@@ -115,6 +115,62 @@ pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 /// narrowed — nothing Loki serves is in the rejected region.
 pub const MAX_DURATION_NS: i64 = i64::MAX / 4;
 
+/// A duration that has PASSED the [`validate_duration_ns`] boundary check —
+/// guaranteed to lie in `0 ..= MAX_DURATION_NS` (issue #227 review round 3).
+///
+/// The inner field is private to this module and the only public way to mint
+/// a non-zero value is [`validate_duration_ns`], so it is **impossible by
+/// construction** to build a [`super::exec::ClientWindow`] — or to reach the
+/// sliding evaluator through the public `run_client_agg_rows` entry point —
+/// carrying an unvalidated client duration. The funnel cannot be walked
+/// around: there is no other constructor, and the field cannot be assigned
+/// from outside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ValidatedDuration(i64);
+
+impl ValidatedDuration {
+    /// The "no `[range]` selector" value (`0`) — used only by the leafless
+    /// `vector(<scalar>)` window, which has no range-vector duration at all.
+    /// Zero is safe everywhere the evaluator uses it (an empty lookback), and
+    /// it is deliberately NOT reachable through [`validate_duration_ns`],
+    /// which rejects `0` as a client input.
+    pub const NONE: Self = ValidatedDuration(0);
+
+    /// The validated nanosecond value, always in `0 ..= MAX_DURATION_NS`.
+    #[inline]
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// The same value widened to `u64` — lossless, the value is non-negative.
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0 as u64
+    }
+}
+
+/// **The client-controlled duration boundary** (issue #227).
+///
+/// Validates a raw `u64` duration — the `[range]` selector from the AST, or
+/// the request `step` — into `1 ..= MAX_DURATION_NS` and mints the
+/// unforgeable [`ValidatedDuration`] the evaluator requires. Every duration
+/// the range/sliding evaluator sees passes through here exactly once, so no
+/// downstream code narrows or wraps client input; a hostile value is a clean
+/// 400 at the boundary.
+pub fn validate_duration_ns(
+    value: u64,
+    what: &'static str,
+) -> Result<ValidatedDuration, super::error::ReadError> {
+    if value == 0 || value > MAX_DURATION_NS as u64 {
+        return Err(super::error::ReadError::DurationOutOfRange {
+            what,
+            value,
+            max: MAX_DURATION_NS,
+        });
+    }
+    Ok(ValidatedDuration(value as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

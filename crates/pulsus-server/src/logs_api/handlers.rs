@@ -465,8 +465,10 @@ mod tests {
         let window = pulsus_read::logql::ClientWindow {
             start_ns: 0,
             end_ns: 11_000 * S,
-            step_ns: Some(S as u64),
-            range_ns: 0,
+            step_ns: Some(
+                pulsus_read::logql::validate_duration_ns(S as u64, "step").expect("valid step"),
+            ),
+            range_ns: pulsus_read::logql::ValidatedDuration::NONE,
         };
         let err = pulsus_read::logql::materialize_vector_lit(0.0, &window)
             .expect_err("an over-cap vector(n) range query must reject");

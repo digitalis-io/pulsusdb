@@ -21,7 +21,9 @@ use pulsus_logql::{
 use super::error::ReadError;
 use super::escape::{ch_regex_anchored, ch_regex_unanchored, ch_string};
 use super::exec::ClientWindow;
-use super::params::{Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec};
+use super::params::{
+    Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
+};
 
 /// A pure fetch plan for either query shape. See the module docs for why
 /// stage 2/3 aren't pre-rendered here. `MetricBinary` (issue M6-10) is
@@ -142,8 +144,9 @@ pub struct MetricPlan {
     /// `Some(step)` = [`QuerySpec::Range`]'s Loki sliding-window shape
     /// (issue #227: the `[range]` window `(t-range, t]` re-evaluated at the
     /// start-anchored grid `{start+k·step ≤ end}`); `None` =
-    /// [`QuerySpec::Instant`]'s single-window aggregate.
-    pub step_ns: Option<u64>,
+    /// [`QuerySpec::Instant`]'s single-window aggregate. Carries the
+    /// boundary-validated [`ValidatedDuration`] (issue #227 review round 3).
+    pub step_ns: Option<ValidatedDuration>,
     /// The emit grid's lower bound — `query_start` (start-anchored,
     /// issue #227). Distinct from `start_ns`, which is the (range-widened)
     /// scan lower bound. Equals `start_ns` for instant queries.
@@ -152,9 +155,10 @@ pub struct MetricPlan {
     /// span and (for `rate`/`bytes_rate`) the per-second divisor.
     ///
     /// **Validated** at the planner boundary into `1 ..= MAX_DURATION_NS`
-    /// ([`validate_duration_ns`], issue #227 review round 2) and carried as a
-    /// plain `i64`, so the evaluator never narrows client-controlled input.
-    pub range_ns: i64,
+    /// ([`validate_duration_ns`]) and carried as the unforgeable
+    /// [`ValidatedDuration`] (issue #227 review round 3), so the evaluator
+    /// can neither narrow nor be handed unvalidated client input.
+    pub range_ns: ValidatedDuration,
     pub rate_window_ns: Option<u64>,
     pub op: RangeAggOp,
     /// Outer-to-inner vector-aggregation chain (`sum by (...) (avg(...))`
@@ -362,7 +366,7 @@ fn build_metric_node(
         )?)),
         MetricExpr::VectorFn(raw) => Ok(MetricNode::VectorLit {
             value: parse_plan_number(raw, "vector() value")?,
-            window: window_from(p),
+            window: window_from(p)?,
         }),
         MetricExpr::Binary {
             op,
@@ -413,27 +417,29 @@ fn build_metric_node(
 /// is `step_ns: None` (a single `{} => n` sample), range carries the
 /// spec's `start_ns`/`end_ns`/`step_ns` so exec materializes the constant
 /// `{}` matrix on the shared bucket grid.
-fn window_from(p: &QueryParams) -> ClientWindow {
+fn window_from(p: &QueryParams) -> Result<ClientWindow, ReadError> {
     // A `vector(n)` literal has no `[range]`; its constant `{}` series is
     // emitted at every start-anchored grid point regardless of window, so
     // `range_ns` is immaterial (0).
     match p.spec {
-        QuerySpec::Instant { at_ns } => ClientWindow {
+        QuerySpec::Instant { at_ns } => Ok(ClientWindow {
             start_ns: at_ns,
             end_ns: at_ns,
             step_ns: None,
-            range_ns: 0,
-        },
+            range_ns: ValidatedDuration::NONE,
+        }),
         QuerySpec::Range {
             start_ns,
             end_ns,
             step_ns,
-        } => ClientWindow {
+        } => Ok(ClientWindow {
             start_ns,
             end_ns,
-            step_ns: Some(step_ns),
-            range_ns: 0,
-        },
+            // The leafless `vector(n)` tree still routes its client `step`
+            // through the boundary (issue #227 review round 3).
+            step_ns: Some(validate_duration_ns(step_ns, "step")?),
+            range_ns: ValidatedDuration::NONE,
+        }),
     }
 }
 
@@ -593,25 +599,6 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
     })
 }
 
-/// **The client-controlled duration boundary** (issue #227 review round 2).
-///
-/// Validates a raw `u64` duration (the `[range]` selector from the AST, or
-/// the request `step`) into the domain `1 ..= MAX_DURATION_NS` and returns it
-/// as a plain `i64`. Every duration the range/sliding evaluator sees passes
-/// through here exactly once, so downstream code carries validated `i64`s and
-/// contains NO `as i64` narrowing of client input — a hostile value is a
-/// clean 400 at the boundary instead of a wrapped window downstream.
-pub(super) fn validate_duration_ns(value: u64, what: &'static str) -> Result<i64, ReadError> {
-    if value == 0 || value > MAX_DURATION_NS as u64 {
-        return Err(ReadError::DurationOutOfRange {
-            what,
-            value,
-            max: MAX_DURATION_NS,
-        });
-    }
-    Ok(value as i64)
-}
-
 fn metric_plan(
     metric_expr: &MetricExpr,
     p: &QueryParams,
@@ -748,7 +735,7 @@ fn metric_plan(
         QuerySpec::Instant { at_ns } => {
             // `range_ns` is validated in-domain, so this is an ordinary i64
             // subtraction (saturating only for a `start` near `i64::MIN`).
-            let start = at_ns.saturating_sub(range_ns);
+            let start = at_ns.saturating_sub(range_ns.get());
             (start, at_ns, None, start, Some(range_ns))
         }
         QuerySpec::Range {
@@ -760,9 +747,9 @@ fn metric_plan(
             // (issue #227 review round 2), so the whole evaluator works over
             // in-domain durations only: every later `step as i128` /
             // `step_ns > i64::MAX` guard is then provably never taken.
-            validate_duration_ns(step_ns, "step")?;
-            let scan_start = start_ns.saturating_sub(range_ns);
-            (scan_start, end_ns, Some(step_ns), start_ns, Some(range_ns))
+            let step = validate_duration_ns(step_ns, "step")?;
+            let scan_start = start_ns.saturating_sub(range_ns.get());
+            (scan_start, end_ns, Some(step), start_ns, Some(range_ns))
         }
     };
 
@@ -893,7 +880,7 @@ fn metric_plan(
         // Widening a boundary-validated positive `i64` to `u64` for
         // `apply_rate`'s divisor — provably lossless (issue #227 round 2).
         rate_window_ns: if is_rate {
-            rate_window_ns.map(|ns| ns as u64)
+            rate_window_ns.map(|ns| ns.as_u64())
         } else {
             None
         },
@@ -1332,7 +1319,7 @@ mod tests {
     #[test]
     fn a_hostile_step_is_rejected_end_to_end_by_the_planner() {
         for hostile in [
-            MAX_DURATION_NS as u64 + 1,
+            super::super::params::MAX_DURATION_NS as u64 + 1,
             i64::MAX as u64 + 1, // would narrow to i64::MIN
             u64::MAX,
         ] {

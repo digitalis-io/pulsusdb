@@ -351,7 +351,7 @@ async fn assert_rollup_matches_raw(
     // FUNCTION-level correctness gate that the tumbling rollup pre-aggregate
     // matches raw tumbling counts (built explicitly, not via routing).
     let mp = metric_plan(query, params, db);
-    let step_ns = mp.step_ns.expect("range spec");
+    let step_ns = mp.step_ns.expect("range spec").as_u64();
     // The scan window is range-widened on `mp`; the tumbling SQL comparison
     // wants the caller's un-widened emit grid.
     let w = TimeWindow {

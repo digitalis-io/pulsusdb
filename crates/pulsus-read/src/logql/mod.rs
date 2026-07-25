@@ -100,6 +100,7 @@ pub use exec::{
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{
     DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec, TimeBounds,
+    ValidatedDuration, validate_duration_ns,
 };
 pub use pipeline::{CompiledPipeline, EntryOut, MetricRun, PipelineError, SAMPLE_EXTRACTION_ERROR};
 pub use plan::{

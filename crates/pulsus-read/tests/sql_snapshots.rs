@@ -878,12 +878,12 @@ fn range_metric_spec_carries_the_caller_supplied_step() {
         r#"rate({env="prod"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
-    assert_eq!(mp.step_ns, Some(STEP_NS));
+    assert_eq!(mp.step_ns.map(|d| d.as_u64()), Some(STEP_NS));
     // Issue #227: the emit grid starts at the caller's `start`; the SCAN
     // lower bound is widened back by the `[5m]` range for the lookback.
     assert_eq!(mp.grid_start_ns, START_NS);
     assert_eq!(mp.start_ns, START_NS - RANGE_NS);
-    assert_eq!(mp.range_ns, RANGE_NS);
+    assert_eq!(mp.range_ns.get(), RANGE_NS);
     assert_eq!(mp.end_ns, END_NS);
 }
 

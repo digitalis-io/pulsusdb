@@ -20,7 +20,7 @@ use pulsus_logql::{
 use super::detected::{self, DetectedFields, DetectedLabelOut, FieldAccumulator};
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
-use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
+use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds, ValidatedDuration};
 use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::rows::{
@@ -995,7 +995,7 @@ impl LogQlEngine {
                     start_ns: mp.start_ns,
                     end_ns: mp.end_ns,
                 },
-                step_ns,
+                step_ns.as_u64(),
                 &mp.extra_predicates,
             );
             if let Some(e) = explain.as_mut() {
@@ -1284,7 +1284,7 @@ impl LogQlEngine {
                     &services,
                     &fingerprints,
                     window,
-                    step_ns,
+                    step_ns.as_u64(),
                     &mp.extra_predicates,
                 ),
                 None => super::sql::metric_instant(
@@ -2926,17 +2926,23 @@ impl<'m> StreamAccumulator<'m> {
 pub struct ClientWindow {
     pub start_ns: i64,
     pub end_ns: i64,
-    pub step_ns: Option<u64>,
+    /// `Some` = a range query's step grid; `None` = instant. Like
+    /// [`Self::range_ns`] this carries the unforgeable [`ValidatedDuration`]
+    /// (issue #227 review round 3), so a hostile `step` cannot reach the grid
+    /// arithmetic by constructing a window directly.
+    pub step_ns: Option<ValidatedDuration>,
     /// The `[range]` selector width in nanoseconds — the sliding window's
     /// span `(t-range, t]`. The scan itself is widened to `(start-range,
     /// end]` so the first grid point `start` sees its full lookback.
     ///
     /// **Validated** into `1 ..= MAX_DURATION_NS` at the planner boundary
-    /// ([`super::plan::validate_duration_ns`], issue #227 review round 2), so
-    /// this is a plain in-domain `i64` and the evaluator performs NO
-    /// narrowing of client-controlled input. (`0` for the leafless
-    /// `vector(<scalar>)` window, which has no `[range]`.)
-    pub range_ns: i64,
+    /// ([`super::params::validate_duration_ns`]). Carrying the unforgeable
+    /// [`ValidatedDuration`] rather than a raw integer makes it IMPOSSIBLE to
+    /// construct a `ClientWindow` — or to call the public
+    /// [`run_client_agg_rows`] entry — around the validation funnel (issue
+    /// #227 review round 3). [`ValidatedDuration::NONE`] is the leafless
+    /// `vector(<scalar>)` window, which has no `[range]` selector.
+    pub range_ns: ValidatedDuration,
 }
 
 /// The instant-mode bucket key (any constant works — there is exactly
@@ -3350,7 +3356,7 @@ impl<'q> ClientAggState<'q> {
         window: ClientWindow,
         rate_window_ns: Option<u64>,
     ) -> Result<Self, ReadError> {
-        if let Some(step) = window.step_ns {
+        if let Some(step) = window.step_ns.map(|d| d.as_u64()) {
             let buckets = grid_bucket_count(window.start_ns, window.end_ns, step);
             if buckets > MAX_CLIENT_AGG_BUCKETS {
                 return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
@@ -3397,7 +3403,7 @@ impl<'q> ClientAggState<'q> {
                 MetricRun::Kept { line, value } => (line, value),
             };
             check_surviving_error(&scratch)?;
-            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns);
+            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns.map(|d| d.as_u64()));
             if is_absent {
                 // Selector-wide presence (plan v2 D2): count surviving
                 // lines per bucket across ALL fingerprints/label sets.
@@ -3498,7 +3504,7 @@ impl<'q> ClientAggState<'q> {
                     QueryResult::Vector(Vec::new())
                 }
             } else {
-                let step = self.window.step_ns.unwrap_or(0);
+                let step = self.window.step_ns.map(|d| d.as_u64()).unwrap_or(0);
                 let points: Vec<(i64, f64)> =
                     bucket_grid(self.window.start_ns, self.window.end_ns, step)
                         .into_iter()
@@ -3602,7 +3608,7 @@ fn grid_bucket_count(start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
 /// range query and `absent_over_time` use), so `points.len() == buckets`
 /// and a `data + vector(n)` binop aligns on the data's populated steps.
 pub fn materialize_vector_lit(value: f64, window: &ClientWindow) -> Result<QueryResult, ReadError> {
-    match window.step_ns {
+    match window.step_ns.map(|d| d.as_u64()) {
         None => Ok(QueryResult::Vector(vec![VectorSample {
             labels: vec![],
             value,
@@ -3678,6 +3684,29 @@ fn stream_hash(sorted_labels: &[(String, String)]) -> u64 {
 /// `QueryTooBroad(TsCollisionGroup)`, never an OOM. A documented constant
 /// (the `DEFAULT_MAX_STREAMS` precedent).
 pub const MAX_TS_COLLISION_GROUP: u64 = 10_000;
+
+/// Byte ceiling on the staged same-`(fingerprint, timestamp_ns)` collision
+/// group (issue #227 review round 3, finding 1).
+///
+/// The member-COUNT cap alone is not a memory bound: 10 000 multi-megabyte
+/// log lines are terabytes of RAM while staying comfortably inside the
+/// byte-scan budget. This cap is charged **before** each body is staged, so
+/// the staged buffer can never exceed it:
+///
+/// > **Bound proof.** `flush_collision` empties `coll` at every
+/// > `(fingerprint, timestamp_ns)` boundary, so at most one group is staged
+/// > at a time. Within a group, a body is cloned only after
+/// > `staged_bytes + body.len() <= MAX_TS_COLLISION_GROUP_BYTES` has been
+/// > checked, and `staged_bytes` is incremented by exactly that `len()`.
+/// > Therefore `Σ staged body bytes <= MAX_TS_COLLISION_GROUP_BYTES` at all
+/// > times, **by construction**, for any body size and any density — the
+/// > breach returns a clean `TsCollisionGroup` error instead of allocating.
+///
+/// 8 MiB of log lines sharing one nanosecond in one stream is already far
+/// beyond any real data (real groups are size 1), so nothing servable is
+/// rejected. Only the order-dependent reducers stage bodies at all
+/// (`needs_body_order`); every other reducer stages zero bytes.
+pub const MAX_TS_COLLISION_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The sliding-window **concurrent** retained-point cap (issue #227):
 /// charge-on-load / discharge-on-evict across every retained window entry
@@ -4107,6 +4136,11 @@ struct RangeSlideState<'q> {
     coll_fp: u64,
     coll_ts: i64,
     coll: Vec<CollMember>,
+    /// Bytes of body currently staged in `coll` — charged BEFORE each clone
+    /// and reset whenever the group is flushed, so the staged buffer is
+    /// bounded by `MAX_TS_COLLISION_GROUP_BYTES` by construction (issue #227
+    /// review round 3, finding 1).
+    coll_bytes: u64,
 }
 
 impl<'q> RangeSlideState<'q> {
@@ -4119,7 +4153,8 @@ impl<'q> RangeSlideState<'q> {
     ) -> Result<Self, ReadError> {
         let step = window
             .step_ns
-            .expect("RangeSlideState requires a range window");
+            .expect("RangeSlideState requires a range window")
+            .as_u64();
         let grid_start = window.start_ns;
         let end_ns = window.end_ns;
         let count = grid_point_count(grid_start, end_ns, step);
@@ -4153,7 +4188,7 @@ impl<'q> RangeSlideState<'q> {
             step,
             // No narrowing: `range_ns` is already a boundary-validated,
             // in-domain `i64` (issue #227 review round 2, finding 2).
-            range: window.range_ns,
+            range: window.range_ns.get(),
             kmax,
             fan_out: compiled.metric_mutates_labels(),
             is_absent: matches!(op, RangeAggOp::AbsentOverTime),
@@ -4175,6 +4210,7 @@ impl<'q> RangeSlideState<'q> {
             coll_fp: 0,
             coll_ts: 0,
             coll: Vec::new(),
+            coll_bytes: 0,
         })
     }
 
@@ -4236,10 +4272,32 @@ impl<'q> RangeSlideState<'q> {
             self.coll_active = true;
             self.coll_fp = row.fingerprint;
             self.coll_ts = row.timestamp_ns;
-            // Only order-dependent reducers retain the body (for the collision
-            // `tie_rank` sort); count/bytes/rate/min/max/quantile do not, so
-            // the common path never clones a body.
+            // Member-COUNT cap, charged BEFORE staging this row.
+            if self.coll.len() as u64 + 1 > MAX_TS_COLLISION_GROUP {
+                result = Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                    count: self.coll.len() as u64 + 1,
+                    cap: MAX_TS_COLLISION_GROUP,
+                }));
+                break;
+            }
+            // Only order-dependent reducers stage the body (for the collision
+            // `tie_rank` sort); count/bytes/rate/min/max/quantile stage zero
+            // bytes, so the common path never clones a body at all.
             let body = if self.needs_body_order {
+                // BYTE cap charged BEFORE the clone (issue #227 review round
+                // 3, finding 1): 10 000 multi-megabyte bodies would be
+                // terabytes of RAM under a count-only cap. Checking first
+                // means the staged buffer provably never exceeds the cap —
+                // the allocation that would breach it is never made.
+                let len = row.body.len() as u64;
+                if self.coll_bytes + len > MAX_TS_COLLISION_GROUP_BYTES {
+                    result = Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                        count: self.coll.len() as u64 + 1,
+                        cap: MAX_TS_COLLISION_GROUP,
+                    }));
+                    break;
+                }
+                self.coll_bytes += len;
                 row.body.clone()
             } else {
                 String::new()
@@ -4249,13 +4307,6 @@ impl<'q> RangeSlideState<'q> {
                 value: v,
                 out,
             });
-            if self.coll.len() as u64 > MAX_TS_COLLISION_GROUP {
-                result = Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
-                    count: self.coll.len() as u64,
-                    cap: MAX_TS_COLLISION_GROUP,
-                }));
-                break;
-            }
         }
         self.base_labels = base_labels;
         result
@@ -4271,6 +4322,11 @@ impl<'q> RangeSlideState<'q> {
         let fp = self.coll_fp;
         let ts = self.coll_ts;
         self.coll_active = false;
+        // The staged bodies are released with this group (every exit path
+        // below either clears or takes `coll`), so the byte charge resets
+        // here — one group is staged at a time, which is what makes
+        // `MAX_TS_COLLISION_GROUP_BYTES` a true bound on the staged buffer.
+        self.coll_bytes = 0;
         // A true total order over the group (order-dependent reducers only):
         // distinct bodies always differ; byte-identical bodies are genuinely
         // interchangeable. Skipped entirely for the common order-independent
@@ -4462,8 +4518,21 @@ impl<'q> RangeSlideState<'q> {
         clamp_bucket(self.grid_start as i128 + k as i128 * self.step as i128)
     }
 
-    /// Finalizes into the query result.
+    /// Finalizes into the query result, asserting the concurrent-retention
+    /// invariant closed out (every charge discharged).
     fn finish(mut self) -> Result<QueryResult, ReadError> {
+        let out = self.finish_in_place()?;
+        debug_assert_eq!(
+            self.retained, 0,
+            "every retention charge must be discharged at finish"
+        );
+        Ok(out)
+    }
+
+    /// The finish body, in place so the post-condition (`retained == 0`) is
+    /// OBSERVABLE — `finish` consumes `self`, which made the release leg of
+    /// the AC8 test unfalsifiable (issue #227 review round 3, finding 3).
+    fn finish_in_place(&mut self) -> Result<QueryResult, ReadError> {
         // `base_labels` moved to a local (as in `push_rows`) so the final
         // `&mut self` flush does not clash with a `self.base_labels` borrow.
         let base_labels = std::mem::take(&mut self.base_labels);
@@ -4492,6 +4561,9 @@ impl<'q> RangeSlideState<'q> {
                 let mut points: Vec<(i64, f64)> = Vec::new();
                 if matches!(class, ReducerClass::InvertInteger) {
                     let mut cells: Vec<(i64, u64)> = group.int_cells.into_iter().collect();
+                    // Symmetric discharge: each cell was charged once on
+                    // creation and is released as it is consumed here.
+                    self.retained = self.retained.saturating_sub(cells.len() as u64);
                     cells.sort_by_key(|(k, _)| *k);
                     for (k, run_int) in cells {
                         points.push((grid_point(k), reduce_int_cell(op, rate_window_ns, run_int)));
@@ -4499,6 +4571,9 @@ impl<'q> RangeSlideState<'q> {
                 } else {
                     let mut cells: Vec<(i64, Vec<WinSample>)> =
                         group.pt_cells.into_iter().collect();
+                    // Symmetric discharge: every retained point released.
+                    let staged: u64 = cells.iter().map(|(_, v)| v.len() as u64).sum();
+                    self.retained = self.retained.saturating_sub(staged);
                     cells.sort_by_key(|(k, _)| *k);
                     for (k, mut pts) in cells {
                         pts.sort_by(win_order);
@@ -4516,14 +4591,14 @@ impl<'q> RangeSlideState<'q> {
             }
             return Ok(QueryResult::Matrix(out));
         }
-        Ok(QueryResult::Matrix(self.series_out))
+        Ok(QueryResult::Matrix(std::mem::take(&mut self.series_out)))
     }
 
     /// `absent_over_time`: emit `1.0` at every grid point whose selector-wide
     /// window `(t-range, t]` is EMPTY (Loki's one emit-on-empty reducer).
     /// Prefix-sums the O(grid) coverage difference array (review finding 1):
     /// a running sum > 0 means at least one sample covers that grid point.
-    fn finish_absent(self) -> QueryResult {
+    fn finish_absent(&mut self) -> QueryResult {
         let mut points: Vec<(i64, f64)> = Vec::new();
         // Same width as the deltas (see `present_cover`'s proof): the running
         // sum is bounded by the total collision-group count, itself bounded by
@@ -4539,7 +4614,7 @@ impl<'q> RangeSlideState<'q> {
             QueryResult::Matrix(Vec::new())
         } else {
             QueryResult::Matrix(vec![MatrixSeries {
-                labels: self.absent_labels,
+                labels: std::mem::take(&mut self.absent_labels),
                 points,
             }])
         }
@@ -6205,6 +6280,21 @@ mod tests {
         le.pipeline
     }
 
+    /// Builds a RANGE `ClientWindow` through the real validation funnel —
+    /// tests cannot fabricate an unvalidated duration either (issue #227
+    /// review round 3).
+    fn slide_window(start_ns: i64, end_ns: i64, step_ns: u64, range_ns: u64) -> ClientWindow {
+        ClientWindow {
+            start_ns,
+            end_ns,
+            step_ns: Some(
+                super::super::params::validate_duration_ns(step_ns, "step").expect("valid step"),
+            ),
+            range_ns: super::super::params::validate_duration_ns(range_ns, "range selector")
+                .expect("valid range"),
+        }
+    }
+
     fn slide_rows(fp: u64, samples: &[(i64, &str)]) -> Vec<MetricScanRow> {
         samples
             .iter()
@@ -6242,12 +6332,7 @@ mod tests {
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
         let rows = slide_rows(1, &[(10, "x"), (20, "x"), (30, "x"), (40, "x"), (50, "x")]);
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: 50,
-            step_ns: Some(10),
-            range_ns: 25,
-        };
+        let window = slide_window(0, 50, 10, 25);
         let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
         let (_, points) = one_series_points(res);
         assert_eq!(
@@ -6276,12 +6361,7 @@ mod tests {
         let rows = slide_rows(1, &[(31_000_000_000, "x"), (59_000_000_000, "x")]);
         let s = 1_000_000_000i64;
         let run = |range_ns: i64| {
-            let window = ClientWindow {
-                start_ns: 60 * s,
-                end_ns: 60 * s,
-                step_ns: Some((60 * s) as u64),
-                range_ns,
-            };
+            let window = slide_window(60 * s, 60 * s, (60 * s) as u64, range_ns as u64);
             let res = run_client_agg_rows(
                 &rows,
                 &compiled,
@@ -6317,12 +6397,7 @@ mod tests {
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: 10,
-            step_ns: Some(10),
-            range_ns: 10,
-        };
+        let window = slide_window(0, 10, 10, 10);
         // Same ts, distinct bodies — count is order-independent, but the
         // collision path must run without panicking and yield a stable count.
         let mut base = vec![(5i64, "ccc"), (5, "aaa"), (5, "bbb")];
@@ -6370,12 +6445,7 @@ mod tests {
                 body: format!("line-{i}"),
             })
             .collect();
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: 10,
-            step_ns: Some(10),
-            range_ns: 10,
-        };
+        let window = slide_window(0, 10, 10, 10);
         match run_client_agg_rows(&rows, &compiled, &meta, &client, window, None) {
             Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup { cap, .. })) => {
                 assert_eq!(cap, MAX_TS_COLLISION_GROUP);
@@ -6448,12 +6518,7 @@ mod tests {
                 body: "x".to_string(),
             })
             .collect();
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: N,
-            step_ns: Some(N as u64),
-            range_ns: N,
-        };
+        let window = slide_window(0, N, N as u64, N as u64);
         let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
             .expect("a dense-but-servable window must stream, never 422");
         assert_eq!(one_series_points(res).1, vec![(N, N as f64)]);
@@ -6581,12 +6646,7 @@ mod tests {
     #[test]
     fn sliding_same_stream_tie_rank_orders_class_c_and_first_last_deterministically() {
         let meta = slide_meta(1, r#"{"app":"a"}"#);
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: 10,
-            step_ns: Some(10),
-            range_ns: 10,
-        };
+        let window = slide_window(0, 10, 10, 10);
         // Three rows at the IDENTICAL `(fingerprint, timestamp_ns)` with
         // DISTINCT bodies that all parse to the same label set (`a` is
         // consumed by the unwrap), chosen so the full-BODY byte order is
@@ -6643,12 +6703,7 @@ mod tests {
     #[test]
     fn sliding_mutating_fan_out_charges_and_releases_retention_for_both_cell_kinds() {
         let meta = slide_meta(1, r#"{"app":"a"}"#);
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: 100,
-            step_ns: Some(10),
-            range_ns: 30,
-        };
+        let window = slide_window(0, 100, 10, 30);
         // A `label_format` makes the output set differ from the base ⇒ the
         // mutating fan-out path (`fan_out == true`).
         for (op, value, expect_int_cells) in [
@@ -6702,10 +6757,16 @@ mod tests {
                     "{op:?}: every retained point is charged exactly once"
                 );
             }
-            // Finishing consumes the state — the whole charge goes away with
-            // it (no leak into a subsequent query).
-            let out = state.finish().expect("finish");
+            // RELEASE leg (review round 3, finding 3): drive the in-place
+            // finish so the discharge is OBSERVABLE — the charge must return
+            // to exactly zero. Deleting the discharge in `finish_in_place`
+            // reddens this assertion (proved by tripping it).
+            let out = state.finish_in_place().expect("finish");
             assert!(matches!(out, QueryResult::Matrix(ref m) if !m.is_empty()));
+            assert_eq!(
+                state.retained, 0,
+                "{op:?}: every mutating-path charge must be discharged at finish"
+            );
         }
     }
 
@@ -6716,11 +6777,15 @@ mod tests {
         use super::super::params::MAX_DURATION_NS;
         // In-domain values pass.
         assert_eq!(
-            super::super::plan::validate_duration_ns(60_000_000_000, "step").unwrap(),
+            super::super::params::validate_duration_ns(60_000_000_000, "step")
+                .unwrap()
+                .get(),
             60_000_000_000
         );
         assert_eq!(
-            super::super::plan::validate_duration_ns(MAX_DURATION_NS as u64, "step").unwrap(),
+            super::super::params::validate_duration_ns(MAX_DURATION_NS as u64, "step")
+                .unwrap()
+                .get(),
             MAX_DURATION_NS
         );
         // Zero and everything above the domain are named 400s, NOT wraps.
@@ -6730,7 +6795,7 @@ mod tests {
             i64::MAX as u64 + 1, // would narrow to a NEGATIVE i64
             u64::MAX,
         ] {
-            match super::super::plan::validate_duration_ns(hostile, "range selector") {
+            match super::super::params::validate_duration_ns(hostile, "range selector") {
                 Err(ReadError::DurationOutOfRange { value, max, .. }) => {
                     assert_eq!(value, hostile);
                     assert_eq!(max, MAX_DURATION_NS);
@@ -6771,6 +6836,83 @@ mod tests {
         // The symmetric decrement is equally exact.
         cover[1] -= cover[0];
         assert_eq!(cover[0] + cover[1], 0, "difference array nets to zero");
+    }
+
+    /// Review round 3, finding 1: the collision group is bounded in BYTES,
+    /// not just member count — a handful of very large same-`(fingerprint,
+    /// ts)` bodies trips the clean error long before the 10 000-member cap,
+    /// and the staged buffer never exceeds `MAX_TS_COLLISION_GROUP_BYTES`.
+    #[test]
+    fn collision_group_byte_cap_trips_before_staging_large_bodies() {
+        // An order-DEPENDENT reducer, so bodies are staged for `tie_rank`.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+
+        // 1 MiB bodies at the SAME (fingerprint, ts): only ~8 fit under the
+        // 8 MiB byte cap — far below the 10 000-member cap, so the byte
+        // dimension is what bites.
+        let big = "x".repeat(1024 * 1024);
+        let rows: Vec<MetricScanRow> = (0..64)
+            .map(|_| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("a=1 {big}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup { count, cap })) => {
+                assert_eq!(cap, MAX_TS_COLLISION_GROUP);
+                assert!(
+                    count < MAX_TS_COLLISION_GROUP,
+                    "the BYTE cap must trip well before the member cap, tripped at {count}"
+                );
+            }
+            other => panic!("expected TsCollisionGroup from the byte cap, got {other:?}"),
+        }
+        // Bound proof, observed: the staged buffer never exceeded the cap.
+        assert!(
+            state.coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
+            "staged {} bytes exceeds the {MAX_TS_COLLISION_GROUP_BYTES}-byte cap",
+            state.coll_bytes
+        );
+    }
+
+    /// A group of ordinary-sized bodies is unaffected by the byte cap (it
+    /// must not reject anything real).
+    #[test]
+    fn collision_group_byte_cap_does_not_reject_ordinary_bodies() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        // Bodies differ in BYTES (trailing padding) but parse to the same
+        // label set, so they form ONE 500-member collision group — the shape
+        // the byte cap must not reject.
+        let rows: Vec<MetricScanRow> = (0..500)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("a=1{}", " ".repeat(i % 7)),
+            })
+            .collect();
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
+            .expect("500 ordinary same-ns bodies must be served");
+        assert_eq!(one_series_points(res).1, vec![(10, 500.0)]);
     }
 
     /// AC10: the retention cap's over-cap error is `MetricRetention` and the
@@ -6827,12 +6969,7 @@ mod tests {
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: 100,
-            step_ns: Some(10),
-            range_ns: 10,
-        };
+        let window = slide_window(0, 100, 10, 10);
         let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
         // 20_000 dense samples covering only the second half of the grid.
         let rows: Vec<MetricScanRow> = (0..20_000)
@@ -8788,7 +8925,7 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
             step_ns: None,
-            range_ns: 0,
+            range_ns: ValidatedDuration::NONE,
         };
         let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
         state.quantile_values = MAX_QUANTILE_VALUES - 1;
@@ -8849,7 +8986,7 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
             step_ns: None,
-            range_ns: 0,
+            range_ns: ValidatedDuration::NONE,
         };
         (compiled, client, meta, window)
     }
@@ -8947,12 +9084,7 @@ mod tests {
         // in three distinct step buckets (0, 20s, 40s).
         let step_ns = 20_000_000_000u64;
         let range_ns = 60_000_000_000u64;
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: range_ns as i64,
-            step_ns: Some(step_ns),
-            range_ns: range_ns as i64,
-        };
+        let window = slide_window(0, range_ns as i64, step_ns, range_ns);
         let rows = [
             (10_000_000_000i64, "c=10"), // bucket 0
             (15_000_000_000, "c=30"),    // bucket 0
