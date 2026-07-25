@@ -753,7 +753,10 @@ async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp
     let client = setup(db, ts_ns).await;
 
     let mp = metric_plan(r#"rate({env="prod"}[5m])"#, &range_params(ts_ns), db);
-    assert!(!mp.rollup, "issue #227: a range query slides raw, never rollup");
+    assert!(
+        !mp.rollup,
+        "issue #227: a range query slides raw, never rollup"
+    );
     assert!(mp.client.is_some());
     assert_eq!(mp.table, "log_samples");
     let table = format!("{db}.log_samples");

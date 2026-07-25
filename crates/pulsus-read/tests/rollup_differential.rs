@@ -42,7 +42,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_logql::{RangeAggOp, parse};
-use pulsus_read::logql::rows::MetricBucketRow;
+use pulsus_read::logql::rows::{MetricBucketRow, MetricScanRow};
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{
     Direction, EngineConfig, LogQlEngine, MatrixSeries, Plan, PlanCtx, QueryParams, QueryResult,
@@ -259,6 +259,62 @@ fn metric_plan(query: &str, params: &QueryParams, db: &str) -> pulsus_read::logq
     }
 }
 
+/// Issue #227: the exact sliding-window `count_over_time` reference — the
+/// independent ground truth the engine's streaming slide must match. Counts
+/// samples in the half-open window `(t-range, t]` at every start-anchored
+/// grid point `{grid_start + k·step ≤ end}`; an empty window emits no point.
+fn sliding_count_reference(
+    ts: &[i64],
+    grid_start: i64,
+    end: i64,
+    step: u64,
+    range: i64,
+) -> BTreeMap<i64, f64> {
+    let mut out = BTreeMap::new();
+    let step = step as i64;
+    let mut k = 0i64;
+    loop {
+        let t = grid_start + k * step;
+        if t > end {
+            break;
+        }
+        let lo = t - range;
+        let n = ts.iter().filter(|&&x| x > lo && x <= t).count();
+        if n > 0 {
+            out.insert(t, n as f64);
+        }
+        k += 1;
+    }
+    out
+}
+
+/// Fetches the raw sample timestamps for one fingerprint (optionally
+/// body-filtered), ascending — the input to [`sliding_count_reference`].
+async fn fetch_timestamps(
+    client: &ChClient,
+    db: &str,
+    fp: u64,
+    body_filter: Option<&str>,
+) -> Vec<i64> {
+    let filter = match body_filter {
+        Some(f) => format!(" AND position(body, '{f}') > 0"),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT fingerprint, timestamp_ns, body FROM {db}.log_samples \
+         WHERE fingerprint = {fp}{filter} ORDER BY timestamp_ns"
+    );
+    let mut stream = client
+        .query_stream::<MetricScanRow>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("timestamp fetch failed: {e}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode sample row").timestamp_ns);
+    }
+    out
+}
+
 /// Runs `sql` and collects it into a `(fingerprint, step) -> n` map.
 /// Doubles literal `?`s exactly as `LogQlEngine::query_stream` does
 /// internally (`exec.rs::escape_query_placeholders`) — this file calls
@@ -290,21 +346,26 @@ async fn assert_rollup_matches_raw(
     params: &QueryParams,
     fps: &[u64],
 ) -> BTreeMap<(u64, i64), u64> {
+    // Issue #227 retires the range rollup ROUTING, but the `metric_range`
+    // rollup SQL builder + the `log_metrics_5s` table still exist — this is a
+    // FUNCTION-level correctness gate that the tumbling rollup pre-aggregate
+    // matches raw tumbling counts (built explicitly, not via routing).
     let mp = metric_plan(query, params, db);
-    assert!(mp.rollup, "fixture query must be rollup-eligible: {query}");
     let step_ns = mp.step_ns.expect("range spec");
+    // The scan window is range-widened on `mp`; the tumbling SQL comparison
+    // wants the caller's un-widened emit grid.
     let w = TimeWindow {
-        start_ns: mp.start_ns,
+        start_ns: mp.grid_start_ns,
         end_ns: mp.end_ns,
     };
 
-    let rollup_table = format!("{db}.{}", mp.table);
+    let is_bytes = matches!(mp.op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime);
+    let rollup_table = format!("{db}.log_metrics_5s");
     let rollup_source = sql::MetricSource {
         table: &rollup_table,
-        bucket_col: mp.bucket_col,
-        agg_expr: mp.agg_expr,
+        bucket_col: "bucket_ns",
+        agg_expr: if is_bytes { "sum(bytes)" } else { "sum(count)" },
     };
-    let is_bytes = matches!(mp.op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime);
     let raw_table = format!("{db}.log_samples");
     let raw_source = sql::MetricSource {
         table: &raw_table,
@@ -455,30 +516,14 @@ async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_coun
     let w = window(base_ns);
     let step_ns = 12 * RES_NS as u64;
 
-    // Independently compute raw truth for `FP_A` alone (the selector below
-    // matches only `FP_A`'s `env="prod"` label) via the raw `sql` builder
-    // directly — this is the ground truth the engine's rollup-served
-    // answer must match exactly.
-    let raw_table = format!("{db}.log_samples");
-    let raw_source = sql::MetricSource {
-        table: &raw_table,
-        bucket_col: "timestamp_ns",
-        agg_expr: "count()",
-    };
-    let raw_sql = sql::metric_range(
-        raw_source,
-        &["'checkout'".to_string()],
-        &[FP_A],
-        w,
-        step_ns,
-        &[],
-    );
-    let raw_map = query_bucket_map(&client, &raw_sql).await;
-    assert!(!raw_map.is_empty(), "fixture produced no raw truth data");
-    let expected: BTreeMap<i64, f64> = raw_map
-        .into_iter()
-        .map(|((_fp, step), n)| (step, n as f64))
-        .collect();
+    // Issue #227: the engine now SLIDES. Independently compute the sliding
+    // ground truth for `FP_A` in Rust from the raw sample timestamps — the
+    // `[1m]` window `(t-60s, t]` at every start-anchored grid point.
+    const RANGE_1M: i64 = 60_000_000_000;
+    let ts = fetch_timestamps(&client, db, FP_A, None).await;
+    assert!(!ts.is_empty(), "fixture produced no raw truth data");
+    let expected = sliding_count_reference(&ts, w.start_ns, w.end_ns, step_ns, RANGE_1M);
+    assert!(!expected.is_empty(), "reference produced no points");
 
     let engine_cfg = ChConnConfig {
         database: db.to_string(),
@@ -548,24 +593,14 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
     // contains "longer", bucketed by step — the same predicate the
     // engine's pushed-down line filter renders.
     let raw_table = format!("{db}.log_samples");
-    let raw_sql = sql::metric_range(
-        sql::MetricSource {
-            table: &raw_table,
-            bucket_col: "timestamp_ns",
-            agg_expr: "count()",
-        },
-        &["'checkout'".to_string()],
-        &[FP_A],
-        w,
-        step_ns,
-        &["position(body, 'longer') > 0".to_string()],
-    );
-    let raw_map = query_bucket_map(&client, &raw_sql).await;
-    assert!(!raw_map.is_empty(), "fixture produced no raw truth data");
-    let expected: BTreeMap<i64, f64> = raw_map
-        .into_iter()
-        .map(|((_fp, step), n)| (step, n as f64))
-        .collect();
+    // Issue #227: the client-agg path SLIDES too. Sliding ground truth in
+    // Rust from the "longer"-filtered raw timestamps, `[1m]` window.
+    const RANGE_1M: i64 = 60_000_000_000;
+    let _ = &raw_table;
+    let ts = fetch_timestamps(&client, db, FP_A, Some("longer")).await;
+    assert!(!ts.is_empty(), "fixture produced no raw truth data");
+    let expected = sliding_count_reference(&ts, w.start_ns, w.end_ns, step_ns, RANGE_1M);
+    assert!(!expected.is_empty(), "reference produced no points");
 
     let engine_cfg = ChConnConfig {
         database: db.to_string(),
