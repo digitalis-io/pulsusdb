@@ -555,6 +555,76 @@ impl LogCorpus {
     /// feature fields with the same f64 operations the engine performs
     /// (duration ms → seconds is `ms * 1e-3`; sums accumulate in
     /// timestamp order).
+    /// Replays the pinned reference's `extrapolatedRate(samples, [1m],
+    /// isCounter=true, isRate=true)` (grafana/loki:3.7.3,
+    /// `pkg/logql/range_vector.go`) over one `rate_counter` witness
+    /// service's `c=<n>` samples, taken in record push order and
+    /// stable-sorted by timestamp. This is an INDEPENDENT oracle derived
+    /// from the reference's ns-as-ms arithmetic (the window iterators store
+    /// ns but `extrapolatedRate` divides every span by 1000, and the
+    /// extrapolation window is anchored on the first sample) — NOT a copy
+    /// of PulsusDB's reducer. Mirrors `rate_counter_extrapolated` in
+    /// pulsus-read; the hermetic evaluator-agreement test proves they
+    /// coincide, and the nightly `oracle_vs_corpus` leg proves this equals
+    /// the live container.
+    fn rate_counter_ref(&self, service: &str) -> f64 {
+        // `[1m]` window in ns; witnesses collapse onto one series.
+        const WINDOW_NS: i64 = 60 * 1_000_000_000;
+        let mut pts: Vec<(i64, f64)> = self
+            .records
+            .iter()
+            .filter(|r| r.service == service)
+            .filter_map(|r| {
+                r.body
+                    .strip_prefix("c=")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|c| (r.ts_ns, c))
+            })
+            .collect();
+        if pts.len() < 2 {
+            return 0.0;
+        }
+        pts.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let first_t = pts[0].0;
+        let last_t = pts[pts.len() - 1].0;
+        let first_f = pts[0].1;
+        let last_f = pts[pts.len() - 1].1;
+        let mut result_value = last_f - first_f;
+        let mut last_value = 0.0_f64;
+        for &(_, f) in &pts {
+            if f < last_value {
+                result_value += last_value;
+            }
+            last_value = f;
+        }
+        let sel_range_ms: i64 = WINDOW_NS / 1_000_000;
+        let range_start = first_t - sel_range_ms;
+        let mut duration_to_start = (first_t - range_start) as f64 / 1000.0;
+        let duration_to_end = 0.0_f64;
+        let sampled_interval = (last_t - first_t) as f64 / 1000.0;
+        let average_duration = sampled_interval / (pts.len() - 1) as f64;
+        if result_value > 0.0 && first_f >= 0.0 {
+            let duration_to_zero = sampled_interval * (first_f / result_value);
+            if duration_to_zero < duration_to_start {
+                duration_to_start = duration_to_zero;
+            }
+        }
+        let threshold = average_duration * 1.1;
+        let mut extrapolate_to = sampled_interval;
+        extrapolate_to += if duration_to_start < threshold {
+            duration_to_start
+        } else {
+            average_duration / 2.0
+        };
+        extrapolate_to += if duration_to_end < threshold {
+            duration_to_end
+        } else {
+            average_duration / 2.0
+        };
+        result_value *= extrapolate_to / sampled_interval;
+        result_value / (WINDOW_NS as f64 / 1_000_000_000.0)
+    }
+
     pub fn expected_metric_vector(&self, case_id: &str) -> MetricVector {
         let json_labels = |r: &GeneratedRecord| {
             let mut labels = self.base_labels(r);
@@ -671,23 +741,31 @@ impl LogCorpus {
                 out.extend(joined);
             }
             // Issue M8-LQ3 `rate_counter`: all samples collapse onto the
-            // base label set (`logfmt` extracts `c`, `unwrap c` deletes
-            // it), one series, value = reset-aware increase / 60s. The
+            // base label set (`logfmt` extracts `c`, `unwrap c` deletes it),
+            // one series, value = the reference's ns/ms `extrapolatedRate`
+            // (isCounter, isRate) over the witness's `c=<n>` samples — the
+            // reset-aware increase scaled by the tiny `1 + 60000/span_ns`
+            // extrapolation factor the ns-as-ms unit mix produces, then
+            // divided by the 60s window. `rate_counter_ref` replays that
+            // arithmetic from the real record timestamps, keeping the corpus
+            // an INDEPENDENT oracle derived from reference semantics
+            // (grafana/loki:3.7.3), not a copy of PulsusDB's reducer. The
             // hermetic `shipped_metric_expectations_agree_with_the_shipped_evaluator`
             // test cross-checks each derived value against the real reducer.
             "metric_rate_counter_reset" => {
-                out.insert(rc_base(SVC_RC_RESET), 32.0 / 60.0);
+                out.insert(rc_base(SVC_RC_RESET), self.rate_counter_ref(SVC_RC_RESET));
             }
             "metric_rate_counter_sparse" => {
-                // increase 60 (200→260) / 60s window = 1.0 (no extrapolation).
-                out.insert(rc_base(SVC_RC_SPARSE), 1.0);
+                out.insert(rc_base(SVC_RC_SPARSE), self.rate_counter_ref(SVC_RC_SPARSE));
             }
             "metric_rate_counter_boundary" => {
-                // increase 60 (100→160) / 60s window = 1.0.
-                out.insert(rc_base(SVC_RC_BOUNDARY), 1.0);
+                out.insert(
+                    rc_base(SVC_RC_BOUNDARY),
+                    self.rate_counter_ref(SVC_RC_BOUNDARY),
+                );
             }
             "metric_rate_counter_dup_ts" => {
-                out.insert(rc_base(SVC_RC_DUPTS), 17.0 / 60.0);
+                out.insert(rc_base(SVC_RC_DUPTS), self.rate_counter_ref(SVC_RC_DUPTS));
             }
             // Issue M8-LQ3 `sort`: `sum by (grp) (count_over_time(...))`
             // reduces to `{grp}` counts {a:5, b:1, c:5}. The set is the

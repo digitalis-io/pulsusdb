@@ -240,28 +240,28 @@
     },
     {
       "case_id": "metric_rate_counter_reset",
-      "construct": "M8-LQ3 rate_counter over a resetting unwrapped counter (c=10,30,5,12 by ts): reset-aware increase 32 / 60s window = 0.5333 (oracle-confirmed v3.7.3). Instant [1m] lookback — semantically identical on both stores (no tumbling divergence)",
+      "construct": "M8-LQ3 rate_counter over a resetting unwrapped counter (c=10,30,5,12 by ts, samples 1s apart ⇒ span 3s): reset-aware increase 32, scaled by the reference's ns-as-ms extrapolation factor (1 + 60000/span_ns; extrapolatedRate divides ns spans by 1000, window anchored on the first sample), then / 60s window = 0.5333439999999999 (oracle-confirmed v3.7.3). Instant [1m] lookback — semantically identical on both stores (no tumbling divergence)",
       "mode": "gated",
       "kind": "metric_instant",
       "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcreset\"} | logfmt | unwrap c [1m])"
     },
     {
       "case_id": "metric_rate_counter_sparse",
-      "construct": "M8-LQ3 rate_counter over sparse interior samples (c=200,260, 10s apart): increase 60 divided by the FULL 60s window = 1.0, NOT boundary-extrapolated (which would inflate to 6.0). Oracle-confirmed v3.7.3",
+      "construct": "M8-LQ3 rate_counter over sparse interior samples (c=200,260 at offsets 10,11 ⇒ 1s apart, span 1s): increase 60, scaled by the reference's ns-as-ms extrapolation factor (1 + 60000/span_ns), then / 60s window = 1.00006 (oracle-confirmed v3.7.3). This is NOT Prometheus full-range extrapolation (which would inflate to ~6.0) — the ns/ms unit mix keeps durationToStart at 60, so the factor is ~1.00006, not ~6",
       "mode": "gated",
       "kind": "metric_instant",
       "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcsparse\"} | logfmt | unwrap c [1m])"
     },
     {
       "case_id": "metric_rate_counter_boundary",
-      "construct": "M8-LQ3 rate_counter over a monotone counter spanning the window (c=100,160): increase 60 / 60s = 1.0 (oracle-confirmed v3.7.3). The half-open (t-range, t] edge-inclusion rule is pinned in the hermetic reducer golden",
+      "construct": "M8-LQ3 rate_counter over a monotone counter (c=100,160 at offsets 12,13 ⇒ 1s apart, span 1s): increase 60, scaled by the reference's ns-as-ms extrapolation factor (1 + 60000/span_ns), then / 60s window = 1.00006 (oracle-confirmed v3.7.3). The half-open (t-range, t] edge-inclusion rule is pinned in the hermetic reducer golden",
       "mode": "gated",
       "kind": "metric_instant",
       "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcbound\"} | logfmt | unwrap c [1m])"
     },
     {
       "case_id": "metric_rate_counter_dup_ts",
-      "construct": "M8-LQ3 rate_counter duplicate-timestamp handling: samples 5,{10,3}@one-ts,12 processed in delivered scan order (ts asc, then body asc) as 5,10,3,12 — +5, reset +3, +9 = increase 17 / 60s = 0.2833 (oracle-confirmed v3.7.3; an ascending-VALUE tie-sort would wrongly give 0.2). Both stores order same-ts samples in storage order, not by value",
+      "construct": "M8-LQ3 rate_counter duplicate-timestamp handling: samples 5,{10,3}@one-ts,12 (offsets 14,15,15,16 ⇒ span 2s) processed in delivered scan order (ts asc, then body asc) as 5,10,3,12 — +5, reset +3, +9 = increase 17, scaled by the reference's ns-as-ms extrapolation factor (1 + 60000/span_ns), then / 60s window = 0.2833418333333333 (oracle-confirmed v3.7.3; an ascending-VALUE tie-sort would wrongly give the 12-based value). Both stores order same-ts samples in storage order, not by value",
       "mode": "gated",
       "kind": "metric_instant",
       "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcdup\"} | logfmt | unwrap c [1m])"

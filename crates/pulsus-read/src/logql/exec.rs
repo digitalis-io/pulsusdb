@@ -3017,7 +3017,7 @@ impl BucketAcc {
     fn finish(self, op: RangeAggOp, rate_window_ns: Option<u64>, quantile: Option<f64>) -> f64 {
         match self {
             BucketAcc::Values(mut vals) => quantile_of(&mut vals, quantile.unwrap_or(f64::NAN)),
-            BucketAcc::Counter(pts) => apply_rate(counter_increase(pts), rate_window_ns),
+            BucketAcc::Counter(pts) => rate_counter_extrapolated(pts, rate_window_ns),
             BucketAcc::Simple(acc) => match op {
                 // Oracle-probed: `rate` over an unwrapped range is the
                 // per-second SUM of values (count-shaped inputs
@@ -3046,36 +3046,92 @@ impl BucketAcc {
     }
 }
 
-/// The reset-aware total counter increase over a bucket's unwrapped
-/// samples (issue M8-LQ3, AC4). Samples are ordered by timestamp with a
-/// STABLE sort (no value tie-break): duplicate-timestamp samples keep
-/// their delivered scan order — the deterministic SQL scan order
-/// `ORDER BY timestamp_ns, fingerprint, body` (`metric_raw_samples`) —
-/// matching the pinned reference (v3.7.3), which processes same-timestamp
-/// unwrapped samples in storage/scan order rather than re-sorting them by
-/// value (branch-validated: the sequence `5, 10, 3, 12` with `10`/`3`
-/// tied at one timestamp yields increase 17 / 0.2833, not the 12 / 0.2 an
-/// ascending-value sort would give). The walk then adds `next - prev` on
-/// a monotone step and the bare `next` on a drop (a counter reset counts
-/// from zero). Total increase `= last - first + Σ(resets)`; the caller
-/// divides by the window seconds (`apply_rate`). No PromQL-style boundary
-/// extrapolation.
-fn counter_increase(mut pts: Vec<(i64, f64)>) -> f64 {
-    pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
-    let mut iter = pts.into_iter().map(|(_, v)| v);
-    let Some(mut prev) = iter.next() else {
+/// `rate_counter` reducer — a bit-exact replica of the pinned reference's
+/// `extrapolatedRate(samples, selRange, isCounter=true, isRate=true)`
+/// (grafana/loki v3.7.3, `pkg/logql/range_vector.go`), replayed over
+/// PulsusDB's nanosecond timestamps.
+///
+/// Two load-bearing quirks make this diverge from a plain
+/// `reset-aware increase / range.Seconds()`:
+///  1. The reference's window iterators store sample timestamps in
+///     nanoseconds, but `extrapolatedRate` divides every span by `1000`
+///     (`durationMilliseconds`) — treating those ns values as ms. We keep
+///     PulsusDB's ns timestamps and divide by `1000` identically, so the
+///     unit-mix is reproduced rather than corrected.
+///  2. The extrapolation window is anchored on the FIRST sample, not the
+///     query step: `rangeStart = samples[0].T - durationMilliseconds(selRange)`,
+///     `rangeEnd = samples[last].T`. So `durationToEnd == 0` and
+///     `durationToStart == selRange_ms/1000 == 60.0` for a `[1m]` window —
+///     the factor is `1 + 60000/span_ns` (~1.00006), NOT PromQL's ~6x
+///     full-range extrapolation.
+///
+/// Samples are ordered by timestamp with a STABLE sort (no value
+/// tie-break): duplicate-timestamp samples keep their delivered scan order
+/// — the deterministic SQL scan order `ORDER BY timestamp_ns, fingerprint,
+/// body` (`metric_raw_samples`) — matching the reference, which processes
+/// same-timestamp unwrapped samples in storage/scan order rather than
+/// re-sorting them by value (branch-validated: `5, 10, 3, 12` with `10`/`3`
+/// tied at one timestamp yields increase 17 / `0.2833…`, not the 12 / 0.2 an
+/// ascending-value sort would give).
+///
+/// The reset-aware increase is accumulated in the reference's own order
+/// (`resultValue = last - first; for s { if s < lastValue { resultValue +=
+/// lastValue } }`), which is the bit-exact form to match. The reference
+/// EMITS `0.0` for `<2`-point groups (verified against grafana/loki:3.7.3 —
+/// a lone sample returns value `"0"`), so we return `0.0` and let `finish`
+/// surface it as a 0-valued vector element; we do NOT drop the group.
+fn rate_counter_extrapolated(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u64>) -> f64 {
+    if pts.len() < 2 {
+        return 0.0;
+    }
+    let Some(rng_ns) = rate_window_ns.filter(|w| *w > 0) else {
         return 0.0;
     };
-    let mut increase = 0.0;
-    for v in iter {
-        if v < prev {
-            increase += v;
-        } else {
-            increase += v - prev;
+    pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
+    let first_t = pts[0].0;
+    let last_t = pts[pts.len() - 1].0;
+    let first_f = pts[0].1;
+    let last_f = pts[pts.len() - 1].1;
+
+    // Reset-aware increase in the reference's accumulation order.
+    let mut result_value = last_f - first_f;
+    let mut last_value = 0.0_f64;
+    for &(_, f) in &pts {
+        if f < last_value {
+            result_value += last_value;
         }
-        prev = v;
+        last_value = f;
     }
-    increase
+
+    // `durationMilliseconds(selRange)`; window anchored on the first sample.
+    let sel_range_ms: i64 = (rng_ns / 1_000_000) as i64;
+    let range_start = first_t - sel_range_ms; // ns − ms: the reference's unit mix
+    let mut duration_to_start = (first_t - range_start) as f64 / 1000.0; // == sel_range_ms/1000
+    let duration_to_end = 0.0_f64; // rangeEnd == last.T ⇒ 0
+    let sampled_interval = (last_t - first_t) as f64 / 1000.0;
+    let average_duration = sampled_interval / (pts.len() - 1) as f64;
+
+    if result_value > 0.0 && first_f >= 0.0 {
+        let duration_to_zero = sampled_interval * (first_f / result_value);
+        if duration_to_zero < duration_to_start {
+            duration_to_start = duration_to_zero;
+        }
+    }
+
+    let threshold = average_duration * 1.1;
+    let mut extrapolate_to = sampled_interval;
+    extrapolate_to += if duration_to_start < threshold {
+        duration_to_start
+    } else {
+        average_duration / 2.0
+    };
+    extrapolate_to += if duration_to_end < threshold {
+        duration_to_end
+    } else {
+        average_duration / 2.0
+    };
+    result_value *= extrapolate_to / sampled_interval;
+    result_value / (rng_ns as f64 / 1_000_000_000.0) // isRate: / selRange.Seconds()
 }
 
 /// The reference oracle's quantile semantics (live-probed: `q=0.9` over
@@ -7044,9 +7100,10 @@ mod tests {
     /// Code review round 2 (M8-LQ3, finding 1): the `rate_counter`
     /// per-bucket point retention is bounded by [`MAX_COUNTER_VALUES`],
     /// mirroring the quantile bound. Below the cap the reset-aware rate is
-    /// unaffected (four samples 10,30,5,12 by ts → increase 32 over the
-    /// 60s window = 32/60); charged to the boundary the next sample trips
-    /// the named `CounterValues` too-broad error — complete-or-error,
+    /// unaffected by the guard (four samples 10,30,5,12 by ts → increase 32,
+    /// span 30e9 ns, scaled by the ns/ms extrapolation factor and divided by
+    /// the 60s window = 0.5333344); charged to the boundary the next sample
+    /// trips the named `CounterValues` too-broad error — complete-or-error,
     /// never a silently truncated increase.
     #[test]
     fn rate_counter_point_retention_is_capped_without_changing_values_below_it() {
@@ -7088,7 +7145,7 @@ mod tests {
             panic!("expected a vector, got {result:?}");
         };
         assert_eq!(items.len(), 1, "one series expected: {items:?}");
-        assert_eq!(items[0].value, 32.0 / 60.0);
+        assert_eq!(items[0].value, 0.5333344);
 
         // At the boundary: the next retained point trips the named error,
         // exactly as the quantile bound does — driven through the real
@@ -7200,9 +7257,11 @@ mod tests {
             "the per-row charge equals total retained points (a true bound)"
         );
 
-        // Values below the cap are unchanged: each bucket's reset-aware
-        // increase, divided by the 60s range. b0: 30-10=20; b20: 12-5=7;
-        // b40: 20-7=13.
+        // Values below the cap are unaffected by the retention guard: each
+        // bucket's reset-aware increase, scaled by the ns/ms extrapolation
+        // factor `(span_ns/1000 + 60)/(span_ns/1000)` and divided by the 60s
+        // range. b0: 30-10=20, span 5e9 ⇒ factor 1.000012; b20: 12-5=7, span
+        // 10e9 ⇒ factor 1.000006; b40: 20-7=13, span 10e9 ⇒ factor 1.000006.
         let QueryResult::Matrix(series) = state.finish() else {
             panic!("a range rate_counter query yields a matrix");
         };
@@ -7210,9 +7269,9 @@ mod tests {
         assert_eq!(
             series[0].points,
             vec![
-                (0, 20.0 / 60.0),
-                (step_ns as i64, 7.0 / 60.0),
-                (2 * step_ns as i64, 13.0 / 60.0),
+                (0, 0.3333373333333333),
+                (step_ns as i64, 0.11666736666666666),
+                (2 * step_ns as i64, 0.21666796666666663),
             ],
             "per-bucket reset-aware rates are unaffected by the retention guard"
         );
