@@ -2052,21 +2052,32 @@ fn a_matching_modifier_on_a_scalar_operand_is_ignored_matching_the_loki_oracle()
 }
 
 // ---------------------------------------------------------------------
-// Issue M8-LQ3 (AC4/AC5): `rate_counter` reset-aware per-second increase
-// and `sort`/`sort_desc` value ordering.
+// Issue M8-LQ3 / #218: `rate_counter` reset-aware per-second increase and
+// `sort`/`sort_desc` value ordering.
 //
-// ORACLE NOTE: the exact `rate_counter` per-window VALUES (reset/dup-ts
-// tie-break/boundary/sparse) and the `sort`/`sort_desc` NaN+tie ORDER are
-// reference-dependent (pinned Loki v3.7.3). The expectations below are the
-// hand-derived values under plan v4's stated Rules 1-3; they are pinned
-// here for the reducer SHAPE every PR and cross-checked against the live
-// reference by the gated e2e vectors (`metric_rate_counter_*`). If the
-// reference diverges the e2e gate goes RED and these are corrected in place.
+// ORACLE NOTE: `rate_counter` replays the pinned reference's ns/ms
+// `extrapolatedRate(samples, [1m], isCounter=true, isRate=true)`
+// (grafana/loki:3.7.3). The result is the reset-aware increase scaled by a
+// TINY extrapolation factor `1 + 60000/span_ns`, then divided by the 60s
+// window. Two quirks make it diverge from a plain `increase / 60s`: the
+// window iterators store timestamps in nanoseconds but `extrapolatedRate`
+// divides every span by 1000 (treating ns as ms), and the extrapolation
+// window is anchored on the FIRST sample (so `durationToStart == 60`,
+// `durationToEnd == 0`). This is NOT Prometheus full-range extrapolation
+// (which would push the sparse case toward ~6.0); the ns/ms unit mix keeps
+// the factor at ~1.00006. Every value below therefore depends on the
+// sample SPAN — the goldens use per-span values, not one uniform factor.
+// These are pinned bit-for-bit against grafana/loki:3.7.3 (each e2e-span
+// witness was replayed against the live container) and cross-checked by the
+// gated e2e vectors (`metric_rate_counter_*`). If the reference diverges
+// the e2e gate goes RED and these are corrected in place.
 // ---------------------------------------------------------------------
 
 /// Runs an instant `rate_counter` query over a single-series counter body
 /// (`c=<n>`, `logfmt | unwrap c`), returning the one per-second value. The
-/// `[1m]` window makes the divisor exactly 60s.
+/// `[1m]` window sets `selRange = 60s`; the returned value is the
+/// reset-aware increase scaled by the ns/ms extrapolation factor and
+/// divided by 60s (see the ORACLE NOTE above).
 fn rate_counter_instant(rows: &[MetricScanRow]) -> f64 {
     let params = instant_params(60 * NS);
     single_vector_value(
@@ -2081,8 +2092,10 @@ fn rate_counter_instant(rows: &[MetricScanRow]) -> f64 {
 }
 
 /// Rule 1 — a counter that RESETS mid-window. Values 10,30,5,12 by ts:
-/// +20 (10→30), reset +5 (drop to 5, counts from zero), +7 (5→12) = 32;
-/// divided by the 60s window = 32/60.
+/// +20 (10→30), reset +5 (drop to 5, counts from zero), +7 (5→12) = 32.
+/// Samples span 10s→40s = 30e9 ns, so the ns/ms extrapolation factor is
+/// `(30e6 + 60000/1000) / 30e6 = 1.000002`; `32 * 1.000002 / 60 =
+/// 0.5333344`.
 #[test]
 fn rate_counter_reset_counts_the_post_reset_value_from_zero() {
     let rows = vec![
@@ -2091,7 +2104,7 @@ fn rate_counter_reset_counts_the_post_reset_value_from_zero() {
         row(1, 30 * NS, "c=5"), // reset: 5 < 30
         row(1, 40 * NS, "c=12"),
     ];
-    assert_eq!(rate_counter_instant(&rows), 32.0 / 60.0);
+    assert_eq!(rate_counter_instant(&rows), 0.5333344);
 }
 
 /// Rule 3 — duplicate-timestamp samples are processed in DELIVERED scan
@@ -2099,10 +2112,12 @@ fn rate_counter_reset_counts_the_post_reset_value_from_zero() {
 /// `ORDER BY timestamp_ns, fingerprint, body` order), NOT re-sorted by
 /// value. Branch-validated against the pinned reference (v3.7.3): values
 /// 5,{10,3}@20s,12 delivered as 5,10,3,12 → +5 (5→10), reset +3 (10→3),
-/// +9 (3→12) = 17; divided by the 60s window = 17/60 (0.2833). An
-/// ascending-value tie-sort would instead see 5,3,10,12 → 12/60 (0.2),
-/// which the reference does NOT produce — so the delivered order is
-/// load-bearing and this vector pins it.
+/// +9 (3→12) = 17. Samples span 10s→30s = 20e9 ns, so the ns/ms
+/// extrapolation factor is `(20e6 + 60) / 20e6 = 1.000003`; `17 * 1.000003
+/// / 60 = 0.2833341833333333`. An ascending-value tie-sort would instead
+/// see 5,3,10,12 → increase 12 (a different value), which the reference
+/// does NOT produce — so the delivered order is load-bearing and this
+/// vector pins it.
 #[test]
 fn rate_counter_duplicate_timestamp_preserves_delivered_scan_order() {
     // Delivered in the SQL scan order (ts asc, then fingerprint/body): the
@@ -2113,7 +2128,7 @@ fn rate_counter_duplicate_timestamp_preserves_delivered_scan_order() {
         row(1, 20 * NS, "c=3"), // same ts as c=10, delivered after it
         row(1, 30 * NS, "c=12"),
     ];
-    assert_eq!(rate_counter_instant(&rows), 17.0 / 60.0);
+    assert_eq!(rate_counter_instant(&rows), 0.2833341833333333);
     // The stable sort keys only on timestamp, so distinct-ts samples are
     // reordered into ascending time regardless of arrival, but the tied
     // pair keeps whatever relative order it was delivered in.
@@ -2123,28 +2138,97 @@ fn rate_counter_duplicate_timestamp_preserves_delivered_scan_order() {
         row(1, 20 * NS, "c=10"),
         row(1, 20 * NS, "c=3"),
     ];
-    assert_eq!(rate_counter_instant(&shuffled_distinct), 17.0 / 60.0);
+    assert_eq!(rate_counter_instant(&shuffled_distinct), 0.2833341833333333);
 }
 
 /// Rule 2 — samples ON the window boundaries both contribute. Monotone
-/// 100→160 with no reset ⇒ increase 60, divided by the 60s window = 1.0.
-/// (The SQL half-open `(t-range, t]` window inclusion itself is validated
-/// by the gated e2e `metric_rate_counter_boundary` vector; the hermetic
-/// reducer sees whatever rows it is handed.)
+/// 100→160 with no reset ⇒ increase 60. Samples span 1ns→60e9 ns, so the
+/// ns/ms extrapolation factor is `(≈60e6 + 60) / ≈60e6 = 1.000001`;
+/// `60 * 1.000001 / 60 = 1.000001`. (The SQL half-open `(t-range, t]`
+/// window inclusion itself is validated by the gated e2e
+/// `metric_rate_counter_boundary` vector; the hermetic reducer sees
+/// whatever rows it is handed.)
 #[test]
 fn rate_counter_boundary_samples_contribute() {
     let rows = vec![row(1, 1, "c=100"), row(1, 60 * NS, "c=160")];
-    assert_eq!(rate_counter_instant(&rows), 60.0 / 60.0);
+    assert_eq!(rate_counter_instant(&rows), 1.000001);
 }
 
-/// Rule 1 divisor / no-extrapolation — sparse interior samples 200→260
-/// (span 10s) still divide by the FULL 60s window, not the sample span:
-/// increase 60 / 60s = 1.0 (a boundary-extrapolated reading would inflate
-/// to 6.0).
+/// No Prometheus full-range extrapolation — sparse interior samples 200→260
+/// (span 10s) do NOT inflate toward 6.0 the way boundary-extrapolated
+/// Prometheus `rate` would. The reference's ns/ms unit mix keeps the factor
+/// at `(10e6 + 60) / 10e6 = 1.000006`, so `increase 60 * 1.000006 / 60 =
+/// 1.000006` — just above 1.0, NOT 6.0.
 #[test]
-fn rate_counter_sparse_window_divides_by_the_full_interval() {
+fn rate_counter_sparse_window_does_not_full_range_extrapolate() {
     let rows = vec![row(1, 25 * NS, "c=200"), row(1, 35 * NS, "c=260")];
-    assert_eq!(rate_counter_instant(&rows), 60.0 / 60.0);
+    assert_eq!(rate_counter_instant(&rows), 1.000006);
+}
+
+/// A single-sample `rate_counter` group is EMITTED as `0.0`, NOT dropped —
+/// pinned against grafana/loki:3.7.3 (a lone `c=42` returns value `"0"`;
+/// `extrapolatedRate` returns 0.0 for `<2`-point groups and the reference's
+/// range evaluator surfaces it as a 0-valued vector element, it does not
+/// filter it out). `single_vector_value` asserts the vector has exactly one
+/// element, so a regression to "dropped" fails loudly here.
+#[test]
+fn rate_counter_single_sample_group_emits_zero() {
+    let rows = vec![row(1, 10 * NS, "c=42")];
+    assert_eq!(rate_counter_instant(&rows), 0.0);
+}
+
+// The four e2e-span exact-f64 goldens (#218): the `rate_counter` witnesses
+// in the e2e corpus (`e2e/src/logs_corpus.rs`) sit at `step_ns = 1s`, so
+// their spans differ from the per-span goldens above. These pin the exact
+// f64 the nightly `oracle_vs_corpus` leg compares against the live
+// container — each literal was observed BYTE-FOR-BYTE from grafana/loki:3.7.3
+// at the fixture's exact samples/offsets, establishing bit-exact parity
+// hermetically (the `1e-9` e2e path is the live regression gate, not the
+// source of the bit-exact claim).
+
+/// e2e reset witness (c=10,30,5,12 at offsets 6..9 ⇒ span 3s): increase 32,
+/// factor `(3e6 + 60)/3e6 = 1.00002`, / 60s = `0.5333439999999999`
+/// (container-observed, byte-for-byte).
+#[test]
+fn rate_counter_e2e_reset_span_matches_container() {
+    let rows = vec![
+        row(1, 10 * NS, "c=10"),
+        row(1, 11 * NS, "c=30"),
+        row(1, 12 * NS, "c=5"), // reset
+        row(1, 13 * NS, "c=12"),
+    ];
+    assert_eq!(rate_counter_instant(&rows), 0.5333439999999999);
+}
+
+/// e2e sparse witness (c=200,260 at offsets 10,11 ⇒ span 1s): increase 60,
+/// factor `(1e6 + 60)/1e6 = 1.00006`, / 60s = `1.00006`
+/// (container-observed).
+#[test]
+fn rate_counter_e2e_sparse_span_matches_container() {
+    let rows = vec![row(1, 10 * NS, "c=200"), row(1, 11 * NS, "c=260")];
+    assert_eq!(rate_counter_instant(&rows), 1.00006);
+}
+
+/// e2e boundary witness (c=100,160 at offsets 12,13 ⇒ span 1s): increase
+/// 60, factor `1.00006`, / 60s = `1.00006` (container-observed).
+#[test]
+fn rate_counter_e2e_boundary_span_matches_container() {
+    let rows = vec![row(1, 10 * NS, "c=100"), row(1, 11 * NS, "c=160")];
+    assert_eq!(rate_counter_instant(&rows), 1.00006);
+}
+
+/// e2e dup_ts witness (c=5,{10,3}@offset15,12 ⇒ span 2s): delivered order
+/// 5,10,3,12 ⇒ increase 17, factor `(2e6 + 60)/2e6 = 1.00003`, / 60s =
+/// `0.2833418333333333` (container-observed; a value tie-sort would not).
+#[test]
+fn rate_counter_e2e_dup_ts_span_matches_container() {
+    let rows = vec![
+        row(1, 10 * NS, "c=5"),
+        row(1, 11 * NS, "c=10"),
+        row(1, 11 * NS, "c=3"), // tied ts, delivered after c=10
+        row(1, 12 * NS, "c=12"),
+    ];
+    assert_eq!(rate_counter_instant(&rows), 0.2833418333333333);
 }
 
 /// Rule 2 (AC10) — the DISCRIMINATING lower-boundary test: the lookback is
@@ -2160,9 +2244,11 @@ fn rate_counter_sparse_window_divides_by_the_full_interval() {
 /// Instant `t = 90s`, `[1m]` ⇒ `start_ns = 30s` (`= t-range`),
 /// `end_ns = 90s` (`= t`). Samples at 30s (`c=100`, the excluded start),
 /// 60s (`c=140`, interior), 90s (`c=200`, the included end). Half-open:
-/// only 140→200 survive ⇒ increase 60 / 60s = 1.0. Closed: 100→140→200 ⇒
-/// increase 100 / 60s ≈ 1.667 — a DIFFERENT value, which the assertions
-/// below reject.
+/// only 140→200 survive (span 60s→90s = 30e9 ns) ⇒ increase 60 scaled by
+/// `(30e6 + 60)/30e6 = 1.000002`, / 60s = 1.000002. Closed: 100→140→200
+/// (span 30s→90s = 60e9 ns) ⇒ increase 100 scaled by `(60e6 + 60)/60e6 =
+/// 1.000001`, / 60s ≈ 1.6666683333333332 — a DIFFERENT value, which the
+/// assertions below reject.
 #[test]
 fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
     let at_ns = 90 * NS;
@@ -2219,7 +2305,7 @@ fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
         )
         .unwrap(),
     );
-    assert_eq!(half_open, 60.0 / 60.0, "excludes the t-range sample");
+    assert_eq!(half_open, 1.000002, "excludes the t-range sample");
 
     // The closed-interval reading (all three rows) would give a DIFFERENT
     // value — proving the boundary rule is load-bearing, not cosmetic.
@@ -2232,7 +2318,7 @@ fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
         )
         .unwrap(),
     );
-    assert_eq!(closed, 100.0 / 60.0);
+    assert_eq!(closed, 1.6666683333333332);
     assert_ne!(
         half_open, closed,
         "the t-range sample must change the result (half-open ≠ closed)"
