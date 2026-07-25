@@ -499,7 +499,11 @@ fn extreme_timestamp_samples_slide_without_overflow() {
     );
     assert_eq!(
         points,
-        vec![(i64::MIN + 3, 1.0), (i64::MIN + 6, 1.0), (i64::MIN + 9, 2.0)]
+        vec![
+            (i64::MIN + 3, 1.0),
+            (i64::MIN + 6, 1.0),
+            (i64::MIN + 9, 2.0)
+        ]
     );
 
     // absent_over_time at the extreme: the `[3s]` range covers all later

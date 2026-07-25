@@ -608,38 +608,6 @@ fn bytes_over_time_range_slides_raw_with_no_rate_division() {
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
-/// Renders `mp`'s metric SQL the way `LogQlEngine` would once fingerprints
-/// and the hydrated service set are known — `services` empty for the
-/// rollup path (no `service` column), non-empty for the raw fallback (fix
-/// -plan amendment §3: the raw fallback must carry `PREWHERE service ...`
-/// to keep `log_samples`'s primary-key prefix engaged).
-fn metric_sql(
-    mp: &pulsus_read::logql::MetricPlan,
-    services: &[String],
-    fingerprints: &[u64],
-) -> String {
-    let source = sql::MetricSource {
-        table: &mp.table,
-        bucket_col: mp.bucket_col,
-        agg_expr: mp.agg_expr,
-    };
-    let window = TimeWindow {
-        start_ns: mp.start_ns,
-        end_ns: mp.end_ns,
-    };
-    match mp.step_ns {
-        Some(step_ns) => sql::metric_range(
-            source,
-            services,
-            fingerprints,
-            window,
-            step_ns,
-            &mp.extra_predicates,
-        ),
-        None => sql::metric_instant(source, services, fingerprints, window, &mp.extra_predicates),
-    }
-}
-
 /// Renders the sliding raw scan (`metric_raw_samples_sliding`) the way
 /// `LogQlEngine` would for a range query, so the `PREWHERE service` contract
 /// (PK-prefix engagement) stays pinned.

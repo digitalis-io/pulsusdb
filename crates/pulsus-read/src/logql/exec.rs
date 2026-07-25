@@ -1111,21 +1111,21 @@ impl LogQlEngine {
             range_ns: mp.range_ns,
         };
         let mut state = if is_range {
-            MetricAggState::Range(RangeSlideState::new(
+            MetricAggState::Range(Box::new(RangeSlideState::new(
                 compiled,
                 &meta,
                 client,
                 window,
                 mp.rate_window_ns,
-            )?)
+            )?))
         } else {
-            MetricAggState::Instant(ClientAggState::new(
+            MetricAggState::Instant(Box::new(ClientAggState::new(
                 compiled,
                 &meta,
                 client,
                 window,
                 mp.rate_window_ns,
-            )?)
+            )?))
         };
         let mut chunk: Vec<MetricScanRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
         {
@@ -3740,10 +3740,7 @@ fn grid_point_count(grid_start: i64, end_ns: i64, step_ns: u64) -> u64 {
     }
     let step = step_ns as i128;
     let span = end_ns as i128 - grid_start as i128; // ≥ 0
-    match u64::try_from(span / step + 1) {
-        Ok(n) => n,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(span / step + 1).unwrap_or(u64::MAX)
 }
 
 /// One retained sample in a sliding window. Fixed-width (no body bytes ever
@@ -4072,7 +4069,9 @@ impl<'q> RangeSlideState<'q> {
         window: ClientWindow,
         rate_window_ns: Option<u64>,
     ) -> Result<Self, ReadError> {
-        let step = window.step_ns.expect("RangeSlideState requires a range window");
+        let step = window
+            .step_ns
+            .expect("RangeSlideState requires a range window");
         let grid_start = window.start_ns;
         let end_ns = window.end_ns;
         let count = grid_point_count(grid_start, end_ns, step);
@@ -4146,11 +4145,10 @@ impl<'q> RangeSlideState<'q> {
             // scratch across the batch.
             if self.coll_active
                 && (self.coll_fp != row.fingerprint || self.coll_ts != row.timestamp_ns)
+                && let Err(e) = self.flush_collision(&base_labels)
             {
-                if let Err(e) = self.flush_collision(&base_labels) {
-                    result = Err(e);
-                    break;
-                }
+                result = Err(e);
+                break;
             }
             let Some(base) = base_labels.get(&row.fingerprint) else {
                 continue;
@@ -4212,10 +4210,7 @@ impl<'q> RangeSlideState<'q> {
 
     /// Ranks and dispatches the buffered collision group (full-body order ⇒
     /// deterministic `tie_rank`), then releases the bodies.
-    fn flush_collision(
-        &mut self,
-        base_labels: &HashMap<u64, LabelSet>,
-    ) -> Result<(), ReadError> {
+    fn flush_collision(&mut self, base_labels: &HashMap<u64, LabelSet>) -> Result<(), ReadError> {
         if self.coll.is_empty() {
             self.coll_active = false;
             return Ok(());
@@ -4255,10 +4250,10 @@ impl<'q> RangeSlideState<'q> {
 
         // Non-mutating: one slider per fingerprint (fingerprints contiguous).
         if self.cur.is_none() || self.cur_fp != fp {
-            if let Some(prev) = self.cur.take() {
-                if let Some(series) = prev.finish(&mut self.retained) {
-                    self.series_out.push(series);
-                }
+            if let Some(prev) = self.cur.take()
+                && let Some(series) = prev.finish(&mut self.retained)
+            {
+                self.series_out.push(series);
             }
             self.series_count += 1;
             if self.series_count > MAX_CLIENT_AGG_SERIES {
@@ -4290,7 +4285,12 @@ impl<'q> RangeSlideState<'q> {
         // reads values straight from the buffer, no intermediate `Vec`; the
         // buffer's capacity is reused (cleared, never reallocated per group).
         let cur = self.cur.as_mut().expect("slider just set");
-        cur.load_group(ts, &self.coll, &mut self.retained, MAX_RETAINED_WINDOW_POINTS)?;
+        cur.load_group(
+            ts,
+            &self.coll,
+            &mut self.retained,
+            MAX_RETAINED_WINDOW_POINTS,
+        )?;
         self.coll.clear();
         Ok(())
     }
@@ -4356,7 +4356,9 @@ impl<'q> RangeSlideState<'q> {
         let k_lo = ceil_div_i128(ts - gs, step).max(0);
         // grid_start + k·step < ts+range ⇒ k·step ≤ ts+range-gs-1 ⇒
         // k ≤ floor((ts+range-gs-1)/step)
-        let k_hi = (ts + range - gs - 1).div_euclid(step).min(self.kmax as i128);
+        let k_hi = (ts + range - gs - 1)
+            .div_euclid(step)
+            .min(self.kmax as i128);
         (
             i64::try_from(k_lo).unwrap_or(i64::MAX),
             i64::try_from(k_hi).unwrap_or(i64::MIN),
@@ -4373,10 +4375,10 @@ impl<'q> RangeSlideState<'q> {
         // `&mut self` flush does not clash with a `self.base_labels` borrow.
         let base_labels = std::mem::take(&mut self.base_labels);
         self.flush_collision(&base_labels)?;
-        if let Some(prev) = self.cur.take() {
-            if let Some(series) = prev.finish(&mut self.retained) {
-                self.series_out.push(series);
-            }
+        if let Some(prev) = self.cur.take()
+            && let Some(series) = prev.finish(&mut self.retained)
+        {
+            self.series_out.push(series);
         }
         if self.is_absent {
             return Ok(self.finish_absent());
@@ -4400,7 +4402,8 @@ impl<'q> RangeSlideState<'q> {
                         points.push((grid_point(k), reduce_int_cell(op, rate_window_ns, run_int)));
                     }
                 } else {
-                    let mut cells: Vec<(i64, Vec<WinSample>)> = group.pt_cells.into_iter().collect();
+                    let mut cells: Vec<(i64, Vec<WinSample>)> =
+                        group.pt_cells.into_iter().collect();
                     cells.sort_by_key(|(k, _)| *k);
                     for (k, mut pts) in cells {
                         pts.sort_by(win_order);
@@ -4496,8 +4499,8 @@ pub fn run_client_agg_rows(
 /// tumbling-into-one-window [`ClientAggState`] or the issue #227 range
 /// sliding evaluator, both driven chunk-wise off the raw scan stream.
 enum MetricAggState<'q> {
-    Instant(ClientAggState<'q>),
-    Range(RangeSlideState<'q>),
+    Instant(Box<ClientAggState<'q>>),
+    Range(Box<RangeSlideState<'q>>),
 }
 
 impl MetricAggState<'_> {
@@ -6176,8 +6179,8 @@ mod tests {
                 step_ns: Some((60 * s) as u64),
                 range_ns,
             };
-            let res =
-                run_client_agg_rows(&rows, &compiled, &meta, &client, window, Some(range_ns)).unwrap();
+            let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, Some(range_ns))
+                .unwrap();
             one_series_points(res).1
         };
         let r1m = run(60 * s as u64); // 2 lines / 60s = 0.0333…
