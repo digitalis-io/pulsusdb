@@ -133,12 +133,24 @@ pub struct MetricPlan {
     /// `body` column — a metric query with a line filter can never be
     /// rollup-served, see [`metric_plan`]).
     pub extra_predicates: Vec<String>,
+    /// The scan lower bound (`timestamp_ns > start_ns`). For a range query
+    /// this is widened to `query_start - range` (issue #227) so the first
+    /// grid point's sliding window `(start-range, start]` sees its full
+    /// lookback; the emit grid still begins at `query_start`.
     pub start_ns: i64,
     pub end_ns: i64,
-    /// `Some(step)` = [`QuerySpec::Range`]'s bucketed shape (`intDiv(_,
-    /// step) * step`); `None` = [`QuerySpec::Instant`]'s single-window
-    /// aggregate, structurally incapable of emitting a bucket expression.
+    /// `Some(step)` = [`QuerySpec::Range`]'s Loki sliding-window shape
+    /// (issue #227: the `[range]` window `(t-range, t]` re-evaluated at the
+    /// start-anchored grid `{start+k·step ≤ end}`); `None` =
+    /// [`QuerySpec::Instant`]'s single-window aggregate.
     pub step_ns: Option<u64>,
+    /// The emit grid's lower bound — `query_start` (start-anchored,
+    /// issue #227). Distinct from `start_ns`, which is the (range-widened)
+    /// scan lower bound. Equals `start_ns` for instant queries.
+    pub grid_start_ns: i64,
+    /// The `[range]` selector width in nanoseconds — the sliding window's
+    /// span and (for `rate`/`bytes_rate`) the per-second divisor.
+    pub range_ns: u64,
     pub rate_window_ns: Option<u64>,
     pub op: RangeAggOp,
     /// Outer-to-inner vector-aggregation chain (`sum by (...) (avg(...))`
@@ -391,11 +403,15 @@ fn build_metric_node(
 /// spec's `start_ns`/`end_ns`/`step_ns` so exec materializes the constant
 /// `{}` matrix on the shared bucket grid.
 fn window_from(p: &QueryParams) -> ClientWindow {
+    // A `vector(n)` literal has no `[range]`; its constant `{}` series is
+    // emitted at every start-anchored grid point regardless of window, so
+    // `range_ns` is immaterial (0).
     match p.spec {
         QuerySpec::Instant { at_ns } => ClientWindow {
             start_ns: at_ns,
             end_ns: at_ns,
             step_ns: None,
+            range_ns: 0,
         },
         QuerySpec::Range {
             start_ns,
@@ -405,6 +421,7 @@ fn window_from(p: &QueryParams) -> ClientWindow {
             start_ns,
             end_ns,
             step_ns: Some(step_ns),
+            range_ns: 0,
         },
     }
 }
@@ -649,7 +666,13 @@ fn metric_plan(
     };
 
     let client_only_op = requires_unwrap || matches!(op, RangeAggOp::AbsentOverTime);
-    let client = if has_beyond_line_filter || has_unwrap || client_only_op {
+    // Issue #227: EVERY range query is now client-aggregated with Loki's
+    // sliding windows — the un-piped count/bytes/rate rollup fast-path is
+    // retired for range reads (the 5s rollup cannot reproduce Loki's
+    // per-event `(t-range, t]` boundary; only raw `log_samples` can).
+    // Instant queries keep their existing routing (rollup/SQL-raw).
+    let is_range = matches!(p.spec, QuerySpec::Range { .. });
+    let client = if has_beyond_line_filter || has_unwrap || client_only_op || is_range {
         let value = if has_unwrap {
             ClientValue::Unwrap
         } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {
@@ -682,16 +705,25 @@ fn metric_plan(
 
     let range_ns = range.range.as_nanos();
 
-    let (start_ns, end_ns, step_ns, rate_window_ns) = match p.spec {
+    // Issue #227: `start_ns` is the (range-widened) SCAN lower bound;
+    // `grid_start_ns` is the start-anchored emit grid's first point. Both
+    // paths reproduce Loki: the window `(t-range, t]` is re-evaluated at
+    // `t ∈ {grid_start + k·step ≤ end}`, so the scan must reach back a full
+    // `range` before `grid_start`. `rate_window_ns = range` (never `step`)
+    // is the `rate([1m]) ≠ rate([10m])` fix.
+    let (start_ns, end_ns, step_ns, grid_start_ns, rate_window_ns) = match p.spec {
         QuerySpec::Instant { at_ns } => {
             let start = at_ns.saturating_sub(range_ns as i64);
-            (start, at_ns, None, Some(range_ns))
+            (start, at_ns, None, start, Some(range_ns))
         }
         QuerySpec::Range {
             start_ns,
             end_ns,
             step_ns,
-        } => (start_ns, end_ns, Some(step_ns), Some(step_ns)),
+        } => {
+            let scan_start = start_ns.saturating_sub(range_ns as i64);
+            (scan_start, end_ns, Some(step_ns), start_ns, Some(range_ns))
+        }
     };
 
     let normalized = normalize_matchers(&range.selector.selector)?;
@@ -732,9 +764,17 @@ fn metric_plan(
     // resolution", and an unaligned window would silently diverge from raw
     // at bucket edges (task-manager resolution #1 on issue #12).
     let routing = if client.is_some() {
+        // Issue #227: a plain (un-piped, non-unwrap) range aggregation now
+        // reads raw and slides — name it distinctly from the pipeline/unwrap
+        // client path so `X-Pulsus-Explain` stays truthful.
+        let reason = if is_range && !(has_beyond_line_filter || has_unwrap || client_only_op) {
+            "raw: sliding-window range aggregation (issue #227)".to_string()
+        } else {
+            "raw: client-side pipeline/unwrap aggregation".to_string()
+        };
         RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: "raw: client-side pipeline/unwrap aggregation".to_string(),
+            reason,
         }
     } else {
         match p.spec {
@@ -808,6 +848,8 @@ fn metric_plan(
         start_ns,
         end_ns,
         step_ns,
+        grid_start_ns,
+        range_ns,
         rate_window_ns: if is_rate { rate_window_ns } else { None },
         op: *op,
         vector_aggs,

@@ -517,6 +517,40 @@ pub fn metric_raw_samples(
     sql
 }
 
+/// The sliding-window range metric fetch (issue #227): identical scan/
+/// predicate shape to [`metric_raw_samples`], but ordered by the **physical
+/// primary key** `(service, fingerprint, timestamp_ns)` so ClickHouse
+/// streams it with `optimize_read_in_order=1` and **no server-side sort** —
+/// the memory-bound streaming slide reads one fingerprint's ascending-ts run
+/// at a time. Deliberately **no `body` in `ORDER BY`** (body is not in the
+/// MergeTree key, so ordering by it would force an unbounded per-collision-
+/// group sort — issue #227 review finding): same-`(fingerprint,
+/// timestamp_ns)` rows arrive in arbitrary order and the deterministic
+/// full-body `tie_rank` order is imposed in Rust at group formation. And
+/// deliberately **no global `ORDER BY timestamp_ns`** (a scan-sized sort;
+/// the canonical `(ts, stream_hash, tie_rank)` fold order is imposed in
+/// Rust over the bounded retained window).
+pub fn metric_raw_samples_sliding(
+    samples_table: &str,
+    services: &[String],
+    fingerprints: &[u64],
+    window: TimeWindow,
+    extra_predicates: &[String],
+) -> String {
+    let service_pred = service_predicate(services);
+    let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
+    let mut sql = format!(
+        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+    );
+    for clause in extra_predicates {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause);
+    }
+    sql.push_str("\nORDER BY service ASC, fingerprint ASC, timestamp_ns ASC");
+    sql
+}
+
 /// Renders the metric-read `PREWHERE service ...\n` line, or an empty
 /// string when `services` is empty (the rollup path — no `service` column
 /// to filter on).

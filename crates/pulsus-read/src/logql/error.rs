@@ -197,6 +197,27 @@ pub enum TooBroadReason {
     /// `metrics::exec`'s `SampleBudget` on the six sample-fetch dispatches
     /// — hydration/probe/discovery fetches never charge it.
     MetricSamples { cap: u64 },
+    /// Issue #227: a consecutive same-`(fingerprint, timestamp_ns)` run in
+    /// the sliding-window range evaluator (the collision group that the
+    /// full-body `tie_rank` order is imposed over) exceeded
+    /// [`crate::logql::exec::MAX_TS_COLLISION_GROUP`]. A same-nanosecond,
+    /// same-stream run this large is pathological/adversarial, never real
+    /// data; the transient full-body buffer that ranks it is bounded by
+    /// this clean error rather than growing without limit. A Rust-side
+    /// structural limit, never from a ClickHouse error code.
+    TsCollisionGroup { count: u64, cap: u64 },
+    /// Issue #227: the sliding-window range evaluator's **concurrent**
+    /// retained window (charge-on-load / discharge-on-evict) exceeded
+    /// [`crate::logql::exec::MAX_RETAINED_WINDOW_POINTS`] — the single
+    /// invariant `retained ≤ cap` that generalizes the instant path's
+    /// per-reducer `QuantileValues`/`CounterValues` total-retention proofs.
+    /// The charge is per-load, so it trips as the FIRST oversized window
+    /// fills (early in the scan, before RSS grows), bounding process memory
+    /// to ≈ cap × entry-width regardless of `[range]`/step/density.
+    /// Complete-or-error, never an OOM; a Rust-side structural limit, never
+    /// from a ClickHouse error code. Set generously so nothing Loki
+    /// reliably serves is rejected.
+    MetricRetention { count: u64, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -330,6 +351,21 @@ impl fmt::Display for TooBroadReason {
                     "query would fetch more than {cap} samples, exceeding the evaluation \
                      sample budget (reader.promql_max_samples) — narrow the selector or \
                      the time range"
+                )
+            }
+            TooBroadReason::TsCollisionGroup { count, cap } => {
+                write!(
+                    f,
+                    "a same-nanosecond, same-stream run retained {count} lines, exceeding the \
+                     {cap}-line collision-group cap — narrow the selector or the pipeline"
+                )
+            }
+            TooBroadReason::MetricRetention { count, cap } => {
+                write!(
+                    f,
+                    "the sliding-window range evaluation retained {count} concurrent sample \
+                     points, exceeding the {cap}-point cap — narrow the [range], the pipeline, \
+                     or the time window"
                 )
             }
         }

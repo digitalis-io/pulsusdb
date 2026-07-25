@@ -47,6 +47,12 @@ regex.workspace = true
 # pipeline — cost bounded to rows that already passed line-filter
 # pushdown.
 serde_json.workspace = true
+# Loki's `labels.StableHash` (issue #227): the same-timestamp cross-stream
+# tie key in the sliding-window range evaluator is `xxhash64(seed 0)` over
+# the stream's sorted `name·0xFF·value·0xFF` labels — byte-identical to
+# Loki v3.7.4 (`model/labels/sharding.go`). Same `xxh64` seed-0 primitive
+# `pulsus-model`/`pulsus-promql` already use for fingerprinting.
+xxhash-rust.workspace = true
 # The refresh loop (`spawn_refresh_loop`) and the resident snapshot slot
 # (`std::sync::RwLock<Arc<CacheSnapshot>>` plus the `tokio::task::JoinHandle`
 # the loop runs in) are the first async/task-spawning code in this crate
