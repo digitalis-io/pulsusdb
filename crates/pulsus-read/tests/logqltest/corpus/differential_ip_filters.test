@@ -1,0 +1,24 @@
+# Ported instant-eval subset of differential.json — ip() label filters
+# (issue #201). A missing addr DROPS under `=` (no error); a present-but-
+# non-IP value is a plain non-match, so `!=` RETURNS it carrying only its
+# raw label and NO __error__/__error_details__.
+
+# --- missing addr drops under `=` -------------------------------------
+load
+  {env="prod", service_name="svc-ipmiss"} service=svc-ipmiss
+  0s  addr=10.1.2.3 msg=x
+  5s  other=1 msg=x
+
+eval instant at 60s {service_name="svc-ipmiss"} | logfmt | addr = ip("10.0.0.0/8")
+  {env="prod", service_name="svc-ipmiss", addr="10.1.2.3", msg="x"}  0s  addr=10.1.2.3 msg=x
+
+clear
+
+# --- present-but-invalid addr is a non-match: `!=` keeps it, no error --
+load
+  {env="prod", service_name="svc-ipbad"} service=svc-ipbad
+  0s  addr=not-an-ip msg=x
+  5s  addr=10.1.2.3 msg=y
+
+eval instant at 60s {service_name="svc-ipbad"} | logfmt | addr != ip("10.0.0.0/8")
+  {env="prod", service_name="svc-ipbad", addr="not-an-ip", msg="x"}  0s  addr=not-an-ip msg=x

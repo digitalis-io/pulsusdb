@@ -1,0 +1,81 @@
+# Ported instant-eval subset of differential.json — vector matching
+# (issue #91): on/ignoring one-to-one, group_left/group_right many-to-one,
+# and the two explicit-matching rejections. All counts divide/multiply
+# exactly. Semantics pinned in logql_metric_agg_golden.rs against the
+# reference.
+
+# --- on(method) one-to-one: output is the reduced {method} signature ---
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"method":"GET","status":200}
+  1s  {"method":"GET","status":200}
+  2s  {"method":"GET","status":500}
+  3s  {"method":"GET","status":500}
+  4s  {"method":"POST","status":200}
+
+eval instant at 60s sum by (method) (count_over_time({service_name="svc-json"} | json [30m])) / on(method) sum by (method) (count_over_time({service_name="svc-json"} | json | status = "200" [30m]))
+  {method="GET"} 2
+  {method="POST"} 1
+
+clear
+
+# --- ignoring(status) one-to-one over by(method) operands -------------
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"method":"GET","status":200}
+  1s  {"method":"GET","status":503}
+  2s  {"method":"GET","status":503}
+  3s  {"method":"POST","status":503}
+
+eval instant at 60s sum by (method) (count_over_time({service_name="svc-json"} | json [30m])) / ignoring(status) sum by (method) (count_over_time({service_name="svc-json"} | json | status = "503" [30m]))
+  {method="GET"} 1.5
+  {method="POST"} 1
+
+clear
+
+# --- on(status) group_left: many (lhs {method,status}) passes through --
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"method":"GET","status":200}
+  1s  {"method":"GET","status":200}
+  2s  {"method":"POST","status":200}
+  3s  {"method":"POST","status":200}
+  4s  {"method":"GET","status":500}
+  5s  {"method":"GET","status":500}
+
+eval instant at 60s sum by (method, status) (count_over_time({service_name="svc-json"} | json [30m])) / on(status) group_left sum by (status) (count_over_time({service_name="svc-json"} | json [30m]))
+  {method="GET", status="200"} 0.5
+  {method="POST", status="200"} 0.5
+  {method="GET", status="500"} 1
+
+clear
+
+# --- on(status) group_right: many (rhs {method,status}) passes through -
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"method":"GET","status":200}
+  1s  {"method":"GET","status":200}
+  2s  {"method":"POST","status":200}
+  3s  {"method":"POST","status":200}
+  4s  {"method":"GET","status":500}
+  5s  {"method":"GET","status":500}
+
+eval instant at 60s sum by (status) (count_over_time({service_name="svc-json"} | json [30m])) * on(status) group_right sum by (method, status) (count_over_time({service_name="svc-json"} | json [30m]))
+  {method="GET", status="200"} 8
+  {method="POST", status="200"} 8
+  {method="GET", status="500"} 4
+
+clear
+
+# --- many-to-one WITHOUT group_left/right: explicit-matching reject ----
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"method":"GET","status":200}
+  1s  {"method":"POST","status":200}
+
+eval_fail instant at 60s sum by (method, status) (count_over_time({service_name="svc-json"} | json [30m])) / on(status) sum by (status) (count_over_time({service_name="svc-json"} | json [30m]))
+  msg: multiple matches for labels: many-to-one matching must be explicit
+
+# --- duplicate one-side signature: many-to-many reject ----------------
+eval_fail instant at 60s sum by (method, status) (count_over_time({service_name="svc-json"} | json [30m])) / on(status) group_left sum by (method, status) (count_over_time({service_name="svc-json"} | json [30m]))
+  msg: many-to-many matching not allowed: matching labels must be unique on one side
