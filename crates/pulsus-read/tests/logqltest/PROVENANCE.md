@@ -75,6 +75,29 @@ This is done **once** per case, offline; CI runs only the hermetic runner.
    podman run --rm -p 3100:3100 grafana/loki:3.7.4
    ```
 
+   **`approx_topk` capture delta (issue #221):** the bare container above
+   returns 500 `approx_topk is not enabled. See -limits.shard_aggregations`
+   for EVERY `approx_topk` query. Capturing `b10_approx_topk.test` requires
+   mounting a config (`-v <cfg>:/etc/loki/local-config.yaml:ro
+   -config.file=/etc/loki/local-config.yaml`) that adds BOTH of these to the
+   default config:
+
+   ```yaml
+   limits_config:
+     shard_aggregations:
+       - approx_topk
+   frontend:
+     encoding: protobuf
+   ```
+
+   The `limits_config` entry enables the construct; the protobuf frontend
+   encoding makes the frontend ship the serialized query PLAN downstream —
+   without it the `approx_topk` rewrite's internal `__count_min_sketch__`
+   subquery is re-parsed from its string form by the querier and every
+   query 400s with `parse error at line 1, col 1: syntax error: unexpected
+   IDENTIFIER` (loki `pkg/loki/config_compat.go` documents the coupling).
+   If ingestion fails on a tight disk, add `--tmpfs /loki:rw,size=512m`.
+
 2. Push the `load` dataset at the exact timestamps. For an `eval instant at
    T`, an entry written at offset `Δ` uses wall-clock `now - (T - Δ)` so the
    sample lands `Δ` before the query instant (Loki keys entries by

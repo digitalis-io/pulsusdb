@@ -71,6 +71,27 @@ pub enum LogQlError {
     /// whole input.
     #[error("unexpected trailing input at byte {}", .span.start)]
     TrailingInput { span: Span },
+
+    /// A `topk`/`bottomk`/`approx_topk` `k` that is not an integer literal
+    /// (issue #221; reference: `strconv.Atoi` in
+    /// `mustNewVectorAggregationExpr`, pkg/logql/syntax/ast.go). The
+    /// reference's message text is embedded VERBATIM (including its
+    /// trailing `(raw,` fragment) so a differential substring gate is
+    /// shared; PulsusDB appends its house `at byte N` position suffix.
+    #[error("invalid parameter {op}({raw}, at byte {}", .span.start)]
+    InvalidAggregationParam { op: String, raw: String, span: Span },
+
+    /// The same `k`, integral but `<= 0` (issue #221;
+    /// pkg/logql/syntax/ast.go — reference text verbatim, position suffix
+    /// appended).
+    #[error("invalid parameter (must be greater than 0) {op}({raw} at byte {}", .span.start)]
+    AggregationParamNotPositive { op: String, raw: String, span: Span },
+
+    /// `approx_topk` with a `by`/`without` clause (issue #221;
+    /// pkg/logql/syntax/ast.go — reference text verbatim, position suffix
+    /// appended).
+    #[error("grouping not allowed for {op} aggregation at byte {}", .span.start)]
+    GroupingNotAllowed { op: String, span: Span },
 }
 
 impl LogQlError {
@@ -87,7 +108,10 @@ impl LogQlError {
             | LogQlError::UnterminatedString { span }
             | LogQlError::EmptySelector { span }
             | LogQlError::RecursionLimitExceeded { span }
-            | LogQlError::TrailingInput { span } => *span,
+            | LogQlError::TrailingInput { span }
+            | LogQlError::InvalidAggregationParam { span, .. }
+            | LogQlError::AggregationParamNotPositive { span, .. }
+            | LogQlError::GroupingNotAllowed { span, .. } => *span,
         }
     }
 }
@@ -170,6 +194,55 @@ mod tests {
         assert!(err.to_string().contains("byte 3"));
     }
 
+    /// Issue #221: the non-integer-`k` message CONTAINS the reference's
+    /// verbatim text (`invalid parameter approx_topk(2.5,` — including the
+    /// trailing comma) plus the house position suffix.
+    #[test]
+    fn invalid_aggregation_param_message_embeds_the_reference_text() {
+        let err = LogQlError::InvalidAggregationParam {
+            op: "approx_topk".to_string(),
+            raw: "2.5".to_string(),
+            span: span(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid parameter approx_topk(2.5,"), "{msg}");
+        assert!(msg.contains("byte 3"), "{msg}");
+    }
+
+    /// Issue #221: the non-positive-`k` message CONTAINS the reference's
+    /// verbatim text (`invalid parameter (must be greater than 0) topk(0`
+    /// — no trailing comma) plus the house position suffix.
+    #[test]
+    fn aggregation_param_not_positive_message_embeds_the_reference_text() {
+        let err = LogQlError::AggregationParamNotPositive {
+            op: "topk".to_string(),
+            raw: "0".to_string(),
+            span: span(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid parameter (must be greater than 0) topk(0"),
+            "{msg}"
+        );
+        assert!(msg.contains("byte 3"), "{msg}");
+    }
+
+    /// Issue #221: the `approx_topk` grouping rejection CONTAINS the
+    /// reference's verbatim text plus the house position suffix.
+    #[test]
+    fn grouping_not_allowed_message_embeds_the_reference_text() {
+        let err = LogQlError::GroupingNotAllowed {
+            op: "approx_topk".to_string(),
+            span: span(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("grouping not allowed for approx_topk aggregation"),
+            "{msg}"
+        );
+        assert!(msg.contains("byte 3"), "{msg}");
+    }
+
     #[test]
     fn span_returns_the_carried_span_for_every_variant() {
         let cases = [
@@ -195,6 +268,20 @@ mod tests {
             LogQlError::EmptySelector { span: span() },
             LogQlError::RecursionLimitExceeded { span: span() },
             LogQlError::TrailingInput { span: span() },
+            LogQlError::InvalidAggregationParam {
+                op: "topk".to_string(),
+                raw: "2.5".to_string(),
+                span: span(),
+            },
+            LogQlError::AggregationParamNotPositive {
+                op: "topk".to_string(),
+                raw: "0".to_string(),
+                span: span(),
+            },
+            LogQlError::GroupingNotAllowed {
+                op: "approx_topk".to_string(),
+                span: span(),
+            },
         ];
         for case in cases {
             assert_eq!(case.span(), span());

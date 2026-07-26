@@ -25,7 +25,12 @@
 //!
 //! Gate: skips cleanly unless `PULSUSDB_LOGQL_DIFF_URL` is set (e.g.
 //! `http://localhost:13100`). The reference and PulsusDB both serve the
-//! `/loki/api/v1/query_range` compat alias (docs/api.md §8.1).
+//! `/loki/api/v1/query_range` compat alias (docs/api.md §8.1). A construct
+//! whose registry entry declares `endpoint: instant` probes the
+//! `/loki/api/v1/query` alias instead (issue #221: `approx_topk` is
+//! instant-only in the reference, so only the instant endpoint yields a
+//! conclusive 2xx/400 syntax verdict; the oracle container config must
+//! enable it — see `ci/logql/config.yaml`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -89,6 +94,36 @@ struct Registry {
 struct Construct {
     id: String,
     probe: String,
+    /// Optional probe endpoint override (issue #221). `"instant"` routes
+    /// the probe to `/loki/api/v1/query`; absent = the default
+    /// `query_range`. Needed for constructs that are INSTANT-ONLY in the
+    /// reference: `approx_topk` returns 500 on `query_range` in every
+    /// configuration (bare: `approx_topk is not enabled`; enabled:
+    /// `count min sketches are only supported on instant queries` — both
+    /// probed against the pinned digest), so a range probe can never be
+    /// conclusive for it. This is registry METADATA driving the probe
+    /// shape, not an id allowlist — the verdict contract is unchanged.
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProbeEndpoint {
+    Range,
+    Instant,
+}
+
+/// Resolves a construct's probe endpoint, failing LOUDLY on an unknown
+/// value (a typo must never silently fall back to the range endpoint).
+fn probe_endpoint(c: &Construct) -> ProbeEndpoint {
+    match c.endpoint.as_deref() {
+        None => ProbeEndpoint::Range,
+        Some("instant") => ProbeEndpoint::Instant,
+        Some(other) => panic!(
+            "{}: unknown probe endpoint {other:?} (only \"instant\" is recognized)",
+            c.id
+        ),
+    }
 }
 #[derive(Deserialize)]
 struct Dispositions {
@@ -101,18 +136,16 @@ struct Disposition {
     oracle: String,
 }
 
-/// GETs a query at the `/loki/api/v1/query_range` compat alias and maps the
-/// HTTP status to a verdict. 2xx is Accept, exactly 400 is Reject; anything
-/// else (0 = connection failure, 401/404/429/5xx, …) is inconclusive and
-/// fails the test loudly.
-fn oracle_verdict(base: &str, query: &str) -> Verdict {
+/// GETs a query at the construct's compat-alias endpoint (`query_range` by
+/// default; `query` for the instant-only constructs, issue #221) and maps
+/// the HTTP status to a verdict. 2xx is Accept, exactly 400 is Reject;
+/// anything else (0 = connection failure, 401/404/429/5xx, …) is
+/// inconclusive and fails the test loudly.
+fn oracle_verdict(base: &str, query: &str, endpoint: ProbeEndpoint) -> Verdict {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-    let start = now.saturating_sub(3600).to_string();
-    let end = now.to_string();
-    let url = format!("{}/loki/api/v1/query_range", base.trim_end_matches('/'));
     let mut cmd = Command::new("curl");
     cmd.args([
         "-s",
@@ -125,11 +158,25 @@ fn oracle_verdict(base: &str, query: &str) -> Verdict {
         "20",
     ]);
     cmd.args(["--data-urlencode", &format!("query={query}")]);
-    cmd.args(["--data-urlencode", &format!("start={start}")]);
-    cmd.args(["--data-urlencode", &format!("end={end}")]);
-    cmd.args(["--data-urlencode", "step=60s"]);
-    cmd.args(["--data-urlencode", "limit=1"]);
-    cmd.arg(&url);
+    match endpoint {
+        ProbeEndpoint::Range => {
+            let start = now.saturating_sub(3600).to_string();
+            let end = now.to_string();
+            cmd.args(["--data-urlencode", &format!("start={start}")]);
+            cmd.args(["--data-urlencode", &format!("end={end}")]);
+            cmd.args(["--data-urlencode", "step=60s"]);
+            cmd.args(["--data-urlencode", "limit=1"]);
+            cmd.arg(format!(
+                "{}/loki/api/v1/query_range",
+                base.trim_end_matches('/')
+            ));
+        }
+        ProbeEndpoint::Instant => {
+            cmd.args(["--data-urlencode", &format!("time={now}000000000")]);
+            cmd.args(["--data-urlencode", "limit=1"]);
+            cmd.arg(format!("{}/loki/api/v1/query", base.trim_end_matches('/')));
+        }
+    }
     let out = cmd.output().expect("curl must be on PATH");
     let code: u32 = String::from_utf8_lossy(&out.stdout)
         .trim()
@@ -178,7 +225,7 @@ fn registry_probes_match_the_recorded_oracle_verdict() {
         let (status, want) = recorded
             .get(c.id.as_str())
             .unwrap_or_else(|| panic!("{}: no disposition", c.id));
-        let live = oracle_verdict(&base, &c.probe);
+        let live = oracle_verdict(&base, &c.probe, probe_endpoint(c));
         if live != *want {
             mismatches.push(format!(
                 "{}: recorded oracle={want:?} but live reference {live:?} for {:?}",
@@ -205,6 +252,39 @@ fn registry_probes_match_the_recorded_oracle_verdict() {
          interim gaps (all visible in the registry with an owning issue)",
         registry.constructs.len()
     );
+}
+
+// Hermetic guards for the probe-endpoint metadata (issue #221): the leg's
+// live run only exercises the values actually present in the registry, so
+// these pin the resolution rules without a container.
+#[test]
+fn probe_endpoint_metadata_is_validated_and_instant_only_constructs_carry_it() {
+    let registry: Registry =
+        serde_json::from_str(&read(conf_dir().join("registry-logql-v3.7.3.json"))).unwrap();
+    for c in &registry.constructs {
+        // Loud on typos — the resolver panics on any unknown value.
+        let endpoint = probe_endpoint(c);
+        if c.id == "agg.approx_topk" {
+            // approx_topk is instant-only in the reference (query_range is
+            // a 500 in EVERY configuration), so its probe MUST route to
+            // the instant endpoint or the leg is structurally
+            // inconclusive.
+            assert!(
+                matches!(endpoint, ProbeEndpoint::Instant),
+                "agg.approx_topk must declare `endpoint: instant`"
+            );
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "unknown probe endpoint")]
+fn an_unknown_probe_endpoint_fails_loudly() {
+    probe_endpoint(&Construct {
+        id: "x".to_string(),
+        probe: "x".to_string(),
+        endpoint: Some("websocket".to_string()),
+    });
 }
 
 // Hermetic RED-path proof (#203 plan-review TEST-GAP): the pinned v3.7.3

@@ -79,6 +79,110 @@ fn topk_without_a_parameter_is_rejected() {
     }
 }
 
+// --- Loki-exact `k` validation, shared by topk/bottomk/approx_topk
+// --- (issue #221, root-cause fix: `topk(0, ...)` is now a 400, no longer
+// --- an empty 200 — adjudicated).
+
+#[test]
+fn a_zero_k_is_rejected_as_not_positive_for_every_k_selection() {
+    for op in ["topk", "bottomk", "approx_topk"] {
+        match parse(&format!(r#"{op}(0, rate({{a="b"}}[5m]))"#)) {
+            Err(err @ LogQlError::AggregationParamNotPositive { .. }) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(&format!(
+                        "invalid parameter (must be greater than 0) {op}(0"
+                    )),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected {op}(0, ...) to be rejected, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_non_integer_k_is_rejected_for_every_k_selection() {
+    for op in ["topk", "bottomk", "approx_topk"] {
+        match parse(&format!(r#"{op}(2.5, rate({{a="b"}}[5m]))"#)) {
+            Err(err @ LogQlError::InvalidAggregationParam { .. }) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(&format!("invalid parameter {op}(2.5,")),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected {op}(2.5, ...) to be rejected, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_negative_k_is_rejected_when_parsed_as_not_positive() {
+    // The lexer has no negative NUMBER token (`topk(-1, ...)` fails on the
+    // `-` exactly as the reference's `syntax error: unexpected ,` class);
+    // a programmatic negative that DOES tokenize (none today) would take
+    // the not-positive arm — pin the boundary with k=0 above and the
+    // syntax-shape here.
+    match parse(r#"topk(-1, rate({a="b"}[5m]))"#) {
+        Err(LogQlError::UnexpectedToken { .. }) => {}
+        other => panic!("expected topk(-1, ...) to be rejected, got {other:?}"),
+    }
+}
+
+/// The `k` checks fire at reduce time in the reference
+/// (`mustNewVectorAggregationExpr` runs only once the whole call parsed),
+/// so a syntax error inside the call still wins over a bad `k`.
+#[test]
+fn a_syntax_error_inside_the_call_wins_over_a_bad_k() {
+    match parse(r#"topk(0, rate({a="b"}[5m])"#) {
+        Err(LogQlError::UnexpectedEof { .. }) => {}
+        other => panic!("expected the unclosed call to fail on EOF, got {other:?}"),
+    }
+}
+
+// --- `approx_topk` grouping rejection (issue #221; reference:
+// --- `grouping not allowed for approx_topk aggregation`).
+
+#[test]
+fn approx_topk_rejects_a_prefix_grouping() {
+    match parse(r#"approx_topk by (lvl) (2, rate({a="b"}[5m]))"#) {
+        Err(err @ LogQlError::GroupingNotAllowed { .. }) => {
+            assert!(
+                err.to_string()
+                    .contains("grouping not allowed for approx_topk aggregation"),
+                "{err}"
+            );
+        }
+        other => panic!("expected the prefix grouping to be rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn approx_topk_rejects_a_postfix_grouping() {
+    match parse(r#"approx_topk(2, rate({a="b"}[5m])) by (lvl)"#) {
+        Err(err @ LogQlError::GroupingNotAllowed { .. }) => {
+            assert!(
+                err.to_string()
+                    .contains("grouping not allowed for approx_topk aggregation"),
+                "{err}"
+            );
+        }
+        other => panic!("expected the postfix grouping to be rejected, got {other:?}"),
+    }
+}
+
+/// The reference validates `k` BEFORE the grouping check — the
+/// `mustNewVectorAggregationExpr` order (pkg/logql/syntax/ast.go: the
+/// `Atoi`/`> 0` checks precede the `OpTypeApproxTopK && gr != nil` arm).
+#[test]
+fn a_bad_k_wins_over_the_approx_topk_grouping_rejection() {
+    match parse(r#"approx_topk by (lvl) (0, rate({a="b"}[5m]))"#) {
+        Err(LogQlError::AggregationParamNotPositive { .. }) => {}
+        other => panic!("expected the k=0 rejection first, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_parameter_on_a_parameterless_vector_aggregation_is_rejected() {
     // `sum(0.5, ...)`: the `0.5` parses as a scalar-literal operand, so

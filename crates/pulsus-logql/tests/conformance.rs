@@ -530,6 +530,7 @@ fn vector_id(op: VectorAggOp) -> &'static str {
         VectorAggOp::Stdvar => "agg.stdvar",
         VectorAggOp::Topk => "agg.topk",
         VectorAggOp::Bottomk => "agg.bottomk",
+        VectorAggOp::ApproxTopk => "agg.approx_topk",
         VectorAggOp::Sort => "agg.sort",
         VectorAggOp::SortDesc => "agg.sort_desc",
     }
@@ -667,6 +668,7 @@ const VECTOR_ALL: &[VectorAggOp] = &[
     VectorAggOp::Stdvar,
     VectorAggOp::Topk,
     VectorAggOp::Bottomk,
+    VectorAggOp::ApproxTopk,
     VectorAggOp::Sort,
     VectorAggOp::SortDesc,
 ];
@@ -1083,8 +1085,9 @@ fn differential_categories_are_pinned() {
     // `supported` and this closeout moved the 2 both-reject residuals
     // (`stage.distinct`/`stage.ip`) into the new reject-parity bucket
     // (both_reject 2 → 0, reject_parity = 2), driving tracked interim to 0.
-    // #221 added `func.vector` (supported) → 98.
-    assert_eq!(supported, 98, "supported (both-accept agreement) count pin");
+    // #221 added `func.vector` (supported) → 98, then `agg.approx_topk`
+    // (supported) → 99.
+    assert_eq!(supported, 99, "supported (both-accept agreement) count pin");
     assert_eq!(
         tracked_interim, 0,
         "tracked interim gap count pin (interim ∧ oracle accepts, each with an owning issue)"

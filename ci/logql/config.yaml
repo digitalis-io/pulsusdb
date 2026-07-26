@@ -39,8 +39,22 @@ schema_config:
 # Generous query limits so a syntactically valid query answers (empty)
 # instead of being rejected on a range/length cap — the leg must distinguish
 # a syntax rejection (400) from an accepted-but-empty query (2xx).
+# `shard_aggregations` (issue #221): without it EVERY approx_topk query is a
+# 500 `approx_topk is not enabled` — inconclusive for the leg, never a
+# syntax verdict.
 limits_config:
   metric_aggregation_enabled: true
+  shard_aggregations:
+    - approx_topk
+
+# Issue #221: with shard_aggregations set, the frontend must ship the
+# serialized query PLAN downstream (the approx_topk rewrite produces an
+# internal `__count_min_sketch__` subquery that is not user-parseable; under
+# the default JSON encoding the querier re-parses the string and 400s with
+# `syntax error: unexpected IDENTIFIER` — a FALSE syntax verdict). The
+# reference's own config validation couples the two settings.
+frontend:
+  encoding: protobuf
 
 query_range:
   cache_results: false

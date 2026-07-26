@@ -890,6 +890,37 @@ fn range_metric_spec_carries_the_caller_supplied_step() {
     assert_eq!(mp.end_ns, END_NS);
 }
 
+/// Issue #221 AC 12 (performance invariant): `approx_topk` adds NO SQL,
+/// no plan change and no extra round-trip — the plan for
+/// `approx_topk(3, X)` is byte-identical to the plan for `topk(3, X)` of
+/// the same inner, except the outer op enum. Same stage-1 SQL, same
+/// routing, same scan window, same pushdown.
+#[test]
+fn approx_topk_plans_byte_identically_to_topk() {
+    let params = QueryParams {
+        spec: QuerySpec::Instant { at_ns: END_NS },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut approx = metric_plan(
+        r#"approx_topk(3, sum by (lvl) (count_over_time({app="x"}[5m])))"#,
+        &params,
+    );
+    let topk = metric_plan(
+        r#"topk(3, sum by (lvl) (count_over_time({app="x"}[5m])))"#,
+        &params,
+    );
+    assert_eq!(
+        approx.vector_aggs[0].0,
+        pulsus_logql::VectorAggOp::ApproxTopk
+    );
+    approx.vector_aggs[0].0 = pulsus_logql::VectorAggOp::Topk;
+    assert_eq!(
+        approx, topk,
+        "the two plans must differ ONLY in the outer vector-agg op"
+    );
+}
+
 #[test]
 fn vector_agg_sum_by_captures_the_grouping_labels() {
     let mp = metric_plan(

@@ -235,3 +235,36 @@ Out of this ledger's scope by design:
   share a substring, so gate on it). This entry records the status-code
   divergence for the record; it is not a `mode: "informational"`
   downgrade (the cases remain gated on their substring).
+
+### approx-topk-determinism-and-range-status (issue #221)
+
+- **Construct:** `approx_topk(k, ...)` — probabilistic top-k via a
+  byte-exact count-min-sketch port (corpus `b10_approx_topk.test`;
+  collision fixtures verified by executing the reference
+  `pkg/logql`/`pkg/logql/sketch` package at v3.7.4).
+- **Reference nondeterminism above the retention cap (exclusion rule,
+  not a divergence):** above 10 000 distinct inner series — and at ties
+  on the k-th selection boundary — the reference's own result depends on
+  a randomized Go map iteration (heap eviction order + topk tie order).
+  Probed live against `grafana/loki:3.7.4`: three identical
+  `approx_topk(15, sum by (id)(count_over_time(...)))` queries over one
+  immutable 20 000-series dataset returned three different tails (the
+  true heavy hitters were stable). **No one can match that regime,
+  including the reference itself.** PulsusDB pins a deterministic
+  canonical insertion order (label-ascending) instead — the same
+  treatment as the ratified instant `first_over_time`/`last_over_time`
+  tie pin — and the corpus pre-commits to staying below the cap and off
+  k-boundary ties (rule recorded in the `.test` header).
+- **Range-rejection status delta (the matching-error-status-divergence
+  precedent, third instance):** any `approx_topk` in a range query is
+  refused with the reference's exact body
+  `count min sketches are only supported on instant queries` — Loki
+  surfaces it as HTTP **500** (probed live against `grafana/loki:3.7.4`),
+  PulsusDB as `ReadError::PipelineInvalid` → HTTP **400**, per the same
+  adjudicated rule as the entry above: gate on the shared body substring,
+  never the status code.
+- **Enablement delta (not gated):** the reference disables `approx_topk`
+  by default (`limits_config.shard_aggregations` + protobuf frontend
+  encoding — capture procedure in `tests/logqltest/PROVENANCE.md`);
+  PulsusDB has no per-tenant limits config, so the construct is
+  unconditionally available, matching the enabled configuration.

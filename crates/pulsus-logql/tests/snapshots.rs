@@ -1195,12 +1195,33 @@ fn new_vector_aggregations_round_trip_with_grouping_and_params() {
         r#"stdvar by(app)(rate({a="b"}[5m]))"#,
         r#"topk(5, rate({a="b"}[5m]))"#,
         r#"bottomk(3, rate({a="b"}[5m]))"#,
+        r#"approx_topk(5, rate({a="b"}[5m]))"#,
         r#"topk by(app)(5, rate({a="b"}[5m]))"#,
         r#"sum by(app)(topk(2, count_over_time({a="b"}[5m])))"#,
+        r#"sum(approx_topk(2, count_over_time({a="b"}[5m])))"#,
     ];
     for q in queries {
         assert_round_trip(q);
     }
+}
+
+/// Issue #221 AC 1: `approx_topk(5, ...)` parses like `topk` —
+/// `VectorAggOp::ApproxTopk`, `grouping: None`, raw `param` `"5"`.
+#[test]
+fn approx_topk_parses_with_no_grouping_and_its_raw_k() {
+    let expr = parse(r#"approx_topk(5, rate({a="b"}[5m]))"#).unwrap();
+    let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Vector {
+        op,
+        grouping,
+        param,
+        ..
+    }) = &expr
+    else {
+        panic!("expected a vector aggregation");
+    };
+    assert_eq!(*op, pulsus_logql::VectorAggOp::ApproxTopk);
+    assert_eq!(param.as_deref(), Some("5"));
+    assert!(grouping.is_none());
 }
 
 #[test]
