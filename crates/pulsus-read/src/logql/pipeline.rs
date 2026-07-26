@@ -766,8 +766,33 @@ impl CompiledPipeline {
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Option<Cow<'a, str>> {
         match self.run_mode_into(body, base, sm, labels, false) {
-            MetricRun::Dropped => None,
-            MetricRun::Kept { line, .. } => Some(line),
+            (MetricRun::Dropped, _) => None,
+            (MetricRun::Kept { line, .. }, _) => Some(line),
+        }
+    }
+
+    /// As [`CompiledPipeline::run_into`], additionally reporting whether the
+    /// pipeline FINISHED with the out-of-band err slot set — the reference's
+    /// `HasErr()` (`labels.go:245`), evaluated before materialization
+    /// (issue #238 review round 7, the ninth site). This is NOT the same
+    /// question as "does the emitted set contain an `__error__` label": a
+    /// parser may extract an ORDINARY label literally named `__error__`
+    /// (`parser.go:160` `Set(ParsedLabel, …)` — never the slot) while
+    /// `HasErr()` stays false, and conversely a slot error always merges
+    /// into the emitted set. Detected-fields auto-detection keys its
+    /// parser-failure test on THIS flag, not on a label-name scan
+    /// (reference-captured: `{"__error__":"","foo":"x"}` and
+    /// `{"__error__":"mine","foo":"x"}` both auto-detect as json with `foo`
+    /// retained).
+    pub(crate) fn run_into_reporting_err<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    ) -> (Option<Cow<'a, str>>, bool) {
+        match self.run_mode_into(body, base, &EMPTY_STRUCTURED_METADATA, labels, false) {
+            (MetricRun::Dropped, has_err) => (None, has_err),
+            (MetricRun::Kept { line, .. }, has_err) => (Some(line), has_err),
         }
     }
 
@@ -790,8 +815,12 @@ impl CompiledPipeline {
         // `MetricScanRow` carries no structured metadata (issue #249), so the
         // metric path always seeds empty slots.
         self.run_mode_into(body, base, &EMPTY_STRUCTURED_METADATA, labels, true)
+            .0
     }
 
+    /// The second element of the return is the reference's `HasErr()` at the
+    /// end of the pipeline — the pre-materialization slot state
+    /// [`CompiledPipeline::run_into_reporting_err`] surfaces.
     fn run_mode_into<'a>(
         &'a self,
         body: &'a str,
@@ -799,7 +828,7 @@ impl CompiledPipeline {
         sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
         metric: bool,
-    ) -> MetricRun<'a> {
+    ) -> (MetricRun<'a>, bool) {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
         let mut value: Option<f64> = None;
         labels.clear();
@@ -832,7 +861,7 @@ impl CompiledPipeline {
                     // `!=`/`!~` keep the line iff NONE of the alternatives match.
                     let keep = if *negated { !hit } else { hit };
                     if !keep {
-                        return MetricRun::Dropped;
+                        return (MetricRun::Dropped, errs.has_err());
                     }
                 }
                 CompiledStage::Json { extractions } => {
@@ -944,7 +973,7 @@ impl CompiledPipeline {
                     let mut failed: Option<(UnitKind, &str)> = None;
                     match eval_label_filter(filter, labels, &errs, &mut failed) {
                         Some(true) => {}
-                        Some(false) => return MetricRun::Dropped,
+                        Some(false) => return (MetricRun::Dropped, errs.has_err()),
                         // Conversion failure: keep the line, tag the error
                         // class in the out-of-band slots (pinned semantics,
                         // oracle-verified; a later `__error__=""` filter
@@ -1098,7 +1127,7 @@ impl CompiledPipeline {
                     let Some(raw) = get_label(labels, label) else {
                         // Oracle-probed: a line without the unwrap label
                         // is silently skipped, never an error.
-                        return MetricRun::Dropped;
+                        return (MetricRun::Dropped, errs.has_err());
                     };
                     match convert_label_value(*kind, raw) {
                         Some(v) => {
@@ -1235,9 +1264,11 @@ impl CompiledPipeline {
         }
 
         // The ONE merge point (`appendErrors` over the `visible()` gate):
-        // kept lines only — a dropped line never merges (issue #238).
+        // kept lines only — a dropped line never merges (issue #238). The
+        // slot state is captured BEFORE the merge consumes the slots.
+        let has_err = errs.has_err();
         errs.merge_into(labels);
-        MetricRun::Kept { line, value }
+        (MetricRun::Kept { line, value }, has_err)
     }
 }
 

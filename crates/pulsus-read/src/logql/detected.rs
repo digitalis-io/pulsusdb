@@ -222,18 +222,27 @@ static LOGFMT_PARSER: LazyLock<CompiledPipeline> = LazyLock::new(|| {
 });
 
 /// Json-first / logfmt-fallback auto-detection on one (post-pipeline)
-/// line, via [`CompiledPipeline`] over a bare parser stage — success = no
-/// `__error__` in the output labels (the reference's `HasErr()` analog:
-/// try json; on failure reset and try logfmt; on failure the entry
-/// contributes no auto-parsed fields). Returns the winning parser name
-/// and its extracted pairs (`__error_details__` never leaks — an
+/// line, via [`CompiledPipeline`] over a bare parser stage — success = the
+/// parser finished with the OUT-OF-BAND err slot unset (the reference's
+/// `HasErr()`, surfaced by `run_into_reporting_err`; issue #238 review
+/// round 7): try json; on failure reset and try logfmt; on failure the
+/// entry contributes no auto-parsed fields. Deliberately NOT a scan of the
+/// emitted labels for the `__error__` NAME: a parser-extracted ordinary
+/// label literally named `__error__` (`parser.go:160`, `Set(ParsedLabel,
+/// …)` — never the slot) leaves `HasErr()` false and must not fail the
+/// detection. Reference-captured (`grafana/loki:3.7.4`,
+/// `discover_log_levels: false`): `{"__error__":"","foo":"x"}` AND
+/// `{"__error__":"mine","foo":"x"}` both detect `foo` as a json field
+/// (and neither surfaces `__error__` itself as a field —
+/// [`FieldAccumulator::observe_parsed`]'s name exclusion matches that);
+/// `not json at all` yields no fields. Returns the winning parser name and
+/// its extracted pairs (a slot `__error_details__` never leaks — an
 /// erroring parser is a failure wholesale).
 pub(super) fn auto_parse(line: &str) -> Option<(&'static str, Vec<(String, String)>)> {
     for (name, parser) in [("json", &*JSON_PARSER), ("logfmt", &*LOGFMT_PARSER)] {
         let mut labels = Vec::new();
-        if parser.run_into(line, &[], &mut labels).is_some()
-            && !labels.iter().any(|(k, _)| k == ERROR_LABEL)
-        {
+        let (kept, has_err) = parser.run_into_reporting_err(line, &[], &mut labels);
+        if kept.is_some() && !has_err {
             let pairs = labels
                 .into_iter()
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -321,6 +330,73 @@ mod tests {
         let (parser, pairs) = auto_parse(r#"plain x="unterminated"#).expect("lenient logfmt");
         assert_eq!(parser, "logfmt");
         assert!(pairs.is_empty(), "no clean fields, got {pairs:?}");
+    }
+
+    // -- auto_parse keys on the error SLOT, not the label name (issue #238
+    // review round 7, the ninth site). Expected values are literal captures
+    // from the pinned reference container (grafana/loki:3.7.4,
+    // `discover_log_levels: false`, no per-entry SM): /detected_fields over
+    // one-line streams. Wrong rules named per row:
+    //   NAME  = the pre-fix emitted-label NAME scan (`any(k == "__error__")`)
+    //   VALUE = a non-emptiness scan (`any(k == "__error__" && !v.is_empty())`)
+    // ---------------------------------------------------------------------
+
+    /// Capture: `{"__error__":"","foo":"x"}` -> field `foo`, parsers
+    /// ["json"]. Correct: `("json", pairs)` with `foo=x` retained (the
+    /// parsed ordinary `__error__` label rides along in the pairs and is
+    /// excluded from FIELDS by name downstream — see
+    /// `error_labels_are_excluded_from_fields`, matching the capture, which
+    /// lists no `__error__` field). Under NAME: `("logfmt", [])` — `foo`
+    /// and the json attribution are lost (this row's killer). Under VALUE:
+    /// same as correct — this row is a DECLARED PIN for VALUE; its
+    /// discriminator is the sibling below.
+    #[test]
+    fn auto_parse_accepts_json_with_an_empty_parsed_error_named_label() {
+        let (parser, pairs) = auto_parse(r#"{"__error__":"","foo":"x"}"#).expect("parsed");
+        assert_eq!(parser, "json");
+        assert!(
+            pairs.contains(&("foo".to_string(), "x".to_string())),
+            "foo must survive: {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("__error__".to_string(), String::new())),
+            "the parsed ORDINARY __error__ label is an ordinary pair: {pairs:?}"
+        );
+    }
+
+    /// Capture: `{"__error__":"mine","foo":"x"}` -> field `foo`, parsers
+    /// ["json"]. Correct: `("json", pairs)` with `foo=x` retained. Under
+    /// NAME: `("logfmt", [])`. Under VALUE: `("logfmt", [])` too ("mine" is
+    /// non-empty) — this row kills BOTH wrong rules, which is why the
+    /// review rejected the "obvious" non-emptiness fix.
+    #[test]
+    fn auto_parse_accepts_json_with_a_nonempty_parsed_error_named_label() {
+        let (parser, pairs) = auto_parse(r#"{"__error__":"mine","foo":"x"}"#).expect("parsed");
+        assert_eq!(parser, "json");
+        assert!(
+            pairs.contains(&("foo".to_string(), "x".to_string())),
+            "foo must survive: {pairs:?}"
+        );
+        assert!(pairs.contains(&("__error__".to_string(), "mine".to_string())));
+    }
+
+    /// A GENUINE json parse failure still falls back: the json parser sets
+    /// the err SLOT (JSONParserErr), so detection moves on to logfmt, which
+    /// extracts `foo`/`bar` (capture: fields foo+bar, parsers ["logfmt"]).
+    /// If the slot state stopped being threaded out (has_err always false),
+    /// json would win with ZERO pairs and the logfmt attribution would be
+    /// lost — this row is the thread-through guard. (`not json at all`
+    /// yields no fields on both stores: lenient logfmt drops the empty
+    /// bare keys — pinned by
+    /// `auto_parse_treats_a_lenient_logfmt_line_as_logfmt_even_when_it_extracts_nothing`.)
+    #[test]
+    fn auto_parse_still_falls_back_on_a_genuine_json_slot_error() {
+        let (parser, pairs) = auto_parse("foo=x bar=y").expect("parsed");
+        assert_eq!(parser, "logfmt");
+        assert!(pairs.contains(&("foo".to_string(), "x".to_string())));
+        assert!(pairs.contains(&("bar".to_string(), "y".to_string())));
+        // And the slot error never leaks into the winner's pairs.
+        assert!(!pairs.iter().any(|(k, _)| k == ERROR_LABEL), "{pairs:?}");
     }
 
     // -- FieldAccumulator --------------------------------------------------
