@@ -513,13 +513,16 @@ pub enum ReadError {
     #[error("range query step_ns must be greater than zero")]
     InvalidStep,
 
-    /// Issue #227 (review round 2): a client-controlled duration — the
-    /// `[range]` selector or the request `step` — fell outside the validated
-    /// domain `1 ..= MAX_DURATION_NS` (≈73 years of nanoseconds). Rejected at
-    /// the planner boundary BEFORE any narrowing, so no hostile `u64` can
-    /// wrap the window/covering arithmetic downstream. A clean 400 (`bad_data`),
+    /// Issue #227 (review round 2; domain widened in round 10): a
+    /// client-controlled duration — the `[range]` selector or the request
+    /// `step` — fell outside the validated domain `1 ..= MAX_DURATION_NS`
+    /// (= `i64::MAX`, the reference's full positive int64-nanosecond
+    /// `time.Duration` range, ≈292 years). Rejected at the planner boundary
+    /// BEFORE any narrowing, so no hostile `u64` can wrap the
+    /// window/covering arithmetic downstream. A clean 400 (`bad_data`),
     /// like [`Self::InvalidStep`]; nothing the reference serves is in the
-    /// rejected region.
+    /// rejected region — values past `i64::MAX` are unrepresentable in a Go
+    /// `time.Duration` and a parse-level 400 there.
     #[error("{what} of {value} ns is outside the supported range (1 to {max} ns)")]
     DurationOutOfRange {
         what: &'static str,

@@ -557,6 +557,32 @@ mod tests {
         );
     }
 
+    /// Issue #227 review round 10 (the reported case, verbatim):
+    /// `query=vector(1)&start=0&end=0&step=3153600000s` — a 100-year step —
+    /// fits the reference's positive `time.Duration` and passes its
+    /// resolution fence, so the reference serves it. The request must clear
+    /// parameter parsing and the resolution guard (hermetically the
+    /// engine-pool 503, never a 400); the engine leg of the same case —
+    /// validator + grid guard — is pinned by the agreement table above and
+    /// the read-crate's `a_100_year_step_the_reference_serves_is_served`.
+    #[tokio::test]
+    async fn query_range_with_a_100_year_step_passes_the_request_guard() {
+        let q = "query=vector(1)&start=0&end=0&step=3153600000s";
+        let res = query_range(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(q.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a 100-year step the reference serves must pass request parsing \
+             (got {json:?})"
+        );
+    }
+
     /// Issue #227 review round 7, finding 1 (extended in round 8 to the
     /// extreme timestamp domain): the HTTP request guard
     /// (`ensure_range_resolution`) and the engine's grid guard
@@ -592,6 +618,14 @@ mod tests {
             (i64::MIN, i64::MAX, sat_reject + 1, true), // 11_000 saturated
             (i64::MIN, i64::MAX, 1, false),          // 1ns step, far over
             (-1, i64::MAX - 1, BIG, true),           // saturation onset, exact
+            // Round 10: the widened duration domain — the reference accepts
+            // ANY positive int64-ns step. A 100-year step (the reported
+            // reject-a-served-request case) and the largest representable
+            // step must both pass BOTH guards (the retired `i64::MAX / 4`
+            // validator cap panicked this table's engine leg on them).
+            (0, 0, 3_153_600_000_000_000_000, true), // 100y (3153600000s)
+            (0, 0, i64::MAX as u64, true),           // Go's maximum Duration
+            (i64::MIN, i64::MAX, i64::MAX as u64, true), // full domain, max step
         ];
         for &(start_ns, end_ns, step_ns, admitted) in cases {
             let guard_ok = params::ensure_range_resolution(start_ns, end_ns, step_ns).is_ok();

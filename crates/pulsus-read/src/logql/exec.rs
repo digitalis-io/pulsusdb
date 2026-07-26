@@ -7635,12 +7635,10 @@ mod tests {
             MAX_DURATION_NS
         );
         // Zero and everything above the domain are named 400s, NOT wraps.
-        for hostile in [
-            0u64,
-            MAX_DURATION_NS as u64 + 1,
-            i64::MAX as u64 + 1, // would narrow to a NEGATIVE i64
-            u64::MAX,
-        ] {
+        // Round 10: the domain is the reference's full positive int64, so
+        // `MAX_DURATION_NS + 1` IS `i64::MAX as u64 + 1` — the first value
+        // that would narrow to a NEGATIVE i64.
+        for hostile in [0u64, MAX_DURATION_NS as u64 + 1, u64::MAX] {
             match super::super::params::validate_duration_ns(hostile, "range selector") {
                 Err(ReadError::DurationOutOfRange { value, max, .. }) => {
                     assert_eq!(value, hostile);

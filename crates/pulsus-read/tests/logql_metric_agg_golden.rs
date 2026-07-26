@@ -452,8 +452,11 @@ fn extreme_window_bounds_hit_the_bucket_cap_without_overflow() {
     assert_eq!(result, QueryResult::Matrix(Vec::new()));
     // A large-but-IN-DOMAIN step over the extreme window is a handful of
     // buckets: accepted (no false positive from the widened arithmetic).
-    // `MAX_DURATION_NS` is the validated ceiling (issue #227 review round 2);
-    // a step ABOVE it is now rejected at the planner boundary instead — see
+    // `MAX_DURATION_NS` is the validated ceiling — since round 10 the
+    // reference's full positive int64 (`i64::MAX`), so this is the largest
+    // step the reference can represent, over the full timestamp domain
+    // (one saturated fence interval); a step ABOVE it is rejected at the
+    // planner boundary instead — see
     // `a_hostile_step_is_rejected_end_to_end_by_the_planner`.
     let params = QueryParams {
         spec: pulsus_read::logql::QuerySpec::Range {
@@ -473,6 +476,37 @@ fn extreme_window_bounds_hit_the_bucket_cap_without_overflow() {
         )
         .is_ok()
     );
+}
+
+/// Issue #227 review round 10: a 100-year step (`step=3153600000s`, start=0,
+/// end=0) fits the reference's positive `time.Duration` and passes its
+/// resolution fence, so the reference SERVES it — the retired
+/// `i64::MAX / 4` duration cap wrongly 400'd it at the planner boundary.
+/// End-to-end through the client-aggregated path: the plan validates, the
+/// grid is the single point `t = 0`, and its `(t-1m, t]` window counts the
+/// one sample at `ts = 0`.
+#[test]
+fn a_100_year_step_the_reference_serves_is_served() {
+    const HUNDRED_YEARS_NS: u64 = 3_153_600_000_000_000_000;
+    let params = QueryParams {
+        spec: pulsus_read::logql::QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 0,
+            step_ns: HUNDRED_YEARS_NS,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let points = single_series_points(
+        run_client(
+            r#"count_over_time({env="prod"}[1m])"#,
+            &params,
+            &[row(1, 0, "a")],
+            &meta_one(),
+        )
+        .expect("the reference serves a 100-year step; PulsusDB must too"),
+    );
+    assert_eq!(points, vec![(0, 1.0)]);
 }
 
 /// Issue #227: the sliding evaluator must survive extreme timestamps near

@@ -99,7 +99,8 @@ pub struct TimeBounds {
 /// `PULSUS_LOGQL_MAX_STREAMS` config field only when a deployment needs it.
 pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 
-/// **The client-controlled duration domain** (issue #227 review round 2).
+/// **The client-controlled duration domain** (issue #227 review round 2;
+/// widened to the reference's full domain in round 10).
 ///
 /// Every duration reaching the range/sliding evaluator — the `[range]`
 /// selector and the request `step` — is validated against this bound ONCE at
@@ -107,13 +108,21 @@ pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 /// as a plain `i64` thereafter, so no downstream `as i64` narrowing exists
 /// and no hostile `u64` can wrap the window/covering arithmetic.
 ///
-/// `i64::MAX / 4` ≈ **73 years** of nanoseconds: four times any conceivable
-/// query window (Loki's own `max_query_length` defaults to 30 days), while
-/// leaving two bits of headroom so that even a plain `i64` sum of a few
-/// in-domain durations (`ts + range`, `t - range`, `start - range`) cannot
-/// overflow. Anything larger is rejected with a clean 400 rather than
-/// narrowed — nothing Loki serves is in the rejected region.
-pub const MAX_DURATION_NS: i64 = i64::MAX / 4;
+/// `i64::MAX` is the reference's EXACT accepted nanosecond domain: a
+/// duration is a positive Go `time.Duration` (int64 ns). Its parse layer
+/// admits nothing beyond that — `model.ParseDuration` rejects an
+/// accumulated `dur > 1<<63-1` ns ("duration out of range"), the
+/// float-seconds path rejects `> float64(MaxInt64)` ("overflows int64"),
+/// and `ParseRangeQuery` 400s `Step <= 0` — so any value in
+/// `1 ..= i64::MAX` is servable there and must be servable here (the
+/// round-10 finding: the previous `i64::MAX / 4` headroom cap rejected a
+/// 100-year step the reference serves). The headroom is obsolete: every
+/// downstream sum/difference of a validated duration is saturating, i128,
+/// or structurally bounded (rounds 2–9's arithmetic sweep). The upper
+/// rejection arm stays load-bearing — the HTTP parse layer produces a
+/// checked `u64`, so values in `(i64::MAX, u64::MAX]` (unrepresentable in
+/// the reference, a parse-level 400 there) are a clean 400 here too.
+pub const MAX_DURATION_NS: i64 = i64::MAX;
 
 /// A duration that has PASSED the [`validate_duration_ns`] boundary check —
 /// guaranteed to lie in `0 ..= MAX_DURATION_NS` (issue #227 review round 3).
@@ -197,5 +206,45 @@ mod tests {
     #[test]
     fn default_max_streams_is_the_documented_100k_constant() {
         assert_eq!(DEFAULT_MAX_STREAMS, 100_000);
+    }
+
+    /// Issue #227 review round 10: the validated domain is the reference's
+    /// full positive int64-nanosecond `time.Duration` range — the largest
+    /// duration the reference can represent is SERVED, and the first value
+    /// past it (unrepresentable there, a parse-level 400 there) is a clean
+    /// 400 here.
+    #[test]
+    fn the_duration_domain_boundary_matches_the_references_positive_int64() {
+        assert_eq!(MAX_DURATION_NS, i64::MAX);
+        // Largest accepted: i64::MAX ns (Go's maximum time.Duration).
+        assert_eq!(
+            validate_duration_ns(i64::MAX as u64, "step").unwrap().get(),
+            i64::MAX
+        );
+        // First rejected: i64::MAX + 1 (= 1<<63) — negative as a Go int64,
+        // so the reference's parser can never produce it.
+        match validate_duration_ns(i64::MAX as u64 + 1, "step") {
+            Err(crate::logql::ReadError::DurationOutOfRange { value, max, .. }) => {
+                assert_eq!(value, i64::MAX as u64 + 1);
+                assert_eq!(max, i64::MAX);
+            }
+            other => panic!("i64::MAX + 1 ns must be rejected, got {other:?}"),
+        }
+    }
+
+    /// The round-10 finding's concrete case: a 100-year step
+    /// (`3153600000s` = 3.1536e18 ns) fits the reference's positive
+    /// `time.Duration` and passes its resolution fence, so it is served
+    /// there — the validator must mint it, not 400 it (the retired
+    /// `i64::MAX / 4` ≈ 73-year cap wrongly rejected it).
+    #[test]
+    fn a_100_year_duration_the_reference_serves_is_validated() {
+        const HUNDRED_YEARS_NS: u64 = 3_153_600_000_000_000_000;
+        assert_eq!(
+            validate_duration_ns(HUNDRED_YEARS_NS, "step")
+                .unwrap()
+                .get(),
+            HUNDRED_YEARS_NS as i64
+        );
     }
 }
