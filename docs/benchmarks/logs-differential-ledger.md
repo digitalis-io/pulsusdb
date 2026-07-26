@@ -268,3 +268,48 @@ Out of this ledger's scope by design:
   encoding — capture procedure in `tests/logqltest/PROVENANCE.md`);
   PulsusDB has no per-tenant limits config, so the construct is
   unconditionally available, matching the enabled configuration.
+
+### error-pair-duplicate-slot (informational note, not a gate downgrade — issue #238)
+
+- **Construct:** the out-of-band `__error__`/`__error_details__` pair
+  (issue #238). No fixture case references this entry; the PulsusDB side
+  is pinned hermetically by two corpus cases in
+  `crates/pulsus-read/tests/logqltest/corpus/b12_error_pair_model.test`
+  §3 (`b12c`): the streams shape `{service_name="b12c"} | logfmt | json`
+  and the `eval_fail` on `count_over_time({service_name="b12c"} | logfmt
+  | json [30m])`.
+- **Reachable shape:** a parser extracts a label literally named
+  `__error__`/`__error_details__` (an ORDINARY parsed label —
+  `pkg/logql/log/parser.go` `Set(ParsedLabel, …)`, never the slots) and a
+  LATER stage sets the out-of-band slot, e.g. `{…} | logfmt | json` over
+  the line `__error__=mine __error_details__=mydet k=v`.
+- **Reference behaviour (probed, `grafana/loki:3.7.4`):**
+  `UnsortedLabels` appends the parsed entry (`labels.go:517`) and then
+  `appendErrors` appends the slot (`labels.go:519-521`), and `labels.New`
+  does not deduplicate — so BOTH entries reach the emitted slice. Streams
+  JSON and the metric `metric` map dedupe last-wins (the slot value), but
+  the metric error message renders both and picks its error type via
+  `metric.Get(ErrorLabel)` = the FIRST = the parsed value:
+  `pipeline error: 'mine' for series: '{__error__="mine",
+  __error__="JSONParserErr", __error_details__="mydet",
+  __error_details__="Value looks like object, but can't find closing '}'
+  symbol", k="v", service_name="e238c"}'`.
+- **PulsusDB behaviour (the pinned deterministic side):** one entry per
+  name, slot value wins — the streams JSON and the metric series labels
+  are IDENTICAL to the reference's deduped view; the metric error reads
+  `pipeline error: 'JSONParserErr' for series: '{__error__="JSONParserErr",
+  __error_details__="Value looks like object, but can't find closing '}'
+  symbol", k="v", service_name="…"}'`.
+- **Exact accepted delta:** only the doubly-populated metric ERROR
+  MESSAGE differs — the selected error class (`'mine'` vs
+  `'JSONParserErr'`) and the duplicate rendering inside the quoted
+  series. Both stores still FAIL the query with a `pipeline error:`
+  naming a real error class.
+- **Why not matched (task-manager ratified, issue #238):** reproducing
+  the duplicate-entry rendering and the first-wins error type would
+  require a duplicate-permitting emitted label set, which breaks
+  `labels_json` canonicalisation, stream fingerprinting and metric
+  grouping — core representation everything else depends on (the
+  same-nanosecond same-stream tie-order precedent). Reachable only when
+  log data contains a literal `__error__`-family key extracted before an
+  erroring parser.

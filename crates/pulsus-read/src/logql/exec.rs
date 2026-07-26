@@ -22,7 +22,7 @@ use super::detected::{self, DetectedFields, DetectedLabelOut, FieldAccumulator};
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds, ValidatedDuration};
-use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
+use super::pipeline::{CompiledPipeline, ERROR_DETAILS_LABEL, ERROR_LABEL, MetricRun};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow,
@@ -2785,6 +2785,9 @@ impl<'m> StreamAccumulator<'m> {
         // `eval_structured_metadata_row` for why the reuse goes through a
         // by-value helper rather than a hoisted `&mut` binding.
         let mut sm_scratch: LabelScratch<'static> = Vec::new();
+        // The per-row reserved-SM routing outcome (issue #238), cleared and
+        // refilled by the merge — reused across rows like the buffers above.
+        let mut sm_ctx = StructuredMetadataCtx::default();
 
         for row in rows {
             if *survivors >= *result_limit {
@@ -2843,6 +2846,7 @@ impl<'m> StreamAccumulator<'m> {
                     &row.structured_metadata,
                     &mut merge_buf,
                     &mut sm_buf,
+                    &mut sm_ctx,
                 );
                 // Reuse `sm_scratch`'s allocation across rows: the helper takes
                 // it by value (fresh per-row lifetime for the `merge_buf`
@@ -2851,6 +2855,7 @@ impl<'m> StreamAccumulator<'m> {
                     compiled,
                     &row.body,
                     &merge_buf,
+                    &sm_ctx,
                     label_groups,
                     row.timestamp_ns,
                     &m.service,
@@ -5967,16 +5972,18 @@ type LabelScratch<'a> = Vec<(Cow<'a, str>, Cow<'a, str>)>;
 /// with an outstanding borrow). Passing by value gives each call its own
 /// lifetime while [`recycle_label_scratch`] hands the same allocation back for
 /// the next row (issue #97 review round 1, finding 2 / AC-12).
+#[allow(clippy::too_many_arguments)]
 fn eval_structured_metadata_row<'a>(
     compiled: &'a super::pipeline::CompiledPipeline,
     body: &'a str,
     merged: &'a [(String, String)],
+    sm: &'a StructuredMetadataCtx,
     label_groups: &mut HashMap<String, FanOutGroup>,
     timestamp_ns: i64,
     service: &str,
     mut scratch: LabelScratch<'a>,
 ) -> (bool, LabelScratch<'a>) {
-    let survived = if let Some(line) = compiled.run_into(body, merged, &mut scratch) {
+    let survived = if let Some(line) = compiled.run_into_with_sm(body, merged, sm, &mut scratch) {
         let line = line.into_owned();
         scratch.sort_unstable();
         push_fanout_entry(label_groups, &scratch, timestamp_ns, line, service);
@@ -6031,6 +6038,10 @@ fn feed_detected_rows(
     // `eval_structured_metadata_row` for why a hoisted `&mut` cannot
     // provide the per-row lifetime).
     let mut scratch: LabelScratch<'static> = Vec::new();
+    // Per-row reserved-SM routing outcome (issue #238); non-SM rows pass the
+    // shared EMPTY context instead (the merge is not run for them, so this
+    // holds a previous SM row's stale outcome).
+    let mut sm_ctx = StructuredMetadataCtx::default();
     for row in rows {
         if *matched >= line_limit {
             break;
@@ -6047,12 +6058,18 @@ fn feed_detected_rows(
                 &row.structured_metadata,
                 &mut merge_buf,
                 &mut sm_buf,
+                &mut sm_ctx,
             );
         }
         let run_base: &[(String, String)] = if has_sm { &merge_buf } else { base };
         let sm_pairs: &[(String, String)] = if has_sm { &sm_obs } else { &[] };
+        let sm: &StructuredMetadataCtx = if has_sm {
+            &sm_ctx
+        } else {
+            &EMPTY_STRUCTURED_METADATA
+        };
         let (survived, used) =
-            observe_detected_row(compiled, &row.body, run_base, sm_pairs, acc, scratch);
+            observe_detected_row(compiled, &row.body, run_base, sm, sm_pairs, acc, scratch);
         scratch = recycle_label_scratch(used);
         if survived {
             *matched += 1;
@@ -6072,11 +6089,12 @@ fn observe_detected_row<'a>(
     compiled: &'a super::pipeline::CompiledPipeline,
     body: &'a str,
     run_base: &'a [(String, String)],
+    sm: &'a StructuredMetadataCtx,
     sm_pairs: &[(String, String)],
     acc: &mut FieldAccumulator,
     mut scratch: LabelScratch<'a>,
 ) -> (bool, LabelScratch<'a>) {
-    let survived = if let Some(line) = compiled.run_into(body, run_base, &mut scratch) {
+    let survived = if let Some(line) = compiled.run_into_with_sm(body, run_base, sm, &mut scratch) {
         acc.observe_structured_metadata(sm_pairs);
         let added: Vec<(String, String)> = scratch
             .iter()
@@ -6116,6 +6134,7 @@ fn fan_out_sm_fast_path(
     // parse scratch (see `merge_labels_with_structured_metadata`).
     let mut merge_buf: Vec<(String, String)> = Vec::new();
     let mut sm_buf: Vec<(String, String)> = Vec::new();
+    let mut sm_ctx = StructuredMetadataCtx::default();
     for row in sm_rows {
         let Some(m) = meta.get(&row.fingerprint) else {
             continue;
@@ -6125,13 +6144,19 @@ fn fan_out_sm_fast_path(
             .or_insert_with(|| parse_flat_labels(&m.labels));
         // Merge base + SM (colliding SM keys renamed `_extracted`, per the
         // oracle — no duplicate keys under any collision pattern), then sort for
-        // canonical rendering.
+        // canonical rendering. NO PIPELINE runs on this path, so the
+        // reserved-SM materialisation gate is applied here, by
+        // `append_visible` (issue #238): a lone `__error_details__` SM entry
+        // must not surface (live-probed — the reference's clean-builder fast
+        // path skips it), while an `__error__` SM entry must.
         merge_labels_with_structured_metadata(
             base,
             &row.structured_metadata,
             &mut merge_buf,
             &mut sm_buf,
+            &mut sm_ctx,
         );
+        sm_ctx.append_visible(&mut merge_buf);
         merge_buf.sort_unstable();
         let sorted: Vec<(Cow<'_, str>, Cow<'_, str>)> = merge_buf
             .iter()
@@ -6492,6 +6517,75 @@ fn parse_flat_labels_into(json: &str, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// `LabelsBuilder.Add`'s routing of ONE row's structured metadata
+/// (`pkg/logql/log/labels.go:392-412`; issue #238): the base-collision
+/// `_extracted` suffix (`parser.go:25`) is applied FIRST (`labels.go:395-397`);
+/// a name that is STILL exactly `__error__`/`__error_details__` is assigned to
+/// the OUT-OF-BAND slot and `return`s (`labels.go:399-407`) — it never reaches
+/// `Set`, so it does NOT dirty the builder. EMPTY VALUES: `Add` assigns them
+/// verbatim, and an empty slot is unset (`HasErr` = `err != ""`), so an empty
+/// reserved SM value contributes nothing at all. Live-probed at v3.7.4 across
+/// eleven SM shapes (`discover_log_levels: false` — with it on, every stream
+/// carries a `detected_level` SM entry and the clean-builder fast paths are
+/// unreachable).
+#[derive(Debug, Default, Clone)]
+pub struct StructuredMetadataCtx {
+    /// SM `__error__` (post-suffix), routed to the err slot. "" == absent.
+    pub err: String,
+    /// SM `__error_details__` (post-suffix), routed to the details slot.
+    /// "" == absent.
+    pub details: String,
+    /// At least one NON-EMPTY ordinary SM entry reached `Set` — the
+    /// reference's `hasAdd()`. Empty-valued entries are excluded because the
+    /// reference's distributor strips them before they can reach the builder
+    /// (`pkg/distributor/distributor.go:698-723` through Prometheus'
+    /// `labels.Builder`, which deletes empty-valued base labels —
+    /// `labels_slicelabels.go:404-412`); PulsusDB stores them (#259), and
+    /// counting only non-empty entries here keeps the details-visibility
+    /// gate reference-exact regardless of what ingest stored (live-probed).
+    pub has_ordinary: bool,
+}
+
+/// The shared no-structured-metadata context. NOT a `const`: `String` has a
+/// `Drop` impl, so `&SOME_CONST` would be a temporary and could not satisfy
+/// a `&'a` parameter; a `static` gives a `&'static` that coerces to any `'a`.
+pub static EMPTY_STRUCTURED_METADATA: StructuredMetadataCtx = StructuredMetadataCtx {
+    err: String::new(),
+    details: String::new(),
+    has_ordinary: false,
+};
+
+impl StructuredMetadataCtx {
+    /// No reserved entry and no non-empty ordinary entry — the row
+    /// contributes nothing to the error slots or the dirty bit.
+    pub fn is_empty(&self) -> bool {
+        self.err.is_empty() && self.details.is_empty() && !self.has_ordinary
+    }
+
+    /// The gated view for the NO-PIPELINE fast path (`fan_out_sm_fast_path`,
+    /// which runs no `CompiledPipeline` and must therefore apply the
+    /// materialisation gate itself — issue #238): `__error__` iff non-empty;
+    /// `__error_details__` iff non-empty AND (`has_ordinary` OR `err`
+    /// non-empty) — the same `visible()` rule the pipeline's `ErrorSlots`
+    /// applies at emit. Upserts into the already-merged label vector
+    /// (`set_label` semantics — the slot value wins on a same-name entry).
+    pub fn append_visible(&self, out: &mut Vec<(String, String)>) {
+        let upsert = |out: &mut Vec<(String, String)>, key: &str, value: &str| match out
+            .iter_mut()
+            .find(|(k, _)| k == key)
+        {
+            Some(slot) => slot.1 = value.to_string(),
+            None => out.push((key.to_string(), value.to_string())),
+        };
+        if !self.err.is_empty() {
+            upsert(out, ERROR_LABEL, &self.err);
+        }
+        if !self.details.is_empty() && (self.has_ordinary || !self.err.is_empty()) {
+            upsert(out, ERROR_DETAILS_LABEL, &self.details);
+        }
+    }
+}
+
 /// Merges a stream's cached base (stream/parsed) labels with one row's
 /// structured metadata into `merge_buf` (cleared first — its heap allocation
 /// is reused across rows; `sm_buf` is a second reused scratch the SM pairs are
@@ -6518,12 +6612,24 @@ fn parse_flat_labels_into(json: &str, out: &mut Vec<(String, String)>) {
 /// decision consults only the base region; the upsert consults the FULL evolving
 /// merged set (base + already-merged SM keys). The result is left UNSORTED;
 /// callers sort before rendering/grouping.
+///
+/// **Reserved-name routing (issue #238):** a pair whose POST-suffix key is
+/// exactly `__error__`/`__error_details__` goes into `sm_ctx` (the reference's
+/// `Add` routes it to the out-of-band slot and returns — `labels.go:399-407`)
+/// and is NEVER pushed into `merge_buf`; every other pair upserts as before
+/// and, when non-empty, sets `sm_ctx.has_ordinary`. `sm_ctx` is cleared and
+/// refilled per row. The suffix rule runs FIRST, so a base `__error__` +
+/// SM `__error__` yields an ordinary `__error___extracted` entry (probed).
 fn merge_labels_with_structured_metadata(
     base: &[(String, String)],
     structured_metadata: &str,
     merge_buf: &mut Vec<(String, String)>,
     sm_buf: &mut Vec<(String, String)>,
+    sm_ctx: &mut StructuredMetadataCtx,
 ) {
+    sm_ctx.err.clear();
+    sm_ctx.details.clear();
+    sm_ctx.has_ordinary = false;
     merge_buf.clear();
     merge_buf.extend(base.iter().cloned());
     let base_len = merge_buf.len();
@@ -6536,6 +6642,16 @@ fn merge_labels_with_structured_metadata(
         if merge_buf[..base_len].iter().any(|(bk, _)| *bk == key) {
             key.push_str("_extracted");
         }
+        if key == ERROR_LABEL {
+            // Assign, INCLUDING an empty value (an empty slot is unset).
+            sm_ctx.err = value;
+            continue;
+        }
+        if key == ERROR_DETAILS_LABEL {
+            sm_ctx.details = value;
+            continue;
+        }
+        sm_ctx.has_ordinary |= !value.is_empty();
         match merge_buf.iter_mut().find(|(k, _)| *k == key) {
             Some(slot) => slot.1 = value,
             None => merge_buf.push((key, value)),
@@ -11377,5 +11493,396 @@ mod tests {
             apply_rate(1.0, Some(1_128_000_000)).to_bits(),
             0.8865248226950354_f64.to_bits()
         );
+    }
+
+    // ---- Issue #238: reserved structured-metadata routing (`Add`,
+    // `labels.go:392-412`) and the no-pipeline fast-path gate. Rows carry
+    // their Delta C''.3 ids; every expected set is a literal reference
+    // capture (grafana/loki:3.7.4, `discover_log_levels: false`). The
+    // pipeline-path C-rows live in `pipeline.rs`'s tests against these
+    // exact (merged base, ctx) pairs. ----
+
+    fn owned_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Runs one row's SM through the real merge/routing; returns the SORTED
+    /// merged (ordinary) set and the routing outcome.
+    fn route_sm(
+        base: &[(&str, &str)],
+        sm_json: &str,
+    ) -> (Vec<(String, String)>, StructuredMetadataCtx) {
+        let base: Vec<(String, String)> = base
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let mut merge_buf = Vec::new();
+        let mut sm_buf = Vec::new();
+        let mut ctx = StructuredMetadataCtx::default();
+        merge_labels_with_structured_metadata(
+            &base,
+            sm_json,
+            &mut merge_buf,
+            &mut sm_buf,
+            &mut ctx,
+        );
+        merge_buf.sort();
+        (merge_buf, ctx)
+    }
+
+    /// The no-pipeline fast-path label set: merge + `append_visible` + sort
+    /// — exactly what `fan_out_sm_fast_path` renders per row.
+    fn fast_path_labels(base: &[(&str, &str)], sm_json: &str) -> Vec<(String, String)> {
+        let base: Vec<(String, String)> = base
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let mut merge_buf = Vec::new();
+        let mut sm_buf = Vec::new();
+        let mut ctx = StructuredMetadataCtx::default();
+        merge_labels_with_structured_metadata(
+            &base,
+            sm_json,
+            &mut merge_buf,
+            &mut sm_buf,
+            &mut ctx,
+        );
+        ctx.append_visible(&mut merge_buf);
+        merge_buf.sort();
+        merge_buf
+    }
+
+    /// D2/D3 (kills W1, W8): reserved SM names route to the ctx — never
+    /// into the merged set, never counting as ordinary.
+    #[test]
+    fn reserved_sm_names_route_to_the_ctx_not_the_merged_set() {
+        // v2: reserved err only.
+        let (merged, ctx) = route_sm(&[("service_name", "v2")], r#"{"__error__":"boom"}"#);
+        assert_eq!(merged, owned_pairs(&[("service_name", "v2")]));
+        assert_eq!(ctx.err, "boom");
+        assert_eq!(ctx.details, "");
+        assert!(!ctx.has_ordinary);
+        // v3: reserved details only.
+        let (merged, ctx) = route_sm(&[("service_name", "v3")], r#"{"__error_details__":"bdet"}"#);
+        assert_eq!(merged, owned_pairs(&[("service_name", "v3")]));
+        assert_eq!(ctx.details, "bdet");
+        assert!(!ctx.has_ordinary && ctx.err.is_empty());
+        // v9: mixed reserved err + ordinary.
+        let (merged, ctx) = route_sm(
+            &[("service_name", "v9")],
+            r#"{"__error__":"boom","trace_id":"abc"}"#,
+        );
+        assert_eq!(
+            merged,
+            owned_pairs(&[("service_name", "v9"), ("trace_id", "abc")])
+        );
+        assert_eq!(ctx.err, "boom");
+        assert!(ctx.has_ordinary);
+        // v1: ordinary only.
+        let (merged, ctx) = route_sm(&[("service_name", "v1")], r#"{"trace_id":"abc"}"#);
+        assert_eq!(
+            merged,
+            owned_pairs(&[("service_name", "v1"), ("trace_id", "abc")])
+        );
+        assert!(ctx.has_ordinary && ctx.err.is_empty() && ctx.details.is_empty());
+    }
+
+    /// D5 (kills W2 at the routing seam): EMPTY reserved values are
+    /// assigned verbatim — and an empty slot is unset (`is_empty`), so the
+    /// v4/v5/v12 shapes contribute nothing at all.
+    #[test]
+    fn empty_reserved_sm_values_leave_the_ctx_empty() {
+        for (id, sm_json) in [
+            ("v4", r#"{"__error__":""}"#),
+            ("v5", r#"{"__error_details__":""}"#),
+            ("v12", r#"{"__error__":"","__error_details__":""}"#),
+        ] {
+            let (merged, ctx) = route_sm(&[("service_name", id)], sm_json);
+            assert_eq!(merged, owned_pairs(&[("service_name", id)]), "{id}");
+            assert!(ctx.is_empty(), "{id}: {ctx:?}");
+        }
+    }
+
+    /// D4 (kills W7): `has_ordinary` counts NON-EMPTY ordinary entries only
+    /// — the reference's distributor strips empty-valued SM before it can
+    /// reach the builder (#259 tracks PulsusDB's ingest divergence; the
+    /// stray `trace_id=""` in the merged set is that issue, not this one).
+    #[test]
+    fn empty_ordinary_sm_values_do_not_set_has_ordinary() {
+        // w1.
+        let (merged, ctx) = route_sm(&[("service_name", "w1")], r#"{"trace_id":""}"#);
+        assert_eq!(
+            merged,
+            owned_pairs(&[("service_name", "w1"), ("trace_id", "")])
+        );
+        assert!(!ctx.has_ordinary);
+        // w2: an empty ordinary + a reserved details.
+        let (merged, ctx) = route_sm(
+            &[("service_name", "w2")],
+            r#"{"trace_id":"","__error_details__":"bdet"}"#,
+        );
+        assert_eq!(
+            merged,
+            owned_pairs(&[("service_name", "w2"), ("trace_id", "")])
+        );
+        assert_eq!(ctx.details, "bdet");
+        assert!(!ctx.has_ordinary);
+    }
+
+    /// D1 (kills W3a — C7's routing seam): the `_extracted` base-collision
+    /// suffix runs BEFORE the reserved-name test, so a base `__error__` +
+    /// SM `__error__` yields an ORDINARY `__error___extracted` entry and an
+    /// empty ctx.
+    #[test]
+    fn the_extracted_suffix_preempts_the_reserved_err_check() {
+        let (merged, ctx) = route_sm(
+            &[("__error__", "streamerr"), ("service_name", "v10")],
+            r#"{"__error__":"boom"}"#,
+        );
+        assert_eq!(
+            merged,
+            owned_pairs(&[
+                ("__error__", "streamerr"),
+                ("__error___extracted", "boom"),
+                ("service_name", "v10"),
+            ])
+        );
+        assert!(ctx.err.is_empty());
+        assert!(ctx.has_ordinary);
+    }
+
+    /// D1 (kills W3b — C25/C26's routing seam): same for the details branch
+    /// (`v13`, the round-4 test gap).
+    #[test]
+    fn the_extracted_suffix_preempts_the_reserved_details_check() {
+        let (merged, ctx) = route_sm(
+            &[("__error_details__", "streamdet"), ("service_name", "v13")],
+            r#"{"__error_details__":"smdet"}"#,
+        );
+        assert_eq!(
+            merged,
+            owned_pairs(&[
+                ("__error_details__", "streamdet"),
+                ("__error_details___extracted", "smdet"),
+                ("service_name", "v13"),
+            ])
+        );
+        assert!(ctx.details.is_empty());
+        assert!(ctx.has_ordinary);
+    }
+
+    /// The bare-selector (no-pipeline) fast-path rows: C3, C5, C7, C10,
+    /// C13, C14, C19, C25, C29 through `append_visible`'s gate — the same
+    /// `visible()` rule the pipeline applies at emit, owned by this path
+    /// because no `CompiledPipeline` runs here (kills W15, and W1/W2/W3/W7
+    /// on this path).
+    #[test]
+    fn fast_path_bare_selector_rows_apply_the_materialisation_gate() {
+        // C3: reserved err emits on a clean builder.
+        assert_eq!(
+            fast_path_labels(&[("service_name", "v2")], r#"{"__error__":"boom"}"#),
+            owned_pairs(&[("__error__", "boom"), ("service_name", "v2")])
+        );
+        // C5: a lone details slot is INVISIBLE.
+        assert_eq!(
+            fast_path_labels(&[("service_name", "v3")], r#"{"__error_details__":"bdet"}"#),
+            owned_pairs(&[("service_name", "v3")])
+        );
+        // C7: suffix-before-reserved (err branch).
+        assert_eq!(
+            fast_path_labels(
+                &[("__error__", "streamerr"), ("service_name", "v10")],
+                r#"{"__error__":"boom"}"#
+            ),
+            owned_pairs(&[
+                ("__error__", "streamerr"),
+                ("__error___extracted", "boom"),
+                ("service_name", "v10"),
+            ])
+        );
+        // C10/C14: empty reserved values contribute nothing.
+        assert_eq!(
+            fast_path_labels(&[("service_name", "v4")], r#"{"__error__":""}"#),
+            owned_pairs(&[("service_name", "v4")])
+        );
+        assert_eq!(
+            fast_path_labels(
+                &[("service_name", "v12")],
+                r#"{"__error__":"","__error_details__":""}"#
+            ),
+            owned_pairs(&[("service_name", "v12")])
+        );
+        // C13: empty err + non-empty details, clean -> nothing.
+        assert_eq!(
+            fast_path_labels(
+                &[("service_name", "v6")],
+                r#"{"__error__":"","__error_details__":"bdet"}"#
+            ),
+            owned_pairs(&[("service_name", "v6")])
+        );
+        // C19: details + ordinary dirt -> visible.
+        assert_eq!(
+            fast_path_labels(
+                &[("service_name", "v11")],
+                r#"{"__error_details__":"bdet","trace_id":"abc"}"#
+            ),
+            owned_pairs(&[
+                ("__error_details__", "bdet"),
+                ("service_name", "v11"),
+                ("trace_id", "abc"),
+            ])
+        );
+        // C25: suffix-before-reserved (details branch) — both entries stay.
+        assert_eq!(
+            fast_path_labels(
+                &[("__error_details__", "streamdet"), ("service_name", "v13")],
+                r#"{"__error_details__":"smdet"}"#
+            ),
+            owned_pairs(&[
+                ("__error_details__", "streamdet"),
+                ("__error_details___extracted", "smdet"),
+                ("service_name", "v13"),
+            ])
+        );
+        // C29 (kills W7 on this path): an empty ordinary entry does not
+        // open the details gate (`trace_id=""` itself is #259).
+        assert_eq!(
+            fast_path_labels(
+                &[("service_name", "w2")],
+                r#"{"trace_id":"","__error_details__":"bdet"}"#
+            ),
+            owned_pairs(&[("service_name", "w2"), ("trace_id", "")])
+        );
+    }
+
+    /// `fan_out_sm_fast_path` itself applies the gate (binding
+    /// `append_visible` into the real path, not just the helper): the
+    /// reserved-err row surfaces `__error__`, the reserved-details row
+    /// surfaces nothing.
+    #[test]
+    fn fan_out_sm_fast_path_applies_the_reserved_sm_gate() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "v2".to_string(),
+                labels: r#"{"service_name":"v2"}"#.to_string(),
+            },
+        );
+        meta.insert(
+            2u64,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "v3".to_string(),
+                labels: r#"{"service_name":"v3"}"#.to_string(),
+            },
+        );
+        let rows = vec![
+            SampleRow {
+                fingerprint: 1,
+                timestamp_ns: 1,
+                body: "a=Hello b=World".to_string(),
+                structured_metadata: r#"{"__error__":"boom"}"#.to_string(),
+            },
+            SampleRow {
+                fingerprint: 2,
+                timestamp_ns: 2,
+                body: "a=Hello b=World".to_string(),
+                structured_metadata: r#"{"__error_details__":"bdet"}"#.to_string(),
+            },
+        ];
+        let mut got: Vec<String> = fan_out_sm_fast_path(&rows, &meta)
+            .into_iter()
+            .map(|s| s.labels_json)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                r#"{"__error__":"boom","service_name":"v2"}"#.to_string(),
+                r#"{"service_name":"v3"}"#.to_string(),
+            ]
+        );
+    }
+
+    /// C18 (kills W11 on the metric path): a pipeline-set error on a CLEAN
+    /// builder still fails the metric query — the emit gate opens on
+    /// `HasErr` alone. C17 (kills W5 on the metric path): after the bare
+    /// drop the series carries NO orphaned details. Both rows use
+    /// pipeline-set errors on the SM-free `v0` shape because
+    /// `MetricScanRow` carries no structured metadata (#249) — SM-borne
+    /// slots cannot reach `run_metric_into`.
+    #[test]
+    fn c17_c18_metric_path_pipeline_set_errors() {
+        let base = vec![("service_name".to_string(), "v0".to_string())];
+        // C18: `count_over_time({v0} | json [5m])` -> pipeline error.
+        let compiled =
+            CompiledPipeline::compile(&parse_pipeline(r#"{x="y"} | json"#)).expect("compile");
+        let mut labels = Vec::new();
+        let MetricRun::Kept { .. } =
+            compiled.run_metric_into("a=Hello b=World", &base, &mut labels)
+        else {
+            panic!("an errored line is kept for the surviving-error check");
+        };
+        let err = check_surviving_error(&labels).expect_err("surviving __error__ fails");
+        assert!(
+            matches!(&err, ReadError::MetricPipelineError { error_type, .. }
+                if error_type == "JSONParserErr"),
+            "{err:?}"
+        );
+        // C17: `count_over_time({v0} | json | drop __error__ [5m])` -> ok,
+        // series `{service_name="v0"}` with NO details.
+        let compiled =
+            CompiledPipeline::compile(&parse_pipeline(r#"{x="y"} | json | drop __error__"#))
+                .expect("compile");
+        let mut labels = Vec::new();
+        let MetricRun::Kept { .. } =
+            compiled.run_metric_into("a=Hello b=World", &base, &mut labels)
+        else {
+            panic!("kept");
+        };
+        check_surviving_error(&labels).expect("no surviving error");
+        let got: Vec<(String, String)> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(got, vec![("service_name".to_string(), "v0".to_string())]);
+    }
+
+    /// D8's metric-failure discriminator, composed hermetically (the metric
+    /// scan itself carries no SM — #249): a reserved-err SM row would fail
+    /// `check_surviving_error` while a reserved-details row would not
+    /// (reference: `count_over_time({v2}[5m])` -> 400 'boom',
+    /// `count_over_time({v3}[5m])` -> 200).
+    #[test]
+    fn reserved_err_sm_fails_the_surviving_error_check_details_do_not() {
+        let compiled = CompiledPipeline::compile(&parse_pipeline(r#"{x="y"}"#)).expect("compile");
+        let base = vec![("service_name".to_string(), "s".to_string())];
+        let err_ctx = StructuredMetadataCtx {
+            err: "boom".to_string(),
+            details: String::new(),
+            has_ordinary: false,
+        };
+        let mut labels = Vec::new();
+        compiled
+            .run_into_with_sm("line", &base, &err_ctx, &mut labels)
+            .expect("kept");
+        assert!(check_surviving_error(&labels).is_err());
+        let details_ctx = StructuredMetadataCtx {
+            err: String::new(),
+            details: "bdet".to_string(),
+            has_ordinary: false,
+        };
+        let mut labels = Vec::new();
+        compiled
+            .run_into_with_sm("line", &base, &details_ctx, &mut labels)
+            .expect("kept");
+        check_surviving_error(&labels).expect("a lone details slot never fails a query");
     }
 }

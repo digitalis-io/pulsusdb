@@ -427,6 +427,38 @@ mod tests {
         );
     }
 
+    /// Anti-rot (issue #238): no corpus SM key is a reserved error-pair
+    /// name and no SM value is empty. The reserved names route OUT-OF-BAND
+    /// at query time (`__error__`/`__error_details__` → the error slots,
+    /// never response labels; `LabelsBuilder.Add`, labels.go:392-412), and
+    /// the reference's distributor strips empty-valued SM at ingest while
+    /// PulsusDB stores it (#259) — so a future corpus edit adding either
+    /// shape would silently diverge from [`merge_sm_into_labels`]'s
+    /// ordinary-SM re-derivation instead of failing loudly. Keep such
+    /// shapes in the hermetic #238 unit tests, not in this live lane.
+    #[test]
+    fn corpus_sm_carries_no_reserved_names_and_no_empty_values() {
+        const RESERVED: &[&str] = &["__error__", "__error_details__", "__preserve_error__"];
+        let corpus = generate(&spec());
+        for entry in &corpus.entries {
+            for (key, value) in &entry.sm {
+                assert!(
+                    !RESERVED.contains(&key.as_str()),
+                    "SM key {key:?} (ts {}) is a reserved error-pair name — \
+                     reserved-SM behavior is pinned hermetically in pulsus-read \
+                     (issue #238), not in this lane",
+                    entry.ts_ns,
+                );
+                assert!(
+                    !value.is_empty(),
+                    "SM key {key:?} (ts {}) has an empty value — the reference \
+                     strips empty-valued SM at ingest (issue #259)",
+                    entry.ts_ns,
+                );
+            }
+        }
+    }
+
     #[test]
     fn push_bodies_carry_three_element_values_with_the_sm_object() {
         let corpus = generate(&spec());

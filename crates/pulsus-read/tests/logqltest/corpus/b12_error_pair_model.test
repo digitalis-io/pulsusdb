@@ -1,0 +1,411 @@
+# B12 — the out-of-band `__error__`/`__error_details__` pair (issue #238).
+#
+# The reference stores the pair in two plain string fields on the label
+# builder (pkg/logql/log/labels.go:119-121), NOT as label-set entries, and
+# materialises it only when the builder is dirty or an error is set
+# (labels.go:554-563, :516-521, :430-444). Every expectation below is a
+# literal capture from the pinned reference container (grafana/loki:3.7.4,
+# 2026-07-26) via /loki/api/v1/query_range / query.
+#
+# PROBE-ENVIRONMENT DISCIPLINE (do not repeat the issue-#238 v1 mistake):
+# the capture container ran with `limits_config.discover_log_levels: false`
+# and `allow_structured_metadata: true`, and every push carried NO per-entry
+# structured metadata — matching this hermetic runner, which models no SM.
+# With log-level discovery ON, every stream carries a `detected_level`
+# structured-metadata entry, `hasAdd()` is permanently true, and the
+# clean-builder fast paths below are unreachable. Adding per-entry SM flips
+# the lone-details cases — captured A/B on one container, same query
+# (`| json | drop __error__`), same line, differing only in the push's
+# third element:
+#
+#   push {"service_name":"e238"}   values [[ts,"a=Hello b=World"]]
+#     -> {env="prod", service_name="e238"}                          DETAILS ABSENT
+#   push {"service_name":"e238sm"} values [[ts,"a=Hello b=World",{"trace_id":"abc"}]]
+#     -> {__error_details__="...", env, service_name, trace_id}      DETAILS PRESENT
+#
+# The SM-bearing shapes therefore live as Rust unit tests (exec.rs /
+# pipeline.rs C-matrix, issue #238 Delta C''), not here. `detected_level`
+# is elided from all expectations (an ingest label PulsusDB does not
+# model); where the probe query dropped it explicitly the query text is
+# kept byte-identical (a no-op here). Template cases are scoped to the
+# `{{.label}}` subset — template FUNCTIONS are #230, and the reference's
+# template-execution-error branch (fmt.go:426-429) is unreachable by type
+# in PulsusDB (U5) until #230 lands.
+#
+# DET abbreviates: Value looks like object, but can't find closing '}' symbol
+
+# ======================================================================
+# §1 (b12a) — pipeline-set errors on a plain line.
+# ======================================================================
+
+load
+  {env="prod", service_name="b12a"} service=b12a
+  0s  a=Hello b=World
+
+# --- label_format rename: the slots are INVISIBLE as a rename source ---
+# (fmt.go:415 GetWithCategory reads the label set only.)
+
+# R1: rename FROM __error__ on a slot-errored line is a complete no-op.
+eval instant at 60s {service_name="b12a"} | json | label_format x=__error__
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# R1b: same for __error_details__ — no `x` is created.
+eval instant at 60s {service_name="b12a"} | json | label_format x=__error_details__
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# --- label_format assignment: the details SLOT masks a vector write ----
+
+# Assigning __error_details__ on an errored line: the template writes the
+# VECTOR, the non-empty slot wins at emit — the assignment is masked.
+eval instant at 60s {service_name="b12a"} | json | label_format __error_details__="boom"
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# On a NON-errored line the same assignment is visible.
+eval instant at 60s {service_name="b12a"} | logfmt | label_format __error_details__="boom"
+  {__error_details__="boom", a="Hello", b="World", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Rename DESTINATION __error_details__: the source-delete side effect lands
+# (env is gone) while the value stays masked by the slot.
+eval instant at 60s {service_name="b12a"} | json | label_format __error_details__=env
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", service_name="b12a"}  0s  a=Hello b=World
+
+# Absent source: complete no-op. DECLARED PIN for W17 (issue #238 Delta
+# C''.4): the wrong reading's `__error_details__=""` write is masked by the
+# non-empty slot, so correct and wrong outputs coincide here — R2 (§4) is
+# the discriminating row.
+eval instant at 60s {service_name="b12a"} | json | label_format __error_details__=nosuch
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Non-errored rename to __error_details__: works off the vector.
+eval instant at 60s {service_name="b12a"} | logfmt | label_format __error_details__=a
+  {__error_details__="Hello", b="World", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# --- templates DO read both slots (appended last into the data map) ----
+
+eval instant at 60s {service_name="b12a"} | json | label_format e="[{{.__error__}}]", d="[{{.__error_details__}}]"
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", d="[Value looks like object, but can't find closing '}' symbol]", e="[JSONParserErr]", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+eval instant at 60s {service_name="b12a"} | json | line_format "E={{.__error__}} D={{.__error_details__}}"
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  E=JSONParserErr D=Value looks like object, but can't find closing '}' symbol
+
+# --- drop on the pair: slot resets, never vector Dels, never dirt -------
+
+# Bare drop of __error__ on a CLEAN builder: the orphaned details slot is
+# INVISIBLE (the labels.go:554-563 gate — a failed `| json` wrote no label).
+eval instant at 60s {service_name="b12a"} | json | drop __error__
+  {env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Matcher form compares the SLOT: a match resets it...
+eval instant at 60s {service_name="b12a"} | json | drop __error__="JSONParserErr"
+  {env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# ...a non-match leaves everything.
+eval instant at 60s {service_name="b12a"} | json | drop __error__="nope"
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Dropping the details leaves __error__.
+eval instant at 60s {service_name="b12a"} | json | drop __error_details__
+  {__error__="JSONParserErr", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# R8 (kills W10d): the details matcher reads the SLOT, not the vector.
+eval instant at 60s {service_name="b12a"} | json | drop __error_details__=~".*closing.*"
+  {__error__="JSONParserErr", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# --- the visibility gate: any Del/Set re-surfaces the orphaned details --
+
+# A PRESENT ordinary label's Del dirties -> details appear (dirty site 5).
+eval instant at 60s {service_name="b12a"} | json | drop __error__, env
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", service_name="b12a"}  0s  a=Hello b=World
+
+# keep that removes something dirties (dirty site 7)...
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | keep env
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", env="prod"}  0s  a=Hello b=World
+
+# ...keep that removes nothing does not.
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | keep env, service_name
+  {env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Bare drop of an ABSENT label is not a Del -> still clean.
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | drop nosuch
+  {env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Matcher drop of an absent label MATCHING "" is a Del -> dirty (dirty
+# site 6; drop_labels.go:80-82 Dels unconditionally on a match)...
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | drop nosuch=""
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# ...a non-matching matcher is not.
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | drop nosuch="zzz"
+  {env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# A RESOLVED rename dirties (dirty site 4).
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | label_format r=env
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", r="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# line_format on the clean builder: gate closed for the render AND the emit.
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | line_format "D=[{{.__error_details__}}]"
+  {env="prod", service_name="b12a"}  0s  D=[]
+
+# label_format template: the data map is built BEFORE the Set (fmt.go:424
+# then :431) — the template renders the gated-off (empty) details while the
+# Set itself dirties the builder, so the emitted set carries them (dirty
+# site 3). The sharpest single-query constraint in the capture set.
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | label_format d="[{{.__error_details__}}]"
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", d="[]", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# AC18 pin: the gate is captured ONCE per map build — a second template in
+# the same stage renders the SAME (empty) value even though the first
+# template's Set dirtied the builder mid-stage.
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | label_format d="[{{.__error_details__}}]", e="[{{.__error_details__}}]"
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", d="[]", e="[]", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | label_format x="1", d="[{{.__error_details__}}]"
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", d="[]", env="prod", service_name="b12a", x="1"}  0s  a=Hello b=World
+
+# Contrast: when the builder is ALREADY dirty at map build (the absent-label
+# matcher Del), the same template DOES read the slot.
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | drop nosuch="" | label_format d="[{{.__error_details__}}]"
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", d="[Value looks like object, but can't find closing '}' symbol]", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Assign-after-drop-err: the Set dirties, the surviving details slot
+# re-surfaces and masks "boom".
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | label_format __error_details__="boom"
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Drop-details-then-assign: the slot is empty, the vector write shows.
+eval instant at 60s {service_name="b12a"} | json | drop __error_details__ | label_format __error_details__="boom"
+  {__error__="JSONParserErr", __error_details__="boom", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Assign-then-drop: TWO independent storage slots for one name — the drop
+# resets the (DET) slot, the vector "boom" survives.
+eval instant at 60s {service_name="b12a"} | json | label_format __error_details__="boom" | drop __error_details__
+  {__error__="JSONParserErr", __error_details__="boom", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Dropped details render empty in a later template.
+eval instant at 60s {service_name="b12a"} | json | drop __error_details__ | label_format d="[{{.__error_details__}}]"
+  {__error__="JSONParserErr", d="[]", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# --- keep: the pair (and __preserve_error__) always survive -------------
+
+eval instant at 60s {service_name="b12a"} | json | keep env
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod"}  0s  a=Hello b=World
+
+eval instant at 60s {service_name="b12a"} | json | keep __error__
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  a=Hello b=World
+
+# __preserve_error__ is retained by name (keep_labels.go:51-57) — the only
+# handling PulsusDB gives it.
+eval instant at 60s {service_name="b12a"} | logfmt | label_format __preserve_error__="x" | keep k
+  {__preserve_error__="x"}  0s  a=Hello b=World
+
+# --- label filters: __error__ reads the SLOT, __error_details__ the VECTOR
+
+# R7 (kills W19): the errored line has NO vector __error_details__, so
+# `= ""` keeps it — and the emitted set still carries the pair.
+eval instant at 60s {service_name="b12a"} | json | __error_details__ = ""
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+eval instant at 60s {service_name="b12a"} | json | __error_details__ != ""
+
+eval instant at 60s {service_name="b12a"} | json | __error_details__ =~ ".*closing.*"
+
+# Numeric filters read the VECTOR: __error__ is absent there -> dropped.
+eval instant at 60s {service_name="b12a"} | json | __error__ > 5
+
+# --- ip(): an errored line passes unconditionally (ip.go:123-127) -------
+
+eval instant at 60s {service_name="b12a"} | json | addr = ip("1.2.3.4")
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+eval instant at 60s {service_name="b12a"} | json | addr != ip("1.2.3.4")
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# After the err slot is reset the short-circuit is gone: addr is absent, so
+# `=` drops the line.
+eval instant at 60s {service_name="b12a"} | json | drop __error__ | addr = ip("1.2.3.4")
+
+# --- numeric-filter failure: first error wins is NOT in play here -------
+
+eval instant at 60s {service_name="b12a"} | logfmt | a > 5
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"Hello\": invalid syntax", a="Hello", b="World", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# --- the label_format map-emptiness rule ---------------------------------
+
+# Errored line: the map is NON-empty (it holds the visible pair) even after
+# every label is dropped -> no `len(m)==0` refill, n2 renders "".
+# (`detected_level` is dropped for the container only; a no-op here.)
+eval instant at 60s {service_name="b12a"} | json | drop env, service_name, detected_level | label_format n1="X", n2="{{.n1}}", n3="{{.n2}}"
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", n1="X", n2="", n3=""}  0s  a=Hello b=World
+
+# Non-errored contrast (also pinned by b10): map empty -> one refill at n2.
+eval instant at 60s {service_name="b12a"} | logfmt | drop a, b, env, service_name, detected_level | label_format n1="X", n2="{{.n1}}", n3="{{.n2}}"
+  {n1="X", n2="X", n3=""}  0s  a=Hello b=World
+
+# --- assign + read in ONE stage: map-before-Set ordering ------------------
+
+# Errored: d reads the slot (DET), the assignment stays masked.
+eval instant at 60s {service_name="b12a"} | json | label_format __error_details__="boom", d="{{.__error_details__}}"
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", d="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# Non-errored: the map was built before the Set, so d renders "" while the
+# vector write shows at emit.
+eval instant at 60s {service_name="b12a"} | logfmt | label_format __error_details__="boom", d="{{.__error_details__}}"
+  {__error_details__="boom", a="Hello", b="World", d="", env="prod", service_name="b12a"}  0s  a=Hello b=World
+
+# --- metric path (C17/C18: pipeline-set errors; SM never reaches the
+# metric scan — MetricScanRow carries none, issue #249) -------------------
+
+# C18 (kills W11 on the metric path): a surviving slot error fails the query.
+eval_fail instant at 60s count_over_time({service_name="b12a"} | json [30m])
+  msg: JSONParserErr
+
+# C17 (kills W5 on the metric path): after the bare drop the builder is
+# clean — the series carries NO orphaned details.
+eval instant at 60s count_over_time({service_name="b12a"} | json | drop __error__ [30m])
+  {env="prod", service_name="b12a"}  1
+
+# The dirty variants DO carry them.
+eval instant at 60s count_over_time({service_name="b12a"} | json | drop __error__, env [30m])
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", service_name="b12a"}  1
+
+eval instant at 60s count_over_time({service_name="b12a"} | json | drop __error__ | label_format x="1" [30m])
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", env="prod", service_name="b12a", x="1"}  1
+
+clear
+
+# ======================================================================
+# §2 (b12b) — a parser EXTRACTS keys literally named like the pair: they
+# are ORDINARY vector labels (parser.go Set(ParsedLabel,...) — never the
+# slots), independently storable alongside the slots.
+# ======================================================================
+
+load
+  {service_name="b12b"} service=b12b
+  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+eval instant at 60s {service_name="b12b"} | json
+  {__error__="mine", __error_details__="mydetails", k="v", service_name="b12b"}  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+# The string filter reads the SLOT (empty), not the parsed vector entry.
+eval instant at 60s {service_name="b12b"} | json | __error__ = ""
+  {__error__="mine", __error_details__="mydetails", k="v", service_name="b12b"}  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+# drop resets the (empty) slot only; the vector entry is untouched.
+eval instant at 60s {service_name="b12b"} | json | drop __error__
+  {__error__="mine", __error_details__="mydetails", k="v", service_name="b12b"}  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+# The matcher compares the SLOT ("") — "mine" does not match.
+eval instant at 60s {service_name="b12b"} | json | drop __error__="mine"
+  {__error__="mine", __error_details__="mydetails", k="v", service_name="b12b"}  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+# R6 (kills W14b): keep retains the VECTOR entries named like the pair.
+eval instant at 60s {service_name="b12b"} | json | keep k
+  {__error__="mine", __error_details__="mydetails", k="v"}  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+# R3 (kills W16b): the rename DOES work off the vector — the miss in §1 is
+# a STORAGE miss, not a name-based skip.
+eval instant at 60s {service_name="b12b"} | json | label_format x=__error__
+  {__error_details__="mydetails", k="v", service_name="b12b", x="mine"}  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+clear
+
+# ======================================================================
+# §3 (b12c) — both storages populated at once (logfmt extracts the names,
+# json then errors): the slot wins at emit, one entry per name.
+# ======================================================================
+
+load
+  {service_name="b12c"} service=b12c
+  0s  __error__=mine __error_details__=mydet k=v
+
+eval instant at 60s {service_name="b12c"} | logfmt
+  {__error__="mine", __error_details__="mydet", k="v", service_name="b12c"}  0s  __error__=mine __error_details__=mydet k=v
+
+# PulsusDB's deterministic side of the RATIFIED duplicate-slot divergence
+# (docs/benchmarks/logs-differential-ledger.md `error-pair-duplicate-slot`):
+# the reference emits BOTH entries per name here (parsed + slot; its JSON
+# map dedupes last-wins = slot); PulsusDB emits one entry per name, slot
+# value wins — identical streams JSON.
+eval instant at 60s {service_name="b12c"} | logfmt | json
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", k="v", service_name="b12c"}  0s  __error__=mine __error_details__=mydet k=v
+
+# TWO SLOTS proof: drop resets the err SLOT; the parsed vector __error__
+# re-surfaces while the details SLOT still masks the parsed mydet.
+eval instant at 60s {service_name="b12c"} | logfmt | json | drop __error__
+  {__error__="mine", __error_details__="Value looks like object, but can't find closing '}' symbol", k="v", service_name="b12c"}  0s  __error__=mine __error_details__=mydet k=v
+
+# The filter reads the SLOT (JSONParserErr), so `= ""` drops the line —
+# expressed as a metric so the empty result is explicit.
+eval instant at 60s count_over_time({service_name="b12c"} | logfmt | json | __error__ = "" [30m])
+
+# First error wins: k="v" fails the numeric conversion but the guarded
+# write (label_filter.go:184) must NOT overwrite JSONParserErr.
+eval instant at 60s {service_name="b12c"} | logfmt | json | k > 5
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", k="v", service_name="b12c"}  0s  __error__=mine __error_details__=mydet k=v
+
+# Metric half of the `error-pair-duplicate-slot` ledger pin: PulsusDB's
+# error type is the SLOT class (the reference's duplicate-emitting message
+# says 'mine' — see the ledger entry for the exact accepted delta).
+eval_fail instant at 60s count_over_time({service_name="b12c"} | logfmt | json [30m])
+  msg: JSONParserErr
+
+clear
+
+# ======================================================================
+# §4 (b12d) — the self-rename (issue #238 Delta C''.4): `Set(dst, v)` THEN
+# `Del(src)` (fmt.go:417-418) means `label_format x=x` net-DELETES a
+# resolved source (and dirties), and stays a no-op when unresolved.
+# ======================================================================
+
+load
+  {app="a1", env="prod", service_name="r1"} service=r1
+  0s  a=Hello b=World
+
+# R4 (kills W18): a resolved self-rename deletes a STREAM label.
+eval instant at 60s {service_name="r1"} | label_format app=app
+  {env="prod", service_name="r1"}  0s  a=Hello b=World
+
+eval instant at 60s {service_name="r1"} | label_format env=env
+  {app="a1", service_name="r1"}  0s  a=Hello b=World
+
+# R4b (kills W18): same for a PARSED label.
+eval instant at 60s {service_name="r1"} | logfmt | label_format a=a
+  {app="a1", b="World", env="prod", service_name="r1"}  0s  a=Hello b=World
+
+# Transcript control (dst != src): ordinary rename semantics unchanged.
+eval instant at 60s {service_name="r1"} | label_format app=env
+  {app="prod", service_name="r1"}  0s  a=Hello b=World
+
+# Transcript control (absent source): no `x`, nothing deleted.
+eval instant at 60s {service_name="r1"} | logfmt | label_format x=nosuch
+  {a="Hello", app="a1", b="World", env="prod", service_name="r1"}  0s  a=Hello b=World
+
+# R9c (kills W5 on the non-SM path): clean builder, details invisible.
+eval instant at 60s {service_name="r1"} | json | drop __error__
+  {app="a1", env="prod", service_name="r1"}  0s  a=Hello b=World
+
+# R2 (kills W17): an UNRESOLVED rename is a complete no-op — no `x=""`
+# write AND no dirt, so the orphaned details stay invisible. (Its §1 pin,
+# `label_format __error_details__=nosuch`, is masked for W17 — this row is
+# the discriminator.)
+eval instant at 60s {service_name="r1"} | json | drop __error__ | label_format x=nosuch
+  {app="a1", env="prod", service_name="r1"}  0s  a=Hello b=World
+
+# R9 (kills W18 + the rename dirty site): a resolved SELF-rename deletes
+# env AND dirties — the orphaned details surface.
+eval instant at 60s {service_name="r1"} | json | drop __error__ | label_format env=env
+  {__error_details__="Value looks like object, but can't find closing '}' symbol", app="a1", service_name="r1"}  0s  a=Hello b=World
+
+clear
+
+load
+  {service_name="r2"} service=r2
+  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+# R5 (kills W18): a self-rename of a VECTOR entry named like the pair
+# deletes it (`__error_details__` is not a reserved destination; the
+# out-of-band slots are empty and untouched).
+eval instant at 60s {service_name="r2"} | json | label_format __error_details__=__error_details__
+  {__error__="mine", k="v", service_name="r2"}  0s  {"__error__":"mine","__error_details__":"mydetails","k":"v"}
+
+clear
