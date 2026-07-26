@@ -415,7 +415,10 @@ fn build_metric_node(
                         .to_string(),
                 }),
                 inner => Ok(MetricNode::VectorAgg {
-                    aggs: parse_vector_agg_params(&raw_aggs)?,
+                    aggs: parse_vector_agg_params(
+                        &raw_aggs,
+                        matches!(p.spec, QuerySpec::Range { .. }),
+                    )?,
                     inner: Box::new(build_metric_node(inner, p, ctx)?),
                 }),
             }
@@ -465,10 +468,17 @@ fn parse_plan_number(raw: &str, what: &str) -> Result<f64, ReadError> {
 }
 
 /// Validates and parses each vector aggregation's parameter:
-/// `topk`/`bottomk` require `k`; the parameterless aggregations must not
-/// carry one (the parser already enforces both — planner re-checks for
-/// defense in depth on programmatically-built ASTs).
-fn parse_vector_agg_params(raw: &[RawVectorAggSpec]) -> Result<Vec<VectorAggSpec>, ReadError> {
+/// `topk`/`bottomk`/`approx_topk` require `k`; the parameterless
+/// aggregations must not carry one (the parser already enforces both —
+/// planner re-checks for defense in depth on programmatically-built
+/// ASTs). `is_range` gates the instant-only `approx_topk` (issue #221):
+/// this function is the SOLE producer of [`VectorAggSpec`] values (both
+/// `metric_plan` and `build_metric_node` route through it), so the gate
+/// cannot be bypassed by either plan shape.
+fn parse_vector_agg_params(
+    raw: &[RawVectorAggSpec],
+    is_range: bool,
+) -> Result<Vec<VectorAggSpec>, ReadError> {
     raw.iter()
         .map(|(op, grouping, param)| {
             // `sort`/`sort_desc` order the result vector by value; the
@@ -477,6 +487,17 @@ fn parse_vector_agg_params(raw: &[RawVectorAggSpec]) -> Result<Vec<VectorAggSpec
             if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) && grouping.is_some() {
                 return Err(ReadError::PipelineInvalid {
                     reason: format!("`{op}` does not accept a grouping clause"),
+                });
+            }
+            // Reference: `JoinCountMinSketchVector` refuses a non-instant
+            // range type (pkg/logql/count_min_sketch.go, body verbatim —
+            // the reference surfaces it as a 500, PulsusDB as a 400 per
+            // the ledgered matching-error-status-divergence precedent).
+            // Rejected at PLAN time, before any DB read, so no round-trip
+            // is spent on a query that cannot be served.
+            if matches!(op, VectorAggOp::ApproxTopk) && is_range {
+                return Err(ReadError::PipelineInvalid {
+                    reason: "count min sketches are only supported on instant queries".to_string(),
                 });
             }
             let parsed = match (op.takes_param(), param) {
@@ -632,7 +653,8 @@ fn metric_plan(
         // base reaching `metric_plan` is structurally always `Range`.
         unreachable!("metric_plan is only called on Vector-chains bottoming at MetricExpr::Range")
     };
-    let vector_aggs = parse_vector_agg_params(&raw_vector_aggs)?;
+    let vector_aggs =
+        parse_vector_agg_params(&raw_vector_aggs, matches!(p.spec, QuerySpec::Range { .. }))?;
 
     // Issue M6-10: metric pipelines now execute in-engine. Classify the
     // query into the SQL-aggregated mode (the four count/bytes ops,
@@ -1329,6 +1351,115 @@ mod tests {
             Plan::Metric(mp) => Ok(mp),
             Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
         }
+    }
+
+    // --- Issue #221: approx_topk is instant-only, gated at the SOLE
+    // --- VectorAggSpec producer (`parse_vector_agg_params`), so BOTH
+    // --- plan routes (`metric_plan` for Range-bottomed chains,
+    // --- `build_metric_node` for binary/literal trees) reject it.
+    // --- (`range_spec()` is the shared helper defined further down.)
+
+    fn plan_at(query: &str, spec: QuerySpec) -> Result<Plan, ReadError> {
+        let params = QueryParams {
+            spec,
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        plan(&parse(query).expect("parse"), &params, &test_ctx())
+    }
+
+    /// The shape that bypassed the v1 design's gate: a vector chain
+    /// bottoming at `MetricExpr::Range` goes through `metric_plan`, not
+    /// `build_metric_node`.
+    #[test]
+    fn range_approx_topk_over_a_bare_range_agg_is_rejected() {
+        match plan_at(r#"approx_topk(2, rate({app="x"}[5m]))"#, range_spec()) {
+            Err(ReadError::PipelineInvalid { reason }) => assert_eq!(
+                reason, "count min sketches are only supported on instant queries",
+                "the reference's body, verbatim"
+            ),
+            other => panic!("expected the range approx_topk to be rejected, got {other:?}"),
+        }
+    }
+
+    /// The `build_metric_node` route (a binary tree under the agg).
+    #[test]
+    fn range_approx_topk_over_a_binary_tree_is_rejected() {
+        match plan_at(
+            r#"approx_topk(2, rate({app="x"}[5m]) + rate({app="y"}[5m]))"#,
+            range_spec(),
+        ) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert_eq!(
+                    reason,
+                    "count min sketches are only supported on instant queries"
+                );
+            }
+            other => panic!("expected the range approx_topk to be rejected, got {other:?}"),
+        }
+    }
+
+    /// Guards over-rejection: the same queries at `Instant` plan fine.
+    #[test]
+    fn instant_approx_topk_over_a_bare_range_agg_plans() {
+        let p = plan_at(
+            r#"approx_topk(2, rate({app="x"}[5m]))"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        )
+        .expect("instant approx_topk must plan");
+        assert!(matches!(p, Plan::Metric(_)));
+        let p = plan_at(
+            r#"approx_topk(2, rate({app="x"}[5m]) + rate({app="y"}[5m]))"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        )
+        .expect("instant approx_topk over a binary tree must plan");
+        assert!(matches!(p, Plan::MetricBinary(_)));
+    }
+
+    /// Issue #221 AC 20: every `VectorAggSpec` carrying `ApproxTopk` has
+    /// `grouping == None` — structurally guaranteed by the parse-time
+    /// grouping rejection, so `select_k_instant`'s group map always
+    /// holds a single empty key on this path (row 8 of the exec
+    /// accounting table holds structurally, not by convention).
+    #[test]
+    fn approx_topk_specs_never_carry_a_grouping() {
+        let mp = metric_mp(
+            r#"approx_topk(3, sum by (lvl) (count_over_time({app="x"}[1m])))"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        )
+        .expect("plan");
+        let approx: Vec<_> = mp
+            .vector_aggs
+            .iter()
+            .filter(|(op, ..)| matches!(op, VectorAggOp::ApproxTopk))
+            .collect();
+        assert_eq!(approx.len(), 1);
+        for (_, grouping, param) in approx {
+            assert!(grouping.is_none(), "grouping is rejected at parse time");
+            assert_eq!(*param, Some(3.0));
+        }
+        // The binary-tree route carries the same invariant.
+        let p = plan_at(
+            r#"approx_topk(2, rate({app="x"}[5m]) + rate({app="y"}[5m]))"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        )
+        .expect("plan");
+        let Plan::MetricBinary(MetricNode::VectorAgg { aggs, .. }) = p else {
+            panic!("expected a VectorAgg node");
+        };
+        assert!(
+            aggs.iter()
+                .all(|(op, grouping, _)| !matches!(op, VectorAggOp::ApproxTopk)
+                    || grouping.is_none())
+        );
     }
 
     /// Test-gap flagged by the architect-plan review: a zero-step `Range`

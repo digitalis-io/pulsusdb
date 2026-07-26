@@ -472,6 +472,13 @@
       "probe": "bottomk(5, rate({app=\"x\"}[5m]))"
     },
     {
+      "id": "agg.approx_topk",
+      "category": "vector-aggregations",
+      "syntax": "approx_topk(k, ...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#probabilistic-aggregation",
+      "probe": "approx_topk(5, rate({app=\"x\"}[5m]))"
+    },
+    {
       "id": "agg.sort",
       "category": "vector-aggregations",
       "syntax": "sort(...)",

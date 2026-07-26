@@ -1,0 +1,253 @@
+# B10 — approx_topk value corpus (issue #221).
+#
+# Every accept case is an instant metric eval: `approx_topk(k, sum by
+# (lvl) (count_over_time/rate(... | logfmt [1m])))`. Expected values are
+# BIT-EXACT captures from grafana/loki:3.7.4
+# (sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc,
+# revision b318f282, captured 2026-07-26) — never hand-authored.
+#
+# CAPTURE CONFIG DELTA (see PROVENANCE.md): the documented bare
+# `podman run ... grafana/loki:3.7.4` returns 500 `approx_topk is not
+# enabled` for EVERY approx_topk query. The capture container needs
+#   limits_config.shard_aggregations: [approx_topk]
+#   frontend.encoding: protobuf
+# (without the protobuf frontend encoding the rewritten
+# `__count_min_sketch__` subquery is re-parsed downstream and 400s with
+# `syntax error: unexpected IDENTIFIER`).
+#
+# PRE-COMMITTED SELECTION RULE (not a post-hoc filter): no case may use
+# more than 10 000 distinct inner series and no case may carry a tie at
+# the k-th selection boundary — the reference is NONDETERMINISTIC there
+# (its insertion order is a randomized Go map walk driving heap eviction
+# and topk tie order; empirically three identical queries over one
+# immutable 20 000-series dataset returned three different tails).
+# PulsusDB pins determinism in that regime instead; see
+# docs/features.md §2 and docs/benchmarks/logs-differential-ledger.md.
+#
+# COLLISION FIXTURES (datasets B/P/Q): the `lvl` tokens were brute-forced
+# offline against the reference cell math (stableBytes -> FNV-1a32 +
+# Jenkins-OAAT -> wrapping-u32 (h1 + i*h2) % 27183) and every expected
+# value was verified by EXECUTING the reference `pkg/logql` /
+# `pkg/logql/sketch` package at v3.7.4 before capture. They are valid
+# only for the pinned reference's hash functions and width; if either
+# ever changes the tokens must be re-derived the same way.
+
+# ===================================================================
+# DATASET A — five `lvl` values with distinct integer counts
+# {alpha=1, beta=2, gamma=3, delta=4, epsilon=5}: no cell collisions,
+# so every estimate is exact and approx_topk == topk value-for-value.
+# ===================================================================
+load
+  {env="prod", service_name="approx-a"}
+  1s  lvl=alpha
+  2s  lvl=beta
+  3s  lvl=beta
+  4s  lvl=gamma
+  5s  lvl=gamma
+  6s  lvl=gamma
+  7s  lvl=delta
+  8s  lvl=delta
+  9s  lvl=delta
+  10s  lvl=delta
+  11s  lvl=epsilon
+  12s  lvl=epsilon
+  13s  lvl=epsilon
+  14s  lvl=epsilon
+  15s  lvl=epsilon
+
+eval instant at 60s approx_topk(3, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  {lvl="delta"} 4
+  {lvl="epsilon"} 5
+  {lvl="gamma"} 3
+
+eval instant at 60s approx_topk(1, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  {lvl="epsilon"} 5
+
+# under-k: every series returns
+eval instant at 60s approx_topk(10, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  {lvl="alpha"} 1
+  {lvl="beta"} 2
+  {lvl="delta"} 4
+  {lvl="epsilon"} 5
+  {lvl="gamma"} 3
+
+# k == series count
+eval instant at 60s approx_topk(5, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  {lvl="alpha"} 1
+  {lvl="beta"} 2
+  {lvl="delta"} 4
+  {lvl="epsilon"} 5
+  {lvl="gamma"} 3
+
+# float inner (rate): exact-f64 capture
+eval instant at 60s approx_topk(3, sum by (lvl) (rate({service_name="approx-a"} | logfmt [1m])))
+  {lvl="delta"} 0.06666666666666667
+  {lvl="epsilon"} 0.08333333333333333
+  {lvl="gamma"} 0.05
+
+# approx_topk under an outer aggregation
+eval instant at 60s sum(approx_topk(2, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m]))))
+  {} 9
+
+# approx_topk in a binary expression
+eval instant at 60s approx_topk(2, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m]))) + 0
+  {lvl="delta"} 4
+  {lvl="epsilon"} 5
+
+# --- reject-parity: grouping (Loki: `parse error : grouping not allowed
+# --- for approx_topk aggregation`, HTTP 400 — probed 2026-07-26)
+
+eval_fail instant at 60s approx_topk by (lvl) (2, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  msg: grouping not allowed for approx_topk aggregation
+
+eval_fail instant at 60s approx_topk(2, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m]))) by (lvl)
+  msg: grouping not allowed for approx_topk aggregation
+
+# --- reject-parity: the shared k validation (issue #221 root-cause fix,
+# --- adjudicated: `topk(0, ...)` is now a 400, no longer an empty 200 —
+# --- all three constructs pinned; Loki bodies probed 2026-07-26)
+
+eval_fail instant at 60s approx_topk(0, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  msg: invalid parameter (must be greater than 0) approx_topk(0
+
+eval_fail instant at 60s approx_topk(2.5, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  msg: invalid parameter approx_topk(2.5,
+
+eval_fail instant at 60s topk(0, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  msg: invalid parameter (must be greater than 0) topk(0
+
+eval_fail instant at 60s topk(2.5, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  msg: invalid parameter topk(2.5,
+
+eval_fail instant at 60s bottomk(0, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  msg: invalid parameter (must be greater than 0) bottomk(0
+
+eval_fail instant at 60s bottomk(2.5, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  msg: invalid parameter bottomk(2.5,
+
+# --- reject-parity: instant-only (Loki: HTTP 500 `count min sketches are
+# --- only supported on instant queries`; PulsusDB 400 with the same body
+# --- per the ledgered matching-error-status-divergence precedent)
+
+eval_fail range from 0s to 300s step 60s approx_topk(2, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
+  msg: count min sketches are only supported on instant queries
+
+clear
+
+# ===================================================================
+# DATASET B — the full-7-row collision fixture: {lvl="v0095169"} (true 3)
+# and {lvl="v0125949"} (true 4) share ALL SEVEN sketch cells, so the
+# reference reports BOTH as 7 (3+4); {lvl="ctrl"} (true 5) is clean.
+# Container-captured AND reproduced by executing the reference sketch
+# package. k=3 returns all three series (no k-boundary decision between
+# the two equal estimates). This case is the corpus-level proof that
+# PulsusDB runs the real sketch — a plain-topk impostor returns 3/4/5
+# (the `topk` truth case below pins that contrast).
+# ===================================================================
+load
+  {env="prod", service_name="approx-b"}
+  1s  lvl=v0095169
+  2s  lvl=v0095169
+  3s  lvl=v0095169
+  4s  lvl=v0125949
+  5s  lvl=v0125949
+  6s  lvl=v0125949
+  7s  lvl=v0125949
+  8s  lvl=ctrl
+  9s  lvl=ctrl
+  10s  lvl=ctrl
+  11s  lvl=ctrl
+  12s  lvl=ctrl
+
+eval instant at 60s approx_topk(3, sum by (lvl) (count_over_time({service_name="approx-b"} | logfmt [1m])))
+  {lvl="ctrl"} 5
+  {lvl="v0095169"} 7
+  {lvl="v0125949"} 7
+
+eval instant at 60s topk(3, sum by (lvl) (count_over_time({service_name="approx-b"} | logfmt [1m])))
+  {lvl="ctrl"} 5
+  {lvl="v0095169"} 3
+  {lvl="v0125949"} 4
+
+clear
+
+# ===================================================================
+# DATASET P — the MIN-estimator ladder: anchor {lvl="pmin"} (true 10)
+# plus six single-row colliders (weight i+1 hits pmin's cell in row i
+# only, rows 0..5; row 6 clean), so pmin's row cells are
+# 11,12,13,14,15,16,10 and only the MIN estimator returns 10.
+# WRONG-PORT TABLE (what a broken implementation returns for pmin):
+#   max over rows -> 16; sum over rows -> 91; fixed row 0 -> 11; fixed
+#   row 1..5 -> 12..16; row 6 -> 10 (caught by dataset Q); no sketch at
+#   all -> 10 (caught by dataset B). No collider-collider cell is
+#   shared, so every collider's own estimate is exact (1..6).
+# ===================================================================
+load
+  {env="prod", service_name="approx-p"}
+  1s  lvl=pmin
+  2s  lvl=pmin
+  3s  lvl=pmin
+  4s  lvl=pmin
+  5s  lvl=pmin
+  6s  lvl=pmin
+  7s  lvl=pmin
+  8s  lvl=pmin
+  9s  lvl=pmin
+  10s  lvl=pmin
+  11s  lvl=c016000
+  12s  lvl=c007375
+  13s  lvl=c007375
+  14s  lvl=c071035
+  15s  lvl=c071035
+  16s  lvl=c071035
+  17s  lvl=c045067
+  18s  lvl=c045067
+  19s  lvl=c045067
+  20s  lvl=c045067
+  21s  lvl=c007616
+  22s  lvl=c007616
+  23s  lvl=c007616
+  24s  lvl=c007616
+  25s  lvl=c007616
+  26s  lvl=c001130
+  27s  lvl=c001130
+  28s  lvl=c001130
+  29s  lvl=c001130
+  30s  lvl=c001130
+  31s  lvl=c001130
+
+eval instant at 60s approx_topk(7, sum by (lvl) (count_over_time({service_name="approx-p"} | logfmt [1m])))
+  {lvl="c001130"} 6
+  {lvl="c007375"} 2
+  {lvl="c007616"} 5
+  {lvl="c016000"} 1
+  {lvl="c045067"} 4
+  {lvl="c071035"} 3
+  {lvl="pmin"} 10
+
+clear
+
+# ===================================================================
+# DATASET Q — the complementary last-row ladder: anchor {lvl="qmin"}
+# (true 8) with ONE collider ({lvl="c003087"}, true 3) on row 6 only, so
+# qmin's cells are 8,8,8,8,8,8,11 — a fixed-row-6 port returns 11 (the
+# one wrong port dataset P cannot catch), max -> 11, sum -> 59; only
+# MIN returns 8.
+# ===================================================================
+load
+  {env="prod", service_name="approx-q"}
+  1s  lvl=qmin
+  2s  lvl=qmin
+  3s  lvl=qmin
+  4s  lvl=qmin
+  5s  lvl=qmin
+  6s  lvl=qmin
+  7s  lvl=qmin
+  8s  lvl=qmin
+  9s  lvl=c003087
+  10s  lvl=c003087
+  11s  lvl=c003087
+
+eval instant at 60s approx_topk(2, sum by (lvl) (count_over_time({service_name="approx-q"} | logfmt [1m])))
+  {lvl="c003087"} 3
+  {lvl="qmin"} 8

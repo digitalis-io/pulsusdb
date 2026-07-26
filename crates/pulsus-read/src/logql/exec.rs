@@ -17,6 +17,7 @@ use pulsus_logql::{
     StreamSelector, VectorAggOp, VectorMatching,
 };
 
+use super::cms;
 use super::detected::{self, DetectedFields, DetectedLabelOut, FieldAccumulator};
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
@@ -4074,6 +4075,8 @@ fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// | `present_cover` / `present` | grid-sized (≤ [`MAX_CLIENT_AGG_BUCKETS`] + 2 entries) |
 /// | `absent_labels` | cloned from the parsed query text — bounded by request size |
 /// | `coll` staging | NOT query-lifetime: one group at a time, ≤ [`MAX_TS_COLLISION_GROUP_BYTES`] |
+/// | `approx_topk` sketch + retention (`cms::CountMinSketch`, `cms::Retention`) | compile-time constants — the 13-row table on `approx_topk_instant`, peak ≤ 7 360 882 B, no input-scaled term (issue #221) |
+/// | post-aggregation selection/grouping keys (`select_k_*`/`group_*`'s `HashMap<LabelSet, _>` owned `group_key` copies) | **flagged, not yet charged** (issue #241): bounded only indirectly by the upstream hydration/series caps; `approx_topk` itself is exempt structurally (`grouping == None` ⇒ a single empty key) |
 ///
 /// 64 MiB across ≤ 500 groups is ~128 KiB of rendered labels per group —
 /// far beyond real extracted label sets (typically well under a KiB), so
@@ -6646,6 +6649,13 @@ fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
         VectorAggOp::Topk | VectorAggOp::Bottomk => {
             unreachable!("topk/bottomk are selections, dispatched before reduce")
         }
+        // approx_topk is an instant-only selection (issue #221): the
+        // planner rejects it for range specs (`parse_vector_agg_params`),
+        // so it can never reach a matrix, and `group_instant` dispatches
+        // it before `reduce` — same contract as the arms above.
+        VectorAggOp::ApproxTopk => {
+            unreachable!("approx_topk is an instant-only selection, dispatched before reduce")
+        }
         // sort/sort_desc reorder the result vector — `group_instant`
         // (reorder) / `group_range` (passthrough) branch before `reduce`.
         VectorAggOp::Sort | VectorAggOp::SortDesc => {
@@ -6695,8 +6705,14 @@ fn k_of(param: Option<f64>) -> usize {
 /// `{5, 1}` and `bottomk(2)` selects `{1, 5}` — a NaN is never
 /// preferred over a finite value); among non-NaN values, descending for
 /// topk / ascending for bottomk; ties broken by the series' label set
-/// ascending.
-fn sort_candidates(candidates: &mut [(usize, f64)], labels_of: &[LabelSet], largest: bool) {
+/// ascending. `labels_of` is an ACCESSOR borrowing the caller's series
+/// (issue #221 memory round: the former `Vec<LabelSet>` parameter was a
+/// deep clone of every label set, input-scaled and uncharged — the
+/// closure reads the identical bytes with zero copies).
+fn sort_candidates<'a, F>(candidates: &mut [(usize, f64)], labels_of: F, largest: bool)
+where
+    F: Fn(usize) -> &'a LabelSet,
+{
     candidates.sort_by(|(ai, av), (bi, bv)| {
         av.is_nan()
             .cmp(&bv.is_nan())
@@ -6711,7 +6727,7 @@ fn sort_candidates(candidates: &mut [(usize, f64)], labels_of: &[LabelSet], larg
                     av.total_cmp(bv)
                 }
             })
-            .then_with(|| labels_of[*ai].cmp(&labels_of[*bi]))
+            .then_with(|| labels_of(*ai).cmp(labels_of(*bi)))
     });
 }
 
@@ -6729,7 +6745,6 @@ fn select_k_range(
         return Vec::new();
     }
     let largest = matches!(op, VectorAggOp::Topk);
-    let labels_of: Vec<LabelSet> = series.iter().map(|s| s.labels.clone()).collect();
     let mut groups: HashMap<LabelSet, Vec<usize>> = HashMap::new();
     for (idx, s) in series.iter().enumerate() {
         groups
@@ -6748,7 +6763,7 @@ fn select_k_range(
                 .iter()
                 .filter_map(|&i| series[i].points.get(&step).map(|v| (i, *v)))
                 .collect();
-            sort_candidates(&mut candidates, &labels_of, largest);
+            sort_candidates(&mut candidates, |i| &series[i].labels, largest);
             for (idx, v) in candidates.into_iter().take(k) {
                 keep[idx].insert(step, v);
             }
@@ -6779,7 +6794,6 @@ fn select_k_instant(
         return Vec::new();
     }
     let largest = matches!(op, VectorAggOp::Topk);
-    let labels_of: Vec<LabelSet> = series.iter().map(|s| s.labels.clone()).collect();
     let mut groups: HashMap<LabelSet, Vec<usize>> = HashMap::new();
     for (idx, s) in series.iter().enumerate() {
         groups
@@ -6791,7 +6805,7 @@ fn select_k_instant(
     for members in groups.values() {
         let mut candidates: Vec<(usize, f64)> =
             members.iter().map(|&i| (i, series[i].value)).collect();
-        sort_candidates(&mut candidates, &labels_of, largest);
+        sort_candidates(&mut candidates, |i| &series[i].labels, largest);
         for (idx, _) in candidates.into_iter().take(k) {
             keep[idx] = true;
         }
@@ -6801,6 +6815,108 @@ fn select_k_instant(
         .zip(keep)
         .filter_map(|(s, kept)| kept.then_some(s))
         .collect()
+}
+
+/// `approx_topk(k, inner)` over an instant result (issue #221) — the
+/// reference's `topk(k, CountMinSketchEval(__count_min_sketch__(inner)))`
+/// rewrite (pkg/logql/optimize.go), evaluated in one pass:
+///
+/// 1. canonical order: labels normalized name-sorted in place, then the
+///    series sorted by label set ascending (value `total_cmp` tiebreak so
+///    the order is total even for a duplicated label set). The
+///    reference's own insertion order is a randomized Go map walk
+///    (pkg/logql/evaluator.go), i.e. unspecified — PulsusDB pins
+///    determinism exactly as instant `first_over_time`/`last_over_time`
+///    ties are pinned (docs/features.md §2);
+/// 2. for every series: stream its `stableBytes` into the three hashes
+///    ([`cms::series_key`]), `add` the SAMPLE VALUE to the sketch, then
+///    the retention decision ([`cms::Retention::observe`] — sketch add
+///    always precedes retention, per the reference order);
+/// 3. at most [`cms::CMS_MAX_LABELS`] label sets are retained (inert
+///    below the cap, which is where bit-exactness is claimed);
+/// 4. every retained value is replaced by `count(key)` — THE ESTIMATE,
+///    never the true value; labels are MOVED out of the input;
+/// 5. `select_k_instant(.., Topk, None, param)` — the existing
+///    selection, not a second implementation (`grouping` is
+///    structurally `None`: rejected at parse time).
+///
+/// MEMORY (the #227 discipline, satisfied by construction — issue #221
+/// plan v4's 13-row accounting, pinned by
+/// `approx_topk_accounting_total_is_a_compile_time_constant`): NOTHING
+/// on this path allocates proportionally to input. `R = CMS_MAX_LABELS +
+/// 1` bounds every input-facing container; using the allocator model
+/// `ab = alloc_block_bytes` / `gb = grown_alloc_bytes`:
+///
+/// | # | allocation | bytes (upper bound) |
+/// |---|---|---|
+/// | 1 | per-series `labels.sort_unstable()` | 0 (in place — a stable sort would allocate scratch; load-bearing) |
+/// | 2 | `series.sort_unstable_by(..)` over all S | 0 (in place — a stable sort would allocate `S/2 x 32` B, input-scaled; load-bearing) |
+/// | 3 | key hashing (`cms::series_key` streams `stableBytes`) | 0 |
+/// | 4 | CMS counter grid (exact `vec![0.0; W*D]`) | ab(1_522_248) = 3_044_496 |
+/// | 5 | retention heap `Vec<(u32, SeriesKey)>` `with_capacity(R)` | ab(24R) = 480_048 |
+/// | 6 | `observed: HashSet<u64>` `with_capacity(R)` | ab(147_472) = 294_944 (16_384-bucket hashbrown layout) |
+/// | 7 | retained output `Vec<InstantSeries>` `with_capacity(R)` (moved labels, zero new string bytes) | ab(32R) = 640_064 |
+/// | 8a | `select_k_instant::groups` table (1 empty-key entry) | 1_024 (generous) |
+/// | 8b | `groups`' member `Vec<usize>` (grown by push) | gb(8R) = 480_048 |
+/// | 9 | `select_k_instant::keep: Vec<bool>` | ab(R) = 20_002 |
+/// | 10 | `select_k_instant::candidates` | ab(16R) = 320_032 |
+/// | 11 | `sort_candidates` driftsort scratch (≤ n/2 elements) | ab(16·⌈R/2⌉) = 160_032 |
+/// | 12 | `select_k_instant` output (`filter_map` collect — grows) | gb(32R) = 1_920_192 |
+///
+/// **Peak ≤ 7_360_882 B (7.02 MiB) per `approx_topk` node** — the
+/// conservative SUM (every row assumed live simultaneously, no reliance
+/// on drop placement), every term a compile-time constant with no
+/// dependence on series count, label size, cardinality or density. The
+/// input `Vec<InstantSeries>` itself is the allocation this path
+/// CONSUMES (built by `apply_vector_aggs` for every vector aggregation,
+/// `topk` included) and is not a new charge. Because no term scales
+/// with input, nothing here can fail a charge and `apply_vector_aggs`
+/// stays infallible. `apply_vector_aggs` applies the agg chain
+/// sequentially, so exactly one sketch is live regardless of nesting
+/// (parser `MAX_DEPTH` = 64).
+fn approx_topk_instant(mut series: Vec<InstantSeries>, param: Option<f64>) -> Vec<InstantSeries> {
+    // 1. Canonical, input-order-independent ordering. `sort_unstable*`
+    // is load-bearing (rows 1-2 of the accounting table): a stable
+    // `sort` here would reintroduce an input-scaled scratch allocation.
+    for s in &mut series {
+        s.labels.sort_unstable();
+    }
+    series.sort_unstable_by(|a, b| {
+        a.labels
+            .cmp(&b.labels)
+            .then_with(|| a.value.total_cmp(&b.value))
+    });
+    // 2-3. One streaming pass: sketch add (ALWAYS, first), then the
+    // retention decision — the reference `HeapCountMinSketchVector.Add`
+    // order.
+    let mut sketch = cms::CountMinSketch::new();
+    let mut retention = cms::Retention::new();
+    for (idx, s) in series.iter().enumerate() {
+        let key = cms::series_key(&s.labels);
+        sketch.add(key, s.value);
+        retention.observe(idx as u32, key, &sketch, |root| {
+            series[root as usize].labels == s.labels
+        });
+    }
+    // 4. Retained series in ascending input (canonical) order, each
+    // value replaced by the sketch ESTIMATE; labels moved, never cloned.
+    let mut retained = retention.into_entries();
+    retained.sort_unstable_by_key(|&(idx, _)| idx);
+    let mut out = Vec::with_capacity(retained.len());
+    let mut next = retained.iter().peekable();
+    for (idx, s) in series.into_iter().enumerate() {
+        if let Some(&&(ridx, key)) = next.peek()
+            && ridx as usize == idx
+        {
+            next.next();
+            out.push(InstantSeries {
+                labels: s.labels,
+                value: sketch.count(key),
+            });
+        }
+    }
+    // 5. The existing selection — reused, not reimplemented.
+    select_k_instant(out, VectorAggOp::Topk, None, param)
 }
 
 fn group_range(
@@ -6854,6 +6970,13 @@ fn group_instant(
     grouping: Option<&Grouping>,
     param: Option<f64>,
 ) -> Vec<InstantSeries> {
+    // approx_topk (issue #221): sketch-estimate the values, then the
+    // ordinary topk selection. Grouping is rejected at parse time, so
+    // `grouping` is structurally `None` here (pinned by
+    // `approx_topk_specs_never_carry_a_grouping` in plan.rs).
+    if matches!(op, VectorAggOp::ApproxTopk) {
+        return approx_topk_instant(series, param);
+    }
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
         return select_k_instant(series, op, grouping, param);
     }
@@ -7991,6 +8114,62 @@ mod tests {
     /// removed (a request-size charge of `n.max(32)` sits strictly below
     /// the model there) — asserted explicitly so the test is provably
     /// non-vacuous.
+    /// Issue #221 AC 17: the `approx_topk` 13-row accounting is a
+    /// compile-time constant — the layout sizes, the capacity constants
+    /// and the row arithmetic are all pinned, and the total recomputed
+    /// through the codebase's own allocator model
+    /// ([`alloc_block_bytes`]/[`grown_alloc_bytes`]) must stay within the
+    /// documented 7_360_882-byte ceiling. Asserts the COMPUTED ceiling,
+    /// never a measured allocation count (the alloc-bound-test lesson: a
+    /// process-global counter flakes on stray allocations).
+    #[test]
+    fn approx_topk_accounting_total_is_a_compile_time_constant() {
+        // Layout pins — a struct-layout change invalidates rows 5/7/12.
+        assert_eq!(std::mem::size_of::<cms::SeriesKey>(), 16);
+        assert_eq!(std::mem::size_of::<(u32, cms::SeriesKey)>(), 24);
+        assert_eq!(std::mem::size_of::<InstantSeries>(), 32);
+        // Capacity constants (the `with_capacity(R)` reservations).
+        assert_eq!(cms::CMS_WIDTH, 27_183);
+        assert_eq!(cms::CMS_DEPTH, 7);
+        assert_eq!(cms::CMS_MAX_LABELS, 10_000);
+        let r = cms::CMS_MAX_LABELS as u64 + 1; // transient post-push size
+
+        // Row 4: the exact `vec![0.0; W*D]` counter grid.
+        let grid = u64::from(cms::CMS_DEPTH) * u64::from(cms::CMS_WIDTH) * 8;
+        assert_eq!(grid, 1_522_248);
+        // Row 6: hashbrown's `with_capacity(R)` table — `R*8/7` rounded
+        // to the next power of two buckets, 8 B per u64 slot + 1 ctrl
+        // byte per bucket + 16 trailing ctrl bytes.
+        let buckets = (r * 8).div_ceil(7).next_power_of_two();
+        let observed = buckets * 8 + buckets + 16;
+        assert_eq!(observed, 147_472);
+
+        // The 13 rows (1-3 are the zero-allocation in-place/streaming
+        // rows), each pinned to the doc-table figure on
+        // `approx_topk_instant`.
+        let rows: [(u64, u64); 10] = [
+            (alloc_block_bytes(grid), 3_044_496),             // 4: CMS grid
+            (alloc_block_bytes(24 * r), 480_048),             // 5: retention heap
+            (alloc_block_bytes(observed), 294_944),           // 6: observed set
+            (alloc_block_bytes(32 * r), 640_064),             // 7: retained output
+            (1_024, 1_024),                                   // 8a: groups table
+            (grown_alloc_bytes(8 * r), 480_048),              // 8b: member indices
+            (alloc_block_bytes(r), 20_002),                   // 9: keep
+            (alloc_block_bytes(16 * r), 320_032),             // 10: candidates
+            (alloc_block_bytes(16 * r.div_ceil(2)), 160_032), // 11: sort scratch
+            (grown_alloc_bytes(32 * r), 1_920_192),           // 12: selection output
+        ];
+        let mut total = 0u64;
+        for (i, (computed, pinned)) in rows.iter().enumerate() {
+            assert_eq!(computed, pinned, "accounting row {i} drifted");
+            total += computed;
+        }
+        assert!(
+            total <= 7_360_882,
+            "approx_topk peak accounting total {total} exceeds the documented ceiling"
+        );
+    }
+
     #[test]
     fn alloc_block_bytes_covers_allocator_size_class_rounding_at_class_boundaries() {
         /// The worst retained block any mainstream allocator keeps for an

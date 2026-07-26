@@ -337,6 +337,11 @@
       "oracle": "accept"
     },
     {
+      "construct": "agg.approx_topk",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
       "construct": "agg.sort",
       "status": "supported",
       "oracle": "accept"

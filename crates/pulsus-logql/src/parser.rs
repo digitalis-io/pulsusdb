@@ -20,7 +20,7 @@ use crate::ast::{
 use crate::duration;
 use crate::error::{LogQlError, MAX_DEPTH};
 use crate::lexer;
-use crate::token::{Token, TokenKind};
+use crate::token::{Span, Token, TokenKind};
 
 /// Parses a full LogQL query into an [`Expr`] — the #11 planner contract.
 pub fn parse(input: &str) -> Result<Expr, LogQlError> {
@@ -1054,7 +1054,7 @@ fn parse_metric_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr
     }
     if let Some(op) = VectorAggOp::from_ident(&name) {
         cursor.advance();
-        return parse_vector_agg_call(cursor, depth, op);
+        return parse_vector_agg_call(cursor, depth, op, tok.span);
     }
     Err(LogQlError::UnexpectedToken {
         found: describe(&tok.kind),
@@ -1099,18 +1099,20 @@ fn parse_vector_agg_call(
     cursor: &mut Cursor<'_>,
     depth: usize,
     op: VectorAggOp,
+    op_span: Span,
 ) -> Result<MetricExpr, LogQlError> {
     let mut grouping = maybe_grouping(cursor)?;
     cursor.expect(&TokenKind::LParen, "'('")?;
-    // `topk`/`bottomk` require a leading `k` parameter (`topk(5, ...)`);
-    // for the parameterless aggregations the inner expression may itself
-    // begin with a number (`sum(2 * rate(...))`), so no-param ops go
-    // straight to the inner parse — a misplaced `0.5,` there fails on the
-    // `,` as an `UnexpectedToken` (expected `')'`).
-    let param = if op.takes_param() {
-        let (raw, _) = cursor.expect_number("the k parameter (e.g. topk(5, ...))")?;
+    // `topk`/`bottomk`/`approx_topk` require a leading `k` parameter
+    // (`topk(5, ...)`); for the parameterless aggregations the inner
+    // expression may itself begin with a number (`sum(2 * rate(...))`),
+    // so no-param ops go straight to the inner parse — a misplaced
+    // `0.5,` there fails on the `,` as an `UnexpectedToken` (expected
+    // `')'`).
+    let raw_param = if op.takes_param() {
+        let (raw, span) = cursor.expect_number("the k parameter (e.g. topk(5, ...))")?;
         cursor.expect(&TokenKind::Comma, "','")?;
-        Some(raw)
+        Some((raw, span))
     } else {
         None
     };
@@ -1120,6 +1122,48 @@ fn parse_vector_agg_call(
     cursor.expect(&TokenKind::RParen, "')'")?;
     if grouping.is_none() {
         grouping = maybe_grouping(cursor)?;
+    }
+    // Loki-exact `k` validation — the root-cause fix shared by
+    // `topk`/`bottomk`/`approx_topk` (issue #221, adjudicated: `topk(0,
+    // ...)` becomes a 400, no longer an empty 200). The reference runs
+    // `strconv.Atoi` then the `> 0` check, then the `approx_topk`
+    // grouping rejection, all in `mustNewVectorAggregationExpr`
+    // (pkg/logql/syntax/ast.go), which fires at reduce time — i.e. only
+    // after the whole call parsed — so the checks run here, after the
+    // inner expression and the postfix grouping lookahead (a syntax
+    // error inside the call still wins, exactly as in the reference).
+    let param = match raw_param {
+        Some((raw, span)) => {
+            match raw.parse::<i64>() {
+                Err(_) => {
+                    return Err(LogQlError::InvalidAggregationParam {
+                        op: op.to_string(),
+                        raw,
+                        span,
+                    });
+                }
+                Ok(k) if k <= 0 => {
+                    return Err(LogQlError::AggregationParamNotPositive {
+                        op: op.to_string(),
+                        raw,
+                        span,
+                    });
+                }
+                Ok(_) => {}
+            }
+            Some(raw)
+        }
+        None => None,
+    };
+    // `grouping not allowed for approx_topk aggregation` — after the
+    // postfix lookahead so BOTH `approx_topk by(x)(k, ...)` and
+    // `approx_topk(k, ...) by(x)` reject (reference: ast.go, gated on
+    // `OpTypeApproxTopK && gr != nil` after the `k` checks).
+    if matches!(op, VectorAggOp::ApproxTopk) && grouping.is_some() {
+        return Err(LogQlError::GroupingNotAllowed {
+            op: op.to_string(),
+            span: op_span,
+        });
     }
     Ok(MetricExpr::Vector {
         op,

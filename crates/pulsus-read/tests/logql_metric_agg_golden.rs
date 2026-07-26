@@ -1208,6 +1208,172 @@ fn stddev_and_stdvar_vector_aggregations_are_population_flavored() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #221: approx_topk — count-min-sketch estimates through the real
+// `apply_vector_aggs` chain. The collision tokens and expected estimates
+// were derived offline (brute-forced cell positions) and VERIFIED by
+// executing the reference `pkg/logql`/`pkg/logql/sketch` package at
+// v3.7.4 — never hand-computed.
+// ---------------------------------------------------------------------
+
+fn lvl_vector(items: &[(&str, f64)]) -> QueryResult {
+    QueryResult::Vector(
+        items
+            .iter()
+            .map(|(tok, v)| VectorSample {
+                labels: vec![("lvl".to_string(), tok.to_string())],
+                value: *v,
+            })
+            .collect(),
+    )
+}
+
+fn sorted_pairs(result: QueryResult) -> Vec<(String, f64)> {
+    let QueryResult::Vector(items) = result else {
+        panic!("expected a vector");
+    };
+    let mut out: Vec<(String, f64)> = items
+        .into_iter()
+        .map(|s| (s.labels[0].1.clone(), s.value))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// AC 8 (two-way): the reference-verified full-7-row collision fixture
+/// returns the sketch ESTIMATES (7/7/5) through `apply_vector_aggs`,
+/// while `topk` over the SAME input returns the true values (3/4/5) —
+/// the proof this is a real sketch, not `topk` in disguise.
+#[test]
+fn approx_topk_emits_the_sketch_estimate_not_the_true_value() {
+    let input = [("v0095169", 3.0), ("v0125949", 4.0), ("ctrl", 5.0)];
+    let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(3.0))];
+    assert_eq!(
+        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)),
+        vec![
+            ("ctrl".to_string(), 5.0),
+            ("v0095169".to_string(), 7.0),
+            ("v0125949".to_string(), 7.0),
+        ],
+        "reference-verified estimates: the colliding pair reports 7, the clean series 5"
+    );
+    let topk = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(3.0))];
+    assert_eq!(
+        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &topk)),
+        vec![
+            ("ctrl".to_string(), 5.0),
+            ("v0095169".to_string(), 3.0),
+            ("v0125949".to_string(), 4.0),
+        ],
+        "topk over the same input keeps the true values"
+    );
+}
+
+/// When no cells collide, the estimate equals the true value and the
+/// selection equals `topk`, value for value.
+#[test]
+fn approx_topk_is_exact_when_no_cells_collide() {
+    let input = [
+        ("alpha", 12.0),
+        ("beta", 9.0),
+        ("gamma", 7.0),
+        ("delta", 4.0),
+        ("epsilon", 2.0),
+    ];
+    let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(3.0))];
+    let topk = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(3.0))];
+    assert_eq!(
+        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)),
+        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &topk)),
+    );
+}
+
+/// Under-`k` returns every series (live-probed reference behaviour:
+/// `approx_topk(10, ...)` over 5 series returns all 5).
+#[test]
+fn approx_topk_under_k_returns_every_series() {
+    let input = [("a", 3.0), ("b", 2.0), ("c", 1.0)];
+    let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(10.0))];
+    assert_eq!(
+        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)).len(),
+        3
+    );
+}
+
+/// AC 9 + AC 18: byte-identical output under three permutations of the
+/// input series AND under permutations of each series' own label order
+/// — pins the canonical-order + in-place-normalization determinism (the
+/// reference's own order is a randomized Go map walk).
+#[test]
+fn approx_topk_is_insertion_order_independent() {
+    let base = [("v0095169", 3.0), ("v0125949", 4.0), ("ctrl", 5.0)];
+    let shuffles: [[usize; 3]; 3] = [[0, 1, 2], [2, 0, 1], [1, 2, 0]];
+    let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(2.0))];
+    let expect = sorted_pairs(apply_vector_aggs(lvl_vector(&base), &approx));
+    for order in shuffles {
+        let shuffled: Vec<(&str, f64)> = order.iter().map(|&i| base[i]).collect();
+        assert_eq!(
+            sorted_pairs(apply_vector_aggs(lvl_vector(&shuffled), &approx)),
+            expect,
+        );
+    }
+    // Per-series label order: the same two-label set given in both
+    // orders normalizes in place to one canonical key.
+    let two_labels = |flip: bool| {
+        let mut labels = vec![
+            ("app".to_string(), "x".to_string()),
+            ("lvl".to_string(), "err".to_string()),
+        ];
+        if flip {
+            labels.reverse();
+        }
+        QueryResult::Vector(vec![
+            VectorSample { labels, value: 6.0 },
+            VectorSample {
+                labels: vec![("lvl".to_string(), "info".to_string())],
+                value: 2.0,
+            },
+        ])
+    };
+    let a = apply_vector_aggs(two_labels(false), &approx);
+    let b = apply_vector_aggs(two_labels(true), &approx);
+    let flatten = |r: QueryResult| {
+        let QueryResult::Vector(items) = r else {
+            panic!("expected a vector");
+        };
+        let mut out: Vec<(Vec<(String, String)>, u64)> = items
+            .into_iter()
+            .map(|s| (s.labels, s.value.to_bits()))
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(flatten(a), flatten(b));
+}
+
+/// B9: retention stops at exactly the reference heap size (10 000) and
+/// drops the minimum-estimate entry; an over-cap `k` then returns every
+/// RETAINED series.
+#[test]
+fn approx_topk_retention_cap_is_the_reference_heap_size() {
+    let cap = 10_000usize;
+    let items: Vec<(String, f64)> = (0..=cap)
+        .map(|i| (format!("t{i:05}"), (i + 1) as f64))
+        .collect();
+    let input: Vec<(&str, f64)> = items.iter().map(|(t, v)| (t.as_str(), *v)).collect();
+    let approx = vec![(
+        pulsus_logql::VectorAggOp::ApproxTopk,
+        None,
+        Some((cap + 1) as f64),
+    )];
+    let out = sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx));
+    assert_eq!(out.len(), cap, "exactly CMS_MAX_LABELS series retained");
+    assert!(
+        !out.iter().any(|(t, _)| t == "t00000"),
+        "the minimum-estimate series (true value 1) is the one dropped"
+    );
+}
+
+// ---------------------------------------------------------------------
 // AC4c: binary operations — both orientations, `^` associativity,
 // mixed precedence, `bool`, comparisons, set ops.
 // ---------------------------------------------------------------------

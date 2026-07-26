@@ -61,6 +61,7 @@
 
 use pulsus_logql::{Expr, MetricExpr, VectorAggOp};
 
+mod cms;
 pub mod detected;
 pub mod error;
 pub mod escape;

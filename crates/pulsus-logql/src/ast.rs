@@ -859,6 +859,12 @@ pub enum VectorAggOp {
     Stdvar,
     Topk,
     Bottomk,
+    /// `approx_topk(k, ...)` — probabilistic top-k via a count-min sketch
+    /// (issue #221). Parses exactly like `topk` except grouping is
+    /// rejected (`grouping not allowed for approx_topk aggregation`) and
+    /// the construct is instant-only (the planner rejects it for range
+    /// queries).
+    ApproxTopk,
     /// `sort(...)` / `sort_desc(...)` — order the instant result vector by
     /// value ascending/descending (issue M8-LQ3). A post-aggregation
     /// in-memory reordering, not a reduction; carries no parameter and no
@@ -879,16 +885,20 @@ impl VectorAggOp {
             "stdvar" => Some(Self::Stdvar),
             "topk" => Some(Self::Topk),
             "bottomk" => Some(Self::Bottomk),
+            "approx_topk" => Some(Self::ApproxTopk),
             "sort" => Some(Self::Sort),
             "sort_desc" => Some(Self::SortDesc),
             _ => None,
         }
     }
 
-    /// `true` for `topk`/`bottomk` — the two aggregations that require a
-    /// leading `k` parameter (`topk(5, ...)`).
+    /// `true` for `topk`/`bottomk`/`approx_topk` — the k-selections that
+    /// require a leading `k` parameter (`topk(5, ...)`).
     pub fn takes_param(self) -> bool {
-        matches!(self, VectorAggOp::Topk | VectorAggOp::Bottomk)
+        matches!(
+            self,
+            VectorAggOp::Topk | VectorAggOp::Bottomk | VectorAggOp::ApproxTopk
+        )
     }
 
     fn as_str(self) -> &'static str {
@@ -902,6 +912,7 @@ impl VectorAggOp {
             VectorAggOp::Stdvar => "stdvar",
             VectorAggOp::Topk => "topk",
             VectorAggOp::Bottomk => "bottomk",
+            VectorAggOp::ApproxTopk => "approx_topk",
             VectorAggOp::Sort => "sort",
             VectorAggOp::SortDesc => "sort_desc",
         }
@@ -1123,6 +1134,7 @@ mod tests {
             ("stdvar", VectorAggOp::Stdvar),
             ("topk", VectorAggOp::Topk),
             ("bottomk", VectorAggOp::Bottomk),
+            ("approx_topk", VectorAggOp::ApproxTopk),
             ("sort", VectorAggOp::Sort),
             ("sort_desc", VectorAggOp::SortDesc),
         ] {
@@ -1141,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn only_topk_and_bottomk_take_a_parameter() {
+    fn only_the_k_selections_take_a_parameter() {
         for op in [
             VectorAggOp::Sum,
             VectorAggOp::Avg,
@@ -1157,6 +1169,7 @@ mod tests {
         }
         assert!(VectorAggOp::Topk.takes_param());
         assert!(VectorAggOp::Bottomk.takes_param());
+        assert!(VectorAggOp::ApproxTopk.takes_param());
     }
 
     #[test]
