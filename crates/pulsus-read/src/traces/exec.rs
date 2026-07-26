@@ -636,7 +636,10 @@ impl TraceEngine {
                 let mut series: Vec<TraceMetricSeries> = bounds
                     .iter()
                     .map(|le| TraceMetricSeries {
-                        labels: vec![MetricLabel::double("__bucket", *le as f64 / 1e9)],
+                        labels: vec![MetricLabel::double(
+                            "__bucket",
+                            histogram_bucket_seconds(*le),
+                        )],
                         samples: Vec::new(),
                         exemplars: Vec::new(),
                     })
@@ -1068,7 +1071,10 @@ impl TraceEngine {
                         .iter()
                         .enumerate()
                         .map(|(i, le)| TraceMetricSeries {
-                            labels: vec![MetricLabel::double("__bucket", *le as f64 / 1e9)],
+                            labels: vec![MetricLabel::double(
+                                "__bucket",
+                                histogram_bucket_seconds(*le),
+                            )],
                             samples: vec![(at_ms, bkts.get(i).copied().unwrap_or(0) as f64)],
                             exemplars: vec![],
                         })
@@ -1991,8 +1997,48 @@ fn count_value(is_rate: bool, n: u64, rate_denominator_s: i64) -> f64 {
 /// `toFloat64`-cast aggregate over the physical `duration_ns` scaled
 /// nanoseconds→seconds (Tempo's duration-metric unit). Attribute value
 /// targets — when wired — will carry a unit scale of 1.
+///
+/// Issue #237 (settled — do NOT "fix" this like #232): the reference's
+/// ns→seconds conversion is the SINGLE-rounding `float64(ns) / 1e9`,
+/// not the two-rounding `float64(sec) + float64(nsec)/1e9` form that
+/// #232 established for the LogQL rate divisor (a different reference).
+/// Evidence of record: 17-significant-digit raw-wire captures from the
+/// pinned reference container (`grafana/tempo:3.0.2@sha256:cda87c21…`,
+/// the digest in `deploy/e2e/compose.single.yaml`, probed 2026-07-26)
+/// for six widths where the two forms differ by 1 ULP —
+/// 18_014_398_509_482_025 / _035 / _017, 1_088_608_058_291_172_412,
+/// 10_000_000_000_000_005 / _015 ns. Each emitted value is the shortest
+/// rendering of the single-rounding f64 at 17 significant digits, which
+/// no ≤16-digit formatter can produce and which determines the f64
+/// uniquely; every witness exceeds 2^53, so the int64→f64 cast is lossy
+/// and the (more accurate) two-rounding value would have been visibly
+/// different. Corroboration only (not proof — a response's exemplar
+/// label does not establish the numeric field's source path): the same
+/// bodies render the raw duration losslessly in an exemplar label while
+/// the numeric field carries the cast-first value, and the reference's
+/// own comparison operator brackets stored values at the single-rounding
+/// f64 (`>= L` matches, `> L` does not, for the 1_118_000_000 ns width).
+/// The claim is observed-behaviour only, at emitted-value granularity;
+/// no reference source was read. Applying #232's two-rounding fix here
+/// would INTRODUCE a 1-ULP divergence — the bit-exact pins in this
+/// file's tests carry paired `assert_ne!`s against that form and will
+/// fail loudly on such a change.
 fn agg_value(v: f64) -> f64 {
     v / 1_000_000_000.0
+}
+
+/// The `__bucket` label's encode-boundary value: the fixed exponential
+/// power-of-two nanosecond `le` boundary rendered as float seconds.
+///
+/// Issue #237: the reference converts duration nanoseconds to seconds
+/// with a SINGLE rounding (`float64(ns) / 1e9`), not the two-rounding
+/// `float64(sec) + float64(nsec)/1e9` form that #232 established for the
+/// LogQL rate divisor (see [`agg_value`]). For this site the distinction
+/// is moot regardless: every argument is a power of two
+/// (`HISTOGRAM_LE_BOUNDS_NS`) and the two forms are bit-identical for
+/// every `2^k`, `k = 0..=62`.
+fn histogram_bucket_seconds(le_ns: i64) -> f64 {
+    le_ns as f64 / 1e9
 }
 
 /// Sanitizes a non-finite aggregate (e.g. `quantilesTDigest` over an empty
@@ -2265,6 +2311,55 @@ fn pick_roots(rows: Vec<RootRow>) -> HashMap<[u8; 16], RootSummary> {
 }
 
 #[cfg(test)]
+mod wire_literal {
+    /// A reference-captured wire rendering (issue #237). Nothing textual
+    /// or numeric leaves this module: every exit is a predicate. There is
+    /// no `value()`, no `tokens()`, and no raw-text accessor, conversion,
+    /// deref or formatting impl of any spelling — and this copy
+    /// deliberately has no text-accepting method at all, so a body assertion is not even
+    /// expressible here (no serialized body exists in this file's scope).
+    /// The whole block, including the attribute above it, is byte-frozen
+    /// by `the_wire_literal_module_is_byte_frozen`; it invokes no macro,
+    /// so no macro can be shadowed into it.
+    pub(crate) struct WireLiteral(&'static str);
+
+    impl WireLiteral {
+        pub(crate) const fn new(text: &'static str) -> Self {
+            Self(text)
+        }
+
+        /// True iff the captured text is EXACTLY what the locked encoder
+        /// emits for `want`: it parses bit-identically to `want` AND
+        /// `serde_json::to_string(&want)` reproduces it. This is the
+        /// per-row transcription pin for the captured table.
+        pub(crate) fn denotes(&self, want: f64) -> bool {
+            let parses = match self.0.parse::<f64>() {
+                Ok(v) => v.to_bits() == want.to_bits(),
+                Err(_) => false,
+            };
+            let renders = match serde_json::to_string(&want) {
+                Ok(s) => s == self.0,
+                Err(_) => false,
+            };
+            parses && renders
+        }
+
+        /// Significant digits of the captured rendering (leading and
+        /// trailing zeros stripped). A width only discriminates the two
+        /// rounding forms formatter-independently if this is 17.
+        pub(crate) fn significant_digits(&self) -> usize {
+            let mut digits = String::new();
+            for c in self.0.chars() {
+                if c.is_ascii_digit() {
+                    digits.push(c);
+                }
+            }
+            digits.trim_start_matches('0').trim_end_matches('0').len()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2525,6 +2620,333 @@ mod tests {
         // Value aggregations scale duration ns → seconds.
         assert_eq!(agg_value(2_000_000_000.0), 2.0);
         assert_eq!(agg_value(0.0), 0.0);
+    }
+
+    use super::wire_literal::WireLiteral;
+
+    /// Reference-captured ns→seconds renderings (issue #237).
+    /// `grafana/tempo:3.0.2@sha256:cda87c21…`, probed 2026-07-26.
+    /// `(ns, seconds value, captured rendering, two-rounding rendering)`.
+    /// One copy per site by design — do NOT lift into a shared crate.
+    const REFERENCE_DURATION_SECONDS: &[(i64, f64, WireLiteral, WireLiteral)] = &[
+        // ≤16-digit group: 1 ULP apart; pinned by the reference's own
+        // comparison operator (`>= L` matches, `> L` does not).
+        (
+            1_118_000_000,
+            1.118,
+            WireLiteral::new("1.118"),
+            WireLiteral::new("1.1179999999999999"),
+        ),
+        (
+            1_122_000_000,
+            1.122,
+            WireLiteral::new("1.122"),
+            WireLiteral::new("1.1219999999999999"),
+        ),
+        (
+            1_128_000_000,
+            1.128,
+            WireLiteral::new("1.128"),
+            WireLiteral::new("1.1280000000000001"),
+        ),
+        (
+            1_235_000_000,
+            1.235,
+            WireLiteral::new("1.235"),
+            WireLiteral::new("1.2349999999999999"),
+        ),
+        (
+            31_952_000_000,
+            31.952,
+            WireLiteral::new("31.952"),
+            WireLiteral::new("31.951999999999998"),
+        ),
+        (
+            1_000_064_438,
+            1.000064438,
+            WireLiteral::new("1.000064438"),
+            WireLiteral::new("1.0000644379999999"),
+        ),
+        // 17-significant-digit group: the formatter-independent RAW-WIRE
+        // discriminators (#237 round 3). `ns > 2^53`, so the `int64->f64`
+        // cast is lossy and the two-rounding value is the correctly
+        // rounded one — the reference emitting the single-rounding value
+        // positively identifies a cast-first form.
+        (
+            18_014_398_509_482_025,
+            18_014_398.509_482_022,
+            WireLiteral::new("18014398.509482022"),
+            WireLiteral::new("18014398.509482026"),
+        ),
+        (
+            18_014_398_509_482_035,
+            18_014_398.509_482_037,
+            WireLiteral::new("18014398.509482037"),
+            WireLiteral::new("18014398.509482034"),
+        ),
+        (
+            18_014_398_509_482_017,
+            18_014_398.509_482_015,
+            WireLiteral::new("18014398.509482015"),
+            WireLiteral::new("18014398.50948202"),
+        ),
+        (
+            1_088_608_058_291_172_412,
+            1_088_608_058.291_172_3,
+            WireLiteral::new("1088608058.2911723"),
+            WireLiteral::new("1088608058.2911725"),
+        ),
+        (
+            10_000_000_000_000_005,
+            10_000_000.000_000_004,
+            WireLiteral::new("10000000.000000004"),
+            WireLiteral::new("10000000.000000006"),
+        ),
+        (
+            10_000_000_000_000_015,
+            10_000_000.000_000_017,
+            WireLiteral::new("10000000.000000017"),
+            WireLiteral::new("10000000.000000015"),
+        ),
+    ];
+
+    /// Exactly representable under both rounding forms — these prove
+    /// nothing on their own and exist only to catch a gross scaling
+    /// error. Bit-level only: integral-double JSON rendering is a
+    /// protojson number-format question (#263), not the ns→seconds
+    /// conversion #237 settles, so controls carry NO wire literal and are
+    /// never asserted as text.
+    const REFERENCE_DURATION_CONTROLS: &[(i64, f64)] = &[
+        (500_000_000, 0.5),
+        (1_500_000_000, 1.5),
+        (2_000_000_000, 2.0),
+    ];
+
+    /// The 17-significant-digit subset of `REFERENCE_DURATION_SECONDS`.
+    const SEVENTEEN_DIGIT_WIDTHS: &[i64] = &[
+        18_014_398_509_482_025,
+        18_014_398_509_482_035,
+        18_014_398_509_482_017,
+        1_088_608_058_291_172_412,
+        10_000_000_000_000_005,
+        10_000_000_000_000_015,
+    ];
+
+    /// Of those, the ones whose `int64->f64` cast is NOT an exact tie
+    /// (ulp = 4 in `[2^54, 2^55)`; `ns % 4 in {1, 3}`). These need no
+    /// round-half-to-even assumption anywhere in the chain.
+    const TIE_FREE_WIDTHS: &[i64] = &[
+        18_014_398_509_482_025,
+        18_014_398_509_482_035,
+        18_014_398_509_482_017,
+        1_088_608_058_291_172_412,
+    ];
+
+    /// The two-rounding form, transcribed ONLY so the tests can assert
+    /// the production code is NOT it (issues #237 / #232).
+    fn two_rounding_seconds(ns: i64) -> f64 {
+        (ns / 1_000_000_000) as f64 + (ns % 1_000_000_000) as f64 / 1e9
+    }
+
+    #[test]
+    fn histogram_bucket_seconds_is_rounding_form_independent_for_every_power_of_two() {
+        for k in 0..=62u32 {
+            let ns = 1i64 << k;
+            assert_eq!(
+                histogram_bucket_seconds(ns).to_bits(),
+                two_rounding_seconds(ns).to_bits(),
+                "2^{k} ns must render identically under both rounding forms"
+            );
+        }
+        for le in crate::traces::metrics_plan::HISTOGRAM_LE_BOUNDS_NS {
+            assert_eq!(
+                histogram_bucket_seconds(*le).to_bits(),
+                two_rounding_seconds(*le).to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn histogram_bucket_seconds_reproduces_the_captured_reference_bucket_labels() {
+        // Observed emitted `__bucket` labels, 2026-07-26 probe run.
+        for (ns, want) in [
+            (1i64 << 29, 0.536870912f64),
+            (1 << 30, 1.073741824),
+            (1 << 31, 2.147483648),
+            (1 << 35, 34.359738368),
+        ] {
+            assert_eq!(histogram_bucket_seconds(ns).to_bits(), want.to_bits());
+        }
+    }
+
+    #[test]
+    fn agg_value_uses_the_references_single_rounding_conversion() {
+        for (ns, want, wire, t_wire) in REFERENCE_DURATION_SECONDS {
+            // Transcription guards: the two rendering columns must denote
+            // the two f64s, or every negative below is vacuous.
+            assert!(wire.denotes(*want), "{ns}: captured rendering");
+            assert!(
+                t_wire.denotes(two_rounding_seconds(*ns)),
+                "{ns}: two-rounding rendering"
+            );
+            // The two forms MUST disagree here, or the case proves nothing.
+            assert_ne!(
+                (*ns as f64 / 1e9).to_bits(),
+                two_rounding_seconds(*ns).to_bits(),
+                "{ns} ns must be a width where the two forms disagree"
+            );
+            assert_eq!(agg_value(*ns as f64).to_bits(), want.to_bits(), "{ns}");
+            assert_ne!(
+                agg_value(*ns as f64).to_bits(),
+                two_rounding_seconds(*ns).to_bits(),
+                "{ns}"
+            );
+        }
+        for (ns, want) in REFERENCE_DURATION_CONTROLS {
+            assert_eq!(agg_value(*ns as f64).to_bits(), want.to_bits(), "{ns}");
+            assert_eq!(
+                agg_value(*ns as f64).to_bits(),
+                two_rounding_seconds(*ns).to_bits(),
+                "{ns}"
+            );
+        }
+    }
+
+    /// Issue #237 round 3: pins the PROPERTY that makes the raw-wire
+    /// capture formatter-independent. A width only discriminates if its
+    /// reference rendering carries 17 significant digits (no <=16-digit
+    /// formatter can emit it) — and 17 digits forces `ns > 2^53`, hence a
+    /// lossy cast.
+    #[test]
+    fn the_seventeen_digit_witnesses_are_formatter_independent_discriminators() {
+        for ns in SEVENTEEN_DIGIT_WIDTHS {
+            let (_, want, wire, t_wire) = REFERENCE_DURATION_SECONDS
+                .iter()
+                .find(|(n, ..)| n == ns)
+                .expect("witness is in the captured table");
+            assert_eq!(wire.significant_digits(), 17, "{ns}");
+            // The two renderings denote distinct f64s (bit level, never a
+            // string comparison — #237 plan v4 §3).
+            assert!(wire.denotes(*ns as f64 / 1e9), "{ns}");
+            assert!(!t_wire.denotes(*ns as f64 / 1e9), "{ns}");
+            assert!(
+                *ns > (1i64 << 53),
+                "{ns}: a 17-digit witness must exceed 2^53"
+            );
+            assert_ne!(
+                (*ns as f64) as i64,
+                *ns,
+                "{ns}: the int64->f64 cast is lossy"
+            );
+            assert_eq!(agg_value(*ns as f64).to_bits(), want.to_bits(), "{ns}");
+            assert_ne!(
+                agg_value(*ns as f64).to_bits(),
+                two_rounding_seconds(*ns).to_bits(),
+                "{ns}"
+            );
+        }
+        for ns in TIE_FREE_WIDTHS {
+            assert_ne!(ns.rem_euclid(4), 2, "{ns}: cast must not be an exact tie");
+        }
+    }
+
+    /// The byte-frozen text of this file's `mod wire_literal` block,
+    /// including the `#[cfg(test)]` line above it (issue #237 Rule C,
+    /// upward-extended span). Regenerated only as a deliberate, reviewed
+    /// edit alongside the module itself.
+    const FROZEN_WIRE_LITERAL_EXEC: &[&str] = &[
+        "#[cfg(test)]",
+        "mod wire_literal {",
+        "    /// A reference-captured wire rendering (issue #237). Nothing textual",
+        "    /// or numeric leaves this module: every exit is a predicate. There is",
+        "    /// no `value()`, no `tokens()`, and no raw-text accessor, conversion,",
+        "    /// deref or formatting impl of any spelling — and this copy",
+        "    /// deliberately has no text-accepting method at all, so a body assertion is not even",
+        "    /// expressible here (no serialized body exists in this file's scope).",
+        "    /// The whole block, including the attribute above it, is byte-frozen",
+        "    /// by `the_wire_literal_module_is_byte_frozen`; it invokes no macro,",
+        "    /// so no macro can be shadowed into it.",
+        "    pub(crate) struct WireLiteral(&'static str);",
+        "",
+        "    impl WireLiteral {",
+        "        pub(crate) const fn new(text: &'static str) -> Self {",
+        "            Self(text)",
+        "        }",
+        "",
+        "        /// True iff the captured text is EXACTLY what the locked encoder",
+        "        /// emits for `want`: it parses bit-identically to `want` AND",
+        "        /// `serde_json::to_string(&want)` reproduces it. This is the",
+        "        /// per-row transcription pin for the captured table.",
+        "        pub(crate) fn denotes(&self, want: f64) -> bool {",
+        "            let parses = match self.0.parse::<f64>() {",
+        "                Ok(v) => v.to_bits() == want.to_bits(),",
+        "                Err(_) => false,",
+        "            };",
+        "            let renders = match serde_json::to_string(&want) {",
+        "                Ok(s) => s == self.0,",
+        "                Err(_) => false,",
+        "            };",
+        "            parses && renders",
+        "        }",
+        "",
+        "        /// Significant digits of the captured rendering (leading and",
+        "        /// trailing zeros stripped). A width only discriminates the two",
+        "        /// rounding forms formatter-independently if this is 17.",
+        "        pub(crate) fn significant_digits(&self) -> usize {",
+        "            let mut digits = String::new();",
+        "            for c in self.0.chars() {",
+        "                if c.is_ascii_digit() {",
+        "                    digits.push(c);",
+        "                }",
+        "            }",
+        "            digits.trim_start_matches('0').trim_end_matches('0').len()",
+        "        }",
+        "    }",
+        "}",
+    ];
+
+    /// Issue #237 residual R4, closed mechanically: `mod wire_literal`
+    /// (including the `#[cfg(test)]` attribute attached to it) is
+    /// byte-frozen against this file's own source. Any attribute above
+    /// it, added method, changed signature or changed body fails here —
+    /// the span extends upward to the previous column-0 `}` so an outer
+    /// attribute cannot sit outside the frozen text.
+    #[test]
+    fn the_wire_literal_module_is_byte_frozen() {
+        let src = include_str!("exec.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut mod_lines: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim() == "mod wire_literal {" {
+                mod_lines.push(i);
+            }
+        }
+        assert_eq!(mod_lines.len(), 1, "exactly one wire_literal module");
+        let m = mod_lines[0];
+        let mut e = None;
+        for (i, line) in lines.iter().enumerate().skip(m + 1) {
+            if *line == "}" {
+                e = Some(i);
+                break;
+            }
+        }
+        let e = e.expect("module closes at column 0");
+        let mut s = 0;
+        for i in (0..m).rev() {
+            if lines[i] == "}" {
+                s = i + 1;
+                break;
+            }
+        }
+        while s < m && lines[s].trim().is_empty() {
+            s += 1;
+        }
+        assert_eq!(
+            lines[s..=e].to_vec(),
+            FROZEN_WIRE_LITERAL_EXEC,
+            "mod wire_literal must stay byte-identical to the frozen text \
+             (issue #237; update both sides in the same commit, loudly)"
+        );
     }
 
     #[test]

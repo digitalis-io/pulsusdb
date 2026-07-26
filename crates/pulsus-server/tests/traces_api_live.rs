@@ -54,6 +54,8 @@ const PORT: u16 = 31_130;
 const ALIAS_PORT: u16 = 31_135;
 /// The issue #75 Zipkin shared-span round-trip suite's own spawn.
 const ZIPKIN_PORT: u16 = 31_136;
+/// The issue #237 ns→seconds wire-byte suite's own spawn.
+const ULP_PORT: u16 = 31_137;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,
@@ -101,6 +103,196 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .windows(needle.len())
         .position(|window| window == needle)
 }
+
+mod wire_literal {
+    /// A reference-captured wire rendering (issue #237), bytes flavour.
+    /// Nothing textual or numeric leaves this module: every exit is a
+    /// predicate or the opaque `WireProbe`. There is no `value()`, no
+    /// `tokens()`, and no raw-text accessor, conversion, deref or
+    /// formatting impl of any spelling, so a bare
+    /// `find_subslice(&body, lit)` does not COMPILE — the captured text
+    /// has no accidental landing site. This whole
+    /// block is byte-frozen by the `metrics_response.rs` scanner (Rule
+    /// C, upward-extended span); it invokes no macro and does not depend
+    /// on `find_subslice` (its search is its own, inside the frozen
+    /// span).
+    pub(crate) struct WireLiteral(&'static str);
+
+    /// Raw HTTP body bytes handed to the single search path. Built only
+    /// from a caller body or `WireLiteral::surrounded_by`; no reader.
+    pub(crate) struct WireProbe(Vec<u8>);
+
+    impl WireProbe {
+        pub(crate) fn body(bytes: &[u8]) -> Self {
+            Self(bytes.to_vec())
+        }
+    }
+
+    impl WireLiteral {
+        pub(crate) const fn new(text: &'static str) -> Self {
+            Self(text)
+        }
+
+        /// True iff the captured text is EXACTLY what the locked encoder
+        /// emits for `want`: it parses bit-identically to `want` AND
+        /// `serde_json::to_string(&want)` reproduces it.
+        pub(crate) fn denotes(&self, want: f64) -> bool {
+            let parses = match self.0.parse::<f64>() {
+                Ok(v) => v.to_bits() == want.to_bits(),
+                Err(_) => false,
+            };
+            let renders = match serde_json::to_string(&want) {
+                Ok(s) => s == self.0,
+                Err(_) => false,
+            };
+            parses && renders
+        }
+
+        /// The rendering as the `}`-closed JSON value token (a
+        /// `Sample.value` is last in its object).
+        fn closed(&self) -> Vec<u8> {
+            let mut t = Vec::new();
+            t.extend_from_slice(b"\"value\":");
+            t.extend_from_slice(self.0.as_bytes());
+            t.push(b'}');
+            t
+        }
+
+        /// The rendering as the `,`-separated JSON value token (an
+        /// `Exemplar.value` precedes `timestampMs`).
+        fn separated(&self) -> Vec<u8> {
+            let mut t = Vec::new();
+            t.extend_from_slice(b"\"value\":");
+            t.extend_from_slice(self.0.as_bytes());
+            t.push(b',');
+            t
+        }
+
+        fn appears(token: &[u8], body: &[u8]) -> bool {
+            if token.is_empty() || body.len() < token.len() {
+                return false;
+            }
+            body.windows(token.len()).any(|w| w == token)
+        }
+
+        /// The ONLY search: true iff the rendering appears as a
+        /// DELIMITED JSON value token. Never bare — one captured
+        /// rendering is a prefix of another (see the #237 table), so a
+        /// bare byte check is wrong in BOTH directions.
+        pub(crate) fn occurs_in(&self, probe: &WireProbe) -> bool {
+            Self::appears(&self.closed(), &probe.0) || Self::appears(&self.separated(), &probe.0)
+        }
+
+        /// This rendering wrapped in caller-chosen text, as a probe —
+        /// the delimiter-sensitivity control runs through the same
+        /// `occurs_in` the body assertions use.
+        pub(crate) fn surrounded_by(&self, left: &str, right: &str) -> WireProbe {
+            let mut t = Vec::new();
+            t.extend_from_slice(left.as_bytes());
+            t.extend_from_slice(self.0.as_bytes());
+            t.extend_from_slice(right.as_bytes());
+            WireProbe(t)
+        }
+    }
+}
+
+use self::wire_literal::{WireLiteral, WireProbe};
+
+/// Reference-captured ns→seconds renderings (issue #237).
+/// `grafana/tempo:3.0.2@sha256:cda87c21…`, probed 2026-07-26.
+/// `(ns, seconds value, captured rendering, two-rounding rendering)`.
+/// One copy per site by design — the `metrics_response.rs` scanner's
+/// Rule A cross-checks this copy against its own, cell for cell.
+const REFERENCE_DURATION_SECONDS: &[(i64, f64, WireLiteral, WireLiteral)] = &[
+    // ≤16-digit group: 1 ULP apart; pinned by the reference's own
+    // comparison operator (`>= L` matches, `> L` does not).
+    (
+        1_118_000_000,
+        1.118,
+        WireLiteral::new("1.118"),
+        WireLiteral::new("1.1179999999999999"),
+    ),
+    (
+        1_122_000_000,
+        1.122,
+        WireLiteral::new("1.122"),
+        WireLiteral::new("1.1219999999999999"),
+    ),
+    (
+        1_128_000_000,
+        1.128,
+        WireLiteral::new("1.128"),
+        WireLiteral::new("1.1280000000000001"),
+    ),
+    (
+        1_235_000_000,
+        1.235,
+        WireLiteral::new("1.235"),
+        WireLiteral::new("1.2349999999999999"),
+    ),
+    (
+        31_952_000_000,
+        31.952,
+        WireLiteral::new("31.952"),
+        WireLiteral::new("31.951999999999998"),
+    ),
+    (
+        1_000_064_438,
+        1.000064438,
+        WireLiteral::new("1.000064438"),
+        WireLiteral::new("1.0000644379999999"),
+    ),
+    // 17-significant-digit group: the formatter-independent RAW-WIRE
+    // discriminators (#237 round 3). `ns > 2^53`, so the `int64->f64`
+    // cast is lossy and the two-rounding value is the correctly rounded
+    // one — the reference emitting the single-rounding value positively
+    // identifies a cast-first form.
+    (
+        18_014_398_509_482_025,
+        18_014_398.509_482_022,
+        WireLiteral::new("18014398.509482022"),
+        WireLiteral::new("18014398.509482026"),
+    ),
+    (
+        18_014_398_509_482_035,
+        18_014_398.509_482_037,
+        WireLiteral::new("18014398.509482037"),
+        WireLiteral::new("18014398.509482034"),
+    ),
+    (
+        18_014_398_509_482_017,
+        18_014_398.509_482_015,
+        WireLiteral::new("18014398.509482015"),
+        WireLiteral::new("18014398.50948202"),
+    ),
+    (
+        1_088_608_058_291_172_412,
+        1_088_608_058.291_172_3,
+        WireLiteral::new("1088608058.2911723"),
+        WireLiteral::new("1088608058.2911725"),
+    ),
+    (
+        10_000_000_000_000_005,
+        10_000_000.000_000_004,
+        WireLiteral::new("10000000.000000004"),
+        WireLiteral::new("10000000.000000006"),
+    ),
+    (
+        10_000_000_000_000_015,
+        10_000_000.000_000_017,
+        WireLiteral::new("10000000.000000017"),
+        WireLiteral::new("10000000.000000015"),
+    ),
+];
+
+/// Exactly representable under both rounding forms — gross-scaling
+/// controls, asserted at bit level only (their wire text is #263's
+/// integral-double question, deliberately not asserted).
+const REFERENCE_DURATION_CONTROLS: &[(i64, f64)] = &[
+    (500_000_000, 0.5),
+    (1_500_000_000, 1.5),
+    (2_000_000_000, 2.0),
+];
 
 fn dechunk(mut raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -899,4 +1091,162 @@ async fn zipkin_shared_span_trace_by_id_returns_both_the_server_and_client_sides
             .is_some_and(|t| t.iter().any(|tr| tr["traceID"] == trace_hex)),
         "{ctx}: the shared-span trace must appear in search results, body {json}"
     );
+}
+
+/// Extracts the one instant sample's numeric token
+/// (`"samples":[{"timestampMs":…,"value":<tok>}`) from a raw metrics body
+/// and parses it with the std (correctly rounded) parser. Deliberately
+/// NOT `res.json()[…].as_f64()`: serde_json's default float parse is
+/// best-effort (the `float_roundtrip` feature is off workspace-wide) and
+/// mis-decodes some 17-significant-digit tokens by 1 ULP — the decoded
+/// assertion would then fire on a byte-correct body (issue #237; observed
+/// live on the 1_088_608_058_291_172_412 ns width).
+fn decoded_instant_sample_bits(body: &[u8], ctx: &str) -> u64 {
+    let samples = find_subslice(body, b"\"samples\":[")
+        .unwrap_or_else(|| panic!("{ctx}: body carries a samples array"));
+    let rest = &body[samples..];
+    let v = find_subslice(rest, b"\"value\":")
+        .unwrap_or_else(|| panic!("{ctx}: the sample carries a value"));
+    let tail = &rest[v + 8..];
+    let end = tail
+        .iter()
+        .position(|b| *b == b'}' || *b == b',')
+        .unwrap_or_else(|| panic!("{ctx}: the value token terminates"));
+    let tok = std::str::from_utf8(&tail[..end]).unwrap_or_else(|e| panic!("{ctx}: utf8: {e}"));
+    tok.parse::<f64>()
+        .unwrap_or_else(|e| panic!("{ctx}: numeric value token: {e}"))
+        .to_bits()
+}
+
+/// Issue #237 (Tier-1, scale-invariant): a seeded span's duration reaches
+/// the HTTP wire as the exact bytes the reference emits for the same
+/// width. Widths are derived-first — `1500ms`/`2s` are exactly
+/// representable under both rounding forms and prove nothing; the six
+/// 17-significant-digit widths (`ns > 2^53`, up to 12 599 days) are the
+/// formatter-independent discriminators captured from the pinned
+/// reference container (`grafana/tempo:3.0.2@sha256:cda87c21…`,
+/// 2026-07-26). Very long spans are valid fixtures: `duration_ns` is
+/// `Int64`, ingest does not clamp below `i64::MAX`, and the metrics
+/// window predicate filters on span START only.
+#[tokio::test(flavor = "multi_thread")]
+async fn duration_seconds_reach_the_wire_exactly_as_the_reference_emits_them() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-server/tests/traces_api_live.rs for setup)"
+        );
+        return;
+    }
+
+    let _guard = spawn_ready(ULP_PORT, "pulsus_traces_ulp_it_live");
+
+    // One single-span service per width (12 discriminating + 3 controls),
+    // one `ResourceSpans` per service, one sync protobuf POST /v1/traces.
+    // The file's `ingest()`/`span()` helpers hardcode `checkout`/1 ms, so
+    // the fixture is built locally. Span start is the file's existing
+    // fixture instant; end = start + width.
+    let mut widths: Vec<(String, i64, f64)> = Vec::new();
+    for (i, (ns, want, _, _)) in REFERENCE_DURATION_SECONDS.iter().enumerate() {
+        widths.push((format!("ulp-w{i}"), *ns, *want));
+    }
+    for (i, (ns, want)) in REFERENCE_DURATION_CONTROLS.iter().enumerate() {
+        widths.push((format!("ulp-c{i}"), *ns, *want));
+    }
+    let start_ns: u64 = 3_100_000_000_000_000_200;
+    let resource_spans: Vec<ResourceSpans> = widths
+        .iter()
+        .enumerate()
+        .map(|(i, (svc, ns, _))| {
+            let seq = u8::try_from(i + 1).expect("small fixture");
+            let mut sp = span([seq; 16], [seq; 8], "ulp-span", start_ns);
+            sp.end_time_unix_nano = start_ns + u64::try_from(*ns).expect("positive width");
+            ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", svc)],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "live-scope".to_string(),
+                        version: String::new(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    spans: vec![sp],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }
+        })
+        .collect();
+    let req = ExportTraceServiceRequest { resource_spans };
+    let ctx = "seed ULP widths";
+    let res = request(
+        ULP_PORT,
+        "POST",
+        "/v1/traces",
+        &[],
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+    )
+    .unwrap_or_else(|| panic!("{ctx}: ingest must be reachable"));
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: sync ingest must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+
+    // Window math in unix SECONDS (magnitude < 10^12), the file's
+    // existing fixture idiom; the instant query returns one series with
+    // one sample per service.
+    for (i, (svc, ns, want)) in widths.iter().enumerate() {
+        let q = format!(
+            "%7B%20resource.service.name%20%3D%20%22{svc}%22%20%7D%20%7C%20max_over_time(duration)"
+        );
+        let path =
+            format!("/api/traces/v1/metrics/query?q={q}&start=3099999000&end=3100001000&step=60");
+        let ctx = format!("ULP width {ns} ns ({svc})");
+        let res = get(ULP_PORT, &path, &[], &ctx);
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        if i < REFERENCE_DURATION_SECONDS.len() {
+            let (_, _, s_lit, t_lit) = &REFERENCE_DURATION_SECONDS[i];
+            let probe = WireProbe::body(&res.body);
+            assert!(s_lit.denotes(*want), "{ctx}: transcription");
+            assert!(s_lit.occurs_in(&probe), "{ctx}: captured bytes on the wire");
+            assert!(!t_lit.occurs_in(&probe), "{ctx}: two-rounding bytes");
+        }
+        // Decoded bit-equality for all 15 widths (controls included),
+        // via the correctly rounded std parser on the raw value token.
+        assert_eq!(
+            decoded_instant_sample_bits(&res.body, &ctx),
+            want.to_bits(),
+            "{ctx}: decoded bits"
+        );
+    }
+}
+
+/// Issue #237 guard leg (e) for the bytes copy: `occurs_in` is
+/// delimiter-sensitive, exercised through the SAME function the live
+/// body assertions use, with needles built from the module's own
+/// `surrounded_by` (derived text only). Hermetic — needs no ClickHouse
+/// and rides the workspace test step on every PR.
+#[test]
+fn wire_literal_occurs_in_is_delimiter_sensitive() {
+    for (ns, want, s_lit, t_lit) in REFERENCE_DURATION_SECONDS {
+        assert!(s_lit.denotes(*want), "{ns}: transcription");
+        for lit in [s_lit, t_lit] {
+            let outside = lit.surrounded_by("prefix", "suffix");
+            assert!(!lit.occurs_in(&outside), "{ns}");
+            let closed = lit.surrounded_by("{\"value\":", "}");
+            assert!(lit.occurs_in(&closed), "{ns}");
+            let inside = lit.surrounded_by("{\"value\":", ",\"timestampMs\":\"1\"}");
+            assert!(lit.occurs_in(&inside), "{ns}");
+        }
+    }
 }

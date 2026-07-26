@@ -1239,3 +1239,115 @@ async fn metrics_internal_consistency_identities() {
          mod 2^32"
     );
 }
+
+/// Isolated DB for the issue #237 ns→seconds ULP gate.
+const DB_ULP: &str = "pulsus_traces_metrics_ulp_it";
+
+/// Issue #237 (Tier-1, scale-invariant): the ns→seconds conversion of a
+/// duration value survives the whole SQL→decode path bit-exactly and
+/// equals the value captured from the pinned reference container
+/// (`grafana/tempo:3.0.2@sha256:cda87c21…`, 2026-07-26). Widths are
+/// derived-first — `1500ms`/`2s` are exactly representable under both
+/// rounding forms and prove nothing; the six `>2^53` widths additionally
+/// prove ClickHouse's `toFloat64(Int64)` agrees bit-for-bit with the
+/// Rust cast on lossy-cast inputs. Own throwaway database — the shared
+/// `DB` corpus is uniformly `duration_ns = 1_000_000` and its
+/// aggregation identities (`min == max == avg`) must not be perturbed.
+#[tokio::test]
+async fn duration_seconds_conversion_matches_the_reference() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-read/tests/traces_metrics_live.rs for setup)"
+        );
+        return;
+    }
+
+    // (ns, reference-captured seconds value). The first six are the
+    // ≤16-digit ULP widths, the next six the 17-significant-digit
+    // raw-wire discriminators, the last three exactly-representable
+    // controls. Do NOT "fix" the expectations to the two-rounding form —
+    // that would introduce the divergence #237 ruled out.
+    const WIDTHS: &[(i64, f64)] = &[
+        (1_118_000_000, 1.118),
+        (1_122_000_000, 1.122),
+        (1_128_000_000, 1.128),
+        (1_235_000_000, 1.235),
+        (31_952_000_000, 31.952),
+        (1_000_064_438, 1.000064438),
+        (18_014_398_509_482_025, 18_014_398.509_482_022),
+        (18_014_398_509_482_035, 18_014_398.509_482_037),
+        (18_014_398_509_482_017, 18_014_398.509_482_015),
+        (1_088_608_058_291_172_412, 1_088_608_058.291_172_3),
+        (10_000_000_000_000_005, 10_000_000.000_000_004),
+        (10_000_000_000_000_015, 10_000_000.000_000_017),
+        (500_000_000, 0.5),
+        (1_500_000_000, 1.5),
+        (2_000_000_000, 2.0),
+    ];
+
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_ULP}")).await;
+    run_init(&admin, &test_ctx(DB_ULP)).await.expect("run_init");
+
+    let client = {
+        let mut cfg = test_config();
+        cfg.database = DB_ULP.to_string();
+        ChClient::new(cfg).await.expect("connect data client")
+    };
+
+    // One single-span trace per width, one service each, starts inside
+    // the aligned window (the window predicate filters on start only).
+    let mut values: Vec<String> = Vec::new();
+    for (i, (ns, _)) in WIDTHS.iter().enumerate() {
+        let ts_ns = (base_s() + i as i64) * NS;
+        values.push(format!(
+            "(toFixedString(unhex('{:032x}'), 16), toFixedString(unhex('{:016x}'), 8), \
+             toFixedString(unhex('0000000000000000'), 8), 'ulp-span', 'u{i}', '', {ts_ns}, \
+             {ns}, 0, 1, 1, 'p')",
+            i + 1,
+            i + 1
+        ));
+    }
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB_ULP}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, status_message, timestamp_ns, \
+              duration_ns, status_code, kind, payload_type, payload) VALUES {}",
+            values.join(", ")
+        ),
+    )
+    .await;
+
+    let engine = TraceEngine::new(
+        {
+            let mut cfg = test_config();
+            cfg.database = DB_ULP.to_string();
+            ChClient::new(cfg).await.expect("connect engine")
+        },
+        engine_config(),
+    );
+
+    // Aligned single-bucket instant query per service: the decoded f64
+    // must be bit-identical to the captured reference value.
+    let end_s = base_s() + CORPUS_SPANS;
+    for (i, (ns, want)) in WIDTHS.iter().enumerate() {
+        let plan = plan_for(
+            &engine,
+            &format!(r#"{{ resource.service.name = "u{i}" }} | max_over_time(duration)"#),
+            base_s(),
+            end_s,
+            CORPUS_SPANS,
+        );
+        let got = vector_value(&engine.metrics_instant(&plan).await.expect("instant"));
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{ns} ns: SQL→decode must reproduce the reference's single-rounding f64 \
+             (got {got}, want {want})"
+        );
+    }
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_ULP}")).await;
+}
