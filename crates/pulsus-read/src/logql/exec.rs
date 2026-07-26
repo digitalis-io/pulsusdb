@@ -3283,7 +3283,7 @@ where
         average_duration / 2.0
     };
     result_value *= extrapolate_to / sampled_interval;
-    result_value / (rng_ns as f64 / 1_000_000_000.0) // isRate: / selRange.Seconds()
+    result_value / range_seconds(rng_ns) // isRate: / selRange.Seconds()
 }
 
 /// The reference oracle's quantile semantics (live-probed: `q=0.9` over
@@ -6290,9 +6290,37 @@ fn check_stream_cap(count: usize, cap: usize) -> Result<(), ReadError> {
     }
 }
 
+/// The `[range]` selector width in seconds, in the reference's EXACT
+/// arithmetic (issue #232).
+///
+/// The reference divides every per-second reducer by `selRange.Seconds()`,
+/// which is `float64(d/Second) + float64(d%Second)/1e9` — **two** roundings
+/// (the sub-second division, then the addition). The obvious
+/// `ns as f64 / 1e9` is **one** rounding and is not the same function: for
+/// `1118ms` it yields `1.1180000000000001048` where the reference yields
+/// `1.1179999999999998828`, one ULP apart, which propagates straight into
+/// the emitted `rate` / `bytes_rate` value (probed against
+/// `grafana/loki:3.7.4`: `rate(...[1118ms])` over one line is
+/// `0.8944543828264759`, not `0.8944543828264757`).
+///
+/// Whole-second and sub-second widths are unaffected (`nsec == 0` makes the
+/// addition exact; `sec == 0` reduces to the single division), which is why
+/// no corpus case caught this before — 788 of the 86.4M millisecond-granular
+/// widths up to 24h differ.
+fn range_seconds(ns: u64) -> f64 {
+    let sec = ns / 1_000_000_000;
+    let nsec = ns % 1_000_000_000;
+    // Both operands are exact in f64 — `sec <= MAX_DURATION_NS / 1e9`
+    // (~9.2e9) and `nsec < 1e9` are both well under 2^53 — so the only
+    // roundings are the two the reference performs. The reference's own
+    // `Duration` is an int64 nanosecond count with the same ceiling, so the
+    // two forms agree over the whole representable domain, not just here.
+    sec as f64 + nsec as f64 / 1_000_000_000.0
+}
+
 fn apply_rate(n: f64, rate_window_ns: Option<u64>) -> f64 {
     match rate_window_ns {
-        Some(window_ns) if window_ns > 0 => n / (window_ns as f64 / 1_000_000_000.0),
+        Some(window_ns) if window_ns > 0 => n / range_seconds(window_ns),
         _ => n,
     }
 }
@@ -7565,7 +7593,10 @@ mod tests {
                 average_duration / 2.0
             };
             result_value *= extrapolate_to / sampled_interval;
-            result_value / (rng_ns as f64 / 1_000_000_000.0)
+            // `selRange.Seconds()`, transcribed inline (issue #232) rather
+            // than calling `range_seconds` — this reference form stays
+            // independent of the production code it pins.
+            result_value / ((rng_ns / 1_000_000_000) as f64 + (rng_ns % 1_000_000_000) as f64 / 1e9)
         }
 
         let windows: Vec<Vec<(i64, f64)>> = vec![
@@ -7590,7 +7621,11 @@ mod tests {
                     value,
                 })
                 .collect();
-            for rate_window_ns in [None, Some(0u64), Some(30_000_000_000)] {
+            // `1_118_000_000` is a NON-whole-second width, where the
+            // reference's two-rounding `Seconds()` and the naive
+            // `ns as f64 / 1e9` disagree by an ULP (issue #232) — so the
+            // divisor is pinned here too, not just the extrapolation.
+            for rate_window_ns in [None, Some(0u64), Some(30_000_000_000), Some(1_118_000_000)] {
                 let borrowed = reduce_window(
                     RangeAggOp::RateCounter,
                     ReducerClass::CanonicalFold,
@@ -11096,5 +11131,72 @@ mod tests {
     #[test]
     fn apply_rate_is_identity_when_no_window_is_given() {
         assert_eq!(apply_rate(42.0, None), 42.0);
+    }
+
+    /// Issue #232: `range_seconds` is the reference's `Duration.Seconds()`
+    /// (`float64(d/Second) + float64(d%Second)/1e9`), NOT `ns as f64 / 1e9`.
+    /// The two disagree by an ULP on widths that are neither whole-second nor
+    /// sub-second; the expected bit patterns below are the reference form's,
+    /// and the naive form is asserted to be a DIFFERENT value so the test
+    /// cannot pass against it.
+    #[test]
+    fn range_seconds_uses_the_references_two_rounding_form() {
+        for ns in [
+            1_118_000_000u64,
+            1_122_000_000,
+            1_235_000_000,
+            1_247_000_000,
+        ] {
+            let naive = ns as f64 / 1_000_000_000.0;
+            let two_rounding =
+                (ns / 1_000_000_000) as f64 + (ns % 1_000_000_000) as f64 / 1_000_000_000.0;
+            assert_ne!(
+                naive.to_bits(),
+                two_rounding.to_bits(),
+                "{ns} ns must be a case where the two forms disagree"
+            );
+            assert_eq!(
+                range_seconds(ns).to_bits(),
+                two_rounding.to_bits(),
+                "{ns} ns must round the reference's way"
+            );
+        }
+    }
+
+    /// Whole-second widths (`nsec == 0`) and sub-second widths (`sec == 0`)
+    /// are identical under both forms — the #232 change is inert for them,
+    /// which is why no corpus case caught the divergence before.
+    #[test]
+    fn range_seconds_matches_the_naive_form_on_whole_and_sub_second_widths() {
+        let mut widths: Vec<u64> = (0..=600).map(|s| s * 1_000_000_000).collect();
+        widths.extend((0..1_000).map(|ms| ms * 1_000_000));
+        widths.push(1);
+        widths.push(999_999_999);
+        for ns in widths {
+            assert_eq!(
+                range_seconds(ns).to_bits(),
+                (ns as f64 / 1_000_000_000.0).to_bits(),
+                "{ns} ns must be identical under both forms"
+            );
+        }
+    }
+
+    /// The captured reference value for `rate` over one line in a `[1118ms]`
+    /// window (`grafana/loki:3.7.4`, 2026-07-26) — the emitted-value proof
+    /// that the divisor's rounding is observable, not merely internal.
+    #[test]
+    fn apply_rate_reproduces_the_captured_reference_value_for_a_sub_ulp_window() {
+        assert_eq!(
+            apply_rate(1.0, Some(1_118_000_000)).to_bits(),
+            0.8944543828264759_f64.to_bits()
+        );
+        assert_eq!(
+            apply_rate(3.0, Some(1_118_000_000)).to_bits(),
+            2.683363148479428_f64.to_bits()
+        );
+        assert_eq!(
+            apply_rate(1.0, Some(1_128_000_000)).to_bits(),
+            0.8865248226950354_f64.to_bits()
+        );
     }
 }
