@@ -2,7 +2,12 @@
 //! current position; a `depth` counter threaded through metric-expression
 //! parsing guards against unbounded nesting (`sum(sum(sum(...)))`) —
 //! [`crate::error::MAX_DEPTH`] levels return `RecursionLimitExceeded`
-//! instead of overflowing the call stack.
+//! instead of overflowing the call stack. A second counter threaded
+//! through the label-filter grammar guards its parenthesis recursion
+//! (`| ((((x="1"))))`) the same way —
+//! [`crate::error::LABEL_FILTER_MAX_DEPTH`] levels, issue #255. It bounds
+//! **paren nesting only**: flat `or`/`and` chains are parsed iteratively
+//! at depth 1 and are not counted.
 //!
 //! Disambiguation of the overloaded `!=`/`!~` tokens (selector matcher,
 //! line filter, or — `!=` only — a binary comparison) is purely
@@ -18,7 +23,7 @@ use crate::ast::{
     StreamSelector, Unwrap, VectorAggOp,
 };
 use crate::duration;
-use crate::error::{LogQlError, MAX_DEPTH};
+use crate::error::{LABEL_FILTER_MAX_DEPTH, LogQlError, MAX_DEPTH};
 use crate::lexer;
 use crate::token::{Span, Token, TokenKind};
 
@@ -325,6 +330,7 @@ fn parse_binary_expr(
     if depth >= MAX_DEPTH {
         return Err(LogQlError::RecursionLimitExceeded {
             span: cursor.peek().span,
+            limit: MAX_DEPTH,
         });
     }
     let mut lhs = parse_metric_primary(cursor, depth)?;
@@ -645,9 +651,9 @@ fn parse_pipe_stage(cursor: &mut Cursor<'_>) -> Result<Stage, LogQlError> {
             }
             // Any other identifier at stage position starts a label
             // filter (e.g. `| status="500"`, `| status >= 500`).
-            _ => Ok(Stage::LabelFilter(parse_label_filter_or(cursor)?)),
+            _ => Ok(Stage::LabelFilter(parse_label_filter_or(cursor, 0)?)),
         },
-        TokenKind::LParen => Ok(Stage::LabelFilter(parse_label_filter_or(cursor)?)),
+        TokenKind::LParen => Ok(Stage::LabelFilter(parse_label_filter_or(cursor, 0)?)),
         TokenKind::Eof => Err(LogQlError::UnexpectedEof {
             expected: "a pipeline stage".to_string(),
             span: tok.span,
@@ -810,19 +816,33 @@ fn parse_unwrap(cursor: &mut Cursor<'_>) -> Result<Unwrap, LogQlError> {
 }
 
 /// Label-filter boolean grammar, precedence-climbing: `or` binds loosest,
-/// `and`/`,` bind tighter, parentheses group.
-fn parse_label_filter_or(cursor: &mut Cursor<'_>) -> Result<LabelFilterExpr, LogQlError> {
-    let mut left = parse_label_filter_and(cursor)?;
+/// `and`/`,` bind tighter, parentheses group. `depth` counts parenthesis
+/// nesting only (the sole recursion in this family, issue #255): `or`/
+/// `and` terms are consumed iteratively and never increment it.
+fn parse_label_filter_or(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+) -> Result<LabelFilterExpr, LogQlError> {
+    if depth >= LABEL_FILTER_MAX_DEPTH {
+        return Err(LogQlError::RecursionLimitExceeded {
+            span: cursor.peek().span,
+            limit: LABEL_FILTER_MAX_DEPTH,
+        });
+    }
+    let mut left = parse_label_filter_and(cursor, depth)?;
     while matches!(&cursor.peek().kind, TokenKind::Ident(name) if name == "or") {
         cursor.advance();
-        let right = parse_label_filter_and(cursor)?;
+        let right = parse_label_filter_and(cursor, depth)?;
         left = LabelFilterExpr::Or(Box::new(left), Box::new(right));
     }
     Ok(left)
 }
 
-fn parse_label_filter_and(cursor: &mut Cursor<'_>) -> Result<LabelFilterExpr, LogQlError> {
-    let mut left = parse_label_filter_factor(cursor)?;
+fn parse_label_filter_and(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+) -> Result<LabelFilterExpr, LogQlError> {
+    let mut left = parse_label_filter_factor(cursor, depth)?;
     loop {
         let is_and = match &cursor.peek().kind {
             TokenKind::Comma => true,
@@ -833,15 +853,18 @@ fn parse_label_filter_and(cursor: &mut Cursor<'_>) -> Result<LabelFilterExpr, Lo
             return Ok(left);
         }
         cursor.advance();
-        let right = parse_label_filter_factor(cursor)?;
+        let right = parse_label_filter_factor(cursor, depth)?;
         left = LabelFilterExpr::And(Box::new(left), Box::new(right));
     }
 }
 
-fn parse_label_filter_factor(cursor: &mut Cursor<'_>) -> Result<LabelFilterExpr, LogQlError> {
+fn parse_label_filter_factor(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+) -> Result<LabelFilterExpr, LogQlError> {
     if matches!(cursor.peek().kind, TokenKind::LParen) {
         cursor.advance();
-        let inner = parse_label_filter_or(cursor)?;
+        let inner = parse_label_filter_or(cursor, depth + 1)?;
         cursor.expect(&TokenKind::RParen, "')'")?;
         return Ok(inner);
     }
@@ -1018,6 +1041,7 @@ fn parse_metric_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr
     if depth >= MAX_DEPTH {
         return Err(LogQlError::RecursionLimitExceeded {
             span: cursor.peek().span,
+            limit: MAX_DEPTH,
         });
     }
     let tok = cursor.peek().clone();
