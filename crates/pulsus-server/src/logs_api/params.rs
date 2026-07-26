@@ -147,9 +147,15 @@ pub(crate) enum ParamError {
 pub(crate) const MAX_RANGE_QUERY_POINTS: u64 = 11_000;
 
 /// Enforces Loki's `(end - start) / step > 11000` resolution limit (issue
-/// #227). i128 arithmetic — the full `i64` span at a 1ns step overflows a
-/// plain `i64` count. A non-positive span never trips (mirrors Loki's
-/// integer `Duration/Duration`).
+/// #227). The span SATURATES, exactly like the reference's (issue #227
+/// review round 8): `End.Sub(Start)` is Go's `time.Time.Sub`, which clamps
+/// an out-of-range difference to the int64-nanosecond `Duration` bounds
+/// (`maxDuration = 1<<63-1`) instead of widening — so a full-domain span
+/// at a huge step is SERVED (`maxDuration / step ≤ 11000`), where exact
+/// i128 arithmetic would wrongly reject it. `end < start` never trips
+/// (the reference 400s that as `errEndBeforeStart` before the fence, and
+/// its saturated `minDuration / step ≤ 0` could not trip either); the
+/// division truncates (Go integer `Duration / Duration`).
 pub(crate) fn ensure_range_resolution(
     start_ns: i64,
     end_ns: i64,
@@ -158,8 +164,9 @@ pub(crate) fn ensure_range_resolution(
     if step_ns == 0 {
         return Ok(()); // a zero step is already a 400 from `parse_step`.
     }
-    let span = end_ns as i128 - start_ns as i128;
-    if span > 0 && span / step_ns as i128 > MAX_RANGE_QUERY_POINTS as i128 {
+    // Loki-exact: `end - start` clamped to i64 (`time.Time.Sub` saturation).
+    let span = end_ns.saturating_sub(start_ns);
+    if span > 0 && span as u64 / step_ns > MAX_RANGE_QUERY_POINTS {
         return Err(ParamError::MaxResolutionExceeded);
     }
     Ok(())
@@ -871,12 +878,40 @@ mod tests {
 
     #[test]
     fn resolution_check_does_not_overflow_at_the_full_i64_span() {
-        // i64::MIN..i64::MAX at a 1ns step is ~2^64 intervals — must reject
-        // via i128, never panic/wrap.
+        // i64::MIN..i64::MAX at a 1ns step: the SATURATED span (i64::MAX
+        // ns, Go `time.Time.Sub`'s `maxDuration` clamp) is still ~9.2e18
+        // intervals — reject, never panic/wrap.
         assert!(matches!(
             ensure_range_resolution(i64::MIN, i64::MAX, 1).unwrap_err(),
             ParamError::MaxResolutionExceeded
         ));
+    }
+
+    #[test]
+    fn resolution_fence_saturates_the_span_like_the_reference() {
+        // Issue #227 review round 8: the reference's `End.Sub(Start)` (Go
+        // `time.Time.Sub`) SATURATES an out-of-range difference at
+        // `maxDuration = 1<<63-1` ns rather than widening. The full-domain
+        // span at a 1_000_000s step therefore counts i64::MAX/step = 9_223
+        // intervals — SERVED — where exact i128 arithmetic counted the true
+        // 2^64-1 ns span as 18_446 and wrongly rejected.
+        const STEP: u64 = 1_000_000_000_000_000; // 1_000_000s in ns
+        assert!(ensure_range_resolution(i64::MIN, i64::MAX, STEP).is_ok());
+
+        // The saturated-fence boundary: floor(i64::MAX / 11_001) is the
+        // largest step counting 11_001 saturated intervals (reject); one
+        // nanosecond of step more counts 11_000 (admit).
+        let reject_step = (i64::MAX / 11_001) as u64;
+        assert!(matches!(
+            ensure_range_resolution(i64::MIN, i64::MAX, reject_step).unwrap_err(),
+            ParamError::MaxResolutionExceeded
+        ));
+        assert!(ensure_range_resolution(i64::MIN, i64::MAX, reject_step + 1).is_ok());
+
+        // Saturation onset: a span of exactly i64::MAX ns is byte-identical
+        // saturated or exact; the ordinary domain is untouched.
+        assert!(ensure_range_resolution(-1, i64::MAX - 1, STEP).is_ok());
+        assert!(ensure_range_resolution(-1, i64::MAX - 1, reject_step).is_err());
     }
 
     #[test]

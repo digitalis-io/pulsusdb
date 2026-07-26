@@ -3328,7 +3328,8 @@ fn render_series_labels(sorted: &[(String, String)]) -> String {
 /// the sliding data leaves' start-anchored grid. i128 intermediates keep
 /// `grid_start + k·step` overflow-free; every point lies in
 /// `[grid_start, end]` (no clamp needed — `k ≥ 0`). The grid passed
-/// [`ensure_grid_resolution`] before this runs (≤ 11 001 points).
+/// [`ensure_grid_resolution`] before this runs (≤ 22_002 points; 11_001
+/// when the span fits an int64 duration — round 8's saturating fence).
 fn bucket_grid(grid_start: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
     if step_ns == 0 || step_ns > i64::MAX as u64 || end_ns < grid_start {
         return Vec::new();
@@ -3357,27 +3358,52 @@ fn bucket_grid(grid_start: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
 pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 
 /// **The one grid-resolution guard** (issue #227 review round 7,
-/// finding 1): rejects iff the start-anchored grid spans more than
-/// [`MAX_CLIENT_AGG_BUCKETS`] step INTERVALS — `floor((end - grid_start)
-/// / step) > 11000`, exactly the reference's request rule — and returns
-/// the grid POINT count (`intervals + 1`, ≤ 11 001) on success. The HTTP
-/// boundary (`ensure_range_resolution` in `pulsus-server`) applies the
-/// identical formula over the identical `(start, end, step)` (the emit
+/// finding 1): rejects iff [`fence_intervals`] — the reference's own
+/// SATURATING `floor((end - grid_start) / step)` (round 8) — exceeds
+/// [`MAX_CLIENT_AGG_BUCKETS`], and returns the EXACT grid POINT count
+/// ([`grid_point_count`]) on success. The HTTP boundary
+/// (`ensure_range_resolution` in `pulsus-server`) applies the identical
+/// saturating formula over the identical `(start, end, step)` (the emit
 /// grid is start-anchored, so `grid_start == start`), so the engine can
-/// never 422 a request the request guard admitted — the previous
-/// point-count comparison rejected exactly-at-the-limit requests the
-/// reference serves. A saturated [`grid_point_count`] (degenerate step)
-/// still rejects: `u64::MAX - 1 > 11000`.
+/// never 422 a request the request guard admitted — across the WHOLE i64
+/// timestamp domain, not just spans that fit an int64 duration. The
+/// admitted point count is still hard-bounded: an unsaturated span holds
+/// ≤ 11_001 points, and a saturated one forces `step > i64::MAX / 11_001`,
+/// so the true `u64` span (< 2^64) holds ≤ 22_002 points — O(fence),
+/// never attacker-sized. A degenerate step (zero, or wider than i64 —
+/// neither passes `validate_duration_ns`) saturates [`fence_intervals`]
+/// to `u64::MAX` and still rejects.
 fn ensure_grid_resolution(grid_start_ns: i64, end_ns: i64, step_ns: u64) -> Result<u64, ReadError> {
-    let count = grid_point_count(grid_start_ns, end_ns, step_ns);
-    let intervals = count.saturating_sub(1);
+    let intervals = fence_intervals(grid_start_ns, end_ns, step_ns);
     if intervals > MAX_CLIENT_AGG_BUCKETS {
         return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
             buckets: intervals,
             cap: MAX_CLIENT_AGG_BUCKETS,
         }));
     }
-    Ok(count)
+    Ok(grid_point_count(grid_start_ns, end_ns, step_ns))
+}
+
+/// The fence's interval count, in the reference's EXACT arithmetic (issue
+/// #227 review round 8): `End.Sub(Start)` is Go's `time.Time.Sub`, which
+/// SATURATES an out-of-range difference at the int64-nanosecond `Duration`
+/// bound (`maxDuration = 1<<63-1`) rather than widening, and the division
+/// is truncating integer `Duration / Duration`. So a full-domain span at a
+/// huge step counts `i64::MAX / step` intervals — under the fence — where
+/// the exact i128 span would wrongly reject a request the reference
+/// serves. `end < grid_start` is zero intervals (never trips, matching
+/// the guard's admit-empty behaviour); a degenerate step saturates to
+/// `u64::MAX` so the guard rejects by name instead of dividing by zero.
+fn fence_intervals(grid_start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
+    if end_ns < grid_start_ns {
+        return 0;
+    }
+    if step_ns == 0 || step_ns > i64::MAX as u64 {
+        return u64::MAX;
+    }
+    // Loki-exact: the span clamped to i64 (`time.Time.Sub` saturation),
+    // non-negative here (`end ≥ grid_start` above).
+    end_ns.saturating_sub(grid_start_ns) as u64 / step_ns
 }
 
 /// The exact-quantile retention cap: `quantile_over_time` is the one
@@ -4195,11 +4221,12 @@ fn reducer_class(op: RangeAggOp, value: ClientValue) -> ReducerClass {
 
 /// Start-anchored grid-point count `|{grid_start + k·step ≤ end}|` (Loki:
 /// `current` seeded at `start-step`, first point `start`, iterate `≤ end`)
-/// — i.e. `floor(span/step) + 1`, BOTH endpoints included, so an admitted
-/// request of exactly [`MAX_CLIENT_AGG_BUCKETS`] intervals counts 11 001
-/// points (the resolution guard compares `count - 1` intervals, review
-/// round 7 finding 1). Saturates to `u64::MAX` for a degenerate step so
-/// [`ensure_grid_resolution`] rejects rather than overflowing.
+/// — i.e. `floor(span/step) + 1`, BOTH endpoints included, EXACT in i128
+/// (the emit grid must cover the true span; only the admission fence
+/// saturates — [`fence_intervals`], review round 8). Every caller runs
+/// AFTER [`ensure_grid_resolution`] admitted the window, which bounds this
+/// count at 22_002 (11_001 when the span fits an int64 duration). Still
+/// saturates to `u64::MAX` for a degenerate step, defense-in-depth.
 fn grid_point_count(grid_start: i64, end_ns: i64, step_ns: u64) -> u64 {
     if end_ns < grid_start {
         return 0;
@@ -10481,18 +10508,19 @@ mod tests {
     #[test]
     fn grid_resolution_guard_is_overflow_safe_at_extreme_bounds() {
         // Full i64 range at step 1: ~2^64 points, saturates cleanly — and
-        // the guard rejects the saturated count by name.
+        // the guard rejects, reporting the reference's own saturated
+        // interval count (`maxDuration / 1ns`, round 8).
         assert_eq!(grid_point_count(i64::MIN, i64::MAX, 1), u64::MAX);
         assert!(matches!(
             ensure_grid_resolution(i64::MIN, i64::MAX, 1),
             Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
-                // The saturated point count minus the inclusive endpoint.
-                buckets: 18_446_744_073_709_551_614, // u64::MAX - 1
+                // The Sub-saturated span (i64::MAX ns) at a 1ns step.
+                buckets: 9_223_372_036_854_775_807, // i64::MAX as u64
                 cap: MAX_CLIENT_AGG_BUCKETS,
             }))
         ));
-        // Inverted/empty windows are zero points, never an underflow —
-        // and the guard's `count - 1` is saturating, so 0 points admits.
+        // Inverted/empty windows are zero points and zero fence intervals,
+        // never an underflow — 0 points admits.
         assert_eq!(grid_point_count(i64::MAX, i64::MIN, 1), 0);
         assert_eq!(ensure_grid_resolution(i64::MAX, i64::MIN, 1).unwrap(), 0);
         // A single-point window (start == end) is one grid point.
@@ -10608,6 +10636,100 @@ mod tests {
             Err(other) => panic!("expected MetricBuckets, got {other:?}"),
             Ok(_) => panic!("one interval over the fence must be rejected"),
         }
+    }
+
+    /// Issue #227 review round 8: the fence's span subtraction SATURATES
+    /// exactly like the reference's — Go's `time.Time.Sub` clamps an
+    /// out-of-range difference to the int64-ns `Duration` bound
+    /// (`maxDuration = 1<<63-1`) instead of widening, and the division
+    /// then truncates. A full-domain span at a huge step is therefore
+    /// SERVED (`i64::MAX / step ≤ 11_000`) where the previous exact-i128
+    /// fence wrongly rejected it.
+    #[test]
+    fn grid_resolution_fence_saturates_the_span_like_the_reference() {
+        // 1_000_000s step over the whole i64 domain: the saturated fence
+        // counts i64::MAX/step = 9_223 intervals (admit); the TRUE span
+        // (2^64-1 ns) holds 18_446 — an exact fence would reject a request
+        // the reference serves.
+        const STEP: u64 = 1_000_000_000_000_000; // 1_000_000s in ns
+        assert_eq!(fence_intervals(i64::MIN, i64::MAX, STEP), 9_223);
+        assert_eq!(
+            ensure_grid_resolution(i64::MIN, i64::MAX, STEP).unwrap(),
+            // The emitted grid still covers the TRUE span: the exact
+            // inclusive point count, not the saturated one.
+            18_447
+        );
+
+        // The saturated-fence boundary: floor(i64::MAX / 11_001) is the
+        // largest step counting 11_001 saturated intervals (reject); one
+        // nanosecond of step more counts 11_000 (admit), whose true grid —
+        // 22_002 points — is the guard's hard ceiling.
+        let reject_step = (i64::MAX / 11_001) as u64;
+        assert!(matches!(
+            ensure_grid_resolution(i64::MIN, i64::MAX, reject_step),
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+                buckets: 11_001,
+                cap: MAX_CLIENT_AGG_BUCKETS,
+            }))
+        ));
+        assert_eq!(
+            ensure_grid_resolution(i64::MIN, i64::MAX, reject_step + 1).unwrap(),
+            22_002
+        );
+
+        // An UNSATURATED span stays exact — a span of exactly i64::MAX ns
+        // is the saturation onset, byte-identical either way, and the
+        // ordinary domain is untouched.
+        assert_eq!(fence_intervals(-1, i64::MAX - 1, STEP), 9_223);
+        assert_eq!(
+            fence_intervals(0, 11_000 * 1_000_000_000, 1_000_000_000),
+            11_000
+        );
+    }
+
+    /// Issue #227 review round 8 (the end-to-end shape at the domain
+    /// edge): a full-domain range request at a 1_000_000s step must be
+    /// SERVED — the saturating fence admits it and the REAL evaluators
+    /// emit the exact 18_447-point start-anchored grid over the true
+    /// span, every point in `[start, end]`, no wrap.
+    #[test]
+    fn a_full_domain_range_query_under_the_saturated_fence_is_served() {
+        const STEP: u64 = 1_000_000_000_000_000; // 1_000_000s in ns
+        let step = super::super::params::validate_duration_ns(STEP, "step").unwrap();
+        // i64::MIN + 18_446·step, in i128 (the product alone overflows i64).
+        let last_point = (i64::MIN as i128 + 18_446 * STEP as i128) as i64;
+
+        // The leafless vector(n) path: the exact inclusive true-span grid.
+        let window = GridWindow {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+            step_ns: Some(step),
+        };
+        let res = materialize_vector_lit(1.0, &window)
+            .expect("the saturating fence must admit the full-domain span");
+        let QueryResult::Matrix(series) = res else {
+            panic!("expected a matrix, got {res:?}");
+        };
+        assert_eq!(series[0].points.len(), 18_447);
+        assert_eq!(series[0].points.first().unwrap().0, i64::MIN);
+        assert_eq!(series[0].points.last().unwrap().0, last_point);
+        assert!(last_point < i64::MAX); // in-domain, short of `end`
+
+        // The sliding data path: RangeSlideState::new admits the same
+        // window with the same exact grid (kmax = 18_446).
+        let client = ClientAgg {
+            range_op: RangeAggOp::CountOverTime,
+            value: ClientValue::Count,
+            param: None,
+            pipeline: vec![],
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(i64::MIN, i64::MAX, STEP, STEP);
+        let state = RangeSlideState::new(&compiled, &meta, &client, window, None)
+            .expect("the engine must admit every request the HTTP guard admits");
+        assert_eq!(state.kmax, 18_446);
     }
 
     /// Review round 1, finding 1 (quantile bound): the exact-quantile

@@ -532,28 +532,68 @@ mod tests {
         );
     }
 
-    /// Issue #227 review round 7, finding 1: the HTTP request guard
+    /// Issue #227 review round 8 (end-to-end): a full-i64-domain request at
+    /// a 1_000_000s step must pass the resolution guard — the reference's
+    /// span subtraction saturates at the int64-ns duration bound (Go
+    /// `time.Time.Sub`), so it counts 9_223 intervals, not the true span's
+    /// 18_446 — and proceed past parameter parsing (hermetically the
+    /// engine-pool 503, never the resolution 400 the pre-round-8 exact
+    /// fence returned).
+    #[tokio::test]
+    async fn query_range_across_the_full_timestamp_domain_passes_the_request_guard() {
+        let q = format!(
+            "query=count_over_time(%7Bapp%3D%22a%22%7D%5B5m%5D)\
+             &start={}&end={}&step=1000000s",
+            i64::MIN,
+            i64::MAX
+        );
+        let res = query_range(State(test_state()), HeaderMap::new(), RawQuery(Some(q))).await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a saturated-span request the reference serves must pass the \
+             resolution guard (got {json:?})"
+        );
+    }
+
+    /// Issue #227 review round 7, finding 1 (extended in round 8 to the
+    /// extreme timestamp domain): the HTTP request guard
     /// (`ensure_range_resolution`) and the engine's grid guard
     /// (`ensure_grid_resolution`, driven here through the public
     /// `materialize_vector_lit` — the SAME function `RangeSlideState::new`
-    /// funnels through) implement the identical Loki fence, so the engine
-    /// can never 422 a request the guard admitted. Enumerates both sides
-    /// of the fence, aligned and unaligned.
+    /// funnels through) implement the identical Loki fence — including its
+    /// SATURATING span subtraction (Go `time.Time.Sub` clamps at
+    /// `maxDuration = 1<<63-1` ns) — so the engine can never 422 a request
+    /// the guard admitted, across the WHOLE i64 domain. Enumerates both
+    /// sides of the fence: aligned, unaligned, and saturated.
     #[tokio::test]
     async fn engine_grid_guard_agrees_with_the_request_guard_at_every_fence_case() {
         const S: i64 = 1_000_000_000; // 1s step
-        let step_ns = S as u64;
-        // (start, end, expect-admitted)
-        let cases: &[(i64, i64, bool)] = &[
-            (0, 10_999 * S, true),         // one interval under
-            (0, 11_000 * S, true),         // exactly at the fence
-            (0, 11_001 * S, false),        // one interval over
-            (0, 11_000 * S + S / 2, true), // step does not divide the span
-            (0, 11_001 * S - 1, true),     // 1ns under the rejecting interval
-            (7, 7 + 11_000 * S, true),     // unaligned start, at the fence
-            (7, 7 + 11_001 * S, false),    // unaligned start, over
+        const BIG: u64 = 1_000_000_000_000_000; // 1_000_000s step
+        let step = S as u64;
+        // floor(i64::MAX/11_001): the largest step whose SATURATED
+        // full-domain span counts 11_001 intervals (reject); +1ns admits.
+        let sat_reject = (i64::MAX / 11_001) as u64;
+        // (start, end, step, expect-admitted)
+        let cases: &[(i64, i64, u64, bool)] = &[
+            (0, 10_999 * S, step, true),         // one interval under
+            (0, 11_000 * S, step, true),         // exactly at the fence
+            (0, 11_001 * S, step, false),        // one interval over
+            (0, 11_000 * S + S / 2, step, true), // step does not divide the span
+            (0, 11_001 * S - 1, step, true),     // 1ns under the rejecting interval
+            (7, 7 + 11_000 * S, step, true),     // unaligned start, at the fence
+            (7, 7 + 11_001 * S, step, false),    // unaligned start, over
+            // Round 8: the saturated extreme — the true 2^64-1 ns span
+            // counts 18_446 intervals, but the reference's saturated span
+            // (i64::MAX ns) counts 9_223 → SERVED.
+            (i64::MIN, i64::MAX, BIG, true),
+            (i64::MIN, i64::MAX, sat_reject, false), // 11_001 saturated
+            (i64::MIN, i64::MAX, sat_reject + 1, true), // 11_000 saturated
+            (i64::MIN, i64::MAX, 1, false),          // 1ns step, far over
+            (-1, i64::MAX - 1, BIG, true),           // saturation onset, exact
         ];
-        for &(start_ns, end_ns, admitted) in cases {
+        for &(start_ns, end_ns, step_ns, admitted) in cases {
             let guard_ok = params::ensure_range_resolution(start_ns, end_ns, step_ns).is_ok();
             assert_eq!(
                 guard_ok, admitted,
