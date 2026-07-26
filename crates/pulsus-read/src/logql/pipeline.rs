@@ -1593,6 +1593,13 @@ fn compile_label_format(fmts: &[LabelFmt]) -> Result<CompiledStage, PipelineErro
         // duplicate-name rule, so `__error__="a", __error__="b"` reports
         // the reserved-label error (live-probed, issue #231). Only
         // `__error__` is reserved: `__error_details__` stays assignable.
+        //
+        // The message below is the reference's INNER text verbatim; the
+        // envelope this gets wrapped in (`bad parser expression: …` here,
+        // `invalid pipeline: …` at the API layer, against the reference's
+        // `parse error : stage '…' : …`) is a cross-cutting property of every
+        // LogQL parse error and is tracked by issue #240 — deliberately NOT
+        // changed here, and deliberately not pinned by the tests.
         if dst == ERROR_LABEL {
             return Err(PipelineError::BadParserExpr(format!(
                 "{ERROR_LABEL} cannot be formatted"
@@ -2940,6 +2947,12 @@ mod tests {
     fn assigning_the_error_label_is_rejected_in_both_label_format_forms() {
         // Reference (HTTP 400): `__error__ cannot be formatted` — for the
         // template form, the rename form, and regardless of position.
+        //
+        // Only the reference-matching INNER text is asserted. The surrounding
+        // envelope (`bad parser expression: …` vs the reference's
+        // `parse error : stage '…' : …`) is a cross-cutting property of the
+        // whole LogQL error surface, tracked by issue #240 — pinning it here
+        // would enshrine wording #240 is going to change.
         for query in [
             r#"{a="b"} | label_format __error__="boom""#,
             r#"{a="b"} | label_format __error__=level"#,
@@ -2949,10 +2962,10 @@ mod tests {
         ] {
             let err = CompiledPipeline::compile(&stages_of(query)).expect_err(query);
             assert!(matches!(err, PipelineError::BadParserExpr(_)), "{query}");
-            assert_eq!(
-                err.to_string(),
-                "bad parser expression: __error__ cannot be formatted",
-                "{query}"
+            let text = err.to_string();
+            assert!(
+                text.contains("__error__ cannot be formatted"),
+                "{query}: {text}"
             );
         }
     }

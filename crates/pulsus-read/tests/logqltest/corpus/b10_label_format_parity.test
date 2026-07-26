@@ -64,7 +64,9 @@ eval instant at 60s {service_name="lfp"} | logfmt | label_format __error_details
 # `__error__` is reserved: the reference returns HTTP 400
 # `__error__ cannot be formatted` for the template form, the rename form, and
 # any position in the list. The `msg:` substring is the reference's own message
-# text, which PulsusDB's compile error carries verbatim.
+# text, which PulsusDB's compile error carries verbatim. Only that inner text
+# is asserted — the surrounding error envelope is cross-cutting across every
+# LogQL parse error and is tracked by issue #240, so it must not be pinned here.
 eval_fail instant at 60s {service_name="lfp"} | logfmt | label_format __error__="boom"
   msg: __error__ cannot be formatted
 
