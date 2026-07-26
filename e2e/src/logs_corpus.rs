@@ -89,15 +89,18 @@ pub const METRIC_CASE_IDS: &[&str] = &[
     "metric_unwrap_sum",
     "metric_vector_agg",
     "metric_binary_scalar",
-    "metric_rate_tumbling",
+    // Issue #227: renamed from `metric_rate_tumbling` when the range path
+    // moved to Loki's SLIDING `(t-range, t]` windows — the case now pins
+    // sliding semantics, so the old id was actively misleading.
+    "metric_rate_sliding",
     "metric_unwrap_error",
     // Issue #91 vector-matching modifiers (instant; gated).
     "metric_match_on",
     "metric_match_ignoring",
     "metric_match_group_left",
     "metric_match_group_right",
-    // Issue #91 vector-matching modifiers (range; informational — the
-    // same tumbling-vs-sliding window divergence as metric_rate_tumbling).
+    // Issue #91 vector-matching modifiers (range; gated since issue #227
+    // re-gated the whole range surface — see `metric_rate_sliding`).
     "metric_match_on_range",
     "metric_match_ignoring_range",
     "metric_match_group_left_range",
@@ -326,9 +329,79 @@ pub type OrderedEntries = Vec<(BTreeMap<String, String>, i64, String)>;
 /// tolerance only absorbs summation-order ulps).
 pub type MetricVector = BTreeMap<BTreeMap<String, String>, f64>;
 
-/// A range metric case's expected shape: series label set → bucket
-/// timestamp (ns) → value.
+/// A range metric case's expected shape: series label set → step point
+/// (epoch MILLISECONDS, see [`point_key_ms`]) → value.
 pub type MetricMatrix = BTreeMap<BTreeMap<String, String>, BTreeMap<i64, f64>>;
+
+/// The evaluation grid a RANGE metric case is answered on — Loki's
+/// **sliding** window contract (issue #227), replacing the former fixed,
+/// epoch-aligned, non-overlapping tumbling buckets.
+///
+/// Loki (`pkg/logql/range_vector.go`, v3.7.4 `batchRangeVectorIterator`)
+/// starts its cursor at the request `start` and advances by `step` while
+/// `current <= end` — a **start-anchored** grid `{start + k·step ≤ end}` —
+/// and re-evaluates the `[range]` selector at every point over the
+/// **half-open** window `(t - range, t]` (`load` skips `ts <= rangeStart`
+/// and stops at `ts > rangeEnd`). Three consequences the by-construction
+/// expectation must encode:
+///
+/// - windows **overlap** whenever `range > step`, so one record can
+///   contribute to several step points;
+/// - a point whose window is **empty emits nothing** — a gap, never a zero
+///   (`popBack` deletes the series from `window`, so `At()` never sees it);
+/// - `rate` divides by the **`[range]`** width, never the step, which is
+///   what makes `rate([1m])` and `rate([10m])` differ.
+#[derive(Debug, Clone, Copy)]
+pub struct RangeGrid {
+    /// The request `start` — the grid's first point (start-anchored).
+    pub start_ns: i64,
+    pub end_ns: i64,
+    pub step_ns: i64,
+    /// The `[range]` selector width: the sliding window spans
+    /// `(t - range_ns, t]`.
+    pub range_ns: i64,
+}
+
+impl RangeGrid {
+    /// The start-anchored step points `{start + k·step ≤ end}`, ascending.
+    pub fn points(&self) -> Vec<i64> {
+        if self.step_ns <= 0 || self.end_ns < self.start_ns {
+            return Vec::new();
+        }
+        let kmax = (self.end_ns - self.start_ns) / self.step_ns;
+        (0..=kmax)
+            .map(|k| self.start_ns + k * self.step_ns)
+            .collect()
+    }
+
+    /// Half-open membership `t - range < ts ≤ t` (Loki's lower bound is
+    /// exclusive, its upper bound inclusive).
+    pub fn covers(&self, t: i64, ts_ns: i64) -> bool {
+        ts_ns <= t && ts_ns > t.saturating_sub(self.range_ns)
+    }
+
+    /// The `rate` divisor: the `[range]` width in seconds.
+    fn range_seconds(&self) -> f64 {
+        self.range_ns as f64 / 1e9
+    }
+}
+
+/// A step point's key in a [`MetricMatrix`]: the grid point floored to
+/// epoch **milliseconds**.
+///
+/// Both stores stamp matrix points at millisecond resolution (Loki
+/// `range_vector.go`'s `ts := r.current/1e6`; PulsusDB
+/// `logs_api::encode::format_unix_seconds`). Under the former tumbling
+/// grid every point was a whole multiple of a `>= 1s` step, so nanosecond
+/// keys were lossless; a START-ANCHORED grid inherits the request
+/// `start`'s sub-millisecond digits, so nanosecond keys would be
+/// unreconstructible from the wire (`<unix_seconds>` with 3 decimals) and
+/// an f64 `seconds × 1e9` round-trip is not even exact at 2^60. The
+/// expectation and `logs::matrix_result_set` therefore both key points in
+/// milliseconds, where the round-trip is exact.
+pub fn point_key_ms(ts_ns: i64) -> i64 {
+    ts_ns.div_euclid(1_000_000)
+}
 
 // ---------------------------------------------------------------------
 // Per-record feature assignment: pure functions of `log_idx`.
@@ -787,24 +860,28 @@ impl LogCorpus {
         out
     }
 
-    /// The by-construction expected MATRIX for the range metric case
-    /// (issue M6-10): PulsusDB's documented tumbling semantics —
-    /// epoch-aligned `floor(ts/step)*step` buckets, `rate` = count/step
-    /// seconds, non-empty buckets only.
-    pub fn expected_metric_matrix(&self, case_id: &str, step_ns: i64) -> MetricMatrix {
-        if case_id == "metric_rate_tumbling" {
-            let mut buckets: BTreeMap<i64, f64> = BTreeMap::new();
-            for r in &self.records {
-                if r.service == SVC_JSON {
-                    let bucket = r.ts_ns.div_euclid(step_ns) * step_ns;
-                    *buckets.entry(bucket).or_insert(0.0) += 1.0;
+    /// The by-construction expected MATRIX for a range metric case —
+    /// Loki's SLIDING window contract (issue #227, resolving the former
+    /// tumbling divergence): at every start-anchored step point
+    /// `t ∈ {start + k·step ≤ end}` the half-open window `(t - range, t]`
+    /// is re-evaluated; overlapping windows (`range > step`) count a
+    /// record once per covering point, an empty window emits NO point, and
+    /// `rate` divides by the `[range]` seconds. See [`RangeGrid`].
+    pub fn expected_metric_matrix(&self, case_id: &str, grid: RangeGrid) -> MetricMatrix {
+        if case_id == "metric_rate_sliding" {
+            let range_seconds = grid.range_seconds();
+            let mut points: BTreeMap<i64, f64> = BTreeMap::new();
+            for t in grid.points() {
+                let n = self
+                    .records
+                    .iter()
+                    .filter(|r| r.service == SVC_JSON && grid.covers(t, r.ts_ns))
+                    .count();
+                // An empty window is a GAP, not a zero.
+                if n > 0 {
+                    points.insert(point_key_ms(t), n as f64 / range_seconds);
                 }
             }
-            let step_seconds = step_ns as f64 / 1e9;
-            let points: BTreeMap<i64, f64> = buckets
-                .into_iter()
-                .map(|(b, n)| (b, n / step_seconds))
-                .collect();
             let mut out = MetricMatrix::new();
             if !points.is_empty() {
                 let base = BTreeMap::from([
@@ -817,10 +894,10 @@ impl LogCorpus {
         }
 
         // Issue #91 vector-matching modifiers, RANGE path: an INDEPENDENT
-        // per-bucket instant join over epoch-aligned `count_over_time`
-        // buckets (the same shape the shipped engine produces per step).
+        // per-step-point instant join over sliding `count_over_time`
+        // windows (the same shape the shipped engine produces per step).
         // These match the four instant cases' queries, run as
-        // range queries — the join is applied fresh per shared bucket.
+        // range queries — the join is applied fresh per shared step point.
         let (op, on, keys, group, lhs_spec, rhs_spec) = match case_id {
             "metric_match_on_range" => (
                 MatchOp::Div,
@@ -856,8 +933,8 @@ impl LogCorpus {
             ),
             other => panic!("expected_metric_matrix: unknown case id {other:?}"),
         };
-        let lhs = svc_json_bucket_counts(&self.records, lhs_spec.0, lhs_spec.1, step_ns);
-        let rhs = svc_json_bucket_counts(&self.records, rhs_spec.0, rhs_spec.1, step_ns);
+        let lhs = svc_json_window_counts(&self.records, lhs_spec.0, lhs_spec.1, grid);
+        let rhs = svc_json_window_counts(&self.records, rhs_spec.0, rhs_spec.1, grid);
         let mut buckets: BTreeSet<i64> = BTreeSet::new();
         buckets.extend(lhs.keys().copied());
         buckets.extend(rhs.keys().copied());
@@ -1012,44 +1089,49 @@ fn svc_json_counts(
     acc.into_iter().collect()
 }
 
-/// The per-tumbling-bucket variant of [`svc_json_counts`] — the range
-/// `count_over_time` value per group per epoch-aligned bucket.
-fn svc_json_bucket_counts(
+/// The per-step-point variant of [`svc_json_counts`] — the range
+/// `count_over_time` value per group per SLIDING window (issue #227),
+/// keyed by [`point_key_ms`]. A record is counted once per step point
+/// whose `(t - range, t]` window covers it (so it is counted several times
+/// when `range > step`), and a step point with no covered record yields no
+/// entry at all (the gap rule).
+fn svc_json_window_counts(
     records: &[GeneratedRecord],
     group: &[&str],
     status: Option<i64>,
-    step_ns: i64,
+    grid: RangeGrid,
 ) -> BTreeMap<i64, Vec<(Labels, f64)>> {
-    let mut per_bucket: BTreeMap<i64, BTreeMap<Labels, f64>> = BTreeMap::new();
-    for r in records {
-        if r.service != SVC_JSON {
-            continue;
-        }
-        if let Some(s) = status
-            && r.status != s
-        {
-            continue;
-        }
-        let bucket = r.ts_ns.div_euclid(step_ns) * step_ns;
-        let mut labels = Labels::new();
-        for k in group {
-            match *k {
-                "method" => {
-                    labels.insert("method".to_string(), r.method.to_string());
-                }
-                "status" => {
-                    labels.insert("status".to_string(), r.status.to_string());
-                }
-                other => panic!("svc_json_bucket_counts: unsupported group key {other:?}"),
+    let mut per_point: BTreeMap<i64, BTreeMap<Labels, f64>> = BTreeMap::new();
+    for t in grid.points() {
+        for r in records {
+            if r.service != SVC_JSON || !grid.covers(t, r.ts_ns) {
+                continue;
             }
+            if let Some(s) = status
+                && r.status != s
+            {
+                continue;
+            }
+            let mut labels = Labels::new();
+            for k in group {
+                match *k {
+                    "method" => {
+                        labels.insert("method".to_string(), r.method.to_string());
+                    }
+                    "status" => {
+                        labels.insert("status".to_string(), r.status.to_string());
+                    }
+                    other => panic!("svc_json_window_counts: unsupported group key {other:?}"),
+                }
+            }
+            *per_point
+                .entry(point_key_ms(t))
+                .or_default()
+                .entry(labels)
+                .or_insert(0.0) += 1.0;
         }
-        *per_bucket
-            .entry(bucket)
-            .or_default()
-            .entry(labels)
-            .or_insert(0.0) += 1.0;
     }
-    per_bucket
+    per_point
         .into_iter()
         .map(|(b, m)| (b, m.into_iter().collect()))
         .collect()

@@ -52,6 +52,7 @@ use crate::harness::{
 };
 use crate::logs_corpus::{
     self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector, OrderedEntries,
+    RangeGrid,
 };
 use crate::logs_sm_corpus;
 use crate::metrics::write_artifact;
@@ -110,13 +111,20 @@ struct CaseRaw {
     /// Case shape (issue M6-10): absent/`"streams"` = the M6-09 streams
     /// comparison; `"metric_instant"` = `/query` vector comparison
     /// (instant windows are semantically identical on both stores);
-    /// `"metric_range"` = `/query_range` matrix comparison (the tumbling
-    /// divergence surface — see the ledger).
+    /// `"metric_range"` = `/query_range` matrix comparison over Loki's
+    /// sliding `(t-range, t]` windows (issue #227).
     #[serde(default)]
     kind: Option<String>,
     /// `metric_range` only: the request step in seconds.
     #[serde(default)]
     step_s: Option<u64>,
+    /// `metric_range` only (issue #227): the case query's `[range]`
+    /// selector width in seconds. The sliding window `(t - range, t]` and
+    /// the `rate` divisor both track this, never `step_s`, so the
+    /// by-construction expectation needs it explicitly; a hermetic test
+    /// pins it against every range selector in the case's parse tree.
+    #[serde(default)]
+    range_s: Option<u64>,
     /// `metric_match_error` only (issue #91): the shared error-body
     /// substring both stores must carry. Oracle-pinned against
     /// `grafana/loki:3.4.2`; status codes are NOT gated (Loki returns 500
@@ -535,7 +543,14 @@ fn vector_result_set(body: &serde_json::Value) -> Result<MetricVector> {
 
 /// Normalizes either store's RANGE metric response (`resultType:
 /// "matrix"`, `values: [[<unix seconds>, "<float>"], ...]`), timestamps
-/// converted to nanoseconds.
+/// converted to epoch MILLISECONDS ([`logs_corpus::point_key_ms`]).
+///
+/// Milliseconds, not nanoseconds (issue #227): both stores stamp a matrix
+/// point at millisecond resolution, and a start-anchored sliding grid no
+/// longer lands on whole seconds, so `seconds × 1e9` would leave the f64
+/// exact-integer range (ulp is 256 ns around 2^60) and round to a value a
+/// nanosecond-keyed expectation could not predict. `seconds × 1e3` stays
+/// far below 2^53 and is exact.
 fn matrix_result_set(body: &serde_json::Value) -> Result<MetricMatrix> {
     let result_type = body["data"]["resultType"].as_str().unwrap_or_default();
     if result_type != "matrix" {
@@ -549,8 +564,8 @@ fn matrix_result_set(body: &serde_json::Value) -> Result<MetricMatrix> {
             let ts_s = value[0]
                 .as_f64()
                 .with_context(|| format!("matrix timestamp was not a number: {value}"))?;
-            let ts_ns = (ts_s * 1e9).round() as i64;
-            points.insert(ts_ns, parse_value_str(&value[1])?);
+            let ts_ms = (ts_s * 1e3).round() as i64;
+            points.insert(ts_ms, parse_value_str(&value[1])?);
         }
         if out.insert(labels.clone(), points).is_some() {
             bail!("duplicate label set in a matrix result: {labels:?}");
@@ -1570,9 +1585,14 @@ async fn run_metric_instant_ordered_case(
 }
 
 /// Range metric case: both stores answer `/query_range`. PulsusDB is
-/// hard-gated against the tumbling by-construction expectation; the
-/// oracle comparison is informational for the ledgered
-/// tumbling-vs-sliding case, with the standard anti-rot.
+/// hard-gated against the by-construction expectation, which encodes
+/// Loki's SLIDING window contract (issue #227): the half-open window
+/// `(t - range, t]` re-evaluated at every start-anchored step point
+/// `{start + k·step ≤ end}`, overlapping when `range > step`, emitting no
+/// point for an empty window, with `rate` divided by the `[range]`. The
+/// oracle comparison keeps the standard gated/informational split plus its
+/// anti-rot (no range case is ledgered as divergent any more — #227
+/// resolved the one entry that was).
 async fn run_metric_range_case(
     ctx: &Ctx,
     corpus: &LogCorpus,
@@ -1583,8 +1603,16 @@ async fn run_metric_range_case(
     let step_s = case
         .step_s
         .with_context(|| format!("case {:?} is metric_range but has no step_s", case.case_id))?;
-    let step_ns = step_s as i64 * 1_000_000_000;
-    let expected = corpus.expected_metric_matrix(&case.case_id, step_ns);
+    let range_s = case
+        .range_s
+        .with_context(|| format!("case {:?} is metric_range but has no range_s", case.case_id))?;
+    let grid = RangeGrid {
+        start_ns: window.start_ns,
+        end_ns: window.end_ns,
+        step_ns: step_s as i64 * 1_000_000_000,
+        range_ns: range_s as i64 * 1_000_000_000,
+    };
+    let expected = corpus.expected_metric_matrix(&case.case_id, grid);
     let gated = case.mode == "gated";
     let query_timeout = query_request_timeout(corpus.scale);
     println!(
@@ -1625,8 +1653,8 @@ async fn run_metric_range_case(
         }
     };
     // Oracle-less on cluster (issue #204): PulsusDB stays hard-gated against
-    // the tumbling corpus; the reference-matrix comparison runs on the
-    // single overlay only.
+    // the sliding corpus expectation; the reference-matrix comparison runs on
+    // the single overlay only.
     let with_oracle = oracle_present(ctx);
     let pulsus_started = std::time::Instant::now();
     let pulsus_body = query_range(ctx.url("/api/logs/v1/query_range")).await?;
@@ -1661,7 +1689,12 @@ async fn run_metric_range_case(
             "mode": case.mode,
             "kind": kind,
             "query": q,
-            "window": { "start_ns": window.start_ns, "end_ns": window.end_ns, "step_s": step_s },
+            "window": {
+                "start_ns": window.start_ns,
+                "end_ns": window.end_ns,
+                "step_s": step_s,
+                "range_s": range_s,
+            },
             "pulsusdb_result": pulsus_body,
             "oracle_result": oracle_body,
             "detail": detail,
@@ -1678,21 +1711,21 @@ async fn run_metric_range_case(
         )
     };
 
-    // PulsusDB vs the tumbling by-construction expectation: ALWAYS hard.
+    // PulsusDB vs the sliding by-construction expectation: ALWAYS hard.
     if !matrices_match(&pulsus_set, &expected) {
         let path = dump(
             "pulsus_vs_corpus",
             &format!("pulsusdb matrix diverged: got {pulsus_set:?}, expected {expected:?}"),
         )?;
         bail!(
-            "case {:?}: pulsusdb diverged from the tumbling corpus expectation (repro {})",
+            "case {:?}: pulsusdb diverged from the sliding-window corpus expectation (repro {})",
             case.case_id,
             path.display()
         );
     }
     if with_oracle {
         if !matrices_match(&oracle_set, &expected) {
-            let path = dump("oracle_vs_corpus", "oracle sliding-window result diverged")?;
+            let path = dump("oracle_vs_corpus", "oracle range-window result diverged")?;
             if gated {
                 bail!(
                     "case {:?}: oracle diverged from the corpus expectation (repro {})",
@@ -2604,21 +2637,19 @@ mod tests {
     /// gated; a case id appears here ONLY after a triaged divergence is
     /// recorded in docs/benchmarks/logs-differential-ledger.md. Update
     /// deliberately, with the ledger entry, never as a quick fix for a
-    /// red run. `metric_rate_tumbling` is the issue-M6-10 SEEDED entry:
-    /// the tumbling-vs-sliding range-window divergence is documented
-    /// by-construction (the M1 tumbling contract), classified in the
-    /// ledger at introduction per the M6-10 plan — PulsusDB stays
-    /// hard-gated against the tumbling corpus expectation.
-    const INFORMATIONAL_CASE_IDS: &[&str] = &[
-        "metric_rate_tumbling",
-        // Issue #91 range matching cases share the tumbling-vs-sliding
-        // window divergence (pulsus == the tumbling corpus is still hard-
-        // gated; only the oracle comparison is informational).
-        "metric_match_on_range",
-        "metric_match_ignoring_range",
-        "metric_match_group_left_range",
-        "metric_match_group_right_range",
-    ];
+    /// red run.
+    ///
+    /// **EMPTY again since issue #227.** The one seeded entry
+    /// (`metric_rate_tumbling`, plus the four issue-#91 range
+    /// vector-matching cases that shared its ledger id) recorded the
+    /// tumbling-vs-sliding range-window divergence. #227 replaced the
+    /// tumbling buckets with Loki's sliding `(t - range, t]` windows, so
+    /// that divergence no longer exists: the cases are re-gated (the very
+    /// move `run_metric_range_case`'s stale-exclusion anti-rot demands
+    /// once an informational case starts matching the oracle) and the rate
+    /// case is renamed `metric_rate_sliding`. The ledger entry stays,
+    /// marked RESOLVED.
+    const INFORMATIONAL_CASE_IDS: &[&str] = &[];
 
     fn shipped_fixture() -> LogsFixture {
         let root = crate::engine::workspace_root();
@@ -2670,10 +2701,51 @@ mod tests {
                 | "metric_instant_ordered"
                 | "metric_error"
                 | "metric_match_error" => {
-                    assert!(case.step_s.is_none(), "{}", case.case_id)
+                    assert!(case.step_s.is_none(), "{}", case.case_id);
+                    assert!(case.range_s.is_none(), "{}", case.case_id);
                 }
-                "metric_range" => assert!(case.step_s.is_some(), "{}", case.case_id),
+                // Issue #227: a range case declares BOTH the request step
+                // and the `[range]` width — the sliding window and the
+                // `rate` divisor track the latter, never the former.
+                "metric_range" => {
+                    assert!(case.step_s.is_some(), "{}", case.case_id);
+                    assert!(case.range_s.is_some(), "{}", case.case_id);
+                }
                 other => panic!("metric case {:?} has kind {other:?}", case.case_id),
+            }
+        }
+    }
+
+    /// Issue #227: the fixture's declared `range_s` is EXACTLY the
+    /// `[range]` every leaf of the case's query carries. The sliding
+    /// expectation is computed from `range_s`, so a drift between the two
+    /// would silently measure a window the query never asked for.
+    #[test]
+    fn shipped_range_cases_declare_the_query_selector_range() {
+        let fixture = shipped_fixture();
+        let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
+        for case in fixture.cases.iter().filter(|c| c.kind() == "metric_range") {
+            let rendered = case.query.replace("{R}", &corpus.run_id);
+            let expr = pulsus_logql::parse(&rendered).expect("parse");
+            let params = hermetic_params(case, &corpus);
+            let plan =
+                pulsus_read::logql::plan(&expr, &params, &hermetic_plan_ctx()).expect("plan");
+            let leaves: Vec<&pulsus_read::logql::MetricPlan> = match &plan {
+                pulsus_read::logql::Plan::Metric(mp) => vec![mp],
+                pulsus_read::logql::Plan::MetricBinary(node) => node.leaves(),
+                pulsus_read::logql::Plan::Streams(_) => {
+                    panic!("range case {:?} planned as streams", case.case_id)
+                }
+            };
+            let declared =
+                case.range_s.expect("a metric_range case declares range_s") as i64 * 1_000_000_000;
+            for leaf in leaves {
+                assert_eq!(
+                    leaf.range_ns.get(),
+                    declared,
+                    "case {:?}: fixture range_s does not match the query's [range]",
+                    case.case_id
+                );
             }
         }
     }
@@ -2783,6 +2855,65 @@ mod tests {
         }
     }
 
+    /// The sliding evaluation grid a committed `metric_range` case runs on
+    /// (issue #227) — the live request window, the fixture's `step_s`, and
+    /// the fixture's `[range]` width. Mirrors `run_metric_range_case`, so
+    /// the hermetic gates below evaluate exactly the live grid.
+    fn case_grid(case: &CaseRaw, corpus: &LogCorpus) -> RangeGrid {
+        let window = query_window(corpus);
+        RangeGrid {
+            start_ns: window.start_ns,
+            end_ns: window.end_ns,
+            step_ns: case.step_s.expect("a metric_range case declares step_s") as i64
+                * 1_000_000_000,
+            range_ns: case.range_s.expect("a metric_range case declares range_s") as i64
+                * 1_000_000_000,
+        }
+    }
+
+    /// The evaluation window for a planned metric leaf — the e2e mirror of
+    /// `pulsus-read`'s private `metric_plan_window` (issue #227). A range
+    /// plan carries the START-ANCHORED grid start and the validated
+    /// `[range]` width, never the range-widened scan `start_ns`.
+    fn hermetic_window(mp: &pulsus_read::logql::MetricPlan) -> pulsus_read::logql::ClientWindow {
+        match mp.step_ns {
+            Some(step_ns) => pulsus_read::logql::ClientWindow::Range {
+                grid_start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+                step_ns,
+                range_ns: mp.range_ns,
+            },
+            None => pulsus_read::logql::ClientWindow::Instant {
+                start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+            },
+        }
+    }
+
+    /// Normalizes a shipped-engine `Matrix` result into the comparison
+    /// shape `matrix_result_set` builds from the wire — same label-set key,
+    /// same millisecond point key (issue #227), so a hermetic evaluation
+    /// and a live response are directly comparable.
+    fn matrix_of_result(result: pulsus_read::logql::QueryResult) -> MetricMatrix {
+        let pulsus_read::logql::QueryResult::Matrix(series) = result else {
+            panic!("a range case must evaluate to a matrix");
+        };
+        let mut out = MetricMatrix::new();
+        for s in series {
+            let labels: BTreeMap<String, String> = s.labels.into_iter().collect();
+            let points: BTreeMap<i64, f64> = s
+                .points
+                .into_iter()
+                .map(|(ts_ns, v)| (logs_corpus::point_key_ms(ts_ns), v))
+                .collect();
+            assert!(
+                out.insert(labels, points).is_none(),
+                "duplicate label set in the evaluated matrix"
+            );
+        }
+        out
+    }
+
     /// Every committed case query PARSES under the shipped grammar and
     /// its pipeline COMPILES under the shipped evaluator (streams cases)
     /// / PLANS under the shipped planner with every leaf pipeline
@@ -2885,8 +3016,8 @@ mod tests {
                         );
                     }
                     "metric_range" => {
-                        let step_ns = case.step_s.unwrap() as i64 * 1_000_000_000;
-                        let expected = corpus.expected_metric_matrix(&case.case_id, step_ns);
+                        let expected =
+                            corpus.expected_metric_matrix(&case.case_id, case_grid(case, &corpus));
                         let points: usize = expected.values().map(|p| p.len()).sum();
                         assert!(
                             points > 0,
@@ -2954,6 +3085,165 @@ mod tests {
                     "case {:?}: value diverged for {labels:?}: {} vs {v}",
                     case.case_id,
                     evaluated[labels]
+                );
+            }
+        }
+    }
+
+    /// Issue #227, the RANGE mirror of the test above and the strongest
+    /// hermetic evidence for the sliding by-construction expectation: every
+    /// committed `metric_range` case's expected MATRIX equals what the
+    /// shipped sliding evaluator produces over the same generated bodies.
+    /// If `expected_metric_matrix` and `RangeSlideState` ever disagree on
+    /// the start-anchored grid, the half-open `(t-range, t]` window, the
+    /// empty-window gap rule, or the `rate` divisor, this fails on every PR
+    /// — no compose stack required.
+    #[test]
+    fn shipped_metric_range_expectations_agree_with_the_shipped_evaluator() {
+        let fixture = shipped_fixture();
+        let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
+        let mut checked = 0usize;
+        for case in fixture.cases.iter().filter(|c| c.kind() == "metric_range") {
+            let evaluated = evaluate_case_matrix(&corpus, case);
+            let expected = corpus.expected_metric_matrix(&case.case_id, case_grid(case, &corpus));
+            assert_matrices_agree(&evaluated, &expected, &case.case_id);
+            checked += 1;
+        }
+        assert!(checked > 0, "the fixture must carry range cases");
+    }
+
+    /// Issue #227 AC4/overlap, hermetic: with `range = 3 x step` the
+    /// windows OVERLAP — one record lands in three consecutive step
+    /// windows, which the retired tumbling bucketing could not express —
+    /// and the shipped engine agrees with the by-construction expectation
+    /// point for point. Also pins the two other sliding rules the
+    /// committed `range == step` cases cannot exercise: empty windows are
+    /// GAPS (the grid is far wider than the data), and the value tracks the
+    /// `[range]`, so `rate(...[3m]) != rate(...[1m])` on the same grid.
+    #[test]
+    fn a_range_wider_than_the_step_overlaps_gaps_and_rescales_like_the_engine() {
+        let fixture = shipped_fixture();
+        let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
+        let window = query_window(&corpus);
+        let step_ns = 60 * 1_000_000_000;
+        let wide = RangeGrid {
+            start_ns: window.start_ns,
+            end_ns: window.end_ns,
+            step_ns,
+            range_ns: 3 * step_ns,
+        };
+        let expected = corpus.expected_metric_matrix("metric_rate_sliding", wide);
+
+        // 1. The shipped sliding evaluator produces exactly this matrix.
+        let rendered = format!(
+            r#"rate({{run_id="{}", service_name="{}"}}[3m])"#,
+            corpus.run_id,
+            logs_corpus::SVC_JSON
+        );
+        let expr = pulsus_logql::parse(&rendered).expect("parse");
+        let params = pulsus_read::logql::QueryParams {
+            spec: pulsus_read::logql::QuerySpec::Range {
+                start_ns: wide.start_ns,
+                end_ns: wide.end_ns,
+                step_ns: wide.step_ns as u64,
+            },
+            limit: 1000,
+            direction: pulsus_read::logql::Direction::Forward,
+        };
+        let plan = pulsus_read::logql::plan(&expr, &params, &hermetic_plan_ctx()).expect("plan");
+        let pulsus_read::logql::Plan::Metric(mp) = &plan else {
+            panic!("a bare rate() plans as a single metric leaf");
+        };
+        let evaluated = matrix_of_result(evaluate_leaf_hermetically(
+            &corpus,
+            mp,
+            logs_corpus::SVC_JSON,
+        ));
+        assert_matrices_agree(&evaluated, &expected, "metric_rate_sliding[3m]");
+
+        // 2. Overlap: summed over the emitted points, the records are
+        // counted MORE times than they exist (each sits in several
+        // windows) — impossible under non-overlapping tumbling buckets.
+        let points = expected
+            .values()
+            .next()
+            .expect("the wide-range matrix has one series");
+        let range_seconds = wide.range_ns as f64 / 1e9;
+        let counted: f64 = points.values().map(|v| v * range_seconds).sum();
+        let records = corpus
+            .records
+            .iter()
+            .filter(|r| r.service == logs_corpus::SVC_JSON)
+            .count() as f64;
+        assert!(
+            counted > records,
+            "range > step must count records in several windows: {counted} vs {records}"
+        );
+
+        // 3. Gaps: the grid is far wider than the data, so most step
+        // points emit nothing at all rather than a zero.
+        assert!(
+            points.len() < wide.points().len(),
+            "empty windows must be gaps: {} points on a {}-point grid",
+            points.len(),
+            wide.points().len()
+        );
+
+        // 4. The `[range]` — not the step — sets the window and the
+        // divisor: the same grid at `[1m]` differs.
+        let narrow = RangeGrid {
+            range_ns: step_ns,
+            ..wide
+        };
+        let narrow_expected = corpus.expected_metric_matrix("metric_rate_sliding", narrow);
+        assert_ne!(
+            narrow_expected, expected,
+            "rate(...[1m]) and rate(...[3m]) must differ on the same grid"
+        );
+    }
+
+    /// Evaluates a committed `metric_range` case through the shipped
+    /// planner + sliding evaluator over the generated corpus.
+    fn evaluate_case_matrix(corpus: &LogCorpus, case: &CaseRaw) -> MetricMatrix {
+        let rendered = case.query.replace("{R}", &corpus.run_id);
+        let expr = pulsus_logql::parse(&rendered).expect("parse");
+        let service = first_selector_service(&expr);
+        let params = hermetic_params(case, corpus);
+        let plan = pulsus_read::logql::plan(&expr, &params, &hermetic_plan_ctx()).expect("plan");
+        let result = match &plan {
+            pulsus_read::logql::Plan::Metric(mp) => {
+                evaluate_leaf_hermetically(corpus, mp, &service)
+            }
+            pulsus_read::logql::Plan::MetricBinary(node) => {
+                evaluate_node_hermetically(corpus, node, &service)
+            }
+            pulsus_read::logql::Plan::Streams(_) => {
+                panic!("range case {:?} planned as streams", case.case_id)
+            }
+        };
+        matrix_of_result(result)
+    }
+
+    /// Series-for-series, point-for-point matrix equality with a diffable
+    /// message (`matrices_match` is a bare bool for the live lane).
+    fn assert_matrices_agree(got: &MetricMatrix, expected: &MetricMatrix, case_id: &str) {
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>(),
+            "case {case_id:?}: label sets diverged"
+        );
+        for (labels, points) in expected {
+            let got_points = &got[labels];
+            assert_eq!(
+                got_points.keys().collect::<Vec<_>>(),
+                points.keys().collect::<Vec<_>>(),
+                "case {case_id:?}: step points diverged for {labels:?}"
+            );
+            for (ts_ms, v) in points {
+                assert!(
+                    approx_eq(got_points[ts_ms], *v),
+                    "case {case_id:?}: value diverged at {ts_ms} for {labels:?}: {} vs {v}",
+                    got_points[ts_ms]
                 );
             }
         }
@@ -3092,11 +3382,7 @@ mod tests {
             &compiled,
             &meta,
             client,
-            pulsus_read::logql::ClientWindow {
-                start_ns: mp.start_ns,
-                end_ns: mp.end_ns,
-                step_ns: mp.step_ns,
-            },
+            hermetic_window(mp),
             mp.rate_window_ns,
         )
         .expect_err("a surviving conversion failure must fail the query");
@@ -3171,11 +3457,7 @@ mod tests {
             &compiled,
             &meta,
             client,
-            pulsus_read::logql::ClientWindow {
-                start_ns: mp.start_ns,
-                end_ns: mp.end_ns,
-                step_ns: mp.step_ns,
-            },
+            hermetic_window(mp),
             mp.rate_window_ns,
         )
         .expect("client aggregation");

@@ -197,6 +197,50 @@ pub enum TooBroadReason {
     /// `metrics::exec`'s `SampleBudget` on the six sample-fetch dispatches
     /// — hydration/probe/discovery fetches never charge it.
     MetricSamples { cap: u64 },
+    /// Issue #227: a consecutive same-`(fingerprint, timestamp_ns)` run in
+    /// the sliding-window range evaluator (the collision group that the
+    /// full-body `tie_rank` order is imposed over) exceeded
+    /// [`crate::logql::exec::MAX_TS_COLLISION_GROUP`]. A same-nanosecond,
+    /// same-stream run this large is pathological/adversarial, never real
+    /// data; the transient full-body buffer that ranks it is bounded by
+    /// this clean error rather than growing without limit. A Rust-side
+    /// structural limit, never from a ClickHouse error code.
+    TsCollisionGroup {
+        count: u64,
+        cap: u64,
+        /// Bytes the group would have staged (bodies + rendered label JSON +
+        /// cloned label sets) — the second, independent dimension of the cap
+        /// (issue #227 review round 4): a handful of very large members trips
+        /// this long before the member count.
+        bytes: u64,
+        bytes_cap: u64,
+    },
+    /// Issue #227: the sliding-window range evaluator's **concurrent**
+    /// retained window (charge-on-load / discharge-on-evict) exceeded
+    /// [`crate::logql::exec::MAX_RETAINED_WINDOW_POINTS`] — the single
+    /// invariant `retained ≤ cap` that generalizes the instant path's
+    /// per-reducer `QuantileValues`/`CounterValues` total-retention proofs.
+    /// The charge is per-load, so it trips as the FIRST oversized window
+    /// fills (early in the scan, before RSS grows), bounding process memory
+    /// to ≈ cap × entry-width regardless of `[range]`/step/density.
+    /// Complete-or-error, never an OOM; a Rust-side structural limit, never
+    /// from a ClickHouse error code. Set generously so nothing Loki
+    /// reliably serves is rejected.
+    MetricRetention { count: u64, cap: u64 },
+    /// Issue #227 (review round 6): the label-mutating client-aggregation
+    /// path retained more QUERY-LIFETIME bytes of distinct output-group
+    /// state — each first-seen group's rendered JSON key plus its cloned
+    /// final `LabelSet`, which live in the group map until finish — than
+    /// [`crate::logql::exec::MAX_CLIENT_AGG_GROUP_BYTES`]. The group
+    /// COUNT was already capped ([`Self::MetricSeries`]) but the BYTES
+    /// behind each key/label set were charged to neither the
+    /// collision-group counter (reset when its group flushes) nor the
+    /// retention counter (denominated in fixed-width points), so 500
+    /// multi-MiB extracted label sets could accumulate for the query's
+    /// lifetime. Charged BEFORE the insertion that retains the entry and
+    /// released as finish consumes it. Complete-or-error, never an OOM; a
+    /// Rust-side structural limit, never from a ClickHouse error code.
+    MetricGroupLabelBytes { bytes: u64, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -332,6 +376,35 @@ impl fmt::Display for TooBroadReason {
                      the time range"
                 )
             }
+            TooBroadReason::TsCollisionGroup {
+                count,
+                cap,
+                bytes,
+                bytes_cap,
+            } => {
+                write!(
+                    f,
+                    "a same-nanosecond, same-stream run would stage {count} lines / {bytes} \
+                     bytes, exceeding the collision-group caps ({cap} lines, {bytes_cap} bytes) \
+                     — narrow the selector or the pipeline"
+                )
+            }
+            TooBroadReason::MetricRetention { count, cap } => {
+                write!(
+                    f,
+                    "the sliding-window range evaluation retained {count} concurrent sample \
+                     points, exceeding the {cap}-point cap — narrow the [range], the pipeline, \
+                     or the time window"
+                )
+            }
+            TooBroadReason::MetricGroupLabelBytes { bytes, cap } => {
+                write!(
+                    f,
+                    "distinct output-group label sets would retain {bytes} bytes for the \
+                     whole query, exceeding the {cap}-byte cap — narrow the pipeline \
+                     (fewer/smaller extracted labels) or use a coarser grouping"
+                )
+            }
         }
     }
 }
@@ -439,6 +512,23 @@ pub enum ReadError {
     /// resolution #4 on issue #12).
     #[error("range query step_ns must be greater than zero")]
     InvalidStep,
+
+    /// Issue #227 (review round 2; domain widened in round 10): a
+    /// client-controlled duration — the `[range]` selector or the request
+    /// `step` — fell outside the validated domain `1 ..= MAX_DURATION_NS`
+    /// (= `i64::MAX`, the reference's full positive int64-nanosecond
+    /// `time.Duration` range, ≈292 years). Rejected at the planner boundary
+    /// BEFORE any narrowing, so no hostile `u64` can wrap the
+    /// window/covering arithmetic downstream. A clean 400 (`bad_data`),
+    /// like [`Self::InvalidStep`]; nothing the reference serves is in the
+    /// rejected region — values past `i64::MAX` are unrepresentable in a Go
+    /// `time.Duration` and a parse-level 400 there.
+    #[error("{what} of {value} ns is outside the supported range (1 to {max} ns)")]
+    DurationOutOfRange {
+        what: &'static str,
+        value: u64,
+        max: i64,
+    },
 
     /// M7-A5a: the metrics dual-read decoded a `metric_hist_samples` row
     /// whose value columns cannot rebuild a [`NativeHistogram`]

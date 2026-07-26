@@ -13,12 +13,15 @@
 //! [`rows`] (`ChClient` result-row shapes), and [`exec`] (`LogQlEngine`,
 //! the only module here that talks to ClickHouse).
 //!
-//! **M1 rate semantic — documented divergence from Loki/Prometheus:**
-//! range-query rate/count bucketing is *fixed, step-aligned, non-overlapping*
-//! (`intDiv(ts, step) * step` tumbling windows), not a sliding `[range]`
-//! window re-evaluated at every step (task-manager resolution #4 on issue
-//! #11). See [`params::QuerySpec::Range`]'s doc comment for the precise
-//! contract. Sliding-window parity is an M6 concern.
+//! **Range-query semantics (issue #227): Loki-exact SLIDING windows.**
+//! A range metric query re-evaluates the `[range]` window `(t - range, t]` at
+//! every start-anchored grid point `{start + k·step ≤ end}`, streamed off raw
+//! `log_samples` — NOT the former fixed, step-aligned, non-overlapping
+//! `intDiv(ts, step) * step` tumbling buckets, and not the 5s rollup (which
+//! cannot reproduce Loki's per-event boundary). So `rate({}[1m])` and
+//! `rate({}[10m])` differ: the window width AND the rate divisor both track
+//! the `[range]`, never `step`. See [`params::QuerySpec::Range`]'s doc
+//! comment for the precise contract.
 //!
 //! **Scan budget applies to every stage.** `ClickHouse
 //! max_bytes_to_read` (from `reader.logql_scan_budget_bytes`) and the
@@ -91,14 +94,17 @@ pub fn terminal_sort(expr: &Expr) -> bool {
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
-    ClientWindow, EngineConfig, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine,
-    LogStats, MatrixSeries, PatternSeries, QueryResult, StreamResult, TAIL_REGISTRATION_GRACE_NS,
-    TailCursor, TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry,
-    VolumeQuery, apply_vector_aggs, combine_binary, materialize_vector_lit, read_query_settings,
-    run_client_agg_rows,
+    ClientWindow, EngineConfig, GridWindow, HistMatrixSeries, HistOrFloat, HistVectorSample,
+    LogQlEngine, LogStats, MatrixSeries, PatternSeries, QueryResult, StreamResult,
+    TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, VectorSample,
+    VolumeAggregateBy, VolumeEntry, VolumeQuery, apply_vector_aggs, combine_binary,
+    materialize_vector_lit, read_query_settings, run_client_agg_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
-pub use params::{DEFAULT_MAX_STREAMS, Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
+pub use params::{
+    DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec, TimeBounds,
+    ValidatedDuration, validate_duration_ns,
+};
 pub use pipeline::{CompiledPipeline, EntryOut, MetricRun, PipelineError, SAMPLE_EXTRACTION_ERROR};
 pub use plan::{
     ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision,

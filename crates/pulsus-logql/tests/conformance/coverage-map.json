@@ -185,7 +185,7 @@
       ]
     },
     {
-      "source": "metric_rate_tumbling",
+      "source": "metric_rate_sliding",
       "kind": "e2e-differential",
       "constructs": [
         "range.rate",

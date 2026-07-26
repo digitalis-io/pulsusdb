@@ -111,10 +111,17 @@ fn run_client(
         &compiled,
         meta,
         client,
-        ClientWindow {
-            start_ns: mp.start_ns,
-            end_ns: mp.end_ns,
-            step_ns: mp.step_ns,
+        match mp.step_ns {
+            Some(step_ns) => ClientWindow::Range {
+                grid_start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+                step_ns,
+                range_ns: mp.range_ns,
+            },
+            None => ClientWindow::Instant {
+                start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+            },
         },
         mp.rate_window_ns,
     )?;
@@ -155,6 +162,10 @@ fn unwrap_rows() -> Vec<MetricScanRow> {
 
 #[test]
 fn every_unwrap_reducer_matches_its_hand_derived_buckets() {
+    // Issue #227 sliding: grid `{0, 60s, 120s}`, window `(t-60s, t]`. t=0 is
+    // empty (gap, no point); t=60s sees the rows at 10s/20s (the old
+    // "bucket 0"); t=120s sees 70s/80s (the old "bucket 60"). So the same
+    // hand-derived values now emit one grid point LATER.
     let params = range_params(0, 2 * STEP);
     for (op, b0, b60) in [
         ("sum_over_time", 3.0, 7.0),
@@ -164,14 +175,14 @@ fn every_unwrap_reducer_matches_its_hand_derived_buckets() {
         // Population stddev/stdvar (oracle-probed: /n, never /(n-1)).
         ("stddev_over_time", 0.5, 0.5),
         ("stdvar_over_time", 0.25, 0.25),
-        // first/last are timestamp-anchored within the bucket.
+        // first/last are the endpoints of the canonical window order.
         ("first_over_time", 1.0, 3.0),
         ("last_over_time", 2.0, 4.0),
     ] {
         let query = format!(r#"{op}({{env="prod"}} | logfmt | unwrap v [1m])"#);
         let points =
             single_series_points(run_client(&query, &params, &unwrap_rows(), &meta_one()).unwrap());
-        assert_eq!(points, vec![(0, b0), (STEP, b60)], "{op}");
+        assert_eq!(points, vec![(STEP, b0), (2 * STEP, b60)], "{op}");
     }
 }
 
@@ -189,7 +200,8 @@ fn rate_over_an_unwrapped_range_is_the_per_second_sum() {
         )
         .unwrap(),
     );
-    assert_eq!(points, vec![(0, 3.0 / 60.0), (STEP, 7.0 / 60.0)]);
+    // Issue #227 sliding: emits at t=60s and t=120s (the empty t=0 is a gap).
+    assert_eq!(points, vec![(STEP, 3.0 / 60.0), (2 * STEP, 7.0 / 60.0)]);
 }
 
 #[test]
@@ -244,7 +256,12 @@ fn first_and_last_are_timestamp_anchored_regardless_of_input_order() {
         let query = format!(r#"{op}({{env="prod"}} | logfmt | unwrap v [1m])"#);
         let points =
             single_series_points(run_client(&query, &params, &shuffled, &meta_one()).unwrap());
-        assert_eq!(points, vec![(0, b0), (STEP, b60)], "{op} (shuffled input)");
+        // Issue #227 sliding: values emit at t=60s/120s (empty t=0 gap).
+        assert_eq!(
+            points,
+            vec![(STEP, b0), (2 * STEP, b60)],
+            "{op} (shuffled input)"
+        );
     }
 }
 
@@ -289,27 +306,24 @@ fn first_and_last_tie_break_identically_for_reordered_equal_timestamp_inputs() {
     }
 }
 
-/// Ordinary start/step/end boundaries: a row exactly ON a bucket edge
-/// (`ts == k*step`) belongs to bucket `k*step` (the `intDiv` floor —
-/// byte-identical to the SQL path's bucketing), including a row at
-/// exactly `ts == end` when `end` is step-aligned.
+/// Issue #227 sliding half-open `(t-range, t]` boundary: a row exactly at
+/// `ts == t` is INCLUDED (upper-inclusive), a row at `ts == t-range` is
+/// EXCLUDED (lower-exclusive). Rows at ts=1, 60s, 120s with the `[1m]`
+/// window on grid `{0, 60s, 120s}`:
+///   t=0   : `(-60s, 0]`  empty (ts=1 excluded)     → gap
+///   t=60s : `(0, 60s]`   ts∈{1, 60s} → v=1, v=2
+///   t=120s: `(60s, 120s]` ts∈{120s}   → v=3  (ts=60s excluded, lower edge)
 #[test]
-fn first_and_last_bucket_edge_rows_land_in_the_edge_bucket() {
+fn sliding_window_boundary_is_half_open_lower_exclusive_upper_inclusive() {
     let rows = vec![
-        row(1, 1, "v=1"),        // just past start -> bucket 0
-        row(1, STEP, "v=2"),     // exactly on the step edge -> bucket STEP
-        row(1, 2 * STEP, "v=3"), // exactly at end -> bucket 2*STEP
+        row(1, 1, "v=1"),
+        row(1, STEP, "v=2"),
+        row(1, 2 * STEP, "v=3"),
     ];
     let params = range_params(0, 2 * STEP);
     for (op, expected) in [
-        (
-            "first_over_time",
-            vec![(0, 1.0), (STEP, 2.0), (2 * STEP, 3.0)],
-        ),
-        (
-            "last_over_time",
-            vec![(0, 1.0), (STEP, 2.0), (2 * STEP, 3.0)],
-        ),
+        ("first_over_time", vec![(STEP, 1.0), (2 * STEP, 3.0)]),
+        ("last_over_time", vec![(STEP, 2.0), (2 * STEP, 3.0)]),
     ] {
         let query = format!(r#"{op}({{env="prod"}} | logfmt | unwrap v [1m])"#);
         let points = single_series_points(run_client(&query, &params, &rows, &meta_one()).unwrap());
@@ -436,13 +450,19 @@ fn extreme_window_bounds_hit_the_bucket_cap_without_overflow() {
     )
     .unwrap();
     assert_eq!(result, QueryResult::Matrix(Vec::new()));
-    // A huge step over the extreme window is a handful of buckets:
-    // accepted (no false positive from the widened arithmetic).
+    // A large-but-IN-DOMAIN step over the extreme window is a handful of
+    // buckets: accepted (no false positive from the widened arithmetic).
+    // `MAX_DURATION_NS` is the validated ceiling — since round 10 the
+    // reference's full positive int64 (`i64::MAX`), so this is the largest
+    // step the reference can represent, over the full timestamp domain
+    // (one saturated fence interval); a step ABOVE it is rejected at the
+    // planner boundary instead — see
+    // `a_hostile_step_is_rejected_end_to_end_by_the_planner`.
     let params = QueryParams {
         spec: pulsus_read::logql::QuerySpec::Range {
             start_ns: i64::MIN,
             end_ns: i64::MAX,
-            step_ns: (i64::MAX / 2) as u64,
+            step_ns: pulsus_read::logql::MAX_DURATION_NS as u64,
         },
         limit: 100,
         direction: Direction::Backward,
@@ -458,32 +478,59 @@ fn extreme_window_bounds_hit_the_bucket_cap_without_overflow() {
     );
 }
 
-/// Review round 3: the PER-ROW bucket assignment must survive a genuine
-/// extreme-timestamp sample — `i64::MIN + 1` at the non-dividing step 3
-/// floors to `i64::MIN - 1` in plain i64 (debug panic / release wrap);
-/// widened i128 intermediates clamp that one sub-`i64::MIN` sliver to
-/// `i64::MIN` deterministically, and a nearby sample whose bucket DOES
-/// fit gets its exact floored start. Full path: plan →
-/// `run_client_agg_rows` with surviving rows.
+/// Issue #227 review round 10: a 100-year step (`step=3153600000s`, start=0,
+/// end=0) fits the reference's positive `time.Duration` and passes its
+/// resolution fence, so the reference SERVES it — the retired
+/// `i64::MAX / 4` duration cap wrongly 400'd it at the planner boundary.
+/// End-to-end through the client-aggregated path: the plan validates, the
+/// grid is the single point `t = 0`, and its `(t-1m, t]` window counts the
+/// one sample at `ts = 0`.
 #[test]
-fn extreme_timestamp_samples_bucket_without_overflow() {
-    // Window (MIN, MIN + 30_000] at step 3 = 10_000 buckets — under the
-    // cap, so real bucketing runs.
+fn a_100_year_step_the_reference_serves_is_served() {
+    const HUNDRED_YEARS_NS: u64 = 3_153_600_000_000_000_000;
+    let params = QueryParams {
+        spec: pulsus_read::logql::QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 0,
+            step_ns: HUNDRED_YEARS_NS,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let points = single_series_points(
+        run_client(
+            r#"count_over_time({env="prod"}[1m])"#,
+            &params,
+            &[row(1, 0, "a")],
+            &meta_one(),
+        )
+        .expect("the reference serves a 100-year step; PulsusDB must too"),
+    );
+    assert_eq!(points, vec![(0, 1.0)]);
+}
+
+/// Issue #227: the sliding evaluator must survive extreme timestamps near
+/// `i64::MIN` without overflow — the grid point `grid_start + k·step`, the
+/// window lower bound `t - range` (a `[3s]` range ≫ the window, so `t-range`
+/// underflows i64 and must saturate), and the covering-set math all run in
+/// i128 / saturating i64. Grid `{MIN, MIN+3, MIN+6, MIN+9}`, window
+/// `(t-3s, t]` (saturates to `(MIN, t]`):
+///   t=MIN   : `(MIN, MIN]`   empty (MIN+1 excluded) → gap
+///   t=MIN+3 : `(MIN, MIN+3]` → MIN+1 → 1
+///   t=MIN+6 : `(MIN, MIN+6]` → MIN+1 → 1
+///   t=MIN+9 : `(MIN, MIN+9]` → MIN+1, MIN+7 → 2
+#[test]
+fn extreme_timestamp_samples_slide_without_overflow() {
     let params = QueryParams {
         spec: pulsus_read::logql::QuerySpec::Range {
             start_ns: i64::MIN,
-            end_ns: i64::MIN + 30_000,
+            end_ns: i64::MIN + 9,
             step_ns: 3,
         },
         limit: 100,
         direction: Direction::Backward,
     };
-    // `| env = "prod"` matches the base label: both rows SURVIVE and
-    // must be bucketed (client mode, fingerprint grouping).
-    let rows = vec![
-        row(1, i64::MIN + 1, "a"), // floors to MIN-1 in i128 → clamps to i64::MIN
-        row(1, i64::MIN + 7, "b"), // floors to MIN+5 — representable, exact
-    ];
+    let rows = vec![row(1, i64::MIN + 1, "a"), row(1, i64::MIN + 7, "b")];
     let points = single_series_points(
         run_client(
             r#"count_over_time({env="prod"} | env = "prod" [3s])"#,
@@ -493,21 +540,18 @@ fn extreme_timestamp_samples_bucket_without_overflow() {
         )
         .unwrap(),
     );
-    assert_eq!(points, vec![(i64::MIN, 1.0), (i64::MIN + 5, 1.0)]);
+    assert_eq!(
+        points,
+        vec![
+            (i64::MIN + 3, 1.0),
+            (i64::MIN + 6, 1.0),
+            (i64::MIN + 9, 2.0)
+        ]
+    );
 
-    // The absent grid near the extreme clamps IDENTICALLY (its first
-    // bucket is the same `i64::MIN` id), so grid and data buckets stay
-    // membership-consistent: with the MIN+1 row present, its bucket
-    // emits no absence and every other grid bucket does.
-    let params = QueryParams {
-        spec: pulsus_read::logql::QuerySpec::Range {
-            start_ns: i64::MIN,
-            end_ns: i64::MIN + 300,
-            step_ns: 3,
-        },
-        limit: 100,
-        direction: Direction::Backward,
-    };
+    // absent_over_time at the extreme: the `[3s]` range covers all later
+    // grid points once MIN+1 enters, so only t=MIN (whose window excludes
+    // MIN+1) reports absence.
     let result = run_client(
         r#"absent_over_time({env="prod"}[3s])"#,
         &params,
@@ -519,19 +563,11 @@ fn extreme_timestamp_samples_bucket_without_overflow() {
         panic!("expected a matrix");
     };
     assert_eq!(items.len(), 1);
-    assert!(
-        !items[0].points.iter().any(|(b, _)| *b == i64::MIN),
-        "the populated clamped bucket must not report absence: {:?}",
-        &items[0].points[..3.min(items[0].points.len())]
-    );
     assert_eq!(
-        items[0].points.first().map(|(b, _)| *b),
-        Some(i64::MIN + 2),
-        "absence starts at the first EMPTY grid bucket"
+        items[0].points,
+        vec![(i64::MIN, 1.0)],
+        "only the first grid point's window is empty"
     );
-    // Grid k_first..=k_first+100 (the clamped MIN bucket, then MIN+2,
-    // MIN+5, ... MIN+299) = 101 buckets, one populated.
-    assert_eq!(items[0].points.len(), 100);
 }
 
 #[test]
@@ -805,10 +841,13 @@ fn a_post_line_format_metric_line_filter_drops_in_engine_on_the_rewritten_line()
         .iter()
         .flat_map(|s| s.points.iter().map(|(b, _)| *b))
         .collect();
+    // Issue #227 sliding: the survivor at 10s lands in the `(0, 60s]` window
+    // (grid point 60s), the survivor at 70s in `(60s, 120s]` (grid point
+    // 120s) — one grid point later than the old tumbling bucket start.
     assert_eq!(
         buckets.into_iter().collect::<Vec<_>>(),
-        vec![0, STEP],
-        "one survivor per bucket"
+        vec![STEP, 2 * STEP],
+        "one survivor per sliding window"
     );
 }
 
@@ -976,15 +1015,14 @@ fn absent_over_time_emits_at_most_one_selector_wide_series() {
         ],
         "Eq-matcher labels only"
     );
-    // Bucket 120s is genuinely empty; bucket 180s exists because the
-    // window end (`ts <= end`, end % step == 0) lands in it under the
-    // tumbling `intDiv` grid — the same bucket the SQL path would emit
-    // for a row at exactly ts=end — and it too is empty here.
+    // Issue #227 sliding, grid `{0, 60s, 120s, 180s}`, window `(t-60s, t]`:
+    // t=0 has no lookback (empty → absent); t=60s sees the 10s line; t=120s
+    // sees the 70s line; t=180s `(120s, 180s]` is empty → absent.
     assert_eq!(
         items[0].points,
-        vec![(2 * STEP, 1.0), (3 * STEP, 1.0)],
-        "absence for empty buckets only — a bucket with a line in ANY \
-         stream emits nothing"
+        vec![(0, 1.0), (3 * STEP, 1.0)],
+        "absence for empty sliding windows only — a window with a line in \
+         ANY stream emits nothing"
     );
 }
 
@@ -2273,6 +2311,7 @@ fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     );
     assert!(
@@ -2455,10 +2494,17 @@ fn eval_node(
                 &compiled,
                 meta,
                 client,
-                ClientWindow {
-                    start_ns: mp.start_ns,
-                    end_ns: mp.end_ns,
-                    step_ns: mp.step_ns,
+                match mp.step_ns {
+                    Some(step_ns) => ClientWindow::Range {
+                        grid_start_ns: mp.grid_start_ns,
+                        end_ns: mp.end_ns,
+                        step_ns,
+                        range_ns: mp.range_ns,
+                    },
+                    None => ClientWindow::Instant {
+                        start_ns: mp.grid_start_ns,
+                        end_ns: mp.end_ns,
+                    },
                 },
                 mp.rate_window_ns,
             )?;
@@ -2535,13 +2581,19 @@ fn or_vector_zero_fills_an_empty_selection() {
 /// Over-cap range `vector(n)` rejects with the SAME `MetricBuckets` 422 a
 /// leaf over-cap range query trips — before allocating any grid (the
 /// `return` precedes the `Vec`, so a successful assertion proves no
-/// allocation). 11_001 buckets > the 11_000 cap.
+/// allocation). 11_001 step INTERVALS > the 11_000 cap (issue #227 review
+/// round 7, finding 1: the fence is the reference's TRUNCATING
+/// `(end-start)/step > 11000`, so exactly 11_000 intervals — 11_001
+/// inclusive grid points — is served, and this fixture sits one interval
+/// past it).
 #[test]
 fn range_vector_lit_over_the_bucket_cap_rejects_without_allocating() {
-    let window = ClientWindow {
+    let window = pulsus_read::logql::GridWindow {
         start_ns: 0,
-        end_ns: 11_000 * NS,
-        step_ns: Some(NS as u64),
+        end_ns: 11_001 * NS,
+        step_ns: Some(
+            pulsus_read::logql::validate_duration_ns(NS as u64, "step").expect("valid step"),
+        ),
     };
     match materialize_vector_lit(0.0, &window) {
         Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets { buckets, cap })) => {
@@ -2552,18 +2604,23 @@ fn range_vector_lit_over_the_bucket_cap_rejects_without_allocating() {
     }
 }
 
-/// At exactly the cap the range `vector(n)` materializes a constant matrix
-/// with one empty-label series carrying the value at every grid step.
+/// At exactly the cap — 11_000 intervals, the widest resolution the
+/// reference serves — the range `vector(n)` materializes a constant matrix
+/// with one empty-label series carrying the value at every one of the
+/// 11_001 inclusive grid points (issue #227 review round 7, finding 1:
+/// this exact shape was previously a wrong 422).
 #[test]
 fn range_vector_lit_at_the_bucket_cap_passes_with_exact_point_count() {
-    let window = ClientWindow {
+    let window = pulsus_read::logql::GridWindow {
         start_ns: 0,
-        end_ns: 10_999 * NS,
-        step_ns: Some(NS as u64),
+        end_ns: 11_000 * NS,
+        step_ns: Some(
+            pulsus_read::logql::validate_duration_ns(NS as u64, "step").expect("valid step"),
+        ),
     };
     let out = materialize_vector_lit(7.0, &window).expect("at-cap must pass");
     let points = single_series_points(out);
-    assert_eq!(points.len(), 11_000);
+    assert_eq!(points.len(), 11_001);
     assert!(points.iter().all(|(_, v)| *v == 7.0));
 }
 
@@ -2573,46 +2630,59 @@ fn range_vector_lit_at_the_bucket_cap_passes_with_exact_point_count() {
 #[test]
 fn range_vector_lit_grid_aligns_under_an_unaligned_start() {
     let step = 10 * NS;
-    let window = ClientWindow {
+    let window = pulsus_read::logql::GridWindow {
         start_ns: 7 * NS,
         end_ns: 37 * NS,
-        step_ns: Some(step as u64),
+        step_ns: Some(
+            pulsus_read::logql::validate_duration_ns(step as u64, "step").expect("valid step"),
+        ),
     };
     let vec_matrix = materialize_vector_lit(0.0, &window).expect("materialize");
+    // Issue #227: the grid is START-anchored `{start + k·step ≤ end}`, so an
+    // unaligned `start=7NS` yields `7NS, 17NS, 27NS, 37NS` (NOT epoch
+    // multiples) — matching the sliding data leaves' grid.
+    let start = 7 * NS;
     assert_eq!(
         single_series_points(vec_matrix.clone()),
-        vec![(0, 0.0), (step, 0.0), (2 * step, 0.0), (3 * step, 0.0)],
+        vec![
+            (start, 0.0),
+            (start + step, 0.0),
+            (start + 2 * step, 0.0),
+            (start + 3 * step, 0.0),
+        ],
     );
 
-    // A sparse data series populated only at two of the grid steps. Empty
-    // labels so it one-to-one matches vector(0)'s `{}` series — the test
-    // isolates GRID/step alignment, not label matching.
+    // A sparse data series populated only at two of the (start-anchored) grid
+    // steps. Empty labels so it one-to-one matches vector(0)'s `{}` series —
+    // the test isolates GRID/step alignment, not label matching.
     let data = QueryResult::Matrix(vec![MatrixSeries {
         labels: vec![],
-        points: vec![(step, 4.0), (3 * step, 9.0)],
+        points: vec![(start + step, 4.0), (start + 3 * step, 9.0)],
     }]);
     let combined = combine_binary(BinOp::Add, false, None, data, vec_matrix).expect("combine");
     assert_eq!(
         single_series_points(combined),
-        vec![(step, 4.0), (3 * step, 9.0)],
+        vec![(start + step, 4.0), (start + 3 * step, 9.0)],
     );
 }
 
 /// Round-4 regression: an `i64::MIN` range window must not panic/overflow —
-/// `vector(n)` inherits `bucket_grid`'s i128 math + `clamp_bucket`
-/// narrowing, so the extreme lower bucket is clamped, not wrapped.
+/// `vector(n)` inherits `bucket_grid`'s i128 math, so the start-anchored grid
+/// begins exactly at `i64::MIN` (k=0) without wrapping.
 #[test]
 fn range_vector_lit_is_i64_min_safe() {
-    let window = ClientWindow {
+    let window = pulsus_read::logql::GridWindow {
         start_ns: i64::MIN,
         end_ns: i64::MIN + 3 * NS,
-        step_ns: Some(NS as u64),
+        step_ns: Some(
+            pulsus_read::logql::validate_duration_ns(NS as u64, "step").expect("valid step"),
+        ),
     };
     let out = materialize_vector_lit(0.0, &window).expect("i64::MIN window must not panic");
     let points = single_series_points(out);
     assert!(!points.is_empty());
-    // The lowest grid bucket sits one step below `i64::MIN`; `clamp_bucket`
-    // narrows it to exactly `i64::MIN` (i128 math), never a wrapped value.
+    // Start-anchored: the first grid point is `grid_start` = `i64::MIN` (k=0),
+    // computed in i128 and cast back without wrapping.
     assert_eq!(points[0].0, i64::MIN);
 }
 

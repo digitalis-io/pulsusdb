@@ -8,7 +8,7 @@
 //! tests (architect plan amendment §4).
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
@@ -20,7 +20,7 @@ use pulsus_logql::{
 use super::detected::{self, DetectedFields, DetectedLabelOut, FieldAccumulator};
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
-use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
+use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds, ValidatedDuration};
 use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::rows::{
@@ -901,11 +901,7 @@ impl LogQlEngine {
                     compiled,
                     &HashMap::new(),
                     client,
-                    ClientWindow {
-                        start_ns: mp.start_ns,
-                        end_ns: mp.end_ns,
-                        step_ns: mp.step_ns,
-                    },
+                    metric_plan_window(mp),
                     mp.rate_window_ns,
                 );
             }
@@ -952,6 +948,7 @@ impl LogQlEngine {
                     start_ns: mp.start_ns,
                     end_ns: mp.end_ns,
                 },
+                mp.scan_lower,
                 &mp.extra_predicates,
             );
             if let Some(e) = explain.as_mut() {
@@ -994,7 +991,8 @@ impl LogQlEngine {
                     start_ns: mp.start_ns,
                     end_ns: mp.end_ns,
                 },
-                step_ns,
+                mp.scan_lower,
+                step_ns.as_u64(),
                 &mp.extra_predicates,
             );
             if let Some(e) = explain.as_mut() {
@@ -1059,16 +1057,22 @@ impl LogQlEngine {
         }
         let meta = self.hydrate(&mp.streams_table, fingerprints).await?;
         let services = distinct_escaped_services(&meta);
-        let sql = super::sql::metric_raw_samples(
-            &mp.table,
-            &services,
-            fingerprints,
-            super::sql::TimeWindow {
-                start_ns: mp.start_ns,
-                end_ns: mp.end_ns,
-            },
-            &mp.extra_predicates,
-        );
+        let is_range = mp.step_ns.is_some();
+        let time_window = super::sql::TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        };
+        // Issue #227: a range query reads in physical-key order
+        // (`optimize_read_in_order`, no server sort) for the streaming slide;
+        // an instant query keeps the total-timestamp order its reducers pin.
+        let sql = client_metric_read_sql(mp, &services, fingerprints, time_window);
+        let settings = if is_range {
+            self.budget_settings()
+                .set("optimize_read_in_order", 1)
+                .set("max_memory_usage", RANGE_READ_MAX_MEMORY_BYTES)
+        } else {
+            self.budget_settings()
+        };
         if let Some(e) = explain.as_mut() {
             e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
         }
@@ -1080,25 +1084,30 @@ impl LogQlEngine {
         // side AS the scan streams and aborts mid-stream as
         // `QueryTooBroad(ScanBudgetBytes)` — complete-or-error holds
         // without buffering-driven OOM risk.
-        let mut state = ClientAggState::new(
-            compiled,
-            &meta,
-            client,
-            ClientWindow {
-                start_ns: mp.start_ns,
-                end_ns: mp.end_ns,
-                step_ns: mp.step_ns,
-            },
-            mp.rate_window_ns,
-        )?;
+        let window = metric_plan_window(mp);
+        let mut state = if is_range {
+            MetricAggState::Range(Box::new(RangeSlideState::new(
+                compiled,
+                &meta,
+                client,
+                window,
+                mp.rate_window_ns,
+            )?))
+        } else {
+            MetricAggState::Instant(Box::new(ClientAggState::new(
+                compiled,
+                &meta,
+                client,
+                window,
+                mp.rate_window_ns,
+            )?))
+        };
         let mut chunk: Vec<MetricScanRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
         {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule) — no other query
             // runs inside this block, and the lease ends at the brace.
-            let mut stream = self
-                .query_stream::<MetricScanRow>(&sql, &self.budget_settings())
-                .await?;
+            let mut stream = self.query_stream::<MetricScanRow>(&sql, &settings).await?;
             while let Some(row) = stream.next().await {
                 chunk.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
                 if chunk.len() >= CLIENT_AGG_CHUNK_ROWS {
@@ -1108,7 +1117,7 @@ impl LogQlEngine {
             }
         }
         state.push_rows(&chunk)?;
-        Ok(apply_vector_aggs(state.finish(), &mp.vector_aggs))
+        Ok(apply_vector_aggs(state.finish()?, &mp.vector_aggs))
     }
 
     /// Evaluates a [`MetricNode`] tree (issue M6-10): leaves execute the
@@ -1230,14 +1239,12 @@ impl LogQlEngine {
         };
         let metric_sql = if mp.client.is_some() {
             // Client-aggregated (issue M6-10): the raw full-window fetch,
-            // not a SQL aggregate.
-            super::sql::metric_raw_samples(
-                &mp.table,
-                &services,
-                &fingerprints,
-                window,
-                &mp.extra_predicates,
-            )
+            // not a SQL aggregate. Issue #227 review round 5, finding 3:
+            // EXPLAIN must report the query that ACTUALLY executes — a range
+            // query runs the PK-ordered sliding scan (`run_metric_client`),
+            // so reporting `metric_raw_samples` here made the
+            // `explain_indexes` gates validate a query we never issue.
+            client_metric_read_sql(mp, &services, &fingerprints, window)
         } else {
             let source = super::sql::MetricSource {
                 table: &mp.table,
@@ -1250,7 +1257,8 @@ impl LogQlEngine {
                     &services,
                     &fingerprints,
                     window,
-                    step_ns,
+                    mp.scan_lower,
+                    step_ns.as_u64(),
                     &mp.extra_predicates,
                 ),
                 None => super::sql::metric_instant(
@@ -1258,6 +1266,7 @@ impl LogQlEngine {
                     &services,
                     &fingerprints,
                     window,
+                    mp.scan_lower,
                     &mp.extra_predicates,
                 ),
             }
@@ -2881,14 +2890,126 @@ impl<'m> StreamAccumulator<'m> {
 // ---------------------------------------------------------------------
 
 /// The evaluation window for one client-aggregated metric query.
-/// `step_ns: None` = instant (one bucket over the whole window);
-/// `Some(step)` = the M1 tumbling bucket contract (`floor(ts/step) *
-/// step`, matching the SQL path's `intDiv` bucketing byte-for-byte).
+/// `step_ns: None` = instant (one window `(at-range, at]` reduced to a
+/// single sample). `Some(step)` = a range query evaluated with Loki's
+/// **sliding** windows (issue #227): the `[range]` window `(t-range, t]` is
+/// re-evaluated at every start-anchored grid point `t ∈ {start+k·step ≤
+/// end}`. `range_ns` is that `[range]` selector width — decoupled from
+/// `step_ns` so `rate({}[1m])` and `rate({}[10m])` differ (the divisor and
+/// the window both track `range`, never `step`).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ClientWindow {
+pub enum ClientWindow {
+    /// A single window, already materialised into `[start_ns, end_ns]` by the
+    /// planner (`start = at - range`). An instant query has **no step grid
+    /// and no residual `[range]`** — both are structurally absent here, so
+    /// neither can be misread downstream.
+    Instant { start_ns: i64, end_ns: i64 },
+    /// Sliding range evaluation. BOTH durations are
+    /// [`ValidatedDuration`]s — boundary-validated and therefore non-zero,
+    /// **by type** (issue #227 review round 4, finding 2). There is no
+    /// "absent"/zero representation for a range window, so
+    /// [`RangeSlideState`] can only ever receive a real, validated range:
+    /// the previous `ValidatedDuration::NONE` sentinel (a public unvalidated
+    /// mint that could be placed in a range slot) is gone entirely.
+    Range {
+        /// The start-anchored emit grid's first point.
+        grid_start_ns: i64,
+        end_ns: i64,
+        step_ns: ValidatedDuration,
+        /// The `[range]` selector width — the sliding span `(t-range, t]`.
+        range_ns: ValidatedDuration,
+    },
+}
+
+impl ClientWindow {
+    /// The evaluation window's lower bound (the emit grid's first point for
+    /// a range query).
+    pub fn start_ns(&self) -> i64 {
+        match *self {
+            ClientWindow::Instant { start_ns, .. } => start_ns,
+            ClientWindow::Range { grid_start_ns, .. } => grid_start_ns,
+        }
+    }
+
+    pub fn end_ns(&self) -> i64 {
+        match *self {
+            ClientWindow::Instant { end_ns, .. } | ClientWindow::Range { end_ns, .. } => end_ns,
+        }
+    }
+
+    /// `Some` only for a range query — an instant window has no step grid.
+    pub fn step_ns(&self) -> Option<ValidatedDuration> {
+        match *self {
+            ClientWindow::Instant { .. } => None,
+            ClientWindow::Range { step_ns, .. } => Some(step_ns),
+        }
+    }
+}
+
+/// The evaluation grid for a leafless `vector(<scalar>)` node (issue #221):
+/// a constant series materialised at every step point. Deliberately a
+/// SEPARATE type from [`ClientWindow`] (issue #227 review round 4): a vector
+/// literal has no `[range]` selector at all, so it must not be able to
+/// occupy — or be built from — a range window's range slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridWindow {
     pub start_ns: i64,
     pub end_ns: i64,
-    pub step_ns: Option<u64>,
+    /// `Some` = the range grid (validated step); `None` = a single instant
+    /// sample.
+    pub step_ns: Option<ValidatedDuration>,
+}
+
+/// The client-aggregated raw fetch SQL for a planned metric leaf — the ONE
+/// implementation shared by execution (`run_metric_client`) and EXPLAIN
+/// (`explain_metric`), so the reported query is by construction the query
+/// that runs (issue #227 review round 5, finding 3). A RANGE query reads in
+/// physical-key order for the streaming slide; an instant query keeps the
+/// total-timestamp order its reducers pin.
+fn client_metric_read_sql(
+    mp: &MetricPlan,
+    services: &[String],
+    fingerprints: &[u64],
+    window: super::sql::TimeWindow,
+) -> String {
+    if mp.step_ns.is_some() {
+        super::sql::metric_raw_samples_sliding(
+            &mp.table,
+            services,
+            fingerprints,
+            window,
+            mp.scan_lower,
+            &mp.extra_predicates,
+        )
+    } else {
+        super::sql::metric_raw_samples(
+            &mp.table,
+            services,
+            fingerprints,
+            window,
+            mp.scan_lower,
+            &mp.extra_predicates,
+        )
+    }
+}
+
+/// Builds the evaluation window for a planned metric leaf. The planner has
+/// already validated both durations, so a `Some(step)` plan yields the
+/// `Range` variant carrying two [`ValidatedDuration`]s and an instant plan
+/// yields `Instant` — an inconsistent window is unrepresentable.
+fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
+    match mp.step_ns {
+        Some(step_ns) => ClientWindow::Range {
+            grid_start_ns: mp.grid_start_ns,
+            end_ns: mp.end_ns,
+            step_ns,
+            range_ns: mp.range_ns,
+        },
+        None => ClientWindow::Instant {
+            start_ns: mp.grid_start_ns,
+            end_ns: mp.end_ns,
+        },
+    }
 }
 
 /// The instant-mode bucket key (any constant works — there is exactly
@@ -3085,22 +3206,41 @@ impl BucketAcc {
 /// a lone sample returns value `"0"`), so we return `0.0` and let `finish`
 /// surface it as a 0-valued vector element; we do NOT drop the group.
 fn rate_counter_extrapolated(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u64>) -> f64 {
-    if pts.len() < 2 {
+    pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
+    rate_counter_over_sorted(pts.len(), |i| pts[i], rate_window_ns)
+}
+
+/// [`rate_counter_extrapolated`]'s body over an ALREADY timestamp-sorted
+/// sequence addressed by index — `at(i)` yields the `i`-th `(ts, value)` in
+/// ascending-`ts` order.
+///
+/// Split out so the sliding evaluator can reduce **over a borrow of the
+/// live window**: the retained window is already in canonical `(ts,
+/// stream_hash, tie_rank)` order (whose leading key is `ts`), so the sort
+/// the owning form performs is a no-op on it, and copying it into a
+/// `Vec<(i64, f64)>` at every grid point — as the round-4 code did — was
+/// pure waste that also doubled peak memory for the copy (issue #227 review
+/// round 5, finding 2). Values are read straight out of the window instead.
+/// The arithmetic is byte-identical to the owning form; only the storage
+/// differs.
+fn rate_counter_over_sorted<F>(len: usize, at: F, rate_window_ns: Option<u64>) -> f64
+where
+    F: Fn(usize) -> (i64, f64),
+{
+    if len < 2 {
         return 0.0;
     }
     let Some(rng_ns) = rate_window_ns.filter(|w| *w > 0) else {
         return 0.0;
     };
-    pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
-    let first_t = pts[0].0;
-    let last_t = pts[pts.len() - 1].0;
-    let first_f = pts[0].1;
-    let last_f = pts[pts.len() - 1].1;
+    let (first_t, first_f) = at(0);
+    let (last_t, last_f) = at(len - 1);
 
     // Reset-aware increase in the reference's accumulation order.
     let mut result_value = last_f - first_f;
     let mut last_value = 0.0_f64;
-    for &(_, f) in &pts {
+    for i in 0..len {
+        let f = at(i).1;
         if f < last_value {
             result_value += last_value;
         }
@@ -3108,12 +3248,20 @@ fn rate_counter_extrapolated(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u6
     }
 
     // `durationMilliseconds(selRange)`; window anchored on the first sample.
-    let sel_range_ms: i64 = (rng_ns / 1_000_000) as i64;
-    let range_start = first_t - sel_range_ms; // ns − ms: the reference's unit mix
-    let mut duration_to_start = (first_t - range_start) as f64 / 1000.0; // == sel_range_ms/1000
+    //
+    // Issue #227 review finding 2: every timestamp SPAN is computed in `i128`
+    // before the float conversion. `first_t - sel_range_ms` underflows i64 for
+    // a first sample near `i64::MIN`, and `last_t - first_t` overflows i64 for
+    // a window spanning near-`MIN` to near-`MAX` — both are valid extreme
+    // inputs that would panic in debug / wrap in release. The i128 widening
+    // changes no in-range value (the arithmetic is identical), it only removes
+    // the overflow; the reference's ns-vs-ms unit mix is preserved verbatim.
+    let sel_range_ms: i128 = (rng_ns / 1_000_000) as i128;
+    let range_start = first_t as i128 - sel_range_ms; // ns − ms: the reference's unit mix
+    let mut duration_to_start = (first_t as i128 - range_start) as f64 / 1000.0; // == sel_range_ms/1000
     let duration_to_end = 0.0_f64; // rangeEnd == last.T ⇒ 0
-    let sampled_interval = (last_t - first_t) as f64 / 1000.0;
-    let average_duration = sampled_interval / (pts.len() - 1) as f64;
+    let sampled_interval = (last_t as i128 - first_t as i128) as f64 / 1000.0;
+    let average_duration = sampled_interval / (len - 1) as f64;
 
     if result_value > 0.0 && first_f >= 0.0 {
         let duration_to_zero = sampled_interval * (first_f / result_value);
@@ -3180,33 +3328,89 @@ fn render_series_labels(sorted: &[(String, String)]) -> String {
     out
 }
 
-/// The full step-bucket grid over `(start, end]` — `absent_over_time`
-/// must emit `1.0` for EMPTY buckets, which the data-driven accumulators
-/// never see.
-fn bucket_grid(start_ns: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
-    if step_ns == 0 || step_ns > i64::MAX as u64 || end_ns <= start_ns {
+/// The start-anchored step grid `{grid_start + k·step : k≥0, ≤ end}` (issue
+/// #227: Loki seeds `current` at `start-step`, first point `start`, iterates
+/// `≤ end`). Used by `vector(<scalar>)`'s constant matrix so it aligns with
+/// the sliding data leaves' start-anchored grid. i128 intermediates keep
+/// `grid_start + k·step` overflow-free; every point lies in
+/// `[grid_start, end]` (no clamp needed — `k ≥ 0`). The grid passed
+/// [`ensure_grid_resolution`] before this runs (≤ 22_002 points; 11_001
+/// when the span fits an int64 duration — round 8's saturating fence).
+fn bucket_grid(grid_start: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
+    if step_ns == 0 || step_ns > i64::MAX as u64 || end_ns < grid_start {
         return Vec::new();
     }
-    // i128 intermediates + the shared clamp, exactly like [`bucket_of`]
-    // (review round 3): `k * step` for the lowest grid bucket can sit
-    // one sliver below `i64::MIN`. Buckets containing any ts in
-    // `(start, end]`: floor((start+1)/step) through floor(end/step).
-    // The grid size passed `MAX_CLIENT_AGG_BUCKETS` before this runs.
     let step = step_ns as i128;
-    let first = (start_ns as i128 + 1).div_euclid(step);
-    let last = (end_ns as i128).div_euclid(step);
-    (first..=last).map(|k| clamp_bucket(k * step)).collect()
+    let gs = grid_start as i128;
+    let kmax = (end_ns as i128 - gs) / step;
+    // Saturating narrowing, like the sliding evaluator's `grid_point` (issue
+    // #227 arithmetic sweep): every point is in `[grid_start, end]` by
+    // construction, so the clamp is defense-in-depth, never a wrap.
+    (0..=kmax).map(|k| clamp_bucket(gs + k * step)).collect()
 }
 
-/// The evaluation-bucket cap for client-aggregated range queries: a
-/// `(end - start) / step` grid larger than this is rejected as
-/// `QueryTooBroad(MetricBuckets)` BEFORE any grid or accumulator
-/// materialization (review round 1, finding 2 — an `absent_over_time`
-/// over a huge range with a tiny step must never allocate an
-/// attacker-sized grid). 11 000 matches the ecosystem-standard
-/// points-per-range-query ceiling. A documented constant, not a config
+/// The evaluation-resolution cap for client-aggregated range queries, in
+/// step INTERVALS — Loki-exact (issue #227 review round 7, finding 1):
+/// the reference rejects iff `(end - start) / step > 11000` (truncating
+/// integer division, `loghttp/query.go` `errStepTooSmall`), so a request
+/// with exactly 11 000 intervals is SERVED, and its inclusive
+/// start-anchored grid holds `intervals + 1 = 11_001` points. Every grid
+/// guard funnels through [`ensure_grid_resolution`], which encodes that
+/// rule — rejected as `QueryTooBroad(MetricBuckets)` BEFORE any grid or
+/// accumulator materialization (review round 1, finding 2 — an
+/// `absent_over_time` over a huge range with a tiny step must never
+/// allocate an attacker-sized grid). A documented constant, not a config
 /// field (the `DEFAULT_MAX_STREAMS` precedent).
 pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
+
+/// **The one grid-resolution guard** (issue #227 review round 7,
+/// finding 1): rejects iff [`fence_intervals`] — the reference's own
+/// SATURATING `floor((end - grid_start) / step)` (round 8) — exceeds
+/// [`MAX_CLIENT_AGG_BUCKETS`], and returns the EXACT grid POINT count
+/// ([`grid_point_count`]) on success. The HTTP boundary
+/// (`ensure_range_resolution` in `pulsus-server`) applies the identical
+/// saturating formula over the identical `(start, end, step)` (the emit
+/// grid is start-anchored, so `grid_start == start`), so the engine can
+/// never 422 a request the request guard admitted — across the WHOLE i64
+/// timestamp domain, not just spans that fit an int64 duration. The
+/// admitted point count is still hard-bounded: an unsaturated span holds
+/// ≤ 11_001 points, and a saturated one forces `step > i64::MAX / 11_001`,
+/// so the true `u64` span (< 2^64) holds ≤ 22_002 points — O(fence),
+/// never attacker-sized. A degenerate step (zero, or wider than i64 —
+/// neither passes `validate_duration_ns`) saturates [`fence_intervals`]
+/// to `u64::MAX` and still rejects.
+fn ensure_grid_resolution(grid_start_ns: i64, end_ns: i64, step_ns: u64) -> Result<u64, ReadError> {
+    let intervals = fence_intervals(grid_start_ns, end_ns, step_ns);
+    if intervals > MAX_CLIENT_AGG_BUCKETS {
+        return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+            buckets: intervals,
+            cap: MAX_CLIENT_AGG_BUCKETS,
+        }));
+    }
+    Ok(grid_point_count(grid_start_ns, end_ns, step_ns))
+}
+
+/// The fence's interval count, in the reference's EXACT arithmetic (issue
+/// #227 review round 8): `End.Sub(Start)` is Go's `time.Time.Sub`, which
+/// SATURATES an out-of-range difference at the int64-nanosecond `Duration`
+/// bound (`maxDuration = 1<<63-1`) rather than widening, and the division
+/// is truncating integer `Duration / Duration`. So a full-domain span at a
+/// huge step counts `i64::MAX / step` intervals — under the fence — where
+/// the exact i128 span would wrongly reject a request the reference
+/// serves. `end < grid_start` is zero intervals (never trips, matching
+/// the guard's admit-empty behaviour); a degenerate step saturates to
+/// `u64::MAX` so the guard rejects by name instead of dividing by zero.
+fn fence_intervals(grid_start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
+    if end_ns < grid_start_ns {
+        return 0;
+    }
+    if step_ns == 0 || step_ns > i64::MAX as u64 {
+        return u64::MAX;
+    }
+    // Loki-exact: the span clamped to i64 (`time.Time.Sub` saturation),
+    // non-negative here (`end ≥ grid_start` above).
+    end_ns.saturating_sub(grid_start_ns) as u64 / step_ns
+}
 
 /// The exact-quantile retention cap: `quantile_over_time` is the one
 /// reducer whose state grows with surviving rows (every value is kept
@@ -3280,6 +3484,15 @@ struct ClientAggState<'q> {
     /// Total timestamped points retained across every `rate_counter`
     /// accumulator, charged against [`MAX_COUNTER_VALUES`].
     counter_values: u64,
+    /// QUERY-LIFETIME bytes retained by `label_groups` — each distinct
+    /// group's rendered key + cloned `LabelSet` + map-slot share. The same
+    /// round-6 charge as the sliding path's `groups`, through the same
+    /// [`charge_group_bytes`]/[`group_entry_bytes`] helpers: the group
+    /// COUNT cap alone left per-group label BYTES unbounded here too.
+    group_bytes: u64,
+    /// Always [`MAX_CLIENT_AGG_GROUP_BYTES`] in production (test seam,
+    /// the `retention_cap` precedent).
+    group_bytes_cap: u64,
 }
 
 impl<'q> ClientAggState<'q> {
@@ -3292,14 +3505,14 @@ impl<'q> ClientAggState<'q> {
         window: ClientWindow,
         rate_window_ns: Option<u64>,
     ) -> Result<Self, ReadError> {
-        if let Some(step) = window.step_ns {
-            let buckets = grid_bucket_count(window.start_ns, window.end_ns, step);
-            if buckets > MAX_CLIENT_AGG_BUCKETS {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
-                    buckets,
-                    cap: MAX_CLIENT_AGG_BUCKETS,
-                }));
-            }
+        if let Some(step) = window.step_ns().map(|d| d.as_u64()) {
+            // Defense-in-depth only: an instant window has no step, and the
+            // range path routes to `RangeSlideState` — but if a stepped
+            // window ever reached here it must obey the SAME Loki-exact
+            // resolution rule as every other grid guard (review round 7,
+            // finding 1: two disagreeing counts turned an admitted request
+            // into a 422).
+            ensure_grid_resolution(window.start_ns(), window.end_ns(), step)?;
         }
         let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
         for (fp, m) in meta {
@@ -3317,6 +3530,8 @@ impl<'q> ClientAggState<'q> {
             label_groups: HashMap::new(),
             quantile_values: 0,
             counter_values: 0,
+            group_bytes: 0,
+            group_bytes_cap: MAX_CLIENT_AGG_GROUP_BYTES,
         })
     }
 
@@ -3339,7 +3554,7 @@ impl<'q> ClientAggState<'q> {
                 MetricRun::Kept { line, value } => (line, value),
             };
             check_surviving_error(&scratch)?;
-            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns);
+            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns().map(|d| d.as_u64()));
             if is_absent {
                 // Selector-wide presence (plan v2 D2): count surviving
                 // lines per bucket across ALL fingerprints/label sets.
@@ -3401,6 +3616,21 @@ impl<'q> ClientAggState<'q> {
                             .iter()
                             .map(|(k, v)| (k.to_string(), v.to_string()))
                             .collect();
+                        // Issue #227 review round 6 (same class as the
+                        // sliding path): the key + `LabelSet` live in
+                        // `label_groups` for the whole query — charged
+                        // BEFORE the insert retains them; refused means the
+                        // per-row transients above drop with the error and
+                        // the map never holds the entry. (`entry()` has
+                        // already reserved the table slot — that growth is
+                        // structurally bounded by the 500-group count cap
+                        // checked above and covered by this charge's slot
+                        // term.)
+                        charge_group_bytes(
+                            &mut self.group_bytes,
+                            group_entry_bytes(e.key(), &labels, INSTANT_GROUP_SLOT),
+                            self.group_bytes_cap,
+                        )?;
                         &mut e.insert((labels, BTreeMap::new())).1
                     }
                 }
@@ -3430,7 +3660,7 @@ impl<'q> ClientAggState<'q> {
     /// `absent_over_time` emits at most ONE series over the (pre-capped)
     /// bucket grid; the other reducers emit per surviving group.
     fn finish(self) -> QueryResult {
-        let is_instant = self.window.step_ns.is_none();
+        let is_instant = self.window.step_ns().is_none();
         if matches!(self.client.range_op, RangeAggOp::AbsentOverTime) {
             let labels: LabelSet = self.client.absent_labels.clone();
             return if is_instant {
@@ -3440,9 +3670,9 @@ impl<'q> ClientAggState<'q> {
                     QueryResult::Vector(Vec::new())
                 }
             } else {
-                let step = self.window.step_ns.unwrap_or(0);
+                let step = self.window.step_ns().map(|d| d.as_u64()).unwrap_or(0);
                 let points: Vec<(i64, f64)> =
-                    bucket_grid(self.window.start_ns, self.window.end_ns, step)
+                    bucket_grid(self.window.start_ns(), self.window.end_ns(), step)
                         .into_iter()
                         .filter(|b| !self.present.contains(b))
                         .map(|b| (b, 1.0))
@@ -3456,14 +3686,31 @@ impl<'q> ClientAggState<'q> {
         }
 
         let base_labels = self.base_labels;
+        let mut group_bytes = self.group_bytes;
         let groups: Vec<(LabelSet, BTreeMap<i64, BucketAcc>)> = if self.fan_out {
-            self.label_groups.into_values().collect()
+            self.label_groups
+                .into_iter()
+                .map(|(key, (labels, buckets))| {
+                    // Round 6 symmetry: sized over the same unmodified
+                    // key/labels as the charge, released as each entry is
+                    // consumed (key dropped, labels move to the output).
+                    discharge_group_bytes(
+                        &mut group_bytes,
+                        group_entry_bytes(&key, &labels, INSTANT_GROUP_SLOT),
+                    );
+                    (labels, buckets)
+                })
+                .collect()
         } else {
             self.fp_groups
                 .into_iter()
                 .filter_map(|(fp, buckets)| base_labels.get(&fp).map(|l| (l.clone(), buckets)))
                 .collect()
         };
+        debug_assert_eq!(
+            group_bytes, 0,
+            "every group-label byte charge must be discharged at finish"
+        );
         let op = self.client.range_op;
         let rate_window_ns = self.rate_window_ns;
         let param = self.client.param;
@@ -3496,67 +3743,29 @@ impl<'q> ClientAggState<'q> {
     }
 }
 
-/// The bucket count the grid guard charges: how many step buckets the
-/// `(start, end]` window touches (0 for an empty/inverted window).
-/// Checked `i128` arithmetic throughout (review round 2, finding 1): the
-/// full `i64` timestamp range at `step = 1` is ~2^64 buckets — a plain
-/// `i64` count would panic/wrap PAST the cap. Anything unrepresentable
-/// or degenerate (a zero step, a step wider than `i64` — both also
-/// structurally rejected upstream) saturates to `u64::MAX`, which the
-/// caller's cap comparison turns into the same named too-broad error.
-fn grid_bucket_count(start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
-    if end_ns <= start_ns {
-        return 0;
-    }
-    if step_ns == 0 || step_ns > i64::MAX as u64 {
-        // Defensive: a zero step is `InvalidStep` at the planner and a
-        // >i64 step never comes out of `parse_step`; saturate so the
-        // guard rejects rather than ever reaching `bucket_of`'s
-        // `div_euclid`.
-        return u64::MAX;
-    }
-    let step = step_ns as i128;
-    // Buckets containing any ts in (start, end]: floor((start+1)/step)
-    // through floor(end/step). i128 makes `start + 1` and the span
-    // arithmetic overflow-free for every i64 input; `checked_*` is
-    // belt-and-braces per the review disposition.
-    let first = (start_ns as i128 + 1).div_euclid(step);
-    let last = (end_ns as i128).div_euclid(step);
-    match last.checked_sub(first).and_then(|d| d.checked_add(1)) {
-        Some(count) if count <= 0 => 0,
-        Some(count) => u64::try_from(count).unwrap_or(u64::MAX),
-        None => u64::MAX,
-    }
-}
-
 /// Materializes `vector(<scalar>)` (issue #221): promotes a constant to a
 /// vector/matrix result with an empty label set. Instant queries yield a
 /// single `{} => value` sample; range queries yield one constant `{}`
 /// series populated at every evaluation-grid step.
 ///
-/// A leafless `vector(n)` bypasses [`ClientAggState::new`]'s
-/// `MAX_CLIENT_AGG_BUCKETS` guard (no leaf ever runs), so this checks the
-/// same cap via [`grid_bucket_count`] BEFORE materializing any grid — an
-/// over-cap `vector(n)` returns the identical `QueryTooBroad(MetricBuckets)`
+/// A leafless `vector(n)` bypasses [`RangeSlideState::new`]'s resolution
+/// guard (no leaf ever runs), so this checks the same Loki-exact rule via
+/// [`ensure_grid_resolution`] BEFORE materializing any grid — an over-cap
+/// `vector(n)` returns the identical `QueryTooBroad(MetricBuckets)`
 /// 422 as every other over-cap LogQL range query, with zero allocation and
 /// no DB round-trip. The grid itself REUSES [`bucket_grid`] (the same
-/// i128-safe, `clamp_bucket`-narrowed, `(start,end]`-aligned grid a leaf
-/// range query and `absent_over_time` use), so `points.len() == buckets`
+/// i128-safe, `clamp_bucket`-narrowed, start-anchored grid a leaf
+/// range query and `absent_over_time` use), so `points.len()` equals the
+/// guard's admitted point count (≤ 11 001)
 /// and a `data + vector(n)` binop aligns on the data's populated steps.
-pub fn materialize_vector_lit(value: f64, window: &ClientWindow) -> Result<QueryResult, ReadError> {
-    match window.step_ns {
+pub fn materialize_vector_lit(value: f64, window: &GridWindow) -> Result<QueryResult, ReadError> {
+    match window.step_ns.map(|d| d.as_u64()) {
         None => Ok(QueryResult::Vector(vec![VectorSample {
             labels: vec![],
             value,
         }])),
         Some(step) => {
-            let buckets = grid_bucket_count(window.start_ns, window.end_ns, step);
-            if buckets > MAX_CLIENT_AGG_BUCKETS {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
-                    buckets,
-                    cap: MAX_CLIENT_AGG_BUCKETS,
-                }));
-            }
+            ensure_grid_resolution(window.start_ns, window.end_ns, step)?;
             let points = bucket_grid(window.start_ns, window.end_ns, step)
                 .into_iter()
                 .map(|ts| (ts, value))
@@ -3565,6 +3774,1503 @@ pub fn materialize_vector_lit(value: f64, window: &ClientWindow) -> Result<Query
                 labels: vec![],
                 points,
             }]))
+        }
+    }
+}
+
+// =====================================================================
+// Issue #227: Loki sliding-window range evaluation.
+//
+// A range query re-evaluates the `[range]` window `(t-range, t]` at every
+// start-anchored grid point `t ∈ {grid_start + k·step ≤ end}` (Loki's
+// `batchRangeVectorIterator`). Rows arrive in physical-key order
+// `(service, fingerprint, timestamp_ns)`, so a fingerprint's samples are
+// contiguous and ascending, and same-`(fingerprint, timestamp_ns)`
+// collision groups arrive consecutively.
+//
+// Two grouping shapes:
+//  - **non-mutating** (output series == fingerprint): a true streaming
+//    slide per fingerprint — interleave grid emission with the ascending
+//    stream, evicting `T ≤ t-range` and loading `T ≤ t`, so peak memory is
+//    one window's contents. The concurrent-retention cap trips here
+//    (charge-on-load / discharge-on-evict).
+//  - **mutating/regrouping** (a `label_format`/parser merges fingerprints
+//    into one output set): fan each sample into every covering grid cell,
+//    retaining fixed-width `(ts, stream_hash, tie_rank, value)` points, then
+//    reduce each cell — class-C folds in the canonical `(ts, stream_hash,
+//    tie_rank)` order, class-B order-independently.
+//
+// Reducer classes (finding-4 table): A invert-integer, B re-reduce
+// order-independent, C re-reduce canonical-fold. See [`reducer_class`].
+// =====================================================================
+
+/// Loki `labels.StableHash` (v3.7.4 `model/labels/sharding.go:24`): the
+/// same-timestamp cross-stream tie key. `xxhash64` (seed 0) over each label
+/// **in sorted-by-name order** rendered `name·0xFF·value·0xFF` (`sep =
+/// '\xff'`, `labels_common.go:38`). Build-tag-independent — byte-identical
+/// to Loki. `sorted_labels` is the stream's base label set (as
+/// [`series_labels`] renders it: canonical labels + the `service_name`
+/// column), already sorted by name.
+fn stream_hash(sorted_labels: &[(String, String)]) -> u64 {
+    let mut buf: Vec<u8> = Vec::new();
+    for (name, value) in sorted_labels {
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0xFF);
+        buf.extend_from_slice(value.as_bytes());
+        buf.push(0xFF);
+    }
+    xxhash_rust::xxh64::xxh64(&buf, 0)
+}
+
+/// Cap on the transient full-body buffer that ranks one consecutive
+/// same-`(fingerprint, timestamp_ns)` collision group (issue #227). A
+/// same-nanosecond, same-stream run larger than this is
+/// pathological/adversarial, never real data; exceeding it is a clean
+/// `QueryTooBroad(TsCollisionGroup)`, never an OOM. A documented constant
+/// (the `DEFAULT_MAX_STREAMS` precedent).
+pub const MAX_TS_COLLISION_GROUP: u64 = 10_000;
+
+/// Byte ceiling on the staged same-`(fingerprint, timestamp_ns)` collision
+/// group (issue #227 review rounds 3 + 4, finding 1).
+///
+/// The member-COUNT cap alone is not a memory bound: 10 000 multi-megabyte
+/// members are terabytes of RAM while staying inside the byte-scan budget.
+///
+/// > **Bound proof (re-derived for EVERY reducer class, round 4).**
+/// > 1. [`RangeSlideState::stage_member`] is the ONLY place a per-member
+/// >    allocation is pushed into `coll` — no reducer class has another
+/// >    path, and it is called exactly once per surviving row.
+/// > 2. It charges [`RangeSlideState::member_stage_bytes`] BEFORE allocating.
+/// >    That figure is an UPPER BOUND covering **every** per-member
+/// >    allocation: the body clone (class C + first/last), the rendered
+/// >    label JSON — sized EXACTLY by [`rendered_labels_json_len`], so the
+/// >    `\u00xx` six-for-one escape expansion is charged — and the cloned
+/// >    `LabelSet` with each of its owned strings (any label-mutating
+/// >    pipeline; charged for ALL classes, including the integer class A that
+/// >    stages no body), each through [`alloc_block_bytes`] /
+/// >    [`grown_alloc_bytes`] so container growth and the allocator's
+/// >    size-class rounding (round 7) are covered. Classes that allocate
+/// >    nothing extra charge only the `CollMember` slot.
+/// > 3. The staging is refused unless
+/// >    `coll_bytes + charge <= MAX_TS_COLLISION_GROUP_BYTES`, so the
+/// >    breaching allocation is never performed; on success `coll_bytes`
+/// >    grows by exactly the charge.
+/// > 4. `flush_collision` empties `coll` and resets `coll_bytes` together at
+/// >    every `(fingerprint, timestamp_ns)` boundary, so exactly one group is
+/// >    staged at a time and the counter can neither leak nor double-count
+/// >    across groups (including when a group straddles a fetch chunk: the
+/// >    straddling group is simply never flushed between chunks, so its
+/// >    charge accumulates continuously in the same counter).
+/// >
+/// > Therefore `actual staged heap bytes <= coll_bytes <=
+/// > MAX_TS_COLLISION_GROUP_BYTES` **at all times, for every reducer class,
+/// > any body/label size and any density**. A breach is a clean
+/// > `TsCollisionGroup` error — never a truncated group, so the `tie_rank`
+/// > order is never silently partial.
+/// >
+/// > **What survives a flush.** `Vec::clear` DROPS every element (bodies,
+/// > rendered JSON and cloned label sets are freed) but keeps `coll`'s own
+/// > element buffer. That spare capacity is bounded by the largest group
+/// > ever staged, whose slot charge (`VEC_GROWTH_FACTOR ×
+/// > size_of::<CollMember>()` per member) was itself inside the cap — so
+/// > the residual buffer is `<= MAX_TS_COLLISION_GROUP_BYTES` too, and no
+/// > content bytes survive.
+///
+/// 8 MiB staged for one nanosecond in one stream is far beyond real data
+/// (real groups are size 1), so nothing servable is rejected.
+pub const MAX_TS_COLLISION_GROUP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The floor one owned heap allocation costs however short its payload is:
+/// `RawVec`'s `min_non_zero_cap` is 8 for byte-sized elements, every
+/// mainstream allocator has a smallest size class / minimum chunk of ≤ 32
+/// bytes, and glibc's minimum chunk is exactly 32 (issue #227 review
+/// round 5, finding 1). The floor keeps [`alloc_block_bytes`] a bound
+/// independent of whichever `ToString`/`clone` capacity specialization the
+/// standard library happens to use.
+const MIN_ALLOC_BYTES: u64 = 32;
+
+/// A conservative, provable UPPER BOUND on the heap block a real allocator
+/// RETAINS for one **exactly reserved** allocation of `content` payload
+/// bytes (`String::clone`, `str::to_owned`, `collect` from a `TrustedLen`
+/// iterator — all reserve exactly the final length in ONE allocation).
+///
+/// Issue #227 review round 7, finding 2: charging the request size itself
+/// (`content.max(32)`) was NOT an upper bound — allocators round a request
+/// up to a size class, so a 33-byte string can retain a 48- or 64-byte
+/// block and adversarial label strings undercounted staging and
+/// query-lifetime group memory by a constant factor. The model here is a
+/// documented over-approximation, `2·content` floored at
+/// [`MIN_ALLOC_BYTES`], NOT any specific allocator's class table. Why
+/// `2·content` dominates every mainstream allocator's retained block
+/// (header/metadata included) for a `content`-byte request:
+///
+/// - **Size-class allocators with out-of-band metadata** (jemalloc,
+///   mimalloc, tcmalloc, snmalloc): no mainstream class grid is coarser
+///   than powers of two, so `class(n) ≤ next_pow2(n) ≤ 2n` for every
+///   `n ≥ 1`, and the smallest classes sit under the 32-byte floor.
+/// - **Inline-header, 16-byte-binned allocators** (glibc malloc): chunk =
+///   `align16(n + 8)` with a 32-byte minimum — `≤ n + 23 ≤ 2n` for
+///   `n ≥ 23`, and `≤ 32` (the floor) for `n ≤ 23`.
+/// - **Page-rounded huge allocations** (mmap past the ~128 KiB
+///   threshold): `n + header + 4 KiB page slack ≤ 2n` at those sizes.
+///
+/// Over-charging is the safe direction (a breach is a clean 422, never an
+/// OOM); the factor halves no real workload's headroom — the caps'
+/// margins are orders of magnitude above real label/body sizes.
+fn alloc_block_bytes(content: u64) -> u64 {
+    content.saturating_mul(2).max(MIN_ALLOC_BYTES)
+}
+
+/// An upper bound on the heap bytes a **geometrically grown** buffer of
+/// `content` final payload bytes occupies at its peak, allocator rounding
+/// included. `RawVec::grow_amortized` sets `cap = max(2·cap_old,
+/// required)`, and `cap_old < required <= content` at the last growth, so
+/// at the realloc peak two blocks are live: the new buffer (request
+/// `≤ 2·content`, retained `≤ alloc_block_bytes(2·content) ≤
+/// 2·alloc_block_bytes(content)`) and the old buffer (request
+/// `< content`, retained `≤ alloc_block_bytes(content)`) — `3·
+/// alloc_block_bytes(content)` dominates the sum for every input (review
+/// round 7, finding 2: the previous `3·content` covered the request
+/// bytes but not the allocator's per-block rounding).
+fn grown_alloc_bytes(content: u64) -> u64 {
+    alloc_block_bytes(content).saturating_mul(3)
+}
+
+/// The exact number of bytes [`push_json_string`] appends for `s` — the two
+/// quotes plus the escaped body — computed WITHOUT allocating so the
+/// collision-group charge can size the rendered JSON *before* it is built
+/// (issue #227 review round 5, finding 1: charging the content once
+/// under-counted the `\u00xx` six-for-one expansion of a C0 control byte).
+/// [`rendered_labels_json_len_matches_the_renderer_byte_for_byte`] pins this
+/// against the renderer itself, so the two cannot drift.
+fn json_string_len(s: &str) -> u64 {
+    let mut n: u64 = 2; // the enclosing quotes
+    for c in s.chars() {
+        n = n.saturating_add(match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0C}' => 2,
+            c if (c as u32) < 0x20 => 6, // `\u00xx`
+            c => c.len_utf8() as u64,
+        });
+    }
+    n
+}
+
+/// The exact byte length [`render_labels_json_sorted`] will produce for
+/// `sorted_labels` (`{"k":"v",...}`), computed without allocating.
+fn rendered_labels_json_len(sorted_labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> u64 {
+    let mut n: u64 = 2; // `{` and `}`
+    for (i, (k, v)) in sorted_labels.iter().enumerate() {
+        if i > 0 {
+            n = n.saturating_add(1); // `,`
+        }
+        n = n
+            .saturating_add(json_string_len(k))
+            .saturating_add(1) // `:`
+            .saturating_add(json_string_len(v));
+    }
+    n
+}
+
+/// The sliding-window **concurrent** retained-point cap (issue #227):
+/// charge-on-load / discharge-on-evict across every retained window entry
+/// (non-mutating deque + mutating cells). The invariant `retained ≤ cap`
+/// holds at all times, so process memory is bounded to ≈ `cap × entry
+/// width` regardless of `[range]`/step/density — the charge is per-load, so
+/// it trips as the FIRST oversized window fills, DURING the scan, before
+/// RSS grows. Generalizes the instant path's per-reducer
+/// [`MAX_QUANTILE_VALUES`]/[`MAX_COUNTER_VALUES`] total-retention proofs
+/// into one concurrent invariant. Same 4M magnitude, set generously so
+/// nothing Loki reliably serves is rejected (see the cap-generosity corpus
+/// case).
+///
+/// **Unit and byte relationship.** One point is one [`WinSample`]. Actual
+/// process bytes are `retained × size_of::<WinSample>()` scaled by the
+/// container's allocator growth slack (a `VecDeque`/`Vec` holds up to ~2×
+/// its length, plus the old buffer during a realloc) — i.e. `O(cap)`, with
+/// no axis that scales with `[range]`, step, cardinality or density. Any
+/// per-emit scratch a reducer needs on top of the window is charged
+/// per-sample up front by [`retention_points_per_sample`], so it is inside
+/// the same bound.
+pub const MAX_RETAINED_WINDOW_POINTS: u64 = 4_000_000;
+
+/// **The one retention gate.** Every sliding-path allocation that scales
+/// with scanned data is sized in retention POINTS, checked against the cap,
+/// and accounted HERE — *before* the allocation is performed (issue #227
+/// review round 5, finding 2: the charge sites used to be scattered, and
+/// three of them charged AFTER inserting, so the breaching allocation was
+/// made before the cap could refuse it). Every caller on the sliding path
+/// funnels through this function and [`discharge_retention`], so the
+/// "size → check the cap → allocate" rule has exactly one implementation.
+///
+/// `saturating_add` cannot mask a breach: saturation only ever makes the
+/// sum LARGER, so the comparison still rejects.
+fn charge_retention(retained: &mut u64, points: u64, cap: u64) -> Result<(), ReadError> {
+    let next = retained.saturating_add(points);
+    if next > cap {
+        return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
+            count: next,
+            cap,
+        }));
+    }
+    *retained = next;
+    Ok(())
+}
+
+/// Releases a charge made by [`charge_retention`], called as the charged
+/// memory is freed (eviction, series close, cell consumption). Saturating
+/// for panic-proofing only — the charge/discharge pairing is exact, which
+/// `finish`'s `retained == 0` post-condition asserts.
+fn discharge_retention(retained: &mut u64, points: u64) {
+    *retained = retained.saturating_sub(points);
+}
+
+/// Retention points charged per retained sample, in [`WinSample`] units.
+///
+/// Most reducers re-reduce over a BORROW of the live window and allocate
+/// nothing per emit, so one retained sample costs exactly one point.
+/// `quantile_over_time` is the sole exception: its reduction must SORT the
+/// values, and it cannot sort the window itself (the deque's ascending-`ts`
+/// order is what eviction depends on), so it materializes a `Vec<f64>` copy
+/// of the LIVE window at every grid point.
+///
+/// That copy is charged up front, at load, rather than at the emit that
+/// makes it — which is what keeps the rule "the cap approves an allocation
+/// before it happens" true for a copy taken deep inside a non-fallible
+/// reduce. **Bound:** the copy is `8 × W` bytes for a live window of `W`
+/// samples (`collect` from a `TrustedLen` iterator reserves exactly `W`),
+/// while the extra point charges `size_of::<WinSample>()` = 32 bytes per
+/// sample — 4× headroom, so the charge dominates the copy for every window
+/// size and every allocator slack.
+fn retention_points_per_sample(op: RangeAggOp) -> u64 {
+    match op {
+        RangeAggOp::QuantileOverTime => 2,
+        _ => 1,
+    }
+}
+
+/// The **query-lifetime** byte cap on the label-mutating client-aggregation
+/// path's distinct output-group state (issue #227 review round 6): each
+/// first-seen group MOVES its rendered JSON key and cloned final `LabelSet`
+/// into the group map, where they live until finish — bytes charged against
+/// NEITHER the collision-group cap (whose counter resets when the group
+/// flushes) nor the retention cap (denominated in fixed-width points). The
+/// group COUNT was already bounded ([`MAX_CLIENT_AGG_SERIES`]), but 500
+/// multi-MiB extracted label sets were a real memory hazard; this cap bounds
+/// their BYTES, charged through [`charge_group_bytes`] BEFORE the insertion
+/// that retains each entry and released as finish consumes it.
+///
+/// **The query-lifetime container audit** (round 6 — earlier sweeps covered
+/// the per-sample/per-window dimension; this is the per-QUERY one). Every
+/// container that lives for the whole evaluation, and what bounds its bytes:
+///
+/// | container | bytes bounded by |
+/// |---|---|
+/// | `RangeSlideState::groups` keys + `MutGroup::labels` | **charged here** (before insertion; released as `finish_in_place` consumes each entry) |
+/// | `ClientAggState::label_groups` keys + `LabelSet`s | **charged here** (same helpers, same discipline) |
+/// | `MutGroup::int_cells`/`pt_cells`, `FpSlide::win`, `BucketAcc` retention | [`MAX_RETAINED_WINDOW_POINTS`] / [`MAX_QUANTILE_VALUES`] / [`MAX_COUNTER_VALUES`], charge-before-insert |
+/// | `base_labels` / `hashes` (both states) | built once from the stage-2 hydration read, which is scan-budget-capped (`max_bytes_to_read`) and stream-capped (`max_streams`); never grown per row |
+/// | non-mutating output labels (`FpSlide::labels`, `series_out`) | one clone per emitted series (≤ [`MAX_CLIENT_AGG_SERIES`]) of a `base_labels` value — inside the same hydration bound |
+/// | emitted points (`FpSlide::points`, `series_out`, fan-out `points`) | fixed-width `(i64, f64)`, structurally ≤ `MAX_CLIENT_AGG_SERIES × grid` (grid ≤ [`MAX_CLIENT_AGG_BUCKETS`] + 1) ≈ 88 MB worst case, independent of input bytes |
+/// | `present_cover` / `present` | grid-sized (≤ [`MAX_CLIENT_AGG_BUCKETS`] + 2 entries) |
+/// | `absent_labels` | cloned from the parsed query text — bounded by request size |
+/// | `coll` staging | NOT query-lifetime: one group at a time, ≤ [`MAX_TS_COLLISION_GROUP_BYTES`] |
+///
+/// 64 MiB across ≤ 500 groups is ~128 KiB of rendered labels per group —
+/// far beyond real extracted label sets (typically well under a KiB), so
+/// nothing servable is rejected; an adversarial 500 × multi-MiB set trips a
+/// clean 422 instead of holding gigabytes for the query's lifetime.
+pub const MAX_CLIENT_AGG_GROUP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// **The one group-byte gate** (round 6): every query-lifetime group-map
+/// insertion is sized by [`group_entry_bytes`], checked against the cap, and
+/// accounted HERE — *before* the insertion that retains the entry, so the
+/// map never holds a refused group. `saturating_add` cannot mask a breach
+/// (saturation only grows the sum).
+fn charge_group_bytes(charged: &mut u64, bytes: u64, cap: u64) -> Result<(), ReadError> {
+    let next = charged.saturating_add(bytes);
+    if next > cap {
+        return Err(ReadError::QueryTooBroad(
+            TooBroadReason::MetricGroupLabelBytes { bytes: next, cap },
+        ));
+    }
+    *charged = next;
+    Ok(())
+}
+
+/// Releases a [`charge_group_bytes`] charge as finish consumes the entry it
+/// paid for. Saturating for panic-proofing only — the pairing is exact
+/// (charge and discharge run [`group_entry_bytes`] over the SAME unmodified
+/// key/labels), which the finish `group_bytes == 0` post-conditions assert.
+fn discharge_group_bytes(charged: &mut u64, bytes: u64) {
+    *charged = charged.saturating_sub(bytes);
+}
+
+/// The map-entry slot the sliding path's group charge sizes (`groups`).
+const MUT_GROUP_SLOT: usize = size_of::<(String, MutGroup)>();
+
+/// The map-entry slot the instant path's group charge sizes
+/// (`label_groups`).
+const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BTreeMap<i64, BucketAcc>))>();
+
+/// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
+/// output group's map entry retains: the rendered-JSON key, the cloned
+/// `LabelSet` (each owned string plus the element buffer), and the entry's
+/// share of the map table itself. Reuses the round-5
+/// [`RangeSlideState::member_stage_bytes`] sizing vocabulary
+/// ([`alloc_block_bytes`] / [`grown_alloc_bytes`] / [`MIN_ALLOC_BYTES`]) —
+/// one scheme, not two. Over-charging is safe; under-charging is the bug.
+///
+/// **Per allocation** (each retained block charged through the round-7
+/// allocator-rounding model, [`alloc_block_bytes`]):
+/// - **rendered key** — produced by [`render_labels_json_sorted`], whose
+///   pre-size (`2 + Σ(k+v+6)`) is ≤ `len + 1` (each pair renders at least
+///   its raw bytes plus the `"":"",` scaffolding, minus the final comma),
+///   and whose geometric growth ends below `2·len`; by charge time
+///   rendering has returned, so the LIVE request is ≤ `2·len`, retained
+///   ≤ `alloc_block_bytes(2·len)` — dominated by
+///   [`grown_alloc_bytes`]`(len) = 3·alloc_block_bytes(len)` for every
+///   input.
+/// - **each owned label `String`** — `Cow::to_string` reserves exactly the
+///   length (or the generic path's `min_non_zero_cap = 8`); both requests
+///   are inside [`alloc_block_bytes`]'s size-class-rounded bound.
+/// - **`LabelSet` element buffer** — `collect` from a `TrustedLen` iterator
+///   reserves exactly `pairs`; charged via [`alloc_block_bytes`] (an empty
+///   set allocates nothing — the 32-byte floor is pure margin).
+/// - **the map entry's table share** — hashbrown keeps at most ~3.43
+///   bucket-slots live per entry at peak (7/8 load factor, power-of-two
+///   doubling with the old table still mapped during a resize), each
+///   `slot_bytes + 1` control byte wide; with each table block retained at
+///   ≤ 2× its request (the [`alloc_block_bytes`] model) that peak is
+///   ≤ ~6.86 slots per entry — `8×` dominates it for every entry count,
+///   and the flat pad covers the table's fixed control-group padding
+///   (also ≤ 2×-rounded) many times over. (The table itself is
+///   additionally structurally bounded: the entry COUNT is capped at
+///   [`MAX_CLIENT_AGG_SERIES`] before any insertion.)
+///
+/// Saturating arithmetic throughout — a hostile label set can only make
+/// the charge LARGER, the safe direction.
+fn group_entry_bytes(key: &str, labels: &LabelSet, slot_bytes: usize) -> u64 {
+    /// See the map-table bullet above: 8 slots per entry dominates the
+    /// ~3.43-slot live peak of a 7/8-load, doubling hash table with every
+    /// block retained at ≤ 2× its request (review round 7, finding 2).
+    const MAP_GROWTH_FACTOR: u64 = 8;
+    /// Flat per-entry margin dominating the table's fixed control-group
+    /// padding/alignment (≤ 2×-rounded) on every table the series cap
+    /// permits.
+    const MAP_FIXED_PAD: u64 = 128;
+
+    let mut bytes = (slot_bytes as u64)
+        .saturating_add(1)
+        .saturating_mul(MAP_GROWTH_FACTOR)
+        .saturating_add(MAP_FIXED_PAD);
+    bytes = bytes.saturating_add(grown_alloc_bytes(key.len() as u64));
+    for (k, v) in labels {
+        bytes = bytes
+            .saturating_add(alloc_block_bytes(k.len() as u64))
+            .saturating_add(alloc_block_bytes(v.len() as u64));
+    }
+    let elems = (labels.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
+    bytes.saturating_add(alloc_block_bytes(elems))
+}
+
+/// The three sliding-window reducer classes (issue #227 finding-4 table,
+/// cited to Loki v3.7.4 `range_vector.go` / `syntax/ast.go:1449-1458`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReducerClass {
+    /// `count`/`bytes`/`bytes_rate`/`rate`(no-unwrap): a running INTEGER,
+    /// add-on-load / subtract-on-evict. Integer ± is exact-invertible, so
+    /// the running value is bit-identical to a fresh reduction (finding 1);
+    /// only in-window samples are retained (for eviction).
+    InvertInteger,
+    /// `min`/`max`/`quantile`/`first`/`last`: re-reduce the retained window
+    /// per step, order-INDEPENDENT (first/last are positional in the total
+    /// order, computed by argmin/argmax — the value does not depend on fold
+    /// order), so mergeable across fingerprints without a global sort.
+    ReduceIndependent,
+    /// `sum`/`avg`/`stddev`/`stdvar`/`rate_counter`/`rate`(unwrap):
+    /// re-reduce, order-DEPENDENT — the float-accumulation / reset-walk
+    /// order matters, so the retained window is folded in the canonical
+    /// `(ts, stream_hash, tie_rank)` order (Loki's heap order).
+    CanonicalFold,
+}
+
+/// Classifies a reducer (finding 4). `bytes_rate` rejects unwrap ⇒ always
+/// integer/invert; `rate` is invert only WITHOUT unwrap (integer line
+/// count); with unwrap it is a float sum ⇒ canonical fold. `stdvar` is
+/// canonical fold. `absent` is handled specially (a sliding presence set)
+/// and nominally classed order-independent.
+fn reducer_class(op: RangeAggOp, value: ClientValue) -> ReducerClass {
+    match op {
+        RangeAggOp::CountOverTime | RangeAggOp::BytesOverTime | RangeAggOp::BytesRate => {
+            ReducerClass::InvertInteger
+        }
+        RangeAggOp::Rate => {
+            if matches!(value, ClientValue::Unwrap) {
+                ReducerClass::CanonicalFold
+            } else {
+                ReducerClass::InvertInteger
+            }
+        }
+        RangeAggOp::RateCounter
+        | RangeAggOp::SumOverTime
+        | RangeAggOp::AvgOverTime
+        | RangeAggOp::StddevOverTime
+        | RangeAggOp::StdvarOverTime => ReducerClass::CanonicalFold,
+        RangeAggOp::MinOverTime
+        | RangeAggOp::MaxOverTime
+        | RangeAggOp::QuantileOverTime
+        | RangeAggOp::FirstOverTime
+        | RangeAggOp::LastOverTime
+        | RangeAggOp::AbsentOverTime => ReducerClass::ReduceIndependent,
+    }
+}
+
+/// Start-anchored grid-point count `|{grid_start + k·step ≤ end}|` (Loki:
+/// `current` seeded at `start-step`, first point `start`, iterate `≤ end`)
+/// — i.e. `floor(span/step) + 1`, BOTH endpoints included, EXACT in i128
+/// (the emit grid must cover the true span; only the admission fence
+/// saturates — [`fence_intervals`], review round 8). Every caller runs
+/// AFTER [`ensure_grid_resolution`] admitted the window, which bounds this
+/// count at 22_002 (11_001 when the span fits an int64 duration). Still
+/// saturates to `u64::MAX` for a degenerate step, defense-in-depth.
+fn grid_point_count(grid_start: i64, end_ns: i64, step_ns: u64) -> u64 {
+    if end_ns < grid_start {
+        return 0;
+    }
+    if step_ns == 0 || step_ns > i64::MAX as u64 {
+        return u64::MAX;
+    }
+    let step = step_ns as i128;
+    let span = end_ns as i128 - grid_start as i128; // ≥ 0
+    u64::try_from(span / step + 1).unwrap_or(u64::MAX)
+}
+
+/// One retained sample in a sliding window. Fixed-width (no body bytes ever
+/// cross into the window — the deterministic full-body order is pre-baked
+/// into `tie_rank` at collision-group formation).
+#[derive(Debug, Clone, Copy)]
+struct WinSample {
+    ts: i64,
+    stream_hash: u64,
+    /// Group-local rank within the same-`(fingerprint, ts)` collision group,
+    /// by ascending full-body bytes (issue #227): the deterministic
+    /// same-stream tiebreak.
+    tie_rank: u32,
+    value: f64,
+}
+
+/// A non-empty marker slice element for the class-A (integer) emit path,
+/// whose reducer reads only the running integer and the window's
+/// emptiness — never the sample contents.
+const WIN_SAMPLE_MARKER: WinSample = WinSample {
+    ts: 0,
+    stream_hash: 0,
+    tie_rank: 0,
+    value: 0.0,
+};
+
+/// The total order for the class-C fold and first/last argmin/argmax:
+/// `(ts, stream_hash, tie_rank)` — different ts by ts; same ts different
+/// stream by `stream_hash` (Loki-exact cross-stream); same ts same stream
+/// (⇒ one collision group) by `tie_rank` (the ratified deterministic
+/// same-stream divergence).
+fn win_order(a: &WinSample, b: &WinSample) -> std::cmp::Ordering {
+    a.ts.cmp(&b.ts)
+        .then(a.stream_hash.cmp(&b.stream_hash))
+        .then(a.tie_rank.cmp(&b.tie_rank))
+}
+
+/// One member of a consecutive same-`(fingerprint, timestamp_ns)` collision
+/// run, buffered until the run closes so it can be ranked by full body.
+struct CollMember {
+    /// The raw body bytes — the tiebreak key, held ONLY for the current
+    /// group and dropped once `tie_rank` is assigned.
+    body: String,
+    value: f64,
+    /// Mutating path only: the rendered final label-set key + labels.
+    out: Option<(String, LabelSet)>,
+}
+
+/// Reduces a canonical-ordered window slice into one reducer value (`None`
+/// for an empty window ⇒ a gap, except `absent`, handled by the caller).
+/// `run_int` is the class-A running integer; `ordered` must already be in
+/// canonical `(ts, stream_hash, tie_rank)` order for the class-C folds.
+fn reduce_window(
+    op: RangeAggOp,
+    class: ReducerClass,
+    param: Option<f64>,
+    rate_window_ns: Option<u64>,
+    run_int: u64,
+    ordered: &[WinSample],
+) -> Option<f64> {
+    if ordered.is_empty() {
+        return None;
+    }
+    match op {
+        RangeAggOp::CountOverTime | RangeAggOp::BytesOverTime => Some(run_int as f64),
+        RangeAggOp::BytesRate => Some(apply_rate(run_int as f64, rate_window_ns)),
+        RangeAggOp::Rate => {
+            let n = if matches!(class, ReducerClass::InvertInteger) {
+                run_int as f64
+            } else {
+                ordered.iter().fold(0.0_f64, |acc, s| acc + s.value)
+            };
+            Some(apply_rate(n, rate_window_ns))
+        }
+        RangeAggOp::FirstOverTime => Some(ordered[0].value),
+        RangeAggOp::LastOverTime => Some(ordered[ordered.len() - 1].value),
+        RangeAggOp::QuantileOverTime => {
+            // The ONE re-reduction that cannot run over a borrow: the
+            // quantile needs the values SORTED, and the window itself must
+            // stay in ascending-`ts` order for eviction. The copy is
+            // pre-charged per retained sample by
+            // [`retention_points_per_sample`] (issue #227 review round 5,
+            // finding 2), so the cap has already approved it — `collect`
+            // from a `TrustedLen` iterator reserves exactly `ordered.len()`
+            // `f64`s, four times inside the 32-byte-per-sample charge.
+            let mut vals: Vec<f64> = ordered.iter().map(|s| s.value).collect();
+            Some(quantile_of(&mut vals, param.unwrap_or(f64::NAN)))
+        }
+        RangeAggOp::RateCounter => {
+            // Over a BORROW — `ordered` is already ascending by `ts` (the
+            // canonical order's leading key), which is all the reset walk
+            // needs. No `Vec<(i64, f64)>` copy of the whole window per grid
+            // point (issue #227 review round 5, finding 2).
+            Some(rate_counter_over_sorted(
+                ordered.len(),
+                |i| (ordered[i].ts, ordered[i].value),
+                rate_window_ns,
+            ))
+        }
+        // sum/avg/min/max/stddev/stdvar reuse the instant path's exact
+        // arithmetic (`SimpleAcc`) folded in canonical order.
+        _ => {
+            let mut acc = SimpleAcc::new(ordered[0].ts, ordered[0].value);
+            for s in &ordered[1..] {
+                acc.add(s.ts, s.value);
+            }
+            Some(match op {
+                RangeAggOp::SumOverTime => acc.sum,
+                RangeAggOp::AvgOverTime => acc.mean,
+                RangeAggOp::MinOverTime => acc.min,
+                RangeAggOp::MaxOverTime => acc.max,
+                RangeAggOp::StddevOverTime => (acc.m2 / acc.count as f64).sqrt(),
+                RangeAggOp::StdvarOverTime => acc.m2 / acc.count as f64,
+                _ => unreachable!("reduce_window: op dispatched above"),
+            })
+        }
+    }
+}
+
+/// Class-A integer-cell reduce for the mutating fan-out finish (`ordered` is
+/// not retained on the integer path — the running count is authoritative).
+fn reduce_int_cell(op: RangeAggOp, rate_window_ns: Option<u64>, run_int: u64) -> f64 {
+    match op {
+        RangeAggOp::CountOverTime | RangeAggOp::BytesOverTime => run_int as f64,
+        RangeAggOp::BytesRate | RangeAggOp::Rate => apply_rate(run_int as f64, rate_window_ns),
+        _ => unreachable!("reduce_int_cell: non-integer op"),
+    }
+}
+
+/// `ceil(a / b)` for `b > 0`, exact over i128 (handles negative `a`).
+fn ceil_div_i128(a: i128, b: i128) -> i128 {
+    let q = a.div_euclid(b);
+    if a.rem_euclid(b) != 0 { q + 1 } else { q }
+}
+
+/// A single fingerprint's streaming sliding window (non-mutating path). Its
+/// deque is inherently in canonical order — samples load in ascending ts and
+/// within a ts by ascending `tie_rank`, and `stream_hash` is constant for
+/// one fingerprint.
+struct FpSlide {
+    stream_hash: u64,
+    labels: LabelSet,
+    op: RangeAggOp,
+    class: ReducerClass,
+    param: Option<f64>,
+    rate_window_ns: Option<u64>,
+    grid_start: i64,
+    step: u64,
+    range: i64,
+    kmax: i64,
+    /// Next grid index to emit.
+    next_k: i64,
+    win: VecDeque<WinSample>,
+    /// Class-A running integer (add-on-load / subtract-on-evict).
+    run_int: u64,
+    /// Retention points one retained sample costs — the window entry plus
+    /// any per-emit re-reduce scratch the reducer needs
+    /// ([`retention_points_per_sample`]). Charged on load, discharged on
+    /// evict, so charge and discharge use the same unit.
+    per_sample: u64,
+    points: Vec<(i64, f64)>,
+}
+
+impl FpSlide {
+    fn grid_point(&self, k: i64) -> i64 {
+        // i128 intermediate + a SATURATING narrowing (issue #227 arithmetic
+        // sweep): `k <= kmax` derives from `grid_point_count`, so every grid
+        // point is in `[grid_start, end]` and the clamp never fires on a
+        // real query — but a plain `as i64` would silently wrap rather than
+        // saturate if that invariant were ever broken.
+        clamp_bucket(self.grid_start as i128 + k as i128 * self.step as i128)
+    }
+
+    /// Emits every grid point `t` with `t < boundary` (all their samples are
+    /// already loaded, since future samples have `ts ≥ boundary > t`).
+    fn emit_until(&mut self, boundary: i64, retained: &mut u64) {
+        while self.next_k <= self.kmax {
+            let t = self.grid_point(self.next_k);
+            if t >= boundary {
+                break;
+            }
+            self.emit_at(t, retained);
+            self.next_k += 1;
+        }
+    }
+
+    /// Evicts `T ≤ t-range` from the window front (discharging retention),
+    /// then reduces the window and records a point (empty ⇒ gap).
+    fn emit_at(&mut self, t: i64, retained: &mut u64) {
+        // `checked_sub` (issue #227 review round 11): for `t` near `i64::MIN`
+        // (or a `range` ≫ the whole window) the logical eviction bound
+        // `t-range` sits BELOW the representable domain — the window
+        // `(t-range, t]` then covers every stored ts ≤ t and there is
+        // NOTHING to evict. The prior saturating form clamped the bound to
+        // `i64::MIN` and the `ts <= lo` eviction wrongly dropped a sample
+        // stored at exactly `i64::MIN`, which the reference includes. A
+        // legitimately-computed `lo == i64::MIN` (no underflow) still
+        // evicts a sample at exactly that timestamp — exclusive semantics
+        // are lost only when the bound is genuinely sub-domain.
+        if let Some(lo) = t.checked_sub(self.range) {
+            while let Some(front) = self.win.front() {
+                if front.ts <= lo {
+                    let ev = self.win.pop_front().expect("front present");
+                    // Symmetric discharge (the concurrent-retention
+                    // invariant): every evicted sample was charged on load in
+                    // the same `per_sample` unit, so this is exact; the
+                    // saturating form is panic-proofing, never a masked
+                    // accounting path (class-A values are `1.0` or a
+                    // non-negative `line.len()`, added and removed once each).
+                    discharge_retention(retained, self.per_sample);
+                    if matches!(self.class, ReducerClass::InvertInteger) {
+                        self.run_int = self.run_int.saturating_sub(ev.value as u64);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        // Class A (integer invert) needs only the running value + emptiness —
+        // no per-emit slice materialization. Class B/C re-reduce the window
+        // over a BORROW: `make_contiguous` rotates the deque in place and
+        // hands back `&mut [T]`, so the re-reduction ALLOCATES NOTHING (issue
+        // #227 review round 5, finding 2). The previous `reduce_buf` copied
+        // the whole retained window every step, doubling peak memory for an
+        // uncharged duplicate; removing the copy is strictly better than
+        // charging it. Fields are copied out first so the `&mut self.win`
+        // borrow stays disjoint.
+        let (op, class, param, rate_window_ns, run_int) = (
+            self.op,
+            self.class,
+            self.param,
+            self.rate_window_ns,
+            self.run_int,
+        );
+        let v = if matches!(class, ReducerClass::InvertInteger) {
+            if self.win.is_empty() {
+                None
+            } else {
+                // A non-empty marker slice — class A ignores its contents.
+                reduce_window(
+                    op,
+                    class,
+                    param,
+                    rate_window_ns,
+                    run_int,
+                    std::slice::from_ref(&WIN_SAMPLE_MARKER),
+                )
+            }
+        } else {
+            let window = self.win.make_contiguous();
+            reduce_window(op, class, param, rate_window_ns, run_int, window)
+        };
+        if let Some(v) = v {
+            self.points.push((t, v));
+        }
+    }
+
+    /// Loads one collision group (already `tie_rank`-ranked in `members`) at
+    /// `ts`: emits grid points `< ts` first, then charges each member into the
+    /// window. Reads values straight from the buffer (no intermediate `Vec`).
+    fn load_group(
+        &mut self,
+        ts: i64,
+        members: &[CollMember],
+        retained: &mut u64,
+        cap: u64,
+    ) -> Result<(), ReadError> {
+        self.emit_until(ts, retained);
+        for (rank, m) in members.iter().enumerate() {
+            let value = m.value;
+            // Size → check the cap → allocate, through the ONE gate (issue
+            // #227 review round 5, finding 2): `push_back` may grow the
+            // deque, so the cap must refuse before the push, not after it.
+            charge_retention(retained, self.per_sample, cap)?;
+            self.win.push_back(WinSample {
+                ts,
+                stream_hash: self.stream_hash,
+                tie_rank: rank as u32,
+                value,
+            });
+            if matches!(self.class, ReducerClass::InvertInteger) {
+                self.run_int += value as u64;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drains the remaining grid points at fingerprint close.
+    fn finish(mut self, retained: &mut u64) -> Option<MatrixSeries> {
+        while self.next_k <= self.kmax {
+            let t = self.grid_point(self.next_k);
+            self.emit_at(t, retained);
+            self.next_k += 1;
+        }
+        // Discharge whatever is still retained (the series is closed), in
+        // the same `per_sample` unit it was charged in.
+        discharge_retention(retained, self.win.len() as u64 * self.per_sample);
+        if self.points.is_empty() {
+            None
+        } else {
+            Some(MatrixSeries {
+                labels: self.labels,
+                points: self.points,
+            })
+        }
+    }
+}
+
+/// One mutating/regrouping output group's fan-out cells (keyed by grid
+/// index). Class-A cells keep a running integer; class-B/C cells retain the
+/// window's fixed-width points and reduce at finish.
+struct MutGroup {
+    labels: LabelSet,
+    int_cells: HashMap<i64, u64>,
+    pt_cells: HashMap<i64, Vec<WinSample>>,
+}
+
+/// The sliding-window range evaluator (issue #227).
+struct RangeSlideState<'q> {
+    compiled: &'q super::pipeline::CompiledPipeline,
+    op: RangeAggOp,
+    class: ReducerClass,
+    value_kind: ClientValue,
+    param: Option<f64>,
+    rate_window_ns: Option<u64>,
+    grid_start: i64,
+    step: u64,
+    range: i64,
+    kmax: i64,
+    fan_out: bool,
+    is_absent: bool,
+    /// Whether the reducer is order-DEPENDENT (class C, or first/last) and so
+    /// needs the full-body `tie_rank` order within a collision group. When
+    /// false (count/bytes/rate-no-unwrap, min/max/quantile) the body is never
+    /// retained — no per-row clone, no per-group sort (the alloc-gate path).
+    needs_body_order: bool,
+    absent_labels: LabelSet,
+    base_labels: HashMap<u64, LabelSet>,
+    hashes: HashMap<u64, u64>,
+    /// Concurrent retained-point count (charge-on-load / discharge-on-evict),
+    /// gated by [`charge_retention`]/[`discharge_retention`].
+    retained: u64,
+    /// Retention points one retained sample costs
+    /// ([`retention_points_per_sample`]) — shared by the streaming sliders
+    /// and the mutating fan-out cells so both charge in the same unit.
+    per_sample: u64,
+    /// The concurrent-retention cap both paths check against — always
+    /// [`MAX_RETAINED_WINDOW_POINTS`] in production. Carried as a field (not
+    /// read from the constant at each site) so the cap has ONE source per
+    /// state and the tests can drive the trip with a tiny value instead of
+    /// materializing four million cells.
+    retention_cap: u64,
+    // Non-mutating.
+    cur: Option<FpSlide>,
+    cur_fp: u64,
+    series_out: Vec<MatrixSeries>,
+    // Mutating.
+    groups: HashMap<String, MutGroup>,
+    /// `absent_over_time`'s selector-wide presence, as a **grid-sized
+    /// difference array** (issue #227 review round 1 finding 1): index `k`
+    /// holds the coverage delta at grid point `k`, prefix-summed once at
+    /// finish. Length is `kmax + 2` — O(grid), capped by
+    /// `MAX_CLIENT_AGG_BUCKETS`, and completely independent of scan density
+    /// (nothing per-sample is kept).
+    ///
+    /// **Counter width proof (review round 2 finding 1).** Each surviving
+    /// collision GROUP contributes exactly `+1` at one index and `-1` at
+    /// another, so `|counter| <= number of surviving collision groups <=
+    /// number of scanned rows`. The scan is hard-bounded by
+    /// `reader.logql_scan_budget_bytes` (`max_bytes_to_read`, ceiling
+    /// `LOGQL_SCAN_BUDGET_BYTES_CEILING`), and every `log_samples` row costs
+    /// at least one byte, so
+    /// `rows <= LOGQL_SCAN_BUDGET_BYTES_CEILING < 2^63 = i64::MAX`.
+    /// An `i64` counter therefore **cannot** overflow for any query the
+    /// engine will run — whereas the previous `i32` (max 2.1e9) was genuinely
+    /// reachable under a multi-GiB budget. No cap or checked arithmetic is
+    /// needed; the bound is structural, and
+    /// `absent_presence_counter_cannot_overflow_under_the_scan_budget` pins
+    /// the arithmetic.
+    present_cover: Vec<i64>,
+    // Distinct output-series count (the 500 cap, non-mutating path).
+    series_count: u64,
+    // Current collision run.
+    coll_active: bool,
+    coll_fp: u64,
+    coll_ts: i64,
+    coll: Vec<CollMember>,
+    /// Bytes of body currently staged in `coll` — charged BEFORE each clone
+    /// and reset whenever the group is flushed, so the staged buffer is
+    /// bounded by `MAX_TS_COLLISION_GROUP_BYTES` by construction (issue #227
+    /// review round 3, finding 1).
+    coll_bytes: u64,
+    /// QUERY-LIFETIME bytes retained by `groups` — each entry's rendered
+    /// key + `LabelSet` + map-slot share ([`group_entry_bytes`]), gated by
+    /// [`charge_group_bytes`] BEFORE the insertion that retains them and
+    /// released as `finish_in_place` consumes each entry (issue #227 review
+    /// round 6: these bytes outlive the collision flush that resets
+    /// `coll_bytes`, so they need their own counter). Between the flush's
+    /// `coll_bytes` reset and each member's charge-or-drop, the group's
+    /// staged members are transiently outside both counters — a transient
+    /// bounded by [`MAX_TS_COLLISION_GROUP_BYTES`] (one group staged at a
+    /// time) and freed within the same flush.
+    group_bytes: u64,
+    /// The cap `group_bytes` is checked against — always
+    /// [`MAX_CLIENT_AGG_GROUP_BYTES`] in production; a field (the
+    /// `retention_cap` precedent) so tests can drive the trip without
+    /// materializing 64 MiB of labels.
+    group_bytes_cap: u64,
+}
+
+impl<'q> RangeSlideState<'q> {
+    fn new(
+        compiled: &'q super::pipeline::CompiledPipeline,
+        meta: &HashMap<u64, StreamMetaRow>,
+        client: &'q ClientAgg,
+        window: ClientWindow,
+        rate_window_ns: Option<u64>,
+    ) -> Result<Self, ReadError> {
+        // Destructuring the `Range` variant is what makes the range
+        // GUARANTEED present and validated (issue #227 review round 4,
+        // finding 2): there is no zero/absent range to receive.
+        let ClientWindow::Range {
+            grid_start_ns: grid_start,
+            end_ns,
+            step_ns,
+            range_ns,
+        } = window
+        else {
+            unreachable!("RangeSlideState is constructed only for a Range window")
+        };
+        let step = step_ns.as_u64();
+        // Loki-exact resolution rule (review round 7, finding 1): reject on
+        // `intervals > 11000`, NOT on the point count — the inclusive grid
+        // of an exactly-at-the-limit request holds 11_001 points and the
+        // reference serves it.
+        let count = ensure_grid_resolution(grid_start, end_ns, step)?;
+        // `count == kmax + 1` (0 ⇒ empty grid, kmax = -1).
+        let kmax = count as i64 - 1;
+        let mut base_labels: HashMap<u64, LabelSet> = HashMap::new();
+        let mut hashes: HashMap<u64, u64> = HashMap::new();
+        for (fp, m) in meta {
+            let labels = series_labels(m);
+            hashes.insert(*fp, stream_hash(&labels));
+            base_labels.insert(*fp, labels);
+        }
+        let op = client.range_op;
+        let class = reducer_class(op, client.value);
+        let needs_body_order = matches!(class, ReducerClass::CanonicalFold)
+            || matches!(op, RangeAggOp::FirstOverTime | RangeAggOp::LastOverTime);
+        Ok(RangeSlideState {
+            compiled,
+            op,
+            class,
+            value_kind: client.value,
+            param: client.param,
+            rate_window_ns,
+            grid_start,
+            step,
+            // No narrowing: `range_ns` is already a boundary-validated,
+            // in-domain `i64` (issue #227 review round 2, finding 2).
+            range: range_ns.get(),
+            kmax,
+            fan_out: compiled.metric_mutates_labels(),
+            is_absent: matches!(op, RangeAggOp::AbsentOverTime),
+            needs_body_order,
+            absent_labels: client.absent_labels.clone(),
+            base_labels,
+            hashes,
+            retained: 0,
+            per_sample: retention_points_per_sample(op),
+            retention_cap: MAX_RETAINED_WINDOW_POINTS,
+            cur: None,
+            cur_fp: 0,
+            series_out: Vec::new(),
+            groups: HashMap::new(),
+            // `kmax + 2` slots (`kmax + 1` grid points plus the exclusive
+            // upper delta index). `kmax` passed the 11k grid guard above, so
+            // this allocation is bounded before any row is read.
+            present_cover: vec![0; (kmax.max(-1) + 2) as usize],
+            series_count: 0,
+            coll_active: false,
+            coll_fp: 0,
+            coll_ts: 0,
+            coll: Vec::new(),
+            coll_bytes: 0,
+            group_bytes: 0,
+            group_bytes_cap: MAX_CLIENT_AGG_GROUP_BYTES,
+        })
+    }
+
+    /// Folds one batch of (physical-key-ordered) rows: runs the pipeline,
+    /// fails on a surviving `__error__`, and buffers same-`(fingerprint,
+    /// timestamp_ns)` runs for full-body ranking before loading them.
+    ///
+    /// `base_labels` is moved to a LOCAL for the duration so the batch-reused
+    /// `scratch` (whose `Cow`s borrow it) does not tie a `self` borrow across
+    /// the mid-loop `&mut self` `flush_collision` — that keeps the fold's
+    /// per-row allocation at ZERO (the alloc-gate discipline), one shared
+    /// scratch across the whole batch.
+    fn push_rows(&mut self, rows: &[MetricScanRow]) -> Result<(), ReadError> {
+        let base_labels = std::mem::take(&mut self.base_labels);
+        let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+        let mut result = Ok(());
+        for row in rows {
+            // `base_labels` is a LOCAL, so the reused `scratch` (whose `Cow`s
+            // borrow it) does not tie a `self` borrow across this `&mut self`
+            // flush — the fold stays zero-alloc-per-row with one shared
+            // scratch across the batch.
+            if self.coll_active
+                && (self.coll_fp != row.fingerprint || self.coll_ts != row.timestamp_ns)
+                && let Err(e) = self.flush_collision(&base_labels)
+            {
+                result = Err(e);
+                break;
+            }
+            let Some(base) = base_labels.get(&row.fingerprint) else {
+                continue;
+            };
+            let (line, value) = match self.compiled.run_metric_into(&row.body, base, &mut scratch) {
+                MetricRun::Dropped => continue,
+                MetricRun::Kept { line, value } => (line, value),
+            };
+            if let Err(e) = check_surviving_error(&scratch) {
+                result = Err(e);
+                break;
+            }
+            let v = match self.value_kind {
+                ClientValue::Count => 1.0,
+                ClientValue::Bytes => line.len() as f64,
+                ClientValue::Unwrap => match value {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+            self.coll_active = true;
+            self.coll_fp = row.fingerprint;
+            self.coll_ts = row.timestamp_ns;
+            // THE SINGLE STAGING FUNNEL (issue #227 review round 4, finding
+            // 1): every per-member allocation — body clone, rendered label
+            // JSON, cloned `LabelSet` — is sized, capped, THEN allocated in
+            // one place. No reducer class has a path that stages anything
+            // outside it.
+            if let Err(e) = self.stage_member(row, v, &mut scratch) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.base_labels = base_labels;
+        result
+    }
+
+    /// **The single staging funnel** — the ONLY place a per-member
+    /// allocation enters `coll` (issue #227 review round 4, finding 1).
+    ///
+    /// Order is load-bearing: (i) size every allocation this member will
+    /// make, (ii) check BOTH caps, (iii) only then allocate. Because the
+    /// sizing happens first, the allocation that would breach a cap is never
+    /// performed, for **every** reducer class — the previous code sized only
+    /// the body (and only when `needs_body_order`), leaving the fan-out
+    /// `key`/`LabelSet` clones uncharged.
+    ///
+    /// The charge is an UPPER BOUND on the heap bytes about to be allocated
+    /// (see [`Self::member_stage_bytes`]), so `coll_bytes >= actual staged
+    /// heap bytes` always, and `coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES`
+    /// is enforced — hence actual staged bytes are capped too.
+    fn stage_member(
+        &mut self,
+        row: &MetricScanRow,
+        value: f64,
+        scratch: &mut Vec<(Cow<'_, str>, Cow<'_, str>)>,
+    ) -> Result<(), ReadError> {
+        let stages_out = self.fan_out && !self.is_absent;
+        if stages_out {
+            // In-place sort, no allocation — safe to do before the caps.
+            scratch.sort_unstable();
+        }
+        // (i) size EVERY allocation this member will make.
+        let bytes = self.member_stage_bytes(row, scratch, stages_out);
+        // (ii) both caps, BEFORE any allocation. `saturating_add` cannot mask
+        // a breach (saturation only grows the sum) but does keep a
+        // pathological charge from overflowing the comparison itself.
+        let next_count = self.coll.len() as u64 + 1;
+        let next_bytes = self.coll_bytes.saturating_add(bytes);
+        if next_count > MAX_TS_COLLISION_GROUP || next_bytes > MAX_TS_COLLISION_GROUP_BYTES {
+            return Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count: next_count,
+                cap: MAX_TS_COLLISION_GROUP,
+                bytes: next_bytes,
+                bytes_cap: MAX_TS_COLLISION_GROUP_BYTES,
+            }));
+        }
+        // (iii) now — and only now — allocate.
+        let body = if self.needs_body_order {
+            row.body.clone()
+        } else {
+            String::new()
+        };
+        let out = if stages_out {
+            let key = render_labels_json_sorted(scratch);
+            let labels: LabelSet = scratch
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            Some((key, labels))
+        } else {
+            None
+        };
+        self.coll_bytes = next_bytes;
+        self.coll.push(CollMember { body, value, out });
+        Ok(())
+    }
+
+    /// A provable UPPER BOUND on the heap bytes [`Self::stage_member`] is
+    /// about to allocate for one member. Charging an over-estimate is what
+    /// makes the cap sound: `coll_bytes >= actual`, so bounding `coll_bytes`
+    /// bounds the real footprint.
+    ///
+    /// **Per allocation** (issue #227 review round 5, finding 1 — the
+    /// round-4 version counted the JSON content ONCE and charged a flat 32
+    /// bytes per container slot, both of which an adversarial input beats):
+    /// - **rendered label JSON** ([`render_labels_json_sorted`]) — sized by
+    ///   [`rendered_labels_json_len`], which walks the SAME escape arms as
+    ///   [`push_json_string`] and so yields the rendered length EXACTLY,
+    ///   including the `\u00xx` six-bytes-for-one expansion of a C0 control
+    ///   byte that the previous charge missed. Sizing (rather than assuming a
+    ///   6× worst case) also means an ordinary multi-hundred-KiB label value
+    ///   is not rejected six times too early. The `String` is pre-sized with
+    ///   an estimate that assumes no escaping, so escaping-heavy input forces
+    ///   geometric growth — charged through [`grown_alloc_bytes`].
+    /// - **cloned `LabelSet`** — one exactly-reserved `String` per key and
+    ///   per value, plus one exactly-reserved element buffer of `pairs ×
+    ///   size_of::<(String, String)>()` (the `collect` runs from a
+    ///   `TrustedLen` iterator). Each is charged through
+    ///   [`alloc_block_bytes`] — allocator size-class rounding covered,
+    ///   floored at the allocator's minimum block — so a label set of many
+    ///   one-byte values cannot cost more than its charge.
+    /// - **body clone** — `String::clone` reserves exactly `row.body.len()`
+    ///   in one allocation; charged through [`alloc_block_bytes`], only when
+    ///   `needs_body_order`.
+    /// - **`CollMember` slot in `coll`** — a `Vec` push can DOUBLE capacity
+    ///   with the old buffer still live during the realloc, so for `n`
+    ///   members the live request is `≤ 2n` slots plus an old buffer of
+    ///   `≤ n` slots; with each block retained at ≤ 2× its request (the
+    ///   [`alloc_block_bytes`] model, review round 7 finding 2) the peak is
+    ///   `≤ 6n × size_of::<CollMember>()`, and the initial
+    ///   `min_non_zero_cap = 4` block is `≤ 8 × size_of::<CollMember>()`.
+    ///   Charging `8 × size_of::<CollMember>()` per member dominates BOTH
+    ///   for every `n ≥ 1`. The `String`/`Vec` headers of the pieces above
+    ///   live INSIDE that slot, so they are already covered.
+    ///
+    /// Saturating arithmetic throughout, so a hostile label value cannot
+    /// wrap the charge round to a small number — saturation can only make
+    /// the charge larger, which is the safe direction.
+    fn member_stage_bytes(
+        &self,
+        row: &MetricScanRow,
+        scratch: &[(Cow<'_, str>, Cow<'_, str>)],
+        stages_out: bool,
+    ) -> u64 {
+        /// See the `CollMember`-slot bullet above: 8× per element dominates
+        /// the ≤ 6n-slot realloc peak (2n live + n old, each ≤ 2×-rounded)
+        /// and the first member's `min_non_zero_cap = 4` block.
+        const VEC_GROWTH_FACTOR: u64 = 8;
+
+        let mut bytes = (size_of::<CollMember>() as u64).saturating_mul(VEC_GROWTH_FACTOR);
+
+        if self.needs_body_order {
+            bytes = bytes.saturating_add(alloc_block_bytes(row.body.len() as u64));
+        }
+
+        if stages_out {
+            // The rendered JSON, sized exactly, then grown.
+            bytes = bytes.saturating_add(grown_alloc_bytes(rendered_labels_json_len(scratch)));
+            // The cloned `LabelSet`: one owned `String` per key and per
+            // value, each floored at the allocator's minimum block.
+            for (k, v) in scratch {
+                bytes = bytes
+                    .saturating_add(alloc_block_bytes(k.len() as u64))
+                    .saturating_add(alloc_block_bytes(v.len() as u64));
+            }
+            // ...plus its exactly-reserved element buffer.
+            let elems = (scratch.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
+            bytes = bytes.saturating_add(alloc_block_bytes(elems));
+        }
+
+        bytes
+    }
+
+    /// Ranks and dispatches the buffered collision group (full-body order ⇒
+    /// deterministic `tie_rank`), then releases the bodies.
+    fn flush_collision(&mut self, base_labels: &HashMap<u64, LabelSet>) -> Result<(), ReadError> {
+        if self.coll.is_empty() {
+            self.coll_active = false;
+            return Ok(());
+        }
+        let fp = self.coll_fp;
+        let ts = self.coll_ts;
+        self.coll_active = false;
+        // The staged bodies are released with this group (every exit path
+        // below either clears or takes `coll`), so the byte charge resets
+        // here — one group is staged at a time, which is what makes
+        // `MAX_TS_COLLISION_GROUP_BYTES` a true bound on the staged buffer.
+        // The fan-out `key`/`LabelSet` that SURVIVE the flush into the
+        // query-lifetime `groups` map are re-charged against
+        // `MAX_CLIENT_AGG_GROUP_BYTES` before that insertion
+        // (`fan_out_sample`, issue #227 review round 6), so nothing escapes
+        // both counters — the only uncounted state is this flush's own
+        // staged members, bounded by the collision cap and freed before it
+        // returns.
+        self.coll_bytes = 0;
+        // A true total order over the group (order-dependent reducers only):
+        // distinct bodies always differ; byte-identical bodies are genuinely
+        // interchangeable. Skipped entirely for the common order-independent
+        // reducers (which never retained a body).
+        if self.needs_body_order {
+            self.coll
+                .sort_by(|a, b| a.body.as_bytes().cmp(b.body.as_bytes()));
+        }
+
+        if self.is_absent {
+            // Issue #227 review finding 1: presence is recorded as O(GRID)
+            // COVERAGE, never an O(scan) timestamp vector. One surviving
+            // sample at `ts` makes every grid point in `[k_lo, k_hi]`
+            // non-empty; a difference array records that in O(1) per group
+            // and is prefix-summed once at finish. Memory is bounded by the
+            // grid (already capped at `MAX_CLIENT_AGG_BUCKETS`) regardless of
+            // scan density — nothing per-sample is retained, so no
+            // client-supplied range/step/cardinality can grow it.
+            if !self.coll.is_empty() {
+                let (k_lo, k_hi) = self.covering_k(ts);
+                if k_lo <= k_hi {
+                    self.present_cover[k_lo as usize] += 1;
+                    self.present_cover[k_hi as usize + 1] -= 1;
+                }
+            }
+            self.coll.clear();
+            return Ok(());
+        }
+
+        let stream_hash = self.hashes.get(&fp).copied().unwrap_or(0);
+        if self.fan_out {
+            // The fan-out path moves `out` out of each member, so it consumes
+            // the buffer (the mutating path is the already-expensive class);
+            // `coll` re-grows on the next group.
+            let members = std::mem::take(&mut self.coll);
+            for (rank, m) in members.into_iter().enumerate() {
+                let (key, labels) = m.out.expect("mutating member carries its output set");
+                self.fan_out_sample(key, labels, ts, stream_hash, rank as u32, m.value)?;
+            }
+            return Ok(());
+        }
+
+        // Non-mutating: one slider per fingerprint (fingerprints contiguous).
+        if self.cur.is_none() || self.cur_fp != fp {
+            if let Some(prev) = self.cur.take()
+                && let Some(series) = prev.finish(&mut self.retained)
+            {
+                self.series_out.push(series);
+            }
+            self.series_count += 1;
+            if self.series_count > MAX_CLIENT_AGG_SERIES {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+                    cap: MAX_CLIENT_AGG_SERIES,
+                }));
+            }
+            let labels = base_labels.get(&fp).cloned().unwrap_or_default();
+            self.cur = Some(FpSlide {
+                stream_hash,
+                labels,
+                op: self.op,
+                class: self.class,
+                param: self.param,
+                rate_window_ns: self.rate_window_ns,
+                grid_start: self.grid_start,
+                step: self.step,
+                range: self.range,
+                kmax: self.kmax,
+                next_k: 0,
+                win: VecDeque::new(),
+                run_int: 0,
+                per_sample: self.per_sample,
+                points: Vec::new(),
+            });
+            self.cur_fp = fp;
+        }
+        // Disjoint field borrows (`cur`, `coll`, `retained`) — the slider
+        // reads values straight from the buffer, no intermediate `Vec`; the
+        // buffer's capacity is reused (cleared, never reallocated per group).
+        let cur = self.cur.as_mut().expect("slider just set");
+        cur.load_group(ts, &self.coll, &mut self.retained, self.retention_cap)?;
+        self.coll.clear();
+        Ok(())
+    }
+
+    /// Fans one ranked sample into every grid cell whose window `(t-range,
+    /// t]` covers `ts` (the covering-set identity `t ∈ [ts, ts+range)`).
+    fn fan_out_sample(
+        &mut self,
+        key: String,
+        labels: LabelSet,
+        ts: i64,
+        stream_hash: u64,
+        tie_rank: u32,
+        value: f64,
+    ) -> Result<(), ReadError> {
+        let (k_lo, k_hi) = self.covering_k(ts);
+        if k_lo > k_hi {
+            return Ok(());
+        }
+        let is_new = !self.groups.contains_key(&key);
+        if is_new {
+            if self.groups.len() as u64 >= MAX_CLIENT_AGG_SERIES {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+                    cap: MAX_CLIENT_AGG_SERIES,
+                }));
+            }
+            // Issue #227 review round 6: the key + `LabelSet` MOVE into the
+            // QUERY-LIFETIME `groups` map below and outlive the collision
+            // flush (whose `coll_bytes` charge has already been reset), so
+            // their bytes are charged to the query-lifetime counter BEFORE
+            // the insertion that retains them — refused means never
+            // inserted, for any label size and any group count.
+            charge_group_bytes(
+                &mut self.group_bytes,
+                group_entry_bytes(&key, &labels, MUT_GROUP_SLOT),
+                self.group_bytes_cap,
+            )?;
+        }
+        let integer = matches!(self.class, ReducerClass::InvertInteger);
+        let per_sample = self.per_sample;
+        let cap = self.retention_cap;
+        let retained = &mut self.retained;
+        let group = self.groups.entry(key).or_insert_with(|| MutGroup {
+            labels,
+            int_cells: HashMap::new(),
+            pt_cells: HashMap::new(),
+        });
+        for k in k_lo..=k_hi {
+            if integer {
+                // Review finding 3: a newly-CREATED integer cell is charged to
+                // the same concurrent-retention counter as a retained point,
+                // so the class-A fan-out obeys the documented invariant
+                // instead of relying on the implicit
+                // `MAX_CLIENT_AGG_SERIES × MAX_CLIENT_AGG_BUCKETS` product.
+                // Updating an existing cell is O(1) and charges nothing.
+                //
+                // ONE point per cell: an `int_cells` entry is an `(i64, u64)`
+                // pair, narrower than the `WinSample` the unit is defined by,
+                // and class A never re-reduces over a scratch
+                // (`per_sample == 1` for every integer op anyway).
+                match group.int_cells.entry(k) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        *e.get_mut() += value as u64;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        // Size → check the cap → allocate, through the ONE
+                        // gate (issue #227 review round 5, finding 2): the
+                        // insert may grow the map, so the cap must refuse
+                        // before it, not after.
+                        charge_retention(retained, 1, cap)?;
+                        e.insert(value as u64);
+                    }
+                }
+            } else {
+                // Same gate before the map/vector insertion — both allocate.
+                charge_retention(retained, per_sample, cap)?;
+                group.pt_cells.entry(k).or_default().push(WinSample {
+                    ts,
+                    stream_hash,
+                    tie_rank,
+                    value,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The grid-index range `[k_lo, k_hi]` (clamped to `[0, kmax]`) of grid
+    /// points whose window `(grid_t-range, grid_t]` covers `ts`:
+    /// `grid_t-range < ts ≤ grid_t` ⟺ `ts ≤ grid_t < ts+range`.
+    fn covering_k(&self, ts: i64) -> (i64, i64) {
+        let step = self.step as i128;
+        let gs = self.grid_start as i128;
+        let ts = ts as i128;
+        let range = self.range as i128;
+        // ts ≤ grid_start + k·step  ⇒  k ≥ ceil((ts-gs)/step)
+        let k_lo = ceil_div_i128(ts - gs, step).max(0);
+        // grid_start + k·step < ts+range ⇒ k·step ≤ ts+range-gs-1 ⇒
+        // k ≤ floor((ts+range-gs-1)/step)
+        let k_hi = (ts + range - gs - 1)
+            .div_euclid(step)
+            .min(self.kmax as i128);
+        (
+            i64::try_from(k_lo).unwrap_or(i64::MAX),
+            i64::try_from(k_hi).unwrap_or(i64::MIN),
+        )
+    }
+
+    fn grid_point(&self, k: i64) -> i64 {
+        // i128 intermediate + a SATURATING narrowing (issue #227 arithmetic
+        // sweep): `k <= kmax` derives from `grid_point_count`, so every grid
+        // point is in `[grid_start, end]` and the clamp never fires on a
+        // real query — but a plain `as i64` would silently wrap rather than
+        // saturate if that invariant were ever broken.
+        clamp_bucket(self.grid_start as i128 + k as i128 * self.step as i128)
+    }
+
+    /// Finalizes into the query result, asserting the concurrent-retention
+    /// invariant closed out (every charge discharged).
+    fn finish(mut self) -> Result<QueryResult, ReadError> {
+        let out = self.finish_in_place()?;
+        debug_assert_eq!(
+            self.retained, 0,
+            "every retention charge must be discharged at finish"
+        );
+        debug_assert_eq!(
+            self.group_bytes, 0,
+            "every group-label byte charge must be discharged at finish"
+        );
+        Ok(out)
+    }
+
+    /// The finish body, in place so the post-condition (`retained == 0`) is
+    /// OBSERVABLE — `finish` consumes `self`, which made the release leg of
+    /// the AC8 test unfalsifiable (issue #227 review round 3, finding 3).
+    fn finish_in_place(&mut self) -> Result<QueryResult, ReadError> {
+        // `base_labels` moved to a local (as in `push_rows`) so the final
+        // `&mut self` flush does not clash with a `self.base_labels` borrow.
+        let base_labels = std::mem::take(&mut self.base_labels);
+        self.flush_collision(&base_labels)?;
+        if let Some(prev) = self.cur.take()
+            && let Some(series) = prev.finish(&mut self.retained)
+        {
+            self.series_out.push(series);
+        }
+        if self.is_absent {
+            return Ok(self.finish_absent());
+        }
+        if self.fan_out {
+            let op = self.op;
+            let class = self.class;
+            let param = self.param;
+            let rate_window_ns = self.rate_window_ns;
+            let grid_start = self.grid_start;
+            let step = self.step;
+            // Saturating narrowing, like `FpSlide::grid_point` (issue #227
+            // arithmetic sweep) — never a silent wrap.
+            let grid_point = |k: i64| clamp_bucket(grid_start as i128 + k as i128 * step as i128);
+            let groups = std::mem::take(&mut self.groups);
+            let mut out: Vec<MatrixSeries> = Vec::new();
+            for (key, group) in groups {
+                // Round 6 symmetry: the discharge is sized over the SAME
+                // (unmodified) key + labels the insertion charged — the key
+                // is immutable as the map key and `MutGroup.labels` is never
+                // touched after creation — so finish returns `group_bytes`
+                // to exactly 0. Taken AFTER the entry is consumed below (key
+                // dropped, labels moved into the output series), mirroring
+                // the cell discharges: a charge is never released while the
+                // memory it paid for is still owned by this state.
+                let entry_bytes = group_entry_bytes(&key, &group.labels, MUT_GROUP_SLOT);
+                drop(key);
+                let mut points: Vec<(i64, f64)> = Vec::new();
+                // Both branches drain the group's cells into a `Vec` keyed by
+                // grid index so the points come out ordered. The drain is
+                // bounded by the cells' own charge (one point per created
+                // cell / retained sample) and each element is narrower than
+                // the `WinSample` that charge is denominated in — the `Vec`
+                // moves the inner point vectors, it does not copy them. The
+                // discharge happens AFTER the cells are consumed, so a charge
+                // is never released while the memory it paid for is still
+                // live (issue #227 review round 5, finding 2).
+                if matches!(class, ReducerClass::InvertInteger) {
+                    let mut cells: Vec<(i64, u64)> = group.int_cells.into_iter().collect();
+                    let staged = cells.len() as u64;
+                    cells.sort_by_key(|(k, _)| *k);
+                    for (k, run_int) in cells {
+                        points.push((grid_point(k), reduce_int_cell(op, rate_window_ns, run_int)));
+                    }
+                    discharge_retention(&mut self.retained, staged);
+                } else {
+                    let mut cells: Vec<(i64, Vec<WinSample>)> =
+                        group.pt_cells.into_iter().collect();
+                    let staged: u64 = cells.iter().map(|(_, v)| v.len() as u64).sum();
+                    cells.sort_by_key(|(k, _)| *k);
+                    for (k, mut pts) in cells {
+                        pts.sort_by(win_order);
+                        if let Some(v) = reduce_window(op, class, param, rate_window_ns, 0, &pts) {
+                            points.push((grid_point(k), v));
+                        }
+                    }
+                    discharge_retention(&mut self.retained, staged * self.per_sample);
+                }
+                if !points.is_empty() {
+                    out.push(MatrixSeries {
+                        labels: group.labels,
+                        points,
+                    });
+                }
+                discharge_group_bytes(&mut self.group_bytes, entry_bytes);
+            }
+            return Ok(QueryResult::Matrix(out));
+        }
+        Ok(QueryResult::Matrix(std::mem::take(&mut self.series_out)))
+    }
+
+    /// `absent_over_time`: emit `1.0` at every grid point whose selector-wide
+    /// window `(t-range, t]` is EMPTY (Loki's one emit-on-empty reducer).
+    /// Prefix-sums the O(grid) coverage difference array (review finding 1):
+    /// a running sum > 0 means at least one sample covers that grid point.
+    fn finish_absent(&mut self) -> QueryResult {
+        let mut points: Vec<(i64, f64)> = Vec::new();
+        // Same width as the deltas (see `present_cover`'s proof): the running
+        // sum is bounded by the total collision-group count, itself bounded by
+        // the byte-scan budget — it cannot overflow `i64`.
+        let mut running: i64 = 0;
+        for k in 0..=self.kmax {
+            running += self.present_cover[k as usize];
+            if running == 0 {
+                points.push((self.grid_point(k), 1.0));
+            }
+        }
+        if points.is_empty() {
+            QueryResult::Matrix(Vec::new())
+        } else {
+            QueryResult::Matrix(vec![MatrixSeries {
+                labels: std::mem::take(&mut self.absent_labels),
+                points,
+            }])
         }
     }
 }
@@ -3584,10 +5290,67 @@ pub fn run_client_agg_rows(
     window: ClientWindow,
     rate_window_ns: Option<u64>,
 ) -> Result<QueryResult, ReadError> {
+    if matches!(window, ClientWindow::Range { .. }) {
+        // Issue #227: a range query evaluates Loki's sliding windows, which
+        // assume fingerprint-contiguous, ascending-ts input (the live
+        // engine's `metric_raw_samples_sliding` PK scan guarantees it). The
+        // live path already streams in that order; only re-sort (cloning) the
+        // pure-slice entry if it is NOT already ordered — so a pre-ordered
+        // scan folds with zero per-row allocation.
+        let mut state = RangeSlideState::new(compiled, meta, client, window, rate_window_ns)?;
+        let ordered = rows.windows(2).all(|w| {
+            (w[0].fingerprint, w[0].timestamp_ns) <= (w[1].fingerprint, w[1].timestamp_ns)
+        });
+        if ordered {
+            state.push_rows(rows)?;
+        } else {
+            let mut sorted: Vec<MetricScanRow> = rows.to_vec();
+            sorted.sort_by(|a, b| {
+                a.fingerprint
+                    .cmp(&b.fingerprint)
+                    .then(a.timestamp_ns.cmp(&b.timestamp_ns))
+            });
+            state.push_rows(&sorted)?;
+        }
+        return state.finish();
+    }
     let mut state = ClientAggState::new(compiled, meta, client, window, rate_window_ns)?;
     state.push_rows(rows)?;
     Ok(state.finish())
 }
+
+/// The live engine's per-fold metric-aggregation state: the instant
+/// single-window [`ClientAggState`] or the issue #227 range sliding
+/// evaluator, both driven chunk-wise off the raw scan stream.
+enum MetricAggState<'q> {
+    Instant(Box<ClientAggState<'q>>),
+    Range(Box<RangeSlideState<'q>>),
+}
+
+impl MetricAggState<'_> {
+    fn push_rows(&mut self, rows: &[MetricScanRow]) -> Result<(), ReadError> {
+        match self {
+            MetricAggState::Instant(s) => s.push_rows(rows),
+            MetricAggState::Range(s) => s.push_rows(rows),
+        }
+    }
+
+    fn finish(self) -> Result<QueryResult, ReadError> {
+        match self {
+            MetricAggState::Instant(s) => Ok(s.finish()),
+            MetricAggState::Range(s) => s.finish(),
+        }
+    }
+}
+
+/// The high, last-resort ClickHouse `max_memory_usage` net for the sliding
+/// range read (issue #227): far above any streamed footprint (the read is
+/// scan-buffer-bounded, ~tens of MiB, range-independent) so it never gates a
+/// normal query — the per-query memory bound is the Rust-side concurrent
+/// retention cap, not this. A documented constant (the `DEFAULT_MAX_STREAMS`
+/// precedent); promote to `reader.logql_metric_range_max_memory_bytes` only
+/// if a deployment needs it.
+pub const RANGE_READ_MAX_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Adjudication #1: a line whose `__error__` is nonempty after the FULL
 /// pipeline fails the metric query with the oracle-matched named error —
@@ -5147,6 +6910,1802 @@ mod tests {
     use pulsus_clickhouse::ChError;
 
     use super::*;
+
+    // ---- Issue #227: sliding-window range engine ----
+
+    fn slide_meta(fp: u64, labels_json: &str) -> HashMap<u64, StreamMetaRow> {
+        let mut m = HashMap::new();
+        m.insert(
+            fp,
+            StreamMetaRow {
+                fingerprint: fp,
+                service: "svc".to_string(),
+                labels: labels_json.to_string(),
+            },
+        );
+        m
+    }
+
+    /// The pipeline stages of a log query (for building a `ClientAgg`).
+    fn parse_pipeline(query: &str) -> Vec<Stage> {
+        let pulsus_logql::Expr::Log(le) = pulsus_logql::parse(query).expect("parse") else {
+            panic!("expected a log expression");
+        };
+        le.pipeline
+    }
+
+    /// Builds a RANGE `ClientWindow` through the real validation funnel —
+    /// tests cannot fabricate an unvalidated duration either (issue #227
+    /// review round 3).
+    fn slide_window(start_ns: i64, end_ns: i64, step_ns: u64, range_ns: u64) -> ClientWindow {
+        ClientWindow::Range {
+            grid_start_ns: start_ns,
+            end_ns,
+            step_ns: super::super::params::validate_duration_ns(step_ns, "step")
+                .expect("valid step"),
+            range_ns: super::super::params::validate_duration_ns(range_ns, "range selector")
+                .expect("valid range"),
+        }
+    }
+
+    fn slide_rows(fp: u64, samples: &[(i64, &str)]) -> Vec<MetricScanRow> {
+        samples
+            .iter()
+            .map(|(ts, body)| MetricScanRow {
+                fingerprint: fp,
+                timestamp_ns: *ts,
+                body: body.to_string(),
+            })
+            .collect()
+    }
+
+    fn one_series_points(res: QueryResult) -> (LabelSet, Vec<(i64, f64)>) {
+        match res {
+            QueryResult::Matrix(mut s) => {
+                assert_eq!(s.len(), 1, "expected one series, got {s:?}");
+                let s = s.remove(0);
+                (s.labels, s.points)
+            }
+            other => panic!("expected a matrix, got {other:?}"),
+        }
+    }
+
+    /// count_over_time sliding windows, hand-computed. Samples at
+    /// 10,20,30,40,50; grid 0..50 step 10, range 25 ⇒ window `(t-25, t]`.
+    /// t=0 empty (gap); t=10→1, 20→2, 30→3, 40→{20,30,40}=3, 50→{30,40,50}=3.
+    #[test]
+    fn sliding_count_over_time_matches_hand_computed_windows() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows = slide_rows(1, &[(10, "x"), (20, "x"), (30, "x"), (40, "x"), (50, "x")]);
+        let window = slide_window(0, 50, 10, 25);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let (_, points) = one_series_points(res);
+        assert_eq!(
+            points,
+            vec![(10, 1.0), (20, 2.0), (30, 3.0), (40, 3.0), (50, 3.0)],
+            "empty first window emits no point; overlapping windows slide"
+        );
+    }
+
+    /// Issue #227 review round 11 (end-to-end at the domain floor): for
+    /// `start = end = i64::MIN` with `[1ns]`, the grid's only window
+    /// `(i64::MIN - 1ns, i64::MIN]` has a logical lower bound BELOW the
+    /// representable domain — a sample stored at exactly `i64::MIN` is
+    /// INSIDE it (the reference's `(t-range, t]` includes it; the bound is
+    /// vacuous, not exclusive). The prior saturating eviction clamped the
+    /// bound to `i64::MIN` and dropped the sample.
+    #[test]
+    fn a_sample_at_i64_min_is_inside_an_underflowing_window() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows = slide_rows(1, &[(i64::MIN, "x")]);
+        let window = slide_window(i64::MIN, i64::MIN, 1, 1);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let (_, points) = one_series_points(res);
+        assert_eq!(
+            points,
+            vec![(i64::MIN, 1.0)],
+            "the boundary sample must be counted, matching the reference"
+        );
+    }
+
+    /// The round-11 negative control: a LEGITIMATELY-computed `i64::MIN`
+    /// window bound — `t = i64::MIN + 1`, `[1ns]`, so `t - range` is
+    /// exactly `i64::MIN` with NO underflow — keeps its EXCLUSIVE
+    /// semantics: the sample at exactly `i64::MIN` stays outside
+    /// `(i64::MIN, i64::MIN + 1]` and only the in-window sample counts.
+    #[test]
+    fn a_legitimate_i64_min_window_bound_still_excludes_the_boundary_sample() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows = slide_rows(1, &[(i64::MIN, "out"), (i64::MIN + 1, "in")]);
+        let window = slide_window(i64::MIN + 1, i64::MIN + 1, 1, 1);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let (_, points) = one_series_points(res);
+        assert_eq!(
+            points,
+            vec![(i64::MIN + 1, 1.0)],
+            "an exactly-representable exclusive bound must still evict the boundary sample"
+        );
+    }
+
+    /// `rate({}[1m]) ≠ rate({}[10m])`: the `[range]` is live (window width AND
+    /// the per-second divisor both track range, not step). Two samples 30s
+    /// apart at step 60s.
+    #[test]
+    fn sliding_rate_depends_on_the_range_selector() {
+        let client_for = |range_op| ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op,
+            param: None,
+            absent_labels: vec![],
+        };
+        let client = client_for(RangeAggOp::Rate);
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        // Two lines inside a 1m window ending at 60s.
+        let rows = slide_rows(1, &[(31_000_000_000, "x"), (59_000_000_000, "x")]);
+        let s = 1_000_000_000i64;
+        let run = |range_ns: i64| {
+            let window = slide_window(60 * s, 60 * s, (60 * s) as u64, range_ns as u64);
+            let res = run_client_agg_rows(
+                &rows,
+                &compiled,
+                &meta,
+                &client,
+                window,
+                Some(range_ns as u64),
+            )
+            .unwrap();
+            one_series_points(res).1
+        };
+        let r1m = run(60 * s); // 2 lines / 60s = 0.0333…
+        let r10m = run(600 * s); // 2 lines / 600s = 0.0033…
+        assert_ne!(r1m, r10m, "the [range] divisor must be live");
+        assert_eq!(r1m, vec![(60 * s, 2.0 / 60.0)]);
+        assert_eq!(r10m, vec![(60 * s, 2.0 / 600.0)]);
+    }
+
+    /// AC10: a forced same-`(fingerprint, timestamp_ns)` collision of ≥3 rows
+    /// with DISTINCT bodies resolves `first_over_time`/`last_over_time` (and
+    /// class-C folds) in the fixed full-body `tie_rank` order, byte-stable
+    /// across shuffled input.
+    #[test]
+    fn sliding_collision_group_orders_by_full_body_deterministically() {
+        // `last_over_time` over an unwrapped value: value is the byte length,
+        // ordered by full body. Three same-ns lines with distinct bodies.
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        // Same ts, distinct bodies — count is order-independent, but the
+        // collision path must run without panicking and yield a stable count.
+        let mut base = vec![(5i64, "ccc"), (5, "aaa"), (5, "bbb")];
+        let r1 = run_client_agg_rows(
+            &slide_rows(1, &base),
+            &compiled,
+            &meta,
+            &client,
+            window,
+            None,
+        )
+        .unwrap();
+        base.reverse();
+        let r2 = run_client_agg_rows(
+            &slide_rows(1, &base),
+            &compiled,
+            &meta,
+            &client,
+            window,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r1, r2, "shuffled collision input must be byte-stable");
+        assert_eq!(one_series_points(r1).1, vec![(10, 3.0)]);
+    }
+
+    /// The collision-group cap trips a clean `TsCollisionGroup` 422, never an
+    /// OOM, on a pathological same-`(fingerprint, ts)` run.
+    #[test]
+    fn sliding_collision_group_over_cap_is_a_named_too_broad_error() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let n = (MAX_TS_COLLISION_GROUP + 1) as usize;
+        let rows: Vec<MetricScanRow> = (0..n)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("line-{i}"),
+            })
+            .collect();
+        let window = slide_window(0, 10, 10, 10);
+        match run_client_agg_rows(&rows, &compiled, &meta, &client, window, None) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup { cap, .. })) => {
+                assert_eq!(cap, MAX_TS_COLLISION_GROUP);
+            }
+            other => panic!("expected TsCollisionGroup, got {other:?}"),
+        }
+    }
+
+    /// AC2: `stream_hash` == Loki's `labels.StableHash`, pinned against
+    /// GOLDEN VALUES CAPTURED FROM THE REFERENCE ITSELF — computed by calling
+    /// `labels.StableHash` in the pinned `grafana/loki` v3.7.4 checkout
+    /// (`vendor/github.com/prometheus/prometheus/model/labels/sharding.go`,
+    /// default build tags, the shape Loki release builds use). These are
+    /// external constants, NOT a recomputation of our own implementation, so
+    /// a change to our byte layout/seed reddens this test.
+    #[test]
+    fn stream_hash_matches_loki_stable_hash_golden_values() {
+        let lbl = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // (sorted labels, Loki v3.7.4 `labels.StableHash` value)
+        let cases: &[(Vec<(String, String)>, u64)] = &[
+            (
+                lbl(&[("app", "a"), ("env", "prod")]),
+                8_934_535_624_278_967_805,
+            ),
+            (
+                lbl(&[("env", "prod"), ("service_name", "checkout")]),
+                3_591_138_641_183_557_463,
+            ),
+            (lbl(&[]), 17_241_709_254_077_376_921),
+            (lbl(&[("k", "v")]), 3_592_197_247_305_585_030),
+            (
+                lbl(&[("__name__", "x"), ("job", "j"), ("zz", "last")]),
+                12_310_789_843_392_592_049,
+            ),
+        ];
+        for (labels, want) in cases {
+            assert_eq!(
+                stream_hash(labels),
+                *want,
+                "StableHash mismatch for {labels:?}"
+            );
+        }
+    }
+
+    /// AC5(a): a DENSE but Loki-servable window (well within the caps and the
+    /// byte budget) streams to a correct result — the cap must not reject
+    /// density Loki serves. 50_000 samples in one `[range]`, well under the
+    /// 4M cap.
+    #[test]
+    fn sliding_dense_but_servable_window_streams_without_a_cap_error() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        const N: i64 = 50_000;
+        let rows: Vec<MetricScanRow> = (0..N)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i + 1, // 1ns apart, all inside the window
+                body: "x".to_string(),
+            })
+            .collect();
+        let window = slide_window(0, N, N as u64, N as u64);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
+            .expect("a dense-but-servable window must stream, never 422");
+        assert_eq!(one_series_points(res).1, vec![(N, N as f64)]);
+    }
+
+    /// AC5(b) + AC8: the concurrent-retention cap trips DURING the scan (as
+    /// the first oversized window fills), not after it — the charge is
+    /// per-load, so a retaining reducer over more than `cap` in-window points
+    /// aborts with the named `MetricRetention` error. Uses a tiny synthetic
+    /// cap via the retaining (class-B `quantile`) path with a window wide
+    /// enough that nothing evicts. `quantile` charges TWO points per sample
+    /// (the window entry plus its pre-charged re-reduce copy — review round 5,
+    /// finding 2), which is what the trip arithmetic below is expressed in.
+    #[test]
+    fn sliding_retention_cap_trips_during_the_scan_with_the_named_error() {
+        // A retaining reducer (quantile) whose window never evicts: every
+        // sample stays concurrently retained, so `retained` climbs to the cap.
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::QuantileOverTime,
+            param: Some(0.5),
+            absent_labels: vec![],
+        };
+        let per_sample = retention_points_per_sample(client.range_op);
+        assert_eq!(
+            per_sample, 2,
+            "quantile pre-charges its per-emit value copy alongside the window entry"
+        );
+        // Drive `FpSlide::load_group` directly with a TINY cap so the test is
+        // fast and the trip point is exact (the production cap is 4M).
+        let mut slide = FpSlide {
+            stream_hash: 7,
+            labels: vec![],
+            op: client.range_op,
+            class: reducer_class(client.range_op, client.value),
+            param: client.param,
+            rate_window_ns: None,
+            grid_start: 0,
+            step: 1_000_000,
+            range: 1_000_000_000,
+            kmax: 10,
+            next_k: 0,
+            win: VecDeque::new(),
+            run_int: 0,
+            per_sample,
+            points: Vec::new(),
+        };
+        let mut retained = 0u64;
+        const TINY_CAP: u64 = 100;
+        let member = |v: f64| CollMember {
+            body: String::new(),
+            value: v,
+            out: None,
+        };
+        let mut err = None;
+        let mut loads = 0u64;
+        for i in 0..1_000i64 {
+            // All at ts=1 so nothing ever evicts (one collision-free load per
+            // call at increasing ts would evict; here the window only grows).
+            let group = [member(i as f64)];
+            loads += 1;
+            if let Err(e) = slide.load_group(1, &group, &mut retained, TINY_CAP) {
+                err = Some(e);
+                break;
+            }
+        }
+        match err {
+            Some(ReadError::QueryTooBroad(TooBroadReason::MetricRetention { count, cap })) => {
+                assert_eq!(cap, TINY_CAP);
+                assert_eq!(
+                    count,
+                    TINY_CAP + per_sample,
+                    "trips at the first over-cap load"
+                );
+            }
+            other => panic!("expected MetricRetention, got {other:?}"),
+        }
+        assert_eq!(
+            loads,
+            TINY_CAP / per_sample + 1,
+            "the cap must trip DURING the scan (after ~cap/per-sample loads), not after all 1000"
+        );
+        // CHARGE BEFORE ALLOCATE (review round 5, finding 2): the breaching
+        // sample must never reach the deque. If the charge were applied AFTER
+        // `push_back` — as it was before — the window would hold one more
+        // sample than the cap allows, i.e. the allocation the cap exists to
+        // refuse would already have happened.
+        assert_eq!(
+            slide.win.len() as u64,
+            TINY_CAP / per_sample,
+            "the refused sample must not have been pushed"
+        );
+    }
+
+    /// AC8: the concurrent-retention invariant is symmetric — every charged
+    /// point is discharged on eviction, so a long streaming slide over a
+    /// narrow window keeps `retained` bounded by the window's contents rather
+    /// than growing with the scan.
+    #[test]
+    fn sliding_retention_charge_and_discharge_are_symmetric() {
+        let mut slide = FpSlide {
+            stream_hash: 7,
+            labels: vec![],
+            op: RangeAggOp::QuantileOverTime,
+            class: ReducerClass::ReduceIndependent,
+            param: Some(0.5),
+            rate_window_ns: None,
+            grid_start: 0,
+            step: 10,
+            range: 10,
+            kmax: 100,
+            next_k: 0,
+            win: VecDeque::new(),
+            run_int: 0,
+            per_sample: retention_points_per_sample(RangeAggOp::QuantileOverTime),
+            points: Vec::new(),
+        };
+        let mut retained = 0u64;
+        // 100 samples 10ns apart over a 10ns window: at most a couple are
+        // ever concurrently retained, however long the scan runs (times the
+        // per-sample charge — 2 for quantile).
+        let bound = 3 * retention_points_per_sample(RangeAggOp::QuantileOverTime);
+        for i in 1..=100i64 {
+            let group = [CollMember {
+                body: String::new(),
+                value: i as f64,
+                out: None,
+            }];
+            slide
+                .load_group(i * 10, &group, &mut retained, MAX_RETAINED_WINDOW_POINTS)
+                .expect("under cap");
+            assert!(
+                retained <= bound,
+                "retention must stay window-bounded, saw {retained} after {i} loads"
+            );
+        }
+        // Closing the series discharges everything left in the window.
+        slide.finish(&mut retained);
+        assert_eq!(retained, 0, "charge/discharge must be symmetric");
+    }
+
+    /// AC10: a forced same-`(fingerprint, timestamp_ns)` collision of ≥3 rows
+    /// with DISTINCT bodies resolves an ORDER-DEPENDENT reducer through the
+    /// full-body `tie_rank` order, byte-stable across shuffled input. Uses
+    /// `last_over_time` (positional in the canonical order) plus a class-C
+    /// `sum` — the two shapes the review called out as untested.
+    #[test]
+    fn sliding_same_stream_tie_rank_orders_class_c_and_first_last_deterministically() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        // Three rows at the IDENTICAL `(fingerprint, timestamp_ns)` with
+        // DISTINCT bodies that all parse to the same label set (`a` is
+        // consumed by the unwrap), chosen so the full-BODY byte order is
+        // deliberately DIFFERENT from the value order:
+        //   `a="3"` (0x22 after `a=`) < `a=1` (0x31) < `a=2` (0x32)
+        //   ⇒ canonical values in order: 3, 1, 2
+        // So `first` = 3 and `last` = 2. A value-tiebreak (the old instant
+        // rule) would give first=1/last=3, and an arrival-order rule would
+        // flap under shuffling — this case discriminates all three.
+        let bodies = [r#"a="3""#, "a=1", "a=2"];
+        let run = |op: RangeAggOp, order: &[usize]| -> Vec<(i64, f64)> {
+            let client = ClientAgg {
+                pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+                value: ClientValue::Unwrap,
+                range_op: op,
+                param: None,
+                absent_labels: vec![],
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            let rows: Vec<MetricScanRow> = order
+                .iter()
+                .map(|&i| MetricScanRow {
+                    fingerprint: 1,
+                    timestamp_ns: 5,
+                    body: bodies[i].to_string(),
+                })
+                .collect();
+            let res =
+                run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).expect("eval");
+            one_series_points(res).1
+        };
+        // Every input permutation must give the SAME, body-order-determined
+        // answer (byte-stable across shuffled runs).
+        for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2], [1, 2, 0], [2, 0, 1]] {
+            assert_eq!(
+                run(RangeAggOp::FirstOverTime, &order),
+                vec![(10, 3.0)],
+                "first = the min-(ts,stream_hash,tie_rank) sample (body order), input {order:?}"
+            );
+            assert_eq!(
+                run(RangeAggOp::LastOverTime, &order),
+                vec![(10, 2.0)],
+                "last = the max-(ts,stream_hash,tie_rank) sample (body order), input {order:?}"
+            );
+            // Class C: the fold runs in the same canonical order.
+            assert_eq!(run(RangeAggOp::SumOverTime, &order), vec![(10, 6.0)]);
+        }
+    }
+
+    /// AC8 (review round 2 gap): the concurrent-retention invariant on the
+    /// MUTATING path — both `MutGroup.int_cells` (class A) and
+    /// `MutGroup.pt_cells` (class B/C) charge `retained`, and the whole
+    /// charge is released when the state is finished/dropped.
+    #[test]
+    fn sliding_mutating_fan_out_charges_and_releases_retention_for_both_cell_kinds() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        // A `label_format` makes the output set differ from the base ⇒ the
+        // mutating fan-out path (`fan_out == true`).
+        for (op, value, expect_int_cells) in [
+            // Class A -> `int_cells`.
+            (RangeAggOp::CountOverTime, ClientValue::Count, true),
+            // Class B -> `pt_cells` (retained points).
+            (RangeAggOp::MaxOverTime, ClientValue::Unwrap, false),
+            // Class B with a per-emit scratch charge (`per_sample == 2`):
+            // the fan-out cells must charge in the SAME unit the streaming
+            // slider does, or the discharge at finish cannot balance.
+            (RangeAggOp::QuantileOverTime, ClientValue::Unwrap, false),
+        ] {
+            let pipeline = if matches!(value, ClientValue::Unwrap) {
+                parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu" | unwrap a"#)
+            } else {
+                parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#)
+            };
+            let client = ClientAgg {
+                pipeline,
+                value,
+                range_op: op,
+                param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
+                absent_labels: vec![],
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
+            let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+            let rows: Vec<MetricScanRow> = (1..=5)
+                .map(|i| MetricScanRow {
+                    fingerprint: 1,
+                    timestamp_ns: i * 10,
+                    body: "a=1".to_string(),
+                })
+                .collect();
+            state.push_rows(&rows).expect("fan-out fold");
+            assert!(
+                state.retained > 0,
+                "{op:?}: the mutating fan-out must CHARGE retention"
+            );
+            let group = state.groups.values().next().expect("one output group");
+            if expect_int_cells {
+                assert!(!group.int_cells.is_empty(), "{op:?}: int_cells populated");
+                assert!(group.pt_cells.is_empty());
+                assert_eq!(
+                    state.retained,
+                    group.int_cells.len() as u64,
+                    "{op:?}: every created int cell is charged exactly once"
+                );
+            } else {
+                assert!(!group.pt_cells.is_empty(), "{op:?}: pt_cells populated");
+                assert!(group.int_cells.is_empty());
+                assert_eq!(
+                    state.retained,
+                    group.pt_cells.values().map(|v| v.len() as u64).sum::<u64>()
+                        * retention_points_per_sample(op),
+                    "{op:?}: every retained point is charged exactly once, in `per_sample` units"
+                );
+            }
+            // RELEASE leg (review round 3, finding 3): drive the in-place
+            // finish so the discharge is OBSERVABLE — the charge must return
+            // to exactly zero. Deleting the discharge in `finish_in_place`
+            // reddens this assertion (proved by tripping it).
+            let out = state.finish_in_place().expect("finish");
+            assert!(matches!(out, QueryResult::Matrix(ref m) if !m.is_empty()));
+            assert_eq!(
+                state.retained, 0,
+                "{op:?}: every mutating-path charge must be discharged at finish"
+            );
+        }
+    }
+
+    /// Review round 5, finding 2: `rate_counter` re-reduces over a BORROW of
+    /// the live window instead of copying the whole window into an owned
+    /// `Vec<(i64, f64)>` at every grid point. The refactor must be
+    /// arithmetically INERT — pinned bit-for-bit (`to_bits`, so a low-bit
+    /// float drift or a reordered reset walk reddens) against an INDEPENDENT
+    /// transcription of the owned-`Vec` form below. Deliberately NOT compared
+    /// against `rate_counter_extrapolated`: that now delegates to the very
+    /// function under test, so such a comparison would move with the code and
+    /// prove nothing.
+    #[test]
+    fn rate_counter_over_a_borrowed_window_is_bit_identical_to_the_owning_form() {
+        /// The pre-refactor owned-`Vec` implementation, transcribed verbatim
+        /// and kept independent of the production code path.
+        fn reference(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u64>) -> f64 {
+            if pts.len() < 2 {
+                return 0.0;
+            }
+            let Some(rng_ns) = rate_window_ns.filter(|w| *w > 0) else {
+                return 0.0;
+            };
+            pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
+            let first_t = pts[0].0;
+            let last_t = pts[pts.len() - 1].0;
+            let first_f = pts[0].1;
+            let last_f = pts[pts.len() - 1].1;
+            let mut result_value = last_f - first_f;
+            let mut last_value = 0.0_f64;
+            for &(_, f) in &pts {
+                if f < last_value {
+                    result_value += last_value;
+                }
+                last_value = f;
+            }
+            let sel_range_ms: i128 = (rng_ns / 1_000_000) as i128;
+            let range_start = first_t as i128 - sel_range_ms;
+            let mut duration_to_start = (first_t as i128 - range_start) as f64 / 1000.0;
+            let duration_to_end = 0.0_f64;
+            let sampled_interval = (last_t as i128 - first_t as i128) as f64 / 1000.0;
+            let average_duration = sampled_interval / (pts.len() - 1) as f64;
+            if result_value > 0.0 && first_f >= 0.0 {
+                let duration_to_zero = sampled_interval * (first_f / result_value);
+                if duration_to_zero < duration_to_start {
+                    duration_to_start = duration_to_zero;
+                }
+            }
+            let threshold = average_duration * 1.1;
+            let mut extrapolate_to = sampled_interval;
+            extrapolate_to += if duration_to_start < threshold {
+                duration_to_start
+            } else {
+                average_duration / 2.0
+            };
+            extrapolate_to += if duration_to_end < threshold {
+                duration_to_end
+            } else {
+                average_duration / 2.0
+            };
+            result_value *= extrapolate_to / sampled_interval;
+            result_value / (rng_ns as f64 / 1_000_000_000.0)
+        }
+
+        let windows: Vec<Vec<(i64, f64)>> = vec![
+            vec![],
+            vec![(10, 5.0)],
+            vec![(10, 1.0), (20, 2.0), (30, 4.5)],
+            // Counter resets (the reset-aware accumulation order matters).
+            vec![(10, 9.0), (20, 3.0), (30, 11.25), (40, 2.5), (50, 7.125)],
+            // Same-timestamp neighbours (canonical order keeps them adjacent).
+            vec![(10, 1.5), (10, 2.5), (10, 0.25), (25, 9.75)],
+            // Values that exercise the extrapolation-to-zero branch.
+            vec![(0, 0.0), (1_000_000, 3.3), (5_000_000, 3.3000000000000003)],
+        ];
+        for pts in &windows {
+            let ordered: Vec<WinSample> = pts
+                .iter()
+                .enumerate()
+                .map(|(i, &(ts, value))| WinSample {
+                    ts,
+                    stream_hash: 7,
+                    tie_rank: i as u32,
+                    value,
+                })
+                .collect();
+            for rate_window_ns in [None, Some(0u64), Some(30_000_000_000)] {
+                let borrowed = reduce_window(
+                    RangeAggOp::RateCounter,
+                    ReducerClass::CanonicalFold,
+                    None,
+                    rate_window_ns,
+                    0,
+                    &ordered,
+                );
+                let owned = if ordered.is_empty() {
+                    None
+                } else {
+                    Some(reference(pts.clone(), rate_window_ns))
+                };
+                match (borrowed, owned) {
+                    (None, None) => {}
+                    (Some(b), Some(o)) => assert_eq!(
+                        b.to_bits(),
+                        o.to_bits(),
+                        "borrowed {b} != owned {o} for {pts:?} / {rate_window_ns:?}"
+                    ),
+                    (b, o) => panic!("presence differs: {b:?} vs {o:?} for {pts:?}"),
+                }
+            }
+        }
+    }
+
+    /// Review round 5, finding 2: on the MUTATING fan-out path the cap gate
+    /// runs BEFORE the cell/point insertion, for both cell kinds — the
+    /// allocation the cap exists to refuse is never made. Driven through a
+    /// tiny `retention_cap` (materializing four million cells would not be a
+    /// test); if the charge were applied after the insert, `retained` would
+    /// settle at `cap + 1` and the container would hold the refused entry.
+    #[test]
+    fn fan_out_retention_cap_refuses_the_breaching_cell_before_inserting_it() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        // range 30 / step 10 ⇒ each sample fans into up to 3 grid cells.
+        let window = slide_window(0, 100, 10, 30);
+        const TINY_CAP: u64 = 4;
+        for (op, value, integer) in [
+            (RangeAggOp::CountOverTime, ClientValue::Count, true),
+            (RangeAggOp::QuantileOverTime, ClientValue::Unwrap, false),
+        ] {
+            let pipeline = if matches!(value, ClientValue::Unwrap) {
+                parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu" | unwrap a"#)
+            } else {
+                parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#)
+            };
+            let client = ClientAgg {
+                pipeline,
+                value,
+                range_op: op,
+                param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
+                absent_labels: vec![],
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+            state.retention_cap = TINY_CAP;
+            let rows: Vec<MetricScanRow> = (1..=20)
+                .map(|i| MetricScanRow {
+                    fingerprint: 1,
+                    timestamp_ns: i * 10,
+                    body: "a=1".to_string(),
+                })
+                .collect();
+            match state.push_rows(&rows) {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention { cap, count })) => {
+                    assert_eq!(cap, TINY_CAP);
+                    assert!(count > TINY_CAP, "{op:?}: the error names the breach");
+                }
+                other => panic!("{op:?}: expected MetricRetention, got {other:?}"),
+            }
+            // What the containers ACTUALLY hold, in charge units.
+            let held: u64 = state
+                .groups
+                .values()
+                .map(|g| {
+                    if integer {
+                        g.int_cells.len() as u64
+                    } else {
+                        g.pt_cells.values().map(|v| v.len() as u64).sum::<u64>()
+                            * retention_points_per_sample(op)
+                    }
+                })
+                .sum();
+            assert_eq!(
+                state.retained, held,
+                "{op:?}: the counter must match what is actually held"
+            );
+            assert!(
+                held <= TINY_CAP,
+                "{op:?}: the breaching cell was inserted anyway ({held} held vs cap {TINY_CAP})"
+            );
+        }
+    }
+
+    /// Review round 2 finding 2: a HOSTILE client-controlled duration is
+    /// rejected cleanly at the planner boundary — never narrowed/wrapped.
+    #[test]
+    fn hostile_durations_are_rejected_at_the_planner_boundary() {
+        use super::super::params::MAX_DURATION_NS;
+        // In-domain values pass.
+        assert_eq!(
+            super::super::params::validate_duration_ns(60_000_000_000, "step")
+                .unwrap()
+                .get(),
+            60_000_000_000
+        );
+        assert_eq!(
+            super::super::params::validate_duration_ns(MAX_DURATION_NS as u64, "step")
+                .unwrap()
+                .get(),
+            MAX_DURATION_NS
+        );
+        // Zero and everything above the domain are named 400s, NOT wraps.
+        // Round 10: the domain is the reference's full positive int64, so
+        // `MAX_DURATION_NS + 1` IS `i64::MAX as u64 + 1` — the first value
+        // that would narrow to a NEGATIVE i64.
+        for hostile in [0u64, MAX_DURATION_NS as u64 + 1, u64::MAX] {
+            match super::super::params::validate_duration_ns(hostile, "range selector") {
+                Err(ReadError::DurationOutOfRange { value, max, .. }) => {
+                    assert_eq!(value, hostile);
+                    assert_eq!(max, MAX_DURATION_NS);
+                }
+                other => panic!("hostile duration {hostile} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// Review round 4, finding 2: the instant/range modelling. A `Range`
+    /// window structurally REQUIRES two `ValidatedDuration`s (no zero/absent
+    /// representation exists), and an `Instant` window structurally has no
+    /// step and no range — so `RangeSlideState` can only receive a real,
+    /// validated, non-zero range. `ValidatedDuration::NONE` is gone.
+    #[test]
+    fn a_range_window_cannot_carry_an_absent_or_zero_range() {
+        // The only way to obtain the durations a `Range` window needs.
+        let step = super::super::params::validate_duration_ns(10, "step").unwrap();
+        let range = super::super::params::validate_duration_ns(30, "range selector").unwrap();
+        let w = ClientWindow::Range {
+            grid_start_ns: 0,
+            end_ns: 100,
+            step_ns: step,
+            range_ns: range,
+        };
+        assert_eq!(w.step_ns(), Some(step));
+        assert!(range.get() > 0, "a validated range is never zero");
+        // And zero can never be minted: the validator rejects it, so no
+        // `ValidatedDuration` carrying 0 exists to place in the range slot.
+        assert!(super::super::params::validate_duration_ns(0, "range selector").is_err());
+        // An instant window has neither a step nor a range slot at all.
+        let i = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        assert_eq!(i.step_ns(), None);
+    }
+
+    /// Review round 2 finding 1: the `absent_over_time` presence counters are
+    /// `i64`, whose maximum magnitude is the number of surviving collision
+    /// groups — itself bounded by the byte-scan budget ceiling (one byte per
+    /// row minimum). This test pins the arithmetic identity the proof rests
+    /// on: the counter stays exact well past the old `i32` ceiling.
+    #[test]
+    fn absent_presence_counter_cannot_overflow_under_the_scan_budget() {
+        // The structural bound: rows <= scan-budget bytes < i64::MAX.
+        let budget_ceiling: u64 = pulsus_config::LOGQL_SCAN_BUDGET_BYTES_CEILING;
+        assert!(
+            (budget_ceiling as u128) < i64::MAX as u128,
+            "the byte-scan budget ceiling must bound the group count inside i64"
+        );
+        // And the counter type genuinely holds a value the old `i32` could
+        // not: accumulate PAST the i32 ceiling one increment at a time (the
+        // exact `+= 1` shape `flush_collision` uses) and stay exact.
+        let mut cover: Vec<i64> = vec![0; 2];
+        let start = i32::MAX as i64 - 5;
+        cover[0] = start;
+        for _ in 0..10 {
+            cover[0] += 1;
+        }
+        assert_eq!(
+            cover[0],
+            start + 10,
+            "counter must stay exact past i32::MAX"
+        );
+        assert!(cover[0] > i32::MAX as i64, "exceeds the old i32 ceiling");
+        // The symmetric decrement is equally exact.
+        cover[1] -= cover[0];
+        assert_eq!(cover[0] + cover[1], 0, "difference array nets to zero");
+    }
+
+    /// Review round 3, finding 1: the collision group is bounded in BYTES,
+    /// not just member count — a handful of very large same-`(fingerprint,
+    /// ts)` bodies trips the clean error long before the 10 000-member cap,
+    /// and the staged buffer never exceeds `MAX_TS_COLLISION_GROUP_BYTES`.
+    #[test]
+    fn collision_group_byte_cap_trips_before_staging_large_bodies() {
+        // An order-DEPENDENT reducer, so bodies are staged for `tie_rank`.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+
+        // 1 MiB bodies at the SAME (fingerprint, ts): only ~8 fit under the
+        // 8 MiB byte cap — far below the 10 000-member cap, so the byte
+        // dimension is what bites.
+        let big = "x".repeat(1024 * 1024);
+        let rows: Vec<MetricScanRow> = (0..64)
+            .map(|_| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("a=1 {big}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count, cap, ..
+            })) => {
+                assert_eq!(cap, MAX_TS_COLLISION_GROUP);
+                assert!(
+                    count < MAX_TS_COLLISION_GROUP,
+                    "the BYTE cap must trip well before the member cap, tripped at {count}"
+                );
+            }
+            other => panic!("expected TsCollisionGroup from the byte cap, got {other:?}"),
+        }
+        // Bound proof, observed: the staged buffer never exceeded the cap.
+        assert!(
+            state.coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
+            "staged {} bytes exceeds the {MAX_TS_COLLISION_GROUP_BYTES}-byte cap",
+            state.coll_bytes
+        );
+    }
+
+    /// Review round 4, finding 1: the byte cap covers the FAN-OUT staging
+    /// (rendered label JSON + cloned `LabelSet`) for a reducer that stages NO
+    /// body — the exact hole in the round-3 accounting. Class A
+    /// (`count_over_time`, `needs_body_order == false`) with a label-mutating
+    /// pipeline extracting huge label values must still trip the byte cap.
+    #[test]
+    fn collision_group_byte_cap_covers_fan_out_staging_without_bodies() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
+        let state_class = reducer_class(client.range_op, client.value);
+        assert_eq!(
+            state_class,
+            ReducerClass::InvertInteger,
+            "this case must be the class that stages NO body"
+        );
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        assert!(
+            !state.needs_body_order,
+            "the hole was that no body ⇒ nothing was charged"
+        );
+        // Each line carries a ~1 MiB extracted label VALUE — no body is
+        // staged, but the rendered JSON + cloned LabelSet are.
+        let big = "v".repeat(1024 * 1024);
+        let rows: Vec<MetricScanRow> = (0..64)
+            .map(|_| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("big={big}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count,
+                bytes,
+                bytes_cap,
+                ..
+            })) => {
+                assert!(
+                    count < MAX_TS_COLLISION_GROUP,
+                    "the BYTE dimension must trip, not the member count ({count})"
+                );
+                assert!(bytes > bytes_cap, "the error reports the byte breach");
+            }
+            other => panic!("fan-out staging must be byte-capped, got {other:?}"),
+        }
+        assert!(
+            state.coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
+            "staged {} bytes exceeds the cap",
+            state.coll_bytes
+        );
+    }
+
+    /// The byte/count caps must ERROR, never silently truncate a group into a
+    /// partial (and therefore wrong) `tie_rank` order — including when the
+    /// group STRADDLES a fetch-chunk boundary. Pushing the same group in two
+    /// batches must accumulate one continuous charge and fail cleanly.
+    #[test]
+    fn a_capped_collision_group_errors_rather_than_truncating_across_chunks() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        // ~512 KiB bodies: 5 members charge ~5.3 MiB (the round-7 block
+        // model charges 2× the body clone) — under the 8 MiB cap; the
+        // second chunk's members push the same open group past it.
+        let big = "x".repeat(512 * 1024);
+        let chunk: Vec<MetricScanRow> = (0..5)
+            .map(|_| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("a=1 {big}"),
+            })
+            .collect();
+        // First chunk: under the cap, group left OPEN (straddling).
+        state.push_rows(&chunk).expect("first chunk under the cap");
+        let after_first = state.coll_bytes;
+        assert!(after_first > 0, "the straddling group carried a charge");
+        assert_eq!(state.coll.len(), 5, "group stayed open across the chunk");
+        // Second chunk continues the SAME (fingerprint, ts) group — the charge
+        // must accumulate continuously (no reset, no double count) and trip.
+        match state.push_rows(&chunk) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup { .. })) => {}
+            other => panic!("the straddling group must trip the cap cleanly, got {other:?}"),
+        }
+        assert!(
+            state.coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
+            "the accumulated charge stayed inside the cap"
+        );
+        // The error is terminal for the query: nothing is emitted from a
+        // partially-staged group, so no truncated tie order can escape.
+        assert!(
+            state.coll_bytes >= after_first,
+            "charge accumulated, not reset"
+        );
+    }
+
+    /// Issue #227 review round 7, finding 2: the per-allocation charge is
+    /// a PROVABLE upper bound on the block a real allocator retains, not
+    /// just on the request size — a 33-byte request can retain a 48/64-
+    /// byte block under size-class rounding. Pins [`alloc_block_bytes`]
+    /// against an independent worst-of-mainstream retained-block model at
+    /// sizes straddling every class boundary up to 1 MiB:
+    /// `max(next_pow2(n), align16(n + 8), 32)` — powers of two are the
+    /// coarsest mainstream class grid (jemalloc/mimalloc/tcmalloc are all
+    /// finer), and `align16(n + 8)` is glibc's inline-header chunk. The
+    /// boundary cases (33, 65, 129, ...) FAIL if the 2× rounding is
+    /// removed (a request-size charge of `n.max(32)` sits strictly below
+    /// the model there) — asserted explicitly so the test is provably
+    /// non-vacuous.
+    #[test]
+    fn alloc_block_bytes_covers_allocator_size_class_rounding_at_class_boundaries() {
+        /// The worst retained block any mainstream allocator keeps for an
+        /// `n`-byte request (see the test doc).
+        fn worst_mainstream_retained(n: u64) -> u64 {
+            let pow2_class = n.max(1).next_power_of_two();
+            let glibc_chunk = (n + 8).div_ceil(16) * 16;
+            pow2_class.max(glibc_chunk).max(32)
+        }
+
+        let sizes: &[u64] = &[
+            1,
+            8,
+            16,
+            17,
+            24,
+            31,
+            32,
+            33,
+            47,
+            48,
+            63,
+            64,
+            65,
+            96,
+            127,
+            128,
+            129,
+            192,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            1023,
+            1024,
+            1025,
+            4095,
+            4096,
+            4097,
+            65_535,
+            65_536,
+            65_537,
+            1 << 20,
+            (1 << 20) + 1,
+        ];
+        for &n in sizes {
+            let charge = alloc_block_bytes(n);
+            let worst = worst_mainstream_retained(n);
+            assert!(
+                charge >= worst,
+                "alloc_block_bytes({n}) = {charge} under-counts a retained \
+                 block of {worst}"
+            );
+            // The realloc peak: the grown buffer's request is ≤ 2n and the
+            // old ≤ n-byte buffer is still mapped — BOTH size-class-rounded.
+            let grown = grown_alloc_bytes(n);
+            let peak = worst_mainstream_retained(2 * n) + worst;
+            assert!(
+                grown >= peak,
+                "grown_alloc_bytes({n}) = {grown} under-counts the realloc \
+                 peak of {peak}"
+            );
+        }
+        // Non-vacuous: at the class-boundary sizes the pre-round-7
+        // request-size charge (`n.max(32)`) sits BELOW the retained block,
+        // so removing the rounding turns the asserts above red.
+        for &n in &[33u64, 65, 129, 257, 1025, 4097] {
+            assert!(
+                worst_mainstream_retained(n) > n.max(MIN_ALLOC_BYTES),
+                "size {n} must straddle a class boundary for this test to \
+                 catch a removed rounding"
+            );
+        }
+    }
+
+    /// Review round 5, finding 1: the charge sizes the rendered JSON by
+    /// walking the SAME escape arms the renderer uses, so the two cannot
+    /// drift. Covers every arm: the two-byte escapes, the `\u00xx` six-byte
+    /// C0 expansion (the one the round-4 charge counted as ONE byte),
+    /// verbatim ASCII, multi-byte UTF-8, empty strings and the empty set.
+    #[test]
+    fn rendered_labels_json_len_matches_the_renderer_byte_for_byte() {
+        let cases: Vec<Vec<(Cow<'_, str>, Cow<'_, str>)>> = vec![
+            vec![],
+            vec![(Cow::Borrowed(""), Cow::Borrowed(""))],
+            vec![(Cow::Borrowed("app"), Cow::Borrowed("checkout"))],
+            // Every short escape.
+            vec![(Cow::Borrowed("q"), Cow::Borrowed("\"\\\n\r\t\u{08}\u{0C}"))],
+            // Every C0 byte that has no short escape ⇒ six bytes each.
+            vec![(
+                Cow::Borrowed("c0"),
+                Cow::Owned((0u8..0x20).map(|b| b as char).collect::<String>()),
+            )],
+            // Multi-byte UTF-8 is copied verbatim at its own width.
+            vec![
+                (Cow::Borrowed("é"), Cow::Borrowed("日本語")),
+                (Cow::Borrowed("emoji"), Cow::Borrowed("🚀🚀")),
+            ],
+            // A dense mixture across several pairs (comma punctuation).
+            vec![
+                (Cow::Borrowed("a"), Cow::Borrowed("1")),
+                (Cow::Borrowed("b"), Cow::Owned("\u{1}x\"y".repeat(7))),
+                (Cow::Borrowed("c"), Cow::Borrowed("plain")),
+            ],
+        ];
+        for pairs in &cases {
+            assert_eq!(
+                rendered_labels_json_len(pairs),
+                render_labels_json_sorted(pairs).len() as u64,
+                "sized length must equal the rendered length for {pairs:?}"
+            );
+        }
+    }
+
+    /// Review round 5, finding 1: `member_stage_bytes` must be a true UPPER
+    /// BOUND on what `stage_member` ACTUALLY allocates. Non-tautological by
+    /// construction — the fixtures drive the real `stage_member` and the
+    /// assertion measures the live `capacity()` of every buffer it created
+    /// (`coll`'s element buffer, the body clone, the rendered JSON, the
+    /// cloned `LabelSet` and each of its owned strings), then compares that
+    /// to the charge the caps were checked against.
+    ///
+    /// The fixtures are the inputs that beat the round-4 accounting: an
+    /// all-control-character label value (six rendered bytes per input byte,
+    /// counted once before), many one-byte labels (whose real allocations
+    /// cannot go below the allocator's minimum block), and enough members to
+    /// force `coll`'s capacity to double repeatedly.
+    #[test]
+    fn member_stage_bytes_upper_bounds_every_allocation_stage_member_makes() {
+        /// The live heap footprint of everything currently staged in `coll`.
+        fn staged_capacity(state: &RangeSlideState<'_>) -> u64 {
+            let mut n = (state.coll.capacity() * size_of::<CollMember>()) as u64;
+            for m in &state.coll {
+                n += m.body.capacity() as u64;
+                if let Some((key, labels)) = &m.out {
+                    n += key.capacity() as u64;
+                    n += (labels.capacity() * size_of::<(String, String)>()) as u64;
+                    for (k, v) in labels {
+                        n += (k.capacity() + v.capacity()) as u64;
+                    }
+                }
+            }
+            n
+        }
+
+        // Class C (`sum_over_time` over `unwrap`) ⇒ bodies staged for
+        // `tie_rank`; `label_format` ⇒ the fan-out `key`/`LabelSet` staged
+        // too. Both legs of the charge are exercised at once.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu" | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+
+        let control: String = std::iter::repeat_n('\u{1}', 512).collect();
+        struct Fixture {
+            name: &'static str,
+            body: String,
+            labels: Vec<(String, String)>,
+        }
+        let fixtures = vec![
+            // Worst-case escaping: every value byte renders as six.
+            Fixture {
+                name: "all-control-character values",
+                body: "a=1".to_string(),
+                labels: vec![
+                    ("k".to_string(), control.clone()),
+                    ("kk".to_string(), control.clone()),
+                ],
+            },
+            // Minimum-block worst case: 64 one-byte keys and values.
+            Fixture {
+                name: "many one-byte labels",
+                body: "a=1".to_string(),
+                labels: (0..64u32)
+                    .map(|i| {
+                        (
+                            char::from(b'a' + (i % 26) as u8).to_string(),
+                            "x".to_string(),
+                        )
+                    })
+                    .collect(),
+            },
+            // No labels at all (charge must still cover the slot + body).
+            Fixture {
+                name: "no labels",
+                body: "a=1 ".repeat(300),
+                labels: Vec::new(),
+            },
+            // Mixed escapes and multi-byte UTF-8.
+            Fixture {
+                name: "mixed escapes and multi-byte",
+                body: "a=1".to_string(),
+                labels: vec![
+                    ("q\"k".to_string(), "v\\\n\t\u{7}".to_string()),
+                    ("日本".to_string(), "🚀".repeat(40)),
+                ],
+            },
+        ];
+
+        for Fixture { name, body, labels } in &fixtures {
+            let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+            assert!(state.needs_body_order, "{name}: bodies must be staged");
+            assert!(state.fan_out, "{name}: label output must be staged");
+            // Enough members to force `coll` to grow through several
+            // capacity doublings (4 → 8 → 16 → 32).
+            for _ in 0..20 {
+                let row = MetricScanRow {
+                    fingerprint: 1,
+                    timestamp_ns: 5,
+                    body: body.clone(),
+                };
+                let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = labels
+                    .iter()
+                    .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
+                    .collect();
+                state.stage_member(&row, 1.0, &mut scratch).expect("staged");
+                assert!(
+                    state.coll_bytes >= staged_capacity(&state),
+                    "{name}: charge {} under-counts the {} bytes actually allocated \
+                     after {} members",
+                    state.coll_bytes,
+                    staged_capacity(&state),
+                    state.coll.len()
+                );
+            }
+        }
+    }
+
+    /// Issue #227 review round 7, finding 2 (the container-slot leg of the
+    /// same allocator-rounding model): the per-member `CollMember` slot
+    /// charge must cover the `coll` buffer's SIZE-CLASS-ROUNDED realloc
+    /// peak — live capacity (doubling growth, initial `min_non_zero_cap`
+    /// of 4) plus the old buffer still mapped during the realloc, each
+    /// retained at up to the worst mainstream block for its request.
+    /// Drives the REAL `member_stage_bytes` (a class-A state stages
+    /// nothing but the slot, so the returned charge IS the per-member
+    /// slot charge) and replays `Vec`'s exact growth schedule; reverting
+    /// the slot factor to the pre-round-7 `4×` fails at `n = 1` and at
+    /// every realloc point.
+    #[test]
+    fn coll_member_slot_charge_covers_the_size_class_rounded_realloc_peak() {
+        fn worst_mainstream_retained(n: u64) -> u64 {
+            let pow2_class = n.max(1).next_power_of_two();
+            let glibc_chunk = (n + 8).div_ceil(16) * 16;
+            pow2_class.max(glibc_chunk).max(32)
+        }
+
+        // A class-A reducer with no fan-out: no body staged, no labels
+        // staged — `member_stage_bytes` returns exactly the slot charge.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"}"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        assert!(!state.needs_body_order && !state.fan_out);
+        let row = MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns: 5,
+            body: "x".to_string(),
+        };
+        let slot_charge = state.member_stage_bytes(&row, &[], false);
+
+        let slot = size_of::<CollMember>() as u64;
+        let mut cap: u64 = 0;
+        for n in 1..=1_000u64 {
+            // `RawVec`: first push reserves `min_non_zero_cap = 4`; a full
+            // buffer doubles, with the old buffer live during the realloc.
+            let old = if n == 1 {
+                cap = 4;
+                0
+            } else if n > cap {
+                let old = cap;
+                cap *= 2;
+                old
+            } else {
+                0
+            };
+            let peak = worst_mainstream_retained(cap * slot)
+                + if old > 0 {
+                    worst_mainstream_retained(old * slot)
+                } else {
+                    0
+                };
+            let charged = slot_charge * n;
+            assert!(
+                charged >= peak,
+                "after {n} members the cumulative slot charge {charged} \
+                 under-counts the rounded realloc peak {peak}"
+            );
+        }
+    }
+
+    /// Review round 6: distinct mutating-label groups' rendered keys +
+    /// `LabelSet`s are QUERY-LIFETIME (they live in `groups` until finish,
+    /// outliving the per-flush `coll_bytes` reset), so they are charged
+    /// against the group-byte cap BEFORE the map insertion — a refused
+    /// group is never inserted and the counter never records it.
+    #[test]
+    fn query_lifetime_group_label_bytes_are_capped_before_the_map_insertion() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        state.group_bytes_cap = 1;
+        // Distinct extracted `u` values ⇒ distinct groups; distinct ts ⇒
+        // singleton collision groups (the collision caps stay silent).
+        let rows: Vec<MetricScanRow> = (1..=3)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i * 10,
+                body: format!("u=v{i}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { bytes, cap })) => {
+                assert_eq!(cap, 1);
+                assert!(bytes > cap, "the error names the byte breach");
+            }
+            other => panic!("expected MetricGroupLabelBytes, got {other:?}"),
+        }
+        // Charge-before-insert, observed: the refused group was never
+        // inserted and the counter never recorded it.
+        assert!(
+            state.groups.is_empty(),
+            "the breaching group was inserted anyway"
+        );
+        assert_eq!(state.group_bytes, 0, "a refused charge must not stick");
+    }
+
+    /// Review round 6 symmetry: every insertion into the query-lifetime
+    /// `groups` map passes the charge (the counter equals the sum of
+    /// [`group_entry_bytes`] over the LIVE map — no bypassing path, no
+    /// double charge for a repeated group), and `finish_in_place` releases
+    /// every charge back to exactly zero. Deleting either the
+    /// `fan_out_sample` charge or the finish discharge fails this test.
+    #[test]
+    fn group_label_byte_charges_match_the_live_map_and_release_at_finish() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        // u=a twice (one group, charged ONCE), u=b once; the final u=c row
+        // stays staged in `coll` until finish flushes — proving the
+        // finish-time flush passes the same charge.
+        let bodies = ["u=a", "u=b", "u=a", "u=c"];
+        let rows: Vec<MetricScanRow> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: (i as i64 + 1) * 10,
+                body: (*b).to_string(),
+            })
+            .collect();
+        state.push_rows(&rows).expect("under every cap");
+        assert_eq!(state.groups.len(), 2, "u=a (deduped) and u=b are flushed");
+        let live: u64 = state
+            .groups
+            .iter()
+            .map(|(k, g)| group_entry_bytes(k, &g.labels, MUT_GROUP_SLOT))
+            .sum();
+        assert!(live > 0, "the fixture must exercise a real charge");
+        assert_eq!(
+            state.group_bytes, live,
+            "the counter must equal the live map's sized entries — every \
+             insertion charged, repeated groups charged once"
+        );
+        let out = state.finish_in_place().expect("finish");
+        assert_eq!(
+            state.group_bytes, 0,
+            "every group-label byte charge must be discharged at finish"
+        );
+        assert_eq!(state.retained, 0, "retention symmetry is undisturbed");
+        match out {
+            QueryResult::Matrix(series) => {
+                assert_eq!(series.len(), 3, "u=a, u=b and the finish-flushed u=c");
+            }
+            other => panic!("expected a matrix, got {other:?}"),
+        }
+    }
+
+    /// Review round 6: [`group_entry_bytes`] is a true UPPER BOUND on the
+    /// heap bytes a retained group-map entry actually holds.
+    /// Non-tautological — the charge is sized from LENGTHS while the
+    /// assertion measures the live `capacity()` of the real entry produced
+    /// by the real staging/flush path (the rendered key's capacity exceeds
+    /// its length whenever escaping forces growth past the renderer's
+    /// raw-byte pre-size, so an exact-length key charge fails here).
+    #[test]
+    fn group_entry_bytes_upper_bounds_the_retained_map_entry() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+
+        let control: String = std::iter::repeat_n('\u{1}', 512).collect();
+        let fixtures: Vec<(&str, Vec<(String, String)>)> = vec![
+            // Worst-case escaping: the rendered key grows geometrically
+            // past its raw-byte pre-size (six rendered bytes per input
+            // byte), leaving capacity well above length.
+            (
+                "all-control-character values",
+                vec![
+                    ("k".to_string(), control.clone()),
+                    ("kk".to_string(), control.clone()),
+                ],
+            ),
+            // Minimum-block worst case: many one-byte strings.
+            (
+                "many one-byte labels",
+                (0..64u32)
+                    .map(|i| {
+                        (
+                            char::from(b'a' + (i % 26) as u8).to_string(),
+                            "x".to_string(),
+                        )
+                    })
+                    .collect(),
+            ),
+            // One huge extracted value (the adversarial shape the round-6
+            // finding names: multi-MiB label sets × the series cap).
+            (
+                "one huge value",
+                vec![("big".to_string(), "v".repeat(1_000_000))],
+            ),
+            // No labels at all (charge still covers key + slot).
+            ("no labels", Vec::new()),
+            // Mixed escapes and multi-byte UTF-8.
+            (
+                "mixed escapes and multi-byte",
+                vec![
+                    ("q\"k".to_string(), "v\\\n\t\u{7}".to_string()),
+                    ("日本".to_string(), "🚀".repeat(40)),
+                ],
+            ),
+        ];
+
+        for (name, labels) in &fixtures {
+            let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+            assert!(state.fan_out, "{name}: must be the fan-out path");
+            let row = MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: "a=1".to_string(),
+            };
+            let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = labels
+                .iter()
+                .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
+                .collect();
+            state.coll_active = true;
+            state.coll_fp = 1;
+            state.coll_ts = 5;
+            state.stage_member(&row, 1.0, &mut scratch).expect("staged");
+            state.flush_collision(&HashMap::new()).expect("flushed");
+            assert_eq!(state.groups.len(), 1, "{name}: one retained group");
+            for (key, g) in &state.groups {
+                // Everything measurable the entry retains (the map-table
+                // share is an unmeasurable documented margin, like
+                // `MIN_ALLOC_BYTES`).
+                let measured = key.capacity() as u64
+                    + (g.labels.capacity() * size_of::<(String, String)>()) as u64
+                    + g.labels
+                        .iter()
+                        .map(|(k, v)| (k.capacity() + v.capacity()) as u64)
+                        .sum::<u64>();
+                let charge = group_entry_bytes(key, &g.labels, MUT_GROUP_SLOT);
+                assert!(
+                    charge >= measured,
+                    "{name}: charge {charge} under-counts the {measured} bytes \
+                     actually retained"
+                );
+                assert_eq!(
+                    state.group_bytes, charge,
+                    "{name}: the counter carries exactly this entry's charge"
+                );
+            }
+        }
+    }
+
+    /// Review round 6, class completion: the INSTANT fan-out path retains
+    /// the same query-lifetime key/`LabelSet` state in `label_groups`
+    /// (count-capped, bytes previously uncharged) — same charge, same
+    /// helper, same symmetric release at finish (whose
+    /// `debug_assert_eq!(group_bytes, 0)` fails this test if the discharge
+    /// is deleted).
+    #[test]
+    fn instant_fan_out_groups_are_byte_charged_capped_and_released_at_finish() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+
+        // Trip leg: a tiny cap refuses the FIRST group before insertion.
+        let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
+        state.group_bytes_cap = 1;
+        let row = |ts: i64, body: &str| MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns: ts,
+            body: body.to_string(),
+        };
+        match state.push_rows(&[row(5, "u=a")]) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { bytes, cap })) => {
+                assert_eq!(cap, 1);
+                assert!(bytes > cap, "the error names the byte breach");
+            }
+            other => panic!("expected MetricGroupLabelBytes, got {other:?}"),
+        }
+        assert!(
+            state.label_groups.is_empty(),
+            "the breaching group was inserted anyway"
+        );
+        assert_eq!(state.group_bytes, 0, "a refused charge must not stick");
+
+        // Charge/release leg: the counter equals the live map (repeated
+        // group charged once), then finish releases every charge.
+        let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
+        state
+            .push_rows(&[row(5, "u=a"), row(6, "u=b"), row(7, "u=a")])
+            .expect("under every cap");
+        assert_eq!(state.label_groups.len(), 2);
+        let live: u64 = state
+            .label_groups
+            .iter()
+            .map(|(k, (labels, _))| group_entry_bytes(k, labels, INSTANT_GROUP_SLOT))
+            .sum();
+        assert!(live > 0, "the fixture must exercise a real charge");
+        assert_eq!(
+            state.group_bytes, live,
+            "every insertion charged; the repeated group charged once"
+        );
+        match state.finish() {
+            QueryResult::Vector(samples) => assert_eq!(samples.len(), 2),
+            other => panic!("expected a vector, got {other:?}"),
+        }
+    }
+
+    /// Review round 5, finding 3: EXPLAIN and execution share ONE SQL
+    /// builder, so the reported `metric_read` query IS the query that runs —
+    /// a range plan yields the PK-ordered sliding scan, an instant plan the
+    /// total-order scan. (Previously EXPLAIN reported `metric_raw_samples`
+    /// while a range query executed the sliding one, making the
+    /// `explain_indexes` gates validate a query we never issue.)
+    #[test]
+    fn explain_and_execution_share_one_client_read_sql() {
+        let ctx = PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1 << 40,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        };
+        let window = super::super::sql::TimeWindow {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+        };
+        let svc = ["'checkout'".to_string()];
+        let mk = |spec| {
+            let expr = pulsus_logql::parse(r#"count_over_time({env="prod"} | logfmt [5m])"#)
+                .expect("parse");
+            let params = QueryParams {
+                spec,
+                limit: 100,
+                direction: Direction::Backward,
+            };
+            match plan::plan(&expr, &params, &ctx).expect("plan") {
+                plan::Plan::Metric(mp) => mp,
+                other => panic!("expected a metric plan, got {other:?}"),
+            }
+        };
+        // RANGE -> the PK-ordered sliding scan.
+        let range_mp = mk(QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+            step_ns: 15_000_000_000,
+        });
+        let range_sql = client_metric_read_sql(&range_mp, &svc, &[1], window);
+        assert!(
+            range_sql.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"),
+            "range EXPLAIN/exec must report the sliding scan: {range_sql}"
+        );
+        // INSTANT -> the total-timestamp-order scan.
+        let instant_mp = mk(QuerySpec::Instant {
+            at_ns: 60_000_000_000,
+        });
+        let instant_sql = client_metric_read_sql(&instant_mp, &svc, &[1], window);
+        assert!(
+            instant_sql.contains("ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC"),
+            "instant must keep its total order: {instant_sql}"
+        );
+    }
+
+    /// A group of ordinary-sized bodies is unaffected by the byte cap (it
+    /// must not reject anything real).
+    #[test]
+    fn collision_group_byte_cap_does_not_reject_ordinary_bodies() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        // Bodies differ in BYTES (trailing padding) but parse to the same
+        // label set, so they form ONE 500-member collision group — the shape
+        // the byte cap must not reject.
+        let rows: Vec<MetricScanRow> = (0..500)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("a=1{}", " ".repeat(i % 7)),
+            })
+            .collect();
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
+            .expect("500 ordinary same-ns bodies must be served");
+        assert_eq!(one_series_points(res).1, vec![(10, 500.0)]);
+    }
+
+    /// AC10: the retention cap's over-cap error is `MetricRetention` and the
+    /// collision-group cap's is `TsCollisionGroup` — two DISTINCT named 422
+    /// reasons, never conflated.
+    #[test]
+    fn sliding_over_cap_errors_are_distinct_named_reasons() {
+        let retention = ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
+            count: MAX_RETAINED_WINDOW_POINTS + 1,
+            cap: MAX_RETAINED_WINDOW_POINTS,
+        })
+        .to_string();
+        let collision = ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+            count: MAX_TS_COLLISION_GROUP + 1,
+            cap: MAX_TS_COLLISION_GROUP,
+            bytes: 1,
+            bytes_cap: MAX_TS_COLLISION_GROUP_BYTES,
+        })
+        .to_string();
+        assert!(retention.contains("concurrent sample"), "{retention}");
+        assert!(collision.contains("same-nanosecond"), "{collision}");
+        assert_ne!(retention, collision);
+    }
+
+    /// Issue #227 arithmetic sweep: `rate_counter` over EXTREME timestamps
+    /// (near `i64::MIN`/`i64::MAX`) must not panic in debug or wrap in
+    /// release — the spans are computed in i128 (review finding 2).
+    #[test]
+    fn rate_counter_extreme_timestamps_do_not_overflow() {
+        // A first sample near i64::MIN underflows `first_t - sel_range_ms`.
+        let v = rate_counter_extrapolated(
+            vec![(i64::MIN + 1, 1.0), (i64::MIN + 1_000, 2.0)],
+            Some(60_000_000_000),
+        );
+        assert!(v.is_finite(), "near-i64::MIN must not overflow, got {v}");
+        // A window spanning near-MIN to near-MAX overflows `last_t - first_t`.
+        let v = rate_counter_extrapolated(
+            vec![(i64::MIN + 1, 1.0), (i64::MAX - 1, 2.0)],
+            Some(60_000_000_000),
+        );
+        assert!(v.is_finite(), "full-i64-span must not overflow, got {v}");
+    }
+
+    /// Issue #227 review finding 1: `absent_over_time` retains NOTHING
+    /// per-sample — its presence state is the O(grid) coverage array, so a
+    /// dense selector cannot grow memory with the scan. Drives a dense scan
+    /// and asserts both the correct gaps and a bounded presence footprint.
+    #[test]
+    fn sliding_absent_presence_is_grid_bounded_not_scan_bounded() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::AbsentOverTime,
+            param: None,
+            absent_labels: vec![("app".to_string(), "a".to_string())],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 10);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        // 20_000 dense samples covering only the second half of the grid.
+        let rows: Vec<MetricScanRow> = (0..20_000)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 51 + (i % 50),
+                body: "x".to_string(),
+            })
+            .collect();
+        state.push_rows(&rows).expect("dense absent scan");
+        // The presence state is exactly the grid-sized array — never 20_000.
+        assert_eq!(
+            state.present_cover.len(),
+            (window.end_ns() / 10 + 2) as usize,
+            "presence state must be grid-sized, independent of scan density"
+        );
+        assert_eq!(state.retained, 0, "absent retains no per-sample points");
+        let QueryResult::Matrix(series) = state.finish().expect("finish") else {
+            panic!("expected a matrix");
+        };
+        // Grid {0,10,...,100}; samples occupy (50,100] ⇒ grid points 60..=100
+        // are covered, 0..=50 are absent.
+        let pts: Vec<i64> = series[0].points.iter().map(|(t, _)| *t).collect();
+        assert_eq!(pts, vec![0, 10, 20, 30, 40, 50]);
+    }
 
     /// The `/stats` pushdown-only gate (M8-LQ2 Delta 1): a pushable literal
     /// line filter is accepted, but a non-pushable `ip()`/mixed-`or` line
@@ -7009,37 +10568,236 @@ mod tests {
         assert_eq!(grouped[0].points.get(&60), Some(&2.0));
     }
 
-    /// Review round 2, finding 1: the grid count uses checked i128
-    /// arithmetic — the extreme/degenerate shapes below must saturate or
-    /// zero out, never panic or wrap past the cap.
+    /// Review round 2, finding 1 (carried to the round-7 shared guard):
+    /// the grid count uses i128/saturating arithmetic — the
+    /// extreme/degenerate shapes below must saturate (and REJECT through
+    /// [`ensure_grid_resolution`]) or zero out, never panic or wrap past
+    /// the cap.
     #[test]
-    fn grid_bucket_count_is_overflow_safe_at_extreme_bounds() {
-        // Full i64 range at step 1: ~2^64 buckets, saturates cleanly.
-        assert_eq!(grid_bucket_count(i64::MIN, i64::MAX, 1), u64::MAX);
-        // Deep-negative window at step 1: ~2^62 buckets, exact.
-        assert_eq!(
-            grid_bucket_count(i64::MIN, i64::MIN / 2, 1),
-            (i64::MIN / 2).abs_diff(i64::MIN)
-        );
-        // Inverted/empty windows are zero buckets, never an underflow.
-        assert_eq!(grid_bucket_count(i64::MAX, i64::MIN, 1), 0);
-        assert_eq!(grid_bucket_count(0, 0, 1), 0);
+    fn grid_resolution_guard_is_overflow_safe_at_extreme_bounds() {
+        // Full i64 range at step 1: ~2^64 points, saturates cleanly — and
+        // the guard rejects, reporting the reference's own saturated
+        // interval count (`maxDuration / 1ns`, round 8).
+        assert_eq!(grid_point_count(i64::MIN, i64::MAX, 1), u64::MAX);
+        assert!(matches!(
+            ensure_grid_resolution(i64::MIN, i64::MAX, 1),
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+                // The Sub-saturated span (i64::MAX ns) at a 1ns step.
+                buckets: 9_223_372_036_854_775_807, // i64::MAX as u64
+                cap: MAX_CLIENT_AGG_BUCKETS,
+            }))
+        ));
+        // Inverted/empty windows are zero points and zero fence intervals,
+        // never an underflow — 0 points admits.
+        assert_eq!(grid_point_count(i64::MAX, i64::MIN, 1), 0);
+        assert_eq!(ensure_grid_resolution(i64::MAX, i64::MIN, 1).unwrap(), 0);
+        // A single-point window (start == end) is one grid point.
+        assert_eq!(grid_point_count(0, 0, 1), 1);
         // A zero step (structurally `InvalidStep` upstream) and a step
         // wider than i64 (never produced by `parse_step`) both saturate
-        // so the cap guard rejects them by name instead of `bucket_of`
+        // so the guard rejects them by name instead of the evaluator
         // ever dividing by a degenerate step.
-        assert_eq!(grid_bucket_count(0, 1_000, 0), u64::MAX);
-        assert_eq!(grid_bucket_count(0, 1_000, u64::MAX), u64::MAX);
-        // Ordinary shapes stay exact (the 11k-boundary golden covers the
-        // cap itself): (0, 120] at step 60 touches buckets 0, 60, and
-        // the end-edge bucket 120.
-        assert_eq!(grid_bucket_count(0, 120, 60), 3);
-        // Full i64 range at a half-range step: floor((MIN+1)/s) = -3
-        // through floor(MAX/s) = 2 — six buckets.
+        assert_eq!(grid_point_count(0, 1_000, 0), u64::MAX);
+        assert_eq!(grid_point_count(0, 1_000, u64::MAX), u64::MAX);
+        assert!(ensure_grid_resolution(0, 1_000, 0).is_err());
+        // Ordinary shapes stay exact (the 11k fence has its own golden):
+        // [0, 120] at step 60 holds grid points 0, 60, 120.
+        assert_eq!(grid_point_count(0, 120, 60), 3);
+    }
+
+    /// Issue #227 review round 7, finding 1: the resolution fence is
+    /// Loki's `(end - start) / step > 11000` (TRUNCATING interval count,
+    /// `loghttp/query.go` `errStepTooSmall`) — exactly-at-the-limit is
+    /// SERVED with its full 11_001-point inclusive grid; one interval
+    /// over is rejected. Both engine grid guards (`RangeSlideState::new`
+    /// and `materialize_vector_lit`) funnel through
+    /// [`ensure_grid_resolution`], so this pins the fence for the whole
+    /// engine against the HTTP guard's identical formula.
+    #[test]
+    fn grid_resolution_fence_serves_11000_intervals_and_rejects_11001() {
+        const S: u64 = 1_000_000_000; // 1s step
+        let step = S as i64;
+
+        // Exactly at the limit, step-aligned: 11_000 intervals → admitted,
+        // 11_001 inclusive grid points.
+        assert_eq!(ensure_grid_resolution(0, 11_000 * step, S).unwrap(), 11_001);
+        // One under: admitted, 11_000 points.
+        assert_eq!(ensure_grid_resolution(0, 10_999 * step, S).unwrap(), 11_000);
+        // One interval over: rejected, reporting the INTERVAL count.
+        assert!(matches!(
+            ensure_grid_resolution(0, 11_001 * step, S),
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+                buckets: 11_001,
+                cap: MAX_CLIENT_AGG_BUCKETS,
+            }))
+        ));
+        // Step not dividing the span (truncating division, like Loki's
+        // integer `Duration / Duration`): 11_000 intervals + half a step
+        // still truncates to 11_000 → admitted, 11_001 points.
         assert_eq!(
-            grid_bucket_count(i64::MIN, i64::MAX, (i64::MAX / 2) as u64),
-            6
+            ensure_grid_resolution(0, 11_000 * step + step / 2, S).unwrap(),
+            11_001
         );
+        // ... and one nanosecond past the 11_001st interval boundary is
+        // 11_001 truncated intervals → rejected.
+        assert!(ensure_grid_resolution(0, 11_001 * step + 1, S).is_err());
+        // Unaligned start (same span, shifted): the fence depends only on
+        // `end - start`, exactly like the reference.
+        let off = 123_456_789;
+        assert_eq!(
+            ensure_grid_resolution(off, off + 11_000 * step, S).unwrap(),
+            11_001
+        );
+        assert!(ensure_grid_resolution(off, off + 11_001 * step, S).is_err());
+    }
+
+    /// Issue #227 review round 7, finding 1 (the end-to-end shape): a
+    /// range request of exactly 11_000 intervals must be SERVED — the
+    /// request guard admits it and the engine's grid guard must not then
+    /// 422 it. Drives the REAL evaluators at the limit: the sliding state
+    /// accepts and emits over the full 11_001-point grid, and the
+    /// `vector(n)` grid materializes all 11_001 points.
+    #[test]
+    fn a_range_query_of_exactly_11000_intervals_is_served_not_422() {
+        const S: i64 = 1_000_000_000;
+        let step = super::super::params::validate_duration_ns(S as u64, "step").unwrap();
+
+        // The leafless vector(n) path: full inclusive grid, both endpoints.
+        let window = GridWindow {
+            start_ns: 0,
+            end_ns: 11_000 * S,
+            step_ns: Some(step),
+        };
+        let res = materialize_vector_lit(1.0, &window)
+            .expect("exactly 11_000 intervals must be served (the reference serves it)");
+        let QueryResult::Matrix(series) = res else {
+            panic!("expected a matrix, got {res:?}");
+        };
+        assert_eq!(series[0].points.len(), 11_001);
+        assert_eq!(series[0].points.first().unwrap().0, 0);
+        assert_eq!(series[0].points.last().unwrap().0, 11_000 * S);
+
+        // The sliding data path: RangeSlideState::new admits the same
+        // window (kmax = 11_000) instead of tripping MetricBuckets.
+        let client = ClientAgg {
+            range_op: RangeAggOp::CountOverTime,
+            value: ClientValue::Count,
+            param: None,
+            pipeline: vec![],
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 11_000 * S, S as u64, S as u64);
+        let state = RangeSlideState::new(&compiled, &meta, &client, window, None)
+            .expect("the engine must admit every request the HTTP guard admits");
+        assert_eq!(state.kmax, 11_000);
+
+        // One interval over IS the engine's 422 (the backstop still holds
+        // for anything that bypasses the HTTP boundary).
+        let window = slide_window(0, 11_001 * S, S as u64, S as u64);
+        match RangeSlideState::new(&compiled, &meta, &client, window, None) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets { buckets, cap })) => {
+                assert_eq!(buckets, 11_001);
+                assert_eq!(cap, MAX_CLIENT_AGG_BUCKETS);
+            }
+            Err(other) => panic!("expected MetricBuckets, got {other:?}"),
+            Ok(_) => panic!("one interval over the fence must be rejected"),
+        }
+    }
+
+    /// Issue #227 review round 8: the fence's span subtraction SATURATES
+    /// exactly like the reference's — Go's `time.Time.Sub` clamps an
+    /// out-of-range difference to the int64-ns `Duration` bound
+    /// (`maxDuration = 1<<63-1`) instead of widening, and the division
+    /// then truncates. A full-domain span at a huge step is therefore
+    /// SERVED (`i64::MAX / step ≤ 11_000`) where the previous exact-i128
+    /// fence wrongly rejected it.
+    #[test]
+    fn grid_resolution_fence_saturates_the_span_like_the_reference() {
+        // 1_000_000s step over the whole i64 domain: the saturated fence
+        // counts i64::MAX/step = 9_223 intervals (admit); the TRUE span
+        // (2^64-1 ns) holds 18_446 — an exact fence would reject a request
+        // the reference serves.
+        const STEP: u64 = 1_000_000_000_000_000; // 1_000_000s in ns
+        assert_eq!(fence_intervals(i64::MIN, i64::MAX, STEP), 9_223);
+        assert_eq!(
+            ensure_grid_resolution(i64::MIN, i64::MAX, STEP).unwrap(),
+            // The emitted grid still covers the TRUE span: the exact
+            // inclusive point count, not the saturated one.
+            18_447
+        );
+
+        // The saturated-fence boundary: floor(i64::MAX / 11_001) is the
+        // largest step counting 11_001 saturated intervals (reject); one
+        // nanosecond of step more counts 11_000 (admit), whose true grid —
+        // 22_002 points — is the guard's hard ceiling.
+        let reject_step = (i64::MAX / 11_001) as u64;
+        assert!(matches!(
+            ensure_grid_resolution(i64::MIN, i64::MAX, reject_step),
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+                buckets: 11_001,
+                cap: MAX_CLIENT_AGG_BUCKETS,
+            }))
+        ));
+        assert_eq!(
+            ensure_grid_resolution(i64::MIN, i64::MAX, reject_step + 1).unwrap(),
+            22_002
+        );
+
+        // An UNSATURATED span stays exact — a span of exactly i64::MAX ns
+        // is the saturation onset, byte-identical either way, and the
+        // ordinary domain is untouched.
+        assert_eq!(fence_intervals(-1, i64::MAX - 1, STEP), 9_223);
+        assert_eq!(
+            fence_intervals(0, 11_000 * 1_000_000_000, 1_000_000_000),
+            11_000
+        );
+    }
+
+    /// Issue #227 review round 8 (the end-to-end shape at the domain
+    /// edge): a full-domain range request at a 1_000_000s step must be
+    /// SERVED — the saturating fence admits it and the REAL evaluators
+    /// emit the exact 18_447-point start-anchored grid over the true
+    /// span, every point in `[start, end]`, no wrap.
+    #[test]
+    fn a_full_domain_range_query_under_the_saturated_fence_is_served() {
+        const STEP: u64 = 1_000_000_000_000_000; // 1_000_000s in ns
+        let step = super::super::params::validate_duration_ns(STEP, "step").unwrap();
+        // i64::MIN + 18_446·step, in i128 (the product alone overflows i64).
+        let last_point = (i64::MIN as i128 + 18_446 * STEP as i128) as i64;
+
+        // The leafless vector(n) path: the exact inclusive true-span grid.
+        let window = GridWindow {
+            start_ns: i64::MIN,
+            end_ns: i64::MAX,
+            step_ns: Some(step),
+        };
+        let res = materialize_vector_lit(1.0, &window)
+            .expect("the saturating fence must admit the full-domain span");
+        let QueryResult::Matrix(series) = res else {
+            panic!("expected a matrix, got {res:?}");
+        };
+        assert_eq!(series[0].points.len(), 18_447);
+        assert_eq!(series[0].points.first().unwrap().0, i64::MIN);
+        assert_eq!(series[0].points.last().unwrap().0, last_point);
+        assert!(last_point < i64::MAX); // in-domain, short of `end`
+
+        // The sliding data path: RangeSlideState::new admits the same
+        // window with the same exact grid (kmax = 18_446).
+        let client = ClientAgg {
+            range_op: RangeAggOp::CountOverTime,
+            value: ClientValue::Count,
+            param: None,
+            pipeline: vec![],
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(i64::MIN, i64::MAX, STEP, STEP);
+        let state = RangeSlideState::new(&compiled, &meta, &client, window, None)
+            .expect("the engine must admit every request the HTTP guard admits");
+        assert_eq!(state.kmax, 18_446);
     }
 
     /// Review round 1, finding 1 (quantile bound): the exact-quantile
@@ -7073,10 +10831,9 @@ mod tests {
                 labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
             },
         )]);
-        let window = ClientWindow {
+        let window = ClientWindow::Instant {
             start_ns: 0,
             end_ns: 60_000_000_000,
-            step_ns: None,
         };
         let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
         state.quantile_values = MAX_QUANTILE_VALUES - 1;
@@ -7133,10 +10890,9 @@ mod tests {
                 labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
             },
         )]);
-        let window = ClientWindow {
+        let window = ClientWindow::Instant {
             start_ns: 0,
             end_ns: 60_000_000_000,
-            step_ns: None,
         };
         (compiled, client, meta, window)
     }
@@ -7234,11 +10990,7 @@ mod tests {
         // in three distinct step buckets (0, 20s, 40s).
         let step_ns = 20_000_000_000u64;
         let range_ns = 60_000_000_000u64;
-        let window = ClientWindow {
-            start_ns: 0,
-            end_ns: range_ns as i64,
-            step_ns: Some(step_ns),
-        };
+        let window = slide_window(0, range_ns as i64, step_ns, range_ns);
         let rows = [
             (10_000_000_000i64, "c=10"), // bucket 0
             (15_000_000_000, "c=30"),    // bucket 0

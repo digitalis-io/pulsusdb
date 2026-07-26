@@ -20,18 +20,20 @@ pub enum Direction {
 /// range, at]` (the `range` comes from the query's own range-vector
 /// duration, e.g. `[5m]`, for metric queries; stream queries have no
 /// window narrower than the caller-supplied bound) and produces a single
-/// aggregate per series, never an `intDiv` bucket expression. `Range`
-/// produces the step-aligned bucketed shape (docs/schemas.md §3.2).
+/// aggregate per series.
 ///
-/// **M1 rate semantic (task-manager resolution #4):** `Range` bucketing is
-/// *fixed, step-aligned, non-overlapping* — `intDiv(ts, step) * step` tumbling
-/// windows — not Prometheus/Loki's sliding `[range]` window re-evaluated at
-/// every step. A query whose step does not divide evenly into whole
-/// buckets, or whose declared range differs from its step, still buckets by
-/// `step` alone; the range-vector duration only bounds which raw samples
-/// are considered eligible for rollup routing. This is a documented M1
-/// simplification, not sliding-window parity — full parity is an M6
-/// concern.
+/// **`Range` = Loki sliding windows (issue #227).** A range metric query
+/// re-evaluates the `[range]` window `(t - range, t]` at every
+/// **start-anchored** grid point `t ∈ {start + k·step ≤ end}` (Loki's
+/// `batchRangeVectorIterator`), streamed off raw `log_samples` — NOT the
+/// former fixed, epoch-aligned, non-overlapping `intDiv(ts, step) * step`
+/// tumbling buckets, and NOT the 5s rollup (which cannot reproduce Loki's
+/// per-event boundary). So `rate({}[1m]) ≠ rate({}[10m])`: the window width
+/// AND the `rate`/`bytes_rate` divisor both track the `[range]`, never
+/// `step`. The scan is widened to `(start - range, end]` so the first grid
+/// point sees its full lookback. The `[range]` itself is carried on
+/// [`super::plan::MetricPlan::range_ns`], not this spec (no type-shape
+/// churn). See docs/features.md and docs/benchmarks/logs-differential-ledger.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuerySpec {
     Instant {
@@ -97,6 +99,80 @@ pub struct TimeBounds {
 /// `PULSUS_LOGQL_MAX_STREAMS` config field only when a deployment needs it.
 pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 
+/// **The client-controlled duration domain** (issue #227 review round 2;
+/// widened to the reference's full domain in round 10).
+///
+/// Every duration reaching the range/sliding evaluator — the `[range]`
+/// selector and the request `step` — is validated against this bound ONCE at
+/// the planner boundary ([`super::plan::validate_duration_ns`]) and carried
+/// as a plain `i64` thereafter, so no downstream `as i64` narrowing exists
+/// and no hostile `u64` can wrap the window/covering arithmetic.
+///
+/// `i64::MAX` is the reference's EXACT accepted nanosecond domain: a
+/// duration is a positive Go `time.Duration` (int64 ns). Its parse layer
+/// admits nothing beyond that — `model.ParseDuration` rejects an
+/// accumulated `dur > 1<<63-1` ns ("duration out of range"), the
+/// float-seconds path rejects `> float64(MaxInt64)` ("overflows int64"),
+/// and `ParseRangeQuery` 400s `Step <= 0` — so any value in
+/// `1 ..= i64::MAX` is servable there and must be servable here (the
+/// round-10 finding: the previous `i64::MAX / 4` headroom cap rejected a
+/// 100-year step the reference serves). The headroom is obsolete: every
+/// downstream sum/difference of a validated duration is saturating, i128,
+/// or structurally bounded (rounds 2–9's arithmetic sweep). The upper
+/// rejection arm stays load-bearing — the HTTP parse layer produces a
+/// checked `u64`, so values in `(i64::MAX, u64::MAX]` (unrepresentable in
+/// the reference, a parse-level 400 there) are a clean 400 here too.
+pub const MAX_DURATION_NS: i64 = i64::MAX;
+
+/// A duration that has PASSED the [`validate_duration_ns`] boundary check —
+/// guaranteed to lie in `0 ..= MAX_DURATION_NS` (issue #227 review round 3).
+///
+/// The inner field is private to this module and the only public way to mint
+/// a non-zero value is [`validate_duration_ns`], so it is **impossible by
+/// construction** to build a [`super::exec::ClientWindow`] — or to reach the
+/// sliding evaluator through the public `run_client_agg_rows` entry point —
+/// carrying an unvalidated client duration. The funnel cannot be walked
+/// around: there is no other constructor, and the field cannot be assigned
+/// from outside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ValidatedDuration(i64);
+
+impl ValidatedDuration {
+    /// The validated nanosecond value, always in `0 ..= MAX_DURATION_NS`.
+    #[inline]
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// The same value widened to `u64` — lossless, the value is non-negative.
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0 as u64
+    }
+}
+
+/// **The client-controlled duration boundary** (issue #227).
+///
+/// Validates a raw `u64` duration — the `[range]` selector from the AST, or
+/// the request `step` — into `1 ..= MAX_DURATION_NS` and mints the
+/// unforgeable [`ValidatedDuration`] the evaluator requires. Every duration
+/// the range/sliding evaluator sees passes through here exactly once, so no
+/// downstream code narrows or wraps client input; a hostile value is a clean
+/// 400 at the boundary.
+pub fn validate_duration_ns(
+    value: u64,
+    what: &'static str,
+) -> Result<ValidatedDuration, super::error::ReadError> {
+    if value == 0 || value > MAX_DURATION_NS as u64 {
+        return Err(super::error::ReadError::DurationOutOfRange {
+            what,
+            value,
+            max: MAX_DURATION_NS,
+        });
+    }
+    Ok(ValidatedDuration(value as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +206,45 @@ mod tests {
     #[test]
     fn default_max_streams_is_the_documented_100k_constant() {
         assert_eq!(DEFAULT_MAX_STREAMS, 100_000);
+    }
+
+    /// Issue #227 review round 10: the validated domain is the reference's
+    /// full positive int64-nanosecond `time.Duration` range — the largest
+    /// duration the reference can represent is SERVED, and the first value
+    /// past it (unrepresentable there, a parse-level 400 there) is a clean
+    /// 400 here.
+    #[test]
+    fn the_duration_domain_boundary_matches_the_references_positive_int64() {
+        assert_eq!(MAX_DURATION_NS, i64::MAX);
+        // Largest accepted: i64::MAX ns (Go's maximum time.Duration).
+        assert_eq!(
+            validate_duration_ns(i64::MAX as u64, "step").unwrap().get(),
+            i64::MAX
+        );
+        // First rejected: i64::MAX + 1 (= 1<<63) — negative as a Go int64,
+        // so the reference's parser can never produce it.
+        match validate_duration_ns(i64::MAX as u64 + 1, "step") {
+            Err(crate::logql::ReadError::DurationOutOfRange { value, max, .. }) => {
+                assert_eq!(value, i64::MAX as u64 + 1);
+                assert_eq!(max, i64::MAX);
+            }
+            other => panic!("i64::MAX + 1 ns must be rejected, got {other:?}"),
+        }
+    }
+
+    /// The round-10 finding's concrete case: a 100-year step
+    /// (`3153600000s` = 3.1536e18 ns) fits the reference's positive
+    /// `time.Duration` and passes its resolution fence, so it is served
+    /// there — the validator must mint it, not 400 it (the retired
+    /// `i64::MAX / 4` ≈ 73-year cap wrongly rejected it).
+    #[test]
+    fn a_100_year_duration_the_reference_serves_is_validated() {
+        const HUNDRED_YEARS_NS: u64 = 3_153_600_000_000_000_000;
+        assert_eq!(
+            validate_duration_ns(HUNDRED_YEARS_NS, "step")
+                .unwrap()
+                .get(),
+            HUNDRED_YEARS_NS as i64
+        );
     }
 }

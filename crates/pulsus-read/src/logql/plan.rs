@@ -20,8 +20,11 @@ use pulsus_logql::{
 
 use super::error::ReadError;
 use super::escape::{ch_regex_anchored, ch_regex_unanchored, ch_string};
-use super::exec::ClientWindow;
-use super::params::{Direction, PlanCtx, QueryParams, QuerySpec};
+use super::exec::GridWindow;
+use super::params::{
+    Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
+};
+use super::sql::ScanLowerBound;
 
 /// A pure fetch plan for either query shape. See the module docs for why
 /// stage 2/3 aren't pre-rendered here. `MetricBinary` (issue M6-10) is
@@ -133,12 +136,40 @@ pub struct MetricPlan {
     /// `body` column — a metric query with a line filter can never be
     /// rollup-served, see [`metric_plan`]).
     pub extra_predicates: Vec<String>,
+    /// The scan lower bound (`timestamp_ns > start_ns`, or `>=` when
+    /// `scan_lower` is [`ScanLowerBound::Inclusive`]). For a range query
+    /// this is widened to `query_start - range` (issue #227) so the first
+    /// grid point's sliding window `(start-range, start]` sees its full
+    /// lookback; the emit grid still begins at `query_start`.
     pub start_ns: i64,
+    /// How `start_ns` compares in SQL — [`ScanLowerBound::Inclusive`]
+    /// EXACTLY when the `start - range` widening underflowed i64
+    /// ([`widen_scan_start`], issue #227 review round 11): the logical
+    /// bound then sits below every representable timestamp, so the
+    /// saturated `i64::MIN` in `start_ns` is vacuous, not exclusive — a
+    /// sample stored at exactly `i64::MIN` is inside the reference's
+    /// window. A legitimately-computed `i64::MIN` bound stays
+    /// [`ScanLowerBound::Exclusive`].
+    pub scan_lower: ScanLowerBound,
     pub end_ns: i64,
-    /// `Some(step)` = [`QuerySpec::Range`]'s bucketed shape (`intDiv(_,
-    /// step) * step`); `None` = [`QuerySpec::Instant`]'s single-window
-    /// aggregate, structurally incapable of emitting a bucket expression.
-    pub step_ns: Option<u64>,
+    /// `Some(step)` = [`QuerySpec::Range`]'s Loki sliding-window shape
+    /// (issue #227: the `[range]` window `(t-range, t]` re-evaluated at the
+    /// start-anchored grid `{start+k·step ≤ end}`); `None` =
+    /// [`QuerySpec::Instant`]'s single-window aggregate. Carries the
+    /// boundary-validated [`ValidatedDuration`] (issue #227 review round 3).
+    pub step_ns: Option<ValidatedDuration>,
+    /// The emit grid's lower bound — `query_start` (start-anchored,
+    /// issue #227). Distinct from `start_ns`, which is the (range-widened)
+    /// scan lower bound. Equals `start_ns` for instant queries.
+    pub grid_start_ns: i64,
+    /// The `[range]` selector width in nanoseconds — the sliding window's
+    /// span and (for `rate`/`bytes_rate`) the per-second divisor.
+    ///
+    /// **Validated** at the planner boundary into `1 ..= MAX_DURATION_NS`
+    /// ([`validate_duration_ns`]) and carried as the unforgeable
+    /// [`ValidatedDuration`] (issue #227 review round 3), so the evaluator
+    /// can neither narrow nor be handed unvalidated client input.
+    pub range_ns: ValidatedDuration,
     pub rate_window_ns: Option<u64>,
     pub op: RangeAggOp,
     /// Outer-to-inner vector-aggregation chain (`sum by (...) (avg(...))`
@@ -204,7 +235,7 @@ pub enum MetricNode {
     /// constant `{}` matrix (reusing the shared bucket grid + cap).
     VectorLit {
         value: f64,
-        window: ClientWindow,
+        window: GridWindow,
     },
     Binary {
         op: BinOp,
@@ -311,11 +342,18 @@ fn plan_metric_expr(
     match base {
         MetricExpr::Range { .. } => Ok(Plan::Metric(metric_plan(metric_expr, p, ctx)?)),
         _ => {
-            // The zero-step guard normally lives in `metric_plan` (run
-            // per leaf); a leaf-less tree (`2 + 2`) must still reject a
-            // zero step for request-shape consistency.
-            if let QuerySpec::Range { step_ns: 0, .. } = p.spec {
-                return Err(ReadError::InvalidStep);
+            // The step-domain guard normally lives in `metric_plan` (run per
+            // leaf); a leaf-LESS tree (`2 + 2`, `vector(1)`) has no leaf to
+            // run it, so the same boundary validation is applied here —
+            // otherwise a hostile `step` would reach `window_from` ->
+            // `materialize_vector_lit`'s grid math unvalidated (issue #227
+            // review round 2). A zero step keeps its dedicated `InvalidStep`
+            // error for request-shape consistency.
+            if let QuerySpec::Range { step_ns, .. } = p.spec {
+                if step_ns == 0 {
+                    return Err(ReadError::InvalidStep);
+                }
+                validate_duration_ns(step_ns, "step")?;
             }
             Ok(Plan::MetricBinary(build_metric_node(metric_expr, p, ctx)?))
         }
@@ -339,7 +377,7 @@ fn build_metric_node(
         )?)),
         MetricExpr::VectorFn(raw) => Ok(MetricNode::VectorLit {
             value: parse_plan_number(raw, "vector() value")?,
-            window: window_from(p),
+            window: window_from(p)?,
         }),
         MetricExpr::Binary {
             op,
@@ -390,22 +428,27 @@ fn build_metric_node(
 /// is `step_ns: None` (a single `{} => n` sample), range carries the
 /// spec's `start_ns`/`end_ns`/`step_ns` so exec materializes the constant
 /// `{}` matrix on the shared bucket grid.
-fn window_from(p: &QueryParams) -> ClientWindow {
+fn window_from(p: &QueryParams) -> Result<GridWindow, ReadError> {
+    // A `vector(n)` literal has no `[range]`; its constant `{}` series is
+    // emitted at every start-anchored grid point regardless of window, so
+    // `range_ns` is immaterial (0).
     match p.spec {
-        QuerySpec::Instant { at_ns } => ClientWindow {
+        QuerySpec::Instant { at_ns } => Ok(GridWindow {
             start_ns: at_ns,
             end_ns: at_ns,
             step_ns: None,
-        },
+        }),
         QuerySpec::Range {
             start_ns,
             end_ns,
             step_ns,
-        } => ClientWindow {
+        } => Ok(GridWindow {
             start_ns,
             end_ns,
-            step_ns: Some(step_ns),
-        },
+            // The leafless `vector(n)` tree still routes its client `step`
+            // through the boundary (issue #227 review round 3).
+            step_ns: Some(validate_duration_ns(step_ns, "step")?),
+        }),
     }
 }
 
@@ -649,7 +692,13 @@ fn metric_plan(
     };
 
     let client_only_op = requires_unwrap || matches!(op, RangeAggOp::AbsentOverTime);
-    let client = if has_beyond_line_filter || has_unwrap || client_only_op {
+    // Issue #227: EVERY range query is now client-aggregated with Loki's
+    // sliding windows — the un-piped count/bytes/rate rollup fast-path is
+    // retired for range reads (the 5s rollup cannot reproduce Loki's
+    // per-event `(t-range, t]` boundary; only raw `log_samples` can).
+    // Instant queries keep their existing routing (rollup/SQL-raw).
+    let is_range = matches!(p.spec, QuerySpec::Range { .. });
+    let client = if has_beyond_line_filter || has_unwrap || client_only_op || is_range {
         let value = if has_unwrap {
             ClientValue::Unwrap
         } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {
@@ -680,18 +729,42 @@ fn metric_plan(
         None
     };
 
-    let range_ns = range.range.as_nanos();
+    // Issue #227 review round 2: VALIDATE the client-controlled `[range]`
+    // duration at this boundary. Everything downstream carries the validated
+    // `i64` — no `as i64` narrowing of client input exists past this line.
+    let range_ns = validate_duration_ns(range.range.as_nanos(), "range selector")?;
 
-    let (start_ns, end_ns, step_ns, rate_window_ns) = match p.spec {
+    // Issue #227: `start_ns` is the (range-widened) SCAN lower bound;
+    // `grid_start_ns` is the start-anchored emit grid's first point. Both
+    // paths reproduce Loki: the window `(t-range, t]` is re-evaluated at
+    // `t ∈ {grid_start + k·step ≤ end}`, so the scan must reach back a full
+    // `range` before `grid_start`. `rate_window_ns = range` (never `step`)
+    // is the `rate([1m]) ≠ rate([10m])` fix.
+    let (start_ns, scan_lower, end_ns, step_ns, grid_start_ns, rate_window_ns) = match p.spec {
         QuerySpec::Instant { at_ns } => {
-            let start = at_ns.saturating_sub(range_ns as i64);
-            (start, at_ns, None, Some(range_ns))
+            let (start, lower) = widen_scan_start(at_ns, range_ns);
+            (start, lower, at_ns, None, start, Some(range_ns))
         }
         QuerySpec::Range {
             start_ns,
             end_ns,
             step_ns,
-        } => (start_ns, end_ns, Some(step_ns), Some(step_ns)),
+        } => {
+            // Validate the client `step` at the same boundary as `[range]`
+            // (issue #227 review round 2), so the whole evaluator works over
+            // in-domain durations only: every later `step as i128` /
+            // `step_ns > i64::MAX` guard is then provably never taken.
+            let step = validate_duration_ns(step_ns, "step")?;
+            let (scan_start, lower) = widen_scan_start(start_ns, range_ns);
+            (
+                scan_start,
+                lower,
+                end_ns,
+                Some(step),
+                start_ns,
+                Some(range_ns),
+            )
+        }
     };
 
     let normalized = normalize_matchers(&range.selector.selector)?;
@@ -732,9 +805,17 @@ fn metric_plan(
     // resolution", and an unaligned window would silently diverge from raw
     // at bucket edges (task-manager resolution #1 on issue #12).
     let routing = if client.is_some() {
+        // Issue #227: a plain (un-piped, non-unwrap) range aggregation now
+        // reads raw and slides — name it distinctly from the pipeline/unwrap
+        // client path so `X-Pulsus-Explain` stays truthful.
+        let reason = if is_range && !(has_beyond_line_filter || has_unwrap || client_only_op) {
+            "raw: sliding-window range aggregation (issue #227)".to_string()
+        } else {
+            "raw: client-side pipeline/unwrap aggregation".to_string()
+        };
         RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: "raw: client-side pipeline/unwrap aggregation".to_string(),
+            reason,
         }
     } else {
         match p.spec {
@@ -806,14 +887,45 @@ fn metric_plan(
         routing,
         extra_predicates,
         start_ns,
+        scan_lower,
         end_ns,
         step_ns,
-        rate_window_ns: if is_rate { rate_window_ns } else { None },
+        grid_start_ns,
+        range_ns,
+        // Widening a boundary-validated positive `i64` to `u64` for
+        // `apply_rate`'s divisor — provably lossless (issue #227 round 2).
+        rate_window_ns: if is_rate {
+            rate_window_ns.map(|ns| ns.as_u64())
+        } else {
+            None
+        },
         op: *op,
         vector_aggs,
         client,
         probes,
     })
+}
+
+/// Widens a window's lower bound back by the `[range]` selector (Loki's
+/// `(t-range, t]` lookback) and decides how the SQL predicate compares
+/// against it (issue #227 review round 11). `checked_sub` is the crux:
+///
+/// * `Some(lo)` — the logical bound is representable, so the scan keeps
+///   the reference's EXCLUSIVE `timestamp_ns > lo` — including a
+///   legitimately-computed `lo == i64::MIN` (e.g. `start = i64::MIN + 1`,
+///   `[1ns]`), where a sample stored at exactly `i64::MIN` is genuinely
+///   outside the window.
+/// * `None` — the subtraction UNDERFLOWED: the logical bound sits strictly
+///   below `i64::MIN`, beneath every representable timestamp, so the
+///   saturated `i64::MIN` is a VACUOUS bound and must render INCLUSIVELY
+///   (`timestamp_ns >= i64::MIN`). The prior saturating form kept `>` and
+///   silently dropped a sample stored at exactly `i64::MIN` that the
+///   reference includes.
+fn widen_scan_start(start_ns: i64, range_ns: ValidatedDuration) -> (i64, ScanLowerBound) {
+    match start_ns.checked_sub(range_ns.get()) {
+        Some(lo) => (lo, ScanLowerBound::Exclusive),
+        None => (i64::MIN, ScanLowerBound::Inclusive),
+    }
 }
 
 /// Unwraps every outer `MetricExpr::Vector` layer, returning the
@@ -1237,8 +1349,123 @@ mod tests {
         assert!(matches!(err, ReadError::InvalidStep));
     }
 
+    /// Issue #227 (review round 2): a HOSTILE client `step` — one above the
+    /// validated duration domain, including values that would narrow to a
+    /// NEGATIVE `i64` — is rejected END-TO-END by the real planner with the
+    /// named 400, never narrowed into the window/covering arithmetic.
     #[test]
-    fn a_step_dividing_the_resolution_routes_to_rollup_with_a_named_reason() {
+    fn a_hostile_step_is_rejected_end_to_end_by_the_planner() {
+        for hostile in [
+            super::super::params::MAX_DURATION_NS as u64 + 1,
+            i64::MAX as u64 + 1, // would narrow to i64::MIN
+            u64::MAX,
+        ] {
+            let err = metric_mp(
+                r#"rate({env="prod"}[5m])"#,
+                QuerySpec::Range {
+                    start_ns: 0,
+                    end_ns: 1_000_000_000,
+                    step_ns: hostile,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ReadError::DurationOutOfRange { what: "step", value, .. } if value == hostile
+                ),
+                "hostile step {hostile} must be a named 400, got {err:?}"
+            );
+        }
+    }
+
+    /// The same boundary guards the LEAFLESS tree (`vector(1)`, `2 + 2`),
+    /// which has no metric leaf to run `metric_plan`'s validation — a hostile
+    /// step there must not reach `materialize_vector_lit`'s grid math.
+    #[test]
+    fn a_hostile_step_is_rejected_for_a_leafless_metric_tree() {
+        let expr = parse("vector(1)").expect("parse");
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000,
+                step_ns: u64::MAX,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        match plan(&expr, &params, &test_ctx()) {
+            Err(ReadError::DurationOutOfRange { what: "step", .. }) => {}
+            other => panic!("expected a named duration rejection, got {other:?}"),
+        }
+    }
+
+    /// Issue #227 review round 11: when the `start - range` scan widening
+    /// UNDERFLOWS i64, the plan carries `start_ns == i64::MIN` with an
+    /// INCLUSIVE lower bound — the logical bound sits below the
+    /// representable domain, so a sample stored at exactly `i64::MIN`
+    /// must survive the SQL predicate (the reference includes it). Both
+    /// the range path and its instant analogue.
+    #[test]
+    fn scan_widening_underflow_makes_the_lower_bound_inclusive() {
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[1ns])"#,
+            QuerySpec::Range {
+                start_ns: i64::MIN,
+                end_ns: i64::MIN,
+                step_ns: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.start_ns, i64::MIN);
+        assert_eq!(mp.scan_lower, ScanLowerBound::Inclusive);
+        assert_eq!(mp.grid_start_ns, i64::MIN, "the emit grid is unwidened");
+
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[1ns])"#,
+            QuerySpec::Instant { at_ns: i64::MIN },
+        )
+        .unwrap();
+        assert_eq!(mp.start_ns, i64::MIN);
+        assert_eq!(mp.scan_lower, ScanLowerBound::Inclusive);
+    }
+
+    /// The negative control (the crux of the round-11 distinction): a
+    /// LEGITIMATELY-computed `i64::MIN` lower bound — `start = i64::MIN +
+    /// 1` minus `[1ns]`, no underflow — keeps EXCLUSIVE semantics, so a
+    /// sample at exactly `i64::MIN` stays outside the window, as in the
+    /// reference.
+    #[test]
+    fn a_legitimately_computed_i64_min_scan_bound_stays_exclusive() {
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[1ns])"#,
+            QuerySpec::Range {
+                start_ns: i64::MIN + 1,
+                end_ns: i64::MIN + 1,
+                step_ns: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.start_ns, i64::MIN, "exactly representable: (MIN+1) - 1");
+        assert_eq!(mp.scan_lower, ScanLowerBound::Exclusive);
+
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[1ns])"#,
+            QuerySpec::Instant {
+                at_ns: i64::MIN + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.start_ns, i64::MIN);
+        assert_eq!(mp.scan_lower, ScanLowerBound::Exclusive);
+    }
+
+    /// Issue #227: a range query NO LONGER routes to the 5s rollup on a
+    /// resolution-dividing step — the rollup cannot reproduce Loki's
+    /// per-event sliding-window boundary, so every range read is the
+    /// streaming raw path.
+    #[test]
+    fn a_range_query_routes_to_the_sliding_raw_path_regardless_of_step() {
         let mp = metric_mp(
             r#"rate({env="prod"}[5m])"#,
             QuerySpec::Range {
@@ -1248,16 +1475,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(mp.routing.chosen, RouteChoice::Rollup);
-        assert!(mp.rollup);
+        assert_eq!(mp.routing.chosen, RouteChoice::Raw);
+        assert!(!mp.rollup);
+        assert!(mp.client.is_some(), "range routes to the client slide");
         assert_eq!(
             mp.routing.reason,
-            "rollup: step 60000000000 ns divisible by resolution 5000000000 ns"
+            "raw: sliding-window range aggregation (issue #227)"
         );
     }
 
+    /// Issue #227: a non-dividing step is also the sliding raw path (there is
+    /// no longer a rollup-vs-raw distinction for range reads).
     #[test]
-    fn a_step_not_dividing_the_resolution_routes_to_raw_with_a_named_reason() {
+    fn a_range_query_with_a_non_dividing_step_still_slides_raw() {
         let mp = metric_mp(
             r#"rate({env="prod"}[5m])"#,
             QuerySpec::Range {
@@ -1271,12 +1501,14 @@ mod tests {
         assert!(!mp.rollup);
         assert_eq!(
             mp.routing.reason,
-            "raw: step 3000000000 ns not a multiple of resolution 5000000000 ns"
+            "raw: sliding-window range aggregation (issue #227)"
         );
     }
 
+    /// Issue #227: a range query WITH a line filter is the pipeline/unwrap
+    /// client path (a beyond-plain aggregation), still raw and sliding.
     #[test]
-    fn a_line_filter_routes_to_raw_with_a_named_reason_even_on_an_eligible_step() {
+    fn a_range_line_filter_query_routes_to_raw_client_aggregation() {
         let mp = metric_mp(
             r#"count_over_time({env="prod"} |= "err" [5m])"#,
             QuerySpec::Range {
@@ -1287,7 +1519,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
-        assert_eq!(mp.routing.reason, "raw: line filter present");
+        assert!(!mp.rollup);
+        assert!(mp.client.is_some());
+        // A plain line filter is pushed as a predicate, not a beyond-line
+        // stage, so the reason is the sliding-range reason.
+        assert_eq!(
+            mp.routing.reason,
+            "raw: sliding-window range aggregation (issue #227)"
+        );
+        assert_eq!(mp.extra_predicates.len(), 1, "the line filter is pushed");
     }
 
     #[test]
@@ -1304,8 +1544,10 @@ mod tests {
         assert_eq!(mp.routing.reason, "raw: instant query");
     }
 
+    /// Issue #227: rollup resolution is irrelevant to a range read now (it
+    /// always slides raw) — an unconfigured resolution changes nothing.
     #[test]
-    fn an_unconfigured_rollup_resolution_routes_to_raw_with_a_named_reason() {
+    fn an_unconfigured_rollup_resolution_still_slides_raw_for_range() {
         let params = QueryParams {
             spec: QuerySpec::Range {
                 start_ns: 0,
@@ -1323,7 +1565,10 @@ mod tests {
             Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
         };
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
-        assert_eq!(mp.routing.reason, "raw: rollup resolution not configured");
+        assert_eq!(
+            mp.routing.reason,
+            "raw: sliding-window range aggregation (issue #227)"
+        );
     }
 
     /// Precedence lock (code review fix, issue #12): `Instant` must win
@@ -1774,10 +2019,11 @@ mod tests {
         assert!(!return_bool);
         let leaves = node.leaves();
         assert_eq!(leaves.len(), 2);
-        // Each leaf routes exactly as it would standalone (rollup here).
+        // Each leaf routes exactly as it would standalone — issue #227: a
+        // range leaf slides raw (client-aggregated), never rollup.
         for leaf in leaves {
-            assert!(leaf.rollup);
-            assert!(leaf.client.is_none());
+            assert!(!leaf.rollup);
+            assert!(leaf.client.is_some());
         }
     }
 
@@ -1834,8 +2080,10 @@ mod tests {
         assert_eq!(mp.vector_aggs.len(), 1);
         assert_eq!(mp.vector_aggs[0].0, VectorAggOp::Topk);
         assert_eq!(mp.vector_aggs[0].2, Some(5.0));
-        // topk/bottomk never disturb the inner query's routing.
-        assert!(mp.rollup);
+        // topk/bottomk never disturb the inner query's routing — issue #227:
+        // a range leaf slides raw (client-aggregated), never rollup.
+        assert!(!mp.rollup);
+        assert!(mp.client.is_some());
     }
 
     #[test]

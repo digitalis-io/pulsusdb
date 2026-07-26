@@ -123,6 +123,9 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
         ReadError::EmptyMatcherSet
         | ReadError::ContradictoryMatchers
         | ReadError::InvalidStep
+        // Issue #227: an out-of-domain `[range]`/`step` duration is a client
+        // input error, same class as `InvalidStep`.
+        | ReadError::DurationOutOfRange { .. }
         | ReadError::PipelineInvalid { .. }
         | ReadError::MetricPipelineError { .. }
         | ReadError::PipelineUnsupportedInMetric { .. } => {

@@ -122,6 +122,10 @@ async fn query_range_impl(
     let expr = pulsus_logql::parse(query)?;
     let (start_ns, end_ns) = parse_bounds(&pairs)?;
     let step_ns = params::parse_step(params::get(&pairs, "step"), start_ns, end_ns)?;
+    // Issue #227: Loki's `(end-start)/step > 11000` resolution limit — a hard
+    // 400 at request parsing with Loki's exact message (the engine keeps its
+    // `MetricBuckets` guard as a defense-in-depth backstop).
+    params::ensure_range_resolution(start_ns, end_ns, step_ns)?;
     let limit = params::parse_limit(params::get(&pairs, "limit"))?;
     let direction = params::parse_direction(params::get(&pairs, "direction"))?;
     let query_params = QueryParams {
@@ -457,11 +461,16 @@ mod tests {
     #[tokio::test]
     async fn over_cap_leafless_vector_range_maps_to_422_query_too_broad() {
         const S: i64 = 1_000_000_000; // 1s
-        // 11_001 buckets over `(0, 11000s]` at a 1s step > the 11000 cap.
-        let window = pulsus_read::logql::ClientWindow {
+        // 11_001 step INTERVALS over `[0, 11001s]` at a 1s step > the 11000
+        // cap (issue #227 review round 7, finding 1: exactly 11_000
+        // intervals — 11_001 grid points — is SERVED, matching the
+        // reference's `(end-start)/step > 11000` rule).
+        let window = pulsus_read::logql::GridWindow {
             start_ns: 0,
-            end_ns: 11_000 * S,
-            step_ns: Some(S as u64),
+            end_ns: 11_001 * S,
+            step_ns: Some(
+                pulsus_read::logql::validate_duration_ns(S as u64, "step").expect("valid step"),
+            ),
         };
         let err = pulsus_read::logql::materialize_vector_lit(0.0, &window)
             .expect_err("an over-cap vector(n) range query must reject");
@@ -472,6 +481,173 @@ mod tests {
             json["error"].as_str().unwrap_or_default().contains("11000"),
             "over-cap message must name the 11000-bucket cap: {json:?}"
         );
+    }
+
+    /// Issue #227: at the REQUEST boundary, `(end-start)/step > 11000` is
+    /// Loki's HTTP **400** with its exact message (the engine's
+    /// `MetricBuckets` 422 above is now only a defense-in-depth backstop).
+    #[tokio::test]
+    async fn query_range_over_the_11000_resolution_is_400_with_lokis_message() {
+        // (0, 11001s] at a 1s step = 11001 intervals > 11000.
+        let q = "query=count_over_time(%7Bapp%3D%22a%22%7D%5B5m%5D)\
+                 &start=0&end=11001000000000&step=1s";
+        let res = query_range(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(q.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(
+            json["error"],
+            "exceeded maximum resolution of 11,000 points per time series. Try increasing the \
+             value of the step parameter"
+        );
+    }
+
+    /// Issue #227 review round 7, finding 1: EXACTLY `(end-start)/step ==
+    /// 11000` is inside the reference's fence (`> 11000` rejects), so the
+    /// request guard must admit it — the request proceeds past parameter
+    /// parsing (hermetically that surfaces as the engine-pool 503, never
+    /// the resolution 400).
+    #[tokio::test]
+    async fn query_range_at_exactly_the_11000_resolution_passes_the_request_guard() {
+        // (end - start) / step == 11000 exactly (0 → 11000s at a 1s step).
+        let q = "query=count_over_time(%7Bapp%3D%22a%22%7D%5B5m%5D)\
+                 &start=0&end=11000000000000&step=1s";
+        let res = query_range(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(q.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exactly-at-the-limit request must pass the resolution guard \
+             (got {json:?})"
+        );
+    }
+
+    /// Issue #227 review round 8 (end-to-end): a full-i64-domain request at
+    /// a 1_000_000s step must pass the resolution guard — the reference's
+    /// span subtraction saturates at the int64-ns duration bound (Go
+    /// `time.Time.Sub`), so it counts 9_223 intervals, not the true span's
+    /// 18_446 — and proceed past parameter parsing (hermetically the
+    /// engine-pool 503, never the resolution 400 the pre-round-8 exact
+    /// fence returned).
+    #[tokio::test]
+    async fn query_range_across_the_full_timestamp_domain_passes_the_request_guard() {
+        let q = format!(
+            "query=count_over_time(%7Bapp%3D%22a%22%7D%5B5m%5D)\
+             &start={}&end={}&step=1000000s",
+            i64::MIN,
+            i64::MAX
+        );
+        let res = query_range(State(test_state()), HeaderMap::new(), RawQuery(Some(q))).await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a saturated-span request the reference serves must pass the \
+             resolution guard (got {json:?})"
+        );
+    }
+
+    /// Issue #227 review round 10 (the reported case, verbatim):
+    /// `query=vector(1)&start=0&end=0&step=3153600000s` — a 100-year step —
+    /// fits the reference's positive `time.Duration` and passes its
+    /// resolution fence, so the reference serves it. The request must clear
+    /// parameter parsing and the resolution guard (hermetically the
+    /// engine-pool 503, never a 400); the engine leg of the same case —
+    /// validator + grid guard — is pinned by the agreement table above and
+    /// the read-crate's `a_100_year_step_the_reference_serves_is_served`.
+    #[tokio::test]
+    async fn query_range_with_a_100_year_step_passes_the_request_guard() {
+        let q = "query=vector(1)&start=0&end=0&step=3153600000s";
+        let res = query_range(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(q.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a 100-year step the reference serves must pass request parsing \
+             (got {json:?})"
+        );
+    }
+
+    /// Issue #227 review round 7, finding 1 (extended in round 8 to the
+    /// extreme timestamp domain): the HTTP request guard
+    /// (`ensure_range_resolution`) and the engine's grid guard
+    /// (`ensure_grid_resolution`, driven here through the public
+    /// `materialize_vector_lit` — the SAME function `RangeSlideState::new`
+    /// funnels through) implement the identical Loki fence — including its
+    /// SATURATING span subtraction (Go `time.Time.Sub` clamps at
+    /// `maxDuration = 1<<63-1` ns) — so the engine can never 422 a request
+    /// the guard admitted, across the WHOLE i64 domain. Enumerates both
+    /// sides of the fence: aligned, unaligned, and saturated.
+    #[tokio::test]
+    async fn engine_grid_guard_agrees_with_the_request_guard_at_every_fence_case() {
+        const S: i64 = 1_000_000_000; // 1s step
+        const BIG: u64 = 1_000_000_000_000_000; // 1_000_000s step
+        let step = S as u64;
+        // floor(i64::MAX/11_001): the largest step whose SATURATED
+        // full-domain span counts 11_001 intervals (reject); +1ns admits.
+        let sat_reject = (i64::MAX / 11_001) as u64;
+        // (start, end, step, expect-admitted)
+        let cases: &[(i64, i64, u64, bool)] = &[
+            (0, 10_999 * S, step, true),         // one interval under
+            (0, 11_000 * S, step, true),         // exactly at the fence
+            (0, 11_001 * S, step, false),        // one interval over
+            (0, 11_000 * S + S / 2, step, true), // step does not divide the span
+            (0, 11_001 * S - 1, step, true),     // 1ns under the rejecting interval
+            (7, 7 + 11_000 * S, step, true),     // unaligned start, at the fence
+            (7, 7 + 11_001 * S, step, false),    // unaligned start, over
+            // Round 8: the saturated extreme — the true 2^64-1 ns span
+            // counts 18_446 intervals, but the reference's saturated span
+            // (i64::MAX ns) counts 9_223 → SERVED.
+            (i64::MIN, i64::MAX, BIG, true),
+            (i64::MIN, i64::MAX, sat_reject, false), // 11_001 saturated
+            (i64::MIN, i64::MAX, sat_reject + 1, true), // 11_000 saturated
+            (i64::MIN, i64::MAX, 1, false),          // 1ns step, far over
+            (-1, i64::MAX - 1, BIG, true),           // saturation onset, exact
+            // Round 10: the widened duration domain — the reference accepts
+            // ANY positive int64-ns step. A 100-year step (the reported
+            // reject-a-served-request case) and the largest representable
+            // step must both pass BOTH guards (the retired `i64::MAX / 4`
+            // validator cap panicked this table's engine leg on them).
+            (0, 0, 3_153_600_000_000_000_000, true), // 100y (3153600000s)
+            (0, 0, i64::MAX as u64, true),           // Go's maximum Duration
+            (i64::MIN, i64::MAX, i64::MAX as u64, true), // full domain, max step
+        ];
+        for &(start_ns, end_ns, step_ns, admitted) in cases {
+            let guard_ok = params::ensure_range_resolution(start_ns, end_ns, step_ns).is_ok();
+            assert_eq!(
+                guard_ok, admitted,
+                "request guard disagrees with the reference at \
+                 ({start_ns}, {end_ns}, {step_ns})"
+            );
+            let window = pulsus_read::logql::GridWindow {
+                start_ns,
+                end_ns,
+                step_ns: Some(
+                    pulsus_read::logql::validate_duration_ns(step_ns, "step").expect("valid step"),
+                ),
+            };
+            let engine_ok = pulsus_read::logql::materialize_vector_lit(0.0, &window).is_ok();
+            assert_eq!(
+                engine_ok, guard_ok,
+                "engine grid guard disagrees with the request guard at \
+                 ({start_ns}, {end_ns}, {step_ns})"
+            );
+        }
     }
 
     #[tokio::test]

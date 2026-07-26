@@ -116,7 +116,7 @@
     },
     {
       "case_id": "metric_filtered_count",
-      "construct": "M6-10 client-aggregated count_over_time over a json + label-filter pipeline (instant vector; instant windows are semantically identical on both stores \u2014 no tumbling divergence)",
+      "construct": "M6-10 client-aggregated count_over_time over a json + label-filter pipeline (instant vector; instant windows are semantically identical on both stores \u2014 issue #227's sliding range grid does not apply)",
       "mode": "gated",
       "kind": "metric_instant",
       "query": "count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"500\" [30m])"
@@ -143,12 +143,12 @@
       "query": "count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"500\" [30m]) * 2"
     },
     {
-      "case_id": "metric_rate_tumbling",
-      "construct": "M6-10 seeded ledger entry: range-query rate \u2014 PulsusDB's epoch-aligned tumbling buckets vs the oracle's request-aligned sliding windows (PulsusDB stays hard-gated against the tumbling by-construction expectation)",
-      "mode": "informational",
+      "case_id": "metric_rate_sliding",
+      "construct": "issue #227 range-query rate over Loki's SLIDING windows: the half-open window (t-range, t] re-evaluated at every start-anchored step point {start + k*step <= end}, empty windows emitting no point, rate divided by the [range]. Was the seeded tumbling-vs-sliding ledger entry (case metric_rate_tumbling, informational); #227 resolved that divergence, so the case is re-gated and renamed",
+      "mode": "gated",
       "kind": "metric_range",
       "step_s": 60,
-      "ledger": "tumbling-vs-sliding-rate",
+      "range_s": 60,
       "query": "rate({run_id=\"{R}\", service_name=\"svc-json\"}[1m])"
     },
     {
@@ -188,38 +188,38 @@
     },
     {
       "case_id": "metric_match_on_range",
-      "construct": "issue #91 on(method) matching on the RANGE path (per-step instant join); informational \u2014 same tumbling-vs-sliding window divergence as metric_rate_tumbling",
-      "mode": "informational",
-      "ledger": "tumbling-vs-sliding-rate",
+      "construct": "issue #91 on(method) matching on the RANGE path (per-step-point instant join over sliding windows); gated since issue #227 resolved the tumbling-vs-sliding divergence these range cases were ledgered under",
+      "mode": "gated",
       "kind": "metric_range",
       "step_s": 60,
+      "range_s": 60,
       "query": "sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m])) / on(method) sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"200\" [1m]))"
     },
     {
       "case_id": "metric_match_ignoring_range",
-      "construct": "issue #91 ignoring(status) matching on the RANGE path; informational (tumbling-vs-sliding)",
-      "mode": "informational",
-      "ledger": "tumbling-vs-sliding-rate",
+      "construct": "issue #91 ignoring(status) matching on the RANGE path (sliding windows); gated since issue #227",
+      "mode": "gated",
       "kind": "metric_range",
       "step_s": 60,
+      "range_s": 60,
       "query": "sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m])) / ignoring(status) sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"503\" [1m]))"
     },
     {
       "case_id": "metric_match_group_left_range",
-      "construct": "issue #91 on(status) group_left matching on the RANGE path; informational (tumbling-vs-sliding)",
-      "mode": "informational",
-      "ledger": "tumbling-vs-sliding-rate",
+      "construct": "issue #91 on(status) group_left matching on the RANGE path (sliding windows); gated since issue #227",
+      "mode": "gated",
       "kind": "metric_range",
       "step_s": 60,
+      "range_s": 60,
       "query": "sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m])) / on(status) group_left sum by (status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m]))"
     },
     {
       "case_id": "metric_match_group_right_range",
-      "construct": "issue #91 on(status) group_right matching on the RANGE path; informational (tumbling-vs-sliding)",
-      "mode": "informational",
-      "ledger": "tumbling-vs-sliding-rate",
+      "construct": "issue #91 on(status) group_right matching on the RANGE path (sliding windows); gated since issue #227",
+      "mode": "gated",
       "kind": "metric_range",
       "step_s": 60,
+      "range_s": 60,
       "query": "sum by (status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m])) * on(status) group_right sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m]))"
     },
     {
@@ -240,7 +240,7 @@
     },
     {
       "case_id": "metric_rate_counter_reset",
-      "construct": "M8-LQ3 rate_counter over a resetting unwrapped counter (c=10,30,5,12 by ts, samples 1s apart ⇒ span 3s): reset-aware increase 32, scaled by the reference's ns-as-ms extrapolation factor (1 + 60000/span_ns; extrapolatedRate divides ns spans by 1000, window anchored on the first sample), then / 60s window = 0.5333439999999999 (oracle-confirmed v3.7.3). Instant [1m] lookback — semantically identical on both stores (no tumbling divergence)",
+      "construct": "M8-LQ3 rate_counter over a resetting unwrapped counter (c=10,30,5,12 by ts, samples 1s apart ⇒ span 3s): reset-aware increase 32, scaled by the reference's ns-as-ms extrapolation factor (1 + 60000/span_ns; extrapolatedRate divides ns spans by 1000, window anchored on the first sample), then / 60s window = 0.5333439999999999 (oracle-confirmed v3.7.3). Instant [1m] lookback — semantically identical on both stores (issue #227's sliding range grid does not apply)",
       "mode": "gated",
       "kind": "metric_instant",
       "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcreset\"} | logfmt | unwrap c [1m])"

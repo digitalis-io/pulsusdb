@@ -163,6 +163,8 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         | ReadError::EmptyMatcherSet
         | ReadError::ContradictoryMatchers
         | ReadError::InvalidStep
+        // Issue #227: LogQL-only (the LogQL planner's duration boundary).
+        | ReadError::DurationOutOfRange { .. }
         | ReadError::PipelineInvalid { .. }
         | ReadError::MetricPipelineError { .. }
         | ReadError::PipelineUnsupportedInMetric { .. } => {
