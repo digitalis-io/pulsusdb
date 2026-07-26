@@ -1,0 +1,84 @@
+# B10 — label_format parity (issue #231).
+#
+# Two pre-existing divergences, both captured from the pinned reference
+# container (grafana/loki:3.7.4, 2026-07-26) via /loki/api/v1/query_range on
+# the same one-line dataset:
+#
+#   1. The template data map is snapshotted ONCE per `label_format` stage —
+#      lazily, at the FIRST template assignment — so a template never observes
+#      an assignment made earlier in the SAME stage, and a rename that runs
+#      between two templates is invisible to the second. Renames themselves
+#      read the live label set, so a rename placed BEFORE the first template is
+#      in the snapshot.
+#   2. `label_format __error__=…` is rejected outright (HTTP 400,
+#      `__error__ cannot be formatted`) in both the template and the rename
+#      form. `__error_details__` is NOT reserved and stays assignable.
+#
+# The container adds its own `detected_level` ingest label, which PulsusDB does
+# not model; it is elided from the expectations here (and explicitly dropped in
+# the empty-label-set case so the query text stays byte-identical to the probe).
+
+load
+  {env="prod", service_name="lfp"} service=lfp
+  0s  a=Hello b=World
+
+# A later assignment cannot see an earlier one: `bb` renders the map's (absent)
+# `aa`, not the `XHello` the same stage just wrote.
+eval instant at 60s {service_name="lfp"} | logfmt | label_format aa="X{{.a}}", bb="[{{.aa}}]"
+  {a="Hello", aa="XHello", b="World", bb="[]", env="prod", service_name="lfp"}  0s  a=Hello b=World
+
+# Chained: neither the second nor the third assignment resolves.
+eval instant at 60s {service_name="lfp"} | logfmt | label_format aa="X{{.a}}", bb="{{.aa}}", cc="{{.bb}}"
+  {a="Hello", aa="XHello", b="World", bb="", cc="", env="prod", service_name="lfp"}  0s  a=Hello b=World
+
+# A template overwriting its own source: the overwrite lands, but the snapshot
+# still holds the pre-stage value for the later read.
+eval instant at 60s {service_name="lfp"} | logfmt | label_format a="Z{{.a}}", z="{{.a}}"
+  {a="ZHello", b="World", env="prod", service_name="lfp", z="Hello"}  0s  a=Hello b=World
+
+# A rename BETWEEN two templates does not refresh the map: `t2` still resolves
+# `a` after the rename deleted it.
+eval instant at 60s {service_name="lfp"} | logfmt | label_format t1="{{.a}}", r=a, t2="{{.a}}"
+  {b="World", env="prod", r="Hello", service_name="lfp", t1="Hello", t2="Hello"}  0s  a=Hello b=World
+
+# A rename BEFORE the first template is in the snapshot (the map is built
+# lazily, at the first template).
+eval instant at 60s {service_name="lfp"} | logfmt | label_format lvl=a, t="{{.lvl}}"
+  {b="World", env="prod", lvl="Hello", service_name="lfp", t="Hello"}  0s  a=Hello b=World
+
+# The snapshot is per STAGE: a second `label_format` sees the first's output.
+eval instant at 60s {service_name="lfp"} | logfmt | label_format z="{{.a}}" | label_format y="{{.z}}"
+  {a="Hello", b="World", env="prod", service_name="lfp", y="Hello", z="Hello"}  0s  a=Hello b=World
+
+# The reference rebuilds the map while it is still EMPTY (`if len(m) == 0`),
+# which dropping every label makes reachable: `n2` sees `n1`, but `n3` no
+# longer sees `n2` — the map became non-empty at the `n2` rebuild.
+# (`detected_level` is dropped for the container only; it is a no-op here.)
+eval instant at 60s {service_name="lfp"} | logfmt | drop a, b, env, service_name, detected_level | label_format n1="X", n2="{{.n1}}", n3="{{.n2}}"
+  {n1="X", n2="X", n3=""}  0s  a=Hello b=World
+
+# `__error_details__` is not reserved — the reference accepts the assignment.
+eval instant at 60s {service_name="lfp"} | logfmt | label_format __error_details__="boom"
+  {__error_details__="boom", a="Hello", b="World", env="prod", service_name="lfp"}  0s  a=Hello b=World
+
+# `__error__` is reserved: the reference returns HTTP 400
+# `__error__ cannot be formatted` for the template form, the rename form, and
+# any position in the list. The `msg:` substring is the reference's own message
+# text, which PulsusDB's compile error carries verbatim. Only that inner text
+# is asserted — the surrounding error envelope is cross-cutting across every
+# LogQL parse error and is tracked by issue #240, so it must not be pinned here.
+eval_fail instant at 60s {service_name="lfp"} | logfmt | label_format __error__="boom"
+  msg: __error__ cannot be formatted
+
+eval_fail instant at 60s {service_name="lfp"} | logfmt | label_format __error__=a
+  msg: __error__ cannot be formatted
+
+eval_fail instant at 60s {service_name="lfp"} | logfmt | label_format ok="1", __error__="boom"
+  msg: __error__ cannot be formatted
+
+# The reserved-name check precedes the duplicate-name rule (probed: this
+# reports the reserved-label error, not `multiple label name`).
+eval_fail instant at 60s {service_name="lfp"} | logfmt | label_format __error__="a", __error__="b"
+  msg: __error__ cannot be formatted
+
+clear

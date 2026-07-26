@@ -51,6 +51,10 @@
 //!   field-substitution + literal-text subset; every excluded template
 //!   function is individually enumerated
 //!   ([`EXCLUDED_TEMPLATE_FUNCTIONS`]) and rejected by name.
+//! - One `label_format` stage renders every template against a single
+//!   data-map **snapshot** of the label set, so an assignment never
+//!   observes an earlier one in the same stage; and `__error__` is not
+//!   assignable at all (issue #231, both live-probed).
 
 use std::borrow::Cow;
 use std::fmt;
@@ -255,7 +259,16 @@ enum CompiledStage {
     Pattern(Vec<PatternTok>),
     LabelFilter(CompiledLabelFilter),
     LineFormat(Vec<TmplPart>),
-    LabelFormat(Vec<CompiledLabelFmt>),
+    LabelFormat {
+        fmts: Vec<CompiledLabelFmt>,
+        /// Whether this stage must render its templates against the
+        /// reference's per-stage data-map **snapshot** instead of the live
+        /// label vector (issue #231). Decided once at compile time by
+        /// [`label_format_needs_snapshot`]: `false` — the overwhelmingly
+        /// common shape — means both render identically, so the stage keeps
+        /// the copy-free live path.
+        needs_snapshot: bool,
+    },
     /// `| unwrap <label>` / `| unwrap <conversion>(<label>)` — evaluated
     /// **only** on the metric path ([`CompiledPipeline::run_metric_into`]);
     /// inert for stream execution (issue M6-10 adjudication #2: the
@@ -409,7 +422,7 @@ impl CompiledPipeline {
                 }
                 Stage::LabelFormat(fmts) => {
                     mutates_labels = true;
-                    compiled.push(CompiledStage::LabelFormat(compile_label_format(fmts)?));
+                    compiled.push(compile_label_format(fmts)?);
                 }
                 Stage::Unwrap(u) => {
                     has_unwrap = true;
@@ -725,7 +738,29 @@ impl CompiledPipeline {
                 CompiledStage::LineFormat(tmpl) => {
                     line = Cow::Owned(render_template(tmpl, labels));
                 }
-                CompiledStage::LabelFormat(fmts) => {
+                CompiledStage::LabelFormat {
+                    fmts,
+                    needs_snapshot,
+                } => {
+                    // Reference `LabelsFormatter.Process` (fmt.go:407-434,
+                    // issue #231): every template in ONE stage renders against
+                    // the SAME data map, materialised lazily from the label set
+                    // at the first template assignment — so an assignment never
+                    // observes an earlier one in the same stage, and a rename
+                    // that runs between two templates is invisible to the
+                    // second. Renames themselves read the LIVE label set, so a
+                    // rename placed before the first template *is* reflected.
+                    //
+                    // `None` here means "the map is still empty", mirroring the
+                    // reference's own `if len(m) == 0 { IntoMap(m) }` refill
+                    // guard: while the label set is empty the map is rebuilt at
+                    // every template, which is exactly live rendering (reachable
+                    // by `| drop`-ing every label — live-probed). The clone is
+                    // taken at most once per line and only for the stages whose
+                    // result can actually differ (`needs_snapshot`, decided at
+                    // compile time), so ordinary `label_format` stages stay
+                    // allocation-free here.
+                    let mut snapshot: Option<Vec<(Cow<'a, str>, Cow<'a, str>)>> = None;
                     for f in fmts {
                         match f {
                             CompiledLabelFmt::Rename { dst, src } => {
@@ -743,7 +778,19 @@ impl CompiledPipeline {
                                 }
                             }
                             CompiledLabelFmt::Template { dst, tmpl } => {
-                                let rendered = render_template(tmpl, labels);
+                                let rendered = if *needs_snapshot {
+                                    if snapshot.is_none() && !labels.is_empty() {
+                                        snapshot = Some(labels.clone());
+                                    }
+                                    match &snapshot {
+                                        Some(snap) => render_template(tmpl, snap),
+                                        // Label set empty ⇒ the reference's map
+                                        // is empty too; every field renders "".
+                                        None => render_template(tmpl, labels),
+                                    }
+                                } else {
+                                    render_template(tmpl, labels)
+                                };
                                 set_label(labels, Cow::Borrowed(dst), Cow::Owned(rendered));
                             }
                         }
@@ -1533,13 +1580,31 @@ fn compile_template(text: &str) -> Result<Vec<TmplPart>, PipelineError> {
     Ok(parts)
 }
 
-fn compile_label_format(fmts: &[LabelFmt]) -> Result<Vec<CompiledLabelFmt>, PipelineError> {
+fn compile_label_format(fmts: &[LabelFmt]) -> Result<CompiledStage, PipelineError> {
     let mut out = Vec::with_capacity(fmts.len());
     let mut dsts: Vec<&str> = Vec::new();
     for f in fmts {
         let dst = match f {
             LabelFmt::Rename { dst, .. } | LabelFmt::Template { dst, .. } => dst.as_str(),
         };
+        // `__error__` is not assignable — the reference rejects the whole
+        // query (HTTP 400, `__error__ cannot be formatted`) for BOTH the
+        // rename and the template form, and it checks this BEFORE the
+        // duplicate-name rule, so `__error__="a", __error__="b"` reports
+        // the reserved-label error (live-probed, issue #231). Only
+        // `__error__` is reserved: `__error_details__` stays assignable.
+        //
+        // The message below is the reference's INNER text verbatim; the
+        // envelope this gets wrapped in (`bad parser expression: …` here,
+        // `invalid pipeline: …` at the API layer, against the reference's
+        // `parse error : stage '…' : …`) is a cross-cutting property of every
+        // LogQL parse error and is tracked by issue #240 — deliberately NOT
+        // changed here, and deliberately not pinned by the tests.
+        if dst == ERROR_LABEL {
+            return Err(PipelineError::BadParserExpr(format!(
+                "{ERROR_LABEL} cannot be formatted"
+            )));
+        }
         if dsts.contains(&dst) {
             return Err(PipelineError::BadParserExpr(format!(
                 "label_format assigns label {dst:?} twice"
@@ -1557,7 +1622,50 @@ fn compile_label_format(fmts: &[LabelFmt]) -> Result<Vec<CompiledLabelFmt>, Pipe
             },
         });
     }
-    Ok(out)
+    Ok(CompiledStage::LabelFormat {
+        needs_snapshot: label_format_needs_snapshot(&out),
+        fmts: out,
+    })
+}
+
+/// Does this `label_format` stage need the reference's per-stage data-map
+/// snapshot, or is rendering against the live label vector equivalent?
+///
+/// The reference builds the template data map ONCE per stage — lazily, at the
+/// first template assignment — and never refreshes it while it is non-empty,
+/// so a template can only observe mutations made *before* that first template
+/// ran (issue #231). Live rendering can therefore differ only for a field
+/// that some element between the first template and the reading template
+/// mutates: a template's destination, or a rename's destination *and* source
+/// (a rename deletes the source). For every other field the snapshot and the
+/// live vector hold the same value by construction, so the (common) stage
+/// that reads nothing it also writes keeps the copy-free path.
+fn label_format_needs_snapshot(fmts: &[CompiledLabelFmt]) -> bool {
+    // Names mutated at or after the first template assignment.
+    let mut mutated: Vec<&str> = Vec::new();
+    let mut seen_template = false;
+    for f in fmts {
+        match f {
+            CompiledLabelFmt::Template { dst, tmpl } => {
+                let reads_mutated = tmpl.iter().any(|part| match part {
+                    TmplPart::Field(name) => mutated.contains(&name.as_str()),
+                    TmplPart::Lit(_) => false,
+                });
+                if seen_template && reads_mutated {
+                    return true;
+                }
+                seen_template = true;
+                mutated.push(dst.as_str());
+            }
+            CompiledLabelFmt::Rename { dst, src } => {
+                if seen_template {
+                    mutated.push(dst.as_str());
+                    mutated.push(src.as_str());
+                }
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------
@@ -2622,5 +2730,257 @@ mod tests {
                 out.labels
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // label_format parity (issue #231) — every expectation below was
+    // live-probed against the pinned reference (grafana/loki:3.7.4).
+    // -----------------------------------------------------------------
+
+    /// Runs `query` over `line` with the `{svc="x"}` base stream (no name
+    /// collision with the extracted keys) and returns the final label set
+    /// sorted by name, as owned pairs.
+    fn label_format_labels(query: &str, line: &str) -> Vec<(String, String)> {
+        let base = vec![("svc".to_string(), "x".to_string())];
+        let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+        let out = compiled
+            .run(line, &base)
+            .unwrap_or_else(|| panic!("{query}: line unexpectedly dropped"));
+        let mut got: Vec<(String, String)> = out
+            .labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        got.sort();
+        got
+    }
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_label_format_template_cannot_observe_an_earlier_assignment_in_the_same_stage() {
+        // Reference: `aa="XHello"`, `bb="[]"` — the data map is snapshotted
+        // once per stage, so `bb` sees no `aa`.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | logfmt | label_format aa="X{{.a}}", bb="[{{.aa}}]""#,
+                "a=Hello b=World",
+            ),
+            owned(&[
+                ("a", "Hello"),
+                ("aa", "XHello"),
+                ("b", "World"),
+                ("bb", "[]"),
+                ("svc", "x"),
+            ]),
+        );
+        // Chained: neither the second nor the third assignment resolves.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | logfmt | label_format aa="X{{.a}}", bb="{{.aa}}", cc="{{.bb}}""#,
+                "a=Hello b=World",
+            ),
+            owned(&[
+                ("a", "Hello"),
+                ("aa", "XHello"),
+                ("b", "World"),
+                ("bb", ""),
+                ("cc", ""),
+                ("svc", "x"),
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_template_overwriting_its_own_source_is_invisible_to_a_later_template() {
+        // Reference: `a="ZHello"` (the overwrite lands) but `z="Hello"` —
+        // the snapshot still holds the pre-stage value of `a`.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | logfmt | label_format a="Z{{.a}}", z="{{.a}}""#,
+                "a=Hello b=World",
+            ),
+            owned(&[
+                ("a", "ZHello"),
+                ("b", "World"),
+                ("svc", "x"),
+                ("z", "Hello"),
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_rename_between_two_templates_is_invisible_to_the_later_template() {
+        // Renames read the LIVE label set, but they do not refresh the
+        // snapshot: `t2` still resolves `a` after the rename deleted it.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | logfmt | label_format t1="{{.a}}", r=a, t2="{{.a}}""#,
+                "a=Hello b=World",
+            ),
+            owned(&[
+                ("b", "World"),
+                ("r", "Hello"),
+                ("svc", "x"),
+                ("t1", "Hello"),
+                ("t2", "Hello"),
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_rename_before_the_first_template_is_visible_to_it() {
+        // The map is materialised lazily AT the first template, so
+        // everything the stage did before that point is in it.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | logfmt | label_format lvl=a, t="{{.lvl}}""#,
+                "a=Hello b=World",
+            ),
+            owned(&[
+                ("b", "World"),
+                ("lvl", "Hello"),
+                ("svc", "x"),
+                ("t", "Hello"),
+            ]),
+        );
+    }
+
+    #[test]
+    fn each_label_format_stage_takes_its_own_snapshot() {
+        // Two stages ⇒ two maps: the second stage sees the first's output.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | logfmt | label_format z="{{.a}}" | label_format y="{{.z}}""#,
+                "a=Hello b=World",
+            ),
+            owned(&[
+                ("a", "Hello"),
+                ("b", "World"),
+                ("svc", "x"),
+                ("y", "Hello"),
+                ("z", "Hello"),
+            ]),
+        );
+    }
+
+    #[test]
+    fn an_empty_label_set_rebuilds_the_snapshot_until_it_is_non_empty() {
+        // The reference refills the map whenever it is still EMPTY
+        // (`if len(m) == 0`), which `| drop`-ing every label makes
+        // reachable: `n2` sees `n1`, but `n3` no longer sees `n2` because
+        // the map became non-empty at the `n2` refill.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | logfmt | drop svc, p | label_format n1="X", n2="{{.n1}}", n3="{{.n2}}""#,
+                "p=1",
+            ),
+            owned(&[("n1", "X"), ("n2", "X"), ("n3", "")]),
+        );
+        // Same rule with a rename in the middle: the refill at `n2` reads
+        // the post-rename live set (no `n1` left), then freezes.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | logfmt | drop svc, p | label_format n1="X", r=n1, n2="{{.n1}}", n3="{{.r}}""#,
+                "p=1",
+            ),
+            owned(&[("n2", ""), ("n3", "X"), ("r", "X")]),
+        );
+    }
+
+    #[test]
+    fn a_snapshotted_template_still_resolves_the_error_labels() {
+        // The reference's map is built from ALL label categories plus the
+        // error pair, so `{{.__error__}}` renders inside `label_format`.
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | json | label_format e="[{{.__error__}}]""#,
+                "not json at all",
+            ),
+            owned(&[
+                ("svc", "x"),
+                ("e", "[JSONParserErr]"),
+                (ERROR_LABEL, "JSONParserErr"),
+                (ERROR_DETAILS_LABEL, JSON_ERROR_DETAILS),
+            ]),
+        );
+    }
+
+    #[test]
+    fn the_snapshot_is_only_taken_for_stages_whose_result_can_differ() {
+        // Perf guard: the copy is confined to the self-referential shapes.
+        // Every ordinary `label_format` keeps rendering against the live
+        // label vector.
+        for (query, want) in [
+            (r#"{a="b"} | label_format x="{{.y}}""#, false),
+            (
+                r#"{a="b"} | label_format lvl=level, tag="v-{{.code}}""#,
+                false,
+            ),
+            (r#"{a="b"} | label_format x="{{.y}}", z="{{.y}}""#, false),
+            // A rename BEFORE the first template is already in the map.
+            (r#"{a="b"} | label_format lvl=level, t="{{.lvl}}""#, false),
+            // Reads a label an earlier template in the stage wrote.
+            (r#"{a="b"} | label_format x="1", z="{{.x}}""#, true),
+            // Reads a label an interleaved rename moved.
+            (r#"{a="b"} | label_format x="1", r=y, z="{{.y}}""#, true),
+            (r#"{a="b"} | label_format x="1", r=y, z="{{.r}}""#, true),
+        ] {
+            let stages = stages_of(query);
+            let compiled = CompiledPipeline::compile(&stages).expect(query);
+            let got = compiled.stages.iter().find_map(|s| match s {
+                CompiledStage::LabelFormat { needs_snapshot, .. } => Some(*needs_snapshot),
+                _ => None,
+            });
+            assert_eq!(got, Some(want), "{query}");
+        }
+    }
+
+    #[test]
+    fn assigning_the_error_label_is_rejected_in_both_label_format_forms() {
+        // Reference (HTTP 400): `__error__ cannot be formatted` — for the
+        // template form, the rename form, and regardless of position.
+        //
+        // Only the reference-matching INNER text is asserted. The surrounding
+        // envelope (`bad parser expression: …` vs the reference's
+        // `parse error : stage '…' : …`) is a cross-cutting property of the
+        // whole LogQL error surface, tracked by issue #240 — pinning it here
+        // would enshrine wording #240 is going to change.
+        for query in [
+            r#"{a="b"} | label_format __error__="boom""#,
+            r#"{a="b"} | label_format __error__=level"#,
+            r#"{a="b"} | label_format ok="1", __error__="boom""#,
+            // The reserved-name check runs BEFORE the duplicate-name rule.
+            r#"{a="b"} | label_format __error__="a", __error__="b""#,
+        ] {
+            let err = CompiledPipeline::compile(&stages_of(query)).expect_err(query);
+            assert!(matches!(err, PipelineError::BadParserExpr(_)), "{query}");
+            let text = err.to_string();
+            assert!(
+                text.contains("__error__ cannot be formatted"),
+                "{query}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn assigning_the_error_details_label_is_accepted_like_the_reference() {
+        // Only `__error__` is reserved: the reference accepts
+        // `__error_details__` (200) and sets it.
+        let got = label_format_labels(
+            r#"{a="b"} | logfmt | label_format __error_details__="boom""#,
+            "p=1",
+        );
+        assert!(
+            got.contains(&(ERROR_DETAILS_LABEL.to_string(), "boom".to_string())),
+            "{got:?}"
+        );
     }
 }
