@@ -227,6 +227,20 @@ pub enum TooBroadReason {
     /// from a ClickHouse error code. Set generously so nothing Loki
     /// reliably serves is rejected.
     MetricRetention { count: u64, cap: u64 },
+    /// Issue #227 (review round 6): the label-mutating client-aggregation
+    /// path retained more QUERY-LIFETIME bytes of distinct output-group
+    /// state — each first-seen group's rendered JSON key plus its cloned
+    /// final `LabelSet`, which live in the group map until finish — than
+    /// [`crate::logql::exec::MAX_CLIENT_AGG_GROUP_BYTES`]. The group
+    /// COUNT was already capped ([`Self::MetricSeries`]) but the BYTES
+    /// behind each key/label set were charged to neither the
+    /// collision-group counter (reset when its group flushes) nor the
+    /// retention counter (denominated in fixed-width points), so 500
+    /// multi-MiB extracted label sets could accumulate for the query's
+    /// lifetime. Charged BEFORE the insertion that retains the entry and
+    /// released as finish consumes it. Complete-or-error, never an OOM; a
+    /// Rust-side structural limit, never from a ClickHouse error code.
+    MetricGroupLabelBytes { bytes: u64, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -381,6 +395,14 @@ impl fmt::Display for TooBroadReason {
                     "the sliding-window range evaluation retained {count} concurrent sample \
                      points, exceeding the {cap}-point cap — narrow the [range], the pipeline, \
                      or the time window"
+                )
+            }
+            TooBroadReason::MetricGroupLabelBytes { bytes, cap } => {
+                write!(
+                    f,
+                    "distinct output-group label sets would retain {bytes} bytes for the \
+                     whole query, exceeding the {cap}-byte cap — narrow the pipeline \
+                     (fewer/smaller extracted labels) or use a coarser grouping"
                 )
             }
         }

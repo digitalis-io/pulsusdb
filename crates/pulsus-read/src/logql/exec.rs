@@ -3424,6 +3424,15 @@ struct ClientAggState<'q> {
     /// Total timestamped points retained across every `rate_counter`
     /// accumulator, charged against [`MAX_COUNTER_VALUES`].
     counter_values: u64,
+    /// QUERY-LIFETIME bytes retained by `label_groups` — each distinct
+    /// group's rendered key + cloned `LabelSet` + map-slot share. The same
+    /// round-6 charge as the sliding path's `groups`, through the same
+    /// [`charge_group_bytes`]/[`group_entry_bytes`] helpers: the group
+    /// COUNT cap alone left per-group label BYTES unbounded here too.
+    group_bytes: u64,
+    /// Always [`MAX_CLIENT_AGG_GROUP_BYTES`] in production (test seam,
+    /// the `retention_cap` precedent).
+    group_bytes_cap: u64,
 }
 
 impl<'q> ClientAggState<'q> {
@@ -3461,6 +3470,8 @@ impl<'q> ClientAggState<'q> {
             label_groups: HashMap::new(),
             quantile_values: 0,
             counter_values: 0,
+            group_bytes: 0,
+            group_bytes_cap: MAX_CLIENT_AGG_GROUP_BYTES,
         })
     }
 
@@ -3545,6 +3556,21 @@ impl<'q> ClientAggState<'q> {
                             .iter()
                             .map(|(k, v)| (k.to_string(), v.to_string()))
                             .collect();
+                        // Issue #227 review round 6 (same class as the
+                        // sliding path): the key + `LabelSet` live in
+                        // `label_groups` for the whole query — charged
+                        // BEFORE the insert retains them; refused means the
+                        // per-row transients above drop with the error and
+                        // the map never holds the entry. (`entry()` has
+                        // already reserved the table slot — that growth is
+                        // structurally bounded by the 500-group count cap
+                        // checked above and covered by this charge's slot
+                        // term.)
+                        charge_group_bytes(
+                            &mut self.group_bytes,
+                            group_entry_bytes(e.key(), &labels, INSTANT_GROUP_SLOT),
+                            self.group_bytes_cap,
+                        )?;
                         &mut e.insert((labels, BTreeMap::new())).1
                     }
                 }
@@ -3600,14 +3626,31 @@ impl<'q> ClientAggState<'q> {
         }
 
         let base_labels = self.base_labels;
+        let mut group_bytes = self.group_bytes;
         let groups: Vec<(LabelSet, BTreeMap<i64, BucketAcc>)> = if self.fan_out {
-            self.label_groups.into_values().collect()
+            self.label_groups
+                .into_iter()
+                .map(|(key, (labels, buckets))| {
+                    // Round 6 symmetry: sized over the same unmodified
+                    // key/labels as the charge, released as each entry is
+                    // consumed (key dropped, labels move to the output).
+                    discharge_group_bytes(
+                        &mut group_bytes,
+                        group_entry_bytes(&key, &labels, INSTANT_GROUP_SLOT),
+                    );
+                    (labels, buckets)
+                })
+                .collect()
         } else {
             self.fp_groups
                 .into_iter()
                 .filter_map(|(fp, buckets)| base_labels.get(&fp).map(|l| (l.clone(), buckets)))
                 .collect()
         };
+        debug_assert_eq!(
+            group_bytes, 0,
+            "every group-label byte charge must be discharged at finish"
+        );
         let op = self.client.range_op;
         let rate_window_ns = self.rate_window_ns;
         let param = self.client.param;
@@ -3956,6 +3999,124 @@ fn retention_points_per_sample(op: RangeAggOp) -> u64 {
         RangeAggOp::QuantileOverTime => 2,
         _ => 1,
     }
+}
+
+/// The **query-lifetime** byte cap on the label-mutating client-aggregation
+/// path's distinct output-group state (issue #227 review round 6): each
+/// first-seen group MOVES its rendered JSON key and cloned final `LabelSet`
+/// into the group map, where they live until finish — bytes charged against
+/// NEITHER the collision-group cap (whose counter resets when the group
+/// flushes) nor the retention cap (denominated in fixed-width points). The
+/// group COUNT was already bounded ([`MAX_CLIENT_AGG_SERIES`]), but 500
+/// multi-MiB extracted label sets were a real memory hazard; this cap bounds
+/// their BYTES, charged through [`charge_group_bytes`] BEFORE the insertion
+/// that retains each entry and released as finish consumes it.
+///
+/// **The query-lifetime container audit** (round 6 — earlier sweeps covered
+/// the per-sample/per-window dimension; this is the per-QUERY one). Every
+/// container that lives for the whole evaluation, and what bounds its bytes:
+///
+/// | container | bytes bounded by |
+/// |---|---|
+/// | `RangeSlideState::groups` keys + `MutGroup::labels` | **charged here** (before insertion; released as `finish_in_place` consumes each entry) |
+/// | `ClientAggState::label_groups` keys + `LabelSet`s | **charged here** (same helpers, same discipline) |
+/// | `MutGroup::int_cells`/`pt_cells`, `FpSlide::win`, `BucketAcc` retention | [`MAX_RETAINED_WINDOW_POINTS`] / [`MAX_QUANTILE_VALUES`] / [`MAX_COUNTER_VALUES`], charge-before-insert |
+/// | `base_labels` / `hashes` (both states) | built once from the stage-2 hydration read, which is scan-budget-capped (`max_bytes_to_read`) and stream-capped (`max_streams`); never grown per row |
+/// | non-mutating output labels (`FpSlide::labels`, `series_out`) | one clone per emitted series (≤ [`MAX_CLIENT_AGG_SERIES`]) of a `base_labels` value — inside the same hydration bound |
+/// | emitted points (`FpSlide::points`, `series_out`, fan-out `points`) | fixed-width `(i64, f64)`, structurally ≤ `MAX_CLIENT_AGG_SERIES × grid` (grid ≤ [`MAX_CLIENT_AGG_BUCKETS`] + 1) ≈ 88 MB worst case, independent of input bytes |
+/// | `present_cover` / `present` | grid-sized (≤ [`MAX_CLIENT_AGG_BUCKETS`] + 2 entries) |
+/// | `absent_labels` | cloned from the parsed query text — bounded by request size |
+/// | `coll` staging | NOT query-lifetime: one group at a time, ≤ [`MAX_TS_COLLISION_GROUP_BYTES`] |
+///
+/// 64 MiB across ≤ 500 groups is ~128 KiB of rendered labels per group —
+/// far beyond real extracted label sets (typically well under a KiB), so
+/// nothing servable is rejected; an adversarial 500 × multi-MiB set trips a
+/// clean 422 instead of holding gigabytes for the query's lifetime.
+pub const MAX_CLIENT_AGG_GROUP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// **The one group-byte gate** (round 6): every query-lifetime group-map
+/// insertion is sized by [`group_entry_bytes`], checked against the cap, and
+/// accounted HERE — *before* the insertion that retains the entry, so the
+/// map never holds a refused group. `saturating_add` cannot mask a breach
+/// (saturation only grows the sum).
+fn charge_group_bytes(charged: &mut u64, bytes: u64, cap: u64) -> Result<(), ReadError> {
+    let next = charged.saturating_add(bytes);
+    if next > cap {
+        return Err(ReadError::QueryTooBroad(
+            TooBroadReason::MetricGroupLabelBytes { bytes: next, cap },
+        ));
+    }
+    *charged = next;
+    Ok(())
+}
+
+/// Releases a [`charge_group_bytes`] charge as finish consumes the entry it
+/// paid for. Saturating for panic-proofing only — the pairing is exact
+/// (charge and discharge run [`group_entry_bytes`] over the SAME unmodified
+/// key/labels), which the finish `group_bytes == 0` post-conditions assert.
+fn discharge_group_bytes(charged: &mut u64, bytes: u64) {
+    *charged = charged.saturating_sub(bytes);
+}
+
+/// The map-entry slot the sliding path's group charge sizes (`groups`).
+const MUT_GROUP_SLOT: usize = size_of::<(String, MutGroup)>();
+
+/// The map-entry slot the instant path's group charge sizes
+/// (`label_groups`).
+const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BTreeMap<i64, BucketAcc>))>();
+
+/// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
+/// output group's map entry retains: the rendered-JSON key, the cloned
+/// `LabelSet` (each owned string plus the element buffer), and the entry's
+/// share of the map table itself. Reuses the round-5
+/// [`RangeSlideState::member_stage_bytes`] sizing vocabulary
+/// ([`exact_alloc_bytes`] / [`grown_alloc_bytes`] / [`MIN_ALLOC_BYTES`]) —
+/// one scheme, not two. Over-charging is safe; under-charging is the bug.
+///
+/// **Per allocation:**
+/// - **rendered key** — produced by [`render_labels_json_sorted`], whose
+///   pre-size (`2 + Σ(k+v+6)`) is ≤ `len + 1` (each pair renders at least
+///   its raw bytes plus the `"":"",` scaffolding, minus the final comma),
+///   and whose geometric growth ends below `2·len`; by charge time
+///   rendering has returned, so the LIVE capacity is ≤ `2·len` — dominated
+///   by [`grown_alloc_bytes`]`(len) = 3·max(len, 32)` for every input.
+/// - **each owned label `String`** — `Cow::to_string` reserves exactly the
+///   length (or the generic path's `min_non_zero_cap = 8`); both are inside
+///   [`exact_alloc_bytes`]'s `max(len, 32)`.
+/// - **`LabelSet` element buffer** — `collect` from a `TrustedLen` iterator
+///   reserves exactly `pairs`; charged via [`exact_alloc_bytes`] (an empty
+///   set allocates nothing — the 32-byte floor is pure margin).
+/// - **the map entry's table share** — hashbrown keeps at most ~3.43
+///   bucket-slots live per entry at peak (7/8 load factor, power-of-two
+///   doubling with the old table still mapped during a resize), each
+///   `slot_bytes + 1` control byte wide; `4×` dominates that for every
+///   entry count, and the flat pad covers the table's fixed control-group
+///   padding many times over. (The table itself is additionally
+///   structurally bounded: the entry COUNT is capped at
+///   [`MAX_CLIENT_AGG_SERIES`] before any insertion.)
+///
+/// Saturating arithmetic throughout — a hostile label set can only make
+/// the charge LARGER, the safe direction.
+fn group_entry_bytes(key: &str, labels: &LabelSet, slot_bytes: usize) -> u64 {
+    /// See the map-table bullet above: 4 slots per entry dominates the
+    /// ~3.43-slot live peak of a 7/8-load, doubling hash table.
+    const MAP_GROWTH_FACTOR: u64 = 4;
+    /// Flat per-entry margin dominating the table's fixed control-group
+    /// padding/alignment on every table the series cap permits.
+    const MAP_FIXED_PAD: u64 = 64;
+
+    let mut bytes = (slot_bytes as u64)
+        .saturating_add(1)
+        .saturating_mul(MAP_GROWTH_FACTOR)
+        .saturating_add(MAP_FIXED_PAD);
+    bytes = bytes.saturating_add(grown_alloc_bytes(key.len() as u64));
+    for (k, v) in labels {
+        bytes = bytes
+            .saturating_add(exact_alloc_bytes(k.len() as u64))
+            .saturating_add(exact_alloc_bytes(v.len() as u64));
+    }
+    let elems = (labels.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
+    bytes.saturating_add(exact_alloc_bytes(elems))
 }
 
 /// The three sliding-window reducer classes (issue #227 finding-4 table,
@@ -4408,6 +4569,22 @@ struct RangeSlideState<'q> {
     /// bounded by `MAX_TS_COLLISION_GROUP_BYTES` by construction (issue #227
     /// review round 3, finding 1).
     coll_bytes: u64,
+    /// QUERY-LIFETIME bytes retained by `groups` — each entry's rendered
+    /// key + `LabelSet` + map-slot share ([`group_entry_bytes`]), gated by
+    /// [`charge_group_bytes`] BEFORE the insertion that retains them and
+    /// released as `finish_in_place` consumes each entry (issue #227 review
+    /// round 6: these bytes outlive the collision flush that resets
+    /// `coll_bytes`, so they need their own counter). Between the flush's
+    /// `coll_bytes` reset and each member's charge-or-drop, the group's
+    /// staged members are transiently outside both counters — a transient
+    /// bounded by [`MAX_TS_COLLISION_GROUP_BYTES`] (one group staged at a
+    /// time) and freed within the same flush.
+    group_bytes: u64,
+    /// The cap `group_bytes` is checked against — always
+    /// [`MAX_CLIENT_AGG_GROUP_BYTES`] in production; a field (the
+    /// `retention_cap` precedent) so tests can drive the trip without
+    /// materializing 64 MiB of labels.
+    group_bytes_cap: u64,
 }
 
 impl<'q> RangeSlideState<'q> {
@@ -4487,6 +4664,8 @@ impl<'q> RangeSlideState<'q> {
             coll_ts: 0,
             coll: Vec::new(),
             coll_bytes: 0,
+            group_bytes: 0,
+            group_bytes_cap: MAX_CLIENT_AGG_GROUP_BYTES,
         })
     }
 
@@ -4698,6 +4877,13 @@ impl<'q> RangeSlideState<'q> {
         // below either clears or takes `coll`), so the byte charge resets
         // here — one group is staged at a time, which is what makes
         // `MAX_TS_COLLISION_GROUP_BYTES` a true bound on the staged buffer.
+        // The fan-out `key`/`LabelSet` that SURVIVE the flush into the
+        // query-lifetime `groups` map are re-charged against
+        // `MAX_CLIENT_AGG_GROUP_BYTES` before that insertion
+        // (`fan_out_sample`, issue #227 review round 6), so nothing escapes
+        // both counters — the only uncounted state is this flush's own
+        // staged members, bounded by the collision cap and freed before it
+        // returns.
         self.coll_bytes = 0;
         // A true total order over the group (order-dependent reducers only):
         // distinct bodies always differ; byte-identical bodies are genuinely
@@ -4799,10 +4985,23 @@ impl<'q> RangeSlideState<'q> {
             return Ok(());
         }
         let is_new = !self.groups.contains_key(&key);
-        if is_new && self.groups.len() as u64 >= MAX_CLIENT_AGG_SERIES {
-            return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                cap: MAX_CLIENT_AGG_SERIES,
-            }));
+        if is_new {
+            if self.groups.len() as u64 >= MAX_CLIENT_AGG_SERIES {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+                    cap: MAX_CLIENT_AGG_SERIES,
+                }));
+            }
+            // Issue #227 review round 6: the key + `LabelSet` MOVE into the
+            // QUERY-LIFETIME `groups` map below and outlive the collision
+            // flush (whose `coll_bytes` charge has already been reset), so
+            // their bytes are charged to the query-lifetime counter BEFORE
+            // the insertion that retains them — refused means never
+            // inserted, for any label size and any group count.
+            charge_group_bytes(
+                &mut self.group_bytes,
+                group_entry_bytes(&key, &labels, MUT_GROUP_SLOT),
+                self.group_bytes_cap,
+            )?;
         }
         let integer = matches!(self.class, ReducerClass::InvertInteger);
         let per_sample = self.per_sample;
@@ -4891,6 +5090,10 @@ impl<'q> RangeSlideState<'q> {
             self.retained, 0,
             "every retention charge must be discharged at finish"
         );
+        debug_assert_eq!(
+            self.group_bytes, 0,
+            "every group-label byte charge must be discharged at finish"
+        );
         Ok(out)
     }
 
@@ -4922,7 +5125,17 @@ impl<'q> RangeSlideState<'q> {
             let grid_point = |k: i64| clamp_bucket(grid_start as i128 + k as i128 * step as i128);
             let groups = std::mem::take(&mut self.groups);
             let mut out: Vec<MatrixSeries> = Vec::new();
-            for group in groups.into_values() {
+            for (key, group) in groups {
+                // Round 6 symmetry: the discharge is sized over the SAME
+                // (unmodified) key + labels the insertion charged — the key
+                // is immutable as the map key and `MutGroup.labels` is never
+                // touched after creation — so finish returns `group_bytes`
+                // to exactly 0. Taken AFTER the entry is consumed below (key
+                // dropped, labels moved into the output series), mirroring
+                // the cell discharges: a charge is never released while the
+                // memory it paid for is still owned by this state.
+                let entry_bytes = group_entry_bytes(&key, &group.labels, MUT_GROUP_SLOT);
+                drop(key);
                 let mut points: Vec<(i64, f64)> = Vec::new();
                 // Both branches drain the group's cells into a `Vec` keyed by
                 // grid index so the points come out ordered. The drain is
@@ -4960,6 +5173,7 @@ impl<'q> RangeSlideState<'q> {
                         points,
                     });
                 }
+                discharge_group_bytes(&mut self.group_bytes, entry_bytes);
             }
             return Ok(QueryResult::Matrix(out));
         }
@@ -7760,6 +7974,280 @@ mod tests {
                     state.coll.len()
                 );
             }
+        }
+    }
+
+    /// Review round 6: distinct mutating-label groups' rendered keys +
+    /// `LabelSet`s are QUERY-LIFETIME (they live in `groups` until finish,
+    /// outliving the per-flush `coll_bytes` reset), so they are charged
+    /// against the group-byte cap BEFORE the map insertion — a refused
+    /// group is never inserted and the counter never records it.
+    #[test]
+    fn query_lifetime_group_label_bytes_are_capped_before_the_map_insertion() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        state.group_bytes_cap = 1;
+        // Distinct extracted `u` values ⇒ distinct groups; distinct ts ⇒
+        // singleton collision groups (the collision caps stay silent).
+        let rows: Vec<MetricScanRow> = (1..=3)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i * 10,
+                body: format!("u=v{i}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { bytes, cap })) => {
+                assert_eq!(cap, 1);
+                assert!(bytes > cap, "the error names the byte breach");
+            }
+            other => panic!("expected MetricGroupLabelBytes, got {other:?}"),
+        }
+        // Charge-before-insert, observed: the refused group was never
+        // inserted and the counter never recorded it.
+        assert!(
+            state.groups.is_empty(),
+            "the breaching group was inserted anyway"
+        );
+        assert_eq!(state.group_bytes, 0, "a refused charge must not stick");
+    }
+
+    /// Review round 6 symmetry: every insertion into the query-lifetime
+    /// `groups` map passes the charge (the counter equals the sum of
+    /// [`group_entry_bytes`] over the LIVE map — no bypassing path, no
+    /// double charge for a repeated group), and `finish_in_place` releases
+    /// every charge back to exactly zero. Deleting either the
+    /// `fan_out_sample` charge or the finish discharge fails this test.
+    #[test]
+    fn group_label_byte_charges_match_the_live_map_and_release_at_finish() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        // u=a twice (one group, charged ONCE), u=b once; the final u=c row
+        // stays staged in `coll` until finish flushes — proving the
+        // finish-time flush passes the same charge.
+        let bodies = ["u=a", "u=b", "u=a", "u=c"];
+        let rows: Vec<MetricScanRow> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: (i as i64 + 1) * 10,
+                body: (*b).to_string(),
+            })
+            .collect();
+        state.push_rows(&rows).expect("under every cap");
+        assert_eq!(state.groups.len(), 2, "u=a (deduped) and u=b are flushed");
+        let live: u64 = state
+            .groups
+            .iter()
+            .map(|(k, g)| group_entry_bytes(k, &g.labels, MUT_GROUP_SLOT))
+            .sum();
+        assert!(live > 0, "the fixture must exercise a real charge");
+        assert_eq!(
+            state.group_bytes, live,
+            "the counter must equal the live map's sized entries — every \
+             insertion charged, repeated groups charged once"
+        );
+        let out = state.finish_in_place().expect("finish");
+        assert_eq!(
+            state.group_bytes, 0,
+            "every group-label byte charge must be discharged at finish"
+        );
+        assert_eq!(state.retained, 0, "retention symmetry is undisturbed");
+        match out {
+            QueryResult::Matrix(series) => {
+                assert_eq!(series.len(), 3, "u=a, u=b and the finish-flushed u=c");
+            }
+            other => panic!("expected a matrix, got {other:?}"),
+        }
+    }
+
+    /// Review round 6: [`group_entry_bytes`] is a true UPPER BOUND on the
+    /// heap bytes a retained group-map entry actually holds.
+    /// Non-tautological — the charge is sized from LENGTHS while the
+    /// assertion measures the live `capacity()` of the real entry produced
+    /// by the real staging/flush path (the rendered key's capacity exceeds
+    /// its length whenever escaping forces growth past the renderer's
+    /// raw-byte pre-size, so an exact-length key charge fails here).
+    #[test]
+    fn group_entry_bytes_upper_bounds_the_retained_map_entry() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+
+        let control: String = std::iter::repeat_n('\u{1}', 512).collect();
+        let fixtures: Vec<(&str, Vec<(String, String)>)> = vec![
+            // Worst-case escaping: the rendered key grows geometrically
+            // past its raw-byte pre-size (six rendered bytes per input
+            // byte), leaving capacity well above length.
+            (
+                "all-control-character values",
+                vec![
+                    ("k".to_string(), control.clone()),
+                    ("kk".to_string(), control.clone()),
+                ],
+            ),
+            // Minimum-block worst case: many one-byte strings.
+            (
+                "many one-byte labels",
+                (0..64u32)
+                    .map(|i| {
+                        (
+                            char::from(b'a' + (i % 26) as u8).to_string(),
+                            "x".to_string(),
+                        )
+                    })
+                    .collect(),
+            ),
+            // One huge extracted value (the adversarial shape the round-6
+            // finding names: multi-MiB label sets × the series cap).
+            (
+                "one huge value",
+                vec![("big".to_string(), "v".repeat(1_000_000))],
+            ),
+            // No labels at all (charge still covers key + slot).
+            ("no labels", Vec::new()),
+            // Mixed escapes and multi-byte UTF-8.
+            (
+                "mixed escapes and multi-byte",
+                vec![
+                    ("q\"k".to_string(), "v\\\n\t\u{7}".to_string()),
+                    ("日本".to_string(), "🚀".repeat(40)),
+                ],
+            ),
+        ];
+
+        for (name, labels) in &fixtures {
+            let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+            assert!(state.fan_out, "{name}: must be the fan-out path");
+            let row = MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: "a=1".to_string(),
+            };
+            let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = labels
+                .iter()
+                .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
+                .collect();
+            state.coll_active = true;
+            state.coll_fp = 1;
+            state.coll_ts = 5;
+            state.stage_member(&row, 1.0, &mut scratch).expect("staged");
+            state.flush_collision(&HashMap::new()).expect("flushed");
+            assert_eq!(state.groups.len(), 1, "{name}: one retained group");
+            for (key, g) in &state.groups {
+                // Everything measurable the entry retains (the map-table
+                // share is an unmeasurable documented margin, like
+                // `MIN_ALLOC_BYTES`).
+                let measured = key.capacity() as u64
+                    + (g.labels.capacity() * size_of::<(String, String)>()) as u64
+                    + g.labels
+                        .iter()
+                        .map(|(k, v)| (k.capacity() + v.capacity()) as u64)
+                        .sum::<u64>();
+                let charge = group_entry_bytes(key, &g.labels, MUT_GROUP_SLOT);
+                assert!(
+                    charge >= measured,
+                    "{name}: charge {charge} under-counts the {measured} bytes \
+                     actually retained"
+                );
+                assert_eq!(
+                    state.group_bytes, charge,
+                    "{name}: the counter carries exactly this entry's charge"
+                );
+            }
+        }
+    }
+
+    /// Review round 6, class completion: the INSTANT fan-out path retains
+    /// the same query-lifetime key/`LabelSet` state in `label_groups`
+    /// (count-capped, bytes previously uncharged) — same charge, same
+    /// helper, same symmetric release at finish (whose
+    /// `debug_assert_eq!(group_bytes, 0)` fails this test if the discharge
+    /// is deleted).
+    #[test]
+    fn instant_fan_out_groups_are_byte_charged_capped_and_released_at_finish() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+
+        // Trip leg: a tiny cap refuses the FIRST group before insertion.
+        let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
+        state.group_bytes_cap = 1;
+        let row = |ts: i64, body: &str| MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns: ts,
+            body: body.to_string(),
+        };
+        match state.push_rows(&[row(5, "u=a")]) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { bytes, cap })) => {
+                assert_eq!(cap, 1);
+                assert!(bytes > cap, "the error names the byte breach");
+            }
+            other => panic!("expected MetricGroupLabelBytes, got {other:?}"),
+        }
+        assert!(
+            state.label_groups.is_empty(),
+            "the breaching group was inserted anyway"
+        );
+        assert_eq!(state.group_bytes, 0, "a refused charge must not stick");
+
+        // Charge/release leg: the counter equals the live map (repeated
+        // group charged once), then finish releases every charge.
+        let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
+        state
+            .push_rows(&[row(5, "u=a"), row(6, "u=b"), row(7, "u=a")])
+            .expect("under every cap");
+        assert_eq!(state.label_groups.len(), 2);
+        let live: u64 = state
+            .label_groups
+            .iter()
+            .map(|(k, (labels, _))| group_entry_bytes(k, labels, INSTANT_GROUP_SLOT))
+            .sum();
+        assert!(live > 0, "the fixture must exercise a real charge");
+        assert_eq!(
+            state.group_bytes, live,
+            "every insertion charged; the repeated group charged once"
+        );
+        match state.finish() {
+            QueryResult::Vector(samples) => assert_eq!(samples.len(), 2),
+            other => panic!("expected a vector, got {other:?}"),
         }
     }
 
