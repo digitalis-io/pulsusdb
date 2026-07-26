@@ -476,7 +476,8 @@
       "category": "vector-aggregations",
       "syntax": "approx_topk(k, ...)",
       "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#probabilistic-aggregation",
-      "probe": "approx_topk(5, rate({app=\"x\"}[5m]))"
+      "probe": "approx_topk(5, rate({app=\"x\"}[5m]))",
+      "endpoint": "instant"
     },
     {
       "id": "agg.sort",

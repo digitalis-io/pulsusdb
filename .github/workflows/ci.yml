@@ -272,11 +272,13 @@ jobs:
 
       # Issue #191 (M8-LQ0): the black-box LogQL differential oracle. ONE
       # UNMODIFIED, digest-pinned v3.7.3 reference container serves the syntax
-      # leg (observes only HTTP status at /loki/api/v1/query_range). Every
-      # registry probe's live accept/reject verdict is pinned against the
-      # recorded `oracle` disposition; a supported∧reject is RED. No upstream
-      # source is copied. The hermetic `ci` job runs the same test with its
-      # gate off, skipping.
+      # leg (observes only HTTP status at /loki/api/v1/query_range — or
+      # /loki/api/v1/query for the registry's instant-only constructs, issue
+      # #221; the mounted config enables approx_topk so its probe is
+      # conclusive). Every registry probe's live accept/reject verdict is
+      # pinned against the recorded `oracle` disposition; a supported∧reject
+      # is RED. No upstream source is copied. The hermetic `ci` job runs the
+      # same test with its gate off, skipping.
       - name: Start LogQL v3.7.3 reference (differential oracle)
         run: |
           docker run -d --name pulsus-logql-diff -p 13100:3100 \

@@ -13,7 +13,13 @@ Files:
 - `registry-logql-v3.7.3.json` — the construct registry. One entry per
   documented construct: `id`, `category`, `syntax`, `doc` (public-docs
   URL with a real page path + anchor), `probe` (a canonical clean-room
-  example query).
+  example query), and — for constructs that are instant-only in the
+  reference — an optional `endpoint: instant` marker (issue #221:
+  `approx_topk` returns 500 on `query_range` in every configuration, so
+  only the `/loki/api/v1/query` alias yields a conclusive 2xx/400 syntax
+  verdict; the differential-leg oracle container must also enable it via
+  `limits_config.shard_aggregations` + `frontend.encoding: protobuf`,
+  see `ci/logql/config.yaml`).
 - `registry-manifest.json` — the integrity pin: SHA-256 of the registry
   file bytes, the pinned `language`/`target`, the total `construct_count`,
   and per-`category` counts. Any edit to the registry must be deliberate
