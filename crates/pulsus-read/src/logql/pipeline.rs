@@ -55,6 +55,19 @@
 //!   data-map **snapshot** of the label set, so an assignment never
 //!   observes an earlier one in the same stage; and `__error__` is not
 //!   assignable at all (issue #231, both live-probed).
+//! - The `__error__`/`__error_details__` pair lives OUT-OF-BAND in
+//!   [`ErrorSlots`] (issue #238), mirroring the reference's two plain
+//!   string fields on the label builder (`pkg/logql/log/labels.go:119-121`)
+//!   — never as ordinary vector entries. Consequences (all live-probed at
+//!   v3.7.4): a `label_format` rename cannot see the slots, `keep` always
+//!   retains the pair (plus `__preserve_error__`), `drop __error__` resets
+//!   only the err slot (the details slot survives, gated), string
+//!   `__error__` filters and `drop` matchers read the slots while
+//!   `__error_details__` filters read the vector, `ip(...)` passes an
+//!   errored line unconditionally, and a numeric-filter failure never
+//!   overwrites an earlier error (first error wins). The pair merges into
+//!   the emitted set once, at [`ErrorSlots::merge_into`], gated on the
+//!   builder-dirty bit (`hasDel() || hasAdd()`, `labels.go:554-563`).
 
 use std::borrow::Cow;
 use std::fmt;
@@ -65,6 +78,7 @@ use pulsus_logql::{
     NumericLiteral, ParserStage, Stage,
 };
 
+use super::exec::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
 use super::ip::{IpMatcher, line_has_ip_in};
 // Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
 // Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go
@@ -87,6 +101,149 @@ pub const ERROR_LABEL: &str = "__error__";
 /// Sorts AFTER `__error__` lexically (`"__error__" < "__error_details__"`),
 /// so the emitted sorted `labels_json` stays canonical with no plumbing.
 pub const ERROR_DETAILS_LABEL: &str = "__error_details__";
+
+/// The reference's `PreserveErrorLabel` (`pkg/logqlmodel/error.go:26`).
+/// PulsusDB never sets it, but `label_format __preserve_error__=…` can, and
+/// `keep` must then retain it (`pkg/logql/log/keep_labels.go:51-58`,
+/// live-probed — issue #238). No other handling exists, by design.
+pub const PRESERVE_ERROR_LABEL: &str = "__preserve_error__";
+
+/// The reference's OUT-OF-BAND error pair: two plain `string` fields on the
+/// label builder (`pkg/logql/log/labels.go:119-121`), NOT entries in the
+/// label set. EMPTY MEANS UNSET — `HasErr()` is `b.err != ""`
+/// (`labels.go:245`), `HasErrorDetails()` is `b.errDetails != ""`
+/// (`labels.go:268`), and `appendErrors` emits each slot only when non-empty
+/// (`labels.go:430-444`). Deliberately NOT `Option<Cow>`: an empty reserved
+/// value must be indistinguishable from an unset slot (issue #238 round-3
+/// finding 1). A name may be populated here AND in the label vector at the
+/// same time; the two are mutated independently and the slot wins at emit
+/// (`labels.go:430-444`, `516-521` — live-probed at v3.7.4).
+#[derive(Debug, Default)]
+struct ErrorSlots<'a> {
+    err: Cow<'a, str>,
+    details: Cow<'a, str>,
+    /// `hasDel() || hasAdd()` (`labels.go:212-223`): any label ADDED to or
+    /// REMOVED from the vector by any stage, plus the per-entry
+    /// structured-metadata merge (the reference adds SM through the builder
+    /// — `pipeline.go:104`). Monotone: never cleared.
+    dirty: bool,
+}
+
+impl<'a> ErrorSlots<'a> {
+    /// `HasErr()` — `labels.go:245`.
+    fn has_err(&self) -> bool {
+        !self.err.is_empty()
+    }
+
+    /// `HasErrorDetails()` — `labels.go:268`.
+    fn has_details(&self) -> bool {
+        !self.details.is_empty()
+    }
+
+    /// `SetErr`/`ResetError` (`labels.go:234`, `:249`) are ONE operation:
+    /// assignment. Assigning "" clears, exactly as `Add` does for an empty
+    /// reserved SM value (`labels.go:399-407`).
+    fn set_err(&mut self, v: Cow<'a, str>) {
+        self.err = v;
+    }
+
+    /// `SetErrorDetails`/`ResetErrorDetails` (`labels.go:255`, `:259`).
+    fn set_details(&mut self, v: Cow<'a, str>) {
+        self.details = v;
+    }
+
+    fn reset_err(&mut self) {
+        self.err = Cow::Borrowed("");
+    }
+
+    fn reset_details(&mut self) {
+        self.details = Cow::Borrowed("");
+    }
+
+    /// `labelValue`'s `GetErr()` (`label_filter.go:418-421`) and the `drop`
+    /// matcher's `GetErr` (`drop_labels.go:69`) — UNGATED: label filters,
+    /// `drop` matchers and `ip` read the slot itself, not the materialised
+    /// view (probed: `drop __error__="JSONParserErr"` matches on a clean
+    /// builder), and "" for an unset slot by construction.
+    fn err_str(&self) -> &str {
+        &self.err
+    }
+
+    /// `GetErrorDetails` (`drop_labels.go:76`) — UNGATED, see [`Self::err_str`].
+    fn details_str(&self) -> &str {
+        &self.details
+    }
+
+    /// The pair AS MATERIALISED right now: the fast-path gate at
+    /// `labels.go:555`/`:573`/`:593`/`:673` (`!hasDel() && !hasAdd() &&
+    /// !HasErr()` returns the untouched base set), then `labels.go:519`
+    /// (`HasErr() || HasErrorDetails()`), then `appendErrors`' per-slot
+    /// non-empty guard. A lone details slot on a CLEAN builder is invisible
+    /// (live-probed: `| json | drop __error__` emits no details; adding any
+    /// `Del`/`Set` makes them reappear).
+    fn visible(&self) -> (Option<&str>, Option<&str>) {
+        if !(self.dirty || self.has_err()) {
+            return (None, None);
+        }
+        (
+            self.has_err().then(|| self.err.as_ref()),
+            self.has_details().then(|| self.details.as_ref()),
+        )
+    }
+
+    /// UNGATED slot accessor for the `label_format`/`line_format` data map —
+    /// the caller supplies the gate captured at map-build time ([`StageMap`]).
+    /// Returns `None` for an EMPTY slot, so the vector entry (if any) is then
+    /// consulted, matching `appendErrors` never appending an empty slot into
+    /// the map.
+    fn raw_slot(&self, name: &str) -> Option<&str> {
+        match name {
+            ERROR_LABEL if self.has_err() => Some(&self.err),
+            ERROR_DETAILS_LABEL if self.has_details() => Some(&self.details),
+            _ => None,
+        }
+    }
+
+    /// `appendErrors` (`labels.go:430-444`) over [`Self::visible`]'s gate.
+    /// Called ONCE, on the kept path only, immediately before
+    /// `MetricRun::Kept` — dropped lines never merge. Consumes `self` so the
+    /// slot `Cow`s MOVE into the vector: zero new allocations (the owned
+    /// detail `String` built at the error site is `set_label`-ed here, same
+    /// allocation count as the pre-#238 direct write).
+    fn merge_into(self, labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) {
+        if !(self.dirty || self.has_err()) {
+            return;
+        }
+        if !self.err.is_empty() {
+            set_label(labels, Cow::Borrowed(ERROR_LABEL), self.err);
+        }
+        if !self.details.is_empty() {
+            set_label(labels, Cow::Borrowed(ERROR_DETAILS_LABEL), self.details);
+        }
+    }
+}
+
+/// The reference's per-stage template data map (`fmt.go:423-425`), built
+/// lazily at the first template assignment and frozen once non-empty
+/// (issue #231); issue #238 adds the error-pair gate state, captured ONCE
+/// at build time — `dirty` can flip mid-stage (each `Set` dirties), so a
+/// per-template re-read would let a second template see details the first
+/// could not (live-probed guard: two templates reading `__error_details__`
+/// after `drop __error__` + `drop nosuch=""` both render the SAME value).
+struct StageMap<'a> {
+    /// Present ONLY when the #231 compile-time `needs_snapshot` gate is set;
+    /// `None` = render against the live vector (the zero-copy fast path).
+    snapshot: Option<Vec<(Cow<'a, str>, Cow<'a, str>)>>,
+    /// Whether [`ErrorSlots::visible`] was OPEN when this map was BUILT.
+    /// A bool, deliberately not borrowed values: it holds no reference to
+    /// the slots, so the element loop stays free to set `dirty`. Sound
+    /// because the slot VALUES are invariant inside a `label_format` stage
+    /// (`__error__` is a compile-time 400, `__error_details__` writes the
+    /// vector, and the `{{.label}}`-only subset has no template-execution
+    /// failure path — `fmt.go:426-429` is unreachable BY TYPE here, see
+    /// the U5 note at [`compile_template`]).
+    errors_visible: bool,
+}
 
 /// Loki (grafana/loki:3.4.2, buger/jsonparser) reports this fixed detail
 /// for a top-level non-object line — the representative `JSONParserErr`
@@ -258,7 +415,13 @@ enum CompiledStage {
     Regexp(regex::Regex),
     Pattern(Vec<PatternTok>),
     LabelFilter(CompiledLabelFilter),
-    LineFormat(Vec<TmplPart>),
+    LineFormat {
+        tmpl: Vec<TmplPart>,
+        /// Some field names `__error__`/`__error_details__` — decided once
+        /// at compile time ([`template_reads_error_pair`]) so every ordinary
+        /// template keeps the slot-blind zero-copy render (issue #238).
+        reads_err: bool,
+    },
     LabelFormat {
         fmts: Vec<CompiledLabelFmt>,
         /// Whether this stage must render its templates against the
@@ -288,10 +451,15 @@ enum CompiledStage {
     /// the line.
     Decolorize(regex::Regex),
     /// `| drop <elems>` — remove each listed label when it matches (issue
-    /// #200); dropping `__error__` also clears `__error_details__`.
+    /// #200). `__error__`/`__error_details__` elements reset the OUT-OF-BAND
+    /// slot only — bare form unconditionally, matcher form iff the matcher
+    /// matches the slot value — and never touch a vector entry of that name
+    /// (`drop_labels.go:51-86`; issue #238).
     Drop(Vec<CompiledDropKeep>),
     /// `| keep <elems>` — retain only labels matched by the list (issue
-    /// #200).
+    /// #200). `__error__`/`__error_details__`/`__preserve_error__` vector
+    /// entries are ALWAYS retained by name, and the out-of-band slots are
+    /// untouched (`keep_labels.go:22`, `:51-57`; issue #238).
     Keep(Vec<CompiledDropKeep>),
 }
 
@@ -326,8 +494,22 @@ impl CompiledDropKeepMatch {
 
 #[derive(Debug)]
 enum CompiledLabelFmt {
+    /// `label_format dst=src` where `dst != src`.
     Rename { dst: String, src: String },
-    Template { dst: String, tmpl: Vec<TmplPart> },
+    /// `label_format x=x`. The reference runs `Set(ParsedLabel, dst, v)` and
+    /// THEN `Del(src)` (`fmt.go:417-418`), so when the two names are equal a
+    /// *resolved* rename net-DELETES the label (and still dirties the
+    /// builder); an unresolved one stays a complete no-op. Split at compile
+    /// time so the hot path keeps a comparison-free arm (issue #238,
+    /// live-probed: `{r1} | label_format env=env` drops `env`).
+    RenameSelf { name: String },
+    Template {
+        dst: String,
+        tmpl: Vec<TmplPart>,
+        /// Some field names `__error__`/`__error_details__` — the same
+        /// compile-time gate as `CompiledStage::LineFormat`'s `reads_err`.
+        reads_err: bool,
+    },
 }
 
 /// The compiled, reusable per-line evaluator (consumed by the streams
@@ -418,7 +600,12 @@ impl CompiledPipeline {
                 Stage::LineFormat(tmpl) => {
                     seen_line_format = true;
                     rewrites_line = true;
-                    compiled.push(CompiledStage::LineFormat(compile_template(tmpl)?));
+                    let parts = compile_template(tmpl)?;
+                    let reads_err = template_reads_error_pair(&parts);
+                    compiled.push(CompiledStage::LineFormat {
+                        tmpl: parts,
+                        reads_err,
+                    });
                 }
                 Stage::LabelFormat(fmts) => {
                     mutates_labels = true;
@@ -557,9 +744,55 @@ impl CompiledPipeline {
         base: &'a [(String, String)],
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Option<Cow<'a, str>> {
-        match self.run_mode_into(body, base, labels, false) {
-            MetricRun::Dropped => None,
-            MetricRun::Kept { line, .. } => Some(line),
+        self.run_into_with_sm(body, base, &EMPTY_STRUCTURED_METADATA, labels)
+    }
+
+    /// As [`CompiledPipeline::run_into`], for a row carrying per-entry
+    /// structured metadata (issue #238). `base` is the stream labels merged
+    /// with the ORDINARY SM entries only; `sm` carries the reserved-name
+    /// routing outcome and `has_ordinary` (see
+    /// [`StructuredMetadataCtx`]). The reference adds structured metadata
+    /// through the label builder (`pkg/logql/log/pipeline.go:104` →
+    /// `LabelsBuilder.Add`), which routes reserved names into the
+    /// out-of-band error slots and marks the builder dirty for ordinary
+    /// entries — live-probed A/B: identical query and line, SM present vs
+    /// absent, `| json | drop __error__` emits `__error_details__` only in
+    /// the (ordinary-)SM case.
+    pub fn run_into_with_sm<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        sm: &'a StructuredMetadataCtx,
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    ) -> Option<Cow<'a, str>> {
+        match self.run_mode_into(body, base, sm, labels, false) {
+            (MetricRun::Dropped, _) => None,
+            (MetricRun::Kept { line, .. }, _) => Some(line),
+        }
+    }
+
+    /// As [`CompiledPipeline::run_into`], additionally reporting whether the
+    /// pipeline FINISHED with the out-of-band err slot set — the reference's
+    /// `HasErr()` (`labels.go:245`), evaluated before materialization
+    /// (issue #238 review round 7, the ninth site). This is NOT the same
+    /// question as "does the emitted set contain an `__error__` label": a
+    /// parser may extract an ORDINARY label literally named `__error__`
+    /// (`parser.go:160` `Set(ParsedLabel, …)` — never the slot) while
+    /// `HasErr()` stays false, and conversely a slot error always merges
+    /// into the emitted set. Detected-fields auto-detection keys its
+    /// parser-failure test on THIS flag, not on a label-name scan
+    /// (reference-captured: `{"__error__":"","foo":"x"}` and
+    /// `{"__error__":"mine","foo":"x"}` both auto-detect as json with `foo`
+    /// retained).
+    pub(crate) fn run_into_reporting_err<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    ) -> (Option<Cow<'a, str>>, bool) {
+        match self.run_mode_into(body, base, &EMPTY_STRUCTURED_METADATA, labels, false) {
+            (MetricRun::Dropped, has_err) => (None, has_err),
+            (MetricRun::Kept { line, .. }, has_err) => (Some(line), has_err),
         }
     }
 
@@ -579,16 +812,23 @@ impl CompiledPipeline {
         base: &'a [(String, String)],
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> MetricRun<'a> {
-        self.run_mode_into(body, base, labels, true)
+        // `MetricScanRow` carries no structured metadata (issue #249), so the
+        // metric path always seeds empty slots.
+        self.run_mode_into(body, base, &EMPTY_STRUCTURED_METADATA, labels, true)
+            .0
     }
 
+    /// The second element of the return is the reference's `HasErr()` at the
+    /// end of the pipeline — the pre-materialization slot state
+    /// [`CompiledPipeline::run_into_reporting_err`] surfaces.
     fn run_mode_into<'a>(
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
+        sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
         metric: bool,
-    ) -> MetricRun<'a> {
+    ) -> (MetricRun<'a>, bool) {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
         let mut value: Option<f64> = None;
         labels.clear();
@@ -596,6 +836,14 @@ impl CompiledPipeline {
             base.iter()
                 .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str()))),
         );
+        // Seed the out-of-band pair from the row's structured-metadata
+        // routing outcome (issue #238): a `Cow::Borrowed("")` seed is exactly
+        // the `Default`, so the no-SM path is bit-identical to pre-#238.
+        let mut errs = ErrorSlots {
+            err: Cow::Borrowed(sm.err.as_str()),
+            details: Cow::Borrowed(sm.details.as_str()),
+            dirty: sm.has_ordinary,
+        };
 
         for stage in &self.stages {
             match stage {
@@ -613,10 +861,12 @@ impl CompiledPipeline {
                     // `!=`/`!~` keep the line iff NONE of the alternatives match.
                     let keep = if *negated { !hit } else { hit };
                     if !keep {
-                        return MetricRun::Dropped;
+                        return (MetricRun::Dropped, errs.has_err());
                     }
                 }
-                CompiledStage::Json { extractions } => run_json(&line, extractions, labels),
+                CompiledStage::Json { extractions } => {
+                    run_json(&line, extractions, labels, &mut errs)
+                }
                 CompiledStage::Logfmt {
                     strict,
                     keep_empty,
@@ -627,14 +877,24 @@ impl CompiledPipeline {
                     // (`line_format`-owned) line cannot be borrowed past
                     // its own reassignment, so its captures are copied.
                     match &line {
-                        Cow::Borrowed(text) => {
-                            run_logfmt(text, *strict, *keep_empty, extractions, labels, |c| c)
-                        }
-                        Cow::Owned(text) => {
-                            run_logfmt(text, *strict, *keep_empty, extractions, labels, |c| {
-                                Cow::Owned(c.into_owned())
-                            })
-                        }
+                        Cow::Borrowed(text) => run_logfmt(
+                            text,
+                            *strict,
+                            *keep_empty,
+                            extractions,
+                            labels,
+                            &mut errs,
+                            |c| c,
+                        ),
+                        Cow::Owned(text) => run_logfmt(
+                            text,
+                            *strict,
+                            *keep_empty,
+                            extractions,
+                            labels,
+                            &mut errs,
+                            |c| Cow::Owned(c.into_owned()),
+                        ),
                     }
                 }
                 CompiledStage::Regexp(re) => {
@@ -648,6 +908,7 @@ impl CompiledPipeline {
                                             labels,
                                             Cow::Borrowed(name),
                                             Cow::Borrowed(m.as_str()),
+                                            &mut errs.dirty,
                                         );
                                     }
                                 }
@@ -661,6 +922,7 @@ impl CompiledPipeline {
                                             labels,
                                             Cow::Borrowed(name),
                                             Cow::Owned(m.as_str().to_string()),
+                                            &mut errs.dirty,
                                         );
                                     }
                                 }
@@ -682,6 +944,7 @@ impl CompiledPipeline {
                                         labels,
                                         Cow::Borrowed(name),
                                         Cow::Borrowed(value),
+                                        &mut errs.dirty,
                                     );
                                 });
                             }
@@ -693,6 +956,7 @@ impl CompiledPipeline {
                                         labels,
                                         Cow::Borrowed(name),
                                         Cow::Owned(value.to_string()),
+                                        &mut errs.dirty,
                                     );
                                 });
                             }
@@ -707,36 +971,42 @@ impl CompiledPipeline {
                     // still absorb this into a definite `Some`, masking the
                     // error entirely, so masked lines never allocate.
                     let mut failed: Option<(UnitKind, &str)> = None;
-                    match eval_label_filter(filter, labels, &mut failed) {
+                    match eval_label_filter(filter, labels, &errs, &mut failed) {
                         Some(true) => {}
-                        Some(false) => return MetricRun::Dropped,
+                        Some(false) => return (MetricRun::Dropped, errs.has_err()),
                         // Conversion failure: keep the line, tag the error
-                        // class (pinned semantics, oracle-verified; a later
-                        // `__error__=""` filter drops it). Build the owned
-                        // detail from the borrowed `raw` before the first
-                        // `set_label` mutation (NLL: the borrow of `labels`
-                        // held by `failed` must end before `labels` is
-                        // mutated).
+                        // class in the out-of-band slots (pinned semantics,
+                        // oracle-verified; a later `__error__=""` filter
+                        // drops it) — but ONLY when no earlier error is set:
+                        // the reference guards every numeric-family write on
+                        // `!lbs.HasErr()` (`label_filter.go:184`, `:204`,
+                        // `:252`, `:272`, `:315`, `:335` — "first error
+                        // wins", live-probed). When the guard blocks, the
+                        // detail `String` is never built (alloc budget).
                         None => {
-                            let details =
-                                failed.map(|(kind, value)| label_filter_error_details(kind, value));
-                            set_label(
-                                labels,
-                                Cow::Borrowed(ERROR_LABEL),
-                                Cow::Borrowed("LabelFilterErr"),
-                            );
-                            if let Some(details) = details {
-                                set_label(
-                                    labels,
-                                    Cow::Borrowed(ERROR_DETAILS_LABEL),
-                                    Cow::Owned(details),
-                                );
+                            if !errs.has_err() {
+                                let details = failed
+                                    .map(|(kind, value)| label_filter_error_details(kind, value));
+                                errs.set_err(Cow::Borrowed("LabelFilterErr"));
+                                if let Some(details) = details {
+                                    errs.set_details(Cow::Owned(details));
+                                }
                             }
                         }
                     }
                 }
-                CompiledStage::LineFormat(tmpl) => {
-                    line = Cow::Owned(render_template(tmpl, labels));
+                CompiledStage::LineFormat { tmpl, reads_err } => {
+                    // A single template: the error-pair gate is evaluated
+                    // inline at this stage (no `StageMap` needed), and only
+                    // when the compile-time `reads_err` flag says some field
+                    // names the pair — every other `line_format` keeps the
+                    // slot-blind zero-copy render (issue #238).
+                    line = Cow::Owned(if *reads_err {
+                        let errors_visible = errs.dirty || errs.has_err();
+                        render_template_with_errors(tmpl, labels, &errs, errors_visible)
+                    } else {
+                        render_template(tmpl, labels)
+                    });
                 }
                 CompiledStage::LabelFormat {
                     fmts,
@@ -753,45 +1023,96 @@ impl CompiledPipeline {
                     //
                     // `None` here means "the map is still empty", mirroring the
                     // reference's own `if len(m) == 0 { IntoMap(m) }` refill
-                    // guard: while the label set is empty the map is rebuilt at
-                    // every template, which is exactly live rendering (reachable
-                    // by `| drop`-ing every label — live-probed). The clone is
-                    // taken at most once per line and only for the stages whose
-                    // result can actually differ (`needs_snapshot`, decided at
-                    // compile time), so ordinary `label_format` stages stay
-                    // allocation-free here.
-                    let mut snapshot: Option<Vec<(Cow<'a, str>, Cow<'a, str>)>> = None;
+                    // guard: while the map is empty it is rebuilt at every
+                    // template, which is exactly live rendering (reachable by
+                    // `| drop`-ing every label — live-probed). The map is
+                    // empty iff the vector is empty AND neither error slot is
+                    // VISIBLE (`errs.visible()` — a lone gated-off details
+                    // slot does not make it non-empty, issue #238). The clone
+                    // is taken at most once per line and only for the stages
+                    // whose result can actually differ (`needs_snapshot`,
+                    // decided at compile time), so ordinary `label_format`
+                    // stages stay allocation-free here. The error-pair gate
+                    // (`errors_visible`) is captured ONCE, at map build —
+                    // `dirty` flips as elements `Set`/`Del`, and a
+                    // per-template re-read would diverge (StageMap doc).
+                    //
+                    // `errs` itself is INVARIANT across this stage: no
+                    // element can write the slots (`__error__` is a
+                    // compile-time 400, `__error_details__` writes the
+                    // vector, and the `{{.label}}`-only subset has no
+                    // template-execution failure path — `fmt.go:426-429` is
+                    // unreachable by type, U5). Only `dirty` changes.
+                    let mut map: Option<StageMap<'a>> = None;
                     for f in fmts {
                         match f {
                             CompiledLabelFmt::Rename { dst, src } => {
                                 // Loki `LabelsFormatter.Process` (fmt.go:414-419):
                                 // the rename runs only when the source resolves
-                                // present; an absent source is a complete no-op and
-                                // dst is NOT created. A present (even empty) source
-                                // still renames — matches Loki's parsed-empty case
-                                // (`Set(dst,"")`+`Del(src)`). Empty *stream* labels
-                                // are non-ingestable (both engines drop them at
-                                // write), so this guard matches Loki for every
-                                // reachable input (#226).
+                                // present — from the LABEL SET only
+                                // (`GetWithCategory`, labels.go:293-314): the
+                                // out-of-band error slots are invisible here, so
+                                // `label_format x=__error__` on a slot-errored
+                                // line is a complete no-op while a parser-
+                                // extracted vector `__error__` DOES rename
+                                // (both live-probed, issue #238). An absent
+                                // source is a complete no-op and dst is NOT
+                                // created. A present (even empty) source still
+                                // renames — matches Loki's parsed-empty case
+                                // (`Set(dst,"")`+`Del(src)`). Empty *stream*
+                                // labels are non-ingestable (both engines drop
+                                // them at write), so this guard matches Loki for
+                                // every reachable input (#226). A resolved
+                                // rename runs `Set`+`Del` and therefore dirties
+                                // the builder (`fmt.go:416-418`).
                                 if let Some(value) = remove_label(labels, src) {
                                     set_label(labels, Cow::Borrowed(dst), value);
+                                    errs.dirty = true;
                                 }
                             }
-                            CompiledLabelFmt::Template { dst, tmpl } => {
-                                let rendered = if *needs_snapshot {
-                                    if snapshot.is_none() && !labels.is_empty() {
-                                        snapshot = Some(labels.clone());
+                            CompiledLabelFmt::RenameSelf { name } => {
+                                // `Set(dst, v)` THEN `Del(src)` with dst == src
+                                // net-deletes the label (`fmt.go:417-418`,
+                                // live-probed); resolved ⇒ dirty, unresolved ⇒
+                                // complete no-op (issue #238).
+                                if remove_label(labels, name).is_some() {
+                                    errs.dirty = true;
+                                }
+                            }
+                            CompiledLabelFmt::Template {
+                                dst,
+                                tmpl,
+                                reads_err,
+                            } => {
+                                if map.is_none() {
+                                    let (ve, vd) = errs.visible();
+                                    let m_empty = labels.is_empty() && ve.is_none() && vd.is_none();
+                                    if !m_empty {
+                                        map = Some(StageMap {
+                                            snapshot: needs_snapshot.then(|| labels.clone()),
+                                            errors_visible: errs.dirty || errs.has_err(),
+                                        });
                                     }
-                                    match &snapshot {
-                                        Some(snap) => render_template(tmpl, snap),
-                                        // Label set empty ⇒ the reference's map
-                                        // is empty too; every field renders "".
-                                        None => render_template(tmpl, labels),
-                                    }
+                                }
+                                let render_labels: &[(Cow<'a, str>, Cow<'a, str>)] = map
+                                    .as_ref()
+                                    .and_then(|m| m.snapshot.as_deref())
+                                    .unwrap_or(labels);
+                                let errors_visible = map.as_ref().is_some_and(|m| m.errors_visible);
+                                let rendered = if *reads_err {
+                                    render_template_with_errors(
+                                        tmpl,
+                                        render_labels,
+                                        &errs,
+                                        errors_visible,
+                                    )
                                 } else {
-                                    render_template(tmpl, labels)
+                                    render_template(tmpl, render_labels)
                                 };
                                 set_label(labels, Cow::Borrowed(dst), Cow::Owned(rendered));
+                                // Every template assignment is a `Set`
+                                // (`fmt.go:431`) — dirty.
+                                errs.dirty = true;
                             }
                         }
                     }
@@ -806,7 +1127,7 @@ impl CompiledPipeline {
                     let Some(raw) = get_label(labels, label) else {
                         // Oracle-probed: a line without the unwrap label
                         // is silently skipped, never an error.
-                        return MetricRun::Dropped;
+                        return (MetricRun::Dropped, errs.has_err());
                     };
                     match convert_label_value(*kind, raw) {
                         Some(v) => {
@@ -824,19 +1145,14 @@ impl CompiledPipeline {
                             // Go-stdlib parse-error string the label-filter
                             // family renders — `unwrap` and `| <label> <op>`
                             // share the conversion, oracle-confirmed
-                            // byte-exact (issue #104). Compute the detail
-                            // from `raw` before mutating `labels`.
+                            // byte-exact (issue #104). The write is
+                            // UNGUARDED, unlike the numeric-filter family —
+                            // the reference has no `HasErr` check here
+                            // (`metrics_extraction.go:222-223`). Compute the
+                            // detail from `raw` before mutating the slots.
                             let detail = label_filter_error_details(*kind, raw);
-                            set_label(
-                                labels,
-                                Cow::Borrowed(ERROR_LABEL),
-                                Cow::Borrowed(SAMPLE_EXTRACTION_ERROR),
-                            );
-                            set_label(
-                                labels,
-                                Cow::Borrowed(ERROR_DETAILS_LABEL),
-                                Cow::Owned(detail),
-                            );
+                            errs.set_err(Cow::Borrowed(SAMPLE_EXTRACTION_ERROR));
+                            errs.set_details(Cow::Owned(detail));
                             value = None;
                         }
                     }
@@ -846,7 +1162,7 @@ impl CompiledPipeline {
                     // (owned) when present. The immutable borrow of `line`
                     // ends when `run_unpack` returns, so reassigning `line`
                     // afterward is sound.
-                    if let Some(entry) = run_unpack(line.as_ref(), labels) {
+                    if let Some(entry) = run_unpack(line.as_ref(), labels, &mut errs) {
                         line = Cow::Owned(entry);
                     }
                 }
@@ -864,20 +1180,57 @@ impl CompiledPipeline {
                 }
                 CompiledStage::Drop(elems) => {
                     for elem in elems {
-                        let drop = match &elem.matcher {
+                        // The error pair: reset the OUT-OF-BAND slot only —
+                        // bare form unconditionally, matcher form iff the
+                        // matcher matches the SLOT value — and `continue`
+                        // without touching a vector entry of that name and
+                        // without dirtying (`ResetError`/`ResetErrorDetails`
+                        // are not `Del`s — `drop_labels.go:51-58`, `:68-81`;
+                        // issue #238, live-probed: `| logfmt | json | drop
+                        // __error__` keeps the parsed vector `__error__`).
+                        if elem.label == ERROR_LABEL {
+                            let reset = match &elem.matcher {
+                                None => true,
+                                Some(m) => m.matches(errs.err_str()),
+                            };
+                            if reset {
+                                errs.reset_err();
+                            }
+                            continue;
+                        }
+                        if elem.label == ERROR_DETAILS_LABEL {
+                            let reset = match &elem.matcher {
+                                None => true,
+                                Some(m) => m.matches(errs.details_str()),
+                            };
+                            if reset {
+                                errs.reset_details();
+                            }
+                            continue;
+                        }
+                        match &elem.matcher {
                             // Bare label: drop unconditionally (a no-op when
-                            // the label is absent).
-                            None => true,
-                            // Matcher present: drop only when the current
-                            // value matches (a missing label is never a match).
-                            Some(m) => get_label(labels, &elem.label).is_some_and(|v| m.matches(v)),
-                        };
-                        if drop {
-                            remove_label(labels, &elem.label);
-                            // Dropping `__error__` clears its detail companion
-                            // too (they are one error record).
-                            if elem.label == ERROR_LABEL {
-                                remove_label(labels, ERROR_DETAILS_LABEL);
+                            // the label is absent — and only a PRESENT label
+                            // dirties, `drop_labels.go:59-61`).
+                            None => {
+                                if remove_label(labels, &elem.label).is_some() {
+                                    errs.dirty = true;
+                                }
+                            }
+                            // Matcher present: the matcher evaluates against
+                            // the value, or "" when the label is ABSENT, and
+                            // a match `Del`s (⇒ dirties) even then
+                            // (`drop_labels.go:80-82` Dels unconditionally on
+                            // a match; live-probed: `drop nosuch=""` dirties
+                            // the builder, `drop nosuch="zzz"` does not).
+                            // Removing an absent label stays a vector no-op.
+                            Some(m) => {
+                                let matched =
+                                    m.matches(get_label(labels, &elem.label).unwrap_or(""));
+                                if matched {
+                                    remove_label(labels, &elem.label);
+                                    errs.dirty = true;
+                                }
                             }
                         }
                     }
@@ -885,21 +1238,37 @@ impl CompiledPipeline {
                 CompiledStage::Keep(elems) => {
                     // Retain only labels matched by some element (a bare
                     // element retains its label; a matcher-qualified element
-                    // retains only on a value match).
+                    // retains only on a value match) — plus the reference's
+                    // special names, ALWAYS retained regardless of the list
+                    // (`keep_labels.go:22`, `:51-57`; issue #238). The
+                    // out-of-band slots are untouched; the builder dirties
+                    // iff at least one label was actually removed.
+                    let before = labels.len();
                     labels.retain(|(k, v)| {
-                        elems.iter().any(|elem| {
-                            elem.label == k.as_ref()
-                                && match &elem.matcher {
-                                    None => true,
-                                    Some(m) => m.matches(v),
-                                }
-                        })
+                        k == ERROR_LABEL
+                            || k == ERROR_DETAILS_LABEL
+                            || k == PRESERVE_ERROR_LABEL
+                            || elems.iter().any(|elem| {
+                                elem.label == k.as_ref()
+                                    && match &elem.matcher {
+                                        None => true,
+                                        Some(m) => m.matches(v),
+                                    }
+                            })
                     });
+                    if labels.len() != before {
+                        errs.dirty = true;
+                    }
                 }
             }
         }
 
-        MetricRun::Kept { line, value }
+        // The ONE merge point (`appendErrors` over the `visible()` gate):
+        // kept lines only — a dropped line never merges (issue #238). The
+        // slot state is captured BEFORE the merge consumes the slots.
+        let has_err = errs.has_err();
+        errs.merge_into(labels);
+        (MetricRun::Kept { line, value }, has_err)
     }
 }
 
@@ -1612,14 +1981,28 @@ fn compile_label_format(fmts: &[LabelFmt]) -> Result<CompiledStage, PipelineErro
         }
         dsts.push(dst);
         out.push(match f {
+            // The self-rename (`x=x`) splits at COMPILE time: the reference
+            // runs `Set(dst, v)` then `Del(src)` (`fmt.go:417-418`), so equal
+            // names net-DELETE a resolved source (issue #238). The reserved-
+            // destination and duplicate-destination rejections above run
+            // BEFORE this split, so `label_format __error__=__error__` stays
+            // a 400.
+            LabelFmt::Rename { dst, src } if dst == src => {
+                CompiledLabelFmt::RenameSelf { name: dst.clone() }
+            }
             LabelFmt::Rename { dst, src } => CompiledLabelFmt::Rename {
                 dst: dst.clone(),
                 src: src.clone(),
             },
-            LabelFmt::Template { dst, tmpl } => CompiledLabelFmt::Template {
-                dst: dst.clone(),
-                tmpl: compile_template(tmpl)?,
-            },
+            LabelFmt::Template { dst, tmpl } => {
+                let parts = compile_template(tmpl)?;
+                let reads_err = template_reads_error_pair(&parts);
+                CompiledLabelFmt::Template {
+                    dst: dst.clone(),
+                    tmpl: parts,
+                    reads_err,
+                }
+            }
         });
     }
     Ok(CompiledStage::LabelFormat {
@@ -1646,7 +2029,7 @@ fn label_format_needs_snapshot(fmts: &[CompiledLabelFmt]) -> bool {
     let mut seen_template = false;
     for f in fmts {
         match f {
-            CompiledLabelFmt::Template { dst, tmpl } => {
+            CompiledLabelFmt::Template { dst, tmpl, .. } => {
                 let reads_mutated = tmpl.iter().any(|part| match part {
                     TmplPart::Field(name) => mutated.contains(&name.as_str()),
                     TmplPart::Lit(_) => false,
@@ -1663,9 +2046,27 @@ fn label_format_needs_snapshot(fmts: &[CompiledLabelFmt]) -> bool {
                     mutated.push(src.as_str());
                 }
             }
+            // A self-rename mutates exactly one name (destination == source
+            // — a resolved one deletes it), so one push, not two (#238).
+            CompiledLabelFmt::RenameSelf { name } => {
+                if seen_template {
+                    mutated.push(name.as_str());
+                }
+            }
         }
     }
     false
+}
+
+/// True iff some field in the template names `__error__`/`__error_details__`
+/// — decided once per query at compile time (issue #238), so every template
+/// that does not name the pair keeps the slot-blind zero-copy
+/// [`render_template`] path.
+fn template_reads_error_pair(parts: &[TmplPart]) -> bool {
+    parts.iter().any(|part| match part {
+        TmplPart::Field(name) => name == ERROR_LABEL || name == ERROR_DETAILS_LABEL,
+        TmplPart::Lit(_) => false,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1704,16 +2105,22 @@ fn remove_label<'a>(
 /// overwrites the `_extracted` slot). Allocation-lean: an already-valid
 /// key passes through as-is (borrowed where the caller borrowed it) —
 /// sanitization and the collision rename are the only allocating paths.
+/// Every call is a `Set` on the reference's builder, so it marks the
+/// builder `dirty` (`labels.go:216-222`; issue #238) — a parser that
+/// writes nothing (e.g. a failed `json` parse) never reaches here and
+/// therefore does not dirty.
 fn add_extracted<'a>(
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     key: Cow<'a, str>,
     value: Cow<'a, str>,
+    dirty: &mut bool,
 ) {
     let sanitized: Cow<'a, str> = if key_needs_sanitizing(&key) {
         Cow::Owned(sanitize_label_key(&key))
     } else {
         key
     };
+    *dirty = true;
     if get_label(labels, &sanitized).is_some() {
         set_label(labels, Cow::Owned(format!("{sanitized}_extracted")), value);
     } else {
@@ -1744,15 +2151,17 @@ fn sanitize_label_key(key: &str) -> String {
     out
 }
 
-fn render_template(parts: &[TmplPart], labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> String {
-    // Exact presize (one sizing pass over tiny part/label lists) so the
-    // render is a single allocation per row, never a growth series —
-    // the allocation-regression suite pins this (review round 2).
+/// The shared renderer, generic over the field lookup so BOTH callers
+/// monomorphize to a branch-free loop (issue #238). Exact presize (one
+/// sizing pass over tiny part/label lists) so the render is a single
+/// allocation per row, never a growth series — the allocation-regression
+/// suite pins this (review round 2).
+fn render_with<'l>(parts: &[TmplPart], lookup: impl Fn(&str) -> &'l str) -> String {
     let cap: usize = parts
         .iter()
         .map(|part| match part {
             TmplPart::Lit(s) => s.len(),
-            TmplPart::Field(name) => get_label(labels, name).map_or(0, str::len),
+            TmplPart::Field(name) => lookup(name).len(),
         })
         .sum();
     let mut out = String::with_capacity(cap);
@@ -1761,10 +2170,36 @@ fn render_template(parts: &[TmplPart], labels: &[(Cow<'_, str>, Cow<'_, str>)]) 
             TmplPart::Lit(s) => out.push_str(s),
             // A missing field renders empty (pinned semantics, plan v3
             // delta 8 / AC2).
-            TmplPart::Field(name) => out.push_str(get_label(labels, name).unwrap_or("")),
+            TmplPart::Field(name) => out.push_str(lookup(name)),
         }
     }
     out
+}
+
+fn render_template(parts: &[TmplPart], labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> String {
+    render_with(parts, |name| get_label(labels, name).unwrap_or(""))
+}
+
+/// [`render_template`] with the out-of-band error pair in the data map
+/// (issue #238): when the gate captured at map-build time is open, a
+/// NON-EMPTY slot overrides a same-named vector entry (the reference
+/// appends the slots LAST — `labels.go:516-521`); an empty slot falls
+/// through to the vector, matching `appendErrors` never appending an
+/// empty slot. Selected only for templates whose compile-time `reads_err`
+/// flag is set.
+fn render_template_with_errors(
+    parts: &[TmplPart],
+    labels: &[(Cow<'_, str>, Cow<'_, str>)],
+    errs: &ErrorSlots<'_>,
+    errors_visible: bool,
+) -> String {
+    render_with(parts, |name| {
+        if errors_visible && let Some(v) = errs.raw_slot(name) {
+            v
+        } else {
+            get_label(labels, name).unwrap_or("")
+        }
+    })
 }
 
 /// Three-valued label-filter evaluation: `Some(true)` keep, `Some(false)`
@@ -1780,6 +2215,7 @@ fn render_template(parts: &[TmplPart], labels: &[(Cow<'_, str>, Cow<'_, str>)]) 
 fn eval_label_filter<'v>(
     f: &CompiledLabelFilter,
     labels: &'v [(Cow<'_, str>, Cow<'_, str>)],
+    errs: &ErrorSlots<'_>,
     failed: &mut Option<(UnitKind, &'v str)>,
 ) -> Option<bool> {
     match f {
@@ -1789,9 +2225,18 @@ fn eval_label_filter<'v>(
             value,
             re,
         } => {
-            // Prometheus matcher semantics: a missing label matches as
-            // the empty string.
-            let v = get_label(labels, name).unwrap_or("");
+            // `labelValue` (`label_filter.go:418-424`): `__error__` — and
+            // ONLY `__error__` — resolves the out-of-band slot; every other
+            // name, INCLUDING `__error_details__`, falls through to the
+            // vector (issue #238, live-probed: `| json | __error_details__
+            // != ""` matches nothing on an errored line). Prometheus
+            // matcher semantics otherwise: a missing label matches as the
+            // empty string — which an unset slot also reads as.
+            let v = if name == ERROR_LABEL {
+                errs.err_str()
+            } else {
+                get_label(labels, name).unwrap_or("")
+            };
             Some(match op {
                 MatchOp::Eq => v == value,
                 MatchOp::Neq => v != value,
@@ -1837,6 +2282,15 @@ fn eval_label_filter<'v>(
             matcher,
             negated,
         } => {
+            // `ip.go:123-127`: an errored line passes the ip filter
+            // UNCONDITIONALLY — for `=` AND `!=` alike — and the
+            // short-circuit reads the SLOT, not the vector (issue #238,
+            // live-probed: `| json | addr = ip(...)` and `!= ip(...)` both
+            // keep the errored line; after `drop __error__` both drop it,
+            // and a stream label `__error__` does NOT trip it).
+            if errs.has_err() {
+                return Some(true);
+            }
             // Reference v3.7.3 semantics (differential-authoritative): parse the
             // label value as an IP and test range membership. A missing label OR
             // an unparseable value is `match = false` — NEVER an error, so no
@@ -1850,8 +2304,8 @@ fn eval_label_filter<'v>(
         }
         CompiledLabelFilter::And(a, b) => {
             match (
-                eval_label_filter(a, labels, failed),
-                eval_label_filter(b, labels, failed),
+                eval_label_filter(a, labels, errs, failed),
+                eval_label_filter(b, labels, errs, failed),
             ) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
@@ -1860,8 +2314,8 @@ fn eval_label_filter<'v>(
         }
         CompiledLabelFilter::Or(a, b) => {
             match (
-                eval_label_filter(a, labels, failed),
-                eval_label_filter(b, labels, failed),
+                eval_label_filter(a, labels, errs, failed),
+                eval_label_filter(b, labels, errs, failed),
             ) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -1883,22 +2337,19 @@ fn run_json<'a>(
     line: &str,
     extractions: &'a [(String, Vec<JsonPathSeg>)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    errs: &mut ErrorSlots<'a>,
 ) {
     let parsed: serde_json::Value = match serde_json::from_str(line) {
         Ok(v @ serde_json::Value::Object(_)) => v,
         // A non-object top level (or a parse failure) is the malformed
-        // class: line kept, error tagged, detail recorded on both paths.
+        // class: line kept, error tagged in the out-of-band slots
+        // (UNGUARDED — the reference's parser error write has no `HasErr`
+        // check, `parser.go:437-444`), detail recorded on both paths. No
+        // label is written, so a failed parse does NOT dirty the builder
+        // (issue #238 — the details-visibility gate depends on this).
         _ => {
-            set_label(
-                labels,
-                Cow::Borrowed(ERROR_LABEL),
-                Cow::Borrowed("JSONParserErr"),
-            );
-            set_label(
-                labels,
-                Cow::Borrowed(ERROR_DETAILS_LABEL),
-                Cow::Borrowed(JSON_ERROR_DETAILS),
-            );
+            errs.set_err(Cow::Borrowed("JSONParserErr"));
+            errs.set_details(Cow::Borrowed(JSON_ERROR_DETAILS));
             return;
         }
     };
@@ -1906,14 +2357,19 @@ fn run_json<'a>(
         let mut extracted = Vec::new();
         flatten_json("", &parsed, &mut extracted);
         for (k, v) in extracted {
-            add_extracted(labels, Cow::Owned(k), Cow::Owned(v));
+            add_extracted(labels, Cow::Owned(k), Cow::Owned(v), &mut errs.dirty);
         }
     } else {
         for (label, path) in extractions {
             let value = lookup_json_path(&parsed, path)
                 .map(json_scalar_to_string)
                 .unwrap_or_default();
-            add_extracted(labels, Cow::Borrowed(label.as_str()), Cow::Owned(value));
+            add_extracted(
+                labels,
+                Cow::Borrowed(label.as_str()),
+                Cow::Owned(value),
+                &mut errs.dirty,
+            );
         }
     }
 }
@@ -1974,20 +2430,17 @@ fn json_scalar_to_string(v: &serde_json::Value) -> String {
 /// parse failure keeps the line and tags `__error__="JSONParserErr"` with
 /// the representative detail — the same malformed class `json` reports.
 /// Returns `Some(new_line)` only when a string `_entry` field was present.
-fn run_unpack<'a>(line: &str, labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) -> Option<String> {
+fn run_unpack<'a>(
+    line: &str,
+    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    errs: &mut ErrorSlots<'a>,
+) -> Option<String> {
     let map = match serde_json::from_str::<serde_json::Value>(line) {
         Ok(serde_json::Value::Object(map)) => map,
+        // Slot write, no label, no dirty — see `run_json` (issue #238).
         _ => {
-            set_label(
-                labels,
-                Cow::Borrowed(ERROR_LABEL),
-                Cow::Borrowed("JSONParserErr"),
-            );
-            set_label(
-                labels,
-                Cow::Borrowed(ERROR_DETAILS_LABEL),
-                Cow::Borrowed(JSON_ERROR_DETAILS),
-            );
+            errs.set_err(Cow::Borrowed("JSONParserErr"));
+            errs.set_details(Cow::Borrowed(JSON_ERROR_DETAILS));
             return None;
         }
     };
@@ -1998,7 +2451,7 @@ fn run_unpack<'a>(line: &str, labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) ->
             if k == "_entry" {
                 new_line = Some(s);
             } else {
-                add_extracted(labels, Cow::Owned(k), Cow::Owned(s));
+                add_extracted(labels, Cow::Owned(k), Cow::Owned(s), &mut errs.dirty);
             }
         }
     }
@@ -2023,6 +2476,7 @@ fn run_logfmt<'a, 't>(
     keep_empty: bool,
     extractions: &'a [(String, String)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    errs: &mut ErrorSlots<'a>,
     to_cow: impl Fn(Cow<'t, str>) -> Cow<'a, str>,
 ) {
     let result = if extractions.is_empty() {
@@ -2030,7 +2484,7 @@ fn run_logfmt<'a, 't>(
             if !keep_empty && v.is_empty() {
                 return;
             }
-            add_extracted(labels, to_cow(Cow::Borrowed(k)), to_cow(v));
+            add_extracted(labels, to_cow(Cow::Borrowed(k)), to_cow(v), &mut errs.dirty);
         })
     } else {
         // Targeted extraction: resolve each requested source key to its
@@ -2052,23 +2506,23 @@ fn run_logfmt<'a, 't>(
             if !keep_empty && value.is_empty() {
                 continue;
             }
-            add_extracted(labels, Cow::Borrowed(label.as_str()), value);
+            add_extracted(
+                labels,
+                Cow::Borrowed(label.as_str()),
+                value,
+                &mut errs.dirty,
+            );
         }
         err
     };
     if let Err(err) = result
         && strict
     {
-        set_label(
-            labels,
-            Cow::Borrowed(ERROR_LABEL),
-            Cow::Borrowed("LogfmtParserErr"),
-        );
-        set_label(
-            labels,
-            Cow::Borrowed(ERROR_DETAILS_LABEL),
-            Cow::Owned(logfmt_error_details(err)),
-        );
+        // Slot writes (UNGUARDED — the reference's parser error write has no
+        // `HasErr` check); the pairs already emitted above dirtied per label
+        // (issue #238).
+        errs.set_err(Cow::Borrowed("LogfmtParserErr"));
+        errs.set_details(Cow::Owned(logfmt_error_details(err)));
     }
 }
 
@@ -2982,5 +3436,700 @@ mod tests {
             got.contains(&(ERROR_DETAILS_LABEL.to_string(), "boom".to_string())),
             "{got:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #238: the out-of-band error pair — pipeline-path rows of the
+    // Delta C''.3 matrix (structured-metadata shapes enter through a
+    // pre-routed `StructuredMetadataCtx`; the raw-SM → ctx routing itself
+    // is pinned in `exec.rs`'s tests, which assert these exact
+    // merged-base/ctx pairs). Every expected set is a literal reference
+    // capture (grafana/loki:3.7.4, discover_log_levels: false). Each test
+    // names its row id and the wrong rule(s) it kills; `DET` is the fixed
+    // JSONParserErr detail.
+    // -----------------------------------------------------------------
+
+    fn sm(err: &str, details: &str, has_ordinary: bool) -> StructuredMetadataCtx {
+        StructuredMetadataCtx {
+            err: err.to_string(),
+            details: details.to_string(),
+            has_ordinary,
+        }
+    }
+
+    /// Runs `query` over `body` with the given (post-routing) merged base
+    /// and SM ctx; returns the sorted emitted label set, `None` = dropped.
+    fn run_sm_labels(
+        query: &str,
+        body: &str,
+        base: &[(&str, &str)],
+        sm: &StructuredMetadataCtx,
+    ) -> Option<Vec<(String, String)>> {
+        let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+        let base: Vec<(String, String)> = base
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let mut labels = Vec::new();
+        compiled.run_into_with_sm(body, &base, sm, &mut labels)?;
+        let mut got: Vec<(String, String)> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        got.sort();
+        Some(got)
+    }
+
+    const DET: &str = JSON_ERROR_DETAILS;
+
+    /// C1 (kills W5): no SM, `| json | drop __error__` — clean builder, the
+    /// lone details slot is invisible.
+    #[test]
+    fn c1_bare_drop_on_a_clean_builder_hides_the_details() {
+        let got = run_sm_labels(
+            r#"{x="y"} | json | drop __error__"#,
+            "a=Hello b=World",
+            &[("service_name", "v0")],
+            &EMPTY_STRUCTURED_METADATA,
+        );
+        assert_eq!(got, Some(owned(&[("service_name", "v0")])));
+    }
+
+    /// C2 (kills W12; the dirty-seed site's killer): ordinary SM dirties the
+    /// builder, so the orphaned details DO surface — even with no error set
+    /// (`HasErr() || HasErrorDetails()` is an OR, `labels.go:519`).
+    #[test]
+    fn c2_ordinary_sm_dirt_surfaces_the_orphaned_details() {
+        let got = run_sm_labels(
+            r#"{x="y"} | json | drop __error__"#,
+            "a=Hello b=World",
+            &[("service_name", "v1"), ("trace_id", "abc")],
+            &sm("", "", true),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_DETAILS_LABEL, DET),
+                ("service_name", "v1"),
+                ("trace_id", "abc"),
+            ]))
+        );
+    }
+
+    /// C3 (kills W11, W13, and W15 on the pipeline path): a reserved-err SM
+    /// entry emits on a CLEAN builder (`HasErr` opens the gate by itself),
+    /// and no empty `__error_details__` is fabricated.
+    #[test]
+    fn c3_reserved_err_sm_emits_on_a_clean_builder() {
+        let got = run_sm_labels(
+            r#"{x="y"}"#,
+            "a=Hello b=World",
+            &[("service_name", "v2")],
+            &sm("boom", "", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[(ERROR_LABEL, "boom"), ("service_name", "v2")]))
+        );
+    }
+
+    /// C4 (kills W1, W5, W8): the reserved SM entry lives in the SLOT, so
+    /// `drop __error__` resets it (json's error overwrote "boom" first) and
+    /// — the builder being clean — nothing survives.
+    #[test]
+    fn c4_reserved_err_sm_is_droppable_and_leaves_a_clean_builder() {
+        let got = run_sm_labels(
+            r#"{x="y"} | json | drop __error__"#,
+            "a=Hello b=World",
+            &[("service_name", "v2")],
+            &sm("boom", "", false),
+        );
+        assert_eq!(got, Some(owned(&[("service_name", "v2")])));
+    }
+
+    /// C5 (kills W1, W5, W8): a lone reserved-details SM entry is invisible
+    /// on the bare (pipeline-path) selector.
+    #[test]
+    fn c5_reserved_details_sm_alone_is_invisible() {
+        let got = run_sm_labels(
+            r#"{x="y"}"#,
+            "a=Hello b=World",
+            &[("service_name", "v3")],
+            &sm("", "bdet", false),
+        );
+        assert_eq!(got, Some(owned(&[("service_name", "v3")])));
+    }
+
+    /// C6 (kills W1, W8, W12): mixed reserved-err + ordinary SM — after the
+    /// drop the details surface (dirty) but no `__error__` survives.
+    #[test]
+    fn c6_mixed_sm_drop_err_keeps_details_only() {
+        let got = run_sm_labels(
+            r#"{x="y"} | json | drop __error__"#,
+            "a=Hello b=World",
+            &[("service_name", "v9"), ("trace_id", "abc")],
+            &sm("boom", "", true),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_DETAILS_LABEL, DET),
+                ("service_name", "v9"),
+                ("trace_id", "abc"),
+            ]))
+        );
+    }
+
+    /// C8 (the ONLY killer of W6a; also kills W3a, W12): a STREAM label
+    /// `__error__` is a vector entry — `drop __error__` resets the slot and
+    /// must NOT remove it.
+    #[test]
+    fn c8_drop_error_never_removes_a_vector_entry_of_that_name() {
+        let got = run_sm_labels(
+            r#"{x="y"} | json | drop __error__"#,
+            "a=Hello b=World",
+            &[
+                ("__error__", "streamerr"),
+                ("service_name", "v10"),
+                ("__error___extracted", "boom"),
+            ],
+            &sm("", "", true),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                ("__error__", "streamerr"),
+                ("__error___extracted", "boom"),
+                (ERROR_DETAILS_LABEL, DET),
+                ("service_name", "v10"),
+            ]))
+        );
+    }
+
+    /// C10 (kills W1, W2): an empty reserved-err SM value contributes no
+    /// label at all on the bare (pipeline-path) selector.
+    #[test]
+    fn c10_empty_reserved_err_sm_emits_nothing() {
+        let got = run_sm_labels(
+            r#"{x="y"}"#,
+            "a=Hello b=World",
+            &[("service_name", "v4")],
+            &sm("", "", false),
+        );
+        assert_eq!(got, Some(owned(&[("service_name", "v4")])));
+    }
+
+    /// C9 (kills W10a): the string `__error__` filter reads the SLOT — empty
+    /// here — never the stream-label vector entry.
+    #[test]
+    fn c9_error_match_filter_reads_the_slot_not_the_vector() {
+        let base = &[
+            ("__error__", "streamerr"),
+            ("service_name", "v10"),
+            ("__error___extracted", "boom"),
+        ];
+        let kept = run_sm_labels(
+            r#"{x="y"} | __error__ = """#,
+            "a=Hello b=World",
+            base,
+            &sm("", "", true),
+        );
+        assert!(kept.is_some(), "slot is empty -> `= \"\"` keeps the line");
+        let dropped = run_sm_labels(
+            r#"{x="y"} | __error__ = "streamerr""#,
+            "a=Hello b=World",
+            base,
+            &sm("", "", true),
+        );
+        assert!(dropped.is_none(), "the stream label must not satisfy it");
+    }
+
+    /// C11 (kills W2): an EMPTY reserved-err SM value is an UNSET slot — no
+    /// `ip()` short-circuit, and the absent `addr` drops the line.
+    #[test]
+    fn c11_empty_reserved_err_sm_does_not_trip_the_ip_short_circuit() {
+        let got = run_sm_labels(
+            r#"{x="y"} | addr = ip("1.2.3.4")"#,
+            "a=Hello b=World",
+            &[("service_name", "v4")],
+            &sm("", "", false),
+        );
+        assert_eq!(got, None);
+    }
+
+    /// C12 (kills W2): an empty err slot does NOT block the numeric-filter
+    /// error write (`!HasErr()` is `err != ""`).
+    #[test]
+    fn c12_empty_err_slot_does_not_block_the_label_filter_error() {
+        let got = run_sm_labels(
+            r#"{x="y"} | logfmt | a > 5"#,
+            "a=Hello b=World",
+            &[("service_name", "v4")],
+            &sm("", "", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_LABEL, "LabelFilterErr"),
+                (
+                    ERROR_DETAILS_LABEL,
+                    "strconv.ParseFloat: parsing \"Hello\": invalid syntax"
+                ),
+                ("a", "Hello"),
+                ("b", "World"),
+                ("service_name", "v4"),
+            ]))
+        );
+    }
+
+    /// C12's contrast partner (first error wins): a NON-empty err slot
+    /// blocks the write.
+    #[test]
+    fn c12b_reserved_err_sm_blocks_the_label_filter_error() {
+        let got = run_sm_labels(
+            r#"{x="y"} | logfmt | a > 5"#,
+            "a=Hello b=World",
+            &[("service_name", "v2")],
+            &sm("boom", "", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_LABEL, "boom"),
+                ("a", "Hello"),
+                ("b", "World"),
+                ("service_name", "v2"),
+            ]))
+        );
+    }
+
+    /// C13 (kills W1, W2, W5): empty err + non-empty details, clean builder
+    /// — nothing emits.
+    #[test]
+    fn c13_empty_err_plus_details_on_a_clean_builder_emits_nothing() {
+        let got = run_sm_labels(
+            r#"{x="y"}"#,
+            "a=Hello b=World",
+            &[("service_name", "v6")],
+            &sm("", "bdet", false),
+        );
+        assert_eq!(got, Some(owned(&[("service_name", "v6")])));
+    }
+
+    /// C14 (kills W1, W2): both reserved values empty — nothing emits.
+    #[test]
+    fn c14_both_reserved_sm_values_empty_emit_nothing() {
+        let got = run_sm_labels(
+            r#"{x="y"}"#,
+            "a=Hello b=World",
+            &[("service_name", "v12")],
+            &sm("", "", false),
+        );
+        assert_eq!(got, Some(owned(&[("service_name", "v12")])));
+    }
+
+    /// C15 (kills W2): an EMPTY details slot does not mask a vector write.
+    #[test]
+    fn c15_empty_details_slot_does_not_mask_an_assignment() {
+        let got = run_sm_labels(
+            r#"{x="y"} | label_format __error_details__="boom""#,
+            "a=Hello b=World",
+            &[("service_name", "v5")],
+            &sm("", "", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_DETAILS_LABEL, "boom"),
+                ("service_name", "v5"),
+            ]))
+        );
+    }
+
+    /// C16 (kills W12, W13; C15's contrast partner): a NON-empty details
+    /// slot masks the same assignment once the Set dirties the builder —
+    /// and no empty `__error__` is fabricated next to it.
+    #[test]
+    fn c16_nonempty_details_slot_masks_the_assignment() {
+        let got = run_sm_labels(
+            r#"{x="y"} | label_format __error_details__="boom""#,
+            "a=Hello b=World",
+            &[("service_name", "v6")],
+            &sm("", "bdet", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_DETAILS_LABEL, "bdet"),
+                ("service_name", "v6"),
+            ]))
+        );
+    }
+
+    /// C19 (kills a gate-always-closed reading): details + ordinary SM
+    /// emit on the bare selector (dirty opens the gate).
+    #[test]
+    fn c19_details_with_ordinary_sm_emit_on_the_bare_selector() {
+        let got = run_sm_labels(
+            r#"{x="y"}"#,
+            "a=Hello b=World",
+            &[("service_name", "v11"), ("trace_id", "abc")],
+            &sm("", "bdet", true),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_DETAILS_LABEL, "bdet"),
+                ("service_name", "v11"),
+                ("trace_id", "abc"),
+            ]))
+        );
+    }
+
+    /// C20 (kills W2): the template gate was CLOSED at map build (clean
+    /// builder), so `d` renders empty — while the Set's dirt re-surfaces the
+    /// details at emit.
+    #[test]
+    fn c20_template_gate_closed_at_map_build_renders_empty() {
+        let got = run_sm_labels(
+            r#"{x="y"} | label_format d="[{{.__error_details__}}]""#,
+            "a=Hello b=World",
+            &[("service_name", "v6")],
+            &sm("", "bdet", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_DETAILS_LABEL, "bdet"),
+                ("d", "[]"),
+                ("service_name", "v6"),
+            ]))
+        );
+    }
+
+    /// C21 (the ONLY killer of W4, also kills W2): the gate is captured
+    /// ONCE per map build — the second template must NOT see the details
+    /// even though the first template's Set dirtied the builder.
+    #[test]
+    fn c21_the_map_gate_is_captured_once_not_per_template() {
+        let got = run_sm_labels(
+            r#"{x="y"} | label_format d="[{{.__error_details__}}]", e="[{{.__error_details__}}]""#,
+            "a=Hello b=World",
+            &[("service_name", "v6")],
+            &sm("", "bdet", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_DETAILS_LABEL, "bdet"),
+                ("d", "[]"),
+                ("e", "[]"),
+                ("service_name", "v6"),
+            ]))
+        );
+    }
+
+    /// C22 (kills W7 on the pipeline path): an EMPTY-valued ordinary SM
+    /// entry does not dirty the builder (`has_ordinary` counts non-empty
+    /// only), so the details stay invisible. The stray `trace_id=""` in the
+    /// base is the pre-existing ingest divergence #259 — its expectation
+    /// changes to the reference's `{sn}` when #259 lands; the
+    /// `__error_details__` half is reference-exact today.
+    #[test]
+    fn c22_empty_ordinary_sm_does_not_open_the_details_gate() {
+        let got = run_sm_labels(
+            r#"{x="y"} | json | drop __error__"#,
+            "a=Hello b=World",
+            &[("service_name", "w2"), ("trace_id", "")],
+            &sm("", "bdet", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[("service_name", "w2"), ("trace_id", "")]))
+        );
+    }
+
+    /// C23 — DECLARED REGRESSION PIN (evidence for no rule): every listed
+    /// reading yields the same outcome, because the slot value is "" and a
+    /// missing vector entry also reads "".
+    #[test]
+    fn c23_pin_empty_err_slot_matches_like_an_absent_label() {
+        let base = &[("service_name", "v4")];
+        assert!(
+            run_sm_labels(
+                r#"{x="y"} | __error__ = """#,
+                "a=Hello b=World",
+                base,
+                &sm("", "", false),
+            )
+            .is_some()
+        );
+        assert!(
+            run_sm_labels(
+                r#"{x="y"} | __error__ != """#,
+                "a=Hello b=World",
+                base,
+                &sm("", "", false),
+            )
+            .is_none()
+        );
+    }
+
+    /// C24 (regression pin for W12's neighborhood): empty details + ordinary
+    /// SM — the pipeline's own details emit under dirt.
+    #[test]
+    fn c24_empty_details_sm_with_ordinary_dirt_still_orphans_json_details() {
+        let got = run_sm_labels(
+            r#"{x="y"} | json | drop __error__"#,
+            "a=Hello b=World",
+            &[("service_name", "v8"), ("trace_id", "abc")],
+            &sm("", "", true),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_DETAILS_LABEL, DET),
+                ("service_name", "v8"),
+                ("trace_id", "abc"),
+            ]))
+        );
+    }
+
+    /// C26 (kills W3b on the pipeline path): base `__error_details__` + the
+    /// suffixed SM twin are BOTH ordinary vector entries; the empty details
+    /// slot must not overwrite the stream value once `label_format` dirties.
+    #[test]
+    fn c26_suffixed_details_sm_stays_ordinary_through_a_pipeline() {
+        let got = run_sm_labels(
+            r#"{x="y"} | label_format x="1""#,
+            "a=Hello b=World",
+            &[
+                ("__error_details__", "streamdet"),
+                ("service_name", "v13"),
+                ("__error_details___extracted", "smdet"),
+            ],
+            &sm("", "", true),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                ("__error_details__", "streamdet"),
+                ("__error_details___extracted", "smdet"),
+                ("service_name", "v13"),
+                ("x", "1"),
+            ]))
+        );
+    }
+
+    /// C27 (the ONLY killer of W6b): `drop __error_details__` resets the
+    /// slot and must NOT remove the stream-label vector entry.
+    #[test]
+    fn c27_drop_details_never_removes_a_vector_entry_of_that_name() {
+        let got = run_sm_labels(
+            r#"{x="y"} | json | drop __error_details__"#,
+            "a=Hello b=World",
+            &[
+                ("__error_details__", "streamdet"),
+                ("service_name", "v13"),
+                ("__error_details___extracted", "smdet"),
+            ],
+            &sm("", "", true),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_LABEL, "JSONParserErr"),
+                ("__error_details__", "streamdet"),
+                ("__error_details___extracted", "smdet"),
+                ("service_name", "v13"),
+            ]))
+        );
+    }
+
+    /// C28 (the ONLY killer of W10c): the `drop __error__=""` matcher reads
+    /// the SLOT ("boom") — an absent vector entry reading "" must not match.
+    #[test]
+    fn c28_drop_error_matcher_reads_the_slot() {
+        let got = run_sm_labels(
+            r#"{x="y"} | drop __error__="""#,
+            "a=Hello b=World",
+            &[("service_name", "v2")],
+            &sm("boom", "", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[(ERROR_LABEL, "boom"), ("service_name", "v2")]))
+        );
+    }
+
+    /// C30 (the ONLY killer of W9): with the vector emptied, the map is
+    /// non-empty ONLY because of the visible err slot — a slots-blind
+    /// emptiness test would discard the capture and rebuild live, letting
+    /// `e` see `d`.
+    #[test]
+    fn c30_a_slots_only_map_counts_as_non_empty() {
+        let got = run_sm_labels(
+            r#"{x="y"} | drop service_name | label_format d="[{{.__error__}}]", e="[{{.d}}]""#,
+            "a=Hello b=World",
+            &[("service_name", "v2")],
+            &sm("boom", "", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[
+                (ERROR_LABEL, "boom"),
+                ("d", "[boom]"),
+                ("e", "[]"),
+            ]))
+        );
+    }
+
+    /// C31 (the ONLY killer of W10b): the `ip()` short-circuit reads the
+    /// SLOT — a stream-label `__error__` must not trip it, so the absent
+    /// `addr` drops the line.
+    #[test]
+    fn c31_ip_short_circuit_reads_the_slot_not_the_vector() {
+        let got = run_sm_labels(
+            r#"{x="y"} | addr = ip("1.2.3.4")"#,
+            "a=Hello b=World",
+            &[
+                ("__error__", "streamerr"),
+                ("service_name", "v10"),
+                ("__error___extracted", "boom"),
+            ],
+            &sm("", "", true),
+        );
+        assert_eq!(got, None);
+    }
+
+    /// C32 (the ONLY killer of W14): a `keep` that does not name the pair
+    /// leaves the SLOTS untouched — the err still emits.
+    #[test]
+    fn c32_keep_never_clears_the_slots() {
+        let got = run_sm_labels(
+            r#"{x="y"} | keep service_name"#,
+            "a=Hello b=World",
+            &[("service_name", "v2")],
+            &sm("boom", "", false),
+        );
+        assert_eq!(
+            got,
+            Some(owned(&[(ERROR_LABEL, "boom"), ("service_name", "v2")]))
+        );
+    }
+
+    /// AC12/AC19: the error-aware render is selected by a COMPILE-TIME flag
+    /// — `false` for every template that does not name the pair.
+    #[test]
+    fn template_reads_error_pair_gates_the_error_aware_render() {
+        for (query, want) in [
+            (r#"{a="b"} | label_format x="{{.a}}""#, false),
+            (r#"{a="b"} | label_format x="{{.__error__}}""#, true),
+            (r#"{a="b"} | label_format x="{{.__error_details__}}""#, true),
+        ] {
+            let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+            let got = compiled.stages.iter().find_map(|s| match s {
+                CompiledStage::LabelFormat { fmts, .. } => fmts.iter().find_map(|f| match f {
+                    CompiledLabelFmt::Template { reads_err, .. } => Some(*reads_err),
+                    _ => None,
+                }),
+                _ => None,
+            });
+            assert_eq!(got, Some(want), "{query}");
+        }
+        for (query, want) in [
+            (r#"{a="b"} | line_format "{{.a}}""#, false),
+            (r#"{a="b"} | line_format "{{.__error__}}""#, true),
+            (r#"{a="b"} | line_format "{{.__error_details__}}""#, true),
+        ] {
+            let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+            let got = compiled.stages.iter().find_map(|s| match s {
+                CompiledStage::LineFormat { reads_err, .. } => Some(*reads_err),
+                _ => None,
+            });
+            assert_eq!(got, Some(want), "{query}");
+        }
+    }
+
+    /// AC27: the self-rename split is decided at COMPILE time; the reserved
+    /// destination is still rejected before the split.
+    #[test]
+    fn a_self_rename_compiles_to_its_own_variant() {
+        let compiled =
+            CompiledPipeline::compile(&stages_of(r#"{a="b"} | label_format x=x, y=z"#)).unwrap();
+        let fmts = compiled
+            .stages
+            .iter()
+            .find_map(|s| match s {
+                CompiledStage::LabelFormat { fmts, .. } => Some(fmts),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&fmts[0], CompiledLabelFmt::RenameSelf { name } if name == "x"),
+            "{fmts:?}"
+        );
+        assert!(
+            matches!(&fmts[1], CompiledLabelFmt::Rename { dst, src } if dst == "y" && src == "z"),
+            "{fmts:?}"
+        );
+        let err =
+            CompiledPipeline::compile(&stages_of(r#"{a="b"} | label_format __error__=__error__"#))
+                .expect_err("reserved destination");
+        assert!(
+            err.to_string().contains("__error__ cannot be formatted"),
+            "{err}"
+        );
+    }
+
+    /// The slots are INVARIANT across a `label_format` stage: assigning
+    /// `__error_details__` writes the vector, and the untouched slot wins
+    /// at emit (v1 contract bullet; also b12 §1).
+    #[test]
+    fn errs_are_invariant_across_a_label_format_stage() {
+        assert_eq!(
+            label_format_labels(
+                r#"{svc="x"} | json | label_format __error_details__="boom""#,
+                "not json at all",
+            ),
+            owned(&[
+                ("svc", "x"),
+                (ERROR_LABEL, "JSONParserErr"),
+                (ERROR_DETAILS_LABEL, JSON_ERROR_DETAILS),
+            ]),
+        );
+    }
+
+    /// D8 (AC17): `run_into` vs `run_into_with_sm` (ordinary SM) on the
+    /// identical bare-drop input differ in EXACTLY the `__error_details__`
+    /// entry — the SM dirty seed is the only delta.
+    #[test]
+    fn run_into_and_run_into_with_sm_differ_in_exactly_the_details_entry() {
+        let base = &[("service_name", "d8")];
+        let query = r#"{x="y"} | json | drop __error__"#;
+        let plain = {
+            let compiled = CompiledPipeline::compile(&stages_of(query)).unwrap();
+            let base: Vec<(String, String)> = base
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            let mut labels = Vec::new();
+            compiled
+                .run_into("a=Hello b=World", &base, &mut labels)
+                .expect("kept");
+            let mut got: Vec<(String, String)> = labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            got.sort();
+            got
+        };
+        let with_sm =
+            run_sm_labels(query, "a=Hello b=World", base, &sm("", "", true)).expect("kept");
+        assert_eq!(plain, owned(&[("service_name", "d8")]));
+        let mut expected = plain.clone();
+        expected.push((ERROR_DETAILS_LABEL.to_string(), DET.to_string()));
+        expected.sort();
+        assert_eq!(with_sm, expected);
     }
 }

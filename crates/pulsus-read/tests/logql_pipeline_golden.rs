@@ -518,11 +518,58 @@ fn drop_with_a_value_matcher_only_removes_on_a_match() {
 }
 
 #[test]
-fn drop_error_clears_the_error_detail_companion() {
-    // A malformed json sets `__error__` + `__error_details__`; dropping
-    // `__error__` clears BOTH (they are one error record).
+fn drop_error_leaves_a_clean_builders_details_invisible() {
+    // Issue #238: `drop __error__` resets ONLY the err slot (the reference's
+    // `ResetError`, never a `Del`), leaving the details slot set — but a
+    // failed `| json` writes no label, so the builder is CLEAN and the
+    // materialisation gate (`!hasDel() && !hasAdd() && !HasErr()`,
+    // labels.go:554-563) keeps the lone details slot invisible. Same emitted
+    // set as before #238, for the opposite mechanistic reason — reference
+    // capture `{v0} | json | drop __error__ => {service_name}` (v3.7.4,
+    // discover_log_levels: false).
     let (got, _) = run(r#"{a="b"} | json | drop __error__"#, "not json").unwrap();
     assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+}
+
+#[test]
+fn drop_error_plus_a_label_del_surfaces_the_orphaned_details() {
+    // The dirty sibling of the test above (without it the pair cannot
+    // distinguish the visibility gate from "drop __error__ clears both"):
+    // dropping a PRESENT ordinary label is a `Del`, which dirties the
+    // builder and re-opens the gate — the orphaned `__error_details__`
+    // surfaces. Reference capture `{v0} | json | drop __error__, env =>
+    // {__error_details__=DET, service_name}` (v3.7.4).
+    let (got, _) = run(r#"{a="b"} | json | drop __error__, app"#, "not json").unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("env", "prod"),
+            (
+                "__error_details__",
+                "Value looks like object, but can't find closing '}' symbol"
+            ),
+        ])
+    );
+}
+
+#[test]
+fn keep_always_retains_the_error_pair() {
+    // `keep` skips `__error__`/`__error_details__`/`__preserve_error__` by
+    // name (`keep_labels.go:22`, `:51-57`) — they survive ANY keep list.
+    // Reference capture `{…} | json | keep env => {__error__, __error_details__,
+    // env}` (v3.7.4).
+    let (got, _) = run(r#"{a="b"} | json | keep env"#, "not json").unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("env", "prod"),
+            ("__error__", "JSONParserErr"),
+            (
+                "__error_details__",
+                "Value looks like object, but can't find closing '}' symbol"
+            ),
+        ])
+    );
 }
 
 #[test]
