@@ -1,0 +1,191 @@
+# B11 — the per-second divisor's EXACT rounding (issue #232).
+#
+# The reference divides every per-second reducer by `selRange.Seconds()` =
+# `float64(d/Second) + float64(d%Second)/1e9` — TWO roundings. The obvious
+# `ns as f64 / 1e9` is ONE rounding and is a different function whenever the
+# range is neither a whole number of seconds nor sub-second: `1118ms` is
+# `1.1179999999999998828` the reference's way and `1.1180000000000001048`
+# the naive way, one ULP apart, and that ULP reaches the emitted value.
+#
+# Every value below is a BIT-EXACT capture from grafana/loki:3.7.4 (probed
+# 2026-07-26, container `grafana/loki:3.7.4`, instant query at the same
+# window membership / inter-sample deltas as the `eval instant at 60s` grid
+# below — see PROVENANCE.md). Under the one-rounding divisor the `1118ms`
+# / `1235ms` / `1128ms` cases come out 1–2 ULP off and this file reddens.
+#
+# Controls (`2s`, `1500ms`, `2s500ms`-class, `100ms`, `[1m]`) pin the other
+# half of the claim: whole-second widths (`nsec == 0`), exactly-representable
+# widths and sub-second widths (`sec == 0`) are IDENTICAL under both forms,
+# so the fix is inert for them.
+
+
+# ===================================================================
+# rate() over a log range — count / selRange.Seconds()
+# ===================================================================
+
+# 1 line / [1118ms]: 1/1.118. Naive divisor gives 0.8944543828264757.
+load
+  {env="prod", service_name="rd_r1118_n1"}
+  60s  lvl=info
+
+eval instant at 60s rate({service_name="rd_r1118_n1", env="prod"} | logfmt [1118ms])
+  {env="prod", lvl="info", service_name="rd_r1118_n1"} 0.8944543828264759
+
+clear
+
+# 3 lines / [1118ms]: 3/1.118. Naive divisor gives 2.6833631484794274.
+load
+  {env="prod", service_name="rd_r1118_n3"}
+  59800ms  lvl=info
+  59900ms  lvl=info
+  60s      lvl=info
+
+eval instant at 60s rate({service_name="rd_r1118_n3", env="prod"} | logfmt [1118ms])
+  {env="prod", lvl="info", service_name="rd_r1118_n3"} 2.683363148479428
+
+clear
+
+# [1235ms]: the reference divisor is one ULP BELOW the naive one.
+load
+  {env="prod", service_name="rd_r1235_n1"}
+  60s  lvl=info
+
+eval instant at 60s rate({service_name="rd_r1235_n1", env="prod"} | logfmt [1235ms])
+  {env="prod", lvl="info", service_name="rd_r1235_n1"} 0.8097165991902835
+
+clear
+
+# [1128ms]: the reference divisor is one ULP ABOVE the naive one — the
+# opposite-direction case, so a "subtract an ULP" fudge cannot pass both.
+load
+  {env="prod", service_name="rd_r1128_n1"}
+  60s  lvl=info
+
+eval instant at 60s rate({service_name="rd_r1128_n1", env="prod"} | logfmt [1128ms])
+  {env="prod", lvl="info", service_name="rd_r1128_n1"} 0.8865248226950354
+
+clear
+
+# CONTROL — whole seconds: `nsec == 0`, both forms exact.
+load
+  {env="prod", service_name="rd_r2s_n1"}
+  60s  lvl=info
+
+eval instant at 60s rate({service_name="rd_r2s_n1", env="prod"} | logfmt [2s])
+  {env="prod", lvl="info", service_name="rd_r2s_n1"} 0.5
+
+clear
+
+# CONTROL — 1.5s is exactly representable: both forms agree.
+load
+  {env="prod", service_name="rd_r1500_n1"}
+  60s  lvl=info
+
+eval instant at 60s rate({service_name="rd_r1500_n1", env="prod"} | logfmt [1500ms])
+  {env="prod", lvl="info", service_name="rd_r1500_n1"} 0.6666666666666666
+
+clear
+
+# CONTROL — sub-second: `sec == 0`, so `Seconds()` degenerates to the single
+# division and both forms are identical by construction.
+load
+  {env="prod", service_name="rd_r100_n1"}
+  60s  lvl=info
+
+eval instant at 60s rate({service_name="rd_r100_n1", env="prod"} | logfmt [100ms])
+  {env="prod", lvl="info", service_name="rd_r100_n1"} 10
+
+clear
+
+# ===================================================================
+# bytes_rate() — same divisor, byte-sum numerator
+# ===================================================================
+
+# 8 bytes / [1118ms]. Naive divisor gives 7.155635062611806.
+load
+  {env="prod", service_name="rd_b1118"}
+  60s  lvl=info
+
+eval instant at 60s bytes_rate({service_name="rd_b1118", env="prod"} | logfmt [1118ms])
+  {env="prod", lvl="info", service_name="rd_b1118"} 7.1556350626118075
+
+clear
+
+# 24 bytes / [1118ms]. Naive divisor gives 21.46690518783542.
+load
+  {env="prod", service_name="rd_b1118_n3"}
+  59800ms  lvl=info
+  59900ms  lvl=info
+  60s      lvl=info
+
+eval instant at 60s bytes_rate({service_name="rd_b1118_n3", env="prod"} | logfmt [1118ms])
+  {env="prod", lvl="info", service_name="rd_b1118_n3"} 21.466905187835422
+
+clear
+
+# 24 bytes / [1235ms]. Naive divisor gives 19.4331983805668.
+load
+  {env="prod", service_name="rd_b1235_n3"}
+  59800ms  lvl=info
+  59900ms  lvl=info
+  60s      lvl=info
+
+eval instant at 60s bytes_rate({service_name="rd_b1235_n3", env="prod"} | logfmt [1235ms])
+  {env="prod", lvl="info", service_name="rd_b1235_n3"} 19.433198380566804
+
+clear
+
+# ===================================================================
+# rate() over an unwrapped range — per-second SUM of values
+# ===================================================================
+
+# sum 7 / [1118ms]. Naive divisor gives 6.261180679785331.
+load
+  {env="prod", service_name="rd_u1118_n1"}
+  60s  lvl=info v=7
+
+eval instant at 60s rate({service_name="rd_u1118_n1", env="prod"} | logfmt | unwrap v [1118ms])
+  {env="prod", lvl="info", service_name="rd_u1118_n1"} 6.2611806797853315
+
+clear
+
+# sum 21 / [1118ms]. Naive divisor gives 18.78354203935599.
+load
+  {env="prod", service_name="rd_u1118_n3"}
+  59800ms  lvl=info v=7
+  59900ms  lvl=info v=7
+  60s      lvl=info v=7
+
+eval instant at 60s rate({service_name="rd_u1118_n3", env="prod"} | logfmt | unwrap v [1118ms])
+  {env="prod", lvl="info", service_name="rd_u1118_n3"} 18.783542039355996
+
+clear
+
+# ===================================================================
+# rate_counter() — the extrapolated increase divided by the same
+# `selRange.Seconds()` (issue #218's ns/ms extrapolation, sub-second range)
+# ===================================================================
+
+# Naive divisor gives 31.305942287815544.
+load
+  {env="prod", service_name="rd_rc1118"}
+  59100ms  c=10
+  59600ms  c=30
+  60s      c=45
+
+eval instant at 60s rate_counter({service_name="rd_rc1118", env="prod"} | logfmt | unwrap c [1118ms])
+  {env="prod", service_name="rd_rc1118"} 31.305942287815547
+
+clear
+
+# CONTROL — same samples, whole-second [1m] divisor.
+load
+  {env="prod", service_name="rd_rc1m"}
+  59100ms  c=10
+  59600ms  c=30
+  60s      c=45
+
+eval instant at 60s rate_counter({service_name="rd_rc1m", env="prod"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="rd_rc1m"} 0.5833722222222222
+
+clear
