@@ -461,10 +461,13 @@ mod tests {
     #[tokio::test]
     async fn over_cap_leafless_vector_range_maps_to_422_query_too_broad() {
         const S: i64 = 1_000_000_000; // 1s
-        // 11_001 buckets over `(0, 11000s]` at a 1s step > the 11000 cap.
+        // 11_001 step INTERVALS over `[0, 11001s]` at a 1s step > the 11000
+        // cap (issue #227 review round 7, finding 1: exactly 11_000
+        // intervals — 11_001 grid points — is SERVED, matching the
+        // reference's `(end-start)/step > 11000` rule).
         let window = pulsus_read::logql::GridWindow {
             start_ns: 0,
-            end_ns: 11_000 * S,
+            end_ns: 11_001 * S,
             step_ns: Some(
                 pulsus_read::logql::validate_duration_ns(S as u64, "step").expect("valid step"),
             ),
@@ -502,6 +505,75 @@ mod tests {
             "exceeded maximum resolution of 11,000 points per time series. Try increasing the \
              value of the step parameter"
         );
+    }
+
+    /// Issue #227 review round 7, finding 1: EXACTLY `(end-start)/step ==
+    /// 11000` is inside the reference's fence (`> 11000` rejects), so the
+    /// request guard must admit it — the request proceeds past parameter
+    /// parsing (hermetically that surfaces as the engine-pool 503, never
+    /// the resolution 400).
+    #[tokio::test]
+    async fn query_range_at_exactly_the_11000_resolution_passes_the_request_guard() {
+        // (end - start) / step == 11000 exactly (0 → 11000s at a 1s step).
+        let q = "query=count_over_time(%7Bapp%3D%22a%22%7D%5B5m%5D)\
+                 &start=0&end=11000000000000&step=1s";
+        let res = query_range(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(q.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exactly-at-the-limit request must pass the resolution guard \
+             (got {json:?})"
+        );
+    }
+
+    /// Issue #227 review round 7, finding 1: the HTTP request guard
+    /// (`ensure_range_resolution`) and the engine's grid guard
+    /// (`ensure_grid_resolution`, driven here through the public
+    /// `materialize_vector_lit` — the SAME function `RangeSlideState::new`
+    /// funnels through) implement the identical Loki fence, so the engine
+    /// can never 422 a request the guard admitted. Enumerates both sides
+    /// of the fence, aligned and unaligned.
+    #[tokio::test]
+    async fn engine_grid_guard_agrees_with_the_request_guard_at_every_fence_case() {
+        const S: i64 = 1_000_000_000; // 1s step
+        let step_ns = S as u64;
+        // (start, end, expect-admitted)
+        let cases: &[(i64, i64, bool)] = &[
+            (0, 10_999 * S, true),         // one interval under
+            (0, 11_000 * S, true),         // exactly at the fence
+            (0, 11_001 * S, false),        // one interval over
+            (0, 11_000 * S + S / 2, true), // step does not divide the span
+            (0, 11_001 * S - 1, true),     // 1ns under the rejecting interval
+            (7, 7 + 11_000 * S, true),     // unaligned start, at the fence
+            (7, 7 + 11_001 * S, false),    // unaligned start, over
+        ];
+        for &(start_ns, end_ns, admitted) in cases {
+            let guard_ok = params::ensure_range_resolution(start_ns, end_ns, step_ns).is_ok();
+            assert_eq!(
+                guard_ok, admitted,
+                "request guard disagrees with the reference at \
+                 ({start_ns}, {end_ns}, {step_ns})"
+            );
+            let window = pulsus_read::logql::GridWindow {
+                start_ns,
+                end_ns,
+                step_ns: Some(
+                    pulsus_read::logql::validate_duration_ns(step_ns, "step").expect("valid step"),
+                ),
+            };
+            let engine_ok = pulsus_read::logql::materialize_vector_lit(0.0, &window).is_ok();
+            assert_eq!(
+                engine_ok, guard_ok,
+                "engine grid guard disagrees with the request guard at \
+                 ({start_ns}, {end_ns}, {step_ns})"
+            );
+        }
     }
 
     #[tokio::test]

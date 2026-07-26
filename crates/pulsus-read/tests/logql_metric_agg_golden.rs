@@ -2546,12 +2546,16 @@ fn or_vector_zero_fills_an_empty_selection() {
 /// Over-cap range `vector(n)` rejects with the SAME `MetricBuckets` 422 a
 /// leaf over-cap range query trips — before allocating any grid (the
 /// `return` precedes the `Vec`, so a successful assertion proves no
-/// allocation). 11_001 buckets > the 11_000 cap.
+/// allocation). 11_001 step INTERVALS > the 11_000 cap (issue #227 review
+/// round 7, finding 1: the fence is the reference's TRUNCATING
+/// `(end-start)/step > 11000`, so exactly 11_000 intervals — 11_001
+/// inclusive grid points — is served, and this fixture sits one interval
+/// past it).
 #[test]
 fn range_vector_lit_over_the_bucket_cap_rejects_without_allocating() {
     let window = pulsus_read::logql::GridWindow {
         start_ns: 0,
-        end_ns: 11_000 * NS,
+        end_ns: 11_001 * NS,
         step_ns: Some(
             pulsus_read::logql::validate_duration_ns(NS as u64, "step").expect("valid step"),
         ),
@@ -2565,20 +2569,23 @@ fn range_vector_lit_over_the_bucket_cap_rejects_without_allocating() {
     }
 }
 
-/// At exactly the cap the range `vector(n)` materializes a constant matrix
-/// with one empty-label series carrying the value at every grid step.
+/// At exactly the cap — 11_000 intervals, the widest resolution the
+/// reference serves — the range `vector(n)` materializes a constant matrix
+/// with one empty-label series carrying the value at every one of the
+/// 11_001 inclusive grid points (issue #227 review round 7, finding 1:
+/// this exact shape was previously a wrong 422).
 #[test]
 fn range_vector_lit_at_the_bucket_cap_passes_with_exact_point_count() {
     let window = pulsus_read::logql::GridWindow {
         start_ns: 0,
-        end_ns: 10_999 * NS,
+        end_ns: 11_000 * NS,
         step_ns: Some(
             pulsus_read::logql::validate_duration_ns(NS as u64, "step").expect("valid step"),
         ),
     };
     let out = materialize_vector_lit(7.0, &window).expect("at-cap must pass");
     let points = single_series_points(out);
-    assert_eq!(points.len(), 11_000);
+    assert_eq!(points.len(), 11_001);
     assert!(points.iter().all(|(_, v)| *v == 7.0));
 }
 

@@ -3327,8 +3327,8 @@ fn render_series_labels(sorted: &[(String, String)]) -> String {
 /// `≤ end`). Used by `vector(<scalar>)`'s constant matrix so it aligns with
 /// the sliding data leaves' start-anchored grid. i128 intermediates keep
 /// `grid_start + k·step` overflow-free; every point lies in
-/// `[grid_start, end]` (no clamp needed — `k ≥ 0`). The grid size passed
-/// `MAX_CLIENT_AGG_BUCKETS` before this runs.
+/// `[grid_start, end]` (no clamp needed — `k ≥ 0`). The grid passed
+/// [`ensure_grid_resolution`] before this runs (≤ 11 001 points).
 fn bucket_grid(grid_start: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
     if step_ns == 0 || step_ns > i64::MAX as u64 || end_ns < grid_start {
         return Vec::new();
@@ -3342,15 +3342,43 @@ fn bucket_grid(grid_start: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
     (0..=kmax).map(|k| clamp_bucket(gs + k * step)).collect()
 }
 
-/// The evaluation-bucket cap for client-aggregated range queries: a
-/// `(end - start) / step` grid larger than this is rejected as
-/// `QueryTooBroad(MetricBuckets)` BEFORE any grid or accumulator
-/// materialization (review round 1, finding 2 — an `absent_over_time`
-/// over a huge range with a tiny step must never allocate an
-/// attacker-sized grid). 11 000 matches the ecosystem-standard
-/// points-per-range-query ceiling. A documented constant, not a config
+/// The evaluation-resolution cap for client-aggregated range queries, in
+/// step INTERVALS — Loki-exact (issue #227 review round 7, finding 1):
+/// the reference rejects iff `(end - start) / step > 11000` (truncating
+/// integer division, `loghttp/query.go` `errStepTooSmall`), so a request
+/// with exactly 11 000 intervals is SERVED, and its inclusive
+/// start-anchored grid holds `intervals + 1 = 11_001` points. Every grid
+/// guard funnels through [`ensure_grid_resolution`], which encodes that
+/// rule — rejected as `QueryTooBroad(MetricBuckets)` BEFORE any grid or
+/// accumulator materialization (review round 1, finding 2 — an
+/// `absent_over_time` over a huge range with a tiny step must never
+/// allocate an attacker-sized grid). A documented constant, not a config
 /// field (the `DEFAULT_MAX_STREAMS` precedent).
 pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
+
+/// **The one grid-resolution guard** (issue #227 review round 7,
+/// finding 1): rejects iff the start-anchored grid spans more than
+/// [`MAX_CLIENT_AGG_BUCKETS`] step INTERVALS — `floor((end - grid_start)
+/// / step) > 11000`, exactly the reference's request rule — and returns
+/// the grid POINT count (`intervals + 1`, ≤ 11 001) on success. The HTTP
+/// boundary (`ensure_range_resolution` in `pulsus-server`) applies the
+/// identical formula over the identical `(start, end, step)` (the emit
+/// grid is start-anchored, so `grid_start == start`), so the engine can
+/// never 422 a request the request guard admitted — the previous
+/// point-count comparison rejected exactly-at-the-limit requests the
+/// reference serves. A saturated [`grid_point_count`] (degenerate step)
+/// still rejects: `u64::MAX - 1 > 11000`.
+fn ensure_grid_resolution(grid_start_ns: i64, end_ns: i64, step_ns: u64) -> Result<u64, ReadError> {
+    let count = grid_point_count(grid_start_ns, end_ns, step_ns);
+    let intervals = count.saturating_sub(1);
+    if intervals > MAX_CLIENT_AGG_BUCKETS {
+        return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+            buckets: intervals,
+            cap: MAX_CLIENT_AGG_BUCKETS,
+        }));
+    }
+    Ok(count)
+}
 
 /// The exact-quantile retention cap: `quantile_over_time` is the one
 /// reducer whose state grows with surviving rows (every value is kept
@@ -3446,13 +3474,13 @@ impl<'q> ClientAggState<'q> {
         rate_window_ns: Option<u64>,
     ) -> Result<Self, ReadError> {
         if let Some(step) = window.step_ns().map(|d| d.as_u64()) {
-            let buckets = grid_bucket_count(window.start_ns(), window.end_ns(), step);
-            if buckets > MAX_CLIENT_AGG_BUCKETS {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
-                    buckets,
-                    cap: MAX_CLIENT_AGG_BUCKETS,
-                }));
-            }
+            // Defense-in-depth only: an instant window has no step, and the
+            // range path routes to `RangeSlideState` — but if a stepped
+            // window ever reached here it must obey the SAME Loki-exact
+            // resolution rule as every other grid guard (review round 7,
+            // finding 1: two disagreeing counts turned an admitted request
+            // into a 422).
+            ensure_grid_resolution(window.start_ns(), window.end_ns(), step)?;
         }
         let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
         for (fp, m) in meta {
@@ -3683,52 +3711,20 @@ impl<'q> ClientAggState<'q> {
     }
 }
 
-/// The bucket count the grid guard charges: how many step buckets the
-/// `(start, end]` window touches (0 for an empty/inverted window).
-/// Checked `i128` arithmetic throughout (review round 2, finding 1): the
-/// full `i64` timestamp range at `step = 1` is ~2^64 buckets — a plain
-/// `i64` count would panic/wrap PAST the cap. Anything unrepresentable
-/// or degenerate (a zero step, a step wider than `i64` — both also
-/// structurally rejected upstream) saturates to `u64::MAX`, which the
-/// caller's cap comparison turns into the same named too-broad error.
-fn grid_bucket_count(start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
-    if end_ns <= start_ns {
-        return 0;
-    }
-    if step_ns == 0 || step_ns > i64::MAX as u64 {
-        // Defensive: a zero step is `InvalidStep` at the planner and a
-        // >i64 step never comes out of `parse_step`; saturate so the
-        // guard rejects rather than ever reaching `bucket_of`'s
-        // `div_euclid`.
-        return u64::MAX;
-    }
-    let step = step_ns as i128;
-    // Buckets containing any ts in (start, end]: floor((start+1)/step)
-    // through floor(end/step). i128 makes `start + 1` and the span
-    // arithmetic overflow-free for every i64 input; `checked_*` is
-    // belt-and-braces per the review disposition.
-    let first = (start_ns as i128 + 1).div_euclid(step);
-    let last = (end_ns as i128).div_euclid(step);
-    match last.checked_sub(first).and_then(|d| d.checked_add(1)) {
-        Some(count) if count <= 0 => 0,
-        Some(count) => u64::try_from(count).unwrap_or(u64::MAX),
-        None => u64::MAX,
-    }
-}
-
 /// Materializes `vector(<scalar>)` (issue #221): promotes a constant to a
 /// vector/matrix result with an empty label set. Instant queries yield a
 /// single `{} => value` sample; range queries yield one constant `{}`
 /// series populated at every evaluation-grid step.
 ///
-/// A leafless `vector(n)` bypasses [`ClientAggState::new`]'s
-/// `MAX_CLIENT_AGG_BUCKETS` guard (no leaf ever runs), so this checks the
-/// same cap via [`grid_bucket_count`] BEFORE materializing any grid — an
-/// over-cap `vector(n)` returns the identical `QueryTooBroad(MetricBuckets)`
+/// A leafless `vector(n)` bypasses [`RangeSlideState::new`]'s resolution
+/// guard (no leaf ever runs), so this checks the same Loki-exact rule via
+/// [`ensure_grid_resolution`] BEFORE materializing any grid — an over-cap
+/// `vector(n)` returns the identical `QueryTooBroad(MetricBuckets)`
 /// 422 as every other over-cap LogQL range query, with zero allocation and
 /// no DB round-trip. The grid itself REUSES [`bucket_grid`] (the same
-/// i128-safe, `clamp_bucket`-narrowed, `(start,end]`-aligned grid a leaf
-/// range query and `absent_over_time` use), so `points.len() == buckets`
+/// i128-safe, `clamp_bucket`-narrowed, start-anchored grid a leaf
+/// range query and `absent_over_time` use), so `points.len()` equals the
+/// guard's admitted point count (≤ 11 001)
 /// and a `data + vector(n)` binop aligns on the data's populated steps.
 pub fn materialize_vector_lit(value: f64, window: &GridWindow) -> Result<QueryResult, ReadError> {
     match window.step_ns.map(|d| d.as_u64()) {
@@ -3737,13 +3733,7 @@ pub fn materialize_vector_lit(value: f64, window: &GridWindow) -> Result<QueryRe
             value,
         }])),
         Some(step) => {
-            let buckets = grid_point_count(window.start_ns, window.end_ns, step);
-            if buckets > MAX_CLIENT_AGG_BUCKETS {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
-                    buckets,
-                    cap: MAX_CLIENT_AGG_BUCKETS,
-                }));
-            }
+            ensure_grid_resolution(window.start_ns, window.end_ns, step)?;
             let points = bucket_grid(window.start_ns, window.end_ns, step)
                 .into_iter()
                 .map(|ts| (ts, value))
@@ -3825,10 +3815,10 @@ pub const MAX_TS_COLLISION_GROUP: u64 = 10_000;
 /// >    `\u00xx` six-for-one escape expansion is charged — and the cloned
 /// >    `LabelSet` with each of its owned strings (any label-mutating
 /// >    pipeline; charged for ALL classes, including the integer class A that
-/// >    stages no body), each through [`exact_alloc_bytes`] /
-/// >    [`grown_alloc_bytes`] so container growth and the allocator's minimum
-/// >    block are covered. Classes that allocate nothing extra charge only
-/// >    the `CollMember` slot.
+/// >    stages no body), each through [`alloc_block_bytes`] /
+/// >    [`grown_alloc_bytes`] so container growth and the allocator's
+/// >    size-class rounding (round 7) are covered. Classes that allocate
+/// >    nothing extra charge only the `CollMember` slot.
 /// > 3. The staging is refused unless
 /// >    `coll_bytes + charge <= MAX_TS_COLLISION_GROUP_BYTES`, so the
 /// >    breaching allocation is never performed; on success `coll_bytes`
@@ -3859,34 +3849,59 @@ pub const MAX_TS_COLLISION_GROUP: u64 = 10_000;
 pub const MAX_TS_COLLISION_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The floor one owned heap allocation costs however short its payload is:
-/// `RawVec`'s `min_non_zero_cap` is 8 for byte-sized elements, and a real
-/// allocator rounds a small request up to its smallest size class. Flooring
-/// here also keeps [`exact_alloc_bytes`] a bound independent of whichever
-/// `ToString`/`clone` capacity specialization the standard library happens
-/// to use (issue #227 review round 5, finding 1).
-///
-/// This one is a deliberate MARGIN, not a tested factor: `String::capacity`
-/// reports the requested capacity, so no capacity-measuring test can observe
-/// the allocator's rounding it covers. Over-charging is the safe direction.
+/// `RawVec`'s `min_non_zero_cap` is 8 for byte-sized elements, every
+/// mainstream allocator has a smallest size class / minimum chunk of ≤ 32
+/// bytes, and glibc's minimum chunk is exactly 32 (issue #227 review
+/// round 5, finding 1). The floor keeps [`alloc_block_bytes`] a bound
+/// independent of whichever `ToString`/`clone` capacity specialization the
+/// standard library happens to use.
 const MIN_ALLOC_BYTES: u64 = 32;
 
-/// An upper bound on the heap bytes an **exactly reserved** allocation of
-/// `content` payload bytes occupies — `String::clone`, `str::to_owned` and
-/// `collect` from a `TrustedLen` iterator all reserve exactly the final
-/// length in ONE allocation, so there is no growth slack to charge, only the
-/// allocator's minimum block ([`MIN_ALLOC_BYTES`]).
-fn exact_alloc_bytes(content: u64) -> u64 {
-    content.max(MIN_ALLOC_BYTES)
+/// A conservative, provable UPPER BOUND on the heap block a real allocator
+/// RETAINS for one **exactly reserved** allocation of `content` payload
+/// bytes (`String::clone`, `str::to_owned`, `collect` from a `TrustedLen`
+/// iterator — all reserve exactly the final length in ONE allocation).
+///
+/// Issue #227 review round 7, finding 2: charging the request size itself
+/// (`content.max(32)`) was NOT an upper bound — allocators round a request
+/// up to a size class, so a 33-byte string can retain a 48- or 64-byte
+/// block and adversarial label strings undercounted staging and
+/// query-lifetime group memory by a constant factor. The model here is a
+/// documented over-approximation, `2·content` floored at
+/// [`MIN_ALLOC_BYTES`], NOT any specific allocator's class table. Why
+/// `2·content` dominates every mainstream allocator's retained block
+/// (header/metadata included) for a `content`-byte request:
+///
+/// - **Size-class allocators with out-of-band metadata** (jemalloc,
+///   mimalloc, tcmalloc, snmalloc): no mainstream class grid is coarser
+///   than powers of two, so `class(n) ≤ next_pow2(n) ≤ 2n` for every
+///   `n ≥ 1`, and the smallest classes sit under the 32-byte floor.
+/// - **Inline-header, 16-byte-binned allocators** (glibc malloc): chunk =
+///   `align16(n + 8)` with a 32-byte minimum — `≤ n + 23 ≤ 2n` for
+///   `n ≥ 23`, and `≤ 32` (the floor) for `n ≤ 23`.
+/// - **Page-rounded huge allocations** (mmap past the ~128 KiB
+///   threshold): `n + header + 4 KiB page slack ≤ 2n` at those sizes.
+///
+/// Over-charging is the safe direction (a breach is a clean 422, never an
+/// OOM); the factor halves no real workload's headroom — the caps'
+/// margins are orders of magnitude above real label/body sizes.
+fn alloc_block_bytes(content: u64) -> u64 {
+    content.saturating_mul(2).max(MIN_ALLOC_BYTES)
 }
 
 /// An upper bound on the heap bytes a **geometrically grown** buffer of
-/// `content` final payload bytes occupies at its peak. `RawVec::grow_amortized`
-/// sets `cap = max(2·cap_old, required)`, and `cap_old < required <= content`
-/// at the last growth, so the final capacity is at most `2·content` while the
-/// old buffer (`< content`) is still mapped during the realloc — `3×`
-/// dominates that peak for every input.
+/// `content` final payload bytes occupies at its peak, allocator rounding
+/// included. `RawVec::grow_amortized` sets `cap = max(2·cap_old,
+/// required)`, and `cap_old < required <= content` at the last growth, so
+/// at the realloc peak two blocks are live: the new buffer (request
+/// `≤ 2·content`, retained `≤ alloc_block_bytes(2·content) ≤
+/// 2·alloc_block_bytes(content)`) and the old buffer (request
+/// `< content`, retained `≤ alloc_block_bytes(content)`) — `3·
+/// alloc_block_bytes(content)` dominates the sum for every input (review
+/// round 7, finding 2: the previous `3·content` covered the request
+/// bytes but not the allocator's per-block rounding).
 fn grown_alloc_bytes(content: u64) -> u64 {
-    exact_alloc_bytes(content).saturating_mul(3)
+    alloc_block_bytes(content).saturating_mul(3)
 }
 
 /// The exact number of bytes [`push_json_string`] appends for `s` — the two
@@ -4070,40 +4085,47 @@ const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BTreeMap<i64, Bu
 /// `LabelSet` (each owned string plus the element buffer), and the entry's
 /// share of the map table itself. Reuses the round-5
 /// [`RangeSlideState::member_stage_bytes`] sizing vocabulary
-/// ([`exact_alloc_bytes`] / [`grown_alloc_bytes`] / [`MIN_ALLOC_BYTES`]) —
+/// ([`alloc_block_bytes`] / [`grown_alloc_bytes`] / [`MIN_ALLOC_BYTES`]) —
 /// one scheme, not two. Over-charging is safe; under-charging is the bug.
 ///
-/// **Per allocation:**
+/// **Per allocation** (each retained block charged through the round-7
+/// allocator-rounding model, [`alloc_block_bytes`]):
 /// - **rendered key** — produced by [`render_labels_json_sorted`], whose
 ///   pre-size (`2 + Σ(k+v+6)`) is ≤ `len + 1` (each pair renders at least
 ///   its raw bytes plus the `"":"",` scaffolding, minus the final comma),
 ///   and whose geometric growth ends below `2·len`; by charge time
-///   rendering has returned, so the LIVE capacity is ≤ `2·len` — dominated
-///   by [`grown_alloc_bytes`]`(len) = 3·max(len, 32)` for every input.
+///   rendering has returned, so the LIVE request is ≤ `2·len`, retained
+///   ≤ `alloc_block_bytes(2·len)` — dominated by
+///   [`grown_alloc_bytes`]`(len) = 3·alloc_block_bytes(len)` for every
+///   input.
 /// - **each owned label `String`** — `Cow::to_string` reserves exactly the
-///   length (or the generic path's `min_non_zero_cap = 8`); both are inside
-///   [`exact_alloc_bytes`]'s `max(len, 32)`.
+///   length (or the generic path's `min_non_zero_cap = 8`); both requests
+///   are inside [`alloc_block_bytes`]'s size-class-rounded bound.
 /// - **`LabelSet` element buffer** — `collect` from a `TrustedLen` iterator
-///   reserves exactly `pairs`; charged via [`exact_alloc_bytes`] (an empty
+///   reserves exactly `pairs`; charged via [`alloc_block_bytes`] (an empty
 ///   set allocates nothing — the 32-byte floor is pure margin).
 /// - **the map entry's table share** — hashbrown keeps at most ~3.43
 ///   bucket-slots live per entry at peak (7/8 load factor, power-of-two
 ///   doubling with the old table still mapped during a resize), each
-///   `slot_bytes + 1` control byte wide; `4×` dominates that for every
-///   entry count, and the flat pad covers the table's fixed control-group
-///   padding many times over. (The table itself is additionally
-///   structurally bounded: the entry COUNT is capped at
+///   `slot_bytes + 1` control byte wide; with each table block retained at
+///   ≤ 2× its request (the [`alloc_block_bytes`] model) that peak is
+///   ≤ ~6.86 slots per entry — `8×` dominates it for every entry count,
+///   and the flat pad covers the table's fixed control-group padding
+///   (also ≤ 2×-rounded) many times over. (The table itself is
+///   additionally structurally bounded: the entry COUNT is capped at
 ///   [`MAX_CLIENT_AGG_SERIES`] before any insertion.)
 ///
 /// Saturating arithmetic throughout — a hostile label set can only make
 /// the charge LARGER, the safe direction.
 fn group_entry_bytes(key: &str, labels: &LabelSet, slot_bytes: usize) -> u64 {
-    /// See the map-table bullet above: 4 slots per entry dominates the
-    /// ~3.43-slot live peak of a 7/8-load, doubling hash table.
-    const MAP_GROWTH_FACTOR: u64 = 4;
+    /// See the map-table bullet above: 8 slots per entry dominates the
+    /// ~3.43-slot live peak of a 7/8-load, doubling hash table with every
+    /// block retained at ≤ 2× its request (review round 7, finding 2).
+    const MAP_GROWTH_FACTOR: u64 = 8;
     /// Flat per-entry margin dominating the table's fixed control-group
-    /// padding/alignment on every table the series cap permits.
-    const MAP_FIXED_PAD: u64 = 64;
+    /// padding/alignment (≤ 2×-rounded) on every table the series cap
+    /// permits.
+    const MAP_FIXED_PAD: u64 = 128;
 
     let mut bytes = (slot_bytes as u64)
         .saturating_add(1)
@@ -4112,11 +4134,11 @@ fn group_entry_bytes(key: &str, labels: &LabelSet, slot_bytes: usize) -> u64 {
     bytes = bytes.saturating_add(grown_alloc_bytes(key.len() as u64));
     for (k, v) in labels {
         bytes = bytes
-            .saturating_add(exact_alloc_bytes(k.len() as u64))
-            .saturating_add(exact_alloc_bytes(v.len() as u64));
+            .saturating_add(alloc_block_bytes(k.len() as u64))
+            .saturating_add(alloc_block_bytes(v.len() as u64));
     }
     let elems = (labels.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
-    bytes.saturating_add(exact_alloc_bytes(elems))
+    bytes.saturating_add(alloc_block_bytes(elems))
 }
 
 /// The three sliding-window reducer classes (issue #227 finding-4 table,
@@ -4172,9 +4194,12 @@ fn reducer_class(op: RangeAggOp, value: ClientValue) -> ReducerClass {
 }
 
 /// Start-anchored grid-point count `|{grid_start + k·step ≤ end}|` (Loki:
-/// `current` seeded at `start-step`, first point `start`, iterate `≤ end`).
-/// Saturates to `u64::MAX` for a degenerate step so the caller's cap
-/// comparison rejects rather than overflowing.
+/// `current` seeded at `start-step`, first point `start`, iterate `≤ end`)
+/// — i.e. `floor(span/step) + 1`, BOTH endpoints included, so an admitted
+/// request of exactly [`MAX_CLIENT_AGG_BUCKETS`] intervals counts 11 001
+/// points (the resolution guard compares `count - 1` intervals, review
+/// round 7 finding 1). Saturates to `u64::MAX` for a degenerate step so
+/// [`ensure_grid_resolution`] rejects rather than overflowing.
 fn grid_point_count(grid_start: i64, end_ns: i64, step_ns: u64) -> u64 {
     if end_ns < grid_start {
         return 0;
@@ -4608,13 +4633,11 @@ impl<'q> RangeSlideState<'q> {
             unreachable!("RangeSlideState is constructed only for a Range window")
         };
         let step = step_ns.as_u64();
-        let count = grid_point_count(grid_start, end_ns, step);
-        if count > MAX_CLIENT_AGG_BUCKETS {
-            return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
-                buckets: count,
-                cap: MAX_CLIENT_AGG_BUCKETS,
-            }));
-        }
+        // Loki-exact resolution rule (review round 7, finding 1): reject on
+        // `intervals > 11000`, NOT on the point count — the inclusive grid
+        // of an exactly-at-the-limit request holds 11_001 points and the
+        // reference serves it.
+        let count = ensure_grid_resolution(grid_start, end_ns, step)?;
         // `count == kmax + 1` (0 ⇒ empty grid, kmax = -1).
         let kmax = count as i64 - 1;
         let mut base_labels: HashMap<u64, LabelSet> = HashMap::new();
@@ -4812,19 +4835,22 @@ impl<'q> RangeSlideState<'q> {
     ///   per value, plus one exactly-reserved element buffer of `pairs ×
     ///   size_of::<(String, String)>()` (the `collect` runs from a
     ///   `TrustedLen` iterator). Each is charged through
-    ///   [`exact_alloc_bytes`], i.e. floored at the allocator's minimum
-    ///   block, so a label set of many one-byte values cannot cost more than
-    ///   its charge.
+    ///   [`alloc_block_bytes`] — allocator size-class rounding covered,
+    ///   floored at the allocator's minimum block — so a label set of many
+    ///   one-byte values cannot cost more than its charge.
     /// - **body clone** — `String::clone` reserves exactly `row.body.len()`
-    ///   in one allocation; charged through [`exact_alloc_bytes`], only when
+    ///   in one allocation; charged through [`alloc_block_bytes`], only when
     ///   `needs_body_order`.
     /// - **`CollMember` slot in `coll`** — a `Vec` push can DOUBLE capacity
-    ///   with the old buffer still live during the realloc, so the peak for
-    ///   `n` members is `≤ 3n × size_of::<CollMember>()`. Charging
-    ///   `4 × size_of::<CollMember>()` per member dominates that for every
-    ///   `n` (and covers the initial `min_non_zero_cap` of 4 elements). The
-    ///   `String`/`Vec` headers of the pieces above live INSIDE that slot, so
-    ///   they are already covered.
+    ///   with the old buffer still live during the realloc, so for `n`
+    ///   members the live request is `≤ 2n` slots plus an old buffer of
+    ///   `≤ n` slots; with each block retained at ≤ 2× its request (the
+    ///   [`alloc_block_bytes`] model, review round 7 finding 2) the peak is
+    ///   `≤ 6n × size_of::<CollMember>()`, and the initial
+    ///   `min_non_zero_cap = 4` block is `≤ 8 × size_of::<CollMember>()`.
+    ///   Charging `8 × size_of::<CollMember>()` per member dominates BOTH
+    ///   for every `n ≥ 1`. The `String`/`Vec` headers of the pieces above
+    ///   live INSIDE that slot, so they are already covered.
     ///
     /// Saturating arithmetic throughout, so a hostile label value cannot
     /// wrap the charge round to a small number — saturation can only make
@@ -4835,14 +4861,15 @@ impl<'q> RangeSlideState<'q> {
         scratch: &[(Cow<'_, str>, Cow<'_, str>)],
         stages_out: bool,
     ) -> u64 {
-        /// A `Vec` push can double capacity with the old buffer still live
-        /// (~3× peak); 4× per element dominates it for every length.
-        const VEC_GROWTH_FACTOR: u64 = 4;
+        /// See the `CollMember`-slot bullet above: 8× per element dominates
+        /// the ≤ 6n-slot realloc peak (2n live + n old, each ≤ 2×-rounded)
+        /// and the first member's `min_non_zero_cap = 4` block.
+        const VEC_GROWTH_FACTOR: u64 = 8;
 
         let mut bytes = (size_of::<CollMember>() as u64).saturating_mul(VEC_GROWTH_FACTOR);
 
         if self.needs_body_order {
-            bytes = bytes.saturating_add(exact_alloc_bytes(row.body.len() as u64));
+            bytes = bytes.saturating_add(alloc_block_bytes(row.body.len() as u64));
         }
 
         if stages_out {
@@ -4852,12 +4879,12 @@ impl<'q> RangeSlideState<'q> {
             // value, each floored at the allocator's minimum block.
             for (k, v) in scratch {
                 bytes = bytes
-                    .saturating_add(exact_alloc_bytes(k.len() as u64))
-                    .saturating_add(exact_alloc_bytes(v.len() as u64));
+                    .saturating_add(alloc_block_bytes(k.len() as u64))
+                    .saturating_add(alloc_block_bytes(v.len() as u64));
             }
             // ...plus its exactly-reserved element buffer.
             let elems = (scratch.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
-            bytes = bytes.saturating_add(exact_alloc_bytes(elems));
+            bytes = bytes.saturating_add(alloc_block_bytes(elems));
         }
 
         bytes
@@ -7787,7 +7814,10 @@ mod tests {
         let meta = slide_meta(1, r#"{"app":"a"}"#);
         let window = slide_window(0, 10, 10, 10);
         let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
-        let big = "x".repeat(1024 * 1024);
+        // ~512 KiB bodies: 5 members charge ~5.3 MiB (the round-7 block
+        // model charges 2× the body clone) — under the 8 MiB cap; the
+        // second chunk's members push the same open group past it.
+        let big = "x".repeat(512 * 1024);
         let chunk: Vec<MetricScanRow> = (0..5)
             .map(|_| MetricScanRow {
                 fingerprint: 1,
@@ -7816,6 +7846,96 @@ mod tests {
             state.coll_bytes >= after_first,
             "charge accumulated, not reset"
         );
+    }
+
+    /// Issue #227 review round 7, finding 2: the per-allocation charge is
+    /// a PROVABLE upper bound on the block a real allocator retains, not
+    /// just on the request size — a 33-byte request can retain a 48/64-
+    /// byte block under size-class rounding. Pins [`alloc_block_bytes`]
+    /// against an independent worst-of-mainstream retained-block model at
+    /// sizes straddling every class boundary up to 1 MiB:
+    /// `max(next_pow2(n), align16(n + 8), 32)` — powers of two are the
+    /// coarsest mainstream class grid (jemalloc/mimalloc/tcmalloc are all
+    /// finer), and `align16(n + 8)` is glibc's inline-header chunk. The
+    /// boundary cases (33, 65, 129, ...) FAIL if the 2× rounding is
+    /// removed (a request-size charge of `n.max(32)` sits strictly below
+    /// the model there) — asserted explicitly so the test is provably
+    /// non-vacuous.
+    #[test]
+    fn alloc_block_bytes_covers_allocator_size_class_rounding_at_class_boundaries() {
+        /// The worst retained block any mainstream allocator keeps for an
+        /// `n`-byte request (see the test doc).
+        fn worst_mainstream_retained(n: u64) -> u64 {
+            let pow2_class = n.max(1).next_power_of_two();
+            let glibc_chunk = (n + 8).div_ceil(16) * 16;
+            pow2_class.max(glibc_chunk).max(32)
+        }
+
+        let sizes: &[u64] = &[
+            1,
+            8,
+            16,
+            17,
+            24,
+            31,
+            32,
+            33,
+            47,
+            48,
+            63,
+            64,
+            65,
+            96,
+            127,
+            128,
+            129,
+            192,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            1023,
+            1024,
+            1025,
+            4095,
+            4096,
+            4097,
+            65_535,
+            65_536,
+            65_537,
+            1 << 20,
+            (1 << 20) + 1,
+        ];
+        for &n in sizes {
+            let charge = alloc_block_bytes(n);
+            let worst = worst_mainstream_retained(n);
+            assert!(
+                charge >= worst,
+                "alloc_block_bytes({n}) = {charge} under-counts a retained \
+                 block of {worst}"
+            );
+            // The realloc peak: the grown buffer's request is ≤ 2n and the
+            // old ≤ n-byte buffer is still mapped — BOTH size-class-rounded.
+            let grown = grown_alloc_bytes(n);
+            let peak = worst_mainstream_retained(2 * n) + worst;
+            assert!(
+                grown >= peak,
+                "grown_alloc_bytes({n}) = {grown} under-counts the realloc \
+                 peak of {peak}"
+            );
+        }
+        // Non-vacuous: at the class-boundary sizes the pre-round-7
+        // request-size charge (`n.max(32)`) sits BELOW the retained block,
+        // so removing the rounding turns the asserts above red.
+        for &n in &[33u64, 65, 129, 257, 1025, 4097] {
+            assert!(
+                worst_mainstream_retained(n) > n.max(MIN_ALLOC_BYTES),
+                "size {n} must straddle a class boundary for this test to \
+                 catch a removed rounding"
+            );
+        }
     }
 
     /// Review round 5, finding 1: the charge sizes the rendered JSON by
@@ -7974,6 +8094,76 @@ mod tests {
                     state.coll.len()
                 );
             }
+        }
+    }
+
+    /// Issue #227 review round 7, finding 2 (the container-slot leg of the
+    /// same allocator-rounding model): the per-member `CollMember` slot
+    /// charge must cover the `coll` buffer's SIZE-CLASS-ROUNDED realloc
+    /// peak — live capacity (doubling growth, initial `min_non_zero_cap`
+    /// of 4) plus the old buffer still mapped during the realloc, each
+    /// retained at up to the worst mainstream block for its request.
+    /// Drives the REAL `member_stage_bytes` (a class-A state stages
+    /// nothing but the slot, so the returned charge IS the per-member
+    /// slot charge) and replays `Vec`'s exact growth schedule; reverting
+    /// the slot factor to the pre-round-7 `4×` fails at `n = 1` and at
+    /// every realloc point.
+    #[test]
+    fn coll_member_slot_charge_covers_the_size_class_rounded_realloc_peak() {
+        fn worst_mainstream_retained(n: u64) -> u64 {
+            let pow2_class = n.max(1).next_power_of_two();
+            let glibc_chunk = (n + 8).div_ceil(16) * 16;
+            pow2_class.max(glibc_chunk).max(32)
+        }
+
+        // A class-A reducer with no fan-out: no body staged, no labels
+        // staged — `member_stage_bytes` returns exactly the slot charge.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"}"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        assert!(!state.needs_body_order && !state.fan_out);
+        let row = MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns: 5,
+            body: "x".to_string(),
+        };
+        let slot_charge = state.member_stage_bytes(&row, &[], false);
+
+        let slot = size_of::<CollMember>() as u64;
+        let mut cap: u64 = 0;
+        for n in 1..=1_000u64 {
+            // `RawVec`: first push reserves `min_non_zero_cap = 4`; a full
+            // buffer doubles, with the old buffer live during the realloc.
+            let old = if n == 1 {
+                cap = 4;
+                0
+            } else if n > cap {
+                let old = cap;
+                cap *= 2;
+                old
+            } else {
+                0
+            };
+            let peak = worst_mainstream_retained(cap * slot)
+                + if old > 0 {
+                    worst_mainstream_retained(old * slot)
+                } else {
+                    0
+                };
+            let charged = slot_charge * n;
+            assert!(
+                charged >= peak,
+                "after {n} members the cumulative slot charge {charged} \
+                 under-counts the rounded realloc peak {peak}"
+            );
         }
     }
 
@@ -10283,37 +10473,141 @@ mod tests {
         assert_eq!(grouped[0].points.get(&60), Some(&2.0));
     }
 
-    /// Review round 2, finding 1: the grid count uses checked i128
-    /// arithmetic — the extreme/degenerate shapes below must saturate or
-    /// zero out, never panic or wrap past the cap.
+    /// Review round 2, finding 1 (carried to the round-7 shared guard):
+    /// the grid count uses i128/saturating arithmetic — the
+    /// extreme/degenerate shapes below must saturate (and REJECT through
+    /// [`ensure_grid_resolution`]) or zero out, never panic or wrap past
+    /// the cap.
     #[test]
-    fn grid_bucket_count_is_overflow_safe_at_extreme_bounds() {
-        // Full i64 range at step 1: ~2^64 buckets, saturates cleanly.
-        assert_eq!(grid_bucket_count(i64::MIN, i64::MAX, 1), u64::MAX);
-        // Deep-negative window at step 1: ~2^62 buckets, exact.
-        assert_eq!(
-            grid_bucket_count(i64::MIN, i64::MIN / 2, 1),
-            (i64::MIN / 2).abs_diff(i64::MIN)
-        );
-        // Inverted/empty windows are zero buckets, never an underflow.
-        assert_eq!(grid_bucket_count(i64::MAX, i64::MIN, 1), 0);
-        assert_eq!(grid_bucket_count(0, 0, 1), 0);
+    fn grid_resolution_guard_is_overflow_safe_at_extreme_bounds() {
+        // Full i64 range at step 1: ~2^64 points, saturates cleanly — and
+        // the guard rejects the saturated count by name.
+        assert_eq!(grid_point_count(i64::MIN, i64::MAX, 1), u64::MAX);
+        assert!(matches!(
+            ensure_grid_resolution(i64::MIN, i64::MAX, 1),
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+                // The saturated point count minus the inclusive endpoint.
+                buckets: 18_446_744_073_709_551_614, // u64::MAX - 1
+                cap: MAX_CLIENT_AGG_BUCKETS,
+            }))
+        ));
+        // Inverted/empty windows are zero points, never an underflow —
+        // and the guard's `count - 1` is saturating, so 0 points admits.
+        assert_eq!(grid_point_count(i64::MAX, i64::MIN, 1), 0);
+        assert_eq!(ensure_grid_resolution(i64::MAX, i64::MIN, 1).unwrap(), 0);
+        // A single-point window (start == end) is one grid point.
+        assert_eq!(grid_point_count(0, 0, 1), 1);
         // A zero step (structurally `InvalidStep` upstream) and a step
         // wider than i64 (never produced by `parse_step`) both saturate
-        // so the cap guard rejects them by name instead of `bucket_of`
+        // so the guard rejects them by name instead of the evaluator
         // ever dividing by a degenerate step.
-        assert_eq!(grid_bucket_count(0, 1_000, 0), u64::MAX);
-        assert_eq!(grid_bucket_count(0, 1_000, u64::MAX), u64::MAX);
-        // Ordinary shapes stay exact (the 11k-boundary golden covers the
-        // cap itself): (0, 120] at step 60 touches buckets 0, 60, and
-        // the end-edge bucket 120.
-        assert_eq!(grid_bucket_count(0, 120, 60), 3);
-        // Full i64 range at a half-range step: floor((MIN+1)/s) = -3
-        // through floor(MAX/s) = 2 — six buckets.
+        assert_eq!(grid_point_count(0, 1_000, 0), u64::MAX);
+        assert_eq!(grid_point_count(0, 1_000, u64::MAX), u64::MAX);
+        assert!(ensure_grid_resolution(0, 1_000, 0).is_err());
+        // Ordinary shapes stay exact (the 11k fence has its own golden):
+        // [0, 120] at step 60 holds grid points 0, 60, 120.
+        assert_eq!(grid_point_count(0, 120, 60), 3);
+    }
+
+    /// Issue #227 review round 7, finding 1: the resolution fence is
+    /// Loki's `(end - start) / step > 11000` (TRUNCATING interval count,
+    /// `loghttp/query.go` `errStepTooSmall`) — exactly-at-the-limit is
+    /// SERVED with its full 11_001-point inclusive grid; one interval
+    /// over is rejected. Both engine grid guards (`RangeSlideState::new`
+    /// and `materialize_vector_lit`) funnel through
+    /// [`ensure_grid_resolution`], so this pins the fence for the whole
+    /// engine against the HTTP guard's identical formula.
+    #[test]
+    fn grid_resolution_fence_serves_11000_intervals_and_rejects_11001() {
+        const S: u64 = 1_000_000_000; // 1s step
+        let step = S as i64;
+
+        // Exactly at the limit, step-aligned: 11_000 intervals → admitted,
+        // 11_001 inclusive grid points.
+        assert_eq!(ensure_grid_resolution(0, 11_000 * step, S).unwrap(), 11_001);
+        // One under: admitted, 11_000 points.
+        assert_eq!(ensure_grid_resolution(0, 10_999 * step, S).unwrap(), 11_000);
+        // One interval over: rejected, reporting the INTERVAL count.
+        assert!(matches!(
+            ensure_grid_resolution(0, 11_001 * step, S),
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+                buckets: 11_001,
+                cap: MAX_CLIENT_AGG_BUCKETS,
+            }))
+        ));
+        // Step not dividing the span (truncating division, like Loki's
+        // integer `Duration / Duration`): 11_000 intervals + half a step
+        // still truncates to 11_000 → admitted, 11_001 points.
         assert_eq!(
-            grid_bucket_count(i64::MIN, i64::MAX, (i64::MAX / 2) as u64),
-            6
+            ensure_grid_resolution(0, 11_000 * step + step / 2, S).unwrap(),
+            11_001
         );
+        // ... and one nanosecond past the 11_001st interval boundary is
+        // 11_001 truncated intervals → rejected.
+        assert!(ensure_grid_resolution(0, 11_001 * step + 1, S).is_err());
+        // Unaligned start (same span, shifted): the fence depends only on
+        // `end - start`, exactly like the reference.
+        let off = 123_456_789;
+        assert_eq!(
+            ensure_grid_resolution(off, off + 11_000 * step, S).unwrap(),
+            11_001
+        );
+        assert!(ensure_grid_resolution(off, off + 11_001 * step, S).is_err());
+    }
+
+    /// Issue #227 review round 7, finding 1 (the end-to-end shape): a
+    /// range request of exactly 11_000 intervals must be SERVED — the
+    /// request guard admits it and the engine's grid guard must not then
+    /// 422 it. Drives the REAL evaluators at the limit: the sliding state
+    /// accepts and emits over the full 11_001-point grid, and the
+    /// `vector(n)` grid materializes all 11_001 points.
+    #[test]
+    fn a_range_query_of_exactly_11000_intervals_is_served_not_422() {
+        const S: i64 = 1_000_000_000;
+        let step = super::super::params::validate_duration_ns(S as u64, "step").unwrap();
+
+        // The leafless vector(n) path: full inclusive grid, both endpoints.
+        let window = GridWindow {
+            start_ns: 0,
+            end_ns: 11_000 * S,
+            step_ns: Some(step),
+        };
+        let res = materialize_vector_lit(1.0, &window)
+            .expect("exactly 11_000 intervals must be served (the reference serves it)");
+        let QueryResult::Matrix(series) = res else {
+            panic!("expected a matrix, got {res:?}");
+        };
+        assert_eq!(series[0].points.len(), 11_001);
+        assert_eq!(series[0].points.first().unwrap().0, 0);
+        assert_eq!(series[0].points.last().unwrap().0, 11_000 * S);
+
+        // The sliding data path: RangeSlideState::new admits the same
+        // window (kmax = 11_000) instead of tripping MetricBuckets.
+        let client = ClientAgg {
+            range_op: RangeAggOp::CountOverTime,
+            value: ClientValue::Count,
+            param: None,
+            pipeline: vec![],
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 11_000 * S, S as u64, S as u64);
+        let state = RangeSlideState::new(&compiled, &meta, &client, window, None)
+            .expect("the engine must admit every request the HTTP guard admits");
+        assert_eq!(state.kmax, 11_000);
+
+        // One interval over IS the engine's 422 (the backstop still holds
+        // for anything that bypasses the HTTP boundary).
+        let window = slide_window(0, 11_001 * S, S as u64, S as u64);
+        match RangeSlideState::new(&compiled, &meta, &client, window, None) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets { buckets, cap })) => {
+                assert_eq!(buckets, 11_001);
+                assert_eq!(cap, MAX_CLIENT_AGG_BUCKETS);
+            }
+            Err(other) => panic!("expected MetricBuckets, got {other:?}"),
+            Ok(_) => panic!("one interval over the fence must be rejected"),
+        }
     }
 
     /// Review round 1, finding 1 (quantile bound): the exact-quantile
