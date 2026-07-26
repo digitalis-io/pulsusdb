@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_read::logql::sql::{self, MetricSource, TimeWindow};
+use pulsus_read::logql::sql::{self, ScanLowerBound, TimeWindow};
 
 fn should_run() -> bool {
     std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
@@ -658,10 +658,6 @@ async fn query_range_metric_returns_a_matrix() {
 /// way, just generalized to an arbitrary step rather than the rollup
 /// resolution.
 const POST_GOLDEN_STEP_NS: i64 = 3_600_000_000_000;
-/// `Config::default()`'s `log_rollup_resolution` — `spawn_ready_server`
-/// sets no `PULSUS_LOG_ROLLUP_RESOLUTION` override, so this is exactly
-/// what the spawned server's `EngineConfig::rollup_res_ns` resolves to.
-const POST_GOLDEN_ROLLUP_RES_NS: i64 = 5_000_000_000;
 
 fn aligned_step_center_ns(step_ns: i64) -> i64 {
     (now_ns() / step_ns) * step_ns + step_ns / 2
@@ -691,10 +687,10 @@ fn months_spanned(start_ns: i64, end_ns: i64) -> Vec<String> {
 /// re-review finding: field-level assertions on a streams-shaped query
 /// are not a byte-exact golden). Uses a **metric** query so the wire
 /// shape under test is matrix points, not free-form log lines, and
-/// computes the one genuinely dynamic value — the bucket timestamp — the
-/// same way the server does (`intDiv` bucket floor) rather than
-/// approximating it: this is a real byte-exact comparison, not a
-/// normalized one.
+/// computes the one genuinely dynamic value — the emitted grid point —
+/// the same way the server does (issue #227: the start-anchored sliding
+/// grid, `base_ns` itself) rather than approximating it: this is a real
+/// byte-exact comparison, not a normalized one.
 #[tokio::test]
 async fn query_range_post_metric_is_byte_exact_against_a_computed_golden() {
     if !should_run() {
@@ -714,7 +710,11 @@ async fn query_range_post_metric_is_byte_exact_against_a_computed_golden() {
 
     let window_start = base_ns - POST_GOLDEN_STEP_NS;
     let window_end = base_ns + POST_GOLDEN_STEP_NS;
-    let bucket_secs = ((base_ns / POST_GOLDEN_STEP_NS) * POST_GOLDEN_STEP_NS) / 1_000_000_000;
+    // Issue #227 (sliding windows): the start-anchored grid is
+    // {window_start, base_ns, window_end}; only `t = base_ns`'s window
+    // `(base_ns - 1h, base_ns]` contains the 3 seeded samples (at
+    // `base_ns - 3s..-1s`), the other two windows are empty ⇒ gaps.
+    let point_secs = base_ns / 1_000_000_000;
 
     let form = format!(
         "query={}&start={window_start}&end={window_end}&step=3600s",
@@ -724,13 +724,13 @@ async fn query_range_post_metric_is_byte_exact_against_a_computed_golden() {
         .expect("query_range POST reachable");
     assert_eq!(res.status, 200);
 
-    // Both seeded fingerprints' 3 samples land in exactly one bucket each
-    // (well inside the window, far from its edges); `env` sorts "prod"
-    // before "staging" (encode.rs's label-set ordering).
+    // Both seeded fingerprints' 3 samples land in exactly one sliding
+    // window each (well inside the window, far from its edges); `env`
+    // sorts "prod" before "staging" (encode.rs's label-set ordering).
     let expected = format!(
         "{{\"status\":\"success\",\"data\":{{\"resultType\":\"matrix\",\"result\":[\
-         {{\"metric\":{{\"env\":\"prod\",\"service_name\":\"checkout\"}},\"values\":[[{bucket_secs}.000,\"3\"]]}},\
-         {{\"metric\":{{\"env\":\"staging\",\"service_name\":\"checkout\"}},\"values\":[[{bucket_secs}.000,\"3\"]]}}\
+         {{\"metric\":{{\"env\":\"prod\",\"service_name\":\"checkout\"}},\"values\":[[{point_secs}.000,\"3\"]]}},\
+         {{\"metric\":{{\"env\":\"staging\",\"service_name\":\"checkout\"}},\"values\":[[{point_secs}.000,\"3\"]]}}\
          ],\"stats\":{{\"series\":2}}}}}}"
     );
     assert_eq!(res.body, expected);
@@ -770,7 +770,9 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
 
     let window_start = base_ns - POST_GOLDEN_STEP_NS;
     let window_end = base_ns + POST_GOLDEN_STEP_NS;
-    let bucket_secs = ((base_ns / POST_GOLDEN_STEP_NS) * POST_GOLDEN_STEP_NS) / 1_000_000_000;
+    // Issue #227 (sliding windows): the samples land in the one window
+    // ending at the grid point `base_ns` (see the metric golden above).
+    let point_secs = base_ns / 1_000_000_000;
 
     let form = format!(
         "query={}&start={window_start}&end={window_end}&step=3600s",
@@ -797,33 +799,31 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
         &[],
     );
     let stage2_sql = sql::stage2("log_streams", &[FP_A]);
-    let metric_sql = sql::metric_range(
-        MetricSource {
-            table: "log_metrics_5s",
-            bucket_col: "bucket_ns",
-            agg_expr: "sum(count)",
-        },
-        &[],
+    // Issue #227: a range aggregation slides raw — the explain reports the
+    // PK-ordered sliding scan over `log_samples`, its lower bound widened
+    // a full `[1h]` range (== POST_GOLDEN_STEP_NS here) before
+    // `window_start` so the first grid point sees its whole lookback.
+    let metric_sql = sql::metric_raw_samples_sliding(
+        "log_samples",
+        &["'checkout'".to_string()],
         &[FP_A],
         TimeWindow {
-            start_ns: window_start,
+            start_ns: window_start - POST_GOLDEN_STEP_NS,
             end_ns: window_end,
         },
-        POST_GOLDEN_STEP_NS as u64,
+        ScanLowerBound::Exclusive,
         &[],
     );
-    let routing_reason = format!(
-        "rollup: step {POST_GOLDEN_STEP_NS} ns divisible by resolution {POST_GOLDEN_ROLLUP_RES_NS} ns"
-    );
+    let routing_reason = "raw: sliding-window range aggregation (issue #227)".to_string();
 
     let mut expected = String::new();
     expected.push_str(r#"{"status":"success","data":{"resultType":"matrix","result":["#);
     expected.push_str(&format!(
-        r#"{{"metric":{{"env":"prod","service_name":"checkout"}},"values":[[{bucket_secs}.000,"3"]]}}"#
+        r#"{{"metric":{{"env":"prod","service_name":"checkout"}},"values":[[{point_secs}.000,"3"]]}}"#
     ));
     expected.push_str(r#"],"stats":{"series":1},"explain":{"#);
     expected.push_str(&format!(
-        r#""result_type":"matrix","routing":{{"chosen":"rollup","reason":{}}},"stages":["#,
+        r#""result_type":"matrix","routing":{{"chosen":"raw","reason":{}}},"stages":["#,
         serde_json::to_string(&routing_reason).expect("json-escape reason")
     ));
     expected.push_str(&format!(

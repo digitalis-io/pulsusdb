@@ -16,6 +16,40 @@ pub struct TimeWindow {
     pub end_ns: i64,
 }
 
+/// How a METRIC scan's lower time bound compares (issue #227 review
+/// round 11). `Exclusive` is the ordinary half-open window predicate
+/// (`timestamp_ns > start_ns` — the reference's `(t-range, t]`).
+/// `Inclusive` (`timestamp_ns >= start_ns`) exists for exactly one case:
+/// the planner's `start - range` scan widening UNDERFLOWED i64, so the
+/// LOGICAL lower bound sits strictly below the representable timestamp
+/// domain and the saturated `i64::MIN` carried in
+/// [`TimeWindow::start_ns`] is a VACUOUS bound, not an exclusive one — a
+/// sample stored at exactly `i64::MIN` is inside the reference's window,
+/// and `>` would silently drop it. A legitimately-computed
+/// (non-underflowing) `i64::MIN` bound stays `Exclusive` and keeps
+/// excluding a sample at exactly that timestamp. Only
+/// [`super::plan::metric_plan`]'s widening decides this; the log-path
+/// stage-3 builders take client bounds verbatim (never widened) and stay
+/// structurally exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanLowerBound {
+    Exclusive,
+    Inclusive,
+}
+
+impl ScanLowerBound {
+    /// The SQL comparison operator the lower bound renders as. Both forms
+    /// are plain range predicates on the `ORDER BY` time column, so
+    /// primary-key pruning is identical (`>=` at `i64::MIN` trivially
+    /// covers every part, exactly like the saturated `>` did).
+    fn sql_op(self) -> &'static str {
+        match self {
+            ScanLowerBound::Exclusive => ">",
+            ScanLowerBound::Inclusive => ">=",
+        }
+    }
+}
+
 /// Which physical table a metric read targets, and that table's
 /// bucket/aggregate column shape — the rollup-vs-raw routing decision
 /// [`super::plan::metric_plan`] makes, grouped into one parameter (same
@@ -429,6 +463,7 @@ pub fn metric_range(
     services: &[String],
     fingerprints: &[u64],
     window: TimeWindow,
+    lower: ScanLowerBound,
     step_ns: u64,
     extra_predicates: &[String],
 ) -> String {
@@ -439,9 +474,10 @@ pub fn metric_range(
     } = source;
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
+    let lower_op = lower.sql_op();
     let prewhere = metric_prewhere(services);
     let mut sql = format!(
-        "SELECT fingerprint, intDiv({bucket_col}, {step_ns}) * {step_ns} AS step, {agg_expr} AS n\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list}) AND {bucket_col} > {start_ns} AND {bucket_col} <= {end_ns}"
+        "SELECT fingerprint, intDiv({bucket_col}, {step_ns}) * {step_ns} AS step, {agg_expr} AS n\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list}) AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str(" AND ");
@@ -460,6 +496,7 @@ pub fn metric_instant(
     services: &[String],
     fingerprints: &[u64],
     window: TimeWindow,
+    lower: ScanLowerBound,
     extra_predicates: &[String],
 ) -> String {
     let MetricSource {
@@ -469,9 +506,10 @@ pub fn metric_instant(
     } = source;
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
+    let lower_op = lower.sql_op();
     let prewhere = metric_prewhere(services);
     let mut sql = format!(
-        "SELECT fingerprint, {agg_expr} AS n\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list}) AND {bucket_col} > {start_ns} AND {bucket_col} <= {end_ns}"
+        "SELECT fingerprint, {agg_expr} AS n\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list}) AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str(" AND ");
@@ -501,13 +539,15 @@ pub fn metric_raw_samples(
     services: &[String],
     fingerprints: &[u64],
     window: TimeWindow,
+    lower: ScanLowerBound,
     extra_predicates: &[String],
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
+    let lower_op = lower.sql_op();
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -535,13 +575,15 @@ pub fn metric_raw_samples_sliding(
     services: &[String],
     fingerprints: &[u64],
     window: TimeWindow,
+    lower: ScanLowerBound,
     extra_predicates: &[String],
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
+    let lower_op = lower.sql_op();
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -677,6 +719,7 @@ mod tests {
                 start_ns: 0,
                 end_ns: 100,
             },
+            ScanLowerBound::Exclusive,
             60,
             &[],
         );
@@ -697,6 +740,7 @@ mod tests {
                 start_ns: 0,
                 end_ns: 100,
             },
+            ScanLowerBound::Exclusive,
             60,
             &[],
         );
@@ -717,6 +761,7 @@ mod tests {
                 start_ns: 0,
                 end_ns: 100,
             },
+            ScanLowerBound::Exclusive,
             60,
             &[],
         );
@@ -971,9 +1016,109 @@ mod tests {
                 start_ns: 0,
                 end_ns: 100,
             },
+            ScanLowerBound::Exclusive,
             &[],
         );
         assert!(sql.contains("PREWHERE service = 'checkout'\n"));
         assert!(!sql.contains("intDiv"));
+    }
+
+    /// Issue #227 review round 11: an UNDERFLOWED scan widening renders the
+    /// lower bound INCLUSIVELY (`>= i64::MIN` — vacuous, so a sample stored
+    /// at exactly `i64::MIN` survives the predicate, matching the
+    /// reference's `(t-range, t]` whose logical bound sits below the
+    /// representable domain), across all four metric builders.
+    #[test]
+    fn an_underflowed_scan_lower_bound_renders_inclusively() {
+        let window = TimeWindow {
+            start_ns: i64::MIN,
+            end_ns: i64::MIN,
+        };
+        let raw_source = MetricSource {
+            table: "log_samples",
+            bucket_col: "timestamp_ns",
+            agg_expr: "count()",
+        };
+        let svc = ["'checkout'".to_string()];
+        let sliding = metric_raw_samples_sliding(
+            "log_samples",
+            &svc,
+            &[1],
+            window,
+            ScanLowerBound::Inclusive,
+            &[],
+        );
+        assert!(
+            sliding.contains(
+                "timestamp_ns >= -9223372036854775808 AND timestamp_ns <= -9223372036854775808"
+            ),
+            "sliding scan must be lower-inclusive on underflow: {sliding}"
+        );
+        let instant_raw = metric_raw_samples(
+            "log_samples",
+            &svc,
+            &[1],
+            window,
+            ScanLowerBound::Inclusive,
+            &[],
+        );
+        assert!(
+            instant_raw.contains("timestamp_ns >= -9223372036854775808"),
+            "instant raw scan must be lower-inclusive on underflow: {instant_raw}"
+        );
+        let instant_agg = metric_instant(
+            raw_source,
+            &svc,
+            &[1],
+            window,
+            ScanLowerBound::Inclusive,
+            &[],
+        );
+        assert!(
+            instant_agg.contains("timestamp_ns >= -9223372036854775808"),
+            "instant aggregate must be lower-inclusive on underflow: {instant_agg}"
+        );
+        let range_agg = metric_range(
+            raw_source,
+            &svc,
+            &[1],
+            window,
+            ScanLowerBound::Inclusive,
+            60,
+            &[],
+        );
+        assert!(
+            range_agg.contains("timestamp_ns >= -9223372036854775808"),
+            "range aggregate must be lower-inclusive on underflow: {range_agg}"
+        );
+    }
+
+    /// The negative control: an `Exclusive` bound at exactly `i64::MIN` (a
+    /// LEGITIMATELY-computed lower bound, e.g. `start = i64::MIN + 1` with
+    /// `[1ns]`) keeps the half-open `>` — a sample at exactly `i64::MIN`
+    /// stays excluded, as in the reference.
+    #[test]
+    fn a_legitimate_i64_min_scan_lower_bound_stays_exclusive() {
+        let window = TimeWindow {
+            start_ns: i64::MIN,
+            end_ns: i64::MIN + 1,
+        };
+        let svc = ["'checkout'".to_string()];
+        let sliding = metric_raw_samples_sliding(
+            "log_samples",
+            &svc,
+            &[1],
+            window,
+            ScanLowerBound::Exclusive,
+            &[],
+        );
+        assert!(
+            sliding.contains("timestamp_ns > -9223372036854775808 AND"),
+            "a non-underflowing i64::MIN bound must stay exclusive: {sliding}"
+        );
+        assert!(
+            !sliding.contains(">="),
+            "no inclusive lower bound: {sliding}"
+        );
     }
 }

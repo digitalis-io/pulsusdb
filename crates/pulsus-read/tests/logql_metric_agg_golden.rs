@@ -2311,6 +2311,7 @@ fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     );
     assert!(

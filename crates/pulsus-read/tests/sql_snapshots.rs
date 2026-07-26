@@ -6,7 +6,7 @@
 //! direction/limit variants; and the `Instant`/`Range` `QuerySpec` shapes.
 
 use pulsus_logql::parse;
-use pulsus_read::logql::sql::{self, TimeWindow};
+use pulsus_read::logql::sql::{self, ScanLowerBound, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 fn ctx() -> PlanCtx<'static> {
@@ -624,6 +624,7 @@ fn sliding_sql(
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     )
 }
@@ -729,6 +730,7 @@ fn metric_range_sql_uses_intdiv_bucketing() {
             start_ns: START_NS,
             end_ns: END_NS,
         },
+        ScanLowerBound::Exclusive,
         STEP_NS,
         &[],
     );
@@ -751,6 +753,7 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
             start_ns: START_NS,
             end_ns: END_NS,
         },
+        ScanLowerBound::Exclusive,
         &[],
     );
     assert_eq!(
@@ -954,6 +957,7 @@ fn client_metric_sql(mp: &pulsus_read::logql::MetricPlan) -> String {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     )
 }

@@ -948,6 +948,7 @@ impl LogQlEngine {
                     start_ns: mp.start_ns,
                     end_ns: mp.end_ns,
                 },
+                mp.scan_lower,
                 &mp.extra_predicates,
             );
             if let Some(e) = explain.as_mut() {
@@ -990,6 +991,7 @@ impl LogQlEngine {
                     start_ns: mp.start_ns,
                     end_ns: mp.end_ns,
                 },
+                mp.scan_lower,
                 step_ns.as_u64(),
                 &mp.extra_predicates,
             );
@@ -1255,6 +1257,7 @@ impl LogQlEngine {
                     &services,
                     &fingerprints,
                     window,
+                    mp.scan_lower,
                     step_ns.as_u64(),
                     &mp.extra_predicates,
                 ),
@@ -1263,6 +1266,7 @@ impl LogQlEngine {
                     &services,
                     &fingerprints,
                     window,
+                    mp.scan_lower,
                     &mp.extra_predicates,
                 ),
             }
@@ -2974,6 +2978,7 @@ fn client_metric_read_sql(
             services,
             fingerprints,
             window,
+            mp.scan_lower,
             &mp.extra_predicates,
         )
     } else {
@@ -2982,6 +2987,7 @@ fn client_metric_read_sql(
             services,
             fingerprints,
             window,
+            mp.scan_lower,
             &mp.extra_predicates,
         )
     }
@@ -4426,25 +4432,33 @@ impl FpSlide {
     /// Evicts `T ≤ t-range` from the window front (discharging retention),
     /// then reduces the window and records a point (empty ⇒ gap).
     fn emit_at(&mut self, t: i64, retained: &mut u64) {
-        // `saturating_sub`: for `t` near `i64::MIN` (or a `range` ≫ the whole
-        // window) `t-range` underflows i64; saturating to `i64::MIN` is
-        // correct — no stored ts is below it, so the eviction bound is exact.
-        let lo = t.saturating_sub(self.range);
-        while let Some(front) = self.win.front() {
-            if front.ts <= lo {
-                let ev = self.win.pop_front().expect("front present");
-                // Symmetric discharge (the concurrent-retention invariant):
-                // every evicted sample was charged on load in the same
-                // `per_sample` unit, so this is exact; the saturating form is
-                // panic-proofing, never a masked accounting path (class-A
-                // values are `1.0` or a non-negative `line.len()`, added and
-                // removed once each).
-                discharge_retention(retained, self.per_sample);
-                if matches!(self.class, ReducerClass::InvertInteger) {
-                    self.run_int = self.run_int.saturating_sub(ev.value as u64);
+        // `checked_sub` (issue #227 review round 11): for `t` near `i64::MIN`
+        // (or a `range` ≫ the whole window) the logical eviction bound
+        // `t-range` sits BELOW the representable domain — the window
+        // `(t-range, t]` then covers every stored ts ≤ t and there is
+        // NOTHING to evict. The prior saturating form clamped the bound to
+        // `i64::MIN` and the `ts <= lo` eviction wrongly dropped a sample
+        // stored at exactly `i64::MIN`, which the reference includes. A
+        // legitimately-computed `lo == i64::MIN` (no underflow) still
+        // evicts a sample at exactly that timestamp — exclusive semantics
+        // are lost only when the bound is genuinely sub-domain.
+        if let Some(lo) = t.checked_sub(self.range) {
+            while let Some(front) = self.win.front() {
+                if front.ts <= lo {
+                    let ev = self.win.pop_front().expect("front present");
+                    // Symmetric discharge (the concurrent-retention
+                    // invariant): every evicted sample was charged on load in
+                    // the same `per_sample` unit, so this is exact; the
+                    // saturating form is panic-proofing, never a masked
+                    // accounting path (class-A values are `1.0` or a
+                    // non-negative `line.len()`, added and removed once each).
+                    discharge_retention(retained, self.per_sample);
+                    if matches!(self.class, ReducerClass::InvertInteger) {
+                        self.run_int = self.run_int.saturating_sub(ev.value as u64);
+                    }
+                } else {
+                    break;
                 }
-            } else {
-                break;
             }
         }
         // Class A (integer invert) needs only the running value + emptiness —
@@ -6978,6 +6992,62 @@ mod tests {
             points,
             vec![(10, 1.0), (20, 2.0), (30, 3.0), (40, 3.0), (50, 3.0)],
             "empty first window emits no point; overlapping windows slide"
+        );
+    }
+
+    /// Issue #227 review round 11 (end-to-end at the domain floor): for
+    /// `start = end = i64::MIN` with `[1ns]`, the grid's only window
+    /// `(i64::MIN - 1ns, i64::MIN]` has a logical lower bound BELOW the
+    /// representable domain — a sample stored at exactly `i64::MIN` is
+    /// INSIDE it (the reference's `(t-range, t]` includes it; the bound is
+    /// vacuous, not exclusive). The prior saturating eviction clamped the
+    /// bound to `i64::MIN` and dropped the sample.
+    #[test]
+    fn a_sample_at_i64_min_is_inside_an_underflowing_window() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows = slide_rows(1, &[(i64::MIN, "x")]);
+        let window = slide_window(i64::MIN, i64::MIN, 1, 1);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let (_, points) = one_series_points(res);
+        assert_eq!(
+            points,
+            vec![(i64::MIN, 1.0)],
+            "the boundary sample must be counted, matching the reference"
+        );
+    }
+
+    /// The round-11 negative control: a LEGITIMATELY-computed `i64::MIN`
+    /// window bound — `t = i64::MIN + 1`, `[1ns]`, so `t - range` is
+    /// exactly `i64::MIN` with NO underflow — keeps its EXCLUSIVE
+    /// semantics: the sample at exactly `i64::MIN` stays outside
+    /// `(i64::MIN, i64::MIN + 1]` and only the in-window sample counts.
+    #[test]
+    fn a_legitimate_i64_min_window_bound_still_excludes_the_boundary_sample() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows = slide_rows(1, &[(i64::MIN, "out"), (i64::MIN + 1, "in")]);
+        let window = slide_window(i64::MIN + 1, i64::MIN + 1, 1, 1);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let (_, points) = one_series_points(res);
+        assert_eq!(
+            points,
+            vec![(i64::MIN + 1, 1.0)],
+            "an exactly-representable exclusive bound must still evict the boundary sample"
         );
     }
 

@@ -377,12 +377,21 @@ async fn assert_rollup_matches_raw(
         },
     };
 
-    let rollup_sql = sql::metric_range(rollup_source, &[], fps, w, step_ns, &mp.extra_predicates);
+    let rollup_sql = sql::metric_range(
+        rollup_source,
+        &[],
+        fps,
+        w,
+        mp.scan_lower,
+        step_ns,
+        &mp.extra_predicates,
+    );
     let raw_sql = sql::metric_range(
         raw_source,
         &["'checkout'".to_string()],
         fps,
         w,
+        mp.scan_lower,
         step_ns,
         &mp.extra_predicates,
     );

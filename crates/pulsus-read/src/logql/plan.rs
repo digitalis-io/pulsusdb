@@ -24,6 +24,7 @@ use super::exec::GridWindow;
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
+use super::sql::ScanLowerBound;
 
 /// A pure fetch plan for either query shape. See the module docs for why
 /// stage 2/3 aren't pre-rendered here. `MetricBinary` (issue M6-10) is
@@ -135,11 +136,21 @@ pub struct MetricPlan {
     /// `body` column — a metric query with a line filter can never be
     /// rollup-served, see [`metric_plan`]).
     pub extra_predicates: Vec<String>,
-    /// The scan lower bound (`timestamp_ns > start_ns`). For a range query
+    /// The scan lower bound (`timestamp_ns > start_ns`, or `>=` when
+    /// `scan_lower` is [`ScanLowerBound::Inclusive`]). For a range query
     /// this is widened to `query_start - range` (issue #227) so the first
     /// grid point's sliding window `(start-range, start]` sees its full
     /// lookback; the emit grid still begins at `query_start`.
     pub start_ns: i64,
+    /// How `start_ns` compares in SQL — [`ScanLowerBound::Inclusive`]
+    /// EXACTLY when the `start - range` widening underflowed i64
+    /// ([`widen_scan_start`], issue #227 review round 11): the logical
+    /// bound then sits below every representable timestamp, so the
+    /// saturated `i64::MIN` in `start_ns` is vacuous, not exclusive — a
+    /// sample stored at exactly `i64::MIN` is inside the reference's
+    /// window. A legitimately-computed `i64::MIN` bound stays
+    /// [`ScanLowerBound::Exclusive`].
+    pub scan_lower: ScanLowerBound,
     pub end_ns: i64,
     /// `Some(step)` = [`QuerySpec::Range`]'s Loki sliding-window shape
     /// (issue #227: the `[range]` window `(t-range, t]` re-evaluated at the
@@ -729,12 +740,10 @@ fn metric_plan(
     // `t ∈ {grid_start + k·step ≤ end}`, so the scan must reach back a full
     // `range` before `grid_start`. `rate_window_ns = range` (never `step`)
     // is the `rate([1m]) ≠ rate([10m])` fix.
-    let (start_ns, end_ns, step_ns, grid_start_ns, rate_window_ns) = match p.spec {
+    let (start_ns, scan_lower, end_ns, step_ns, grid_start_ns, rate_window_ns) = match p.spec {
         QuerySpec::Instant { at_ns } => {
-            // `range_ns` is validated in-domain, so this is an ordinary i64
-            // subtraction (saturating only for a `start` near `i64::MIN`).
-            let start = at_ns.saturating_sub(range_ns.get());
-            (start, at_ns, None, start, Some(range_ns))
+            let (start, lower) = widen_scan_start(at_ns, range_ns);
+            (start, lower, at_ns, None, start, Some(range_ns))
         }
         QuerySpec::Range {
             start_ns,
@@ -746,8 +755,15 @@ fn metric_plan(
             // in-domain durations only: every later `step as i128` /
             // `step_ns > i64::MAX` guard is then provably never taken.
             let step = validate_duration_ns(step_ns, "step")?;
-            let scan_start = start_ns.saturating_sub(range_ns.get());
-            (scan_start, end_ns, Some(step), start_ns, Some(range_ns))
+            let (scan_start, lower) = widen_scan_start(start_ns, range_ns);
+            (
+                scan_start,
+                lower,
+                end_ns,
+                Some(step),
+                start_ns,
+                Some(range_ns),
+            )
         }
     };
 
@@ -871,6 +887,7 @@ fn metric_plan(
         routing,
         extra_predicates,
         start_ns,
+        scan_lower,
         end_ns,
         step_ns,
         grid_start_ns,
@@ -887,6 +904,28 @@ fn metric_plan(
         client,
         probes,
     })
+}
+
+/// Widens a window's lower bound back by the `[range]` selector (Loki's
+/// `(t-range, t]` lookback) and decides how the SQL predicate compares
+/// against it (issue #227 review round 11). `checked_sub` is the crux:
+///
+/// * `Some(lo)` — the logical bound is representable, so the scan keeps
+///   the reference's EXCLUSIVE `timestamp_ns > lo` — including a
+///   legitimately-computed `lo == i64::MIN` (e.g. `start = i64::MIN + 1`,
+///   `[1ns]`), where a sample stored at exactly `i64::MIN` is genuinely
+///   outside the window.
+/// * `None` — the subtraction UNDERFLOWED: the logical bound sits strictly
+///   below `i64::MIN`, beneath every representable timestamp, so the
+///   saturated `i64::MIN` is a VACUOUS bound and must render INCLUSIVELY
+///   (`timestamp_ns >= i64::MIN`). The prior saturating form kept `>` and
+///   silently dropped a sample stored at exactly `i64::MIN` that the
+///   reference includes.
+fn widen_scan_start(start_ns: i64, range_ns: ValidatedDuration) -> (i64, ScanLowerBound) {
+    match start_ns.checked_sub(range_ns.get()) {
+        Some(lo) => (lo, ScanLowerBound::Exclusive),
+        None => (i64::MIN, ScanLowerBound::Inclusive),
+    }
 }
 
 /// Unwraps every outer `MetricExpr::Vector` layer, returning the
@@ -1359,6 +1398,66 @@ mod tests {
             Err(ReadError::DurationOutOfRange { what: "step", .. }) => {}
             other => panic!("expected a named duration rejection, got {other:?}"),
         }
+    }
+
+    /// Issue #227 review round 11: when the `start - range` scan widening
+    /// UNDERFLOWS i64, the plan carries `start_ns == i64::MIN` with an
+    /// INCLUSIVE lower bound — the logical bound sits below the
+    /// representable domain, so a sample stored at exactly `i64::MIN`
+    /// must survive the SQL predicate (the reference includes it). Both
+    /// the range path and its instant analogue.
+    #[test]
+    fn scan_widening_underflow_makes_the_lower_bound_inclusive() {
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[1ns])"#,
+            QuerySpec::Range {
+                start_ns: i64::MIN,
+                end_ns: i64::MIN,
+                step_ns: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.start_ns, i64::MIN);
+        assert_eq!(mp.scan_lower, ScanLowerBound::Inclusive);
+        assert_eq!(mp.grid_start_ns, i64::MIN, "the emit grid is unwidened");
+
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[1ns])"#,
+            QuerySpec::Instant { at_ns: i64::MIN },
+        )
+        .unwrap();
+        assert_eq!(mp.start_ns, i64::MIN);
+        assert_eq!(mp.scan_lower, ScanLowerBound::Inclusive);
+    }
+
+    /// The negative control (the crux of the round-11 distinction): a
+    /// LEGITIMATELY-computed `i64::MIN` lower bound — `start = i64::MIN +
+    /// 1` minus `[1ns]`, no underflow — keeps EXCLUSIVE semantics, so a
+    /// sample at exactly `i64::MIN` stays outside the window, as in the
+    /// reference.
+    #[test]
+    fn a_legitimately_computed_i64_min_scan_bound_stays_exclusive() {
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[1ns])"#,
+            QuerySpec::Range {
+                start_ns: i64::MIN + 1,
+                end_ns: i64::MIN + 1,
+                step_ns: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.start_ns, i64::MIN, "exactly representable: (MIN+1) - 1");
+        assert_eq!(mp.scan_lower, ScanLowerBound::Exclusive);
+
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[1ns])"#,
+            QuerySpec::Instant {
+                at_ns: i64::MIN + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.start_ns, i64::MIN);
+        assert_eq!(mp.scan_lower, ScanLowerBound::Exclusive);
     }
 
     /// Issue #227: a range query NO LONGER routes to the 5s rollup on a

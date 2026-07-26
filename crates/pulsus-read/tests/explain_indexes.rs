@@ -768,6 +768,7 @@ async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     );
     assert!(
@@ -917,6 +918,7 @@ async fn metric_instant_read_routes_to_raw_and_uses_the_service_fingerprint_time
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     );
 
@@ -1480,6 +1482,7 @@ async fn m6_10_unpiped_count_over_time_range_slides_raw() {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     );
     let usage = explain(&client, &sql).await;
@@ -1514,6 +1517,7 @@ async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key(
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     );
     assert!(!sql.contains("LIMIT"), "aggregations never truncate: {sql}");
@@ -1550,6 +1554,7 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
+        mp.scan_lower,
         &mp.extra_predicates,
     );
 

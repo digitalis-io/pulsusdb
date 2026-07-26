@@ -1461,6 +1461,7 @@ async fn run_metric_shape(
                 start_ns: mp.start_ns,
                 end_ns: mp.end_ns,
             },
+            mp.scan_lower,
             // Issue #227 made `MetricPlan::step_ns` a `ValidatedDuration`.
             // This bench stage still measures the step-bucketed rollup SQL
             // shape directly (the committed evidence JSON is byte-frozen);
