@@ -1,0 +1,293 @@
+# b13_variants.test — issue #221: `variants(<metricExpr>, …) of (<logRangeExpr>)`.
+#
+# Every accept-case value below was CAPTURED from the pinned reference
+# container (never hand-computed):
+#   image  docker.io/grafana/loki:3.7.4
+#   digest sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc
+#   date   2026-07-26 (capture session)
+#   config delta: `limits_config.enable_multi_variant_queries: true` (the
+#   bare container 400s EVERY variants query with `multi variant queries
+#   are disabled for this instance`) — plus the b10 `shard_aggregations`/
+#   `frontend.encoding: protobuf` deltas already documented in
+#   PROVENANCE.md (one capture config serves both, `ci/logql/config.yaml`).
+#   Transcription discipline (PROVENANCE.md): the container adds
+#   `detected_level`/`detected_level_extracted` labels PulsusDB's label
+#   model has no analogue for — dropped from every expected label set
+#   below; values are unaffected.
+#
+# PRE-COMMITTED EXCLUSIONS (selection rules, not post-hoc filters):
+#   - no case sets `__variant__` in the COMMON pipeline (the reference
+#     appends a duplicate label and mis-routes samples — a recorded
+#     divergence, docs/benchmarks/logs-differential-ledger.md; PulsusDB
+#     pins index-wins, gated hermetically);
+#   - no `offset`, no range-aggregation grouping, no case above the
+#     series cap (workspace-wide pre-existing gaps / the #236 cap class);
+#   - the `sum(absent_over_time(...))` sub-case: the capture gives `{}`
+#     (the injected `by (__variant__)` grouping over the index-less
+#     synthetic series); PulsusDB's `by`-grouping currently materializes
+#     a MISSING grouped label as `name=""` — a PRE-EXISTING engine
+#     semantic (every `by` over a missing label, not variants-specific)
+#     reported for adjudication in the issue #221 follow-up rather than
+#     changed here. The absent instant/range cases below ARE pinned: the
+#     adjudicated capture correction (2026-07-26 session; the reference
+#     attaches `__variant__` per EXTRACTED SAMPLE, so a synthetic absent
+#     series never carries it — index-less and kept at instant, dropped
+#     at range).
+#
+# Reference-observed rejections for the eval_fail cases (both sides
+# reject; the status/body divergences are deliberate and ledgered —
+# "we do not reproduce the reference where it is self-inconsistent or
+# crashing"):
+#   sum(variants(…))                    400 syntax error: unexpected )
+#   (variants(…))                       400 syntax error: unexpected )
+#   topk(1, variants(…))                400 syntax error: unexpected )
+#   label_replace(variants(…), …)       400 syntax error: unexpected ,
+#   variants() of (…)                   400 syntax error: unexpected )
+#   variants(V,) of (…)                 400 syntax error: unexpected )
+#   variants(V)  [no of]                400 unexpected $end, expecting of
+#   variants(V) of LR  [unparenthesised] 400 unexpected {, expecting (
+#   variants(variants(…) of (…)) of (…) 400 syntax error: unexpected )
+#   variants(1) of (…)                  500 unexpected empty result
+#   variants(V + 1) of (…)              500 runtime error: invalid memory
+#                                           address or nil pointer dereference
+#   variants(sum(sum(V))) of (…)        500 expected range aggregation
+#                                           expression but got *syntax.VectorAggregationExpr
+#   variants(approx_topk(1, V)) of (…)  500 expected aggregation operator
+#                                           but got "approx_topk"
+#   variants(sum_over_time({…}[5m])) of 500 runtime error: invalid memory
+#                                           address or nil pointer dereference
+
+load
+  {env="dev", service_name="svcv"} service=svcv
+  10s  ab
+  40s  ab
+  {env="prod", service_name="svcv"} service=svcv
+  15s  ab
+  45s  ab
+  55s  ab
+
+# case 1 — single count variant: decimal `__variant__="0"`, one series
+# per stream (a missing/misspelled index or zero-padding fails here).
+eval instant at 60s variants(count_over_time({service_name="svcv"}[5m])) of ({service_name="svcv"}[5m])
+  {__variant__="0", env="dev", service_name="svcv"} 2
+  {__variant__="0", env="prod", service_name="svcv"} 3
+
+# case 2 — two extractors over ONE scan yield DIFFERENT values per index
+# (a one-extractor implementation fails).
+eval instant at 60s variants(count_over_time({service_name="svcv"}[5m]), bytes_over_time({service_name="svcv"}[5m])) of ({service_name="svcv"}[5m])
+  {__variant__="0", env="dev", service_name="svcv"} 2
+  {__variant__="0", env="prod", service_name="svcv"} 3
+  {__variant__="1", env="dev", service_name="svcv"} 4
+  {__variant__="1", env="prod", service_name="svcv"} 6
+
+# case 3 — the variant's own selector and line filters are DEAD SYNTAX:
+# only the common range selects data.
+eval instant at 60s variants(count_over_time({service_name="nope"} |= "zzzz" [5m])) of ({service_name="svcv"}[5m])
+  {__variant__="0", env="dev", service_name="svcv"} 2
+  {__variant__="0", env="prod", service_name="svcv"} 3
+
+# case 4 — each variant honours its OWN [range]: (30s, 60s] sees only
+# the 40s/45s/55s samples; the common scan window is [5m]'s.
+eval instant at 60s variants(count_over_time({service_name="svcv"}[30s]), count_over_time({service_name="svcv"}[5m])) of ({service_name="svcv"}[5m])
+  {__variant__="0", env="dev", service_name="svcv"} 1
+  {__variant__="0", env="prod", service_name="svcv"} 2
+  {__variant__="1", env="dev", service_name="svcv"} 2
+  {__variant__="1", env="prod", service_name="svcv"} 3
+
+# case 5 — `__variant__` is injected into a `by` grouping.
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="svcv"}[5m]))) of ({service_name="svcv"}[5m])
+  {__variant__="0", env="dev"} 2
+  {__variant__="0", env="prod"} 3
+
+# case 6 — a bare `sum` (nil grouping) becomes `by (__variant__)`.
+eval instant at 60s variants(sum(count_over_time({service_name="svcv"}[5m]))) of ({service_name="svcv"}[5m])
+  {__variant__="0"} 5
+
+# case 7 — `__variant__` is injected into `without` too, which STRIPS
+# it; the resulting index-less series is KEPT at instant…
+eval instant at 60s variants(sum without (env) (count_over_time({service_name="svcv"}[5m]))) of ({service_name="svcv"}[5m])
+  {service_name="svcv"} 5
+
+# case 8 — …and the SAME query at range DROPS it (the reference's
+# instant/range asymmetry — the corpus's killer case).
+eval range from 0s to 60s step 60s variants(sum without (env) (count_over_time({service_name="svcv"}[5m]))) of ({service_name="svcv"}[5m])
+
+# case 13 — range envelope: matrix, `__variant__` per series, values on
+# the shared grid (t=0's window (−1m, 0] is empty — a gap).
+eval range from 0s to 60s step 60s variants(count_over_time({service_name="svcv"}[1m]), bytes_over_time({service_name="svcv"}[1m])) of ({service_name="svcv"}[1m])
+  {__variant__="0", env="dev", service_name="svcv"} 60s 2
+  {__variant__="0", env="prod", service_name="svcv"} 60s 3
+  {__variant__="1", env="dev", service_name="svcv"} 60s 4
+  {__variant__="1", env="prod", service_name="svcv"} 60s 6
+
+# case 11 — eleven variants: plain decimal `strconv.Itoa` indexes ("10",
+# never zero-padded or capped).
+eval instant at 60s variants(count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m]), count_over_time({service_name="svcv"}[5m])) of ({service_name="svcv"}[5m])
+  {__variant__="0", env="dev", service_name="svcv"} 2
+  {__variant__="0", env="prod", service_name="svcv"} 3
+  {__variant__="1", env="dev", service_name="svcv"} 2
+  {__variant__="1", env="prod", service_name="svcv"} 3
+  {__variant__="2", env="dev", service_name="svcv"} 2
+  {__variant__="2", env="prod", service_name="svcv"} 3
+  {__variant__="3", env="dev", service_name="svcv"} 2
+  {__variant__="3", env="prod", service_name="svcv"} 3
+  {__variant__="4", env="dev", service_name="svcv"} 2
+  {__variant__="4", env="prod", service_name="svcv"} 3
+  {__variant__="5", env="dev", service_name="svcv"} 2
+  {__variant__="5", env="prod", service_name="svcv"} 3
+  {__variant__="6", env="dev", service_name="svcv"} 2
+  {__variant__="6", env="prod", service_name="svcv"} 3
+  {__variant__="7", env="dev", service_name="svcv"} 2
+  {__variant__="7", env="prod", service_name="svcv"} 3
+  {__variant__="8", env="dev", service_name="svcv"} 2
+  {__variant__="8", env="prod", service_name="svcv"} 3
+  {__variant__="9", env="dev", service_name="svcv"} 2
+  {__variant__="9", env="prod", service_name="svcv"} 3
+  {__variant__="10", env="dev", service_name="svcv"} 2
+  {__variant__="10", env="prod", service_name="svcv"} 3
+
+# case 12 — `variants(…) of (…) + 1` is a legal binary operand: every
+# variant's value +1, `__variant__` preserved.
+eval instant at 60s variants(count_over_time({service_name="svcv"}[5m]), bytes_over_time({service_name="svcv"}[5m])) of ({service_name="svcv"}[5m]) + 1
+  {__variant__="0", env="dev", service_name="svcv"} 3
+  {__variant__="0", env="prod", service_name="svcv"} 4
+  {__variant__="1", env="dev", service_name="svcv"} 5
+  {__variant__="1", env="prod", service_name="svcv"} 7
+
+clear
+
+load
+  {service_name="svcw"} service=svcw
+  5s  {"d":2,"a":10,"b":100}
+  15s  {"d":5,"a":7,"b":200}
+  25s  {"e":1}
+
+# case 9 — an unwrap variant beside a count variant over one common
+# `| json`: each variant gets its OWN unwrap tail (the unwrapped label is
+# deleted from variant 0's series; the count variant keeps `d` as a
+# label). A line without the unwrap label is silently skipped.
+eval instant at 60s variants(sum_over_time({service_name="svcw"} | unwrap d [5m]), count_over_time({service_name="svcw"}[5m])) of ({service_name="svcw"} | json [5m])
+  {__variant__="0", a="10", b="100", service_name="svcw"} 2
+  {__variant__="0", a="7", b="200", service_name="svcw"} 5
+  {__variant__="1", a="10", b="100", d="2", service_name="svcw"} 1
+  {__variant__="1", a="7", b="200", d="5", service_name="svcw"} 1
+  {__variant__="1", e="1", service_name="svcw"} 1
+
+# case 10 — post-`unwrap` label filters in a variant's tail ARE honoured
+# (`ReduceAndLabelFilter(PostFilters)`): `d > 2` keeps only the d=5 line.
+eval instant at 60s variants(sum_over_time({service_name="svcw"} | unwrap d | d > 2 [5m]), sum_over_time({service_name="svcw"} | unwrap d [5m])) of ({service_name="svcw"} | json [5m])
+  {__variant__="0", a="7", b="200", service_name="svcw"} 5
+  {__variant__="1", a="10", b="100", service_name="svcw"} 2
+  {__variant__="1", a="7", b="200", service_name="svcw"} 5
+
+clear
+
+load
+  {service_name="svcx"} service=svcx
+  5s  {"d":2,"a":10,"b":100}
+  15s  {"d":5,"a":7,"b":200}
+  25s  {"e":1}
+  35s  {"d":"x"}
+
+# case 15a (Δ1) — a COMMON-range `unwrap` is DEAD SYNTAX: the common
+# pipeline truncates at the first unwrap, so lines whose `d` is missing
+# or non-numeric are NOT dropped (an implementation that executes the
+# dead unwrap undercounts to 2 and errors on `d="x"`).
+eval instant at 60s variants(count_over_time({service_name="svcx"}[5m])) of ({service_name="svcx"} | json | unwrap d [5m])
+  {__variant__="0", a="10", b="100", d="2", service_name="svcx"} 1
+  {__variant__="0", a="7", b="200", d="5", service_name="svcx"} 1
+  {__variant__="0", d="x", service_name="svcx"} 1
+  {__variant__="0", e="1", service_name="svcx"} 1
+
+# case 15b (Δ1) — the VARIANT's `unwrap a` runs (against the common
+# `| json` extraction); the DEAD common `unwrap b` does not (`b` stays a
+# label; an implementation executing it would unwrap `b`, or reject the
+# double unwrap).
+eval instant at 60s variants(sum_over_time({service_name="svcx"} | unwrap a [5m])) of ({service_name="svcx"} | json | unwrap b [5m])
+  {__variant__="0", b="100", d="2", service_name="svcx"} 10
+  {__variant__="0", b="200", d="5", service_name="svcx"} 7
+
+# case 15c (Δ1) — the dead common unwrap's POST-FILTER is dead too: all
+# d < 1000, yet every line still counts.
+eval instant at 60s variants(count_over_time({service_name="svcx"}[5m])) of ({service_name="svcx"} | json | unwrap d | d > 1000 [5m])
+  {__variant__="0", a="10", b="100", d="2", service_name="svcx"} 1
+  {__variant__="0", a="7", b="200", d="5", service_name="svcx"} 1
+  {__variant__="0", d="x", service_name="svcx"} 1
+  {__variant__="0", e="1", service_name="svcx"} 1
+
+clear
+
+# --- Rejections (msg = PulsusDB's own error substring; the reference's
+# --- observed status+body per case is in the header table above).
+
+load
+  {service_name="rj"} service=rj
+  10s  ab
+
+# positional: `variantsExpr` is an `expr` alternative, not a
+# `metricExpr` — every nested position rejects.
+eval_fail instant at 60s sum(variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m]))
+  msg: an aggregation function
+
+eval_fail instant at 60s (variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m]))
+  msg: an aggregation function
+
+eval_fail instant at 60s topk(1, variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m]))
+  msg: an aggregation function
+
+eval_fail instant at 60s label_replace(variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m]), "a", "b", "c", "d")
+  msg: an aggregation function
+
+eval_fail instant at 60s variants(variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m])) of ({service_name="rj"}[5m])
+  msg: an aggregation function
+
+# grammar shapes.
+eval_fail instant at 60s variants() of ({service_name="rj"}[5m])
+  msg: an aggregation function
+
+eval_fail instant at 60s variants(count_over_time({service_name="rj"}[5m]),) of ({service_name="rj"}[5m])
+  msg: an aggregation function
+
+eval_fail instant at 60s variants(count_over_time({service_name="rj"}[5m]))
+  msg: 'of'
+
+eval_fail instant at 60s variants(count_over_time({service_name="rj"}[5m])) of {service_name="rj"}[5m]
+  msg: '('
+
+# non-conforming variant shapes — the reference 500s (three texts plus a
+# nil-pointer panic, header table); PulsusDB rejects each at plan time
+# with one named 400. Both sides reject (ledgered divergence).
+eval_fail instant at 60s variants(1) of ({service_name="rj"}[5m])
+  msg: must be a range aggregation
+
+eval_fail instant at 60s variants(count_over_time({service_name="rj"}[5m]) + 1) of ({service_name="rj"}[5m])
+  msg: must be a range aggregation
+
+eval_fail instant at 60s variants(sum(sum(count_over_time({service_name="rj"}[5m])))) of ({service_name="rj"}[5m])
+  msg: must be a range aggregation
+
+eval_fail instant at 60s variants(approx_topk(1, count_over_time({service_name="rj"}[5m]))) of ({service_name="rj"}[5m])
+  msg: must be a range aggregation
+
+# unwrap arity is decided by the VARIANT's own pipeline (reference
+# message verbatim).
+eval_fail instant at 60s variants(sum_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m])
+  msg: invalid aggregation sum_over_time without unwrap
+
+clear
+
+load
+  {service_name="svcy"} service=svcy
+  10s  hello
+
+# case 16 (Δ2 + the adjudicated absent correction) — an absent variant's
+# synthetic labels come from the VARIANT's own (otherwise dead) selector
+# (`tier="x"` — a common-selector implementation loses it), and the
+# series carries NO `__variant__` (captured; the plan's append-to-every-
+# series order was wrong here). The [5m] window before 3600s is a gap.
+eval instant at 3600s variants(absent_over_time({service_name="svcy", tier="x"}[5m])) of ({service_name="svcy"}[5m])
+  {service_name="svcy", tier="x"} 1
+
+# case 16r — the same query at range: the index-less synthetic series is
+# dropped by the instant/range asymmetry (captured: empty matrix).
+eval range from 3600s to 3660s step 60s variants(absent_over_time({service_name="svcy", tier="x"}[5m])) of ({service_name="svcy"}[5m])

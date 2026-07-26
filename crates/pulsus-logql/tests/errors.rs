@@ -574,3 +574,60 @@ fn deeply_nested_vector_aggregations_hit_the_recursion_limit_not_a_stack_overflo
         other => panic!("expected RecursionLimitExceeded, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #221: `variants(...) of (...)` positional + grammar rejections.
+// Every rejection is a plain positional `UnexpectedToken`/`UnexpectedEof`
+// — never `NotYetSupported` — matching the reference's 400s
+// (`variantsExpr` is an `expr` alternative, not a `metricExpr`).
+// ---------------------------------------------------------------------
+
+/// A4 — the four positions the reference grammar rejects: inside a vector
+/// aggregation, inside `topk`'s operand, inside parentheses, and inside
+/// another `variants` argument list.
+#[test]
+fn variants_in_a_nested_position_is_a_positional_parse_error() {
+    for q in [
+        r#"sum(variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m]))"#,
+        r#"topk(1, variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m]))"#,
+        r#"(variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m]))"#,
+        r#"variants(variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m])) of ({app="x"}[5m])"#,
+        r#"label_replace(variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m]), "a", "b", "c", "d")"#,
+    ] {
+        match parse(q) {
+            Err(LogQlError::UnexpectedToken { .. } | LogQlError::UnexpectedEof { .. }) => {}
+            other => panic!("expected a positional parse error for {q:?}, got {other:?}"),
+        }
+    }
+}
+
+/// A5 — the grammar-shape rejections: empty argument list, trailing
+/// comma, missing `of`, unparenthesised range, and uppercase keywords
+/// (PulsusDB is case-sensitive for EVERY keyword — the reference's
+/// case-insensitive lexer is a workspace-wide pre-existing gap, issue
+/// #221 plan §risk 6; pinned here as PulsusDB-rejects).
+#[test]
+fn variants_grammar_shape_rejections() {
+    for q in [
+        r#"variants() of ({app="x"}[5m])"#,
+        r#"variants(count_over_time({app="x"}[5m]),) of ({app="x"}[5m])"#,
+        r#"variants(count_over_time({app="x"}[5m])) of {app="x"}[5m]"#,
+        r#"VARIANTS(count_over_time({app="x"}[5m])) OF ({app="x"}[5m])"#,
+    ] {
+        match parse(q) {
+            Err(LogQlError::UnexpectedToken { .. } | LogQlError::UnexpectedEof { .. }) => {}
+            other => panic!("expected a parse error for {q:?}, got {other:?}"),
+        }
+    }
+    // Missing `of` names the expected token (the reference: `unexpected
+    // $end, expecting of`).
+    match parse(r#"variants(count_over_time({app="x"}[5m]))"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("of"), "expected 'of' in {expected:?}");
+        }
+        Err(LogQlError::UnexpectedEof { expected, .. }) => {
+            assert!(expected.contains("of"), "expected 'of' in {expected:?}");
+        }
+        other => panic!("expected a missing-`of` parse error, got {other:?}"),
+    }
+}

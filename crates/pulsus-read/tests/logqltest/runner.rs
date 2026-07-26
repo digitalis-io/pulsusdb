@@ -45,7 +45,7 @@ use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
     QueryParams, QueryResult, QuerySpec, apply_vector_aggs, combine_binary, materialize_vector_lit,
-    plan, run_client_agg_rows,
+    plan, run_client_agg_rows, run_variants_rows,
 };
 
 /// A sorted label set.
@@ -759,6 +759,19 @@ fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {
         }
         MetricNode::VectorAgg { aggs, inner } => {
             Ok(apply_vector_aggs(eval_node(inner, store)?, aggs))
+        }
+        // `variants(...) of (...)` (issue #221): the pure twin of the
+        // live engine's fan-out — the SAME `VariantArena` +
+        // `VariantsAggState`, so corpus cases exercise the identical
+        // charging path. The common pipeline comes from the scan plan
+        // (already truncated at any dead common-range `unwrap`).
+        MetricNode::Variants { scan, variants, .. } => {
+            let common = scan
+                .client
+                .as_ref()
+                .ok_or_else(|| "variants scan plan must be client-aggregated".to_string())?;
+            run_variants_rows(&store.rows, &store.meta, &common.pipeline, variants)
+                .map_err(|e| e.to_string())
         }
     }
 }

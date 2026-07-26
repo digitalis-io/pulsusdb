@@ -475,6 +475,13 @@ fn walk_metric(me: &MetricExpr, out: &mut BTreeSet<String>) {
         MetricExpr::VectorFn(_) => {
             out.insert("func.vector".to_string());
         }
+        MetricExpr::Variants(v) => {
+            out.insert("func.variants".to_string());
+            for variant in &v.variants {
+                walk_metric(variant, out);
+            }
+            walk_log(&v.range.selector, out);
+        }
         MetricExpr::Binary {
             op,
             modifier,
@@ -1086,8 +1093,11 @@ fn differential_categories_are_pinned() {
     // (`stage.distinct`/`stage.ip`) into the new reject-parity bucket
     // (both_reject 2 → 0, reject_parity = 2), driving tracked interim to 0.
     // #221 added `func.vector` (supported) → 98, then `agg.approx_topk`
-    // (supported) → 99.
-    assert_eq!(supported, 99, "supported (both-accept agreement) count pin");
+    // (supported) → 99, then `func.variants` (supported) → 100.
+    assert_eq!(
+        supported, 100,
+        "supported (both-accept agreement) count pin"
+    );
     assert_eq!(
         tracked_interim, 0,
         "tracked interim gap count pin (interim ∧ oracle accepts, each with an owning issue)"

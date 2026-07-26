@@ -19,7 +19,13 @@ Files:
   only the `/loki/api/v1/query` alias yields a conclusive 2xx/400 syntax
   verdict; the differential-leg oracle container must also enable it via
   `limits_config.shard_aggregations` + `frontend.encoding: protobuf`,
-  see `ci/logql/config.yaml`).
+  see `ci/logql/config.yaml`). `func.variants` (issue #221) needs a
+  config delta too — `limits_config.enable_multi_variant_queries: true`
+  in `ci/logql/config.yaml` — but NO `endpoint` marker: with the flag the
+  probe returns 2xx at the default `query_range` endpoint (verified on
+  the pinned oracle image; without the flag every variants probe is a
+  400 `multi variant queries are disabled for this instance`, a false
+  REJECT verdict).
 - `registry-manifest.json` — the integrity pin: SHA-256 of the registry
   file bytes, the pinned `language`/`target`, the total `construct_count`,
   and per-`category` counts. Any edit to the registry must be deliberate

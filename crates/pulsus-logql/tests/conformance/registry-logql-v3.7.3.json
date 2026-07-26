@@ -709,6 +709,13 @@
       "syntax": "vector(<scalar>)",
       "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#vector",
       "probe": "vector(1)"
+    },
+    {
+      "id": "func.variants",
+      "category": "functions",
+      "syntax": "variants(<metricExpr>, ...) of (<logRangeExpr>)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#multiple-metric-queries-variants",
+      "probe": "variants(count_over_time({app=\"x\"}[5m])) of ({app=\"x\"}[5m])"
     }
   ]
 }

@@ -77,3 +77,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Unique per-invocation run-database naming for the #90 query_log gates
 # (strict `CREATE DATABASE`), so concurrent/repeat live runs never collide.
 uuid = { version = "1", features = ["v4"] }
+# DEV-ONLY (issue #221): the variants G4 census parses this crate's own
+# `exec.rs`/`plan.rs` with a syntax-aware visitor (a token/regex rule
+# cannot see generic calls or macro bodies). Never a production
+# dependency — `cargo tree -p pulsus-read -e normal` must not show syn.
+syn = { version = "=2.0.118", default-features = false, features = ["full", "parsing", "visit", "clone-impls", "printing"] }
+proc-macro2 = "1"

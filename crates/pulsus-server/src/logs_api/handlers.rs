@@ -483,6 +483,51 @@ mod tests {
         );
     }
 
+    /// Issue #221 (AC 9/10): a `variants(...)` query past the DERIVED
+    /// sub-state backstop plans to `QueryTooBroad(VariantSubStates)` —
+    /// raised at PLAN time, before any state exists — and maps to the
+    /// same 422 `query_too_broad` surface as every other too-broad LogQL
+    /// query (via the real `ReadError` → `ApiError` → response path
+    /// `query_range` uses).
+    #[tokio::test]
+    async fn variants_past_the_sub_state_backstop_maps_to_422_query_too_broad() {
+        let query = format!(
+            "variants({}) of ({{app=\"x\"}}[5m])",
+            vec!["count_over_time({app=\"x\"}[5m])"; 501].join(", ")
+        );
+        let expr = pulsus_logql::parse(&query).expect("parse");
+        let params = pulsus_read::logql::QueryParams {
+            spec: pulsus_read::logql::QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: pulsus_read::logql::Direction::Backward,
+        };
+        let ctx = pulsus_read::logql::PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1024,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        };
+        let err = pulsus_read::logql::plan(&expr, &params, &ctx)
+            .expect_err("501 variants must reject at plan time");
+        let (status, json) = status_and_body(ApiError::Read(err).into_response()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "query_too_broad");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("501 variants, exceeding the 500-variant cap"),
+            "the message names the derived cap: {json:?}"
+        );
+    }
+
     /// Issue #227: at the REQUEST boundary, `(end-start)/step > 11000` is
     /// Loki's HTTP **400** with its exact message (the engine's
     /// `MetricBuckets` 422 above is now only a defense-in-depth backstop).

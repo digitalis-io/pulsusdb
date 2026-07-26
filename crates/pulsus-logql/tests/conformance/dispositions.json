@@ -498,6 +498,11 @@
       "oracle": "accept"
     },
     {
+      "construct": "func.variants",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
       "construct": "statics.string",
       "status": "supported",
       "oracle": "accept"

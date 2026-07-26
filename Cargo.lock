@@ -1762,6 +1762,7 @@ version = "0.0.0"
 dependencies = [
  "clickhouse",
  "futures",
+ "proc-macro2",
  "pulsus-clickhouse",
  "pulsus-config",
  "pulsus-logql",
@@ -1774,6 +1775,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "syn",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

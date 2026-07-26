@@ -1583,3 +1583,73 @@ fn every_m1_subset_query_shape_from_features_md_section_2_parses() {
         parse(q).unwrap_or_else(|e| panic!("expected {q:?} to parse, got {e}"));
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #221: `variants(<metricExpr>, …) of (<logRangeExpr>)`.
+// ---------------------------------------------------------------------
+
+/// A1 — a single-variant `variants` expression parses to
+/// `Expr::Metric(MetricExpr::Variants(..))` with one variant and the
+/// common range, and `Display` round-trips.
+#[test]
+fn a_single_variant_variants_expression_parses_and_round_trips() {
+    let query = r#"variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m])"#;
+    let expr = parse(query).unwrap();
+    let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Variants(v)) = &expr else {
+        panic!("expected MetricExpr::Variants, got {expr:?}");
+    };
+    assert_eq!(v.variants.len(), 1);
+    assert_round_trip(query);
+}
+
+/// A2 — multi-variant + a piped common range round-trips (including a
+/// common range that itself carries an unwrap — dead syntax downstream,
+/// but grammatical).
+#[test]
+fn multi_variant_with_piped_common_range_round_trips() {
+    for q in [
+        r#"variants(count_over_time({app="x"}[30s]), bytes_over_time({app="x"}[5m])) of ({app="x"} | logfmt [5m])"#,
+        r#"variants(sum by(env)(count_over_time({app="x"}[5m])), sum_over_time({app="x"} | unwrap d [5m])) of ({app="x"} | json [5m])"#,
+        r#"variants(count_over_time({app="x"}[5m])) of ({app="x"} | json | unwrap d | d > 5 [5m])"#,
+    ] {
+        assert_round_trip(q);
+    }
+}
+
+/// A3 — `variants(…) of (…)` is a legal binary operand on either side
+/// (the reference's `binOpExpr: expr OP expr` admits it), parsing to a
+/// `MetricExpr::Binary` with a `Variants` operand.
+#[test]
+fn variants_is_a_legal_top_level_binary_operand() {
+    for (q, left) in [
+        (
+            r#"variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m]) + 1"#,
+            true,
+        ),
+        (
+            r#"1 + variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m])"#,
+            false,
+        ),
+    ] {
+        let expr = parse(q).unwrap_or_else(|e| panic!("expected {q:?} to parse, got {e}"));
+        let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Binary { lhs, rhs, .. }) = &expr
+        else {
+            panic!("expected a Binary root for {q:?}, got {expr:?}");
+        };
+        let operand = if left { lhs } else { rhs };
+        assert!(
+            matches!(**operand, pulsus_logql::MetricExpr::Variants(_)),
+            "expected a Variants operand for {q:?}"
+        );
+        assert_round_trip(q);
+    }
+}
+
+/// `variants(…) of (…) or variants(…) of (…)` — both operands variants
+/// (reference-probed 200).
+#[test]
+fn variants_or_variants_parses() {
+    assert_round_trip(
+        r#"variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m]) or variants(bytes_over_time({app="x"}[5m])) of ({app="x"}[5m])"#,
+    );
+}
