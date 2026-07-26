@@ -105,9 +105,12 @@ pub enum PlanKind {
 /// The fixed exponential power-of-two nanosecond `le` boundaries for
 /// `histogram_over_time` (issue #182, OQ4). Captured to match the Tempo
 /// v3.0.2 `__bucket` convention (power-of-two nanoseconds rendered as
-/// float seconds — e.g. `2^30 ns = 1.073741824`); exact
-/// boundary/membership value parity vs Tempo is Tier-2 (issue #25). The
-/// series count is fixed (bounded), so no cardinality probe applies.
+/// float seconds — e.g. `2^30 ns = 1.073741824`); the ladder's
+/// *rendering* (the ns→seconds conversion of each bound) is
+/// Tier-1-settled (issue #237 — form-independent for every power of
+/// two, pinned in `exec.rs` tests); the ladder's *membership/shape*
+/// parity vs Tempo stays Tier-2 (issues #252/#25). The series count is
+/// fixed (bounded), so no cardinality probe applies.
 pub const HISTOGRAM_LE_BOUNDS_NS: &[i64] = &[
     1 << 10, // ~1.02µs
     1 << 13,
@@ -631,6 +634,20 @@ fn analyze_pipeline(query: &Query) -> Result<PipelineAnalysis, PlanError> {
 /// Parses a trailing metrics-result comparison value to `f64` (a duration
 /// literal is compared in seconds, matching the value aggregations'
 /// ns→seconds encode scaling).
+///
+/// Issue #237 (settled — do NOT "fix" this like #232): the reference's
+/// ns→seconds conversion is the SINGLE-rounding `float64(ns) / 1e9`
+/// this function already uses, not #232's two-rounding form (see
+/// `exec.rs::agg_value` for the 17-significant-digit raw-wire evidence
+/// of record). Corroboration for this threshold site specifically,
+/// captured from the pinned container 2026-07-26: for a stored
+/// 1_118_000_000 ns span, `… | max_over_time(duration) = 1118ms`
+/// returns the series, `>= ` the single-rounding f64's shortest decimal
+/// matches, `> ` it does not, and `> ` the two-rounding 17-digit
+/// neighbour matches — i.e. the reference converts the duration literal
+/// to exactly the single-rounding value, as here. (Labelled
+/// corroboration, not proof: the load-bearing leg is the raw-wire
+/// capture.)
 fn resolve_result_filter(
     filter: &Option<(pulsus_traceql::ComparisonOp, pulsus_traceql::Value)>,
 ) -> Result<Option<(pulsus_traceql::ComparisonOp, f64)>, PlanError> {
@@ -1050,6 +1067,43 @@ mod tests {
             Some((pulsus_traceql::ComparisonOp::Gt, 0.005))
         );
         assert_eq!(plan("{} | rate()").result_filter(), None);
+    }
+
+    /// Issue #237: a duration threshold converts ns→seconds with the
+    /// reference's SINGLE rounding, never #232's two-rounding form. The
+    /// widths are the ≤16-digit captured group where the two forms
+    /// disagree by 1 ULP; the self-consistency leg (threshold bits ==
+    /// `ns as f64 / 1e9`, the exact expression `exec.rs::agg_value`
+    /// applies to a stored span of that width) is what makes the
+    /// reference's observed `= 1118ms` match reproduce.
+    #[test]
+    fn duration_result_filter_threshold_uses_the_single_rounding_conversion() {
+        fn two_rounding_seconds(ns: i64) -> f64 {
+            (ns / 1_000_000_000) as f64 + (ns % 1_000_000_000) as f64 / 1e9
+        }
+        for (ns, lit, want) in [
+            (1_118_000_000_i64, "1118ms", 1.118_f64),
+            (1_122_000_000, "1122ms", 1.122),
+            (1_128_000_000, "1128ms", 1.128),
+            (1_235_000_000, "1235ms", 1.235),
+            (31_952_000_000, "31952ms", 31.952),
+            (1_000_064_438, "1000064438ns", 1.000064438),
+        ] {
+            let p = plan(&format!("{{}} | max_over_time(duration) > {lit}"));
+            let (op, threshold) = p.result_filter().expect("filter present");
+            assert_eq!(op, pulsus_traceql::ComparisonOp::Gt, "{lit}");
+            assert_eq!(threshold.to_bits(), want.to_bits(), "{lit}");
+            assert_ne!(
+                threshold.to_bits(),
+                two_rounding_seconds(ns).to_bits(),
+                "{lit}: the two-rounding form must never be produced"
+            );
+            assert_eq!(
+                threshold.to_bits(),
+                (ns as f64 / 1e9).to_bits(),
+                "{lit}: threshold == the encode-boundary value for the same span"
+            );
+        }
     }
 
     #[test]
