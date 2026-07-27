@@ -574,15 +574,19 @@ pub static REGISTRY: [FuncDef; 67] = [
             Err(msg) => string_val(msg),
         }
     )),
-    f!("lower", [Str], None, |_c, a| Ok(str_val(go_to_lower(
-        bytes_of(&a[0])
-    )))),
-    f!("upper", [Str], None, |_c, a| Ok(str_val(go_to_upper(
-        bytes_of(&a[0])
-    )))),
-    f!("title", [Str], None, |_c, a| Ok(str_val(go_title(
-        bytes_of(&a[0])
-    )))),
+    f!("lower", [Str], None, |c, a| {
+        // Case mapping can EXPAND (≤4 bytes out per input byte).
+        c.charge(4 * bytes_of(&a[0]).len() + 4)?;
+        Ok(str_val(go_to_lower(bytes_of(&a[0]))))
+    }),
+    f!("upper", [Str], None, |c, a| {
+        c.charge(4 * bytes_of(&a[0]).len() + 4)?;
+        Ok(str_val(go_to_upper(bytes_of(&a[0]))))
+    }),
+    f!("title", [Str], None, |c, a| {
+        c.charge(4 * bytes_of(&a[0]).len() + 4)?;
+        Ok(str_val(go_title(bytes_of(&a[0]))))
+    }),
     f!("trunc", [Int, Str], None, |_c, a| {
         // sprig trunc: BYTE slicing (strings.go:189-197).
         let c = int_of(&a[0]);
@@ -808,9 +812,14 @@ pub static REGISTRY: [FuncDef; 67] = [
         };
         Ok(Value::Float(rounded / pow))
     }),
-    f!("fromJson", [Str], None, |_c, a| Ok(from_json(bytes_of(
-        &a[0]
-    )))),
+    f!("fromJson", [Str], None, |c, a| {
+        // The parsed tree multiplies input bytes by a structural
+        // constant: worst density is one element per two input bytes
+        // ("[1,1,…"), each costing ≤64 bytes across the serde tree and
+        // the converted Value tree — a ≤32× ceiling, charged up front.
+        c.charge(32usize.saturating_mul(bytes_of(&a[0]).len()) + 64)?;
+        Ok(from_json(bytes_of(&a[0])))
+    }),
     f!("date", [Str, Any], None, |c, a| {
         // sprig dateInZone(fmt, date, "Local").
         let t = coerce_sprig_date(&a[1], c.env());
@@ -1215,24 +1224,24 @@ fn indent_impl(
 }
 
 fn align(ctx: &FuncCtx<'_, '_>, count: i64, src: &[u8], left: bool) -> Result<Vec<u8>, String> {
-    // alignLeft/alignRight operate on RUNES (fmt.go:460-484).
-    let runes: Vec<(usize, usize)> = {
-        let mut v = Vec::new();
-        let mut i = 0;
-        while i < src.len() {
-            let (_, w) = decode_rune(src, i);
-            v.push((i, w));
-            i += w;
-        }
-        v
-    };
-    let l = runes.len() as i64;
+    // alignLeft/alignRight operate on RUNES (fmt.go:460-484). Count and
+    // cut WITHOUT materialising per-rune data (review round 1, miss 2:
+    // the former `Vec<(usize, usize)>` intermediate allocated 16 bytes
+    // per rune BEFORE the first charge — an uncharged 16× blow-up).
+    let mut n_runes: i64 = 0;
+    let mut i = 0;
+    while i < src.len() {
+        let (_, w) = decode_rune(src, i);
+        i += w;
+        n_runes += 1;
+    }
+    let l = n_runes;
     if count < 0 || count == l {
         return Ok(src.to_vec());
     }
     let pad = count - l;
     if pad > 0 {
-        // The pad width is template-controlled: charge it first.
+        // The pad width is template-controlled: charge FIRST.
         ctx.charge((pad as usize).saturating_add(src.len()))?;
         let mut out = Vec::with_capacity(src.len() + pad as usize);
         if left {
@@ -1244,12 +1253,20 @@ fn align(ctx: &FuncCtx<'_, '_>, count: i64, src: &[u8], left: bool) -> Result<Ve
         }
         return Ok(out);
     }
+    // Truncation: find the byte offset of the cut rune boundary by a
+    // second scan (output ≤ input — input-bounded, no charge needed).
+    let keep_from_start = if left { count } else { l - count };
+    let mut i = 0;
+    let mut seen: i64 = 0;
+    while seen < keep_from_start {
+        let (_, w) = decode_rune(src, i);
+        i += w;
+        seen += 1;
+    }
     Ok(if left {
-        let end = runes[count as usize].0;
-        src[..end].to_vec()
+        src[..i].to_vec()
     } else {
-        let start = runes[(l - count) as usize].0;
-        src[start..].to_vec()
+        src[i..].to_vec()
     })
 }
 

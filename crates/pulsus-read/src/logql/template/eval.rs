@@ -24,10 +24,15 @@ use super::timefns::TemplateEnv;
 use super::value::{IntKind, UintKind, Value};
 
 /// Go caps template-invocation depth at 100000 relying on growable
-/// goroutine stacks; a fixed Rust stack cannot honour that safely, so
-/// PulsusDB pins the wasm-tier cap (Go uses 1000 there for the same
-/// reason). Only runaway recursive `define`s can reach it; ledgered.
-const MAX_EXEC_DEPTH: usize = 1000;
+/// goroutine stacks; a fixed Rust stack cannot honour that. Derivation
+/// of this cap (stack floor, not taste): the smallest thread stack the
+/// render runs on is the 2 MiB default (tokio workers, test threads);
+/// one template invocation recurses through ~4 walk/eval frames that
+/// measure ≈2 KiB/level in debug builds (a 1000-cap overflowed a 2 MiB
+/// test thread), so 250 levels ≈ 0.5 MiB — a 4× margin on the floor.
+/// Only runaway recursive `define`s can reach it; ledgered
+/// (`template-exec-depth-cap`).
+const MAX_EXEC_DEPTH: usize = 250;
 
 /// Everything one render needs (plan v1 §5's `render` contract).
 pub struct EvalInput<'c, 'a> {
@@ -271,6 +276,14 @@ impl<'s, 'c, 'a> State<'s, 'c, 'a> {
     fn walk(&mut self, dot: &Dot<'c>, node: &'c Node) -> WResult {
         match node {
             Node::Text { text, .. } => {
+                // Control flow (range over a large int, nested ranges,
+                // recursive defines) re-emits text nodes per iteration —
+                // caller-controlled output growth with no function call
+                // in sight, so the write itself charges first (issue
+                // #230 review round 1, the loop-amplification class).
+                if self.input.budget.charge(text.len()).is_err() {
+                    return Err(self.budget_error());
+                }
                 self.out.extend_from_slice(text.as_bytes());
                 Ok(Walk::Ok)
             }
@@ -1237,9 +1250,20 @@ impl<'s, 'c, 'a> State<'s, 'c, 'a> {
         // Borrow-split: the print environment reads only `input`, so the
         // renderer can write straight into `out` (no temp buffer — the
         // per-row allocation gates count on it).
+        let before = self.out.len();
         let env = InputPrintEnv { input: self.input };
         gofmt::write_template_value(self.out, val, &env);
         if self.input.budget.breached() {
+            return Err(self.budget_error());
+        }
+        // Account the emitted bytes so per-iteration printing (`range N
+        // → {{.x}}`) is cumulatively bounded. Every single write above
+        // is itself charged (padding/precision) or bounded by an
+        // already-charged/stored value, so the one-step overshoot past
+        // the budget is bounded and the peak stays ≤ ~2× the budget —
+        // the loop-amplification closure (review round 1).
+        let delta = self.out.len().saturating_sub(before);
+        if self.input.budget.charge(delta).is_err() {
             return Err(self.budget_error());
         }
         Ok(())

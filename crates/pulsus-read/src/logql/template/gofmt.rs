@@ -408,7 +408,15 @@ impl<'o, 'e> P<'o, 'e> {
         if !self.charge(prec + 8) {
             return;
         }
-        let mut s = format!("U+{u:0width$X}", width = prec);
+        // Manual zero padding: std fmt's runtime width panics past
+        // 65535, and charged precisions may exceed it.
+        let hex = format!("{u:X}");
+        let mut s = String::with_capacity(prec + 8);
+        s.push_str("U+");
+        for _ in hex.len()..prec {
+            s.push('0');
+        }
+        s.push_str(&hex);
         if self.f.sharp
             && u <= 0x10FFFF
             && let Some(r) = char::from_u32(u as u32)
@@ -438,6 +446,16 @@ impl<'o, 'e> P<'o, 'e> {
             }
         };
         let prec = if self.f.prec_present {
+            // A runtime precision is a caller-multiplied allocation
+            // (issue #230 review round 1, miss 1): charge it BEFORE any
+            // digit rendering. (The pre-charge build did not just
+            // over-allocate here — `%.999999999f` PANICKED in std fmt,
+            // whose runtime precision caps at 65535; large-but-charged
+            // precisions render through the exact-expansion path in
+            // `format_float_go` instead.)
+            if !self.charge(self.f.prec.saturating_add(32)) {
+                return;
+            }
             self.f.prec as i32
         } else {
             default_prec
@@ -1649,7 +1667,18 @@ pub fn format_float_go(v: f64, verb: char, prec: i32) -> Vec<u8> {
             } else {
                 prec as usize
             };
-            format!("{v:.p$}").into_bytes()
+            // Rust's runtime precision caps at 65535 (panics past it);
+            // an f64's EXACT decimal expansion has at most 1074
+            // fraction digits, so beyond that the digits are literal
+            // zeros — render the exact part and pad (byte-identical to
+            // the reference's big-decimal 'f').
+            if p > 1074 {
+                let mut out = format!("{v:.1074}").into_bytes();
+                out.extend(std::iter::repeat_n(b'0', p - 1074));
+                out
+            } else {
+                format!("{v:.p$}").into_bytes()
+            }
         }
         'g' | 'G' => {
             let upper = verb == 'G';
@@ -1702,9 +1731,14 @@ pub fn format_float_go(v: f64, verb: char, prec: i32) -> Vec<u8> {
 /// `{:.p$e}` formatting (arbitrary-precision Dragon), so rounding
 /// matches strconv.
 fn decimal_digits(v: f64, sig: Option<usize>) -> (bool, Vec<u8>, i32) {
+    // Cap the significant-digit request at the exact-expansion width
+    // (an f64 carries at most 767 significant decimal digits): Rust's
+    // runtime precision panics past 65535, and every digit beyond the
+    // exact expansion is a zero the callers pad themselves (`fmt_e`'s
+    // `unwrap_or('0')`, the 'g' trailing-zero trim).
     let s = match sig {
         None => format!("{v:e}"),
-        Some(n) => format!("{v:.p$e}", p = n.saturating_sub(1)),
+        Some(n) => format!("{v:.p$e}", p = n.saturating_sub(1).min(800)),
     };
     let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
     let exp: i32 = exp.parse().unwrap_or(0);

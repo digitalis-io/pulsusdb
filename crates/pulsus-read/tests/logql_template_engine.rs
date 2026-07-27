@@ -533,7 +533,8 @@ fn now_renders_the_injected_wall_clock() {
 }
 
 // ---------------------------------------------------------------------
-// Depth cap (pinned at the wasm-tier 1000 — ledgered divergence from
+// Depth cap (pinned at 250 — derived from the 2 MiB worker/test-thread
+// stack floor at ~2 KiB/level of debug frames; ledgered divergence from
 // the reference's goroutine-stack-backed 100000).
 // ---------------------------------------------------------------------
 
@@ -545,7 +546,7 @@ fn runaway_template_recursion_is_a_bounded_per_line_error() {
     )
     .expect_err("must exceed the depth cap");
     assert!(
-        err.contains("exceeded maximum template depth (1000)"),
+        err.contains("exceeded maximum template depth (250)"),
         "{err}"
     );
 }
@@ -696,8 +697,14 @@ fn full_templates_route_the_metric_path_through_fan_out_grouping() {
 fn a_repeat_render_at_the_budget_succeeds_and_one_past_it_is_a_clean_query_error() {
     use pulsus_read::logql::template::MAX_TEMPLATE_RENDER_BYTES;
     let base = base();
-    // Exactly AT the budget: `count × len` is charged up front and fits.
-    let at = MAX_TEMPLATE_RENDER_BYTES;
+    // The budget bounds the render's CUMULATIVE charged bytes: this
+    // template charges twice — `repeat`'s `count × len` when the value
+    // is built, and the emitted output when it is printed (the
+    // loop-amplification accounting) — so the exact boundary for a
+    // single maximal output line is budget/2. AT the boundary (2·at ==
+    // budget) the render succeeds; one byte past it (2·(at+1) > budget)
+    // fails cleanly BEFORE the allocation.
+    let at = MAX_TEMPLATE_RENDER_BYTES / 2;
     let pipeline = compiled(&format!(
         r#"{{a="b"}} | line_format "{{{{ repeat {at} \"x\" }}}}""#
     ));
@@ -783,5 +790,62 @@ fn a_budget_breach_surfaces_as_the_bounded_query_too_broad_422_class() {
             }) if budget_bytes == MAX_TEMPLATE_RENDER_BYTES
         ),
         "{err:?}"
+    );
+}
+
+#[test]
+fn every_caller_amplified_allocation_path_charges_the_budget() {
+    // One eval per newly-charged path (issue #230 review round 1: the
+    // three misses + the loop-amplification class). Each `expect_err`
+    // FAILED against the pre-fix build (the render succeeded after an
+    // uncharged multi-hundred-MiB allocation) — demonstrated red-first.
+    let base = base();
+    let over = |query: &str| {
+        let pipeline = compiled(query);
+        pipeline
+            .run("line", &base, 0)
+            .map(|_| ())
+            .expect_err(&format!("{query}: must breach the render budget"));
+    };
+    // (1) float PRECISION (integer width was charged; precision was not).
+    over(r#"{a="b"} | line_format "{{ printf \"%.999999999f\" 1.5 }}""#);
+    // (2) sprig case mapping — output can EXPAND (ß→SS is the reference
+    // rule for the map variants; ours charge the 4×/rune ceiling).
+    over(r#"{a="b"} | line_format "{{ lower (repeat 30000000 \"X\") }}""#);
+    over(r#"{a="b"} | line_format "{{ upper (repeat 30000000 \"x\") }}""#);
+    over(r#"{a="b"} | line_format "{{ title (repeat 30000000 \"x\") }}""#);
+    // (3) fromJson's value tree multiplies input bytes by a structural
+    // constant (~50× for one-element-per-two-bytes arrays).
+    over(
+        r#"{a="b"} | line_format "{{ len (fromJson (printf \"[%s1]\" (repeat 1500000 \"1,\"))) }}""#,
+    );
+    // (4) loop amplification: a range-over-int repeats a text node /
+    // printed value without any function in the loop body — cumulative
+    // output accounting must breach, not OOM.
+    over(r#"{a="b"} | line_format "{{ range 20000000 }}0123456789{{ end }}""#);
+    over(r#"{a="b"} | line_format "{{ range 20000000 }}{{ $.env }}{{ end }}""#);
+
+    // Green controls: the same shapes under the budget still render
+    // (both directions discriminate).
+    let ok = |query: &str, want: &str| {
+        let pipeline = compiled(query);
+        let out = pipeline
+            .run("line", &base, 0)
+            .expect("no budget breach")
+            .expect("kept");
+        assert_eq!(out.line, want, "{query}");
+    };
+    ok(
+        r#"{a="b"} | line_format "{{ printf \"%.6f\" 1.5 }}""#,
+        "1.500000",
+    );
+    ok(r#"{a="b"} | line_format "{{ lower \"ABC\" }}""#, "abc");
+    ok(
+        r#"{a="b"} | line_format "{{ len (fromJson \"[1,2,3]\") }}""#,
+        "3",
+    );
+    ok(
+        r#"{a="b"} | line_format "{{ range 3 }}ab{{ end }}""#,
+        "ababab",
     );
 }

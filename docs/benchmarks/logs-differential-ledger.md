@@ -438,10 +438,13 @@ clients only display it).
 - **Reference behaviour:** runaway recursive `{{define}}` invocations
   error at depth 100 000 (`exceeded maximum template depth (100000)`),
   a bound that relies on Go's growable goroutine stacks.
-- **PulsusDB behaviour:** the same per-line error at depth 1000 — Go's
-  own wasm-tier value, chosen because a fixed Rust thread stack cannot
-  survive 100 000 recursion levels (a crash is never acceptable).
-  Reachable only by deliberately recursive templates.
+- **PulsusDB behaviour:** the same per-line error at depth 250 —
+  derived from the stack floor, not chosen: the smallest stack the
+  render runs on is the 2 MiB default (tokio workers, test threads),
+  one invocation level costs ≈2 KiB of debug-build frames (a 1000-deep
+  cap measurably overflowed a 2 MiB thread), so 250 levels ≈ 0.5 MiB
+  with a 4× margin. A crash is never acceptable; reachable only by
+  deliberately recursive templates.
 
 ### `template-error-wording-residuals` (issue #230, owner wording ruling)
 
