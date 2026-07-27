@@ -3233,13 +3233,17 @@ fn variants_absent_series_use_the_variants_selector_and_carry_no_index() {
         "absent series must drop at range: {items:?}"
     );
     // Under a bare `sum` the reference groups the index-less series to
-    // `{}` (captured). PulsusDB's `by`-grouping currently materializes a
-    // MISSING grouped label as `name=""` (`group_key`'s
-    // `unwrap_or_default`) — a PRE-EXISTING engine semantic this capture
-    // exposes for every `by` over a missing label, reported to the
-    // task-manager rather than changed under this issue's adjudication
-    // (issue #221 follow-up comment); the sub-case is deliberately not
-    // pinned here or in the corpus until adjudicated.
+    // `{}` (captured). PulsusDB's `group_key` `by`-grouping currently
+    // materializes a MISSING grouped label as `name=""`
+    // (`unwrap_or_default`) — a PRE-EXISTING engine semantic affecting
+    // EVERY `by` over a missing label, nothing variants-specific.
+    // OWNED BY #241, which captured the same divergence independently by
+    // a different route and carries the root-cause fix (omit missing
+    // labels from the `by` key, reference-exact). OBLIGATION: when #241
+    // lands, re-capture and pin the `sum(absent_over_time(...))`
+    // sub-case here and in `b13_variants.test` — it is a ready-made
+    // acceptance test for that fix (expected `{} 1`). Until then the
+    // sub-case stays excluded at both sites.
 }
 
 /// B16 — `append_variant_label` OVERRIDES a common-pipeline

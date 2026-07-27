@@ -24,15 +24,20 @@
 #     series cap (workspace-wide pre-existing gaps / the #236 cap class);
 #   - the `sum(absent_over_time(...))` sub-case: the capture gives `{}`
 #     (the injected `by (__variant__)` grouping over the index-less
-#     synthetic series); PulsusDB's `by`-grouping currently materializes
-#     a MISSING grouped label as `name=""` — a PRE-EXISTING engine
-#     semantic (every `by` over a missing label, not variants-specific)
-#     reported for adjudication in the issue #221 follow-up rather than
-#     changed here. The absent instant/range cases below ARE pinned: the
-#     adjudicated capture correction (2026-07-26 session; the reference
-#     attaches `__variant__` per EXTRACTED SAMPLE, so a synthetic absent
-#     series never carries it — index-less and kept at instant, dropped
-#     at range).
+#     synthetic series); PulsusDB's `group_key` `by`-grouping currently
+#     materializes a MISSING grouped label as `name=""` — a PRE-EXISTING
+#     engine semantic affecting EVERY `by` over a missing label, nothing
+#     variants-specific. **Owned by #241**, which captured the same
+#     divergence independently by a different route and carries the
+#     root-cause fix (omit missing labels from the `by` key,
+#     reference-exact). OBLIGATION: when #241 lands, RE-CAPTURE this
+#     sub-case from the pinned container and add it here — it is a
+#     ready-made acceptance test for that fix (expected `{} 1` over the
+#     case-16 gap dataset below). The absent instant/range cases below
+#     ARE pinned: the adjudicated capture correction (2026-07-26
+#     session; the reference attaches `__variant__` per EXTRACTED
+#     SAMPLE, so a synthetic absent series never carries it — index-less
+#     and kept at instant, dropped at range).
 #
 # Reference-observed rejections for the eval_fail cases (both sides
 # reject; the status/body divergences are deliberate and ledgered —
