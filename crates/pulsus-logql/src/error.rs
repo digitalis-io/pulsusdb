@@ -14,6 +14,22 @@ use crate::token::Span;
 /// "Duration & recursion as panic vectors").
 pub(crate) const MAX_DEPTH: usize = 64;
 
+/// The label-filter *parenthesis*-nesting recursion guard
+/// (`| ((((x="1"))))`) — issue #255. Bounds paren-driven parse depth ONLY:
+/// a flat `or`/`and` chain builds a left-deep tree at parse depth 1 and is
+/// not bounded by this counter (surviving vector, issue #272).
+///
+/// Derived, not chosen: the binding measured abort threshold is a debug
+/// build on tokio's default 2 MiB worker stack under the deepest legal
+/// metric prefix (`sum(`x63) — 364 levels OK, 365 aborts, re-measured
+/// with this guard's `depth` parameter in place; `364 / 4 = 91` — divided
+/// by a safety factor of 4. That factor is in LEVELS; the accepted worst
+/// case consumes 1,029 KiB of the 2 MiB stack (1.99x), because the metric
+/// prefix alone costs a fixed 694 KiB. Interim: #272 converts these walks
+/// to iterative form, after which this limit should be raised to the
+/// reference's own (it bounds this shape only by its 131,072-byte cap).
+pub(crate) const LABEL_FILTER_MAX_DEPTH: usize = 91;
+
 /// Errors from `pulsus-logql`'s lexer and parser.
 #[derive(Debug, Error)]
 pub enum LogQlError {
@@ -63,9 +79,12 @@ pub enum LogQlError {
     #[error("empty stream selector: at least one label matcher is required")]
     EmptySelector { span: Span },
 
-    /// Nested vector aggregations exceeded [`MAX_DEPTH`] levels.
-    #[error("query nesting exceeds the {MAX_DEPTH} level limit")]
-    RecursionLimitExceeded { span: Span },
+    /// Nested vector aggregations exceeded [`MAX_DEPTH`] levels, or
+    /// label-filter parenthesis nesting exceeded
+    /// [`LABEL_FILTER_MAX_DEPTH`] levels (issue #255). `limit` is the
+    /// guard that fired, so the message names the right number.
+    #[error("query nesting exceeds the {limit} level limit")]
+    RecursionLimitExceeded { span: Span, limit: usize },
 
     /// The full expression parsed successfully but did not consume the
     /// whole input.
@@ -107,7 +126,7 @@ impl LogQlError {
             | LogQlError::InvalidDuration { span, .. }
             | LogQlError::UnterminatedString { span }
             | LogQlError::EmptySelector { span }
-            | LogQlError::RecursionLimitExceeded { span }
+            | LogQlError::RecursionLimitExceeded { span, .. }
             | LogQlError::TrailingInput { span }
             | LogQlError::InvalidAggregationParam { span, .. }
             | LogQlError::AggregationParamNotPositive { span, .. }
@@ -172,7 +191,10 @@ mod tests {
 
     #[test]
     fn recursion_limit_message_names_the_configured_limit() {
-        let err = LogQlError::RecursionLimitExceeded { span: span() };
+        let err = LogQlError::RecursionLimitExceeded {
+            span: span(),
+            limit: MAX_DEPTH,
+        };
         assert!(err.to_string().contains(&MAX_DEPTH.to_string()));
     }
 
@@ -266,7 +288,10 @@ mod tests {
             },
             LogQlError::UnterminatedString { span: span() },
             LogQlError::EmptySelector { span: span() },
-            LogQlError::RecursionLimitExceeded { span: span() },
+            LogQlError::RecursionLimitExceeded {
+                span: span(),
+                limit: MAX_DEPTH,
+            },
             LogQlError::TrailingInput { span: span() },
             LogQlError::InvalidAggregationParam {
                 op: "topk".to_string(),
