@@ -554,7 +554,13 @@ clients only display it).
   registry function runs through its branch shapes (happy / empty /
   identity / no-match / error) asserting allocated ≤ charged, plus a
   near-exhausted-budget ORDERING leg that fails any charge moved
-  after its allocation (mutation-verified). A breach aborts the query with the bounded
+  after its allocation (mutation-verified). Round 4 added a DERIVED
+  invalid-UTF-8 variant of every shape (big string arguments get
+  invalid bytes mechanically, not by hand-listing), which surfaced
+  and closed the last conversion gap: `from_utf8_lossy`'s ≤3× owned
+  substitution buffer on the regex argument/pattern paths is now
+  RESERVED before converting (`lossy_charged`); valid-UTF-8 inputs
+  borrow and charge nothing, so every pinned boundary is unchanged. A breach aborts the query with the bounded
   `422 query_too_broad` (`TooBroadReason::TemplateOutputBytes`) — never
   a per-line `TemplateFormatErr`, never a truncation, never an OOM.
 - **Threshold (derived, not chosen):**

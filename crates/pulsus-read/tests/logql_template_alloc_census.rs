@@ -903,9 +903,10 @@ static PINS: &[Pin] = &[
             ".into_owned",
             "RegexBuilder::new",
             "format!",
+            "str::from_utf8",
         ],
         disposition: CHARGED,
-        why: "pattern copy + the 1 MiB dynamic-program ceiling charged BEFORE building (RegexBuilder size_limit enforces the ceiling); cache hits share the query-compile program",
+        why: "pattern copy (≤3× U+FFFD ceiling when invalid UTF-8, round 4) + the 1 MiB dynamic-program ceiling, both charged BEFORE converting/building; cache hits share the query-compile program",
     },
     Pin {
         file: "funcs.rs",
@@ -1099,9 +1100,9 @@ static PINS: &[Pin] = &[
     Pin {
         file: "funcs.rs",
         func: "go_parse_int_base0",
-        callees: &[".clone", ".collect", ".to_string"],
+        callees: &[".collect"],
         disposition: TRANSIENT,
-        why: "≤ input, freed; int result",
+        why: "underscore-stripped Cow only when '_' present (round-4 sweep), freed; int result",
     },
     Pin {
         file: "funcs.rs",
@@ -1171,6 +1172,13 @@ static PINS: &[Pin] = &[
         callees: &["String::from_utf8_lossy"],
         disposition: TRANSIENT,
         why: "borrowed Cow; ≤ 3× input only for invalid UTF-8 replacement, freed by the caller",
+    },
+    Pin {
+        file: "funcs.rs",
+        func: "lossy_charged",
+        callees: &["str::from_utf8"],
+        disposition: CHARGED,
+        why: "reserves the ≤3× U+FFFD expansion BEFORE from_utf8_lossy's owned branch (round 4); the validity probe borrows",
     },
     Pin {
         file: "funcs.rs",

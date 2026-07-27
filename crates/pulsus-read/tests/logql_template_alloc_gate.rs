@@ -255,6 +255,14 @@ fn extra_shapes(name: &str) -> Vec<(&'static str, Vec<Value<'static>>)> {
         "regexReplaceAll" | "regexReplaceAllLiteral" => vec![
             ("no-match", vec![s("ZZZ+"), big_str(), s("YY")]),
             ("error-bad-pattern", vec![s("("), big_str(), s("YY")]),
+            // A big replacement so the auto-derived invalid-UTF-8
+            // variant exercises the REPL conversion too (round 4).
+            ("big-repl", vec![s("x+"), big_str(), big_str()]),
+            // An uncached pattern keeps the 1 MiB dynamic-program
+            // ceiling under dominance (the happy pattern now sits in
+            // the pre-populated compile-time cache, mirroring
+            // production literal precompilation).
+            ("uncached-pattern", vec![s("y+"), big_str(), s("YY")]),
         ],
         "count" => vec![("error-bad-pattern", vec![s("("), big_str()])],
         "fromJson" => vec![
@@ -299,6 +307,33 @@ fn empty_args(params: &[ParamTy], variadic: Option<ParamTy>) -> Vec<Value<'stati
     args
 }
 
+/// The invalid-UTF-8 variant of a shape, DERIVED mechanically rather
+/// than hand-enumerated (round 4: the regex functions' `lossy(...)`
+/// conversion allocated a ≤3× owned buffer before its charge, and the
+/// shape set had no invalid-byte member to see it): every big string
+/// argument gets alternate `0xFF` bytes, forcing every
+/// `String::from_utf8_lossy` on the call path onto its `Cow::Owned`
+/// branch. Applied to EVERY shape of EVERY function, so any future
+/// conversion of caller bytes inherits coverage without being named.
+fn invalidate_utf8(args: &[Value<'static>]) -> Option<Vec<Value<'static>>> {
+    let mut changed = false;
+    let out = args
+        .iter()
+        .map(|v| match v {
+            Value::Str(b) if b.len() >= 4096 => {
+                changed = true;
+                let mut nb = b.clone().into_owned();
+                for i in (0..nb.len()).step_by(2) {
+                    nb[i] = 0xFF;
+                }
+                Value::Str(Cow::Owned(nb))
+            }
+            other => other.clone(),
+        })
+        .collect();
+    changed.then_some(out)
+}
+
 fn input_bytes(args: &[Value<'_>], line_len: usize) -> u64 {
     let mut total = line_len as u64;
     for a in args {
@@ -330,17 +365,37 @@ fn every_registry_function_charge_dominates_its_allocations() {
     use pulsus_read::logql::template::MAX_TEMPLATE_RENDER_BYTES;
     let env = TemplateEnv::process();
     let line = vec![b'L'; BIG];
-    let regex_cache: HashMap<String, regex::Regex> = HashMap::new();
+    // Literal patterns are compiled ONCE at query compile in production
+    // and every per-line call hits this cache — mirrored here so the
+    // ordering leg reaches the argument conversions instead of
+    // breaching at the dynamic-program ceiling first (round 4).
+    let mut regex_cache: HashMap<String, regex::Regex> = HashMap::new();
+    for pat in ["x+", "ZZZ+"] {
+        regex_cache.insert(pat.to_string(), regex::Regex::new(pat).expect("pattern"));
+    }
     let mut failures = Vec::new();
     for def in REGISTRY.iter() {
         // Branch shapes, not just the happy path (review round 3):
         // identity / no-match / n==0 / empty / error arguments each get
-        // their own dominance run.
-        let mut shapes: Vec<(&'static str, Vec<Value<'static>>)> = vec![
-            ("happy", args_for(def.name, def.params, def.variadic)),
-            ("empty", empty_args(def.params, def.variadic)),
+        // their own dominance run — plus a DERIVED invalid-UTF-8
+        // variant of every shape (round 4).
+        let mut shapes: Vec<(String, Vec<Value<'static>>)> = vec![
+            (
+                "happy".to_string(),
+                args_for(def.name, def.params, def.variadic),
+            ),
+            ("empty".to_string(), empty_args(def.params, def.variadic)),
         ];
-        shapes.extend(extra_shapes(def.name));
+        shapes.extend(
+            extra_shapes(def.name)
+                .into_iter()
+                .map(|(n, a)| (n.to_string(), a)),
+        );
+        let invalid: Vec<(String, Vec<Value<'static>>)> = shapes
+            .iter()
+            .filter_map(|(n, a)| invalidate_utf8(a).map(|ia| (format!("{n}+invalid-utf8"), ia)))
+            .collect();
+        shapes.extend(invalid);
         for (shape, args) in shapes {
             let gate = GateEnv {
                 env: env.clone(),
@@ -355,6 +410,8 @@ fn every_registry_function_charge_dominates_its_allocations() {
                 _marker: std::marker::PhantomData,
             };
             let inputs = input_bytes(&args, line.len());
+            // Clone for the ordering rerun BEFORE the first call.
+            let args_rerun = args.clone();
             let before = BYTES.load(Ordering::Relaxed);
             let result = (def.call)(&ctx, &args);
             let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
@@ -400,17 +457,8 @@ fn every_registry_function_charge_dominates_its_allocations() {
                     budget: &gate.budget,
                     _marker: std::marker::PhantomData,
                 };
-                let args = match shape {
-                    "happy" => args_for(def.name, def.params, def.variadic),
-                    "empty" => empty_args(def.params, def.variadic),
-                    named => extra_shapes(def.name)
-                        .into_iter()
-                        .find(|(n, _)| *n == named)
-                        .map(|(_, a)| a)
-                        .expect("shape exists"),
-                };
                 let before = BYTES.load(Ordering::Relaxed);
-                let result = (def.call)(&ctx, &args);
+                let result = (def.call)(&ctx, &args_rerun);
                 let tiny_alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
                 if tiny_alloc > ORDERING_CEILING {
                     failures.push(format!(

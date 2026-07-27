@@ -219,6 +219,20 @@ fn lossy(v: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(v)
 }
 
+/// [`lossy`] with its expansion RESERVED first (review round 4):
+/// invalid UTF-8 forces `from_utf8_lossy` onto its `Cow::Owned` branch
+/// — a ≤3× buffer (each invalid byte becomes a 3-byte U+FFFD), which
+/// is an allocation like any other and is charged BEFORE the
+/// conversion. Valid input borrows and charges nothing, so
+/// valid-UTF-8 budget arithmetic (and every pinned boundary) is
+/// unchanged.
+fn lossy_charged<'v>(ctx: &FuncCtx<'_, '_>, v: &'v [u8]) -> Result<Cow<'v, str>, String> {
+    if std::str::from_utf8(v).is_err() {
+        ctx.charge(3usize.saturating_mul(v.len()) + 4)?;
+    }
+    Ok(lossy(v))
+}
+
 /// Go float→int64 conversion semantics (amd64 `cvttsd2si`): truncate
 /// toward zero; NaN/±Inf/out-of-range yield the INDEFINITE value
 /// `i64::MIN`.
@@ -275,35 +289,41 @@ fn go_parse_int_base0(s: &str) -> Option<i64> {
         return None;
     }
     // Underscore validation is looser than Go's exact rule; the
-    // reachable corpus shapes have none.
-    let cleaned: String = body.chars().filter(|&c| c != '_').collect();
+    // reachable corpus shapes have none. Only allocate the stripped
+    // copy when underscores are present (round-4 sweep: the
+    // unconditional copy was a ~2× transient on every big cast).
+    let cleaned: Cow<'_, str> = if body.contains('_') {
+        Cow::Owned(body.chars().filter(|&c| c != '_').collect())
+    } else {
+        Cow::Borrowed(body)
+    };
     if cleaned.is_empty() || (body.starts_with('_') || body.ends_with('_') || body.contains("__")) {
         return None;
     }
-    let (base, digits) = if let Some(r) = cleaned
+    let (base, digits): (u32, &str) = if let Some(r) = cleaned
         .strip_prefix("0x")
         .or_else(|| cleaned.strip_prefix("0X"))
     {
-        (16, r.to_string())
+        (16, r)
     } else if let Some(r) = cleaned
         .strip_prefix("0o")
         .or_else(|| cleaned.strip_prefix("0O"))
     {
-        (8, r.to_string())
+        (8, r)
     } else if let Some(r) = cleaned
         .strip_prefix("0b")
         .or_else(|| cleaned.strip_prefix("0B"))
     {
-        (2, r.to_string())
+        (2, r)
     } else if cleaned.len() > 1 && cleaned.starts_with('0') {
-        (8, cleaned[1..].to_string())
+        (8, &cleaned[1..])
     } else {
-        (10, cleaned.clone())
+        (10, &cleaned)
     };
     if digits.is_empty() {
         return None;
     }
-    let mag = u64::from_str_radix(&digits, base).ok()?;
+    let mag = u64::from_str_radix(digits, base).ok()?;
     if neg {
         if mag > (i64::MAX as u64) + 1 {
             return None;
@@ -481,11 +501,11 @@ pub static REGISTRY: [FuncDef; 67] = [
     )?))),
     f!("regexReplaceAll", [Str, Str, Str], None, |c, a| {
         let re = compile_regex(c, bytes_of(&a[0]))?;
-        // Borrowed Cow args (round 3): no copy happens before the
-        // charge on the valid-UTF-8 path; the invalid-input lossy
-        // substitution is a ≤3× transient.
-        let s = lossy(bytes_of(&a[1]));
-        let repl = lossy(bytes_of(&a[2]));
+        // Borrowed Cow args (round 3); an INVALID-UTF-8 input's ≤3×
+        // owned substitution buffer is charged before converting
+        // (round 4 — the shape the ordering leg had not covered).
+        let s = lossy_charged(c, bytes_of(&a[1]))?;
+        let repl = lossy_charged(c, bytes_of(&a[2]))?;
         // ≤ (matches+1)×len(repl) + len(s); matches ≤ len(s)+1.
         c.charge(
             (s.len() + 2)
@@ -498,8 +518,8 @@ pub static REGISTRY: [FuncDef; 67] = [
     }),
     f!("regexReplaceAllLiteral", [Str, Str, Str], None, |c, a| {
         let re = compile_regex(c, bytes_of(&a[0]))?;
-        let s = lossy(bytes_of(&a[1]));
-        let repl = lossy(bytes_of(&a[2]));
+        let s = lossy_charged(c, bytes_of(&a[1]))?;
+        let repl = lossy_charged(c, bytes_of(&a[2]))?;
         c.charge(
             (s.len() + 2)
                 .saturating_mul(repl.len().max(1))
@@ -512,7 +532,7 @@ pub static REGISTRY: [FuncDef; 67] = [
     }),
     f!("count", [Str, Str], None, |c, a| {
         let re = compile_regex(c, bytes_of(&a[0]))?;
-        let s = lossy(bytes_of(&a[1]));
+        let s = lossy_charged(c, bytes_of(&a[1]))?;
         Ok(Value::int(re.find_iter(s.as_ref()).count() as i64))
     }),
     f!("urldecode", [Str], None, |c, a| {
@@ -1692,8 +1712,16 @@ fn json_to_value<'a>(v: serde_json::Value) -> Value<'a> {
 const DYNAMIC_REGEX_PROGRAM_CEILING: usize = 1 << 20;
 
 fn compile_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex::Regex, String> {
-    // The pattern copy is charged too (repeatable per call).
-    ctx.charge(pattern.len())?;
+    // The pattern copy is charged too (repeatable per call) — at the
+    // ≤3× U+FFFD ceiling when the pattern bytes are invalid UTF-8
+    // (round 4: the conversion allocates BEFORE the old len-sized
+    // charge could cover it).
+    let copy_ceiling = if std::str::from_utf8(pattern).is_ok() {
+        pattern.len()
+    } else {
+        3usize.saturating_mul(pattern.len()) + 4
+    };
+    ctx.charge(copy_ceiling)?;
     let text = lossy(pattern).into_owned();
     if let Some(re) = ctx.regex_cache.get(&text) {
         // Query-compile-time program (literal pattern): `Regex` is
