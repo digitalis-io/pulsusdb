@@ -14,13 +14,14 @@
 use std::collections::HashMap;
 
 use pulsus_logql::{
-    BinModifier, BinOp, Expr, Grouping, LineFilter, LineFilterOp, LogExpr, MatchOp, Matcher,
-    MetricExpr, RangeAggOp, Stage, StreamSelector, VectorAggOp, VectorMatching,
+    BinModifier, BinOp, Expr, Grouping, GroupingKind, LineFilter, LineFilterOp, LogExpr, LogRange,
+    MatchOp, Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
+    VectorMatching,
 };
 
-use super::error::ReadError;
+use super::error::{ReadError, TooBroadReason};
 use super::escape::{ch_regex_anchored, ch_regex_unanchored, ch_string};
-use super::exec::GridWindow;
+use super::exec::{AggCaps, ClientWindow, GridWindow};
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
@@ -99,9 +100,12 @@ pub enum RouteChoice {
 /// [`MetricNode::VectorAgg`] carry (issue M6-10).
 pub type VectorAggSpec = (VectorAggOp, Option<Grouping>, Option<f64>);
 
-/// The raw-parameter shape straight off the AST (parameter still the
-/// raw literal text), before [`parse_vector_agg_params`] validates it.
-type RawVectorAggSpec = (VectorAggOp, Option<Grouping>, Option<String>);
+/// The raw-parameter shape straight off the AST, BORROWED — the walk that
+/// produces it must not allocate (issue #221 review round 4: the owned
+/// form cloned every grouping and parameter once per variant, before the
+/// `variant_spec_bytes` charge could reject). [`parse_vector_agg_params`]
+/// stays the sole producer of the OWNED [`VectorAggSpec`].
+type RawVectorAggSpec<'a> = (VectorAggOp, Option<&'a Grouping>, Option<&'a str>);
 
 /// The rollup-vs-raw routing decision for one metric query, computed once
 /// in [`metric_plan`] and carried on both [`MetricPlan`] (for [`super::exec`]
@@ -252,6 +256,21 @@ pub enum MetricNode {
         aggs: Vec<VectorAggSpec>,
         inner: Box<MetricNode>,
     },
+    /// `variants(...) of (...)` (issue #221): ONE scan feeding N
+    /// reducers. `scan` is planned from the COMMON log range alone
+    /// (truncated at its first `unwrap` — dead syntax in the reference),
+    /// so the SQL/index path is byte-identical to the equivalent
+    /// single-extractor query and independent of N.
+    Variants {
+        scan: Box<MetricPlan>,
+        variants: Vec<VariantSpec>,
+        /// The plan-time fan-out charge (`Σ variant_spec_bytes` plus the
+        /// spec vector's own buffer), carried so
+        /// [`super::exec::VariantArena::build`] CONTINUES the same
+        /// counter — one budget for plan-time + exec-time state, never
+        /// two.
+        spec_bytes: u64,
+    },
 }
 
 impl MetricNode {
@@ -276,6 +295,7 @@ impl MetricNode {
                 rhs.collect_leaves(out);
             }
             MetricNode::VectorAgg { inner, .. } => inner.collect_leaves(out),
+            MetricNode::Variants { scan, .. } => out.push(scan),
         }
     }
 
@@ -287,7 +307,9 @@ impl MetricNode {
     /// classification (issue #221).
     pub fn produces_series(&self) -> bool {
         match self {
-            MetricNode::Leaf(_) | MetricNode::VectorLit { .. } => true,
+            MetricNode::Leaf(_) | MetricNode::VectorLit { .. } | MetricNode::Variants { .. } => {
+                true
+            }
             MetricNode::Scalar(_) => false,
             MetricNode::Binary { lhs, rhs, .. } => lhs.produces_series() || rhs.produces_series(),
             MetricNode::VectorAgg { inner, .. } => inner.produces_series(),
@@ -340,7 +362,7 @@ fn plan_metric_expr(
 ) -> Result<Plan, ReadError> {
     let (base, _) = unwrap_vector_aggs(metric_expr);
     match base {
-        MetricExpr::Range { .. } => Ok(Plan::Metric(metric_plan(metric_expr, p, ctx)?)),
+        MetricExpr::Range { .. } => Ok(Plan::Metric(metric_plan(metric_expr, p, ctx, false)?)),
         _ => {
             // The step-domain guard normally lives in `metric_plan` (run per
             // leaf); a leaf-LESS tree (`2 + 2`, `vector(1)`) has no leaf to
@@ -373,12 +395,13 @@ fn build_metric_node(
     match metric_expr {
         MetricExpr::Literal(raw) => Ok(MetricNode::Scalar(parse_plan_number(
             raw,
-            "scalar literal",
+            format_args!("scalar literal"),
         )?)),
         MetricExpr::VectorFn(raw) => Ok(MetricNode::VectorLit {
-            value: parse_plan_number(raw, "vector() value")?,
+            value: parse_plan_number(raw, format_args!("vector() value"))?,
             window: window_from(p)?,
         }),
+        MetricExpr::Variants(v) => build_variants_node(v, p, ctx),
         MetricExpr::Binary {
             op,
             modifier,
@@ -401,6 +424,7 @@ fn build_metric_node(
             metric_expr,
             p,
             ctx,
+            false,
         )?))),
         MetricExpr::Vector { .. } => {
             let (base, raw_aggs) = unwrap_vector_aggs(metric_expr);
@@ -409,6 +433,7 @@ fn build_metric_node(
                     metric_expr,
                     p,
                     ctx,
+                    false,
                 )?))),
                 MetricExpr::Literal(_) => Err(ReadError::PipelineInvalid {
                     reason: "a vector aggregation cannot aggregate a bare scalar literal"
@@ -457,8 +482,11 @@ fn window_from(p: &QueryParams) -> Result<GridWindow, ReadError> {
 
 /// Parses a raw AST number the parser guaranteed to be `Number`-token
 /// shaped; a non-finite/unparseable value is a named 400, never a NaN
-/// smuggled into evaluation.
-fn parse_plan_number(raw: &str, what: &str) -> Result<f64, ReadError> {
+/// smuggled into evaluation. `what` is formatted ONLY on the error path —
+/// `format_args!` allocates nothing, so the happy path of a parameterized
+/// vector aggregation costs zero allocations per variant (issue #221
+/// review round 5, finding 1).
+fn parse_plan_number(raw: &str, what: std::fmt::Arguments<'_>) -> Result<f64, ReadError> {
     match raw.parse::<f64>() {
         Ok(v) if v.is_finite() => Ok(v),
         _ => Err(ReadError::PipelineInvalid {
@@ -476,7 +504,7 @@ fn parse_plan_number(raw: &str, what: &str) -> Result<f64, ReadError> {
 /// `metric_plan` and `build_metric_node` route through it), so the gate
 /// cannot be bypassed by either plan shape.
 fn parse_vector_agg_params(
-    raw: &[RawVectorAggSpec],
+    raw: &[RawVectorAggSpec<'_>],
     is_range: bool,
 ) -> Result<Vec<VectorAggSpec>, ReadError> {
     raw.iter()
@@ -501,7 +529,7 @@ fn parse_vector_agg_params(
                 });
             }
             let parsed = match (op.takes_param(), param) {
-                (true, Some(raw)) => Some(parse_plan_number(raw, &format!("{op} parameter"))?),
+                (true, Some(raw)) => Some(parse_plan_number(raw, format_args!("{op} parameter"))?),
                 (true, None) => {
                     return Err(ReadError::PipelineInvalid {
                         reason: format!("`{op}` requires a k parameter (e.g. {op}(5, ...))"),
@@ -514,7 +542,7 @@ fn parse_vector_agg_params(
                 }
                 (false, None) => None,
             };
-            Ok((*op, grouping.clone(), parsed))
+            Ok((*op, grouping.cloned(), parsed))
         })
         .collect()
 }
@@ -629,10 +657,18 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
     })
 }
 
+/// `force_client` (issue #221): `true` ONLY for the `variants(...)` scan
+/// plan — the routing decision becomes `Raw` with its own named reason and
+/// `client` is always `Some`, so the multi-extractor scan reads raw
+/// `log_samples` and never the rollup table (which cannot serve unwraps,
+/// per-variant `[range]` windows, or the common pipeline). Both
+/// pre-existing call sites pass `false`, so every existing plan/SQL
+/// snapshot is byte-identical.
 fn metric_plan(
     metric_expr: &MetricExpr,
     p: &QueryParams,
     ctx: &PlanCtx<'_>,
+    force_client: bool,
 ) -> Result<MetricPlan, ReadError> {
     // `0.is_multiple_of(_)` is trivially `true`, which would otherwise let
     // a zero step reach the routing decision below and pick rollup, then
@@ -701,7 +737,7 @@ fn metric_plan(
     }
     let quantile = match (op, param) {
         (RangeAggOp::QuantileOverTime, Some(raw)) => {
-            Some(parse_plan_number(raw, "quantile parameter")?)
+            Some(parse_plan_number(raw, format_args!("quantile parameter"))?)
         }
         (RangeAggOp::QuantileOverTime, None) => {
             // The parser requires the parameter; re-checked for
@@ -720,36 +756,37 @@ fn metric_plan(
     // per-event `(t-range, t]` boundary; only raw `log_samples` can).
     // Instant queries keep their existing routing (rollup/SQL-raw).
     let is_range = matches!(p.spec, QuerySpec::Range { .. });
-    let client = if has_beyond_line_filter || has_unwrap || client_only_op || is_range {
-        let value = if has_unwrap {
-            ClientValue::Unwrap
-        } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {
-            ClientValue::Bytes
+    let client =
+        if force_client || has_beyond_line_filter || has_unwrap || client_only_op || is_range {
+            let value = if has_unwrap {
+                ClientValue::Unwrap
+            } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {
+                ClientValue::Bytes
+            } else {
+                ClientValue::Count
+            };
+            let absent_labels = if matches!(op, RangeAggOp::AbsentOverTime) {
+                range
+                    .selector
+                    .selector
+                    .matchers
+                    .iter()
+                    .filter(|m| m.op == MatchOp::Eq)
+                    .map(|m| (m.name.clone(), m.value.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Some(ClientAgg {
+                pipeline: pipeline.clone(),
+                value,
+                range_op: *op,
+                param: quantile,
+                absent_labels,
+            })
         } else {
-            ClientValue::Count
+            None
         };
-        let absent_labels = if matches!(op, RangeAggOp::AbsentOverTime) {
-            range
-                .selector
-                .selector
-                .matchers
-                .iter()
-                .filter(|m| m.op == MatchOp::Eq)
-                .map(|m| (m.name.clone(), m.value.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Some(ClientAgg {
-            pipeline: pipeline.clone(),
-            value,
-            range_op: *op,
-            param: quantile,
-            absent_labels,
-        })
-    } else {
-        None
-    };
 
     // Issue #227 review round 2: VALIDATE the client-controlled `[range]`
     // duration at this boundary. Everything downstream carries the validated
@@ -826,7 +863,12 @@ fn metric_plan(
     // ties eligibility strictly to "the query step is a multiple of the
     // resolution", and an unaligned window would silently diverge from raw
     // at bucket edges (task-manager resolution #1 on issue #12).
-    let routing = if client.is_some() {
+    let routing = if force_client {
+        RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: "raw: variants single-pass multi-extractor scan".to_string(),
+        }
+    } else if client.is_some() {
         // Issue #227: a plain (un-piped, non-unwrap) range aggregation now
         // reads raw and slides — name it distinctly from the pipeline/unwrap
         // client path so `X-Pulsus-Explain` stays truthful.
@@ -954,8 +996,21 @@ fn widen_scan_start(start_ns: i64, range_ns: ValidatedDuration) -> (i64, ScanLow
 /// innermost non-`Vector` expression and the aggregation chain (with raw
 /// parameters) in outer-to-inner order (`sum by (svc) (avg(...))` yields
 /// `[(Sum, Some(by(svc)), None)]` first, then deeper wrappers after).
-fn unwrap_vector_aggs(expr: &MetricExpr) -> (&MetricExpr, Vec<RawVectorAggSpec>) {
+fn unwrap_vector_aggs(expr: &MetricExpr) -> (&MetricExpr, Vec<RawVectorAggSpec<'_>>) {
     let mut aggs = Vec::new();
+    let base = unwrap_vector_aggs_into(expr, &mut aggs);
+    (base, aggs)
+}
+
+/// Fills `out` (cleared first) with borrowed handles — allocates only
+/// when `out`'s capacity grows, so ONE buffer reused across a variants
+/// query's variant loop is N-independent (issue #221, member M5). Depth
+/// is parser-bounded (`MAX_DEPTH = 64`) for every parser-produced AST.
+fn unwrap_vector_aggs_into<'a>(
+    expr: &'a MetricExpr,
+    out: &mut Vec<RawVectorAggSpec<'a>>,
+) -> &'a MetricExpr {
+    out.clear();
     let mut cur = expr;
     while let MetricExpr::Vector {
         op,
@@ -964,10 +1019,480 @@ fn unwrap_vector_aggs(expr: &MetricExpr) -> (&MetricExpr, Vec<RawVectorAggSpec>)
         inner,
     } = cur
     {
-        aggs.push((*op, grouping.clone(), param.clone()));
+        out.push((*op, grouping.as_ref(), param.as_deref()));
         cur = inner;
     }
-    (cur, aggs)
+    cur
+}
+
+/// The number of sub-states (variants) a single `variants(...)` query may
+/// declare — the DERIVED backstop (issue #221): the smallest
+/// [`AggCaps::DEFAULT`] field, so every [`AggCaps::divided`] cap stays
+/// ≥ 1 and the per-field TOTAL over sub-states remains exactly today's
+/// single-query bound. Derived, not chosen — it moves with
+/// [`super::exec::MAX_CLIENT_AGG_SERIES`]. The reference is unbounded
+/// here (a recorded divergence, `docs/benchmarks/logs-differential-ledger.md`).
+pub const MAX_VARIANT_SUB_STATES: u64 = AggCaps::DEFAULT.min_field();
+
+/// The COMMON pipeline the reference executes for a `variants(...)` scan:
+/// everything BEFORE the first `Stage::Unwrap` (issue #221 Δ1). A
+/// common-range `unwrap` and its post-`unwrap` label filters are dead
+/// syntax inside `variants(...) of (...)` — the reference's common
+/// extraction is `logRange.Left.Pipeline()`, and its `Unwrap` is a
+/// sibling field it never reads. The parser guarantees only label filters
+/// follow `unwrap`, so the truncated prefix IS `Left`.
+fn common_stages(pipeline: &[Stage]) -> &[Stage] {
+    match pipeline.iter().position(|s| matches!(s, Stage::Unwrap(_))) {
+        Some(i) => &pipeline[..i],
+        None => pipeline,
+    }
+}
+
+/// A variant's own executable TAIL: its pipeline from its first
+/// `Stage::Unwrap` (the unwrap plus the post-`unwrap` label filters the
+/// reference honours — `ReduceAndLabelFilter(PostFilters)`); empty for
+/// every non-unwrap reducer. Everything before it — the variant's own
+/// selector, line filters, parsers, formatters — is dead syntax.
+fn variant_tail(pipeline: &[Stage]) -> &[Stage] {
+    match pipeline.iter().position(|s| matches!(s, Stage::Unwrap(_))) {
+        Some(i) => &pipeline[i..],
+        None => &[],
+    }
+}
+
+pub use variant_spec::VariantSpec;
+
+mod variant_spec {
+    use super::*;
+
+    /// One variant's reducer, derived from the variant metric expression
+    /// (issue #221). The variant's own selector, line filters, parsers
+    /// and formatters are DISCARDED (reference:
+    /// `variantRangeAggExprExtractor` passes `nil` stages — live-probed).
+    ///
+    /// COMPILE-ENFORCED: every `VariantSpec` in existence was sized and
+    /// charged, because the fields are private to this module and
+    /// [`VariantSpec::try_new`] is the only constructor; and no
+    /// per-variant owned payload can be built outside this module,
+    /// because `try_new` takes borrowed inputs only. NOT
+    /// compile-enforced: that no unrelated temporary is allocated before
+    /// the charge — Rust cannot express that. That residual is policed by
+    /// the `ALLOC_CALLS`/`TOTAL_BYTES` slope gates in
+    /// `tests/logql_variants_alloc.rs` and narrowed by the census.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct VariantSpec {
+        /// `__variant__`'s numeric source: the position in the source
+        /// expression (`strconv.Itoa(i)` in the reference — plain
+        /// decimal, no padding).
+        index: usize,
+        /// `client.pipeline` is this variant's UNWRAP TAIL ONLY (empty
+        /// for every non-unwrap reducer) — NEVER the common pipeline,
+        /// which lives once in the scan plan's `client.pipeline`. exec
+        /// runs `common ++ tail` through the [`super::super::exec::VariantArena`];
+        /// nothing may compile `client.pipeline` on its own.
+        client: ClientAgg,
+        /// This variant's OWN evaluation window (its `[range]`) on the
+        /// SHARED grid. The SCAN window stays the common range's, so a
+        /// wider variant range simply sees fewer rows (reference-probed).
+        window: ClientWindow,
+        /// `true` iff the instant window's lower bound UNDERFLOWED i64
+        /// during widening ([`widen_scan_start`]) — the bound is then
+        /// vacuous and compares inclusively, mirroring
+        /// [`super::super::sql::ScanLowerBound::Inclusive`] on the scan
+        /// path. Always `false` for a range window.
+        instant_lower_inclusive: bool,
+        rate_window_ns: Option<u64>,
+        /// 0 or 1 outer vector aggregation with `__variant__` already
+        /// injected into its grouping (BOTH `by` and `without`; under
+        /// `without` this deliberately STRIPS it — the reference's
+        /// observed behaviour) and the label list re-sorted.
+        vector_aggs: Vec<VectorAggSpec>,
+    }
+
+    impl VariantSpec {
+        /// The SOLE `VariantSpec` construction site in the crate. Order
+        /// (normative, single body): size from borrowed inputs
+        /// ([`super::super::exec::variant_spec_bytes`]) → charge
+        /// (`charge_fanout_bytes`, a 422
+        /// [`TooBroadReason::VariantSpecBytes`] on breach) → clone →
+        /// construct. Allocates nothing before the charge returns `Ok`.
+        /// The injected grouping list is sorted with `sort_unstable`
+        /// (`sort` allocates a scratch buffer, `sort_unstable` does not).
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn try_new(
+            charged: &mut u64,
+            cap: u64,
+            index: usize,
+            tail: &[Stage],
+            selector: &StreamSelector,
+            raw_aggs: &[RawVectorAggSpec<'_>],
+            agg_chain: &MetricExpr,
+            range_op: RangeAggOp,
+            value: ClientValue,
+            param: Option<f64>,
+            is_range: bool,
+            window: ClientWindow,
+            instant_lower_inclusive: bool,
+            rate_window_ns: Option<u64>,
+        ) -> Result<Self, ReadError> {
+            let is_absent = matches!(range_op, RangeAggOp::AbsentOverTime);
+            let bytes =
+                super::super::exec::variant_spec_bytes(tail, selector, is_absent, agg_chain);
+            super::super::exec::charge_fanout_bytes(charged, bytes, cap).map_err(
+                |(bytes, cap)| {
+                    ReadError::QueryTooBroad(TooBroadReason::VariantSpecBytes { bytes, cap })
+                },
+            )?;
+            // Charged — the clones below are what the charge paid for.
+            let mut vector_aggs = parse_vector_agg_params(raw_aggs, is_range)?;
+            for (_, grouping, _) in &mut vector_aggs {
+                // `__variant__` is injected into the grouping for BOTH
+                // `by` and `without` (under `without` this deliberately
+                // STRIPS it), creating `by (__variant__)` when the
+                // aggregation had none — the reference's non-nil default
+                // `Grouping` (`mustNewVectorAggregationExpr`).
+                let g = grouping.get_or_insert_with(|| Grouping {
+                    kind: GroupingKind::By,
+                    labels: Vec::new(),
+                });
+                g.labels.push(super::super::exec::VARIANT_LABEL.to_string());
+                g.labels.sort_unstable();
+            }
+            // `absent_over_time`'s synthetic labels come from the
+            // VARIANT'S OWN (otherwise dead) selector, not the common one
+            // (issue #221 Δ2: `absentLabels(expr)` reads
+            // `expr.Selector() = e.Left.Left`). Sorted so
+            // `append_variant_label`'s key-sorted insertion holds.
+            let mut absent_labels: Vec<(String, String)> = if is_absent {
+                selector
+                    .matchers
+                    .iter()
+                    .filter(|m| m.op == MatchOp::Eq)
+                    .map(|m| (m.name.clone(), m.value.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            absent_labels.sort_unstable();
+            Ok(VariantSpec {
+                index,
+                client: ClientAgg {
+                    pipeline: tail.to_vec(),
+                    value,
+                    range_op,
+                    param,
+                    absent_labels,
+                },
+                window,
+                instant_lower_inclusive,
+                rate_window_ns,
+                vector_aggs,
+            })
+        }
+
+        pub fn index(&self) -> usize {
+            self.index
+        }
+
+        pub fn client(&self) -> &ClientAgg {
+            &self.client
+        }
+
+        pub fn window(&self) -> ClientWindow {
+            self.window
+        }
+
+        pub fn rate_window_ns(&self) -> Option<u64> {
+            self.rate_window_ns
+        }
+
+        pub fn vector_aggs(&self) -> &[VectorAggSpec] {
+            &self.vector_aggs
+        }
+
+        /// Whether a scanned row at `ts_ns` falls inside THIS variant's
+        /// instant window `(at - range, at]` (issue #221): the scan is
+        /// bounded by the COMMON range only, so a variant with a shorter
+        /// `[range]` must exclude the older rows in-engine. Always `true`
+        /// for a range window — the sliding evaluator's own `(t-range, t]`
+        /// windows apply the variant range there.
+        pub fn admits_instant(&self, ts_ns: i64) -> bool {
+            match self.window {
+                ClientWindow::Instant { start_ns, end_ns } => {
+                    ts_ns <= end_ns
+                        && if self.instant_lower_inclusive {
+                            ts_ns >= start_ns
+                        } else {
+                            ts_ns > start_ns
+                        }
+                }
+                ClientWindow::Range { .. } => true,
+            }
+        }
+    }
+
+    /// The W-MEM field-addition guard (issue #221): adding a field to
+    /// `VariantSpec` breaks this test's compilation, forcing the
+    /// type-closure walk (charged in [`super::super::exec::variant_spec_bytes`])
+    /// to be re-run for it before it can ship. Lives INSIDE the module
+    /// because the fields are deliberately private (the sole-constructor
+    /// invariant); the indented `cfg(test)` stays out of the column-0
+    /// census split.
+    #[cfg(test)]
+    mod field_guard {
+        use super::*;
+
+        #[test]
+        fn every_variant_spec_field_is_accounted() {
+            let expr = pulsus_logql::parse(r#"sum(count_over_time({a="b"}[5m]))"#).expect("parse");
+            let pulsus_logql::Expr::Metric(me) = &expr else {
+                panic!()
+            };
+            let (base, raw) = unwrap_vector_aggs(me);
+            let MetricExpr::Range { op, range, .. } = base else {
+                panic!()
+            };
+            let mut charged = 0u64;
+            let spec = VariantSpec::try_new(
+                &mut charged,
+                u64::MAX,
+                7,
+                &[],
+                &range.selector.selector,
+                &raw,
+                me,
+                *op,
+                ClientValue::Count,
+                None,
+                false,
+                ClientWindow::Instant {
+                    start_ns: 0,
+                    end_ns: 60,
+                },
+                false,
+                None,
+            )
+            .expect("try_new");
+            // Exhaustive, no `..` — each binding annotated with its
+            // W-MEM bucket and charge term.
+            let VariantSpec {
+                index,                        // S
+                client,                       // H — tail/absent terms
+                window,                       // S (Copy)
+                instant_lower_inclusive: _il, // S
+                rate_window_ns: _rw,          // S
+                vector_aggs,                  // C+H — grown buffer + grouping terms
+            } = spec;
+            assert_eq!(index, 7);
+            assert!(client.pipeline.is_empty());
+            assert!(matches!(window, ClientWindow::Instant { .. }));
+            assert_eq!(vector_aggs.len(), 1);
+        }
+    }
+}
+
+/// Validates and plans a `variants(...) of (...)` expression (issue
+/// #221): ONE scan planned from the truncated common range, plus one
+/// [`VariantSpec`] per variant. Order is normative — count gate (no
+/// allocation) → spec-vector buffer charge → reservation → per variant:
+/// shape gate (no allocation) → charge (`VariantSpec::try_new`) →
+/// materialize → push.
+fn build_variants_node(
+    v: &VariantsExpr,
+    p: &QueryParams,
+    ctx: &PlanCtx<'_>,
+) -> Result<MetricNode, ReadError> {
+    let n = v.variants.len() as u64;
+    if n > MAX_VARIANT_SUB_STATES {
+        return Err(ReadError::QueryTooBroad(TooBroadReason::VariantSubStates {
+            count: n,
+            cap: MAX_VARIANT_SUB_STATES,
+        }));
+    }
+    let cap = super::exec::MAX_VARIANT_FANOUT_STATE_BYTES;
+    let mut charged: u64 = 0;
+    // C2: the spec vector's own buffer, charged after the count gate and
+    // before the exact reservation below — no P5 residue remains in the
+    // plan-time list.
+    super::exec::charge_fanout_bytes(
+        &mut charged,
+        super::exec::vec_buffer_bytes::<VariantSpec>(n),
+        cap,
+    )
+    .map_err(|(bytes, cap)| {
+        ReadError::QueryTooBroad(TooBroadReason::VariantSpecBytes { bytes, cap })
+    })?;
+    let mut variants: Vec<VariantSpec> = Vec::with_capacity(v.variants.len());
+
+    // The ONE scan, planned from the COMMON log range alone (its pipeline
+    // truncated at the first `unwrap` — Δ1). `Rate` is the deliberate
+    // synthesis op: it is in neither `requires_unwrap` nor
+    // `forbids_unwrap`, so a common range carrying `| unwrap` is not
+    // spuriously rejected by an arity rule that belongs to the variants.
+    // The emitted SQL depends only on table/services/fingerprints/window/
+    // scan_lower/extra_predicates — all op-independent — so it is
+    // byte-identical to the client-aggregated `count_over_time(<common
+    // range>)` plan for the same range.
+    let scan_expr = MetricExpr::Range {
+        op: RangeAggOp::Rate,
+        range: LogRange {
+            selector: LogExpr {
+                selector: v.range.selector.selector.clone(),
+                pipeline: common_stages(&v.range.selector.pipeline).to_vec(),
+            },
+            range: v.range.range,
+            unwrap: None,
+        },
+        param: None,
+    };
+    let scan = metric_plan(&scan_expr, p, ctx, /*force_client=*/ true)?;
+
+    let is_range = matches!(p.spec, QuerySpec::Range { .. });
+    // ONE raw handle buffer, reused (cleared) across the variant loop —
+    // never the allocating wrapper here (issue #221 member M5).
+    let mut raw_buf: Vec<RawVectorAggSpec<'_>> = Vec::new();
+    for (index, variant) in v.variants.iter().enumerate() {
+        let base = unwrap_vector_aggs_into(variant, &mut raw_buf);
+        // One rejection for every non-conforming shape — the reference
+        // 500s (three different texts plus a nil-pointer panic), which is
+        // not a matchable contract; both sides reject (ledgered).
+        let reject = |index: usize| ReadError::PipelineInvalid {
+            reason: format!(
+                "variant {index} must be a range aggregation, optionally wrapped in one \
+                 vector aggregation (e.g. variants(count_over_time({{app=\"x\"}}[5m]), \
+                 sum by (level) (rate({{app=\"x\"}}[5m]))) of ({{app=\"x\"}}[5m]))"
+            ),
+        };
+        if raw_buf.len() > 1 {
+            return Err(reject(index));
+        }
+        // `approx_topk` is rejected like every other non-conforming
+        // variant (the reference 500s `expected aggregation operator but
+        // got "approx_topk"`).
+        if raw_buf
+            .iter()
+            .any(|(op, ..)| matches!(op, VectorAggOp::ApproxTopk))
+        {
+            return Err(reject(index));
+        }
+        let MetricExpr::Range { op, range, param } = base else {
+            return Err(reject(index));
+        };
+
+        // Arity is decided by the VARIANT's own expression, not the
+        // common range (Δ1) — the reference messages verbatim.
+        let pipeline = &range.selector.pipeline;
+        let has_unwrap =
+            pipeline.iter().any(|s| matches!(s, Stage::Unwrap(_))) || range.unwrap.is_some();
+        let requires_unwrap = matches!(
+            op,
+            RangeAggOp::SumOverTime
+                | RangeAggOp::AvgOverTime
+                | RangeAggOp::MinOverTime
+                | RangeAggOp::MaxOverTime
+                | RangeAggOp::StddevOverTime
+                | RangeAggOp::StdvarOverTime
+                | RangeAggOp::QuantileOverTime
+                | RangeAggOp::FirstOverTime
+                | RangeAggOp::LastOverTime
+                | RangeAggOp::RateCounter
+        );
+        let forbids_unwrap = matches!(
+            op,
+            RangeAggOp::CountOverTime | RangeAggOp::BytesRate | RangeAggOp::BytesOverTime
+        );
+        if requires_unwrap && !has_unwrap {
+            return Err(ReadError::PipelineInvalid {
+                reason: format!("invalid aggregation {op} without unwrap"),
+            });
+        }
+        if forbids_unwrap && has_unwrap {
+            return Err(ReadError::PipelineInvalid {
+                reason: format!("invalid aggregation {op} with unwrap"),
+            });
+        }
+        let quantile = match (op, param) {
+            (RangeAggOp::QuantileOverTime, Some(raw)) => {
+                Some(parse_plan_number(raw, format_args!("quantile parameter"))?)
+            }
+            (RangeAggOp::QuantileOverTime, None) => {
+                return Err(ReadError::PipelineInvalid {
+                    reason: "quantile_over_time requires a quantile parameter".to_string(),
+                });
+            }
+            _ => None,
+        };
+        let tail = variant_tail(pipeline);
+        let value = if has_unwrap {
+            ClientValue::Unwrap
+        } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {
+            ClientValue::Bytes
+        } else {
+            ClientValue::Count
+        };
+        // The variant's OWN `[range]`, validated at the boundary, on the
+        // SHARED grid (`grid_start_ns`/`end_ns`/`step_ns` equal the scan
+        // plan's; only `range_ns` differs).
+        let range_ns = validate_duration_ns(range.range.as_nanos(), "range selector")?;
+        let (window, instant_lower_inclusive) = match p.spec {
+            QuerySpec::Instant { at_ns } => {
+                let (lo, bound) = widen_scan_start(at_ns, range_ns);
+                (
+                    ClientWindow::Instant {
+                        start_ns: lo,
+                        end_ns: at_ns,
+                    },
+                    matches!(bound, ScanLowerBound::Inclusive),
+                )
+            }
+            QuerySpec::Range {
+                start_ns,
+                end_ns,
+                step_ns,
+            } => {
+                let step = validate_duration_ns(step_ns, "step")?;
+                (
+                    ClientWindow::Range {
+                        grid_start_ns: start_ns,
+                        end_ns,
+                        step_ns: step,
+                        range_ns,
+                    },
+                    false,
+                )
+            }
+        };
+        let rate_window_ns = if matches!(
+            op,
+            RangeAggOp::Rate | RangeAggOp::BytesRate | RangeAggOp::RateCounter
+        ) {
+            Some(range_ns.as_u64())
+        } else {
+            None
+        };
+        let spec = VariantSpec::try_new(
+            &mut charged,
+            cap,
+            index,
+            tail,
+            &range.selector.selector,
+            &raw_buf,
+            variant,
+            *op,
+            value,
+            quantile,
+            is_range,
+            window,
+            instant_lower_inclusive,
+            rate_window_ns,
+        )?;
+        variants.push(spec);
+    }
+    Ok(MetricNode::Variants {
+        scan: Box::new(scan),
+        variants,
+        spec_bytes: charged,
+    })
 }
 
 /// Streams (log-selector) queries always evaluate over an explicit
@@ -2266,5 +2791,421 @@ mod tests {
     fn is_plain_literal_rejects_regex_metacharacters() {
         assert!(is_plain_literal("connection refused"));
         assert!(!is_plain_literal("test.*"));
+    }
+    // -----------------------------------------------------------------
+    // Issue #221: `variants(...) of (...)` — plan-time validation,
+    // charges (I8–I13) and censuses.
+    // -----------------------------------------------------------------
+
+    use super::super::exec;
+
+    fn variants_plan_of(query: &str, spec: QuerySpec) -> Result<Plan, ReadError> {
+        let params = QueryParams {
+            spec,
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let expr = parse(query).expect("parse");
+        plan(&expr, &params, &test_ctx())
+    }
+
+    fn variants_parts(query: &str, spec: QuerySpec) -> (MetricPlan, Vec<VariantSpec>, u64) {
+        match variants_plan_of(query, spec).expect("plan") {
+            Plan::MetricBinary(MetricNode::Variants {
+                scan,
+                variants,
+                spec_bytes,
+            }) => (*scan, variants, spec_bytes),
+            other => panic!("expected a variants plan, got {other:?}"),
+        }
+    }
+
+    fn spec_bytes_of(query: &str) -> u64 {
+        variants_parts(
+            query,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        )
+        .2
+    }
+
+    /// B1 / AC 4 — every non-conforming variant shape (binary, literal,
+    /// `vector(1)`, doubly-nested vector agg, `approx_topk`) is rejected
+    /// at PLAN time with the single named message. (`label_replace` is
+    /// not in PulsusDB's grammar at all — it rejects at parse, covered in
+    /// `pulsus-logql`'s error tests.)
+    #[test]
+    fn variants_rejects_every_nonconforming_variant_shape() {
+        for q in [
+            r#"variants(count_over_time({a="b"}[5m]) + 1) of ({a="b"}[5m])"#,
+            r#"variants(1) of ({a="b"}[5m])"#,
+            r#"variants(vector(1)) of ({a="b"}[5m])"#,
+            r#"variants(sum(sum(count_over_time({a="b"}[5m])))) of ({a="b"}[5m])"#,
+            r#"variants(approx_topk(1, count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#,
+        ] {
+            match variants_plan_of(
+                q,
+                QuerySpec::Instant {
+                    at_ns: 60_000_000_000,
+                },
+            ) {
+                Err(ReadError::PipelineInvalid { reason }) => assert!(
+                    reason.contains("must be a range aggregation"),
+                    "{q}: {reason}"
+                ),
+                other => panic!("{q}: expected the variant-shape rejection, got {other:?}"),
+            }
+        }
+    }
+
+    /// B2 / AC 4 — unwrap arity is decided by the VARIANT's own pipeline
+    /// (the reference messages verbatim); a common-range unwrap alone
+    /// trips NEITHER (it is dead syntax — Δ1).
+    #[test]
+    fn variants_unwrap_arity_is_decided_by_the_variants_own_pipeline() {
+        match variants_plan_of(
+            r#"variants(sum_over_time({a="b"}[5m])) of ({a="b"}[5m])"#,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        ) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert_eq!(reason, "invalid aggregation sum_over_time without unwrap");
+            }
+            other => panic!("expected the without-unwrap rejection, got {other:?}"),
+        }
+        match variants_plan_of(
+            r#"variants(count_over_time({a="b"} | logfmt | unwrap v [5m])) of ({a="b"}[5m])"#,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        ) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert_eq!(reason, "invalid aggregation count_over_time with unwrap");
+            }
+            other => panic!("expected the with-unwrap rejection, got {other:?}"),
+        }
+        // A COMMON-range unwrap is dead syntax: no arity trip, and the
+        // scan pipeline is truncated (B3 below).
+        variants_plan_of(
+            r#"variants(count_over_time({a="b"}[5m])) of ({a="b"} | logfmt | unwrap v [5m])"#,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        )
+        .expect("a common-range unwrap must not trip the variant arity rule");
+    }
+
+    /// B3 / AC 5 — the scan's common pipeline is truncated at the first
+    /// `Stage::Unwrap`, post-`unwrap` filters dropped: byte-identical to
+    /// the same query written without the common unwrap.
+    #[test]
+    fn variants_scan_truncates_the_common_pipeline_at_unwrap() {
+        let spec = QuerySpec::Instant {
+            at_ns: 60_000_000_000,
+        };
+        let (with_unwrap, ..) = variants_parts(
+            r#"variants(count_over_time({a="b"}[5m])) of ({a="b"} | logfmt | unwrap v | v > 1 [5m])"#,
+            spec,
+        );
+        let (without, ..) = variants_parts(
+            r#"variants(count_over_time({a="b"}[5m])) of ({a="b"} | logfmt [5m])"#,
+            spec,
+        );
+        let wu = with_unwrap.client.expect("client scan");
+        let wo = without.client.expect("client scan");
+        assert_eq!(
+            wu.pipeline, wo.pipeline,
+            "truncated common == unwrap-free common"
+        );
+        assert_eq!(with_unwrap.stage1_sql, without.stage1_sql);
+        // The variants scan routes raw with its own named reason and is
+        // always client-aggregated (`force_client`).
+        assert_eq!(
+            with_unwrap.routing.reason,
+            "raw: variants single-pass multi-extractor scan"
+        );
+    }
+
+    /// B4 / AC 9+10 — the DERIVED count backstop: 501 variants is a 422
+    /// carrying `VariantSubStates { 501, 500 }` at plan time; 500 plans.
+    #[test]
+    fn variants_past_the_derived_backstop_reject_at_plan_time() {
+        let over = format!(
+            "variants({}) of ({{a=\"b\"}}[5m])",
+            [r#"count_over_time({a="b"}[5m])"#; 501].join(", ")
+        );
+        match variants_plan_of(
+            &over,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        ) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::VariantSubStates { count, cap })) => {
+                assert_eq!((count, cap), (501, 500));
+            }
+            other => panic!("expected VariantSubStates, got {other:?}"),
+        }
+        let at = format!(
+            "variants({}) of ({{a=\"b\"}}[5m])",
+            [r#"count_over_time({a="b"}[5m])"#; 500].join(", ")
+        );
+        variants_plan_of(
+            &at,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        )
+        .expect("exactly the backstop must plan");
+    }
+
+    /// AC 14 — a 1-variant query is admitted exactly when the equivalent
+    /// single-extractor query is, and its only charge is `spec_bytes`
+    /// (for a bare variant: exactly the spec-vector buffer term — every
+    /// per-spec term is 0).
+    #[test]
+    fn one_variant_query_charges_only_the_spec_vector_buffer() {
+        let spec = QuerySpec::Instant {
+            at_ns: 60_000_000_000,
+        };
+        variants_plan_of(r#"count_over_time({a="b"}[5m])"#, spec)
+            .expect("the plain query is admitted");
+        let (_, variants, spec_bytes) = variants_parts(
+            r#"variants(count_over_time({a="b"}[5m])) of ({a="b"}[5m])"#,
+            spec,
+        );
+        assert_eq!(variants.len(), 1);
+        assert_eq!(spec_bytes, exec::vec_buffer_bytes::<VariantSpec>(1));
+    }
+
+    /// I8 — CHARGE: the spec's tail terms (buffer + clone factor). Pair:
+    /// tail `[unwrap v]` vs `[unwrap v, v > 1, v < 9]` (single axis: the
+    /// tail). Deleting either `pipeline` term zeroes half the delta.
+    #[test]
+    fn i8_spec_pipeline_terms_are_charged() {
+        let short = spec_bytes_of(
+            r#"variants(sum_over_time({a="b"} | unwrap v [5m])) of ({a="b"} | logfmt [5m])"#,
+        );
+        let (_, long_specs, long) = variants_parts(
+            r#"variants(sum_over_time({a="b"} | unwrap v | v > 1 | v < 9 [5m])) of ({a="b"} | logfmt [5m])"#,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        );
+        let (_, short_specs, _) = variants_parts(
+            r#"variants(sum_over_time({a="b"} | unwrap v [5m])) of ({a="b"} | logfmt [5m])"#,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        );
+        let long_tail = &long_specs[0].client().pipeline;
+        let short_tail = &short_specs[0].client().pipeline;
+        let expected = (exec::vec_buffer_bytes::<Stage>(long_tail.len() as u64)
+            - exec::vec_buffer_bytes::<Stage>(short_tail.len() as u64))
+            + (exec::stage_source_bytes(long_tail) - exec::stage_source_bytes(short_tail)) * 130;
+        assert!(expected > 0);
+        assert_eq!(long - short, expected);
+    }
+
+    /// I9 — CHARGE: the spec's absent-label terms. Pair: an absent
+    /// variant whose OWN selector carries 3 Eq matchers vs 1.
+    #[test]
+    fn i9_spec_absent_labels_terms_are_charged() {
+        let three = spec_bytes_of(
+            r#"variants(absent_over_time({a="1", b="2", c="3"}[5m])) of ({a="1"}[5m])"#,
+        );
+        let one = spec_bytes_of(r#"variants(absent_over_time({a="1"}[5m])) of ({a="1"}[5m])"#);
+        let expected = (exec::vec_buffer_bytes::<(String, String)>(3)
+            - exec::vec_buffer_bytes::<(String, String)>(1))
+            + 2 * (exec::alloc_block_bytes(1) + exec::alloc_block_bytes(1));
+        assert!(expected > 0);
+        assert_eq!(three - one, expected);
+    }
+
+    /// I10 — CHARGE: the grouping terms, including the CREATED grouping
+    /// (member M3: bare `sum` gets `by (__variant__)` from nothing — its
+    /// low side must still charge the created buffer + injected label).
+    #[test]
+    fn i10_spec_grouping_terms_are_charged() {
+        let declared = spec_bytes_of(
+            r#"variants(sum by (aa, bb, cc) (count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#,
+        );
+        let bare = spec_bytes_of(r#"variants(sum(count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#);
+        let ptr = size_of::<String>() as u64;
+        let expected = (exec::grown_alloc_bytes(4 * ptr) - exec::grown_alloc_bytes(ptr))
+            + 3 * exec::alloc_block_bytes(2);
+        assert!(expected > 0);
+        assert_eq!(declared - bare, expected);
+    }
+
+    /// I11 — CHARGE: the `vector_aggs` buffer term (grown — the
+    /// `Result<Vec<_>>` collect grows by pushes, C1), isolated from I10:
+    /// one layer vs none moves the buffer term PLUS the created-grouping
+    /// terms, so I11 fails alone when only the buffer term is deleted.
+    #[test]
+    fn i11_spec_vector_agg_buffer_term_is_charged() {
+        let one_layer =
+            spec_bytes_of(r#"variants(sum(count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#);
+        let bare = spec_bytes_of(r#"variants(count_over_time({a="b"}[5m])) of ({a="b"}[5m])"#);
+        let ptr = size_of::<String>() as u64;
+        let expected = exec::grown_alloc_bytes(size_of::<VectorAggSpec>() as u64)
+            + exec::grown_alloc_bytes(ptr)
+            + exec::alloc_block_bytes(exec::VARIANT_LABEL.len() as u64);
+        assert_eq!(one_layer - bare, expected);
+    }
+
+    /// I12 — the spec charge GATES admission (an event, not a computed
+    /// value): at exactly the sized bytes `try_new` admits; one byte
+    /// under, it returns `VariantSpecBytes` — and the C2 spec-vector term
+    /// is additive on top of the per-spec charges (deleting it collapses
+    /// the N-delta to zero).
+    #[test]
+    fn i12_spec_charge_gates_admission_and_the_vec_term_is_additive() {
+        let expr = parse(r#"sum by (env) (sum_over_time({a="1", t="x"} | unwrap v | v > 1 [5m]))"#)
+            .expect("parse");
+        let Expr::Metric(me) = &expr else { panic!() };
+        let (base, raw) = unwrap_vector_aggs(me);
+        let MetricExpr::Range { op, range, .. } = base else {
+            panic!("range base")
+        };
+        let tail = variant_tail(&range.selector.pipeline);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+        };
+        let sized = exec::variant_spec_bytes(tail, &range.selector.selector, false, me);
+        assert!(sized > 0);
+        let mut charged = 0u64;
+        VariantSpec::try_new(
+            &mut charged,
+            sized,
+            0,
+            tail,
+            &range.selector.selector,
+            &raw,
+            me,
+            *op,
+            ClientValue::Unwrap,
+            None,
+            false,
+            window,
+            false,
+            None,
+        )
+        .expect("exactly the sized charge admits");
+        assert_eq!(charged, sized);
+        let mut charged = 0u64;
+        match VariantSpec::try_new(
+            &mut charged,
+            sized - 1,
+            0,
+            tail,
+            &range.selector.selector,
+            &raw,
+            me,
+            *op,
+            ClientValue::Unwrap,
+            None,
+            false,
+            window,
+            false,
+            None,
+        ) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::VariantSpecBytes { bytes, cap })) => {
+                assert_eq!((bytes, cap), (sized, sized - 1));
+            }
+            other => panic!("expected VariantSpecBytes, got {other:?}"),
+        }
+        assert_eq!(charged, 0, "a refused spec charges nothing");
+        // The C2 vec-buffer term is the only N-scaled plan-time residue,
+        // charged once per query.
+        let q2 = format!(
+            "variants({}) of ({{a=\"b\"}}[5m])",
+            [r#"count_over_time({a="b"}[5m])"#; 2].join(", ")
+        );
+        let q3 = format!(
+            "variants({}) of ({{a=\"b\"}}[5m])",
+            [r#"count_over_time({a="b"}[5m])"#; 3].join(", ")
+        );
+        assert_eq!(
+            spec_bytes_of(&q3) - spec_bytes_of(&q2),
+            exec::vec_buffer_bytes::<VariantSpec>(3) - exec::vec_buffer_bytes::<VariantSpec>(2)
+        );
+    }
+
+    /// I13 — BEHAVIOUR only: the reused raw-aggregation buffer is
+    /// CLEARED, not appended to (an append regression yields 3). The
+    /// allocation claim for the reuse lives on the alloc-gate count
+    /// bands, not on an end-state `capacity()` assertion.
+    #[test]
+    fn i13_unwrap_vector_aggs_into_clears_the_reused_buffer() {
+        let two = parse(r#"sum(max(count_over_time({a="b"}[5m])))"#).expect("parse");
+        let one = parse(r#"sum(count_over_time({a="b"}[5m]))"#).expect("parse");
+        let (Expr::Metric(two), Expr::Metric(one)) = (&two, &one) else {
+            panic!()
+        };
+        let mut buf = Vec::new();
+        unwrap_vector_aggs_into(two, &mut buf);
+        assert_eq!(buf.len(), 2);
+        unwrap_vector_aggs_into(one, &mut buf);
+        assert_eq!(buf.len(), 1, "the buffer is cleared, never appended to");
+    }
+
+    /// AC 32/59-style censuses over plan.rs production text (before the
+    /// column-0 `#[cfg(test)]`, `//` text stripped — the `search_sql.rs`
+    /// precedent).
+    #[test]
+    fn variants_plan_census() {
+        let src = include_str!("plan.rs");
+        let production = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Two plan-time charge sites: the C2 spec-vector buffer
+        // (`build_variants_node`, `&mut charged`) and the per-spec charge
+        // (`VariantSpec::try_new`, forwarding its `&mut u64` parameter).
+        // (The v6 census text predates C2's second site — flagged in the
+        // implementation notes.)
+        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        let charges = compact.matches("exec::charge_fanout_bytes(").count();
+        assert_eq!(charges, 2, "plan charge-site census");
+        // The sole `VariantSpec { .. }` construction literal (the struct
+        // declaration subtracted).
+        // The declaration, the impl header and the field-guard's
+        // DESTRUCTURING pattern (an indented `cfg(test)` module, kept out
+        // of the column-0 split by design) are subtracted; what remains
+        // is the construction literal.
+        let literals = compact.matches("VariantSpec{").count()
+            - compact.matches("structVariantSpec{").count()
+            - compact.matches("implVariantSpec{").count()
+            - compact.matches("letVariantSpec{").count();
+        assert_eq!(literals, 1, "VariantSpec has exactly one construction site");
+        // M1: the raw aggregation walk is borrowed — no grouping clone
+        // outside the sole `grouping.cloned()` in `parse_vector_agg_params`.
+        assert_eq!(compact.matches("grouping.clone()").count(), 0);
+        assert_eq!(compact.matches("grouping.cloned()").count(), 1);
+        // M5: the reused buffer's producer has exactly two production
+        // call sites (the allocating single-shot wrapper and the variant
+        // loop), and `build_variants_node` never calls the wrapper.
+        assert_eq!(compact.matches("unwrap_vector_aggs_into(").count(), 2);
+        let bvn = {
+            let start = production
+                .find("fn build_variants_node(")
+                .expect("build_variants_node");
+            let tail = &production[start..];
+            let end = tail.find("\n}").expect("fn end");
+            &tail[..end]
+        };
+        assert!(
+            !bvn.contains("unwrap_vector_aggs("),
+            "the loop must reuse the buffer"
+        );
+        // M4: the injected grouping list sorts without a scratch buffer.
+        assert!(!compact.contains("labels.sort()"), "sort_unstable only");
     }
 }

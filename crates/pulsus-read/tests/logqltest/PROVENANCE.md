@@ -98,6 +98,17 @@ This is done **once** per case, offline; CI runs only the hermetic runner.
    IDENTIFIER` (loki `pkg/loki/config_compat.go` documents the coupling).
    If ingestion fails on a tight disk, add `--tmpfs /loki:rw,size=512m`.
 
+   **`variants` capture delta (issue #221):** capturing `b13_variants.test`
+   additionally requires `limits_config.enable_multi_variant_queries: true`
+   — the bare container returns 400 `multi variant queries are disabled
+   for this instance` for EVERY `variants(...) of (...)` query (verified
+   on both the v3.7.4 capture image and the v3.7.3 differential oracle
+   image). One config serves every capture: `ci/logql/config.yaml`
+   carries all three deltas. Transcription: the container attaches
+   `detected_level`/`detected_level_extracted` labels to variants results
+   that PulsusDB's label model has no analogue for — DROP them from
+   expected label sets (values are unaffected).
+
 2. Push the `load` dataset at the exact timestamps. For an `eval instant at
    T`, an entry written at offset `Δ` uses wall-clock `now - (T - Δ)` so the
    sample lands `Δ` before the query instant (Loki keys entries by

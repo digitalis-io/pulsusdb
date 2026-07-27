@@ -46,6 +46,12 @@ limits_config:
   metric_aggregation_enabled: true
   shard_aggregations:
     - approx_topk
+  # `enable_multi_variant_queries` (issue #221): without it EVERY
+  # `variants(...) of (...)` query is a 400 `multi variant queries are
+  # disabled for this instance` — a FALSE syntax REJECT that would red the
+  # differential leg against the `func.variants` supported/accept
+  # disposition.
+  enable_multi_variant_queries: true
 
 # Issue #221: with shard_aggregations set, the frontend must ship the
 # serialized query PLAN downstream (the approx_topk rewrite produces an

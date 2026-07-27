@@ -551,6 +551,44 @@ pub enum MetricExpr {
         lhs: Box<MetricExpr>,
         rhs: Box<MetricExpr>,
     },
+    /// `variants(<metricExpr>, …) of (<logRangeExpr>)` (issue #221): N
+    /// metric extractors over ONE log range, each result tagged
+    /// `__variant__="<index>"`. Modelled as a `MetricExpr` (not a new
+    /// [`Expr`] arm) because the reference's `MultiVariantExpr` implements
+    /// `SampleExpr` and is therefore a legal binary operand —
+    /// `variants(…) of (…) + 1` is accepted upstream — while the
+    /// positional `allow_variants` parser rule keeps it out of every
+    /// nested position the reference grammar rejects (`sum(variants(…))`,
+    /// `(variants(…))`, another `variants` argument list).
+    Variants(Box<VariantsExpr>),
+}
+
+/// `variants(<metricExpr>, …) of (<logRangeExpr>)` (issue #221). Mirrors
+/// the reference's `MultiVariantExpr`: N metric extractors over ONE log
+/// range, each result tagged with an index-based `__variant__` label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VariantsExpr {
+    /// At least one (the parser cannot produce an empty list); each is
+    /// validated at PLAN time to be a range aggregation optionally
+    /// wrapped in exactly ONE vector aggregation.
+    pub variants: Vec<MetricExpr>,
+    /// The single common log range — the ONLY selector/pipeline that
+    /// selects and transforms data (a variant's own selector, line
+    /// filters and parsers are dead syntax in the reference).
+    pub range: LogRange,
+}
+
+impl fmt::Display for VariantsExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "variants(")?;
+        for (i, v) in self.variants.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{v}")?;
+        }
+        write!(f, ") of ({})", self.range)
+    }
 }
 
 impl MetricExpr {
@@ -590,6 +628,7 @@ impl fmt::Display for MetricExpr {
             }
             MetricExpr::Literal(raw) => write!(f, "{raw}"),
             MetricExpr::VectorFn(raw) => write!(f, "vector({raw})"),
+            MetricExpr::Variants(v) => write!(f, "{v}"),
             MetricExpr::Binary {
                 op,
                 modifier,

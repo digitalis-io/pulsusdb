@@ -236,7 +236,7 @@ fn parse_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<Expr, LogQlError>
     match &cursor.peek().kind {
         TokenKind::LBrace => Ok(Expr::Log(parse_log_expr(cursor)?)),
         TokenKind::Ident(_) | TokenKind::Number(_) | TokenKind::LParen => {
-            let metric = parse_binary_expr(cursor, depth, 0)?;
+            let metric = parse_binary_expr(cursor, depth, 0, true)?;
             check_no_stray_filter_op(cursor)?;
             Ok(Expr::Metric(metric))
         }
@@ -322,10 +322,19 @@ fn peek_binop(cursor: &Cursor<'_>) -> Option<(BinOp, u8, bool)> {
 /// comparisons only, followed by the optional vector-matching clause
 /// (`on`/`ignoring` with an optional `group_left`/`group_right`), issue
 /// #91.
+///
+/// `allow_variants` is the positional `variants(...)` acceptance rule
+/// (issue #221): the reference's `variantsExpr` is an alternative of
+/// `expr` (not of `metricExpr`), and `binOpExpr` is `expr OP expr` — so
+/// `variants(...)` is legal exactly at the top level and in any operand
+/// position of a TOP-LEVEL binary chain, and illegal inside `( … )`,
+/// inside a vector aggregation, and inside another `variants(...)`
+/// argument list. This flag is that rule; there is no other mechanism.
 fn parse_binary_expr(
     cursor: &mut Cursor<'_>,
     depth: usize,
     min_prec: u8,
+    allow_variants: bool,
 ) -> Result<MetricExpr, LogQlError> {
     if depth >= MAX_DEPTH {
         return Err(LogQlError::RecursionLimitExceeded {
@@ -333,7 +342,7 @@ fn parse_binary_expr(
             limit: MAX_DEPTH,
         });
     }
-    let mut lhs = parse_metric_primary(cursor, depth)?;
+    let mut lhs = parse_metric_primary(cursor, depth, allow_variants)?;
     while let Some((op, prec, right_assoc)) = peek_binop(cursor) {
         if prec < min_prec {
             break;
@@ -341,7 +350,7 @@ fn parse_binary_expr(
         cursor.advance();
         let modifier = parse_bin_modifier(cursor, op)?;
         let next_min = if right_assoc { prec } else { prec + 1 };
-        let rhs = parse_binary_expr(cursor, depth + 1, next_min)?;
+        let rhs = parse_binary_expr(cursor, depth + 1, next_min, allow_variants)?;
         lhs = MetricExpr::Binary {
             op,
             modifier,
@@ -452,12 +461,18 @@ fn parse_label_list_parens(cursor: &mut Cursor<'_>) -> Result<Vec<String>, LogQl
 }
 
 /// A metric-expression primary: a parenthesized binary expression, a bare
-/// scalar number literal, or an aggregation call.
-fn parse_metric_primary(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr, LogQlError> {
+/// scalar number literal, or an aggregation call. The `LParen` arm drops
+/// `allow_variants` (issue #221): `(variants(…) of (…))` is a reference
+/// 400 (`variantsExpr` is not a `metricExpr`, so it cannot parenthesize).
+fn parse_metric_primary(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+    allow_variants: bool,
+) -> Result<MetricExpr, LogQlError> {
     match &cursor.peek().kind {
         TokenKind::LParen => {
             cursor.advance();
-            let inner = parse_binary_expr(cursor, depth + 1, 0)?;
+            let inner = parse_binary_expr(cursor, depth + 1, 0, false)?;
             cursor.expect(&TokenKind::RParen, "')'")?;
             Ok(inner)
         }
@@ -466,7 +481,7 @@ fn parse_metric_primary(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricE
             cursor.advance();
             Ok(MetricExpr::Literal(raw))
         }
-        _ => parse_metric_expr(cursor, depth),
+        _ => parse_metric_expr(cursor, depth, allow_variants),
     }
 }
 
@@ -1037,7 +1052,11 @@ fn parse_stream_selector(cursor: &mut Cursor<'_>) -> Result<StreamSelector, LogQ
 /// range/vector aggregation names build the corresponding node; anything
 /// else is an `UnexpectedToken` (the M6-10 aggregation set is complete —
 /// no future-aggregation keyword table remains).
-fn parse_metric_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr, LogQlError> {
+fn parse_metric_expr(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+    allow_variants: bool,
+) -> Result<MetricExpr, LogQlError> {
     if depth >= MAX_DEPTH {
         return Err(LogQlError::RecursionLimitExceeded {
             span: cursor.peek().span,
@@ -1071,6 +1090,16 @@ fn parse_metric_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr
         let (raw, _) = cursor.expect_number("the vector value (e.g. vector(0))")?;
         cursor.expect(&TokenKind::RParen, "')'")?;
         return Ok(MetricExpr::VectorFn(raw));
+    }
+    // `variants(...) of (...)` (issue #221) — recognized ONLY in the
+    // positions the reference grammar admits (`allow_variants`, see
+    // `parse_binary_expr`). In a disallowed position the identifier falls
+    // through to the ordinary `UnexpectedToken` below — a plain 400, the
+    // same shape the reference's `syntax error: unexpected )` carries,
+    // never `NotYetSupported`.
+    if name == "variants" && allow_variants {
+        cursor.advance();
+        return parse_variants_expr(cursor, depth);
     }
     if let Some(op) = RangeAggOp::from_ident(&name) {
         cursor.advance();
@@ -1119,6 +1148,51 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
     })
 }
 
+/// `variants "(" metricExpr ("," metricExpr)* ")" "of" "(" logRange ")"`
+/// (issue #221). The `variants` keyword itself has already been consumed.
+///
+/// An empty argument list needs NO special case: the first
+/// `parse_binary_expr` sees `)` and produces the ordinary
+/// `UnexpectedToken { found: "')'", expected: "an aggregation function" }`,
+/// which is the same rejection shape the reference's `unexpected )`
+/// carries. A trailing comma fails identically. Arguments parse with
+/// `allow_variants = false`, so a nested `variants(...)` argument is the
+/// same plain 400.
+fn parse_variants_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr, LogQlError> {
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    let mut variants = vec![parse_binary_expr(cursor, depth + 1, 0, false)?];
+    while matches!(cursor.peek().kind, TokenKind::Comma) {
+        cursor.advance();
+        variants.push(parse_binary_expr(cursor, depth + 1, 0, false)?);
+    }
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    // The `of` keyword is matched as the exact lowercase identifier,
+    // consistent with every other PulsusDB keyword (`sum`, `by`,
+    // `unwrap`) — the reference's case-insensitive lexer is a
+    // workspace-wide pre-existing gap, deliberately not special-cased
+    // here (issue #221 plan §risk 6).
+    match &cursor.peek().kind {
+        TokenKind::Ident(name) if name == "of" => {
+            cursor.advance();
+        }
+        other => {
+            let span = cursor.peek().span;
+            return Err(LogQlError::UnexpectedToken {
+                found: describe(other),
+                expected: "'of'".to_string(),
+                span,
+            });
+        }
+    }
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    let range = parse_log_range(cursor)?;
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    Ok(MetricExpr::Variants(Box::new(ast::VariantsExpr {
+        variants,
+        range,
+    })))
+}
+
 fn parse_vector_agg_call(
     cursor: &mut Cursor<'_>,
     depth: usize,
@@ -1141,8 +1215,9 @@ fn parse_vector_agg_call(
         None
     };
     // The aggregated operand is a full binary-capable metric expression
-    // (`sum(rate(a) + rate(b))` — issue M6-10).
-    let inner = parse_binary_expr(cursor, depth + 1, 0)?;
+    // (`sum(rate(a) + rate(b))` — issue M6-10). `variants` is NOT legal
+    // here (`sum(variants(…))` is a reference 400 — issue #221).
+    let inner = parse_binary_expr(cursor, depth + 1, 0, false)?;
     cursor.expect(&TokenKind::RParen, "')'")?;
     if grouping.is_none() {
         grouping = maybe_grouping(cursor)?;

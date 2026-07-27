@@ -29,7 +29,7 @@ pub use ast::{
     GroupingKind, LabelExtraction, LabelFilterExpr, LabelFmt, LabelMatch, LineFilter, LineFilterOp,
     LineMatch, LogExpr, LogRange, MatchGroup, MatchOp, Matcher, MetricExpr, NumericLiteral,
     ParserStage, REMAINING_UNSUPPORTED_STAGES, RangeAggOp, Stage, StreamSelector,
-    UNWRAP_CONVERSIONS, Unwrap, VectorAggOp, VectorMatching,
+    UNWRAP_CONVERSIONS, Unwrap, VariantsExpr, VectorAggOp, VectorMatching,
 };
 pub use error::LogQlError;
 pub use parser::{parse, parse_selector};

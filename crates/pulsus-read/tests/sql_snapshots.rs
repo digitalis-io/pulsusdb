@@ -1097,3 +1097,111 @@ fn a_range_spanning_a_month_boundary_resolves_both_partitions() {
             .contains("month IN ('2026-07-01', '2026-08-01')")
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #221 — the variants single-scan performance gate (Tier-1).
+// ---------------------------------------------------------------------
+
+/// The variants scan plan for `query` (the `MetricNode::Variants` leaf).
+fn variants_scan(query: &str, params: &QueryParams) -> pulsus_read::logql::MetricPlan {
+    let expr = parse(query).expect("parse");
+    match plan(&expr, params, &ctx()).expect("plan") {
+        Plan::MetricBinary(pulsus_read::logql::MetricNode::Variants { scan, .. }) => *scan,
+        other => panic!("expected a variants plan, got {other:?}"),
+    }
+}
+
+fn n_variants(n: usize, common: &str) -> String {
+    format!(
+        "variants({}) of ({common})",
+        vec![r#"count_over_time({env="prod"}[5m])"#; n].join(", ")
+    )
+}
+
+/// AC 11/13 (C1) — ONE scan, independent of N: the `stage1_sql` and the
+/// rendered read SQL for `variants(V1) of (LR)`, `variants(V1,V2) of
+/// (LR)` and `variants(V1..V5) of (LR)` are byte-identical to each other
+/// AND to the client-aggregated `count_over_time(LR)` plan's, at both
+/// range and instant — same fingerprint resolution, same `PREWHERE
+/// service` PK-prefix engagement, same `tokenbf_v1` line-filter pushdown
+/// surface, same single round-trip. A common-range `unwrap` (dead
+/// syntax) changes neither string.
+#[test]
+fn variants_scan_sql_is_byte_identical_to_the_single_extractor_plan() {
+    let services = &["'checkout'".to_string()];
+    let fps = &[101u64, 205];
+    for params in [
+        range_params(100, Direction::Backward),
+        QueryParams {
+            spec: QuerySpec::Instant { at_ns: END_NS },
+            limit: 100,
+            direction: Direction::Backward,
+        },
+    ] {
+        let is_range = matches!(params.spec, QuerySpec::Range { .. });
+        let read_sql = |mp: &pulsus_read::logql::MetricPlan| {
+            if is_range {
+                sliding_sql(mp, services, fps)
+            } else {
+                sql::metric_raw_samples(
+                    &mp.table,
+                    services,
+                    fps,
+                    TimeWindow {
+                        start_ns: mp.start_ns,
+                        end_ns: mp.end_ns,
+                    },
+                    mp.scan_lower,
+                    &mp.extra_predicates,
+                )
+            }
+        };
+        // The single-extractor baseline (AC 13's byte-equality) exists at
+        // RANGE, where every plain range aggregation is client-aggregated
+        // (#227); an INSTANT un-piped count is SQL-aggregated (a different
+        // read shape by design), so the instant half of the gate is
+        // N-independence.
+        let (baseline_stage1, baseline_read) = if is_range {
+            let single = metric_plan(r#"count_over_time({env="prod"}[5m])"#, &params);
+            assert!(single.client.is_some(), "the baseline is client-aggregated");
+            (single.stage1_sql.clone(), read_sql(&single))
+        } else {
+            let scan = variants_scan(&n_variants(1, r#"{env="prod"}[5m]"#), &params);
+            (scan.stage1_sql.clone(), read_sql(&scan))
+        };
+        for n in [1usize, 2, 5] {
+            let scan = variants_scan(&n_variants(n, r#"{env="prod"}[5m]"#), &params);
+            assert_eq!(
+                scan.stage1_sql, baseline_stage1,
+                "stage1 SQL must be N-independent and single-extractor-identical (n={n})"
+            );
+            assert_eq!(
+                read_sql(&scan),
+                baseline_read,
+                "read SQL must be N-independent and single-extractor-identical (n={n})"
+            );
+        }
+        // Δ1: a dead common-range unwrap changes neither string.
+        let scan = variants_scan(
+            r#"variants(count_over_time({env="prod"}[5m])) of ({env="prod"} | unwrap v [5m])"#,
+            &params,
+        );
+        assert_eq!(scan.stage1_sql, baseline_stage1);
+        assert_eq!(read_sql(&scan), baseline_read);
+    }
+}
+
+/// AC 12 (C2, structural half) — a 5-variant tree has exactly ONE scan
+/// leaf, so the engine (whose `run_variants` pushes exactly one
+/// `stage1_stream_resolution`, one `stage2_hydration` and one
+/// `metric_read` per scan) issues exactly one of each; the full
+/// explain-stage assertion is live-path territory.
+#[test]
+fn a_five_variant_tree_has_exactly_one_scan_leaf() {
+    let expr = parse(&n_variants(5, r#"{env="prod"}[5m]"#)).expect("parse");
+    let params = range_params(100, Direction::Backward);
+    let Plan::MetricBinary(node) = plan(&expr, &params, &ctx()).expect("plan") else {
+        panic!("expected a MetricBinary plan");
+    };
+    assert_eq!(node.leaves().len(), 1, "one scan, N-independent");
+}

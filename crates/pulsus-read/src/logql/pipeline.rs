@@ -332,14 +332,14 @@ pub enum MetricRun<'a> {
 /// so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
 /// down and it is evaluated here); a plain value compiles to `Literal`
 /// (`|=`/`!=`) or `Regex` (`|~`/`!~`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum LineMatcher {
     Literal(String),
     Regex(regex::Regex),
     Ip(IpMatcher),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CompiledLabelFilter {
     Match {
         name: String,
@@ -377,20 +377,20 @@ enum JsonPathSeg {
     Index(usize),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PatternTok {
     Literal(String),
     Capture(String),
     Discard,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TmplPart {
     Lit(String),
     Field(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CompiledStage {
     LineFilter {
         /// `or`-disjunction alternatives; the stage matches iff ANY matches.
@@ -465,13 +465,13 @@ enum CompiledStage {
 
 /// One compiled `drop`/`keep` element: a label name plus an optional
 /// value matcher (regexes compiled once, fully anchored).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledDropKeep {
     label: String,
     matcher: Option<CompiledDropKeepMatch>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledDropKeepMatch {
     op: MatchOp,
     value: String,
@@ -492,7 +492,7 @@ impl CompiledDropKeepMatch {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CompiledLabelFmt {
     /// `label_format dst=src` where `dst != src`.
     Rename { dst: String, src: String },
@@ -514,14 +514,191 @@ enum CompiledLabelFmt {
 
 /// The compiled, reusable per-line evaluator (consumed by the streams
 /// read path here and by the M6-10 metric-pipeline seam later).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledPipeline {
     stages: Vec<CompiledStage>,
     mutates_labels: bool,
     rewrites_line: bool,
     line_filter_only: bool,
     has_unwrap: bool,
+    /// Compile-state carry so [`CompiledPipeline::extended_with`] resumes
+    /// EXACTLY where [`CompiledPipeline::compile`] stopped (issue #221):
+    /// whether a line-rewriting stage was seen (a tail line filter after
+    /// it could not push down)…
+    seen_line_format: bool,
+    /// …and whether every SOURCE stage so far was a line filter (the
+    /// `line_filter_only` fast-path derivation).
+    all_line_filter_source: bool,
 }
+
+/// Compile state carried across stages, so [`CompiledPipeline::compile`]
+/// and [`CompiledPipeline::extended_with`] share ONE per-stage
+/// implementation ([`compile_stage`]) — no second compiler to drift
+/// (issue #221).
+#[derive(Debug, Clone, Copy)]
+struct CompileState {
+    seen_line_format: bool,
+    mutates_labels: bool,
+    rewrites_line: bool,
+    has_unwrap: bool,
+    all_line_filter_source: bool,
+}
+
+impl Default for CompileState {
+    fn default() -> Self {
+        CompileState {
+            seen_line_format: false,
+            mutates_labels: false,
+            rewrites_line: false,
+            has_unwrap: false,
+            // Vacuously true over the empty prefix; any non-line-filter
+            // source stage clears it.
+            all_line_filter_source: true,
+        }
+    }
+}
+
+/// Compiles ONE source stage, updating the carried [`CompileState`].
+/// `Ok(None)` = the stage is pushed down to SQL and skipped here (the
+/// pushable-line-filter case). Extracted verbatim from the former
+/// `compile` loop body (issue #221) so `compile` and `extended_with`
+/// cannot drift.
+fn compile_stage(
+    stage: &Stage,
+    st: &mut CompileState,
+) -> Result<Option<CompiledStage>, PipelineError> {
+    if !matches!(stage, Stage::LineFilter(_)) {
+        st.all_line_filter_source = false;
+    }
+    match stage {
+        Stage::LineFilter(lf) => {
+            // A line filter is pushed down to SQL (and skipped here to
+            // avoid double evaluation) ONLY when it both precedes the
+            // first `line_format` (it references the original `body`)
+            // AND is pushable — i.e. no alternative is an `ip("…")`.
+            // An `ip(…)`/mixed-`or` filter, or any filter following a
+            // `line_format`, is served here client-side, matching
+            // `plan::compile_line_filters`'s pushdown split exactly.
+            if !st.seen_line_format && super::plan::is_pushable_line_filter(lf) {
+                return Ok(None);
+            }
+            let mut matchers = Vec::with_capacity(1 + lf.or_matches.len());
+            for (value, is_ip) in lf.alternatives() {
+                let matcher = if is_ip {
+                    // `ip("…")` compiles to a range matcher regardless
+                    // of the outer op (`ip(…)` is only ever `|=`/`!=`).
+                    LineMatcher::Ip(
+                        IpMatcher::parse(value)
+                            .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?,
+                    )
+                } else {
+                    match lf.op {
+                        LineFilterOp::Contains | LineFilterOp::NotContains => {
+                            LineMatcher::Literal(value.to_string())
+                        }
+                        LineFilterOp::Regex | LineFilterOp::NotRegex => {
+                            // Unanchored, like the SQL pushdown's
+                            // `match(body, ...)`.
+                            LineMatcher::Regex(compile_regex(value)?)
+                        }
+                    }
+                };
+                matchers.push(matcher);
+            }
+            let negated = matches!(lf.op, LineFilterOp::NotContains | LineFilterOp::NotRegex);
+            Ok(Some(CompiledStage::LineFilter { matchers, negated }))
+        }
+        Stage::Parser(p) => {
+            st.mutates_labels = true;
+            Ok(Some(compile_parser(p)?))
+        }
+        Stage::LabelFilter(expr) => {
+            let filter = compile_label_filter(expr)?;
+            // A numeric comparison can add `__error__` on a
+            // conversion failure — that changes the label set, so
+            // it must route through the fan-out path (correctness
+            // refinement over the plan's parser/label_format-only
+            // trigger; flagged in the implementation notes).
+            if filter_contains_compare(&filter) {
+                st.mutates_labels = true;
+            }
+            Ok(Some(CompiledStage::LabelFilter(filter)))
+        }
+        Stage::LineFormat(tmpl) => {
+            st.seen_line_format = true;
+            st.rewrites_line = true;
+            let parts = compile_template(tmpl)?;
+            let reads_err = template_reads_error_pair(&parts);
+            Ok(Some(CompiledStage::LineFormat {
+                tmpl: parts,
+                reads_err,
+            }))
+        }
+        Stage::LabelFormat(fmts) => {
+            st.mutates_labels = true;
+            Ok(Some(compile_label_format(fmts)?))
+        }
+        Stage::Unwrap(u) => {
+            st.has_unwrap = true;
+            let kind = match u.conversion.as_deref() {
+                None => UnitKind::Number,
+                Some("duration") | Some("duration_seconds") => UnitKind::Duration,
+                Some("bytes") => UnitKind::Bytes,
+                // The parser only emits the three conversions in
+                // `UNWRAP_CONVERSIONS`; anything else is a named
+                // defensive rejection, never a silent Number.
+                Some(other) => {
+                    return Err(PipelineError::BadParserExpr(format!(
+                        "unknown unwrap conversion {other:?}"
+                    )));
+                }
+            };
+            // Deliberately does NOT set `mutates_labels`: the
+            // streams path never executes unwrap (it stays
+            // byte-identical with/without a trailing unwrap —
+            // adjudication #2); the metric path's grouping keys
+            // off `metric_mutates_labels()` instead.
+            Ok(Some(CompiledStage::Unwrap {
+                label: u.label.clone(),
+                kind,
+            }))
+        }
+        Stage::Unpack => {
+            // Unpack rewrites the line (`_entry` becomes the line) and
+            // promotes fields to labels — a following line filter must
+            // therefore evaluate in-engine, so it sets the line-rewrite
+            // gate exactly like `line_format`.
+            st.mutates_labels = true;
+            st.rewrites_line = true;
+            st.seen_line_format = true;
+            Ok(Some(CompiledStage::Unpack))
+        }
+        Stage::Decolorize => {
+            // Decolorize rewrites the line; a following line filter must
+            // evaluate in-engine (the raw body still carries the color
+            // codes ClickHouse would match against).
+            st.rewrites_line = true;
+            st.seen_line_format = true;
+            Ok(Some(CompiledStage::Decolorize(compile_regex(
+                DECOLORIZE_PATTERN,
+            )?)))
+        }
+        Stage::Drop(elems) => {
+            st.mutates_labels = true;
+            Ok(Some(CompiledStage::Drop(compile_drop_keep(elems)?)))
+        }
+        Stage::Keep(elems) => {
+            st.mutates_labels = true;
+            Ok(Some(CompiledStage::Keep(compile_drop_keep(elems)?)))
+        }
+    }
+}
+
+/// The compiled-stage slot width, exported so the variants arena can
+/// bound a cloned stage list's retained heap without duplicating this
+/// enum's layout (issue #221). `CompiledStage` itself stays private; only
+/// its size crosses the boundary.
+pub(crate) const COMPILED_STAGE_SLOT_BYTES: usize = size_of::<CompiledStage>();
 
 impl CompiledPipeline {
     /// Compiles `stages` once per query: regexes, templates, extraction
@@ -535,153 +712,61 @@ impl CompiledPipeline {
     /// bare log queries via `PipelineInvalid` before it could reach
     /// `run` anyway.
     pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
+        let mut st = CompileState::default();
         let mut compiled = Vec::new();
-        let mut seen_line_format = false;
-        let mut mutates_labels = false;
-        let mut rewrites_line = false;
-        let mut has_unwrap = false;
-
         for stage in stages {
-            match stage {
-                Stage::LineFilter(lf) => {
-                    // A line filter is pushed down to SQL (and skipped here to
-                    // avoid double evaluation) ONLY when it both precedes the
-                    // first `line_format` (it references the original `body`)
-                    // AND is pushable — i.e. no alternative is an `ip("…")`.
-                    // An `ip(…)`/mixed-`or` filter, or any filter following a
-                    // `line_format`, is served here client-side, matching
-                    // `plan::compile_line_filters`'s pushdown split exactly.
-                    if !seen_line_format && super::plan::is_pushable_line_filter(lf) {
-                        continue;
-                    }
-                    let mut matchers = Vec::with_capacity(1 + lf.or_matches.len());
-                    for (value, is_ip) in lf.alternatives() {
-                        let matcher = if is_ip {
-                            // `ip("…")` compiles to a range matcher regardless
-                            // of the outer op (`ip(…)` is only ever `|=`/`!=`).
-                            LineMatcher::Ip(
-                                IpMatcher::parse(value)
-                                    .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?,
-                            )
-                        } else {
-                            match lf.op {
-                                LineFilterOp::Contains | LineFilterOp::NotContains => {
-                                    LineMatcher::Literal(value.to_string())
-                                }
-                                LineFilterOp::Regex | LineFilterOp::NotRegex => {
-                                    // Unanchored, like the SQL pushdown's
-                                    // `match(body, ...)`.
-                                    LineMatcher::Regex(compile_regex(value)?)
-                                }
-                            }
-                        };
-                        matchers.push(matcher);
-                    }
-                    let negated =
-                        matches!(lf.op, LineFilterOp::NotContains | LineFilterOp::NotRegex);
-                    compiled.push(CompiledStage::LineFilter { matchers, negated });
-                }
-                Stage::Parser(p) => {
-                    mutates_labels = true;
-                    compiled.push(compile_parser(p)?);
-                }
-                Stage::LabelFilter(expr) => {
-                    let filter = compile_label_filter(expr)?;
-                    // A numeric comparison can add `__error__` on a
-                    // conversion failure — that changes the label set, so
-                    // it must route through the fan-out path (correctness
-                    // refinement over the plan's parser/label_format-only
-                    // trigger; flagged in the implementation notes).
-                    if filter_contains_compare(&filter) {
-                        mutates_labels = true;
-                    }
-                    compiled.push(CompiledStage::LabelFilter(filter));
-                }
-                Stage::LineFormat(tmpl) => {
-                    seen_line_format = true;
-                    rewrites_line = true;
-                    let parts = compile_template(tmpl)?;
-                    let reads_err = template_reads_error_pair(&parts);
-                    compiled.push(CompiledStage::LineFormat {
-                        tmpl: parts,
-                        reads_err,
-                    });
-                }
-                Stage::LabelFormat(fmts) => {
-                    mutates_labels = true;
-                    compiled.push(compile_label_format(fmts)?);
-                }
-                Stage::Unwrap(u) => {
-                    has_unwrap = true;
-                    let kind = match u.conversion.as_deref() {
-                        None => UnitKind::Number,
-                        Some("duration") | Some("duration_seconds") => UnitKind::Duration,
-                        Some("bytes") => UnitKind::Bytes,
-                        // The parser only emits the three conversions in
-                        // `UNWRAP_CONVERSIONS`; anything else is a named
-                        // defensive rejection, never a silent Number.
-                        Some(other) => {
-                            return Err(PipelineError::BadParserExpr(format!(
-                                "unknown unwrap conversion {other:?}"
-                            )));
-                        }
-                    };
-                    // Deliberately does NOT set `mutates_labels`: the
-                    // streams path never executes unwrap (it stays
-                    // byte-identical with/without a trailing unwrap —
-                    // adjudication #2); the metric path's grouping keys
-                    // off `metric_mutates_labels()` instead.
-                    compiled.push(CompiledStage::Unwrap {
-                        label: u.label.clone(),
-                        kind,
-                    });
-                }
-                Stage::Unpack => {
-                    // Unpack rewrites the line (`_entry` becomes the line) and
-                    // promotes fields to labels — a following line filter must
-                    // therefore evaluate in-engine, so it sets the line-rewrite
-                    // gate exactly like `line_format`.
-                    mutates_labels = true;
-                    rewrites_line = true;
-                    seen_line_format = true;
-                    compiled.push(CompiledStage::Unpack);
-                }
-                Stage::Decolorize => {
-                    // Decolorize rewrites the line; a following line filter must
-                    // evaluate in-engine (the raw body still carries the color
-                    // codes ClickHouse would match against).
-                    rewrites_line = true;
-                    seen_line_format = true;
-                    compiled.push(CompiledStage::Decolorize(compile_regex(
-                        DECOLORIZE_PATTERN,
-                    )?));
-                }
-                Stage::Drop(elems) => {
-                    mutates_labels = true;
-                    compiled.push(CompiledStage::Drop(compile_drop_keep(elems)?));
-                }
-                Stage::Keep(elems) => {
-                    mutates_labels = true;
-                    compiled.push(CompiledStage::Keep(compile_drop_keep(elems)?));
-                }
+            if let Some(cs) = compile_stage(stage, &mut st)? {
+                compiled.push(cs);
             }
         }
+        Ok(Self::from_parts(compiled, st))
+    }
 
-        // Fast path only when the pipeline is line filters AND every one
-        // pushed down (nothing compiled to run). A non-pushable `ip(…)`/
-        // mixed-`or` filter compiles a run-stage, so `compiled` is non-empty
-        // and the fast path is (correctly) declined — otherwise exec would
-        // skip its client-side evaluation entirely.
-        let line_filter_only =
-            compiled.is_empty() && stages.iter().all(|s| matches!(s, Stage::LineFilter(_)));
+    /// A clone of `self` with `tail` compiled and appended, RESUMING the
+    /// compile state (`seen_line_format` etc.), so the result is
+    /// behaviourally identical to `compile(source ++ tail)` for ANY tail
+    /// (issue #221 — the variants pipeline arena). The clone SHARES every
+    /// already-compiled regex program with `self`: `regex::Regex` is
+    /// `Arc`-backed, so a clone costs a fresh lazily-populated cache
+    /// pool, never a recompiled program — the coder must NOT "simplify"
+    /// this back to `compile(common ++ tail)` per variant, which would
+    /// recompile every common-pipeline regex per distinct tail (a real
+    /// OOM vector: each program is bounded only by the crate's 10 MiB
+    /// `nfa_size_limit`).
+    pub fn extended_with(&self, tail: &[Stage]) -> Result<Self, PipelineError> {
+        let mut st = CompileState {
+            seen_line_format: self.seen_line_format,
+            mutates_labels: self.mutates_labels,
+            rewrites_line: self.rewrites_line,
+            has_unwrap: self.has_unwrap,
+            all_line_filter_source: self.all_line_filter_source,
+        };
+        let mut stages = self.stages.clone();
+        for stage in tail {
+            if let Some(cs) = compile_stage(stage, &mut st)? {
+                stages.push(cs);
+            }
+        }
+        Ok(Self::from_parts(stages, st))
+    }
 
-        Ok(CompiledPipeline {
-            stages: compiled,
-            mutates_labels,
-            rewrites_line,
+    /// The ONE assembly point `compile`/`extended_with` share, so the
+    /// `line_filter_only` fast-path derivation cannot drift between them:
+    /// fast path only when the pipeline is line filters AND every one
+    /// pushed down (nothing compiled to run). A non-pushable `ip(…)`/
+    /// mixed-`or` filter compiles a run-stage, so `stages` is non-empty
+    /// and the fast path is (correctly) declined.
+    fn from_parts(stages: Vec<CompiledStage>, st: CompileState) -> Self {
+        let line_filter_only = stages.is_empty() && st.all_line_filter_source;
+        CompiledPipeline {
+            stages,
+            mutates_labels: st.mutates_labels,
+            rewrites_line: st.rewrites_line,
             line_filter_only,
-            has_unwrap,
-        })
+            has_unwrap: st.has_unwrap,
+            seen_line_format: st.seen_line_format,
+            all_line_filter_source: st.all_line_filter_source,
+        }
     }
 
     /// The pipeline can change a stream's label set (a parser, a
@@ -831,6 +916,15 @@ impl CompiledPipeline {
     ) -> (MetricRun<'a>, bool) {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
         let mut value: Option<f64> = None;
+        // A successfully-unwrapped label pending deletion (issue #221): the
+        // reference's post-`unwrap` label filters run over the STILL-PRESENT
+        // label (`labelSampleExtractor.Process` applies `postFilters`
+        // before the grouping step deletes the unwrapped label from the
+        // result series), so `| unwrap v | v > 1` filters by the raw label
+        // value. The deletion is therefore DEFERRED to the end of the stage
+        // loop — only label filters can follow `unwrap` (parser rule), so
+        // this is exactly the reference's ordering.
+        let mut unwrapped: Option<&str> = None;
         labels.clear();
         labels.extend(
             base.iter()
@@ -1131,9 +1225,11 @@ impl CompiledPipeline {
                     };
                     match convert_label_value(*kind, raw) {
                         Some(v) => {
-                            // Oracle-probed: a successful unwrap DELETES
-                            // the unwrapped label from the series.
-                            remove_label(labels, label);
+                            // Oracle-probed: a successful unwrap DELETES the
+                            // unwrapped label from the RESULT series — but
+                            // only after any post-`unwrap` label filters ran
+                            // over it (deferred; see `unwrapped` above).
+                            unwrapped = Some(label);
                             value = Some(v);
                         }
                         None => {
@@ -1263,6 +1359,12 @@ impl CompiledPipeline {
             }
         }
 
+        // The deferred successful-unwrap deletion (issue #221): the label
+        // leaves the result series only now, AFTER every post-`unwrap`
+        // filter processed it — the reference's ordering.
+        if let Some(label) = unwrapped {
+            remove_label(labels, label);
+        }
         // The ONE merge point (`appendErrors` over the `visible()` gate):
         // kept lines only — a dropped line never merges (issue #238). The
         // slot state is captured BEFORE the merge consumes the slots.

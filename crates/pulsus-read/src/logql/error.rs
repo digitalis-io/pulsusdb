@@ -241,6 +241,30 @@ pub enum TooBroadReason {
     /// released as finish consumes it. Complete-or-error, never an OOM; a
     /// Rust-side structural limit, never from a ClickHouse error code.
     MetricGroupLabelBytes { bytes: u64, cap: u64 },
+    /// Issue #221: a `variants(...) of (...)` query declared more variants
+    /// than [`crate::logql::plan::MAX_VARIANT_SUB_STATES`] — the DERIVED
+    /// backstop (the smallest [`crate::logql::exec::AggCaps::DEFAULT`]
+    /// field) past which `AggCaps::divided(n)` would floor a per-sub-state
+    /// cap to zero. Checked at plan time before any per-variant
+    /// allocation. The reference is unbounded here (a recorded
+    /// divergence, `docs/benchmarks/logs-differential-ledger.md`); a
+    /// Rust-side structural limit, never from a ClickHouse error code.
+    VariantSubStates { count: u64, cap: u64 },
+    /// Issue #221: the charged per-variant PLAN-time state (each
+    /// `VariantSpec`'s cloned unwrap tail, absent labels and injected
+    /// grouping, plus the spec vector's own buffer) exceeded
+    /// [`crate::logql::exec::MAX_VARIANT_FANOUT_STATE_BYTES`]. Charged
+    /// from borrowed AST slices BEFORE the clone that would retain the
+    /// bytes — a clean 422, never an OOM.
+    VariantSpecBytes { bytes: u64, cap: u64 },
+    /// Issue #221: the charged EXEC-time variants fan-out state (the
+    /// compiled-pipeline arena, the driver buffers, and each additional
+    /// sub-state's boxed slot / meta snapshot / absent labels /
+    /// `present_cover`) exceeded
+    /// [`crate::logql::exec::MAX_VARIANT_FANOUT_STATE_BYTES`]. Every term
+    /// is charged BEFORE the allocation it pays for and released as
+    /// `finish` consumes the state — a clean 422, never an OOM.
+    VariantStateBytes { bytes: u64, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -403,6 +427,27 @@ impl fmt::Display for TooBroadReason {
                     "distinct output-group label sets would retain {bytes} bytes for the \
                      whole query, exceeding the {cap}-byte cap — narrow the pipeline \
                      (fewer/smaller extracted labels) or use a coarser grouping"
+                )
+            }
+            TooBroadReason::VariantSubStates { count, cap } => {
+                write!(
+                    f,
+                    "variants(...) declares {count} variants, exceeding the {cap}-variant \
+                     cap — split the query into fewer variants"
+                )
+            }
+            TooBroadReason::VariantSpecBytes { bytes, cap } => {
+                write!(
+                    f,
+                    "variants(...) would retain {bytes} bytes of per-variant plan state, \
+                     exceeding the {cap}-byte cap — use fewer or smaller variants"
+                )
+            }
+            TooBroadReason::VariantStateBytes { bytes, cap } => {
+                write!(
+                    f,
+                    "variants(...) would retain {bytes} bytes of fan-out evaluation state, \
+                     exceeding the {cap}-byte cap — use fewer or smaller variants"
                 )
             }
         }

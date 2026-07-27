@@ -3409,6 +3409,15 @@ mod tests {
                 }
                 pulsus_logql::MetricExpr::Literal(_) => None,
                 pulsus_logql::MetricExpr::VectorFn(_) => None,
+                // issue #221: only the COMMON range selects data.
+                pulsus_logql::MetricExpr::Variants(v) => v
+                    .range
+                    .selector
+                    .selector
+                    .matchers
+                    .iter()
+                    .find(|m| m.name == "service_name")
+                    .map(|m| m.value.clone()),
             }
         }
         let pulsus_logql::Expr::Metric(me) = expr else {
@@ -3500,6 +3509,14 @@ mod tests {
                 evaluate_node_hermetically(corpus, rhs, service),
             )
             .expect("combine"),
+            // No differential fixture declares a `variants(...)` case (the
+            // approx_topk precedent set the bar at hermetic corpus + syntax
+            // differential; a live case would additionally need the
+            // per-tenant flag on the e2e oracle deployment) — reaching this
+            // arm means a fixture drifted (issue #221).
+            pulsus_read::logql::MetricNode::Variants { .. } => {
+                panic!("no differential fixture declares variants (issue #221)")
+            }
         }
     }
 

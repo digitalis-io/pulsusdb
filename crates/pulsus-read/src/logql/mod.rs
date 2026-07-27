@@ -96,10 +96,11 @@ pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
     ClientWindow, EngineConfig, GridWindow, HistMatrixSeries, HistOrFloat, HistVectorSample,
-    LogQlEngine, LogStats, MatrixSeries, PatternSeries, QueryResult, StreamResult,
-    TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, VectorSample,
-    VolumeAggregateBy, VolumeEntry, VolumeQuery, apply_vector_aggs, combine_binary,
-    materialize_vector_lit, read_query_settings, run_client_agg_rows,
+    LogQlEngine, LogStats, MAX_VARIANT_FANOUT_STATE_BYTES, MatrixSeries, PatternSeries,
+    QueryResult, StreamResult, TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage,
+    TailSetup, VARIANT_LABEL, VariantArena, VariantsAggState, VectorSample, VolumeAggregateBy,
+    VolumeEntry, VolumeQuery, append_variant_label, apply_vector_aggs, combine_binary,
+    materialize_vector_lit, read_query_settings, run_client_agg_rows, run_variants_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{
@@ -108,8 +109,8 @@ pub use params::{
 };
 pub use pipeline::{CompiledPipeline, EntryOut, MetricRun, PipelineError, SAMPLE_EXTRACTION_ERROR};
 pub use plan::{
-    ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision,
-    StreamsPlan, plan,
+    ClientAgg, ClientValue, MAX_VARIANT_SUB_STATES, MetricNode, MetricPlan, Plan, ProbePlan,
+    RouteChoice, RoutingDecision, StreamsPlan, VariantSpec, plan,
 };
 
 #[cfg(test)]
@@ -142,5 +143,15 @@ mod tests {
         ] {
             assert!(!terminal_sort(&parse(query).unwrap()), "{query}");
         }
+    }
+
+    /// Issue #221 (§risk pin): a variants root is NEVER a terminal sort,
+    /// even when a variant is `sort(...)` — the reference's `Sortable`
+    /// returns false for a variants expression, so an instant variants
+    /// result is always label-sorted on the wire.
+    #[test]
+    fn terminal_sort_is_false_for_a_variants_root() {
+        let query = r#"variants(sort(count_over_time({app="x"}[5m]))) of ({app="x"}[5m])"#;
+        assert!(!terminal_sort(&parse(query).unwrap()));
     }
 }

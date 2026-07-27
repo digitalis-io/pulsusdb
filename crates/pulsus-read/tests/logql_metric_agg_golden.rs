@@ -15,6 +15,7 @@ use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
     QueryParams, QueryResult, ReadError, SAMPLE_EXTRACTION_ERROR, TooBroadReason, VectorSample,
     apply_vector_aggs, combine_binary, materialize_vector_lit, plan, run_client_agg_rows,
+    run_variants_rows,
 };
 
 fn ctx() -> PlanCtx<'static> {
@@ -1398,7 +1399,9 @@ fn eval_scalar_query(query: &str) -> f64 {
                 rhs,
             } => combine_binary(*op, *return_bool, matching.as_ref(), eval(lhs)?, eval(rhs)?),
             MetricNode::VectorAgg { aggs, inner } => Ok(apply_vector_aggs(eval(inner)?, aggs)),
-            MetricNode::Leaf(_) => panic!("scalar-only trees expected"),
+            MetricNode::Leaf(_) | MetricNode::Variants { .. } => {
+                panic!("scalar-only trees expected")
+            }
         }
     }
     match eval(&node).expect("eval") {
@@ -2692,6 +2695,15 @@ fn eval_node(
         MetricNode::VectorAgg { aggs, inner } => {
             Ok(apply_vector_aggs(eval_node(inner, rows, meta)?, aggs))
         }
+        // `variants(...) of (...)` (issue #221): the pure fan-out twin,
+        // over the scan plan's (unwrap-truncated) common pipeline.
+        MetricNode::Variants { scan, variants, .. } => {
+            let common = scan
+                .client
+                .as_ref()
+                .expect("variants scan is client-aggregated");
+            run_variants_rows(rows, meta, &common.pipeline, variants)
+        }
     }
 }
 
@@ -2868,4 +2880,549 @@ fn sort_with_a_grouping_is_rejected() {
             other => panic!("expected {query:?} to be PipelineInvalid, got {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #221: `variants(<metricExpr>, …) of (<logRangeExpr>)` — hermetic
+// goldens over the pure fan-out twin (`run_variants_rows` via
+// `eval_node`). Reference semantics per the #221 plan §1 (live-probed
+// against the pinned reference container): a variant's own selector/
+// filters/parsers are dead syntax; its `[range]`, reducer, unwrap tail
+// and post-`unwrap` filters are honoured; `__variant__` is the plain
+// decimal index injected into an outer aggregation's grouping for BOTH
+// `by` and `without`; a `__variant__`-less series is returned at instant
+// and dropped at range.
+// ---------------------------------------------------------------------
+
+fn meta_env(entries: &[(u64, &str, &str)]) -> HashMap<u64, StreamMetaRow> {
+    entries
+        .iter()
+        .map(|(fp, service, env)| {
+            (
+                *fp,
+                StreamMetaRow {
+                    fingerprint: *fp,
+                    service: service.to_string(),
+                    labels: format!(r#"{{"env":"{env}","service_name":"{service}"}}"#),
+                },
+            )
+        })
+        .collect()
+}
+
+fn sorted_vector(result: QueryResult) -> Vec<(Vec<(String, String)>, f64)> {
+    let QueryResult::Vector(items) = result else {
+        panic!("expected a vector, got {result:?}");
+    };
+    let mut out: Vec<(Vec<(String, String)>, f64)> =
+        items.into_iter().map(|s| (s.labels, s.value)).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn lbl(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// B10/B14 — two extractors over ONE dataset yield DIFFERENT values under
+/// decimal `__variant__` indexes (a one-extractor implementation fails).
+#[test]
+fn variants_two_extractors_yield_different_values_per_index() {
+    let node = metric_node_of(
+        r#"variants(count_over_time({service_name="checkout"}[5m]), bytes_over_time({service_name="checkout"}[5m])) of ({service_name="checkout"}[5m])"#,
+        &instant_params(60 * NS),
+    );
+    let rows = vec![
+        row(1, 10 * NS, "ab"),
+        row(1, 20 * NS, "ab"),
+        row(1, 30 * NS, "ab"),
+    ];
+    let out = sorted_vector(eval_node(&node, &rows, &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![
+            (
+                lbl(&[
+                    ("__variant__", "0"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                3.0
+            ),
+            (
+                lbl(&[
+                    ("__variant__", "1"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                6.0
+            ),
+        ]
+    );
+}
+
+/// B10 — the variant's OWN selector and line filters are DEAD SYNTAX:
+/// only the common range selects data (reference `variantRangeAggExprExtractor`
+/// passes nil stages; live-probed).
+#[test]
+fn variants_ignores_the_variants_own_selector_and_line_filters() {
+    let node = metric_node_of(
+        r#"variants(count_over_time({service_name="nope"} |= "zzzz" [5m])) of ({service_name="checkout"}[5m])"#,
+        &instant_params(60 * NS),
+    );
+    let rows = vec![row(1, 10 * NS, "hello"), row(1, 20 * NS, "world")];
+    let out = sorted_vector(eval_node(&node, &rows, &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![(
+            lbl(&[
+                ("__variant__", "0"),
+                ("env", "prod"),
+                ("service_name", "checkout")
+            ]),
+            2.0
+        )]
+    );
+}
+
+/// B10 — each variant honours its OWN `[range]` on the shared instant
+/// window; the scan window stays the common range's (live-probed: 30s vs
+/// 5m over one dataset → 1 vs 2 here).
+#[test]
+fn variants_honour_their_own_range_at_instant() {
+    let node = metric_node_of(
+        r#"variants(count_over_time({service_name="checkout"}[30s]), count_over_time({service_name="checkout"}[5m])) of ({service_name="checkout"}[5m])"#,
+        &instant_params(60 * NS),
+    );
+    // ts=10s is outside variant 0's (30s, 60s] window but inside 5m.
+    let rows = vec![row(1, 10 * NS, "a"), row(1, 40 * NS, "b")];
+    let out = sorted_vector(eval_node(&node, &rows, &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![
+            (
+                lbl(&[
+                    ("__variant__", "0"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                1.0
+            ),
+            (
+                lbl(&[
+                    ("__variant__", "1"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                2.0
+            ),
+        ]
+    );
+}
+
+/// B14 — `__variant__` is injected into a `by` grouping; a bare `sum`
+/// (nil grouping) becomes `by (__variant__)` (the reference's non-nil
+/// default `Grouping`), so bare `sum` yields `{__variant__="i"}` only.
+#[test]
+fn variants_inject_the_index_into_by_and_bare_groupings() {
+    let meta = meta_env(&[(1, "svc", "dev"), (2, "svc", "prod")]);
+    let rows = vec![
+        row(1, 10 * NS, "a"),
+        row(1, 20 * NS, "b"),
+        row(2, 10 * NS, "c"),
+        row(2, 20 * NS, "d"),
+        row(2, 30 * NS, "e"),
+    ];
+    let by_node = metric_node_of(
+        r#"variants(sum by (env) (count_over_time({service_name="svc"}[5m]))) of ({service_name="svc"}[5m])"#,
+        &instant_params(60 * NS),
+    );
+    assert_eq!(
+        sorted_vector(eval_node(&by_node, &rows, &meta).unwrap()),
+        vec![
+            (lbl(&[("__variant__", "0"), ("env", "dev")]), 2.0),
+            (lbl(&[("__variant__", "0"), ("env", "prod")]), 3.0),
+        ]
+    );
+    let bare_node = metric_node_of(
+        r#"variants(sum(count_over_time({service_name="svc"}[5m]))) of ({service_name="svc"}[5m])"#,
+        &instant_params(60 * NS),
+    );
+    assert_eq!(
+        sorted_vector(eval_node(&bare_node, &rows, &meta).unwrap()),
+        vec![(lbl(&[("__variant__", "0")]), 5.0)]
+    );
+}
+
+/// B15 (the killer case) — `__variant__` is injected into a `without`
+/// grouping too, which STRIPS it; the resulting `__variant__`-less series
+/// is PRESENT at instant and ABSENT at range (reference
+/// `JoinMultiVariantSampleVector` vs `multiVariantVectorsToSeries` —
+/// live-probed). A "just concatenate everything" implementation fails
+/// the range half.
+#[test]
+fn variants_without_strips_the_index_kept_at_instant_dropped_at_range() {
+    let meta = meta_env(&[(1, "svc", "dev"), (2, "svc", "prod")]);
+    let rows = vec![
+        row(1, 10 * NS, "a"),
+        row(1, 20 * NS, "b"),
+        row(2, 10 * NS, "c"),
+        row(2, 20 * NS, "d"),
+        row(2, 30 * NS, "e"),
+    ];
+    let query = r#"variants(sum without (env) (count_over_time({service_name="svc"}[5m]))) of ({service_name="svc"}[5m])"#;
+    // Instant: the stripped series is KEPT.
+    let node = metric_node_of(query, &instant_params(60 * NS));
+    assert_eq!(
+        sorted_vector(eval_node(&node, &rows, &meta).unwrap()),
+        vec![(lbl(&[("service_name", "svc")]), 5.0)]
+    );
+    // Range: the same series is DROPPED (no `__variant__`).
+    let node = metric_node_of(query, &range_params(0, 60 * NS));
+    let out = eval_node(&node, &rows, &meta).unwrap();
+    let QueryResult::Matrix(items) = out else {
+        panic!("expected a matrix, got {out:?}");
+    };
+    assert!(
+        items.is_empty(),
+        "a __variant__-less series must be dropped at range, got {items:?}"
+    );
+}
+
+/// B14 — an unwrap variant beside a count variant over one common
+/// pipeline: each variant gets its OWN unwrap tail; the count variant
+/// sees the common (label-mutating) pipeline only.
+#[test]
+fn variants_unwrap_tail_beside_a_count_variant() {
+    let node = metric_node_of(
+        r#"variants(sum_over_time({service_name="checkout"} | unwrap v [5m]), count_over_time({service_name="checkout"}[5m])) of ({service_name="checkout"} | logfmt [5m])"#,
+        &instant_params(60 * NS),
+    );
+    let rows = vec![row(1, 10 * NS, "v=1"), row(1, 20 * NS, "v=2")];
+    let out = sorted_vector(eval_node(&node, &rows, &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![
+            // variant 0: logfmt extracts v, unwrap consumes it (label
+            // deleted) => one series summing 1+2.
+            (
+                lbl(&[
+                    ("__variant__", "0"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                3.0
+            ),
+            // variant 1: the common logfmt keeps v as a LABEL => one
+            // series per v value.
+            (
+                lbl(&[
+                    ("__variant__", "1"),
+                    ("env", "prod"),
+                    ("service_name", "checkout"),
+                    ("v", "1")
+                ]),
+                1.0
+            ),
+            (
+                lbl(&[
+                    ("__variant__", "1"),
+                    ("env", "prod"),
+                    ("service_name", "checkout"),
+                    ("v", "2")
+                ]),
+                1.0
+            ),
+        ]
+    );
+}
+
+/// B14 — post-`unwrap` label filters in a variant's tail ARE honoured
+/// (reference `ReduceAndLabelFilter(PostFilters)`; live-probed 2 vs 3).
+#[test]
+fn variants_post_unwrap_label_filters_are_honoured() {
+    let node = metric_node_of(
+        r#"variants(sum_over_time({service_name="checkout"} | unwrap v | v > 1 [5m]), sum_over_time({service_name="checkout"} | unwrap v [5m])) of ({service_name="checkout"} | logfmt [5m])"#,
+        &instant_params(60 * NS),
+    );
+    let rows = vec![row(1, 10 * NS, "v=1"), row(1, 20 * NS, "v=2")];
+    let out = sorted_vector(eval_node(&node, &rows, &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![
+            (
+                lbl(&[
+                    ("__variant__", "0"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                2.0
+            ),
+            (
+                lbl(&[
+                    ("__variant__", "1"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                3.0
+            ),
+        ]
+    );
+}
+
+/// Δ1 — a COMMON-range `unwrap` (and its post-`unwrap` filters) is dead
+/// syntax: the common pipeline is truncated at the first `Stage::Unwrap`,
+/// so lines whose unwrap label is missing/unconvertible are NOT dropped
+/// and the dead post-filter never applies.
+#[test]
+fn variants_common_range_unwrap_is_dead_syntax() {
+    let rows = vec![
+        row(1, 10 * NS, r#"{"d":"x"}"#), // non-numeric d
+        row(1, 20 * NS, r#"{"e":1}"#),   // no d at all
+        row(1, 30 * NS, r#"{"d":5}"#),
+    ];
+    for query in [
+        r#"variants(count_over_time({service_name="checkout"}[5m])) of ({service_name="checkout"} | json | unwrap d [5m])"#,
+        r#"variants(count_over_time({service_name="checkout"}[5m])) of ({service_name="checkout"} | json | unwrap d | d > 1000 [5m])"#,
+    ] {
+        let node = metric_node_of(query, &instant_params(60 * NS));
+        let out = eval_node(&node, &rows, &meta_one()).unwrap();
+        let QueryResult::Vector(items) = out else {
+            panic!("expected a vector, got {out:?}");
+        };
+        assert_eq!(
+            items.len(),
+            3,
+            "{query}: one series per distinct d label set"
+        );
+        let total: f64 = items.iter().map(|s| s.value).sum();
+        assert_eq!(
+            total, 3.0,
+            "{query}: every line counted — the dead unwrap dropped none"
+        );
+    }
+}
+
+/// Δ2 + the adjudicated absent correction — an `absent_over_time`
+/// variant's synthetic labels come from the VARIANT's own (otherwise
+/// dead) selector (`absentLabels(expr)` reads `expr.Selector() =
+/// e.Left.Left`), and the series carries NO `__variant__` (the reference
+/// attaches the index per extracted sample; a synthetic series never
+/// passes through the extractor — container-captured): index-less and
+/// KEPT at instant, DROPPED at range, `{}` under a bare `sum`.
+#[test]
+fn variants_absent_series_use_the_variants_selector_and_carry_no_index() {
+    let query = r#"variants(absent_over_time({service_name="checkout", tier="x"}[5m])) of ({service_name="checkout"}[5m])"#;
+    let node = metric_node_of(query, &instant_params(60 * NS));
+    let out = sorted_vector(eval_node(&node, &[], &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![(lbl(&[("service_name", "checkout"), ("tier", "x")]), 1.0)]
+    );
+    // Range: the index-less synthetic series is dropped entirely.
+    let node = metric_node_of(query, &range_params(0, 60 * NS));
+    let out = eval_node(&node, &[], &meta_one()).unwrap();
+    let QueryResult::Matrix(items) = out else {
+        panic!("expected a matrix, got {out:?}");
+    };
+    assert!(
+        items.is_empty(),
+        "absent series must drop at range: {items:?}"
+    );
+    // Under a bare `sum` the reference groups the index-less series to
+    // `{}` (captured). PulsusDB's `group_key` `by`-grouping currently
+    // materializes a MISSING grouped label as `name=""`
+    // (`unwrap_or_default`) — a PRE-EXISTING engine semantic affecting
+    // EVERY `by` over a missing label, nothing variants-specific.
+    // OWNED BY #241, which captured the same divergence independently by
+    // a different route and carries the root-cause fix (omit missing
+    // labels from the `by` key, reference-exact). OBLIGATION: when #241
+    // lands, re-capture and pin the `sum(absent_over_time(...))`
+    // sub-case here and in `b13_variants.test` — it is a ready-made
+    // acceptance test for that fix (expected `{} 1`). Until then the
+    // sub-case stays excluded at both sites.
+}
+
+/// B16 — `append_variant_label` OVERRIDES a common-pipeline
+/// `__variant__` (the reference appends a duplicate and mis-routes
+/// samples — deliberately not reproduced; ledgered).
+#[test]
+fn variants_index_overrides_a_common_pipeline_variant_label() {
+    let node = metric_node_of(
+        r#"variants(count_over_time({service_name="checkout"}[5m])) of ({service_name="checkout"} | label_format __variant__="9" [5m])"#,
+        &instant_params(60 * NS),
+    );
+    let rows = vec![row(1, 10 * NS, "a"), row(1, 20 * NS, "b")];
+    let out = sorted_vector(eval_node(&node, &rows, &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![(
+            lbl(&[
+                ("__variant__", "0"),
+                ("env", "prod"),
+                ("service_name", "checkout")
+            ]),
+            2.0
+        )]
+    );
+}
+
+/// Corpus case 11's hermetic twin — 11 variants: the index is plain
+/// decimal (`"10"`, never zero-padded or capped).
+#[test]
+fn variants_eleventh_index_is_plain_decimal_ten() {
+    let variants = (0..11)
+        .map(|_| r#"count_over_time({service_name="checkout"}[5m])"#)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let node = metric_node_of(
+        &format!(r#"variants({variants}) of ({{service_name="checkout"}}[5m])"#),
+        &instant_params(60 * NS),
+    );
+    let rows = vec![row(1, 10 * NS, "a")];
+    let out = sorted_vector(eval_node(&node, &rows, &meta_one()).unwrap());
+    assert_eq!(out.len(), 11);
+    let indexes: Vec<&str> = out
+        .iter()
+        .map(|(labels, _)| {
+            labels
+                .iter()
+                .find(|(k, _)| k == "__variant__")
+                .map(|(_, v)| v.as_str())
+                .expect("__variant__ present")
+        })
+        .collect();
+    assert!(
+        indexes.contains(&"10"),
+        "plain decimal index 10: {indexes:?}"
+    );
+    // Sorted label order puts "10" before "2" (string sort) — the
+    // reference's instant label-sorted order.
+    assert!(indexes.iter().position(|i| *i == "10") < indexes.iter().position(|i| *i == "2"));
+}
+
+/// A2/corpus 12 — `variants(…) of (…) + 1` composes as a binary operand:
+/// every variant's value +1, `__variant__` preserved.
+#[test]
+fn variants_binary_composition_adds_to_every_variant() {
+    let node = metric_node_of(
+        r#"variants(count_over_time({service_name="checkout"}[5m]), bytes_over_time({service_name="checkout"}[5m])) of ({service_name="checkout"}[5m]) + 1"#,
+        &instant_params(60 * NS),
+    );
+    let rows = vec![row(1, 10 * NS, "ab"), row(1, 20 * NS, "ab")];
+    let out = sorted_vector(eval_node(&node, &rows, &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![
+            (
+                lbl(&[
+                    ("__variant__", "0"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                3.0
+            ),
+            (
+                lbl(&[
+                    ("__variant__", "1"),
+                    ("env", "prod"),
+                    ("service_name", "checkout")
+                ]),
+                5.0
+            ),
+        ]
+    );
+}
+
+/// B13/B17 — error determinism: chunks are pushed into sub-states in
+/// INDEX order, so with two failing-capable variants the raised
+/// `MetricPipelineError` is the lowest-indexed variant's (here variant
+/// 0's unwrap of the non-numeric `a`, whose failing series carries
+/// `a`'s error, not `b`'s).
+#[test]
+fn variants_error_is_raised_by_the_lowest_indexed_variant() {
+    let node = metric_node_of(
+        r#"variants(sum_over_time({service_name="checkout"} | unwrap a [5m]), sum_over_time({service_name="checkout"} | unwrap b [5m])) of ({service_name="checkout"} | logfmt [5m])"#,
+        &instant_params(60 * NS),
+    );
+    let rows = vec![row(1, 10 * NS, "a=x b=y")];
+    let err = eval_node(&node, &rows, &meta_one()).expect_err("both unwraps fail");
+    let ReadError::MetricPipelineError { error_type, series } = &err else {
+        panic!("expected MetricPipelineError, got {err:?}");
+    };
+    assert_eq!(error_type, SAMPLE_EXTRACTION_ERROR);
+    // Variant 0 unwraps `a` (value "x"); variant 1 would have failed on
+    // `b` (value "y") — the reported detail names `a`'s value, proving
+    // index order.
+    assert!(
+        series.contains(r#"parsing \"x\""#),
+        "expected variant 0's failure (parsing \"x\"): {series}"
+    );
+}
+
+/// B18 — every variant's window shares the SCAN plan's grid
+/// (`grid_start_ns`/`end_ns`/`step_ns`); only `range_ns` differs.
+#[test]
+fn variants_share_the_scan_plans_grid() {
+    let node = metric_node_of(
+        r#"variants(count_over_time({service_name="checkout"}[30s]), count_over_time({service_name="checkout"}[10m])) of ({service_name="checkout"}[5m])"#,
+        &range_params(7 * NS, 127 * NS),
+    );
+    let MetricNode::Variants { scan, variants, .. } = &node else {
+        panic!("expected a Variants node");
+    };
+    for spec in variants {
+        let ClientWindow::Range {
+            grid_start_ns,
+            end_ns,
+            step_ns,
+            ..
+        } = spec.window()
+        else {
+            panic!("expected a Range window");
+        };
+        assert_eq!(grid_start_ns, scan.grid_start_ns);
+        assert_eq!(end_ns, scan.end_ns);
+        assert_eq!(Some(step_ns), scan.step_ns);
+    }
+    let windows: Vec<_> = variants
+        .iter()
+        .map(|s| match s.window() {
+            ClientWindow::Range { range_ns, .. } => range_ns.get(),
+            ClientWindow::Instant { .. } => unreachable!(),
+        })
+        .collect();
+    assert_eq!(windows, vec![30 * NS, 600 * NS]);
+}
+
+/// Range-kind golden — corpus case 13's hermetic twin: matrix envelope,
+/// `__variant__` at range, per-variant values on the shared grid.
+#[test]
+fn variants_range_matrix_carries_the_index_per_series() {
+    let node = metric_node_of(
+        r#"variants(count_over_time({service_name="checkout"}[1m]), bytes_over_time({service_name="checkout"}[1m])) of ({service_name="checkout"}[1m])"#,
+        &range_params(0, 60 * NS),
+    );
+    let rows = vec![row(1, 10 * NS, "ab"), row(1, 20 * NS, "ab")];
+    let out = eval_node(&node, &rows, &meta_one()).unwrap();
+    let QueryResult::Matrix(mut items) = out else {
+        panic!("expected a matrix, got {out:?}");
+    };
+    items.sort_by(|a, b| a.labels.cmp(&b.labels));
+    assert_eq!(items.len(), 2);
+    let idx = |s: &MatrixSeries| {
+        s.labels
+            .iter()
+            .find(|(k, _)| k == "__variant__")
+            .map(|(_, v)| v.clone())
+            .expect("__variant__ present at range")
+    };
+    assert_eq!(idx(&items[0]), "0");
+    assert_eq!(idx(&items[1]), "1");
+    // count at the 60s grid point sees both rows; bytes sees 4 bytes.
+    assert_eq!(items[0].points.last(), Some(&(60 * NS, 2.0)));
+    assert_eq!(items[1].points.last(), Some(&(60 * NS, 4.0)));
 }

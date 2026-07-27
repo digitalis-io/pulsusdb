@@ -313,3 +313,77 @@ Out of this ledger's scope by design:
   same-nanosecond same-stream tie-order precedent). Reachable only when
   log data contains a literal `__error__`-family key extracted before an
   erroring parser.
+
+### `variants-nonconforming-shape-status` (issue #221, adjudicated)
+
+Head-of-group rule for the three `variants-*` entries, recorded once
+(task-manager adjudication, issue #221): **we do not reproduce the
+reference where it is self-inconsistent or crashing.** A nil-pointer
+panic is not behaviour; a 500 where the same implementation returns 400
+everywhere else is a bug, not a contract; a provably wrong value is not
+a semantic. Where both sides reject, PulsusDB matches the REJECTION even
+though the status differs — stated in each entry so a future reader does
+not "fix" us toward the panic.
+
+- **Reference behaviour (probed, `grafana/loki:3.7.4`,
+  `enable_multi_variant_queries: true`):** a non-conforming variant shape
+  inside `variants(...) of (...)` returns one of THREE different 500
+  bodies — `expected range aggregation expression but got
+  *syntax.VectorAggregationExpr` (doubly-nested vector aggregation),
+  `expected aggregation operator but got "approx_topk"`, `unexpected
+  empty result` (a literal/`vector(n)` variant) — or a nil-pointer PANIC
+  (`runtime error: invalid memory address or nil pointer dereference`)
+  for a binary variant (`count_over_time(A[5m]) + 1`) and for an
+  unwrap-arity mismatch (`variants(sum_over_time({...}[5m])) of (...)`).
+- **PulsusDB behaviour:** one plan-time 400 naming the rule (`variant N
+  must be a range aggregation, optionally wrapped in one vector
+  aggregation (...)`), before any DB read — except the arity mismatch,
+  which reproduces the reference's own non-variants message verbatim
+  (`invalid aggregation sum_over_time without unwrap`).
+- **Why deliberate:** both sides reject every one of these shapes — we
+  match the rejection; the panic text is unmatchable by construction and
+  a crash is not a contract. Gated by `b13_variants.test`'s `eval_fail`
+  cases (each header-annotated with the observed reference status+body).
+
+### `variants-surviving-error-status` (issue #221, adjudicated)
+
+- **Reference behaviour (probed):** a surviving `__error__` inside
+  `variants` returns **500 `unexpected empty result`**, or silently drops
+  that variant while another answers — while the SAME implementation
+  returns **400 `pipeline error: '<Err>' for series: '{...}'`** for the
+  identical input outside `variants`.
+- **PulsusDB behaviour:** the existing 400 `pipeline error: ...`,
+  byte-identical to the reference's own non-variants surface, raised by
+  the lowest-indexed failing variant (chunks fan out in index order —
+  deterministic).
+- **Why deliberate:** the reference contradicts itself; we match its
+  consistent branch. Same class as the ratified
+  `matching-error-status-divergence`.
+
+### `variants-label-collision-and-fanout-bounds` (issue #221, adjudicated)
+
+- **(a) `__variant__` collision.** *Reference:* with `| label_format
+  __variant__="..."` in the COMMON pipeline, the consolidated extractor
+  APPENDS a duplicate `__variant__` (add + sort, no override) and then
+  routes samples by re-parsing the two-valued label string — probed: a
+  `bytes_over_time` variant reports **2** where the truth is **58**, and
+  a non-integer collision value yields an empty 200. Provably wrong
+  output, stable within a run. *PulsusDB:* `append_variant_label`
+  OVERRIDES (the index wins) — the single-valued outcome, values always
+  correct. The corpus PRE-COMMITS (in `b13_variants.test`'s header, not
+  post-hoc) to setting no `__variant__` in a common pipeline; the
+  override is gated hermetically.
+- **(b) Fan-out bounds.** *Reference:* unbounded in variant count.
+  *PulsusDB:* a clean 422 `query_too_broad` at two DERIVED thresholds —
+  `MAX_VARIANT_SUB_STATES` = `AggCaps::DEFAULT.min_field()` (currently
+  500, the point past which a divided per-sub-state cap would floor to
+  zero; it moves with `MAX_CLIENT_AGG_SERIES`) and
+  `MAX_VARIANT_FANOUT_STATE_BYTES` = `AggCaps::DEFAULT.group_bytes`
+  (64 MiB) of charged fan-out state (plan-time spec clones + arena +
+  per-sub-state snapshots, one counter end to end). The worked
+  thresholds are emitted by the charge functions' own unit tests
+  (`crates/pulsus-read/src/logql/exec.rs`), never hand-computed here.
+- **(c) Per-variant series cap.** *Reference:* applies `maxSeries` PER
+  VARIANT and SKIPS the breaching variant with a warning. *PulsusDB:*
+  422s on the shared divided cap — the pre-existing #236 class
+  (mid-scan group cap vs result-size cap), not re-litigated here.
