@@ -20,11 +20,12 @@ use pulsus_logql::{
 };
 
 use super::error::{ReadError, TooBroadReason};
-use super::escape::{ch_regex_anchored, ch_regex_unanchored, ch_string};
+use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
 use super::exec::{AggCaps, ClientWindow, GridWindow};
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
+use super::pipeline::PipelineError;
 use super::sql::ScanLowerBound;
 
 /// A pure fetch plan for either query shape. See the module docs for why
@@ -577,7 +578,7 @@ fn streams_plan(
         });
     }
 
-    let line_filters = compile_line_filters(&log_expr.pipeline);
+    let line_filters = compile_line_filters(&log_expr.pipeline)?;
     let result_limit = p.limit;
     let fetch_until_limit = has_unpushed_dropping_stage(&log_expr.pipeline);
     let scan_limit = if fetch_until_limit {
@@ -836,7 +837,7 @@ fn metric_plan(
     );
     let probes = build_probes(ctx, &months, &normalized.probe_keys);
 
-    let extra_predicates = compile_line_filters(&range.selector.pipeline);
+    let extra_predicates = compile_line_filters(&range.selector.pipeline)?;
     // A line filter constrains which log lines count; the rollup table
     // (`log_metrics_<res>`) has no `body` column to re-filter, so any
     // pipeline stage forces the raw fallback (docs/schemas.md §3.2: metric
@@ -1608,7 +1609,7 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
                 negative_branches.push(format!(
                     "(key = {} AND match(val, {}))",
                     ch_string(name),
-                    ch_regex_anchored(value)
+                    ch_regex_anchored_checked(value)?
                 ));
             }
         }
@@ -1618,20 +1619,18 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
         return Err(ReadError::EmptyMatcherSet);
     }
 
-    let positive_branches = positive_order
-        .iter()
-        .map(|key| {
-            let group = &positive_groups[key];
-            let mut conds = vec![format!("key = {}", ch_string(&group.key))];
-            if let Some(v) = &group.eq_value {
-                conds.push(format!("val = {}", ch_string(v)));
-            }
-            for pat in &group.re_patterns {
-                conds.push(format!("match(val, {})", ch_regex_anchored(pat)));
-            }
-            format!("({})", conds.join(" AND "))
-        })
-        .collect();
+    let mut positive_branches: Vec<String> = Vec::with_capacity(positive_order.len());
+    for key in &positive_order {
+        let group = &positive_groups[key];
+        let mut conds = vec![format!("key = {}", ch_string(&group.key))];
+        if let Some(v) = &group.eq_value {
+            conds.push(format!("val = {}", ch_string(v)));
+        }
+        for pat in &group.re_patterns {
+            conds.push(format!("match(val, {})", ch_regex_anchored_checked(pat)?));
+        }
+        positive_branches.push(format!("({})", conds.join(" AND ")));
+    }
 
     Ok(NormalizedMatchers {
         positive_branches,
@@ -1648,7 +1647,16 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
 /// M6-09 skip-index-preservation gate, `tests/explain_indexes.rs`);
 /// filters after a `line_format` reference the rewritten line and are
 /// deliberately absent here (evaluated in-engine instead).
-pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Vec<String> {
+///
+/// Fallible since issue #240: a pushed-down regex is validated (by
+/// compiling exactly the unanchored form the SQL emits) BEFORE any I/O,
+/// so an uncompilable pattern is a 400 at plan time, never a ClickHouse
+/// 500 mid-query. This is the right seam — not `pipeline.rs`'s pushdown
+/// short-circuit — because `/api/logs/v1/stats` is pushdown-only and
+/// never compiles a client pipeline (`exec.rs` plans via `plan::plan`),
+/// so a validator behind the client-compile path would leave `stats`
+/// still returning 500.
+pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<String>, ReadError> {
     let mut out = Vec::new();
     for stage in pipeline {
         match stage {
@@ -1657,7 +1665,7 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Vec<String> {
             // in the client pipeline — never emit SQL for them here (doing so
             // would drop lines the client scan must keep / re-test).
             Stage::LineFilter(lf) if is_pushable_line_filter(lf) => {
-                out.push(compile_line_filter(lf))
+                out.push(compile_line_filter(lf)?)
             }
             Stage::LineFilter(_) => {}
             // `line_format`/`decolorize`/`unpack` rewrite the line — a line
@@ -1667,7 +1675,7 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Vec<String> {
             _ => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// The single source of truth for "does this line filter push down to SQL,
@@ -1730,14 +1738,14 @@ fn is_plain_literal(pattern: &str) -> bool {
 /// byte-identical to the pre-`or` output. Callers must gate on
 /// [`is_pushable_line_filter`]: this only ever sees literal/regex
 /// alternatives (`ip(…)` is served client-side).
-pub(crate) fn compile_line_filter(lf: &LineFilter) -> String {
-    let disjuncts: Vec<String> = lf
-        .alternatives()
-        .map(|(value, _)| match lf.op {
+pub(crate) fn compile_line_filter(lf: &LineFilter) -> Result<String, PipelineError> {
+    let mut disjuncts: Vec<String> = Vec::new();
+    for (value, _) in lf.alternatives() {
+        disjuncts.push(match lf.op {
             LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
-            LineFilterOp::Regex | LineFilterOp::NotRegex => regex_predicate(value),
-        })
-        .collect();
+            LineFilterOp::Regex | LineFilterOp::NotRegex => regex_predicate(value)?,
+        });
+    }
     let core = if lf.or_matches.is_empty() {
         disjuncts
             .into_iter()
@@ -1750,7 +1758,7 @@ pub(crate) fn compile_line_filter(lf: &LineFilter) -> String {
             .collect::<Vec<_>>()
             .join(" OR ")
     };
-    match lf.op {
+    Ok(match lf.op {
         LineFilterOp::Contains | LineFilterOp::Regex => {
             if lf.or_matches.is_empty() {
                 core
@@ -1759,7 +1767,7 @@ pub(crate) fn compile_line_filter(lf: &LineFilter) -> String {
             }
         }
         LineFilterOp::NotContains | LineFilterOp::NotRegex => format!("NOT ({core})"),
-    }
+    })
 }
 
 fn contains_predicate(phrase: &str) -> String {
@@ -1771,7 +1779,7 @@ fn contains_predicate(phrase: &str) -> String {
     parts.join(" AND ")
 }
 
-fn regex_predicate(pattern: &str) -> String {
+fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
     let mut parts: Vec<String> = Vec::new();
     if is_plain_literal(pattern) {
         parts.extend(
@@ -1780,8 +1788,11 @@ fn regex_predicate(pattern: &str) -> String {
                 .map(|t| format!("hasToken(body, {})", ch_string(t))),
         );
     }
-    parts.push(format!("match(body, {})", ch_regex_unanchored(pattern)));
-    parts.join(" AND ")
+    parts.push(format!(
+        "match(body, {})",
+        ch_regex_unanchored_checked(pattern)?
+    ));
+    Ok(parts.join(" AND "))
 }
 
 /// Days since the Unix epoch, per nanosecond. Local to this module rather
@@ -1891,6 +1902,78 @@ mod tests {
             direction: Direction::Backward,
         };
         plan(&parse(query).expect("parse"), &params, &test_ctx())
+    }
+
+    // --- issue #240 AC7(b): the §3 invariant on both LogQL paths — an
+    // uncompilable pushed-down regex is a 400-class plan-time rejection
+    // (`bad regex: …`), never SQL handed to ClickHouse.
+
+    fn expect_bad_regex(query: &str, spec: QuerySpec) {
+        match plan_at(query, spec) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert!(reason.starts_with("bad regex: "), "{query}: {reason}");
+            }
+            other => panic!("{query}: expected a bad-regex rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_uncompilable_pushed_down_line_filter_regex_rejects_at_plan_time() {
+        let instant = QuerySpec::Instant {
+            at_ns: 1_000_000_000_000,
+        };
+        expect_bad_regex(r#"{service_name="x"} |~ "(""#, instant);
+        expect_bad_regex(r#"{service_name="x"} !~ "(""#, instant);
+        expect_bad_regex(r#"{service_name="x"} |~ "ok" or "(""#, instant);
+    }
+
+    /// The metric caller (`compile_line_filters` at its second call
+    /// site) rejects identically.
+    #[test]
+    fn an_uncompilable_line_filter_regex_in_a_metric_query_rejects_at_plan_time() {
+        expect_bad_regex(
+            r#"count_over_time({service_name="x"} |~ "(" [5m])"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        );
+    }
+
+    #[test]
+    fn an_uncompilable_stream_matcher_regex_rejects_at_plan_time() {
+        let instant = QuerySpec::Instant {
+            at_ns: 1_000_000_000_000,
+        };
+        expect_bad_regex(r#"{service_name="x", app=~"("}"#, instant);
+        expect_bad_regex(r#"{service_name="x", app!~"("}"#, instant);
+    }
+
+    /// Deterministic rejection order: `normalize_matchers` runs before
+    /// `compile_line_filters` at both call sites, so a query carrying
+    /// BOTH a bad matcher regex and a bad line-filter regex reports the
+    /// matcher one. The two patterns produce distinct regex errors, so
+    /// the assertion discriminates.
+    #[test]
+    fn a_bad_matcher_regex_wins_over_a_bad_line_filter_regex() {
+        match plan_at(
+            r#"{service_name="x", app=~"("} |~ "[""#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        ) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert!(reason.starts_with("bad regex: "), "{reason}");
+                assert!(
+                    reason.contains("missing closing )") || reason.contains('('),
+                    "the MATCHER pattern's error, not the line filter's: {reason}"
+                );
+                assert!(
+                    !reason.contains("[b"),
+                    "must not be the line-filter pattern's error: {reason}"
+                );
+            }
+            other => panic!("expected the matcher rejection, got {other:?}"),
+        }
     }
 
     /// The shape that bypassed the v1 design's gate: a vector chain

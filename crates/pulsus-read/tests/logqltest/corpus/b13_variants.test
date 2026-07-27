@@ -274,10 +274,12 @@ eval_fail instant at 60s variants(sum(sum(count_over_time({service_name="rj"}[5m
 eval_fail instant at 60s variants(approx_topk(1, count_over_time({service_name="rj"}[5m]))) of ({service_name="rj"}[5m])
   msg: must be a range aggregation
 
-# unwrap arity is decided by the VARIANT's own pipeline (reference
-# message verbatim).
+# unwrap arity is decided by the VARIANT's own pipeline. PulsusDB's whole
+# body equals the reference's INNER message (enforced byte-exact by
+# `msg_exact:` since issue #240); the reference wraps it in its own
+# `parse error : ` envelope — the accepted cosmetic divergence.
 eval_fail instant at 60s variants(sum_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m])
-  msg: invalid aggregation sum_over_time without unwrap
+  msg_exact: invalid aggregation sum_over_time without unwrap
 
 clear
 

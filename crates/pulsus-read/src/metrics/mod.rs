@@ -64,6 +64,28 @@ pub mod sample_sql;
 pub mod sql;
 pub mod stats;
 
+/// Capability token (issue #240). Possession proves the caller is on the
+/// PromQL fallback path, where ClickHouse's RE2 — not the Rust `regex`
+/// crate — is the regex authority (`labels.rs:496-506`, `:521-526`).
+///
+/// SEALING FORM IS LOAD-BEARING — do not "tidy" either line:
+///  * the tuple field has NO visibility modifier, so it is visible only in
+///    `crate::metrics` and its descendants;
+///  * `new` has NO visibility modifier, for the same reason.
+///
+/// `pub(super)` on either is WRONG here: `metrics` is declared at the crate
+/// root (`lib.rs:6`), so `super` IS the crate root and `pub(super)` ==
+/// `pub(crate)` — which would let `logql` construct the token. Measured:
+/// that spelling compiles from `logql`; this one is rejected with
+/// `E0603` (field) / `E0624` (constructor).
+pub(crate) struct PromqlRe2Fallback(());
+
+impl PromqlRe2Fallback {
+    fn new() -> Self {
+        PromqlRe2Fallback(())
+    }
+}
+
 pub use exec::{
     FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, TsdbStatus,
 };

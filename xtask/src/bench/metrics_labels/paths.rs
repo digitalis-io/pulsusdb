@@ -57,7 +57,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 use pulsus_model::floor_to_activity_bucket;
-use pulsus_read::logql::escape::{ch_regex_anchored, ch_string};
+use pulsus_read::logql::escape::ch_string;
 use pulsus_read::metrics::{
     DEFAULT_STALENESS_MULTIPLIER, DataWindow, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp,
     Resolution, SeriesResolver, SeriesRow, sql as metrics_sql,
@@ -542,9 +542,13 @@ fn idx_resolve_sql(
                 }
             }
             MatchOp::Re => {
+                // Anchored form built via the public escaper: the raw
+                // `ch_regex_anchored` is module-private since #240 (this
+                // is xtask's deliberate sweep-SQL copy over TRUSTED bench
+                // patterns; byte-identical to the product's rendering).
                 pos_branches.push(format!(
                     "(key = {key_lit} AND match(val, {}))",
-                    ch_regex_anchored(&m.value)
+                    ch_string(&format!("^(?:{})$", m.value))
                 ));
                 if !positive_keys.contains(&m.key) {
                     positive_keys.push(m.key.clone());
@@ -556,7 +560,7 @@ fn idx_resolve_sql(
             MatchOp::Nre => {
                 neg_branches.push(format!(
                     "(key = {key_lit} AND match(val, {}))",
-                    ch_regex_anchored(&m.value)
+                    ch_string(&format!("^(?:{})$", m.value))
                 ));
             }
         }

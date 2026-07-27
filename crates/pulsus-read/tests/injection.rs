@@ -6,7 +6,7 @@
 //! regex value flows through escape.rs").
 
 use pulsus_logql::{LineFilter, LineFilterOp, MatchOp, Matcher, StreamSelector};
-use pulsus_read::logql::escape::{ch_ident, ch_regex_anchored, ch_regex_unanchored, ch_string};
+use pulsus_read::logql::escape::{ch_ident, ch_string};
 use pulsus_read::logql::plan;
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec};
@@ -88,29 +88,9 @@ fn ch_string_never_emits_a_bare_quote_for_any_payload() {
     }
 }
 
-#[test]
-fn ch_regex_anchored_never_emits_a_bare_quote_for_any_payload() {
-    for payload in [
-        PAYLOAD_QUOTE,
-        PAYLOAD_BACKSLASH_QUOTE,
-        PAYLOAD_COMMENT,
-        PAYLOAD_PAREN,
-    ] {
-        assert_no_unescaped_quote_or_backslash(&ch_regex_anchored(payload));
-    }
-}
-
-#[test]
-fn ch_regex_unanchored_never_emits_a_bare_quote_for_any_payload() {
-    for payload in [
-        PAYLOAD_QUOTE,
-        PAYLOAD_BACKSLASH_QUOTE,
-        PAYLOAD_COMMENT,
-        PAYLOAD_PAREN,
-    ] {
-        assert_no_unescaped_quote_or_backslash(&ch_regex_unanchored(payload));
-    }
-}
+// The two regex escaper property tests moved into `escape.rs`'s own test
+// module (issue #240 §4.4): the raw escapers are module-private now, so an
+// external test crate cannot name them.
 
 #[test]
 fn ch_ident_never_emits_a_bare_backtick() {
@@ -173,7 +153,10 @@ fn a_regex_matcher_value_with_metacharacters_and_a_quote_is_fully_escaped() {
         }],
     };
     let sp = plan_streams(selector);
-    let expected_literal = ch_regex_anchored(payload);
+    // Byte-identical to `escape.rs`'s anchored construction; the escapers
+    // themselves are private since #240 and `_checked` is `pub(crate)`,
+    // both invisible to this external test crate.
+    let expected_literal = ch_string(&format!("^(?:{payload})$"));
     assert_no_unescaped_quote_or_backslash(&expected_literal);
     assert!(
         sp.stage1_sql

@@ -852,6 +852,23 @@ mod tests {
         }
     }
 
+    /// Issue #240 (R4): the WebSocket close reason for a LogQL pipeline
+    /// rejection is the poll error's `to_string()` — since #240 that is
+    /// the BARE reason (no fixed prefix), and a reason that itself
+    /// begins `parse error ` appears exactly once. (The 123-byte
+    /// close-frame truncation is a separate, deliberately retained
+    /// limitation — out of scope here.)
+    #[test]
+    fn pipeline_invalid_close_reason_is_the_bare_reason() {
+        let reason = "parse error : synthetic prefix-collision probe";
+        let e = pulsus_read::logql::ReadError::PipelineInvalid {
+            reason: reason.to_string(),
+        };
+        let close_reason = e.to_string();
+        assert_eq!(close_reason, reason);
+        assert_eq!(close_reason.matches("parse error ").count(), 1);
+    }
+
     /// `start_ns` sits just behind "now" so the loop reaches steady
     /// state immediately — a deep past start would (correctly, by
     /// design) walk the whole backlog one slice per poll first.

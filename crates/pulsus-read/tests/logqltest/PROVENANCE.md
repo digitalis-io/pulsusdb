@@ -167,3 +167,58 @@ windows, covered by `b9_range_sliding.test` and the `eval range` directive);
 (needs per-entry structured-metadata modelling, not yet in the DSL);
 `fetch_until_limit_paged` (keyset paging / result-limit — an exec/SQL concern,
 not the pure value path).
+
+## Issue #240 — error-body identity and rejection-status probes
+
+The four corpus rows whose produced error is a `ReadError::PipelineInvalid`
+stringification AND whose committed prose claims reference-body identity are
+pinned **byte-exactly** (`msg_exact:`, gated both directions by
+`tests/logqltest_provenance.rs` checks A/B). Sources: `wave0 <date>` is a
+fresh capture against the pinned `grafana/loki:3.7.4` container (the
+`ci/logql/config.yaml` capture config — `shard_aggregations`, protobuf
+frontend encoding, `enable_multi_variant_queries`); a `probe:` URL must
+resolve to a published comment showing the capture.
+
+Capture commands (2026-07-27, container digest per §Pinned reference; push
+the row's `load` dataset first, exactly as §2 above):
+
+```
+# B1/B2: the two vector-matching runtime errors (HTTP 500 on the
+# reference — the ledgered matching-error-status divergence):
+curl -sw '\n%{http_code}\n' 'http://localhost:3100/loki/api/v1/query' \
+  --data-urlencode 'query=sum by (method, status) (count_over_time({service_name="svc-json"} | json [30m])) / on(status) sum by (status) (count_over_time({service_name="svc-json"} | json [30m]))' \
+  --data-urlencode 'time=<T_ns>'
+# -> multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)  [500]
+#    (B2: the same with `/ on(status) group_left sum by (method, status) (...)`
+#     -> found duplicate series on the right hand-side;many-to-many matching
+#        not allowed: matching labels must be unique on one side  [500])
+# B3: any approx_topk on query_range:
+#  -> count min sketches are only supported on instant queries  [500]
+# B4: the reference has NO variants-form body for this (the variants form
+# nil-panics, ledgered); the INNER text comes from the non-variants probe:
+curl -sw '\n%{http_code}\n' 'http://localhost:3100/loki/api/v1/query' \
+  --data-urlencode 'query=sum_over_time({service_name="rj"}[5m])' --data-urlencode 'time=<T_ns>'
+# -> parse error : invalid aggregation sum_over_time without unwrap  [400]
+#    (the `parse error : ` envelope is the accepted cosmetic divergence;
+#     the pinned value is the inner text, which is PulsusDB's WHOLE body)
+```
+
+```pulsus-240-bodies
+| id | corpus-file | source | value |
+| B1 | differential_vector_matching.test | wave0 2026-07-27 | multiple matches for labels: many-to-one matching must be explicit (group_left/group_right) |
+| B2 | differential_vector_matching.test | wave0 2026-07-27 | found duplicate series on the right hand-side;many-to-many matching not allowed: matching labels must be unique on one side |
+| B3 | b10_approx_topk.test | wave0 2026-07-27 | count min sketches are only supported on instant queries |
+| B4 | b13_variants.test | wave0 2026-07-27 | invalid aggregation sum_over_time without unwrap |
+```
+
+Rejection-status probes (issue #240 AC7(h) — the reference's status for an
+uncompilable pushed-down regex is PROBED, not assumed; both 400, so the
+plan-time rejection ships). Captured 2026-07-27; the same probes on the
+other route each also returned 400 (`|~ "("` on `index/stats` is refused
+earlier with `only label matchers are supported`, still 400):
+
+```pulsus-240-status
+| id | query | surface | reference-status |
+| S1 | {service_name="svc-json"} \|~ "(" | /loki/api/v1/query_range | 400 |
+| S2 | {app=~"("} | /loki/api/v1/index/stats | 400 |
+```

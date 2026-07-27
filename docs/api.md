@@ -121,9 +121,19 @@ Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|
 | Malformed params, malformed LogQL, empty/contradictory matchers, invalid `step` | `400` | `bad_data` |
+| Pipeline/plan rejection (bad regex — **including an uncompilable pushed-down line-filter or stream-matcher regex, since #240** — bad parser expression, unwrap-arity, …) | `400` | `bad_data` |
 | Query rejected as too broad (scan-budget or stream-count cap exceeded) | `422` | `query_too_broad` |
 | ClickHouse read timed out | `504` | `timeout` |
 | Unclassified ClickHouse/internal failure | `500` | `internal` |
+
+LogQL rejection **bodies** carry the bare reason with no PulsusDB prefix
+(issue #240); where a body has a reference counterpart it is byte-identical
+and corpus-gated. PulsusDB does **not** reproduce the reference's
+`parse error : …` / `stage '…' :` envelope wording (accepted cosmetic
+divergence, owner-ruled: status, container and accept/reject decision must
+match; message prose need not). The JSON-vs-`text/plain` response-container
+divergence is tracked in #264; the WebSocket close frame truncates reasons
+at 123 bytes; the LogQL corpus runner's pushdown blind spot is #278.
 
 ### 2.4 `GET /api/logs/v1/tail` (WebSocket)
 
