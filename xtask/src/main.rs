@@ -11,6 +11,7 @@
 
 mod bench;
 mod ch_bench;
+mod template_audit;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -35,6 +36,10 @@ enum Command {
     /// Run the M1 logs read-path benchmark (issue #16; `--scenario
     /// logs-read` is the only implemented scenario).
     Bench(BenchArgs),
+    /// Re-run the issue #230 template printf-domain non-reproducibility
+    /// audit against two fresh reference containers (offline; the
+    /// source of the pinned-address exclusion ledger).
+    TemplateAudit(template_audit::TemplateAuditArgs),
 }
 
 #[derive(Parser)]
@@ -107,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::ChBench(args) => run_ch_bench(args).await,
         Command::Bench(args) => bench::run(args).await,
+        Command::TemplateAudit(args) => template_audit::run(args).await,
     }
 }
 

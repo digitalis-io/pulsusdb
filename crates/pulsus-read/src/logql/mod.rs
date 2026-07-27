@@ -73,6 +73,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod rows;
 pub mod sql;
+pub mod template;
 
 /// True iff the OUTERMOST node of `expr` is a terminal `sort`/`sort_desc`
 /// vector aggregation (issue M8-LQ3). Mirrors PromQL's

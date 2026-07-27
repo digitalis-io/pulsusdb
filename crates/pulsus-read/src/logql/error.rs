@@ -265,11 +265,27 @@ pub enum TooBroadReason {
     /// is charged BEFORE the allocation it pays for and released as
     /// `finish` consumes the state — a clean 422, never an OOM.
     VariantStateBytes { bytes: u64, cap: u64 },
+    /// Issue #230 follow-up: a single `line_format`/`label_format`
+    /// template render would allocate more output bytes than
+    /// [`crate::logql::template::MAX_TEMPLATE_RENDER_BYTES`] (charged
+    /// BEFORE every output-multiplying allocation — `repeat`/`indent`/
+    /// padding widths and the whole caller-multiplied class; released
+    /// when the render ends). The reference is UNBOUNDED here (a large
+    /// `repeat` OOM-kills it — measured); a bounded 422 is the ruled
+    /// behaviour (never copy the reference where it is wrong), the same
+    /// shape as the #236 O1 residual. Ledgered as
+    /// `template-output-budget`.
+    TemplateOutputBytes { budget_bytes: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TooBroadReason::TemplateOutputBytes { budget_bytes } => write!(
+                f,
+                "a line_format/label_format template render exceeded the {budget_bytes}-byte \
+                 output budget — shrink the template's repeat/indent/padding factors"
+            ),
             TooBroadReason::ScanBudgetBytes {
                 budget_bytes,
                 estimate,

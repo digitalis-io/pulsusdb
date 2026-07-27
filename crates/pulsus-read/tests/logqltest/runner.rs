@@ -42,6 +42,7 @@ use std::collections::HashMap;
 
 use pulsus_logql::{Expr, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
+use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
     QueryParams, QueryResult, QuerySpec, apply_vector_aggs, combine_binary, materialize_vector_lit,
@@ -674,11 +675,19 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
             if matches!(spec, QuerySpec::Range { .. }) {
                 return Err("a `range` eval requires a metric query".to_string());
             }
-            let compiled = CompiledPipeline::compile(&log.pipeline).map_err(|e| e.to_string())?;
+            // Pin the template environment to the capture precondition
+            // (stock container: degenerate-UTC Local, PROVENANCE §230) so
+            // goldens replay identically on any host/CI timezone.
+            let compiled = CompiledPipeline::compile(&log.pipeline)
+                .map_err(|e| e.to_string())?
+                .with_template_env(TemplateEnv::default());
             let mut out = Vec::new();
             for stream in &store.streams {
                 for (ts, body) in &stream.samples {
-                    if let Some(entry) = compiled.run(body, &stream.base) {
+                    if let Some(entry) = compiled
+                        .run(body, &stream.base, *ts)
+                        .map_err(|e| e.to_string())?
+                    {
                         let mut labels: Vec<(String, String)> = entry
                             .labels
                             .iter()
@@ -715,7 +724,9 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
     let client = mp.client.as_ref().ok_or_else(|| {
         "logqltest supports only client-aggregated (raw-scan) metric plans (Batch 0)".to_string()
     })?;
-    let compiled = CompiledPipeline::compile(&client.pipeline).map_err(|e| e.to_string())?;
+    let compiled = CompiledPipeline::compile(&client.pipeline)
+        .map_err(|e| e.to_string())?
+        .with_template_env(TemplateEnv::default());
     let result = run_client_agg_rows(
         &store.rows,
         &compiled,

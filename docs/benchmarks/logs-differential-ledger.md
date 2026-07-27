@@ -387,3 +387,116 @@ not "fix" us toward the panic.
   VARIANT and SKIPS the breaching variant with a warning. *PulsusDB:*
   422s on the shared divided cap — the pre-existing #236 class
   (mid-scan group cap vs result-size cap), not re-litigated here.
+
+## Issue #230 — `line_format`/`label_format` template engine
+
+The full Go `text/template` + reference function-map surface landed in
+issue #230; 676 container-captured corpus cases
+(`tests/logqltest/corpus/t1…t6_*.test`) replay byte-exact hermetically,
+including execution-error strings. The following residuals are the
+complete divergence set, each pinned deterministic (owner adjudications
+on #230: byte-model + lossy boundary; pin-deterministic where the
+reference is non-reproducible; error WORDING is not load-bearing where
+clients only display it).
+
+### `template-pinned-address-cells` (issue #230, plan v7 §D + capture)
+
+- **Reference behaviour:** 29 cells of the 224-cell printf verb×shape
+  domain print a process memory address — either per-process heap
+  pointers (23 cells, proven by the committed dual-container diff:
+  `cargo run -p xtask -- template-audit`) or package-global addresses
+  identical across containers but coupled to the reference binary's
+  layout (6 cells, caught by the audit's decimal/octal/binary
+  address-token scan). Exact cell list = the audit's flagged union,
+  re-derivable on any reference bump.
+- **PulsusDB behaviour:** the pinned address constant `0xfa11ed`
+  (16388589) in the same structural position — shape-asserted in
+  `tests/logql_template_engine.rs`; a grep-gate proves no corpus golden
+  ever contains a pinned-address rendering.
+- **Why deliberate:** the values are addresses of the reference
+  process's own memory; not reproducible even by the reference across
+  rebuilds.
+
+### `template-tzdata-table-cells` (issue #230, capture-surfaced plan correction)
+
+- **Reference behaviour:** 11 further cells (`%O %c %U %e %E %f %F %g
+  %G %t` + the catch-all rune on a LOADED `*time.Location`) dump the
+  zone's ENTIRE IANA transition table (with NUL bytes and invalid
+  UTF-8). Deterministic within one binary but coupled to the embedded
+  tzdata release. Plan v7 §D classified these as goldens because its
+  R1 criterion was address-presence only; the capture surfaced the
+  gap (goldens 195 → 184, exclusions 29 → 40).
+- **PulsusDB behaviour:** the same struct shape with PINNED-EMPTY
+  `zone`/`tx` tables and the pinned `cacheZone` address (`chrono-tz`
+  does not expose raw transition tables; OQ-3's ratified tzdata-skew
+  class).
+- **Why deliberate:** tzdata-release-coupled output; the adjudication
+  on #230 OQ-3 pins deterministic substitutes for this class.
+
+### `template-exec-depth-cap` (issue #230)
+
+- **Reference behaviour:** runaway recursive `{{define}}` invocations
+  error at depth 100 000 (`exceeded maximum template depth (100000)`),
+  a bound that relies on Go's growable goroutine stacks.
+- **PulsusDB behaviour:** the same per-line error at depth 1000 — Go's
+  own wasm-tier value, chosen because a fixed Rust thread stack cannot
+  survive 100 000 recursion levels (a crash is never acceptable).
+  Reachable only by deliberately recursive templates.
+
+### `template-error-wording-residuals` (issue #230, owner wording ruling)
+
+- **regex compile errors** inside `regexReplaceAll`/
+  `regexReplaceAllLiteral`/`count`: the reference embeds Go's
+  `error parsing regexp: missing closing ): …` wording in
+  `__error_details__`; PulsusDB embeds rust-regex's diagnostic behind
+  the same `error parsing regexp: ` prefix. Accept/reject boundaries
+  match (both RE2-class engines); the error CLASS
+  (`TemplateFormatErr`) and position prefix are byte-exact. Kept out
+  of the corpus; hermetically gated instead.
+- Everything else — including `divf`'s `decimal division by 0`,
+  slice-bounds panics, `unixToTime`'s `%!w(<nil>)` quirk, goodFunc
+  signature rejects and coercion errors — proved byte-exact in the
+  captured corpus and stays in it.
+
+### `template-local-zone-environment` (issue #230, adjudication 3)
+
+- The `Local` zone (`__timestamp__`, `date`, `toDate`) resolves from
+  the process environment exactly like a reference process on the same
+  host (`$TZ` name → that zone; no `$TZ` → `/etc/localtime`, named
+  "Local"; else the degenerate UTC form). The hermetic corpus and its
+  captures pin the degenerate-UTC form (stock container, PROVENANCE
+  precondition). Residuals inside this class: `chrono-tz` 0.10.4's
+  IANA tables vs the reference toolchain's (mainstream post-1970 zones
+  agree), zone-abbreviation lookups for layout PARSING approximate
+  Go's `lookupName` with instant±6-month probes, and zone-offset
+  lookups clamp beyond chrono's ±262k-year range.
+
+### `template-output-budget` (issue #230 follow-up, bounded divergence)
+
+- **Reference behaviour:** template output size is UNBOUNDED — `repeat
+  1073741824 "x"×17` (17 GB) OOM-kills the reference container
+  (measured); `printf` padding widths up to 2^30 allocate eagerly.
+- **PulsusDB behaviour:** every caller-multiplied render allocation
+  (`repeat`'s `count × len`, `indent`/`nindent`'s per-line pad,
+  `alignLeft`/`alignRight` padding, `printf`/`print` padding widths and
+  precisions, `Replace`-with-empty-needle expansion, the regex-replace
+  upper bound, and the constant-factor string producers) is CHARGED
+  against a cumulative per-render budget BEFORE it happens and released
+  when the render ends. A breach aborts the query with the bounded
+  `422 query_too_broad` (`TooBroadReason::TemplateOutputBytes`) — never
+  a per-line `TemplateFormatErr`, never a truncation, never an OOM.
+- **Threshold (derived, not chosen):**
+  `MAX_TEMPLATE_RENDER_BYTES = MAX_CLIENT_AGG_GROUP_BYTES` (64 MiB) —
+  the crate's established per-query retained-bytes budget (#104, reused
+  by #221's fan-out charge): one render is the line path's peak
+  transient retention, so it may not allocate more than a whole query
+  is allowed to retain. Gated both ways in
+  `tests/logql_template_engine.rs`: a `repeat` exactly AT the budget
+  renders; one byte past it is the clean 422 on the streams, metric and
+  `label_format` paths.
+- **Why deliberate:** the reference has no bound, so no finite cap can
+  match it (the #236 O1 shape); the standing charge-before-allocate
+  rule (#227) and the "never copy the reference where it is wrong"
+  ruling both require the bound. Overflowing `int` still panics with
+  the reference's exact `strings: Repeat output length overflow` per
+  line (that surface is bounded and correct).

@@ -70,13 +70,13 @@ fn count_run_into(query: &str, bodies: &[String], base: &[(String, String)]) -> 
     let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
     // Warm-up: scratch capacity, allocator internals.
     for body in bodies {
-        let out = pipeline.run_into(body, base, &mut scratch);
+        let out = pipeline.run_into(body, base, 0, &mut scratch);
         std::hint::black_box(&out);
     }
     let start = ALLOCS.load(Ordering::Relaxed);
     for i in 0..ROWS {
         let body = &bodies[i as usize % bodies.len()];
-        let out = pipeline.run_into(body, base, &mut scratch);
+        let out = pipeline.run_into(body, base, 0, &mut scratch);
         std::hint::black_box(&out);
     }
     ALLOCS.load(Ordering::Relaxed) - start
@@ -92,11 +92,12 @@ fn count_assembly(
 ) -> u64 {
     let pipeline = compiled(query);
     // Warm-up run (also proves the path is exercised).
-    let warm = run_pipeline_rows(rows.to_vec(), &pipeline, meta, u32::MAX);
+    let warm =
+        run_pipeline_rows(rows.to_vec(), &pipeline, meta, u32::MAX).expect("no budget breach");
     assert!(!warm.is_empty(), "assembly fixture must produce output");
     let rows_clone = rows.to_vec(); // clone outside the window too
     let start = ALLOCS.load(Ordering::Relaxed);
-    let out = run_pipeline_rows(rows_clone, &pipeline, meta, u32::MAX);
+    let out = run_pipeline_rows(rows_clone, &pipeline, meta, u32::MAX).expect("no budget breach");
     let total = ALLOCS.load(Ordering::Relaxed) - start;
     std::hint::black_box(&out);
     total
@@ -288,6 +289,47 @@ fn per_row_allocation_bounds_hold() {
         total <= 4 * n + n / 2 + ZERO_RESIDUE,
         "high-cardinality fan-out assembly: {total} allocations over {n} rows — must stay \
          <= 4.5 per row (a per-new-group key clone would push this past 5)"
+    );
+
+    // --- Issue #230: template-engine bounds. The pre-#230 `{{.label}}`
+    // --- shapes keep their fast paths (`Simple`/`Parts` — asserted at
+    // --- <= 2/row above via the existing line_format case); the new
+    // --- gates pin the label_format shapes and the FULL evaluator's
+    // --- function-pipeline cost.
+    // label_format single template (Parts path): one rendered String,
+    // one set_label entry — <= 2 per row (plan AC-1/W1).
+    let total = count_run_into(
+        r#"{a="b"} | label_format out="{{.env}}-x""#,
+        &plain_bodies,
+        &base,
+    );
+    assert!(
+        total <= 2 * ROWS + ZERO_RESIDUE,
+        "label_format single template: {total} allocations over {ROWS} rows — must stay <= 2/row"
+    );
+    // label_format with two templates where the second reads the first's
+    // destination: the #231 snapshot clone runs per row — <= 4 per row
+    // (plan AC-1/W1).
+    let total = count_run_into(
+        r#"{a="b"} | label_format out="{{.env}}", two="[{{.out}}]""#,
+        &plain_bodies,
+        &base,
+    );
+    assert!(
+        total <= 4 * ROWS + ZERO_RESIDUE,
+        "label_format snapshot pair: {total} allocations over {ROWS} rows — must stay <= 4/row"
+    );
+    // FULL-evaluator function pipeline (plan AC-1/W3): the render's
+    // fixed overhead (variable scope + output buffer) plus the function
+    // result and its argument vector — <= 4 per row.
+    let total = count_run_into(
+        r#"{a="b"} | line_format "{{ .env | upper }}""#,
+        &plain_bodies,
+        &base,
+    );
+    assert!(
+        total <= 4 * ROWS + ZERO_RESIDUE,
+        "full-template function pipeline: {total} allocations over {ROWS} rows — must stay <= 4/row"
     );
 
     // --- Issue #97 (AC-12): structured-metadata merge path.

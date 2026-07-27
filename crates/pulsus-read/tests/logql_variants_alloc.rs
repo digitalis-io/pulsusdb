@@ -1672,7 +1672,11 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("ClientAggState"),
         anchor: "push_rows",
-        branches: 20,
+        // 21st branch: issue #230's `?` on the now-fallible
+        // `run_metric_into` (template render-budget breach → the
+        // bounded 422). Row-path only — covered by F-d's NOT-EXEC
+        // disposition (rows.is_empty() in every W_fin window).
+        branches: 21,
         callees: &[
             ".add",
             ".as_u64",
@@ -1743,9 +1747,13 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         ty: Some("RangeSlideState"),
         anchor: "push_rows",
         branches: 8,
+        // `.into` joined with issue #230: the render-budget breach
+        // (`TemplateBudgetExceeded`) converts into `ReadError` on the
+        // row path — F-d's NOT-EXEC disposition covers it.
         callees: &[
             ".flush_collision",
             ".get",
+            ".into",
             ".len",
             ".run_metric_into",
             ".stage_member",
