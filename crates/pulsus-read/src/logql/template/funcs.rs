@@ -219,18 +219,79 @@ fn lossy(v: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(v)
 }
 
-/// [`lossy`] with its expansion RESERVED first (review round 4):
-/// invalid UTF-8 forces `from_utf8_lossy` onto its `Cow::Owned` branch
-/// — a ≤3× buffer (each invalid byte becomes a 3-byte U+FFFD), which
-/// is an allocation like any other and is charged BEFORE the
-/// conversion. Valid input borrows and charges nothing, so
-/// valid-UTF-8 budget arithmetic (and every pinned boundary) is
-/// unchanged.
+/// [`lossy`]'s charged twin (review rounds 4+6): invalid UTF-8 forces
+/// the owned branch, whose EXACT repaired length is precomputed,
+/// charged, and then allocated ONCE — never `from_utf8_lossy`'s
+/// grow-doubling buffer, so there is no growth worst case to bound.
+/// Valid input borrows and charges nothing, so valid-UTF-8 budget
+/// arithmetic (and every pinned boundary) is unchanged.
 fn lossy_charged<'v>(ctx: &FuncCtx<'_, '_>, v: &'v [u8]) -> Result<Cow<'v, str>, String> {
-    if std::str::from_utf8(v).is_err() {
-        ctx.charge(3usize.saturating_mul(v.len()) + 4)?;
+    match std::str::from_utf8(v) {
+        Ok(s) => Ok(Cow::Borrowed(s)),
+        Err(_) => {
+            // Round 6: the repaired length is PRECOMPUTED and the buffer
+            // allocated ONCE at exactly that size, after charging it — a
+            // `from_utf8_lossy` call may start at `len` capacity and
+            // grow-double to 4× (cumulatively requesting up to 7×), so
+            // no constant ceiling is a provable bound; a single
+            // allocation of a computed size has no worst case.
+            let need = lossy_repaired_len(v);
+            ctx.charge(need)?;
+            Ok(Cow::Owned(lossy_repaired(v, need)))
+        }
     }
-    Ok(lossy(v))
+}
+
+/// The exact byte length of `String::from_utf8_lossy(v)` — same
+/// substitution granularity as std (one U+FFFD per maximal invalid
+/// sequence, per `Utf8Error::error_len`), computed without allocating.
+fn lossy_repaired_len(v: &[u8]) -> usize {
+    let mut rest = v;
+    let mut len = 0usize;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => return len + s.len(),
+            Err(e) => {
+                len += e.valid_up_to() + '\u{FFFD}'.len_utf8();
+                match e.error_len() {
+                    Some(bad) => rest = &rest[e.valid_up_to() + bad..],
+                    // Truncated trailing sequence: one replacement, done.
+                    None => return len,
+                }
+            }
+        }
+    }
+}
+
+/// Builds the lossy repair in ONE allocation of exactly `cap` bytes
+/// (byte-identical to `String::from_utf8_lossy(v)` — pinned by a unit
+/// test below, including the truncated-tail and interleaved cases).
+fn lossy_repaired(v: &[u8], cap: usize) -> String {
+    let mut out = String::with_capacity(cap);
+    let mut rest = v;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let (valid, tail) = rest.split_at(e.valid_up_to());
+                out.push_str(std::str::from_utf8(valid).expect("validated by valid_up_to"));
+                out.push('\u{FFFD}');
+                match e.error_len() {
+                    Some(bad) => rest = &tail[bad..],
+                    None => break,
+                }
+            }
+        }
+    }
+    // Length only — an equality debug_assert against
+    // `String::from_utf8_lossy` would re-run the grow-doubling path in
+    // debug builds and re-appear in the allocation gate; byte equality
+    // is pinned by the unit test below instead.
+    debug_assert_eq!(out.len(), cap);
+    out
 }
 
 /// Go float→int64 conversion semantics (amd64 `cvttsd2si`): truncate
@@ -1713,16 +1774,22 @@ const DYNAMIC_REGEX_PROGRAM_CEILING: usize = 1 << 20;
 
 fn compile_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex::Regex, String> {
     // The pattern copy is charged too (repeatable per call) — at the
-    // ≤3× U+FFFD ceiling when the pattern bytes are invalid UTF-8
-    // (round 4: the conversion allocates BEFORE the old len-sized
-    // charge could cover it).
-    let copy_ceiling = if std::str::from_utf8(pattern).is_ok() {
-        pattern.len()
-    } else {
-        3usize.saturating_mul(pattern.len()) + 4
+    // EXACT repaired length when the pattern bytes are invalid UTF-8
+    // (rounds 4+6: the conversion must neither allocate before its
+    // charge nor grow past it).
+    let text = match std::str::from_utf8(pattern) {
+        Ok(s) => {
+            ctx.charge(pattern.len())?;
+            s.to_string()
+        }
+        Err(_) => {
+            // Round 6: exact repaired length, one allocation, charged
+            // first — same as `lossy_charged` (no growth to bound).
+            let need = lossy_repaired_len(pattern);
+            ctx.charge(need)?;
+            lossy_repaired(pattern, need)
+        }
     };
-    ctx.charge(copy_ceiling)?;
-    let text = lossy(pattern).into_owned();
     if let Some(re) = ctx.regex_cache.get(&text) {
         // Query-compile-time program (literal pattern): `Regex` is
         // Arc-backed, the clone shares it — no per-line program.
@@ -1888,4 +1955,40 @@ pub(crate) fn go_parse_duration(orig: &str) -> Result<i64, String> {
         return Err(invalid());
     }
     Ok(d as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lossy_repaired, lossy_repaired_len};
+
+    /// Round 6: the single-allocation repair must be byte-identical to
+    /// `String::from_utf8_lossy` (std's maximal-subpart substitution
+    /// granularity — NOT the Go per-byte rule `go_json_sanitize`
+    /// implements for fromJson), and `lossy_repaired_len` must be its
+    /// exact length, across the awkward shapes: truncated tails,
+    /// invalid continuations, overlong encodings, interleaved runs.
+    #[test]
+    fn lossy_repaired_matches_std_from_utf8_lossy_byte_for_byte() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"plain ascii",
+            "caf\u{e9} \u{1F600}".as_bytes(),
+            &[0xFF],
+            &[0xFF; 7],
+            b"a\xFFb\xFFc",
+            b"\xC2",                   // truncated 2-byte tail
+            b"\xE0\xA0",               // truncated 3-byte tail
+            b"\xF0\x9F\x92",           // truncated 4-byte tail
+            b"a\xF0\x28b",             // invalid continuation mid-stream
+            b"\xC0\xAF",               // overlong encoding
+            b"\xED\xA0\x80",           // surrogate range
+            b"x\xF0\x9F\x92\x96y\xFF", // valid 4-byte + trailing invalid
+        ];
+        for v in cases {
+            let expected = String::from_utf8_lossy(v);
+            let need = lossy_repaired_len(v);
+            assert_eq!(need, expected.len(), "{v:X?}");
+            assert_eq!(lossy_repaired(v, need), expected.as_ref(), "{v:X?}");
+        }
+    }
 }

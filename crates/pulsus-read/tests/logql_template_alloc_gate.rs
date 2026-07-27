@@ -106,6 +106,36 @@ fn s(text: &str) -> Value<'static> {
     Value::Str(Cow::Owned(text.as_bytes().to_vec()))
 }
 
+/// A 1 MiB invalid-UTF-8 string (alternate `0xFF`).
+fn invalid_big_str() -> Value<'static> {
+    let mut v = vec![b'x'; BIG];
+    for i in (0..v.len()).step_by(2) {
+        v[i] = 0xFF;
+    }
+    Value::Str(Cow::Owned(v))
+}
+
+/// A 128-byte invalid-UTF-8 PATTERN — enough to exercise
+/// `compile_regex`'s invalid-pattern conversion (the round-6 finding-2
+/// gap: derived variants only invalidate BIG args, and patterns were
+/// tiny), sized to stay inside the charged 1 MiB program ceiling.
+///
+/// It is deliberately NOT larger: measured on this toolchain, regex
+/// COMPILATION allocates ~630x the pattern length and
+/// `RegexBuilder::size_limit` does not bound it (a 16 KiB literal
+/// pattern allocates 10.4 MB and still reports Ok under a 1 MiB
+/// limit) — an amplification path INDEPENDENT of invalid UTF-8 (valid
+/// patterns behave identically), reported for adjudication rather than
+/// papered over here. See the issue notes; this shape is scoped to the
+/// conversion it was added for.
+fn invalid_pattern() -> Value<'static> {
+    let mut v = vec![b'x'; 128];
+    for i in (0..v.len()).step_by(2) {
+        v[i] = 0xFF;
+    }
+    Value::Str(Cow::Owned(v))
+}
+
 fn default_arg(ty: ParamTy) -> Value<'static> {
     match ty {
         ParamTy::Any | ParamTy::Str => big_str(),
@@ -159,8 +189,8 @@ fn args_for(name: &str, params: &[ParamTy], variadic: Option<ParamTy>) -> Vec<Va
         "unixToTime" => return vec![s("1700000000")],
         "toDate" => return vec![s("2006-01-02"), s("2024-05-06")],
         "toDateInZone" => return vec![s("2006-01-02"), s("UTC"), s("2024-05-06")],
-        "substr" => return vec![Value::int(0), Value::int(200_000), big_str()],
-        "trunc" => return vec![Value::int(200_000), big_str()],
+        "substr" => return vec![Value::int(0), Value::int(500_000), big_str()],
+        "trunc" => return vec![Value::int(500_000), big_str()],
         "int" | "float64" => return vec![digits_big()],
         "round" => return vec![Value::Float(1.234_567), Value::int(2)],
         "fromJson" => {
@@ -255,16 +285,29 @@ fn extra_shapes(name: &str) -> Vec<(&'static str, Vec<Value<'static>>)> {
         "regexReplaceAll" | "regexReplaceAllLiteral" => vec![
             ("no-match", vec![s("ZZZ+"), big_str(), s("YY")]),
             ("error-bad-pattern", vec![s("("), big_str(), s("YY")]),
-            // A big replacement so the auto-derived invalid-UTF-8
-            // variant exercises the REPL conversion too (round 4).
-            ("big-repl", vec![s("x+"), big_str(), big_str()]),
+            // A big replacement with a SMALL haystack (round 6: the old
+            // big-haystack form breached at the conservative expansion
+            // charge and never reached the ORDERING leg at all — the
+            // silent-filtering failure mode the reached-check now pins).
+            ("big-repl", vec![s("x+"), s("xxxx"), big_str()]),
+            // Round 6: INDEPENDENT invalid-pattern and invalid-repl
+            // ordering shapes — the derived variants only invalidate
+            // BIG string args, and patterns stayed tiny.
+            (
+                "invalid-pattern",
+                vec![invalid_pattern(), s("xxxx"), s("YY")],
+            ),
+            ("invalid-repl", vec![s("x+"), s("xxxx"), invalid_big_str()]),
             // An uncached pattern keeps the 1 MiB dynamic-program
             // ceiling under dominance (the happy pattern now sits in
             // the pre-populated compile-time cache, mirroring
             // production literal precompilation).
             ("uncached-pattern", vec![s("y+"), big_str(), s("YY")]),
         ],
-        "count" => vec![("error-bad-pattern", vec![s("("), big_str()])],
+        "count" => vec![
+            ("error-bad-pattern", vec![s("("), big_str()]),
+            ("invalid-pattern", vec![invalid_pattern(), s("xxxx")]),
+        ],
         "fromJson" => vec![
             ("error-not-json", vec![big_str()]),
             ("invalid-utf8-string", {
@@ -360,6 +403,62 @@ const TINY_REMAINING: u64 = 64 * 1024;
 /// charge fails by an order of magnitude.
 const ORDERING_CEILING: u64 = 192 * 1024;
 
+/// Round 6, the structural reached-check: a shape can be useless
+/// without ever passing wrongly — it can error upstream (a breach at a
+/// conservative charge) and never reach the ORDERING leg, which looks
+/// identical in a green run. Every entry here is asserted to have
+/// actually executed the ordering leg; a shape that starts erroring
+/// early DISAPPEARS from the reached set and fails this list instead
+/// of silently narrowing the gate. (`fn/shape` naming; derived
+/// `+invalid-utf8` variants included where they must survive to the
+/// leg.)
+///
+/// DELIBERATELY ABSENT, with the measured reason (round 6): the
+/// `invalid-pattern` shapes are DOMINANCE-only. An invalid PATTERN's
+/// conversion allocates 2× the pattern, and a pattern large enough to
+/// clear the ordering threshold (~128 KiB) repairs to a literal whose
+/// compiled program exceeds the 1 MiB `size_limit` (measured: a 32 KiB
+/// repaired literal is already CompiledTooBig), so the shape would
+/// error upstream instead. Ordering coverage for that conversion rides
+/// on the shared `lossy_repaired_len`/`lossy_repaired` helpers, which
+/// the `invalid-repl` and `+invalid-utf8` haystack legs discriminate at
+/// size.
+const MUST_REACH_ORDERING: &[&str] = &[
+    "Replace/happy",
+    "Trim/happy",
+    "__line__/happy",
+    "b64dec/happy",
+    "b64enc/happy",
+    "date/happy",
+    "default/happy",
+    "fromJson/happy",
+    "indent/wide",
+    "lower/happy",
+    "lower/happy+invalid-utf8",
+    "regexReplaceAll/big-repl",
+    "regexReplaceAll/big-repl+invalid-utf8",
+    "regexReplaceAll/happy",
+    "regexReplaceAll/happy+invalid-utf8",
+    "regexReplaceAll/invalid-repl",
+    "regexReplaceAll/no-match",
+    "regexReplaceAll/no-match+invalid-utf8",
+    "regexReplaceAll/uncached-pattern",
+    "regexReplaceAllLiteral/big-repl",
+    "regexReplaceAllLiteral/big-repl+invalid-utf8",
+    "regexReplaceAllLiteral/happy",
+    "regexReplaceAllLiteral/happy+invalid-utf8",
+    "regexReplaceAllLiteral/invalid-repl",
+    "regexReplaceAllLiteral/no-match",
+    "regexReplaceAllLiteral/no-match+invalid-utf8",
+    "repeat/happy",
+    "replace/happy",
+    "substr/happy",
+    "title/happy",
+    "trunc/happy",
+    "upper/happy",
+    "urldecode/happy",
+];
+
 #[test]
 fn every_registry_function_charge_dominates_its_allocations() {
     use pulsus_read::logql::template::MAX_TEMPLATE_RENDER_BYTES;
@@ -374,6 +473,10 @@ fn every_registry_function_charge_dominates_its_allocations() {
         regex_cache.insert(pat.to_string(), regex::Regex::new(pat).expect("pattern"));
     }
     let mut failures = Vec::new();
+    let mut registered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut executed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut reached_ordering: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for def in REGISTRY.iter() {
         // Branch shapes, not just the happy path (review round 3):
         // identity / no-match / n==0 / empty / error arguments each get
@@ -396,6 +499,9 @@ fn every_registry_function_charge_dominates_its_allocations() {
             .filter_map(|(n, a)| invalidate_utf8(a).map(|ia| (format!("{n}+invalid-utf8"), ia)))
             .collect();
         shapes.extend(invalid);
+        for (shape, _) in &shapes {
+            registered.insert(format!("{}/{}", def.name, shape));
+        }
         for (shape, args) in shapes {
             let gate = GateEnv {
                 env: env.clone(),
@@ -409,6 +515,7 @@ fn every_registry_function_charge_dominates_its_allocations() {
                 budget: &gate.budget,
                 _marker: std::marker::PhantomData,
             };
+            executed.insert(format!("{}/{}", def.name, shape));
             let inputs = input_bytes(&args, line.len());
             // Clone for the ordering rerun BEFORE the first call.
             let args_rerun = args.clone();
@@ -442,6 +549,7 @@ fn every_registry_function_charge_dominates_its_allocations() {
             // the counter. (This is what a post-hoc charged-vs-allocated
             // comparison can never see.)
             if retainable_ok && alloc >= 4 * SLACK {
+                reached_ordering.insert(format!("{}/{}", def.name, shape));
                 let gate = GateEnv {
                     env: env.clone(),
                     budget: RenderBudget::default(),
@@ -475,6 +583,65 @@ fn every_registry_function_charge_dominates_its_allocations() {
             }
         }
     }
+    // --- round 6, structural: every registered shape executed, and every
+    // shape committed to the ordering leg actually reached it. A shape
+    // that errors upstream (e.g. at a conservative charge) vanishes from
+    // `reached_ordering` and fails HERE, instead of silently narrowing
+    // the gate while it stays green.
+    assert_eq!(
+        registered, executed,
+        "every registered shape must execute (a shape the loop never ran)"
+    );
+    for want in MUST_REACH_ORDERING {
+        if !reached_ordering.contains(*want) {
+            failures.push(format!(
+                "{want}: committed to the ORDERING leg but never reached it — the shape \
+                 errored or shrank upstream; fix the shape (or reclassify it here) rather \
+                 than letting the leg silently narrow. Reached: {:?}",
+                reached_ordering
+            ));
+        }
+    }
+
+    // --- round 6, the single-allocation lossy repair (finding 1): an
+    // all-invalid haystack must not allocate past its charge — the old
+    // `from_utf8_lossy` path grow-doubled (len + 2len + 4len cumulative
+    // against a 3len charge). Factor-1 bound: alloc ≤ charged + 512 KiB.
+    {
+        let gate = GateEnv {
+            env: env.clone(),
+            budget: RenderBudget::default(),
+        };
+        let ctx = FuncCtx {
+            print_env: &gate,
+            line: &line,
+            ts_ns: 1_700_000_000_000_000_000,
+            regex_cache: &regex_cache,
+            budget: &gate.budget,
+            _marker: std::marker::PhantomData,
+        };
+        let def = REGISTRY
+            .iter()
+            .find(|d| d.name == "count")
+            .expect("count registered");
+        let args = vec![s("x+"), Value::Str(Cow::Owned(vec![0xFF; BIG]))];
+        let before = BYTES.load(Ordering::Relaxed);
+        let result = (def.call)(&ctx, &args);
+        let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+        let charged = gate.budget.charged_bytes();
+        assert!(
+            result.is_ok(),
+            "count over an all-invalid haystack: {result:?}"
+        );
+        if alloc > charged + 512 * 1024 {
+            failures.push(format!(
+                "lossy repair churn: allocated {alloc} B > charged {charged} B + 512 KiB — \
+                 the conversion must precompute its repaired length and allocate ONCE \
+                 (round 6, finding 1)"
+            ));
+        }
+    }
+
     assert!(
         failures.is_empty(),
         "registry functions whose allocations are NOT dominated by their budget \

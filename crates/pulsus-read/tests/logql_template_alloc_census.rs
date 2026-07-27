@@ -422,6 +422,11 @@ static VIA: &[Via] = &[
         other_callers: &[],
     },
     Via {
+        func: "lossy_repaired",
+        chargers: &["lossy_charged", "compile_regex"],
+        other_callers: &[],
+    },
+    Via {
         func: "go_json_sanitize",
         chargers: &["from_json"],
         other_callers: &[],
@@ -900,7 +905,7 @@ static PINS: &[Pin] = &[
         callees: &[
             ".build",
             ".clone",
-            ".into_owned",
+            ".to_string",
             "RegexBuilder::new",
             "format!",
             "str::from_utf8",
@@ -1172,6 +1177,32 @@ static PINS: &[Pin] = &[
         callees: &["String::from_utf8_lossy"],
         disposition: TRANSIENT,
         why: "borrowed Cow; ≤ 3× input only for invalid UTF-8 replacement, freed by the caller",
+    },
+    Pin {
+        file: "funcs.rs",
+        func: "lossy_repaired",
+        callees: &[
+            ".push",
+            ".push_str",
+            "String::with_capacity",
+            "str::from_utf8",
+        ],
+        disposition: CHARGED_VIA,
+        why: "ONE allocation of the precomputed repaired length; its callers charge that exact size first (round 6)",
+    },
+    Pin {
+        file: "funcs.rs",
+        func: "lossy_repaired_matches_std_from_utf8_lossy_byte_for_byte",
+        callees: &["String::from_utf8_lossy"],
+        disposition: CONST,
+        why: "test-region equality check over fixed short byte cases (round 6)",
+    },
+    Pin {
+        file: "funcs.rs",
+        func: "lossy_repaired_len",
+        callees: &["str::from_utf8"],
+        disposition: CONST,
+        why: "pure length scan, borrows only — no allocation",
     },
     Pin {
         file: "funcs.rs",

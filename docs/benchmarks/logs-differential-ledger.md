@@ -557,10 +557,17 @@ clients only display it).
   after its allocation (mutation-verified). Round 4 added a DERIVED
   invalid-UTF-8 variant of every shape (big string arguments get
   invalid bytes mechanically, not by hand-listing), which surfaced
-  and closed the last conversion gap: `from_utf8_lossy`'s ≤3× owned
-  substitution buffer on the regex argument/pattern paths is now
-  RESERVED before converting (`lossy_charged`); valid-UTF-8 inputs
-  borrow and charge nothing, so every pinned boundary is unchanged. A breach aborts the query with the bounded
+  and closed the conversion gap on the regex argument/pattern paths.
+  Round 5 reserved a ≤3× ceiling before converting; round 6 replaced
+  that with the stronger form — the repaired length is PRECOMPUTED,
+  charged, and the buffer allocated ONCE at exactly that size, because
+  `from_utf8_lossy` may start at `len` and grow-double to 4×
+  (cumulatively requesting up to 7×), so no constant is a provable
+  bound. Valid-UTF-8 inputs borrow and charge nothing, so every pinned
+  boundary is unchanged. The gate additionally asserts, structurally,
+  that every registered shape EXECUTES and that every shape committed
+  to the ordering leg actually REACHES it — a shape that errors
+  upstream is otherwise indistinguishable from a shape that passed. A breach aborts the query with the bounded
   `422 query_too_broad` (`TooBroadReason::TemplateOutputBytes`) — never
   a per-line `TemplateFormatErr`, never a truncation, never an OOM.
 - **Threshold (derived, not chosen):**
