@@ -171,8 +171,12 @@ not the pure value path).
 ## Issue #230 — template-engine corpus (`t1…t6_*.test`)
 
 The `t*` files pin the `line_format`/`label_format` template engine —
-676 cases, every value AND execution-error string captured verbatim
-from `grafana/loki:3.7.4`, never hand-authored. **Toolchain of record:**
+688 directives: 678 `eval` (t1 60 + t2 228 + t3 34 + t4 29 + t5 258 +
+t6 69) plus 10 `eval_fail` reject-parity cases (all in t1) — every
+value AND execution-error string captured verbatim from
+`grafana/loki:3.7.4`, never hand-authored. (Re-derive with
+`grep -c '^eval ' / '^eval_fail'` per file; an earlier "676 cases"
+claim mixed the two directive kinds without saying so.) **Toolchain of record:**
 the pinned image's binary is built with **go1.26.5** (`go version -m`
 on the extracted binary) — semantics citations against an older local
 Go tree are advisory only; on any disagreement the container capture

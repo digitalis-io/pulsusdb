@@ -223,6 +223,40 @@ impl<'a> Value<'a> {
         Value::Str(Cow::Owned(s.into()))
     }
 
+    /// An upper bound on the heap bytes a copy of this value costs AND
+    /// on the bytes its `%v` rendering emits (scalars render into ≤ the
+    /// per-node constant; container nodes add brackets/separators well
+    /// under it). Used to charge-before-allocate for value copies and
+    /// for the print path's output ceiling (issue #230 review round 2:
+    /// arbitrary `Value` output is charged BEFORE it is written).
+    pub fn charge_ceiling(&self) -> usize {
+        const NODE: usize = 64;
+        match self {
+            // A string copies and renders as exactly its bytes — kept
+            // EXACT so the repeat-at-the-boundary budget gate stays at
+            // build-charge + print-charge == 2×len.
+            Value::Str(b) => b.len(),
+            Value::Bytes(b) => {
+                // `%v` of a []byte renders each byte in decimal (≤4×).
+                b.len().saturating_mul(4) + NODE
+            }
+            Value::List(l) => l.iter().fold(NODE, |acc, v| {
+                acc.saturating_add(v.charge_ceiling()).saturating_add(16)
+            }),
+            Value::Map(m) => m.iter().fold(NODE, |acc, (k, v)| {
+                acc.saturating_add(k.len())
+                    .saturating_add(v.charge_ceiling())
+                    .saturating_add(NODE)
+            }),
+            // Location renders its (short) zone name; everything else
+            // is a scalar whose shortest rendering fits the constant
+            // (widths/precisions charge separately in the formatter).
+            Value::Location(GoLoc::Named(tz)) => tz.name().len() + NODE,
+            Value::Location(GoLoc::Fixed { name, .. }) => name.len() + NODE,
+            _ => NODE,
+        }
+    }
+
     /// Convenience: `int` (the Go builtin kind).
     pub fn int(n: i64) -> Value<'a> {
         Value::Int(n, IntKind::Int)

@@ -87,6 +87,12 @@ impl RenderBudget {
     pub fn breached(&self) -> bool {
         self.breached.get()
     }
+
+    /// How many bytes this render has charged so far (the runtime
+    /// allocation-dominance gate compares allocated bytes against this).
+    pub fn charged_bytes(&self) -> u64 {
+        MAX_TEMPLATE_RENDER_BYTES - self.remaining.get()
+    }
 }
 
 /// Which of the reference's two template names this body compiles under

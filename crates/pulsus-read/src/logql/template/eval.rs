@@ -30,7 +30,15 @@ use super::value::{IntKind, UintKind, Value};
 /// one template invocation recurses through ~4 walk/eval frames that
 /// measure ≈2 KiB/level in debug builds (a 1000-cap overflowed a 2 MiB
 /// test thread), so 250 levels ≈ 0.5 MiB — a 4× margin on the floor.
-/// Only runaway recursive `define`s can reach it; ledgered
+///
+/// Review round 2 (issue #230): the counter is UNIFIED across every
+/// evaluator recursion site, not just `{{template}}` invocation —
+/// nested `if`/`with`/`range` walks and parenthesized-pipeline
+/// evaluation increment it too (their frames are no larger than the
+/// invocation path's), so a recursive define whose body nests controls
+/// cannot multiply the two depths past the stack. Structural nesting
+/// in a SINGLE tree is already parse-capped at 40
+/// (`parse::MAX_PARSE_DEPTH`), well inside this cap. Ledgered
 /// (`template-exec-depth-cap`).
 const MAX_EXEC_DEPTH: usize = 250;
 
@@ -205,6 +213,23 @@ impl<'s, 'c, 'a> State<'s, 'c, 'a> {
         }
     }
 
+    /// The unified recursion-depth guard (see [`MAX_EXEC_DEPTH`]):
+    /// every evaluator recursion site brackets itself with
+    /// `enter_depth`/`leave_depth`.
+    fn enter_depth(&mut self) -> Result<(), ExecError> {
+        if self.depth >= MAX_EXEC_DEPTH {
+            return Err(self.errorf(format!(
+                "exceeded maximum template depth ({MAX_EXEC_DEPTH})"
+            )));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave_depth(&mut self) {
+        self.depth -= 1;
+    }
+
     // -- variables -------------------------------------------------------
 
     fn push_var(&mut self, name: &'c str, value: Value<'c>, iface: bool) {
@@ -301,19 +326,34 @@ impl<'s, 'c, 'a> State<'s, 'c, 'a> {
                 pipe,
                 list,
                 else_list,
-            } => self.walk_if_or_with(true, *pos, dot, pipe, list, else_list.as_ref()),
+            } => {
+                self.enter_depth()?;
+                let r = self.walk_if_or_with(true, *pos, dot, pipe, list, else_list.as_ref());
+                self.leave_depth();
+                r
+            }
             Node::With {
                 pos,
                 pipe,
                 list,
                 else_list,
-            } => self.walk_if_or_with(false, *pos, dot, pipe, list, else_list.as_ref()),
+            } => {
+                self.enter_depth()?;
+                let r = self.walk_if_or_with(false, *pos, dot, pipe, list, else_list.as_ref());
+                self.leave_depth();
+                r
+            }
             Node::Range {
                 pos,
                 pipe,
                 list,
                 else_list,
-            } => self.walk_range(*pos, dot, pipe, list, else_list.as_ref()),
+            } => {
+                self.enter_depth()?;
+                let r = self.walk_range(*pos, dot, pipe, list, else_list.as_ref());
+                self.leave_depth();
+                r
+            }
             Node::Template { pos, name, pipe } => {
                 self.walk_template(*pos, dot, name, pipe.as_ref())?;
                 Ok(Walk::Ok)
@@ -533,7 +573,10 @@ impl<'s, 'c, 'a> State<'s, 'c, 'a> {
                 )));
             }
         };
-        if self.depth == MAX_EXEC_DEPTH {
+        // Go checks the cap BEFORE evaluating the pipe (exec.go
+        // walkTemplate) — a cap-hit with an erroring pipe reports the
+        // depth error.
+        if self.depth >= MAX_EXEC_DEPTH {
             return Err(self.errorf(format!(
                 "exceeded maximum template depth ({MAX_EXEC_DEPTH})"
             )));
@@ -559,6 +602,15 @@ impl<'s, 'c, 'a> State<'s, 'c, 'a> {
     // -- pipelines ----------------------------------------------------------
 
     fn eval_pipeline(&mut self, dot: &Dot<'c>, pipe: &'c Pipe) -> VResult<'c> {
+        // Parenthesized pipelines recurse back here through
+        // `eval_command`/`eval_arg` — a unified-depth site (round 2).
+        self.enter_depth()?;
+        let result = self.eval_pipeline_inner(dot, pipe);
+        self.leave_depth();
+        result
+    }
+
+    fn eval_pipeline_inner(&mut self, dot: &Dot<'c>, pipe: &'c Pipe) -> VResult<'c> {
         let mut value: Option<Value<'c>> = None;
         for cmd in &pipe.cmds {
             value = Some(self.eval_command(dot, cmd, value)?);
@@ -1009,7 +1061,7 @@ impl<'s, 'c, 'a> State<'s, 'c, 'a> {
                 methods::MethodImpl::Reject(msg) => return Err(self.errorf(msg.to_string())),
                 methods::MethodImpl::Call(f) => {
                     let env = InputPrintEnv { input: self.input };
-                    f(&receiver, &argv, env.env())
+                    f(&receiver, &argv, env.env(), self.input.budget)
                 }
             },
         };
@@ -1246,24 +1298,81 @@ impl<'s, 'c, 'a> State<'s, 'c, 'a> {
 
     // -- output -----------------------------------------------------------
 
+    /// An upper bound on the bytes `%v`-printing `val` emits (and on
+    /// the heap a copy of it costs). [`Value::charge_ceiling`] covers
+    /// everything except the `LabelMap` marker, whose rendering is the
+    /// whole sorted data map — bounded by the render input here.
+    fn value_output_ceiling(&self, val: &Value<'c>) -> usize {
+        match val {
+            Value::LabelMap => {
+                let mut total = 64usize;
+                for (k, v) in self.input.labels {
+                    total = total
+                        .saturating_add(k.len())
+                        .saturating_add(v.len())
+                        .saturating_add(64);
+                }
+                for extra in [self.input.err, self.input.err_details]
+                    .into_iter()
+                    .flatten()
+                {
+                    total = total.saturating_add(extra.len()).saturating_add(64);
+                }
+                total
+            }
+            v => v.charge_ceiling(),
+        }
+    }
+
+    /// The print-family builtins' pre-charge (round 2): the produced
+    /// buffer is a retainable `Value`, so its ceiling is charged BEFORE
+    /// formatting. Factor 4 over the `%v` ceiling absorbs the widest
+    /// uncharged verb expansions (`%x` doubles, `%d` over `[]byte` is
+    /// ≤4×; `%q`'s 10× and padding widths/precisions charge themselves
+    /// inside the formatter).
+    fn charge_print_family(&self, args: &[Value<'c>], format_len: usize) -> Result<(), String> {
+        let mut total = 64usize.saturating_add(format_len);
+        for v in args {
+            total = total
+                .saturating_add(self.value_output_ceiling(v).saturating_mul(4))
+                .saturating_add(64);
+        }
+        self.input.budget.charge(total)
+    }
+
+    /// html/js/urlquery pre-charge: the `evalArgs` copy (≤1×) plus the
+    /// escaper's worst expansion (html ≤6×, js ≤6×, urlquery ≤3×).
+    fn charge_escaper(&self, args: &[Value<'c>], factor: usize) -> Result<(), String> {
+        let mut total = 64usize;
+        for v in args {
+            total = total
+                .saturating_add(self.value_output_ceiling(v).saturating_mul(factor))
+                .saturating_add(64);
+        }
+        self.input.budget.charge(total)
+    }
+
     fn print_value_go(&mut self, val: &Value<'c>) -> Result<(), ExecError> {
+        // Charge the output ceiling BEFORE writing (review round 2,
+        // finding 1: arbitrary `Value` output was written first and
+        // charged after) — a string's ceiling is exactly its length,
+        // so the repeat boundary gate (build charge + print charge ==
+        // 2×len) is unchanged. Cumulative per-iteration printing
+        // (`range N → {{.x}}`) stays bounded as before.
+        if self
+            .input
+            .budget
+            .charge(self.value_output_ceiling(val))
+            .is_err()
+        {
+            return Err(self.budget_error());
+        }
         // Borrow-split: the print environment reads only `input`, so the
         // renderer can write straight into `out` (no temp buffer — the
         // per-row allocation gates count on it).
-        let before = self.out.len();
         let env = InputPrintEnv { input: self.input };
         gofmt::write_template_value(self.out, val, &env);
         if self.input.budget.breached() {
-            return Err(self.budget_error());
-        }
-        // Account the emitted bytes so per-iteration printing (`range N
-        // → {{.x}}`) is cumulatively bounded. Every single write above
-        // is itself charged (padding/precision) or bounded by an
-        // already-charged/stored value, so the one-step overshoot past
-        // the budget is bounded and the peak stays ≤ ~2× the budget —
-        // the loop-amplification closure (review round 1).
-        let delta = self.out.len().saturating_sub(before);
-        if self.input.budget.charge(delta).is_err() {
             return Err(self.budget_error());
         }
         Ok(())
@@ -1408,36 +1517,42 @@ fn builtin_sig(name: &str) -> Option<&'static BuiltinDef> {
             other => Err(format!("non-function of type {}", other.type_name())),
         }),
         "print" => def!(&[], Some(Any), |st, a| {
+            st.charge_print_family(a, 0)?;
             let mut buf = Vec::new();
             let env = InputPrintEnv { input: st.input };
             gofmt::sprint(&mut buf, a, &env);
             Ok(Value::Str(Cow::Owned(buf)))
         }),
         "println" => def!(&[], Some(Any), |st, a| {
+            st.charge_print_family(a, 0)?;
             let mut buf = Vec::new();
             let env = InputPrintEnv { input: st.input };
             gofmt::sprintln(&mut buf, a, &env);
             Ok(Value::Str(Cow::Owned(buf)))
         }),
         "printf" => def!(&[Str], Some(Any), |st, a| {
-            let mut buf = Vec::new();
-            let env = InputPrintEnv { input: st.input };
             let format = match &a[0] {
                 Value::Str(s) => s.clone().into_owned(),
                 _ => Vec::new(),
             };
+            st.charge_print_family(&a[1..], format.len())?;
+            let mut buf = Vec::new();
+            let env = InputPrintEnv { input: st.input };
             gofmt::sprintf(&mut buf, &format, &a[1..], &env);
             Ok(Value::Str(Cow::Owned(buf)))
         }),
         "html" => def!(&[], Some(Any), |st, a| {
+            st.charge_escaper(a, 7)?;
             let text = eval_args_text(st, a);
             Ok(Value::Str(Cow::Owned(html_escape(&text))))
         }),
         "js" => def!(&[], Some(Any), |st, a| {
+            st.charge_escaper(a, 7)?;
             let text = eval_args_text(st, a);
             Ok(Value::Str(Cow::Owned(js_escape(&text))))
         }),
         "urlquery" => def!(&[], Some(Any), |st, a| {
+            st.charge_escaper(a, 4)?;
             let text = eval_args_text(st, a);
             Ok(Value::Str(Cow::Owned(url_query_escape(&text))))
         }),
@@ -1606,7 +1721,7 @@ fn builtin_index<'s, 'c, 'a>(
 }
 
 fn builtin_slice<'s, 'c, 'a>(
-    _st: &mut State<'s, 'c, 'a>,
+    st: &mut State<'s, 'c, 'a>,
     args: &[Value<'c>],
 ) -> Result<Value<'c>, String> {
     let item = &args[0];
@@ -1646,6 +1761,17 @@ fn builtin_slice<'s, 'c, 'a>(
     if indexes.len() == 3 && idx[1] > idx[2] {
         return Err(format!("invalid slice index: {} > {}", idx[1], idx[2]));
     }
+    // The subslice copy is a retainable production — charged (round 2;
+    // list elements are deep-cloned for owned strings, so the element
+    // ceilings are summed).
+    let copy_cost = match item {
+        Value::Str(_) | Value::Bytes(_) => idx[1] - idx[0],
+        Value::List(l) => l[idx[0]..idx[1]].iter().fold(64usize, |acc, v| {
+            acc.saturating_add(v.charge_ceiling()).saturating_add(16)
+        }),
+        _ => 0,
+    };
+    st.input.budget.charge(copy_cost)?;
     Ok(match item {
         Value::Str(s) => Value::Str(Cow::Owned(s[idx[0]..idx[1]].to_vec())),
         Value::Bytes(b) => Value::Bytes(Cow::Owned(b[idx[0]..idx[1]].to_vec())),

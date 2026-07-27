@@ -21,7 +21,12 @@ pub enum MethodImpl {
     Call(MethodFn),
 }
 
-pub type MethodFn = for<'a> fn(&Value<'a>, &[Value<'a>], &TemplateEnv) -> Result<Value<'a>, String>;
+pub type MethodFn = for<'a> fn(
+    &Value<'a>,
+    &[Value<'a>],
+    &TemplateEnv,
+    &super::RenderBudget,
+) -> Result<Value<'a>, String>;
 
 pub struct MethodSig {
     pub params: &'static [ParamTy],
@@ -100,6 +105,14 @@ fn arg_bytes(args: &[Value<'_>], i: usize) -> Vec<u8> {
     }
 }
 
+/// The size [`arg_bytes`] will copy — for charging BEFORE the copy.
+fn arg_bytes_len(args: &[Value<'_>], i: usize) -> usize {
+    match &args[i] {
+        Value::Bytes(b) => b.len(),
+        _ => 0,
+    }
+}
+
 fn bytes_val<'a>(b: Vec<u8>) -> Value<'a> {
     Value::Bytes(Cow::Owned(b))
 }
@@ -141,11 +154,11 @@ fn time_method(name: &str) -> Option<&'static MethodSig> {
         // The 38 callable methods.
         "Add" => sig!(
             &[Dur],
-            MethodImpl::Call(|r, a, _e| Ok(Value::Time(recv_time(r).add(arg_dur(a, 0)))))
+            MethodImpl::Call(|r, a, _e, _b| Ok(Value::Time(recv_time(r).add(arg_dur(a, 0)))))
         ),
         "AddDate" => sig!(
             &[Int, Int, Int],
-            MethodImpl::Call(|r, a, e| Ok(Value::Time(recv_time(r).add_date(
+            MethodImpl::Call(|r, a, e, _b| Ok(Value::Time(recv_time(r).add_date(
                 e,
                 arg_int(a, 0),
                 arg_int(a, 1),
@@ -154,11 +167,14 @@ fn time_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "After" => sig!(
             &[Time],
-            MethodImpl::Call(|r, a, _e| Ok(Value::Bool(recv_time(r).after(arg_time(a, 0)))))
+            MethodImpl::Call(|r, a, _e, _b| Ok(Value::Bool(recv_time(r).after(arg_time(a, 0)))))
         ),
         "AppendBinary" => sig!(
             &[BytesTy],
-            MethodImpl::Call(|r, a, e| {
+            MethodImpl::Call(|r, a, e, budget| {
+                // The argument copy grows per call in an assignment
+                // chain — charged (round 2).
+                budget.charge(arg_bytes_len(a, 0) + 64)?;
                 let mut b = arg_bytes(a, 0);
                 b.extend_from_slice(&marshal_binary(recv_time(r), e)?);
                 Ok(bytes_val(b))
@@ -166,19 +182,26 @@ fn time_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "AppendFormat" => sig!(
             &[BytesTy, Str],
-            MethodImpl::Call(|r, a, e| {
-                let mut b = arg_bytes(a, 0);
+            MethodImpl::Call(|r, a, e, budget| {
+                // Charged: the []byte argument copy (an `$b =
+                // $t.AppendFormat $b <l>` chain GROWS per call) plus
+                // the ≤10× layout expansion.
                 let layout = match &a[1] {
                     Value::Str(s) => s.clone().into_owned(),
                     _ => Vec::new(),
                 };
+                budget.charge(
+                    arg_bytes_len(a, 0).saturating_add(10usize.saturating_mul(layout.len())) + 64,
+                )?;
+                let mut b = arg_bytes(a, 0);
                 b.extend_from_slice(&super::golayout::format_layout(recv_time(r), &layout, e));
                 Ok(bytes_val(b))
             })
         ),
         "AppendText" => sig!(
             &[BytesTy],
-            MethodImpl::Call(|r, a, e| {
+            MethodImpl::Call(|r, a, e, budget| {
+                budget.charge(arg_bytes_len(a, 0) + 64)?;
                 let mut b = arg_bytes(a, 0);
                 b.extend_from_slice(&marshal_text(recv_time(r), e)?);
                 Ok(bytes_val(b))
@@ -186,76 +209,80 @@ fn time_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "Before" => sig!(
             &[Time],
-            MethodImpl::Call(|r, a, _e| Ok(Value::Bool(recv_time(r).before(arg_time(a, 0)))))
+            MethodImpl::Call(|r, a, _e, _b| Ok(Value::Bool(recv_time(r).before(arg_time(a, 0)))))
         ),
         "Compare" => sig!(
             &[Time],
-            MethodImpl::Call(|r, a, _e| Ok(Value::Int(
+            MethodImpl::Call(|r, a, _e, _b| Ok(Value::Int(
                 recv_time(r).compare(arg_time(a, 0)),
                 IntKind::Int
             )))
         ),
         "Day" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Int(recv_time(r).date(e).2, IntKind::Int)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Int(recv_time(r).date(e).2, IntKind::Int)))
         ),
         "Equal" => sig!(
             &[Time],
-            MethodImpl::Call(|r, a, _e| Ok(Value::Bool(recv_time(r).equal(arg_time(a, 0)))))
+            MethodImpl::Call(|r, a, _e, _b| Ok(Value::Bool(recv_time(r).equal(arg_time(a, 0)))))
         ),
         "Format" => sig!(
             &[Str],
-            MethodImpl::Call(|r, a, e| {
+            MethodImpl::Call(|r, a, e, b| {
+                // The layout is a template value expanding ≤ ~10×
+                // (review round 2: `$a = $t.Format $a` compounds
+                // without a charge).
                 let layout = match &a[0] {
                     Value::Str(s) => s.clone().into_owned(),
                     _ => Vec::new(),
                 };
+                b.charge(10usize.saturating_mul(layout.len()) + 64)?;
                 let out = super::golayout::format_layout(recv_time(r), &layout, e);
                 Ok(Value::Str(Cow::Owned(out)))
             })
         ),
         "GoString" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(str_val(recv_time(r).go_string(e))))
+            MethodImpl::Call(|r, _a, e, _b| Ok(str_val(recv_time(r).go_string(e))))
         ),
         "GobEncode" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(bytes_val(marshal_binary(recv_time(r), e)?)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(bytes_val(marshal_binary(recv_time(r), e)?)))
         ),
         "Hour" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Int(recv_time(r).clock(e).0, IntKind::Int)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Int(recv_time(r).clock(e).0, IntKind::Int)))
         ),
         "In" => sig!(
             &[Loc],
-            MethodImpl::Call(|r, a, _e| match &a[0] {
+            MethodImpl::Call(|r, a, _e, _b| match &a[0] {
                 Value::Location(loc) => Ok(Value::Time(recv_time(r).in_loc(loc.clone()))),
                 _ => Err("time: missing Location in call to Time.In".to_string()),
             })
         ),
         "IsDST" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Bool(timefns::is_dst(recv_time(r), e))))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Bool(timefns::is_dst(recv_time(r), e))))
         ),
         "IsZero" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::Bool(recv_time(r).is_zero())))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::Bool(recv_time(r).is_zero())))
         ),
         "Local" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::Time(recv_time(r).local())))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::Time(recv_time(r).local())))
         ),
         "Location" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::Location(recv_time(r).loc.clone())))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::Location(recv_time(r).loc.clone())))
         ),
         "MarshalBinary" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(bytes_val(marshal_binary(recv_time(r), e)?)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(bytes_val(marshal_binary(recv_time(r), e)?)))
         ),
         "MarshalJSON" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| {
+            MethodImpl::Call(|r, _a, e, _b| {
                 let body = strict_rfc3339(recv_time(r), e)
                     .map_err(|err| format!("Time.MarshalJSON: {err}"))?;
                 let mut out = vec![b'"'];
@@ -266,71 +293,74 @@ fn time_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "MarshalText" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(bytes_val(marshal_text(recv_time(r), e)?)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(bytes_val(marshal_text(recv_time(r), e)?)))
         ),
         "Minute" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Int(recv_time(r).clock(e).1, IntKind::Int)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Int(recv_time(r).clock(e).1, IntKind::Int)))
         ),
         "Month" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Month(recv_time(r).date(e).1)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Month(recv_time(r).date(e).1)))
         ),
         "Nanosecond" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::Int(recv_time(r).nsec as i64, IntKind::Int)))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::Int(
+                recv_time(r).nsec as i64,
+                IntKind::Int
+            )))
         ),
         "Round" => sig!(
             &[Dur],
-            MethodImpl::Call(|r, a, _e| Ok(Value::Time(recv_time(r).round(arg_dur(a, 0)))))
+            MethodImpl::Call(|r, a, _e, _b| Ok(Value::Time(recv_time(r).round(arg_dur(a, 0)))))
         ),
         "Second" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Int(recv_time(r).clock(e).2, IntKind::Int)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Int(recv_time(r).clock(e).2, IntKind::Int)))
         ),
         "String" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(str_val(recv_time(r).string(e))))
+            MethodImpl::Call(|r, _a, e, _b| Ok(str_val(recv_time(r).string(e))))
         ),
         "Sub" => sig!(
             &[Time],
-            MethodImpl::Call(|r, a, _e| Ok(Value::Duration(recv_time(r).sub(arg_time(a, 0)))))
+            MethodImpl::Call(|r, a, _e, _b| Ok(Value::Duration(recv_time(r).sub(arg_time(a, 0)))))
         ),
         "Truncate" => sig!(
             &[Dur],
-            MethodImpl::Call(|r, a, _e| Ok(Value::Time(recv_time(r).truncate(arg_dur(a, 0)))))
+            MethodImpl::Call(|r, a, _e, _b| Ok(Value::Time(recv_time(r).truncate(arg_dur(a, 0)))))
         ),
         "UTC" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::Time(recv_time(r).utc())))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::Time(recv_time(r).utc())))
         ),
         "Unix" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::int64(recv_time(r).unix())))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::int64(recv_time(r).unix())))
         ),
         "UnixMicro" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::int64(recv_time(r).unix_micro())))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::int64(recv_time(r).unix_micro())))
         ),
         "UnixMilli" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::int64(recv_time(r).unix_milli())))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::int64(recv_time(r).unix_milli())))
         ),
         "UnixNano" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::int64(recv_time(r).unix_nano())))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::int64(recv_time(r).unix_nano())))
         ),
         "Weekday" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Weekday(recv_time(r).weekday(e))))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Weekday(recv_time(r).weekday(e))))
         ),
         "Year" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Int(recv_time(r).date(e).0, IntKind::Int)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Int(recv_time(r).date(e).0, IntKind::Int)))
         ),
         "YearDay" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e| Ok(Value::Int(recv_time(r).year_day(e), IntKind::Int)))
+            MethodImpl::Call(|r, _a, e, _b| Ok(Value::Int(recv_time(r).year_day(e), IntKind::Int)))
         ),
         _ => None,
     }
@@ -341,23 +371,23 @@ fn duration_method(name: &str) -> Option<&'static MethodSig> {
     match name {
         "String" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(str_val(timefns::duration_string(recv_dur(r)))))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(str_val(timefns::duration_string(recv_dur(r)))))
         ),
         "Nanoseconds" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::int64(recv_dur(r))))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::int64(recv_dur(r))))
         ),
         "Microseconds" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::int64(recv_dur(r) / 1_000)))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::int64(recv_dur(r) / 1_000)))
         ),
         "Milliseconds" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| Ok(Value::int64(recv_dur(r) / 1_000_000)))
+            MethodImpl::Call(|r, _a, _e, _b| Ok(Value::int64(recv_dur(r) / 1_000_000)))
         ),
         "Seconds" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| {
+            MethodImpl::Call(|r, _a, _e, _b| {
                 let d = recv_dur(r);
                 let sec = d / 1_000_000_000;
                 let nsec = d % 1_000_000_000;
@@ -366,7 +396,7 @@ fn duration_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "Minutes" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| {
+            MethodImpl::Call(|r, _a, _e, _b| {
                 let d = recv_dur(r);
                 let min = d / 60_000_000_000;
                 let nsec = d % 60_000_000_000;
@@ -375,7 +405,7 @@ fn duration_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "Hours" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| {
+            MethodImpl::Call(|r, _a, _e, _b| {
                 let d = recv_dur(r);
                 let hour = d / 3_600_000_000_000;
                 let nsec = d % 3_600_000_000_000;
@@ -386,21 +416,21 @@ fn duration_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "Truncate" => sig!(
             &[Dur],
-            MethodImpl::Call(|r, a, _e| {
+            MethodImpl::Call(|r, a, _e, _b| {
                 let (d, m) = (recv_dur(r), arg_dur(a, 0));
                 Ok(Value::Duration(if m <= 0 { d } else { d - d % m }))
             })
         ),
         "Round" => sig!(
             &[Dur],
-            MethodImpl::Call(|r, a, _e| {
+            MethodImpl::Call(|r, a, _e, _b| {
                 let (d, m) = (recv_dur(r), arg_dur(a, 0));
                 Ok(Value::Duration(duration_round(d, m)))
             })
         ),
         "Abs" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e| {
+            MethodImpl::Call(|r, _a, _e, _b| {
                 let d = recv_dur(r);
                 Ok(Value::Duration(if d >= 0 {
                     d
@@ -448,6 +478,7 @@ fn named_int_string<'a>(
     receiver: &Value<'a>,
     _args: &[Value<'a>],
     _env: &TemplateEnv,
+    _budget: &super::RenderBudget,
 ) -> Result<Value<'a>, String> {
     Ok(match receiver {
         Value::Month(m) => str_val(timefns::month_string(*m)),
@@ -460,6 +491,7 @@ fn location_string<'a>(
     receiver: &Value<'a>,
     _args: &[Value<'a>],
     env: &TemplateEnv,
+    _budget: &super::RenderBudget,
 ) -> Result<Value<'a>, String> {
     match receiver {
         Value::Location(loc) => Ok(str_val(timefns::location_name(loc, env))),

@@ -13,6 +13,19 @@
 
 use super::lex::{Item, ItemType, Lexer};
 
+/// One enforced structural-depth limit across BOTH parser recursion
+/// sites: nested controls (`if`/`with`/`range`/`block` bodies recurse
+/// through `item_list`) and parenthesized pipelines (`term` recurses
+/// through `pipeline`). Go caps only the paren site, at 10000
+/// (`parse.go maxStackDepth`, error `max expression depth exceeded`),
+/// and leaves control nesting to growable goroutine stacks; a fixed
+/// 2 MiB Rust stack cannot honour either (measured on this build:
+/// ~170 nested controls ≈ 12 KiB/level or ~400 nested parens overflow
+/// a 2 MiB thread — a live SIGABRT, the #272 class). 40 is a 4×
+/// margin on the worst (control) unit; the error text matches Go's
+/// paren-site wording. Ledgered (`template-parse-depth-cap`).
+const MAX_PARSE_DEPTH: usize = 40;
+
 /// A parse failure. `msg` is Go's inner text (`function "x" not
 /// defined`); `Display` (via [`super::TemplateCompileError`]) prepends
 /// `template: <name>:<line>: `.
@@ -316,6 +329,9 @@ pub struct Parser<'t> {
     defines: Vec<(String, List)>,
     /// The `{{block}}` counter is irrelevant; kept for parity docs.
     action_line: usize,
+    /// Structural recursion depth (controls + parens) — see
+    /// [`MAX_PARSE_DEPTH`].
+    depth: usize,
 }
 
 /// Result alias.
@@ -336,6 +352,7 @@ pub fn parse(
         funcs,
         defines: Vec::new(),
         action_line: 0,
+        depth: 0,
     };
     let root = p.parse_root()?;
     Ok(TreeSet {
@@ -537,10 +554,23 @@ impl<'t> Parser<'t> {
         }
     }
 
-    /// itemList: gathers nodes until `{{end}}` or `{{else}}`.
+    /// itemList: gathers nodes until `{{end}}` or `{{else}}`. Every
+    /// nested control body passes through here — the structural-depth
+    /// guard site for control nesting (see [`MAX_PARSE_DEPTH`]).
     fn item_list(&mut self) -> PResult<(List, Flow)> {
+        let first = self.peek_non_space();
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(self.errorf(first.line, "max expression depth exceeded".to_string()));
+        }
+        self.depth += 1;
+        let result = self.item_list_inner(first.pos);
+        self.depth -= 1;
+        result
+    }
+
+    fn item_list_inner(&mut self, pos: usize) -> PResult<(List, Flow)> {
         let mut list = List {
-            pos: self.peek_non_space().pos,
+            pos,
             nodes: Vec::new(),
         };
         loop {
@@ -990,10 +1020,19 @@ impl<'t> Parser<'t> {
                 }
             }
             ItemType::LeftParen => {
-                let pipe = self.pipeline("parenthesized pipeline", ItemType::RightParen)?;
+                // Go's own guard site (`parse.go` itemLeftParen,
+                // maxStackDepth) — same error text, our measured cap.
+                if self.depth >= MAX_PARSE_DEPTH {
+                    return Err(
+                        self.errorf(token.line, "max expression depth exceeded".to_string())
+                    );
+                }
+                self.depth += 1;
+                let result = self.pipeline("parenthesized pipeline", ItemType::RightParen);
+                self.depth -= 1;
                 Arg::Pipe {
                     pos: token.pos,
-                    pipe,
+                    pipe: result?,
                 }
             }
             ItemType::String | ItemType::RawString => {

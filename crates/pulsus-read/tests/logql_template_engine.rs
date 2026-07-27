@@ -794,6 +794,166 @@ fn a_budget_breach_surfaces_as_the_bounded_query_too_broad_422_class() {
 }
 
 #[test]
+fn a_no_output_repeated_intermediate_breaches_the_budget() {
+    // Review round 2, the fifth amplification class: `__line__` inside a
+    // `range` body that emits NO text — the reference renders "" after
+    // 200 MB of per-iteration copies; the per-call charge turns it into
+    // the clean bounded abort. (Red pre-fix: rendered successfully.)
+    let pipeline =
+        compiled(r#"{a="b"} | line_format "{{ range 200000 }}{{ $x := __line__ }}{{ end }}""#);
+    let line = "x".repeat(1024);
+    let base = base();
+    pipeline
+        .run(&line, &base, 0)
+        .expect_err("uncharged repeated intermediate must breach");
+    // Green control: bounded repetition still renders.
+    let pipeline =
+        compiled(r#"{a="b"} | line_format "s{{ range 3 }}{{ $x := __line__ }}{{ end }}e""#);
+    let out = pipeline
+        .run(&line, &base, 0)
+        .expect("no budget breach")
+        .expect("kept");
+    assert_eq!(out.line, "se");
+}
+
+#[test]
+fn a_compounding_variable_reassignment_breaches_the_budget() {
+    // The COMPOUNDING member of the fifth class: `$a = printf "%s%s" $a
+    // $a` doubles a variable per iteration with no output — uncharged
+    // this is a 2^40 KiB OOM; the printf pre-charge (4× value ceilings)
+    // breaches after ~13 doublings with peak allocation ≤ the budget.
+    let pipeline = compiled(
+        r#"{a="b"} | line_format "{{ $a := __line__ }}{{ range 40 }}{{ $a = printf \"%s%s\" $a $a }}{{ end }}ok""#,
+    );
+    let line = "x".repeat(1024);
+    let base = base();
+    pipeline
+        .run(&line, &base, 0)
+        .expect_err("doubling reassignment must breach, never OOM");
+    // Green control: three doublings render (2 → 16 bytes).
+    let pipeline = compiled(
+        r#"{a="b"} | line_format "{{ $a := __line__ }}{{ range 3 }}{{ $a = printf \"%s%s\" $a $a }}{{ end }}{{ len $a }}""#,
+    );
+    let out = pipeline
+        .run("ab", &base, 0)
+        .expect("no budget breach")
+        .expect("kept");
+    assert_eq!(out.line, "16");
+}
+
+#[test]
+fn from_json_lone_surrogate_before_another_escape_leaves_the_escape_alone() {
+    // Container-captured (grafana/loki:3.7.4): {"x":"\ud800\n"} → "�\n"
+    // — the lone high surrogate becomes U+FFFD and the FOLLOWING \n
+    // escape is processed normally (not consumed by the pair probe).
+    // Lives here because the corpus line format cannot hold a newline.
+    assert_eq!(
+        render(r#"{{ (fromJson "{\"x\":\"\\ud800\\n\"}").x }}"#, 0).expect("renders"),
+        "\u{FFFD}\n"
+    );
+    // And the two-invalid-bytes length capture: each byte is one U+FFFD
+    // (len 6), never a single merged replacement.
+    assert_eq!(
+        render(r#"{{ len ((fromJson "{\"x\":\"\xff\xfe\"}").x) }}"#, 0).expect("renders"),
+        "6"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Structural depth (issue #230 review round 2): parse-time cap over
+// BOTH recursion classes, and the unified evaluator counter — a crash
+// is never acceptable (the #272 class; pre-fix, 5000 nested ifs
+// SIGABRTed a 2 MiB thread).
+// ---------------------------------------------------------------------
+
+#[test]
+fn structural_nesting_is_capped_at_parse_time_never_a_stack_overflow() {
+    let nested_ifs = |n: usize| {
+        format!(
+            r#"{{a="b"}} | line_format `{}X{}`"#,
+            "{{if \"x\"}}".repeat(n),
+            "{{end}}".repeat(n)
+        )
+    };
+    let nested_parens = |n: usize| {
+        format!(
+            r#"{{a="b"}} | line_format `{{{{ {}"y"{} }}}}`"#,
+            "(".repeat(n),
+            ")".repeat(n)
+        )
+    };
+    // Everything on a 2 MiB thread — the smallest stack the render runs
+    // on (tokio workers); width-independent.
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let base = base();
+            // AT the cap (40): parses and renders.
+            let pipeline = compiled(&nested_ifs(40));
+            let out = pipeline
+                .run("line", &base, 0)
+                .expect("no budget breach")
+                .expect("kept");
+            assert_eq!(out.line, "X");
+            let pipeline = compiled(&nested_parens(40));
+            let out = pipeline
+                .run("line", &base, 0)
+                .expect("no budget breach")
+                .expect("kept");
+            assert_eq!(out.line, "y");
+            // One past the cap: the clean compile rejection with Go's
+            // paren-site wording (the reference accepts these depths —
+            // its goroutine stacks grow; ledgered
+            // `template-parse-depth-cap`).
+            for query in [nested_ifs(41), nested_parens(41)] {
+                let err = compile_err(&query);
+                assert!(
+                    err.to_string().contains("max expression depth exceeded"),
+                    "{err}"
+                );
+            }
+            // The pre-fix crash shapes: 5000 deep of each class is a
+            // clean error, not a SIGABRT (this thread would die first).
+            for query in [nested_ifs(5000), nested_parens(5000)] {
+                let err = compile_err(&query);
+                assert!(
+                    err.to_string().contains("max expression depth exceeded"),
+                    "{err}"
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("no stack overflow");
+}
+
+#[test]
+fn combined_define_recursion_and_nesting_is_a_bounded_per_line_error() {
+    // A recursive define whose body nests 30 ifs: pre-fix only the
+    // {{template}} hop counted, so 250 invocations × 30 uncounted
+    // if-levels overflowed the stack. The UNIFIED counter charges both,
+    // so the render aborts with the depth error on a 2 MiB thread.
+    let n = 30;
+    let tmpl = format!(
+        "{{{{ define \"R\" }}}}{}{{{{ template \"R\" }}}}{}{{{{ end }}}}{{{{ template \"R\" }}}}",
+        "{{if \"x\"}}".repeat(n),
+        "{{end}}".repeat(n)
+    );
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let err = render(&tmpl, 0).expect_err("must exceed the unified depth cap");
+            assert!(
+                err.contains("exceeded maximum template depth (250)"),
+                "{err}"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("no stack overflow");
+}
+
+#[test]
 fn every_caller_amplified_allocation_path_charges_the_budget() {
     // One eval per newly-charged path (issue #230 review round 1: the
     // three misses + the loop-amplification class). Each `expect_err`

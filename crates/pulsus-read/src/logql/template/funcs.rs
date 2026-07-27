@@ -442,35 +442,43 @@ pub static REGISTRY: [FuncDef; 67] = [
             n,
         )?))
     }),
-    f!("Trim", [Str, Str], None, |_c, a| Ok(str_val(go_trim(
+    f!("Trim", [Str, Str], None, |c, a| Ok(str_val(go_trim(
+        c,
         bytes_of(&a[0]),
         bytes_of(&a[1]),
         true,
         true
-    )))),
-    f!("TrimLeft", [Str, Str], None, |_c, a| Ok(str_val(go_trim(
+    )?))),
+    f!("TrimLeft", [Str, Str], None, |c, a| Ok(str_val(go_trim(
+        c,
         bytes_of(&a[0]),
         bytes_of(&a[1]),
         true,
         false
-    )))),
-    f!("TrimRight", [Str, Str], None, |_c, a| Ok(str_val(go_trim(
+    )?))),
+    f!("TrimRight", [Str, Str], None, |c, a| Ok(str_val(go_trim(
+        c,
         bytes_of(&a[0]),
         bytes_of(&a[1]),
         false,
         true
-    )))),
-    f!("TrimPrefix", [Str, Str], None, |_c, a| {
+    )?))),
+    f!("TrimPrefix", [Str, Str], None, |c, a| {
         let (s, p) = (bytes_of(&a[0]), bytes_of(&a[1]));
-        Ok(str_val(s.strip_prefix(p).unwrap_or(s).to_vec()))
+        let out = s.strip_prefix(p).unwrap_or(s);
+        c.charge(out.len())?;
+        Ok(str_val(out.to_vec()))
     }),
-    f!("TrimSuffix", [Str, Str], None, |_c, a| {
+    f!("TrimSuffix", [Str, Str], None, |c, a| {
         let (s, p) = (bytes_of(&a[0]), bytes_of(&a[1]));
-        Ok(str_val(s.strip_suffix(p).unwrap_or(s).to_vec()))
+        let out = s.strip_suffix(p).unwrap_or(s);
+        c.charge(out.len())?;
+        Ok(str_val(out.to_vec()))
     }),
-    f!("TrimSpace", [Str], None, |_c, a| Ok(str_val(
-        go_trim_space(bytes_of(&a[0]))
-    ))),
+    f!("TrimSpace", [Str], None, |c, a| Ok(str_val(go_trim_space(
+        c,
+        bytes_of(&a[0])
+    )?))),
     f!("regexReplaceAll", [Str, Str, Str], None, |c, a| {
         let re = compile_regex(c, bytes_of(&a[0]))?;
         let s = lossy(bytes_of(&a[1])).into_owned();
@@ -501,9 +509,9 @@ pub static REGISTRY: [FuncDef; 67] = [
         let s = lossy(bytes_of(&a[1])).into_owned();
         Ok(Value::int(re.find_iter(&s).count() as i64))
     }),
-    f!("urldecode", [Str], None, |_c, a| {
+    f!("urldecode", [Str], None, |c, a| {
         let s = bytes_of(&a[0]);
-        query_unescape(s).map(str_val)
+        query_unescape(c, s).map(str_val)
     }),
     f!("urlencode", [Str], None, |c, a| {
         c.charge(3 * bytes_of(&a[0]).len() + 4)?;
@@ -555,7 +563,13 @@ pub static REGISTRY: [FuncDef; 67] = [
         false,
     )?))),
     // -- injected per line (2) ------------------------------------------
-    f!("__line__", [], None, |c, _a| Ok(str_val(c.line.to_vec()))),
+    f!("__line__", [], None, |c, _a| {
+        // One copy of the stored line — but REPEATABLE inside a
+        // `range`/variable-only body (review round 2, the fifth
+        // amplification class): charged like every retainable output.
+        c.charge(c.line.len())?;
+        Ok(str_val(c.line.to_vec()))
+    }),
     f!("__timestamp__", [], None, |c, _a| Ok(Value::Time(
         GoTime::from_unix_ns(c.ts_ns)
     ))),
@@ -567,13 +581,15 @@ pub static REGISTRY: [FuncDef; 67] = [
             base64::engine::general_purpose::STANDARD.encode(bytes_of(&a[0])),
         ))
     }),
-    f!("b64dec", [Str], None, |_c, a| Ok(
-        match b64_decode_go(bytes_of(&a[0])) {
+    f!("b64dec", [Str], None, |c, a| {
+        // Output ≤ 3/4 input, charged before the decode buffer.
+        c.charge(bytes_of(&a[0]).len() / 4 * 3 + 8)?;
+        Ok(match b64_decode_go(bytes_of(&a[0])) {
             Ok(data) => str_val(data),
             // sprig returns err.Error() as the VALUE.
             Err(msg) => string_val(msg),
-        }
-    )),
+        })
+    }),
     f!("lower", [Str], None, |c, a| {
         // Case mapping can EXPAND (≤4 bytes out per input byte).
         c.charge(4 * bytes_of(&a[0]).len() + 4)?;
@@ -587,20 +603,22 @@ pub static REGISTRY: [FuncDef; 67] = [
         c.charge(4 * bytes_of(&a[0]).len() + 4)?;
         Ok(str_val(go_title(bytes_of(&a[0]))))
     }),
-    f!("trunc", [Int, Str], None, |_c, a| {
+    f!("trunc", [Int, Str], None, |c, a| {
         // sprig trunc: BYTE slicing (strings.go:189-197).
-        let c = int_of(&a[0]);
+        let n = int_of(&a[0]);
         let s = bytes_of(&a[1]);
         let len = s.len() as i64;
-        Ok(str_val(if c < 0 && len + c > 0 {
-            s[(len + c) as usize..].to_vec()
-        } else if c >= 0 && len > c {
-            s[..c as usize].to_vec()
+        let out = if n < 0 && len + n > 0 {
+            &s[(len + n) as usize..]
+        } else if n >= 0 && len > n {
+            &s[..n as usize]
         } else {
-            s.to_vec()
-        }))
+            s
+        };
+        c.charge(out.len())?;
+        Ok(str_val(out.to_vec()))
     }),
-    f!("substr", [Int, Int, Str], None, |_c, a| {
+    f!("substr", [Int, Int, Str], None, |c, a| {
         // sprig substring: BYTE slicing with Go's exact panic surfaces
         // (`sprig/strings.go:228-236` + the runtime boundsError texts).
         let start = int_of(&a[0]);
@@ -617,6 +635,7 @@ pub static REGISTRY: [FuncDef; 67] = [
                     "runtime error: slice bounds out of range [:{end}] with length {len}"
                 ));
             }
+            c.charge(end as usize)?;
             return Ok(str_val(s[..end as usize].to_vec()));
         }
         if end < 0 || end > len {
@@ -626,6 +645,7 @@ pub static REGISTRY: [FuncDef; 67] = [
                     "runtime error: slice bounds out of range [{start}:{len}]"
                 ));
             }
+            c.charge(s.len() - start as usize)?;
             return Ok(str_val(s[start as usize..].to_vec()));
         }
         if start > end {
@@ -633,6 +653,7 @@ pub static REGISTRY: [FuncDef; 67] = [
                 "runtime error: slice bounds out of range [{start}:{end}]"
             ));
         }
+        c.charge((end - start) as usize)?;
         Ok(str_val(s[start as usize..end as usize].to_vec()))
     }),
     f!("contains", [Str, Str], None, |_c, a| {
@@ -673,22 +694,28 @@ pub static REGISTRY: [FuncDef; 67] = [
         c.charge(total.min(u64::MAX as u128) as usize)?;
         Ok(str_val(s.repeat(count as usize)))
     }),
-    f!("trim", [Str], None, |_c, a| Ok(str_val(go_trim_space(
+    f!("trim", [Str], None, |c, a| Ok(str_val(go_trim_space(
+        c,
         bytes_of(&a[0])
-    )))),
-    f!("trimAll", [Str, Str], None, |_c, a| Ok(str_val(go_trim(
+    )?))),
+    f!("trimAll", [Str, Str], None, |c, a| Ok(str_val(go_trim(
+        c,
         bytes_of(&a[1]),
         bytes_of(&a[0]),
         true,
         true,
-    )))),
-    f!("trimSuffix", [Str, Str], None, |_c, a| {
+    )?))),
+    f!("trimSuffix", [Str, Str], None, |c, a| {
         let (p, s) = (bytes_of(&a[0]), bytes_of(&a[1]));
-        Ok(str_val(s.strip_suffix(p).unwrap_or(s).to_vec()))
+        let out = s.strip_suffix(p).unwrap_or(s);
+        c.charge(out.len())?;
+        Ok(str_val(out.to_vec()))
     }),
-    f!("trimPrefix", [Str, Str], None, |_c, a| {
+    f!("trimPrefix", [Str, Str], None, |c, a| {
         let (p, s) = (bytes_of(&a[0]), bytes_of(&a[1]));
-        Ok(str_val(s.strip_prefix(p).unwrap_or(s).to_vec()))
+        let out = s.strip_prefix(p).unwrap_or(s);
+        c.charge(out.len())?;
+        Ok(str_val(out.to_vec()))
     }),
     f!("int", [Any], None, |_c, a| Ok(Value::Int(
         cast_to_int(&a[0]),
@@ -812,16 +839,15 @@ pub static REGISTRY: [FuncDef; 67] = [
         };
         Ok(Value::Float(rounded / pow))
     }),
-    f!("fromJson", [Str], None, |c, a| {
-        // The parsed tree multiplies input bytes by a structural
-        // constant: worst density is one element per two input bytes
-        // ("[1,1,…"), each costing ≤64 bytes across the serde tree and
-        // the converted Value tree — a ≤32× ceiling, charged up front.
-        c.charge(32usize.saturating_mul(bytes_of(&a[0]).len()) + 64)?;
-        Ok(from_json(bytes_of(&a[0])))
-    }),
+    f!("fromJson", [Str], None, |c, a| from_json(
+        c,
+        bytes_of(&a[0])
+    )),
     f!("date", [Str, Any], None, |c, a| {
-        // sprig dateInZone(fmt, date, "Local").
+        // sprig dateInZone(fmt, date, "Local"). The layout is a
+        // template value and expands ≤ ~10× (longest token: a month
+        // name for a 3-byte "Jan") — charged before formatting.
+        c.charge(10usize.saturating_mul(bytes_of(&a[0]).len()) + 64)?;
         let t = coerce_sprig_date(&a[1], c.env());
         let out = super::golayout::format_layout(&t.in_loc(GoLoc::Local), bytes_of(&a[0]), c.env());
         Ok(str_val(out))
@@ -840,13 +866,18 @@ pub static REGISTRY: [FuncDef; 67] = [
     f!("unixEpoch", [Time], None, |_c, a| Ok(string_val(
         time_arg(a, 0).unix().to_string()
     ))),
-    f!("default", [Any], Some(Any), |_c, a| {
+    f!("default", [Any], Some(Any), |c, a| {
         // dfault(d, given...): d when given is empty or given[0] empty.
+        // The winner is CLONED into the result (deep for owned
+        // strings) — a retainable copy, charged like every production.
         let given = &a[1..];
-        if given.is_empty() || sprig_empty(&given[0]) {
-            return Ok(a[0].clone());
-        }
-        Ok(given[0].clone())
+        let winner = if given.is_empty() || sprig_empty(&given[0]) {
+            &a[0]
+        } else {
+            &given[0]
+        };
+        c.charge(winner.charge_ceiling())?;
+        Ok(winner.clone())
     }),
 ];
 
@@ -951,7 +982,13 @@ fn cutset_contains(cutset: &[u8], r: char) -> bool {
     false
 }
 
-fn go_trim(s: &[u8], cutset: &[u8], left: bool, right: bool) -> Vec<u8> {
+fn go_trim(
+    ctx: &FuncCtx<'_, '_>,
+    s: &[u8],
+    cutset: &[u8],
+    left: bool,
+    right: bool,
+) -> Result<Vec<u8>, String> {
     let mut lo = 0;
     let mut hi = s.len();
     if left {
@@ -986,7 +1023,9 @@ fn go_trim(s: &[u8], cutset: &[u8], left: bool, right: bool) -> Vec<u8> {
             hi = start;
         }
     }
-    s[lo..hi].to_vec()
+    // The output copy is retainable — charged like every production.
+    ctx.charge(hi - lo)?;
+    Ok(s[lo..hi].to_vec())
 }
 
 fn is_go_space(r: char) -> bool {
@@ -996,7 +1035,7 @@ fn is_go_space(r: char) -> bool {
     ) || r.is_whitespace()
 }
 
-fn go_trim_space(s: &[u8]) -> Vec<u8> {
+fn go_trim_space(ctx: &FuncCtx<'_, '_>, s: &[u8]) -> Result<Vec<u8>, String> {
     let mut lo = 0;
     let mut hi = s.len();
     while lo < hi {
@@ -1017,7 +1056,8 @@ fn go_trim_space(s: &[u8]) -> Vec<u8> {
         }
         hi = start;
     }
-    s[lo..hi].to_vec()
+    ctx.charge(hi - lo)?;
+    Ok(s[lo..hi].to_vec())
 }
 
 /// `strings.Replace` — the exact stdlib algorithm (n < 0 = all; an
@@ -1254,7 +1294,8 @@ fn align(ctx: &FuncCtx<'_, '_>, count: i64, src: &[u8], left: bool) -> Result<Ve
         return Ok(out);
     }
     // Truncation: find the byte offset of the cut rune boundary by a
-    // second scan (output ≤ input — input-bounded, no charge needed).
+    // second scan; the output copy is retainable, so it is charged like
+    // every production (review round 2).
     let keep_from_start = if left { count } else { l - count };
     let mut i = 0;
     let mut seen: i64 = 0;
@@ -1264,8 +1305,10 @@ fn align(ctx: &FuncCtx<'_, '_>, count: i64, src: &[u8], left: bool) -> Result<Ve
         seen += 1;
     }
     Ok(if left {
+        ctx.charge(i)?;
         src[..i].to_vec()
     } else {
+        ctx.charge(src.len() - i)?;
         src[i..].to_vec()
     })
 }
@@ -1288,7 +1331,9 @@ fn unhex(c: u8) -> u8 {
 }
 
 /// `url.QueryUnescape`.
-fn query_unescape(s: &[u8]) -> Result<Vec<u8>, String> {
+fn query_unescape(ctx: &FuncCtx<'_, '_>, s: &[u8]) -> Result<Vec<u8>, String> {
+    // Output ≤ input, charged before the buffer (review round 2).
+    ctx.charge(s.len())?;
     let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
@@ -1483,15 +1528,121 @@ fn coerce_sprig_date(v: &Value<'_>, env: &TemplateEnv) -> GoTime {
 }
 
 /// `fromJson` — `encoding/json.Unmarshal` into `any` (errors swallowed:
-/// a failed parse yields nil).
-fn from_json<'a>(s: &[u8]) -> Value<'a> {
-    let Ok(text) = std::str::from_utf8(s) else {
-        return Value::Nil;
+/// a failed parse yields nil). Go's string decoding substitutes
+/// U+FFFD where serde is strict, so the input is sanitised first
+/// (see [`go_json_sanitize`]); the parse-tree ceiling is charged up
+/// front: worst structural density is one element per two input bytes
+/// ("[1,1,…"), each costing ≤64 bytes across the serde tree and the
+/// converted Value tree — a ≤32× ceiling, plus the ≤3× sanitised copy.
+fn from_json<'a>(ctx: &FuncCtx<'_, '_>, s: &[u8]) -> Result<Value<'a>, String> {
+    ctx.charge(35usize.saturating_mul(s.len()) + 64)?;
+    let sanitized = go_json_sanitize(s);
+    Ok(
+        match serde_json::from_slice::<serde_json::Value>(&sanitized) {
+            Ok(v) => json_to_value(v),
+            Err(_) => Value::Nil,
+        },
+    )
+}
+
+/// Reproduces the two places Go's `encoding/json` string decoding is
+/// LENIENT where serde is strict, both container-captured on the
+/// pinned reference (grafana/loki:3.7.4, go1.26.5):
+///
+/// - invalid UTF-8 **bytes** inside a JSON string become U+FFFD, one
+///   replacement per invalid byte (`unquoteBytes` advances by
+///   `utf8.DecodeRune`'s size-1 on error: `"a\xf0\x9fb"` → `a��b`,
+///   a truncated `"\xf0\x9f\x92"` tail → three U+FFFD);
+/// - a `\uXXXX` escape encoding a LONE surrogate becomes U+FFFD
+///   (`\ud800` → `�`, `\ud800\ud800` → `��`, `\ud800x` → `�x`); a
+///   valid surrogate PAIR is left for serde to combine (`😀`
+///   → 😀).
+///
+/// Outside string literals nothing is rewritten: a stray invalid byte
+/// is a syntax error for Go's scanner and for serde alike (→ nil).
+/// The rewrite is length-preserving-or-expanding by ≤3×, under
+/// `from_json`'s charge.
+fn go_json_sanitize(s: &[u8]) -> Cow<'_, [u8]> {
+    const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut in_string = false;
+    let mut i = 0;
+    let mut copied = 0; // bytes of `s` already flushed into `out`
+    let replace = |out: &mut Option<Vec<u8>>, copied: &mut usize, upto: usize, skip: usize| {
+        let buf = out.get_or_insert_with(|| Vec::with_capacity(s.len() + 8));
+        buf.extend_from_slice(&s[*copied..upto]);
+        buf.extend_from_slice(REPLACEMENT);
+        *copied = upto + skip;
     };
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(v) => json_to_value(v),
-        Err(_) => Value::Nil,
+    while i < s.len() {
+        let c = s[i];
+        if !in_string {
+            if c == b'"' {
+                in_string = true;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_string = false;
+                i += 1;
+            }
+            b'\\' => {
+                // An escape: only `\uXXXX` needs surrogate handling;
+                // serde validates everything else identically to Go.
+                if s[i + 1..].first() == Some(&b'u')
+                    && let Some(r) = hex4(s, i + 2)
+                    && (0xD800..=0xDFFF).contains(&r)
+                {
+                    // High surrogate followed by a valid low surrogate
+                    // is a pair — leave both escapes for serde.
+                    let paired = (0xD800..0xDC00).contains(&r)
+                        && s.get(i + 6) == Some(&b'\\')
+                        && s.get(i + 7) == Some(&b'u')
+                        && hex4(s, i + 8).is_some_and(|r2| (0xDC00..=0xDFFF).contains(&r2));
+                    if paired {
+                        i += 12;
+                    } else {
+                        replace(&mut out, &mut copied, i, 6);
+                        i += 6;
+                    }
+                } else {
+                    // Skip the escape introducer + one byte so an
+                    // escaped quote (`\"`) cannot flip the string state.
+                    i += 2;
+                }
+            }
+            0x20..=0x7F => i += 1,
+            _ => {
+                let (_, w) = decode_rune(s, i);
+                if w == 1 && c >= 0x80 {
+                    // Invalid byte: one U+FFFD per byte (Go DecodeRune).
+                    replace(&mut out, &mut copied, i, 1);
+                    i += 1;
+                } else {
+                    i += w;
+                }
+            }
+        }
     }
+    match out {
+        Some(mut buf) => {
+            buf.extend_from_slice(&s[copied..]);
+            Cow::Owned(buf)
+        }
+        None => Cow::Borrowed(s),
+    }
+}
+
+/// Four hex digits at `s[i..i+4]` (Go `getu4`, case-insensitive).
+fn hex4(s: &[u8], i: usize) -> Option<u32> {
+    let chunk = s.get(i..i + 4)?;
+    let mut v: u32 = 0;
+    for &c in chunk {
+        v = v * 16 + (c as char).to_digit(16)?;
+    }
+    Some(v)
 }
 
 fn json_to_value<'a>(v: serde_json::Value) -> Value<'a> {
@@ -1515,18 +1666,37 @@ fn json_to_value<'a>(v: serde_json::Value) -> Value<'a> {
     }
 }
 
+/// The compiled-program ceiling for a DYNAMICALLY-built pattern (one
+/// whose text a template computes per line, so it misses the
+/// compile-time cache): `regex::RegexBuilder::size_limit` guarantees
+/// the program stays under it, and the render budget is charged the
+/// full ceiling BEFORE compiling (review round 2: regex programs are
+/// caller-sized allocations like any other). 1 MiB keeps 64 dynamic
+/// compiles inside one render budget; the reference is unbounded here
+/// (Go regexp has no program cap) — the same ledgered class as the
+/// output budget itself (`template-output-budget`).
+const DYNAMIC_REGEX_PROGRAM_CEILING: usize = 1 << 20;
+
 fn compile_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex::Regex, String> {
+    // The pattern copy is charged too (repeatable per call).
+    ctx.charge(pattern.len())?;
     let text = lossy(pattern).into_owned();
     if let Some(re) = ctx.regex_cache.get(&text) {
+        // Query-compile-time program (literal pattern): `Regex` is
+        // Arc-backed, the clone shares it — no per-line program.
         return Ok(re.clone());
     }
-    regex::Regex::new(&text).map_err(|e| {
-        // The reference emits Go's `error parsing regexp: …` wording;
-        // rust-regex words its diagnostics differently. The accept/
-        // reject boundary matches (both are RE2-class engines); the
-        // wording difference is ledgered (owner error-wording ruling).
-        format!("error parsing regexp: {e}")
-    })
+    ctx.charge(DYNAMIC_REGEX_PROGRAM_CEILING)?;
+    regex::RegexBuilder::new(&text)
+        .size_limit(DYNAMIC_REGEX_PROGRAM_CEILING)
+        .build()
+        .map_err(|e| {
+            // The reference emits Go's `error parsing regexp: …` wording;
+            // rust-regex words its diagnostics differently. The accept/
+            // reject boundary matches (both are RE2-class engines); the
+            // wording difference is ledgered (owner error-wording ruling).
+            format!("error parsing regexp: {e}")
+        })
 }
 
 /// `uint8` element of a `[]byte` (for `index $b 0`).

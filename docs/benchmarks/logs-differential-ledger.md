@@ -391,9 +391,13 @@ not "fix" us toward the panic.
 ## Issue #230 — `line_format`/`label_format` template engine
 
 The full Go `text/template` + reference function-map surface landed in
-issue #230; 676 container-captured corpus cases
-(`tests/logqltest/corpus/t1…t6_*.test`) replay byte-exact hermetically,
-including execution-error strings. The following residuals are the
+issue #230; 688 container-captured corpus directives — 678 `eval`
+(60+228+34+29+258+69 across `tests/logqltest/corpus/t1…t6_*.test`) +
+10 `eval_fail` reject-parity cases (all in t1) — replay byte-exact
+hermetically, including execution-error strings. (The pre-round-2
+"676 cases" figure was 666 `eval` + the 10 `eval_fail` counted without
+saying so; round 2 added 12 captured `fromJson` invalid-UTF-8 /
+surrogate cases to t6.) The following residuals are the
 complete divergence set, each pinned deterministic (owner adjudications
 on #230: byte-model + lossy boundary; pin-deterministic where the
 reference is non-reproducible; error WORDING is not load-bearing where
@@ -445,6 +449,39 @@ clients only display it).
   cap measurably overflowed a 2 MiB thread), so 250 levels ≈ 0.5 MiB
   with a 4× margin. A crash is never acceptable; reachable only by
   deliberately recursive templates.
+- **Round 2:** the 250 counter is UNIFIED across every evaluator
+  recursion site — `{{template}}` invocation, nested
+  `if`/`with`/`range` walks and parenthesized-pipeline evaluation all
+  increment the same counter. A cap that counted only the invocation
+  hop let a recursive define whose body nests controls multiply the
+  two depths past the stack (250 invocations × 30 uncounted if-levels
+  overflowed a 2 MiB thread — the #272 class); gated in
+  `logql_template_engine.rs`
+  (`combined_define_recursion_and_nesting_…`).
+
+### `template-parse-depth-cap` (issue #230, review round 2)
+
+- **Reference behaviour:** the parser caps parenthesized-pipeline
+  nesting at 10 000 (`text/template/parse.go maxStackDepth`, error
+  `max expression depth exceeded` — captured verbatim on
+  grafana/loki:3.7.4: depth 10 000 renders, 10 001 rejects) and does
+  NOT cap control nesting at all (2 000 nested `{{if}}` render on the
+  container; in practice its 131 072-byte query-length limit bounds
+  nesting at ≈12 k).
+- **PulsusDB behaviour:** ONE structural-depth counter across both
+  parser recursion classes — nested controls (`item_list`) and
+  parenthesized pipelines (`term`) — capped at 40 with Go's own error
+  text (`template: line:N: max expression depth exceeded`, surfaced
+  through the same `invalid line template: `/`invalid template for
+  label…` compile-error wrapping the reference uses for its paren
+  cap). Derived from the measured floor, not chosen: ~170 nested
+  controls (≈12 KiB/level of debug parser frames) or ~400 nested
+  parens overflow a 2 MiB thread — a live SIGABRT pre-fix — so 40 is
+  a 4× margin on the worst unit. Depths 41..10 000 parse in the
+  reference and reject here (compile-time 400, same shape as the
+  reference's own paren rejection); realistic templates nest < 10.
+  Gated on a 2 MiB thread both ways in `logql_template_engine.rs`
+  (`structural_nesting_is_capped_at_parse_time_…`).
 
 ### `template-error-wording-residuals` (issue #230, owner wording ruling)
 
@@ -479,13 +516,31 @@ clients only display it).
 - **Reference behaviour:** template output size is UNBOUNDED — `repeat
   1073741824 "x"×17` (17 GB) OOM-kills the reference container
   (measured); `printf` padding widths up to 2^30 allocate eagerly.
-- **PulsusDB behaviour:** every caller-multiplied render allocation
-  (`repeat`'s `count × len`, `indent`/`nindent`'s per-line pad,
-  `alignLeft`/`alignRight` padding, `printf`/`print` padding widths and
-  precisions, `Replace`-with-empty-needle expansion, the regex-replace
-  upper bound, and the constant-factor string producers) is CHARGED
-  against a cumulative per-render budget BEFORE it happens and released
-  when the render ends. A breach aborts the query with the bounded
+- **PulsusDB behaviour:** every RETAINABLE render production — any
+  string/bytes/list/map a template value can hold — is CHARGED against
+  a cumulative per-render budget BEFORE it is built, and the budget is
+  released when the render ends. That covers the multipliers
+  (`repeat`'s `count × len`, `indent`/`nindent`, `align*`, `printf`
+  padding widths/precisions, `Replace`-with-empty-needle, the
+  regex-replace bound, case mapping, `fromJson`'s 35× tree ceiling,
+  the ≤10× `date`/`Time.Format` layout expansion), the print-family
+  and html/js/urlquery output buffers (pre-charged at 4×/7× value
+  ceilings), action output (`print_value_go` charges the value's
+  ceiling BEFORE writing), text-node emission per iteration, dynamic
+  regex programs (a 1 MiB `RegexBuilder::size_limit` ceiling charged
+  per dynamic compile; query-compile-time literal programs are shared,
+  not re-charged), AND plain input-bounded copies (`__line__`, the
+  trim/trunc/substr/slice family, `default`'s clone, `Append*`'s
+  argument copy) — review round 2 closed the fifth amplification
+  class, where an uncharged per-call copy repeats inside a
+  `range`/variable-only body that emits no text, or COMPOUNDS through
+  `{{ $a = printf "%s%s" $a $a }}` (uncharged, that doubling is a
+  literal OOM-kill — reproduced). Scalar-returning parse scratch
+  (freed by return, nothing retained) and once-per-render error paths
+  stay uncharged; the census (`logql_template_alloc_census.rs`) pins
+  the classification with per-disposition evidence and the runtime
+  gate (`logql_template_alloc_gate.rs`) asserts charge-dominance over
+  the whole registry. A breach aborts the query with the bounded
   `422 query_too_broad` (`TooBroadReason::TemplateOutputBytes`) — never
   a per-line `TemplateFormatErr`, never a truncation, never an OOM.
 - **Threshold (derived, not chosen):**
@@ -493,13 +548,22 @@ clients only display it).
   the crate's established per-query retained-bytes budget (#104, reused
   by #221's fan-out charge): one render is the line path's peak
   transient retention, so it may not allocate more than a whole query
-  is allowed to retain. Gated both ways in
-  `tests/logql_template_engine.rs`: a `repeat` exactly AT the budget
-  renders; one byte past it is the clean 422 on the streams, metric and
-  `label_format` paths.
+  is allowed to retain. The budget is CUMULATIVE over the render and a
+  maximal output line is charged twice (once when the value is built,
+  once when it is printed), so the single-`repeat` rejection boundary
+  sits at budget/2 = 32 MiB of output: `tests/logql_template_engine.rs`
+  pins both directions — a `repeat` of exactly budget/2 renders, one
+  byte past it is the clean 422 on the streams, metric and
+  `label_format` paths alike.
 - **Why deliberate:** the reference has no bound, so no finite cap can
   match it (the #236 O1 shape); the standing charge-before-allocate
   rule (#227) and the "never copy the reference where it is wrong"
-  ruling both require the bound. Overflowing `int` still panics with
-  the reference's exact `strings: Repeat output length overflow` per
-  line (that surface is bounded and correct).
+  ruling both require the bound. Consequences inside the same class:
+  templates whose CUMULATIVE productions cross 64 MiB reject even when
+  each individual value is small, and a dynamic (per-line-computed)
+  regex pattern whose compiled program exceeds the 1 MiB ceiling gets
+  the per-line `error parsing regexp: Compiled regex exceeds size
+  limit…` where the unbounded reference would compile it. Overflowing
+  `int` still panics with the reference's exact `strings: Repeat
+  output length overflow` per line (that surface is bounded and
+  correct).

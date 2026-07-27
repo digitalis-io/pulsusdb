@@ -192,3 +192,54 @@ eval instant at 1785119441989621248ns {service_name="t6s1r1785119441"} | json | 
   {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <divf 1 0>: error calling divf: decimal division by 0", service_name="t6s1r1785119441", svc="e"} 1785119321000000000ns not json
 
 clear
+
+# --- fromJson invalid-UTF-8 / lone-surrogate parity (issue #230 review
+# round 2, finding: fromJson returned nil where Go's encoding/json
+# substitutes U+FFFD). Captured 2026-07-27 from grafana/loki:3.7.4
+# (go1.26.5) via /loki/api/v1/query_range: one U+FFFD per invalid BYTE
+# (unquoteBytes advances DecodeRune's size-1-on-error), lone \uXXXX
+# surrogate escapes become U+FFFD, valid pairs combine, an escaped
+# backslash is NOT an escape, and invalid bytes OUTSIDE a string stay a
+# syntax error (nil).
+
+load
+  {service_name="t6s2r1785119441"} service=t6s2r1785119441
+  1785119321000000000ns seed
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\xff\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns �
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"a\xf0\x9fb\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns a��b
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"a\xf0\x9f\x92\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns a���
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ index (fromJson "{\"\xff\":\"v\"}") "�" }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns v
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `X{{ fromJson "\xff" }}Y`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns X<no value>Y
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `X{{ printf "%v" (fromJson "\xff") }}Y`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns X<nil>Y
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\ud800\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns �
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\ud83d\\ude00\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns 😀
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\ud800\\ud800\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns ��
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\udc00\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns �
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\ud800x\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns �x
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\\\ud800\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns \ud800
+
+clear
