@@ -1,9 +1,22 @@
-//! Issue #230 review round 1 + round 2: the MECHANICAL allocation
-//! census over `src/logql/template/` — the boundary is derived from the
-//! AST, not from a hand-drawn list (the hand-drawn list missed float
-//! precisions, the `align*` rune-vec ordering, the sprig case-mapping
-//! charges and `fromJson`; a text grep misses macro bodies, which is
-//! exactly where the sprig closures live).
+//! Issue #230 review rounds 1–3: the allocation-site DRIFT TRIPWIRE
+//! over `src/logql/template/`.
+//!
+//! **What this census IS (round-3 adjudication — the same demotion
+//! #236 and #272 made): a drift tripwire, not the completeness or
+//! dominance argument.** It is a syntactic AST walk over a curated
+//! vocabulary: it detects NEW or CHANGED allocation sites (including
+//! inside the `f!`/`def!`/`sig!` macro tables, where a text grep is
+//! blind) and forces every one to be re-classified with its
+//! disposition's checkable side-conditions. It cannot prove that a
+//! charge DOMINATES an allocation (dominance is a control-flow
+//! property — the round-3 `go_replace` identity branches contained a
+//! charge yet copied before it on three paths), and its vocabulary is
+//! curated, so an allocator spelled a new way escapes it until pinned.
+//! **The dominance and ordering evidence lives in the RUNTIME gate**
+//! (`logql_template_alloc_gate.rs`): per-function, per-BRANCH-shape
+//! allocated-vs-charged dominance plus a near-exhausted-budget
+//! ordering leg that fails any charge moved after its allocation
+//! (mutation-verified).
 //!
 //! **The classifying question** (coordinator ruling): *can a
 //! caller-controlled input make this allocation large?* — NOT "is it a
@@ -55,12 +68,11 @@
 //! caller-sized program; `Rc::new`/`Box::new` are factor-1
 //! moves-to-heap) except the zero-capacity constructors
 //! (`Vec`/`String`/`HashMap`/`Cell`), which allocate nothing until a
-//! growth call that is itself in vocabulary.
-//!
-//! The registry surface additionally has a RUNTIME dominance gate
-//! (`logql_template_alloc_gate.rs`): every function is called with
-//! adversarial inputs under a counting allocator and its allocated
-//! bytes must be dominated by its budget charges.
+//! growth call that is itself in vocabulary. Round 3 added the two
+//! escapees the reviewer named — `serde_json::from_slice` and
+//! `RegexBuilder::build` — as tripwire entries; the vocabulary stays
+//! curated by nature, which is exactly why the census is not the
+//! completeness argument.
 //!
 //! The zz generator prints the discovered table for re-pinning.
 
@@ -91,10 +103,20 @@ const METHOD_VOCAB: &[&str] = &[
     "insert",
     "append",
     "encode",
+    // A builder's `.build()` allocates the built artifact
+    // (`RegexBuilder::build` compiles a caller-sized program) — round 3.
+    "build",
     // `impl Into<Vec<u8>>` copies borrowed inputs at factor 1.
     "into",
 ];
-const PATH_VOCAB: &[&str] = &["with_capacity", "from_utf8", "from_utf8_lossy", "new"];
+const PATH_VOCAB: &[&str] = &[
+    "with_capacity",
+    "from_utf8",
+    "from_utf8_lossy",
+    "new",
+    // `serde_json::from_slice` builds a caller-sized parse tree — round 3.
+    "from_slice",
+];
 const MACRO_VOCAB: &[&str] = &["vec", "format", "write"];
 
 /// `X::new` constructors that provably allocate NOTHING at the call
@@ -875,7 +897,13 @@ static PINS: &[Pin] = &[
     Pin {
         file: "funcs.rs",
         func: "compile_regex",
-        callees: &[".clone", ".into_owned", "RegexBuilder::new", "format!"],
+        callees: &[
+            ".build",
+            ".clone",
+            ".into_owned",
+            "RegexBuilder::new",
+            "format!",
+        ],
         disposition: CHARGED,
         why: "pattern copy + the 1 MiB dynamic-program ceiling charged BEFORE building (RegexBuilder size_limit enforces the ceiling); cache hits share the query-compile program",
     },
@@ -920,13 +948,6 @@ static PINS: &[Pin] = &[
         callees: &[".into_owned", ".to_string"],
         disposition: TRANSIENT,
         why: "one lossy copy freed by return; float result; error text bounded",
-    },
-    Pin {
-        file: "funcs.rs",
-        func: "f!count",
-        callees: &[".into_owned"],
-        disposition: TRANSIENT,
-        why: "haystack copy freed by return; int result (program ceiling charged in compile_regex)",
     },
     Pin {
         file: "funcs.rs",
@@ -1046,6 +1067,13 @@ static PINS: &[Pin] = &[
         callees: &[".into_owned"],
         disposition: TRANSIENT,
         why: "one copy freed by return; Time result",
+    },
+    Pin {
+        file: "funcs.rs",
+        func: "from_json",
+        callees: &["serde_json::from_slice"],
+        disposition: CHARGED,
+        why: "the 35×len+64 tree ceiling is charged before sanitize/parse",
     },
     Pin {
         file: "funcs.rs",
@@ -1724,17 +1752,17 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "parse.rs",
-        func: "item_list",
+        func: "enter_depth",
         callees: &[".to_string"],
         disposition: COMPILE_TIME,
-        why: "depth-cap error text (round 2: the structural-depth guard site)",
+        why: "depth-cap error text (round 3: the guard moved to parse_control/block_control/term so else-if chains count)",
     },
     Pin {
         file: "parse.rs",
-        func: "item_list_inner",
+        func: "item_list",
         callees: &[".push", ".to_string"],
         disposition: COMPILE_TIME,
-        why: "via text_or_action",
+        why: "node lists ≤ template text (NOT a guard site — round 3)",
     },
     Pin {
         file: "parse.rs",

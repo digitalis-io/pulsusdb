@@ -1,11 +1,15 @@
-//! Issue #230 review round 2: the RUNTIME allocation-dominance gate
-//! over the whole template function registry — the executable evidence
-//! behind the census's `CHARGED` dispositions (the static census proves
-//! a charge call EXISTS; this gate proves it DOMINATES the allocation).
+//! Issue #230 review rounds 2–3: the RUNTIME allocation gate over the
+//! whole template function registry — **the dominance and ordering
+//! evidence** for charge-before-allocate (the AST census is a drift
+//! tripwire only; dominance is a control-flow property no syntactic
+//! walk can establish — round-3 adjudication).
 //!
-//! Every one of the 67 registry functions is invoked with adversarial
-//! large inputs under a byte-counting allocator and one fresh
-//! `RenderBudget`, and:
+//! Every one of the 67 registry functions is invoked through its
+//! BRANCH SHAPES — the happy path, an all-empty-inputs shape, and the
+//! per-function identity / no-match / `n == 0` / error shapes (round 3:
+//! `go_replace`'s identity early-returns passed a single-shape gate
+//! while copying before their charge) — under a byte-counting
+//! allocator and one fresh `RenderBudget`, and:
 //!
 //! - a **string/container** result (`Str`/`Bytes`/`List`/`Map` — bytes a
 //!   template variable can RETAIN and feed back through
@@ -21,6 +25,14 @@
 //! - an **error** result may allocate one bounded error rendering
 //!   (`≤ 32×input + 128 KiB`): every function error aborts the render,
 //!   so error paths run at most once per render (`ERROR_PATH`).
+//!
+//! Retainable shapes that allocate big additionally run an **ORDERING
+//! leg** under a near-exhausted budget: correct charge-BEFORE-allocate
+//! breaches at the charge and returns before copying, so allocation
+//! stays under a small constant; a charge moved after its allocation
+//! leaves the full copy on the counter (mutation-verified: relocating
+//! `f!lower`'s charge after `go_to_lower` fails exactly this leg while
+//! passing post-hoc dominance).
 //!
 //! This is the gate that catches the fifth amplification class the
 //! round-1 census could not judge: an existing site labelled
@@ -106,9 +118,9 @@ fn default_arg(ty: ParamTy) -> Value<'static> {
     }
 }
 
-/// Per-function argument overrides steering the call onto its SUCCESS
-/// path with the largest reachable output (the dominance bound bites on
-/// success; error paths get the looser once-per-render bound).
+/// Per-function argument overrides steering the call onto its happy
+/// SUCCESS path with the largest reachable output (the dominance bound
+/// bites on success; error paths get the looser once-per-render bound).
 fn args_for(name: &str, params: &[ParamTy], variadic: Option<ParamTy>) -> Vec<Value<'static>> {
     let digits_big = || {
         let mut d = String::from("1");
@@ -171,6 +183,122 @@ fn args_for(name: &str, params: &[ParamTy], variadic: Option<ParamTy>) -> Vec<Va
     args
 }
 
+/// BRANCH shapes beyond the happy path (review round 3: `go_replace`'s
+/// identity/no-match/`n == 0` early returns and `align`'s identity
+/// copies passed a single-shape gate while staying uncharged). Each
+/// entry is `(shape_name, args)`; every function additionally gets an
+/// all-empty-inputs shape.
+fn extra_shapes(name: &str) -> Vec<(&'static str, Vec<Value<'static>>)> {
+    match name {
+        "Replace" => vec![
+            (
+                "identity-old==new",
+                vec![big_str(), s("x"), s("x"), Value::int(-1)],
+            ),
+            (
+                "no-match",
+                vec![big_str(), s("ZZZ"), s("y"), Value::int(-1)],
+            ),
+            ("n==0", vec![big_str(), s("x"), s("y"), Value::int(0)]),
+            (
+                "empty-needle",
+                vec![big_str(), s(""), s("-"), Value::int(-1)],
+            ),
+        ],
+        "replace" => vec![
+            ("identity-old==new", vec![s("x"), s("x"), big_str()]),
+            ("no-match", vec![s("ZZZ"), s("y"), big_str()]),
+            ("empty-needle", vec![s(""), s("-"), big_str()]),
+        ],
+        "alignLeft" | "alignRight" => vec![
+            ("truncate", vec![Value::int(200_000), big_str()]),
+            (
+                "identity-count==len",
+                vec![Value::int(BIG as i64), big_str()],
+            ),
+            ("identity-negative", vec![Value::int(-1), big_str()]),
+        ],
+        "trunc" => vec![
+            (
+                "identity-count>=len",
+                vec![Value::int(2 * BIG as i64), big_str()],
+            ),
+            ("negative-tail", vec![Value::int(-200_000), big_str()]),
+            ("zero", vec![Value::int(0), big_str()]),
+        ],
+        "substr" => vec![
+            ("open-end", vec![Value::int(0), Value::int(-1), big_str()]),
+            (
+                "error-start>end",
+                vec![Value::int(5), Value::int(2), big_str()],
+            ),
+            (
+                "error-negative-end",
+                vec![Value::int(-1), Value::int(-2), big_str()],
+            ),
+        ],
+        "repeat" => vec![
+            ("zero", vec![Value::int(0), big_str()]),
+            ("error-negative", vec![Value::int(-1), big_str()]),
+            ("error-overflow", vec![Value::int(i64::MAX), big_str()]),
+        ],
+        "Trim" | "TrimLeft" | "TrimRight" => vec![("all-trimmed", vec![big_str(), s("x")])],
+        "trimAll" => vec![("all-trimmed", vec![s("x"), big_str()])],
+        "TrimPrefix" | "TrimSuffix" => vec![("affix-matches-whole", vec![big_str(), big_str()])],
+        "trimPrefix" | "trimSuffix" => vec![("affix-matches-whole", vec![big_str(), big_str()])],
+        "b64dec" => vec![("error-as-value", vec![big_str()])],
+        "urldecode" => vec![("error-bad-escape", {
+            let mut v = vec![b'%'; 3];
+            v.extend_from_slice(b"zz");
+            vec![Value::Str(Cow::Owned(v))]
+        })],
+        "regexReplaceAll" | "regexReplaceAllLiteral" => vec![
+            ("no-match", vec![s("ZZZ+"), big_str(), s("YY")]),
+            ("error-bad-pattern", vec![s("("), big_str(), s("YY")]),
+        ],
+        "count" => vec![("error-bad-pattern", vec![s("("), big_str()])],
+        "fromJson" => vec![
+            ("error-not-json", vec![big_str()]),
+            ("invalid-utf8-string", {
+                let mut j = b"{\"x\":\"".to_vec();
+                j.extend(std::iter::repeat_n(0xFF, BIG / 2));
+                j.extend_from_slice(b"\"}");
+                vec![Value::Str(Cow::Owned(j))]
+            }),
+        ],
+        "indent" | "nindent" => vec![
+            ("wide", vec![Value::int(2_000_000), s("a\nb\nc")]),
+            ("error-negative", vec![Value::int(-1), big_str()]),
+        ],
+        "default" => vec![
+            ("winner-default", vec![big_str(), s("")]),
+            ("winner-given", vec![s("d"), big_str()]),
+        ],
+        "bytes" | "duration" | "duration_seconds" | "unixToTime" => {
+            vec![("error-unparseable", vec![big_str()])]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The all-empty-inputs shape (zero-length strings, zero ints).
+fn empty_args(params: &[ParamTy], variadic: Option<ParamTy>) -> Vec<Value<'static>> {
+    let empty = |ty: ParamTy| match ty {
+        ParamTy::Any | ParamTy::Str => s(""),
+        ParamTy::Int => Value::int(0),
+        ParamTy::Float => Value::Float(0.0),
+        ParamTy::Time => Value::Time(GoTime::from_unix(0, 0)),
+        ParamTy::Dur => Value::Duration(0),
+        ParamTy::Loc => Value::Nil,
+        ParamTy::BytesTy => Value::Bytes(Cow::Owned(Vec::new())),
+    };
+    let mut args: Vec<Value<'static>> = params.iter().map(|&p| empty(p)).collect();
+    if let Some(v) = variadic {
+        args.push(empty(v));
+    }
+    args
+}
+
 fn input_bytes(args: &[Value<'_>], line_len: usize) -> u64 {
     let mut total = line_len as u64;
     for a in args {
@@ -188,48 +316,116 @@ fn is_retainable(v: &Value<'_>) -> bool {
     )
 }
 
+/// The near-exhausted budget the ORDERING leg runs under: whatever a
+/// function allocates before its first (breaching) charge is visible as
+/// allocated bytes with almost no budget left.
+const TINY_REMAINING: u64 = 64 * 1024;
+/// The ordering leg's allocation ceiling — far below the ≥256 KiB the
+/// same shape allocated under a full budget, so a copy made BEFORE the
+/// charge fails by an order of magnitude.
+const ORDERING_CEILING: u64 = 192 * 1024;
+
 #[test]
 fn every_registry_function_charge_dominates_its_allocations() {
+    use pulsus_read::logql::template::MAX_TEMPLATE_RENDER_BYTES;
     let env = TemplateEnv::process();
     let line = vec![b'L'; BIG];
     let regex_cache: HashMap<String, regex::Regex> = HashMap::new();
     let mut failures = Vec::new();
     for def in REGISTRY.iter() {
-        let args = args_for(def.name, def.params, def.variadic);
-        let gate = GateEnv {
-            env: env.clone(),
-            budget: RenderBudget::default(),
-        };
-        let ctx = FuncCtx {
-            print_env: &gate,
-            line: &line,
-            ts_ns: 1_700_000_000_000_000_000,
-            regex_cache: &regex_cache,
-            budget: &gate.budget,
-            _marker: std::marker::PhantomData,
-        };
-        let inputs = input_bytes(&args, line.len());
-        let before = BYTES.load(Ordering::Relaxed);
-        let result = (def.call)(&ctx, &args);
-        let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
-        let charged = gate.budget.charged_bytes();
-        let (bound, kind) = match &result {
-            Ok(v) if is_retainable(v) => (4 * charged + SLACK, "retainable"),
-            Ok(_) => (4 * inputs + SLACK, "scalar"),
-            Err(_) => (32 * inputs + 2 * SLACK, "error"),
-        };
-        if alloc > bound {
-            failures.push(format!(
-                "{}: allocated {alloc} B > {kind} bound {bound} B (charged {charged} B, \
-                 inputs {inputs} B, result {})",
-                def.name,
-                match &result {
-                    Ok(v) => v.type_name().to_string(),
-                    Err(e) => format!("Err({e})"),
+        // Branch shapes, not just the happy path (review round 3):
+        // identity / no-match / n==0 / empty / error arguments each get
+        // their own dominance run.
+        let mut shapes: Vec<(&'static str, Vec<Value<'static>>)> = vec![
+            ("happy", args_for(def.name, def.params, def.variadic)),
+            ("empty", empty_args(def.params, def.variadic)),
+        ];
+        shapes.extend(extra_shapes(def.name));
+        for (shape, args) in shapes {
+            let gate = GateEnv {
+                env: env.clone(),
+                budget: RenderBudget::default(),
+            };
+            let ctx = FuncCtx {
+                print_env: &gate,
+                line: &line,
+                ts_ns: 1_700_000_000_000_000_000,
+                regex_cache: &regex_cache,
+                budget: &gate.budget,
+                _marker: std::marker::PhantomData,
+            };
+            let inputs = input_bytes(&args, line.len());
+            let before = BYTES.load(Ordering::Relaxed);
+            let result = (def.call)(&ctx, &args);
+            let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+            let charged = gate.budget.charged_bytes();
+            let (bound, kind) = match &result {
+                Ok(v) if is_retainable(v) => (4 * charged + SLACK, "retainable"),
+                Ok(_) => (4 * inputs + SLACK, "scalar"),
+                Err(_) => (32 * inputs + 2 * SLACK, "error"),
+            };
+            if alloc > bound {
+                failures.push(format!(
+                    "{} [{shape}]: allocated {alloc} B > {kind} bound {bound} B \
+                     (charged {charged} B, inputs {inputs} B, result {})",
+                    def.name,
+                    match &result {
+                        Ok(v) => v.type_name().to_string(),
+                        Err(e) => format!("Err({e})"),
+                    }
+                ));
+            }
+            let retainable_ok = matches!(&result, Ok(v) if is_retainable(v));
+            drop(result);
+            // --- the ORDERING leg (charge BEFORE allocate) -------------
+            // Rerun retainable shapes that allocated big under a nearly
+            // exhausted budget: correct ordering breaches at the charge
+            // and returns before the copy, so allocation stays tiny; a
+            // charge moved AFTER its allocation leaves the big copy on
+            // the counter. (This is what a post-hoc charged-vs-allocated
+            // comparison can never see.)
+            if retainable_ok && alloc >= 4 * SLACK {
+                let gate = GateEnv {
+                    env: env.clone(),
+                    budget: RenderBudget::default(),
+                };
+                gate.budget
+                    .charge((MAX_TEMPLATE_RENDER_BYTES - TINY_REMAINING) as usize)
+                    .expect("pre-exhaust");
+                let ctx = FuncCtx {
+                    print_env: &gate,
+                    line: &line,
+                    ts_ns: 1_700_000_000_000_000_000,
+                    regex_cache: &regex_cache,
+                    budget: &gate.budget,
+                    _marker: std::marker::PhantomData,
+                };
+                let args = match shape {
+                    "happy" => args_for(def.name, def.params, def.variadic),
+                    "empty" => empty_args(def.params, def.variadic),
+                    named => extra_shapes(def.name)
+                        .into_iter()
+                        .find(|(n, _)| *n == named)
+                        .map(|(_, a)| a)
+                        .expect("shape exists"),
+                };
+                let before = BYTES.load(Ordering::Relaxed);
+                let result = (def.call)(&ctx, &args);
+                let tiny_alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+                if tiny_alloc > ORDERING_CEILING {
+                    failures.push(format!(
+                        "{} [{shape}] ORDERING: allocated {tiny_alloc} B under a \
+                         {TINY_REMAINING} B budget remainder — a copy happens BEFORE \
+                         its charge (result {})",
+                        def.name,
+                        match &result {
+                            Ok(v) => v.type_name().to_string(),
+                            Err(e) => format!("Err({e})"),
+                        }
+                    ));
                 }
-            ));
+            }
         }
-        drop(result);
     }
     assert!(
         failures.is_empty(),

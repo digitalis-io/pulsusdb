@@ -481,33 +481,39 @@ pub static REGISTRY: [FuncDef; 67] = [
     )?))),
     f!("regexReplaceAll", [Str, Str, Str], None, |c, a| {
         let re = compile_regex(c, bytes_of(&a[0]))?;
-        let s = lossy(bytes_of(&a[1])).into_owned();
-        let repl = lossy(bytes_of(&a[2])).into_owned();
+        // Borrowed Cow args (round 3): no copy happens before the
+        // charge on the valid-UTF-8 path; the invalid-input lossy
+        // substitution is a ≤3× transient.
+        let s = lossy(bytes_of(&a[1]));
+        let repl = lossy(bytes_of(&a[2]));
         // ≤ (matches+1)×len(repl) + len(s); matches ≤ len(s)+1.
         c.charge(
             (s.len() + 2)
                 .saturating_mul(repl.len().max(1))
                 .saturating_add(s.len()),
         )?;
-        Ok(string_val(re.replace_all(&s, repl.as_str()).into_owned()))
+        Ok(string_val(
+            re.replace_all(s.as_ref(), repl.as_ref()).into_owned(),
+        ))
     }),
     f!("regexReplaceAllLiteral", [Str, Str, Str], None, |c, a| {
         let re = compile_regex(c, bytes_of(&a[0]))?;
-        let s = lossy(bytes_of(&a[1])).into_owned();
-        let repl = lossy(bytes_of(&a[2])).into_owned();
+        let s = lossy(bytes_of(&a[1]));
+        let repl = lossy(bytes_of(&a[2]));
         c.charge(
             (s.len() + 2)
                 .saturating_mul(repl.len().max(1))
                 .saturating_add(s.len()),
         )?;
         Ok(string_val(
-            re.replace_all(&s, regex::NoExpand(&repl)).into_owned(),
+            re.replace_all(s.as_ref(), regex::NoExpand(repl.as_ref()))
+                .into_owned(),
         ))
     }),
     f!("count", [Str, Str], None, |c, a| {
         let re = compile_regex(c, bytes_of(&a[0]))?;
-        let s = lossy(bytes_of(&a[1])).into_owned();
-        Ok(Value::int(re.find_iter(&s).count() as i64))
+        let s = lossy(bytes_of(&a[1]));
+        Ok(Value::int(re.find_iter(s.as_ref()).count() as i64))
     }),
     f!("urldecode", [Str], None, |c, a| {
         let s = bytes_of(&a[0]);
@@ -1070,6 +1076,10 @@ fn go_replace(
     n: i64,
 ) -> Result<Vec<u8>, String> {
     if old == new || n == 0 {
+        // IDENTITY copies are retainable productions too — a no-output
+        // `range` repeats them past budget (review round 3, finding 1):
+        // charge before every early-return copy.
+        ctx.charge(s.len())?;
         return Ok(s.to_vec());
     }
     // Count occurrences (Go strings.Count).
@@ -1079,6 +1089,7 @@ fn go_replace(
         count_non_overlapping(s, old) as i64
     };
     if m == 0 {
+        ctx.charge(s.len())?;
         return Ok(s.to_vec());
     }
     let n = if n < 0 || m < n { m } else { n };
@@ -1277,6 +1288,9 @@ fn align(ctx: &FuncCtx<'_, '_>, count: i64, src: &[u8], left: bool) -> Result<Ve
     }
     let l = n_runes;
     if count < 0 || count == l {
+        // Identity copy: charged like every retainable production
+        // (review round 3, finding 1).
+        ctx.charge(src.len())?;
         return Ok(src.to_vec());
     }
     let pad = count - l;

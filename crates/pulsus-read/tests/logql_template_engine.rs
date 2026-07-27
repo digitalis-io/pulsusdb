@@ -928,6 +928,116 @@ fn structural_nesting_is_capped_at_parse_time_never_a_stack_overflow() {
 }
 
 #[test]
+fn else_if_and_else_with_chains_are_capped_never_a_stack_overflow() {
+    // Review round 3, finding 2: `item_list` used to decrement depth
+    // BEFORE the else-if recursion, so a chain of `{{else if}}` links
+    // bypassed the 40 cap entirely — 5000 links SIGABRTed a 2 MiB
+    // thread on the unfixed build (demonstrated). The guard now lives
+    // in `parse_control`, whose frame stays live across the chain.
+    let if_chain = |links: usize| {
+        format!(
+            r#"{{a="b"}} | line_format `{{{{if "a"}}}}x{}{{{{end}}}}`"#,
+            r#"{{else if "a"}}x"#.repeat(links)
+        )
+    };
+    let with_chain = |links: usize| {
+        format!(
+            r#"{{a="b"}} | line_format `{{{{with "a"}}}}x{}{{{{end}}}}`"#,
+            r#"{{else with "a"}}x"#.repeat(links)
+        )
+    };
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let base = base();
+            // 39 links = chain depth 40 (the head `if` is link 0): renders.
+            let pipeline = compiled(&if_chain(39));
+            let out = pipeline
+                .run("line", &base, 0)
+                .expect("no budget breach")
+                .expect("kept");
+            assert_eq!(out.line, "x");
+            // 40 links = depth 41: the clean compile rejection.
+            for query in [if_chain(40), with_chain(40)] {
+                let err = compile_err(&query);
+                assert!(
+                    err.to_string().contains("max expression depth exceeded"),
+                    "{err}"
+                );
+            }
+            // The pre-fix crash shape: 5000 links reject cleanly on this
+            // 2 MiB thread instead of overflowing it.
+            for query in [if_chain(5000), with_chain(5000)] {
+                let err = compile_err(&query);
+                assert!(
+                    err.to_string().contains("max expression depth exceeded"),
+                    "{err}"
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("no stack overflow");
+}
+
+#[test]
+fn identity_and_no_match_copies_breach_the_budget_in_a_no_output_range() {
+    // Review round 3, finding 1: `go_replace`'s early returns (old ==
+    // new / n == 0 / no match) and `align`'s identity branch copied the
+    // input BEFORE charging — repeatable past budget inside a range
+    // body that emits nothing. Each shape breaches now (red pre-fix:
+    // rendered "" after ~200 MB of uncharged copies).
+    let base = base();
+    let line = "x".repeat(1024);
+    let over = |query: &str| {
+        let pipeline = compiled(query);
+        pipeline
+            .run(&line, &base, 0)
+            .map(|_| ())
+            .expect_err(&format!("{query}: must breach the render budget"));
+    };
+    // The big input is bound ONCE before the loop ($s costs one charge)
+    // so the per-iteration production is EXACTLY the branch under test.
+    // replace with old == new (identity early-return).
+    over(
+        r#"{a="b"} | line_format "{{ $s := __line__ }}{{ range 200000 }}{{ $x := replace \"q\" \"q\" $s }}{{ end }}""#,
+    );
+    // replace with no match (m == 0 early-return).
+    over(
+        r#"{a="b"} | line_format "{{ $s := __line__ }}{{ range 200000 }}{{ $x := replace \"ZZZ\" \"y\" $s }}{{ end }}""#,
+    );
+    // Replace with n == 0.
+    over(
+        r#"{a="b"} | line_format "{{ $s := __line__ }}{{ range 200000 }}{{ $x := Replace $s \"x\" \"y\" 0 }}{{ end }}""#,
+    );
+    // alignLeft identity (count == rune length).
+    over(
+        r#"{a="b"} | line_format "{{ $s := __line__ }}{{ range 200000 }}{{ $x := alignLeft 1024 $s }}{{ end }}""#,
+    );
+    // alignRight identity (negative count).
+    over(
+        r#"{a="b"} | line_format "{{ $s := __line__ }}{{ range 200000 }}{{ $x := alignRight -1 $s }}{{ end }}""#,
+    );
+    // Green controls: the same shapes render outside the loop.
+    let ok = |query: &str, want: &str| {
+        let pipeline = compiled(query);
+        let out = pipeline
+            .run("ab", &base, 0)
+            .expect("no budget breach")
+            .expect("kept");
+        assert_eq!(out.line, want, "{query}");
+    };
+    ok(
+        r#"{a="b"} | line_format "{{ replace \"q\" \"q\" __line__ }}""#,
+        "ab",
+    );
+    ok(
+        r#"{a="b"} | line_format "{{ alignLeft -1 __line__ }}""#,
+        "ab",
+    );
+}
+
+#[test]
 fn combined_define_recursion_and_nesting_is_a_bounded_per_line_error() {
     // A recursive define whose body nests 30 ifs: pre-fix only the
     // {{template}} hop counted, so 250 invocations × 30 uncounted

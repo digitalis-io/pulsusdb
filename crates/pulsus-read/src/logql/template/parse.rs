@@ -554,23 +554,16 @@ impl<'t> Parser<'t> {
         }
     }
 
-    /// itemList: gathers nodes until `{{end}}` or `{{else}}`. Every
-    /// nested control body passes through here — the structural-depth
-    /// guard site for control nesting (see [`MAX_PARSE_DEPTH`]).
+    /// itemList: gathers nodes until `{{end}}` or `{{else}}`. NOT a
+    /// depth-guard site: the guard lives in `parse_control` (which
+    /// stays on the stack across an `else if`/`else with` CHAIN — a
+    /// guard here decrements before the chain recursion and lets a
+    /// 5000-link chain overflow the stack, review round 3 finding 2)
+    /// and in `block_control` (nested blocks recurse through here
+    /// without a `parse_control` frame).
     fn item_list(&mut self) -> PResult<(List, Flow)> {
-        let first = self.peek_non_space();
-        if self.depth >= MAX_PARSE_DEPTH {
-            return Err(self.errorf(first.line, "max expression depth exceeded".to_string()));
-        }
-        self.depth += 1;
-        let result = self.item_list_inner(first.pos);
-        self.depth -= 1;
-        result
-    }
-
-    fn item_list_inner(&mut self, pos: usize) -> PResult<(List, Flow)> {
         let mut list = List {
-            pos,
+            pos: self.peek_non_space().pos,
             nodes: Vec::new(),
         };
         loop {
@@ -583,6 +576,22 @@ impl<'t> Parser<'t> {
                 flow => return Ok((list, flow)),
             }
         }
+    }
+
+    /// The structural-depth guard (see [`MAX_PARSE_DEPTH`]): callers
+    /// bracket every control/paren recursion with `enter_depth`/
+    /// `leave_depth` so the count only unwinds when the RECURSION
+    /// unwinds (an `else if` chain keeps every link's frame live).
+    fn enter_depth(&mut self, line: usize) -> PResult<()> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(self.errorf(line, "max expression depth exceeded".to_string()));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave_depth(&mut self) {
+        self.depth -= 1;
     }
 
     fn action(&mut self) -> PResult<Flow> {
@@ -647,9 +656,17 @@ impl<'t> Parser<'t> {
         &mut self,
         context: &'static str,
     ) -> PResult<(usize, Pipe, List, Option<List>)> {
+        // The depth guard site for EVERY control recursion shape:
+        // nested bodies (via item_list → action → *_control) AND
+        // `else if`/`else with` chains (parse_control_inner calls
+        // if_control/with_control while this frame is still live, so
+        // the counter cannot unwind mid-chain — review round 3).
+        let line = self.peek_non_space().line;
+        self.enter_depth(line)?;
         let vars_len = self.vars.len();
         let result = self.parse_control_inner(context);
         self.pop_vars(vars_len);
+        self.leave_depth();
         result
     }
 
@@ -765,8 +782,13 @@ impl<'t> Parser<'t> {
             self.backup(next);
             Some(self.pipeline(CONTEXT, ItemType::RightDelim)?)
         };
-        // Parse the block body as a define'd sub-tree sharing this lexer.
-        let (list, end) = self.item_list()?;
+        // Parse the block body as a define'd sub-tree sharing this
+        // lexer. Nested blocks recurse through item_list WITHOUT a
+        // parse_control frame — guard here.
+        self.enter_depth(token.line)?;
+        let body = self.item_list();
+        self.leave_depth();
+        let (list, end) = body?;
         match end {
             Flow::End(_) => {}
             Flow::Else(pos) => {
@@ -1022,14 +1044,9 @@ impl<'t> Parser<'t> {
             ItemType::LeftParen => {
                 // Go's own guard site (`parse.go` itemLeftParen,
                 // maxStackDepth) — same error text, our measured cap.
-                if self.depth >= MAX_PARSE_DEPTH {
-                    return Err(
-                        self.errorf(token.line, "max expression depth exceeded".to_string())
-                    );
-                }
-                self.depth += 1;
+                self.enter_depth(token.line)?;
                 let result = self.pipeline("parenthesized pipeline", ItemType::RightParen);
-                self.depth -= 1;
+                self.leave_depth();
                 Arg::Pipe {
                     pos: token.pos,
                     pipe: result?,

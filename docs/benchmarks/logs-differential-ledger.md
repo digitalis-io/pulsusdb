@@ -468,9 +468,13 @@ clients only display it).
   NOT cap control nesting at all (2 000 nested `{{if}}` render on the
   container; in practice its 131 072-byte query-length limit bounds
   nesting at ≈12 k).
-- **PulsusDB behaviour:** ONE structural-depth counter across both
-  parser recursion classes — nested controls (`item_list`) and
-  parenthesized pipelines (`term`) — capped at 40 with Go's own error
+- **PulsusDB behaviour:** ONE structural-depth counter across every
+  parser recursion shape — nested control bodies and `else if`/`else
+  with` CHAINS (guarded in `parse_control`, whose frame stays live
+  across a chain — round 3 fixed the `item_list` guard placement that
+  let a 5000-link else-if chain bypass the cap and SIGABRT a 2 MiB
+  thread), nested `block` bodies (`block_control`), and parenthesized
+  pipelines (`term`) — capped at 40 with Go's own error
   text (`template: line:N: max expression depth exceeded`, surfaced
   through the same `invalid line template: `/`invalid template for
   label…` compile-error wrapping the reference uses for its paren
@@ -481,7 +485,10 @@ clients only display it).
   reference and reject here (compile-time 400, same shape as the
   reference's own paren rejection); realistic templates nest < 10.
   Gated on a 2 MiB thread both ways in `logql_template_engine.rs`
-  (`structural_nesting_is_capped_at_parse_time_…`).
+  (`structural_nesting_is_capped_at_parse_time_…`,
+  `else_if_and_else_with_chains_are_capped_…`). The 40 stays the
+  ledgered interim (round-3 adjudication): it is not raised without
+  iterative parsing, the #255 shape.
 
 ### `template-error-wording-residuals` (issue #230, owner wording ruling)
 
@@ -535,12 +542,19 @@ clients only display it).
   class, where an uncharged per-call copy repeats inside a
   `range`/variable-only body that emits no text, or COMPOUNDS through
   `{{ $a = printf "%s%s" $a $a }}` (uncharged, that doubling is a
-  literal OOM-kill — reproduced). Scalar-returning parse scratch
-  (freed by return, nothing retained) and once-per-render error paths
-  stay uncharged; the census (`logql_template_alloc_census.rs`) pins
-  the classification with per-disposition evidence and the runtime
-  gate (`logql_template_alloc_gate.rs`) asserts charge-dominance over
-  the whole registry. A breach aborts the query with the bounded
+  literal OOM-kill — reproduced), and — round 3 — the IDENTITY /
+  no-match / `n == 0` early-return copies (`replace` with `old ==
+  new`, `align` at its identity count) that a single-shape check let
+  through. Scalar-returning parse scratch (freed by return, nothing
+  retained) and once-per-render error paths stay uncharged. The
+  evidence split (round 3, the #236/#272 demotion): the AST census
+  (`logql_template_alloc_census.rs`) is a DRIFT TRIPWIRE over new or
+  changed sites, and the runtime gate
+  (`logql_template_alloc_gate.rs`) is the dominance proof — every
+  registry function runs through its branch shapes (happy / empty /
+  identity / no-match / error) asserting allocated ≤ charged, plus a
+  near-exhausted-budget ORDERING leg that fails any charge moved
+  after its allocation (mutation-verified). A breach aborts the query with the bounded
   `422 query_too_broad` (`TooBroadReason::TemplateOutputBytes`) — never
   a per-line `TemplateFormatErr`, never a truncation, never an OOM.
 - **Threshold (derived, not chosen):**
