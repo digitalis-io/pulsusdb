@@ -609,6 +609,7 @@ clients only display it).
   `int` still panics with the reference's exact `strings: Repeat
   output length overflow` per line (that surface is bounded and
   correct).
+
 ### `logql-error-envelope` (issue #240)
 
 - **What changed:** `ReadError::PipelineInvalid`'s `Display` is now the

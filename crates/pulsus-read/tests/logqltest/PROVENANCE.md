@@ -219,6 +219,7 @@ wins. Capture deltas from the base procedure above:
    the substring is of PULSUSDB's reject `Display` (whose inner text is
    the Go parse error verbatim); the capture proved the container 400s
    the same query before emitting each case.
+
 ## Issue #240 — error-body identity and rejection-status probes
 
 The corpus rows whose produced error is a `ReadError::PipelineInvalid`
