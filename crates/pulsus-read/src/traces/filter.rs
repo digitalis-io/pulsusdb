@@ -452,11 +452,17 @@ fn hex_column_sql(column: &str, op: ComparisonOp, value: &str) -> String {
         ComparisonOp::Neq => format!("lower(hex({column})) != {}", escape::ch_string(value)),
         ComparisonOp::Re => format!(
             "match(lower(hex({column})), {})",
-            escape::ch_regex_anchored(value)
+            escape::ch_regex_anchored_traceql_prevalidated(
+                crate::traces::TraceqlPrevalidated::new(),
+                value
+            )
         ),
         ComparisonOp::Nre => format!(
             "NOT match(lower(hex({column})), {})",
-            escape::ch_regex_anchored(value)
+            escape::ch_regex_anchored_traceql_prevalidated(
+                crate::traces::TraceqlPrevalidated::new(),
+                value
+            )
         ),
         _ => unreachable!("hex id columns accept only = != =~ !~ (checked at compile_leaf)"),
     }
@@ -466,8 +472,20 @@ fn string_column_sql(column: &str, op: ComparisonOp, value: &str) -> String {
     match op {
         ComparisonOp::Eq => format!("{column} = {}", escape::ch_string(value)),
         ComparisonOp::Neq => format!("{column} != {}", escape::ch_string(value)),
-        ComparisonOp::Re => format!("match({column}, {})", escape::ch_regex_anchored(value)),
-        ComparisonOp::Nre => format!("NOT match({column}, {})", escape::ch_regex_anchored(value)),
+        ComparisonOp::Re => format!(
+            "match({column}, {})",
+            escape::ch_regex_anchored_traceql_prevalidated(
+                crate::traces::TraceqlPrevalidated::new(),
+                value
+            )
+        ),
+        ComparisonOp::Nre => format!(
+            "NOT match({column}, {})",
+            escape::ch_regex_anchored_traceql_prevalidated(
+                crate::traces::TraceqlPrevalidated::new(),
+                value
+            )
+        ),
         _ => unreachable!("string columns accept only = != =~ !~ (checked at compile_leaf)"),
     }
 }
@@ -477,7 +495,13 @@ fn string_column_sql(column: &str, op: ComparisonOp, value: &str) -> String {
 pub(crate) fn value_pred_sql(pred: &ValuePred) -> String {
     match pred {
         ValuePred::StringEq(v) => format!("val = {}", escape::ch_string(v)),
-        ValuePred::Regex(pat) => format!("match(val, {})", escape::ch_regex_anchored(pat)),
+        ValuePred::Regex(pat) => format!(
+            "match(val, {})",
+            escape::ch_regex_anchored_traceql_prevalidated(
+                crate::traces::TraceqlPrevalidated::new(),
+                pat
+            )
+        ),
         ValuePred::Num { op, value } => {
             let sym = sql_op(*op).expect("numeric ops are ordering/equality by construction");
             format!("val_num {sym} {}", render_num(*value))
@@ -870,11 +894,17 @@ fn compile_trace_id_leaf(op: ComparisonOp, value: &Value) -> Result<CompiledLeaf
         ComparisonOp::Neq => format!("trace_id != unhex({})", escape::ch_string(&stored)),
         ComparisonOp::Re => format!(
             "match(lower(hex(trace_id)), {})",
-            escape::ch_regex_anchored(&stored)
+            escape::ch_regex_anchored_traceql_prevalidated(
+                crate::traces::TraceqlPrevalidated::new(),
+                &stored
+            )
         ),
         ComparisonOp::Nre => format!(
             "NOT match(lower(hex(trace_id)), {})",
-            escape::ch_regex_anchored(&stored)
+            escape::ch_regex_anchored_traceql_prevalidated(
+                crate::traces::TraceqlPrevalidated::new(),
+                &stored
+            )
         ),
         _ => unreachable!("trace:id accepts only = != =~ !~"),
     };

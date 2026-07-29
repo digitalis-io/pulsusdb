@@ -198,6 +198,21 @@ impl IntoResponse for ApiError {
                 ReadError::Clickhouse(ChError::Timeout(_)) => {
                     (StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string(), None)
                 }
+                // Issue #240: a LogQL rejection is a client error on every
+                // surface that can carry it — `logs_api::error::
+                // read_error_parts` and `prom_api::error::read_error_parts`
+                // both map it to 400 `bad_data`, matched exhaustively so
+                // this stays correct rather than merely "impossible
+                // today". Unreachable from `traces_api` (111 `ReadError`
+                // mentions, zero LogQL-class constructions), matched here
+                // so a future call path cannot silently downgrade a 400
+                // into the 500 `internal` catch-all below. `Display` is
+                // transparent, so `e.to_string()` is the body, unmodified.
+                // The other LogQL-only variants stay on the catch-all —
+                // #266 owns that.
+                ReadError::PipelineInvalid { .. } => {
+                    (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None)
+                }
                 _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal",
@@ -240,6 +255,40 @@ mod tests {
             .expect("read body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         (status, json)
+    }
+
+    /// Issue #240: the LogQL-class rejection is 400 `bad_data` on this
+    /// surface too, with the BARE reason as the whole body (the variant's
+    /// `Display` carries no prefix). Deleting the explicit arm drops this
+    /// to the 500 `internal` catch-all; restoring a decorating `#[error]`
+    /// prefix breaks the byte-exact `error`-field assertion.
+    #[tokio::test]
+    async fn read_error_pipeline_invalid_maps_to_400_bad_data() {
+        let err = ApiError::Read(ReadError::PipelineInvalid {
+            reason: "bad regex: unclosed group".to_string(),
+        });
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(json.get("position").is_none());
+        assert_eq!(json["error"], "bad regex: unclosed group");
+    }
+
+    /// Issue #240 (AC2's once-only leg): a reason that itself begins
+    /// `parse error ` appears in the rendered body exactly once — no
+    /// renderer- or variant-level decoration doubles it.
+    #[tokio::test]
+    async fn read_error_pipeline_invalid_body_is_the_reason_exactly_once() {
+        let reason = "parse error : synthetic prefix-collision probe";
+        let err = ApiError::Read(ReadError::PipelineInvalid {
+            reason: reason.to_string(),
+        });
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body = json["error"].as_str().expect("error body");
+        assert_eq!(body, reason);
+        assert_eq!(body.matches("parse error ").count(), 1);
     }
 
     #[tokio::test]

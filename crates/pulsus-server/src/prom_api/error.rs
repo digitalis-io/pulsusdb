@@ -219,6 +219,25 @@ mod tests {
         assert_eq!(json["errorType"], "bad_data");
     }
 
+    /// Issue #240: the LogQL pipeline rejection's body is the BARE
+    /// reason on this surface too — whole `error` field, byte-exact,
+    /// present exactly once even when the reason itself begins
+    /// `parse error `.
+    #[tokio::test]
+    async fn read_error_pipeline_invalid_body_is_the_bare_reason() {
+        let reason = "parse error : synthetic prefix-collision probe";
+        let err = pulsus_read::logql::ReadError::PipelineInvalid {
+            reason: reason.to_string(),
+        };
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(json.get("position").is_none());
+        let body = json["error"].as_str().expect("error body");
+        assert_eq!(body, reason);
+        assert_eq!(body.matches("parse error ").count(), 1);
+    }
+
     #[tokio::test]
     async fn envelope_has_exactly_three_fields_never_a_position() {
         let (_, json) = envelope(ApiError::Param(ParamError::MissingQuery)).await;
