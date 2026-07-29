@@ -688,7 +688,7 @@ impl LogQlEngine {
         }
 
         Ok((
-            run_pipeline_rows(rows, &compiled, &meta, sp.result_limit),
+            run_pipeline_rows(rows, &compiled, &meta, sp.result_limit)?,
             false,
         ))
     }
@@ -846,7 +846,7 @@ impl LogQlEngine {
                     structured_metadata: r.structured_metadata,
                 })
                 .collect();
-            let filled = acc.feed(&sample_rows, compiled);
+            let filled = acc.feed(&sample_rows, compiled)?;
 
             if filled {
                 // Result limit filled — a complete result, never partial.
@@ -2263,7 +2263,7 @@ impl LogQlEngine {
                 &mut acc,
                 &mut matched,
                 line_limit,
-            );
+            )?;
             return Ok(DetectedFields {
                 fields: acc.finish(),
                 truncated: false,
@@ -2439,7 +2439,7 @@ impl LogQlEngine {
                 acc,
                 &mut matched,
                 line_limit,
-            );
+            )?;
 
             if matched >= line_limit {
                 // Post-pipeline limit filled — complete, never partial.
@@ -2611,7 +2611,7 @@ impl LogQlEngine {
                 structured_metadata: r.structured_metadata,
             })
             .collect();
-        let streams = run_pipeline_rows(sample_rows, &setup.compiled, &meta, fetch_limit);
+        let streams = run_pipeline_rows(sample_rows, &setup.compiled, &meta, fetch_limit)?;
         Ok(TailPage {
             streams,
             next,
@@ -2809,13 +2809,24 @@ pub fn run_pipeline_rows(
     compiled: &super::pipeline::CompiledPipeline,
     meta: &HashMap<u64, StreamMetaRow>,
     result_limit: u32,
-) -> Vec<StreamResult> {
+) -> Result<Vec<StreamResult>, ReadError> {
     // A one-shot feed over the whole slice — byte-identical output and
     // per-row allocation profile to the pre-#90 monolithic function (the
     // `logql_pipeline_alloc`/`logql_pipeline_golden` suites pin both).
     let mut acc = StreamAccumulator::new(meta, result_limit);
-    acc.feed(&rows, compiled);
-    acc.into_streams()
+    acc.feed(&rows, compiled)?;
+    Ok(acc.into_streams())
+}
+
+/// Issue #230 follow-up: a template-render output-budget breach is the
+/// bounded 422 (the same complete-or-error class as every other
+/// `QueryTooBroad` reason — never a truncation, never an OOM).
+impl From<super::pipeline::TemplateBudgetExceeded> for ReadError {
+    fn from(e: super::pipeline::TemplateBudgetExceeded) -> Self {
+        ReadError::QueryTooBroad(TooBroadReason::TemplateOutputBytes {
+            budget_bytes: e.budget_bytes,
+        })
+    }
 }
 
 /// The stateful grouping/counting core of [`run_pipeline_rows`], extracted
@@ -2871,7 +2882,7 @@ impl<'m> StreamAccumulator<'m> {
         &mut self,
         rows: &[SampleRow],
         compiled: &super::pipeline::CompiledPipeline,
-    ) -> bool {
+    ) -> Result<bool, ReadError> {
         let Self {
             meta,
             result_limit,
@@ -2917,7 +2928,9 @@ impl<'m> StreamAccumulator<'m> {
                 // Zero-structured-metadata fast path — UNCHANGED (the
                 // `logql_pipeline_alloc` golden pins its zero-per-row
                 // profile; AC-8 byte-identity for pre-#97 data).
-                let Some(line) = compiled.run_into(&row.body, base, &mut scratch) else {
+                let Some(line) =
+                    compiled.run_into(&row.body, base, row.timestamp_ns, &mut scratch)?
+                else {
                     continue;
                 };
                 *survivors += 1;
@@ -2976,14 +2989,14 @@ impl<'m> StreamAccumulator<'m> {
                     &m.service,
                     sm_scratch,
                 );
-                sm_scratch = recycle_label_scratch(used);
+                sm_scratch = recycle_label_scratch(used?);
                 if survived {
                     *survivors += 1;
                 }
             }
         }
 
-        *survivors >= *result_limit
+        Ok(*survivors >= *result_limit)
     }
 
     pub fn into_streams(self) -> Vec<StreamResult> {
@@ -3751,7 +3764,12 @@ impl<'q> ClientAggState<'q> {
             let Some(base) = self.base_labels.get(&row.fingerprint) else {
                 continue;
             };
-            let (line, value) = match self.compiled.run_metric_into(&row.body, base, &mut scratch) {
+            let (line, value) = match self.compiled.run_metric_into(
+                &row.body,
+                base,
+                row.timestamp_ns,
+                &mut scratch,
+            )? {
                 MetricRun::Dropped => continue,
                 MetricRun::Kept { line, value } => (line, value),
             };
@@ -4999,10 +5017,18 @@ impl<'q> RangeSlideState<'q> {
             let Some(base) = base_labels.get(&row.fingerprint) else {
                 continue;
             };
-            let (line, value) = match self.compiled.run_metric_into(&row.body, base, &mut scratch) {
-                MetricRun::Dropped => continue,
-                MetricRun::Kept { line, value } => (line, value),
-            };
+            let (line, value) =
+                match self
+                    .compiled
+                    .run_metric_into(&row.body, base, row.timestamp_ns, &mut scratch)
+                {
+                    Ok(MetricRun::Dropped) => continue,
+                    Ok(MetricRun::Kept { line, value }) => (line, value),
+                    Err(e) => {
+                        result = Err(e.into());
+                        break;
+                    }
+                };
             if let Err(e) = check_surviving_error(&scratch) {
                 result = Err(e);
                 break;
@@ -7044,18 +7070,22 @@ fn eval_structured_metadata_row<'a>(
     timestamp_ns: i64,
     service: &str,
     mut scratch: LabelScratch<'a>,
-) -> (bool, LabelScratch<'a>) {
-    let survived = if let Some(line) = compiled.run_into_with_sm(body, merged, sm, &mut scratch) {
-        let line = line.into_owned();
-        scratch.sort_unstable();
-        push_fanout_entry(label_groups, &scratch, timestamp_ns, line, service);
-        true
-    } else {
-        false
+) -> (bool, Result<LabelScratch<'a>, ReadError>) {
+    let survived = match compiled.run_into_with_sm(body, merged, timestamp_ns, sm, &mut scratch) {
+        Ok(Some(line)) => {
+            let line = line.into_owned();
+            scratch.sort_unstable();
+            push_fanout_entry(label_groups, &scratch, timestamp_ns, line, service);
+            true
+        }
+        Ok(None) => false,
+        // Template render-budget breach: the whole query fails (bounded
+        // 422 — issue #230 follow-up).
+        Err(e) => return (false, Err(e.into())),
     };
     // Drop every borrow of `merged` before the buffer is recycled for reuse.
     scratch.clear();
-    (survived, scratch)
+    (survived, Ok(scratch))
 }
 
 /// Re-tags a cleared borrowed-label scratch's (now empty) heap allocation as
@@ -7087,7 +7117,7 @@ fn feed_detected_rows(
     acc: &mut FieldAccumulator,
     matched: &mut u32,
     line_limit: u32,
-) {
+) -> Result<(), ReadError> {
     let mut merge_buf: Vec<(String, String)> = Vec::new();
     let mut sm_buf: Vec<(String, String)> = Vec::new();
     // The SM pairs kept for `observe_structured_metadata` — parsed
@@ -7130,13 +7160,22 @@ fn feed_detected_rows(
         } else {
             &EMPTY_STRUCTURED_METADATA
         };
-        let (survived, used) =
-            observe_detected_row(compiled, &row.body, run_base, sm, sm_pairs, acc, scratch);
-        scratch = recycle_label_scratch(used);
+        let (survived, used) = observe_detected_row(
+            compiled,
+            &row.body,
+            run_base,
+            row.timestamp_ns,
+            sm,
+            sm_pairs,
+            acc,
+            scratch,
+        );
+        scratch = recycle_label_scratch(used?);
         if survived {
             *matched += 1;
         }
     }
+    Ok(())
 }
 
 /// Runs one sampled row through the query pipeline and, when it
@@ -7147,33 +7186,39 @@ fn feed_detected_rows(
 /// then json-first/logfmt-fallback auto-detection on the POST-pipeline
 /// line. `scratch` is taken by value and returned for recycling — same
 /// per-row-lifetime rationale as [`eval_structured_metadata_row`].
+#[allow(clippy::too_many_arguments)]
 fn observe_detected_row<'a>(
     compiled: &'a super::pipeline::CompiledPipeline,
     body: &'a str,
     run_base: &'a [(String, String)],
+    ts_ns: i64,
     sm: &'a StructuredMetadataCtx,
     sm_pairs: &[(String, String)],
     acc: &mut FieldAccumulator,
     mut scratch: LabelScratch<'a>,
-) -> (bool, LabelScratch<'a>) {
-    let survived = if let Some(line) = compiled.run_into_with_sm(body, run_base, sm, &mut scratch) {
-        acc.observe_structured_metadata(sm_pairs);
-        let added: Vec<(String, String)> = scratch
-            .iter()
-            .filter(|(k, _)| !run_base.iter().any(|(bk, _)| bk.as_str() == k.as_ref()))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        acc.observe_parsed(&added, None);
-        if let Some((parser, pairs)) = detected::auto_parse(line.as_ref()) {
-            acc.observe_parsed(&pairs, Some(parser));
+) -> (bool, Result<LabelScratch<'a>, ReadError>) {
+    let survived = match compiled.run_into_with_sm(body, run_base, ts_ns, sm, &mut scratch) {
+        Ok(Some(line)) => {
+            acc.observe_structured_metadata(sm_pairs);
+            let added: Vec<(String, String)> = scratch
+                .iter()
+                .filter(|(k, _)| !run_base.iter().any(|(bk, _)| bk.as_str() == k.as_ref()))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            acc.observe_parsed(&added, None);
+            if let Some((parser, pairs)) = detected::auto_parse(line.as_ref()) {
+                acc.observe_parsed(&pairs, Some(parser));
+            }
+            true
         }
-        true
-    } else {
-        false
+        Ok(None) => false,
+        // Template render-budget breach fails the sampling query too —
+        // the bounded 422 (issue #230 follow-up).
+        Err(e) => return (false, Err(e.into())),
     };
     // Drop every borrow of `run_base` before the buffer is recycled.
     scratch.clear();
-    (survived, scratch)
+    (survived, Ok(scratch))
 }
 
 /// Fan-out for structured-metadata-bearing rows on the line-filter-only fast
@@ -10190,7 +10235,8 @@ mod tests {
         ];
         let mut acc = super::super::detected::FieldAccumulator::new(1000);
         let mut matched = 0u32;
-        feed_detected_rows(&rows, &base_labels, &compiled, &mut acc, &mut matched, 100);
+        feed_detected_rows(&rows, &base_labels, &compiled, &mut acc, &mut matched, 100)
+            .expect("no budget breach");
         assert_eq!(
             matched, 1,
             "only the post-pipeline surviving row counts toward line_limit"
@@ -10229,7 +10275,8 @@ mod tests {
             .collect();
         let mut acc = super::super::detected::FieldAccumulator::new(1000);
         let mut matched = 0u32;
-        feed_detected_rows(&rows, &base_labels, &compiled, &mut acc, &mut matched, 2);
+        feed_detected_rows(&rows, &base_labels, &compiled, &mut acc, &mut matched, 2)
+            .expect("no budget breach");
         assert_eq!(matched, 2);
         let fields = acc.finish();
         assert_eq!(fields.len(), 1);
@@ -11486,8 +11533,10 @@ mod tests {
                 },
             ]
         };
-        let mut tail_out = run_pipeline_rows(rows(), &tail_compiled, &meta, 100);
-        let mut query_out = run_pipeline_rows(rows(), &query_compiled, &meta, 100);
+        let mut tail_out = run_pipeline_rows(rows(), &tail_compiled, &meta, 100)
+            .expect("no template budget breach");
+        let mut query_out = run_pipeline_rows(rows(), &query_compiled, &meta, 100)
+            .expect("no template budget breach");
         tail_out.sort_by(|a, b| a.labels_json.cmp(&b.labels_json));
         query_out.sort_by(|a, b| a.labels_json.cmp(&b.labels_json));
         assert_eq!(tail_out, query_out);
@@ -11597,7 +11646,8 @@ mod tests {
             body: "line".to_string(),
             structured_metadata: r#"{"env":"SMVAL","trace_id":"abc"}"#.to_string(),
         }];
-        let results = run_pipeline_rows(rows, &compiled, &meta, 100);
+        let results =
+            run_pipeline_rows(rows, &compiled, &meta, 100).expect("no template budget breach");
         assert_eq!(results.len(), 1);
         // Canonical sorted JSON: the stream `env` keeps "prod"; the colliding
         // SM `env` surfaces as `env_extracted`; `trace_id` merges as-is.
@@ -11637,7 +11687,8 @@ mod tests {
             body: "line".to_string(),
             structured_metadata: r#"{"env":"smval"}"#.to_string(),
         }];
-        let results = run_pipeline_rows(rows, &compiled, &meta, 100);
+        let results =
+            run_pipeline_rows(rows, &compiled, &meta, 100).expect("no template budget breach");
         assert_eq!(results.len(), 1);
         // Exactly one `env_extracted`, carrying the SM value (last-write-wins);
         // the stream `env` keeps "prod"; no duplicate key entries.
@@ -11671,7 +11722,8 @@ mod tests {
             body: "line".to_string(),
             structured_metadata: r#"{"env":"smval","env_extracted":"smextra"}"#.to_string(),
         }];
-        let results = run_pipeline_rows(rows, &compiled, &meta, 100);
+        let results =
+            run_pipeline_rows(rows, &compiled, &meta, 100).expect("no template budget breach");
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].labels_json,
@@ -11692,7 +11744,8 @@ mod tests {
             sample(1, 20, r#"{"status":"500","m":"b"}"#),
             sample(2, 10, r#"{"status":"500","m":"a"}"#),
         ];
-        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 3);
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 3)
+            .expect("no template budget breach");
         let total: usize = results.iter().map(|r| r.entries.len()).sum();
         assert_eq!(total, 3, "global cap, not per-stream");
         let mut kept: Vec<i64> = results
@@ -11712,7 +11765,8 @@ mod tests {
             sample(2, 30, r#"{"status":"500","m":"c"}"#),
             sample(1, 40, r#"{"status":"500","m":"d"}"#),
         ];
-        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 3);
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 3)
+            .expect("no template budget breach");
         let mut kept: Vec<i64> = results
             .iter()
             .flat_map(|r| r.entries.iter().map(|(ts, _)| *ts))
@@ -11732,7 +11786,8 @@ mod tests {
             sample(1, 20, r#"{"status":"200","method":"GET"}"#), // dropped
             sample(1, 30, r#"{"status":"500","method":"PUT"}"#),
         ];
-        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 100);
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 100)
+            .expect("no template budget breach");
         assert_eq!(results.len(), 2, "one result stream per final label set");
         let total: usize = results.iter().map(|r| r.entries.len()).sum();
         assert_eq!(total, 2);
@@ -11765,7 +11820,8 @@ mod tests {
             sample(1, 30, r#"{"status":"500","method":"PUT"}"#),
             sample(1, 40, r#"{"status":"500","method":"DELETE"}"#),
         ];
-        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 2);
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 2)
+            .expect("no template budget breach");
         let mut entries: Vec<(i64, String)> = results
             .iter()
             .flat_map(|r| r.entries.iter().cloned())
@@ -11806,6 +11862,7 @@ mod tests {
         // survivor — an under-return against a limit of 3.
         assert_eq!(
             run_pipeline_rows(page(0), &compiled, &meta, 3)
+                .expect("no budget breach")
                 .iter()
                 .map(|r| r.entries.len())
                 .sum::<usize>(),
@@ -11819,7 +11876,9 @@ mod tests {
         let mut pages = 0;
         let mut base_ts = 0;
         loop {
-            let filled = acc.feed(&page(base_ts), &compiled);
+            let filled = acc
+                .feed(&page(base_ts), &compiled)
+                .expect("no budget breach");
             pages += 1;
             base_ts += 4;
             if filled {
@@ -11848,10 +11907,16 @@ mod tests {
         };
         let meta = meta_two_streams();
         let mut acc = StreamAccumulator::new(&meta, 3);
-        assert!(!acc.feed(&rows(0), &compiled), "2 < 3, not filled");
-        assert!(acc.feed(&rows(10), &compiled), "2 + 2 ⇒ filled at 3");
+        assert!(
+            !acc.feed(&rows(0), &compiled).expect("no budget breach"),
+            "2 < 3, not filled"
+        );
+        assert!(
+            acc.feed(&rows(10), &compiled).expect("no budget breach"),
+            "2 + 2 ⇒ filled at 3"
+        );
         // A further page must not push the total past the limit.
-        acc.feed(&rows(20), &compiled);
+        acc.feed(&rows(20), &compiled).expect("no budget breach");
         let total: usize = acc.into_streams().iter().map(|r| r.entries.len()).sum();
         assert_eq!(
             total, 3,
@@ -11868,7 +11933,8 @@ mod tests {
             sample(1, 10, "anything"),
             sample(2, 20, "anything"), // env=staging -> rewritten "L=staging" -> dropped
         ];
-        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 100);
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 100)
+            .expect("no template budget breach");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].fingerprint, 1);
         assert_eq!(
@@ -12932,8 +12998,9 @@ mod tests {
         let compiled =
             CompiledPipeline::compile(&parse_pipeline(r#"{x="y"} | json"#)).expect("compile");
         let mut labels = Vec::new();
-        let MetricRun::Kept { .. } =
-            compiled.run_metric_into("a=Hello b=World", &base, &mut labels)
+        let MetricRun::Kept { .. } = compiled
+            .run_metric_into("a=Hello b=World", &base, 0, &mut labels)
+            .expect("no budget breach")
         else {
             panic!("an errored line is kept for the surviving-error check");
         };
@@ -12949,8 +13016,9 @@ mod tests {
             CompiledPipeline::compile(&parse_pipeline(r#"{x="y"} | json | drop __error__"#))
                 .expect("compile");
         let mut labels = Vec::new();
-        let MetricRun::Kept { .. } =
-            compiled.run_metric_into("a=Hello b=World", &base, &mut labels)
+        let MetricRun::Kept { .. } = compiled
+            .run_metric_into("a=Hello b=World", &base, 0, &mut labels)
+            .expect("no budget breach")
         else {
             panic!("kept");
         };
@@ -12978,7 +13046,7 @@ mod tests {
         };
         let mut labels = Vec::new();
         compiled
-            .run_into_with_sm("line", &base, &err_ctx, &mut labels)
+            .run_into_with_sm("line", &base, 0, &err_ctx, &mut labels)
             .expect("kept");
         assert!(check_surviving_error(&labels).is_err());
         let details_ctx = StructuredMetadataCtx {
@@ -12988,7 +13056,7 @@ mod tests {
         };
         let mut labels = Vec::new();
         compiled
-            .run_into_with_sm("line", &base, &details_ctx, &mut labels)
+            .run_into_with_sm("line", &base, 0, &details_ctx, &mut labels)
             .expect("kept");
         check_surviving_error(&labels).expect("a lone details slot never fails a query");
     }

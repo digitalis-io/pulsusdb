@@ -1,0 +1,98 @@
+# t4_numeric.test — issue #230 template-engine corpus.
+# Wave-4: numeric batch (18 sprig + bytes/duration/duration_seconds)
+# — plan AC-7/AC-8 (the decimal-arithmetic pins).
+# Captured from grafana/loki:3.7.4 per PROVENANCE.md (stock container,
+# no TZ, no host zoneinfo — the degenerate-UTC Local precondition).
+
+load
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} service=t4s0r1785119441
+  1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ int "0x10" }}|{{ int "abc" }}|{{ int "1.9" }}|[{{ int "" }}]|{{ int "010" }}|{{ int "-12" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 16|0|1|[0]|8|-12
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ int "0b101" }}|{{ int "0o17" }}|{{ int "0777" }}|{{ int "9223372036854775807" }}|{{ int "9223372036854775808" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 5|15|511|9223372036854775807|0
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ int 1.9 }}|{{ int -9.5 }}|{{ int true }}|{{ int .n }}|{{ int "  5" }}|{{ int ".5" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1|-9|1|5|0|0
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ float64 "1e300" }}|{{ float64 "abc" }}|{{ float64 "1.5" }}|{{ float64 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1e+300|0|1.5|5
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ float64 "NaN" }}|{{ float64 "Inf" }}|{{ float64 "-inf" }}|{{ float64 "infinity" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns NaN|+Inf|-Inf|+Inf
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ add 1 2 3 }}|{{ add }}|{{ add .n "2" }}|{{ sub 10 .n }}|{{ mul 2 3 4 }}|{{ mul 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 6|0|7|5|24|5
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ div 7 2 }}|{{ div -7 2 }}|{{ mod 7 3 }}|{{ mod -7 3 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 3|-3|1|-1
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ add 9223372036854775807 1 }}|{{ mul 9223372036854775807 2 }}|{{ sub 0 9223372036854775807 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns -9223372036854775808|-2|-9223372036854775807
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ div -9223372036854775808 -1 }}|{{ mod -9223372036854775808 -1 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns -9223372036854775808|0
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ addf 0.1 0.2 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 0.3
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ divf 1 3 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 0.3333333333333333
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ int "0x10" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 16
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ int "1.9" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ round 2.5 0 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 3
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ float64 "1e300" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1e+300
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ mulf 1e20 10 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1e+21
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ subf 1 0.9 }}|{{ subf 0.3 0.1 }}|{{ mulf 1.1 1.1 1.1 }}|{{ subf 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 0.1|0.2|1.331|5
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ divf 10 2 }}|{{ divf 100 3 7 }}|{{ divf 2 3 }}|{{ divf -2 3 }}|{{ divf 2 -3 }}|{{ divf -2 -3 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 5|4.761904761904762|0.6666666666666667|-0.6666666666666667|-0.6666666666666667|0.6666666666666667
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ divf 1 7 }}|{{ divf 22 7 }}|{{ divf 1e-300 1e300 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 0.1428571428571429|3.142857142857143|0
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ addf 1e300 1e-300 }}|{{ addf 123456789.123456789 0.000000001 }}|{{ addf .n "2.5" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1e+300|1.2345678912345679e+08|7.5
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ addf 1e308 1e308 }}|{{ mulf 1e308 10 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns +Inf|+Inf
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ max 1 5 3 }}|{{ min 1 5 -3 }}|{{ maxf 1.5 2.5 }}|{{ minf 1.5 "0.5" }}|{{ max 2 }}|{{ maxf 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 5|-3|2.5|0.5|2|1.5
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ max 1 2.9 }}|{{ min 5 "abc" }}|{{ maxf (float64 "NaN") 1 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 2|0|NaN
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ ceil 1.1 }}|{{ floor 1.9 }}|{{ ceil -1.1 }}|{{ floor -1.9 }}|{{ ceil "2.3" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 2|1|-1|-2|3
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ round 2.4 0 }}|{{ round -2.5 0 }}|{{ round -2.4 0 }}|{{ round 123.456 2 }}|{{ round 123.454 2 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 2|-3|-3|123.46|123.45
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ round 2.5 0 0.6 }}|{{ round "3.75" 1 }}|{{ round 2.5 -1 }}|{{ round 25 -1 }}|{{ round 1.005 2 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 2|3.8|0|30|1
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ bytes .sz }}|{{ bytes "1MiB" }}|{{ bytes "1.5KB" }}|{{ bytes "1,000" }}|{{ bytes "10 MiB" }}|{{ bytes "1PB" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1000|1.048576e+06|1500|1000|1.048576e+07|1e+15
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ duration .dur }}|{{ duration_seconds "1h30m" }}|{{ duration "1h30m45.5s" }}|{{ duration "-2m" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 0.25|5400|5445.5|-120
+
+eval instant at 1785119441989621248ns {service_name="t4s0r1785119441"} | line_format `{{ duration "1µs" }}|{{ duration "125" }}{{/* numeric, no unit -> err */}}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:25: executing \"line\" at <duration \"125\">: error calling duration: time: missing unit in duration \"125\"", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t4s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+clear

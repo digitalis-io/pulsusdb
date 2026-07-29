@@ -168,6 +168,58 @@ windows, covered by `b9_range_sliding.test` and the `eval range` directive);
 `fetch_until_limit_paged` (keyset paging / result-limit — an exec/SQL concern,
 not the pure value path).
 
+## Issue #230 — template-engine corpus (`t1…t6_*.test`)
+
+The `t*` files pin the `line_format`/`label_format` template engine —
+688 directives: 678 `eval` (t1 60 + t2 228 + t3 34 + t4 29 + t5 258 +
+t6 69) plus 10 `eval_fail` reject-parity cases (all in t1) — every
+value AND execution-error string captured verbatim from
+`grafana/loki:3.7.4`, never hand-authored. (Re-derive with
+`grep -c '^eval ' / '^eval_fail'` per file; an earlier "676 cases"
+claim mixed the two directive kinds without saying so.) **Toolchain of record:**
+the pinned image's binary is built with **go1.26.5** (`go version -m`
+on the extracted binary) — semantics citations against an older local
+Go tree are advisory only; on any disagreement the container capture
+wins. Capture deltas from the base procedure above:
+
+1. **Stock-environment precondition (load-bearing).** Run the container
+   with **no `TZ`** and **no host zoneinfo mounted**, so Go's
+   `initLocal` degenerates `Local` to the all-nil "UTC" form — the
+   `t5` zone goldens (`Location` prints, `%d` struct dumps, MarshalBinary
+   offsets) depend on it. The hermetic runner mirrors this by pinning
+   `CompiledPipeline::with_template_env(TemplateEnv::default())`.
+2. **Disable ingest-side level detection.** The stock config must gain
+   `limits_config: { discover_log_levels: false }` (mounted like the
+   `approx_topk` delta above) — otherwise the distributor injects a
+   `detected_level` stream label into every captured labelset that the
+   hermetic store would not reproduce.
+3. **Capture through `query_range`.** v3.7.4 rejects instant queries on
+   log selectors ("log queries are not supported as an instant query
+   type"); capture with `/loki/api/v1/query_range` over a window
+   covering the pushed entries. The `.test` replays as `eval instant`
+   (the hermetic runner applies no window).
+4. **Absolute-ns `load` offsets.** Entries are pushed at wall-clock ns
+   and the `.test` records those exact stamps
+   (`1785119131123456789ns`-style), so `__timestamp__` goldens replay
+   hermetically at the captured instants.
+5. **Representable outputs only.** A stream expected line cannot carry
+   newlines, a leading `#`, leading/trailing whitespace, or be empty —
+   templates whose output has any of these render into `label_format`
+   values (escaped) or are bracketed (`[{{ … }}]`). The capture driver
+   hard-fails on unrepresentable output instead of quietly mangling it.
+6. **Exclusion classes stay out of the corpus.** The pinned-address and
+   tzdata-table printf cells (ledger `template-pinned-address-cells` /
+   `template-tzdata-table-cells`) and the rust-regex compile-error
+   wordings are gated hermetically in `tests/logql_template_engine.rs`;
+   a grep-gate there proves no `t*` golden contains a pinned-address
+   token. `cargo run -p xtask -- template-audit` re-derives the
+   address-cell evidence (dual-container diff + address-token scan) on
+   any reference bump.
+7. **`eval_fail` msg lines** follow the `b8_reject_parity` convention:
+   the substring is of PULSUSDB's reject `Display` (whose inner text is
+   the Go parse error verbatim); the capture proved the container 400s
+   the same query before emitting each case.
+
 ## Issue #240 — error-body identity and rejection-status probes
 
 The corpus rows whose produced error is a `ReadError::PipelineInvalid`

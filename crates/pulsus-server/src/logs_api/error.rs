@@ -111,7 +111,7 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
             Some(inner.span().start),
         ),
         // Issue M6-09 plan v3 delta 6: pipeline-validation failures (bad
-        // regex / unsupported template function / bad parser expression /
+        // regex / invalid template (#230) / bad parser expression /
         // `unwrap` outside a range aggregation) and the M6-10
         // metric-pipeline deferral are both client-caused query-shape
         // rejections — 400 `bad_data`, alongside the other planner

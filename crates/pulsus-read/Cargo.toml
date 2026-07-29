@@ -47,6 +47,14 @@ regex.workspace = true
 # pipeline — cost bounded to rows that already passed line-filter
 # pushdown.
 serde_json.workspace = true
+# Go template engine (issue #230): IANA zone offsets for the `time`
+# function family (`date`/`toDate`/`toDateInZone`/`__timestamp__`
+# methods) — versions pinned by the existing workspace lock.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+# `b64enc` (the sprig subset); decode is a hand port for Go's exact
+# error offsets.
+base64 = "0.22"
 # Loki's `labels.StableHash` (issue #227): the same-timestamp cross-stream
 # tie key in the sliding-window range evaluator is `xxhash64(seed 0)` over
 # the stream's sorted `name·0xFF·value·0xFF` labels — byte-identical to

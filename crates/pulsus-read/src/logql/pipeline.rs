@@ -47,10 +47,12 @@
 //!   is missing; numeric label filters drop lines missing the label and
 //!   keep (with `__error__="LabelFilterErr"`) lines whose value fails
 //!   unit conversion.
-//! - `line_format`/`label_format` templates support the `{{.label}}`
-//!   field-substitution + literal-text subset; every excluded template
-//!   function is individually enumerated
-//!   ([`EXCLUDED_TEMPLATE_FUNCTIONS`]) and rejected by name.
+//! - `line_format`/`label_format` bodies are FULL Go `text/template`
+//!   programs with the reference's 67-function map (issue #230,
+//!   [`super::template`]): a compile-error is a 400, a per-line
+//!   execution error tags `TemplateFormatErr` + the engine's error
+//!   detail and keeps the line (unchanged for `line_format`;
+//!   destination unset for `label_format`).
 //! - One `label_format` stage renders every template against a single
 //!   data-map **snapshot** of the label set, so an assignment never
 //!   observes an earlier one in the same stage; and `__error__` is not
@@ -80,6 +82,7 @@ use pulsus_logql::{
 
 use super::exec::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
 use super::ip::{IpMatcher, line_has_ip_in};
+use super::template::{self, Part as TmplPart, Template, TemplateEnv, TemplateKind};
 // Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
 // Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go
 // stdlib `time`'s internal `quote` (duration branch) — reused here so the
@@ -101,6 +104,12 @@ pub const ERROR_LABEL: &str = "__error__";
 /// Sorts AFTER `__error__` lexically (`"__error__" < "__error_details__"`),
 /// so the emitted sorted `labels_json` stays canonical with no plumbing.
 pub const ERROR_DETAILS_LABEL: &str = "__error_details__";
+
+/// The reference's `errTemplateFormat` (`pkg/logql/log/error.go:9`): the
+/// per-line error class a FAILING template execution sets — the query
+/// succeeds, the line keeps flowing (issue #230; `fmt.go:252-256`,
+/// `:426-429`).
+pub const TEMPLATE_FORMAT_ERROR: &str = "TemplateFormatErr";
 
 /// The reference's `PreserveErrorLabel` (`pkg/logqlmodel/error.go:26`).
 /// PulsusDB never sets it, but `label_format __preserve_error__=…` can, and
@@ -234,15 +243,16 @@ struct StageMap<'a> {
     /// Present ONLY when the #231 compile-time `needs_snapshot` gate is set;
     /// `None` = render against the live vector (the zero-copy fast path).
     snapshot: Option<Vec<(Cow<'a, str>, Cow<'a, str>)>>,
-    /// Whether [`ErrorSlots::visible`] was OPEN when this map was BUILT.
-    /// A bool, deliberately not borrowed values: it holds no reference to
-    /// the slots, so the element loop stays free to set `dirty`. Sound
-    /// because the slot VALUES are invariant inside a `label_format` stage
-    /// (`__error__` is a compile-time 400, `__error_details__` writes the
-    /// vector, and the `{{.label}}`-only subset has no template-execution
-    /// failure path — `fmt.go:426-429` is unreachable BY TYPE here, see
-    /// the U5 note at [`compile_template`]).
-    errors_visible: bool,
+    /// The error-pair AS THE MAP FROZE IT (issue #230): pre-#230 the slot
+    /// values were invariant inside a `label_format` stage (the old U5
+    /// note), so a gate bool sufficed; a FULL template can now fail per
+    /// line and OVERWRITE the slots mid-stage (`fmt.go:426-429`), while
+    /// the reference's data map — built once, `fmt.go:423-425` — keeps
+    /// showing the values from map-build time. Snapshotting the values
+    /// (owned, only when the visibility gate was open at build)
+    /// reproduces that exactly.
+    frozen_err: Option<String>,
+    frozen_details: Option<String>,
 }
 
 /// Loki (grafana/loki:3.4.2, buger/jsonparser) reports this fixed detail
@@ -252,12 +262,47 @@ struct StageMap<'a> {
 /// them); those are ledgered off-corpus, not reproduced.
 const JSON_ERROR_DETAILS: &str = "Value looks like object, but can't find closing '}' symbol";
 
+/// A `line_format`/`label_format` render breached the per-render
+/// output-byte budget (issue #230 follow-up;
+/// [`super::template::MAX_TEMPLATE_RENDER_BYTES`]). Query-aborting: the
+/// exec layer maps it to the bounded 422
+/// (`TooBroadReason::TemplateOutputBytes`) — never a per-line
+/// `TemplateFormatErr`, never a truncation, never an OOM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateBudgetExceeded {
+    pub budget_bytes: u64,
+}
+
+impl TemplateBudgetExceeded {
+    pub(crate) fn new() -> Self {
+        TemplateBudgetExceeded {
+            budget_bytes: super::template::MAX_TEMPLATE_RENDER_BYTES,
+        }
+    }
+}
+
+impl fmt::Display for TemplateBudgetExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "template render exceeded the {}-byte output budget",
+            self.budget_bytes
+        )
+    }
+}
+
+impl std::error::Error for TemplateBudgetExceeded {}
+
 /// Errors from compiling a pipeline — all client-caused, surfaced as
 /// [`super::error::ReadError::PipelineInvalid`] (400-class).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineError {
     BadRegex(String),
-    UnsupportedTemplate(String),
+    /// A `line_format`/`label_format` template body the template engine
+    /// rejects at compile time (issue #230). Carries the reference's full
+    /// message (`invalid line template: template: line:1: …` /
+    /// `invalid template for label '<dst>': …`).
+    InvalidTemplate(String),
     BadParserExpr(String),
     BadIpFilter(String),
 }
@@ -266,11 +311,7 @@ impl fmt::Display for PipelineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PipelineError::BadRegex(msg) => write!(f, "bad regex: {msg}"),
-            PipelineError::UnsupportedTemplate(name) => write!(
-                f,
-                "unsupported template function `{name}`: line_format/label_format support \
-                 only `{{{{.label}}}}` field substitution and literal text"
-            ),
+            PipelineError::InvalidTemplate(msg) => f.write_str(msg),
             PipelineError::BadParserExpr(msg) => write!(f, "bad parser expression: {msg}"),
             PipelineError::BadIpFilter(msg) => write!(f, "bad ip() label filter: {msg}"),
         }
@@ -385,12 +426,6 @@ enum PatternTok {
 }
 
 #[derive(Debug, Clone)]
-enum TmplPart {
-    Lit(String),
-    Field(String),
-}
-
-#[derive(Debug, Clone)]
 enum CompiledStage {
     LineFilter {
         /// `or`-disjunction alternatives; the stage matches iff ANY matches.
@@ -416,10 +451,12 @@ enum CompiledStage {
     Pattern(Vec<PatternTok>),
     LabelFilter(CompiledLabelFilter),
     LineFormat {
-        tmpl: Vec<TmplPart>,
+        tmpl: Template,
         /// Some field names `__error__`/`__error_details__` — decided once
         /// at compile time ([`template_reads_error_pair`]) so every ordinary
         /// template keeps the slot-blind zero-copy render (issue #238).
+        /// Always true for `Template::Full` (a full-language template can
+        /// reach the pair dynamically — `index . "__error__"`).
         reads_err: bool,
     },
     LabelFormat {
@@ -505,7 +542,7 @@ enum CompiledLabelFmt {
     RenameSelf { name: String },
     Template {
         dst: String,
-        tmpl: Vec<TmplPart>,
+        tmpl: Template,
         /// Some field names `__error__`/`__error_details__` — the same
         /// compile-time gate as `CompiledStage::LineFormat`'s `reads_err`.
         reads_err: bool,
@@ -517,6 +554,11 @@ enum CompiledLabelFmt {
 #[derive(Debug, Clone)]
 pub struct CompiledPipeline {
     stages: Vec<CompiledStage>,
+    /// The template execution environment (issue #230): the `Local`
+    /// zone + wall clock the reference resolves from the process.
+    /// Tests/the corpus runner override it via
+    /// [`CompiledPipeline::with_template_env`] to pin determinism.
+    template_env: TemplateEnv,
     mutates_labels: bool,
     rewrites_line: bool,
     line_filter_only: bool,
@@ -627,10 +669,17 @@ fn compile_stage(
         Stage::LineFormat(tmpl) => {
             st.seen_line_format = true;
             st.rewrites_line = true;
-            let parts = compile_template(tmpl)?;
-            let reads_err = template_reads_error_pair(&parts);
+            let compiled = compile_template(tmpl, TemplateKind::Line)?;
+            if matches!(compiled, Template::Full(_)) {
+                // A full-language template can FAIL per line, which sets
+                // the error pair — a label-set change, so the metric
+                // fan-out must group by final labels (the Parts shapes
+                // cannot error and keep the cheaper path).
+                st.mutates_labels = true;
+            }
+            let reads_err = template_reads_error_pair(&compiled);
             Ok(Some(CompiledStage::LineFormat {
-                tmpl: parts,
+                tmpl: compiled,
                 reads_err,
             }))
         }
@@ -760,6 +809,7 @@ impl CompiledPipeline {
         let line_filter_only = stages.is_empty() && st.all_line_filter_source;
         CompiledPipeline {
             stages,
+            template_env: TemplateEnv::process(),
             mutates_labels: st.mutates_labels,
             rewrites_line: st.rewrites_line,
             line_filter_only,
@@ -767,6 +817,13 @@ impl CompiledPipeline {
             seen_line_format: st.seen_line_format,
             all_line_filter_source: st.all_line_filter_source,
         }
+    }
+
+    /// Overrides the template execution environment (tests + the
+    /// hermetic corpus runner: pinned UTC zone and injectable `now`).
+    pub fn with_template_env(mut self, env: TemplateEnv) -> Self {
+        self.template_env = env;
+        self
     }
 
     /// The pipeline can change a stream's label set (a parser, a
@@ -805,10 +862,17 @@ impl CompiledPipeline {
     /// vector — the plan-contract convenience shape. Hot loops use
     /// [`CompiledPipeline::run_into`] with a reused scratch instead
     /// (issue #72 review round 1, finding 3).
-    pub fn run<'a>(&'a self, body: &'a str, base: &'a [(String, String)]) -> Option<EntryOut<'a>> {
+    pub fn run<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        ts_ns: i64,
+    ) -> Result<Option<EntryOut<'a>>, TemplateBudgetExceeded> {
         let mut labels = Vec::new();
-        let line = self.run_into(body, base, &mut labels)?;
-        Some(EntryOut { line, labels })
+        let Some(line) = self.run_into(body, base, ts_ns, &mut labels)? else {
+            return Ok(None);
+        };
+        Ok(Some(EntryOut { line, labels }))
     }
 
     /// Runs one line through the pipeline into a caller-owned label
@@ -827,9 +891,10 @@ impl CompiledPipeline {
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
+        ts_ns: i64,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    ) -> Option<Cow<'a, str>> {
-        self.run_into_with_sm(body, base, &EMPTY_STRUCTURED_METADATA, labels)
+    ) -> Result<Option<Cow<'a, str>>, TemplateBudgetExceeded> {
+        self.run_into_with_sm(body, base, ts_ns, &EMPTY_STRUCTURED_METADATA, labels)
     }
 
     /// As [`CompiledPipeline::run_into`], for a row carrying per-entry
@@ -847,12 +912,13 @@ impl CompiledPipeline {
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
+        ts_ns: i64,
         sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    ) -> Option<Cow<'a, str>> {
-        match self.run_mode_into(body, base, sm, labels, false) {
-            (MetricRun::Dropped, _) => None,
-            (MetricRun::Kept { line, .. }, _) => Some(line),
+    ) -> Result<Option<Cow<'a, str>>, TemplateBudgetExceeded> {
+        match self.run_mode_into(body, base, ts_ns, sm, labels, false)? {
+            (MetricRun::Dropped, _) => Ok(None),
+            (MetricRun::Kept { line, .. }, _) => Ok(Some(line)),
         }
     }
 
@@ -873,11 +939,12 @@ impl CompiledPipeline {
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
+        ts_ns: i64,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    ) -> (Option<Cow<'a, str>>, bool) {
-        match self.run_mode_into(body, base, &EMPTY_STRUCTURED_METADATA, labels, false) {
-            (MetricRun::Dropped, has_err) => (None, has_err),
-            (MetricRun::Kept { line, .. }, has_err) => (Some(line), has_err),
+    ) -> Result<(Option<Cow<'a, str>>, bool), TemplateBudgetExceeded> {
+        match self.run_mode_into(body, base, ts_ns, &EMPTY_STRUCTURED_METADATA, labels, false)? {
+            (MetricRun::Dropped, has_err) => Ok((None, has_err)),
+            (MetricRun::Kept { line, .. }, has_err) => Ok((Some(line), has_err)),
         }
     }
 
@@ -895,12 +962,14 @@ impl CompiledPipeline {
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
+        ts_ns: i64,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    ) -> MetricRun<'a> {
+    ) -> Result<MetricRun<'a>, TemplateBudgetExceeded> {
         // `MetricScanRow` carries no structured metadata (issue #249), so the
         // metric path always seeds empty slots.
-        self.run_mode_into(body, base, &EMPTY_STRUCTURED_METADATA, labels, true)
-            .0
+        Ok(self
+            .run_mode_into(body, base, ts_ns, &EMPTY_STRUCTURED_METADATA, labels, true)?
+            .0)
     }
 
     /// The second element of the return is the reference's `HasErr()` at the
@@ -910,10 +979,11 @@ impl CompiledPipeline {
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
+        ts_ns: i64,
         sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
         metric: bool,
-    ) -> (MetricRun<'a>, bool) {
+    ) -> Result<(MetricRun<'a>, bool), TemplateBudgetExceeded> {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
         let mut value: Option<f64> = None;
         // A successfully-unwrapped label pending deletion (issue #221): the
@@ -955,7 +1025,7 @@ impl CompiledPipeline {
                     // `!=`/`!~` keep the line iff NONE of the alternatives match.
                     let keep = if *negated { !hit } else { hit };
                     if !keep {
-                        return (MetricRun::Dropped, errs.has_err());
+                        return Ok((MetricRun::Dropped, errs.has_err()));
                     }
                 }
                 CompiledStage::Json { extractions } => {
@@ -1067,7 +1137,7 @@ impl CompiledPipeline {
                     let mut failed: Option<(UnitKind, &str)> = None;
                     match eval_label_filter(filter, labels, &errs, &mut failed) {
                         Some(true) => {}
-                        Some(false) => return (MetricRun::Dropped, errs.has_err()),
+                        Some(false) => return Ok((MetricRun::Dropped, errs.has_err())),
                         // Conversion failure: keep the line, tag the error
                         // class in the out-of-band slots (pinned semantics,
                         // oracle-verified; a later `__error__=""` filter
@@ -1090,17 +1160,75 @@ impl CompiledPipeline {
                     }
                 }
                 CompiledStage::LineFormat { tmpl, reads_err } => {
-                    // A single template: the error-pair gate is evaluated
-                    // inline at this stage (no `StageMap` needed), and only
-                    // when the compile-time `reads_err` flag says some field
-                    // names the pair — every other `line_format` keeps the
-                    // slot-blind zero-copy render (issue #238).
-                    line = Cow::Owned(if *reads_err {
-                        let errors_visible = errs.dirty || errs.has_err();
-                        render_template_with_errors(tmpl, labels, &errs, errors_visible)
-                    } else {
-                        render_template(tmpl, labels)
-                    });
+                    // The error-pair gate is evaluated inline at this stage
+                    // (no `StageMap` needed), and only when the compile-time
+                    // `reads_err` flag says the template can name the pair —
+                    // every other `line_format` keeps the slot-blind
+                    // zero-copy render (issue #238). Full templates (#230)
+                    // render through the engine; a FAILED render keeps the
+                    // line UNCHANGED and tags `TemplateFormatErr` + the
+                    // byte-exact detail (`fmt.go:252-256`) — the query
+                    // succeeds.
+                    match tmpl {
+                        Template::Simple(name) => {
+                            let errors_visible = errs.dirty || errs.has_err();
+                            let v = if *reads_err && errors_visible {
+                                errs.raw_slot(name)
+                            } else {
+                                None
+                            };
+                            let v = v.or_else(|| get_label(labels, name)).unwrap_or("");
+                            line = Cow::Owned(v.to_string());
+                        }
+                        Template::Parts(parts) => {
+                            line = Cow::Owned(if *reads_err {
+                                let errors_visible = errs.dirty || errs.has_err();
+                                render_template_with_errors(parts, labels, &errs, errors_visible)
+                            } else {
+                                render_template(parts, labels)
+                            });
+                        }
+                        Template::Full(prog) => {
+                            let errors_visible = errs.dirty || errs.has_err();
+                            let (pair_err, pair_details) = if errors_visible {
+                                (
+                                    errs.has_err().then(|| errs.err_str().to_string()),
+                                    errs.has_details().then(|| errs.details_str().to_string()),
+                                )
+                            } else {
+                                (None, None)
+                            };
+                            let mut out = Vec::new();
+                            let rendered = template::render_full(
+                                prog,
+                                labels,
+                                pair_err.as_deref(),
+                                pair_details.as_deref(),
+                                &line,
+                                ts_ns,
+                                &self.template_env,
+                                &mut out,
+                            );
+                            match rendered {
+                                Ok(()) => {
+                                    // Byte model internally, U+FFFD at the
+                                    // boundary (owner-ratified, issue #230
+                                    // adjudication 2). The valid-UTF-8 case
+                                    // is a move, not a copy.
+                                    line = Cow::Owned(lossy_string(out));
+                                }
+                                Err(e) if e.budget_breach => {
+                                    // Render-budget breach: abort the QUERY
+                                    // (bounded 422) — never a per-line tag.
+                                    return Err(TemplateBudgetExceeded::new());
+                                }
+                                Err(e) => {
+                                    errs.set_err(Cow::Borrowed(TEMPLATE_FORMAT_ERROR));
+                                    errs.set_details(Cow::Owned(e.msg));
+                                }
+                            }
+                        }
+                    }
                 }
                 CompiledStage::LabelFormat {
                     fmts,
@@ -1182,9 +1310,19 @@ impl CompiledPipeline {
                                     let (ve, vd) = errs.visible();
                                     let m_empty = labels.is_empty() && ve.is_none() && vd.is_none();
                                     if !m_empty {
+                                        let gate = errs.dirty || errs.has_err();
                                         map = Some(StageMap {
                                             snapshot: needs_snapshot.then(|| labels.clone()),
-                                            errors_visible: errs.dirty || errs.has_err(),
+                                            // Freeze the pair VALUES at map
+                                            // build (issue #230): a failing
+                                            // Full template overwrites the
+                                            // slots mid-stage, but the
+                                            // reference's once-built map
+                                            // keeps showing these.
+                                            frozen_err: (gate && errs.has_err())
+                                                .then(|| errs.err_str().to_string()),
+                                            frozen_details: (gate && errs.has_details())
+                                                .then(|| errs.details_str().to_string()),
                                         });
                                     }
                                 }
@@ -1192,21 +1330,67 @@ impl CompiledPipeline {
                                     .as_ref()
                                     .and_then(|m| m.snapshot.as_deref())
                                     .unwrap_or(labels);
-                                let errors_visible = map.as_ref().is_some_and(|m| m.errors_visible);
-                                let rendered = if *reads_err {
-                                    render_template_with_errors(
-                                        tmpl,
-                                        render_labels,
-                                        &errs,
-                                        errors_visible,
-                                    )
-                                } else {
-                                    render_template(tmpl, render_labels)
-                                };
-                                set_label(labels, Cow::Borrowed(dst), Cow::Owned(rendered));
-                                // Every template assignment is a `Set`
-                                // (`fmt.go:431`) — dirty.
-                                errs.dirty = true;
+                                let pair_err = map.as_ref().and_then(|m| m.frozen_err.as_deref());
+                                let pair_details =
+                                    map.as_ref().and_then(|m| m.frozen_details.as_deref());
+                                let rendered: Result<String, template::TemplateExecError> =
+                                    match tmpl {
+                                        Template::Simple(name) => {
+                                            let slot = if *reads_err {
+                                                frozen_slot(name, pair_err, pair_details)
+                                            } else {
+                                                None
+                                            };
+                                            let v = slot
+                                                .or_else(|| get_label(render_labels, name))
+                                                .unwrap_or("");
+                                            Ok(v.to_string())
+                                        }
+                                        Template::Parts(parts) => Ok(render_with(parts, |n| {
+                                            if *reads_err
+                                                && let Some(v) =
+                                                    frozen_slot(n, pair_err, pair_details)
+                                            {
+                                                return v;
+                                            }
+                                            get_label(render_labels, n).unwrap_or("")
+                                        })),
+                                        Template::Full(prog) => {
+                                            let mut out = Vec::new();
+                                            template::render_full(
+                                                prog,
+                                                render_labels,
+                                                pair_err,
+                                                pair_details,
+                                                &line,
+                                                ts_ns,
+                                                &self.template_env,
+                                                &mut out,
+                                            )
+                                            .map(|()| lossy_string(out))
+                                        }
+                                    };
+                                match rendered {
+                                    Ok(rendered) => {
+                                        set_label(labels, Cow::Borrowed(dst), Cow::Owned(rendered));
+                                        // Every template assignment is a
+                                        // `Set` (`fmt.go:431`) — dirty.
+                                        errs.dirty = true;
+                                    }
+                                    Err(e) if e.budget_breach => {
+                                        // Render-budget breach: abort the
+                                        // QUERY (bounded 422 — issue #230
+                                        // follow-up), never a per-line tag.
+                                        return Err(TemplateBudgetExceeded::new());
+                                    }
+                                    Err(e) => {
+                                        // `fmt.go:426-429`: destination NOT
+                                        // set, the stage continues, the LAST
+                                        // error wins (SetErr overwrites).
+                                        errs.set_err(Cow::Borrowed(TEMPLATE_FORMAT_ERROR));
+                                        errs.set_details(Cow::Owned(e.msg));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1221,7 +1405,7 @@ impl CompiledPipeline {
                     let Some(raw) = get_label(labels, label) else {
                         // Oracle-probed: a line without the unwrap label
                         // is silently skipped, never an error.
-                        return (MetricRun::Dropped, errs.has_err());
+                        return Ok((MetricRun::Dropped, errs.has_err()));
                     };
                     match convert_label_value(*kind, raw) {
                         Some(v) => {
@@ -1370,7 +1554,7 @@ impl CompiledPipeline {
         // slot state is captured BEFORE the merge consumes the slots.
         let has_err = errs.has_err();
         errs.merge_into(labels);
-        (MetricRun::Kept { line, value }, has_err)
+        Ok((MetricRun::Kept { line, value }, has_err))
     }
 }
 
@@ -1956,130 +2140,20 @@ fn logfmt_rune_pos(text: &str, byte_off: usize) -> usize {
     text[..byte_off].chars().count() + 1
 }
 
-// ---------------------------------------------------------------------
-// Templates: the `{{.label}}` + literal-text subset. Every Go-template
-// function outside the subset is individually enumerated so the
-// coverage surface is auditable (M6-09 adjudication item 4) and later
-// issues can flip functions one by one.
-// ---------------------------------------------------------------------
-
-/// The upstream-documented template function inventory this subset
-/// excludes — each one rejected **by name** at compile time.
-pub const EXCLUDED_TEMPLATE_FUNCTIONS: &[&str] = &[
-    "__line__",
-    "__timestamp__",
-    "add",
-    "addf",
-    "alignLeft",
-    "alignRight",
-    "b64dec",
-    "b64enc",
-    "bytes",
-    "ceil",
-    "contains",
-    "count",
-    "date",
-    "default",
-    "div",
-    "divf",
-    "duration",
-    "duration_seconds",
-    "float64",
-    "floor",
-    "fromJson",
-    "hasPrefix",
-    "hasSuffix",
-    "indent",
-    "int",
-    "lower",
-    "max",
-    "maxf",
-    "min",
-    "minf",
-    "mod",
-    "mul",
-    "mulf",
-    "nindent",
-    "now",
-    "printf",
-    "regexReplaceAll",
-    "regexReplaceAllLiteral",
-    "repeat",
-    "replace",
-    "round",
-    "sha1sum",
-    "sha256sum",
-    "sub",
-    "subf",
-    "substr",
-    "title",
-    "toDate",
-    "toDateInZone",
-    "trim",
-    "trimAll",
-    "trimPrefix",
-    "trimSuffix",
-    "trunc",
-    "unixEpoch",
-    "unixEpochMillis",
-    "unixEpochNanos",
-    "unixToTime",
-    "upper",
-    "urldecode",
-    "urlencode",
-    "ToLower",
-    "ToUpper",
-    "Replace",
-    "Trim",
-    "TrimLeft",
-    "TrimRight",
-    "TrimPrefix",
-    "TrimSuffix",
-    "TrimSpace",
-];
-
-fn compile_template(text: &str) -> Result<Vec<TmplPart>, PipelineError> {
-    let mut parts = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find("{{") {
-        if open > 0 {
-            parts.push(TmplPart::Lit(rest[..open].to_string()));
-        }
-        let after = &rest[open + 2..];
-        let close = after.find("}}").ok_or_else(|| {
-            PipelineError::BadParserExpr(format!("template {text:?}: unclosed '{{{{'"))
-        })?;
-        let action = after[..close].trim();
-        if let Some(field) = action.strip_prefix('.') {
-            let valid =
-                !field.is_empty() && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if !valid {
-                return Err(PipelineError::BadParserExpr(format!(
-                    "template {text:?}: invalid field reference {{{{{action}}}}}"
-                )));
-            }
-            parts.push(TmplPart::Field(field.to_string()));
-        } else {
-            // Not a field reference: name the first token — the excluded
-            // function inventory drives auditability; anything else is
-            // still rejected by whatever name it carries.
-            let name = action
-                .split(|c: char| c.is_whitespace() || c == '(')
-                .next()
-                .unwrap_or(action)
-                .to_string();
-            return Err(PipelineError::UnsupportedTemplate(if name.is_empty() {
-                "(empty action)".to_string()
-            } else {
-                name
-            }));
-        }
-        rest = &after[close + 2..];
-    }
-    if !rest.is_empty() {
-        parts.push(TmplPart::Lit(rest.to_string()));
-    }
-    Ok(parts)
+/// Compiles a template body with the full engine (issue #230); the
+/// `{{.label}}`-only shapes come back as the byte-identical
+/// `Simple`/`Parts` fast paths (the reference keeps the same `simpleKey`
+/// shortcut, `fmt.go:218-228`).
+fn compile_template(text: &str, kind: TemplateKind) -> Result<Template, PipelineError> {
+    template::compile(text, kind).map_err(|e| {
+        let prefix = match kind {
+            TemplateKind::Line => "invalid line template: ".to_string(),
+            // The label prefix is built at the call site (needs the
+            // destination name); pass through unprefixed here.
+            TemplateKind::Label => String::new(),
+        };
+        PipelineError::InvalidTemplate(format!("{prefix}{e}"))
+    })
 }
 
 fn compile_label_format(fmts: &[LabelFmt]) -> Result<CompiledStage, PipelineError> {
@@ -2131,11 +2205,19 @@ fn compile_label_format(fmts: &[LabelFmt]) -> Result<CompiledStage, PipelineErro
                 src: src.clone(),
             },
             LabelFmt::Template { dst, tmpl } => {
-                let parts = compile_template(tmpl)?;
-                let reads_err = template_reads_error_pair(&parts);
+                let compiled = compile_template(tmpl, TemplateKind::Label).map_err(|e| {
+                    // `fmt.go:381`: invalid template for label '<dst>': <err>
+                    let PipelineError::InvalidTemplate(inner) = &e else {
+                        return e;
+                    };
+                    PipelineError::InvalidTemplate(format!(
+                        "invalid template for label '{dst}': {inner}"
+                    ))
+                })?;
+                let reads_err = template_reads_error_pair(&compiled);
                 CompiledLabelFmt::Template {
                     dst: dst.clone(),
-                    tmpl: parts,
+                    tmpl: compiled,
                     reads_err,
                 }
             }
@@ -2166,10 +2248,17 @@ fn label_format_needs_snapshot(fmts: &[CompiledLabelFmt]) -> bool {
     for f in fmts {
         match f {
             CompiledLabelFmt::Template { dst, tmpl, .. } => {
-                let reads_mutated = tmpl.iter().any(|part| match part {
-                    TmplPart::Field(name) => mutated.contains(&name.as_str()),
-                    TmplPart::Lit(_) => false,
-                });
+                // A Full template's read set is unknowable statically
+                // (dot map, dynamic `index`) — treat it as reading
+                // everything (issue #230).
+                let reads_mutated = match tmpl {
+                    Template::Simple(name) => mutated.contains(&name.as_str()),
+                    Template::Parts(parts) => parts.iter().any(|part| match part {
+                        TmplPart::Field(name) => mutated.contains(&name.as_str()),
+                        TmplPart::Lit(_) => false,
+                    }),
+                    Template::Full(_) => !mutated.is_empty(),
+                };
                 if seen_template && reads_mutated {
                     return true;
                 }
@@ -2198,11 +2287,18 @@ fn label_format_needs_snapshot(fmts: &[CompiledLabelFmt]) -> bool {
 /// — decided once per query at compile time (issue #238), so every template
 /// that does not name the pair keeps the slot-blind zero-copy
 /// [`render_template`] path.
-fn template_reads_error_pair(parts: &[TmplPart]) -> bool {
-    parts.iter().any(|part| match part {
-        TmplPart::Field(name) => name == ERROR_LABEL || name == ERROR_DETAILS_LABEL,
-        TmplPart::Lit(_) => false,
-    })
+fn template_reads_error_pair(tmpl: &Template) -> bool {
+    match tmpl {
+        Template::Simple(name) => name == ERROR_LABEL || name == ERROR_DETAILS_LABEL,
+        Template::Parts(parts) => parts.iter().any(|part| match part {
+            TmplPart::Field(name) => name == ERROR_LABEL || name == ERROR_DETAILS_LABEL,
+            TmplPart::Lit(_) => false,
+        }),
+        // A full template can reach the pair dynamically (`index .
+        // "__error__"`, `range .`): conservatively gate it in. The gate
+        // costs nothing when no error is set.
+        Template::Full(_) => true,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -2310,6 +2406,36 @@ fn render_with<'l>(parts: &[TmplPart], lookup: impl Fn(&str) -> &'l str) -> Stri
         }
     }
     out
+}
+
+/// `convertBytes` for the `bytes` template function (issue #230). The
+/// `duration`/`duration_seconds` template functions carry their own full
+/// `time.ParseDuration` port instead (the label-filter conversion path
+/// is pinned to the filter-reachable subset and rejects e.g. negative
+/// durations the template function must accept).
+pub(crate) fn convert_bytes_value(raw: &str) -> Result<f64, String> {
+    convert_label_value(UnitKind::Bytes, raw)
+        .ok_or_else(|| label_filter_error_details(UnitKind::Bytes, raw))
+}
+
+/// Byte render → `String` at the pipeline boundary: valid UTF-8 moves,
+/// invalid bytes become U+FFFD (owner-ratified lossy boundary, #230).
+fn lossy_string(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
+/// The FROZEN error-pair lookup for `label_format` templates (issue
+/// #230; see [`StageMap`]): a non-empty frozen slot overrides the
+/// same-named vector entry.
+fn frozen_slot<'m>(name: &str, err: Option<&'m str>, details: Option<&'m str>) -> Option<&'m str> {
+    match name {
+        ERROR_LABEL => err,
+        ERROR_DETAILS_LABEL => details,
+        _ => None,
+    }
 }
 
 fn render_template(parts: &[TmplPart], labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> String {
@@ -2974,11 +3100,17 @@ mod tests {
             let above = format!("latency={}s", threshold_secs + 1.0);
             let below = format!("latency={}s", threshold_secs / 2.0);
             assert!(
-                compiled.run(&above, &base).is_some(),
+                compiled
+                    .run(&above, &base, 0)
+                    .expect("no budget breach")
+                    .is_some(),
                 "{query}: {above:?} should survive"
             );
             assert!(
-                compiled.run(&below, &base).is_none(),
+                compiled
+                    .run(&below, &base, 0)
+                    .expect("no budget breach")
+                    .is_none(),
                 "{query}: {below:?} should be dropped"
             );
         }
@@ -2994,7 +3126,7 @@ mod tests {
         let base = vec![("app".to_string(), "x".to_string())];
         // Metric extraction still works end-to-end.
         let mut labels = Vec::new();
-        let _ = compiled.run_metric_into("d=250ms latency=2s", &base, &mut labels);
+        let _ = compiled.run_metric_into("d=250ms latency=2s", &base, 0, &mut labels);
     }
 
     #[test]
@@ -3016,21 +3148,11 @@ mod tests {
     }
 
     #[test]
-    fn every_excluded_template_function_is_rejected_by_name() {
-        for func in EXCLUDED_TEMPLATE_FUNCTIONS {
-            let tmpl = format!("{{{{ {func} .x }}}}");
-            match compile_template(&tmpl) {
-                Err(PipelineError::UnsupportedTemplate(name)) => {
-                    assert_eq!(&name, func, "template {tmpl:?}");
-                }
-                other => panic!("expected {func} to be UnsupportedTemplate, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
     fn the_field_substitution_subset_compiles_and_renders() {
-        let parts = compile_template("{{.method}} -> {{.path}}!").unwrap();
+        let compiled = compile_template("{{.method}} -> {{.path}}!", TemplateKind::Line).unwrap();
+        let Template::Parts(parts) = compiled else {
+            panic!("expected the field-substitution subset to derive Parts");
+        };
         let labels = vec![
             (Cow::Borrowed("method"), Cow::Borrowed("GET")),
             (Cow::Borrowed("path"), Cow::Borrowed("/x")),
@@ -3107,8 +3229,14 @@ mod tests {
             "took=abc level=warn", // would FAIL conversion on the metric path
             "level=error",         // unwrap label missing entirely
         ] {
-            let a = without.run(body, &base).expect("kept");
-            let b = with.run(body, &base).expect("kept");
+            let a = without
+                .run(body, &base, 0)
+                .expect("no budget breach")
+                .expect("kept");
+            let b = with
+                .run(body, &base, 0)
+                .expect("no budget breach")
+                .expect("kept");
             assert_eq!(a.line, b.line, "body {body:?}");
             assert_eq!(a.labels, b.labels, "body {body:?}");
             assert!(
@@ -3126,8 +3254,9 @@ mod tests {
         .unwrap();
         let base = vec![("app".to_string(), "x".to_string())];
         let mut labels = Vec::new();
-        let MetricRun::Kept { value, .. } =
-            compiled.run_metric_into("took=250ms level=info", &base, &mut labels)
+        let MetricRun::Kept { value, .. } = compiled
+            .run_metric_into("took=250ms level=info", &base, 0, &mut labels)
+            .expect("no budget breach")
         else {
             panic!("expected the line to be kept");
         };
@@ -3147,8 +3276,9 @@ mod tests {
         .unwrap();
         let base = vec![("app".to_string(), "x".to_string())];
         let mut labels = Vec::new();
-        let MetricRun::Kept { value, .. } =
-            compiled.run_metric_into("took=abc level=warn", &base, &mut labels)
+        let MetricRun::Kept { value, .. } = compiled
+            .run_metric_into("took=abc level=warn", &base, 0, &mut labels)
+            .expect("no budget breach")
         else {
             panic!("a failed conversion keeps the line (a later __error__ filter may drop it)");
         };
@@ -3174,7 +3304,9 @@ mod tests {
         let base = vec![("app".to_string(), "x".to_string())];
         let mut labels = Vec::new();
         assert!(matches!(
-            compiled.run_metric_into("level=error", &base, &mut labels),
+            compiled
+                .run_metric_into("level=error", &base, 0, &mut labels)
+                .expect("no budget breach"),
             MetricRun::Dropped
         ));
     }
@@ -3190,11 +3322,15 @@ mod tests {
         let base = vec![("app".to_string(), "x".to_string())];
         let mut labels = Vec::new();
         assert!(matches!(
-            compiled.run_metric_into("took=abc", &base, &mut labels),
+            compiled
+                .run_metric_into("took=abc", &base, 0, &mut labels)
+                .expect("no budget breach"),
             MetricRun::Dropped
         ));
         assert!(matches!(
-            compiled.run_metric_into("took=100ms", &base, &mut labels),
+            compiled
+                .run_metric_into("took=100ms", &base, 0, &mut labels)
+                .expect("no budget breach"),
             MetricRun::Kept {
                 value: Some(v),
                 ..
@@ -3226,7 +3362,9 @@ mod tests {
         ] {
             let compiled = CompiledPipeline::compile(&stages_of(query)).unwrap();
             let mut labels = Vec::new();
-            let MetricRun::Kept { value, .. } = compiled.run_metric_into(body, &base, &mut labels)
+            let MetricRun::Kept { value, .. } = compiled
+                .run_metric_into(body, &base, 0, &mut labels)
+                .expect("no budget breach")
             else {
                 panic!("expected {query} over {body:?} to keep the line");
             };
@@ -3271,7 +3409,12 @@ mod tests {
         let base = vec![("a".to_string(), "b".to_string())];
         // `level = "warn"` is definite-false; `and` absorbs the sibling's
         // conversion failure on `took=bad` without ever setting a label.
-        assert!(compiled.run("level=info took=bad", &base).is_none());
+        assert!(
+            compiled
+                .run("level=info took=bad", &base, 0)
+                .expect("no budget breach")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3284,7 +3427,8 @@ mod tests {
         // `level = "info"` is definite-true; `or` absorbs the sibling's
         // conversion failure on `took=bad` without ever setting a label.
         let out = compiled
-            .run("level=info took=bad", &base)
+            .run("level=info took=bad", &base, 0)
+            .expect("no budget breach")
             .expect("or-true absorbs the failure and keeps the line");
         assert!(!out.labels.iter().any(|(k, _)| k == ERROR_LABEL));
         assert!(!out.labels.iter().any(|(k, _)| k == ERROR_DETAILS_LABEL));
@@ -3298,8 +3442,9 @@ mod tests {
         .unwrap();
         let base = vec![("a".to_string(), "b".to_string())];
         let mut labels = Vec::new();
-        let MetricRun::Kept { .. } =
-            compiled.run_metric_into("level=info took=bad", &base, &mut labels)
+        let MetricRun::Kept { .. } = compiled
+            .run_metric_into("level=info took=bad", &base, 0, &mut labels)
+            .expect("no budget breach")
         else {
             panic!("or-true absorbs the failure and keeps the line");
         };
@@ -3320,7 +3465,8 @@ mod tests {
         ] {
             let compiled = CompiledPipeline::compile(&stages_of(query)).unwrap();
             let out = compiled
-                .run("level=info took=bad", &base)
+                .run("level=info took=bad", &base, 0)
+                .expect("no budget breach")
                 .unwrap_or_else(|| panic!("{query}: an unabsorbed error keeps the line"));
             assert!(
                 out.labels
@@ -3350,7 +3496,8 @@ mod tests {
         let base = vec![("svc".to_string(), "x".to_string())];
         let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
         let out = compiled
-            .run(line, &base)
+            .run(line, &base, 0)
+            .expect("no budget breach")
             .unwrap_or_else(|| panic!("{query}: line unexpectedly dropped"));
         let mut got: Vec<(String, String)> = out
             .labels
@@ -3623,7 +3770,9 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         let mut labels = Vec::new();
-        compiled.run_into_with_sm(body, &base, sm, &mut labels)?;
+        compiled
+            .run_into_with_sm(body, &base, 0, sm, &mut labels)
+            .expect("no budget breach")?;
         let mut got: Vec<(String, String)> = labels
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -4267,7 +4416,7 @@ mod tests {
                 .collect();
             let mut labels = Vec::new();
             compiled
-                .run_into("a=Hello b=World", &base, &mut labels)
+                .run_into("a=Hello b=World", &base, 0, &mut labels)
                 .expect("kept");
             let mut got: Vec<(String, String)> = labels
                 .iter()

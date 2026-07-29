@@ -41,7 +41,9 @@ fn base() -> Vec<(String, String)> {
 fn run(query: &str, body: &str) -> Option<(Vec<(String, String)>, String)> {
     let pipeline = compiled(query);
     let base = base();
-    let out = pipeline.run(body, &base)?;
+    let out = pipeline
+        .run(body, &base, 0)
+        .expect("no template budget breach")?;
     let mut labels: Vec<(String, String)> = out
         .labels
         .iter()
@@ -924,14 +926,23 @@ fn label_format_assigning_the_same_label_twice_is_a_named_compile_error() {
 }
 
 #[test]
-fn an_excluded_template_function_is_rejected_by_its_own_name() {
-    for func in ["printf", "regexReplaceAll", "__line__", "ToLower"] {
+fn an_unregistered_template_function_is_rejected_with_the_reference_text() {
+    // Post-#230 every reference-registered function COMPILES; only names
+    // outside the 86-name surface reject, with Go's parse-error wording
+    // wrapped in the reference's line-template prefix (`fmt.go:216`).
+    for func in ["sha256sum", "toJson", "b32enc", "nosuchfn"] {
         let query = format!(r#"{{a="b"}} | line_format "{{{{ {func} .x }}}}""#);
         let err = compile_err(&query);
-        match err {
-            PipelineError::UnsupportedTemplate(name) => assert_eq!(name, func),
-            other => panic!("expected UnsupportedTemplate({func}), got {other:?}"),
-        }
+        assert!(matches!(err, PipelineError::InvalidTemplate(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("function \"{func}\" not defined")),
+            "{text}"
+        );
+        assert!(
+            text.starts_with("invalid line template: template: line:1: "),
+            "{text}"
+        );
     }
 }
 
@@ -963,7 +974,10 @@ fn pushed_down_line_filters_are_not_re_evaluated_in_engine() {
     let pipeline = compiled(r#"{a="b"} |= "err" | json"#);
     let base = base();
     assert!(
-        pipeline.run(r#"{"clean":"1"}"#, &base).is_some(),
+        pipeline
+            .run(r#"{"clean":"1"}"#, &base, 0)
+            .expect("no budget breach")
+            .is_some(),
         "pre-line_format line filters are SQL's job, not the evaluator's"
     );
 }
@@ -1119,7 +1133,9 @@ fn metric_path_sets_both_error_and_the_detail_label() {
     let pipeline = compiled(r#"{a="b"} | json"#);
     let base = base();
     let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
-    let out = pipeline.run_metric_into("not json", &base, &mut labels);
+    let out = pipeline
+        .run_metric_into("not json", &base, 0, &mut labels)
+        .expect("no budget breach");
     assert!(matches!(out, MetricRun::Kept { .. }));
     assert!(
         labels

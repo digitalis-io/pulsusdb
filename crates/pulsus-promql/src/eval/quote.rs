@@ -29,6 +29,14 @@
 /// search over the generated tables with the not-print exception lists
 /// and the `>= 0x20000` early accept.
 fn is_print(c: char) -> bool {
+    go_is_print(c)
+}
+
+/// Public alias of [`is_print`] — Go `strconv.IsPrint`, exactly. The
+/// LogQL template engine's `%q`/rune quoting (`pulsus-read`, issue
+/// #230) reuses this table rather than duplicating the generated
+/// unicode ranges.
+pub fn go_is_print(c: char) -> bool {
     let r = c as u32;
     if r <= 0xFF {
         return (0x20..=0x7E).contains(&r) || ((0xA1..=0xFF).contains(&r) && r != 0xAD);

@@ -241,7 +241,13 @@ static LOGFMT_PARSER: LazyLock<CompiledPipeline> = LazyLock::new(|| {
 pub(super) fn auto_parse(line: &str) -> Option<(&'static str, Vec<(String, String)>)> {
     for (name, parser) in [("json", &*JSON_PARSER), ("logfmt", &*LOGFMT_PARSER)] {
         let mut labels = Vec::new();
-        let (kept, has_err) = parser.run_into_reporting_err(line, &[], &mut labels);
+        // Auto-detection probes carry no row timestamp; the probe
+        // pipelines are bare parsers (no templates), so 0 is inert and a
+        // template render-budget breach is unreachable — a defensive Err
+        // maps to "not this format" (plan v1 §4: detected.rs passes 0).
+        let (kept, has_err) = parser
+            .run_into_reporting_err(line, &[], 0, &mut labels)
+            .unwrap_or((None, false));
         if kept.is_some() && !has_err {
             let pairs = labels
                 .into_iter()

@@ -3564,7 +3564,10 @@ mod tests {
                     ("run_id".to_string(), corpus.run_id.clone()),
                     ("service_name".to_string(), r.service.to_string()),
                 ];
-                let Some(out) = compiled.run(&r.body, &base) else {
+                let Some(out) = compiled
+                    .run(&r.body, &base, r.ts_ns)
+                    .expect("no template budget breach")
+                else {
                     continue;
                 };
                 let labels: std::collections::BTreeMap<String, String> = out
@@ -3766,7 +3769,10 @@ mod tests {
                 ("run_id".to_string(), corpus.run_id.clone()),
                 ("service_name".to_string(), r.service.to_string()),
             ];
-            let Some(out) = compiled.run(&r.body, &base) else {
+            let Some(out) = compiled
+                .run(&r.body, &base, r.ts_ns)
+                .expect("no template budget breach")
+            else {
                 continue;
             };
             let labels: std::collections::BTreeMap<String, String> = out

@@ -403,6 +403,213 @@ not "fix" us toward the panic.
   422s on the shared divided cap — the pre-existing #236 class
   (mid-scan group cap vs result-size cap), not re-litigated here.
 
+## Issue #230 — `line_format`/`label_format` template engine
+
+The full Go `text/template` + reference function-map surface landed in
+issue #230; 688 container-captured corpus directives — 678 `eval`
+(60+228+34+29+258+69 across `tests/logqltest/corpus/t1…t6_*.test`) +
+10 `eval_fail` reject-parity cases (all in t1) — replay byte-exact
+hermetically, including execution-error strings. (The pre-round-2
+"676 cases" figure was 666 `eval` + the 10 `eval_fail` counted without
+saying so; round 2 added 12 captured `fromJson` invalid-UTF-8 /
+surrogate cases to t6.) The following residuals are the
+complete divergence set, each pinned deterministic (owner adjudications
+on #230: byte-model + lossy boundary; pin-deterministic where the
+reference is non-reproducible; error WORDING is not load-bearing where
+clients only display it).
+
+### `template-pinned-address-cells` (issue #230, plan v7 §D + capture)
+
+- **Reference behaviour:** 29 cells of the 224-cell printf verb×shape
+  domain print a process memory address — either per-process heap
+  pointers (23 cells, proven by the committed dual-container diff:
+  `cargo run -p xtask -- template-audit`) or package-global addresses
+  identical across containers but coupled to the reference binary's
+  layout (6 cells, caught by the audit's decimal/octal/binary
+  address-token scan). Exact cell list = the audit's flagged union,
+  re-derivable on any reference bump.
+- **PulsusDB behaviour:** the pinned address constant `0xfa11ed`
+  (16388589) in the same structural position — shape-asserted in
+  `tests/logql_template_engine.rs`; a grep-gate proves no corpus golden
+  ever contains a pinned-address rendering.
+- **Why deliberate:** the values are addresses of the reference
+  process's own memory; not reproducible even by the reference across
+  rebuilds.
+
+### `template-tzdata-table-cells` (issue #230, capture-surfaced plan correction)
+
+- **Reference behaviour:** 11 further cells (`%O %c %U %e %E %f %F %g
+  %G %t` + the catch-all rune on a LOADED `*time.Location`) dump the
+  zone's ENTIRE IANA transition table (with NUL bytes and invalid
+  UTF-8). Deterministic within one binary but coupled to the embedded
+  tzdata release. Plan v7 §D classified these as goldens because its
+  R1 criterion was address-presence only; the capture surfaced the
+  gap (goldens 195 → 184, exclusions 29 → 40).
+- **PulsusDB behaviour:** the same struct shape with PINNED-EMPTY
+  `zone`/`tx` tables and the pinned `cacheZone` address (`chrono-tz`
+  does not expose raw transition tables; OQ-3's ratified tzdata-skew
+  class).
+- **Why deliberate:** tzdata-release-coupled output; the adjudication
+  on #230 OQ-3 pins deterministic substitutes for this class.
+
+### `template-exec-depth-cap` (issue #230)
+
+- **Reference behaviour:** runaway recursive `{{define}}` invocations
+  error at depth 100 000 (`exceeded maximum template depth (100000)`),
+  a bound that relies on Go's growable goroutine stacks.
+- **PulsusDB behaviour:** the same per-line error at depth 250 —
+  derived from the stack floor, not chosen: the smallest stack the
+  render runs on is the 2 MiB default (tokio workers, test threads),
+  one invocation level costs ≈2 KiB of debug-build frames (a 1000-deep
+  cap measurably overflowed a 2 MiB thread), so 250 levels ≈ 0.5 MiB
+  with a 4× margin. A crash is never acceptable; reachable only by
+  deliberately recursive templates.
+- **Round 2:** the 250 counter is UNIFIED across every evaluator
+  recursion site — `{{template}}` invocation, nested
+  `if`/`with`/`range` walks and parenthesized-pipeline evaluation all
+  increment the same counter. A cap that counted only the invocation
+  hop let a recursive define whose body nests controls multiply the
+  two depths past the stack (250 invocations × 30 uncounted if-levels
+  overflowed a 2 MiB thread — the #272 class); gated in
+  `logql_template_engine.rs`
+  (`combined_define_recursion_and_nesting_…`).
+
+### `template-parse-depth-cap` (issue #230, review round 2)
+
+- **Reference behaviour:** the parser caps parenthesized-pipeline
+  nesting at 10 000 (`text/template/parse.go maxStackDepth`, error
+  `max expression depth exceeded` — captured verbatim on
+  grafana/loki:3.7.4: depth 10 000 renders, 10 001 rejects) and does
+  NOT cap control nesting at all (2 000 nested `{{if}}` render on the
+  container; in practice its 131 072-byte query-length limit bounds
+  nesting at ≈12 k).
+- **PulsusDB behaviour:** ONE structural-depth counter across every
+  parser recursion shape — nested control bodies and `else if`/`else
+  with` CHAINS (guarded in `parse_control`, whose frame stays live
+  across a chain — round 3 fixed the `item_list` guard placement that
+  let a 5000-link else-if chain bypass the cap and SIGABRT a 2 MiB
+  thread), nested `block` bodies (`block_control`), and parenthesized
+  pipelines (`term`) — capped at 40 with Go's own error
+  text (`template: line:N: max expression depth exceeded`, surfaced
+  through the same `invalid line template: `/`invalid template for
+  label…` compile-error wrapping the reference uses for its paren
+  cap). Derived from the measured floor, not chosen: ~170 nested
+  controls (≈12 KiB/level of debug parser frames) or ~400 nested
+  parens overflow a 2 MiB thread — a live SIGABRT pre-fix — so 40 is
+  a 4× margin on the worst unit. Depths 41..10 000 parse in the
+  reference and reject here (compile-time 400, same shape as the
+  reference's own paren rejection); realistic templates nest < 10.
+  Gated on a 2 MiB thread both ways in `logql_template_engine.rs`
+  (`structural_nesting_is_capped_at_parse_time_…`,
+  `else_if_and_else_with_chains_are_capped_…`). The 40 stays the
+  ledgered interim (round-3 adjudication): it is not raised without
+  iterative parsing, the #255 shape.
+
+### `template-error-wording-residuals` (issue #230, owner wording ruling)
+
+- **regex compile errors** inside `regexReplaceAll`/
+  `regexReplaceAllLiteral`/`count`: the reference embeds Go's
+  `error parsing regexp: missing closing ): …` wording in
+  `__error_details__`; PulsusDB embeds rust-regex's diagnostic behind
+  the same `error parsing regexp: ` prefix. Accept/reject boundaries
+  match (both RE2-class engines); the error CLASS
+  (`TemplateFormatErr`) and position prefix are byte-exact. Kept out
+  of the corpus; hermetically gated instead.
+- Everything else — including `divf`'s `decimal division by 0`,
+  slice-bounds panics, `unixToTime`'s `%!w(<nil>)` quirk, goodFunc
+  signature rejects and coercion errors — proved byte-exact in the
+  captured corpus and stays in it.
+
+### `template-local-zone-environment` (issue #230, adjudication 3)
+
+- The `Local` zone (`__timestamp__`, `date`, `toDate`) resolves from
+  the process environment exactly like a reference process on the same
+  host (`$TZ` name → that zone; no `$TZ` → `/etc/localtime`, named
+  "Local"; else the degenerate UTC form). The hermetic corpus and its
+  captures pin the degenerate-UTC form (stock container, PROVENANCE
+  precondition). Residuals inside this class: `chrono-tz` 0.10.4's
+  IANA tables vs the reference toolchain's (mainstream post-1970 zones
+  agree), zone-abbreviation lookups for layout PARSING approximate
+  Go's `lookupName` with instant±6-month probes, and zone-offset
+  lookups clamp beyond chrono's ±262k-year range.
+
+### `template-output-budget` (issue #230 follow-up, bounded divergence)
+
+- **Reference behaviour:** template output size is UNBOUNDED — `repeat
+  1073741824 "x"×17` (17 GB) OOM-kills the reference container
+  (measured); `printf` padding widths up to 2^30 allocate eagerly.
+- **PulsusDB behaviour:** every RETAINABLE render production — any
+  string/bytes/list/map a template value can hold — is CHARGED against
+  a cumulative per-render budget BEFORE it is built, and the budget is
+  released when the render ends. That covers the multipliers
+  (`repeat`'s `count × len`, `indent`/`nindent`, `align*`, `printf`
+  padding widths/precisions, `Replace`-with-empty-needle, the
+  regex-replace bound, case mapping, `fromJson`'s 35× tree ceiling,
+  the ≤10× `date`/`Time.Format` layout expansion), the print-family
+  and html/js/urlquery output buffers (pre-charged at 4×/7× value
+  ceilings), action output (`print_value_go` charges the value's
+  ceiling BEFORE writing), text-node emission per iteration, dynamic
+  regex programs (a 1 MiB `RegexBuilder::size_limit` ceiling charged
+  per dynamic compile; query-compile-time literal programs are shared,
+  not re-charged), AND plain input-bounded copies (`__line__`, the
+  trim/trunc/substr/slice family, `default`'s clone, `Append*`'s
+  argument copy) — review round 2 closed the fifth amplification
+  class, where an uncharged per-call copy repeats inside a
+  `range`/variable-only body that emits no text, or COMPOUNDS through
+  `{{ $a = printf "%s%s" $a $a }}` (uncharged, that doubling is a
+  literal OOM-kill — reproduced), and — round 3 — the IDENTITY /
+  no-match / `n == 0` early-return copies (`replace` with `old ==
+  new`, `align` at its identity count) that a single-shape check let
+  through. Scalar-returning parse scratch (freed by return, nothing
+  retained) and once-per-render error paths stay uncharged. The
+  evidence split (round 3, the #236/#272 demotion): the AST census
+  (`logql_template_alloc_census.rs`) is a DRIFT TRIPWIRE over new or
+  changed sites, and the runtime gate
+  (`logql_template_alloc_gate.rs`) is the dominance proof — every
+  registry function runs through its branch shapes (happy / empty /
+  identity / no-match / error) asserting allocated ≤ charged, plus a
+  near-exhausted-budget ORDERING leg that fails any charge moved
+  after its allocation (mutation-verified). Round 4 added a DERIVED
+  invalid-UTF-8 variant of every shape (big string arguments get
+  invalid bytes mechanically, not by hand-listing), which surfaced
+  and closed the conversion gap on the regex argument/pattern paths.
+  Round 5 reserved a ≤3× ceiling before converting; round 6 replaced
+  that with the stronger form — the repaired length is PRECOMPUTED,
+  charged, and the buffer allocated ONCE at exactly that size, because
+  `from_utf8_lossy` may start at `len` and grow-double to 4×
+  (cumulatively requesting up to 7×), so no constant is a provable
+  bound. Valid-UTF-8 inputs borrow and charge nothing, so every pinned
+  boundary is unchanged. The gate additionally asserts, structurally,
+  that every registered shape EXECUTES and that every shape committed
+  to the ordering leg actually REACHES it — a shape that errors
+  upstream is otherwise indistinguishable from a shape that passed. A breach aborts the query with the bounded
+  `422 query_too_broad` (`TooBroadReason::TemplateOutputBytes`) — never
+  a per-line `TemplateFormatErr`, never a truncation, never an OOM.
+- **Threshold (derived, not chosen):**
+  `MAX_TEMPLATE_RENDER_BYTES = MAX_CLIENT_AGG_GROUP_BYTES` (64 MiB) —
+  the crate's established per-query retained-bytes budget (#104, reused
+  by #221's fan-out charge): one render is the line path's peak
+  transient retention, so it may not allocate more than a whole query
+  is allowed to retain. The budget is CUMULATIVE over the render and a
+  maximal output line is charged twice (once when the value is built,
+  once when it is printed), so the single-`repeat` rejection boundary
+  sits at budget/2 = 32 MiB of output: `tests/logql_template_engine.rs`
+  pins both directions — a `repeat` of exactly budget/2 renders, one
+  byte past it is the clean 422 on the streams, metric and
+  `label_format` paths alike.
+- **Why deliberate:** the reference has no bound, so no finite cap can
+  match it (the #236 O1 shape); the standing charge-before-allocate
+  rule (#227) and the "never copy the reference where it is wrong"
+  ruling both require the bound. Consequences inside the same class:
+  templates whose CUMULATIVE productions cross 64 MiB reject even when
+  each individual value is small, and a dynamic (per-line-computed)
+  regex pattern whose compiled program exceeds the 1 MiB ceiling gets
+  the per-line `error parsing regexp: Compiled regex exceeds size
+  limit…` where the unbounded reference would compile it. Overflowing
+  `int` still panics with the reference's exact `strings: Repeat
+  output length overflow` per line (that surface is bounded and
+  correct).
+
 ### `logql-error-envelope` (issue #240)
 
 - **What changed:** `ReadError::PipelineInvalid`'s `Display` is now the

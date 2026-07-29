@@ -1,0 +1,245 @@
+# t6_errors_edges.test — issue #230 template-engine corpus.
+# Wave-6 closeout: per-function execution-error surfaces (the
+# per-line TemplateFormatErr class — the line is preserved and the
+# query succeeds), label_format destination-unset/last-error-wins,
+# and multi-stage error-pair interaction.
+# Captured from grafana/loki:3.7.4 per PROVENANCE.md (stock container,
+# no TZ, no host zoneinfo — the degenerate-UTC Local precondition).
+
+load
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} service=t6s0r1785119441
+  1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ div 7 0 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <div 7 0>: error calling div: runtime error: integer divide by zero", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ mod 7 0 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <mod 7 0>: error calling mod: runtime error: integer divide by zero", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ divf 1 0 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <divf 1 0>: error calling divf: decimal division by 0", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ divf 100 0 3 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <divf 100 0 3>: error calling divf: decimal division by 0", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ substr 5 2 .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <substr 5 2 .a>: error calling substr: runtime error: slice bounds out of range [5:2]", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ substr 99 100 .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <substr 99 100 .a>: error calling substr: runtime error: slice bounds out of range [99:5]", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ substr -1 99 .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <substr -1 99 .a>: error calling substr: runtime error: slice bounds out of range [:99] with length 5", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ substr -1 -2 .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <substr -1 -2 .a>: error calling substr: runtime error: slice bounds out of range [:-2]", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ repeat -1 "ab" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <repeat -1 \"ab\">: error calling repeat: strings: negative Repeat count", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ repeat 1000000000000000000 "xxxxxxxxxxxxxxxxx" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <repeat 1000000000000000000 \"xxxxxxxxxxxxxxxxx\">: error calling repeat: strings: Repeat output length overflow", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ indent -1 .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <indent -1 .a>: error calling indent: strings: negative Repeat count", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ unixToTime "123" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <unixToTime \"123\">: error calling unixToTime: unable to parse time '123': %!w(<nil>)", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ unixToTime "abc" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <unixToTime \"abc\">: error calling unixToTime: unable to parse time 'abc': strconv.ParseInt: parsing \"abc\": invalid syntax", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ unixToTime "-1673798889" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <unixToTime \"-1673798889\">: error calling unixToTime: unable to parse time '-1673798889': %!w(<nil>)", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ duration "abc" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <duration \"abc\">: error calling duration: time: invalid duration \"abc\"", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ duration "2x" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <duration \"2x\">: error calling duration: time: unknown unit \"x\" in duration \"2x\"", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ bytes "zz" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <bytes \"zz\">: error calling bytes: strconv.ParseFloat: parsing \"\": invalid syntax", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ addf (mulf 1e308 10) 1 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <addf (mulf 1e308 10) 1>: error calling addf: Cannot create a Decimal from +Inf", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ $t := __timestamp__ }}{{ $t.In nil }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:30: executing \"line\" at <$t.In>: error calling In: time: missing Location in call to Time.In", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ ((toDate "2006-01-02" "9999-12-31").AddDate 1 0 0).MarshalText }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:53: executing \"line\" at <((toDate \"2006-01-02\" \"9999-12-31\").AddDate 1 0 0).MarshalText>: error calling MarshalText: Time.MarshalText: year outside of range [0,9999]", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ ((toDate "2006-01-02" "9999-12-31").AddDate 1 0 0).MarshalJSON }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:53: executing \"line\" at <((toDate \"2006-01-02\" \"9999-12-31\").AddDate 1 0 0).MarshalJSON>: error calling MarshalJSON: Time.MarshalJSON: year outside of range [0,9999]", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ .a.b }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:5: executing \"line\" at <.a.b>: can't evaluate field b in type string", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ .u.x.y }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:5: executing \"line\" at <.u.x.y>: can't evaluate field x in type string", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ (fromJson "{\"z\":null}").z.q }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:13: executing \"line\" at <\"{\\\"z\\\":null}\">: nil pointer evaluating interface {}.q", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ trunc 1 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <trunc>: wrong number of args for trunc: want 2 got 1", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ upper 5 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:9: executing \"line\" at <5>: expected string; found 5", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ upper .absent .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <upper>: wrong number of args for upper: want 1 got 2", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ trunc "x" .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:9: executing \"line\" at <\"x\">: expected integer; found \"x\"", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ Replace .a "l" "L" "x" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:22: executing \"line\" at <\"x\">: expected integer; found \"x\"", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ len 5 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <len 5>: error calling len: len of type int", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ len (fromJson "nope") }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <len (fromJson \"nope\")>: error calling len: reflect: call of reflect.Value.Type on zero Value", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ index (fromJson .arr) 9 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <index (fromJson .arr) 9>: error calling index: index out of range: 9", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ index (fromJson .arr) 1.5 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <index (fromJson .arr) 1.5>: error calling index: cannot index slice/array with type float64", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ index (fromJson .js) 1 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <index (fromJson .js) 1>: error calling index: value has type int; should be string", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ index (fromJson "{\"z\":null}") "z" "q" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <index (fromJson \"{\\\"z\\\":null}\") \"z\" \"q\">: error calling index: index of nil pointer", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ index (fromJson "nope") 0 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <index (fromJson \"nope\") 0>: error calling index: index of untyped nil", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ slice .a 3 1 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <slice .a 3 1>: error calling slice: invalid slice index: 3 > 1", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ slice .a 1 99 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <slice .a 1 99>: error calling slice: index out of range: 99", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ slice (fromJson .arr) 0 1 5 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <slice (fromJson .arr) 0 1 5>: error calling slice: index out of range: 5", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ slice "abc" 1 2 3 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <slice \"abc\" 1 2 3>: error calling slice: cannot 3-index slice a string", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ call .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <call .a>: error calling call: non-function .a of type string", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ call nil }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <call nil>: error calling call: call of nil", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ nil }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <nil>: nil is not a command", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ eq 1 .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <eq 1 .a>: error calling eq: incompatible types for comparison: int and string", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ lt 1 "x" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <lt 1 \"x\">: error calling lt: incompatible types for comparison: int and string", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ lt true false }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <lt true false>: error calling lt: invalid type for comparison", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ eq (fromJson .arr) (fromJson .arr) }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <eq (fromJson .arr) (fromJson .arr)>: error calling eq: non-comparable type [%!s(float64=5) %!s(float64=6) %!s(float64=7)]: []interface {}", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ 18446744073709551615 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <18446744073709551615>: 18446744073709551615 overflows int", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ printf "%d" 18446744073709551615 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:15: executing \"line\" at <18446744073709551615>: 18446744073709551615 overflows int", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ range $a := 5.5 }}x{{ end }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:15: executing \"line\" at <5.5>: range can't iterate over 5.5", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ range .a }}x{{ end }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:9: executing \"line\" at <.a>: range can't iterate over Hello", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ range $k, $v := 3 }}x{{ end }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:19: executing \"line\" at <3>: can't use 3 to iterate over more than one variable", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | line_format `{{ template "nope" }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:12: executing \"line\" at <{{template \"nope\"}}>: template \"nope\" not defined", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+# last error wins; failed destinations stay unset
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | label_format one=`{{ divf 1 0 }}`, two=`{{ substr 9 2 .a }}`, ok=`{{ .a }}`
+  {__error__="TemplateFormatErr", __error_details__="template: label:1:3: executing \"label\" at <substr 9 2 .a>: error calling substr: runtime error: slice bounds out of range [9:2]", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", ok="Hello", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+# the once-per-stage data map freezes the error pair at map build
+eval instant at 1785119441989621248ns {service_name="t6s0r1785119441"} | label_format c=`{{ divf 1 0 }}`, d=`E[{{ .__error__ }}]`
+  {__error__="TemplateFormatErr", __error_details__="template: label:1:3: executing \"label\" at <divf 1 0>: error calling divf: decimal division by 0", a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", d="E[]", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t6s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns level=info msg="hi there" took=250ms
+
+clear
+
+load
+  {service_name="t6s1r1785119441", svc="e"} service=t6s1r1785119441
+  1785119321000000000ns not json
+
+# the data map exposes the out-of-band pair once an error is set
+eval instant at 1785119441989621248ns {service_name="t6s1r1785119441"} | json | line_format `E={{ .__error__ }}|D={{ len .__error_details__ }}`
+  {__error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol", service_name="t6s1r1785119441", svc="e"} 1785119321000000000ns E=JSONParserErr|D=58
+
+# a template failure OVERWRITES an earlier error class (SetErr)
+eval instant at 1785119441989621248ns {service_name="t6s1r1785119441"} | json | line_format `{{ divf 1 0 }}`
+  {__error__="TemplateFormatErr", __error_details__="template: line:1:3: executing \"line\" at <divf 1 0>: error calling divf: decimal division by 0", service_name="t6s1r1785119441", svc="e"} 1785119321000000000ns not json
+
+clear
+
+# --- fromJson invalid-UTF-8 / lone-surrogate parity (issue #230 review
+# round 2, finding: fromJson returned nil where Go's encoding/json
+# substitutes U+FFFD). Captured 2026-07-27 from grafana/loki:3.7.4
+# (go1.26.5) via /loki/api/v1/query_range: one U+FFFD per invalid BYTE
+# (unquoteBytes advances DecodeRune's size-1-on-error), lone \uXXXX
+# surrogate escapes become U+FFFD, valid pairs combine, an escaped
+# backslash is NOT an escape, and invalid bytes OUTSIDE a string stay a
+# syntax error (nil).
+
+load
+  {service_name="t6s2r1785119441"} service=t6s2r1785119441
+  1785119321000000000ns seed
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\xff\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns �
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"a\xf0\x9fb\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns a��b
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"a\xf0\x9f\x92\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns a���
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ index (fromJson "{\"\xff\":\"v\"}") "�" }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns v
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `X{{ fromJson "\xff" }}Y`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns X<no value>Y
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `X{{ printf "%v" (fromJson "\xff") }}Y`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns X<nil>Y
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\ud800\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns �
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\ud83d\\ude00\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns 😀
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\ud800\\ud800\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns ��
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\udc00\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns �
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\ud800x\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns �x
+
+eval instant at 1785119441989621248ns {service_name="t6s2r1785119441"} | line_format `{{ (fromJson "{\"x\":\"\\\\ud800\"}").x }}`
+  {service_name="t6s2r1785119441"} 1785119321000000000ns \ud800
+
+clear

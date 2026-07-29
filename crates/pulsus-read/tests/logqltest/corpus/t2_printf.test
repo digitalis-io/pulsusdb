@@ -1,0 +1,696 @@
+# t2_printf.test — issue #230 template-engine corpus.
+# Wave-2: the printf verb engine — one case per (verb × reachable
+# value kind) cell plus flags/width/precision and the malformed
+# forms — plan AC-6.
+# Captured from grafana/loki:3.7.4 per PROVENANCE.md (stock container,
+# no TZ, no host zoneinfo — the degenerate-UTC Local precondition).
+
+load
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} service=t2s0r1785119441
+  1785119321000000000ns level=info msg="hi there" took=250ms
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [Hello]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [-7]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1.5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [true]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [<nil>]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[5 6 7]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[a:1 b:[1 2 <nil>] neg:-2.5 s:x t:true]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%v]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [97]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!t(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!t(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!t(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!t(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [true]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!t(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!t(float64=5) %!t(float64=6) %!t(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!t(string=a):%!t(float64=1) %!t(string=b):[%!t(float64=1) %!t(float64=2) <nil>] %!t(string=neg):%!t(float64=-2.5) %!t(string=s):%!t(string=x) %!t(string=t):true]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%t]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!t(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!d(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [-7]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!d(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!d(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!d(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!d(float64=5) %!d(float64=6) %!d(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!d(string=a):%!d(float64=1) %!d(string=b):[%!d(float64=1) %!d(float64=2) <nil>] %!d(string=neg):%!d(float64=-2.5) %!d(string=s):%!d(string=x) %!d(string=t):%!d(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%d]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [97]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!b(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [101]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [-111]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [6755399441055744p-52]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!b(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!b(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[5629499534213120p-50 6755399441055744p-50 7881299347898368p-50]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!b(string=a):4503599627370496p-52 %!b(string=b):[4503599627370496p-52 4503599627370496p-51 <nil>] %!b(string=neg):-5629499534213120p-51 %!b(string=s):%!b(string=x) %!b(string=t):%!b(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%b]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1100001]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!o(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [-7]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!o(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!o(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!o(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!o(float64=5) %!o(float64=6) %!o(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!o(string=a):%!o(float64=1) %!o(string=b):[%!o(float64=1) %!o(float64=2) <nil>] %!o(string=neg):%!o(float64=-2.5) %!o(string=s):%!o(string=x) %!o(string=t):%!o(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%o]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [141]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!O(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [0o5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [-0o7]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!O(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!O(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!O(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!O(float64=5) %!O(float64=6) %!O(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!O(string=a):%!O(float64=1) %!O(string=b):[%!O(float64=1) %!O(float64=2) <nil>] %!O(string=neg):%!O(float64=-2.5) %!O(string=s):%!O(string=x) %!O(string=t):%!O(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%O]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [0o141]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [48656c6c6f]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [-7]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [0x1.8p+00]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!x(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!x(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[0x1.4p+02 0x1.8p+02 0x1.cp+02]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[61:0x1p+00 62:[0x1p+00 0x1p+01 <nil>] 6e6567:-0x1.4p+01 73:78 74:%!x(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%x]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [61]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [48656C6C6F]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [-7]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [0X1.8P+00]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!X(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!X(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[0X1.4P+02 0X1.8P+02 0X1.CP+02]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[61:0X1P+00 62:[0X1P+00 0X1P+01 <nil>] 6E6567:-0X1.4P+01 73:78 74:%!X(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%X]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [61]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!c(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns []
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [�]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!c(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!c(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!c(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!c(float64=5) %!c(float64=6) %!c(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!c(string=a):%!c(float64=1) %!c(string=b):[%!c(float64=1) %!c(float64=2) <nil>] %!c(string=neg):%!c(float64=-2.5) %!c(string=s):%!c(string=x) %!c(string=t):%!c(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%c]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [a]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns ["Hello"]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns ['\x05']
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns ['�']
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!q(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!q(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!q(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!q(float64=5) %!q(float64=6) %!q(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map["a":%!q(float64=1) "b":[%!q(float64=1) %!q(float64=2) <nil>] "neg":%!q(float64=-2.5) "s":"x" "t":%!q(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%q]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns ['a']
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!U(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [U+0005]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [U+FFFFFFFFFFFFFFF9]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!U(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!U(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!U(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!U(float64=5) %!U(float64=6) %!U(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!U(string=a):%!U(float64=1) %!U(string=b):[%!U(float64=1) %!U(float64=2) <nil>] %!U(string=neg):%!U(float64=-2.5) %!U(string=s):%!U(string=x) %!U(string=t):%!U(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%U]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [U+0061]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!e(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!e(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!e(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1.500000e+00]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!e(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!e(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[5.000000e+00 6.000000e+00 7.000000e+00]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!e(string=a):1.000000e+00 %!e(string=b):[1.000000e+00 2.000000e+00 <nil>] %!e(string=neg):-2.500000e+00 %!e(string=s):%!e(string=x) %!e(string=t):%!e(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%e]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!e(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!E(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!E(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!E(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1.500000E+00]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!E(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!E(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[5.000000E+00 6.000000E+00 7.000000E+00]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!E(string=a):1.000000E+00 %!E(string=b):[1.000000E+00 2.000000E+00 <nil>] %!E(string=neg):-2.500000E+00 %!E(string=s):%!E(string=x) %!E(string=t):%!E(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%E]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!E(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!f(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!f(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!f(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1.500000]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!f(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!f(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[5.000000 6.000000 7.000000]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!f(string=a):1.000000 %!f(string=b):[1.000000 2.000000 <nil>] %!f(string=neg):-2.500000 %!f(string=s):%!f(string=x) %!f(string=t):%!f(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%f]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!f(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!F(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!F(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!F(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1.500000]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!F(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!F(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[5.000000 6.000000 7.000000]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!F(string=a):1.000000 %!F(string=b):[1.000000 2.000000 <nil>] %!F(string=neg):-2.500000 %!F(string=s):%!F(string=x) %!F(string=t):%!F(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%F]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!F(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!g(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!g(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!g(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1.5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!g(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!g(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[5 6 7]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!g(string=a):1 %!g(string=b):[1 2 <nil>] %!g(string=neg):-2.5 %!g(string=s):%!g(string=x) %!g(string=t):%!g(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%g]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!g(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!G(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!G(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!G(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1.5]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!G(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!G(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[5 6 7]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!G(string=a):1 %!G(string=b):[1 2 <nil>] %!G(string=neg):-2.5 %!G(string=s):%!G(string=x) %!G(string=t):%!G(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%G]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!G(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [Hello]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!s(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!s(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!s(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!s(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!s(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!s(float64=5) %!s(float64=6) %!s(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[a:%!s(float64=1) b:[%!s(float64=1) %!s(float64=2) <nil>] neg:%!s(float64=-2.5) s:x t:%!s(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%s]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!s(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [string]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [int]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [int]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [float64]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [bool]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [<nil>]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[]interface {}]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[string]interface {}]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%T]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [int]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w([]interface {}=[5 6 7])]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w(map[string]interface {}=map[a:1 b:[1 2 <nil>] neg:-2.5 s:x t:true])]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%w]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!w(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!y(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!y(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" -7 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!y(int=-7)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!y(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!y(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" (fromJson "nope") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!y(<nil>)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [[%!y(float64=5) %!y(float64=6) %!y(float64=7)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [map[%!y(string=a):%!y(float64=1) %!y(string=b):[%!y(float64=1) %!y(float64=2) <nil>] %!y(string=neg):%!y(float64=-2.5) %!y(string=s):%!y(string=x) %!y(string=t):%!y(bool=true)]]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%y]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!y(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%p]" "Hello" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!p(string=Hello)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%p]" 5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!p(int=5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%p]" 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!p(float64=1.5)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%p]" true }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!p(bool=true)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "[%p]" 'a' }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [%!p(int=97)]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `[{{ printf "%5d|%-5d|%05d|%+d|% d|%#x|%#o|%#b|%#O" 42 42 42 42 42 42 42 42 42 }}]`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [   42|42   |00042|+42| 42|0x2a|052|0b101010|0o052]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `[{{ printf "%8.2f|%-8.2f|%08.2f|%.0f|%.4e|%.3g|%#g|%.2x" 3.14159 3.14159 3.14159 3.14159 3.14159 3.14159 3.14159 3.14159 }}]`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [    3.14|3.14    |00003.14|3|3.1416e+00|3.14|3.14159|0x1.92p+01]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `[{{ printf "%6.3s|%-6.3s|%q|%#q|%+q" .a .a .a .a .u }}]`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [   Hel|Hel   |"Hello"|`Hello`|"h\u00e9llo"]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%x|%X|% x|%#x" .a .a .a .a }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 48656c6c6f|48656C6C6F|48 65 6c 6c 6f|0x48656c6c6f
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `[{{ printf "%*d|%.*f" 6 42 2 3.14159 }}]`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [    42|3.14]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `[{{ printf "%*d" -6 42 }}]`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [42    ]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%[2]d %[1]d" 1 2 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 2 1
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%[5]d" 1 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns %!d(BADINDEX)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%[0]d" 1 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns %!d(BADINDEX)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%d" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns %!d(MISSING)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%d %d" 1 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1 %!d(MISSING)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%%" .a }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns %%!(EXTRA string=Hello)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "abc%" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns abc%!(NOVERB)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%!" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns %!!(MISSING)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "100%%" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 100%
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%y" .a }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns %!y(string=Hello)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%d" 1 2 3 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1%!(EXTRA int=2, int=3)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%v %d %s" 1e21 7 "x" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1e+21 7 x
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%v|%v|%v|%v|%v|%v" 1e6 1234567.0 123456.7 1e-4 1e-5 0.3333333333333333 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 1e+06|1.234567e+06|123456.7|0.0001|1e-05|0.3333333333333333
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%c|%c|%c" 65 9731 55296 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns A|☃|�
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%q|%q" 65 9731 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 'A'|'☃'
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%U|%#U" 9731 9731 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns U+2603|U+2603 '☃'
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%e|%E|%g|%G|%b|%x|%X" 0.25 0.25 0.25 0.25 0.25 0.25 0.25 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 2.500000e-01|2.500000E-01|0.25|0.25|4503599627370496p-54|0x1p-02|0X1P-02
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%f|%e|%g" 0.0 0.0 0.0 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 0.000000|0.000000e+00|0
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%v|%d" -0.0 -42 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns -0|-42
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%v" (fromJson "{\"z\":null}") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns map[z:<nil>]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%v" (fromJson "[1,\"b\",null]") }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [1 b <nil>]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%#v" (fromJson .js) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns map[string]interface {}{"a":1, "b":[]interface {}{1, 2, interface {}(nil)}, "neg":-2.5, "s":"x", "t":true}
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%+v" (fromJson .arr) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns [5 6 7]
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%#v|%#v|%#v" "str" 5 1.5 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns "str"|5|1.5
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%t|%t" true 1 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns true|%!t(int=1)
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%030.10v|" 1234567.898 }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 00000000000000000001234567.898|
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%q" "\x80" }}|{{ printf "%q" "\u00e9" }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns "\x80"|"é"
+
+eval instant at 1785119441989621248ns {service_name="t2s0r1785119441"} | line_format `{{ printf "%s" (printf "%d" 42) }}`
+  {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} 1785119321000000000ns 42
+
+clear
