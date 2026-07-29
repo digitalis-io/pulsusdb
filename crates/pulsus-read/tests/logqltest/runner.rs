@@ -299,7 +299,9 @@ pub enum EvalMode {
     Value,
     /// Compare as an ordered list (`sort`/`sort_desc`).
     Ordered,
-    /// The query must error; `fail_msg` (if present) must be a substring.
+    /// The query must error; the (required) assert line matches the
+    /// produced error text — `msg:` as a substring, `msg_exact:`
+    /// byte-exactly (issue #240).
     Fail,
 }
 
@@ -324,8 +326,19 @@ pub struct EvalCmd {
     /// Raw expected result lines (interpreted at compare time by result
     /// kind); empty = an empty result.
     pub expected: Vec<String>,
-    /// `eval_fail` only: the required error substring.
-    pub fail_msg: Option<String>,
+    /// `eval_fail` only: the required error assertion (issue #240 —
+    /// exactly one per `eval_fail`, enforced at parse time).
+    pub fail_msg: Option<FailAssert>,
+}
+
+/// `eval_fail`'s single assert line (issue #240): `msg:` gates a
+/// substring; `msg_exact:` gates the WHOLE produced error, byte-exactly.
+/// Values are trimmed — a named limitation; none of the pinned bodies has
+/// significant leading/trailing whitespace.
+#[derive(Debug, Clone)]
+pub enum FailAssert {
+    Contains(String),
+    Exact(String),
 }
 
 #[derive(Debug, Clone)]
@@ -566,19 +579,55 @@ fn parse_eval(
             continue;
         }
         if mode == EvalMode::Fail {
-            if let Some(msg) = content.strip_prefix("msg:") {
-                fail_msg = Some(msg.trim().to_string());
+            // Exactly ONE assert line per eval_fail; `msg_exact:` first
+            // (note `"msg_exact:".strip_prefix("msg:")` is None — the
+            // fourth byte is `_` — so the order is for clarity only).
+            let assert = if let Some(msg) = content.strip_prefix("msg_exact:") {
+                FailAssert::Exact(msg.trim().to_string())
+            } else if let Some(msg) = content.strip_prefix("msg:") {
+                FailAssert::Contains(msg.trim().to_string())
             } else {
                 return Err(fmt_err(
                     file,
                     idx,
-                    format!("eval_fail expects a `msg: <substring>` line, got {content:?}"),
+                    format!(
+                        "eval_fail expects a `msg: <substring>` or `msg_exact: <text>` line, \
+                         got {content:?}"
+                    ),
+                ));
+            };
+            let value = match &assert {
+                FailAssert::Contains(v) | FailAssert::Exact(v) => v,
+            };
+            if value.is_empty() {
+                return Err(fmt_err(
+                    file,
+                    idx,
+                    "eval_fail assert line has an empty value".into(),
                 ));
             }
+            if fail_msg.is_some() {
+                return Err(fmt_err(
+                    file,
+                    idx,
+                    "eval_fail carries more than one assert line (exactly one \
+                     `msg:`/`msg_exact:` is required)"
+                        .into(),
+                ));
+            }
+            fail_msg = Some(assert);
         } else {
             expected.push(content.to_string());
         }
         idx += 1;
+    }
+
+    if mode == EvalMode::Fail && fail_msg.is_none() {
+        return Err(fmt_err(
+            file,
+            directive_idx,
+            "eval_fail requires exactly one `msg: <substring>` or `msg_exact: <text>` line".into(),
+        ));
     }
 
     Ok((
@@ -799,9 +848,13 @@ fn judge(cmd: &EvalCmd, outcome: Result<Outcome, String>) -> (bool, String) {
                 "eval_fail expected the query to error but it succeeded".to_string(),
             ),
             Err(text) => match &cmd.fail_msg {
-                Some(m) if !text.contains(m.as_str()) => (
+                Some(FailAssert::Contains(m)) if !text.contains(m.as_str()) => (
                     false,
                     format!("error {text:?} does not contain the required substring {m:?}"),
+                ),
+                Some(FailAssert::Exact(m)) if text != *m => (
+                    false,
+                    format!("error {text:?} != the required exact text {m:?}"),
                 ),
                 _ => (true, String::new()),
             },

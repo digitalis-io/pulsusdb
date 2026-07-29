@@ -14,14 +14,14 @@
 //! | `metric_name = '<name>'` | ClickHouse string literal | [`ch_string`] |
 //! | label key in `JSONExtractString(labels, '<key>')` | string literal (a *value argument*, never an identifier) | [`ch_string`] |
 //! | Eq/Neq value `... = '<val>'` / `!= '<val>'` | string literal | [`ch_string`] |
-//! | Re/Nre pattern `match(JSONExtractString(labels,'<key>'), '<pat>')` | fully-anchored `'^(?:pat)$'` literal | [`ch_regex_anchored`] |
+//! | Re/Nre pattern `match(JSONExtractString(labels,'<key>'), '<pat>')` | fully-anchored `'^(?:pat)$'` literal | [`ch_regex_anchored_promql_re2`] (the issue #240 PromQL RE2-authority exemption) |
 //!
 //! Absent-label semantics are unchanged from the in-process path:
 //! `JSONExtractString` returns `''` for a missing key, matching
 //! [`super::labels`]'s `""` rule for a missing [`pulsus_model::LabelSet`]
 //! entry (load-bearing for the cache-vs-SQL differential test).
 //!
-//! **Placeholder-doubling is NOT this module's concern.** `ch_regex_anchored`
+//! **Placeholder-doubling is NOT this module's concern.** `ch_regex_anchored_promql_re2`
 //! always emits a literal `?` (the `^(?:...)$` template) — the `clickhouse`
 //! crate's `SqlBuilder` treats a bare `?` as an unbound bind placeholder
 //! unless doubled. The canonical SQL text this module returns is
@@ -31,7 +31,8 @@
 //! engine must apply it before this text reaches `ChClient::query_stream`,
 //! exactly as `logql::exec` already does for its own regex SQL.
 
-use crate::logql::escape::{ch_regex_anchored, ch_string};
+use crate::logql::escape::{ch_regex_anchored_promql_re2, ch_string};
+use crate::metrics::PromqlRe2Fallback;
 use pulsus_model::floor_to_activity_bucket;
 
 use super::matcher::{DataWindow, DiscoveryFilter, LabelMatcher, MatchOp};
@@ -54,8 +55,14 @@ fn matcher_predicate(m: &LabelMatcher) -> String {
     match m.op {
         MatchOp::Eq => format!("{target} = {}", ch_string(&m.value)),
         MatchOp::Neq => format!("{target} != {}", ch_string(&m.value)),
-        MatchOp::Re => format!("match({target}, {})", ch_regex_anchored(&m.value)),
-        MatchOp::Nre => format!("NOT match({target}, {})", ch_regex_anchored(&m.value)),
+        MatchOp::Re => format!(
+            "match({target}, {})",
+            ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), &m.value)
+        ),
+        MatchOp::Nre => format!(
+            "NOT match({target}, {})",
+            ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), &m.value)
+        ),
     }
 }
 
@@ -261,15 +268,21 @@ pub fn discovery_fetch_multi(
 /// arm is the concrete-name route, which never reaches this builder — kept
 /// total (rendered identically to `metric_name = '<v>'`) rather than
 /// panicking on an unreachable input. Reuses the same [`ch_string`]/
-/// [`ch_regex_anchored`] injection primitives and `^(?:…)$` anchoring as
+/// [`ch_regex_anchored_promql_re2`] injection primitives and `^(?:…)$` anchoring as
 /// [`matcher_predicate`], so a regex here carries the accepted RE2-vs-Rust
 /// differential this module's header already documents.
 fn metric_name_predicate(m: &LabelMatcher) -> String {
     match m.op {
         MatchOp::Eq => format!("metric_name = {}", ch_string(&m.value)),
         MatchOp::Neq => format!("metric_name != {}", ch_string(&m.value)),
-        MatchOp::Re => format!("match(metric_name, {})", ch_regex_anchored(&m.value)),
-        MatchOp::Nre => format!("NOT match(metric_name, {})", ch_regex_anchored(&m.value)),
+        MatchOp::Re => format!(
+            "match(metric_name, {})",
+            ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), &m.value)
+        ),
+        MatchOp::Nre => format!(
+            "NOT match(metric_name, {})",
+            ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), &m.value)
+        ),
     }
 }
 
@@ -568,7 +581,7 @@ mod tests {
             value: payload.to_string(),
         };
         let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
-        let expected = ch_regex_anchored(payload);
+        let expected = ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), payload);
         assert_no_unescaped_quote(&expected);
         assert!(sql.contains(&format!(
             "match(JSONExtractString(labels, 'status'), {expected})"
@@ -818,7 +831,7 @@ mod tests {
             3_600_000,
             2,
         );
-        let expected = ch_regex_anchored(payload);
+        let expected = ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), payload);
         assert_no_unescaped_quote(&expected);
         assert!(sql.contains(&format!("match(metric_name, {expected})")));
     }

@@ -173,3 +173,132 @@ fn a_perturbed_expected_value_reddens_the_runner() {
     );
     assert_eq!(run.cases[0].mode, EvalMode::Value);
 }
+
+/// Issue #240 AC7(g), the positive direction: the new plan-time regex
+/// validation must reject NOTHING the corpus accepts. The corpus runner
+/// never routes LOG queries through `plan()` (its documented pushdown
+/// blind spot, #278), so this walks every `eval`/`eval_ordered` log
+/// query in the corpus through the real planner and requires `Ok` —
+/// zero false rejections from the pushed-down line-filter/matcher
+/// validation. (Metric queries already plan inside the green corpus
+/// run; `sql_snapshots.rs`/`explain_indexes.rs` prove the emitted SQL
+/// is byte-identical.)
+#[test]
+fn every_corpus_log_query_still_plans_ok_under_regex_validation() {
+    use pulsus_read::logql::{Direction, QueryParams, QuerySpec, plan};
+    let mut checked = 0usize;
+    for name in &corpus_files() {
+        let path = driver::corpus_dir().join(name);
+        let text = driver::read_file(&path);
+        for (i, line) in text.lines().enumerate() {
+            let mut tokens = line.split_whitespace();
+            let directive = tokens.next().unwrap_or("");
+            if !matches!(directive, "eval" | "eval_ordered") {
+                continue;
+            }
+            // `eval[/_ordered] instant at <T> <query>` — range evals are
+            // metric queries by construction (already planned green).
+            let rest = line.split_once(" at ").map(|(_, r)| r);
+            let Some(rest) = rest else { continue };
+            let Some((t_tok, query)) = rest.trim().split_once(' ') else {
+                continue;
+            };
+            let Ok(at_ns) = driver::runner::parse_duration_ns(t_tok) else {
+                continue;
+            };
+            let Ok(expr) = pulsus_logql::parse(query.trim()) else {
+                continue;
+            };
+            if !matches!(expr, pulsus_logql::Expr::Log(_)) {
+                continue;
+            }
+            let params = QueryParams {
+                spec: QuerySpec::Instant { at_ns },
+                limit: 100,
+                direction: Direction::Backward,
+            };
+            let ctx = pulsus_read::logql::PlanCtx {
+                db: "pulsus",
+                streams_idx: "log_streams_idx",
+                streams: "log_streams",
+                samples: "log_samples",
+                rollup_table: "log_metrics_5s",
+                rollup_res_ns: 5_000_000_000,
+                scan_budget_bytes: 50 * 1024 * 1024 * 1024,
+                max_streams: 100_000,
+                pipeline_scan_factor: 10,
+            };
+            plan(&expr, &params, &ctx).unwrap_or_else(|e| {
+                panic!("{name}:{}: corpus log query must still plan Ok: {e}", i + 1)
+            });
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 30,
+        "expected to plan a meaningful number of corpus log queries, got {checked}"
+    );
+}
+
+/// Issue #240 AC3: `msg_exact:` exists, is anchored on the WHOLE produced
+/// error, and its grammar is exactly-one-nonempty-assert-line — four
+/// negative controls, each proved to redden/reject for real.
+#[test]
+fn msg_exact_discriminates_and_its_grammar_is_exactly_one_assert_line() {
+    let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"} service=checkout\n\
+                   \t10s  c=10\n\n";
+    let body = "count min sketches are only supported on instant queries";
+    let query = "eval_fail range from 0s to 300s step 60s approx_topk(2, count_over_time({env=\"prod\"}[1m]))";
+
+    // Control 0 (green baseline): the exact produced text passes.
+    let good = format!("{dataset}{query}\n\tmsg_exact: {body}\n");
+    let run = run_file("inline/msg_exact_good.test", &good).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "byte-exact match: {}",
+        run.cases[0].detail
+    );
+
+    // (i) a one-byte perturbation reddens.
+    let perturbed = format!(
+        "{dataset}{query}\n\tmsg_exact: {}\n",
+        body.replace('m', "n")
+    );
+    let run = run_file("inline/msg_exact_perturbed.test", &perturbed).expect("parse");
+    assert!(
+        !run.cases[0].passed,
+        "a one-byte perturbation must redden msg_exact"
+    );
+
+    // (ii) a strict SUBSTRING expectation reddens under msg_exact (the
+    // same value passes under msg:).
+    let substring = "count min sketches";
+    let strict = format!("{dataset}{query}\n\tmsg_exact: {substring}\n");
+    let run = run_file("inline/msg_exact_substring.test", &strict).expect("parse");
+    assert!(
+        !run.cases[0].passed,
+        "a strict substring must redden msg_exact (it is anchored, not contains)"
+    );
+    let loose = format!("{dataset}{query}\n\tmsg: {substring}\n");
+    let run = run_file("inline/msg_substring.test", &loose).expect("parse");
+    assert!(run.cases[0].passed, "msg: stays a substring gate");
+
+    // (iii) two assert lines is a parse-time grammar error naming the line.
+    let two = format!("{dataset}{query}\n\tmsg: {substring}\n\tmsg_exact: {body}\n");
+    let err = run_file("inline/msg_two_lines.test", &two).expect_err("two assert lines");
+    assert!(
+        err.contains("more than one assert line"),
+        "grammar error: {err}"
+    );
+
+    // (iv) an empty value is a parse-time grammar error.
+    let empty = format!("{dataset}{query}\n\tmsg_exact:\n");
+    let err = run_file("inline/msg_empty.test", &empty).expect_err("empty value");
+    assert!(err.contains("empty value"), "grammar error: {err}");
+
+    // And zero assert lines is a grammar error too (the exactly-one rule's
+    // other edge; the plan's grammar statement).
+    let zero = format!("{dataset}{query}\n");
+    let err = run_file("inline/msg_zero_lines.test", &zero).expect_err("no assert line");
+    assert!(err.contains("requires exactly one"), "grammar error: {err}");
+}

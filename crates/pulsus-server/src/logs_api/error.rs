@@ -231,6 +231,9 @@ mod tests {
     /// Issue M6-09 plan v3 delta 6: both pipeline rejection classes map
     /// to 400 `bad_data` (matching the
     /// `read_error_empty_matcher_set_maps_to_400_bad_data` idiom).
+    /// Issue #240: the body is the BARE reason, asserted byte-exactly on
+    /// the WHOLE `error` field — the old `contains(…)` assert pinned the
+    /// removed PulsusDB-only prefix and is deleted, not weakened.
     #[tokio::test]
     async fn read_error_pipeline_invalid_maps_to_400_bad_data() {
         let err = ReadError::PipelineInvalid {
@@ -239,12 +242,23 @@ mod tests {
         let (status, json) = envelope(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("invalid pipeline")
-        );
+        assert!(json.get("position").is_none());
+        assert_eq!(json["error"], "bad regex: unclosed group");
+    }
+
+    /// Issue #240 (AC2's once-only leg): a reason that itself begins
+    /// `parse error ` renders exactly once — no decoration doubles it.
+    #[tokio::test]
+    async fn read_error_pipeline_invalid_body_is_the_reason_exactly_once() {
+        let reason = "parse error : synthetic prefix-collision probe";
+        let err = ReadError::PipelineInvalid {
+            reason: reason.to_string(),
+        };
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body = json["error"].as_str().expect("error body");
+        assert_eq!(body, reason);
+        assert_eq!(body.matches("parse error ").count(), 1);
     }
 
     /// Issue M6-10 adjudication #1: a surviving metric-pipeline

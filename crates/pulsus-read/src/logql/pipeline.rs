@@ -1562,8 +1562,40 @@ impl CompiledPipeline {
 // Compilation
 // ---------------------------------------------------------------------
 
+/// The single construction site for a regex-compilation failure. Reports
+/// the pattern the CLIENT wrote, never `compile_anchored_regex`'s `^(?:…)$`
+/// rewrite (issue #240). Deterministic rule, no text sniffing: if the
+/// user's own pattern fails to compile, its error is the message;
+/// otherwise the observed (anchored) error is used unchanged, so a
+/// size-limit-class failure of the wrapped form is never misreported.
+/// Issue #246 replaces this body and nowhere else.
+///
+/// NOTE: `label_replace` is not in PulsusDB's LogQL grammar today
+/// (`plan.rs` rejects it at parse) — see issue #276, which adds it. The
+/// reference genuinely DOES report the WRAPPED form at that one site, so
+/// once #276 lands this seam must NOT be "consistency fixed" to wrap.
+fn bad_regex(user_pattern: &str, observed: &regex::Error) -> PipelineError {
+    let msg = match regex::Regex::new(user_pattern) {
+        Err(e) => e.to_string(),
+        Ok(_) => observed.to_string(),
+    };
+    PipelineError::BadRegex(msg)
+}
+
+/// Validation-only entry for [`super::escape::ch_regex_unanchored_checked`]
+/// (issue #240): every path that turns a user regex into SQL compiles
+/// exactly the form it will emit, first.
+pub(super) fn validate_unanchored_regex(p: &str) -> Result<(), PipelineError> {
+    compile_regex(p).map(|_| ())
+}
+
+/// Validation-only entry for [`super::escape::ch_regex_anchored_checked`].
+pub(super) fn validate_anchored_regex(p: &str) -> Result<(), PipelineError> {
+    compile_anchored_regex(p).map(|_| ())
+}
+
 fn compile_regex(pattern: &str) -> Result<regex::Regex, PipelineError> {
-    regex::Regex::new(pattern).map_err(|e| PipelineError::BadRegex(e.to_string()))
+    regex::Regex::new(pattern).map_err(|e| bad_regex(pattern, &e))
 }
 
 /// The ANSI SGR (Select Graphic Rendition) color-escape pattern
@@ -1602,8 +1634,7 @@ fn compile_drop_keep(elems: &[DropKeepElem]) -> Result<Vec<CompiledDropKeep>, Pi
 /// the same `^(?:...)$` wrapping shape `escape::ch_regex_anchored` uses
 /// for the SQL side, compiled locally for in-engine evaluation.
 fn compile_anchored_regex(pattern: &str) -> Result<regex::Regex, PipelineError> {
-    regex::Regex::new(&format!("^(?:{pattern})$"))
-        .map_err(|e| PipelineError::BadRegex(e.to_string()))
+    regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| bad_regex(pattern, &e))
 }
 
 fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
@@ -2139,12 +2170,15 @@ fn compile_label_format(fmts: &[LabelFmt]) -> Result<CompiledStage, PipelineErro
         // the reserved-label error (live-probed, issue #231). Only
         // `__error__` is reserved: `__error_details__` stays assignable.
         //
-        // The message below is the reference's INNER text verbatim; the
-        // envelope this gets wrapped in (`bad parser expression: …` here,
-        // `invalid pipeline: …` at the API layer, against the reference's
-        // `parse error : stage '…' : …`) is a cross-cutting property of every
-        // LogQL parse error and is tracked by issue #240 — deliberately NOT
-        // changed here, and deliberately not pinned by the tests.
+        // The message below is the reference's INNER text verbatim. The
+        // envelope: `PipelineError::Display` still prepends its own
+        // `bad parser expression: ` marker here, while the API-layer
+        // `ReadError::PipelineInvalid` wrapper renders the reason BARE
+        // (issue #240 removed its fixed prefix — the removed bytes are
+        // recorded once, in docs/benchmarks/logs-differential-ledger.md,
+        // and deliberately not quoted in `crates/` so AC1's zero-hit grep
+        // cannot rot). The reference's own `parse error : stage '…' : …`
+        // wording remains an accepted cosmetic divergence.
         if dst == ERROR_LABEL {
             return Err(PipelineError::BadParserExpr(format!(
                 "{ERROR_LABEL} cannot be formatted"
@@ -2931,6 +2965,22 @@ fn walk_pattern<'n, 't>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #240 AC6: the `bad_regex` seam reports the USER's pattern —
+    /// a label-filter regex failure (`| a=~"("`) carries the compile
+    /// error for `(` and never for `compile_anchored_regex`'s `^(?:()$`
+    /// rewrite, asserted on the WHOLE message. Reverting the seam (back
+    /// to `e.to_string()` of the anchored error) reddens this.
+    #[test]
+    #[allow(clippy::invalid_regex)] // deliberate: derives the expected error for an invalid pattern
+    fn bad_regex_reports_the_users_pattern_not_the_anchored_rewrite() {
+        let user_err = regex::Regex::new("(").expect_err("must not compile");
+        let expected = format!("bad regex: {user_err}");
+        let err = CompiledPipeline::compile(&stages_of(r#"{service_name="x"} | a=~"(""#))
+            .expect_err("must reject");
+        assert_eq!(err.to_string(), expected, "the whole message, byte-exact");
+        assert!(!err.to_string().contains("^(?:"), "{err}");
+    }
 
     #[test]
     fn duration_seconds_parses_single_compound_and_fractional_literals() {

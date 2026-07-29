@@ -216,25 +216,32 @@ Out of this ledger's scope by design:
 - **Cases:** `metric_match_multiple_err`, `metric_match_duplicate_err`
   (issue #91). These queries are runtime vector-matching failures on both
   stores.
-- **Probed live against `grafana/loki:3.4.2`:**
+- **Probed live against `grafana/loki:3.4.2`, re-probed byte-identical
+  at `grafana/loki:3.7.4` (issue #240 wave0):**
   - many-to-one without a grouping modifier → HTTP **500**, body
     `multiple matches for labels: many-to-one matching must be explicit
-    (group_left/group_right)` (byte-identical to PulsusDB's message).
+    (group_left/group_right)` — PulsusDB's WHOLE wire body matches it
+    byte-for-byte since issue #240 (before it, a fixed PulsusDB-only
+    prefix on `ReadError::PipelineInvalid` made this claim false on the
+    wire).
   - duplicate one-side signature (many-to-many) → HTTP **500**, body
     `found duplicate series on the right hand-side;many-to-many matching
-    not allowed: matching labels must be unique on one side`
-    (PulsusDB emits the same string).
+    not allowed: matching labels must be unique on one side` — the same:
+    byte-identical since issue #240, prefix-divergent before it.
 - **Exact accepted delta:** Loki returns HTTP **500** for these
   execution-time matching errors; PulsusDB classifies them as a bad
   request (`ReadError::PipelineInvalid` → HTTP **400**), which is the
   semantically correct code for a user-query cardinality error. The two
-  stores therefore agree on the error BODY (the gated substring) but not
-  the status code. The `metric_match_error` differential cases stay
-  **gated on the shared error-body substring** and deliberately do NOT
-  gate the HTTP status (per the plan-adjudication probe decision: bodies
-  share a substring, so gate on it). This entry records the status-code
+  stores therefore agree on the error BODY but not the status code.
+  Since issue #240 body identity is enforced BYTE-EXACTLY: the corpus
+  rows carry `msg_exact:` (whole produced text) and
+  `tests/logqltest_provenance.rs` checks A/B tie each pinned body to its
+  `pulsus-240-bodies` capture row, both directions. The cases still
+  deliberately do NOT gate the HTTP status: they gate the whole
+  produced body, byte-exactly, via `msg_exact:` (issue #240 superseded
+  the older shared-substring gate). This entry records the status-code
   divergence for the record; it is not a `mode: "informational"`
-  downgrade (the cases remain gated on their substring).
+  downgrade (the cases remain gated on their bodies).
 
 ### approx-topk-determinism-and-range-status (issue #221)
 
@@ -257,12 +264,15 @@ Out of this ledger's scope by design:
   k-boundary ties (rule recorded in the `.test` header).
 - **Range-rejection status delta (the matching-error-status-divergence
   precedent, third instance):** any `approx_topk` in a range query is
-  refused with the reference's exact body
-  `count min sketches are only supported on instant queries` — Loki
+  refused with the reference's body, byte-for-byte:
+  `count min sketches are only supported on instant queries` (since
+  issue #240 this identity holds on the WHOLE wire body and is enforced
+  by `b10_approx_topk.test`'s `msg_exact:` gate; before #240 the fixed
+  `PipelineInvalid` prefix made it inner-text-only) — Loki
   surfaces it as HTTP **500** (probed live against `grafana/loki:3.7.4`),
   PulsusDB as `ReadError::PipelineInvalid` → HTTP **400**, per the same
-  adjudicated rule as the entry above: gate on the shared body substring,
-  never the status code.
+  adjudicated rule as the entry above: gate on the body (byte-exact via
+  `msg_exact:` since issue #240), never the status code.
 - **Enablement delta (not gated):** the reference disables `approx_topk`
   by default (`limits_config.shard_aggregations` + protobuf frontend
   encoding — capture procedure in `tests/logqltest/PROVENANCE.md`);
@@ -338,8 +348,13 @@ not "fix" us toward the panic.
 - **PulsusDB behaviour:** one plan-time 400 naming the rule (`variant N
   must be a range aggregation, optionally wrapped in one vector
   aggregation (...)`), before any DB read — except the arity mismatch,
-  which reproduces the reference's own non-variants message verbatim
-  (`invalid aggregation sum_over_time without unwrap`).
+  whose wording borrows the reference's non-variants arity phrasing
+  (`invalid aggregation sum_over_time without unwrap`). The reference
+  nil-panics on the variants form itself, so NO reference body exists
+  to pin: the byte-exact provenance row is BLOCKED (issue #240 AC10 —
+  a capture of the different, non-variants query is not substituted;
+  `logqltest/PROVENANCE.md` §#240) and `b13_variants.test` gates that
+  body by substring (`msg:`), claiming no reference identity.
 - **Why deliberate:** both sides reject every one of these shapes — we
   match the rejection; the panic text is unmatchable by construction and
   a crash is not a contract. Gated by `b13_variants.test`'s `eval_fail`
@@ -594,3 +609,46 @@ clients only display it).
   `int` still panics with the reference's exact `strings: Repeat
   output length overflow` per line (that surface is bounded and
   correct).
+### `logql-error-envelope` (issue #240)
+
+- **What changed:** `ReadError::PipelineInvalid`'s `Display` is now the
+  BARE `reason`. The removed prefix bytes — recorded here ONCE,
+  deliberately outside `crates/` so AC1's zero-hit grep cannot rot —
+  were `invalid pipeline: ` (18 bytes, trailing space included). For
+  the bodies with a captured reference counterpart (the two runtime
+  vector-matching errors and the range `approx_topk` rejection) the
+  wire body is now byte-identical to the reference's and gated so
+  (`msg_exact:` + provenance checks A/B, rows B1–B3). The `variants`
+  unwrap-arity body has NO reference counterpart — the reference
+  nil-panics on that query — so its byte-exact row is BLOCKED per
+  issue #240 AC10 (`logqltest/PROVENANCE.md` §#240) and it stays on a
+  substring gate; every other `PipelineInvalid` body is PulsusDB-only
+  prose.
+- **Accepted cosmetic divergence (owner-ruled):** PulsusDB does NOT
+  reproduce the reference's `parse error : …` / `stage '…' :` envelope
+  wording around parse/pipeline errors. Status must match, the response
+  container must match, the accept/reject decision must match; the
+  message prose need not. (The JSON-vs-`text/plain` CONTAINER
+  divergence is tracked separately in **#264**; the WebSocket close
+  frame still truncates reasons at 123 bytes.)
+- **Rejection-status fix (probed, `pulsus-240-status`):** an
+  uncompilable regex in a pushed-down line filter (`{…} |~ "("`) or a
+  stream matcher (`{app=~"("}`) was a ClickHouse-side 500 `internal`;
+  the reference answers 400 on the query and index-stats routes
+  (probed 2026-07-27 at v3.7.4, both 400). Every path that turns a
+  user regex into SQL now validates it first, in exactly the form it
+  emits (`escape.rs`'s `_checked` renderers; the raw escapers are
+  module-private; PromQL/TraceQL hold sealed capability tokens —
+  PromQL's SQL fallback deliberately defers to ClickHouse's RE2 as the
+  regex authority (#280), TraceQL Rust-compiles upstream and migrates
+  to `_checked` under #282). The generated SQL is byte-identical; the
+  cost is one plan-time `Regex::new` per pushed regex, never per row.
+- **Residual, recorded not built (filed as #286):** `ch_string` remains
+  `pub`, so a future `logql/` file could render an UNANCHORED user
+  regex into a `match(body, …)` fragment without touching the regex
+  seam. The anchored form of that bypass is closed by the provenance
+  check-C guard (`^(?:{` at exactly two committed sites); the
+  unanchored form is a dataflow property no lexical gate can see —
+  the fix is a validated-literal newtype through `logql::sql`'s
+  builders (#286). The corpus runner's pushdown blind spot (**#278**)
+  is why AC7's gates are Rust tests rather than corpus rows.

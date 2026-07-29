@@ -6700,7 +6700,8 @@ fn remove_label_sorted(labels: &mut Vec<(String, String)>, key: &str) {
 }
 
 fn duplicate_one_side_error(swapped: bool) -> ReadError {
-    // Oracle-pinned (grafana/loki:3.4.2): the "one" side is the source
+    // Oracle-pinned, re-probed byte-identical at grafana/loki:3.7.4
+    // (issue #240 wave0 capture): the "one" side is the source
     // rhs normally, the source lhs under `group_right`.
     let side = if swapped { "left" } else { "right" };
     ReadError::PipelineInvalid {
@@ -6712,7 +6713,8 @@ fn duplicate_one_side_error(swapped: bool) -> ReadError {
 }
 
 fn multiple_matches_error() -> ReadError {
-    // Oracle-pinned (grafana/loki:3.4.2), byte-exact.
+    // Oracle-pinned, re-probed byte-identical at grafana/loki:3.7.4
+    // (issue #240 wave0 capture), byte-exact.
     ReadError::PipelineInvalid {
         reason: "multiple matches for labels: many-to-one matching must be explicit \
                  (group_left/group_right)"

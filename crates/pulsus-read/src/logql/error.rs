@@ -545,7 +545,16 @@ pub enum ReadError {
     /// rejections in the same family (unwrap-required/-forbidden ops,
     /// bad aggregation parameters, set operations against scalars).
     /// Always a 400-class client error.
-    #[error("invalid pipeline: {reason}")]
+    ///
+    /// Issue #240: `Display` is the BARE reason. This variant used to
+    /// prepend a fixed PulsusDB-only marker that the reference does not
+    /// emit; for the bodies that DO have a captured reference
+    /// counterpart (runtime vector-matching, range `approx_topk`) it
+    /// made the wire body differ while six committed places claimed it
+    /// did not. The removed bytes are recorded once, in
+    /// docs/benchmarks/logs-differential-ledger.md; they are deliberately
+    /// not quoted here so `git grep` can prove none survive in `crates/`.
+    #[error("{reason}")]
     PipelineInvalid { reason: String },
 
     /// Issue M6-10 (adjudication #1): a metric-query line retained a
@@ -632,6 +641,18 @@ impl From<super::pipeline::PipelineError> for ReadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #240 AC1: `PipelineInvalid`'s `Display` is the reason and
+    /// NOTHING else — byte-exact equality, so any reintroduced
+    /// decoration (variant-level or renderer-level) fails here first.
+    #[test]
+    fn pipeline_invalid_display_is_the_bare_reason_byte_exact() {
+        let reason = "count min sketches are only supported on instant queries";
+        let e = ReadError::PipelineInvalid {
+            reason: reason.to_string(),
+        };
+        assert_eq!(e.to_string(), reason);
+    }
 
     #[test]
     fn scan_budget_bytes_display_names_the_budget() {

@@ -336,7 +336,13 @@ impl TailFetcher for EngineFetcher {
 /// production, a fake sink in the hermetic tests.
 trait TailSender: Send + 'static {
     fn send_text(&mut self, text: String) -> impl Future<Output = Result<(), ()>> + Send;
-    fn send_close(&mut self, reason: Option<String>) -> impl Future<Output = ()> + Send;
+    /// Takes the ALREADY-RENDERED close frame (issue #240 re-review):
+    /// `writer_loop` maps the reason through [`error_close_frame`]
+    /// BEFORE this boundary, so the hermetic sender fake captures the
+    /// frame the production wiring produced — the render seam is
+    /// pinned, and the impls are pure transport with no rendering
+    /// decision left to bypass.
+    fn send_close(&mut self, frame: Option<CloseFrame>) -> impl Future<Output = ()> + Send;
 }
 
 /// The inbound half (review round 1, medium): a dedicated reader task
@@ -362,22 +368,29 @@ impl TailSender for AxumSender {
             .map_err(|_| ())
     }
 
-    async fn send_close(&mut self, reason: Option<String>) {
+    async fn send_close(&mut self, frame: Option<CloseFrame>) {
         use futures::SinkExt;
-        let frame = reason.map(|mut r| {
-            // A WebSocket close reason is capped at 123 bytes; truncate
-            // on a char boundary.
-            let mut cut = r.len().min(123);
-            while !r.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            r.truncate(cut);
-            CloseFrame {
-                code: close_code::ERROR,
-                reason: r.into(),
-            }
-        });
         let _ = self.0.send(Message::Close(frame)).await;
+    }
+}
+
+/// Renders an error close reason into the wire close frame (issue #240
+/// R4). Called by `writer_loop` on the SHARED path ahead of the
+/// `TailSender` boundary, so the hermetic end-to-end test observes this
+/// function's output through `send_close` (re-review: deleting that
+/// wiring turns the captured close bare and reddens the suite). A
+/// WebSocket close reason is capped at 123 bytes; truncate on a char
+/// boundary. (The truncation itself is a documented, deliberately
+/// retained limitation — docs/api.md §2.3.)
+fn error_close_frame(mut reason: String) -> CloseFrame {
+    let mut cut = reason.len().min(123);
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    reason.truncate(cut);
+    CloseFrame {
+        code: close_code::ERROR,
+        reason: reason.into(),
     }
 }
 
@@ -790,9 +803,12 @@ async fn writer_loop<S: TailSender>(
         close_reason = shared.lock().error.take();
     }
     // Cancel the siblings FIRST so they stop while the (bounded,
-    // best-effort) Close goes out.
+    // best-effort) Close goes out. The error reason is rendered into
+    // the wire frame HERE, on the shared path, so every `TailSender`
+    // receives the production renderer's output (issue #240 re-review).
     let _ = cancel_tx.send(true);
-    let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(close_reason)).await;
+    let frame = close_reason.map(error_close_frame);
+    let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(frame)).await;
 }
 
 /// Runs one tail connection to completion: spawns the producer and the
@@ -850,6 +866,135 @@ mod tests {
                 .map(|(ts, line)| (ts, line.to_string()))
                 .collect(),
         }
+    }
+
+    /// Drives a fatal `PipelineInvalid { reason }` through the REAL
+    /// producer→writer path (`run_tail`) and returns the close frame
+    /// the PRODUCTION wiring rendered and handed to the sender
+    /// (`writer_loop`'s `close_reason.map(error_close_frame)` — the
+    /// fake only records what it was handed). Deliberately NEVER calls
+    /// `error_close_frame`: every assertion made on the returned frame
+    /// pins the production render, not the helper (issue #240
+    /// re-review 2).
+    async fn production_close_frame(reason: &str) -> CloseFrame {
+        let (_tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let closed = Arc::clone(&sender.closed);
+        let handle = tokio::spawn(run_tail(
+            PipelineInvalidFetcher(reason.to_string()),
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("a fatal poll error must terminate the connection")
+            .expect("no panic");
+        closed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("close was sent")
+            .expect("close carried a frame rendered by the production path")
+    }
+
+    /// Issue #240 (R4, re-review): a `PipelineInvalid` poll failure
+    /// closes the socket through the REAL producer→writer path, and the
+    /// captured `CloseFrame` carries the ERROR code and the BARE reason
+    /// bytes unchanged (no fixed prefix; a reason that itself begins
+    /// `parse error ` appears exactly once, and a short reason is never
+    /// truncated). Deleting the `writer_loop` map turns the close bare
+    /// and reddens this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipeline_invalid_closes_the_socket_with_the_bare_reason_through_the_renderer() {
+        let reason = "parse error : synthetic prefix-collision probe";
+        let frame = production_close_frame(reason).await;
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), reason);
+        assert_eq!(frame.reason.as_str().matches("parse error ").count(), 1);
+    }
+
+    /// Issue #240 (re-review 2): the 123-byte close-reason cap is
+    /// applied ON THE PRODUCTION PATH — a long reason driven through
+    /// `run_tail` reaches the socket already cut to exactly 123 bytes,
+    /// and an exactly-123-byte reason passes through byte-identical
+    /// (the cap is inclusive). This test never invokes
+    /// `error_close_frame`, so replacing the `writer_loop` map with an
+    /// inline untruncated frame — or moving the cap in either
+    /// direction — reddens it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_reason_through_run_tail_reaches_the_socket_truncated_at_123_bytes() {
+        let frame = production_close_frame(&"a".repeat(200)).await;
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), "a".repeat(123));
+        // Inclusive boundary: exactly 123 bytes is NOT cut.
+        let exact = "y".repeat(123);
+        let frame = production_close_frame(&exact).await;
+        assert_eq!(frame.reason.as_str(), exact);
+    }
+
+    /// Issue #240 (re-review 2): the char-boundary back-off is applied
+    /// on the production path — a reason whose 3-byte '€' straddles the
+    /// 123-byte cap reaches the socket cut at the 121-byte boundary, a
+    /// valid UTF-8 prefix, never a split code point. (Deleting the
+    /// boundary loop panics `String::truncate` inside `writer_loop`,
+    /// reddening this through the joined task.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multibyte_reason_through_run_tail_is_cut_on_a_char_boundary() {
+        let long = format!("{}€ tail beyond the close-frame cap", "x".repeat(121));
+        let frame = production_close_frame(&long).await;
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), "x".repeat(121));
+    }
+
+    /// Issue #240 (re-review 2, property enumeration): the frame's
+    /// PRESENCE cuts both ways — an error-free shutdown closes with a
+    /// BARE close (`None`: no code, no reason on the wire). Rendering a
+    /// frame unconditionally would tag every graceful close with the
+    /// ERROR code; this pins the `close_reason.map(..)` staying a map.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graceful_shutdown_closes_bare_with_no_frame() {
+        let (tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let closed = Arc::clone(&sender.closed);
+        let handle = tokio::spawn(run_tail(
+            FrameEveryPoll,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("run_tail must return promptly on shutdown")
+            .expect("no panic");
+        let closed = closed.lock().unwrap().clone().expect("close was sent");
+        assert!(
+            closed.is_none(),
+            "a graceful close must carry no frame, got {closed:?}"
+        );
+    }
+
+    /// Issue #240 (R4): the production renderer's 123-byte close-reason
+    /// cap truncates on a char boundary — the frame carries a valid
+    /// UTF-8 PREFIX of the reason, never a split code point. (The cap
+    /// itself is the documented retained limitation — docs/api.md §2.3.)
+    #[test]
+    fn error_close_frame_truncates_at_123_bytes_on_a_char_boundary() {
+        // 121 ASCII bytes, then a 3-byte '€' straddling the 123-byte
+        // cap: the cut backs off to the 121-byte boundary.
+        let long = format!("{}€ tail beyond the close-frame cap", "x".repeat(121));
+        assert!(long.len() > 123);
+        let frame = error_close_frame(long.clone());
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), "x".repeat(121));
+        assert!(long.starts_with(frame.reason.as_str()));
+        // At or under the cap the reason passes through byte-identical.
+        let exact = "y".repeat(123);
+        assert_eq!(error_close_frame(exact.clone()).reason.as_str(), exact);
     }
 
     /// `start_ns` sits just behind "now" so the loop reaches steady
@@ -1244,6 +1389,23 @@ mod tests {
         }
     }
 
+    /// A fetcher that fails with a LogQL pipeline rejection (issue #240
+    /// R4 — the close-reason construction path).
+    struct PipelineInvalidFetcher(String);
+    impl TailFetcher for PipelineInvalidFetcher {
+        async fn poll(
+            &mut self,
+            _lower: TailLower,
+            _upper_ns: i64,
+            _narrow: bool,
+            _fetch_limit: u32,
+        ) -> Result<TailPage, ReadError> {
+            Err(ReadError::PipelineInvalid {
+                reason: self.0.clone(),
+            })
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum SinkMode {
         /// `send_text` succeeds instantly.
@@ -1266,7 +1428,11 @@ mod tests {
     struct FakeSender {
         mode: SinkMode,
         sent: Arc<Mutex<Vec<String>>>,
-        closed: Arc<Mutex<Option<Option<String>>>>,
+        /// Outer `Some` = a close was sent; inner = the wire frame the
+        /// PRODUCTION path rendered (`writer_loop` maps through
+        /// `error_close_frame` before the `TailSender` boundary — issue
+        /// #240 re-review: the fake captures, never re-renders).
+        closed: Arc<Mutex<Option<Option<CloseFrame>>>>,
     }
 
     impl FakeSender {
@@ -1291,8 +1457,8 @@ mod tests {
             }
         }
 
-        async fn send_close(&mut self, reason: Option<String>) {
-            *self.closed.lock().unwrap() = Some(reason);
+        async fn send_close(&mut self, frame: Option<CloseFrame>) {
+            *self.closed.lock().unwrap() = Some(frame);
         }
     }
 
@@ -1449,12 +1615,13 @@ mod tests {
             .await
             .expect("a fatal poll error must terminate the connection")
             .expect("no panic");
-        let reason = closed
+        let frame = closed
             .lock()
             .unwrap()
             .clone()
             .expect("close was sent")
             .expect("close carried a reason");
+        let reason = frame.reason.as_str();
         assert!(reason.contains("query too broad"), "{reason}");
     }
 

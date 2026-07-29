@@ -126,11 +126,14 @@ eval_fail instant at 60s bottomk(2.5, sum by (lvl) (count_over_time({service_nam
   msg: invalid parameter bottomk(2.5,
 
 # --- reject-parity: instant-only (Loki: HTTP 500 `count min sketches are
-# --- only supported on instant queries`; PulsusDB 400 with the same body
-# --- per the ledgered matching-error-status-divergence precedent)
+# --- only supported on instant queries`; PulsusDB 400 — the body is
+# --- byte-identical and ENFORCED so by the `msg_exact:` gate below
+# --- (issue #240; before #240 a fixed PulsusDB-only prefix made this
+# --- claim false) — status per the ledgered
+# --- matching-error-status-divergence precedent)
 
 eval_fail range from 0s to 300s step 60s approx_topk(2, sum by (lvl) (count_over_time({service_name="approx-a"} | logfmt [1m])))
-  msg: count min sketches are only supported on instant queries
+  msg_exact: count min sketches are only supported on instant queries
 
 clear
 
