@@ -1,4 +1,4 @@
-//! Issue #230 review rounds 2–7: the RUNTIME allocation gate over the
+//! Issue #230 review rounds 2–8: the RUNTIME allocation gate over the
 //! whole template function registry — **the dominance and ordering
 //! evidence** for charge-before-allocate (the AST census is a drift
 //! tripwire only; dominance is a control-flow property no syntactic
@@ -38,12 +38,14 @@
 //! a hand-maintained subset (nor the tautological `registered ==
 //! executed`, whose two sides one loop populated): EVERY shape now
 //! carries a declared [`ShapeClass`] — `OrderingRequired` /
-//! `DominanceOnly(reason)` / `ScalarError` — at its construction site.
+//! `DominanceOnly(reason)` / `ScalarError` / `HarnessBlind(reason)` —
+//! at its construction site.
 //! Omitting a class is a missing-field COMPILE error; a registry
 //! function absent from the [`Func`] partition fails the runtime
 //! domain bridge; a `Func` variant without a `spec()`/`name()` arm is
 //! a non-exhaustive-match COMPILE error; deleting an entry from
-//! `Func::ALL` fails any build (the declared array length), while
+//! `Func::ALL` fails to compile whenever this test target is compiled
+//! (the declared array length), while
 //! ADDING a variant omitted from `ALL` is caught as `dead_code` only
 //! under `-D warnings` — CI-enforced, not plain-build-enforced. The
 //! gate then asserts
@@ -53,6 +55,17 @@
 //! shape declared `OrderingRequired` that errors or shrinks upstream
 //! FAILS (it never reached its leg), and a shape that reaches the leg
 //! while declared exempt FAILS (its declaration is stale).
+//!
+//! **Round 8 — the declared exception.** Exactly two shapes,
+//! `regexReplaceAll/invalid-pattern` and
+//! `regexReplaceAllLiteral/invalid-pattern`, are declared
+//! [`ShapeClass::HarnessBlind`]: their branch CAN cross the ordering
+//! trigger, but it allocates and then returns `Err`, and the ordering
+//! leg re-runs only shapes returning a retainable `Ok` — so no probe
+//! size reaches it. That is a limit of this instrument, not of the
+//! branch, so it gets its own state instead of a `DominanceOnly`
+//! reason that would assert something false. Charge ordering on
+//! allocate-then-error branches is filed as #294.
 //!
 //! This is the gate that catches the fifth amplification class the
 //! round-1 census could not judge: an existing site labelled
@@ -330,8 +343,26 @@ enum ShapeClass {
     /// ordering leg does not apply by construction — verified, not
     /// trusted (a retainable `Ok` from such a shape fails the gate).
     ScalarError,
+    /// **Declared exception (round 8).** The branch CAN cross the
+    /// ordering trigger, and THIS HARNESS cannot observe it — so
+    /// neither `OrderingRequired` (the shape can never reach the leg)
+    /// nor `DominanceOnly` (whose reason asserts a branch limit that
+    /// does not exist here) is a true statement about it.
+    ///
+    /// Deliberately a separate state rather than a carefully-worded
+    /// `DominanceOnly`: the two are different KINDS of claim — one is
+    /// about the branch, this one is about the instrument — and the
+    /// reason-header rule below binds `DominanceOnly` reasons to branch
+    /// relations. The reason string must name the tracking issue for
+    /// the harness gap.
+    ///
+    /// Excluded from `required` (the leg is unreachable for it), but
+    /// NOT trusted in the other direction: if such a shape ever DOES
+    /// reach the leg, the harness was not blind and the declaration
+    /// fails as stale.
+    HarnessBlind(&'static str),
 }
-use ShapeClass::{DominanceOnly, OrderingRequired, ScalarError};
+use ShapeClass::{DominanceOnly, HarnessBlind, OrderingRequired, ScalarError};
 
 /// Whether [`invalidate_utf8`] derives a `+invalid-utf8` variant from
 /// a shape (it does iff some `Str` argument is ≥ 4 KiB) and the
@@ -377,6 +408,10 @@ struct FnSpec {
 /// trigger and MUST be probed at ≥ trigger size as `OrderingRequired`
 /// (`align*/truncate` and `trunc/negative-tail` were fitted to
 /// 200,000-byte probes and hid exactly that).
+///
+/// A branch that can cross the trigger but which this harness cannot
+/// observe has NO such reason to state and does not belong here: it is
+/// [`ShapeClass::HarnessBlind`], whose reasons live below.
 const R_EMPTY: &str = "the shape is DEFINITIONALLY the all-zero-length-inputs probe: its \
      output is empty/constant-size at the only arguments that make it \
      this shape, far below the 256 KiB ordering trigger";
@@ -387,16 +422,37 @@ const R_SMALL: &str = "this shape's output is pinned EMPTY by its defining argum
      by the function's other shapes";
 const R_CONST: &str = "constant-size decimal rendering of a timestamp, \
      orders of magnitude below the ordering trigger";
-/// Round 6, measured: why the invalid-PATTERN conversion cannot be
-/// ordering-covered through these shapes — and where its ordering
-/// coverage actually comes from.
-const R_INVALID_PATTERN: &str = "an invalid PATTERN's conversion allocates ~2x the pattern, and a pattern \
-     large enough to clear the ~256 KiB ordering trigger repairs to a literal \
-     whose compiled program exceeds the 1 MiB size_limit (measured: a 32 KiB \
-     repaired literal is already CompiledTooBig), so the shape errors upstream \
-     instead of reaching the leg; ordering coverage for the shared \
-     lossy_repaired_len/lossy_repaired helpers rides on the invalid-repl and \
-     +invalid-utf8 haystack shapes, which reach at size";
+/// [`ShapeClass::HarnessBlind`] reasons — the ONLY one, round 8.
+///
+/// `compile_regex`'s invalid-UTF-8 repair arm is NOT branch-limited:
+/// a large enough invalid pattern repairs to well past the 256 KiB
+/// trigger, and only then does the compiled program exceed the 1 MiB
+/// `size_limit`. Its round-7 `DominanceOnly` reason asserted the
+/// opposite and was wrong: what stops the coverage is the instrument,
+/// not the branch. The ordering leg re-runs only shapes that returned a
+/// RETAINABLE `Ok`, so a branch that allocates and then errors cannot
+/// enter it at ANY probe size — enlarging this shape's pattern would
+/// move it from "too small to trigger" to "errors before the rerun",
+/// never into the leg.
+///
+/// The `invalid-repl` / `+invalid-utf8` haystack shapes do NOT cover
+/// this site: they charge through `lossy_charged`, a different call
+/// site from the pattern conversion's `lossy_repaired*`.
+///
+/// Ordering coverage for allocate-then-error branches needs a
+/// different instrument (bounded transient, not charge-before-allocate
+/// on retained bytes) and is filed as **#294**, which carries the
+/// acceptance criteria; **#291** (regex compilation allocating ~630x
+/// the pattern) is the worst case already on file. This is a declared
+/// exception, not a covered shape.
+const HB_INVALID_PATTERN: &str = "the invalid-PATTERN repair CAN cross the 256 KiB ordering trigger \
+     (a large invalid pattern repairs to ~2x its length before the compiled \
+     program hits the 1 MiB size_limit), so no branch limit exempts it — but \
+     the branch allocates and then returns Err, and the ordering leg re-runs \
+     only shapes returning a retainable Ok, so this harness cannot observe it \
+     at ANY probe size; allocate-then-error charge ordering is filed as #294 \
+     (#291 is the worst case on file). The invalid-repl shapes cover a \
+     DIFFERENT charge site (lossy_charged), not this one";
 
 /// The partition's DOMAIN: one variant per registry function.
 ///
@@ -404,18 +460,23 @@ const R_INVALID_PATTERN: &str = "an invalid PATTERN's conversion allocates ~2x t
 ///   the runtime domain bridge with the set difference;
 /// - a variant without a [`Func::name`]/[`Func::spec`] arm fails to
 ///   COMPILE (exhaustive matches, no wildcard);
-/// - DELETING an entry from [`Func::ALL`] fails to COMPILE on any
-///   build: the declared `[Func; 67]` length no longer matches
-///   (E0308);
+/// - DELETING an entry from [`Func::ALL`] fails to COMPILE whenever
+///   this test target is compiled: the declared `[Func; 67]` length no
+///   longer matches (E0308). This file is an INTEGRATION TEST, so a
+///   plain `cargo build`/`cargo check -p pulsus-read` does not build
+///   it and exits 0 (measured); the error appears under
+///   `cargo test --test logql_template_alloc_gate --no-run`, under
+///   `cargo check/clippy --all-targets`, and hence in CI;
 /// - ADDING a variant (with `name()`/`spec()` arms) while omitting it
-///   from [`Func::ALL`] compiles under a plain `cargo build` — the
+///   from [`Func::ALL`] compiles even when this target IS built — the
 ///   declared array length is unchanged — and is caught only as
 ///   `dead_code` (never-constructed variant), a hard error solely
 ///   under `-D warnings`: CI-enforced (`.github/workflows/ci.yml` sets
 ///   `RUSTFLAGS: "-D warnings"`, as does the clippy gate), NOT
 ///   build-enforced.
 ///
-/// Both legs verified by mutation (round 7).
+/// Both legs verified by mutation (round 7; the deletion leg's
+/// build-command scope re-measured in round 8).
 ///
 /// Case-colliding sprig names carry a `Sprig` suffix (`Trim`/`trim`,
 /// `Replace`/`replace`, `TrimPrefix`/`trimPrefix`,
@@ -797,12 +858,15 @@ impl Func {
                         args: vec![s("x+"), s("xxxx"), big_str()],
                     },
                     // 128-byte invalid pattern: exercises the pattern
-                    // conversion under dominance; ordering-exempt for
-                    // the measured reason (and too small to derive a
-                    // +invalid-utf8 variant).
+                    // conversion under dominance (and is too small to
+                    // derive a +invalid-utf8 variant). Round 8: the
+                    // ONLY `HarnessBlind` shapes — this branch can
+                    // cross the ordering trigger, but it errors on the
+                    // way and the leg admits retainable-Ok shapes only,
+                    // so no probe size reaches it. See #294.
                     ExtraShape {
                         name: "invalid-pattern",
-                        decl: d(DominanceOnly(R_INVALID_PATTERN), NotDerived),
+                        decl: d(HarnessBlind(HB_INVALID_PATTERN), NotDerived),
                         args: vec![invalid_pattern(), s("xxxx"), s("YY")],
                     },
                     // Invalid REPLACEMENT bytes: the lossy conversion
@@ -1288,6 +1352,13 @@ fn every_registry_function_charge_dominates_its_allocations() {
     // errored or shrank upstream never reached its leg — fix the shape
     // or reclassify it WITH a reason. A shape that reached the leg
     // while declared exempt has a stale declaration — promote it.
+    //
+    // Round 8: `HarnessBlind` is excluded from `required` for the
+    // reason it carries — the leg admits retainable-`Ok` shapes only,
+    // so an allocate-then-error branch cannot enter it at any probe
+    // size (#294). It is NOT trusted in the other direction: reaching
+    // the leg disproves the blindness claim and fails, exactly like a
+    // stale `DominanceOnly`.
     let required: std::collections::BTreeSet<String> = declared
         .iter()
         .filter(|(_, c)| matches!(c, OrderingRequired))
@@ -1297,13 +1368,18 @@ fn every_registry_function_charge_dominates_its_allocations() {
         failures.push(format!(
             "{missing}: declared OrderingRequired but never reached the ordering leg \
              — the shape errored or shrank upstream; fix the shape or reclassify it \
-             (DominanceOnly with the measured reason)"
+             (DominanceOnly with the measured BRANCH limit, or HarnessBlind if the \
+             branch can cross the trigger but this harness cannot observe it)"
         ));
     }
     for stale in reached.difference(&required) {
         let declared_as = match declared.get(stale.as_str()) {
             Some(DominanceOnly(reason)) => format!("DominanceOnly (stale reason: {reason})"),
             Some(ScalarError) => "ScalarError".to_string(),
+            Some(HarnessBlind(reason)) => format!(
+                "HarnessBlind (the declared exception is stale — this harness DID \
+                 observe the branch: {reason})"
+            ),
             // `required` contains every OrderingRequired declaration,
             // and `reached` only ever holds declared shapes.
             Some(OrderingRequired) | None => unreachable!("stale is reached \\ required"),
