@@ -435,6 +435,91 @@ mod tests {
         assert_eq!(json["errorType"], "unavailable");
     }
 
+    /// Issue #279: a syntactically valid selector of exactly 131,072
+    /// bytes — `MAX_QUERY_BYTES`, the reference's `maxInputSize`
+    /// (grafana/loki v3.7.4 `pkg/logql/syntax/parser.go:42`), one byte
+    /// past the longest accepted query. Valid syntax so the only possible
+    /// rejection is the cap itself.
+    fn oversized_query() -> String {
+        format!(r#"{{app="{}"}}"#, "a".repeat(131_072 - 8))
+    }
+
+    /// Issue #279: the over-cap rejection envelope — 400 `bad_data`, the
+    /// reference's verbatim message (its own `len > cap` rendering of a
+    /// `>=` comparison), `position` 0.
+    fn assert_query_too_long(status: StatusCode, json: &serde_json::Value) {
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(json["error"], "input size too long (131072 > 131072)");
+        assert_eq!(json["position"], 0);
+    }
+
+    /// Issue #279 (AC4): `/query_range` rejects an over-cap query 400
+    /// against a POOLLESS state, while a valid query on the same state is
+    /// 503 — proving the parse (and so the cap) precedes the pool check,
+    /// so the 400 is the cap and not an artefact.
+    #[tokio::test]
+    async fn query_range_rejects_an_over_cap_query_400_before_the_pool_check() {
+        let res = query_range(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(format!("query={}", oversized_query()))),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_query_too_long(status, &json);
+        // The valid-query half lives in
+        // `query_range_without_a_pool_is_503_unavailable` above.
+    }
+
+    /// Issue #279 (AC4): `/query` — over-cap 400 vs valid 503, poolless.
+    #[tokio::test]
+    async fn query_rejects_an_over_cap_query_400_before_the_pool_check() {
+        let res = query(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(format!("query={}", oversized_query()))),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_query_too_long(status, &json);
+
+        let res = query(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(r#"query={app="x"}"#.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["errorType"], "unavailable");
+    }
+
+    /// Issue #279 (AC4): `/series` — an over-cap `match[]` value is 400
+    /// (the cap applies per matcher string, matching the reference's
+    /// one-input-at-a-time `ParseMatchers`) vs valid 503, poolless.
+    #[tokio::test]
+    async fn series_rejects_an_over_cap_match_value_400_before_the_pool_check() {
+        let res = series_get(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(format!("match[]={}", oversized_query()))),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_query_too_long(status, &json);
+
+        let res = series_get(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(r#"match[]={app="x"}"#.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["errorType"], "unavailable");
+    }
+
     /// Issue #221: an over-cap **leafless** `vector(n)` range query is guarded
     /// at the engine's materialization boundary (no leaf ever runs, so it
     /// bypasses `ClientAggState::new`'s cap) and returns the same

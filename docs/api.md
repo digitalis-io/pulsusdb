@@ -121,6 +121,7 @@ Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|
 | Malformed params, malformed LogQL, empty/contradictory matchers, invalid `step` | `400` | `bad_data` |
+| LogQL query text of **131,072 bytes or more** (`pulsus_logql::MAX_QUERY_BYTES`, an exclusive maximum — the longest accepted query is **131,071 bytes**; the reference's `maxInputSize` at grafana/loki v3.7.4 `pkg/logql/syntax/parser.go:42`, enforced `>=` at `:86`; applies at every LogQL parse, incl. per `match[]` value and `/tail`) | `400` | `bad_data` |
 | Pipeline/plan rejection (bad regex — **including an uncompilable pushed-down line-filter or stream-matcher regex, since #240** — bad parser expression, unwrap-arity, …) | `400` | `bad_data` |
 | Query rejected as too broad (scan-budget or stream-count cap exceeded) | `422` | `query_too_broad` |
 | ClickHouse read timed out | `504` | `timeout` |

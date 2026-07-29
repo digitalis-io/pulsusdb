@@ -237,6 +237,24 @@ mod tests {
         assert_eq!(json["errorType"], "unavailable");
     }
 
+    /// Issue #279 (AC4): `/patterns` — a valid selector of exactly
+    /// 131,072 bytes (`MAX_QUERY_BYTES`, the reference's `maxInputSize`;
+    /// one byte past the longest accepted query) is 400 against a
+    /// POOLLESS state, while a valid query is 503 (the test above) — the
+    /// parse precedes the pool check, so the 400 is the cap.
+    #[tokio::test]
+    async fn patterns_rejects_an_over_cap_query_400_before_the_pool_check() {
+        let (status, json) = get(Some(&format!(
+            r#"query={{app="{}"}}"#,
+            "a".repeat(131_072 - 8)
+        )))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(json["error"], "input size too long (131072 > 131072)");
+        assert_eq!(json["position"], 0);
+    }
+
     /// AC 5b (M7-C3, issue #171 review finding 2): with the kill-switch OFF,
     /// the endpoint stays mounted but serves the empty success payload — a
     /// valid selector returns `{"status":"success","data":[]}` and NEVER

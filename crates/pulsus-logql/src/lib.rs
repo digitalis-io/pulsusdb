@@ -21,6 +21,7 @@ mod ast;
 mod duration;
 mod error;
 mod lexer;
+mod limits;
 mod parser;
 mod token;
 
@@ -32,6 +33,7 @@ pub use ast::{
     UNWRAP_CONVERSIONS, Unwrap, VariantsExpr, VectorAggOp, VectorMatching,
 };
 pub use error::LogQlError;
+pub use limits::MAX_QUERY_BYTES;
 pub use parser::{parse, parse_selector};
 pub use token::Span;
 
