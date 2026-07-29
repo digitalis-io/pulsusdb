@@ -400,8 +400,23 @@ procedure), then:
 GET /loki/api/v1/detected_fields?query=<selector>&start=<now-1h>&end=<now>[&line_limit=N][&limit=N]
 ```
 
-Captured responses, verbatim (sorted keys; `jsonPath` dropped per A4;
-fields transcribed as a set per A4):
+Captured responses as a **NORMALIZED TRANSCRIPTION — not verbatim**.
+The complete set of normalizations applied to each response body:
+
+1. **Envelope unwrapped** — the body is `{"fields":[…],"limit":N}`; the
+   `fields` array is transcribed inline and the envelope's own `limit`
+   is recorded as the trailing `limit=N`.
+2. **Object keys sorted alphabetically**, not kept in the response's own
+   key order (hence `cardinality` first).
+3. **`jsonPath` omitted** (A4; #254 — PulsusDB does not emit it).
+4. **Fields transcribed as a SET** (A4) — the line order carries NO
+   information, the reference's is Go map order (visible in C1, where
+   `uid` precedes `lvl`).
+
+Nothing else is altered: every label, type, parser list and cardinality
+below is the captured value. The request side is likewise abbreviated to
+the case id, selector and non-default params — the full request is the
+URL template above.
 
 ```pulsus-244-detected-capture
 C1 {app="c1"} (defaults)      -> [{"cardinality":3,"label":"uid","parsers":["json"],"type":"string"},{"cardinality":2,"label":"lvl","parsers":["json"],"type":"string"}] limit=1000

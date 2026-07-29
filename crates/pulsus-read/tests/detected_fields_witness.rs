@@ -429,6 +429,25 @@ fn assert_non_vacuous(probe: &DetectedFieldsProbe, peak: u64, case: &str) {
 /// value-width transient — so the claim is backed here by the total,
 /// which M4 inflates by the whole observation stream's width (a
 /// width-independent BYTE ceiling, per the house alloc-test rule).
+///
+/// COVERAGE — which CASES catch M4 depends on WHERE M4 is placed, so it
+/// is stated here rather than left for the next reader to rediscover.
+/// Both placements were run and observed (issue #244, implementation and
+/// review of `8caa4c1`):
+///  * M4 at the TOP of `observe_pair`, so every observed pair pays the
+///    transient: **A, B and D fail** (in-window totals 268 895 079 /
+///    25 952 355 / 134 415 016 B). **C does not** — case C's values are
+///    1 byte, so a value-width clone is structurally invisible to any
+///    byte ceiling. The plan's "M4 must fail A–D" is over-broad for C,
+///    and that is a property of C's axis (field NAMES), not a hole.
+///  * M4 immediately BEFORE `observe_admitted`, i.e. after the
+///    field-name charge: **only A and B fail**. In C and D the 64 KiB
+///    field names exhaust the 1 MiB budget within the first handful of
+///    observations, after which the name charge refuses and
+///    `observe_pair` returns early — the transient never runs.
+///
+/// Every placement tried is caught, but A and B are the only cases that
+/// catch both; C and D corroborate, they do not stand in for A/B.
 fn assert_transient_total(probe: &DetectedFieldsProbe, w: &Window, case: &str) {
     assert!(
         w.bytes <= 4 * probe.charged() + MIB,

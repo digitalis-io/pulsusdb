@@ -187,13 +187,25 @@ Out of this ledger's scope by design:
   and pinned by `detected_fields_witness.rs`'s AC 19 gate (our side is
   recomputed through the production accumulator; the reference column is
   the recorded estimate).
-- **Reachability:** per-field cardinality is bounded by the sampled
-  entries on BOTH stores (one value per key per entry; `line_limit`
-  <= 5000 on each side), so `N >= 5328` is unreachable through the HTTP
-  endpoint at default limits — every
+- **Reachability — NOT ESTABLISHED.** The divergence is real and is
+  registered here at the ESTIMATOR level; the largest per-field
+  cardinality reachable through the HTTP endpoint is **not established,
+  and no bound is claimed**. An earlier revision of this entry asserted
+  that `N >= 5328` was unreachable at default limits, reasoning from
+  "one value per key per entry" and `line_limit <= 5000`. **That premise
+  is false:** a SINGLE sampled row can contribute distinct values for
+  the same key more than once — once from its structured-metadata pairs
+  and again from the auto-parse pass over the post-pipeline line (both
+  call `observe_pair` for the same row; `crates/pulsus-read/src/logql/exec.rs`,
+  `observe_detected_row` / `auto_parse_observe`) — so 5 328 distinct
+  values fit comfortably inside 5 000 sampled rows. Deriving the true
+  maximum needs that per-row multiplicity argued exactly, on both
+  stores; a second wrong bound in this entry would be worse than an
+  acknowledged gap, so none is given. What IS established: every
   `crates/pulsus-read/tests/logqltest/corpus/b14_detected_fields.test`
-  case is pure hard-gated parity, and the divergence is registered at the
-  estimator level.
+  case captures a cardinality `<= 100`, far inside the agreeing range,
+  so every corpus case is pure hard-gated parity rather than a
+  divergence.
 - **Fixture status:** `/detected_fields` has no case in
   `test/fixtures/logs/differential.json`, so this entry is not referenced
   from the fixture (`informational_cases_are_recorded_in_the_committed_ledger`
