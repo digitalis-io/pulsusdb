@@ -60,6 +60,7 @@
 //! inside one too. This binary declares its own `#[global_allocator]`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -778,8 +779,18 @@ fn case_g_wide_json_body_does_not_bloat_the_carried_scratch() {
 // ---------------------------------------------------------------------
 
 const WARMUP: usize = 3;
-/// One of the three per-row spines the legacy shape allocates, derived
-/// from the fixture's declared width and `size_of` — floored at 65 536.
+/// One of the TWO per-row spines the legacy shape allocates, derived from
+/// the fixture's declared width and `size_of` — floored at 65 536.
+///
+/// Two, not three (corrected on #244 after the byte-exact decomposition
+/// of shape (iv)): the legacy shape allocates `added`'s spine
+/// (`exec.rs:7417-7421`) and `auto_parse_legacy_shape`'s fresh `labels`
+/// spine (`detected.rs:431`), but NOT a third for the `pairs` collect —
+/// `labels.into_iter().map(..).collect()` reuses `labels`' allocation in
+/// place, because `vec::IntoIter`'s same-size in-place collect
+/// specialization applies (`(Cow, Cow)` and `(String, String)` are both
+/// 48 B). The floor still counts ONE of them and ignores the rest, so no
+/// number moves; only the sentence was wrong.
 const K_SHAPE: usize = 2048;
 const LEGACY_DELTA_FLOOR: u64 = {
     let derived = (K_SHAPE * size_of::<(String, String)>()) as u64;
@@ -846,6 +857,99 @@ fn flat_json_body(k: usize) -> String {
     s
 }
 
+/// `k` logfmt pairs, `k00000=v00000 …` (13 B each, single-space
+/// separated: 28 671 B at `K_SHAPE`). Shape (iv)'s body — logfmt is the
+/// only auto-parse format where the owned-copy delta 13(b) floors
+/// literally exists, because logfmt captures are `Cow::Borrowed` slices
+/// of the line (`pipeline.rs:2749` under the `Cow::Borrowed` arm at
+/// `:1044`), so the legacy `into_owned()` genuinely COPIES; a JSON body's
+/// captures are already `Cow::Owned` (`pipeline.rs:2622`) and
+/// `into_owned()` is a move.
+fn logfmt_body(k: usize) -> String {
+    let mut s = String::with_capacity(k * 14);
+    for i in 0..k {
+        if i > 0 {
+            s.push(' ');
+        }
+        write!(s, "k{i:05}=v{i:05}").expect("write");
+    }
+    s
+}
+
+/// Pushes ONE `&'static str` pair into a caller-owned vector — the shape
+/// `ErrorSlots::merge_into(self, labels: &mut Vec<(Cow, Cow)>)`
+/// (`pipeline.rs:222-232`) presents to the legacy helper's fresh
+/// `Vec::new()` (`detected.rs:431`) when a failing `| json` sets the
+/// out-of-band pair.
+fn push_one_static_pair(out: &mut Vec<(Cow<'static, str>, Cow<'static, str>)>) {
+    out.push((Cow::Borrowed("k"), Cow::Borrowed("v")));
+}
+
+/// Shape (iii)'s control window: derived, not calibrated. It does nothing
+/// but push ONE pair into a fresh vector, so its peak is `RawVec`'s
+/// `MIN_NON_ZERO_CAP` (4 slots for `1 < size_of::<T>() <= 1024`) times the
+/// slot width. Measured through the SAME instrument as the gate, so a
+/// libstd growth-rule change moves the control and the gate together
+/// instead of reddening one of them. Both `Cow`s are `Borrowed(&'static
+/// str)`, exactly as the out-of-band error pair is
+/// (`pipeline.rs:2613-2614`), so no string bytes enter the measurement.
+///
+/// `Vec::new()` plus a push through a `&mut` callee is the whole point,
+/// and it is NOT interchangeable with the `vec![…]` macro that
+/// `clippy::vec_init_then_push` suggests: the macro allocates EXACTLY one
+/// slot (48 B) from a boxed array, so the control would measure the
+/// literal instead of the growth rule the gate depends on. Pushing from
+/// [`push_one_static_pair`] is also the faithful shape — the legacy
+/// helper's fresh vector receives its first pair from
+/// `ErrorSlots::merge_into(&mut labels)`, not from a local push.
+fn min_pair_spine_bytes() -> u64 {
+    let (v, w) = measure(|| {
+        let mut v: Vec<(Cow<'static, str>, Cow<'static, str>)> = Vec::new();
+        push_one_static_pair(&mut v);
+        v
+    });
+    drop(v);
+    assert_no_overflow("min_pair_spine_bytes");
+    assert_eq!(
+        w.peak,
+        (4 * size_of::<(Cow<'static, str>, Cow<'static, str>)>()) as u64,
+        "the first-push spine is no longer MIN_NON_ZERO_CAP(4) x slot width — re-derive \
+         AC 13(iii) rather than widening it"
+    );
+    w.peak // 192
+}
+
+/// Shape (iv)'s NON-VACUITY precondition. If the POST-pipeline line stops
+/// auto-parsing into `expect`, AC 13(b)'s owned-copy floor becomes
+/// unsatisfiable by ANY correct implementation — the #244 AC 13 (iv)
+/// defect, where `line_format "{{.app}} {{__line__}}"` over a JSON body
+/// rendered a line that is neither json (the `x ` prefix) nor logfmt
+/// (`("logfmt", 0)`), so the delta the floor names did not exist. Named
+/// here so that failure mode reports itself instead of surfacing as an
+/// unexplained floor breach. Runs OUTSIDE every measured window, so it
+/// perturbs no measurement.
+fn assert_auto_parse_yields(
+    compiled: &CompiledPipeline,
+    base: &[(String, String)],
+    body: &str,
+    expect: (&'static str, usize),
+    case: &str,
+) {
+    let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+    let line = compiled
+        .run_into(body, base, 0, &mut scratch)
+        .expect("the fixture pipeline never breaches the template budget")
+        .expect("the fixture row survives the pipeline");
+    let got = pulsus_read::logql::detected::auto_parse_legacy_shape(&line)
+        .map(|(parser, pairs)| (parser, pairs.len()));
+    assert_eq!(
+        got,
+        Some(expect),
+        "{case}: the post-pipeline line must auto-parse into {expect:?}; got {got:?} — the \
+         fixture went vacuous, do NOT relax the floor"
+    );
+}
+
 /// The 13(a)/(b) improvement gates for the three improving shapes.
 fn assert_improved(r: &ShapeRun, case: &str) {
     assert!(
@@ -890,6 +994,21 @@ fn ac13_shape_i_flat_json_is_not_worse_at_helper_granularity() {
 
 /// Shape (ii) — the same body with a 4 096-entry SM string (exercises the
 /// D1 re-parse).
+///
+/// SETTLED READING (recorded so nobody re-derives it): the legacy wrapper
+/// SHARES `trim()` with the new path — implemented and documented at
+/// `exec.rs:7683-7693` (the wrapper's carry-policy doc) and
+/// `exec.rs:7746-7750` (the single `self.state.feeder.trim()` call site).
+/// AC 13's contract — "the measured difference is exactly the shape
+/// change" — requires it: a baseline that also reverted #244's carry
+/// policy would fold `trim`'s capacity-drop cost into a comparison meant
+/// to isolate the per-row owned-copy shape. Both readings' numbers stay
+/// on record: shared `trim()` gives `legacy 1 530 308 > new 1 284 548`
+/// (Δ 245 760, passes); the UN-shared reading gives `legacy 743 780 <
+/// new 1 284 548`, because at the 4 096-entry SM fixture `trim` drops
+/// `merge_buf`/`label_scratch` every row (capacities land at 8 192 > the
+/// 4 096 cap) and the new path respins per row — i.e. it measures the
+/// carry policy, not the shape.
 #[test]
 fn ac13_shape_ii_json_with_wide_sm_is_not_worse_at_helper_granularity() {
     let _guard = lock_serial();
@@ -900,41 +1019,106 @@ fn ac13_shape_ii_json_with_wide_sm_is_not_worse_at_helper_granularity() {
 }
 
 /// Shape (iii) — an 8 KiB non-parseable body, no SM (D2's O(1) floor
-/// path): EXACT equality, not improvement — on this shape the two paths
-/// genuinely allocate the same amount (the legacy `Vec::new()` never
-/// grows, its empty collect allocates nothing, the recycled scratch never
-/// grows, and the json-attempt's boxed `serde_json::Error` is an ABSOLUTE
-/// cost on both sides, not a legacy-minus-new delta). Pre-committed: an
-/// inequality either way is recorded and ESCALATED — it would mean the
-/// paths differ where the #244 plan says they do not.
+/// path). Derived before measurement, from the code:
+///
+/// * the `| json` attempt FAILS, and a failed json parse writes the
+///   out-of-band pair (`pipeline.rs:2613-2614`,
+///   `Cow::Borrowed("JSONParserErr")` + `Cow::Borrowed(JSON_ERROR_DETAILS)`),
+///   which `ErrorSlots::merge_into` (`pipeline.rs:222-232`) sets into the
+///   legacy helper's fresh `Vec::new()` (`detected.rs:431`) on the kept
+///   path — a first push, so `MIN_NON_ZERO_CAP` 4 x 48 B = **192 B**, and
+///   both values are `&'static str`, so no string bytes are allocated;
+/// * the logfmt attempt allocates **0** — a second fresh `Vec::new()`,
+///   and lenient logfmt drops the single bare `z…z` token
+///   (`keep_empty=false`), so nothing is pushed and the collect over an
+///   empty iterator allocates nothing;
+/// * the failing json probe's own transient — one
+///   `Box<serde_json::ErrorImpl>`, **40 B** on serde_json 1.x/64-bit — is
+///   paid by BOTH paths and is freed before `merge_into` pushes, so on
+///   the legacy side it is not concurrent with the spine.
+///
+/// So `peak_legacy = max(40, 192) = 192` and `peak_new = 40`: (iii) is
+/// NOT an equality shape (v18's prediction, corrected on #244) — the new
+/// path is strictly better here too, by 152 B, so C2's direction holds a
+/// fortiori. (iii) stays exempt from 13(b)'s `LEGACY_DELTA_FLOOR` for the
+/// reason it always was: a non-parseable row extracts no pairs, so the
+/// extracted-pair spines the floor counts are never allocated.
+///
+/// (iii)(b) tolerates but deliberately does NOT pin serde_json's boxed
+/// error size — it is a foreign crate's private layout, not a property of
+/// this change; the assertion only needs `0 < E < 192`.
 #[test]
-fn ac13_shape_iii_non_parseable_body_is_exactly_equal_at_helper_granularity() {
+fn ac13_shape_iii_non_parseable_body_costs_the_legacy_one_error_spine() {
     let _guard = lock_serial();
+    let spine = min_pair_spine_bytes(); // 192
     let body = "z".repeat(8192);
     let r = run_shape(r#"{app="x"}"#, &body, "", "shape (iii)");
+    // (a) the legacy pays exactly ONE first-push spine: the failing json
+    //     attempt's __error__/__error_details__ pair into its fresh
+    //     `Vec::new()`. Both values are &'static str, so nothing else.
     assert_eq!(
-        r.peak_legacy, r.peak_new_1,
-        "shape (iii): expected EXACT equality; peaks {} vs {} — ESCALATE with both numbers \
-         (an inequality either way means the paths differ where the plan says they do not)",
-        r.peak_legacy, r.peak_new_1
+        r.peak_legacy, spine,
+        "shape (iii): expected exactly one MIN_NON_ZERO_CAP spine ({spine} B); got {} — \
+         ESCALATE with both numbers",
+        r.peak_legacy
+    );
+    // (b) the new path allocates NO pair spine at all: its whole peak is
+    //     the shared failing-json probe transient, which is smaller than
+    //     the smallest allocation any Vec<(Cow, Cow)> can make.
+    assert!(
+        r.peak_new_1 > 0 && r.peak_new_1 < spine,
+        "shape (iii): peak_new_1 {} must be in (0, {spine}) — 0 means the window measured \
+         nothing, >= {spine} means the recycled scratch was respun",
+        r.peak_new_1
     );
     assert_stable(&r, "shape (iii)");
 }
 
-/// Shape (iv) — the same JSON body under a `line_format`-rewritten
-/// pipeline: under the helper-level comparison it is simply another
-/// input.
+/// Shape (iv) — a genuine `line_format` prefix rewrite over a 2 048-pair
+/// LOGFMT body, with the matching `| logfmt` stage so the rewritten line
+/// is parsed both by the pipeline and by auto-detection.
+///
+/// The body is logfmt, not JSON, because shape (iv)'s auto-parse input is
+/// a template RENDER rather than the fixture's own literal body — the one
+/// shape where parseability is not manifest in the fixture. The pinned
+/// JSON body rendered `x {…}`, which is neither json (the `x ` prefix)
+/// nor logfmt (`("logfmt", 0)`), so the owned-copy delta 13(b) floors did
+/// not exist and `73 804 == 73 804` was what a correct implementation had
+/// to measure. The TEMPLATE is kept verbatim; only the body changed, and
+/// `assert_auto_parse_yields` now states the precondition directly.
+///
+/// Derived, all four terms simultaneously live across the
+/// `auto_parse_legacy_shape` call (`exec.rs:7417-7425`), with
+/// `R = 28 673` rendered bytes, `K = 2048`, 48 B slots, 6 B keys/values:
+/// `added` spine `98 304` + `added` copies `24 576` + the fresh `labels`
+/// spine `98 304` + `pairs` copies `24 576` = `245 760` legacy-only, on
+/// top of the shared `R 28 673` + the `| logfmt` stage's copies `24 576`
+/// (the rewritten line is `Cow::Owned`, so `to_cow` copies,
+/// `pipeline.rs:1053-1059`) — so `peak_legacy = 299 009`, and
+/// `peak_new <= 3R + 24 576 = 110 595`, giving `Δ >= 188 414 >=
+/// LEGACY_DELTA_FLOOR 98 304`.
+///
+/// The rejected fork, with its number: a parser-free (iv) —
+/// `| line_format "{{__line__}}"` over the JSON body — is also
+/// non-vacuous (`("json", 2048)`) but measures `Δ = 98 304`, sitting on
+/// `LEGACY_DELTA_FLOOR` to the byte; a gate with zero margin is one
+/// library change from a false red. `… | json` instead measures
+/// `Δ = 245 760`, numerically degenerate with shape (i).
 #[test]
 fn ac13_shape_iv_line_format_rewrite_is_not_worse_at_helper_granularity() {
     let _guard = lock_serial();
-    let body = flat_json_body(K_SHAPE);
-    let r = run_shape(
-        r#"{app="x"} | line_format "{{.app}} {{__line__}}""#,
+    let body = logfmt_body(K_SHAPE);
+    let query = r#"{app="x"} | line_format "{{.app}} {{__line__}}" | logfmt"#;
+    let base = [("app".to_string(), "x".to_string())];
+    assert_auto_parse_yields(
+        &compile(query),
+        &base,
         &body,
-        "",
+        ("logfmt", K_SHAPE),
         "shape (iv)",
     );
-    assert_improved(&r, "shape (iv)");
+    let r = run_shape(query, &body, "", "shape (iv)");
+    assert_improved(&r, "shape (iv)"); // (a) strict + (b) floor + (d) stability
 }
 
 // ---------------------------------------------------------------------
