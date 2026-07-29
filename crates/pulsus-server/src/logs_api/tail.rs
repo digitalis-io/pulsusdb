@@ -336,7 +336,13 @@ impl TailFetcher for EngineFetcher {
 /// production, a fake sink in the hermetic tests.
 trait TailSender: Send + 'static {
     fn send_text(&mut self, text: String) -> impl Future<Output = Result<(), ()>> + Send;
-    fn send_close(&mut self, reason: Option<String>) -> impl Future<Output = ()> + Send;
+    /// Takes the ALREADY-RENDERED close frame (issue #240 re-review):
+    /// `writer_loop` maps the reason through [`error_close_frame`]
+    /// BEFORE this boundary, so the hermetic sender fake captures the
+    /// frame the production wiring produced — the render seam is
+    /// pinned, and the impls are pure transport with no rendering
+    /// decision left to bypass.
+    fn send_close(&mut self, frame: Option<CloseFrame>) -> impl Future<Output = ()> + Send;
 }
 
 /// The inbound half (review round 1, medium): a dedicated reader task
@@ -362,18 +368,17 @@ impl TailSender for AxumSender {
             .map_err(|_| ())
     }
 
-    async fn send_close(&mut self, reason: Option<String>) {
+    async fn send_close(&mut self, frame: Option<CloseFrame>) {
         use futures::SinkExt;
-        let _ = self
-            .0
-            .send(Message::Close(reason.map(error_close_frame)))
-            .await;
+        let _ = self.0.send(Message::Close(frame)).await;
     }
 }
 
 /// Renders an error close reason into the wire close frame (issue #240
-/// R4: this is the production renderer, unit-tested directly because a
-/// real `WebSocket` sink cannot be constructed hermetically). A
+/// R4). Called by `writer_loop` on the SHARED path ahead of the
+/// `TailSender` boundary, so the hermetic end-to-end test observes this
+/// function's output through `send_close` (re-review: deleting that
+/// wiring turns the captured close bare and reddens the suite). A
 /// WebSocket close reason is capped at 123 bytes; truncate on a char
 /// boundary. (The truncation itself is a documented, deliberately
 /// retained limitation — docs/api.md §2.3.)
@@ -798,9 +803,12 @@ async fn writer_loop<S: TailSender>(
         close_reason = shared.lock().error.take();
     }
     // Cancel the siblings FIRST so they stop while the (bounded,
-    // best-effort) Close goes out.
+    // best-effort) Close goes out. The error reason is rendered into
+    // the wire frame HERE, on the shared path, so every `TailSender`
+    // receives the production renderer's output (issue #240 re-review).
     let _ = cancel_tx.send(true);
-    let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(close_reason)).await;
+    let frame = close_reason.map(error_close_frame);
+    let _ = tokio::time::timeout(CLOSE_GRACE, sender.send_close(frame)).await;
 }
 
 /// Runs one tail connection to completion: spawns the producer and the
@@ -860,12 +868,15 @@ mod tests {
         }
     }
 
-    /// Issue #240 (R4): a `PipelineInvalid` poll failure closes the
-    /// socket through the REAL producer→writer path with the BARE
-    /// reason (no fixed prefix), and the production close-frame
-    /// renderer (`error_close_frame`, the `AxumSender::send_close`
-    /// seam) emits those bytes unchanged with the ERROR close code — a
-    /// reason that itself begins `parse error ` appears exactly once.
+    /// Issue #240 (R4, re-review): a `PipelineInvalid` poll failure
+    /// closes the socket through the REAL producer→writer path, and the
+    /// captured `CloseFrame` is the one the PRODUCTION wiring rendered
+    /// (`writer_loop`'s `close_reason.map(error_close_frame)` — the
+    /// fake sender only records what it was handed, so deleting that
+    /// map turns the close bare and this test red). The frame carries
+    /// the ERROR code and the BARE reason bytes unchanged (no fixed
+    /// prefix; a reason that itself begins `parse error ` appears
+    /// exactly once, and a short reason is never truncated).
     #[tokio::test(flavor = "multi_thread")]
     async fn pipeline_invalid_closes_the_socket_with_the_bare_reason_through_the_renderer() {
         let reason = "parse error : synthetic prefix-collision probe";
@@ -883,16 +894,12 @@ mod tests {
             .await
             .expect("a fatal poll error must terminate the connection")
             .expect("no panic");
-        let close_reason = closed
+        let frame = closed
             .lock()
             .unwrap()
             .clone()
             .expect("close was sent")
-            .expect("close carried a reason");
-        assert_eq!(close_reason, reason);
-        // The wire frame: the production renderer forwards these bytes
-        // unchanged (a short reason is never truncated).
-        let frame = error_close_frame(close_reason);
+            .expect("close carried a frame rendered by the production path");
         assert_eq!(frame.code, close_code::ERROR);
         assert_eq!(frame.reason.as_str(), reason);
         assert_eq!(frame.reason.as_str().matches("parse error ").count(), 1);
@@ -1348,7 +1355,11 @@ mod tests {
     struct FakeSender {
         mode: SinkMode,
         sent: Arc<Mutex<Vec<String>>>,
-        closed: Arc<Mutex<Option<Option<String>>>>,
+        /// Outer `Some` = a close was sent; inner = the wire frame the
+        /// PRODUCTION path rendered (`writer_loop` maps through
+        /// `error_close_frame` before the `TailSender` boundary — issue
+        /// #240 re-review: the fake captures, never re-renders).
+        closed: Arc<Mutex<Option<Option<CloseFrame>>>>,
     }
 
     impl FakeSender {
@@ -1373,8 +1384,8 @@ mod tests {
             }
         }
 
-        async fn send_close(&mut self, reason: Option<String>) {
-            *self.closed.lock().unwrap() = Some(reason);
+        async fn send_close(&mut self, frame: Option<CloseFrame>) {
+            *self.closed.lock().unwrap() = Some(frame);
         }
     }
 
@@ -1531,12 +1542,13 @@ mod tests {
             .await
             .expect("a fatal poll error must terminate the connection")
             .expect("no panic");
-        let reason = closed
+        let frame = closed
             .lock()
             .unwrap()
             .clone()
             .expect("close was sent")
             .expect("close carried a reason");
+        let reason = frame.reason.as_str();
         assert!(reason.contains("query too broad"), "{reason}");
     }
 
