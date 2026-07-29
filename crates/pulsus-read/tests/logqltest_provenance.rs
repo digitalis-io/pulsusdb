@@ -6,6 +6,11 @@
 //!   `pulsus-240-bodies` capture table in `logqltest/PROVENANCE.md` are
 //!   the SAME set, both directions (a body nobody captured cannot be
 //!   pinned; a captured body cannot silently drop out of the corpus).
+//!   The table carries exactly the rows B1–B3: the fourth candidate
+//!   (B4, the `variants` unwrap-arity body) is provenance-BLOCKED —
+//!   the reference nil-panics on that exact query, and a capture of a
+//!   different, non-`variants` query must not be substituted (issue
+//!   #240 AC10; see PROVENANCE.md §#240).
 //! - **C** — `ReadError::PipelineInvalid` construction census over
 //!   `src/logql/*.rs` production regions (every construction is the
 //!   canonical multi-line form the sweep counted, with pinned per-file
@@ -75,7 +80,18 @@ fn provenance_body_rows() -> Vec<BodyRow> {
             value: cells[3].to_string(),
         });
     }
-    assert_eq!(rows.len(), 4, "pulsus-240-bodies must carry four rows");
+    // Exactly B1–B3. B4 is provenance-BLOCKED (issue #240 AC10): the
+    // reference nil-panics on the variants-form query, so no applicable
+    // capture exists, and a different query's capture must not be
+    // substituted. Re-adding a B4 row is the review event — it requires
+    // an applicable v3.7.4 capture (or immutable probe URL) first.
+    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["B1", "B2", "B3"],
+        "pulsus-240-bodies must carry exactly the rows B1-B3 (B4 is blocked, \
+         see PROVENANCE.md, issue #240 section)"
+    );
     rows
 }
 

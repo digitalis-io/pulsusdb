@@ -274,12 +274,16 @@ eval_fail instant at 60s variants(sum(sum(count_over_time({service_name="rj"}[5m
 eval_fail instant at 60s variants(approx_topk(1, count_over_time({service_name="rj"}[5m]))) of ({service_name="rj"}[5m])
   msg: must be a range aggregation
 
-# unwrap arity is decided by the VARIANT's own pipeline. PulsusDB's whole
-# body equals the reference's INNER message (enforced byte-exact by
-# `msg_exact:` since issue #240); the reference wraps it in its own
-# `parse error : ` envelope — the accepted cosmetic divergence.
+# unwrap arity is decided by the VARIANT's own pipeline. The reference
+# nil-panics on this exact form (header table above), so there is NO
+# reference body to pin byte-exactly: the byte-exact row is
+# provenance-BLOCKED (issue #240 AC10 — a capture of a different,
+# non-variants query must not be substituted; see
+# `logqltest/PROVENANCE.md` §#240). This row gates a substring of
+# PulsusDB's own wording, which borrows the reference's non-variants
+# arity phrasing without claiming reference provenance for it.
 eval_fail instant at 60s variants(sum_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m])
-  msg_exact: invalid aggregation sum_over_time without unwrap
+  msg: invalid aggregation sum_over_time without unwrap
 
 clear
 

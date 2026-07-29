@@ -532,10 +532,10 @@ pub enum ReadError {
     ///
     /// Issue #240: `Display` is the BARE reason. This variant used to
     /// prepend a fixed PulsusDB-only marker that the reference does not
-    /// emit; for the bodies that DO have a reference counterpart (runtime
-    /// vector-matching, range `approx_topk`, the `variants` unwrap-arity
-    /// message) it made the wire body differ while six committed places
-    /// claimed it did not. The removed bytes are recorded once, in
+    /// emit; for the bodies that DO have a captured reference
+    /// counterpart (runtime vector-matching, range `approx_topk`) it
+    /// made the wire body differ while six committed places claimed it
+    /// did not. The removed bytes are recorded once, in
     /// docs/benchmarks/logs-differential-ledger.md; they are deliberately
     /// not quoted here so `git grep` can prove none survive in `crates/`.
     #[error("{reason}")]

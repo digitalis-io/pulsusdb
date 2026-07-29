@@ -170,14 +170,31 @@ not the pure value path).
 
 ## Issue #240 — error-body identity and rejection-status probes
 
-The four corpus rows whose produced error is a `ReadError::PipelineInvalid`
+The corpus rows whose produced error is a `ReadError::PipelineInvalid`
 stringification AND whose committed prose claims reference-body identity are
 pinned **byte-exactly** (`msg_exact:`, gated both directions by
 `tests/logqltest_provenance.rs` checks A/B). Sources: `wave0 <date>` is a
 fresh capture against the pinned `grafana/loki:3.7.4` container (the
 `ci/logql/config.yaml` capture config — `shard_aggregations`, protobuf
 frontend encoding, `enable_multi_variant_queries`); a `probe:` URL must
-resolve to a published comment showing the capture.
+resolve to a published comment showing the capture. A row that can be
+neither captured nor URL-cited is **BLOCKED** — reported to the
+task-manager, never invented and never substituted from a different
+query's capture. Three rows qualify (B1–B3); the fourth candidate is
+blocked:
+
+**B4 — BLOCKED (issue #240 AC10, reported).** The candidate row
+(`b13_variants.test`,
+`variants(sum_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m])`)
+has NO applicable reference capture: probing that exact query against the
+pinned v3.7.4 container returns a 500 nil-pointer panic (`runtime error:
+invalid memory address or nil pointer dereference` — exactly as the
+b13 ledger entry records), so no reference body for the variants form
+exists. The non-variants probe (`sum_over_time({service_name="rj"}[5m])`
+→ `parse error : invalid aggregation sum_over_time without unwrap`)
+captures a DIFFERENT query and must not be substituted as B4's
+provenance. The corpus row therefore stays on a substring `msg:` gate
+and claims no reference-derived byte identity.
 
 Capture commands (2026-07-27, container digest per §Pinned reference; push
 the row's `load` dataset first, exactly as §2 above):
@@ -194,13 +211,13 @@ curl -sw '\n%{http_code}\n' 'http://localhost:3100/loki/api/v1/query' \
 #        not allowed: matching labels must be unique on one side  [500])
 # B3: any approx_topk on query_range:
 #  -> count min sketches are only supported on instant queries  [500]
-# B4: the reference has NO variants-form body for this (the variants form
-# nil-panics, ledgered); the INNER text comes from the non-variants probe:
+# B4 (BLOCKED — see above): the variants-form probe itself:
 curl -sw '\n%{http_code}\n' 'http://localhost:3100/loki/api/v1/query' \
-  --data-urlencode 'query=sum_over_time({service_name="rj"}[5m])' --data-urlencode 'time=<T_ns>'
-# -> parse error : invalid aggregation sum_over_time without unwrap  [400]
-#    (the `parse error : ` envelope is the accepted cosmetic divergence;
-#     the pinned value is the inner text, which is PulsusDB's WHOLE body)
+  --data-urlencode 'query=variants(sum_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m])' \
+  --data-urlencode 'time=<T_ns>'
+# -> runtime error: invalid memory address or nil pointer dereference  [500]
+#    (a nil panic, not a body — no applicable capture exists, so B4 has
+#     no pulsus-240-bodies row and the corpus row stays on `msg:`)
 ```
 
 ```pulsus-240-bodies
@@ -208,7 +225,6 @@ curl -sw '\n%{http_code}\n' 'http://localhost:3100/loki/api/v1/query' \
 | B1 | differential_vector_matching.test | wave0 2026-07-27 | multiple matches for labels: many-to-one matching must be explicit (group_left/group_right) |
 | B2 | differential_vector_matching.test | wave0 2026-07-27 | found duplicate series on the right hand-side;many-to-many matching not allowed: matching labels must be unique on one side |
 | B3 | b10_approx_topk.test | wave0 2026-07-27 | count min sketches are only supported on instant queries |
-| B4 | b13_variants.test | wave0 2026-07-27 | invalid aggregation sum_over_time without unwrap |
 ```
 
 Rejection-status probes (issue #240 AC7(h) — the reference's status for an

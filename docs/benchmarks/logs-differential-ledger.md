@@ -237,11 +237,11 @@ Out of this ledger's scope by design:
   rows carry `msg_exact:` (whole produced text) and
   `tests/logqltest_provenance.rs` checks A/B tie each pinned body to its
   `pulsus-240-bodies` capture row, both directions. The cases still
-  deliberately do NOT gate the HTTP status (per the plan-adjudication
-  probe decision: bodies
-  share a substring, so gate on it). This entry records the status-code
+  deliberately do NOT gate the HTTP status: they gate the whole
+  produced body, byte-exactly, via `msg_exact:` (issue #240 superseded
+  the older shared-substring gate). This entry records the status-code
   divergence for the record; it is not a `mode: "informational"`
-  downgrade (the cases remain gated on their substring).
+  downgrade (the cases remain gated on their bodies).
 
 ### approx-topk-determinism-and-range-status (issue #221)
 
@@ -271,8 +271,8 @@ Out of this ledger's scope by design:
   `PipelineInvalid` prefix made it inner-text-only) — Loki
   surfaces it as HTTP **500** (probed live against `grafana/loki:3.7.4`),
   PulsusDB as `ReadError::PipelineInvalid` → HTTP **400**, per the same
-  adjudicated rule as the entry above: gate on the shared body substring,
-  never the status code.
+  adjudicated rule as the entry above: gate on the body (byte-exact via
+  `msg_exact:` since issue #240), never the status code.
 - **Enablement delta (not gated):** the reference disables `approx_topk`
   by default (`limits_config.shard_aggregations` + protobuf frontend
   encoding — capture procedure in `tests/logqltest/PROVENANCE.md`);
@@ -348,11 +348,13 @@ not "fix" us toward the panic.
 - **PulsusDB behaviour:** one plan-time 400 naming the rule (`variant N
   must be a range aggregation, optionally wrapped in one vector
   aggregation (...)`), before any DB read — except the arity mismatch,
-  which reproduces the reference's own non-variants INNER message
-  (`invalid aggregation sum_over_time without unwrap`) as PulsusDB's
-  whole wire body — byte-exact since issue #240 (enforced by
-  `b13_variants.test`'s `msg_exact:` gate); the reference wraps it in
-  its own `parse error : ` envelope, the accepted cosmetic divergence.
+  whose wording borrows the reference's non-variants arity phrasing
+  (`invalid aggregation sum_over_time without unwrap`). The reference
+  nil-panics on the variants form itself, so NO reference body exists
+  to pin: the byte-exact provenance row is BLOCKED (issue #240 AC10 —
+  a capture of the different, non-variants query is not substituted;
+  `logqltest/PROVENANCE.md` §#240) and `b13_variants.test` gates that
+  body by substring (`msg:`), claiming no reference identity.
 - **Why deliberate:** both sides reject every one of these shapes — we
   match the rejection; the panic text is unmatchable by construction and
   a crash is not a contract. Gated by `b13_variants.test`'s `eval_fail`
@@ -407,11 +409,15 @@ not "fix" us toward the panic.
   BARE `reason`. The removed prefix bytes — recorded here ONCE,
   deliberately outside `crates/` so AC1's zero-hit grep cannot rot —
   were `invalid pipeline: ` (18 bytes, trailing space included). For
-  the bodies with a reference counterpart (the two runtime
-  vector-matching errors, the range `approx_topk` rejection, the
-  `variants` unwrap-arity message) the wire body is now byte-identical
-  to the reference's and gated so (`msg_exact:` + provenance checks
-  A/B); every other `PipelineInvalid` body is PulsusDB-only prose.
+  the bodies with a captured reference counterpart (the two runtime
+  vector-matching errors and the range `approx_topk` rejection) the
+  wire body is now byte-identical to the reference's and gated so
+  (`msg_exact:` + provenance checks A/B, rows B1–B3). The `variants`
+  unwrap-arity body has NO reference counterpart — the reference
+  nil-panics on that query — so its byte-exact row is BLOCKED per
+  issue #240 AC10 (`logqltest/PROVENANCE.md` §#240) and it stays on a
+  substring gate; every other `PipelineInvalid` body is PulsusDB-only
+  prose.
 - **Accepted cosmetic divergence (owner-ruled):** PulsusDB does NOT
   reproduce the reference's `parse error : …` / `stage '…' :` envelope
   wording around parse/pipeline errors. Status must match, the response

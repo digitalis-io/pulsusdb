@@ -364,20 +364,28 @@ impl TailSender for AxumSender {
 
     async fn send_close(&mut self, reason: Option<String>) {
         use futures::SinkExt;
-        let frame = reason.map(|mut r| {
-            // A WebSocket close reason is capped at 123 bytes; truncate
-            // on a char boundary.
-            let mut cut = r.len().min(123);
-            while !r.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            r.truncate(cut);
-            CloseFrame {
-                code: close_code::ERROR,
-                reason: r.into(),
-            }
-        });
-        let _ = self.0.send(Message::Close(frame)).await;
+        let _ = self
+            .0
+            .send(Message::Close(reason.map(error_close_frame)))
+            .await;
+    }
+}
+
+/// Renders an error close reason into the wire close frame (issue #240
+/// R4: this is the production renderer, unit-tested directly because a
+/// real `WebSocket` sink cannot be constructed hermetically). A
+/// WebSocket close reason is capped at 123 bytes; truncate on a char
+/// boundary. (The truncation itself is a documented, deliberately
+/// retained limitation — docs/api.md §2.3.)
+fn error_close_frame(mut reason: String) -> CloseFrame {
+    let mut cut = reason.len().min(123);
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    reason.truncate(cut);
+    CloseFrame {
+        code: close_code::ERROR,
+        reason: reason.into(),
     }
 }
 
@@ -852,21 +860,61 @@ mod tests {
         }
     }
 
-    /// Issue #240 (R4): the WebSocket close reason for a LogQL pipeline
-    /// rejection is the poll error's `to_string()` — since #240 that is
-    /// the BARE reason (no fixed prefix), and a reason that itself
-    /// begins `parse error ` appears exactly once. (The 123-byte
-    /// close-frame truncation is a separate, deliberately retained
-    /// limitation — out of scope here.)
-    #[test]
-    fn pipeline_invalid_close_reason_is_the_bare_reason() {
+    /// Issue #240 (R4): a `PipelineInvalid` poll failure closes the
+    /// socket through the REAL producer→writer path with the BARE
+    /// reason (no fixed prefix), and the production close-frame
+    /// renderer (`error_close_frame`, the `AxumSender::send_close`
+    /// seam) emits those bytes unchanged with the ERROR close code — a
+    /// reason that itself begins `parse error ` appears exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipeline_invalid_closes_the_socket_with_the_bare_reason_through_the_renderer() {
         let reason = "parse error : synthetic prefix-collision probe";
-        let e = pulsus_read::logql::ReadError::PipelineInvalid {
-            reason: reason.to_string(),
-        };
-        let close_reason = e.to_string();
+        let (_tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let closed = Arc::clone(&sender.closed);
+        let handle = tokio::spawn(run_tail(
+            PipelineInvalidFetcher(reason.to_string()),
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("a fatal poll error must terminate the connection")
+            .expect("no panic");
+        let close_reason = closed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("close was sent")
+            .expect("close carried a reason");
         assert_eq!(close_reason, reason);
-        assert_eq!(close_reason.matches("parse error ").count(), 1);
+        // The wire frame: the production renderer forwards these bytes
+        // unchanged (a short reason is never truncated).
+        let frame = error_close_frame(close_reason);
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), reason);
+        assert_eq!(frame.reason.as_str().matches("parse error ").count(), 1);
+    }
+
+    /// Issue #240 (R4): the production renderer's 123-byte close-reason
+    /// cap truncates on a char boundary — the frame carries a valid
+    /// UTF-8 PREFIX of the reason, never a split code point. (The cap
+    /// itself is the documented retained limitation — docs/api.md §2.3.)
+    #[test]
+    fn error_close_frame_truncates_at_123_bytes_on_a_char_boundary() {
+        // 121 ASCII bytes, then a 3-byte '€' straddling the 123-byte
+        // cap: the cut backs off to the 121-byte boundary.
+        let long = format!("{}€ tail beyond the close-frame cap", "x".repeat(121));
+        assert!(long.len() > 123);
+        let frame = error_close_frame(long.clone());
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), "x".repeat(121));
+        assert!(long.starts_with(frame.reason.as_str()));
+        // At or under the cap the reason passes through byte-identical.
+        let exact = "y".repeat(123);
+        assert_eq!(error_close_frame(exact.clone()).reason.as_str(), exact);
     }
 
     /// `start_ns` sits just behind "now" so the loop reaches steady
@@ -1258,6 +1306,23 @@ mod tests {
                     cap: 100_000,
                 },
             ))
+        }
+    }
+
+    /// A fetcher that fails with a LogQL pipeline rejection (issue #240
+    /// R4 — the close-reason construction path).
+    struct PipelineInvalidFetcher(String);
+    impl TailFetcher for PipelineInvalidFetcher {
+        async fn poll(
+            &mut self,
+            _lower: TailLower,
+            _upper_ns: i64,
+            _narrow: bool,
+            _fetch_limit: u32,
+        ) -> Result<TailPage, ReadError> {
+            Err(ReadError::PipelineInvalid {
+                reason: self.0.clone(),
+            })
         }
     }
 
