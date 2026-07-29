@@ -10,17 +10,24 @@
 //!   the already-oracle-verified unit converters
 //!   [`super::pipeline::parse_duration_seconds`] /
 //!   [`super::pipeline::parse_bytes_value`];
-//! - [`auto_parse`]'s json-first / logfmt-fallback per-line detection
+//! - [`auto_parse_into`]'s json-first / logfmt-fallback per-line detection
 //!   (success = the parser set no `__error__` label — the reference's
 //!   `HasErr()` analog), evaluated via the SAME [`CompiledPipeline`]
 //!   parser stages the query path runs;
 //! - [`FieldAccumulator`]'s first-seen field cap, exact cardinality
-//!   (documented improvement over the reference's hyperloglog sketch),
-//!   per-observation type re-detection (last observation wins, matching
-//!   the reference's per-entry re-detect), and encounter-order deduped
-//!   parser attribution.
+//!   (documented improvement over the reference's hyperloglog sketch —
+//!   registered as `detected-cardinality-exact-not-estimated` in
+//!   docs/benchmarks/logs-differential-ledger.md), per-observation type
+//!   re-detection (last observation wins, matching the reference's
+//!   per-entry re-detect), encounter-order deduped parser attribution,
+//!   and — issue #244 — a server-side byte ceiling
+//!   ([`MAX_DETECTED_FIELD_BYTES`]) charged BEFORE every retaining
+//!   allocation; a refused charge freezes the field's value set and keeps
+//!   serving (`retention_capped`, surfaced as `pulsus_partial`), never an
+//!   error.
 
-use std::collections::{BTreeSet, HashMap};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use pulsus_logql::{ParserStage, Stage};
@@ -55,12 +62,16 @@ pub struct DetectedFieldOut {
 
 /// A `/detected_fields` engine result (issue #170 plan v2): `truncated`
 /// is set only when the fetch-until-limit paging loop stopped because the
-/// byte scan budget was spent — surfaced as the additive `pulsus_partial`
-/// response key (omitted when false, the #90 wire convention).
+/// byte scan budget was spent; `retention_capped` (issue #244) when the
+/// [`MAX_DETECTED_FIELD_BYTES`] retention budget refused at least one
+/// distinct value or field name, so some `cardinality` may under-report.
+/// Either is surfaced as the additive `pulsus_partial` response key
+/// (omitted when false, the #90 wire convention).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedFields {
     pub fields: Vec<DetectedFieldOut>,
     pub truncated: bool,
+    pub retention_capped: bool,
 }
 
 /// Labels the reference always keeps regardless of ID-likeness
@@ -105,12 +116,122 @@ pub(super) fn determine_type(value: &str) -> &'static str {
     "string"
 }
 
+/// Per-request byte budget over everything [`FieldAccumulator`] RETAINS
+/// (issue #244). A count cap is not a byte bound (#227), so this is
+/// denominated in bytes and charged BEFORE each retaining allocation with
+/// the SAME model as `super::exec::{alloc_block_bytes, grown_alloc_bytes,
+/// map_entry_bytes}`. 64 MiB matches `super::exec::MAX_CLIENT_AGG_GROUP_BYTES`,
+/// the house per-query retained-state ceiling.
+pub const MAX_DETECTED_FIELD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Check-then-add, clamp-never-error. A REFUSED charge does not mutate
+/// `charged` — the `traces::exec::ByteBudget` contract (a failed charge
+/// never carries a phantom byte for an allocation that was refused before
+/// it happened); unlike that budget, a refusal here CLAMPS (sets `capped`)
+/// instead of erroring — the #236 lesson (a new rejection surface is its
+/// own bug).
+#[derive(Debug)]
+pub(super) struct RetentionBudget {
+    charged: u64,
+    peak: u64,
+    budget: u64,
+    capped: bool,
+}
+
+impl RetentionBudget {
+    fn new(budget: u64) -> Self {
+        Self {
+            charged: 0,
+            peak: 0,
+            budget,
+            capped: false,
+        }
+    }
+
+    /// `true` = the charge was accepted (and `charged` grew by `bytes`);
+    /// `false` = refused, `charged` unchanged, `capped` set.
+    fn charge(&mut self, bytes: u64) -> bool {
+        let next = self.charged.saturating_add(bytes);
+        if next > self.budget {
+            self.capped = true;
+            return false;
+        }
+        self.charged = next;
+        self.peak = self.peak.max(next);
+        true
+    }
+
+    fn capped(&self) -> bool {
+        self.capped
+    }
+
+    fn charged(&self) -> u64 {
+        self.charged
+    }
+
+    fn peak_charged(&self) -> u64 {
+        self.peak
+    }
+}
+
 /// One detected field's accumulating state.
 #[derive(Debug)]
 struct FieldState {
     field_type: &'static str,
-    values: BTreeSet<String>,
+    values: HashSet<String>,
     parsers: Vec<&'static str>,
+    /// The budget refused a growth: type still re-detects and parsers still
+    /// append (both bounded), the VALUE set stops growing.
+    frozen: bool,
+}
+
+/// A provable upper bound on the retained heap one admitted field NAME
+/// costs: the map entry's table share, the owned key `String` (map
+/// insertion may route through growth paths, so the geometric
+/// [`super::exec::grown_alloc_bytes`] bound is used), and the `parsers`
+/// vector's `with_capacity(2)` buffer — which NEVER reallocates because
+/// the parser universe is the closed pair `json`/`logfmt`.
+fn field_entry_bytes(name: &str) -> u64 {
+    super::exec::map_entry_bytes(size_of::<(String, FieldState)>())
+        .saturating_add(super::exec::grown_alloc_bytes(name.len() as u64))
+        .saturating_add(super::exec::alloc_block_bytes(
+            2 * size_of::<&'static str>() as u64,
+        ))
+}
+
+/// `HashSet<String>` is `HashMap<String, ()>`; `()` is a ZST, so the slot is
+/// `size_of::<String>()` and [`super::exec::map_entry_bytes`] applies
+/// verbatim. `to_string()` reserves EXACTLY the length —
+/// [`super::exec::alloc_block_bytes`] is the precedented bound
+/// (`label_set_bytes`).
+fn value_entry_bytes(value: &str) -> u64 {
+    super::exec::map_entry_bytes(size_of::<String>())
+        .saturating_add(super::exec::alloc_block_bytes(value.len() as u64))
+}
+
+/// The post-admission tail of [`FieldAccumulator::observe_pair`], factored
+/// free so the `&mut` budget and the `&mut` field state (both reached
+/// through `self`) can be borrowed simultaneously. The ORDER is the
+/// contract: the charge precedes the `value.to_string()` clone.
+fn observe_admitted(
+    budget: &mut RetentionBudget,
+    state: &mut FieldState,
+    value: &str,
+    parser: Option<&'static str>,
+) {
+    state.field_type = determine_type(value);
+    if !state.frozen && !state.values.contains(value) {
+        if budget.charge(value_entry_bytes(value)) {
+            state.values.insert(value.to_string());
+        } else {
+            state.frozen = true; // clamp + serve
+        }
+    }
+    if let Some(p) = parser
+        && !state.parsers.contains(&p)
+    {
+        state.parsers.push(p);
+    }
 }
 
 /// Accumulates detected fields across sampled entries: the first
@@ -118,18 +239,27 @@ struct FieldState {
 /// entirely, values uncounted — the reference's `fieldCount < limit`
 /// gate), each observation re-detects the type (last wins) and inserts
 /// the exact value, and parser attribution appends deduped in encounter
-/// order.
+/// order. Everything it RETAINS is charged against a byte budget BEFORE
+/// the allocation (issue #244; [`MAX_DETECTED_FIELD_BYTES`]).
 #[derive(Debug)]
 pub(super) struct FieldAccumulator {
     field_limit: u32,
     fields: HashMap<String, FieldState>,
+    budget: RetentionBudget,
 }
 
 impl FieldAccumulator {
     pub(super) fn new(field_limit: u32) -> Self {
+        Self::with_byte_budget(field_limit, MAX_DETECTED_FIELD_BYTES)
+    }
+
+    /// Test seam: a caller-chosen retention budget (production always uses
+    /// [`MAX_DETECTED_FIELD_BYTES`] via [`FieldAccumulator::new`]).
+    pub(super) fn with_byte_budget(field_limit: u32, budget: u64) -> Self {
         Self {
             field_limit,
             fields: HashMap::new(),
+            budget: RetentionBudget::new(budget),
         }
     }
 
@@ -139,51 +269,77 @@ impl FieldAccumulator {
     }
 
     /// Parsed pairs — from the query pipeline's own extractions
-    /// (`parser = None`) or from [`auto_parse`]'s json/logfmt detection
-    /// (`parser = Some(...)`). `__error__`/`__error_details__` never
-    /// become fields.
+    /// (`parser = None`) or from [`auto_parse_into`]'s json/logfmt
+    /// detection (`parser = Some(...)`).
     pub(super) fn observe_parsed(
         &mut self,
         pairs: &[(String, String)],
         parser: Option<&'static str>,
     ) {
         for (key, value) in pairs {
-            if key == ERROR_LABEL || key == ERROR_DETAILS_LABEL {
-                continue;
-            }
-            if !self.fields.contains_key(key.as_str()) {
-                if self.fields.len() >= self.field_limit as usize {
-                    continue;
-                }
-                self.fields.insert(
-                    key.clone(),
-                    FieldState {
-                        field_type: "string",
-                        values: BTreeSet::new(),
-                        parsers: Vec::new(),
-                    },
-                );
-            }
-            // Present by construction: either it already existed or the
-            // insert above just admitted it.
-            let Some(state) = self.fields.get_mut(key.as_str()) else {
-                continue;
-            };
-            state.field_type = determine_type(value);
-            if !state.values.contains(value.as_str()) {
-                state.values.insert(value.clone());
-            }
-            if let Some(p) = parser
-                && !state.parsers.contains(&p)
-            {
-                state.parsers.push(p);
-            }
+            self.observe_pair(key, value, parser);
         }
     }
 
+    /// One observed `key = value` pair, borrowed — nothing is cloned until
+    /// the retention budget has approved the bytes (issue #244).
+    /// `__error__`/`__error_details__` never become fields.
+    pub(super) fn observe_pair(&mut self, key: &str, value: &str, parser: Option<&'static str>) {
+        if key == ERROR_LABEL || key == ERROR_DETAILS_LABEL {
+            return;
+        }
+        if !self.fields.contains_key(key) {
+            if self.fields.len() >= self.field_limit as usize {
+                return;
+            }
+            // Charge BEFORE `key.to_string()`. A refused name is absent
+            // entirely — never inserted, never counted. (The
+            // `contains_key` + `get_mut` double lookup is deliberate: the
+            // entry API would demand an owned key before the charge.)
+            if !self.budget.charge(field_entry_bytes(key)) {
+                return;
+            }
+            self.fields.insert(
+                key.to_string(),
+                FieldState {
+                    field_type: "string",
+                    values: HashSet::new(),
+                    parsers: Vec::with_capacity(2),
+                    frozen: false,
+                },
+            );
+        }
+        // Present by construction: either it already existed or the
+        // insert above just admitted it.
+        let Some(state) = self.fields.get_mut(key) else {
+            return;
+        };
+        observe_admitted(&mut self.budget, state, value, parser);
+    }
+
+    /// Bytes the retention budget has accepted so far.
+    pub(super) fn charged(&self) -> u64 {
+        self.budget.charged()
+    }
+
+    /// The high-water mark of [`FieldAccumulator::charged`] (identical to
+    /// it today — nothing discharges — kept as the named runtime term the
+    /// witness gates bound).
+    pub(super) fn peak_charged(&self) -> u64 {
+        self.budget.peak_charged()
+    }
+
     /// Final response entries, sorted by label (deterministic wire order —
-    /// a documented divergence from the reference's Go map order).
-    pub(super) fn finish(self) -> Vec<DetectedFieldOut> {
+    /// a documented divergence from the reference's Go map order), plus
+    /// whether the retention budget ever refused a charge (issue #244).
+    ///
+    /// Allocates the response `Vec<DetectedFieldOut>` — RESPONSE-scoped, at
+    /// most `field_limit` (<= 5000) entries, once per request. Outside every
+    /// per-row window; the budget covers what is RETAINED during
+    /// accumulation, and this vector is the accumulation's output, not part
+    /// of it.
+    pub(super) fn finish(self) -> (Vec<DetectedFieldOut>, bool) {
+        let capped = self.budget.capped();
         let mut out: Vec<DetectedFieldOut> = self
             .fields
             .into_iter()
@@ -195,7 +351,7 @@ impl FieldAccumulator {
             })
             .collect();
         out.sort_by(|a, b| a.label.cmp(&b.label));
-        out
+        (out, capped)
     }
 }
 
@@ -234,17 +390,45 @@ static LOGFMT_PARSER: LazyLock<CompiledPipeline> = LazyLock::new(|| {
 /// `discover_log_levels: false`): `{"__error__":"","foo":"x"}` AND
 /// `{"__error__":"mine","foo":"x"}` both detect `foo` as a json field
 /// (and neither surfaces `__error__` itself as a field —
-/// [`FieldAccumulator::observe_parsed`]'s name exclusion matches that);
-/// `not json at all` yields no fields. Returns the winning parser name and
-/// its extracted pairs (a slot `__error_details__` never leaks — an
-/// erroring parser is a failure wholesale).
-pub(super) fn auto_parse(line: &str) -> Option<(&'static str, Vec<(String, String)>)> {
+/// [`FieldAccumulator::observe_pair`]'s name exclusion matches that);
+/// `not json at all` yields no fields. Writes the winning parser's
+/// extracted pairs into the caller's reused scratch (`run_into` clears it
+/// per attempt) and returns the parser name; on failure `out` is left
+/// cleared (issue #244 — no per-row owned `Vec<(String, String)>` is
+/// built; a slot `__error_details__` never leaks — an erroring parser is
+/// a failure wholesale).
+pub(super) fn auto_parse_into<'l>(
+    line: &'l str,
+    out: &mut Vec<(Cow<'l, str>, Cow<'l, str>)>,
+) -> Option<&'static str> {
     for (name, parser) in [("json", &*JSON_PARSER), ("logfmt", &*LOGFMT_PARSER)] {
-        let mut labels = Vec::new();
         // Auto-detection probes carry no row timestamp; the probe
         // pipelines are bare parsers (no templates), so 0 is inert and a
         // template render-budget breach is unreachable — a defensive Err
         // maps to "not this format" (plan v1 §4: detected.rs passes 0).
+        let (kept, has_err) = parser
+            .run_into_reporting_err(line, &[], 0, out)
+            .unwrap_or((None, false));
+        if kept.is_some() && !has_err {
+            return Some(name);
+        }
+    }
+    out.clear();
+    None
+}
+
+/// AC 13's baseline ONLY (issue #244): the pre-#244 owned-return form of
+/// the auto-parse pass — byte-for-byte the shipped `auto_parse` at merge
+/// base `a627a6c` (== the plan-pinned `d145ded` `detected.rs:241-254` plus
+/// the #230 timestamp argument and defensive `unwrap_or` that landed with
+/// `a627a6c`), including its per-row `let mut labels = Vec::new()` and the
+/// owned `(String, String)` pair collect. Never called by any production
+/// path (AC 13e); exists so the helper-level before/after measures exactly
+/// the shape change.
+#[doc(hidden)]
+pub fn auto_parse_legacy_shape(line: &str) -> Option<(&'static str, Vec<(String, String)>)> {
+    for (name, parser) in [("json", &*JSON_PARSER), ("logfmt", &*LOGFMT_PARSER)] {
+        let mut labels = Vec::new();
         let (kept, has_err) = parser
             .run_into_reporting_err(line, &[], 0, &mut labels)
             .unwrap_or((None, false));
@@ -268,6 +452,19 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// The pre-#244 convenience shape, over the production
+    /// [`auto_parse_into`] — the tests below assert detection semantics,
+    /// which the scratch-reuse refactor did not change.
+    fn auto_parse(line: &str) -> Option<(&'static str, Vec<(String, String)>)> {
+        let mut out = Vec::new();
+        let parser = auto_parse_into(line, &mut out)?;
+        let pairs = out
+            .into_iter()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        Some((parser, pairs))
     }
 
     // -- determine_type: the pinned table --------------------------------
@@ -418,7 +615,7 @@ mod tests {
             ]),
             None,
         );
-        let fields = acc.finish();
+        let (fields, _) = acc.finish();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].label, "ok");
     }
@@ -429,7 +626,7 @@ mod tests {
         acc.observe_parsed(&owned(&[("a", "1"), ("b", "2"), ("c", "3")]), None);
         // `a` is already admitted — later observations still count.
         acc.observe_parsed(&owned(&[("a", "4"), ("c", "5")]), None);
-        let fields = acc.finish();
+        let (fields, _) = acc.finish();
         assert_eq!(
             fields.iter().map(|f| f.label.as_str()).collect::<Vec<_>>(),
             vec!["a", "b"],
@@ -444,7 +641,7 @@ mod tests {
         acc.observe_parsed(&owned(&[("k", "x")]), None);
         acc.observe_parsed(&owned(&[("k", "y")]), None);
         acc.observe_parsed(&owned(&[("k", "x")]), None);
-        let fields = acc.finish();
+        let (fields, _) = acc.finish();
         assert_eq!(fields[0].cardinality, 2);
     }
 
@@ -454,7 +651,7 @@ mod tests {
         acc.observe_parsed(&owned(&[("k", "42")]), None);
         assert_eq!(acc.fields["k"].field_type, "int");
         acc.observe_parsed(&owned(&[("k", "hello")]), None);
-        let fields = acc.finish();
+        let (fields, _) = acc.finish();
         assert_eq!(fields[0].field_type, "string", "last observation wins");
     }
 
@@ -465,7 +662,7 @@ mod tests {
         acc.observe_parsed(&owned(&[("level", "info")]), Some("json"));
         acc.observe_parsed(&owned(&[("level", "warn")]), Some("json"));
         acc.observe_parsed(&owned(&[("level", "err")]), Some("logfmt"));
-        let fields = acc.finish();
+        let (fields, _) = acc.finish();
         let trace = fields
             .iter()
             .find(|f| f.label == "trace_id")
@@ -486,7 +683,7 @@ mod tests {
     fn finish_sorts_fields_by_label() {
         let mut acc = FieldAccumulator::new(100);
         acc.observe_parsed(&owned(&[("zeta", "1"), ("alpha", "2")]), None);
-        let fields = acc.finish();
+        let (fields, _) = acc.finish();
         assert_eq!(
             fields.iter().map(|f| f.label.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "zeta"]
@@ -500,5 +697,147 @@ mod tests {
         assert!(is_static_detected_label("instance"));
         assert!(is_static_detected_label("pod"));
         assert!(!is_static_detected_label("env"));
+    }
+
+    // -- Issue #244: the charged retention budget --------------------------
+
+    /// AC 1(a): after ANY observation sequence, `charged() <= budget`.
+    #[test]
+    fn charged_bytes_never_exceed_the_budget_over_any_sequence() {
+        let budget = 4 * 1024;
+        let mut acc = FieldAccumulator::with_byte_budget(100, budget);
+        for i in 0..500u32 {
+            acc.observe_pair(&format!("k{}", i % 7), &format!("value-{i}"), None);
+            assert!(
+                acc.charged() <= budget,
+                "charged {} exceeded budget {budget} at observation {i}",
+                acc.charged()
+            );
+        }
+        let (_, capped) = acc.finish();
+        assert!(capped, "the tiny budget must have refused something");
+    }
+
+    /// AC 1(b): a refused FIELD admission leaves the name absent and
+    /// `charged()` unchanged (the check-then-add contract: a failed charge
+    /// never mutates the counter). The budget is sized so the second
+    /// name's admission is provably the refused charge.
+    #[test]
+    fn a_refused_field_admission_is_absent_and_charges_nothing() {
+        let first = "alpha";
+        let second = "omega";
+        // Enough for the first name + its value, NOT for a second name.
+        let budget = field_entry_bytes(first) + value_entry_bytes("1") + 1;
+        assert!(
+            budget < field_entry_bytes(first) + value_entry_bytes("1") + field_entry_bytes(second),
+            "budget must refuse the second admission"
+        );
+        let mut acc = FieldAccumulator::with_byte_budget(100, budget);
+        acc.observe_pair(first, "1", None);
+        let charged_before = acc.charged();
+        acc.observe_pair(second, "2", None);
+        assert_eq!(
+            acc.charged(),
+            charged_before,
+            "a refused admission must not mutate the charge"
+        );
+        let (fields, capped) = acc.finish();
+        assert!(capped);
+        assert_eq!(fields.len(), 1, "the refused name is absent: {fields:?}");
+        assert_eq!(fields[0].label, first);
+    }
+
+    /// AC 1(c): a refused VALUE leaves the value absent, `charged()`
+    /// unchanged, and the field frozen.
+    #[test]
+    fn a_refused_value_is_absent_charges_nothing_and_freezes_the_field() {
+        let budget = field_entry_bytes("k") + value_entry_bytes("small") + 1;
+        let wide = "w".repeat(4096);
+        assert!(
+            budget < field_entry_bytes("k") + value_entry_bytes("small") + value_entry_bytes(&wide),
+            "budget must refuse the wide value"
+        );
+        let mut acc = FieldAccumulator::with_byte_budget(100, budget);
+        acc.observe_pair("k", "small", None);
+        let charged_before = acc.charged();
+        acc.observe_pair("k", &wide, None);
+        assert_eq!(acc.charged(), charged_before);
+        assert!(acc.fields["k"].frozen, "the refusal freezes the field");
+        let (fields, capped) = acc.finish();
+        assert!(capped);
+        assert_eq!(
+            fields[0].cardinality, 1,
+            "the refused value was never inserted"
+        );
+    }
+
+    /// AC 2: clamp, never reject — 500 distinct values across 50 fields
+    /// under a tiny budget still serve (under-reported cardinalities,
+    /// `retention_capped == true`, no error anywhere on the path).
+    #[test]
+    fn a_tiny_budget_clamps_and_serves_never_errors() {
+        let mut acc = FieldAccumulator::with_byte_budget(100, 4 * 1024);
+        for i in 0..500u32 {
+            acc.observe_pair(&format!("field{}", i % 50), &format!("v{i}"), None);
+        }
+        let (fields, capped) = acc.finish();
+        assert!(capped, "retention_capped must be set");
+        assert!(!fields.is_empty(), "the response still serves");
+        let total: u64 = fields.iter().map(|f| f.cardinality).sum();
+        assert!(
+            total < 500,
+            "cardinalities must under-report under the clamp, got {total}"
+        );
+    }
+
+    /// AC 3: a frozen field still re-detects its type (a DIFFERENT
+    /// `determine_type` outcome) and appends the OTHER parser name, while
+    /// `cardinality` stays unchanged.
+    #[test]
+    fn a_frozen_field_still_re_detects_type_and_appends_parsers() {
+        let budget = field_entry_bytes("k") + value_entry_bytes("42") + 1;
+        let mut acc = FieldAccumulator::with_byte_budget(100, budget);
+        acc.observe_pair("k", "42", Some("json"));
+        assert_eq!(acc.fields["k"].field_type, "int");
+        // Refused (freezes): a value with a different detected type and
+        // the other parser name.
+        acc.observe_pair("k", "hello-world-wide-value", Some("logfmt"));
+        assert!(acc.fields["k"].frozen);
+        let (fields, capped) = acc.finish();
+        assert!(capped);
+        assert_eq!(
+            fields[0].field_type, "string",
+            "type re-detected (last wins)"
+        );
+        assert_eq!(fields[0].parsers, vec!["json", "logfmt"], "parser appended");
+        assert_eq!(fields[0].cardinality, 1, "value set frozen");
+    }
+
+    /// AC 4: the field-NAME axis is charged before the clone —
+    /// `field_entry_bytes` strictly increases across >= 3 distinct name
+    /// lengths, and at 64 KiB names `admitted × field_entry_bytes(name)`
+    /// stays within the budget.
+    #[test]
+    fn field_name_bytes_are_charged_by_length() {
+        let short = "a";
+        let mid = "a".repeat(64);
+        let long = "a".repeat(65_536);
+        assert!(field_entry_bytes(short) < field_entry_bytes(&mid));
+        assert!(field_entry_bytes(&mid) < field_entry_bytes(&long));
+
+        let budget = 1024 * 1024;
+        let mut acc = FieldAccumulator::with_byte_budget(5000, budget);
+        for i in 0..512u32 {
+            let name = format!("{i:05}-{}", "n".repeat(65_536));
+            acc.observe_pair(&name, "v", None);
+        }
+        let (fields, capped) = acc.finish();
+        assert!(capped, "512 x 64 KiB names must breach 1 MiB");
+        let per_name = field_entry_bytes(&format!("{:05}-{}", 0, "n".repeat(65_536)));
+        assert!(
+            (fields.len() as u64) * per_name <= budget,
+            "admitted count {} x per-name charge {per_name} must fit the budget {budget}",
+            fields.len()
+        );
     }
 }

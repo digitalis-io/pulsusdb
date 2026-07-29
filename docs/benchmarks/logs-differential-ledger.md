@@ -169,6 +169,37 @@ Out of this ledger's scope by design:
 
 ## Entries
 
+### detected-cardinality-exact-not-estimated (issues #244, #261)
+
+- **Construct:** `/detected_fields`' per-field `cardinality` (and, when
+  issue #261 lands its sibling audit, `/detected_labels`' — cross-reference
+  #261). Informational note, not a gate downgrade.
+- **Direction:** **PulsusDB reports the EXACT distinct-value count** over
+  the sampled entries; the reference reports a **p14 HyperLogLog
+  estimate** (`grafana/loki` v3.7.4 =
+  `b318f2829f0ae2094ab3a1e90780450e9e4b03be`,
+  `pkg/querier/queryrange/detected_fields.go` `parsedFields.sketch`,
+  vendored `github.com/axiomhq/hyperloglog` `New()` = precision 14,
+  sparse). The estimate equals the exact count for every `N <= 5327`;
+  the first divergence is `N = 5328` (sparse-key collision
+  `"v2888"`/`"v5327"`), captured with the pre-committed larger points in
+  `crates/pulsus-read/tests/golden/detected_cardinality/reference_divergence.tsv`
+  and pinned by `detected_fields_witness.rs`'s AC 19 gate (our side is
+  recomputed through the production accumulator; the reference column is
+  the recorded estimate).
+- **Reachability:** per-field cardinality is bounded by the sampled
+  entries on BOTH stores (one value per key per entry; `line_limit`
+  <= 5000 on each side), so `N >= 5328` is unreachable through the HTTP
+  endpoint at default limits — every
+  `crates/pulsus-read/tests/logqltest/corpus/b14_detected_fields.test`
+  case is pure hard-gated parity, and the divergence is registered at the
+  estimator level.
+- **Fixture status:** `/detected_fields` has no case in
+  `test/fixtures/logs/differential.json`, so this entry is not referenced
+  from the fixture (`informational_cases_are_recorded_in_the_committed_ledger`
+  guards fixture-referenced entries only); it is registered here so the
+  divergence has a ledger identity before any future fixture case lands.
+
 ### tumbling-vs-sliding-rate — RESOLVED (issue #227)
 
 - **Status:** RESOLVED. The former tumbling divergence is fixed — RANGE
