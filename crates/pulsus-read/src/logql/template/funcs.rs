@@ -1980,7 +1980,11 @@ mod tests {
             b"\xE0\xA0",               // truncated 3-byte tail
             b"\xF0\x9F\x92",           // truncated 4-byte tail
             b"a\xF0\x28b",             // invalid continuation mid-stream
-            b"\xC0\xAF",               // overlong encoding
+            b"\xC0\xAF",               // overlong encoding (2-byte)
+            b"\xE0\x80\x80",           // overlong encoding (3-byte)
+            b"\xF0\x80\x80\x80",       // overlong encoding (4-byte)
+            b"\xF4\x90\x80\x80",       // above U+10FFFF (first out of range)
+            b"\xF5\x80\x80\x80",       // above U+10FFFF (lead byte 0xF5)
             b"\xED\xA0\x80",           // surrogate range
             b"x\xF0\x9F\x92\x96y\xFF", // valid 4-byte + trailing invalid
         ];
@@ -1989,6 +1993,18 @@ mod tests {
             let need = lossy_repaired_len(v);
             assert_eq!(need, expected.len(), "{v:X?}");
             assert_eq!(lossy_repaired(v, need), expected.as_ref(), "{v:X?}");
+        }
+        // Every lone continuation byte, bare and mid-stream: std
+        // distinguishes continuation bytes from lead bytes when it
+        // picks the maximal-subpart boundary, so a byte-equality claim
+        // must cover the whole 0x80..=0xBF range, not one exemplar.
+        for b in 0x80u8..=0xBF {
+            for v in [&[b][..], &[b'a', b, b'z'][..], &[b, b][..]] {
+                let expected = String::from_utf8_lossy(v);
+                let need = lossy_repaired_len(v);
+                assert_eq!(need, expected.len(), "{v:X?}");
+                assert_eq!(lossy_repaired(v, need), expected.as_ref(), "{v:X?}");
+            }
         }
     }
 }
