@@ -868,18 +868,15 @@ mod tests {
         }
     }
 
-    /// Issue #240 (R4, re-review): a `PipelineInvalid` poll failure
-    /// closes the socket through the REAL producer→writer path, and the
-    /// captured `CloseFrame` is the one the PRODUCTION wiring rendered
+    /// Drives a fatal `PipelineInvalid { reason }` through the REAL
+    /// producer→writer path (`run_tail`) and returns the close frame
+    /// the PRODUCTION wiring rendered and handed to the sender
     /// (`writer_loop`'s `close_reason.map(error_close_frame)` — the
-    /// fake sender only records what it was handed, so deleting that
-    /// map turns the close bare and this test red). The frame carries
-    /// the ERROR code and the BARE reason bytes unchanged (no fixed
-    /// prefix; a reason that itself begins `parse error ` appears
-    /// exactly once, and a short reason is never truncated).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn pipeline_invalid_closes_the_socket_with_the_bare_reason_through_the_renderer() {
-        let reason = "parse error : synthetic prefix-collision probe";
+    /// fake only records what it was handed). Deliberately NEVER calls
+    /// `error_close_frame`: every assertion made on the returned frame
+    /// pins the production render, not the helper (issue #240
+    /// re-review 2).
+    async fn production_close_frame(reason: &str) -> CloseFrame {
         let (_tx, rx) = watch::channel(false);
         let sender = FakeSender::new(SinkMode::Accept);
         let closed = Arc::clone(&sender.closed);
@@ -894,15 +891,91 @@ mod tests {
             .await
             .expect("a fatal poll error must terminate the connection")
             .expect("no panic");
-        let frame = closed
+        closed
             .lock()
             .unwrap()
             .clone()
             .expect("close was sent")
-            .expect("close carried a frame rendered by the production path");
+            .expect("close carried a frame rendered by the production path")
+    }
+
+    /// Issue #240 (R4, re-review): a `PipelineInvalid` poll failure
+    /// closes the socket through the REAL producer→writer path, and the
+    /// captured `CloseFrame` carries the ERROR code and the BARE reason
+    /// bytes unchanged (no fixed prefix; a reason that itself begins
+    /// `parse error ` appears exactly once, and a short reason is never
+    /// truncated). Deleting the `writer_loop` map turns the close bare
+    /// and reddens this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipeline_invalid_closes_the_socket_with_the_bare_reason_through_the_renderer() {
+        let reason = "parse error : synthetic prefix-collision probe";
+        let frame = production_close_frame(reason).await;
         assert_eq!(frame.code, close_code::ERROR);
         assert_eq!(frame.reason.as_str(), reason);
         assert_eq!(frame.reason.as_str().matches("parse error ").count(), 1);
+    }
+
+    /// Issue #240 (re-review 2): the 123-byte close-reason cap is
+    /// applied ON THE PRODUCTION PATH — a long reason driven through
+    /// `run_tail` reaches the socket already cut to exactly 123 bytes,
+    /// and an exactly-123-byte reason passes through byte-identical
+    /// (the cap is inclusive). This test never invokes
+    /// `error_close_frame`, so replacing the `writer_loop` map with an
+    /// inline untruncated frame — or moving the cap in either
+    /// direction — reddens it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_reason_through_run_tail_reaches_the_socket_truncated_at_123_bytes() {
+        let frame = production_close_frame(&"a".repeat(200)).await;
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), "a".repeat(123));
+        // Inclusive boundary: exactly 123 bytes is NOT cut.
+        let exact = "y".repeat(123);
+        let frame = production_close_frame(&exact).await;
+        assert_eq!(frame.reason.as_str(), exact);
+    }
+
+    /// Issue #240 (re-review 2): the char-boundary back-off is applied
+    /// on the production path — a reason whose 3-byte '€' straddles the
+    /// 123-byte cap reaches the socket cut at the 121-byte boundary, a
+    /// valid UTF-8 prefix, never a split code point. (Deleting the
+    /// boundary loop panics `String::truncate` inside `writer_loop`,
+    /// reddening this through the joined task.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multibyte_reason_through_run_tail_is_cut_on_a_char_boundary() {
+        let long = format!("{}€ tail beyond the close-frame cap", "x".repeat(121));
+        let frame = production_close_frame(&long).await;
+        assert_eq!(frame.code, close_code::ERROR);
+        assert_eq!(frame.reason.as_str(), "x".repeat(121));
+    }
+
+    /// Issue #240 (re-review 2, property enumeration): the frame's
+    /// PRESENCE cuts both ways — an error-free shutdown closes with a
+    /// BARE close (`None`: no code, no reason on the wire). Rendering a
+    /// frame unconditionally would tag every graceful close with the
+    /// ERROR code; this pins the `close_reason.map(..)` staying a map.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graceful_shutdown_closes_bare_with_no_frame() {
+        let (tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let closed = Arc::clone(&sender.closed);
+        let handle = tokio::spawn(run_tail(
+            FrameEveryPoll,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            test_cfg(),
+            rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("run_tail must return promptly on shutdown")
+            .expect("no panic");
+        let closed = closed.lock().unwrap().clone().expect("close was sent");
+        assert!(
+            closed.is_none(),
+            "a graceful close must carry no frame, got {closed:?}"
+        );
     }
 
     /// Issue #240 (R4): the production renderer's 123-byte close-reason
