@@ -42,9 +42,11 @@
 //! Omitting a class is a missing-field COMPILE error; a registry
 //! function absent from the [`Func`] partition fails the runtime
 //! domain bridge; a `Func` variant without a `spec()`/`name()` arm is
-//! a non-exhaustive-match COMPILE error, and one omitted from
-//! `Func::ALL` fails to compile too (the array length, then dead code
-//! under `-D warnings`). The gate then asserts
+//! a non-exhaustive-match COMPILE error; deleting an entry from
+//! `Func::ALL` fails any build (the declared array length), while
+//! ADDING a variant omitted from `ALL` is caught as `dead_code` only
+//! under `-D warnings` — CI-enforced, not plain-build-enforced. The
+//! gate then asserts
 //! `required == reached`, where `required` derives ONLY from the
 //! declarations and `reached` ONLY from runtime observation — two
 //! independently-sourced sets that can disagree in both directions: a
@@ -368,12 +370,21 @@ struct FnSpec {
     extra: Vec<ExtraShape>,
 }
 
-/// `DominanceOnly` reasons (measured, round 7).
-const R_EMPTY: &str = "all-empty inputs produce an empty/constant-size output, \
-     far below the 256 KiB ordering trigger";
-const R_SMALL: &str = "this branch's output is empty or capped below the \
-     256 KiB ordering trigger by construction (identity/truncation probe; \
-     its dominance run is the evidence it exists for)";
+/// `DominanceOnly` reasons. Round-7 review rule: a reason must state a
+/// limit of the BRANCH, never of the arguments the probe happens to
+/// pass — a branch whose output size is a free argument (a count, a
+/// tail length, an affix remainder) can cross the 256 KiB ordering
+/// trigger and MUST be probed at ≥ trigger size as `OrderingRequired`
+/// (`align*/truncate` and `trunc/negative-tail` were fitted to
+/// 200,000-byte probes and hid exactly that).
+const R_EMPTY: &str = "the shape is DEFINITIONALLY the all-zero-length-inputs probe: its \
+     output is empty/constant-size at the only arguments that make it \
+     this shape, far below the 256 KiB ordering trigger";
+const R_SMALL: &str = "this shape's output is pinned EMPTY by its defining argument \
+     RELATION (cutset covers every rune / the affix is the whole input / \
+     n == 0) at ANY input size — a branch limit, not a fitted probe \
+     magnitude; the same production's at-size charge ordering is covered \
+     by the function's other shapes";
 const R_CONST: &str = "constant-size decimal rendering of a timestamp, \
      orders of magnitude below the ordering trigger";
 /// Round 6, measured: why the invalid-PATTERN conversion cannot be
@@ -393,9 +404,18 @@ const R_INVALID_PATTERN: &str = "an invalid PATTERN's conversion allocates ~2x t
 ///   the runtime domain bridge with the set difference;
 /// - a variant without a [`Func::name`]/[`Func::spec`] arm fails to
 ///   COMPILE (exhaustive matches, no wildcard);
-/// - a variant omitted from [`Func::ALL`] fails to COMPILE (the
-///   declared array length, then never-constructed dead code under
-///   `-D warnings`) — both verified by mutation.
+/// - DELETING an entry from [`Func::ALL`] fails to COMPILE on any
+///   build: the declared `[Func; 67]` length no longer matches
+///   (E0308);
+/// - ADDING a variant (with `name()`/`spec()` arms) while omitting it
+///   from [`Func::ALL`] compiles under a plain `cargo build` — the
+///   declared array length is unchanged — and is caught only as
+///   `dead_code` (never-constructed variant), a hard error solely
+///   under `-D warnings`: CI-enforced (`.github/workflows/ci.yml` sets
+///   `RUSTFLAGS: "-D warnings"`, as does the clippy gate), NOT
+///   build-enforced.
+///
+/// Both legs verified by mutation (round 7).
 ///
 /// Case-colliding sprig names carry a `Sprig` suffix (`Trim`/`trim`,
 /// `Replace`/`replace`, `TrimPrefix`/`trimPrefix`,
@@ -662,21 +682,49 @@ impl Func {
                     args: vec![s("x"), big_str()],
                 }],
             },
-            // Affix strips: the whole input is the affix, so the output
-            // is empty — and stays empty in the derived variant (both
+            // Affix strips. Two matched-arm probes (round-7 audit): the
+            // whole-input affix pins the output EMPTY by its defining
+            // relation (and stays empty in the derived variant — both
             // arguments are invalidated identically, the affix still
-            // matches the whole input).
-            Func::TrimPrefix | Func::TrimSuffix | Func::TrimPrefixSprig | Func::TrimSuffixSprig => {
-                FnSpec {
-                    happy: or_d,
-                    empty: empty_do,
-                    extra: vec![ExtraShape {
+            // matches the whole input); but the matched arm's output is
+            // input − affix, a FREE size that probe pins to zero, so a
+            // small matching affix probes the same strip at ~1 MiB. Its
+            // derived variant reaches via the unmatched identity arm
+            // instead (the 0xFF-corrupted input no longer starts/ends
+            // with the valid-`x` affix) — still a ≥trigger retainable
+            // copy.
+            Func::TrimPrefix | Func::TrimSuffix => FnSpec {
+                happy: or_d,
+                empty: empty_do,
+                extra: vec![
+                    ExtraShape {
                         name: "affix-matches-whole",
                         decl: d(DominanceOnly(R_SMALL), Derived(DominanceOnly(R_SMALL))),
                         args: vec![big_str(), big_str()],
-                    }],
-                }
-            }
+                    },
+                    ExtraShape {
+                        name: "affix-strips-at-size",
+                        decl: or_d,
+                        args: vec![big_str(), s("xx")],
+                    },
+                ],
+            },
+            Func::TrimPrefixSprig | Func::TrimSuffixSprig => FnSpec {
+                happy: or_d,
+                empty: empty_do,
+                extra: vec![
+                    ExtraShape {
+                        name: "affix-matches-whole",
+                        decl: d(DominanceOnly(R_SMALL), Derived(DominanceOnly(R_SMALL))),
+                        args: vec![big_str(), big_str()],
+                    },
+                    ExtraShape {
+                        name: "affix-strips-at-size",
+                        decl: or_d,
+                        args: vec![s("xx"), big_str()],
+                    },
+                ],
+            },
             Func::Replace => FnSpec {
                 happy: or_d,
                 empty: empty_do,
@@ -841,10 +889,16 @@ impl Func {
                 happy: or_d,
                 empty: empty_do,
                 extra: vec![
+                    // The truncation arm's own charge+copy emits `count`
+                    // (left) / tail (right) bytes — a FREE argument, so
+                    // the probe must clear the 256 KiB ordering trigger
+                    // (round-7 finding: a 200,000-byte probe fitted this
+                    // shape into `DominanceOnly` while the branch can
+                    // emit up to the full input).
                     ExtraShape {
                         name: "truncate",
-                        decl: d(DominanceOnly(R_SMALL), Derived(DominanceOnly(R_SMALL))),
-                        args: vec![Value::int(200_000), big_str()],
+                        decl: or_d,
+                        args: vec![Value::int(500_000), big_str()],
                     },
                     ExtraShape {
                         name: "identity-count==len",
@@ -867,10 +921,15 @@ impl Func {
                         decl: or_d,
                         args: vec![Value::int(2 * BIG as i64), big_str()],
                     },
+                    // The negative-count tail is a FREE magnitude (the
+                    // shape pins only the sign): probe it above the
+                    // 256 KiB ordering trigger (round-7 finding — the
+                    // old 200,000-byte tail fitted it into
+                    // `DominanceOnly`).
                     ExtraShape {
                         name: "negative-tail",
-                        decl: d(DominanceOnly(R_SMALL), Derived(DominanceOnly(R_SMALL))),
-                        args: vec![Value::int(-200_000), big_str()],
+                        decl: or_d,
+                        args: vec![Value::int(-500_000), big_str()],
                     },
                     ExtraShape {
                         name: "zero",
@@ -1049,10 +1108,19 @@ fn every_registry_function_charge_dominates_its_allocations() {
         Func::ALL.iter().map(|f| f.name()).collect();
     let registry_names: std::collections::BTreeSet<&str> =
         REGISTRY.iter().map(|d| d.name).collect();
-    assert_eq!(
-        partition_names, registry_names,
+    let partition_only: Vec<&str> = partition_names
+        .difference(&registry_names)
+        .copied()
+        .collect();
+    let registry_only: Vec<&str> = registry_names
+        .difference(&partition_names)
+        .copied()
+        .collect();
+    assert!(
+        partition_only.is_empty() && registry_only.is_empty(),
         "the shape partition's function domain must match the registry exactly \
-         (add the Func variant + spec arm, or remove the stale one)"
+         (add the Func variant + spec arm, or remove the stale one) — \
+         partition-only: {partition_only:?}, registry-only: {registry_only:?}"
     );
 
     let mut failures = Vec::new();
