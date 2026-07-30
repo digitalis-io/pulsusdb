@@ -653,3 +653,105 @@ clients only display it).
   the fix is a validated-literal newtype through `logql::sql`'s
   builders (#286). The corpus runner's pushdown blind spot (**#278**)
   is why AC7's gates are Rust tests rather than corpus rows.
+
+## Issue #279 — LogQL query-text cap
+
+The 131,072-byte `MAX_QUERY_BYTES` cap (docs/api.md §2.3, the reference's
+`maxInputSize`) matches the reference exactly at the parse seam. Its one
+divergence is a transport-layer bound discovered while shipping it.
+
+### `get-request-target-uri-bound` (issue #279, informational note, not a gate downgrade)
+
+No fixture case references this entry — nothing is downgraded. It records
+a divergence at a public surface, found while implementing the cap.
+
+- **What diverges:** an over-cap LogQL query (131,072 bytes or more, the
+  400 `bad_data` row in docs/api.md §2.3) cannot reach PulsusDB through
+  ANY GET query string. Our HTTP stack bounds the whole request-target
+  at **65,534 bytes** — `http::Uri`'s hard maximum — under half the cap,
+  so the request is refused by the HTTP layer before routing and before
+  any PulsusDB code runs. The bound is on the request-target as a whole
+  (path + `?query=` + the percent-encoded value, where `{` `"` `}` `[`
+  `]` each cost 3 bytes), so the longest query text a GET can actually
+  carry is somewhat under 65,534 and depends on the route and the query's
+  own punctuation. The same bound also blocks legitimate **sub-cap**
+  queries: everything from roughly 65.5 KB up to the 131,071-byte longest
+  accepted query is unreachable by GET too, even though the parse seam
+  would accept it.
+- **PulsusDB behaviour, measured 2026-07-30, two surfaces of the one
+  limit:**
+  - *In process* (the `tower::ServiceExt::oneshot` harness the
+    `logs_api` tests use): `"…".parse::<http::Uri>()` succeeds at 65,534
+    bytes and fails at 65,535 with **`InvalidUri(TooLong)`**; a
+    request-target carrying a 131,072-byte query is 131,097 bytes and
+    fails the same way. This is why #279's AC5 `/index/stats` GET leg
+    pins alias/native identity on a short query and pins the over-cap
+    rejection of that same handler directly in `stats.rs`.
+  - *Over a real socket* (`axum::serve` + default hyper h1 — the exact
+    configuration `crates/pulsus-server/src/serve.rs:225,237` runs in
+    production): a 65,534-byte request-target reaches the handler
+    (`200`); at 65,535 bytes hyper answers **`HTTP/1.1 414 URI Too
+    Long`** with `content-length: 0` and `connection: close`, before
+    routing. 100,000- and 131,097-byte targets: the same 414.
+- **Reference behaviour (probed 2026-07-30, `grafana/loki:3.7.4`
+  @ `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+  fresh container, `GET /loki/api/v1/query?query=…`):** a 100,000-byte
+  query (curl `size_request` 100,120 bytes — request line plus headers,
+  so a request-target well past 100,000) → **200** `application/json`,
+  empty vector; a 131,071-byte query (`size_request` 131,191) → **200**
+  likewise; a 131,072-byte query → **400** `text/plain; charset=utf-8`,
+  `Content-Length: 51`, body `parse error : input size too long
+  (131072 > 131072)`. So the reference serves GET request-targets far
+  above our 65,534-byte ceiling, and applies its own cap at the same
+  131,072 boundary we do — the downstream half is established, not
+  assumed.
+- **Exact accepted delta:** for a GET whose request-target exceeds
+  65,534 bytes PulsusDB answers **414 with an empty body** where the
+  reference answers **200** (sub-cap query) or its **400 `parse error :
+  …`** (at or over the cap). Status, response container (no JSON error
+  envelope at all) and — for sub-cap queries — the accept/reject
+  decision all differ. At or below a 65,534-byte request-target the two
+  agree; and the cap boundary itself (131,071 accepted / 131,072
+  rejected `400` with the same reason text, `input size too long
+  (131072 > 131072)` — the JSON-vs-`text/plain` container divergence is
+  the separate #264) agrees whenever the query arrives by POST instead.
+- **Why this is a divergence and not a defect we chose:** the limit is
+  imposed by our HTTP stack (`http::Uri` stores its length in a `u16`),
+  not by any PulsusDB decision, and it is not reachable through
+  configuration; it surfaces a different error — a bare 414 from the
+  transport — than the reference produces for the same request. Nothing
+  in the cap's own design or in the routing layer sets it, and no
+  PulsusDB code observes the request.
+- **What actually carries an over-cap query in production:** the POST
+  form surfaces — `/query`, `/query_range`, `/series` (per `match[]`
+  value), `/detected_labels`, `/detected_fields`, and their
+  `/loki/api/v1` aliases, all `GET|POST` form-encoded. Those are where
+  `MAX_QUERY_BYTES` and its `400 bad_data` `input size too long (…)`
+  envelope are genuinely exercised (byte-identically on native and alias
+  routes, `logs_api/mod.rs`). **Correction to an earlier reading:
+  `/tail` is NOT such a carrier** — `/api/logs/v1/tail` is a GET
+  WebSocket upgrade (`logs_api/mod.rs:100,119`), so on the wire it sits
+  under the same 65,534-byte ceiling; its cap enforcement is pinned at
+  the params seam (`parse_tail_params`, `tail.rs`), not over a socket.
+  The other GET-only routes — `/stats`, `/volume`, `/patterns`,
+  `/label/{name}/values` and the `/index/*` aliases — likewise cannot
+  receive a long query by any transport. On three of those the reference
+  does mount POST (probed at v3.7.4: `POST /loki/api/v1/index/stats`,
+  `/index/volume`, `/patterns` all `200`), a pre-existing and already
+  documented method-matrix deviation (docs/api.md §2.6.1) that this
+  entry only notes as the reason those routes have no long-query carrier
+  at all.
+- **Re-derivation (both halves, no fixture needed):**
+  - *Ours:* parse `http::Uri` at 65,534 / 65,535 bytes; and serve any
+    `axum::Router` with `axum::serve` on `127.0.0.1:0`, then write a raw
+    `GET <target> HTTP/1.1\r\nHost: …\r\nConnection: close\r\n\r\n` with
+    an all-unreserved-character target of 65,534 and 65,535 bytes and
+    read the response. (Use unreserved characters: an unencoded `{` in
+    the target is an invalid request-target and yields hyper's generic
+    empty `400` at any length, which is a different rejection.)
+  - *Reference:* `podman run --rm -d -p 127.0.0.1:3199:3100
+    grafana/loki:3.7.4`, wait for `/ready`, then
+    `curl -sS -G --data-urlencode "query@<file>"
+    http://127.0.0.1:3199/loki/api/v1/query` with files holding
+    `count_over_time({app="a…"}[5m])` at exactly 100,000 / 131,071 /
+    131,072 bytes.

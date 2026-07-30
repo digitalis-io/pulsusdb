@@ -136,6 +136,21 @@ match; message prose need not). The JSON-vs-`text/plain` response-container
 divergence is tracked in #264; the WebSocket close frame truncates reasons
 at 123 bytes; the LogQL corpus runner's pushdown blind spot is #278.
 
+**Transport bound on the query-text cap (#279).** The 131,072-byte row
+above is reachable only where the query arrives in a **POST form body**
+(`/query`, `/query_range`, `/series`, `/detected_labels`,
+`/detected_fields` and their aliases). Our HTTP stack caps the whole
+request-target at **65,534 bytes** (`http::Uri`), so on any GET a
+request-target past that is answered `414 URI Too Long` with an empty
+body by hyper, before routing — never the `400 bad_data` envelope above.
+That ceiling is below the cap, so it also blocks legitimate sub-cap
+queries above roughly 65.5 KB, and it applies to the GET-only routes
+(`/tail`, `/stats`, `/volume`, `/patterns`, `/label/{name}/values`,
+`/index/*`) as a whole. The reference serves such GETs; measured
+divergence and re-derivation in
+docs/benchmarks/logs-differential-ledger.md
+(`get-request-target-uri-bound`).
+
 ### 2.4 `GET /api/logs/v1/tail` (WebSocket)
 
 | Param | Notes |

@@ -216,6 +216,12 @@ mod tests {
     /// and the over-cap rejection of that same handler is pinned directly
     /// in `stats.rs`'s
     /// `stats_rejects_an_over_cap_query_400_before_the_pool_check`.
+    ///
+    /// That GET ceiling is a divergence at a public surface (the
+    /// reference serves such GETs) and is recorded as
+    /// `get-request-target-uri-bound` in
+    /// docs/benchmarks/logs-differential-ledger.md — over a socket it
+    /// surfaces as hyper's `414 URI Too Long`, before routing.
     #[tokio::test]
     async fn alias_surfaces_reject_an_over_cap_query_identically_to_native() {
         // Pure prefix swap, genuine over-cap payload via POST.
