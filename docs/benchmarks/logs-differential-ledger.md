@@ -722,13 +722,30 @@ a divergence at a public surface, found while implementing the cap.
   transport — than the reference produces for the same request. Nothing
   in the cap's own design or in the routing layer sets it, and no
   PulsusDB code observes the request.
-- **What actually carries an over-cap query in production:** the POST
-  form surfaces — `/query`, `/query_range`, `/series` (per `match[]`
-  value), `/detected_labels`, `/detected_fields`, and their
-  `/loki/api/v1` aliases, all `GET|POST` form-encoded. Those are where
-  `MAX_QUERY_BYTES` and its `400 bad_data` `input size too long (…)`
-  envelope are genuinely exercised (byte-identically on native and alias
-  routes, `logs_api/mod.rs`). **Correction to an earlier reading:
+- **What actually carries an over-cap query in production:** exactly five
+  routes — those that both take a query parameter and accept a POST form
+  body: `/query`, `/query_range`, `/series` (per `match[]` value),
+  `/detected_labels`, `/detected_fields`. Each is mounted on **both** the
+  native `/api/logs/v1` and the `/loki/api/v1` alias prefix, so ten paths
+  in total. Those are where `MAX_QUERY_BYTES` and its `400 bad_data`
+  `input size too long (…)` envelope are genuinely exercised
+  (byte-identically on native and alias routes, `logs_api/mod.rs`).
+  **The carrier set is not "the `GET|POST` form routes"** — that phrase is
+  false in the other direction, and a reader deriving the list from it
+  gets six. There are six `GET|POST` form routes per prefix, four in
+  `mount_log_query_routes` (`/query_range` `:55`, `/query` `:59`,
+  `/labels` `:63`, `/series` `:71`) and two in `mount_detected_routes`
+  (`/detected_labels` `:85`, `/detected_fields` `:89`), both helpers
+  called for each prefix (`mod.rs:99,104` native; `:114,126` alias).
+  **`/labels` is `GET|POST` and is NOT a carrier:** `labels_impl`
+  (`handlers.rs:272`) consumes only `parse_bounds` — `start` and `end`.
+  It never reads a `query` parameter, never builds a selector and so
+  never reaches the cap seam; `pulsus_logql::parse`/`parse_selector`
+  occur at `handlers.rs:122` (`/query_range`), `:190` (`/query`), `:365`
+  (`/series`) and `detected.rs:88`, `:153` — the five carriers and nothing
+  else. A query of any length cannot arrive at `/labels`, so listing it
+  would assert a reachability that does not exist.
+  **Correction to an earlier reading:
   `/tail` is NOT such a carrier** — `/api/logs/v1/tail` is a GET
   WebSocket upgrade (`logs_api/mod.rs:100,119`), so on the wire it sits
   under the same 65,534-byte ceiling; its cap enforcement is pinned at
