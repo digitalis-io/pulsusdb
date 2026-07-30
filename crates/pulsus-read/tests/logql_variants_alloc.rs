@@ -124,7 +124,6 @@
 //! | F-f | ClientAggState::finish absent vs non-absent | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 vs Phi4/Phi5 |
 //! | F-g | absent: the finish-time absent_labels clone (1 + 2k) | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (k = 2 gives 5) |
 //! | F-h | absent instant: present empty vec![sample] vs empty Vector | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (empty-present arm; no rows) |
-//! | F-i | absent RANGE arm of ClientAggState::finish (bucket_grid) | ClientAggState::finish | exec.rs ClientAggState::finish | UNREACH | Instant states are built only for instant windows; a routing change breaks Phi1/Phi3's RangeSlideState-derived constants |
 //! | F-j | non-absent fan_out label_groups vs fp_groups collects | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi5 / Phi4 (0 each: empty maps reserve nothing) |
 //! | F-k | non-absent instant emit | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi4/Phi5 (0) |
 //! | F-l | RangeSlideState finish prologue (flush early-return, cur None) | RangeSlideState::finish, RangeSlideState::finish_in_place, RangeSlideState::flush_collision | exec.rs RangeSlideState::finish_in_place | NIL | Phi1-Phi3 |
@@ -137,8 +136,10 @@
 //! | F-s | per-variant charge release (integer arithmetic) | VariantsAggState::finish_in_place | exec.rs VariantsAggState::finish_in_place | NIL | finish asserts charged == base |
 //! | F-t | the forwarding loop hands each sub-state the SAME slice | VariantsAggState::push_rows | exec.rs VariantsAggState::push_rows | NIL | Phi1-Phi7; row-bearing work is F-d's NOT-EXEC |
 //! | F-u | VariantsAggState::finish delegation + post-condition | VariantsAggState::finish | exec.rs VariantsAggState::finish | NIL | Phi1-Phi7 |
-//! | F-v | non-absent RANGE emit arm of ClientAggState::finish | ClientAggState::finish | exec.rs ClientAggState::finish | UNREACH | same routing citation as F-i |
 //! | F-w | apply_vector_aggs for an aggregation-bearing variant | VariantsAggState::finish_in_place | exec.rs apply_vector_aggs | R4 (iii) | input bounded by AggCaps::divided(n).series; G2/G3 slopes |
+//! | F-z | instant sub-state narrowing refusal (issue #236 Part D) | VariantsAggState::new | exec.rs VariantsAggState::new as_instant/ok_or_else | UNREACH | a stepped window routes to the Range arm above, and the witness cannot be minted from one |
+//! | F-y | one mutating group's cell drain (expanded / delta / sample sweep) | RangeSlideState::drain_group | exec.rs RangeSlideState::drain_group | NOT-EXEC | rows.is_empty() => no mutating group exists => never called (F-d's premise) |
+//! | F-x | issue #236 Part B fold containers (dense slots, live map) | RangeSlideState::finish_in_place | exec.rs RangeSlideState::emit + VectorAggFold | NOT-EXEC | run_variants never calls attach_fold; fold is None here |
 //!
 //! # G4 — what this gate does NOT catch (eight gaps)
 //!
@@ -1288,7 +1289,7 @@ fn parse_source(name: &str) -> syn::File {
 fn zz_print_frame_censuses() {
     let exec = parse_source("exec.rs");
     let plan_f = parse_source("plan.rs");
-    let frames: [(&str, Option<&str>, &str); 26] = [
+    let frames: [(&str, Option<&str>, &str); 27] = [
         ("plan.rs", None, "build_variants_node"),
         ("plan.rs", None, "unwrap_vector_aggs_into"),
         ("plan.rs", None, "parse_vector_agg_params"),
@@ -1312,6 +1313,7 @@ fn zz_print_frame_censuses() {
         ("exec.rs", Some("RangeSlideState"), "push_rows"),
         ("exec.rs", Some("RangeSlideState"), "finish"),
         ("exec.rs", Some("RangeSlideState"), "finish_in_place"),
+        ("exec.rs", Some("RangeSlideState"), "drain_group"),
         ("exec.rs", Some("RangeSlideState"), "finish_absent"),
         ("exec.rs", Some("RangeSlideState"), "flush_collision"),
         ("exec.rs", Some("FpSlide"), "finish"),
@@ -1336,7 +1338,7 @@ fn zz_print_frame_censuses() {
     }
 }
 
-/// The 26 per-variant frames (`W-MEM`): one entry per FUNCTION. The 12
+/// The 27 per-variant frames (`W-MEM`): one entry per FUNCTION. The 12
 /// frames this issue creates are pinned from the implementation-commit
 /// census; the 14 pre-existing frames reproduce the plan's pinned
 /// censuses except where the plan itself edits the body (deviations
@@ -1344,7 +1346,7 @@ fn zz_print_frame_censuses() {
 /// (M1's `.clone` → `.cloned` plus `format_args!`) and
 /// `RangeSlideState::new` (the `vec![0; …]` macro body does not parse as
 /// an expression list, so the token fallback records `max?`).
-static PER_VARIANT_FRAMES: [Frame; 26] = [
+static PER_VARIANT_FRAMES: [Frame; 27] = [
     // --- W_plan (4) ---
     Frame {
         file: "plan.rs",
@@ -1453,8 +1455,16 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("VariantsAggState"),
         anchor: "new",
-        branches: 11,
+        // Issue #236 Part D: the instant sub-state arm narrows the
+        // window to an `InstantWindow` witness before constructing
+        // (`.as_instant` + the `.ok_or_else` refusal), 11 -> 12
+        // branches. Regenerated with `zz_print_frame_censuses`. W-MEM
+        // disposition: **NIL** — a `match` on a `Copy` enum and an
+        // `Option`; the `.to_string` is inside the refusal arm, which
+        // is unreachable (a stepped window routes to `Range` above).
+        branches: 12,
         callees: &[
+            ".as_instant",
             ".as_u64",
             ".charged_bytes",
             ".client",
@@ -1465,8 +1475,10 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             ".len",
             ".map_err",
             ".max",
+            ".ok_or_else",
             ".push",
             ".rate_window_ns",
+            ".to_string",
             ".window",
             "Instant",
             "Ok",
@@ -1545,17 +1557,17 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("ClientAggState"),
         anchor: "new",
-        branches: 3,
+        // Issue #236 Part D: the stepped-grid guard is deleted with the
+        // `InstantWindow` parameter — a stepped window can no longer
+        // reach this constructor, so the branch it defended is gone
+        // (3 -> 1 branches). Regenerated with `zz_print_frame_censuses`.
+        // W-MEM disposition: **unchanged** — row C-e still prices the
+        // `base_labels` snapshot, which is the only allocation here.
+        branches: 1,
         callees: &[
-            ".as_u64",
-            ".end_ns",
             ".insert",
-            ".map",
             ".metric_mutates_labels",
-            ".start_ns",
-            ".step_ns",
             "Ok",
-            "ensure_grid_resolution",
             "new",
             "series_labels",
         ],
@@ -1610,7 +1622,25 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("VariantsAggState"),
         anchor: "finish_in_place",
-        branches: 16,
+        // Issue #236 (§10.5, predicted): the per-variant
+        // `ensure_result_series(&out)?` adds one `syn::ExprTry` branch
+        // (16 → 17) and one callee. Regenerated with
+        // `zz_print_frame_censuses`, not hand-edited. W-MEM inventory
+        // disposition: **NIL** — the call takes `&QueryResult`, reads a
+        // `Vec::len`, and allocates nothing on either arm (the error arm
+        // constructs a fixed-size `TooBroadReason`), so it adds no
+        // per-variant allocation for the G-gates to bound.
+        //
+        // Issue #236 §4: `apply_vector_aggs` is fallible now (it charges
+        // the stage's modelled bytes before allocating), so the
+        // per-variant call gains a second `syn::ExprTry` branch
+        // (17 -> 18). The callee set is unchanged. Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — the
+        // charge is integer arithmetic over an already-materialised
+        // `StageInput` and the refusal arm builds one fixed-size
+        // `TooBroadReason`, so the per-variant allocation count does not
+        // move.
+        branches: 18,
         callees: &[
             ".any",
             ".client",
@@ -1636,6 +1666,7 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             "append_variant_label",
             "apply_vector_aggs",
             "discharge_fanout_bytes",
+            "ensure_result_series",
             "matches!",
             "take",
             "with_capacity",
@@ -1672,14 +1703,16 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("ClientAggState"),
         anchor: "push_rows",
-        // 21st branch: issue #230's `?` on the now-fallible
-        // `run_metric_into` (template render-budget breach → the
-        // bounded 422). Row-path only — covered by F-d's NOT-EXEC
-        // disposition (rows.is_empty() in every W_fin window).
+        // Issue #236 Part D: the per-group `BTreeMap` collapses to one
+        // `BucketAcc`, so the bucket-entry match moves inside each
+        // grouping arm and `bucket_of`/`INSTANT_BUCKET` leave the frame;
+        // `present` becomes a flag, so `.insert` on the bucket set goes
+        // too. Regenerated with `zz_print_frame_censuses`. W-MEM
+        // disposition: **NIL**, unchanged (row F-b) — the fold's
+        // per-row work is the same minus one map lookup.
         branches: 21,
         callees: &[
             ".add",
-            ".as_u64",
             ".collect",
             ".contains_key",
             ".entry",
@@ -1691,15 +1724,12 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             ".key",
             ".len",
             ".map",
-            ".or_default",
             ".run_metric_into",
             ".sort_unstable",
-            ".step_ns",
             ".to_string",
             "Err",
             "Ok",
             "QueryTooBroad",
-            "bucket_of",
             "charge_group_bytes",
             "check_surviving_error",
             "group_entry_bytes",
@@ -1712,28 +1742,25 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("ClientAggState"),
         anchor: "finish",
-        branches: 7,
+        // Issue #236 Part D: the state is instant-only by construction,
+        // so the two stepped arms — the `bucket_grid` absence walk and
+        // the per-bucket `Matrix` emit — are DELETED, not merely unused
+        // (10 -> 5 branches, `bucket_grid`/`Matrix`/`MatrixSeries`/
+        // `INSTANT_BUCKET` leave the frame). Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: rows F-i and
+        // F-v classified exactly those two arms as UNREACH and are
+        // deleted with them.
+        branches: 5,
         callees: &[
-            ".as_u64",
             ".clone",
             ".collect",
-            ".contains",
-            ".end_ns",
-            ".filter",
             ".filter_map",
             ".finish",
             ".get",
             ".into_iter",
-            ".is_empty",
-            ".is_none",
             ".map",
-            ".remove",
-            ".start_ns",
-            ".step_ns",
-            ".unwrap_or",
-            "Matrix",
+            "Some",
             "Vector",
-            "bucket_grid",
             "debug_assert_eq!",
             "discharge_group_bytes",
             "group_entry_bytes",
@@ -1775,47 +1802,94 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish_in_place",
+        // Issue #236 P2 / Part B / Part C history above; the result-point
+        // charge (issue #236 §4) made `finish_absent` fallible, so the
+        // absent arm gains a `?` (10 -> 11 branches). Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — a
+        // propagated `Result`, no allocation.
         branches: 11,
         callees: &[
+            ".as_mut",
+            ".cmp",
             ".collect",
+            ".drain_group",
+            ".emit",
             ".finish",
             ".finish_absent",
             ".flush_collision",
             ".into_iter",
             ".is_empty",
-            ".iter",
-            ".len",
-            ".map",
             ".push",
+            ".push_series",
+            ".rotate_slider",
             ".sort_by",
-            ".sort_by_key",
-            ".sum",
             ".take",
             "Matrix",
             "Ok",
-            "clamp_bucket",
             "discharge_group_bytes",
-            "discharge_retention",
             "drop",
-            "grid_point",
             "group_entry_bytes",
-            "matches!",
             "new",
-            "reduce_int_cell",
-            "reduce_window",
             "take",
         ],
     },
     Frame {
         file: "exec.rs",
         ty: Some("RangeSlideState"),
+        anchor: "drain_group",
+        // NEW with issue #236 Part C: one mutating group's cells drained
+        // into grid points. Three arms — the class-A expanded map (kept
+        // verbatim), the class-A difference array (C1) and the class-B/C
+        // retained-sample sweep (C2). W-MEM disposition: **BAND** (row
+        // F-y) — the measured windows push an EMPTY row slice, so no
+        // mutating group is ever created and this body never runs, the
+        // same premise F-d rests on. What it WOULD allocate is the
+        // drained `Vec` and, on the C2 arm, the merged
+        // covering-interval `Vec`, both bounded by the retention ALREADY
+        // charged for the cells being drained.
+        branches: 14,
+        callees: &[
+            ".checked_sub",
+            ".collect",
+            ".covering_k",
+            ".get",
+            ".grid_point",
+            ".into_iter",
+            ".last_mut",
+            ".len",
+            ".map_or",
+            ".max",
+            ".min",
+            ".push",
+            ".sort_by",
+            ".sort_by_key",
+            ".unwrap_or",
+            "discharge_retention",
+            "new",
+            "reduce_int_cell",
+            "reduce_window",
+            "try_from",
+        ],
+    },
+    Frame {
+        file: "exec.rs",
+        ty: Some("RangeSlideState"),
         anchor: "finish_absent",
-        branches: 3,
+        // Issue #236 Part B made this return `Vec<MatrixSeries>`; the
+        // §4 result-point charge made it fallible and added the
+        // reservation for the one series it may emit (3 -> 4 branches).
+        // Regenerated with `zz_print_frame_censuses`. W-MEM disposition:
+        // **BAND**, unchanged — row F-m already prices the points vector
+        // and the one-element `vec![series]`; the charge is integer
+        // arithmetic ahead of them.
+        branches: 4,
         callees: &[
             ".grid_point",
             ".is_empty",
             ".push",
-            "Matrix",
+            "Ok",
+            "charge_result_points",
+            "grid_slot_count",
             "new",
             "take",
             "vec!",
@@ -1825,7 +1899,14 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("RangeSlideState"),
         anchor: "flush_collision",
-        branches: 12,
+        // Issue #236: Part A deleted the `series_count > caps.series`
+        // rejection, P2 put a `charge_group_bytes` in its place, and the
+        // §4 result-point charge reserves one grid width per slider
+        // beside it (12 -> 13 branches). Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** —
+        // integer arithmetic on the same once-per-fingerprint path the
+        // deleted check occupied; it allocates nothing.
+        branches: 13,
         callees: &[
             ".as_bytes",
             ".as_mut",
@@ -1837,21 +1918,22 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             ".enumerate",
             ".expect",
             ".fan_out_sample",
-            ".finish",
             ".get",
             ".into_iter",
             ".is_empty",
             ".is_none",
             ".load_group",
-            ".push",
+            ".rotate_slider",
             ".sort_by",
             ".take",
             ".unwrap_or",
             ".unwrap_or_default",
-            "Err",
             "Ok",
-            "QueryTooBroad",
             "Some",
+            "charge_group_bytes",
+            "charge_result_points",
+            "grid_slot_count",
+            "group_entry_bytes",
             "new",
             "take",
         ],
@@ -1876,7 +1958,7 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
 /// W_ctor + 23 W_fin = 46 rows, each with exactly ONE disposition. The
 /// module-doc tables are a RENDERING of this const (assertion 7), never
 /// the source.
-static INVENTORY: [Row; 46] = [
+static INVENTORY: [Row; 47] = [
     // --- W_plan (11) ---
     Row {
         id: "P-a",
@@ -2174,15 +2256,6 @@ static INVENTORY: [Row; 46] = [
         covered_by: "Phi6/Phi7 (empty-present arm; no rows)",
     },
     Row {
-        id: "F-i",
-        window: Win::Fin,
-        what: "absent RANGE arm of ClientAggState::finish (bucket_grid)",
-        frames: &["ClientAggState::finish"],
-        site: "exec.rs ClientAggState::finish",
-        disp: Disp::Unreach,
-        covered_by: "Instant states are built only for instant windows; a routing change breaks Phi1/Phi3's RangeSlideState-derived constants",
-    },
-    Row {
         id: "F-j",
         window: Win::Fin,
         what: "non-absent fan_out label_groups vs fp_groups collects",
@@ -2301,15 +2374,6 @@ static INVENTORY: [Row; 46] = [
         covered_by: "Phi1-Phi7",
     },
     Row {
-        id: "F-v",
-        window: Win::Fin,
-        what: "non-absent RANGE emit arm of ClientAggState::finish",
-        frames: &["ClientAggState::finish"],
-        site: "exec.rs ClientAggState::finish",
-        disp: Disp::Unreach,
-        covered_by: "same routing citation as F-i",
-    },
-    Row {
         id: "F-w",
         window: Win::Fin,
         what: "apply_vector_aggs for an aggregation-bearing variant",
@@ -2318,10 +2382,37 @@ static INVENTORY: [Row; 46] = [
         disp: Disp::R4(3),
         covered_by: "input bounded by AggCaps::divided(n).series; G2/G3 slopes",
     },
+    Row {
+        id: "F-z",
+        window: Win::Fin,
+        what: "instant sub-state narrowing refusal (issue #236 Part D)",
+        frames: &["VariantsAggState::new"],
+        site: "exec.rs VariantsAggState::new as_instant/ok_or_else",
+        disp: Disp::Unreach,
+        covered_by: "a stepped window routes to the Range arm above, and the witness cannot be minted from one",
+    },
+    Row {
+        id: "F-y",
+        window: Win::Fin,
+        what: "one mutating group's cell drain (expanded / delta / sample sweep)",
+        frames: &["RangeSlideState::drain_group"],
+        site: "exec.rs RangeSlideState::drain_group",
+        disp: Disp::NotExec,
+        covered_by: "rows.is_empty() => no mutating group exists => never called (F-d's premise)",
+    },
+    Row {
+        id: "F-x",
+        window: Win::Fin,
+        what: "issue #236 Part B fold containers (dense slots, live map)",
+        frames: &["RangeSlideState::finish_in_place"],
+        site: "exec.rs RangeSlideState::emit + VectorAggFold",
+        disp: Disp::NotExec,
+        covered_by: "run_variants never calls attach_fold; fold is None here",
+    },
 ];
 
 /// The 15 delegating boundary callees (see [`Boundary`]).
-static BOUNDARY_CALLEES: [Boundary; 15] = [
+static BOUNDARY_CALLEES: [Boundary; 13] = [
     Boundary {
         callee: ".run_metric_into",
         rows: &["F-d"],
@@ -2334,11 +2425,6 @@ static BOUNDARY_CALLEES: [Boundary; 15] = [
     },
     Boundary {
         callee: ".stage_member",
-        rows: &["F-d"],
-        disp: Disp::NotExec,
-    },
-    Boundary {
-        callee: "bucket_of",
         rows: &["F-d"],
         disp: Disp::NotExec,
     },
@@ -2369,13 +2455,8 @@ static BOUNDARY_CALLEES: [Boundary; 15] = [
     },
     Boundary {
         callee: ".covering_k",
-        rows: &["F-d"],
+        rows: &["F-d", "F-y"],
         disp: Disp::NotExec,
-    },
-    Boundary {
-        callee: "bucket_grid",
-        rows: &["F-i"],
-        disp: Disp::Unreach,
     },
     Boundary {
         callee: "series_labels",
@@ -2444,7 +2525,7 @@ fn g4_frame_census_and_inventory_closure() {
     let exec = parse_source("exec.rs");
     let plan_src = parse_source("plan.rs");
     // (1) 26 unique frames, each resolving to exactly one item.
-    assert_eq!(PER_VARIANT_FRAMES.len(), 26);
+    assert_eq!(PER_VARIANT_FRAMES.len(), 27);
     let mut keys = BTreeSet::new();
     for f in &PER_VARIANT_FRAMES {
         assert!(
@@ -2476,11 +2557,11 @@ fn g4_frame_census_and_inventory_closure() {
         );
     }
     // (3) inventory size and per-window counts; unique ids.
-    assert_eq!(INVENTORY.len(), 46);
+    assert_eq!(INVENTORY.len(), 47);
     let count = |w: Win| INVENTORY.iter().filter(|r| r.window == w).count();
     assert_eq!(
         (count(Win::Plan), count(Win::Ctor), count(Win::Fin)),
-        (11, 12, 23)
+        (11, 12, 24)
     );
     let mut ids = BTreeSet::new();
     for r in &INVENTORY {
@@ -2525,7 +2606,7 @@ fn g4_frame_census_and_inventory_closure() {
     // ≥1 pinned callee set; its rows exist with the SAME disposition;
     // and every frame whose pinned set contains the name is listed in
     // one of those rows' frames.
-    assert_eq!(BOUNDARY_CALLEES.len(), 15);
+    assert_eq!(BOUNDARY_CALLEES.len(), 13);
     for b in &BOUNDARY_CALLEES {
         let carriers: Vec<String> = PER_VARIANT_FRAMES
             .iter()

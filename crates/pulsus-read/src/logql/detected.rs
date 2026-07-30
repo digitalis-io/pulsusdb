@@ -120,8 +120,12 @@ pub(super) fn determine_type(value: &str) -> &'static str {
 /// (issue #244). A count cap is not a byte bound (#227), so this is
 /// denominated in bytes and charged BEFORE each retaining allocation with
 /// the SAME model as `super::exec::{alloc_block_bytes, grown_alloc_bytes,
-/// map_entry_bytes}`. 64 MiB matches `super::exec::MAX_CLIENT_AGG_GROUP_BYTES`,
-/// the house per-query retained-state ceiling.
+/// map_entry_bytes}`. 64 MiB was the house per-query retained-state
+/// ceiling when #244 chose it; issue #236 later raised
+/// `super::exec::MAX_CLIENT_AGG_GROUP_BYTES` to 256 MiB for a reason
+/// specific to the aggregation GROUP axis, which does not apply here, so
+/// this stays an independent 64 MiB (a literal, never a derived link —
+/// the same treatment `super::template::MAX_TEMPLATE_RENDER_BYTES` got).
 pub const MAX_DETECTED_FIELD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Check-then-add, clamp-never-error. A REFUSED charge does not mutate

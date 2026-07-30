@@ -29,7 +29,7 @@
 //!
 //! Evaluation drives the SAME pure functions the engine executes — for a
 //! log query `CompiledPipeline::run` per loaded line; for a metric query
-//! `plan()` → `run_client_agg_rows`/`apply_vector_aggs`/`combine_binary`
+//! `plan()` → `run_client_agg_rows_folded`/`apply_vector_aggs`/`combine_binary`
 //! at `QuerySpec::Instant` — and compares with EXACT-f64 equality
 //! (`f64::to_bits`, no tolerance — the #218 discipline). No ClickHouse.
 //!
@@ -46,7 +46,8 @@ use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, DetectedFieldOut, DetectedFieldsProbe, Direction, MatrixSeries,
     MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, apply_vector_aggs,
-    combine_binary, materialize_vector_lit, plan, run_client_agg_rows, run_variants_rows,
+    combine_binary, ensure_result_series, materialize_vector_lit, plan, run_client_agg_rows_folded,
+    run_variants_rows,
 };
 
 /// A sorted label set.
@@ -946,6 +947,13 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
                     return Err("a metric expression planned to a streams query".to_string());
                 }
             };
+            // Issue #236: the SAME final-result series gate the engine
+            // applies on its `Plan::Metric`/`Plan::MetricBinary` arms, so
+            // corpus `eval_fail` cases can pin the reference's verbatim
+            // `maximum number of series (500) …` body. Applied here and
+            // never inside `eval_leaf`/`eval_node`, mirroring the engine:
+            // intermediates are uncapped.
+            ensure_result_series(&result).map_err(|e| e.to_string())?;
             Ok(Outcome::Metric(result))
         }
     }
@@ -960,7 +968,11 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
     let compiled = CompiledPipeline::compile(&client.pipeline)
         .map_err(|e| e.to_string())?
         .with_template_env(TemplateEnv::default());
-    let result = run_client_agg_rows(
+    // Issue #236 Part B: the folded seam, so the corpus exercises the
+    // engine's ACTUAL sequence — innermost aggregation folded at the leaf
+    // on a range query, the remaining prefix materialised — rather than a
+    // materialising approximation of it.
+    run_client_agg_rows_folded(
         &store.rows,
         &compiled,
         &store.meta,
@@ -978,9 +990,9 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
             },
         },
         mp.rate_window_ns,
+        &mp.vector_aggs,
     )
-    .map_err(|e| e.to_string())?;
-    Ok(apply_vector_aggs(result, &mp.vector_aggs))
+    .map_err(|e| e.to_string())
 }
 
 fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {
@@ -1002,7 +1014,7 @@ fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {
             combine_binary(*op, *return_bool, matching.as_ref(), l, r).map_err(|e| e.to_string())
         }
         MetricNode::VectorAgg { aggs, inner } => {
-            Ok(apply_vector_aggs(eval_node(inner, store)?, aggs))
+            apply_vector_aggs(eval_node(inner, store)?, aggs).map_err(|e| e.to_string())
         }
         // `variants(...) of (...)` (issue #221): the pure twin of the
         // live engine's fan-out — the SAME `VariantArena` +

@@ -433,18 +433,177 @@ not "fix" us toward the panic.
   override is gated hermetically.
 - **(b) Fan-out bounds.** *Reference:* unbounded in variant count.
   *PulsusDB:* a clean 422 `query_too_broad` at two DERIVED thresholds —
-  `MAX_VARIANT_SUB_STATES` = `AggCaps::DEFAULT.min_field()` (currently
-  500, the point past which a divided per-sub-state cap would floor to
-  zero; it moves with `MAX_CLIENT_AGG_SERIES`) and
+  `MAX_VARIANT_SUB_STATES` = `AggCaps::DEFAULT.min_field()` and
   `MAX_VARIANT_FANOUT_STATE_BYTES` = `AggCaps::DEFAULT.group_bytes`
-  (64 MiB) of charged fan-out state (plan-time spec clones + arena +
+  (256 MiB) of charged fan-out state (plan-time spec clones + arena +
   per-sub-state snapshots, one counter end to end). The worked
   thresholds are emitted by the charge functions' own unit tests
   (`crates/pulsus-read/src/logql/exec.rs`), never hand-computed here.
+
+  **Re-derived by #236.** Deleting `AggCaps::series` (the mid-scan
+  500-group cap) moved `min_field()` off that 500 and onto
+  `MAX_TS_COLLISION_GROUP`, so `MAX_VARIANT_SUB_STATES` is now
+  **10 000** — strictly permissive, in the direction the reference sits.
+  It is also now **UNREACHABLE**: at #279's `MAX_QUERY_BYTES` (131 072,
+  exclusive) the largest expressible variants query carries **4 368**
+  variants, so no legal query can trip this backstop. The divergence is
+  therefore registered as *unreachable* rather than live —
+  `variants_past_the_derived_backstop_reject_at_plan_time` computes the
+  verdict from the two constants and fails if it ever becomes reachable.
 - **(c) Per-variant series cap.** *Reference:* applies `maxSeries` PER
   VARIANT and SKIPS the breaching variant with a warning. *PulsusDB:*
-  422s on the shared divided cap — the pre-existing #236 class
-  (mid-scan group cap vs result-size cap), not re-litigated here.
+  applies the result-series cap per variant too (#236 — matching the
+  reference's GRANULARITY, a strict acceptance win: a 3-variant query
+  returning 3×400 series is served), but **422s** on breach where the
+  reference skips-and-warns. The remaining divergence is the
+  skip-and-warn behaviour, which needs a `warnings` response-envelope
+  field that exists nowhere in the tree: owned by **#277**, a real
+  parity bug deferred for sequencing, not an accepted shape.
+
+## Issue #236 — high-cardinality aggregations: the result-size cap
+
+- **(a) Result-series cap semantics.** *Reference:* `querier.max-query-series`
+  (default 500, `pkg/validation/limits.go:373`) counts the series a metric
+  query RETURNS, enforced on the final result (`pkg/logql/engine.go:538`
+  instant, `:588` accumulated across steps); nothing anywhere caps scanned
+  or inner-aggregation groups. *PulsusDB:* identical semantics, threshold
+  and `> cap` test, enforced by `ensure_result_series` on the whole
+  expression's output and read in exactly one place (gated by
+  `max_query_series_is_read_in_exactly_one_place`). Before #236 PulsusDB
+  applied its 500 MID-SCAN, rejecting a broad class of aggregations the
+  reference serves (`sum(...)` over 20,505 groups returned `{} 20505`
+  there and a 422 here); that divergence is CLOSED. The remaining
+  difference is the HTTP status — 422 `query_too_broad` where the
+  reference returns 400 — carrying the reference's verbatim body, under
+  the established matching-error-status precedent.
+
+- **(b) `avg`/`stddev`/`stdvar` member order.** *Reference:* computes these
+  with Welford's online recurrence (`pkg/logql/evaluator.go:547-550`,
+  finish `:586-596`), which is ORDER-SENSITIVE, and accumulates in Go map
+  order — so the reference is nondeterministic run to run on identical
+  data (measured 10/2 over 12 runs). *PulsusDB:* ports the recurrence
+  bit-for-bit (so the values are the reference's, not the former
+  `sum/len` + two-pass `population_variance`) and then PINS the member
+  order ascending by label set, one sort per stage before grouping
+  (`pin_reduction_order`), because PulsusDB's own incoming order is a
+  randomly-seeded `HashMap` walk. Without the pin the same query returned
+  different bits on different runs — 6 failures in 20 runs of
+  `logqltest_corpus`; with it, 20/20.
+
+  **Residual, and it must not be over-read.** Deterministic is not the
+  same as order-identical to the reference. The committed
+  `b4_vector_aggs.test` captures sit in a wide majority basin —
+  enumerating all 24 member orders of `{2,4,6,8}`, 20 of them (including
+  ascending) yield exactly the captured `stdvar=5.0` /
+  `stddev=2.23606797749979` — so the green corpus is genuine evidence
+  that the pin agrees with the reference on that data. It is NOT proof
+  that the sorted order IS the reference's: on other data a different
+  member order could differ in the last bit, and no order can match a
+  source that does not reproduce itself. What PulsusDB guarantees is
+  reproducibility; agreement with any single reference run is only
+  established where captured.
+
+- **(c) The non-mutating range leaf still materialises its series before
+  aggregating** — the price of (b), recorded as a residual rather than
+  remembered. *Reference:* evaluates a range query step by step, so a
+  `sum(...)` over a very wide non-mutating selector holds one step's
+  vector at a time and serves it. *PulsusDB:* the streaming aggregation
+  fold (issue #236 Part B) collapses the leaf's output to
+  `output groups x grid points` on the label-mutating fan-out path — the
+  shape this issue exists to serve — but the NON-mutating path folds only
+  after its sliders have finished, from `series_out`, so that vector is
+  still materialised at `streams x grid points`.
+
+  **Why, and it is a consequence of (b), not an oversight.** Feeding the
+  fold at each slider's close would be strictly better on memory, but
+  sliders complete in FINGERPRINT order (the scan's physical-key order),
+  which is deterministic yet is not the label-set order (b) pins. Folding
+  in it would make the folded answer differ from the materialised one in
+  the last bit for `sum`/`avg`/`stddev`/`stdvar` — i.e. it would buy
+  memory by breaking the equivalence the fold's correctness argument
+  rests on. Sliders cannot be reordered without buffering, and the buffer
+  IS `series_out`.
+
+  **The price, stated before it bites.** Once emitted points are charged
+  (`MAX_METRIC_RESULT_POINTS`, not yet levied), a non-mutating range leaf
+  wide enough that `streams x grid points` exceeds the charge will be
+  REFUSED where the reference serves it. The bound is the product, so it
+  is reached by breadth and grid fineness together, not by either alone.
+  Removing it needs a step-ordered evaluator (**#250**) or a fold order
+  that a streaming emit can reproduce — not a larger constant.
+
+- **(d) O6 — the `by(...)` grouping-name amplifier.** *Reference:* has no
+  post-aggregation byte bound at all: it evaluates step-ordered and never
+  materialises the inner matrix, so a wide `by(...)` clause costs it one
+  step's worth of keys. *PulsusDB:* materialises the stage, so
+  `group_key`'s `By` arm builds one owned pair per `by` NAME per output
+  group; the funnel charges that as `W_GROUPNAME x series x
+  group_name_bytes` against `MAX_POST_AGG_BYTES` (8 GiB) and refuses
+  above it with `MetricPostAggBytes` (HTTP 422). **Threshold, as a
+  number a reader can compare their query against: `A_MIN = 597` total
+  `by`-clause bytes** — with `A_NAME_MIN = 2` (a one-character name plus
+  its separator) that is **at least 299 one-character `by` names** —
+  measured at the argmin `N = 435,558` series. Strictly below `A_MIN`,
+  refusal is impossible at ANY group count; above it, refusal begins at
+  proportionally fewer series. **Reachable**: 597 bytes fits easily
+  inside `MAX_QUERY_BYTES = 131,072`, and
+  `both_amplifiers_are_refused_end_to_end_from_query_text` drives the
+  refusal from real query text. Owner: **#250** (a step-ordered
+  evaluator removes the materialisation this bound exists for).
+
+- **(e) O7 — the `group_left/right(include)` amplifier.** *Reference:*
+  same reason as (d) — no equivalent bound. *PulsusDB:* `instant_join`
+  copies each include label onto every many-side series through
+  `set_label_sorted`'s insert chain, so the cost is `B_INCLUDE x
+  many.series x include_bytes` where `include_bytes = Σ (name.len() +
+  one.max_value_bytes + 1)`. **Threshold: `AMP_MIN = 97,030,221`**, the
+  smallest `many.series x include_bytes` PRODUCT at which refusal is
+  possible, at the argmin `N_many = 546`. **Reachable** within the query
+  text cap — a few thousand include names against a one side carrying a
+  kilobyte-scale label value clears it — and the same test drives that
+  refusal end to end. Owner: **#250**.
+
+  **What the cap does and does not claim, for both (d) and (e).**
+  `MAX_POST_AGG_BYTES` is derived by MEASUREMENT — a cohort-attributed
+  allocator witness (`tests/logql_post_agg_witness.rs`), coefficients =
+  the observed per-unit rates times a stated 2x margin — not by
+  enumerating containers. It guarantees that every client-leaf-sourced
+  input carrying NEITHER amplifier is admitted, and nothing broader. It
+  is not a worst-case proof: the residual is a distribution adversarial
+  in a dimension no ladder varies, and the margin is what covers it.
+  Before #236 this stage had no bound at all and could OOM; the
+  divergence registered here is a clean bounded refusal replacing an
+  unbounded path.
+
+- **(f) The reference's 500 is NOT a pure result-size cap for
+  NON-SHARDABLE aggregations — PulsusDB over-accepts there.** *Measured*
+  on `grafana/loki:3.7.4` (digest `sha256:87f0a0…56cfcc`, default config)
+  at exactly 501 distinct inner groups, with the boundary confirmed by
+  capture at 499 / 500 / 501: the reference **serves** `sum`, `count`,
+  `min`, `max`, `avg` (bare and grouped), `sum by (<low-cardinality>)`
+  and `sum(sum by (id) (…))`, and **rejects** `topk(k)`, `bottomk(k)`,
+  `stddev`, `stdvar`, `sort`, `sum by (id)`, the bare leaf,
+  `sum(topk(600, …))` and `count(topk(3, …))` — all with the same
+  `maximum number of series (500) reached for a single query…` body,
+  even where the FINAL result is 1 or 3 series. The split is
+  shardability: Loki's frontend rewrites the associative aggregations
+  into per-shard sub-queries so the wide inner vector never materialises,
+  while the others materialise it and trip `max_query_series` on that
+  intermediate. *PulsusDB:* applies the 500 to the final result only, so
+  it **serves** `topk(3, …)`/`stddev(…)`/`bottomk(…)` over 501+ inner
+  groups where the reference refuses. That is **over-acceptance**, the
+  same direction (and the same disposition) as the SQL instant path's
+  missing series cap: PulsusDB answers a query the reference declines,
+  which no user query breaks. It is registered rather than fixed because
+  matching it would mean reintroducing an intermediate group cap — the
+  exact rejection surface issue #236 exists to delete — and because the
+  reference's own behaviour here is an artefact of its sharding plan, not
+  of its documented limit semantics (`pkg/validation/limits.go:373`
+  describes series "returned by a metric query").
+
+  **This corrects plan v14 §1's live probe**, which recorded `stddev`,
+  `topk(3, …)`, `approx_topk(3, …)` and `sum(topk(600, …))` as served
+  over 600 groups. They are not, on the pinned image.
 
 ## Issue #230 — `line_format`/`label_format` template engine
 

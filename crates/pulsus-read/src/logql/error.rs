@@ -147,15 +147,24 @@ pub enum TooBroadReason {
     /// RETAINED points; the computed reset-aware rate is unaffected below
     /// the cap.
     CounterValues { count: u64, cap: u64 },
-    /// Issue #73 (retroactive re-review): a client-aggregated LogQL
-    /// metric query resolved more distinct output series (final label
-    /// sets on the fan-out/label-mutating path, or fingerprints on the
-    /// non-mutating path) than
-    /// [`crate::logql::exec::MAX_CLIENT_AGG_SERIES`] — rejected DURING
-    /// aggregation before the (cap+1)-th group is materialized, so the
-    /// group axis of reducer state (`groups x buckets`) stays bounded.
-    /// Complete-or-error, never a truncated result. A Rust-side
-    /// structural limit, never from a ClickHouse error code.
+    /// A LogQL metric query's **FINAL result** carried more distinct
+    /// series than [`crate::logql::exec::MAX_QUERY_SERIES`] — the
+    /// reference's `querier.max-query-series` (grafana/loki v3.7.4,
+    /// `pkg/validation/limits.go:373`, default 500), enforced on the whole
+    /// expression's output at `pkg/logql/engine.go:538` (instant) and
+    /// `:588` (accumulated across steps).
+    ///
+    /// Issue #236 moved this from a MID-SCAN group cap to a result-size
+    /// cap. It counts what the reference counts: top-level result series.
+    /// It does **not** count scanned groups, inner-aggregation groups or
+    /// binary operands — a query that scans 20 000 groups and aggregates
+    /// to one series is served, exactly as the reference serves it.
+    /// Intermediate state is bounded by BYTES and POINTS instead
+    /// ([`Self::MetricGroupLabelBytes`], [`Self::MetricPostAggBytes`]).
+    ///
+    /// An exact tally, not a lower bound: the whole result exists before
+    /// the check runs. A Rust-side structural limit, never from a
+    /// ClickHouse error code.
     MetricSeries { cap: u64 },
     /// Issue #89 (retroactive re-review): a regex/negated-`__name__`
     /// PromQL selector's multi-metric resolution *examined* more resident
@@ -227,6 +236,47 @@ pub enum TooBroadReason {
     /// from a ClickHouse error code. Set generously so nothing Loki
     /// reliably serves is rejected.
     MetricRetention { count: u64, cap: u64 },
+    /// Issue #236: a metric evaluation reserved more fixed-width RESULT
+    /// point-slots — grid points a leaf series will emit, and the dense
+    /// per-group slots the streaming vector-aggregation fold retains —
+    /// than [`crate::logql::exec::MAX_METRIC_RESULT_POINTS`].
+    ///
+    /// This is the POINTS half of the bound that replaced the deleted
+    /// mid-scan group-COUNT cap; the bytes half is
+    /// [`Self::MetricGroupLabelBytes`]. It is an ADMISSION counter, not a
+    /// concurrent-retention one: a slot is reserved before the allocation
+    /// that holds it and is never released, because the points it stands
+    /// for ARE the result. The charge is `O(1)` per output series and per
+    /// fold group — never per point — so a breach is refused before the
+    /// allocation rather than observed after it.
+    ///
+    /// The cap is DERIVED from what a servable result can hold
+    /// ([`crate::logql::exec::MAX_QUERY_SERIES`] series x
+    /// [`crate::logql::exec::MAX_ADMITTED_GRID_POINTS`] points), so no
+    /// result the reference serves is refused by it; what it does refuse
+    /// is an INTERMEDIATE wide enough that its point product exceeds
+    /// that, which is a bounded error rather than an OOM.
+    MetricResultPoints { count: u64, cap: u64 },
+    /// Issue #236 §4: the post-aggregation chain or a binary combination
+    /// would hold more heap bytes SIMULTANEOUSLY, over and above its
+    /// input, than [`crate::logql::exec::MAX_POST_AGG_BYTES`].
+    ///
+    /// The bound is charged BEFORE the stage allocates — a refusal means
+    /// the operand was never converted, no group map was built and no
+    /// join index exists — so a query too wide for this stage is a clean
+    /// bounded error rather than an OOM. The modelled byte count is
+    /// `post_agg_peak_bytes`/`binary_peak_bytes` over WITNESS-DERIVED
+    /// coefficients (`tests/logql_post_agg_witness.rs`), not a container
+    /// enumeration.
+    ///
+    /// The cap covers every client-leaf-sourced input with no `by`-name
+    /// and no `group_left/right(include)` amplification; a query carrying
+    /// either amplifier may be refused above the O6/O7 thresholds
+    /// recorded in [`crate::logql::exec::MAX_POST_AGG_BYTES`]' doc. The
+    /// reference has no equivalent bound — it evaluates step-ordered and
+    /// never materialises the inner matrix — so this is a registered
+    /// bounded divergence, not a parity match.
+    MetricPostAggBytes { bytes: u64, cap: u64 },
     /// Issue #227 (review round 6): the label-mutating client-aggregation
     /// path retained more QUERY-LIFETIME bytes of distinct output-group
     /// state — each first-seen group's rendered JSON key plus its cloned
@@ -363,14 +413,18 @@ impl fmt::Display for TooBroadReason {
                      fan-out cap (reader.promql_max_metric_fanout)"
                 )
             }
-            // Lower-bound wording, like `MetricFanout`: the guard bails at
-            // the breach point (the cap+1-th group), so this is not an
-            // exact final tally.
+            // VERBATIM from the reference (issue #236): grafana/loki
+            // v3.7.4 `pkg/logqlmodel/error.go:96`
+            // (`NewSeriesLimitError`). Byte-for-byte, including the
+            // semicolon and the `sum(), count() or topk()` list — pinned
+            // by `metric_series_display_is_the_reference_body_verbatim`.
             TooBroadReason::MetricSeries { cap } => {
                 write!(
                     f,
-                    "resolved more than {cap} series — narrow the pipeline (fewer parsed/\
-                     formatted labels), use a coarser grouping, or a narrower window"
+                    "maximum number of series ({cap}) reached for a single query; consider \
+                     reducing query cardinality by adding more specific stream selectors, \
+                     reducing the time range, or aggregating results with functions like \
+                     sum(), count() or topk()"
                 )
             }
             // Lower-bound wording, like `MetricFanout`/`MetricSeries`: the
@@ -435,6 +489,20 @@ impl fmt::Display for TooBroadReason {
                     "the sliding-window range evaluation retained {count} concurrent sample \
                      points, exceeding the {cap}-point cap — narrow the [range], the pipeline, \
                      or the time window"
+                )
+            }
+            TooBroadReason::MetricResultPoints { count, cap } => {
+                write!(
+                    f,
+                    "the metric evaluation would reserve {count} result point-slots, exceeding \
+                     the {cap}-point cap — narrow the aggregation, the step, or the time window"
+                )
+            }
+            TooBroadReason::MetricPostAggBytes { bytes, cap } => {
+                write!(
+                    f,
+                    "the post-aggregation stage would hold {bytes} bytes, exceeding the {cap}-byte \
+                     cap — narrow the aggregation, the grouping clause, or the time window"
                 )
             }
             TooBroadReason::MetricGroupLabelBytes { bytes, cap } => {
@@ -754,14 +822,32 @@ mod tests {
         assert!(msg.contains("rate_counter"), "{msg}");
     }
 
-    /// Issue #73 (retroactive re-review): the derived-series cap uses
-    /// LOWER-BOUND wording ("more than {cap}"), like `MetricFanout` — the
-    /// guard bails at the breach point, never an exact final tally.
+    /// Issue #236 AC 3 — the result-series cap's body is the reference's,
+    /// VERBATIM. The literal below is transcribed from grafana/loki
+    /// v3.7.4 `pkg/logqlmodel/error.go:96` (`NewSeriesLimitError`) with
+    /// `%d` substituted; asserted by full equality on the body, not by
+    /// `contains`, so a reworded message cannot pass. `to_string()` adds
+    /// the crate's own `query too broad: ` prefix (the shared
+    /// `QueryTooBroad` wrapper), which is asserted separately.
     #[test]
-    fn metric_series_display_names_the_cap_with_lower_bound_wording() {
+    fn metric_series_display_is_the_reference_body_verbatim() {
+        const REFERENCE_BODY: &str = "maximum number of series (500) reached for a single query; \
+             consider reducing query cardinality by adding more specific stream selectors, \
+             reducing the time range, or aggregating results with functions like sum(), count() \
+             or topk()";
+        let body = TooBroadReason::MetricSeries { cap: 500 }.to_string();
+        assert_eq!(body, REFERENCE_BODY);
+
         let msg = ReadError::QueryTooBroad(TooBroadReason::MetricSeries { cap: 500 }).to_string();
         assert!(msg.contains("query too broad"), "{msg}");
-        assert!(msg.contains("resolved more than 500 series"), "{msg}");
+        assert!(msg.ends_with(REFERENCE_BODY), "{msg}");
+
+        // The cap is interpolated, not hard-coded into the literal.
+        assert!(
+            TooBroadReason::MetricSeries { cap: 7 }
+                .to_string()
+                .starts_with("maximum number of series (7) reached"),
+        );
     }
 
     /// Issue #89 (retroactive re-review): the cache-scan budget uses

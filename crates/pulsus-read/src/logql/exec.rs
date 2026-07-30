@@ -204,8 +204,21 @@ impl LogQlEngine {
                 .run_streams_inner(&sp, None)
                 .await
                 .map(|(items, partial)| QueryResult::Streams { items, partial }),
-            Plan::Metric(mp) => self.run_metric_inner(&mp, None).await,
-            Plan::MetricBinary(node) => self.run_metric_node(&node, None).await,
+            // Issue #236: [`MAX_QUERY_SERIES`] is a FINAL-RESULT cap, so it
+            // is applied here — on the whole expression's output — and
+            // never inside `run_metric_inner`/`run_metric_node`/
+            // `apply_vector_aggs`, where it would reject on scanned or
+            // intermediate groups the reference never counts.
+            Plan::Metric(mp) => {
+                let result = self.run_metric_inner(&mp, None).await?;
+                ensure_result_series(&result)?;
+                Ok(result)
+            }
+            Plan::MetricBinary(node) => {
+                let result = self.run_metric_node(&node, None).await?;
+                ensure_result_series(&result)?;
+                Ok(result)
+            }
         }
     }
 
@@ -236,11 +249,13 @@ impl LogQlEngine {
                 };
                 let mut explain = PlanExplain::new(result_type);
                 let result = self.run_metric_inner(&mp, Some(&mut explain)).await?;
+                ensure_result_series(&result)?;
                 Ok((result, explain))
             }
             Plan::MetricBinary(node) => {
                 let mut explain = PlanExplain::new(binary_result_type(&node, params));
                 let result = self.run_metric_node(&node, Some(&mut explain)).await?;
+                ensure_result_series(&result)?;
                 Ok((result, explain))
             }
         }
@@ -971,9 +986,7 @@ impl LogQlEngine {
                     value,
                 });
             }
-            for (op, grouping, param) in mp.vector_aggs.iter().rev() {
-                series = group_instant(series, *op, grouping.as_ref(), *param);
-            }
+            let series = charged_instant_chain(series, &mp.vector_aggs, MAX_POST_AGG_BYTES)?;
             Ok(QueryResult::Vector(
                 series
                     .into_iter()
@@ -1012,7 +1025,7 @@ impl LogQlEngine {
                     .or_default()
                     .insert(row.step, value);
             }
-            let mut series: Vec<RangeSeries> = by_fp
+            let series: Vec<RangeSeries> = by_fp
                 .into_iter()
                 .filter_map(|(fp, points)| {
                     meta.get(&fp).map(|m| RangeSeries {
@@ -1021,9 +1034,7 @@ impl LogQlEngine {
                     })
                 })
                 .collect();
-            for (op, grouping, param) in mp.vector_aggs.iter().rev() {
-                series = group_range(series, *op, grouping.as_ref(), *param);
-            }
+            let series = charged_range_chain(series, &mp.vector_aggs, MAX_POST_AGG_BYTES)?;
             Ok(QueryResult::Matrix(
                 series
                     .into_iter()
@@ -1087,24 +1098,52 @@ impl LogQlEngine {
         // `QueryTooBroad(ScanBudgetBytes)` — complete-or-error holds
         // without buffering-driven OOM risk.
         let window = metric_plan_window(mp);
-        let mut state = if is_range {
-            MetricAggState::Range(Box::new(RangeSlideState::new(
+        // Issue #236 Part B: on a range query the INNERMOST vector
+        // aggregation is folded at the leaf. `vector_aggs` is outer-first
+        // (`unwrap_vector_aggs`) and collapses onto the leaf whenever the
+        // base is a range expr, so `.last()` is the innermost one and
+        // `apply_vector_aggs`' `.rev()` walk over the remaining prefix
+        // continues exactly where the fold stopped. `folded` — not the
+        // caller's intent — records what the leaf actually took: the fold
+        // declines the specs it cannot own (`sort`/`sort_desc`/
+        // `approx_topk`), and those must still be applied here.
+        let (mut state, folded) = if is_range {
+            let mut range = RangeSlideState::new(
                 compiled,
                 &meta,
                 client,
                 window,
                 mp.rate_window_ns,
                 AggCaps::DEFAULT,
-            )?))
+            )?;
+            if let Some(spec) = mp.vector_aggs.last() {
+                range.attach_fold(spec);
+            }
+            let folded = range.folded_aggs();
+            (MetricAggState::Range(Box::new(range)), folded)
         } else {
-            MetricAggState::Instant(Box::new(ClientAggState::new(
-                compiled,
-                &meta,
-                client,
-                window,
-                mp.rate_window_ns,
-                AggCaps::DEFAULT,
-            )?))
+            // `is_range` is `mp.step_ns.is_some()` and `metric_plan_window`
+            // builds a `Range` window exactly then, so this narrowing
+            // cannot fail — but it is expressed as a narrowing rather than
+            // asserted, so the instant state simply cannot be built for a
+            // stepped window (issue #236 Part D).
+            let instant = window
+                .as_instant()
+                .ok_or_else(|| ReadError::PipelineInvalid {
+                    reason: "internal: a stepped window reached the instant aggregation state"
+                        .to_string(),
+                })?;
+            (
+                MetricAggState::Instant(Box::new(ClientAggState::new(
+                    compiled,
+                    &meta,
+                    client,
+                    instant,
+                    mp.rate_window_ns,
+                    AggCaps::DEFAULT,
+                )?)),
+                0,
+            )
         };
         let mut chunk: Vec<MetricScanRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
         {
@@ -1121,7 +1160,8 @@ impl LogQlEngine {
             }
         }
         state.push_rows(&chunk)?;
-        Ok(apply_vector_aggs(state.finish()?, &mp.vector_aggs))
+        let result = state.finish()?;
+        apply_vector_aggs(result, &mp.vector_aggs[..mp.vector_aggs.len() - folded])
     }
 
     /// Executes `variants(...) of (...)` (issue #221): ONE scan (planned
@@ -1246,7 +1286,7 @@ impl LogQlEngine {
                 MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window),
                 MetricNode::VectorAgg { aggs, inner } => {
                     let result = self.run_metric_node(inner, explain.as_deref_mut()).await?;
-                    Ok(apply_vector_aggs(result, aggs))
+                    apply_vector_aggs(result, aggs)
                 }
                 MetricNode::Variants {
                     scan,
@@ -3158,32 +3198,10 @@ fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
     }
 }
 
-/// The instant-mode bucket key (any constant works — there is exactly
-/// one bucket).
-const INSTANT_BUCKET: i64 = 0;
-
 /// How many rows the streaming client-aggregation fetch buffers between
 /// folds into [`ClientAggState`] — bounds transient memory without
 /// per-row fold overhead (review round 1, finding 1).
 const CLIENT_AGG_CHUNK_ROWS: usize = 8_192;
-
-fn bucket_of(ts_ns: i64, step_ns: Option<u64>) -> i64 {
-    match step_ns {
-        Some(step) => {
-            // i128 intermediates (review round 3): for a timestamp near
-            // `i64::MIN` with a non-dividing step, the FLOORED quotient
-            // re-multiplied by step lands up to one step below the
-            // timestamp — which can sit just below `i64::MIN` (e.g.
-            // `i64::MIN + 1` at step 3 floors to `i64::MIN - 1`), a
-            // debug panic / release wrap in i64. `step_ns > 0` and
-            // `<= i64::MAX` are guaranteed by `ClientAggState::new`'s
-            // grid guard before any row is bucketed.
-            let step = step as i128;
-            clamp_bucket((ts_ns as i128).div_euclid(step) * step)
-        }
-        None => INSTANT_BUCKET,
-    }
-}
 
 /// Converts an i128 bucket start back to the i64 point-timestamp domain.
 /// Only the sliver within one step below `i64::MIN` (or, symmetrically,
@@ -3587,20 +3605,79 @@ pub const MAX_QUANTILE_VALUES: u64 = 4_000_000;
 /// `rate_counter_cap_bounds_total_retained_points_across_overlapping_buckets`).
 pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
 
-/// Derived-series cap for client-aggregated metric queries: the number
-/// of distinct output groups (final label sets, or fingerprints on the
-/// non-mutating path) a single query may materialize. Bounds the last
-/// unbounded axis of reducer state — total accumulators are then
-/// `<= MAX_CLIENT_AGG_SERIES x MAX_CLIENT_AGG_BUCKETS`. 500 matches the
-/// reference oracle's default series ceiling (it likewise ERRORS, never
-/// truncates, past it). A documented constant, not a config field (the
-/// `DEFAULT_MAX_STREAMS` / `MAX_CLIENT_AGG_BUCKETS` precedent); operator-
-/// scale tuning routes to #25.
-pub const MAX_CLIENT_AGG_SERIES: u64 = 500;
+/// The reference's `querier.max-query-series` (grafana/loki v3.7.4,
+/// `pkg/validation/limits.go:373`, default 500): the number of distinct
+/// series a metric query may **RETURN**.
+///
+/// Enforced on the **FINAL result of the whole expression**
+/// (`pkg/logql/engine.go:538` instant / first step, `:588` distinct
+/// series accumulated across steps; frontend duplicate at
+/// `pkg/querier/queryrange/limits.go:518`) — **never** on scanned groups,
+/// inner-aggregation groups or binary operands — **that is the LIMIT's
+/// documented meaning, and it is what PulsusDB implements.**
+///
+/// **What the reference actually does, captured at 501 groups** (the
+/// `b15_wide_aggregation.test` capture, boundary confirmed at 499 / 500 /
+/// 501): it serves `sum`, `count`, `min`, `max`, `avg`,
+/// `sum by (<low-cardinality>)` and `sum(sum by (id) (...))`, and it
+/// REJECTS `topk(k)`, `bottomk(k)`, `stddev`, `stdvar`, `sort`,
+/// `sum by (id)`, the bare leaf and `sum(topk(600, ...))` — the last of
+/// these even though its result is one series. The split is
+/// SHARDABILITY, not result size: the reference's frontend rewrites the
+/// associative aggregations into per-shard sub-queries so the wide inner
+/// vector never materialises, while the others materialise it and trip
+/// the cap on that intermediate. PulsusDB applies the limit to the final
+/// result only and therefore SERVES the non-shardable ones — an
+/// over-acceptance registered as ledger entry `#236 (f)`, in the
+/// direction that matters: PulsusDB rejects nothing the reference
+/// serves. Exactly 500 served, 501 rejected, on both sides.
+///
+/// **Read by [`ensure_result_series`] and by nothing else** (issue #236).
+/// Applying it to an intermediate would reject on a *proxy* rather than
+/// on the resource consumed: an outer `sum` over an inner `sum by (id)`
+/// collapses 501+ inner groups to ONE final series, which the reference
+/// serves. Intermediate aggregation state is bounded by BYTES
+/// ([`MAX_CLIENT_AGG_GROUP_BYTES`]) and POINTS
+/// ([`MAX_METRIC_RESULT_POINTS`]) — and by nothing else.
+pub const MAX_QUERY_SERIES: u64 = 500;
+
+/// Enforces [`MAX_QUERY_SERIES`] on a metric query's **final** result.
+///
+/// Counts TOP-LEVEL series: one per `Vector`/`VectorHist` sample and one
+/// per `Matrix`/`MatrixHist` series (the reference counts distinct series,
+/// not points — `engine.go:588` accumulates a set across steps, and a
+/// PulsusDB matrix already holds one entry per distinct series). `Streams`
+/// is a log query (bounded by `max_entries_limit_per_query` instead),
+/// and `Scalar`/`String` carry no series, so all three pass.
+///
+/// `> cap` is the reference's own test (`engine.go:538`), so exactly 500
+/// is served.
+///
+/// `pub` so the conformance runner (`tests/logqltest/runner.rs`) applies
+/// the identical gate on its own `Expr::Metric` arm and corpus
+/// `eval_fail` cases can pin the reference's body. Exporting the FUNCTION
+/// keeps [`MAX_QUERY_SERIES`] read in exactly one place.
+pub fn ensure_result_series(result: &QueryResult) -> Result<(), ReadError> {
+    let n = match result {
+        QueryResult::Vector(v) => v.len() as u64,
+        QueryResult::Matrix(m) => m.len() as u64,
+        QueryResult::VectorHist(v) => v.len() as u64,
+        QueryResult::MatrixHist(m) => m.len() as u64,
+        QueryResult::Streams { .. } | QueryResult::Scalar(_) | QueryResult::String(_) => {
+            return Ok(());
+        }
+    };
+    if n > MAX_QUERY_SERIES {
+        return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+            cap: MAX_QUERY_SERIES,
+        }));
+    }
+    Ok(())
+}
 
 /// Every per-query retention cap in ONE place (issue #221), so the
 /// `variants(...)` fan-out path can divide them all at a single auditable
-/// point. [`AggCaps::DEFAULT`] is today's seven constants verbatim;
+/// point. [`AggCaps::DEFAULT`] is today's six constants verbatim;
 /// [`AggCaps::divided`] is what a variants query hands each of its `n`
 /// sub-states, so the SUM over sub-states is exactly `DEFAULT` for every
 /// field and the query's total retention bound is INDEPENDENT of the
@@ -3610,24 +3687,27 @@ pub const MAX_CLIENT_AGG_SERIES: u64 = 500;
 /// `DEFAULT`, so its behaviour and every error value are byte-identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AggCaps {
-    pub series: u64,
     pub group_bytes: u64,
     pub retention_points: u64,
     pub quantile_values: u64,
     pub counter_values: u64,
     pub collision_members: u64,
     pub collision_bytes: u64,
+    /// Issue #236: fixed-width RESULT point-slots — emitted grid points
+    /// and the fold's dense per-group slots — an ADMISSION counter, see
+    /// [`charge_result_points`].
+    pub result_points: u64,
 }
 
 impl AggCaps {
     pub(crate) const DEFAULT: AggCaps = AggCaps {
-        series: MAX_CLIENT_AGG_SERIES,
         group_bytes: MAX_CLIENT_AGG_GROUP_BYTES,
         retention_points: MAX_RETAINED_WINDOW_POINTS,
         quantile_values: MAX_QUANTILE_VALUES,
         counter_values: MAX_COUNTER_VALUES,
         collision_members: MAX_TS_COLLISION_GROUP,
         collision_bytes: MAX_TS_COLLISION_GROUP_BYTES,
+        result_points: MAX_METRIC_RESULT_POINTS,
     };
 
     /// The per-sub-state caps for a `variants(...)` query with `n`
@@ -3638,13 +3718,13 @@ impl AggCaps {
     /// `1..=MAX_VARIANT_SUB_STATES` at every call site.
     pub(crate) fn divided(self, n: u64) -> AggCaps {
         AggCaps {
-            series: self.series / n,
             group_bytes: self.group_bytes / n,
             retention_points: self.retention_points / n,
             quantile_values: self.quantile_values / n,
             counter_values: self.counter_values / n,
             collision_members: self.collision_members / n,
             collision_bytes: self.collision_bytes / n,
+            result_points: self.result_points / n,
         }
     }
 
@@ -3652,10 +3732,7 @@ impl AggCaps {
     /// a cap to 0. [`super::plan::MAX_VARIANT_SUB_STATES`] is DERIVED from
     /// this (not chosen), so it moves with the caps.
     pub(crate) const fn min_field(self) -> u64 {
-        let mut min = self.series;
-        if self.group_bytes < min {
-            min = self.group_bytes;
-        }
+        let mut min = self.group_bytes;
         if self.retention_points < min {
             min = self.retention_points;
         }
@@ -3671,22 +3748,87 @@ impl AggCaps {
         if self.collision_bytes < min {
             min = self.collision_bytes;
         }
+        if self.result_points < min {
+            min = self.result_points;
+        }
         min
+    }
+}
+
+/// The instant-window witness, in a module of its own so that its field
+/// is private to it (issue #236 Part D).
+///
+/// The nesting is the whole point and is not decoration. A bare
+/// `struct InstantWindow;` is a UNIT struct: any line in `exec.rs` can
+/// write `InstantWindow` and mint one — and every `ClientAggState::new`
+/// call site is in `exec.rs`, so such a guard would be merely
+/// *unreachable today*, not *unrepresentable*. With the field private to
+/// this module, [`InstantWindow::mint`] is the only way to obtain one
+/// anywhere in the crate, INCLUDING this file's own `mod tests`.
+mod instant_window {
+    use super::ClientWindow;
+
+    /// A WITNESS that a [`ClientWindow`] was narrowed to its instant
+    /// case.
+    ///
+    /// `ClientAggState`'s per-group accumulator is a SINGLE `BucketAcc`,
+    /// which is sound only because an instant window has exactly one
+    /// bucket. Requiring this witness at the constructor keeps that true
+    /// without a runtime check nobody re-reads — and it was already true
+    /// at every call site, so nothing is newly forbidden.
+    ///
+    /// It carries NO bounds, a deliberate difference from plan v14's
+    /// "explicit instant bounds": nothing in an instant state reads
+    /// them. The two former readers — the stepped-grid guard in the
+    /// constructor and the `bucket_grid` walk in `finish` — are both
+    /// deleted by Part D, and a field that exists only to look used is
+    /// worse than none. The witness is also the stronger of the two
+    /// shapes: a pair of `i64` bounds can be hand-derived from a stepped
+    /// window, an unforgeable witness cannot.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct InstantWindow(());
+
+    impl InstantWindow {
+        /// The ONE mint. Refuses a stepped window, so a caller has to say
+        /// what it does with one instead of assuming it cannot get one.
+        pub(super) fn mint(window: ClientWindow) -> Option<Self> {
+            match window {
+                ClientWindow::Instant { .. } => Some(InstantWindow(())),
+                ClientWindow::Range { .. } => None,
+            }
+        }
+    }
+}
+
+use instant_window::InstantWindow;
+
+impl ClientWindow {
+    /// Narrows to the INSTANT case, or `None` for a stepped window.
+    fn as_instant(self) -> Option<InstantWindow> {
+        InstantWindow::mint(self)
     }
 }
 
 /// Streaming client-aggregation state (issue M6-10, review round 1
 /// finding 1): rows fold into reducer state as they arrive so process
-/// memory stays `O(buckets x series)` (+ the caller's bounded chunk)
-/// instead of retaining the whole raw scan. The pure
-/// [`run_client_agg_rows`] wrapper drives it over a slice for the
-/// hermetic golden/allocation suites; the engine drives it chunk-wise
-/// off the live row stream.
+/// memory stays `O(series)` (+ the caller's bounded chunk) instead of
+/// retaining the whole raw scan. The pure [`run_client_agg_rows`]
+/// wrapper drives it over a slice for the hermetic golden/allocation
+/// suites; the engine drives it chunk-wise off the live row stream.
+///
+/// **Instant-only by construction** (issue #236 Part D). It always was —
+/// `run_metric_client` and `run_client_agg_rows` route every stepped
+/// window to [`RangeSlideState`], and `bucket_of` returned the single
+/// [`INSTANT_BUCKET`] with no step — so the per-group
+/// `BTreeMap<i64, BucketAcc>` always held exactly one entry, and the map
+/// (a ~1 KB/group allocation `group_entry_bytes` never saw: an #227
+/// accounting hole) was pure overhead. The constructor now takes an
+/// [`InstantWindow`], so the dead stepped branches are not merely unused
+/// but unrepresentable.
 #[derive(Debug)]
 struct ClientAggState<'q> {
     compiled: &'q super::pipeline::CompiledPipeline,
     client: &'q ClientAgg,
-    window: ClientWindow,
     rate_window_ns: Option<u64>,
     /// Base labels once per fingerprint, in the same shape the SQL
     /// metric path exposes (`series_labels`: canonical JSON labels +
@@ -3694,14 +3836,19 @@ struct ClientAggState<'q> {
     /// sorted).
     base_labels: HashMap<u64, Vec<(String, String)>>,
     fan_out: bool,
-    /// `absent_over_time`'s selector-wide presence set (plan v2 D2).
-    present: BTreeSet<i64>,
+    /// `absent_over_time`'s selector-wide presence (plan v2 D2). A FLAG,
+    /// not a bucket set, since issue #236 Part D: an instant window has
+    /// exactly one bucket, so the set could only ever hold
+    /// `{INSTANT_BUCKET}` and the only question ever asked of it was
+    /// whether it was empty.
+    present: bool,
     /// Non-mutating pipelines group by fingerprint (zero per-row
-    /// allocations — the alloc-gate path).
-    fp_groups: HashMap<u64, BTreeMap<i64, BucketAcc>>,
+    /// allocations — the alloc-gate path). ONE accumulator per group,
+    /// not a bucket map — see [`ClientAggState`]'s instant-only contract.
+    fp_groups: HashMap<u64, BucketAcc>,
     /// Label-mutating/unwrapping pipelines group by the rendered final
     /// label set.
-    label_groups: HashMap<String, (LabelSet, BTreeMap<i64, BucketAcc>)>,
+    label_groups: HashMap<String, (LabelSet, BucketAcc)>,
     /// Total values retained across every quantile accumulator, charged
     /// against [`MAX_QUANTILE_VALUES`].
     quantile_values: u64,
@@ -3722,25 +3869,22 @@ struct ClientAggState<'q> {
 }
 
 impl<'q> ClientAggState<'q> {
-    /// Validates the bucket grid BEFORE any accumulation (finding 2) and
-    /// snapshots the per-fingerprint base labels.
+    /// Snapshots the per-fingerprint base labels.
+    ///
+    /// The former stepped-grid guard is gone with the [`InstantWindow`]
+    /// parameter (issue #236 Part D): it existed to make a stepped window
+    /// that reached here obey the Loki-exact resolution rule, and a
+    /// stepped window can no longer reach here. `Result` is kept because
+    /// the constructor is one of the fallible-by-contract seams the
+    /// variants fan-out charges through.
     fn new(
         compiled: &'q super::pipeline::CompiledPipeline,
         meta: &HashMap<u64, StreamMetaRow>,
         client: &'q ClientAgg,
-        window: ClientWindow,
+        _window: InstantWindow,
         rate_window_ns: Option<u64>,
         caps: AggCaps,
     ) -> Result<Self, ReadError> {
-        if let Some(step) = window.step_ns().map(|d| d.as_u64()) {
-            // Defense-in-depth only: an instant window has no step, and the
-            // range path routes to `RangeSlideState` — but if a stepped
-            // window ever reached here it must obey the SAME Loki-exact
-            // resolution rule as every other grid guard (review round 7,
-            // finding 1: two disagreeing counts turned an admitted request
-            // into a 422).
-            ensure_grid_resolution(window.start_ns(), window.end_ns(), step)?;
-        }
         let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
         for (fp, m) in meta {
             base_labels.insert(*fp, series_labels(m));
@@ -3748,11 +3892,10 @@ impl<'q> ClientAggState<'q> {
         Ok(ClientAggState {
             compiled,
             client,
-            window,
             rate_window_ns,
             base_labels,
             fan_out: compiled.metric_mutates_labels(),
-            present: BTreeSet::new(),
+            present: false,
             fp_groups: HashMap::new(),
             label_groups: HashMap::new(),
             quantile_values: 0,
@@ -3786,11 +3929,11 @@ impl<'q> ClientAggState<'q> {
                 MetricRun::Kept { line, value } => (line, value),
             };
             check_surviving_error(&scratch)?;
-            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns().map(|d| d.as_u64()));
             if is_absent {
-                // Selector-wide presence (plan v2 D2): count surviving
-                // lines per bucket across ALL fingerprints/label sets.
-                self.present.insert(bucket);
+                // Selector-wide presence (plan v2 D2): did ANY line
+                // survive, across every fingerprint and label set. One
+                // bucket, so one flag (issue #236 Part D).
+                self.present = true;
                 continue;
             }
             let v = match self.client.value {
@@ -3832,18 +3975,18 @@ impl<'q> ClientAggState<'q> {
                     }));
                 }
             }
-            let buckets = if self.fan_out {
+            // ONE accumulator per group (issue #236 Part D): an instant
+            // window has a single bucket, so each arm either seeds the
+            // group's accumulator or folds into it — there is no bucket
+            // map to index.
+            if self.fan_out {
                 scratch.sort_unstable();
                 let key = render_labels_json_sorted(&scratch);
-                let groups = self.label_groups.len() as u64;
                 match self.label_groups.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(e) => &mut e.into_mut().1,
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        e.into_mut().1.add(row.timestamp_ns, v);
+                    }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        if groups >= self.caps.series {
-                            return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                                cap: self.caps.series,
-                            }));
-                        }
                         let labels: LabelSet = scratch
                             .iter()
                             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -3855,32 +3998,40 @@ impl<'q> ClientAggState<'q> {
                         // per-row transients above drop with the error and
                         // the map never holds the entry. (`entry()` has
                         // already reserved the table slot — that growth is
-                        // structurally bounded by the 500-group count cap
-                        // checked above and covered by this charge's slot
-                        // term.)
+                        // covered by this charge's slot term, which since
+                        // issue #236 deleted the group-COUNT cap is the
+                        // whole bound on this map: bytes, never a count.)
                         charge_group_bytes(
                             &mut self.group_bytes,
                             group_entry_bytes(e.key(), &labels, INSTANT_GROUP_SLOT),
                             self.caps.group_bytes,
                         )?;
-                        &mut e.insert((labels, BTreeMap::new())).1
+                        e.insert((labels, BucketAcc::new(op, row.timestamp_ns, v)));
                     }
                 }
             } else {
-                let groups = self.fp_groups.len() as u64;
-                if !self.fp_groups.contains_key(&row.fingerprint) && groups >= self.caps.series {
-                    return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                        cap: self.caps.series,
-                    }));
+                // Issue #236 P1 — the premise fix. Before #236 this arm was
+                // count-gated only and its per-group BYTES were never
+                // charged: `base_labels` is hydrated with no charge, so
+                // deleting the count cap (Part A) would have left the
+                // non-mutating instant path with no bound at all. The
+                // charge rides the EXISTING `contains_key` probe (no added
+                // per-row work) and happens BEFORE the entry is created, so
+                // a refusal never leaves the map holding it.
+                if !self.fp_groups.contains_key(&row.fingerprint) {
+                    charge_group_bytes(
+                        &mut self.group_bytes,
+                        group_entry_bytes("", base, FP_GROUP_SLOT),
+                        self.caps.group_bytes,
+                    )?;
                 }
-                self.fp_groups.entry(row.fingerprint).or_default()
-            };
-            match buckets.entry(bucket) {
-                std::collections::btree_map::Entry::Occupied(mut e) => {
-                    e.get_mut().add(row.timestamp_ns, v)
-                }
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(BucketAcc::new(op, row.timestamp_ns, v));
+                match self.fp_groups.entry(row.fingerprint) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        e.get_mut().add(row.timestamp_ns, v);
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(BucketAcc::new(op, row.timestamp_ns, v));
+                    }
                 }
             }
         }
@@ -3888,40 +4039,30 @@ impl<'q> ClientAggState<'q> {
     }
 
     /// Finishes every accumulator into the metric result.
-    /// `absent_over_time` emits at most ONE series over the (pre-capped)
-    /// bucket grid; the other reducers emit per surviving group.
+    /// `absent_over_time` emits at most ONE sample; the other reducers
+    /// emit one per surviving group.
+    ///
+    /// Always a `Vector` (issue #236 Part D): the state is instant-only by
+    /// construction, so the former stepped arms — the `bucket_grid` walk
+    /// for absence and the per-bucket `Matrix` emit — were dead, and are
+    /// deleted rather than left as a second reading of a contract the type
+    /// already states.
     fn finish(self) -> QueryResult {
-        let is_instant = self.window.step_ns().is_none();
         if matches!(self.client.range_op, RangeAggOp::AbsentOverTime) {
             let labels: LabelSet = self.client.absent_labels.clone();
-            return if is_instant {
-                if self.present.is_empty() {
-                    QueryResult::Vector(vec![VectorSample { labels, value: 1.0 }])
-                } else {
-                    QueryResult::Vector(Vec::new())
-                }
+            return if self.present {
+                QueryResult::Vector(Vec::new())
             } else {
-                let step = self.window.step_ns().map(|d| d.as_u64()).unwrap_or(0);
-                let points: Vec<(i64, f64)> =
-                    bucket_grid(self.window.start_ns(), self.window.end_ns(), step)
-                        .into_iter()
-                        .filter(|b| !self.present.contains(b))
-                        .map(|b| (b, 1.0))
-                        .collect();
-                if points.is_empty() {
-                    QueryResult::Matrix(Vec::new())
-                } else {
-                    QueryResult::Matrix(vec![MatrixSeries { labels, points }])
-                }
+                QueryResult::Vector(vec![VectorSample { labels, value: 1.0 }])
             };
         }
 
         let base_labels = self.base_labels;
         let mut group_bytes = self.group_bytes;
-        let groups: Vec<(LabelSet, BTreeMap<i64, BucketAcc>)> = if self.fan_out {
+        let groups: Vec<(LabelSet, BucketAcc)> = if self.fan_out {
             self.label_groups
                 .into_iter()
-                .map(|(key, (labels, buckets))| {
+                .map(|(key, (labels, acc))| {
                     // Round 6 symmetry: sized over the same unmodified
                     // key/labels as the charge, released as each entry is
                     // consumed (key dropped, labels move to the output).
@@ -3929,13 +4070,29 @@ impl<'q> ClientAggState<'q> {
                         &mut group_bytes,
                         group_entry_bytes(&key, &labels, INSTANT_GROUP_SLOT),
                     );
-                    (labels, buckets)
+                    (labels, acc)
                 })
                 .collect()
         } else {
             self.fp_groups
                 .into_iter()
-                .filter_map(|(fp, buckets)| base_labels.get(&fp).map(|l| (l.clone(), buckets)))
+                .filter_map(|(fp, acc)| {
+                    // Issue #236 P1's discharge leg, with the SAME symmetry
+                    // the fan-out arm has had since round 6: sized over the
+                    // same `base_labels` value the charge used (empty key,
+                    // `FP_GROUP_SLOT`), released as the entry is consumed.
+                    // `push_rows` only charges a fingerprint it successfully
+                    // resolved in `base_labels`, so every charged entry is
+                    // discharged here and `group_bytes` returns to exactly 0
+                    // — the `filter_map` below can only drop an entry that
+                    // was never charged.
+                    let l = base_labels.get(&fp)?;
+                    discharge_group_bytes(
+                        &mut group_bytes,
+                        group_entry_bytes("", l, FP_GROUP_SLOT),
+                    );
+                    Some((l.clone(), acc))
+                })
                 .collect()
         };
         debug_assert_eq!(
@@ -3945,32 +4102,15 @@ impl<'q> ClientAggState<'q> {
         let op = self.client.range_op;
         let rate_window_ns = self.rate_window_ns;
         let param = self.client.param;
-        if is_instant {
-            QueryResult::Vector(
-                groups
-                    .into_iter()
-                    .filter_map(|(labels, mut buckets)| {
-                        buckets.remove(&INSTANT_BUCKET).map(|acc| VectorSample {
-                            labels,
-                            value: acc.finish(op, rate_window_ns, param),
-                        })
-                    })
-                    .collect(),
-            )
-        } else {
-            QueryResult::Matrix(
-                groups
-                    .into_iter()
-                    .map(|(labels, buckets)| MatrixSeries {
-                        labels,
-                        points: buckets
-                            .into_iter()
-                            .map(|(b, acc)| (b, acc.finish(op, rate_window_ns, param)))
-                            .collect(),
-                    })
-                    .collect(),
-            )
-        }
+        QueryResult::Vector(
+            groups
+                .into_iter()
+                .map(|(labels, acc)| VectorSample {
+                    labels,
+                    value: acc.finish(op, rate_window_ns, param),
+                })
+                .collect(),
+        )
     }
 }
 
@@ -4294,10 +4434,18 @@ fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// into the group map, where they live until finish — bytes charged against
 /// NEITHER the collision-group cap (whose counter resets when the group
 /// flushes) nor the retention cap (denominated in fixed-width points). The
-/// group COUNT was already bounded ([`MAX_CLIENT_AGG_SERIES`]), but 500
-/// multi-MiB extracted label sets were a real memory hazard; this cap bounds
-/// their BYTES, charged through [`charge_group_bytes`] BEFORE the insertion
-/// that retains each entry and released as finish consumes it.
+/// group COUNT used to be bounded too, but multi-MiB extracted label sets
+/// were a real memory hazard at any count; this cap bounds their BYTES,
+/// charged through [`charge_group_bytes`] BEFORE the insertion that
+/// retains each entry and released as finish consumes it.
+///
+/// **Since issue #236 this is the ONLY bound on the group axis.** The
+/// mid-scan group-count cap is deleted (it rejected queries the reference
+/// serves — see [`MAX_QUERY_SERIES`]), so every row of the table below
+/// that used to lean on a count now leans on bytes or on the grid.
+/// Raised 64 MiB → 256 MiB with that deletion (owner ruling O1): the
+/// count cap used to keep the group axis small, and the byte cap now
+/// carries the whole load.
 ///
 /// **The query-lifetime container audit** (round 6 — earlier sweeps covered
 /// the per-sample/per-window dimension; this is the per-QUERY one). Every
@@ -4309,8 +4457,9 @@ fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// | `ClientAggState::label_groups` keys + `LabelSet`s | **charged here** (same helpers, same discipline) |
 /// | `MutGroup::int_cells`/`pt_cells`, `FpSlide::win`, `BucketAcc` retention | [`MAX_RETAINED_WINDOW_POINTS`] / [`MAX_QUANTILE_VALUES`] / [`MAX_COUNTER_VALUES`], charge-before-insert |
 /// | `base_labels` / `hashes` (both states) | built once from the stage-2 hydration read, which is scan-budget-capped (`max_bytes_to_read`) and stream-capped (`max_streams`); never grown per row |
-/// | non-mutating output labels (`FpSlide::labels`, `series_out`) | one clone per emitted series (≤ [`MAX_CLIENT_AGG_SERIES`]) of a `base_labels` value — inside the same hydration bound |
-/// | emitted points (`FpSlide::points`, `series_out`, fan-out `points`) | fixed-width `(i64, f64)`, structurally ≤ `MAX_CLIENT_AGG_SERIES × grid` (grid ≤ [`MAX_CLIENT_AGG_BUCKETS`] + 1) ≈ 88 MB worst case, independent of input bytes |
+/// | `ClientAggState::fp_groups` (non-mutating instant) | **charged here** since issue #236 P1 ([`FP_GROUP_SLOT`]), inside the existing `contains_key` probe — before #236 this arm was count-gated only and its bytes were never charged |
+/// | non-mutating output labels (`FpSlide::labels`, `series_out`) | **charged here** since issue #236 P2 ([`SERIES_OUT_SLOT`]), before the `labels` clone; discharged at the slider's no-points drop or as `finish_in_place` releases the vector |
+/// | emitted points (`FpSlide::points`, `series_out`, fan-out `points`) | fixed-width `(i64, f64)`, charged against [`MAX_METRIC_RESULT_POINTS`] — the former `series × grid` product leaned on the deleted count cap |
 /// | `present_cover` / `present` | grid-sized (≤ [`MAX_CLIENT_AGG_BUCKETS`] + 2 entries) |
 /// | `absent_labels` | cloned from the parsed query text — bounded by request size |
 /// | `coll` staging | NOT query-lifetime: one group at a time, ≤ [`MAX_TS_COLLISION_GROUP_BYTES`] |
@@ -4322,11 +4471,44 @@ fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// | variants: per-sub-state growing state (`groups`/retention/collision/quantile/counter) | [`AggCaps::divided`]`(n)` — the per-field SUM over sub-states is exactly the single-query bound above |
 /// | post-aggregation selection/grouping keys (`select_k_*`/`group_*`'s `HashMap<LabelSet, _>` owned `group_key` copies) | **flagged, not yet charged** (issue #241): bounded only indirectly by the upstream hydration/series caps; `approx_topk` itself is exempt structurally (`grouping == None` ⇒ a single empty key) |
 ///
-/// 64 MiB across ≤ 500 groups is ~128 KiB of rendered labels per group —
-/// far beyond real extracted label sets (typically well under a KiB), so
-/// nothing servable is rejected; an adversarial 500 × multi-MiB set trips a
-/// clean 422 instead of holding gigabytes for the query's lifetime.
-pub const MAX_CLIENT_AGG_GROUP_BYTES: u64 = 64 * 1024 * 1024;
+/// **Value: 256 MiB, raised from 64 MiB by issue #236 (owner ruling O1).**
+/// With the group-COUNT cap deleted this became the only bound on the
+/// group axis, so it had to admit the high-cardinality shapes #236 exists
+/// to serve. At the stated 6-pair label model that is ≈ 80 321 admitted
+/// groups — 3.4× the pre-#236 figure and comfortably above the issue's
+/// reported 20 505-group probe shape. The residual, stated rather than
+/// hidden: above ≈ 80 321 groups PulsusDB still refuses where the
+/// reference serves. That is a bounded divergence, not a fix — the real
+/// fix is a step-ordered evaluator (#250). O2 (1 GiB) was rejected
+/// because per-query ceilings do not compose across concurrent queries;
+/// O4 (operator-configurable) routes to #25.
+pub const MAX_CLIENT_AGG_GROUP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The exact upper bound [`ensure_grid_resolution`] can ADMIT, in grid
+/// POINTS. The fence saturates ([`fence_intervals`]) while
+/// [`grid_point_count`] is exact over i128, so a full-domain span at a
+/// step just wide enough to pass the fence admits
+/// `2 * (MAX_CLIENT_AGG_BUCKETS + 1)` points — `ensure_grid_resolution`'s
+/// own doc says so. DERIVED from the fence, never chosen, and it enforces
+/// nothing on its own: the gate is [`MAX_CLIENT_AGG_BUCKETS`] intervals,
+/// which is the reference's rule.
+pub const MAX_ADMITTED_GRID_POINTS: u64 = 2 * (MAX_CLIENT_AGG_BUCKETS + 1); // 22_002
+
+/// The cap on emitted points, fold cells and fold slots — one counter
+/// each, charged before allocation (issue #236).
+///
+/// DERIVED, not chosen: a result the reference will serve carries at most
+/// [`MAX_QUERY_SERIES`] series, and each holds at most
+/// [`MAX_ADMITTED_GRID_POINTS`] points, so every counter's provable
+/// maximum for a servable result is `500 × 22 002 = 11 001 000`. The
+/// shipped value is the next round figure above it, so no servable result
+/// is ever refused by this cap.
+///
+/// It replaces the structural `series × grid` product that the deleted
+/// group-count cap used to supply. Unlike that product it does not reject
+/// on a group COUNT, so a wide scan collapsing to a narrow result passes
+/// it untouched.
+pub const MAX_METRIC_RESULT_POINTS: u64 = 12_000_000;
 
 /// **The one group-byte gate** (round 6): every query-lifetime group-map
 /// insertion is sized by [`group_entry_bytes`], checked against the cap, and
@@ -4338,6 +4520,37 @@ fn charge_group_bytes(charged: &mut u64, bytes: u64, cap: u64) -> Result<(), Rea
     if next > cap {
         return Err(ReadError::QueryTooBroad(
             TooBroadReason::MetricGroupLabelBytes { bytes: next, cap },
+        ));
+    }
+    *charged = next;
+    Ok(())
+}
+
+/// **The one result-point gate** (issue #236): every fixed-width point
+/// slot a metric evaluation will RETAIN is reserved here, against
+/// [`MAX_METRIC_RESULT_POINTS`], *before* the allocation that holds it.
+///
+/// An ADMISSION counter, not a concurrent-retention one — there is no
+/// discharge, because the slots it reserves hold the RESULT and live
+/// until the result is returned. `charge_retention`'s counters return to
+/// zero at finish; this one asserts a charge IDENTITY instead (the tests
+/// pin `charged == series x (kmax + 1)`).
+///
+/// **Charged `O(1)` per output series and per fold group, never per
+/// point.** Each reservation is the grid's full width (`kmax + 1`), which
+/// is both an exact upper bound on what one series can emit and the
+/// model [`MAX_METRIC_RESULT_POINTS`] is derived from
+/// (`MAX_QUERY_SERIES x MAX_ADMITTED_GRID_POINTS`) — so the gate and the
+/// constant speak the same units, and the read path gains no per-point
+/// work.
+///
+/// `saturating_add` cannot mask a breach (saturation only grows the sum)
+/// but keeps a pathological reservation from wrapping the comparison.
+fn charge_result_points(charged: &mut u64, points: u64, cap: u64) -> Result<(), ReadError> {
+    let next = charged.saturating_add(points);
+    if next > cap {
+        return Err(ReadError::QueryTooBroad(
+            TooBroadReason::MetricResultPoints { count: next, cap },
         ));
     }
     *charged = next;
@@ -4357,7 +4570,38 @@ const MUT_GROUP_SLOT: usize = size_of::<(String, MutGroup)>();
 
 /// The map-entry slot the instant path's group charge sizes
 /// (`label_groups`).
-const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BTreeMap<i64, BucketAcc>))>();
+const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BucketAcc))>();
+
+/// The map-entry slot the non-mutating instant path's group charge sizes
+/// (`fp_groups`) — issue #236 P1. The key is a `u64` fingerprint, not a
+/// rendered string, so the charge passes an empty key to
+/// [`group_entry_bytes`] and the `LabelSet` term prices the hydrated
+/// `base_labels` value the group stands for.
+const FP_GROUP_SLOT: usize = size_of::<(u64, BucketAcc)>();
+
+/// The label set a fingerprint with no hydrated meta stands for — issue
+/// #236 P2 sizes its charge over this so the charge/discharge pair stays
+/// exact on a fingerprint `base_labels` never saw (`cloned().unwrap_or_
+/// default()` yields exactly this).
+static EMPTY_LABEL_SET: LabelSet = Vec::new();
+
+/// The map-entry slot a FOLD group occupies. Both fold maps are keyed by
+/// the `LabelSet` the grouping projects; the value differs per fold, so
+/// the larger of the two is charged (over-charging is the safe
+/// direction, and one constant keeps the two sites speaking one
+/// vocabulary).
+const FOLD_GROUP_SLOT: usize = {
+    let reduce = size_of::<(LabelSet, Vec<VectorAccum>)>();
+    let select = size_of::<(LabelSet, Vec<KSel>)>();
+    if reduce > select { reduce } else { select }
+};
+
+/// A `Vec` element sized through the map-entry helper — issue #236 P2.
+/// `series_out` is a `Vec`, not a map, so this is a deliberate
+/// OVER-charge: both leaf paths then speak ONE vocabulary
+/// ([`group_entry_bytes`]) and the derivation has a single term to reason
+/// about instead of two.
+const SERIES_OUT_SLOT: usize = size_of::<MatrixSeries>();
 
 /// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
 /// output group's map entry retains: the rendered-JSON key, the cloned
@@ -4390,9 +4634,10 @@ const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BTreeMap<i64, Bu
 ///   ≤ 2× its request (the [`alloc_block_bytes`] model) that peak is
 ///   ≤ ~6.86 slots per entry — `8×` dominates it for every entry count,
 ///   and the flat pad covers the table's fixed control-group padding
-///   (also ≤ 2×-rounded) many times over. (The table itself is
-///   additionally structurally bounded: the entry COUNT is capped at
-///   [`MAX_CLIENT_AGG_SERIES`] before any insertion.)
+///   (also ≤ 2×-rounded) many times over. (`MAP_GROWTH_FACTOR = 8` is a
+///   LOAD-FACTOR argument and holds for any entry count — issue #236
+///   deleted the group-count cap that used to be quoted here as an
+///   additional structural bound, and the bound is unaffected.)
 ///
 /// Saturating arithmetic throughout — a hostile label set can only make
 /// the charge LARGER, the safe direction.
@@ -4820,14 +5065,91 @@ impl FpSlide {
     }
 }
 
-/// One mutating/regrouping output group's fan-out cells (keyed by grid
-/// index). Class-A cells keep a running integer; class-B/C cells retain the
-/// window's fixed-width points and reduce at finish.
+/// One class-A grid cell's DELTA (issue #236 Part C, C1): a sample
+/// covering `[k_lo, k_hi]` records `(+value, +1)` at `k_lo` and
+/// `(-value, -1)` at `k_hi + 1`, and the covered cells are recovered by
+/// prefix-summing ascending. Two map touches per sample instead of one
+/// per covered cell — the same difference-array trick `present_cover`
+/// already uses for `absent_over_time`.
+///
+/// `dcount` cannot fold into `dvalue`: `bytes_over_time` over an empty
+/// line contributes value 0 to a cell that is nonetheless COVERED and
+/// must emit `0`, which only a separate coverage count distinguishes from
+/// a gap.
+///
+/// Both fields are `i64` and the arithmetic is exact — class A is the
+/// invert-INTEGER class, so the running value is integral end to end and
+/// `reduce_int_cell` is the only float conversion. Neither can overflow:
+/// each surviving sample contributes one `+`/`-` pair, `|value|` is
+/// either 1 or a line length, and the scan is hard-bounded by
+/// `LOGQL_SCAN_BUDGET_BYTES_CEILING` bytes — so both running totals are
+/// bounded by the scanned byte count, itself `< 2^63` (the same structural
+/// argument `present_cover`'s counter width rests on).
+#[derive(Debug, Clone, Copy, Default)]
+struct IntDelta {
+    dvalue: i64,
+    dcount: i64,
+}
+
+/// How ONE mutating output group accumulates. Which arm a query uses is
+/// fixed once, at state construction, by [`mut_cells_for`] — never per
+/// group and never per sample — so a group cannot hold a mixed
+/// representation and the arms cannot interleave.
+#[derive(Debug)]
+enum MutCells {
+    /// **Class A, non-overlapping windows.** One entry per COVERED grid
+    /// cell, accumulated in place. Kept VERBATIM through issue #236 Part
+    /// C: each sample then covers exactly one cell, so this is already
+    /// `O(1)` per sample, it charges ONE retention point where the delta
+    /// form would charge two, and it collapses repeated samples in the
+    /// same cell into that single entry.
+    IntExpanded(HashMap<i64, u64>),
+    /// **Class A, overlapping windows.** A difference array over grid
+    /// indices ([`IntDelta`]), prefix-summed at finish — two map touches
+    /// per sample instead of `ceil(range/step)`.
+    IntDeltas(HashMap<i64, IntDelta>),
+    /// **Classes B/C.** Every surviving sample, retained ONCE; the
+    /// covering cells are recovered at finish by sorting with
+    /// [`win_order`] and sweeping two pointers over ascending grid
+    /// indices. Retention is `O(samples)` and INDEPENDENT of
+    /// `ceil(range/step)`, where the previous per-cell map retained one
+    /// copy of the sample per covering cell.
+    Samples(Vec<WinSample>),
+}
+
+impl MutCells {
+    /// Retained entries, in the same unit [`charge_retention`] charged
+    /// them in — one point per created class-A entry, `per_sample` points
+    /// per retained class-B/C sample (the caller multiplies).
+    ///
+    /// Test-only observability, like [`VectorAggFold::cells`]: production
+    /// code charges and discharges through the counter itself, so
+    /// exposing a second way to ask would invite the two to drift.
+    #[cfg(test)]
+    fn charged_units(&self) -> u64 {
+        match self {
+            MutCells::IntExpanded(m) => m.len() as u64,
+            MutCells::IntDeltas(m) => m.len() as u64,
+            MutCells::Samples(v) => v.len() as u64,
+        }
+    }
+
+    /// Test-only, as [`MutCells::charged_units`].
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        match self {
+            MutCells::IntExpanded(m) => m.is_empty(),
+            MutCells::IntDeltas(m) => m.is_empty(),
+            MutCells::Samples(v) => v.is_empty(),
+        }
+    }
+}
+
+/// One mutating/regrouping output group's fan-out state.
 #[derive(Debug)]
 struct MutGroup {
     labels: LabelSet,
-    int_cells: HashMap<i64, u64>,
-    pt_cells: HashMap<i64, Vec<WinSample>>,
+    cells: MutCells,
 }
 
 /// The sliding-window range evaluator (issue #227).
@@ -4897,8 +5219,6 @@ struct RangeSlideState<'q> {
     /// `absent_presence_counter_cannot_overflow_under_the_scan_budget` pins
     /// the arithmetic.
     present_cover: Vec<i64>,
-    // Distinct output-series count (the 500 cap, non-mutating path).
-    series_count: u64,
     // Current collision run.
     coll_active: bool,
     coll_fp: u64,
@@ -4920,6 +5240,19 @@ struct RangeSlideState<'q> {
     /// bounded by [`MAX_TS_COLLISION_GROUP_BYTES`] (one group staged at a
     /// time) and freed within the same flush.
     group_bytes: u64,
+    /// Issue #236: RESULT point-slots reserved by this state, through
+    /// [`charge_result_points`]. One grid's width per output series, at
+    /// the moment the series is created — `O(1)`, never per point. An
+    /// ADMISSION counter: it is never discharged, because the points it
+    /// reserves are the result.
+    result_points: u64,
+    /// The innermost vector aggregation, applied AS this state emits
+    /// (issue #236 Part B) instead of over its materialised output.
+    /// `None` — the state's own construction default — is the
+    /// materialising path this leaf has always taken; it is attached by
+    /// [`RangeSlideState::attach_fold`] after construction, so the
+    /// constructor's shape (and its allocation census) is unchanged.
+    fold: Option<VectorAggFold>,
 }
 
 impl<'q> RangeSlideState<'q> {
@@ -5000,14 +5333,51 @@ impl<'q> RangeSlideState<'q> {
             // `vec![0; 0]` never allocates) so this constructor's censused
             // branch shape is unchanged.
             present_cover: vec![0; (kmax.max(-1) + 2) as usize * (is_absent as usize)],
-            series_count: 0,
             coll_active: false,
             coll_fp: 0,
             coll_ts: 0,
             coll: Vec::new(),
             coll_bytes: 0,
             group_bytes: 0,
+            result_points: 0,
+            fold: None,
         })
+    }
+
+    /// The grid this state emits on — the fold indexes its dense slots by
+    /// the same triple, so a slot and a grid point are two views of one
+    /// value.
+    fn grid(&self) -> FoldGrid {
+        FoldGrid {
+            start: self.grid_start,
+            step: self.step,
+            kmax: self.kmax,
+        }
+    }
+
+    /// Hands the INNERMOST vector aggregation to the leaf (issue #236
+    /// Part B). A no-op for the specs the leaf cannot own
+    /// ([`VectorAggFold::new`] returns `None`), which is why
+    /// [`RangeSlideState::folded_aggs`] — not the caller's intent —
+    /// decides how many specs the caller must still apply.
+    ///
+    /// Attached AFTER `new` rather than taken as a constructor parameter:
+    /// the grid is only known once `ensure_grid_resolution` has run, and
+    /// keeping it out of `new` leaves that constructor's branch/allocation
+    /// census (issue #221 `logql_variants_alloc`) untouched.
+    fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
+        self.fold = VectorAggFold::new(
+            spec,
+            self.grid(),
+            self.caps.result_points,
+            self.caps.group_bytes,
+        );
+    }
+
+    /// How many trailing (innermost) specs this leaf has taken over: 0 or
+    /// 1. The caller applies the remaining prefix.
+    fn folded_aggs(&self) -> usize {
+        usize::from(self.fold.is_some())
     }
 
     /// Folds one batch of (physical-key-ordered) rows: runs the pipeline,
@@ -5282,18 +5652,33 @@ impl<'q> RangeSlideState<'q> {
 
         // Non-mutating: one slider per fingerprint (fingerprints contiguous).
         if self.cur.is_none() || self.cur_fp != fp {
-            if let Some(prev) = self.cur.take()
-                && let Some(series) = prev.finish(&mut self.retained)
-            {
-                self.series_out.push(series);
+            if let Some(prev) = self.cur.take() {
+                self.rotate_slider(prev);
             }
-            self.series_count += 1;
-            if self.series_count > self.caps.series {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                    cap: self.caps.series,
-                }));
-            }
-            let labels = base_labels.get(&fp).cloned().unwrap_or_default();
+            // Issue #236 P2 — the premise fix on the non-mutating RANGE
+            // path. Part A deleted the mid-scan group-count rejection
+            // that used to stand here, and the `labels` clone
+            // below plus the eventual `series_out` element were otherwise
+            // uncharged. Charged BEFORE the clone, so a refusal never
+            // allocates; discharged in the slider rotation's `None` arm
+            // (a series that yields no points) and at the end of
+            // `finish_in_place`'s non-mutating arm.
+            let src = base_labels.get(&fp);
+            charge_group_bytes(
+                &mut self.group_bytes,
+                group_entry_bytes("", src.unwrap_or(&EMPTY_LABEL_SET), SERIES_OUT_SLOT),
+                self.caps.group_bytes,
+            )?;
+            // Issue #236: this slider will emit at most one point per
+            // grid point, so the grid's width is reserved once, here,
+            // before the slider exists — `O(1)`, and in the same units
+            // `MAX_METRIC_RESULT_POINTS` is derived in.
+            charge_result_points(
+                &mut self.result_points,
+                grid_slot_count(self.kmax),
+                self.caps.result_points,
+            )?;
+            let labels = src.cloned().unwrap_or_default();
             self.cur = Some(FpSlide {
                 stream_hash,
                 labels,
@@ -5327,6 +5712,22 @@ impl<'q> RangeSlideState<'q> {
         Ok(())
     }
 
+    /// Retires the finished non-mutating slider — issue #236 P2's discharge
+    /// leg. A slider that produced points hands its `MatrixSeries` to
+    /// `series_out` and KEEPS its charge (the bytes are still live) until
+    /// `finish_in_place` releases the whole vector; a slider that produced
+    /// NONE is dropped here, so its charge is released here. Sized over the
+    /// same labels P2 charged (`FpSlide::labels` is `base_labels`' value,
+    /// cloned and never mutated), which is what makes `group_bytes == 0` at
+    /// finish an exact identity rather than an inequality.
+    fn rotate_slider(&mut self, prev: FpSlide) {
+        let entry_bytes = group_entry_bytes("", &prev.labels, SERIES_OUT_SLOT);
+        match prev.finish(&mut self.retained) {
+            Some(series) => self.series_out.push(series),
+            None => discharge_group_bytes(&mut self.group_bytes, entry_bytes),
+        }
+    }
+
     /// Fans one ranked sample into every grid cell whose window `(t-range,
     /// t]` covers `ts` (the covering-set identity `t ∈ [ts, ts+range)`).
     fn fan_out_sample(
@@ -5344,11 +5745,6 @@ impl<'q> RangeSlideState<'q> {
         }
         let is_new = !self.groups.contains_key(&key);
         if is_new {
-            if self.groups.len() as u64 >= self.caps.series {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                    cap: self.caps.series,
-                }));
-            }
             // Issue #227 review round 6: the key + `LabelSet` MOVE into the
             // QUERY-LIFETIME `groups` map below and outlive the collision
             // flush (whose `coll_bytes` charge has already been reset), so
@@ -5360,46 +5756,80 @@ impl<'q> RangeSlideState<'q> {
                 group_entry_bytes(&key, &labels, MUT_GROUP_SLOT),
                 self.caps.group_bytes,
             )?;
+            // Issue #236: same reservation as the non-mutating slider —
+            // one grid width per output group, once, before the group
+            // exists.
+            charge_result_points(
+                &mut self.result_points,
+                grid_slot_count(self.kmax),
+                self.caps.result_points,
+            )?;
         }
-        let integer = matches!(self.class, ReducerClass::InvertInteger);
         let per_sample = self.per_sample;
         let cap = self.caps.retention_points;
+        let empty_cells = mut_cells_for(self.class, self.range, self.step, self.kmax);
         let retained = &mut self.retained;
         let group = self.groups.entry(key).or_insert_with(|| MutGroup {
             labels,
-            int_cells: HashMap::new(),
-            pt_cells: HashMap::new(),
+            cells: empty_cells,
         });
-        for k in k_lo..=k_hi {
-            if integer {
-                // Review finding 3: a newly-CREATED integer cell is charged to
-                // the same concurrent-retention counter as a retained point,
-                // so the class-A fan-out obeys the documented invariant
-                // instead of relying on the implicit
-                // `MAX_CLIENT_AGG_SERIES × MAX_CLIENT_AGG_BUCKETS` product.
-                // Updating an existing cell is O(1) and charges nothing.
-                //
-                // ONE point per cell: an `int_cells` entry is an `(i64, u64)`
-                // pair, narrower than the `WinSample` the unit is defined by,
-                // and class A never re-reduces over a scratch
-                // (`per_sample == 1` for every integer op anyway).
-                match group.int_cells.entry(k) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        *e.get_mut() += value as u64;
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        // Size → check the cap → allocate, through the ONE
-                        // gate (issue #227 review round 5, finding 2): the
-                        // insert may grow the map, so the cap must refuse
-                        // before it, not after.
-                        charge_retention(retained, 1, cap)?;
-                        e.insert(value as u64);
+        // Review finding 3: a newly-CREATED entry is charged to the same
+        // concurrent-retention counter as a retained point, so the
+        // mutating fan-out obeys the documented invariant instead of
+        // relying on an implicit `groups × grid` product — which issue
+        // #236 has since deleted outright (there is no group-count cap
+        // left to form one). Updating an EXISTING entry is O(1) and
+        // charges nothing. Size → check the cap → allocate, through the
+        // ONE gate (issue #227 review round 5, finding 2): an insert may
+        // grow the map, so the cap must refuse before it, not after.
+        //
+        // ONE point per entry on the class-A arms: an entry is a pair of
+        // integers, narrower than the `WinSample` the unit is defined by,
+        // and class A never re-reduces over a scratch (`per_sample == 1`
+        // for every integer op anyway).
+        match &mut group.cells {
+            // Issue #236 Part C, C1: two touches per SAMPLE — the deltas
+            // at `k_lo` and at the exclusive `k_hi + 1` — instead of one
+            // per covered cell. `k_hi + 1` may be `kmax + 1`, which is a
+            // delta index only and is never emitted.
+            MutCells::IntDeltas(cells) => {
+                for (k, dv, dc) in [(k_lo, value as i64, 1i64), (k_hi + 1, -(value as i64), -1)] {
+                    match cells.entry(k) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let d = e.get_mut();
+                            d.dvalue += dv;
+                            d.dcount += dc;
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            charge_retention(retained, 1, cap)?;
+                            e.insert(IntDelta {
+                                dvalue: dv,
+                                dcount: dc,
+                            });
+                        }
                     }
                 }
-            } else {
-                // Same gate before the map/vector insertion — both allocate.
+            }
+            MutCells::IntExpanded(cells) => {
+                for k in k_lo..=k_hi {
+                    match cells.entry(k) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            *e.get_mut() += value as u64;
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            charge_retention(retained, 1, cap)?;
+                            e.insert(value as u64);
+                        }
+                    }
+                }
+            }
+            // Issue #236 Part C, C2: classes B/C retain each surviving
+            // sample ONCE. The covering cells are recovered at finish by
+            // a two-pointer sweep, so retention no longer scales with
+            // `ceil(range/step)`.
+            MutCells::Samples(samples) => {
                 charge_retention(retained, per_sample, cap)?;
-                group.pt_cells.entry(k).or_default().push(WinSample {
+                samples.push(WinSample {
                     ts,
                     stream_hash,
                     tie_rank,
@@ -5414,21 +5844,7 @@ impl<'q> RangeSlideState<'q> {
     /// points whose window `(grid_t-range, grid_t]` covers `ts`:
     /// `grid_t-range < ts ≤ grid_t` ⟺ `ts ≤ grid_t < ts+range`.
     fn covering_k(&self, ts: i64) -> (i64, i64) {
-        let step = self.step as i128;
-        let gs = self.grid_start as i128;
-        let ts = ts as i128;
-        let range = self.range as i128;
-        // ts ≤ grid_start + k·step  ⇒  k ≥ ceil((ts-gs)/step)
-        let k_lo = ceil_div_i128(ts - gs, step).max(0);
-        // grid_start + k·step < ts+range ⇒ k·step ≤ ts+range-gs-1 ⇒
-        // k ≤ floor((ts+range-gs-1)/step)
-        let k_hi = (ts + range - gs - 1)
-            .div_euclid(step)
-            .min(self.kmax as i128);
-        (
-            i64::try_from(k_lo).unwrap_or(i64::MAX),
-            i64::try_from(k_hi).unwrap_or(i64::MIN),
-        )
+        covering_k_of(ts, self.grid_start, self.step, self.range, self.kmax)
     }
 
     fn grid_point(&self, k: i64) -> i64 {
@@ -5463,25 +5879,34 @@ impl<'q> RangeSlideState<'q> {
         // `&mut self` flush does not clash with a `self.base_labels` borrow.
         let base_labels = std::mem::take(&mut self.base_labels);
         self.flush_collision(&base_labels)?;
-        if let Some(prev) = self.cur.take()
-            && let Some(series) = prev.finish(&mut self.retained)
-        {
-            self.series_out.push(series);
+        if let Some(prev) = self.cur.take() {
+            self.rotate_slider(prev);
         }
         if self.is_absent {
-            return Ok(self.finish_absent());
+            let series = self.finish_absent()?;
+            return self.emit(series);
         }
         if self.fan_out {
-            let op = self.op;
-            let class = self.class;
-            let param = self.param;
-            let rate_window_ns = self.rate_window_ns;
-            let grid_start = self.grid_start;
-            let step = self.step;
-            // Saturating narrowing, like `FpSlide::grid_point` (issue #227
-            // arithmetic sweep) — never a silent wrap.
-            let grid_point = |k: i64| clamp_bucket(grid_start as i128 + k as i128 * step as i128);
-            let groups = std::mem::take(&mut self.groups);
+            // **The reduction-order pin, extended to the fold** (issue
+            // #236, task-manager ruling "Option B"). `groups` is a
+            // `HashMap` under a per-process randomly-seeded hasher, so
+            // draining it directly would hand the fold a member order
+            // that varies run to run — and Welford, and float addition,
+            // are order-SENSITIVE. Sorting by label set here is the same
+            // total order `pin_reduction_order` applies immediately
+            // before grouping on the materialising path, so the folded
+            // and materialised values are the same bits, and both are
+            // reproducible. One sort per stage, never per group.
+            //
+            // Applied whether or not a fold is attached — unlike
+            // `emit`'s, which is inside the folding arm. A fan-out result
+            // came out in `HashMap` walk order before, which no test
+            // could assert and no user could rely on; making it
+            // label-ascending is the same order the wire already carries
+            // everywhere else.
+            let mut groups: Vec<(String, MutGroup)> =
+                std::mem::take(&mut self.groups).into_iter().collect();
+            groups.sort_by(|(_, a), (_, b)| a.labels.cmp(&b.labels));
             let mut out: Vec<MatrixSeries> = Vec::new();
             for (key, group) in groups {
                 // Round 6 symmetry: the discharge is sized over the SAME
@@ -5494,55 +5919,236 @@ impl<'q> RangeSlideState<'q> {
                 // memory it paid for is still owned by this state.
                 let entry_bytes = group_entry_bytes(&key, &group.labels, MUT_GROUP_SLOT);
                 drop(key);
-                let mut points: Vec<(i64, f64)> = Vec::new();
-                // Both branches drain the group's cells into a `Vec` keyed by
-                // grid index so the points come out ordered. The drain is
-                // bounded by the cells' own charge (one point per created
-                // cell / retained sample) and each element is narrower than
-                // the `WinSample` that charge is denominated in — the `Vec`
-                // moves the inner point vectors, it does not copy them. The
-                // discharge happens AFTER the cells are consumed, so a charge
-                // is never released while the memory it paid for is still
-                // live (issue #227 review round 5, finding 2).
-                if matches!(class, ReducerClass::InvertInteger) {
-                    let mut cells: Vec<(i64, u64)> = group.int_cells.into_iter().collect();
-                    let staged = cells.len() as u64;
-                    cells.sort_by_key(|(k, _)| *k);
-                    for (k, run_int) in cells {
-                        points.push((grid_point(k), reduce_int_cell(op, rate_window_ns, run_int)));
-                    }
-                    discharge_retention(&mut self.retained, staged);
-                } else {
-                    let mut cells: Vec<(i64, Vec<WinSample>)> =
-                        group.pt_cells.into_iter().collect();
-                    let staged: u64 = cells.iter().map(|(_, v)| v.len() as u64).sum();
-                    cells.sort_by_key(|(k, _)| *k);
-                    for (k, mut pts) in cells {
-                        pts.sort_by(win_order);
-                        if let Some(v) = reduce_window(op, class, param, rate_window_ns, 0, &pts) {
-                            points.push((grid_point(k), v));
-                        }
-                    }
-                    discharge_retention(&mut self.retained, staged * self.per_sample);
-                }
+                let (labels, points) = self.drain_group(group);
                 if !points.is_empty() {
-                    out.push(MatrixSeries {
-                        labels: group.labels,
-                        points,
-                    });
+                    // Issue #236 Part B: the fold consumes each group AS
+                    // it is built, so the `scanned groups x grid points`
+                    // materialisation that `out` used to accumulate never
+                    // exists — that is the whole point-axis win.
+                    match self.fold.as_mut() {
+                        Some(fold) => fold.push_series(&labels, &points)?,
+                        None => out.push(MatrixSeries { labels, points }),
+                    }
                 }
                 discharge_group_bytes(&mut self.group_bytes, entry_bytes);
             }
-            return Ok(QueryResult::Matrix(out));
+            return Ok(QueryResult::Matrix(match self.fold.take() {
+                Some(fold) => fold.finish(),
+                None => out,
+            }));
         }
-        Ok(QueryResult::Matrix(std::mem::take(&mut self.series_out)))
+        // Issue #236 P2's other discharge leg: every series that reached
+        // `series_out` still holds its charge, released as the vector
+        // leaves the state. Sized over the same (never-mutated) labels the
+        // charge used, so `group_bytes` returns to exactly 0.
+        let out = std::mem::take(&mut self.series_out);
+        for s in &out {
+            discharge_group_bytes(
+                &mut self.group_bytes,
+                group_entry_bytes("", &s.labels, SERIES_OUT_SLOT),
+            );
+        }
+        self.emit(out)
+    }
+
+    /// Drains ONE mutating output group's retained cells into its grid
+    /// points, discharging the retention they were charged for (issue
+    /// #236 Part C).
+    ///
+    /// A frame of its own rather than an inline block in
+    /// `finish_in_place`: it holds all three [`MutCells`] arms, and the
+    /// per-variant allocation census (`logql_variants_alloc`) pins a
+    /// FUNCTION's body — folding it into the caller would have made one
+    /// 24-branch frame, and hiding it behind an un-censused helper would
+    /// have made its allocations invisible to a window that genuinely
+    /// executes them (a `variants(...)` sub-state whose pipeline mutates
+    /// labels takes exactly this path).
+    fn drain_group(&mut self, group: MutGroup) -> (LabelSet, Vec<(i64, f64)>) {
+        let mut points: Vec<(i64, f64)> = Vec::new();
+        // Every arm drains the group's cells into a `Vec` keyed by
+        // grid index so the points come out ordered. The drain is
+        // bounded by the cells' own charge (one point per created
+        // cell / retained sample) and each element is narrower than
+        // the `WinSample` that charge is denominated in — the `Vec`
+        // moves, it does not copy. The discharge happens AFTER the
+        // cells are consumed, so a charge is never released while
+        // the memory it paid for is still live (issue #227 review
+        // round 5, finding 2).
+        match group.cells {
+            MutCells::IntExpanded(cells) => {
+                let mut cells: Vec<(i64, u64)> = cells.into_iter().collect();
+                let staged = cells.len() as u64;
+                cells.sort_by_key(|(k, _)| *k);
+                for (k, run_int) in cells {
+                    points.push((
+                        self.grid_point(k),
+                        reduce_int_cell(self.op, self.rate_window_ns, run_int),
+                    ));
+                }
+                discharge_retention(&mut self.retained, staged);
+            }
+            // Issue #236 Part C, C1: prefix-sum the difference
+            // array ascending. Between two consecutive delta
+            // indices the running pair is CONSTANT, so a covered
+            // run emits one point per cell and an uncovered run is
+            // skipped in O(1) — the emitted set and its values are
+            // exactly the expanded form's (`covering_k` is the
+            // half-open interval each `(+1, -1)` pair spans).
+            // `run_count > 0` is the coverage test, which is why
+            // it cannot fold into `run_value`: a covered cell of
+            // value 0 emits `0`, an uncovered one emits nothing.
+            MutCells::IntDeltas(cells) => {
+                let mut cells: Vec<(i64, IntDelta)> = cells.into_iter().collect();
+                let staged = cells.len() as u64;
+                cells.sort_by_key(|(k, _)| *k);
+                let (mut run_value, mut run_count) = (0i64, 0i64);
+                for i in 0..cells.len() {
+                    let (k, d) = cells[i];
+                    run_value += d.dvalue;
+                    run_count += d.dcount;
+                    if run_count <= 0 {
+                        continue;
+                    }
+                    // Constant until the next delta index, and
+                    // never past the last grid point.
+                    let end = cells
+                        .get(i + 1)
+                        .map_or(self.kmax + 1, |(next, _)| *next)
+                        .min(self.kmax + 1);
+                    let run_int = u64::try_from(run_value).unwrap_or(0);
+                    let v = reduce_int_cell(self.op, self.rate_window_ns, run_int);
+                    for cell in k.max(0)..end {
+                        points.push((self.grid_point(cell), v));
+                    }
+                }
+                discharge_retention(&mut self.retained, staged);
+            }
+            // Issue #236 Part C, C2: one sort per GROUP, then a
+            // two-pointer sweep over ascending grid indices. The
+            // slice handed to `reduce_window` is the identical
+            // element sequence the per-cell form produced —
+            // `win_order` is `ts`-major and total on a group's
+            // samples, and the window `(t-range, t]` is exactly
+            // `covering_k`'s inverse. Cells are visited only where
+            // some sample covers them (the merged covering
+            // intervals), so an uncovered stretch of grid costs
+            // nothing, as it did before.
+            MutCells::Samples(mut samples) => {
+                let staged = samples.len() as u64;
+                samples.sort_by(win_order);
+                // `covering_k` is monotone in `ts` and the samples
+                // are now `ts`-ascending, so the covering
+                // intervals arrive sorted and merging them is ONE
+                // pass. Merging is what keeps an uncovered stretch
+                // of grid free, exactly as the per-cell map made
+                // it free.
+                let mut covered: Vec<(i64, i64)> = Vec::new();
+                for s in &samples {
+                    let (a, b) = self.covering_k(s.ts);
+                    if a > b {
+                        continue;
+                    }
+                    match covered.last_mut() {
+                        Some(last) if a <= last.1 + 1 => last.1 = last.1.max(b),
+                        _ => covered.push((a, b)),
+                    }
+                }
+                let (mut lo, mut hi) = (0usize, 0usize);
+                for (a, b) in covered {
+                    for cell in a..=b {
+                        let t = self.grid_point(cell);
+                        while hi < samples.len() && samples[hi].ts <= t {
+                            hi += 1;
+                        }
+                        // `checked_sub` for the same reason
+                        // `FpSlide::emit_at` uses it: an eviction
+                        // bound below the representable domain
+                        // evicts nothing.
+                        if let Some(bound) = t.checked_sub(self.range) {
+                            while lo < hi && samples[lo].ts <= bound {
+                                lo += 1;
+                            }
+                        }
+                        if let Some(v) = reduce_window(
+                            self.op,
+                            self.class,
+                            self.param,
+                            self.rate_window_ns,
+                            0,
+                            &samples[lo..hi],
+                        ) {
+                            points.push((t, v));
+                        }
+                    }
+                }
+                discharge_retention(&mut self.retained, staged * self.per_sample);
+            }
+        }
+        (group.labels, points)
+    }
+
+    /// Routes an already-materialised batch of leaf series through the
+    /// attached fold (issue #236 Part B), or hands it back unchanged when
+    /// nothing folded.
+    ///
+    /// **The reduction-order pin, extended to the fold.** The batch is put
+    /// in label-set order before folding — the same total order
+    /// `pin_reduction_order` applies immediately before grouping on the
+    /// materialising path — so the folded value is the materialised value
+    /// bit for bit, and both are reproducible. The sort is inside the
+    /// folding arm so a query that does NOT fold keeps its existing output
+    /// order byte for byte.
+    ///
+    /// Series are consumed one at a time, so a series' points are freed as
+    /// they are folded rather than all being held until finish.
+    ///
+    /// **Residual, recorded so it is not rediscovered as a surprise**
+    /// (ledger entry `#236 (c)`). The non-mutating caller has already
+    /// materialised `series_out` by the time it gets here, so this arm
+    /// does NOT collapse that vector the way the fan-out arm collapses
+    /// its groups. Folding at each slider's close instead would, but
+    /// sliders complete in FINGERPRINT order — deterministic, and not the
+    /// label-set order this pins — so the folded value would stop being
+    /// the materialised value. The consequence is deferred, not absent:
+    /// once emitted points are charged
+    /// ([`MAX_METRIC_RESULT_POINTS`], not yet levied) a non-mutating range
+    /// leaf whose `streams x grid points` exceeds the charge is refused
+    /// where the reference serves it. The fix is a step-ordered
+    /// evaluator (issue #250), not a larger constant.
+    fn emit(&mut self, mut series: Vec<MatrixSeries>) -> Result<QueryResult, ReadError> {
+        match self.fold.take() {
+            None => Ok(QueryResult::Matrix(series)),
+            Some(mut fold) => {
+                pin_reduction_order(
+                    &mut series,
+                    |s| &s.labels,
+                    |a, b| range_payload_cmp(a.points.iter().copied(), b.points.iter().copied()),
+                );
+                for s in series {
+                    fold.push_series(&s.labels, &s.points)?;
+                }
+                Ok(QueryResult::Matrix(fold.finish()))
+            }
+        }
     }
 
     /// `absent_over_time`: emit `1.0` at every grid point whose selector-wide
     /// window `(t-range, t]` is EMPTY (Loki's one emit-on-empty reducer).
     /// Prefix-sums the O(grid) coverage difference array (review finding 1):
     /// a running sum > 0 means at least one sample covers that grid point.
-    fn finish_absent(&mut self) -> QueryResult {
+    ///
+    /// Returns the series rather than a [`QueryResult`] so the caller can
+    /// route them through the issue #236 Part B fold like every other
+    /// emit path; the 0-or-1 shape is unchanged.
+    fn finish_absent(&mut self) -> Result<Vec<MatrixSeries>, ReadError> {
+        // Issue #236: `absent_over_time` emits at most ONE series, whose
+        // points are the grid's empty windows — reserved before the
+        // vector is built, like every other emitted series.
+        charge_result_points(
+            &mut self.result_points,
+            grid_slot_count(self.kmax),
+            self.caps.result_points,
+        )?;
         let mut points: Vec<(i64, f64)> = Vec::new();
         // Same width as the deltas (see `present_cover`'s proof): the running
         // sum is bounded by the total collision-group count, itself bounded by
@@ -5554,14 +6160,14 @@ impl<'q> RangeSlideState<'q> {
                 points.push((self.grid_point(k), 1.0));
             }
         }
-        if points.is_empty() {
-            QueryResult::Matrix(Vec::new())
+        Ok(if points.is_empty() {
+            Vec::new()
         } else {
-            QueryResult::Matrix(vec![MatrixSeries {
+            vec![MatrixSeries {
                 labels: std::mem::take(&mut self.absent_labels),
                 points,
-            }])
-        }
+            }]
+        })
     }
 }
 
@@ -5571,7 +6177,9 @@ impl<'q> RangeSlideState<'q> {
 /// of buffering the scan — review round 1, finding 1).
 ///
 /// Vector aggregations are NOT applied here — the caller finishes them
-/// (`apply_vector_aggs`), mirroring the SQL path.
+/// (`apply_vector_aggs`), mirroring the SQL path. Callers that want the
+/// engine's ACTUAL sequence, with the innermost aggregation folded at the
+/// leaf (issue #236 Part B), use [`run_client_agg_rows_folded`].
 pub fn run_client_agg_rows(
     rows: &[MetricScanRow],
     compiled: &super::pipeline::CompiledPipeline,
@@ -5579,6 +6187,30 @@ pub fn run_client_agg_rows(
     client: &ClientAgg,
     window: ClientWindow,
     rate_window_ns: Option<u64>,
+) -> Result<QueryResult, ReadError> {
+    run_client_agg_rows_folded(rows, compiled, meta, client, window, rate_window_ns, &[])
+}
+
+/// [`run_client_agg_rows`] plus the whole vector-aggregation chain, run
+/// the way [`LogQlEngine::run_metric_client`] runs it (issue #236 Part
+/// B): on a RANGE query the innermost spec is handed to the leaf, which
+/// folds it AS it emits, and only the remaining prefix is materialised
+/// through [`apply_vector_aggs`]. On an instant query, and for the specs
+/// the leaf cannot own (`sort`/`sort_desc`/`approx_topk`), every spec goes
+/// to `apply_vector_aggs` — i.e. exactly today's path.
+///
+/// `pub` so the hermetic suites and the conformance runner drive the same
+/// sequence the engine does, rather than a materialising approximation of
+/// it: the fold's equivalence with `apply_vector_aggs` is a property that
+/// has to be EXERCISED, not asserted.
+pub fn run_client_agg_rows_folded(
+    rows: &[MetricScanRow],
+    compiled: &super::pipeline::CompiledPipeline,
+    meta: &HashMap<u64, StreamMetaRow>,
+    client: &ClientAgg,
+    window: ClientWindow,
+    rate_window_ns: Option<u64>,
+    aggs: &[plan::VectorAggSpec],
 ) -> Result<QueryResult, ReadError> {
     if matches!(window, ClientWindow::Range { .. }) {
         // Issue #227: a range query evaluates Loki's sliding windows, which
@@ -5595,6 +6227,10 @@ pub fn run_client_agg_rows(
             rate_window_ns,
             AggCaps::DEFAULT,
         )?;
+        if let Some(spec) = aggs.last() {
+            state.attach_fold(spec);
+        }
+        let folded = state.folded_aggs();
         let ordered = rows.windows(2).all(|w| {
             (w[0].fingerprint, w[0].timestamp_ns) <= (w[1].fingerprint, w[1].timestamp_ns)
         });
@@ -5609,18 +6245,27 @@ pub fn run_client_agg_rows(
             });
             state.push_rows(&sorted)?;
         }
-        return state.finish();
+        let result = state.finish()?;
+        return apply_vector_aggs(result, &aggs[..aggs.len() - folded]);
     }
+    // The `Range` arm returned above, so this narrowing cannot fail; it
+    // is a narrowing rather than an assertion so the instant state cannot
+    // be built for a stepped window at all (issue #236 Part D).
+    let instant = window
+        .as_instant()
+        .ok_or_else(|| ReadError::PipelineInvalid {
+            reason: "internal: a stepped window reached the instant aggregation state".to_string(),
+        })?;
     let mut state = ClientAggState::new(
         compiled,
         meta,
         client,
-        window,
+        instant,
         rate_window_ns,
         AggCaps::DEFAULT,
     )?;
     state.push_rows(rows)?;
-    Ok(state.finish())
+    apply_vector_aggs(state.finish(), aggs)
 }
 
 /// The live engine's per-fold metric-aggregation state: the instant
@@ -6228,11 +6873,19 @@ impl<'q> VariantsAggState<'q> {
                     caps,
                 )?))
             } else {
+                let instant =
+                    spec.window()
+                        .as_instant()
+                        .ok_or_else(|| ReadError::PipelineInvalid {
+                            reason: "internal: a stepped variant window reached the instant \
+                                     aggregation state"
+                                .to_string(),
+                        })?;
                 MetricAggState::Instant(Box::new(ClientAggState::new(
                     compiled,
                     meta,
                     spec.client(),
-                    spec.window(),
+                    instant,
                     spec.rate_window_ns(),
                     caps,
                 )?))
@@ -6347,8 +7000,18 @@ impl<'q> VariantsAggState<'q> {
             let out = if spec.vector_aggs().is_empty() {
                 out
             } else {
-                apply_vector_aggs(out, spec.vector_aggs())
+                apply_vector_aggs(out, spec.vector_aggs())?
             };
+            // Issue #236: the result-series cap is applied PER VARIANT,
+            // before the concat — matching the reference's own granularity
+            // (`engine.go:474-506`, `:609-621` apply `maxSeries` per
+            // variant, not to the concatenated whole). Strictly more
+            // permissive than capping the concat: a 3-variant query
+            // returning 400 series each is served (1 200 result series).
+            // The remaining divergence is that the reference SKIPS the
+            // breaching variant with a warning where PulsusDB 422s —
+            // that needs a `warnings` response envelope and is #277.
+            ensure_result_series(&out)?;
             discharge_fanout_bytes(&mut self.charged, self.sub_charged[i]);
             per_variant.push(out);
         }
@@ -6568,6 +7231,34 @@ pub fn combine_binary(
     lhs: QueryResult,
     rhs: QueryResult,
 ) -> Result<QueryResult, ReadError> {
+    let mut charged = 0u64;
+    combine_binary_capped(
+        &mut charged,
+        op,
+        return_bool,
+        matching,
+        lhs,
+        rhs,
+        MAX_POST_AGG_BYTES,
+    )
+}
+
+/// The binary cap seam; see [`apply_vector_aggs_capped`]. The charge is
+/// levied on the measured operands BEFORE the join builds its one-side
+/// index, its match signatures or its output.
+#[allow(clippy::too_many_arguments)]
+pub fn combine_binary_capped(
+    charged: &mut u64,
+    op: BinOp,
+    return_bool: bool,
+    matching: Option<&VectorMatching>,
+    lhs: QueryResult,
+    rhs: QueryResult,
+    cap: u64,
+) -> Result<QueryResult, ReadError> {
+    let (lm, rm) = (measure_operand(&lhs), measure_operand(&rhs));
+    let bytes = binary_peak_bytes(op, matching, &lm, &rm);
+    let l = Ledger::acquire_binary(charged, &lm, &rm, bytes, cap)?;
     match (lhs, rhs) {
         (QueryResult::Scalar(l), QueryResult::Scalar(r)) => {
             if is_set_op(op) {
@@ -6592,9 +7283,11 @@ pub fn combine_binary(
             if is_set_op(op) {
                 return Err(set_op_scalar_error(op));
             }
-            Ok(map_samples(vector_side, |v| {
-                scalar_apply(op, return_bool, s, v, true)
-            }))
+            map_samples(
+                vector_side,
+                |v| scalar_apply(op, return_bool, s, v, true),
+                &l,
+            )
         }
         (
             vector_side @ (QueryResult::Vector(_) | QueryResult::Matrix(_)),
@@ -6603,15 +7296,17 @@ pub fn combine_binary(
             if is_set_op(op) {
                 return Err(set_op_scalar_error(op));
             }
-            Ok(map_samples(vector_side, |v| {
-                scalar_apply(op, return_bool, s, v, false)
-            }))
+            map_samples(
+                vector_side,
+                |v| scalar_apply(op, return_bool, s, v, false),
+                &l,
+            )
         }
-        (QueryResult::Vector(l), QueryResult::Vector(r)) => Ok(QueryResult::Vector(
-            combine_vectors(op, return_bool, matching, l, r)?,
+        (QueryResult::Vector(a), QueryResult::Vector(b)) => Ok(QueryResult::Vector(
+            combine_vectors(op, return_bool, matching, a, b, &l)?,
         )),
-        (QueryResult::Matrix(l), QueryResult::Matrix(r)) => Ok(QueryResult::Matrix(
-            combine_matrices(op, return_bool, matching, l, r)?,
+        (QueryResult::Matrix(a), QueryResult::Matrix(b)) => Ok(QueryResult::Matrix(
+            combine_matrices(op, return_bool, matching, a, b, &l)?,
         )),
         // Both operands evaluate under the same QuerySpec, so a
         // vector/matrix mix (or a streams/string operand) is structurally
@@ -6634,8 +7329,22 @@ fn set_op_scalar_error(op: BinOp) -> ReadError {
 /// Maps every sample of a vector/matrix result through `f` (`None`
 /// drops the sample — the comparison-filter path), dropping series left
 /// empty.
-fn map_samples(result: QueryResult, f: impl Fn(f64) -> Option<f64>) -> QueryResult {
-    match result {
+fn map_samples(
+    result: QueryResult,
+    f: impl Fn(f64) -> Option<f64>,
+    l: &Ledger<'_>,
+) -> Result<QueryResult, ReadError> {
+    match &result {
+        QueryResult::Vector(items) => l.admit(items.len() as u64, items.len() as u64)?,
+        QueryResult::Matrix(items) => {
+            let points = items
+                .iter()
+                .fold(0u64, |a, s| a.saturating_add(s.points.len() as u64));
+            l.admit(items.len() as u64, points)?;
+        }
+        _ => {}
+    }
+    Ok(match result {
         QueryResult::Vector(items) => QueryResult::Vector(
             items
                 .into_iter()
@@ -6664,7 +7373,7 @@ fn map_samples(result: QueryResult, f: impl Fn(f64) -> Option<f64>) -> QueryResu
                 .collect(),
         ),
         other => other,
-    }
+    })
 }
 
 /// A reduced match signature — the `on`/`ignoring` projection of a
@@ -6687,7 +7396,11 @@ struct JoinItem<'a> {
 /// the listed keys, `ignoring(l)` drops them, `None` keeps the full set
 /// (byte-identical to the pre-#91 full-`LabelSet` key). Input is
 /// key-sorted (aggregation sorts labels), so the output stays sorted.
-fn match_signature(labels: &[(String, String)], matching: Option<&VectorMatching>) -> MatchSig {
+fn match_signature(
+    labels: &[(String, String)],
+    matching: Option<&VectorMatching>,
+    _l: &Ledger<'_>,
+) -> MatchSig {
     match matching {
         None => labels.to_vec(),
         Some(vm) if vm.on => labels
@@ -6706,7 +7419,7 @@ fn match_signature(labels: &[(String, String)], matching: Option<&VectorMatching
 /// Sets `key`=`value` in a key-sorted label vector, replacing an existing
 /// entry or inserting in sorted position (keeps the vector sorted so
 /// downstream identity/equality stays canonical).
-fn set_label_sorted(labels: &mut Vec<(String, String)>, key: &str, value: &str) {
+fn set_label_sorted(labels: &mut Vec<(String, String)>, key: &str, value: &str, _l: &Ledger<'_>) {
     match labels.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
         Ok(i) => labels[i].1 = value.to_string(),
         Err(i) => labels.insert(i, (key.to_string(), value.to_string())),
@@ -6774,9 +7487,11 @@ fn instant_join(
     matching: Option<&VectorMatching>,
     lhs: &[JoinItem<'_>],
     rhs: &[JoinItem<'_>],
+    led: &Ledger<'_>,
 ) -> Result<Vec<VectorSample>, ReadError> {
+    admit_join(lhs, rhs, led)?;
     if is_set_op(op) {
-        return Ok(set_op_join(op, matching, lhs, rhs));
+        return set_op_join(op, matching, lhs, rhs, led);
     }
 
     // Arithmetic/comparison empty-operand short-circuit — BEFORE the
@@ -6801,7 +7516,7 @@ fn instant_join(
     // many-to-many, an error for every cardinality.
     let mut one_by_key: HashMap<MatchSig, &JoinItem<'_>> = HashMap::with_capacity(one.len());
     for r in one {
-        let key = match_signature(r.labels, matching);
+        let key = match_signature(r.labels, matching, led);
         if one_by_key.insert(key, r).is_some() {
             return Err(duplicate_one_side_error(swapped));
         }
@@ -6811,7 +7526,7 @@ fn instant_join(
     let mut many_matched: HashMap<MatchSig, HashSet<MatchSig>> = HashMap::new();
     let mut out: Vec<VectorSample> = Vec::new();
     for l in many {
-        let key = match_signature(l.labels, matching);
+        let key = match_signature(l.labels, matching, led);
         let Some(r) = one_by_key.get(&key) else {
             continue;
         };
@@ -6841,7 +7556,7 @@ fn instant_join(
             if let Some(inc) = include {
                 for ln in inc {
                     match r.labels.iter().find(|(k, _)| k == ln) {
-                        Some((_, v)) if !v.is_empty() => set_label_sorted(&mut labels, ln, v),
+                        Some((_, v)) if !v.is_empty() => set_label_sorted(&mut labels, ln, v, led),
                         _ => remove_label_sorted(&mut labels, ln),
                     }
                 }
@@ -6882,47 +7597,49 @@ fn set_op_join(
     matching: Option<&VectorMatching>,
     lhs: &[JoinItem<'_>],
     rhs: &[JoinItem<'_>],
-) -> Vec<VectorSample> {
+    l: &Ledger<'_>,
+) -> Result<Vec<VectorSample>, ReadError> {
+    admit_join(lhs, rhs, l)?;
     let own = |it: &JoinItem<'_>| VectorSample {
         labels: it.labels.to_vec(),
         value: it.value,
     };
-    match op {
+    Ok(match op {
         BinOp::And => {
             let rhs_sigs: HashSet<MatchSig> = rhs
                 .iter()
-                .map(|s| match_signature(s.labels, matching))
+                .map(|s| match_signature(s.labels, matching, l))
                 .collect();
             lhs.iter()
-                .filter(|l| rhs_sigs.contains(&match_signature(l.labels, matching)))
+                .filter(|it| rhs_sigs.contains(&match_signature(it.labels, matching, l)))
                 .map(own)
                 .collect()
         }
         BinOp::Unless => {
             let rhs_sigs: HashSet<MatchSig> = rhs
                 .iter()
-                .map(|s| match_signature(s.labels, matching))
+                .map(|s| match_signature(s.labels, matching, l))
                 .collect();
             lhs.iter()
-                .filter(|l| !rhs_sigs.contains(&match_signature(l.labels, matching)))
+                .filter(|it| !rhs_sigs.contains(&match_signature(it.labels, matching, l)))
                 .map(own)
                 .collect()
         }
         BinOp::Or => {
             let lhs_sigs: HashSet<MatchSig> = lhs
                 .iter()
-                .map(|s| match_signature(s.labels, matching))
+                .map(|s| match_signature(s.labels, matching, l))
                 .collect();
             let mut out: Vec<VectorSample> = lhs.iter().map(own).collect();
             out.extend(
                 rhs.iter()
-                    .filter(|r| !lhs_sigs.contains(&match_signature(r.labels, matching)))
+                    .filter(|r| !lhs_sigs.contains(&match_signature(r.labels, matching, l)))
                     .map(own),
             );
             out
         }
         _ => unreachable!("is_set_op gates the arm"),
-    }
+    })
 }
 
 /// Vector⊗vector: the [`instant_join`] core over one virtual step.
@@ -6932,7 +7649,12 @@ fn combine_vectors(
     matching: Option<&VectorMatching>,
     lhs: Vec<VectorSample>,
     rhs: Vec<VectorSample>,
+    l: &Ledger<'_>,
 ) -> Result<Vec<VectorSample>, ReadError> {
+    l.admit(
+        (lhs.len() as u64).saturating_add(rhs.len() as u64),
+        (lhs.len() as u64).saturating_add(rhs.len() as u64),
+    )?;
     let lhs_items: Vec<JoinItem<'_>> = lhs
         .iter()
         .map(|s| JoinItem {
@@ -6947,7 +7669,7 @@ fn combine_vectors(
             value: s.value,
         })
         .collect();
-    instant_join(op, return_bool, matching, &lhs_items, &rhs_items)
+    instant_join(op, return_bool, matching, &lhs_items, &rhs_items, l)
 }
 
 /// Matrix⊗matrix: an INDEPENDENT per-step instant join (issue #91 delta
@@ -6961,7 +7683,14 @@ fn combine_matrices(
     matching: Option<&VectorMatching>,
     lhs: Vec<MatrixSeries>,
     rhs: Vec<MatrixSeries>,
+    l: &Ledger<'_>,
 ) -> Result<Vec<MatrixSeries>, ReadError> {
+    let series = (lhs.len() as u64).saturating_add(rhs.len() as u64);
+    let points = lhs
+        .iter()
+        .chain(rhs.iter())
+        .fold(0u64, |a, s| a.saturating_add(s.points.len() as u64));
+    l.admit(series, points)?;
     // Index each side's points by timestamp once (labels stay borrowable
     // from the owned operands for the whole loop).
     let lhs_maps: StepIndex<'_> = lhs
@@ -6999,7 +7728,7 @@ fn combine_matrices(
                 rhs_items.push(JoinItem { labels, value: *v });
             }
         }
-        for sample in instant_join(op, return_bool, matching, &lhs_items, &rhs_items)? {
+        for sample in instant_join(op, return_bool, matching, &lhs_items, &rhs_items, l)? {
             match out.get_mut(&sample.labels) {
                 Some(points) => points.push((t, sample.value)),
                 None => {
@@ -8393,6 +9122,131 @@ struct InstantSeries {
     value: f64,
 }
 
+/// The bytes [`group_key`] is ABOUT TO allocate for `labels`/`grouping`,
+/// computed without allocating them — the fold's charge-before-allocate
+/// needs the size before the key exists.
+///
+/// It mirrors `group_key`'s projection arm for arm and prices the result
+/// through the leaf's own vocabulary ([`alloc_block_bytes`] per owned
+/// `String`, one exactly-reserved element buffer), which is
+/// [`label_set_bytes`] evaluated on a `LabelSet` that has not been built.
+/// `group_key_bytes_matches_group_key` pins the two together, so the
+/// sizing cannot drift from the thing it sizes.
+fn group_key_bytes(labels: &[(String, String)], grouping: Option<&Grouping>) -> u64 {
+    let Some(g) = grouping else {
+        // `group_key` returns `Vec::new()`, which allocates nothing.
+        return 0;
+    };
+    let mut bytes: u64 = 0;
+    let mut pairs: u64 = 0;
+    match g.kind {
+        GroupingKind::By => {
+            for name in &g.labels {
+                let value_len = labels
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map_or(0, |(_, v)| v.len());
+                bytes = bytes
+                    .saturating_add(alloc_block_bytes(name.len() as u64))
+                    .saturating_add(alloc_block_bytes(value_len as u64));
+                pairs += 1;
+            }
+        }
+        GroupingKind::Without => {
+            for (k, v) in labels {
+                if g.labels.contains(k) {
+                    continue;
+                }
+                bytes = bytes
+                    .saturating_add(alloc_block_bytes(k.len() as u64))
+                    .saturating_add(alloc_block_bytes(v.len() as u64));
+                pairs += 1;
+            }
+        }
+    }
+    // `group_key` collects into an exactly-reserved buffer and then
+    // `sort()`s it in place; the sort allocates a scratch of at most the
+    // same size, which the `grown_alloc_bytes` growth model covers.
+    let elems = pairs.saturating_mul(size_of::<(String, String)>() as u64);
+    bytes.saturating_add(grown_alloc_bytes(elems))
+}
+
+/// **The refund, by construction** — the RAII half of
+/// [`charged_group_key`]. The key's bytes are charged BEFORE the key
+/// exists, so the charge is only correct once the key is RETAINED; until
+/// then it is transient and owed back. Pairing a `discharge_group_bytes`
+/// call with each non-retaining exit is what let the points-charge error
+/// path leak (issue #236 whole-branch re-review `[low]`), so the refund
+/// is `Drop`'s job instead: the charge sticks ONLY through
+/// [`GroupKeyCharge::commit`], called immediately after the insertion
+/// that retains the key. Every other exit between the charge and that
+/// insertion — including ones added later — refunds by construction.
+///
+/// The guarantee is this `Drop` impl plus the absence of any other route
+/// from the fold to `group_key`
+/// (`the_fold_charges_before_it_builds_a_group_key`), NOT a behavioural
+/// test: on the leaking path `push_series` returns `Err`, the query
+/// aborts and no finish post-condition runs, so nothing observable
+/// distinguishes a refunded charge from a leaked one and a test asserting
+/// the refund could not fail.
+#[derive(Debug)]
+#[must_use = "the guard refunds the key charge when it drops; hold it until the key is retained"]
+struct GroupKeyCharge<'a> {
+    charged: &'a mut u64,
+    /// The bytes owed back. [`GroupKeyCharge::commit`] zeroes it, which
+    /// is how a committed charge becomes a no-op refund.
+    bytes: u64,
+}
+
+impl GroupKeyCharge<'_> {
+    /// The key is RETAINED — the charge belongs to the counter now.
+    fn commit(mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for GroupKeyCharge<'_> {
+    fn drop(&mut self) {
+        discharge_group_bytes(self.charged, self.bytes);
+    }
+}
+
+/// **The fold's only route to [`group_key`]** — charge, THEN allocate,
+/// in ONE place so the ordering is read once rather than repeated at
+/// every call site (issue #236 review round 1 `[high]`).
+///
+/// Returns the key and a [`GroupKeyCharge`] guard for the bytes charged
+/// for it. The counter tracks what is RETAINED, so the charge survives
+/// only if the caller RETAINS the key ([`GroupKeyCharge::commit`]); every
+/// other exit — the group was already present, or an intervening charge
+/// refused — refunds when the guard drops. The bound therefore covers
+/// `retained + one transient`, which is what charging before allocating
+/// necessarily costs.
+///
+/// The guard is built IMMEDIATELY after the charge lands and BEFORE
+/// `group_key` runs, because a guard cannot refund a charge it does not
+/// yet own: `group_key` allocates, so an unwinding panic inside it would
+/// otherwise unwind past a charge with nothing holding the refund. Three
+/// steps, in this order — charge, guard, build — and no fallible or
+/// allocating step between the first two.
+///
+/// `the_fold_charges_before_it_builds_a_group_key` pins that statement
+/// ORDER inside this function: a behavioural test cannot see the
+/// inversion (the transient key is built either way), so the ordering is
+/// checked where it is written.
+fn charged_group_key<'a>(
+    labels: &[(String, String)],
+    grouping: Option<&Grouping>,
+    charged: &'a mut u64,
+    cap: u64,
+) -> Result<(LabelSet, GroupKeyCharge<'a>), ReadError> {
+    let bytes = group_key_bytes(labels, grouping).saturating_add(map_entry_bytes(FOLD_GROUP_SLOT));
+    charge_group_bytes(charged, bytes, cap)?;
+    let charge = GroupKeyCharge { charged, bytes };
+    let key = group_key(labels, grouping);
+    Ok((key, charge))
+}
+
 fn group_key(labels: &[(String, String)], grouping: Option<&Grouping>) -> LabelSet {
     let Some(g) = grouping else {
         return Vec::new();
@@ -8425,43 +9279,270 @@ fn group_key(labels: &[(String, String)], grouping: Option<&Grouping>) -> LabelS
     kv
 }
 
-/// Population variance (the reference oracle's `stdvar` semantics —
-/// live-probed: `stdvar` of `1,2,3,4` is `1.25`, i.e. `/n`, not the
-/// sample `/(n-1)`).
-fn population_variance(vals: &[f64]) -> f64 {
-    let n = vals.len() as f64;
-    let mean = vals.iter().sum::<f64>() / n;
-    vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n
+/// **The reduction-order pin** (issue #236 Part B, task-manager ruling
+/// "Option B").
+///
+/// [`VectorAccum`] transcribes the reference's Welford recurrence, which
+/// is **order-sensitive**: a group's `avg`/`stddev`/`stdvar` depends on
+/// the order its members are accumulated in. PulsusDB's member order is
+/// the order series arrive from the leaf, and the leaf emits by walking a
+/// `HashMap` (`ClientAggState::finish` over `label_groups`/`fp_groups`).
+/// Rust's default hasher is randomly seeded PER PROCESS, so without this
+/// pin the same query returns different bits on different runs —
+/// measured at 6 failures in 20 runs of `logqltest_corpus` before the pin
+/// existed.
+///
+/// So the members are put in a total order that is a property of the
+/// DATA, not of a hash seed: ascending by label set, which is the series'
+/// own identity and the canonical order used throughout this crate.
+/// Applied once per stage, immediately before grouping — never inside a
+/// group's reduce (that would be `O(k log k)` per group on the read hot
+/// path) — and AFTER the selection/reorder early returns, so
+/// `select_k_*`/`sort_instant` keep their existing order contracts
+/// untouched.
+///
+/// **Residual, stated because "deterministic" must not be read as
+/// "identical".** This makes PulsusDB reproducible; it does not make it
+/// order-identical to the reference, which walks a Go map and is itself
+/// nondeterministic here (measured 10/2 over 12 runs on identical data).
+/// The committed `b4_vector_aggs.test` captures land in a wide majority
+/// basin — enumerating all 24 member orders of `{2,4,6,8}`, 20 of them
+/// (including ascending) produce exactly the captured
+/// `stdvar=5.0`/`stddev=2.23606797749979` — so the green corpus is real
+/// evidence that this pin agrees with the reference on that data. It is
+/// NOT proof that the sorted order is the reference's: on other data a
+/// different member order could differ in the last bit. Plan v14's risk
+/// #6 called these values "not capturable"; the accurate statement,
+/// established by that enumeration, is **capturable but not
+/// order-independent**.
+fn pin_reduction_order<T>(
+    series: &mut [T],
+    labels_of: impl Fn(&T) -> &LabelSet,
+    payload_cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
+    series.sort_by(|a, b| {
+        labels_of(a)
+            .cmp(labels_of(b))
+            .then_with(|| payload_cmp(a, b))
+    });
 }
 
-fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
-    match op {
-        VectorAggOp::Sum => vals.iter().sum(),
-        VectorAggOp::Avg => vals.iter().sum::<f64>() / vals.len() as f64,
-        VectorAggOp::Min => vals.iter().cloned().fold(f64::INFINITY, f64::min),
-        VectorAggOp::Max => vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-        VectorAggOp::Count => vals.len() as f64,
-        VectorAggOp::Stddev => population_variance(vals).sqrt(),
-        VectorAggOp::Stdvar => population_variance(vals),
-        // Documented invariant: topk/bottomk are per-step SELECTIONS, not
-        // reductions — `group_range`/`group_instant` branch to
-        // `select_k_*` before ever calling `reduce`.
-        VectorAggOp::Topk | VectorAggOp::Bottomk => {
-            unreachable!("topk/bottomk are selections, dispatched before reduce")
-        }
-        // approx_topk is an instant-only selection (issue #221): the
-        // planner rejects it for range specs (`parse_vector_agg_params`),
-        // so it can never reach a matrix, and `group_instant` dispatches
-        // it before `reduce` — same contract as the arms above.
-        VectorAggOp::ApproxTopk => {
-            unreachable!("approx_topk is an instant-only selection, dispatched before reduce")
-        }
-        // sort/sort_desc reorder the result vector — `group_instant`
-        // (reorder) / `group_range` (passthrough) branch before `reduce`.
-        VectorAggOp::Sort | VectorAggOp::SortDesc => {
-            unreachable!("sort/sort_desc reorder, dispatched before reduce")
+/// A total order on an instant series' payload — its value's BITS, so
+/// `NaN` orders too (`total_cmp`, never `partial_cmp`).
+fn instant_payload_cmp(a: &InstantSeries, b: &InstantSeries) -> std::cmp::Ordering {
+    a.value.total_cmp(&b.value)
+}
+
+/// A total order on a range series' payload: the `(timestamp, value)`
+/// sequence, lexicographically, values by BITS. Allocates nothing.
+fn range_payload_cmp(
+    a: impl Iterator<Item = (i64, f64)>,
+    b: impl Iterator<Item = (i64, f64)>,
+) -> std::cmp::Ordering {
+    let mut a = a;
+    let mut b = b;
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some((ta, va)), Some((tb, vb))) => {
+                let o = ta.cmp(&tb).then_with(|| va.total_cmp(&vb));
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
         }
     }
+}
+
+/// The reference's per-op STREAMING accumulator, transcribed arm for arm
+/// from grafana/loki v3.7.4 `pkg/logql/evaluator.go` — seed `:479-486`
+/// (plus the `Stddev`/`Stdvar` zeroing at `:491-492`), update `:522-580`,
+/// finish `:586-596`.
+///
+/// Used by BOTH [`reduce`] and the range fold, so instant and range can
+/// never disagree on a value. It is simultaneously:
+///
+/// * **the parity fix.** PulsusDB previously computed `avg` as
+///   `sum/len` and `stddev`/`stdvar` through a two-pass
+///   `population_variance`; the reference uses Welford's online
+///   recurrence, which produces DIFFERENT bits. And an all-NaN `min`/`max`
+///   group folded to `±INF` here where the reference yields `NaN` (its
+///   `group.value < s.F || IsNaN(group.value)` test seeds from the first
+///   member and only ever replaces a NaN accumulator).
+/// * **the enabler.** It is O(1) per group, which is what lets the fold
+///   retain state proportional to OUTPUT groups rather than scanned ones.
+///
+/// Order-sensitivity, stated: Welford is not associative, so a group's
+/// value depends on member order. The reference iterates a Go map and is
+/// therefore order-NONDETERMINISTIC for `avg`/`stddev`/`stdvar` (measured
+/// 10/2 over 12 runs on identical data), which is why those ops are
+/// proved here by source-cited unit goldens and are NOT capturable from a
+/// container. PulsusDB pins a deterministic order — the same treatment
+/// the instant `first_over_time`/`last_over_time` tie already gets.
+#[derive(Clone, Copy, Debug)]
+struct VectorAccum {
+    value: f64,
+    mean: f64,
+    count: u64,
+}
+
+impl VectorAccum {
+    /// The "no member yet" state of a [`ReduceFold`] slot.
+    ///
+    /// `count == 0` is a SENTINEL, not a reachable accumulator: [`seed`]
+    /// sets `count: 1` for **every** op and [`update`] never decrements,
+    /// so a slot that has taken a value can never be mistaken for an
+    /// empty one. Pinned by
+    /// `vector_accum_seed_always_leaves_a_nonzero_count`, which drives
+    /// every reducing op — the sentinel is what lets the fold hold a
+    /// dense `Vec<VectorAccum>` (24 B/slot) instead of a
+    /// `Vec<Option<VectorAccum>>` (32 B/slot) across a grid of up to
+    /// [`MAX_ADMITTED_GRID_POINTS`] slots per group.
+    ///
+    /// [`seed`]: VectorAccum::seed
+    /// [`update`]: VectorAccum::update
+    const EMPTY: Self = VectorAccum {
+        value: 0.0,
+        mean: 0.0,
+        count: 0,
+    };
+
+    /// Whether this slot has taken a value yet — see [`VectorAccum::EMPTY`].
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// `evaluator.go:479-486` — the first member seeds `value` AND `mean`
+    /// with its own sample and `groupCount` with 1; `:491-492` then zeroes
+    /// `value` for `stddev`/`stdvar` (their `value` accumulates M2, not a
+    /// running total).
+    fn seed(op: VectorAggOp, f: f64) -> Self {
+        let value = match op {
+            VectorAggOp::Stddev | VectorAggOp::Stdvar => 0.0,
+            _ => f,
+        };
+        VectorAccum {
+            value,
+            mean: f,
+            count: 1,
+        }
+    }
+
+    /// `evaluator.go:522-580`, arm for arm.
+    fn update(&mut self, op: VectorAggOp, f: f64) {
+        match op {
+            // `:527` group.value += s.F
+            VectorAggOp::Sum => self.value += f,
+            // `:530-531` groupCount++; mean += (s.F - mean) / groupCount
+            VectorAggOp::Avg => {
+                self.count += 1;
+                self.mean += (f - self.mean) / self.count as f64;
+            }
+            // `:534-536` if group.value < s.F || IsNaN(group.value)
+            VectorAggOp::Max => {
+                if self.value < f || self.value.is_nan() {
+                    self.value = f;
+                }
+            }
+            // `:539-541` if group.value > s.F || IsNaN(group.value)
+            VectorAggOp::Min => {
+                if self.value > f || self.value.is_nan() {
+                    self.value = f;
+                }
+            }
+            // `:544` groupCount++
+            VectorAggOp::Count => self.count += 1,
+            // `:547-550` Welford: delta = s.F - mean; mean += delta/n;
+            //            value += delta * (s.F - mean)   [the NEW mean]
+            VectorAggOp::Stddev | VectorAggOp::Stdvar => {
+                self.count += 1;
+                let delta = f - self.mean;
+                self.mean += delta / self.count as f64;
+                self.value += delta * (f - self.mean);
+            }
+            // Selections and reorders never reach a reducing accumulator —
+            // `group_range`/`group_instant` and the fold dispatch them to
+            // `select_k_*`/`sort_instant` first. Guarded by
+            // `is_reduction`, whose exhaustive match is the single source
+            // of truth for this partition.
+            VectorAggOp::Topk
+            | VectorAggOp::Bottomk
+            | VectorAggOp::ApproxTopk
+            | VectorAggOp::Sort
+            | VectorAggOp::SortDesc => {
+                unreachable!("{op:?} is a selection/reorder, dispatched before any accumulator")
+            }
+        }
+    }
+
+    /// `evaluator.go:586-596`.
+    fn finish(self, op: VectorAggOp) -> f64 {
+        match op {
+            // `:588` aggr.value = aggr.mean
+            VectorAggOp::Avg => self.mean,
+            // `:591` aggr.value = float64(aggr.groupCount)
+            VectorAggOp::Count => self.count as f64,
+            // `:594` sqrt(value / groupCount)
+            VectorAggOp::Stddev => (self.value / self.count as f64).sqrt(),
+            // `:596` value / groupCount
+            VectorAggOp::Stdvar => self.value / self.count as f64,
+            // Sum/Min/Max carry their answer in `value` untouched.
+            VectorAggOp::Sum | VectorAggOp::Min | VectorAggOp::Max => self.value,
+            VectorAggOp::Topk
+            | VectorAggOp::Bottomk
+            | VectorAggOp::ApproxTopk
+            | VectorAggOp::Sort
+            | VectorAggOp::SortDesc => {
+                unreachable!("{op:?} is a selection/reorder, dispatched before any accumulator")
+            }
+        }
+    }
+
+    /// The reducing/selecting partition over `VectorAggOp`, as ONE
+    /// exhaustive match with no `_` arm — a new operator is a build
+    /// failure here until it is dispositioned, rather than silently
+    /// landing in whichever branch the caller happened to write.
+    fn is_reduction(op: VectorAggOp) -> bool {
+        match op {
+            VectorAggOp::Sum
+            | VectorAggOp::Avg
+            | VectorAggOp::Min
+            | VectorAggOp::Max
+            | VectorAggOp::Count
+            | VectorAggOp::Stddev
+            | VectorAggOp::Stdvar => true,
+            VectorAggOp::Topk
+            | VectorAggOp::Bottomk
+            | VectorAggOp::ApproxTopk
+            | VectorAggOp::Sort
+            | VectorAggOp::SortDesc => false,
+        }
+    }
+}
+
+/// Reduces a materialised group through [`VectorAccum`], so the
+/// materialising path and the streaming fold compute the SAME bits.
+///
+/// `vals` is never empty at any call site (a group exists because a
+/// member created it), which is what makes the `seed`-then-`update`
+/// shape total; the `unwrap_or(f64::NAN)` is defence-in-depth, matching
+/// the reference's own behaviour of emitting no group at all rather than
+/// a sentinel.
+fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
+    debug_assert!(
+        VectorAccum::is_reduction(op),
+        "reduce called with the selection/reorder op {op:?}"
+    );
+    let Some((first, rest)) = vals.split_first() else {
+        return f64::NAN;
+    };
+    let mut acc = VectorAccum::seed(op, *first);
+    for v in rest {
+        acc.update(op, *v);
+    }
+    acc.finish(op)
 }
 
 /// `sort`/`sort_desc` order an instant result vector by value: ascending
@@ -8469,7 +9550,12 @@ fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
 /// directions (compared via `is_nan()`, so a NaN's sign never leaks into
 /// the order the way `f64::total_cmp` alone would); equal values break by
 /// label set ascending — deterministic and hermetically golden-able.
-fn sort_instant(mut series: Vec<InstantSeries>, op: VectorAggOp) -> Vec<InstantSeries> {
+fn sort_instant(
+    mut series: Vec<InstantSeries>,
+    op: VectorAggOp,
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
     let desc = matches!(op, VectorAggOp::SortDesc);
     series.sort_by(|a, b| {
         a.value
@@ -8486,7 +9572,7 @@ fn sort_instant(mut series: Vec<InstantSeries>, op: VectorAggOp) -> Vec<InstantS
             })
             .then_with(|| a.labels.cmp(&b.labels))
     });
-    series
+    Ok(series)
 }
 
 /// The `topk`/`bottomk` `k`: the parameter floored to a count; a missing
@@ -8509,8 +9595,12 @@ fn k_of(param: Option<f64>) -> usize {
 /// (issue #221 memory round: the former `Vec<LabelSet>` parameter was a
 /// deep clone of every label set, input-scaled and uncharged — the
 /// closure reads the identical bytes with zero copies).
-fn sort_candidates<'a, F>(candidates: &mut [(usize, f64)], labels_of: F, largest: bool)
-where
+fn sort_candidates<'a, F>(
+    candidates: &mut [(usize, f64)],
+    labels_of: F,
+    largest: bool,
+    _l: &Ledger<'_>,
+) where
     F: Fn(usize) -> &'a LabelSet,
 {
     candidates.sort_by(|(ai, av), (bi, bv)| {
@@ -8539,10 +9629,12 @@ fn select_k_range(
     op: VectorAggOp,
     grouping: Option<&Grouping>,
     param: Option<f64>,
-) -> Vec<RangeSeries> {
+    l: &Ledger<'_>,
+) -> Result<Vec<RangeSeries>, ReadError> {
+    admit_range(&series, l)?;
     let k = k_of(param);
     if k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let largest = matches!(op, VectorAggOp::Topk);
     let mut groups: HashMap<LabelSet, Vec<usize>> = HashMap::new();
@@ -8563,13 +9655,13 @@ fn select_k_range(
                 .iter()
                 .filter_map(|&i| series[i].points.get(&step).map(|v| (i, *v)))
                 .collect();
-            sort_candidates(&mut candidates, |i| &series[i].labels, largest);
+            sort_candidates(&mut candidates, |i| &series[i].labels, largest, l);
             for (idx, v) in candidates.into_iter().take(k) {
                 keep[idx].insert(step, v);
             }
         }
     }
-    series
+    Ok(series
         .into_iter()
         .zip(keep)
         .filter_map(|(s, points)| {
@@ -8578,7 +9670,7 @@ fn select_k_range(
                 points,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// `topk`/`bottomk` over an instant result: keep the k highest/lowest
@@ -8588,10 +9680,12 @@ fn select_k_instant(
     op: VectorAggOp,
     grouping: Option<&Grouping>,
     param: Option<f64>,
-) -> Vec<InstantSeries> {
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
     let k = k_of(param);
     if k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let largest = matches!(op, VectorAggOp::Topk);
     let mut groups: HashMap<LabelSet, Vec<usize>> = HashMap::new();
@@ -8605,16 +9699,684 @@ fn select_k_instant(
     for members in groups.values() {
         let mut candidates: Vec<(usize, f64)> =
             members.iter().map(|&i| (i, series[i].value)).collect();
-        sort_candidates(&mut candidates, |i| &series[i].labels, largest);
+        sort_candidates(&mut candidates, |i| &series[i].labels, largest, l);
         for (idx, _) in candidates.into_iter().take(k) {
             keep[idx] = true;
         }
     }
-    series
+    Ok(series
         .into_iter()
         .zip(keep)
         .filter_map(|(s, kept)| kept.then_some(s))
-        .collect()
+        .collect())
+}
+
+// =====================================================================
+// Issue #236 Part B — the streaming vector-aggregation fold at the range
+// leaf.
+//
+// `apply_vector_aggs` MATERIALISES: the leaf builds one `MatrixSeries`
+// per scanned group and the aggregation collapses that vector afterwards,
+// so peak retention is `scanned groups x grid points` even when the
+// result is one series. The fold applies the INNERMOST aggregation as the
+// leaf emits, so retention is `OUTPUT groups x grid points` — the
+// reference's own bound.
+//
+// **The fold applies NO group-count rejection** (plan v14 §3 Part B, the
+// round-13 `[high]`). [`MAX_QUERY_SERIES`] is a FINAL-result cap: an
+// outer `sum` over an inner `sum by (id)` collapsing 501+ inner groups to
+// ONE series is served by the reference, so rejecting an intermediate
+// would reject on a proxy rather than on the resource consumed. Fold
+// state is bounded by BYTES and by POINTS — and by nothing else.
+//
+// **The point half of that bound is NOT YET LEVIED**, and this comment
+// says so rather than letting the sentence above be read as enforcement.
+// A group's slots are DENSE — `kmax + 1` per output group, whatever the
+// data's sparsity — so a fold over `G` output groups holds
+// `G x (kmax + 1)` cells. Plan v14 §4's `charge_result_points` charges
+// exactly that against [`MAX_METRIC_RESULT_POINTS`] BEFORE the vector is
+// allocated; until it lands, the ceiling on a fold's retention is the
+// leaf's own group-byte charge and the grid guard, and a query whose
+// INTERMEDIATE grouping is very wide over a very fine grid can retain
+// more than the finished result would. `MAX_METRIC_RESULT_POINTS` and
+// [`MAX_ADMITTED_GRID_POINTS`] are defined but uncharged — do not read
+// them as live gates.
+// =====================================================================
+
+/// The output grid a [`VectorAggFold`] indexes its dense slots by: the
+/// same `(grid_start, step, kmax)` triple `RangeSlideState` emits its
+/// points from, so a slot index and a grid point are two views of one
+/// value.
+#[derive(Clone, Copy, Debug)]
+struct FoldGrid {
+    start: i64,
+    step: u64,
+    kmax: i64,
+}
+
+impl FoldGrid {
+    /// Slots in one group's dense vector: `kmax + 1`, and 0 for the empty
+    /// grid (`kmax == -1`, which `grid_point_count == 0` produces).
+    fn slots(&self) -> usize {
+        usize::try_from(grid_slot_count(self.kmax)).unwrap_or(0)
+    }
+
+    /// `grid_start + k*step`, narrowed exactly as `FpSlide::grid_point`
+    /// does — one arithmetic, so a folded point and a materialised point
+    /// carry the same timestamp bits.
+    fn point(&self, k: usize) -> i64 {
+        clamp_bucket(self.start as i128 + k as i128 * self.step as i128)
+    }
+
+    /// The inverse of [`Self::point`]: `None` when `t` is not one of this
+    /// grid's points. Every producer that feeds the fold emits at
+    /// `grid_point(k)` for `k in 0..=kmax` (`FpSlide::emit_at`,
+    /// `finish_in_place`'s fan-out arm, `finish_absent`), so `None` is an
+    /// internal-invariant breach, not a user-reachable input — it is
+    /// reported as an error rather than dropped, because a dropped point
+    /// is a silently wrong result.
+    fn index_of(&self, t: i64) -> Option<usize> {
+        let step = i128::from(self.step);
+        if step <= 0 {
+            return None;
+        }
+        let delta = i128::from(t) - i128::from(self.start);
+        if delta < 0 || delta % step != 0 {
+            return None;
+        }
+        let k = delta / step;
+        if k > i128::from(self.kmax) {
+            return None;
+        }
+        usize::try_from(k).ok()
+    }
+}
+
+/// [`RangeSlideState::covering_k`]'s body as a free function over the
+/// grid scalars, so `finish_in_place`'s C2 sweep can compute the same
+/// intervals without holding a `&self` borrow across its `&mut self`
+/// discharges. ONE implementation, called from both.
+fn covering_k_of(ts: i64, grid_start: i64, step: u64, range: i64, kmax: i64) -> (i64, i64) {
+    let step = step as i128;
+    let gs = grid_start as i128;
+    let ts = ts as i128;
+    let range = range as i128;
+    // ts ≤ grid_start + k·step  ⇒  k ≥ ceil((ts-gs)/step)
+    let k_lo = ceil_div_i128(ts - gs, step).max(0);
+    // grid_start + k·step < ts+range ⇒ k·step ≤ ts+range-gs-1 ⇒
+    // k ≤ floor((ts+range-gs-1)/step)
+    let k_hi = (ts + range - gs - 1).div_euclid(step).min(kmax as i128);
+    (
+        i64::try_from(k_lo).unwrap_or(i64::MAX),
+        i64::try_from(k_hi).unwrap_or(i64::MIN),
+    )
+}
+
+/// The empty [`MutCells`] a query's mutating groups start from — the ONE
+/// place the representation is chosen (issue #236 Part C).
+///
+/// Classes B/C always retain samples. Within class A, the delta form's
+/// win is proportional to `ceil(range/step)` — the number of cells one
+/// sample covers — so it is taken exactly where that exceeds one, i.e.
+/// where the sliding windows OVERLAP. That is the reference's own
+/// `selRange >= step` predicate (`pkg/logql/range_vector.go`'s stepped
+/// iterator), plus `kmax > 0`: on a one-point grid there is nothing to
+/// fan out into and the expanded form is already minimal. Below the
+/// predicate the expanded form is strictly better (one charge per sample
+/// rather than two, and repeated samples in one cell collapse), so it is
+/// kept rather than replaced.
+/// The comparison is over `i128`, not `range >= step as i64`: `step` is a
+/// `u64` and the narrowing form wraps a wide step to a negative number, so
+/// every range would compare `>=` it and take the delta arm. Validated
+/// durations keep that out of reach today — the exhaustive predicate test
+/// found it anyway, which is the argument for enumerating a small domain
+/// rather than sampling it.
+fn mut_cells_for(class: ReducerClass, range: i64, step: u64, kmax: i64) -> MutCells {
+    if !matches!(class, ReducerClass::InvertInteger) {
+        return MutCells::Samples(Vec::new());
+    }
+    if i128::from(range) >= i128::from(step) && kmax > 0 {
+        MutCells::IntDeltas(HashMap::new())
+    } else {
+        MutCells::IntExpanded(HashMap::new())
+    }
+}
+
+/// Grid points on a `kmax`-indexed emit grid: `kmax + 1`, and 0 for the
+/// empty grid. The unit every [`charge_result_points`] reservation is
+/// made in — one series can emit at most this many points, and
+/// [`MAX_METRIC_RESULT_POINTS`] is derived as
+/// `MAX_QUERY_SERIES * MAX_ADMITTED_GRID_POINTS` in exactly these units.
+fn grid_slot_count(kmax: i64) -> u64 {
+    u64::try_from(kmax.saturating_add(1)).unwrap_or(0)
+}
+
+/// The internal-invariant breach [`FoldGrid::index_of`] reports.
+fn fold_off_grid(t: i64) -> ReadError {
+    ReadError::PipelineInvalid {
+        reason: format!(
+            "internal: vector-aggregation fold received a point at {t} off the query grid"
+        ),
+    }
+}
+
+/// One `topk`/`bottomk` candidate holding a grid slot: the sample value
+/// and the id of the series it came from. Ids are assigned in PUSH order,
+/// which is what makes [`SelectFold`]'s emission order `select_k_range`'s
+/// (whose survivors come out in the input vector's order).
+#[derive(Clone, Copy, Debug)]
+struct Cand {
+    value: f64,
+    series: u32,
+}
+
+/// One grid slot's surviving candidates, best first.
+///
+/// `Empty`/`One` keep the common cases allocation-free — a slot no series
+/// reached, and `topk(1, …)` or a slot only one series reached. `Many` is
+/// the only arm that allocates and holds at most `k` elements, so a
+/// group's whole selection state is `O(grid x k)` and never `O(scanned
+/// series x grid)`.
+#[derive(Clone, Debug)]
+enum KSel {
+    Empty,
+    One(Cand),
+    Many(Vec<Cand>),
+}
+
+impl KSel {
+    fn as_slice(&self) -> &[Cand] {
+        match self {
+            KSel::Empty => &[],
+            KSel::One(c) => std::slice::from_ref(c),
+            KSel::Many(v) => v,
+        }
+    }
+
+    /// Inserts `cand`, keeping the slot ordered best-first under `order`
+    /// and at most `k` long. Returns the candidate that lost its place —
+    /// which is `cand` itself when the slot is full and `cand` is worse
+    /// than every survivor.
+    ///
+    /// Equivalent to `sort_candidates(all).take(k)` because `order` is a
+    /// TOTAL order (see [`cand_order`]): the k best elements of a set are
+    /// the same set whatever sequence they arrive in.
+    fn insert<F>(&mut self, cand: Cand, k: usize, order: &F) -> Option<Cand>
+    where
+        F: Fn(&Cand, &Cand) -> std::cmp::Ordering,
+    {
+        match self {
+            KSel::Empty => {
+                *self = KSel::One(cand);
+                None
+            }
+            KSel::One(cur) => {
+                if k == 1 {
+                    if order(&cand, cur) == std::cmp::Ordering::Less {
+                        let evicted = *cur;
+                        *self = KSel::One(cand);
+                        Some(evicted)
+                    } else {
+                        Some(cand)
+                    }
+                } else {
+                    let pair = if order(&cand, cur) == std::cmp::Ordering::Less {
+                        vec![cand, *cur]
+                    } else {
+                        vec![*cur, cand]
+                    };
+                    *self = KSel::Many(pair);
+                    None
+                }
+            }
+            KSel::Many(v) => {
+                let pos = v.partition_point(|c| order(c, &cand) == std::cmp::Ordering::Less);
+                if pos >= k {
+                    // The slot is full (`pos <= v.len() <= k`) and `cand`
+                    // sorts after every survivor.
+                    return Some(cand);
+                }
+                v.insert(pos, cand);
+                if v.len() > k { v.pop() } else { None }
+            }
+        }
+    }
+}
+
+/// A series that currently holds at least one selection slot. Dropped the
+/// moment its refcount reaches 0, so `live` is bounded by `output groups
+/// x k` rather than by the number of series pushed.
+#[derive(Debug)]
+struct LiveSeries {
+    labels: LabelSet,
+    slots: u64,
+}
+
+/// [`sort_candidates`]' order, as a comparator over [`Cand`] and extended
+/// with the series id ascending as a final tiebreak.
+///
+/// The tiebreak is not cosmetic and it is not a divergence: `sort_by` is
+/// STABLE and `select_k_range` collects its candidates in ascending input
+/// index, so two candidates that tie on `(is_nan, value, labels)` already
+/// come out in ascending input order there. Naming it makes the fold's
+/// order TOTAL, which is what lets an incremental top-k equal a full sort
+/// plus `take(k)`. It is reachable: a fingerprint with no hydrated meta
+/// gets an EMPTY label set, so two such series tie on labels.
+fn cand_order<'a, F>(a: &Cand, b: &Cand, largest: bool, labels_of: &F) -> std::cmp::Ordering
+where
+    F: Fn(u32) -> &'a LabelSet,
+{
+    a.value
+        .is_nan()
+        .cmp(&b.value.is_nan())
+        .then_with(|| {
+            if a.value.is_nan() {
+                std::cmp::Ordering::Equal
+            } else if largest {
+                b.value.total_cmp(&a.value)
+            } else {
+                a.value.total_cmp(&b.value)
+            }
+        })
+        .then_with(|| labels_of(a.series).cmp(labels_of(b.series)))
+        .then_with(|| a.series.cmp(&b.series))
+}
+
+/// The reducing fold (`sum`/`avg`/`min`/`max`/`count`/`stddev`/`stdvar`):
+/// one dense `Vec<VectorAccum>` of `kmax + 1` slots per OUTPUT group,
+/// each slot the same [`VectorAccum`] `reduce` uses — so a folded value
+/// and a materialised one are the same bits by construction, not by
+/// coincidence.
+#[derive(Debug)]
+struct ReduceFold {
+    op: VectorAggOp,
+    grouping: Option<Grouping>,
+    grid: FoldGrid,
+    groups: HashMap<LabelSet, Vec<VectorAccum>>,
+    /// Reserved point-slots, charged through [`charge_result_points`]
+    /// BEFORE the dense vector below is allocated (issue #236).
+    slots: u64,
+    slot_cap: u64,
+    /// Retained group-key bytes, charged through [`charge_group_bytes`]
+    /// BEFORE [`group_key`] builds the key (issue #236 review round 1
+    /// `[high]`). A `by(...)` clause is read off the QUERY TEXT, so
+    /// without this the fold retained query-text-derived label bytes with
+    /// nothing bounding them.
+    group_bytes: u64,
+    group_cap: u64,
+}
+
+impl ReduceFold {
+    fn push_series(&mut self, labels: &LabelSet, points: &[(i64, f64)]) -> Result<(), ReadError> {
+        // A group materialises on the first accumulated VALUE, never on
+        // first sight of a member (plan v14 §3 Part B): a series with no
+        // points must not create — or charge for — a group.
+        if points.is_empty() {
+            return Ok(());
+        }
+        let (op, grid) = (self.op, self.grid);
+        // CHARGE, THEN ALLOCATE. `or_insert_with` would allocate inside
+        // its closure, which is why the entry is matched explicitly: the
+        // dense `kmax + 1` vector is reserved against the cap before it
+        // exists, so a breach refuses rather than being observed after
+        // the fact.
+        let charged = &mut self.slots;
+        let cap = self.slot_cap;
+        // The KEY's bytes are charged before `group_key` builds it —
+        // `group_key` allocates one owned `String` per `by` NAME, read
+        // off the query text, and the entry expression would otherwise
+        // evaluate it before any charge (review round 1 `[high]`). The
+        // counter tracks what is RETAINED, so `key_charge` only sticks
+        // where the key does: an Occupied group lets the guard drop and
+        // refunds (the key is transient there), and the Vacant arm's
+        // point reservation can still refuse AFTER the key charge — the
+        // guard refunds that exit too.
+        let (key, key_charge) = charged_group_key(
+            labels,
+            self.grouping.as_ref(),
+            &mut self.group_bytes,
+            self.group_cap,
+        )?;
+        let slots = match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                charge_result_points(charged, grid.slots() as u64, cap)?;
+                let slots = e.insert(vec![VectorAccum::EMPTY; grid.slots()]);
+                key_charge.commit();
+                slots
+            }
+        };
+        for &(t, v) in points {
+            let k = grid.index_of(t).ok_or_else(|| fold_off_grid(t))?;
+            let Some(slot) = slots.get_mut(k) else {
+                return Err(fold_off_grid(t));
+            };
+            if slot.is_empty() {
+                *slot = VectorAccum::seed(op, v);
+            } else {
+                slot.update(op, v);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<MatrixSeries> {
+        let (op, grid) = (self.op, self.grid);
+        self.groups
+            .into_iter()
+            .filter_map(|(labels, slots)| {
+                let points: Vec<(i64, f64)> = slots
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, acc)| !acc.is_empty())
+                    .map(|(k, acc)| (grid.point(k), acc.finish(op)))
+                    .collect();
+                (!points.is_empty()).then_some(MatrixSeries { labels, points })
+            })
+            .collect()
+    }
+}
+
+/// The selecting fold (`topk`/`bottomk`): one dense `Vec<KSel>` of
+/// `kmax + 1` slots per output group, each holding at most `k`
+/// candidates, plus the label sets of the series currently holding a
+/// slot. `select_k_range` materialises `scanned series x steps` before
+/// applying `k`; this never holds more than `output groups x grid x k`.
+#[derive(Debug)]
+struct SelectFold {
+    /// `topk` keeps the largest, `bottomk` the smallest.
+    largest: bool,
+    k: usize,
+    grouping: Option<Grouping>,
+    grid: FoldGrid,
+    groups: HashMap<LabelSet, Vec<KSel>>,
+    /// Refcounted by held slots — see [`LiveSeries`].
+    live: HashMap<u32, LiveSeries>,
+    /// The next push-order id; `select_k_range`'s input index.
+    next_series: u32,
+    /// Reserved point-slots (issue #236): the dense per-group vector, and
+    /// one more for each candidate a slot retains beyond its first — the
+    /// `KSel::Many` heap, which the dense reservation does not cover.
+    slots: u64,
+    slot_cap: u64,
+    /// Retained group-key bytes — see [`ReduceFold::group_bytes`].
+    group_bytes: u64,
+    group_cap: u64,
+}
+
+impl SelectFold {
+    fn push_series(&mut self, labels: &LabelSet, points: &[(i64, f64)]) -> Result<(), ReadError> {
+        let id = self.next_series;
+        self.next_series = self.next_series.saturating_add(1);
+        if points.is_empty() {
+            return Ok(());
+        }
+        let (grid, k, largest) = (self.grid, self.k, self.largest);
+        // A group's slot vector is created on the first push that can
+        // fill a slot: `k >= 1` here (`k == 0` is `VectorAggFold::Empty`,
+        // which never constructs a `SelectFold`), so the first series to
+        // reach a fresh group always wins its slots.
+        // CHARGE, THEN ALLOCATE — as `ReduceFold::push_series`.
+        let charged = &mut self.slots;
+        let cap = self.slot_cap;
+        // CHARGE, THEN ALLOCATE — as `ReduceFold::push_series`, and for
+        // the same reason.
+        let (key, key_charge) = charged_group_key(
+            labels,
+            self.grouping.as_ref(),
+            &mut self.group_bytes,
+            self.group_cap,
+        )?;
+        let slots = match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                charge_result_points(charged, grid.slots() as u64, cap)?;
+                let slots = e.insert(vec![KSel::Empty; grid.slots()]);
+                key_charge.commit();
+                slots
+            }
+        };
+        let live = &mut self.live;
+        for &(t, v) in points {
+            let idx = grid.index_of(t).ok_or_else(|| fold_off_grid(t))?;
+            let Some(slot) = slots.get_mut(idx) else {
+                return Err(fold_off_grid(t));
+            };
+            // CHARGE, THEN ALLOCATE — the reservation must sit AHEAD of
+            // the insertion, not observe it afterwards. The slot's
+            // occupancy grows by exactly one iff it is not already full,
+            // which is known before `insert` runs: below `k` the new
+            // candidate is always accepted, at `k` the insertion is
+            // occupancy-neutral (it either evicts one or is rejected).
+            if slot.as_slice().len() < k {
+                charge_result_points(charged, 1, cap)?;
+            }
+            let evicted = {
+                let seen: &HashMap<u32, LiveSeries> = live;
+                // Every candidate already in the slot HOLDS it, so its
+                // series is live; the pushing series may not be yet.
+                // `EMPTY_LABEL_SET` is the defensive arm, never a
+                // reachable one.
+                let labels_of = |sid: u32| {
+                    if sid == id {
+                        labels
+                    } else {
+                        seen.get(&sid).map_or(&EMPTY_LABEL_SET, |s| &s.labels)
+                    }
+                };
+                let order = |a: &Cand, b: &Cand| cand_order(a, b, largest, &labels_of);
+                slot.insert(
+                    Cand {
+                        value: v,
+                        series: id,
+                    },
+                    k,
+                    &order,
+                )
+            };
+            // A series pushes at most one candidate per slot (its points
+            // carry distinct timestamps), so an evicted candidate from
+            // THIS series can only be the one just offered and rejected.
+            if let Some(ev) = evicted
+                && ev.series == id
+            {
+                continue;
+            }
+            if let Some(ev) = evicted {
+                let dropped = match live.get_mut(&ev.series) {
+                    Some(held) => {
+                        held.slots = held.slots.saturating_sub(1);
+                        held.slots == 0
+                    }
+                    None => false,
+                };
+                if dropped {
+                    live.remove(&ev.series);
+                }
+            }
+            // The label set is cloned on the first slot this series
+            // actually wins, never on first sight of it.
+            live.entry(id)
+                .or_insert_with(|| LiveSeries {
+                    labels: labels.clone(),
+                    slots: 0,
+                })
+                .slots += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<MatrixSeries> {
+        let grid = self.grid;
+        // A series belongs to exactly one group (its `group_key` is a
+        // function of its labels), and each group's slots are walked in
+        // ascending grid index, so a survivor's points come out
+        // TIMESTAMP-ASCENDING — the order `select_k_range`'s per-survivor
+        // `BTreeMap` yields.
+        let mut by_series: HashMap<u32, Vec<(i64, f64)>> = HashMap::new();
+        for slots in self.groups.into_values() {
+            for (k, sel) in slots.iter().enumerate() {
+                let t = grid.point(k);
+                for cand in sel.as_slice() {
+                    by_series
+                        .entry(cand.series)
+                        .or_default()
+                        .push((t, cand.value));
+                }
+            }
+        }
+        // Survivors in ORIGINAL PUSH ORDER — `select_k_range` emits
+        // `series.into_iter().zip(keep).filter_map(..)`, i.e. the input
+        // vector's order, and ids are the input index.
+        let mut survivors: Vec<(u32, LiveSeries)> = self.live.into_iter().collect();
+        survivors.sort_by_key(|(id, _)| *id);
+        survivors
+            .into_iter()
+            .filter_map(|(id, held)| {
+                by_series
+                    .remove(&id)
+                    .filter(|points| !points.is_empty())
+                    .map(|points| MatrixSeries {
+                        labels: held.labels,
+                        points,
+                    })
+            })
+            .collect()
+    }
+}
+
+/// The innermost vector aggregation, applied AS the range leaf emits
+/// rather than over its materialised output. See the module-section
+/// comment above for the bound this replaces.
+#[derive(Debug)]
+enum VectorAggFold {
+    Reduce(ReduceFold),
+    Select(SelectFold),
+    /// `topk(0, …)`/`bottomk(0, …)`: the result is empty whatever the
+    /// input, so no group is ever constructed and no point is ever
+    /// retained. Its reason is purely charge discipline — do not charge
+    /// for a group that emits nothing; the group-count rejection whose
+    /// premise it used to protect is gone (plan v14 §3 Part B).
+    Empty,
+}
+
+impl VectorAggFold {
+    /// `None` when the leaf cannot own the aggregation:
+    ///
+    /// * `sort`/`sort_desc` — a range matrix is a PASSTHROUGH at
+    ///   `group_range` (there is no single sortable value per series), so
+    ///   there is nothing to fold;
+    /// * `approx_topk` — instant-only, rejected for a range query at
+    ///   plan time (`plan.rs`'s `approx_topk` range check).
+    ///
+    /// The match is exhaustive with no `_` arm, and
+    /// `vector_agg_fold_partitions_every_op_like_is_reduction` pins the
+    /// reducing arm against [`VectorAccum::is_reduction`], so a new
+    /// operator is a build failure here rather than a silent
+    /// misclassification.
+    fn new(
+        spec: &plan::VectorAggSpec,
+        grid: FoldGrid,
+        slot_cap: u64,
+        group_cap: u64,
+    ) -> Option<Self> {
+        let (op, grouping, param) = spec;
+        match *op {
+            VectorAggOp::Sort | VectorAggOp::SortDesc | VectorAggOp::ApproxTopk => None,
+            VectorAggOp::Topk | VectorAggOp::Bottomk => {
+                let k = k_of(*param);
+                if k == 0 {
+                    return Some(VectorAggFold::Empty);
+                }
+                Some(VectorAggFold::Select(SelectFold {
+                    largest: matches!(*op, VectorAggOp::Topk),
+                    k,
+                    grouping: grouping.clone(),
+                    grid,
+                    groups: HashMap::new(),
+                    live: HashMap::new(),
+                    next_series: 0,
+                    slots: 0,
+                    slot_cap,
+                    group_bytes: 0,
+                    group_cap,
+                }))
+            }
+            VectorAggOp::Sum
+            | VectorAggOp::Avg
+            | VectorAggOp::Min
+            | VectorAggOp::Max
+            | VectorAggOp::Count
+            | VectorAggOp::Stddev
+            | VectorAggOp::Stdvar => Some(VectorAggFold::Reduce(ReduceFold {
+                op: *op,
+                grouping: grouping.clone(),
+                grid,
+                groups: HashMap::new(),
+                slots: 0,
+                slot_cap,
+                group_bytes: 0,
+                group_cap,
+            })),
+        }
+    }
+
+    /// Folds one COMPLETE leaf series. `points` must be this grid's
+    /// points, timestamp-ascending — which is what every emit site
+    /// produces.
+    ///
+    /// Fallible today only through [`FoldGrid::index_of`]; the signature
+    /// is the seam plan v14 §4's `charge_result_points` charges through,
+    /// so it is `Result` from the start rather than widened later across
+    /// every call site.
+    fn push_series(&mut self, labels: &LabelSet, points: &[(i64, f64)]) -> Result<(), ReadError> {
+        match self {
+            VectorAggFold::Reduce(f) => f.push_series(labels, points),
+            VectorAggFold::Select(f) => f.push_series(labels, points),
+            VectorAggFold::Empty => Ok(()),
+        }
+    }
+
+    fn finish(self) -> Vec<MatrixSeries> {
+        match self {
+            VectorAggFold::Reduce(f) => f.finish(),
+            VectorAggFold::Select(f) => f.finish(),
+            VectorAggFold::Empty => Vec::new(),
+        }
+    }
+
+    /// Retained cells: the quantity plan v14 §4's `charge_result_points`
+    /// will charge, and the one AC 8 pins as `output groups x steps`.
+    /// Test-only until that counter exists — nothing in the engine reads
+    /// it, and exposing it now would suggest it were enforced.
+    #[cfg(test)]
+    fn cells(&self) -> usize {
+        match self {
+            VectorAggFold::Reduce(f) => f.groups.values().map(Vec::len).sum(),
+            VectorAggFold::Select(f) => f.groups.values().map(Vec::len).sum(),
+            VectorAggFold::Empty => 0,
+        }
+    }
+
+    /// Point-slots reserved so far. Test-only, as [`Self::cells`].
+    #[cfg(test)]
+    fn reserved_slots(&self) -> u64 {
+        match self {
+            VectorAggFold::Reduce(f) => f.slots,
+            VectorAggFold::Select(f) => f.slots,
+            VectorAggFold::Empty => 0,
+        }
+    }
+
+    /// Output groups currently materialised. Test-only, as [`Self::cells`].
+    #[cfg(test)]
+    fn groups(&self) -> usize {
+        match self {
+            VectorAggFold::Reduce(f) => f.groups.len(),
+            VectorAggFold::Select(f) => f.groups.len(),
+            VectorAggFold::Empty => 0,
+        }
+    }
 }
 
 /// `approx_topk(k, inner)` over an instant result (issue #221) — the
@@ -8674,7 +10436,12 @@ fn select_k_instant(
 /// stays infallible. `apply_vector_aggs` applies the agg chain
 /// sequentially, so exactly one sketch is live regardless of nesting
 /// (parser `MAX_DEPTH` = 64).
-fn approx_topk_instant(mut series: Vec<InstantSeries>, param: Option<f64>) -> Vec<InstantSeries> {
+fn approx_topk_instant(
+    mut series: Vec<InstantSeries>,
+    param: Option<f64>,
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
     // 1. Canonical, input-order-independent ordering. `sort_unstable*`
     // is load-bearing (rows 1-2 of the accounting table): a stable
     // `sort` here would reintroduce an input-scaled scratch allocation.
@@ -8716,7 +10483,7 @@ fn approx_topk_instant(mut series: Vec<InstantSeries>, param: Option<f64>) -> Ve
         }
     }
     // 5. The existing selection — reused, not reimplemented.
-    select_k_instant(out, VectorAggOp::Topk, None, param)
+    select_k_instant(out, VectorAggOp::Topk, None, param, l)
 }
 
 fn group_range(
@@ -8724,16 +10491,32 @@ fn group_range(
     op: VectorAggOp,
     grouping: Option<&Grouping>,
     param: Option<f64>,
-) -> Vec<RangeSeries> {
+    l: &Ledger<'_>,
+) -> Result<Vec<RangeSeries>, ReadError> {
+    admit_range(&series, l)?;
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
-        return select_k_range(series, op, grouping, param);
+        return select_k_range(series, op, grouping, param, l);
     }
     // A range result (matrix) has no single sortable value per series;
     // `sort`/`sort_desc` are passthrough here (the reference likewise does
     // not value-order matrices — the wire stays label-canonical).
     if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
-        return series;
+        return Ok(series);
     }
+    // Issue #236: the same pin as `group_instant`. `members` is walked in
+    // push order at every step below, so pinning the push order pins the
+    // per-step accumulation order for every step at once.
+    let mut series = series;
+    pin_reduction_order(
+        &mut series,
+        |s| &s.labels,
+        |a, b| {
+            range_payload_cmp(
+                a.points.iter().map(|(t, v)| (*t, *v)),
+                b.points.iter().map(|(t, v)| (*t, *v)),
+            )
+        },
+    );
     let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new();
     for s in series {
         groups
@@ -8741,7 +10524,7 @@ fn group_range(
             .or_default()
             .push(s.points);
     }
-    groups
+    Ok(groups
         .into_iter()
         .map(|(labels, members)| {
             let steps: BTreeSet<i64> = members.iter().flat_map(|m| m.keys().copied()).collect();
@@ -8761,7 +10544,7 @@ fn group_range(
                 .collect();
             RangeSeries { labels, points }
         })
-        .collect()
+        .collect())
 }
 
 fn group_instant(
@@ -8769,22 +10552,29 @@ fn group_instant(
     op: VectorAggOp,
     grouping: Option<&Grouping>,
     param: Option<f64>,
-) -> Vec<InstantSeries> {
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
     // approx_topk (issue #221): sketch-estimate the values, then the
     // ordinary topk selection. Grouping is rejected at parse time, so
     // `grouping` is structurally `None` here (pinned by
     // `approx_topk_specs_never_carry_a_grouping` in plan.rs).
     if matches!(op, VectorAggOp::ApproxTopk) {
-        return approx_topk_instant(series, param);
+        return approx_topk_instant(series, param, l);
     }
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
-        return select_k_instant(series, op, grouping, param);
+        return select_k_instant(series, op, grouping, param, l);
     }
     // `sort`/`sort_desc` reorder the vector by value (no grouping —
     // rejected at plan time), preserving each series unchanged.
     if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
-        return sort_instant(series, op);
+        return sort_instant(series, op, l);
     }
+    // Issue #236: pin the reduction order before grouping — see
+    // `pin_reduction_order`. Welford is order-sensitive and the incoming
+    // order is a hash walk.
+    let mut series = series;
+    pin_reduction_order(&mut series, |s| &s.labels, instant_payload_cmp);
     let mut groups: HashMap<LabelSet, Vec<f64>> = HashMap::new();
     for s in series {
         groups
@@ -8792,34 +10582,961 @@ fn group_instant(
             .or_default()
             .push(s.value);
     }
-    groups
+    Ok(groups
         .into_iter()
         .map(|(labels, vals)| InstantSeries {
             labels,
             value: reduce(op, &vals),
         })
-        .collect()
+        .collect())
 }
 
-/// Applies an outer-to-inner vector-aggregation chain to a metric result
-/// (innermost applied first — the `.rev()` matching `MetricPlan.
-/// vector_aggs`' outer-first order). `pub` like [`run_pipeline_rows`]:
-/// the hermetic golden suite (`tests/logql_metric_agg_golden.rs`) pins
-/// the reducer/selection semantics from outside the crate.
-pub fn apply_vector_aggs(result: QueryResult, aggs: &[plan::VectorAggSpec]) -> QueryResult {
+// ---------------------------------------------------------------------
+// Issue #236 §4/§5 — the post-aggregation byte model.
+//
+// The coefficients below are MEASURED, not enumerated. Every `W_*`/`B_*`
+// is `WITNESS_MARGIN x rate_max` where `rate_max` is the largest secant
+// slope observed on that axis by the cohort-attributed allocator witness
+// (`crates/pulsus-read/tests/logql_post_agg_witness.rs`). Nothing here
+// enumerates containers, element widths or growth factors: the measured
+// rate absorbs all of them, which is what makes a forgotten container
+// impossible rather than merely unlikely.
+//
+// Every coefficient below is
+//     shipped = ceil(rate_max x WITNESS_MARGIN x 11/10)
+// with WITNESS_MARGIN = 2. The extra tenth is NOT a second safety margin
+// and is not a hand tightening in either direction: an allocation
+// measurement jitters by a few units between runs (hashbrown growth
+// order, in-place-collect eligibility), and a gate of the form
+// `shipped >= 2 x rate_max_measured_now` would redden on a 1 % drift. The
+// tenth is a stated, uniform rounding rule so the CI gate is
+// deterministic. There is no upper-bound gate, so rounding up costs
+// nothing but tightness, which this design deliberately does not pin.
+//
+// Read `MAX_POST_AGG_BYTES`' doc for what the resulting bound does and
+// does NOT claim.
+// ---------------------------------------------------------------------
+
+/// `W_SERIES` — bytes per stage-input series.
+///
+/// Ladder: `topk(k = N)` over a RANGE operand with no grouping, so every
+/// stage retains everything. `N` spans `128 -> 8 192` (64x) with
+/// points-per-series and label pairs scaled as `8 192 / N`, so `points`,
+/// `label_bytes` and `label_pairs` are constant along the ladder.
+/// Measured `rate_max` = **710** B/series (uniform; concentrated 416).
+/// Shipped = `ceil(710 x 2 x 11/10)`.
+pub const W_SERIES: u64 = 1_562;
+
+/// `W_POINT` — bytes per stage-input point.
+///
+/// Ladder: a RANGE operand of 64 series with no grouping, so it collapses
+/// to a SINGLE output group and one `BTreeSet<i64>` step union holds every
+/// point; `steps` spans `4 -> 512` (128x on `points`).
+/// Measured `rate_max` = **53** B/point (concentrated; uniform 42).
+/// Shipped = `ceil(53 x 2 x 11/10)`.
+pub const W_POINT: u64 = 117;
+
+/// `W_LABEL_BYTE` — bytes per raw label content byte.
+///
+/// Ladder: `without(id00)` over 256 instant series of 4 label pairs — one
+/// output group per series, so the retained key mass is maximal; the label
+/// VALUE width spans `4 -> 1 024` bytes (128x on `label_bytes`).
+/// Measured `rate_max` = **1** B/B on both skews.
+/// Shipped = `ceil(1 x 2 x 11/10)`.
+pub const W_LABEL_BYTE: u64 = 3;
+
+/// `W_PAIR` — bytes per label pair.
+///
+/// Ladder: `without(id00)` over 64 instant series, pairs spanning
+/// `4 -> 512` (128x) with the per-pair value width scaled as `2 048 /
+/// pairs` so the byte total stays near constant.
+/// Measured `rate_max` = **103** B/pair (concentrated; uniform 68; the
+/// measurement jitters between 102 and 103 between runs, which is what
+/// the 11/10 rounding covers).
+/// Shipped = `ceil(103 x 2 x 11/10)`.
+pub const W_PAIR: u64 = 227;
+
+/// `W_STAGE_SERIES` — bytes per (series x chain stage).
+///
+/// **MEASURED ZERO, and that is a finding rather than an oversight.**
+/// Plan v14 §6.1 predicted that "the previous stage's buffer is live
+/// while its successor is collected", so a chain of `L` stages would cost
+/// `L` concurrent buffers. It does not:
+///
+/// * `select_k_instant`'s output is
+///   `series.into_iter().zip(keep).filter_map(..).collect()`, and `Zip`
+///   and `FilterMap` over `vec::IntoIter` are `SourceIter` +
+///   `InPlaceIterable`, so the standard library collects the output **in
+///   place, into the input's own buffer** — the second buffer does not
+///   exist at all;
+/// * every vector-aggregation arm is non-expanding in both series and
+///   points (grouping collapses, `topk` selects, `sort` permutes), so a
+///   later stage's input is never larger than an earlier stage's, and the
+///   peak cannot accumulate down the chain.
+///
+/// Ladder: nested `topk(k = N)` over 512 instant series at chain lengths
+/// 1, 2, 4 and 64 — the peak is **21 204 B at every length**, on both
+/// skews, so the rate is 0. Measured further across 8 (shape x grouping x
+/// operator) combinations at lengths 1, 2, 4, 8 and 64: flat from length
+/// 2 onward everywhere.
+///
+/// # DO NOT DELETE THIS TERM BECAUSE IT IS ZERO
+///
+/// **The zero is contingent on a COMPILER SPECIALISATION, not on the
+/// nature of the computation.** Same-size in-place collect is an
+/// optimisation the standard library is free to apply or not: it holds
+/// because `InstantSeries` and `VectorSample` have identical layout and
+/// because `Zip`/`FilterMap` over `vec::IntoIter` happen to implement
+/// `SourceIter` + `InPlaceIterable` today. Insert an expanding
+/// aggregation arm, change a collect's source shape, or add a stage whose
+/// output type differs in layout from its input, and the second buffer
+/// reappears — at which point a DELETED term would silently under-bound
+/// the model and [`MAX_POST_AGG_BYTES`] would stop covering the real
+/// peak. A bound that is too small is worse than no bound, because it is
+/// trusted.
+///
+/// So the term stays in the model's published form (plan v14 §4), inert,
+/// with `chain_depth_does_not_multiply_peak_memory` in
+/// `tests/logql_post_agg_witness.rs` as the guard: it asserts that depth
+/// beyond TWO stages adds nothing and that at most two stage buffers are
+/// ever concurrent, over 8 shapes, and reddens the moment either stops
+/// being true. Re-derive the coefficient then; do not delete the axis.
+///
+/// (Second occurrence in a week of `vec::IntoIter`'s in-place
+/// specialisation falsifying a stated premise — issue #272's §8.6
+/// correction was the first. It is a genuinely surprising optimisation.)
+pub const W_STAGE_SERIES: u64 = 0;
+
+/// `W_GROUPNAME` — bytes per (series x `by`-clause byte).
+///
+/// Ladder: `by(id00, <q-1 names absent from the data>)` over 256 instant
+/// series, `q` spanning `4 -> 256` (64x on `series x
+/// group_name_bytes`). §5.4 named an ALL-absent clause as the maximising
+/// shape; measurement refutes that — every series then collapses into ONE
+/// group, so exactly one key is retained and the peak is flat from `q = 4`
+/// to `q = 16` — and §5.4's actual rule, the shape that maximises the
+/// axis's rate, selects the one-present-name form.
+/// Measured `rate_max` = **11** B per (series x by-byte), both skews.
+/// Shipped = `ceil(11 x 2 x 11/10)`.
+pub const W_GROUPNAME: u64 = 25;
+
+/// `W_APPROX_TOPK` — the flat count-min sketch plus retention heap
+/// (`cms::CMS_DEPTH x cms::CMS_WIDTH` `f64` counters = 7 x 27 183 x 8 B,
+/// fixed and input-independent).
+///
+/// Derived as the measured peak MINUS the model without this term, over
+/// the `approx_topk` cells at the SMALLEST inputs (1, 2, 8 and 64
+/// series). A flat term is masked at a large fixture — the input-scaled
+/// terms already dominate the 1.5 MiB sketch, and the excess reads as 0 —
+/// so it is derived where it is visible, which is also where
+/// under-bounding would be a real safety hole rather than a cosmetic one.
+/// Measured excess = **1 907 298** B at one series.
+/// Shipped = `ceil(1 907 298 x 2 x 11/10)`.
+pub const W_APPROX_TOPK: u64 = 4_196_056;
+
+/// `B_SERIES` — bytes per binary-operand series.
+///
+/// Ladder: one-to-one, `matching = None` (so the join signature is the
+/// FULL label set and `B_MANY`/`B_INCLUDE` are zero in every rung),
+/// instant operands, `N` spanning `64 -> 4 096` per side (64x on
+/// `lhs.series + rhs.series`).
+/// Measured `rate_max` = **578** B/series (concentrated; uniform 458).
+/// Shipped = `ceil(578 x 2 x 11/10)`.
+pub const B_SERIES: u64 = 1_272;
+
+/// `B_POINT` — bytes per binary-operand point.
+///
+/// Ladder: the same matching over MATRIX operands of 16 series, `steps`
+/// spanning `4 -> 512` (128x on the point total). Sixteen series, not the
+/// usual baseline: `combine_matrices` runs an INDEPENDENT per-step join,
+/// so its cost is `steps x series` and the widest rung otherwise
+/// dominates the whole binary's wall time.
+/// Measured `rate_max` = **37** B/point (concentrated; uniform 33).
+/// Shipped = `ceil(37 x 2 x 11/10)`.
+pub const B_POINT: u64 = 82;
+
+/// `B_LABEL` — bytes per binary-operand raw label content byte.
+///
+/// Ladder: the same matching over 256 instant series of 4 pairs, label
+/// VALUE width spanning `4 -> 1 024` bytes (128x).
+/// Measured `rate_max` = **2** B/B on both skews.
+/// Shipped = `ceil(2 x 2 x 11/10)`.
+pub const B_LABEL: u64 = 5;
+
+/// `B_PAIR` — bytes per binary-operand label pair.
+///
+/// Ladder: the same matching over 64 instant series, pairs spanning
+/// `4 -> 512` (128x) with the per-pair width scaled as `2 048 / pairs`.
+/// `matching = None` is load-bearing here: under `on(id00)` the match
+/// signature is a ONE-pair projection, the other pairs are never cloned,
+/// and the measured rate is 0 — the plan's pre-commitment to `None` for
+/// this row is what makes the axis visible at all.
+/// Measured `rate_max` = **107** B/pair (concentrated; uniform 79).
+/// Shipped = `ceil(107 x 2 x 11/10)`.
+pub const B_PAIR: u64 = 236;
+
+/// `B_MANY` — bytes per many-side series under a group modifier. Zero
+/// when there is no group modifier: the one-to-one arm keeps a single
+/// `HashSet<MatchSig>` where the grouped arm keeps a `HashMap<MatchSig,
+/// HashSet<MatchSig>>`.
+///
+/// Ladder: `on(id00) group_left()` with an EMPTY include list, many-side
+/// width spanning `64 -> 4 096` (64x). This is the per-many-side-item
+/// cost of `instant_join`'s `many_matched` map.
+/// Measured `rate_max` = **1 319** B/series (concentrated; uniform
+/// 1 152). Shipped = `ceil(1 319 x 2 x 11/10)`.
+pub const B_MANY: u64 = 2_902;
+
+/// `B_INCLUDE` — bytes per (many-side series x include byte).
+///
+/// Ladder: `on(id00) group_left(inc_1..inc_q)` over 128 instant series,
+/// with the ONE side carrying all 256 include labels in every rung, `q`
+/// spanning `4 -> 256` (64x on `many.series x include_bytes`). This is
+/// `set_label_sorted`'s insert chain — one `Vec::insert` per include name
+/// per many-side series.
+/// Measured `rate_max` = **12** B per (series x include byte), both
+/// skews. Shipped = `ceil(12 x 2 x 11/10)`.
+pub const B_INCLUDE: u64 = 27;
+
+/// **The post-aggregation byte cap** — the smallest power of two at or
+/// above `max(X_chain, X_bin)`, where each `X` is the corresponding model
+/// maximised over the leaf-gated feasible region **at the non-amplifying
+/// corner** (`group_name_bytes = 0`, `include_bytes = 0`, both binary
+/// operands at independent leaf budgets).
+///
+/// **What it buys, exactly:** every client-leaf-sourced stage input with
+/// no `by`-name amplification and no `group_left/right` include
+/// amplification is admitted. Nothing broader. A query carrying either
+/// amplifier may be refused above the thresholds recorded as the O6/O7
+/// ledger entries.
+///
+/// **What it is NOT.** It is not a worst-case proof. It is a bound
+/// "measured-and-margined over a compile-enforced construct space, with a
+/// clean refusal instead of an OOM at the boundary". Anyone reading it as
+/// a worst-case guarantee is reading it wrong: the residual is a
+/// distribution adversarial in a dimension no ladder varies, and the 2x
+/// margin is what covers it.
+///
+/// **Deliberately not pinned from above.** No test asserts
+/// `MAX_POST_AGG_BYTES < k x max(X)`. A change that REDUCES peak memory
+/// (issue #245's Part C deletes two `BTreeMap` indexes and a `BTreeSet`
+/// union from `combine_matrices`) must never redden CI; regenerating is
+/// one command, `zz_witness_report`.
+///
+/// # The generator's numbers
+///
+/// ```text
+/// s_min              = 616 bytes        (min over the four leaf entry slots)
+/// N_max              = 435 771 series   (MAX_CLIENT_AGG_GROUP_BYTES / s_min)
+/// stages             = 64               (min(MAX_DEPTH, MAX_QUERY_BYTES / 4))
+/// X_chain            = 2 847 288 941 bytes   (argmax N = 546)
+/// X_bin              = 5 970 118 644 bytes   (argmax N = 546)
+/// MAX_POST_AGG_BYTES = 8 589 934 592 bytes   (8 GiB)
+/// tightness ratio    = 1.4388           (printed, NOT gated)
+/// ```
+///
+/// # O6 — the `by(...)` amplification threshold
+///
+/// `A_MIN = 597` total `by`-clause bytes, at `N = 435 558`; with
+/// `A_NAME_MIN = 2` that is **at least 299 one-character `by` names**.
+/// Strictly below `A_MIN`, refusal is impossible at ANY group count.
+/// **Reachable**: 597 bytes fits inside `MAX_QUERY_BYTES = 131 072`.
+///
+/// # O7 — the `group_left/right(include)` amplification threshold
+///
+/// `AMP_MIN = 97 030 221`, the smallest `many.series x include_bytes`
+/// PRODUCT at which the binary funnel can refuse, at `N_many = 546`.
+/// **Reachable** within the query-text cap.
+///
+/// Both are the model-level thresholds; the funnel that turns them into
+/// an actual refusal is issue #236's §4 and is not wired yet, so the
+/// divergence ledger does not carry O6/O7 rows until it is.
+pub const MAX_POST_AGG_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// A stage input's measured shape — the raw counted quantities the byte
+/// model multiplies. One `O(series + label pairs)` pass over data that is
+/// already materialised (`Vec::len` is `O(1)`, so **no per-point work**).
+///
+/// Fields are private and every accessor is derived from one exhaustive
+/// destructure ([`StageInput::model_inputs`]), so a new axis cannot be
+/// added without the paired-fixture isolation gate seeing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageInput {
+    /// `N` — top-level series in the stage input.
+    series: u64,
+    /// `Σ labels.len()` over the input's series.
+    label_pairs: u64,
+    /// `Σ (k.len() + v.len())` — RAW label content bytes.
+    label_bytes: u64,
+    /// `Σ label_set_bytes(labels)` — the leaf's own charging vocabulary,
+    /// so the feasible region's operand and the model's input are the
+    /// same quantity.
+    label_block_bytes: u64,
+    /// The widest single series' label-pair count.
+    max_series_pairs: u64,
+    /// The longest single label VALUE, in bytes — read only through
+    /// [`include_bytes`].
+    max_value_bytes: u64,
+    /// `P` — total points (1 per series for an instant vector).
+    points: u64,
+    /// The longest single series, in points.
+    max_series_points: u64,
+}
+
+impl StageInput {
+    /// Every model-relevant input, named, from ONE exhaustive destructure
+    /// — adding a field to [`StageInput`] stops this compiling, which is
+    /// what keeps §6's "every non-target input is byte-identical" gate
+    /// from silently missing a new axis (the `AggCaps` `E0027` precedent).
+    pub fn model_inputs(&self) -> [(&'static str, u64); 8] {
+        let Self {
+            series,
+            label_pairs,
+            label_bytes,
+            label_block_bytes,
+            max_series_pairs,
+            max_value_bytes,
+            points,
+            max_series_points,
+        } = *self;
+        [
+            ("series", series),
+            ("label_pairs", label_pairs),
+            ("label_bytes", label_bytes),
+            ("label_block_bytes", label_block_bytes),
+            ("max_series_pairs", max_series_pairs),
+            ("max_value_bytes", max_value_bytes),
+            ("points", points),
+            ("max_series_points", max_series_points),
+        ]
+    }
+
+    /// `N`.
+    pub fn series(&self) -> u64 {
+        self.series
+    }
+
+    /// `P`.
+    pub fn points(&self) -> u64 {
+        self.points
+    }
+
+    /// `Σ label_set_bytes(labels)` — the quantity the leaf's own
+    /// group-byte charge is denominated in.
+    pub fn label_block_bytes(&self) -> u64 {
+        self.label_block_bytes
+    }
+
+    /// `Σ (k.len() + v.len())`.
+    pub fn label_bytes(&self) -> u64 {
+        self.label_bytes
+    }
+
+    /// `Σ labels.len()`.
+    pub fn label_pairs(&self) -> u64 {
+        self.label_pairs
+    }
+
+    /// The longest single label VALUE — read only through
+    /// [`include_bytes`].
+    pub fn max_value_bytes(&self) -> u64 {
+        self.max_value_bytes
+    }
+
+    /// **Derivation seam, not a measurement.** Builds a [`StageInput`]
+    /// from raw counted quantities so the cap derivation can evaluate the
+    /// model at the feasible region's corners (`N` up to ~4.4e5 series,
+    /// `P` up to 1.2e7 points) without materialising hundreds of MiB of
+    /// synthetic series. Every production charge obtains its `StageInput`
+    /// from [`measure_matrix`]/[`measure_vector`] — this constructor
+    /// measures nothing and must never be used to authorise a charge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_derivation(
+        series: u64,
+        label_pairs: u64,
+        label_bytes: u64,
+        label_block_bytes: u64,
+        max_series_pairs: u64,
+        max_value_bytes: u64,
+        points: u64,
+        max_series_points: u64,
+    ) -> Self {
+        Self {
+            series,
+            label_pairs,
+            label_bytes,
+            label_block_bytes,
+            max_series_pairs,
+            max_value_bytes,
+            points,
+            max_series_points,
+        }
+    }
+}
+
+/// Measures a matrix stage input. `s.points.len()` is `O(1)`, so the pass
+/// is `O(series + label pairs)` and adds nothing per point.
+pub fn measure_matrix(series: &[MatrixSeries]) -> StageInput {
+    let mut m = StageInput {
+        series: series.len() as u64,
+        ..StageInput::default()
+    };
+    for s in series {
+        measure_labels(&mut m, &s.labels);
+        let pts = s.points.len() as u64;
+        m.points = m.points.saturating_add(pts);
+        m.max_series_points = m.max_series_points.max(pts);
+    }
+    m
+}
+
+/// Measures an instant-vector stage input — one point per series, which
+/// is what makes `points == series` here.
+pub fn measure_vector(series: &[VectorSample]) -> StageInput {
+    let mut m = StageInput {
+        series: series.len() as u64,
+        points: series.len() as u64,
+        max_series_points: u64::from(!series.is_empty()),
+        ..StageInput::default()
+    };
+    for s in series {
+        measure_labels(&mut m, &s.labels);
+    }
+    m
+}
+
+/// The label half of a `measure_*` pass, shared so the two entry points
+/// cannot drift.
+fn measure_labels(m: &mut StageInput, labels: &LabelSet) {
+    let pairs = labels.len() as u64;
+    m.label_pairs = m.label_pairs.saturating_add(pairs);
+    m.max_series_pairs = m.max_series_pairs.max(pairs);
+    for (k, v) in labels {
+        m.label_bytes = m
+            .label_bytes
+            .saturating_add(k.len() as u64)
+            .saturating_add(v.len() as u64);
+        m.max_value_bytes = m.max_value_bytes.max(v.len() as u64);
+    }
+    m.label_block_bytes = m.label_block_bytes.saturating_add(label_set_bytes(labels));
+}
+
+/// `Σ_stages Σ_{name ∈ by(...)} (name.len() + 1)` — the grouping-name
+/// amplifier, read off the QUERY TEXT and never off the data.
+///
+/// Counts **every** `by` name, including ones absent from the data: which
+/// names are absent is unknowable before the stage runs, and counting all
+/// of them is the conservative direction. `without(...)` contributes
+/// nothing — `group_key`'s `Without` arm copies the series' own labels,
+/// which the `W_PAIR`/`W_LABEL_BYTE` terms already price.
+pub fn group_name_bytes(aggs: &[plan::VectorAggSpec]) -> u64 {
+    let mut total: u64 = 0;
+    for (_, grouping, _) in aggs {
+        let Some(g) = grouping else { continue };
+        if g.kind != GroupingKind::By {
+            continue;
+        }
+        for name in &g.labels {
+            total = total.saturating_add(name.len() as u64).saturating_add(1);
+        }
+    }
+    total
+}
+
+/// `Σ_{ln ∈ include} (ln.len() + one.max_value_bytes + 1)` — the
+/// `group_left/right(include)` amplifier, per many-side series.
+///
+/// Zero for a set operation ([`is_set_op`] returns before `include` is
+/// read, `instant_join`'s first statement) and zero for one-to-one
+/// matching (`matching.group.is_none()`).
+pub fn include_bytes(matching: Option<&VectorMatching>, op: BinOp, one: &StageInput) -> u64 {
+    if is_set_op(op) {
+        return 0;
+    }
+    let Some(group) = matching.and_then(|m| m.group.as_ref()) else {
+        return 0;
+    };
+    let include = match group {
+        MatchGroup::Left(inc) | MatchGroup::Right(inc) => inc,
+    };
+    let mut total: u64 = 0;
+    for ln in include {
+        total = total
+            .saturating_add(ln.len() as u64)
+            .saturating_add(one.max_value_bytes)
+            .saturating_add(1);
+    }
+    total
+}
+
+/// One term of [`post_agg_peak_bytes`]. `None` evaluates the shipped
+/// model; every other variant zeroes exactly one coefficient.
+///
+/// **A test seam** (the `apply_vector_aggs_capped` / `group_bytes_cap`
+/// precedent): §6's paired fixtures assert a term is NECESSARY by
+/// showing the model WITHOUT it fails to cover the incremental bytes the
+/// pair causes. Discriminating on increments is the only comparison that
+/// survives independently-margined coefficients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainTerm {
+    /// The shipped model, no term suppressed.
+    None,
+    Series,
+    Point,
+    LabelByte,
+    Pair,
+    StageSeries,
+    GroupName,
+    ApproxTopk,
+}
+
+/// One term of [`binary_peak_bytes`]; see [`ChainTerm`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryTerm {
+    /// The shipped model, no term suppressed.
+    None,
+    Series,
+    Point,
+    Label,
+    Pair,
+    Many,
+    Include,
+}
+
+/// An upper bound on the heap bytes the post-aggregation chain may hold
+/// SIMULTANEOUSLY, over and above its input. Contains no container
+/// enumeration and no allocator model — every coefficient is measured
+/// (§5.4) and margined.
+///
+/// All arithmetic saturates: `group_name_bytes` is read off unbounded-
+/// until-#279 query text and stays large after it, so an amplified query
+/// must resolve to `u64::MAX` (⇒ a clean refusal) and never wrap to a
+/// small number that would admit an unbounded allocation.
+pub fn post_agg_peak_bytes(m: &StageInput, aggs: &[plan::VectorAggSpec]) -> u64 {
+    post_agg_peak_bytes_without(m, aggs, ChainTerm::None)
+}
+
+/// [`post_agg_peak_bytes`] with one coefficient forced to zero — §6's
+/// necessity seam. The `match` is exhaustive with no `_` arm, so a new
+/// term must be dispositioned here before it can ship.
+pub fn post_agg_peak_bytes_without(
+    m: &StageInput,
+    aggs: &[plan::VectorAggSpec],
+    drop: ChainTerm,
+) -> u64 {
+    let w = |term: ChainTerm, coeff: u64| if drop == term { 0 } else { coeff };
+    let stages = aggs.len() as u64;
+    let names = group_name_bytes(aggs);
+    let approx = aggs
+        .iter()
+        .any(|(op, _, _)| matches!(op, VectorAggOp::ApproxTopk));
+
+    let mut total = w(ChainTerm::Series, W_SERIES).saturating_mul(m.series);
+    total = total.saturating_add(w(ChainTerm::Point, W_POINT).saturating_mul(m.points));
+    total =
+        total.saturating_add(w(ChainTerm::LabelByte, W_LABEL_BYTE).saturating_mul(m.label_bytes));
+    total = total.saturating_add(w(ChainTerm::Pair, W_PAIR).saturating_mul(m.label_pairs));
+    total = total.saturating_add(
+        w(ChainTerm::StageSeries, W_STAGE_SERIES)
+            .saturating_mul(m.series)
+            .saturating_mul(stages),
+    );
+    total = total.saturating_add(
+        w(ChainTerm::GroupName, W_GROUPNAME)
+            .saturating_mul(m.series)
+            .saturating_mul(names),
+    );
+    if approx {
+        total = total.saturating_add(w(ChainTerm::ApproxTopk, W_APPROX_TOPK));
+    }
+    total
+}
+
+/// The same for a binary combination. `many`/`one` are chosen EXACTLY as
+/// [`instant_join`] chooses them (`MatchGroup::Left` and one-to-one ⇒
+/// many = lhs, `MatchGroup::Right` ⇒ many = rhs), so the include
+/// amplification is never charged against the wrong side.
+pub fn binary_peak_bytes(
+    op: BinOp,
+    matching: Option<&VectorMatching>,
+    lhs: &StageInput,
+    rhs: &StageInput,
+) -> u64 {
+    binary_peak_bytes_without(op, matching, lhs, rhs, BinaryTerm::None)
+}
+
+/// [`binary_peak_bytes`] with one coefficient forced to zero — §6's
+/// necessity seam; see [`post_agg_peak_bytes_without`].
+pub fn binary_peak_bytes_without(
+    op: BinOp,
+    matching: Option<&VectorMatching>,
+    lhs: &StageInput,
+    rhs: &StageInput,
+    drop: BinaryTerm,
+) -> u64 {
+    let b = |term: BinaryTerm, coeff: u64| if drop == term { 0 } else { coeff };
+    // `instant_join`'s own role assignment, transcribed.
+    let group = matching.and_then(|m| m.group.as_ref());
+    let (many, one) = match group {
+        None | Some(MatchGroup::Left(_)) => (lhs, rhs),
+        Some(MatchGroup::Right(_)) => (rhs, lhs),
+    };
+    let inc = include_bytes(matching, op, one);
+    // The `B_MANY` term prices `instant_join`'s `many_matched:
+    // HashMap<MatchSig, HashSet<MatchSig>>`, which exists ONLY on the
+    // grouped arm — the one-to-one arm keeps a single
+    // `HashSet<MatchSig>` and is priced by `B_SERIES`. Without this gate
+    // the term takes the same value with and without a group modifier and
+    // §6.4's difference-of-differences cancels it to zero, which is how
+    // the gate found the omission.
+    let many_series = if group.is_some() { many.series } else { 0 };
+
+    let mut total =
+        b(BinaryTerm::Series, B_SERIES).saturating_mul(lhs.series.saturating_add(rhs.series));
+    total = total.saturating_add(
+        b(BinaryTerm::Point, B_POINT).saturating_mul(lhs.points.saturating_add(rhs.points)),
+    );
+    total = total.saturating_add(
+        b(BinaryTerm::Label, B_LABEL)
+            .saturating_mul(lhs.label_bytes.saturating_add(rhs.label_bytes)),
+    );
+    total = total.saturating_add(
+        b(BinaryTerm::Pair, B_PAIR).saturating_mul(lhs.label_pairs.saturating_add(rhs.label_pairs)),
+    );
+    total = total.saturating_add(b(BinaryTerm::Many, B_MANY).saturating_mul(many_series));
+    total = total.saturating_add(
+        b(BinaryTerm::Include, B_INCLUDE)
+            .saturating_mul(many.series)
+            .saturating_mul(inc),
+    );
+    total
+}
+
+/// Measures a range stage input — the chain's shape once the
+/// `QueryResult` has been converted. `points.len()` on a `BTreeMap` is
+/// `O(1)`, so the pass stays `O(series + label pairs)`.
+fn measure_range(series: &[RangeSeries]) -> StageInput {
+    let mut m = StageInput {
+        series: series.len() as u64,
+        ..StageInput::default()
+    };
+    for s in series {
+        measure_labels(&mut m, &s.labels);
+        let pts = s.points.len() as u64;
+        m.points = m.points.saturating_add(pts);
+        m.max_series_points = m.max_series_points.max(pts);
+    }
+    m
+}
+
+/// Measures an instant stage input — one point per series.
+fn measure_instant(series: &[InstantSeries]) -> StageInput {
+    let mut m = StageInput {
+        series: series.len() as u64,
+        points: series.len() as u64,
+        max_series_points: u64::from(!series.is_empty()),
+        ..StageInput::default()
+    };
+    for s in series {
+        measure_labels(&mut m, &s.labels);
+    }
+    m
+}
+
+/// The funnel's proof token (issue #236 §4.1).
+///
+/// Everything in this module is private to it: [`Ledger`]'s fields, its
+/// only constructors and the charge they perform. A `&Ledger` in a
+/// signature is therefore PROOF that the stage's modelled bytes were
+/// charged against the cap before that function could be reached — an
+/// uncapped call site does not compile, in release exactly as in debug.
+mod ledger {
+    #[cfg(test)]
+    use super::MAX_POST_AGG_BYTES;
+    use super::{ReadError, StageInput, TooBroadReason};
+
+    /// Proof that a stage's modelled bytes were charged, AND the budget
+    /// that charge covers.
+    ///
+    /// The discharge is [`Drop`], so charge/discharge symmetry is
+    /// structural on every return path (`?`, early return, unwind) — a
+    /// leak is not expressible rather than merely tested for.
+    #[derive(Debug)]
+    pub(super) struct Ledger<'a> {
+        charged: &'a mut u64,
+        bytes: u64,
+        cap: u64,
+        admitted_series: u64,
+        admitted_points: u64,
+    }
+
+    impl<'a> Ledger<'a> {
+        /// The chain funnel's charge: atomic check-then-add, and a FAILED
+        /// charge does not mutate the counter (the `charge_group_bytes` /
+        /// `traces::exec::ByteBudget::charge` precedent).
+        pub(super) fn acquire(
+            charged: &'a mut u64,
+            m: &StageInput,
+            bytes: u64,
+            cap: u64,
+        ) -> Result<Self, ReadError> {
+            Self::acquire_for(charged, m.series(), m.points(), bytes, cap)
+        }
+
+        /// The binary funnel's charge. Both operands are live at once and
+        /// both enter the join, so the admitted envelope is their SUM —
+        /// the same quantity `binary_peak_bytes` is evaluated over.
+        pub(super) fn acquire_binary(
+            charged: &'a mut u64,
+            lhs: &StageInput,
+            rhs: &StageInput,
+            bytes: u64,
+            cap: u64,
+        ) -> Result<Self, ReadError> {
+            Self::acquire_for(
+                charged,
+                lhs.series().saturating_add(rhs.series()),
+                lhs.points().saturating_add(rhs.points()),
+                bytes,
+                cap,
+            )
+        }
+
+        fn acquire_for(
+            charged: &'a mut u64,
+            admitted_series: u64,
+            admitted_points: u64,
+            bytes: u64,
+            cap: u64,
+        ) -> Result<Self, ReadError> {
+            let next = charged.saturating_add(bytes);
+            if next > cap {
+                return Err(ReadError::QueryTooBroad(
+                    TooBroadReason::MetricPostAggBytes { bytes: next, cap },
+                ));
+            }
+            *charged = next;
+            Ok(Self {
+                charged,
+                bytes,
+                cap,
+                admitted_series,
+                admitted_points,
+            })
+        }
+
+        /// **UNCONDITIONAL** — no `debug_assert`, no `cfg`. Every
+        /// classified ENTRY function calls this on the collection it is
+        /// about to process; a shortfall is a clean refusal in release
+        /// exactly as in debug, because a `debug_assert` is not an
+        /// enforcement mechanism, it is a comment that runs in CI.
+        ///
+        /// `series` is a `Vec::len` (`O(1)`); `points` is `O(series)` for
+        /// the two matrix entries and `O(1)` for the vector/join entries.
+        /// Nothing per point is added anywhere.
+        pub(super) fn admit(&self, series: u64, points: u64) -> Result<(), ReadError> {
+            if series > self.admitted_series || points > self.admitted_points {
+                return Err(ReadError::QueryTooBroad(
+                    TooBroadReason::MetricPostAggBytes {
+                        bytes: self.bytes,
+                        cap: self.cap,
+                    },
+                ));
+            }
+            Ok(())
+        }
+
+        /// A token whose budget is the whole cap, for the in-module tests
+        /// that drive one region function directly. It charges like any
+        /// other acquisition — there is no unchecked constructor.
+        #[cfg(test)]
+        pub(super) fn for_test(charged: &'a mut u64) -> Self {
+            Self::acquire_for(charged, u64::MAX, u64::MAX, 0, MAX_POST_AGG_BYTES)
+                .expect("a zero-byte charge is always admitted")
+        }
+    }
+
+    impl Drop for Ledger<'_> {
+        fn drop(&mut self) {
+            *self.charged = self.charged.saturating_sub(self.bytes);
+        }
+    }
+}
+
+use ledger::Ledger;
+
+/// One binary operand's measured shape; a scalar/string/streams operand
+/// carries no series and measures empty.
+fn measure_operand(r: &QueryResult) -> StageInput {
+    match r {
+        QueryResult::Vector(items) => measure_vector(items),
+        QueryResult::Matrix(items) => measure_matrix(items),
+        _ => StageInput::default(),
+    }
+}
+
+/// A range collection's admission: `Vec::len` plus one `O(series)` sum of
+/// `BTreeMap::len`. Nothing per point.
+fn admit_range(series: &[RangeSeries], l: &Ledger<'_>) -> Result<(), ReadError> {
+    let points = series
+        .iter()
+        .fold(0u64, |a, s| a.saturating_add(s.points.len() as u64));
+    l.admit(series.len() as u64, points)
+}
+
+/// An instant collection's admission — one point per series, so `O(1)`.
+fn admit_instant(series: &[InstantSeries], l: &Ledger<'_>) -> Result<(), ReadError> {
+    l.admit(series.len() as u64, series.len() as u64)
+}
+
+/// A join operand pair's admission — `O(1)`, run once per step on the
+/// matrix path.
+fn admit_join(lhs: &[JoinItem<'_>], rhs: &[JoinItem<'_>], l: &Ledger<'_>) -> Result<(), ReadError> {
+    let n = (lhs.len() as u64).saturating_add(rhs.len() as u64);
+    l.admit(n, n)
+}
+
+/// `s_min` — the smallest per-entry byte charge any of the four client
+/// leaf group paths levies, computed from live `size_of` through the
+/// leaf's own [`map_entry_bytes`]/[`grown_alloc_bytes`] vocabulary with
+/// the shortest possible key.
+///
+/// It is the feasible region's series operand: a leaf that admitted `N`
+/// groups paid at least `s_min * N` of its
+/// [`MAX_CLIENT_AGG_GROUP_BYTES`] budget, so `N <=
+/// (MAX_CLIENT_AGG_GROUP_BYTES - L̂) / s_min`. Derived, never chosen —
+/// if a slot's layout changes the region moves with it.
+pub fn leaf_min_entry_bytes() -> u64 {
+    [
+        MUT_GROUP_SLOT,
+        INSTANT_GROUP_SLOT,
+        FP_GROUP_SLOT,
+        SERIES_OUT_SLOT,
+    ]
+    .into_iter()
+    .map(|slot| map_entry_bytes(slot).saturating_add(grown_alloc_bytes(0)))
+    .min()
+    .expect("four leaf entry slots")
+}
+
+/// The chain over an already-converted RANGE vector. Entry-class: it
+/// admits the collection it is handed, then applies the stages
+/// innermost-first (the `.rev()` matching `MetricPlan.vector_aggs`'
+/// outer-first order).
+fn run_range_chain(
+    mut series: Vec<RangeSeries>,
+    aggs: &[plan::VectorAggSpec],
+    l: &Ledger<'_>,
+) -> Result<Vec<RangeSeries>, ReadError> {
+    admit_range(&series, l)?;
+    for (op, grouping, param) in aggs.iter().rev() {
+        series = group_range(series, *op, grouping.as_ref(), *param, l)?;
+    }
+    Ok(series)
+}
+
+/// The chain over an already-converted INSTANT vector; see
+/// [`run_range_chain`].
+fn run_instant_chain(
+    mut series: Vec<InstantSeries>,
+    aggs: &[plan::VectorAggSpec],
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
+    for (op, grouping, param) in aggs.iter().rev() {
+        series = group_instant(series, *op, grouping.as_ref(), *param, l)?;
+    }
+    Ok(series)
+}
+
+/// Charges, then runs the chain over an already-converted range vector.
+///
+/// The SQL metric path holds `Vec<RangeSeries>` directly and reaching
+/// [`apply_vector_aggs`] from there would cost a `BTreeMap -> Vec ->
+/// BTreeMap` round trip per point on the commonest metric shape. This is
+/// the same funnel — measure, charge, run — entered one conversion
+/// earlier.
+fn charged_range_chain(
+    series: Vec<RangeSeries>,
+    aggs: &[plan::VectorAggSpec],
+    cap: u64,
+) -> Result<Vec<RangeSeries>, ReadError> {
+    if aggs.is_empty() {
+        return Ok(series);
+    }
+    let m = measure_range(&series);
+    let bytes = post_agg_peak_bytes(&m, aggs);
+    let mut charged = 0u64;
+    let l = Ledger::acquire(&mut charged, &m, bytes, cap)?;
+    run_range_chain(series, aggs, &l)
+}
+
+/// [`charged_range_chain`] for an instant vector.
+fn charged_instant_chain(
+    series: Vec<InstantSeries>,
+    aggs: &[plan::VectorAggSpec],
+    cap: u64,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    if aggs.is_empty() {
+        return Ok(series);
+    }
+    let m = measure_instant(&series);
+    let bytes = post_agg_peak_bytes(&m, aggs);
+    let mut charged = 0u64;
+    let l = Ledger::acquire(&mut charged, &m, bytes, cap)?;
+    run_instant_chain(series, aggs, &l)
+}
+
+/// Applies an outer-to-inner vector-aggregation chain to a metric result,
+/// charged against [`MAX_POST_AGG_BYTES`] before it allocates.
+///
+/// `pub` like [`run_pipeline_rows`]: the hermetic golden suite
+/// (`tests/logql_metric_agg_golden.rs`) pins the reducer/selection
+/// semantics from outside the crate.
+pub fn apply_vector_aggs(
+    result: QueryResult,
+    aggs: &[plan::VectorAggSpec],
+) -> Result<QueryResult, ReadError> {
+    let mut charged = 0u64;
+    apply_vector_aggs_capped(&mut charged, result, aggs, MAX_POST_AGG_BYTES)
+}
+
+/// The cap seam (the `group_bytes_cap`/`retention_cap` precedent): exists
+/// ONLY so tests can drive the boundary, and takes the counter by
+/// reference so the charge/discharge symmetry is observable.
+///
+/// **The order is the contract.** (1) an empty chain returns its input
+/// before any measurement and before the conversion — which also deletes
+/// an `O(points)` `Vec -> BTreeMap -> Vec` round trip from every
+/// no-aggregation result; (2) measurement happens on the
+/// `MatrixSeries`/`VectorSample` shape, so the conversion is INSIDE its
+/// own charge; (3) a refused charge means nothing is converted, nothing
+/// is grouped and no token exists, so the chain cannot run; (4) every
+/// Entry function admits its own input unconditionally; (5) the token
+/// drops and discharges.
+pub fn apply_vector_aggs_capped(
+    charged: &mut u64,
+    result: QueryResult,
+    aggs: &[plan::VectorAggSpec],
+    cap: u64,
+) -> Result<QueryResult, ReadError> {
+    if aggs.is_empty() {
+        return Ok(result);
+    }
     match result {
         QueryResult::Matrix(items) => {
-            let mut series: Vec<RangeSeries> = items
+            let m = measure_matrix(&items);
+            let bytes = post_agg_peak_bytes(&m, aggs);
+            let l = Ledger::acquire(charged, &m, bytes, cap)?;
+            let series: Vec<RangeSeries> = items
                 .into_iter()
                 .map(|s| RangeSeries {
                     labels: s.labels,
                     points: s.points.into_iter().collect(),
                 })
                 .collect();
-            for (op, grouping, param) in aggs.iter().rev() {
-                series = group_range(series, *op, grouping.as_ref(), *param);
-            }
-            QueryResult::Matrix(
+            let series = run_range_chain(series, aggs, &l)?;
+            Ok(QueryResult::Matrix(
                 series
                     .into_iter()
                     .map(|s| MatrixSeries {
@@ -8827,20 +11544,21 @@ pub fn apply_vector_aggs(result: QueryResult, aggs: &[plan::VectorAggSpec]) -> Q
                         points: s.points.into_iter().collect(),
                     })
                     .collect(),
-            )
+            ))
         }
         QueryResult::Vector(items) => {
-            let mut series: Vec<InstantSeries> = items
+            let m = measure_vector(&items);
+            let bytes = post_agg_peak_bytes(&m, aggs);
+            let l = Ledger::acquire(charged, &m, bytes, cap)?;
+            let series: Vec<InstantSeries> = items
                 .into_iter()
                 .map(|s| InstantSeries {
                     labels: s.labels,
                     value: s.value,
                 })
                 .collect();
-            for (op, grouping, param) in aggs.iter().rev() {
-                series = group_instant(series, *op, grouping.as_ref(), *param);
-            }
-            QueryResult::Vector(
+            let series = run_instant_chain(series, aggs, &l)?;
+            Ok(QueryResult::Vector(
                 series
                     .into_iter()
                     .map(|s| VectorSample {
@@ -8848,11 +11566,11 @@ pub fn apply_vector_aggs(result: QueryResult, aggs: &[plan::VectorAggSpec]) -> Q
                         value: s.value,
                     })
                     .collect(),
-            )
+            ))
         }
         // A vector aggregation over a scalar is rejected at plan time
         // (`build_metric_node`); passthrough is defensive only.
-        other => other,
+        other => Ok(other),
     }
 }
 
@@ -8897,6 +11615,16 @@ mod tests {
             range_ns: super::super::params::validate_duration_ns(range_ns, "range selector")
                 .expect("valid range"),
         }
+    }
+
+    /// Narrows an instant `ClientWindow` for [`ClientAggState::new`]
+    /// (issue #236 Part D). Tests cannot fabricate the witness either —
+    /// `InstantWindow`'s field is private to `mod instant_window`, so
+    /// `mint` is the only source anywhere in the crate, `mod tests`
+    /// included; a test that hands a stepped window here fails at the
+    /// `expect`, not silently.
+    fn instant_of(window: ClientWindow) -> InstantWindow {
+        window.as_instant().expect("an instant window")
     }
 
     fn slide_rows(fp: u64, samples: &[(i64, &str)]) -> Vec<MetricScanRow> {
@@ -9379,10 +12107,1028 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Issue #236 §4 — the result-point charge.
+    // -----------------------------------------------------------------
+
+    /// The charge is an ADMISSION counter with an exact IDENTITY: one
+    /// grid width per output series, whatever the data's density.
+    ///
+    /// Stated as an identity rather than an inequality because that is
+    /// what makes it checkable — a charge that merely stayed under the
+    /// cap would pass with the reservation deleted.
+    #[test]
+    fn the_result_point_charge_is_one_grid_width_per_output_series() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        // step 10 over [0, 100] => kmax = 10 => 11 grid points.
+        let window = slide_window(0, 100, 10, 30);
+        let grid = 11u64;
+
+        // Non-mutating: one slider per FINGERPRINT.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | line_format "keep""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(!compiled.metric_mutates_labels());
+        let mut state =
+            RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                .unwrap();
+        // Six rows on ONE fingerprint: density must not move the charge.
+        state
+            .push_rows(&slide_rows(
+                1,
+                &[
+                    (5, "a"),
+                    (6, "b"),
+                    (17, "c"),
+                    (28, "d"),
+                    (39, "e"),
+                    (95, "f"),
+                ],
+            ))
+            .expect("fold");
+        assert_eq!(
+            state.result_points, grid,
+            "one fingerprint => exactly one grid width, whatever its density"
+        );
+
+        // Mutating: one group per distinct OUTPUT LABEL SET.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(compiled.metric_mutates_labels());
+        for groups in [1u64, 3, 7] {
+            let mut state =
+                RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                    .unwrap();
+            // Two rows per group, so the count is groups and not rows.
+            let mut rows: Vec<MetricScanRow> = Vec::new();
+            for g in 0..groups {
+                for r in 0..2u64 {
+                    rows.push(MetricScanRow {
+                        fingerprint: 1,
+                        timestamp_ns: (g * 10 + r) as i64,
+                        body: format!("id={g}"),
+                    });
+                }
+            }
+            state.push_rows(&rows).expect("fold");
+            assert_eq!(
+                state.result_points,
+                groups * grid,
+                "{groups} output groups => {groups} grid widths"
+            );
+        }
+    }
+
+    /// The cap REFUSES, and it refuses BEFORE the allocation it is
+    /// guarding — the group that would breach is never created.
+    #[test]
+    fn the_result_point_cap_refuses_before_the_group_exists() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let mut state =
+            RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                .unwrap();
+        // Room for exactly two groups (11 points each).
+        state.caps.result_points = 22;
+        // FOUR rows: `push_rows` flushes a collision group only when the
+        // next row's `(fingerprint, ts)` differs, so the trailing group
+        // stays staged. The fourth row is what makes the third group
+        // flush — and breach — inside `push_rows` rather than at finish.
+        let rows: Vec<MetricScanRow> = (0..4u64)
+            .map(|g| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: g as i64 * 10,
+                body: format!("id={g}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricResultPoints { count, cap })) => {
+                assert_eq!(cap, 22);
+                assert_eq!(count, 33, "the error names the breaching reservation");
+            }
+            other => panic!("expected MetricResultPoints, got {other:?}"),
+        }
+        assert_eq!(
+            state.groups.len(),
+            2,
+            "the breaching group must never be created"
+        );
+        assert_eq!(state.result_points, 22, "a refused charge must not stick");
+    }
+
+    /// **The ordering, checked where it is written.** A behavioural test
+    /// cannot distinguish charge-then-build from build-then-charge — the
+    /// transient key is allocated either way and the refusal lands at the
+    /// same point — so the three-step order inside `charged_group_key`
+    /// (charge, guard, build) is asserted directly, and the fold is
+    /// asserted to reach `group_key` through NOTHING ELSE and to commit
+    /// its [`GroupKeyCharge`] only after the insertion that retains the
+    /// key.
+    #[test]
+    fn the_fold_charges_before_it_builds_a_group_key() {
+        let src = include_str!("exec.rs");
+        let start = src
+            .find("fn charged_group_key<'a>(")
+            .expect("the fold's charged route to group_key");
+        let end = src[start..]
+            .find("\nfn group_key(")
+            .expect("the end of charged_group_key")
+            + start;
+        let body = &src[start..end];
+        let charge = body
+            .find("charge_group_bytes(")
+            .expect("charged_group_key must charge");
+        let guard = body
+            .find("GroupKeyCharge { charged, bytes }")
+            .expect("charged_group_key must build the refund guard");
+        let build = body
+            .find("group_key(labels, grouping)")
+            .expect("charged_group_key must build the key");
+        assert!(
+            charge < build,
+            "charged_group_key builds the key BEFORE charging for it — the charge must precede \
+             the allocation, not observe it"
+        );
+        // And the guard sits BETWEEN them. `group_key` allocates, so a
+        // guard constructed after it leaves a window in which an
+        // unwinding panic passes a charge that nothing owns: the guard
+        // cannot refund a charge it does not yet have. Compiles either
+        // way — `group_key` does not touch `charged` — so the position
+        // is asserted where it is written.
+        assert!(
+            charge < guard && guard < build,
+            "charged_group_key must construct its GroupKeyCharge between the charge and the key \
+             — a guard built after group_key cannot refund a charge it does not yet own"
+        );
+
+        // And the two fold bodies reach `group_key` only through it: a
+        // direct call there would reintroduce the reviewed defect at a
+        // site this census does not read.
+        for anchor in ["impl ReduceFold {", "impl SelectFold {"] {
+            let s = src.find(anchor).unwrap_or_else(|| panic!("{anchor} moved"));
+            let e = src[s + anchor.len()..]
+                .find("\nimpl ")
+                .map_or(src.len(), |o| s + anchor.len() + o);
+            let region = &src[s..e];
+            assert!(
+                region.contains("charged_group_key("),
+                "{anchor} must reach group_key through charged_group_key"
+            );
+            assert!(
+                !region.contains("group_key(labels, self.grouping"),
+                "{anchor} calls group_key DIRECTLY — the fold has no funnel token and must \
+                 charge in its own regime first"
+            );
+            // The same class, one statement later: `GroupKeyCharge`
+            // refunds unless `commit` runs, so a `commit` hoisted above
+            // the insertion it pays for would put the fallible point
+            // reservation back INSIDE the committed window and leak the
+            // key charge on refusal. Compiles either way, and — as
+            // above — nothing observable would show it, so the order is
+            // asserted where it is written.
+            let insert = region
+                .find(".insert(vec![")
+                .unwrap_or_else(|| panic!("{anchor} must insert its dense slot vector"));
+            let commit = region
+                .find("key_charge.commit();")
+                .unwrap_or_else(|| panic!("{anchor} must commit the key charge it retains"));
+            assert!(
+                insert < commit,
+                "{anchor} commits the key charge BEFORE the insertion that retains the key — \
+                 every fallible step ahead of the insertion must still be able to refund"
+            );
+            assert_eq!(
+                region.matches("key_charge.commit();").count(),
+                1,
+                "{anchor} must commit the key charge exactly once — on the retaining path only"
+            );
+        }
+    }
+
+    /// `group_key_bytes` sizes exactly what `group_key` allocates. If the
+    /// two drift the charge stops meaning anything, so they are pinned
+    /// against each other over both grouping kinds, absent names, empty
+    /// values and the no-grouping case.
+    #[test]
+    fn group_key_bytes_matches_group_key() {
+        let labels = fold_labels(&[("id", "abc"), ("host", ""), ("zone", "eu-west-1")]);
+        let cases: Vec<Option<Grouping>> = vec![
+            None,
+            Some(Grouping {
+                kind: GroupingKind::By,
+                labels: vec!["id".to_string()],
+            }),
+            Some(Grouping {
+                kind: GroupingKind::By,
+                labels: vec!["id".to_string(), "absent".to_string(), "host".to_string()],
+            }),
+            Some(Grouping {
+                kind: GroupingKind::By,
+                labels: (0..64).map(|i| format!("absent{i:03}")).collect(),
+            }),
+            Some(Grouping {
+                kind: GroupingKind::Without,
+                labels: vec!["id".to_string()],
+            }),
+            Some(Grouping {
+                kind: GroupingKind::Without,
+                labels: vec!["nothing".to_string()],
+            }),
+        ];
+        for g in &cases {
+            let built = group_key(&labels, g.as_ref());
+            let sized = group_key_bytes(&labels, g.as_ref());
+            let actual = if built.is_empty() && g.is_none() {
+                0
+            } else {
+                label_set_bytes(&built)
+            };
+            assert!(
+                sized >= actual,
+                "{g:?}: sized {sized} under-charges the {actual} bytes group_key allocates"
+            );
+            // And it must not be a blanket over-charge either: the only
+            // slack is `grown_alloc_bytes` vs `alloc_block_bytes` on the
+            // element buffer, a factor of 3 on one term.
+            assert!(
+                sized <= actual.saturating_mul(3).saturating_add(96),
+                "{g:?}: sized {sized} is not a tight bound on {actual}"
+            );
+        }
+    }
+
+    /// **Review round 1's `[high]`, as a gate.** The fold charges a
+    /// group's KEY bytes before `group_key` builds it: a refused key is
+    /// never retained, the map never grows, and the counter does not
+    /// stick. Mutant shape: moving the charge after the `entry`
+    /// expression, or deleting it, reddens here.
+    #[test]
+    fn the_fold_charges_a_group_key_before_group_key_allocates_it() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 10,
+            kmax: 4,
+        };
+        // A `by(...)` clause whose names come from the QUERY TEXT — the
+        // bytes that were unbounded before this charge existed.
+        // One PRESENT distinguishing name, so distinct series land in
+        // distinct groups; the other 64 are absent from the data and
+        // exist only in the query text — which is the mass this charge
+        // exists to bound.
+        let wide = Grouping {
+            kind: GroupingKind::By,
+            labels: std::iter::once("id".to_string())
+                .chain((0..64).map(|i| format!("qtext{i:04}")))
+                .collect(),
+        };
+        let labels = fold_labels(&[("id", "a")]);
+        let key_bytes =
+            group_key_bytes(&labels, Some(&wide)).saturating_add(map_entry_bytes(FOLD_GROUP_SLOT));
+        assert!(key_bytes > 0, "a 64-name by-clause must cost something");
+
+        for op in [VectorAggOp::Sum, VectorAggOp::Topk] {
+            let param = matches!(op, VectorAggOp::Topk).then_some(2.0);
+            // One byte short of the first key.
+            let mut fold = VectorAggFold::new(
+                &(op, Some(wide.clone()), param),
+                grid,
+                u64::MAX,
+                key_bytes - 1,
+            )
+            .expect("folds");
+            match fold.push_series(&labels, &[(0, 1.0)]) {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes {
+                    bytes,
+                    cap,
+                })) => {
+                    assert_eq!(cap, key_bytes - 1);
+                    assert_eq!(bytes, key_bytes);
+                }
+                other => panic!("{op:?}: expected MetricGroupLabelBytes, got {other:?}"),
+            }
+            assert_eq!(
+                fold.groups(),
+                0,
+                "{op:?}: the refused group's key must never be retained"
+            );
+            assert_eq!(
+                fold.cells(),
+                0,
+                "{op:?}: nothing may be allocated behind a refused key"
+            );
+
+            // Room for ONE retained key plus the one TRANSIENT key a push
+            // must be able to build before it can be compared: the charge
+            // precedes the allocation, so the bound necessarily covers
+            // `retained + 1`. A second DISTINCT group needs a third and
+            // breaches.
+            let mut fold = VectorAggFold::new(
+                &(op, Some(wide.clone()), param),
+                grid,
+                u64::MAX,
+                2 * key_bytes,
+            )
+            .expect("folds");
+            fold.push_series(&labels, &[(0, 1.0)])
+                .expect("the first group fits");
+            assert_eq!(fold.groups(), 1);
+            // Re-pushing the SAME group REFUNDS its transient key: without
+            // the refund the counter would climb on every row of an
+            // existing group and the fold would refuse its own data.
+            fold.push_series(&labels, &[(10, 2.0)])
+                .expect("an existing group refunds its transient key");
+            assert_eq!(fold.groups(), 1);
+            let second = fold_labels(&[("id", "b")]);
+            fold.push_series(&second, &[(0, 1.0)])
+                .expect("a second retained group fits the two-key budget");
+            assert_eq!(fold.groups(), 2);
+            let third = fold_labels(&[("id", "c")]);
+            match fold.push_series(&third, &[(0, 1.0)]) {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { .. })) => {}
+                other => panic!("{op:?}: a third group must breach, got {other:?}"),
+            }
+            assert_eq!(fold.groups(), 2, "{op:?}: the refusal must not evict");
+        }
+    }
+
+    /// The FOLD reserves its dense slots before the vector exists, and
+    /// the reservation is the vector's own width.
+    #[test]
+    fn the_fold_reserves_its_dense_slots_before_allocating_them() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 10,
+            kmax: 4,
+        };
+        let slots = 5u64;
+        let by_id = Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["id".to_string()],
+        };
+        // Two output groups' worth of room, three groups offered.
+        let mut fold = VectorAggFold::new(
+            &(VectorAggOp::Sum, Some(by_id), None),
+            grid,
+            2 * slots,
+            u64::MAX,
+        )
+        .expect("sum folds");
+        for g in 0..2u32 {
+            let labels = fold_labels(&[("id", &g.to_string())]);
+            fold.push_series(&labels, &[(0, 1.0)]).expect("admitted");
+        }
+        assert_eq!(fold.groups(), 2);
+        assert_eq!(
+            fold.cells(),
+            2 * slots as usize,
+            "dense, kmax + 1 per group"
+        );
+        let labels = fold_labels(&[("id", "2")]);
+        match fold.push_series(&labels, &[(0, 1.0)]) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricResultPoints { count, cap })) => {
+                assert_eq!(cap, 2 * slots);
+                assert_eq!(count, 3 * slots);
+            }
+            other => panic!("expected MetricResultPoints, got {other:?}"),
+        }
+        assert_eq!(
+            fold.groups(),
+            2,
+            "the refused group's dense vector must never be allocated"
+        );
+
+        // The selecting fold charges the same dense reservation, plus one
+        // for each candidate a slot retains beyond its first.
+        let mut fold =
+            VectorAggFold::new(&(VectorAggOp::Topk, None, Some(2.0)), grid, 1_000, u64::MAX)
+                .expect("topk folds");
+        fold.push_series(&fold_labels(&[("h", "a")]), &[(0, 1.0)])
+            .expect("admitted");
+        // One group's dense vector (5) + one candidate.
+        assert_eq!(fold_slots(&fold), slots + 1);
+        fold.push_series(&fold_labels(&[("h", "b")]), &[(0, 2.0)])
+            .expect("admitted");
+        assert_eq!(fold_slots(&fold), slots + 2, "the slot grew to k = 2");
+        // The slot is now FULL: a third candidate evicts rather than
+        // growing, so it reserves nothing.
+        fold.push_series(&fold_labels(&[("h", "c")]), &[(0, 3.0)])
+            .expect("admitted");
+        assert_eq!(
+            fold_slots(&fold),
+            slots + 2,
+            "an eviction is occupancy-neutral and must charge nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #236 Part D — `ClientAggState` is instant-only.
+    // -----------------------------------------------------------------
+
+    /// AC 16 — a stepped window cannot reach [`ClientAggState`].
+    ///
+    /// The domain is the `ClientWindow` enum, which has exactly two
+    /// variants, so it is enumerated rather than sampled. The guard is
+    /// UNREPRESENTABILITY, not unreachability: `InstantWindow`'s single
+    /// field is private to `mod instant_window`, so no line in the crate
+    /// — including this one — can write the witness directly, and
+    /// `mint` is the only source. A bare unit struct would have been
+    /// merely unreachable, since every `ClientAggState::new` call site
+    /// lives in this file.
+    #[test]
+    fn a_stepped_window_cannot_mint_the_instant_witness() {
+        let instant = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        assert!(
+            instant.as_instant().is_some(),
+            "an instant window must narrow"
+        );
+        // Every stepped shape the constructor could be handed: the
+        // narrowest legal grid and a wide one.
+        for (start, end, step, range) in [(0i64, 0i64, 1u64, 1u64), (0, 1_000, 10, 45)] {
+            let stepped = slide_window(start, end, step, range);
+            assert!(
+                stepped.as_instant().is_none(),
+                "a stepped window must NOT narrow: {stepped:?}"
+            );
+        }
+    }
+
+    /// AC 16 — the state's result is a `Vector`, always.
+    ///
+    /// The former stepped arms of `finish` (the `bucket_grid` absence
+    /// walk and the per-bucket `Matrix` emit) are deleted, so there is no
+    /// input that makes this state emit a matrix. Driven over all four
+    /// shapes: absent and non-absent, fan-out and non-fan-out.
+    #[test]
+    fn the_instant_state_can_only_emit_a_vector() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let rows = slide_rows(1, &[(10, "a=1"), (20, "a=2"), (30, "a=3")]);
+        for (op, value, pipeline) in [
+            // non-absent, non-fan-out
+            (RangeAggOp::CountOverTime, ClientValue::Count, r#"{x="y"}"#),
+            // non-absent, fan-out
+            (
+                RangeAggOp::MaxOverTime,
+                ClientValue::Unwrap,
+                r#"{x="y"} | logfmt | unwrap a"#,
+            ),
+            // absent, non-fan-out
+            (RangeAggOp::AbsentOverTime, ClientValue::Count, r#"{x="y"}"#),
+        ] {
+            for rows in [&rows[..], &[][..]] {
+                let client = ClientAgg {
+                    pipeline: parse_pipeline(pipeline),
+                    value,
+                    range_op: op,
+                    param: None,
+                    absent_labels: vec![("app".to_string(), "a".to_string())],
+                };
+                let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+                let mut state = ClientAggState::new(
+                    &compiled,
+                    &meta,
+                    &client,
+                    instant_of(window),
+                    None,
+                    AggCaps::DEFAULT,
+                )
+                .unwrap();
+                state.push_rows(rows).expect("fold");
+                let out = state.finish();
+                assert!(
+                    matches!(out, QueryResult::Vector(_)),
+                    "{op:?} over {} row(s) must emit a vector, got {out:?}",
+                    rows.len()
+                );
+            }
+        }
+    }
+
+    /// Every row folds into its group's ONE accumulator, on BOTH
+    /// grouping arms.
+    ///
+    /// The collapse of the per-group `BTreeMap` to a single `BucketAcc`
+    /// moved the fold into each arm, so each arm now owns a
+    /// seed-or-accumulate decision of its own. A mutant that made the
+    /// non-fan-out arm REPLACE rather than fold was caught only by six
+    /// `variants(...)` goldens — which drive the same state for an
+    /// unrelated reason and would stop covering it the moment those
+    /// fixtures changed. This pins the property where it lives, on both
+    /// arms and over ops whose value depends on every member.
+    #[test]
+    fn both_grouping_arms_fold_every_row_into_one_accumulator() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        // Four rows, ascending values, all in the one window.
+        let rows = slide_rows(1, &[(10, "a=1"), (20, "a=8"), (30, "a=2"), (40, "a=4")]);
+        // (op, value kind, non-fan-out pipeline, fan-out pipeline, want)
+        // The fan-out pipelines set a CONSTANT label, so both arms
+        // produce exactly one group and the only difference between them
+        // is which map the accumulator lives in.
+        let cases: [(RangeAggOp, ClientValue, &str, &str, f64); 3] = [
+            (
+                RangeAggOp::CountOverTime,
+                ClientValue::Count,
+                r#"{x="y"}"#,
+                r#"{x="y"} | label_format zone="eu""#,
+                4.0,
+            ),
+            (
+                RangeAggOp::BytesOverTime,
+                ClientValue::Bytes,
+                r#"{x="y"} | line_format "abcde""#,
+                r#"{x="y"} | line_format "abcde" | label_format zone="eu""#,
+                20.0,
+            ),
+            (
+                RangeAggOp::BytesOverTime,
+                ClientValue::Bytes,
+                r#"{x="y"}"#,
+                r#"{x="y"} | label_format zone="eu""#,
+                // "a=1" / "a=8" / "a=2" / "a=4" — 3 bytes each.
+                12.0,
+            ),
+        ];
+        for (op, value, plain, mutating, want) in cases {
+            for (arm, query) in [("non-fan-out", plain), ("fan-out", mutating)] {
+                let client = ClientAgg {
+                    pipeline: parse_pipeline(query),
+                    value,
+                    range_op: op,
+                    param: None,
+                    absent_labels: vec![],
+                };
+                let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+                assert_eq!(
+                    compiled.metric_mutates_labels(),
+                    arm == "fan-out",
+                    "{op:?} {arm}: the fixture must take the arm it names"
+                );
+                let mut state = ClientAggState::new(
+                    &compiled,
+                    &meta,
+                    &client,
+                    instant_of(window),
+                    None,
+                    AggCaps::DEFAULT,
+                )
+                .unwrap();
+                state.push_rows(&rows).expect("fold");
+                let QueryResult::Vector(items) = state.finish() else {
+                    panic!("instant results are vectors");
+                };
+                assert_eq!(items.len(), 1, "{op:?} {arm}: one group");
+                assert_eq!(
+                    items[0].value.to_bits(),
+                    want.to_bits(),
+                    "{op:?} {arm}: every row must fold into the group's accumulator"
+                );
+            }
+        }
+    }
+
+    /// `absent_over_time` instant: the presence FLAG that replaced the
+    /// bucket set answers the same question. One surviving line anywhere
+    /// suppresses the absence sample; none emits it.
+    #[test]
+    fn instant_absence_is_a_flag_over_the_whole_selector() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"}"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::AbsentOverTime,
+            param: None,
+            absent_labels: vec![("app".to_string(), "a".to_string())],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let run = |rows: &[MetricScanRow]| -> usize {
+            let mut state = ClientAggState::new(
+                &compiled,
+                &meta,
+                &client,
+                instant_of(window),
+                None,
+                AggCaps::DEFAULT,
+            )
+            .unwrap();
+            state.push_rows(rows).expect("fold");
+            let QueryResult::Vector(items) = state.finish() else {
+                panic!("instant absence is a vector");
+            };
+            items.len()
+        };
+        assert_eq!(run(&[]), 1, "nothing survived => one absence sample");
+        assert_eq!(
+            run(&slide_rows(1, &[(10, "x")])),
+            0,
+            "one surviving line anywhere suppresses absence"
+        );
+        assert_eq!(
+            run(&slide_rows(1, &[(10, "x"), (20, "y"), (90, "z")])),
+            0,
+            "several surviving lines are still just 'present'"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #236 Part C — the mutating range path's cell representation.
+    // -----------------------------------------------------------------
+
+    /// The three [`MutCells`] arms and the C1 branch predicate, pinned at
+    /// the ONE place the representation is chosen.
+    ///
+    /// The domain is small and enumerated rather than sampled: every
+    /// class, and `range` on both sides of `step` plus the exact
+    /// boundary, plus the degenerate one-point grid.
+    #[test]
+    fn the_mutating_cell_representation_is_chosen_by_one_predicate() {
+        let arm =
+            |class, range: i64, step: u64, kmax: i64| match mut_cells_for(class, range, step, kmax)
+            {
+                MutCells::IntExpanded(_) => "expanded",
+                MutCells::IntDeltas(_) => "deltas",
+                MutCells::Samples(_) => "samples",
+            };
+        // Class A: deltas exactly where the windows overlap AND the grid
+        // has more than one point.
+        for (range, step, kmax, want) in [
+            (9i64, 10u64, 10i64, "expanded"), // range < step
+            (10, 10, 10, "deltas"),           // the boundary: range == step
+            (11, 10, 10, "deltas"),           // overlapping
+            (1_000, 10, 10, "deltas"),        // heavily overlapping
+            (1_000, 10, 0, "expanded"),       // one-point grid
+            (1_000, 10, -1, "expanded"),      // empty grid
+            (1, u64::MAX, 10, "expanded"),    // step wider than any range
+        ] {
+            assert_eq!(
+                arm(ReducerClass::InvertInteger, range, step, kmax),
+                want,
+                "class A at range={range} step={step} kmax={kmax}"
+            );
+        }
+        // Every other class retains samples, whatever the geometry.
+        for class in [ReducerClass::CanonicalFold, ReducerClass::ReduceIndependent] {
+            for (range, step, kmax) in [(9i64, 10u64, 10i64), (10, 10, 10), (1_000, 10, 10)] {
+                assert_eq!(arm(class, range, step, kmax), "samples", "{class:?}");
+            }
+        }
+    }
+
+    /// AC 12 — **Part C moves no result**, leg 1: the class-A drain
+    /// against the UNTOUCHED streaming slider.
+    ///
+    /// `FpSlide` (the non-mutating path) is not changed by Part C, so it
+    /// is the oracle the rewritten mutating drain is measured against:
+    /// the same rows through the same reducer, once without a label
+    /// mutation (slider) and once with one constant `label_format` label
+    /// (fan-out), must emit the identical point SEQUENCE on
+    /// `f64::to_bits`. Driven on BOTH C1 branches — `range < step` uses
+    /// the expanded arm, `range >= step` the difference array.
+    ///
+    /// Class A is the only class where both paths exist:
+    /// `metric_mutates_labels()` is `mutates_labels || has_unwrap`, so
+    /// every unwrap query is a fan-out query by construction. Classes
+    /// B/C are covered by the sweep oracle below.
+    #[test]
+    fn the_class_a_drain_reproduces_the_untouched_streaming_slider() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows: Vec<MetricScanRow> = (1..=9)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i * 7,
+                body: format!("body-{i}"),
+            })
+            .collect();
+        for (step, range) in [(10u64, 5u64), (10, 10), (10, 45), (10, 200)] {
+            let window = slide_window(0, 100, step, range);
+            for (op, value) in [
+                (RangeAggOp::CountOverTime, ClientValue::Count),
+                (RangeAggOp::BytesOverTime, ClientValue::Bytes),
+                (RangeAggOp::BytesRate, ClientValue::Bytes),
+                (RangeAggOp::Rate, ClientValue::Count),
+            ] {
+                let run = |query: &str| -> Vec<(i64, u64)> {
+                    let client = ClientAgg {
+                        pipeline: parse_pipeline(query),
+                        value,
+                        range_op: op,
+                        param: None,
+                        absent_labels: vec![],
+                    };
+                    let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+                    let res =
+                        run_client_agg_rows(&rows, &compiled, &meta, &client, window, Some(range))
+                            .unwrap();
+                    let QueryResult::Matrix(items) = res else {
+                        panic!("expected a matrix");
+                    };
+                    assert_eq!(items.len(), 1, "{op:?}: one series");
+                    items[0]
+                        .points
+                        .iter()
+                        .map(|(t, v)| (*t, v.to_bits()))
+                        .collect()
+                };
+                // BOTH a non-empty and an EMPTY rendered line. The empty
+                // one is what makes `dcount` load-bearing: it gives a
+                // COVERED cell the value 0, which must still emit `0`
+                // and which a coverage test folded into the value would
+                // silently drop. (A mutant that folded them passed
+                // against the non-empty fixture alone.)
+                for line in ["keep", ""] {
+                    let sliding = run(&format!(r#"{{x="y"}} | line_format "{line}""#));
+                    let fanned = run(&format!(
+                        r#"{{x="y"}} | line_format "{line}" | label_format zone="eu""#
+                    ));
+                    assert!(
+                        !sliding.is_empty(),
+                        "{op:?}: the fixture must emit (line {line:?})"
+                    );
+                    assert_eq!(
+                        fanned, sliding,
+                        "{op:?} at step={step} range={range} line={line:?}: the rewritten \
+                         class-A drain must reproduce the streaming slider bit for bit"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC 12 — **Part C moves no result**, leg 2: the class-B/C sweep
+    /// against the PER-CELL reduction it replaces.
+    ///
+    /// Classes B/C have no non-mutating path to compare with (every
+    /// unwrap query fans out), so the oracle is the OLD ALGORITHM,
+    /// reimplemented here over the state's own retained samples: bucket
+    /// each sample into every cell `covering_k` gives it, sort each
+    /// bucket with `win_order`, reduce. The sweep must produce that
+    /// sequence exactly.
+    ///
+    /// **This is WEAKER evidence than leg 1, and the difference is not
+    /// cosmetic.** Leg 1 compares the class-A drain against an
+    /// INDEPENDENT implementation — `FpSlide`, written for a different
+    /// path and untouched by Part C — so a shared misconception cannot
+    /// hide in it. This leg compares the sweep against a
+    /// reimplementation written by the same hand, from the same
+    /// understanding, in the same sitting: it catches transcription
+    /// errors (wrong bucket, missing sort, off-by-one in the pointers —
+    /// mutants 21/22/23 all die here) but it CANNOT catch a
+    /// misunderstanding of what `covering_k` means, because both sides
+    /// would be wrong together. What backs classes B/C against that is
+    /// the untouched corpus and goldens (`b9_range_sliding.test`, every
+    /// range case in `logql_metric_agg_golden.rs`, the `differential_*`
+    /// files), whose values come from the reference. Do not read the two
+    /// legs as the same strength.
+    #[test]
+    fn the_sample_sweep_reproduces_the_per_cell_reduction() {
+        // TWO fingerprints collapsing into ONE output group
+        // (`label_format app=...` overrides the only distinguishing
+        // label), fed in the scan's FINGERPRINT-MAJOR order. That is what
+        // makes the group's retained samples arrive out of `win_order`
+        // and the finish-time sort load-bearing: a single-fingerprint
+        // fixture pushes them already sorted, and a mutant deleting the
+        // sort passed against one.
+        let mut meta = slide_meta(1, r#"{"app":"a"}"#);
+        meta.insert(
+            2,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "svc".to_string(),
+                labels: r#"{"app":"b"}"#.to_string(),
+            },
+        );
+        let mut rows: Vec<MetricScanRow> = (1..=9)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i * 7,
+                body: format!("a={}", (i * 13) % 7),
+            })
+            .collect();
+        rows.extend((1..=9).map(|i| MetricScanRow {
+            fingerprint: 2,
+            timestamp_ns: i * 5 + 2,
+            body: format!("a={}", (i * 11) % 5),
+        }));
+        for (step, range) in [(10u64, 5u64), (10, 10), (10, 45), (10, 200)] {
+            let window = slide_window(0, 100, step, range);
+            for op in [
+                RangeAggOp::MaxOverTime,
+                RangeAggOp::MinOverTime,
+                RangeAggOp::SumOverTime,
+                RangeAggOp::AvgOverTime,
+                RangeAggOp::FirstOverTime,
+                RangeAggOp::LastOverTime,
+                RangeAggOp::StddevOverTime,
+                RangeAggOp::QuantileOverTime,
+                RangeAggOp::RateCounter,
+            ] {
+                let client = ClientAgg {
+                    pipeline: parse_pipeline(
+                        r#"{x="y"} | logfmt | label_format app="same" | unwrap a"#,
+                    ),
+                    value: ClientValue::Unwrap,
+                    range_op: op,
+                    param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
+                    absent_labels: vec![],
+                };
+                let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+                let mut state = RangeSlideState::new(
+                    &compiled,
+                    &meta,
+                    &client,
+                    window,
+                    Some(range),
+                    AggCaps::DEFAULT,
+                )
+                .unwrap();
+                state.push_rows(&rows).expect("fold");
+                // Flush the trailing collision group before reading the
+                // retained set: `push_rows` leaves the last
+                // `(fingerprint, ts)` run buffered until finish, so an
+                // oracle built before the flush would be one sample
+                // short (it was, and said so).
+                let base_labels = std::mem::take(&mut state.base_labels);
+                state.flush_collision(&base_labels).expect("flush");
+                state.base_labels = base_labels;
+                // The oracle, computed the PRE-CHANGE way from exactly
+                // the samples the state retained.
+                let mut want: Vec<(LabelSet, Vec<(i64, u64)>)> = Vec::new();
+                for group in state.groups.values() {
+                    let MutCells::Samples(samples) = &group.cells else {
+                        panic!("{op:?} must retain samples");
+                    };
+                    let mut cells: HashMap<i64, Vec<WinSample>> = HashMap::new();
+                    for s in samples {
+                        let (lo, hi) = state.covering_k(s.ts);
+                        for k in lo..=hi {
+                            cells.entry(k).or_default().push(*s);
+                        }
+                    }
+                    let mut keys: Vec<i64> = cells.keys().copied().collect();
+                    keys.sort_unstable();
+                    let mut points: Vec<(i64, u64)> = Vec::new();
+                    for k in keys {
+                        let pts = cells.get_mut(&k).expect("key present");
+                        pts.sort_by(win_order);
+                        if let Some(v) = reduce_window(
+                            op,
+                            state.class,
+                            state.param,
+                            state.rate_window_ns,
+                            0,
+                            pts,
+                        ) {
+                            points.push((state.grid_point(k), v.to_bits()));
+                        }
+                    }
+                    want.push((group.labels.clone(), points));
+                }
+                want.sort();
+                let QueryResult::Matrix(items) = state.finish_in_place().expect("finish") else {
+                    panic!("expected a matrix");
+                };
+                let mut got: Vec<(LabelSet, Vec<(i64, u64)>)> = items
+                    .into_iter()
+                    .map(|s| {
+                        (
+                            s.labels,
+                            s.points
+                                .into_iter()
+                                .map(|(t, v)| (t, v.to_bits()))
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                got.sort();
+                want.retain(|(_, p)| !p.is_empty());
+                assert!(!want.is_empty(), "{op:?}: the fixture must emit");
+                assert_eq!(
+                    got, want,
+                    "{op:?} at step={step} range={range}: the two-pointer sweep must \
+                     reproduce the per-cell reduction it replaces"
+                );
+            }
+        }
+    }
+
+    /// AC 13 — **charged retention is independent of the window width.**
+    ///
+    /// The SAME data at `W = ceil(range/step) = 1, 5, 40` charges the same
+    /// number of retention points, where the pre-change per-cell form
+    /// charged one per covering cell — a `~W x` factor. The expanded
+    /// count is recomputed in-test from `covering_k` so the win is
+    /// measured, not asserted from memory.
+    #[test]
+    fn mutating_retention_is_independent_of_the_window_width() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows: Vec<MetricScanRow> = (1..=6)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i * 13,
+                body: format!("a={i}"),
+            })
+            .collect();
+        for (op, value) in [
+            (RangeAggOp::CountOverTime, ClientValue::Count),
+            (RangeAggOp::MaxOverTime, ClientValue::Unwrap),
+        ] {
+            let unwrap = matches!(value, ClientValue::Unwrap);
+            let query = if unwrap {
+                r#"{x="y"} | logfmt | label_format zone="eu" | unwrap a"#
+            } else {
+                r#"{x="y"} | logfmt | label_format zone="eu""#
+            };
+            let client = ClientAgg {
+                pipeline: parse_pipeline(query),
+                value,
+                range_op: op,
+                param: None,
+                absent_labels: vec![],
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            assert!(compiled.metric_mutates_labels());
+            let mut charged: Vec<u64> = Vec::new();
+            let mut expanded: Vec<u64> = Vec::new();
+            for w in [1u64, 5, 40] {
+                let step = 10u64;
+                let window = slide_window(0, 2_000, step, w * step);
+                let mut state =
+                    RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                        .unwrap();
+                state.push_rows(&rows).expect("fold");
+                charged.push(state.retained);
+                // What the per-cell form WOULD have charged: one unit per
+                // (sample, covering cell), in the same `per_sample` unit.
+                let cells: u64 = rows
+                    .iter()
+                    .map(|r| {
+                        let (lo, hi) = state.covering_k(r.timestamp_ns);
+                        if lo > hi { 0 } else { (hi - lo + 1) as u64 }
+                    })
+                    .sum();
+                expanded.push(cells * state.per_sample);
+                state.finish_in_place().expect("finish");
+                assert_eq!(state.retained, 0, "{op:?} W={w}: charge returns to zero");
+            }
+            assert_eq!(
+                charged[0], charged[1],
+                "{op:?}: W=1 and W=5 must charge the same, got {charged:?}"
+            );
+            assert_eq!(
+                charged[0], charged[2],
+                "{op:?}: W=1 and W=40 must charge the same, got {charged:?}"
+            );
+            // ...and the per-cell form it replaces grew with W.
+            assert!(
+                expanded[2] > 10 * charged[2],
+                "{op:?}: the fixture must actually exercise a wide window \
+                 (per-cell would charge {} vs {} now)",
+                expanded[2],
+                charged[2]
+            );
+        }
+    }
+
     /// AC8 (review round 2 gap): the concurrent-retention invariant on the
-    /// MUTATING path — both `MutGroup.int_cells` (class A) and
-    /// `MutGroup.pt_cells` (class B/C) charge `retained`, and the whole
-    /// charge is released when the state is finished/dropped.
+    /// MUTATING path — every [`MutCells`] arm charges `retained`, and the
+    /// whole charge is released when the state is finished/dropped.
+    ///
+    /// One of the two tests plan v14 permits to change for issue #236 Part
+    /// C: it asserts the REPRESENTATION, which C1/C2 replace (`int_cells`
+    /// → `MutCells::IntExpanded`/`IntDeltas`, `pt_cells` →
+    /// `MutCells::Samples`). The invariant it pins is unchanged.
     #[test]
     fn sliding_mutating_fan_out_charges_and_releases_retention_for_both_cell_kinds() {
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -9390,9 +13136,9 @@ mod tests {
         // A `label_format` makes the output set differ from the base ⇒ the
         // mutating fan-out path (`fan_out == true`).
         for (op, value, expect_int_cells) in [
-            // Class A -> `int_cells`.
+            // Class A -> the integer arms.
             (RangeAggOp::CountOverTime, ClientValue::Count, true),
-            // Class B -> `pt_cells` (retained points).
+            // Class B -> `MutCells::Samples` (retained points).
             (RangeAggOp::MaxOverTime, ClientValue::Unwrap, false),
             // Class B with a per-emit scratch charge (`per_sample == 2`):
             // the fan-out cells must charge in the SAME unit the streaming
@@ -9429,21 +13175,27 @@ mod tests {
                 "{op:?}: the mutating fan-out must CHARGE retention"
             );
             let group = state.groups.values().next().expect("one output group");
+            assert!(!group.cells.is_empty(), "{op:?}: cells populated");
             if expect_int_cells {
-                assert!(!group.int_cells.is_empty(), "{op:?}: int_cells populated");
-                assert!(group.pt_cells.is_empty());
+                // `range (30) >= step (10)` and `kmax > 0`, so class A is
+                // on the DELTA arm here (C1's predicate).
+                assert!(
+                    matches!(group.cells, MutCells::IntDeltas(_)),
+                    "{op:?}: overlapping windows take the delta arm"
+                );
                 assert_eq!(
                     state.retained,
-                    group.int_cells.len() as u64,
+                    group.cells.charged_units(),
                     "{op:?}: every created int cell is charged exactly once"
                 );
             } else {
-                assert!(!group.pt_cells.is_empty(), "{op:?}: pt_cells populated");
-                assert!(group.int_cells.is_empty());
+                assert!(
+                    matches!(group.cells, MutCells::Samples(_)),
+                    "{op:?}: classes B/C retain samples"
+                );
                 assert_eq!(
                     state.retained,
-                    group.pt_cells.values().map(|v| v.len() as u64).sum::<u64>()
-                        * retention_points_per_sample(op),
+                    group.cells.charged_units() * retention_points_per_sample(op),
                     "{op:?}: every retained point is charged exactly once, in `per_sample` units"
                 );
             }
@@ -9629,12 +13381,12 @@ mod tests {
                 .groups
                 .values()
                 .map(|g| {
-                    if integer {
-                        g.int_cells.len() as u64
-                    } else {
-                        g.pt_cells.values().map(|v| v.len() as u64).sum::<u64>()
-                            * retention_points_per_sample(op)
-                    }
+                    g.cells.charged_units()
+                        * if integer {
+                            1
+                        } else {
+                            retention_points_per_sample(op)
+                        }
                 })
                 .sum();
             assert_eq!(
@@ -10502,6 +14254,114 @@ mod tests {
         }
     }
 
+    /// Issue #236 P1's charge, gated BEHAVIOURALLY.
+    ///
+    /// The non-mutating instant arm (`fp_groups`) was count-gated only
+    /// before #236; Part A deleted the count cap and P1 put a byte charge
+    /// in its place. Found by a mutant: deleting that charge outright was
+    /// caught by NOTHING except the `logql_variants_alloc` frame census —
+    /// a structural gate that notices the callee set changed, not that
+    /// the bound is gone. `discharge_group_bytes` saturates, so the
+    /// finish-time `group_bytes == 0` post-condition still holds with the
+    /// charge removed, and both existing group-byte tests drive the two
+    /// FAN-OUT arms. Plan v14 AC 14(b) asks for exactly this case; it did
+    /// not land with Part A.
+    #[test]
+    fn instant_fp_groups_are_byte_charged_capped_and_released_at_finish() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | line_format "keep""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(
+            !compiled.metric_mutates_labels(),
+            "must be the NON-fan-out (fp_groups) path"
+        );
+        // Two fingerprints with real label bytes to charge for.
+        let mut meta = slide_meta(1, r#"{"app":"a","region":"eu-west-1"}"#);
+        meta.insert(
+            2,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "svc".to_string(),
+                labels: r#"{"app":"b","region":"eu-west-2"}"#.to_string(),
+            },
+        );
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let row = |fp: u64, ts: i64| MetricScanRow {
+            fingerprint: fp,
+            timestamp_ns: ts,
+            body: "hello".to_string(),
+        };
+
+        // Trip leg: a tiny cap refuses the FIRST group BEFORE insertion.
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
+        state.caps.group_bytes = 1;
+        match state.push_rows(&[row(1, 5)]) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { bytes, cap })) => {
+                assert_eq!(cap, 1);
+                assert!(bytes > cap, "the error names the byte breach");
+            }
+            other => panic!("expected MetricGroupLabelBytes, got {other:?}"),
+        }
+        assert!(
+            state.fp_groups.is_empty(),
+            "the breaching group was inserted anyway"
+        );
+        assert_eq!(state.group_bytes, 0, "a refused charge must not stick");
+
+        // Charge/release leg: the counter equals the live map (a repeated
+        // fingerprint charged once), then finish releases every charge —
+        // its `debug_assert_eq!(group_bytes, 0)` is the release gate.
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
+        state
+            .push_rows(&[row(1, 5), row(2, 6), row(1, 7)])
+            .expect("under every cap");
+        assert_eq!(state.fp_groups.len(), 2);
+        let live: u64 = state
+            .fp_groups
+            .keys()
+            .map(|fp| {
+                group_entry_bytes(
+                    "",
+                    state.base_labels.get(fp).expect("hydrated"),
+                    FP_GROUP_SLOT,
+                )
+            })
+            .sum();
+        assert!(live > 0, "the fixture must exercise a real charge");
+        assert_eq!(
+            state.group_bytes, live,
+            "every fingerprint charged; the repeated one charged once"
+        );
+        match state.finish() {
+            QueryResult::Vector(samples) => assert_eq!(samples.len(), 2),
+            other => panic!("expected a vector, got {other:?}"),
+        }
+    }
+
     /// Review round 6, class completion: the INSTANT fan-out path retains
     /// the same query-lifetime key/`LabelSet` state in `label_groups`
     /// (count-capped, bytes previously uncharged) — same charge, same
@@ -10526,8 +14386,15 @@ mod tests {
         };
 
         // Trip leg: a tiny cap refuses the FIRST group before insertion.
-        let mut state =
-            ClientAggState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT).unwrap();
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
         state.caps.group_bytes = 1;
         let row = |ts: i64, body: &str| MetricScanRow {
             fingerprint: 1,
@@ -10549,8 +14416,15 @@ mod tests {
 
         // Charge/release leg: the counter equals the live map (repeated
         // group charged once), then finish releases every charge.
-        let mut state =
-            ClientAggState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT).unwrap();
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
         state
             .push_rows(&[row(5, "u=a"), row(6, "u=b"), row(7, "u=a")])
             .expect("under every cap");
@@ -13092,7 +16966,10 @@ mod tests {
             kind: GroupingKind::By,
             labels: vec!["service_name".to_string()],
         };
-        let grouped = group_range(series, VectorAggOp::Sum, Some(&grouping), None);
+        let mut charged = 0u64;
+        let led = Ledger::for_test(&mut charged);
+        let grouped =
+            group_range(series, VectorAggOp::Sum, Some(&grouping), None, &led).expect("grouped");
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].points.get(&0), Some(&4.0));
         assert_eq!(grouped[0].points.get(&60), Some(&2.0));
@@ -13365,8 +17242,15 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
         };
-        let mut state =
-            ClientAggState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT).unwrap();
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
         state.quantile_values = MAX_QUANTILE_VALUES - 1;
         let rows = [
             MetricScanRow {
@@ -13486,7 +17370,7 @@ mod tests {
             &compiled,
             &meta,
             &client,
-            window,
+            instant_of(window),
             Some(60_000_000_000),
             AggCaps::DEFAULT,
         )
@@ -13504,38 +17388,34 @@ mod tests {
 
     /// Code review round 3 (M8-LQ3, finding 1 — settled EMPIRICALLY): the
     /// concern was that `counter_values += 1` charges an INPUT ROW before
-    /// `buckets` is derived, so a row copied into MULTIPLE overlapping
-    /// `Counter` accumulators (a range query with `step < range`) would
-    /// consume one quota unit while retaining several points — leaving
-    /// bucket×row retention unbounded.
+    /// the accumulator is derived, so a row copied into MULTIPLE
+    /// accumulators would consume one quota unit while retaining several
+    /// points — leaving retention unbounded.
     ///
-    /// This test drives the real `push_rows` fold for a RANGE
-    /// `rate_counter(...[1m])` at `step = 20s` (`step < range`, the
-    /// reference's overlapping-window shape) with samples spanning THREE
-    /// step buckets, and proves the premise is false: `bucket_of` maps
-    /// each row to exactly one bucket, so the COMBINED length of every
-    /// `Counter` vector equals both the input-row count AND the
-    /// `counter_values` charge. A per-row charge is therefore a true bound
-    /// on total retained points — no under-count is possible. The
-    /// reset-aware per-bucket values are unchanged below the cap, and the
-    /// named `CounterValues` error still trips exactly when the combined
-    /// retention crosses the ceiling.
+    /// **Rewritten by issue #236 Part D, and the reason matters.** The
+    /// original drove this state with a RANGE window at `step < range`
+    /// and asserted the charge held across THREE step buckets. That
+    /// configuration is now unrepresentable: `ClientAggState` takes an
+    /// [`InstantWindow`] witness, and a range `rate_counter` has always
+    /// gone to [`RangeSlideState`] in production — so the old test pinned
+    /// a property of a state the engine never built. The identity it
+    /// existed for survives in its instant form, where it is exact rather
+    /// than merely bounded: every scanned row is retained EXACTLY once,
+    /// so `counter_values` equals the retained point count, so a per-row
+    /// charge is a true bound. The range half of the same invariant is
+    /// pinned on the path that actually serves it, by
+    /// `sliding_mutating_fan_out_charges_and_releases_retention_for_both_cell_kinds`
+    /// and `mutating_retention_is_independent_of_the_window_width`.
     #[test]
-    fn rate_counter_cap_bounds_total_retained_points_across_overlapping_buckets() {
-        let (compiled, client, meta, _instant_window) = rate_counter_state_inputs();
-        // A RANGE query: 20s step, 60s (=1m) range — step < range, so the
-        // reference's per-output-point windows overlap. Six samples land
-        // in three distinct step buckets (0, 20s, 40s).
-        let step_ns = 20_000_000_000u64;
-        let range_ns = 60_000_000_000u64;
-        let window = slide_window(0, range_ns as i64, step_ns, range_ns);
+    fn rate_counter_cap_bounds_total_retained_points() {
+        let (compiled, client, meta, window) = rate_counter_state_inputs();
         let rows = [
-            (10_000_000_000i64, "c=10"), // bucket 0
-            (15_000_000_000, "c=30"),    // bucket 0
-            (25_000_000_000, "c=5"),     // bucket 20s
-            (35_000_000_000, "c=12"),    // bucket 20s
-            (45_000_000_000, "c=7"),     // bucket 40s
-            (55_000_000_000, "c=20"),    // bucket 40s
+            (10_000_000_000i64, "c=10"),
+            (15_000_000_000, "c=30"),
+            (25_000_000_000, "c=5"),
+            (35_000_000_000, "c=12"),
+            (45_000_000_000, "c=7"),
+            (55_000_000_000, "c=20"),
         ]
         .into_iter()
         .map(|(timestamp_ns, body)| MetricScanRow {
@@ -13551,8 +17431,8 @@ mod tests {
             &compiled,
             &meta,
             &client,
-            window,
-            Some(range_ns),
+            instant_of(window),
+            Some(60_000_000_000),
             AggCaps::DEFAULT,
         )
         .unwrap();
@@ -13560,29 +17440,12 @@ mod tests {
 
         // `unwrap` sets the metric fan-out gate, so grouping is by final
         // label set — one group here (the unwrapped `c` is removed, base
-        // labels are shared).
+        // labels are shared), and ONE accumulator in it.
         assert_eq!(state.label_groups.len(), 1, "one series expected");
-        let buckets = &state
-            .label_groups
-            .values()
-            .next()
-            .expect("the one label group's buckets")
-            .1;
-        assert!(
-            buckets.len() > 1,
-            "the case must genuinely span multiple buckets: {} bucket(s)",
-            buckets.len()
-        );
-        assert_eq!(buckets.len(), 3, "samples land in buckets 0, 20s, 40s");
-
-        // The crux: the COMBINED length of every retained `Counter` vector
-        // equals the input-row count AND the per-row charge. Each row is
-        // retained EXACTLY once — overlapping windows do not multiply it.
         let total_retained: usize = state
             .label_groups
             .values()
-            .flat_map(|(_, b)| b.values())
-            .map(|acc| match acc {
+            .map(|(_, acc)| match acc {
                 BucketAcc::Counter(pts) => pts.len(),
                 other => panic!("expected a Counter accumulator, got {other:?}"),
             })
@@ -13590,7 +17453,7 @@ mod tests {
         assert_eq!(
             total_retained,
             rows.len(),
-            "every scanned row is retained exactly once across all buckets"
+            "every scanned row is retained exactly once"
         );
         assert_eq!(
             state.counter_values,
@@ -13598,35 +17461,20 @@ mod tests {
             "the per-row charge equals total retained points (a true bound)"
         );
 
-        // Values below the cap are unaffected by the retention guard: each
-        // bucket's reset-aware increase, scaled by the ns/ms extrapolation
-        // factor `(span_ns/1000 + 60)/(span_ns/1000)` and divided by the 60s
-        // range. b0: 30-10=20, span 5e9 ⇒ factor 1.000012; b20: 12-5=7, span
-        // 10e9 ⇒ factor 1.000006; b40: 20-7=13, span 10e9 ⇒ factor 1.000006.
-        let QueryResult::Matrix(series) = state.finish() else {
-            panic!("a range rate_counter query yields a matrix");
+        // Values below the cap are unaffected by the retention guard.
+        let QueryResult::Vector(items) = state.finish() else {
+            panic!("an instant rate_counter query yields a vector");
         };
-        assert_eq!(series.len(), 1, "one series: {series:?}");
-        assert_eq!(
-            series[0].points,
-            vec![
-                (0, 0.3333373333333333),
-                (step_ns as i64, 0.11666736666666666),
-                (2 * step_ns as i64, 0.21666796666666663),
-            ],
-            "per-bucket reset-aware rates are unaffected by the retention guard"
-        );
+        assert_eq!(items.len(), 1, "one series: {items:?}");
 
-        // The cap bounds the COMBINED retention, not source rows in some
-        // privileged bucket: pre-charged to `MAX - 1`, the second scanned
-        // row (regardless of which bucket it lands in) trips the named
-        // error at `count = MAX + 1`.
+        // The cap bounds the retention: pre-charged to `MAX - 1`, the
+        // second scanned row trips the named error at `count = MAX + 1`.
         let mut capped = ClientAggState::new(
             &compiled,
             &meta,
             &client,
-            window,
-            Some(range_ns),
+            instant_of(window),
+            Some(60_000_000_000),
             AggCaps::DEFAULT,
         )
         .unwrap();
@@ -14161,33 +18009,1160 @@ mod tests {
         format!("variants({list}) of ({common})")
     }
 
-    /// B5 / AC 9 — `AggCaps::DEFAULT` is the seven existing constants
-    /// verbatim; `divided` keeps the per-field sum ≤ the single-query
-    /// bound with every field ≥ 1 for all admissible `n`; the backstop is
-    /// DERIVED (`== min_field() == MAX_CLIENT_AGG_SERIES`).
+    // -----------------------------------------------------------------
+    // Issue #236 Part B — `VectorAccum`, the reference's streaming
+    // accumulator.
+    // -----------------------------------------------------------------
+
+    /// AC 6 — every reducing arm reproduces grafana/loki v3.7.4
+    /// `pkg/logql/evaluator.go` at the EXACT BITS, with each assertion
+    /// carrying its line cite.
+    ///
+    /// The three datasets are chosen so each op DISCRIMINATES against the
+    /// pre-#236 formula (`sum/len` for avg, a two-pass
+    /// `population_variance` for stddev/stdvar): reverting any one arm
+    /// changes the asserted bits. Compared through `to_bits`, never `==`
+    /// — one float rendering is a prefix of another and `assert_eq!` on
+    /// `f64` hides a last-bit difference in the printed output.
+    #[test]
+    fn vector_accum_reproduces_the_reference_recurrence_bit_for_bit() {
+        fn run(op: VectorAggOp, vals: &[f64]) -> f64 {
+            let mut acc = VectorAccum::seed(op, vals[0]);
+            for v in &vals[1..] {
+                acc.update(op, *v);
+            }
+            acc.finish(op)
+        }
+
+        // `:530-531` avg — Welford mean, NOT `sum/len`. Two-pass gives
+        // 4610184818551597739; the recurrence gives one ULP below.
+        assert_eq!(
+            run(VectorAggOp::Avg, &[1.0, 1.0, 3.0]).to_bits(),
+            4610184818551597738u64,
+            "avg must be the Welford mean (evaluator.go:530-531, :588)"
+        );
+
+        // `:547-550` + `:596` stdvar — M2/n. Two-pass gives
+        // 4597174419628082972.
+        assert_eq!(
+            run(VectorAggOp::Stdvar, &[1.0, 1.0, 2.0]).to_bits(),
+            4597174419628082973u64,
+            "stdvar must be Welford M2/n (evaluator.go:547-550, :596)"
+        );
+
+        // `:547-550` + `:594` stddev — sqrt(M2/n). Two-pass gives
+        // 4612489961860455552.
+        assert_eq!(
+            run(VectorAggOp::Stddev, &[1.0, 1.0, 6.0]).to_bits(),
+            4612489961860455551u64,
+            "stddev must be sqrt(Welford M2/n) (evaluator.go:547-550, :594)"
+        );
+
+        // `:527` sum, `:544`+`:591` count — unchanged by the port.
+        assert_eq!(run(VectorAggOp::Sum, &[1.0, 2.0, 4.0]), 7.0);
+        assert_eq!(run(VectorAggOp::Count, &[9.0, 9.0, 9.0]), 3.0);
+
+        // `:534-541` min/max over an ALL-NaN group is NaN, not ±INF.
+        //
+        // **Where the behavioural difference actually lives — measured,
+        // not assumed.** The defect was the SEED, not the comparison:
+        // PulsusDB's old `fold(f64::INFINITY, f64::min)` started from an
+        // infinity that no member could displace, because Rust's
+        // `f64::min` prefers the non-NaN operand. Seeding from the first
+        // member (as `evaluator.go:481` does) is what fixes it.
+        //
+        // The `|| IsNaN(group.value)` disjunct is transcription fidelity
+        // rather than a second behavioural fix: substituting
+        // `self.value.min(f)` for the whole arm leaves every assertion
+        // below passing, because Rust's `f64::min`/`max` already agree
+        // with the reference's comparison on all three NaN placements.
+        // Recorded so nobody reads these cases as pinning the disjunct —
+        // they pin the seed.
+        let nans = [f64::NAN, f64::NAN, f64::NAN];
+        assert!(
+            run(VectorAggOp::Min, &nans).is_nan(),
+            "all-NaN min must be NaN (evaluator.go:539-541)"
+        );
+        assert!(
+            run(VectorAggOp::Max, &nans).is_nan(),
+            "all-NaN max must be NaN (evaluator.go:534-536)"
+        );
+
+        // ...but a NaN seed followed by a real sample takes the real one
+        // (the `IsNaN(group.value)` disjunct), and a real seed followed by
+        // NaN keeps the real one (every comparison with NaN is false).
+        assert_eq!(run(VectorAggOp::Max, &[f64::NAN, 5.0]), 5.0);
+        assert_eq!(run(VectorAggOp::Min, &[f64::NAN, 5.0]), 5.0);
+        assert_eq!(run(VectorAggOp::Max, &[5.0, f64::NAN]), 5.0);
+        assert_eq!(run(VectorAggOp::Min, &[5.0, f64::NAN]), 5.0);
+    }
+
+    /// Issue #236 Part B — the reduction-order pin is a GATE, not a
+    /// convention.
+    ///
+    /// Welford is order-sensitive, so a hash-walk member order makes
+    /// `avg`/`stddev`/`stdvar` vary between runs. This drives
+    /// `group_instant`/`group_range` over EVERY permutation of a dataset
+    /// known to discriminate (`{2,4,6,8}`: 20 of its 24 orders give
+    /// `stdvar` exactly `5.0`, the other 4 give `4.999999999999999`) and
+    /// asserts one single output value across all of them.
+    ///
+    /// Without the pin this fails on 4 of the 24 inputs; the assertion
+    /// therefore cannot pass vacuously, and the unit is PERMUTATIONS OF
+    /// THE INPUT SERIES VECTOR, not runs of the process — which makes it
+    /// deterministic in CI rather than a 1-in-6 flake.
+    #[test]
+    fn the_reduction_order_pin_makes_welford_input_order_independent() {
+        /// Every permutation of `[0, 1, 2, 3]` (Heap's algorithm,
+        /// iterative). Written out rather than pulling in a combinatorics
+        /// dependency the plan does not specify.
+        fn permutations_of_four() -> Vec<[usize; 4]> {
+            let mut out = Vec::with_capacity(24);
+            let mut a = [0usize, 1, 2, 3];
+            let mut c = [0usize; 4];
+            out.push(a);
+            let mut i = 1;
+            while i < 4 {
+                if c[i] < i {
+                    if i % 2 == 0 {
+                        a.swap(0, i);
+                    } else {
+                        a.swap(c[i], i);
+                    }
+                    out.push(a);
+                    c[i] += 1;
+                    i = 1;
+                } else {
+                    c[i] = 0;
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        let vals = [2.0f64, 4.0, 6.0, 8.0];
+        let perms = permutations_of_four();
+        assert_eq!(
+            perms.len(),
+            24,
+            "the unit is PERMUTATIONS of the input vector"
+        );
+        // Distinct label sets, so the pin has a total order to impose and
+        // every permutation is a genuinely different input vector.
+        //
+        // **Two label models, and the second is the one that matters**
+        // (review round 1 `[medium]`). With DISTINCT label sets the sort
+        // key alone is total, so the sweep could not see a pin that
+        // ordered only by labels — and equal label sets are exactly where
+        // Welford stays order-dependent, because `LabelSet::cmp` returns
+        // `Equal` and a stable sort then keeps the INPUT order. `Shared`
+        // is the case the sweep exists for, and it was the case the
+        // sweep excluded.
+        let distinct =
+            |v: f64| -> LabelSet { vec![("host".to_string(), format!("h{}", v as u64))] };
+        let identical = |_: f64| -> LabelSet { vec![("host".to_string(), "same".to_string())] };
+        let models: [(&str, &dyn Fn(f64) -> LabelSet); 2] = [
+            ("distinct label sets", &distinct),
+            ("EQUAL label sets", &identical),
+        ];
+
+        let mut charged = 0u64;
+        let led = Ledger::for_test(&mut charged);
+        for (model, labels_for) in models {
+            for op in [VectorAggOp::Stdvar, VectorAggOp::Stddev, VectorAggOp::Avg] {
+                let mut instant_seen: BTreeSet<u64> = BTreeSet::new();
+                let mut range_seen: BTreeSet<u64> = BTreeSet::new();
+
+                for perm in &perms {
+                    let instant: Vec<InstantSeries> = perm
+                        .iter()
+                        .map(|&i| InstantSeries {
+                            labels: labels_for(vals[i]),
+                            value: vals[i],
+                        })
+                        .collect();
+                    // Bare aggregation (`grouping: None`) collapses all four
+                    // into ONE group, which is what exposes member order.
+                    let out = group_instant(instant, op, None, None, &led).expect("grouped");
+                    assert_eq!(out.len(), 1);
+                    instant_seen.insert(out[0].value.to_bits());
+
+                    let range: Vec<RangeSeries> = perm
+                        .iter()
+                        .map(|&i| RangeSeries {
+                            labels: labels_for(vals[i]),
+                            points: BTreeMap::from([(0i64, vals[i])]),
+                        })
+                        .collect();
+                    let out = group_range(range, op, None, None, &led).expect("grouped");
+                    assert_eq!(out.len(), 1);
+                    range_seen.insert(out[0].points[&0].to_bits());
+                }
+
+                assert_eq!(
+                    instant_seen.len(),
+                    1,
+                    "group_instant {op:?} over {model} produced {} distinct values across the 24 \
+                 member orders — the reduction-order pin is not holding: {instant_seen:?}",
+                    instant_seen.len()
+                );
+                assert_eq!(
+                    range_seen.len(),
+                    1,
+                    "group_range {op:?} over {model} produced {} distinct values across the 24 \
+                 member orders — the reduction-order pin is not holding: {range_seen:?}",
+                    range_seen.len()
+                );
+                // Instant and range must also agree with EACH OTHER — the
+                // whole point of both routing through `VectorAccum`.
+                assert_eq!(
+                    instant_seen, range_seen,
+                    "{op:?} over {model}: instant/range disagree"
+                );
+            }
+        }
+
+        // ...and the pinned value is the one the committed corpus
+        // captured from the reference (the 20-of-24 majority basin).
+        let instant: Vec<InstantSeries> = vals
+            .iter()
+            .map(|v| InstantSeries {
+                labels: distinct(*v),
+                value: *v,
+            })
+            .collect();
+        let out = group_instant(instant, VectorAggOp::Stdvar, None, None, &led).expect("grouped");
+        assert_eq!(
+            out[0].value.to_bits(),
+            5.0f64.to_bits(),
+            "the pin must reproduce b4_vector_aggs.test's captured stdvar"
+        );
+    }
+
+    /// `reduce` and the accumulator are the SAME computation — the
+    /// property that lets the range fold and the materialising instant
+    /// path never disagree. Asserted on bits over every reducing op.
+    #[test]
+    fn reduce_routes_through_the_accumulator_for_every_reducing_op() {
+        const OPS: [VectorAggOp; 7] = [
+            VectorAggOp::Sum,
+            VectorAggOp::Avg,
+            VectorAggOp::Min,
+            VectorAggOp::Max,
+            VectorAggOp::Count,
+            VectorAggOp::Stddev,
+            VectorAggOp::Stdvar,
+        ];
+        let vals = [1.0, 1.0, 3.0, -2.5, 7.25];
+        for op in OPS {
+            assert!(VectorAccum::is_reduction(op), "{op:?}");
+            let mut acc = VectorAccum::seed(op, vals[0]);
+            for v in &vals[1..] {
+                acc.update(op, *v);
+            }
+            assert_eq!(
+                reduce(op, &vals).to_bits(),
+                acc.finish(op).to_bits(),
+                "reduce and VectorAccum must agree bit-for-bit on {op:?}"
+            );
+        }
+        // The partition is total and the selecting side is disjoint.
+        for op in [
+            VectorAggOp::Topk,
+            VectorAggOp::Bottomk,
+            VectorAggOp::ApproxTopk,
+            VectorAggOp::Sort,
+            VectorAggOp::SortDesc,
+        ] {
+            assert!(!VectorAccum::is_reduction(op), "{op:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #236 Part B — the streaming fold.
+    // -----------------------------------------------------------------
+
+    const REDUCING_OPS: [VectorAggOp; 7] = [
+        VectorAggOp::Sum,
+        VectorAggOp::Avg,
+        VectorAggOp::Min,
+        VectorAggOp::Max,
+        VectorAggOp::Count,
+        VectorAggOp::Stddev,
+        VectorAggOp::Stdvar,
+    ];
+
+    const SELECTING_OPS: [VectorAggOp; 5] = [
+        VectorAggOp::Topk,
+        VectorAggOp::Bottomk,
+        VectorAggOp::ApproxTopk,
+        VectorAggOp::Sort,
+        VectorAggOp::SortDesc,
+    ];
+
+    /// The dense `Vec<VectorAccum>` a `ReduceFold` slot lives in uses
+    /// `count == 0` as its "no member yet" sentinel. That is only sound
+    /// because a SEEDED accumulator can never have `count == 0` — for
+    /// EVERY reducing op, including the four that never touch `count`
+    /// again. Break the seed's `count: 1` and this fails.
+    #[test]
+    fn vector_accum_seed_always_leaves_a_nonzero_count() {
+        assert!(
+            VectorAccum::EMPTY.is_empty(),
+            "the sentinel must read as empty"
+        );
+        for op in REDUCING_OPS {
+            for v in [0.0f64, -0.0, 1.5, f64::NAN, f64::INFINITY] {
+                let mut acc = VectorAccum::seed(op, v);
+                assert!(
+                    !acc.is_empty(),
+                    "{op:?} seeded from {v} must not read as the EMPTY sentinel"
+                );
+                acc.update(op, 2.0);
+                assert!(!acc.is_empty(), "{op:?} after update");
+            }
+        }
+    }
+
+    /// The fold's op partition is the SAME partition
+    /// [`VectorAccum::is_reduction`] states, plus the two the leaf cannot
+    /// own. Both matches are exhaustive with no `_` arm, so a new
+    /// operator is a build failure; this pins that they agree with each
+    /// other rather than each being separately exhaustive and wrong.
+    #[test]
+    fn vector_agg_fold_partitions_every_op_like_is_reduction() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 1,
+            kmax: 3,
+        };
+        for op in REDUCING_OPS {
+            let fold =
+                VectorAggFold::new(&(op, None, None), grid, MAX_METRIC_RESULT_POINTS, u64::MAX)
+                    .unwrap_or_else(|| panic!("{op:?} is reducing and must fold"));
+            assert!(
+                matches!(fold, VectorAggFold::Reduce(_)),
+                "{op:?} must be a ReduceFold"
+            );
+            assert!(VectorAccum::is_reduction(op));
+        }
+        for op in SELECTING_OPS {
+            assert!(!VectorAccum::is_reduction(op));
+        }
+        // `sort`/`sort_desc` are a matrix PASSTHROUGH at `group_range`,
+        // and `approx_topk` is rejected for a range query at plan time —
+        // the leaf declines all three and the caller materialises.
+        for op in [
+            VectorAggOp::Sort,
+            VectorAggOp::SortDesc,
+            VectorAggOp::ApproxTopk,
+        ] {
+            assert!(
+                VectorAggFold::new(
+                    &(op, None, Some(3.0)),
+                    grid,
+                    MAX_METRIC_RESULT_POINTS,
+                    u64::MAX
+                )
+                .is_none(),
+                "{op:?} must be declined by the leaf"
+            );
+        }
+        for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
+            assert!(matches!(
+                VectorAggFold::new(
+                    &(op, None, Some(2.0)),
+                    grid,
+                    MAX_METRIC_RESULT_POINTS,
+                    u64::MAX
+                ),
+                Some(VectorAggFold::Select(_))
+            ));
+            assert!(matches!(
+                VectorAggFold::new(
+                    &(op, None, Some(0.0)),
+                    grid,
+                    MAX_METRIC_RESULT_POINTS,
+                    u64::MAX
+                ),
+                Some(VectorAggFold::Empty)
+            ));
+        }
+    }
+
+    /// A leaf series as the fold receives it: labels plus grid-aligned
+    /// `(timestamp, value)` points.
+    type FoldInput = (LabelSet, Vec<(i64, f64)>);
+
+    fn fold_slots(fold: &VectorAggFold) -> u64 {
+        fold.reserved_slots()
+    }
+
+    fn fold_labels(pairs: &[(&str, &str)]) -> LabelSet {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Drives `input` through a fold, in the given order.
+    fn drive_fold(
+        spec: &plan::VectorAggSpec,
+        grid: FoldGrid,
+        input: &[FoldInput],
+    ) -> Vec<MatrixSeries> {
+        let mut fold = VectorAggFold::new(spec, grid, MAX_METRIC_RESULT_POINTS, u64::MAX)
+            .expect("this spec folds");
+        for (labels, points) in input {
+            fold.push_series(labels, points).expect("on-grid points");
+        }
+        fold.finish()
+    }
+
+    /// Drives the same input through `select_k_range`, the materialising
+    /// implementation the fold must reproduce.
+    fn drive_select_k_range(
+        op: VectorAggOp,
+        grouping: Option<&Grouping>,
+        param: Option<f64>,
+        input: &[FoldInput],
+    ) -> Vec<(LabelSet, Vec<(i64, f64)>)> {
+        let series: Vec<RangeSeries> = input
+            .iter()
+            .map(|(labels, points)| RangeSeries {
+                labels: labels.clone(),
+                points: points.iter().copied().collect(),
+            })
+            .collect();
+        let mut charged = 0u64;
+        let led = Ledger::for_test(&mut charged);
+        select_k_range(series, op, grouping, param, &led)
+            .expect("selected")
+            .into_iter()
+            .map(|s| (s.labels, s.points.into_iter().collect()))
+            .collect()
+    }
+
+    fn as_pairs(series: Vec<MatrixSeries>) -> Vec<(LabelSet, Vec<(i64, f64)>)> {
+        series.into_iter().map(|s| (s.labels, s.points)).collect()
+    }
+
+    /// AC 9 — the SELECTION ORDER, not merely the selected set.
+    ///
+    /// `SelectFold`'s output SEQUENCE (survivors in original push order,
+    /// each survivor's points ascending) and its values must be identical
+    /// to `select_k_range` over the same explicit input vector, including
+    /// the four adversarial shapes: equal values across series, a group
+    /// where every value is equal, two series with identical EMPTY label
+    /// sets (which is what makes the series-id tiebreak reachable), and
+    /// NaN candidates.
+    #[test]
+    fn select_fold_reproduces_select_k_range_sequence_and_values() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 10,
+            kmax: 2,
+        };
+        let pts = |vals: [f64; 3]| vec![(0i64, vals[0]), (10, vals[1]), (20, vals[2])];
+        let cases: Vec<(&str, Vec<FoldInput>)> = vec![
+            (
+                "distinct values",
+                vec![
+                    (fold_labels(&[("h", "a")]), pts([1.0, 5.0, 3.0])),
+                    (fold_labels(&[("h", "b")]), pts([4.0, 2.0, 9.0])),
+                    (fold_labels(&[("h", "c")]), pts([7.0, 8.0, 0.5])),
+                ],
+            ),
+            (
+                "equal values ACROSS series (label tiebreak)",
+                vec![
+                    (fold_labels(&[("h", "c")]), pts([1.0, 1.0, 1.0])),
+                    (fold_labels(&[("h", "a")]), pts([1.0, 1.0, 1.0])),
+                    (fold_labels(&[("h", "b")]), pts([1.0, 1.0, 1.0])),
+                ],
+            ),
+            (
+                "an all-equal group of two",
+                vec![
+                    (fold_labels(&[("h", "a")]), pts([2.0, 2.0, 2.0])),
+                    (fold_labels(&[("h", "b")]), pts([2.0, 2.0, 2.0])),
+                ],
+            ),
+            (
+                "two series with IDENTICAL EMPTY label sets (series-id tiebreak)",
+                vec![
+                    (Vec::new(), pts([3.0, 1.0, 4.0])),
+                    (Vec::new(), pts([1.0, 5.0, 9.0])),
+                    (fold_labels(&[("h", "z")]), pts([2.0, 6.0, 5.0])),
+                ],
+            ),
+            (
+                // THE discriminating shape for the series-id tiebreak.
+                // Two series that tie need no tiebreak (both the fold and
+                // the stable sort keep the earlier one), and three that
+                // tie at EVERY step are indistinguishable in the output.
+                // It takes THREE series with identical labels tying at
+                // ONE step and differing at another for the choice to be
+                // observable: at step 0 all three hold 2.0 with `k = 2`,
+                // and which two survive decides who owns that point.
+                "three IDENTICAL-label series tying at one step only",
+                vec![
+                    (Vec::new(), pts([2.0, 1.0, 1.0])),
+                    (Vec::new(), pts([2.0, 2.0, 2.0])),
+                    (Vec::new(), pts([2.0, 3.0, 3.0])),
+                ],
+            ),
+            (
+                "NaN candidates rank last in BOTH directions",
+                vec![
+                    (fold_labels(&[("h", "a")]), pts([f64::NAN, 5.0, 1.0])),
+                    (fold_labels(&[("h", "b")]), pts([5.0, f64::NAN, 2.0])),
+                    (fold_labels(&[("h", "c")]), pts([1.0, 2.0, f64::NAN])),
+                ],
+            ),
+            (
+                "every candidate NaN",
+                vec![
+                    (fold_labels(&[("h", "a")]), pts([f64::NAN; 3])),
+                    (fold_labels(&[("h", "b")]), pts([f64::NAN; 3])),
+                ],
+            ),
+        ];
+
+        let bits = |v: Vec<(LabelSet, Vec<(i64, f64)>)>| -> Vec<(LabelSet, Vec<(i64, u64)>)> {
+            v.into_iter()
+                .map(|(l, p)| (l, p.into_iter().map(|(t, x)| (t, x.to_bits())).collect()))
+                .collect()
+        };
+
+        for (name, input) in &cases {
+            for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
+                for k in [1.0f64, 2.0, 3.0, 9.0] {
+                    let folded = bits(as_pairs(drive_fold(&(op, None, Some(k)), grid, input)));
+                    let materialised = bits(drive_select_k_range(op, None, Some(k), input));
+                    assert_eq!(
+                        folded, materialised,
+                        "{op:?}({k}) over `{name}`: the fold must reproduce \
+                         select_k_range's SEQUENCE and values"
+                    );
+                }
+            }
+            // ...and with a grouping, so the group key is exercised too.
+            let grouping = Grouping {
+                kind: GroupingKind::By,
+                labels: vec!["h".to_string()],
+            };
+            let folded = bits(as_pairs(drive_fold(
+                &(VectorAggOp::Topk, Some(grouping.clone()), Some(1.0)),
+                grid,
+                input,
+            )));
+            let materialised = bits(drive_select_k_range(
+                VectorAggOp::Topk,
+                Some(&grouping),
+                Some(1.0),
+                input,
+            ));
+            assert_eq!(folded, materialised, "topk(1) by (h) over `{name}`");
+        }
+    }
+
+    /// AC 8 — the fold's state is bounded by the OUTPUT, not by the scan.
+    ///
+    /// A range query over `N` leaf groups collapsing to `G` output groups
+    /// over `S` steps retains exactly `G x S` cells, and running at `N`
+    /// and `10N` retains the IDENTICAL number. Under the materialising
+    /// path the same input holds `N x S` points before the aggregation
+    /// runs, which is the quantity this replaces.
+    #[test]
+    fn the_fold_retains_output_groups_times_steps_whatever_the_scan_width() {
+        const STEPS: usize = 7;
+        let grid = FoldGrid {
+            start: 0,
+            step: 10,
+            kmax: STEPS as i64 - 1,
+        };
+        // Two output groups (`by (tier)`), `n` leaf series feeding them.
+        let grouping = Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["tier".to_string()],
+        };
+        let leaf = |n: usize| -> Vec<FoldInput> {
+            (0..n)
+                .map(|i| {
+                    (
+                        fold_labels(&[
+                            ("tier", if i % 2 == 0 { "hot" } else { "cold" }),
+                            ("id", &i.to_string()),
+                        ]),
+                        (0..STEPS)
+                            .map(|k| ((k as i64) * 10, (i + k) as f64))
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        let cells_at = |n: usize| -> (usize, usize, usize) {
+            let mut fold = VectorAggFold::new(
+                &(VectorAggOp::Sum, Some(grouping.clone()), None),
+                grid,
+                MAX_METRIC_RESULT_POINTS,
+                u64::MAX,
+            )
+            .expect("sum folds");
+            for (labels, points) in leaf(n) {
+                fold.push_series(&labels, &points).expect("on-grid");
+            }
+            let cells = fold.cells();
+            let groups = fold.groups();
+            let out = fold.finish().len();
+            (cells, groups, out)
+        };
+        let small = cells_at(20);
+        let wide = cells_at(200);
+        assert_eq!(small, (2 * STEPS, 2, 2), "G x S cells, G output series");
+        assert_eq!(
+            small, wide,
+            "10x the leaf groups must retain the IDENTICAL cell count — the \
+             fold is bounded by the OUTPUT, not by the scan"
+        );
+    }
+
+    /// AC 10 — `topk(0, …)`/`bottomk(0, …)`: no group is ever
+    /// constructed and no cell is ever retained, however wide the scan.
+    /// A fold that counted groups before consulting `k` would build 501
+    /// of them here.
+    #[test]
+    fn zero_k_fold_constructs_no_group_and_retains_no_cell() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 1,
+            kmax: 100,
+        };
+        // Bare AND `by (id)`: the grouped shape is the one that would
+        // build 501 groups if `k` were consulted after the group.
+        let by_id = Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["id".to_string()],
+        };
+        let shapes = [None, Some(by_id)];
+        for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
+            for grouping in &shapes {
+                let mut fold = VectorAggFold::new(
+                    &(op, grouping.clone(), Some(0.0)),
+                    grid,
+                    MAX_METRIC_RESULT_POINTS,
+                    u64::MAX,
+                )
+                .expect("k == 0 still folds");
+                for i in 0..501u32 {
+                    let labels = fold_labels(&[("id", &i.to_string())]);
+                    let points: Vec<(i64, f64)> =
+                        (0..101).map(|k| (k, (i + k as u32) as f64)).collect();
+                    fold.push_series(&labels, &points).expect("no-op push");
+                }
+                // The RESOURCE claim first, so a mutant that keeps a real
+                // selection state at `k == 0` fails on what actually matters
+                // rather than on the enum's shape.
+                assert_eq!(fold.groups(), 0, "{op:?}: no group may be constructed");
+                assert_eq!(fold.cells(), 0, "{op:?}: no cell may be retained");
+                assert!(
+                    matches!(fold, VectorAggFold::Empty),
+                    "{op:?}: k == 0 is the structurally-empty fold"
+                );
+                assert!(fold.finish().is_empty(), "{op:?}: the result is empty");
+            }
+        }
+    }
+
+    /// A point that is not on the query grid is an internal-invariant
+    /// breach and is REPORTED, never silently dropped — a dropped point
+    /// is a silently wrong result.
+    #[test]
+    fn a_point_off_the_query_grid_is_an_error_not_a_dropped_point() {
+        let grid = FoldGrid {
+            start: 100,
+            step: 10,
+            kmax: 4,
+        };
+        assert_eq!(grid.index_of(100), Some(0));
+        assert_eq!(grid.index_of(140), Some(4));
+        assert_eq!(grid.index_of(150), None, "past kmax");
+        assert_eq!(grid.index_of(105), None, "between grid points");
+        assert_eq!(grid.index_of(90), None, "before the grid");
+        for k in 0..=4usize {
+            assert_eq!(grid.index_of(grid.point(k)), Some(k), "point/index inverse");
+        }
+        let mut fold = VectorAggFold::new(
+            &(VectorAggOp::Sum, None, None),
+            grid,
+            MAX_METRIC_RESULT_POINTS,
+            u64::MAX,
+        )
+        .expect("sum folds");
+        match fold.push_series(&Vec::new(), &[(105, 1.0)]) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert!(reason.contains("off the query grid"), "{reason}");
+            }
+            other => panic!("expected an off-grid error, got {other:?}"),
+        }
+    }
+
+    /// Issue #236 Part B — **the reduction-order pin extends to the
+    /// fold**, and the gate is exhaustive rather than sampled.
+    ///
+    /// `RangeSlideState::emit` puts the leaf's series in label-set order
+    /// before folding, which is the same total order `pin_reduction_order`
+    /// imposes on the materialising path. This drives `emit` over ALL 24
+    /// permutations of the discriminating `{2,4,6,8}` dataset (unit:
+    /// permutations of the emitted series vector, not runs of the
+    /// process) and asserts one single value — and that it is the value
+    /// `group_range` produces over the same data.
+    ///
+    /// Emptying the sort makes this fail on 4 of the 24 inputs, every
+    /// run.
+    #[test]
+    fn the_reduction_order_pin_extends_to_the_fold() {
+        fn permutations_of_four() -> Vec<[usize; 4]> {
+            let mut out = Vec::with_capacity(24);
+            let mut a = [0usize, 1, 2, 3];
+            let mut c = [0usize; 4];
+            out.push(a);
+            let mut i = 1;
+            while i < 4 {
+                if c[i] < i {
+                    if i % 2 == 0 {
+                        a.swap(0, i);
+                    } else {
+                        a.swap(c[i], i);
+                    }
+                    out.push(a);
+                    c[i] += 1;
+                    i = 1;
+                } else {
+                    c[i] = 0;
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        let vals = [2.0f64, 4.0, 6.0, 8.0];
+        let perms = permutations_of_four();
+        assert_eq!(
+            perms.len(),
+            24,
+            "the unit is PERMUTATIONS of the emitted series vector"
+        );
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 0, 10, 10);
+
+        for op in [VectorAggOp::Stdvar, VectorAggOp::Stddev, VectorAggOp::Avg] {
+            let mut seen: BTreeSet<u64> = BTreeSet::new();
+            for perm in &perms {
+                let mut state =
+                    RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                        .expect("state");
+                state.attach_fold(&(op, None, None));
+                assert_eq!(state.folded_aggs(), 1);
+                let emitted: Vec<MatrixSeries> = perm
+                    .iter()
+                    .map(|&i| MatrixSeries {
+                        labels: vec![("host".to_string(), format!("h{}", vals[i] as u64))],
+                        points: vec![(0i64, vals[i])],
+                    })
+                    .collect();
+                let QueryResult::Matrix(out) = state.emit(emitted).expect("emit") else {
+                    panic!("a range leaf emits a matrix");
+                };
+                assert_eq!(out.len(), 1, "a bare aggregation collapses to one series");
+                seen.insert(out[0].points[0].1.to_bits());
+            }
+            assert_eq!(
+                seen.len(),
+                1,
+                "the fold produced {} distinct {op:?} values across the 24 emission \
+                 orders — the reduction-order pin is not holding in the fold: {seen:?}",
+                seen.len()
+            );
+            // ...and it is the SAME value the materialising path gives.
+            let mut charged = 0u64;
+            let led = Ledger::for_test(&mut charged);
+            let materialised = group_range(
+                vals.iter()
+                    .map(|v| RangeSeries {
+                        labels: vec![("host".to_string(), format!("h{}", *v as u64))],
+                        points: BTreeMap::from([(0i64, *v)]),
+                    })
+                    .collect(),
+                op,
+                None,
+                None,
+                &led,
+            )
+            .expect("materialised");
+            assert_eq!(
+                seen.iter().copied().collect::<Vec<u64>>(),
+                vec![materialised[0].points[&0].to_bits()],
+                "{op:?}: folded and materialised must be the same bits"
+            );
+        }
+    }
+
+    /// The mutating (fan-out) arm hands the fold its groups in label-set
+    /// order, so the fold's member order is a property of the DATA and
+    /// not of a per-process hash seed.
+    ///
+    /// Observable without a fold too: the emitted series come out
+    /// label-ascending where they used to come out in `HashMap` walk
+    /// order. With 6 distinct groups a walk order that happens to be
+    /// sorted has probability 1/720, so removing the sort reddens this on
+    /// essentially every run — stated rather than implied.
+    #[test]
+    fn the_mutating_finish_emits_its_groups_in_label_order() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{app="a"} | logfmt"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(
+            compiled.metric_mutates_labels(),
+            "this fixture must take the fan-out arm"
+        );
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        // Bodies chosen so the rendered group labels do NOT sort the way
+        // the insertion order does.
+        let rows = slide_rows(
+            1,
+            &[
+                (10, "id=zeta"),
+                (11, "id=mike"),
+                (12, "id=alpha"),
+                (13, "id=romeo"),
+                (14, "id=bravo"),
+                (15, "id=xray"),
+            ],
+        );
+        let window = slide_window(0, 20, 10, 20);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let QueryResult::Matrix(out) = res else {
+            panic!("expected a matrix");
+        };
+        assert_eq!(out.len(), 6, "one group per distinct id");
+        let labels: Vec<LabelSet> = out.iter().map(|s| s.labels.clone()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(
+            labels, sorted,
+            "the fan-out arm must emit label-ascending — that ordering is what \
+             pins the fold's member order"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #236 — the result-series cap.
+    // -----------------------------------------------------------------
+
+    fn n_vector(n: usize) -> QueryResult {
+        QueryResult::Vector(
+            (0..n)
+                .map(|i| VectorSample {
+                    labels: vec![("id".to_string(), i.to_string())],
+                    value: i as f64,
+                })
+                .collect(),
+        )
+    }
+
+    fn n_matrix(n: usize) -> QueryResult {
+        QueryResult::Matrix(
+            (0..n)
+                .map(|i| MatrixSeries {
+                    labels: vec![("id".to_string(), i.to_string())],
+                    points: vec![(0, i as f64), (1, i as f64)],
+                })
+                .collect(),
+        )
+    }
+
+    /// AC 2 — `ensure_result_series` counts TOP-LEVEL SERIES and uses the
+    /// reference's own `> cap` test, so exactly `MAX_QUERY_SERIES` is
+    /// served and `cap + 1` is refused. Both vector and matrix shapes,
+    /// plus the histogram twins and the three pass-through variants.
+    #[test]
+    fn ensure_result_series_admits_exactly_the_cap_and_refuses_one_more() {
+        let cap = MAX_QUERY_SERIES as usize;
+        assert_eq!(cap, 500);
+
+        for at in [n_vector(cap), n_matrix(cap)] {
+            ensure_result_series(&at).expect("exactly the cap must be served");
+        }
+        for over in [n_vector(cap + 1), n_matrix(cap + 1)] {
+            match ensure_result_series(&over) {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries { cap: got })) => {
+                    assert_eq!(got, MAX_QUERY_SERIES);
+                }
+                other => panic!("expected MetricSeries, got {other:?}"),
+            }
+        }
+
+        // A matrix with FEW series but MANY points is not a breach — the
+        // reference counts distinct series, never points.
+        let deep = QueryResult::Matrix(vec![MatrixSeries {
+            labels: vec![],
+            points: (0..100_000).map(|k| (k, k as f64)).collect(),
+        }]);
+        ensure_result_series(&deep).expect("point count is not the series axis");
+
+        // Non-metric shapes pass: log streams are bounded by the entries
+        // limit instead, and scalar/string carry no series at all.
+        for other in [
+            QueryResult::Streams {
+                items: Vec::new(),
+                partial: false,
+            },
+            QueryResult::Scalar(1.0),
+            QueryResult::String("x".to_string()),
+        ] {
+            ensure_result_series(&other).expect("non-metric shapes carry no series axis");
+        }
+    }
+
+    /// AC 11's static companion, as an executable check rather than a
+    /// review-time grep: `MAX_QUERY_SERIES` is read by
+    /// `ensure_result_series` and by NOTHING else in production source.
+    ///
+    /// This is the property the plan calls normative — a constant that is
+    /// *currently* read once and one that *can only* be read once are
+    /// different guarantees, and the second is what stops the next person
+    /// reintroducing a mid-scan group cap.
+    ///
+    /// **Scope, stated because an unscoped conclusion from a scoped
+    /// census is worthless:** every file in
+    /// `crates/pulsus-read/src/logql/` (the whole tree in which the
+    /// symbol is nameable), truncated at each file's `#[cfg(test)]`
+    /// marker — i.e. PRODUCTION source only. Test code is deliberately
+    /// out of scope: this very test reads the constant, and so does
+    /// `ensure_result_series_admits_exactly_the_cap_and_refuses_one_more`.
+    /// The counted unit is SOURCE LINES mentioning the identifier outside
+    /// a comment or its own definition.
+    #[test]
+    fn max_query_series_is_read_in_exactly_one_place() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("exec.rs", include_str!("exec.rs")),
+            ("error.rs", include_str!("error.rs")),
+            ("plan.rs", include_str!("plan.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("pipeline.rs", include_str!("pipeline.rs")),
+            ("sql.rs", include_str!("sql.rs")),
+            ("detected.rs", include_str!("detected.rs")),
+            ("cms.rs", include_str!("cms.rs")),
+            ("rows.rs", include_str!("rows.rs")),
+            ("params.rs", include_str!("params.rs")),
+            ("explain.rs", include_str!("explain.rs")),
+            ("escape.rs", include_str!("escape.rs")),
+            ("ip.rs", include_str!("ip.rs")),
+        ];
+
+        // **The file set must not be able to shrink silently.**
+        // `include_str!` needs compile-time literals, so `SOURCES` is
+        // written out — which means a source file added to `src/logql`
+        // (the post-aggregation region is scheduled to move into one of
+        // its own after #236 merges) would simply not be searched, and
+        // this census would keep passing while covering less. That is the
+        // gate-weakening shape this issue has hit repeatedly, so it is
+        // closed here rather than noted: the list is compared against the
+        // DIRECTORY at run time and a file it does not name is a loud
+        // failure naming the file, not a quiet reduction in scope.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the logql source directory")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .map(|p| {
+                p.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        on_disk.sort();
+        let mut named: Vec<String> = SOURCES.iter().map(|(n, _)| (*n).to_string()).collect();
+        named.sort();
+        assert_eq!(
+            named, on_disk,
+            "the census file set and `src/logql` have diverged — add the new file to \
+             `SOURCES` (and to any other census scoped to this region) rather than \
+             letting the search quietly cover less than the module"
+        );
+
+        /// Everything above the file's `#[cfg(test)]` marker.
+        fn production(src: &str) -> &str {
+            match src.find("\n#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => src,
+            }
+        }
+
+        let mut reads: Vec<String> = Vec::new();
+        for (name, src) in SOURCES {
+            for (i, line) in production(src).lines().enumerate() {
+                if !line.contains("MAX_QUERY_SERIES") {
+                    continue;
+                }
+                let t = line.trim();
+                // The definition and doc/line comments are not reads.
+                if t.starts_with("///") || t.starts_with("//") || t.starts_with("pub const") {
+                    continue;
+                }
+                reads.push(format!("{name}:{}: {t}", i + 1));
+            }
+        }
+        // Exactly two production lines mention it, both inside
+        // `ensure_result_series`: the `> cap` test and the error payload.
+        assert_eq!(
+            reads.len(),
+            2,
+            "MAX_QUERY_SERIES must be read only by ensure_result_series; found {reads:#?}"
+        );
+        for r in &reads {
+            assert!(r.starts_with("exec.rs:"), "unexpected reader: {r}");
+        }
+        // ...and the deleted mid-scan group cap must not return, under
+        // its own name, anywhere in the tree (tests included). The
+        // needles are assembled at runtime so this test's OWN source does
+        // not contain them — a literal here would match itself and the
+        // assertion would fail for the wrong reason.
+        let deleted_cap = format!("MAX_CLIENT_AGG{}SERIES", '_');
+        let deleted_field = format!("caps{}series", '.');
+        for (name, src) in SOURCES {
+            assert!(
+                !src.contains(&deleted_cap),
+                "{name} still references the deleted mid-scan group cap"
+            );
+            assert!(
+                !src.contains(&deleted_field),
+                "{name} still reads a per-state series cap"
+            );
+        }
+    }
+
+    /// AC 30 — the query-text premise #236's derivation rests on is
+    /// ENFORCED by this change, not assumed by it. #279 shipped the cap as
+    /// an EXCLUSIVE maximum (`limits.rs:40` rejects `len >= cap`), so the
+    /// boundary is pinned from BOTH sides: `cap - 1` accepted, `cap` and
+    /// `cap + 1` rejected. Plan v14 phrases it as `cap + 1` only; asserting
+    /// the accepted side too is what makes an off-by-one visible.
+    #[test]
+    fn the_query_text_cap_exists_is_finite_and_rejects_at_the_boundary() {
+        let cap = pulsus_logql::MAX_QUERY_BYTES;
+        assert!(cap > 0 && cap < usize::MAX, "the cap must be finite");
+        assert_eq!(cap, 131_072);
+
+        // A selector whose label VALUE is padded to hit an exact byte
+        // length — valid LogQL at every length, so the only thing under
+        // test is the admission check.
+        let pad = |total: usize| {
+            let (head, tail) = (r#"{a=""#, r#""}"#);
+            format!(
+                "{head}{}{tail}",
+                "b".repeat(total - head.len() - tail.len())
+            )
+        };
+
+        let ok = pad(cap - 1);
+        assert_eq!(ok.len(), cap - 1);
+        pulsus_logql::parse(&ok).expect("cap - 1 bytes must be accepted");
+
+        for len in [cap, cap + 1] {
+            let too_long = pad(len);
+            assert_eq!(too_long.len(), len);
+            match pulsus_logql::parse(&too_long) {
+                Err(pulsus_logql::LogQlError::QueryTooLong {
+                    len: got, cap: c, ..
+                }) => {
+                    assert_eq!((got, c), (len, cap));
+                }
+                other => panic!("{len} bytes must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// AC 30's second half — the feasible region's `aggs.len()` operand is
+    /// `min(MAX_DEPTH, Q/4)`, read from BOTH constants rather than a
+    /// literal, so neither can drift without this failing.
+    ///
+    /// `pulsus_logql::MAX_DEPTH` is `pub(crate)`, so the depth is read
+    /// back from the typed error the parser actually raises rather than
+    /// by widening another crate's API — which also pins the value the
+    /// guard ENFORCES, not merely the one it declares.
+    #[test]
+    fn the_aggregation_depth_operand_reads_both_constants() {
+        let q = pulsus_logql::MAX_QUERY_BYTES as u64;
+
+        let too_deep = format!(
+            "{}{}{}",
+            "sum(".repeat(200),
+            r#"count_over_time({a="b"}[1m])"#,
+            ")".repeat(200)
+        );
+        assert!(too_deep.len() < pulsus_logql::MAX_QUERY_BYTES);
+        let depth = match pulsus_logql::parse(&too_deep) {
+            Err(pulsus_logql::LogQlError::RecursionLimitExceeded { limit, .. }) => limit as u64,
+            other => panic!("expected RecursionLimitExceeded, got {other:?}"),
+        };
+        assert_eq!(depth, 64);
+
+        // Every nesting level costs at least `sum(` — four bytes of text.
+        let operand = depth.min(q / 4);
+        assert_eq!(operand, depth, "at Q = {q} the parser depth is binding");
+    }
+
+    /// B5 / AC 9, re-derived by issue #236 (AC 35) — `AggCaps::DEFAULT` is
+    /// the SIX remaining constants verbatim (`series` is deleted: it was
+    /// the mid-scan group cap, and #236 moved the 500 to the final result
+    /// as `MAX_QUERY_SERIES`); `divided` keeps the per-field sum ≤ the
+    /// single-query bound with every field ≥ 1 for all admissible `n`; and
+    /// the backstop is still DERIVED, now landing on
+    /// `MAX_TS_COLLISION_GROUP == 10_000` instead of 500 — a strictly
+    /// PERMISSIVE re-derivation (the reference is unbounded there).
     #[test]
     fn agg_caps_default_is_the_constants_and_divides_soundly() {
         let d = AggCaps::DEFAULT;
-        assert_eq!(d.series, MAX_CLIENT_AGG_SERIES);
         assert_eq!(d.group_bytes, MAX_CLIENT_AGG_GROUP_BYTES);
         assert_eq!(d.retention_points, MAX_RETAINED_WINDOW_POINTS);
         assert_eq!(d.quantile_values, MAX_QUANTILE_VALUES);
         assert_eq!(d.counter_values, MAX_COUNTER_VALUES);
         assert_eq!(d.collision_members, MAX_TS_COLLISION_GROUP);
         assert_eq!(d.collision_bytes, MAX_TS_COLLISION_GROUP_BYTES);
+        assert_eq!(d.result_points, MAX_METRIC_RESULT_POINTS);
         assert_eq!(d.divided(1), d, "divided(1) must be byte-identical");
-        assert_eq!(d.min_field(), MAX_CLIENT_AGG_SERIES);
+        // The re-derivation, pinned to the SYMBOL and to the VALUE so a
+        // future cap change cannot silently move the backstop.
+        assert_eq!(d.min_field(), MAX_TS_COLLISION_GROUP);
+        assert_eq!(d.min_field(), 10_000);
         assert_eq!(plan::MAX_VARIANT_SUB_STATES, d.min_field());
         for n in 1..=plan::MAX_VARIANT_SUB_STATES {
             let v = d.divided(n);
             for (field, whole) in [
-                (v.series, d.series),
                 (v.group_bytes, d.group_bytes),
                 (v.retention_points, d.retention_points),
                 (v.quantile_values, d.quantile_values),
                 (v.counter_values, d.counter_values),
                 (v.collision_members, d.collision_members),
                 (v.collision_bytes, d.collision_bytes),
+                (v.result_points, d.result_points),
             ] {
                 assert!(field >= 1, "divided({n}) floored a cap to 0");
                 assert!(field * n <= whole, "divided({n}) sum exceeds the whole");
@@ -14200,6 +19175,24 @@ mod tests {
             MAX_TS_COLLISION_GROUP_BYTES / 2
         );
         assert_eq!(d.divided(2).collision_members, MAX_TS_COLLISION_GROUP / 2);
+        // Issue #236 §4: the result-point cap divides like every other
+        // field, so a `variants(...)` query's sub-states SUM to the
+        // single-query bound rather than each getting the whole of it.
+        assert_eq!(d.divided(2).result_points, MAX_METRIC_RESULT_POINTS / 2);
+
+        // The hand-written field lists above are the census's weak point:
+        // a NEW cap added to `AggCaps` would be divided by `divided` and
+        // ignored here. Destructuring is what makes that a build failure
+        // — add a field and this stops compiling until it is listed.
+        let AggCaps {
+            group_bytes: _,
+            retention_points: _,
+            quantile_values: _,
+            counter_values: _,
+            collision_members: _,
+            collision_bytes: _,
+            result_points: _,
+        } = d;
     }
 
     /// (S)-leaf pin: the walk's `Copy ⇒ no owned heap` rule holds for

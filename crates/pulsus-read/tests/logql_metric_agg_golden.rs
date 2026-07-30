@@ -15,8 +15,20 @@ use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
     QueryParams, QueryResult, ReadError, SAMPLE_EXTRACTION_ERROR, TooBroadReason, VectorSample,
     apply_vector_aggs, combine_binary, materialize_vector_lit, plan, run_client_agg_rows,
-    run_variants_rows,
+    run_client_agg_rows_folded, run_variants_rows,
 };
+
+/// Issue #236 §4: `apply_vector_aggs` is fallible now — it charges the
+/// stage's modelled bytes against `MAX_POST_AGG_BYTES` before it
+/// allocates. Every fixture in this suite is orders of magnitude below
+/// that cap, so a refusal here means the model or the charge is wrong,
+/// not that the fixture is too big; the panic says so.
+fn apply_vector_aggs_ok(
+    result: QueryResult,
+    aggs: &[pulsus_read::logql::plan::VectorAggSpec],
+) -> QueryResult {
+    apply_vector_aggs(result, aggs).expect("a golden-suite fixture is far below MAX_POST_AGG_BYTES")
+}
 
 fn ctx() -> PlanCtx<'static> {
     PlanCtx {
@@ -95,9 +107,59 @@ fn row(fp: u64, ts_ns: i64, body: &str) -> MetricScanRow {
     }
 }
 
+/// One series in the EXACT-comparison rendering: its label set and its
+/// points with every value as raw bits.
+type BitSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
+
+/// A `QueryResult` rendered for EXACT comparison: series sorted, every
+/// value as `f64::to_bits` (no tolerance, and `2` never a prefix of
+/// `2.5`). Sorting is over the whole `(labels, points)` tuple so two
+/// series sharing a label set still order deterministically.
+fn bit_canonical(result: &QueryResult) -> Vec<BitSeries> {
+    let mut out: Vec<BitSeries> = match result {
+        QueryResult::Matrix(items) => items
+            .iter()
+            .map(|s| {
+                (
+                    s.labels.clone(),
+                    s.points.iter().map(|(t, v)| (*t, v.to_bits())).collect(),
+                )
+            })
+            .collect(),
+        QueryResult::Vector(items) => items
+            .iter()
+            .map(|s| (s.labels.clone(), vec![(0i64, s.value.to_bits())]))
+            .collect(),
+        other => panic!("bit_canonical: unsupported result {other:?}"),
+    };
+    out.sort();
+    out
+}
+
 /// Runs the full client-aggregated path for `query` over `rows`: plan →
 /// compile → aggregate → vector aggs — exactly the engine's post-fetch
 /// sequence.
+///
+/// **Issue #236 AC 7 rides here — on every fixture that goes THROUGH
+/// this helper, which is not the same as every fixture in the file.** The
+/// engine folds the innermost vector aggregation at the range leaf
+/// (`run_client_agg_rows_folded`) instead of materialising the leaf's
+/// output and aggregating it afterwards (`run_client_agg_rows` +
+/// `apply_vector_aggs`). Those two must agree BIT FOR BIT — the fold
+/// changes memory, not values — so this helper runs both and asserts it,
+/// then returns the folded one (what the engine actually returns). Any
+/// fixture routed here is an equivalence case automatically; there is no
+/// list of "the range fixtures" to keep in step.
+///
+/// **The scope, stated because the earlier wording overstated it**
+/// (review round 1 `[low]`): fixtures that drive the engine by another
+/// door — `materialize_vector_lit` for `vector(...)`, the direct
+/// `apply_vector_aggs` reducer/selection goldens, the `combine_binary`
+/// cases and the `run_variants_rows` fan-out — never reach the folded
+/// leaf, so there is no second path to compare them against and they
+/// execute no bit-equality assertion here.
+/// `every_client_routed_fixture_is_an_equivalence_case` counts what does
+/// ride, so the claim and the mechanism cannot drift apart.
 fn run_client(
     query: &str,
     params: &QueryParams,
@@ -107,26 +169,48 @@ fn run_client(
     let mp = metric_plan_of(query, params);
     let client = mp.client.as_ref().expect("client-aggregated plan");
     let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
-    let result = run_client_agg_rows(
+    let window = match mp.step_ns {
+        Some(step_ns) => ClientWindow::Range {
+            grid_start_ns: mp.grid_start_ns,
+            end_ns: mp.end_ns,
+            step_ns,
+            range_ns: mp.range_ns,
+        },
+        None => ClientWindow::Instant {
+            start_ns: mp.grid_start_ns,
+            end_ns: mp.end_ns,
+        },
+    };
+    let materialised =
+        run_client_agg_rows(rows, &compiled, meta, client, window, mp.rate_window_ns)
+            .map(|r| apply_vector_aggs_ok(r, &mp.vector_aggs));
+    let folded = run_client_agg_rows_folded(
         rows,
         &compiled,
         meta,
         client,
-        match mp.step_ns {
-            Some(step_ns) => ClientWindow::Range {
-                grid_start_ns: mp.grid_start_ns,
-                end_ns: mp.end_ns,
-                step_ns,
-                range_ns: mp.range_ns,
-            },
-            None => ClientWindow::Instant {
-                start_ns: mp.grid_start_ns,
-                end_ns: mp.end_ns,
-            },
-        },
+        window,
         mp.rate_window_ns,
-    )?;
-    Ok(apply_vector_aggs(result, &mp.vector_aggs))
+        &mp.vector_aggs,
+    );
+    match (&folded, &materialised) {
+        (Ok(f), Ok(m)) => assert_eq!(
+            bit_canonical(f),
+            bit_canonical(m),
+            "issue #236 AC 7: the folded leaf and the materialising path \
+             must agree bit for bit — {query}"
+        ),
+        (Err(f), Err(m)) => assert_eq!(
+            f.to_string(),
+            m.to_string(),
+            "issue #236 AC 7: both paths must refuse the same way — {query}"
+        ),
+        (f, m) => panic!(
+            "issue #236 AC 7: the folded leaf and the materialising path \
+             disagree on admission — {query}\n  folded: {f:?}\n  materialised: {m:?}"
+        ),
+    }
+    folded
 }
 
 /// One series expected: returns its points sorted by step.
@@ -906,83 +990,254 @@ fn meta_n(n: usize) -> HashMap<u64, StreamMetaRow> {
         .collect()
 }
 
+/// Issue #236, rewritten cap golden (AC 16). Before #236 this asserted a
+/// mid-scan `MetricSeries` 422 at the 501st fan-out group. That rejection
+/// is DELETED: `MAX_QUERY_SERIES` is a final-RESULT cap, so the leaf must
+/// now serve every group it scans and let `ensure_result_series` judge the
+/// finished result at the engine boundary.
+///
+/// `logfmt` is a parser -> `mutates_labels` -> fan-out. Every row carries a
+/// unique `id=<n>` body on the SAME fingerprint, so each survivor's final
+/// label set is distinct -> one `label_groups` entry per row.
+///
+/// Fails on `590220a` (which 422s at the 501st group).
 #[test]
-fn label_groups_fan_out_past_the_series_cap_is_a_named_too_broad_error() {
-    // `logfmt` is a parser -> `mutates_labels` -> fan-out. Every row
-    // carries a unique `id=<n>` body on the SAME fingerprint, so each
-    // survivor's final label set is distinct -> one `label_groups` entry
-    // per row.
-    let cap = pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES as usize;
+fn label_groups_fan_out_past_the_old_series_cap_is_served_by_the_leaf() {
+    let old_cap = 500usize;
     let params = instant_params(60 * NS);
-    let over_cap: Vec<MetricScanRow> = (0..=cap)
-        .map(|n| row(1, 10 * NS, &format!("id={n}")))
-        .collect();
-    let err = run_client(
-        r#"count_over_time({env="prod"} | logfmt [1m])"#,
-        &params,
-        &over_cap,
-        &meta_one(),
-    )
-    .unwrap_err();
-    let ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::MetricSeries { cap: got }) =
-        err
-    else {
-        panic!("expected QueryTooBroad(MetricSeries), got {err:?}");
-    };
-    assert_eq!(got, pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES);
+    let query = r#"count_over_time({env="prod"} | logfmt [1m])"#;
 
-    // Exactly at the cap: `cap` distinct label sets -> Ok, `cap` series.
-    let at_cap: Vec<MetricScanRow> = (0..cap)
-        .map(|n| row(1, 10 * NS, &format!("id={n}")))
-        .collect();
-    let result = run_client(
-        r#"count_over_time({env="prod"} | logfmt [1m])"#,
-        &params,
-        &at_cap,
-        &meta_one(),
-    )
-    .unwrap();
-    let QueryResult::Vector(items) = result else {
-        panic!("expected a vector, got {result:?}");
-    };
-    assert_eq!(items.len(), cap);
+    // One PAST the deleted cap, and far past it: both served, with every
+    // group present in the output.
+    for n in [old_cap + 1, old_cap * 4] {
+        let rows: Vec<MetricScanRow> = (0..n)
+            .map(|i| row(1, 10 * NS, &format!("id={i}")))
+            .collect();
+        let result = run_client(query, &params, &rows, &meta_one())
+            .unwrap_or_else(|e| panic!("{n} fan-out groups must be served by the leaf, got {e:?}"));
+        let QueryResult::Vector(items) = result else {
+            panic!("expected a vector");
+        };
+        assert_eq!(items.len(), n, "every scanned group must reach the result");
+    }
 }
 
+/// Issue #236, rewritten cap golden (AC 16) — the non-mutating twin of the
+/// test above, and AC 14(a)'s premise-fix case.
+///
+/// `line_format` is beyond-line-filter (so the query IS client-aggregated)
+/// but its compile arm sets only `rewrites_line`, never `mutates_labels`
+/// (pipeline.rs) — so `metric_mutates_labels() == false` and the query
+/// lands on the NON-fan-out `fp_groups` branch, keyed by fingerprint. That
+/// branch had NO byte charge before #236; P1 added one, and this pins that
+/// the charge admits a large, ordinary label model rather than rejecting
+/// it.
+///
+/// Fails on `590220a` (422 at the 501st fingerprint).
 #[test]
-fn fp_groups_non_mutating_past_the_series_cap_is_a_named_too_broad_error() {
-    // Plan v2 correction: `line_format` is beyond-line-filter (so the
-    // query IS client-aggregated) but its compile arm sets only
-    // `rewrites_line`, never `mutates_labels` (pipeline.rs) — so
-    // `metric_mutates_labels() == false` and the query lands on the
-    // NON-fan-out `fp_groups` branch, keyed by fingerprint. Driven with
-    // one row per distinct fingerprint.
-    let cap = pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES as usize;
+fn fp_groups_non_mutating_past_the_old_series_cap_is_served_by_the_leaf() {
+    let old_cap = 500usize;
     let params = instant_params(60 * NS);
     let query = r#"count_over_time({env="prod"} | line_format "keep" [1m])"#;
 
-    let over_cap_meta = meta_n(cap + 1);
-    let over_cap_rows: Vec<MetricScanRow> = (1..=(cap as u64 + 1))
-        .map(|fp| row(fp, 10 * NS, "hello"))
-        .collect();
-    let err = run_client(query, &params, &over_cap_rows, &over_cap_meta).unwrap_err();
-    let ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::MetricSeries { cap: got }) =
-        err
-    else {
-        panic!("expected QueryTooBroad(MetricSeries), got {err:?}");
-    };
-    assert_eq!(got, pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES);
+    for n in [old_cap + 1, old_cap * 4] {
+        let meta = meta_n(n);
+        let rows: Vec<MetricScanRow> = (1..=n as u64).map(|fp| row(fp, 10 * NS, "hello")).collect();
+        let result = run_client(query, &params, &rows, &meta).unwrap_or_else(|e| {
+            panic!("{n} fingerprint groups must be served by the leaf, got {e:?}")
+        });
+        let QueryResult::Vector(items) = result else {
+            panic!("expected a vector");
+        };
+        assert_eq!(
+            items.len(),
+            n,
+            "every scanned fingerprint must reach the result"
+        );
+    }
+}
 
-    // Exactly at the cap: `cap` distinct fingerprints -> Ok, `cap`
-    // series.
-    let at_cap_meta = meta_n(cap);
-    let at_cap_rows: Vec<MetricScanRow> = (1..=cap as u64)
-        .map(|fp| row(fp, 10 * NS, "hello"))
+/// Issue #236 AC 11 — **no group-count rejection before the final
+/// result**, on the range path where the fold owns the inner aggregation.
+///
+/// The INNER `sum by (id)` produces 501 groups; the OUTER `sum` collapses
+/// them to ONE series, which the reference serves. `MAX_QUERY_SERIES` is a
+/// final-RESULT cap, so nothing may reject on the intermediate — not the
+/// leaf (Part A deleted that), and not the fold (plan v14 §3 Part B: fold
+/// state is bounded by bytes and points and nothing else).
+///
+/// Fails on `7754844` under any fold that rejects at
+/// `groups > MAX_QUERY_SERIES`, and on `590220a` at the 501st scanned
+/// group. `run_client`'s AC-7 assertion additionally proves the folded and
+/// materialised answers are the same bits at this width.
+#[test]
+fn a_range_chain_whose_inner_grouping_is_wide_and_result_is_one_series_is_served() {
+    let inner_groups = 501usize;
+    let params = range_params(0, 2 * STEP);
+    let query = r#"sum(sum by (id) (count_over_time({env="prod"} | logfmt [1m])))"#;
+    let rows: Vec<MetricScanRow> = (0..inner_groups)
+        .map(|i| row(1, 30 * NS, &format!("id={i}")))
         .collect();
-    let result = run_client(query, &params, &at_cap_rows, &at_cap_meta).unwrap();
-    let QueryResult::Vector(items) = result else {
-        panic!("expected a vector, got {result:?}");
+
+    let result = run_client(query, &params, &rows, &meta_one())
+        .unwrap_or_else(|e| panic!("{inner_groups} inner groups must be served, got {e:?}"));
+    let QueryResult::Matrix(items) = result else {
+        panic!("expected a matrix");
     };
-    assert_eq!(items.len(), cap);
+    assert_eq!(items.len(), 1, "the FINAL result is one series");
+    // Every scanned group contributes exactly 1 to each covering step.
+    for (_, v) in &items[0].points {
+        assert_eq!(
+            v.to_bits(),
+            (inner_groups as f64).to_bits(),
+            "every inner group must reach the outer sum"
+        );
+    }
+
+    // The same shape one group narrower is served identically — the
+    // boundary is not a boundary at all on an intermediate.
+    let rows: Vec<MetricScanRow> = (0..inner_groups - 2)
+        .map(|i| row(1, 30 * NS, &format!("id={i}")))
+        .collect();
+    let result = run_client(query, &params, &rows, &meta_one()).expect("499 inner groups");
+    let QueryResult::Matrix(items) = result else {
+        panic!("expected a matrix");
+    };
+    assert_eq!(items.len(), 1);
+}
+
+/// Issue #236 Part B — the shape the rest of this file did not have:
+/// **several leaf series merging into ONE fold group at the SAME step**.
+///
+/// Every other range fixture here either has one stream or keeps one
+/// output group per leaf group, so the fold's per-slot ACCUMULATION —
+/// second and later members reaching a slot that already holds one — was
+/// never exercised, and `run_client`'s AC-7 equivalence gate therefore
+/// could not see a defect in it. Found by a mutant (last-value-wins in
+/// place of `VectorAccum::update`) that this file passed; the gap was in
+/// the fixtures, not in the claim, so the fixture is added rather than the
+/// claim softened.
+///
+/// Three streams with DIFFERENT line counts in the same window, so `sum`,
+/// `avg`, `min`, `max` and `count` each discriminate a different way, and
+/// the AC-7 assertion inside `run_client` proves the folded and
+/// materialised answers agree over all five.
+#[test]
+fn a_range_aggregation_merging_several_streams_into_one_group_accumulates() {
+    let meta: HashMap<u64, StreamMetaRow> = (1u64..=3)
+        .map(|fp| {
+            (
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: format!("svc{fp}"),
+                    labels: format!(r#"{{"env":"prod","service_name":"svc{fp}"}}"#),
+                },
+            )
+        })
+        .collect();
+    // Stream 1 → 1 line, stream 2 → 2 lines, stream 3 → 4 lines, all
+    // inside the window `(0, 60s]` so all three land on the SAME grid
+    // point with the same group key.
+    let mut rows = vec![row(1, 10 * NS, "x")];
+    rows.extend((0..2).map(|i| row(2, (10 + i) * NS, "x")));
+    rows.extend((0..4).map(|i| row(3, (10 + i) * NS, "x")));
+    let params = range_params(0, STEP);
+
+    // (query, the value at t = 60s over members {1, 2, 4})
+    let cases: [(&str, f64); 5] = [
+        (r#"sum(count_over_time({env="prod"}[1m]))"#, 7.0),
+        (r#"count(count_over_time({env="prod"}[1m]))"#, 3.0),
+        (r#"min(count_over_time({env="prod"}[1m]))"#, 1.0),
+        (r#"max(count_over_time({env="prod"}[1m]))"#, 4.0),
+        (r#"avg(count_over_time({env="prod"}[1m]))"#, 7.0f64 / 3.0f64),
+    ];
+    for (query, want) in cases {
+        let result = run_client(query, &params, &rows, &meta).expect(query);
+        let QueryResult::Matrix(items) = result else {
+            panic!("expected a matrix for {query}");
+        };
+        assert_eq!(items.len(), 1, "{query}: one collapsed series");
+        let at_step = items[0]
+            .points
+            .iter()
+            .find(|(t, _)| *t == STEP)
+            .unwrap_or_else(|| panic!("{query}: no point at 60s in {:?}", items[0].points));
+        assert_eq!(
+            at_step.1.to_bits(),
+            want.to_bits(),
+            "{query}: every member must reach the slot"
+        );
+    }
+}
+
+/// Issue #236 AC 10 — `topk(0, …)`/`bottomk(0, …)` through the LEAF SEAM
+/// over 501 distinct groups, range and instant: `Ok(empty)`, never a
+/// group-count rejection.
+///
+/// `topk(0, …)` is a reference-verbatim 400 at PARSE in both
+/// implementations, so this arm is reachable only through the programmatic
+/// seam — which is exactly why it is pinned here as well as end-to-end
+/// (`pulsus-logql/tests/errors.rs`): the two levels cannot swap without
+/// one of them reddening. Fails on `590220a` (422 `MetricSeries` at the
+/// 501st group) and under a fold that counts groups before consulting `k`.
+#[test]
+fn zero_k_over_501_groups_is_empty_not_a_rejection() {
+    let n = 501usize;
+    let rows: Vec<MetricScanRow> = (0..n)
+        .map(|i| row(1, 30 * NS, &format!("id={i}")))
+        .collect();
+
+    for op in ["topk", "bottomk"] {
+        // Planned with a positive `k` (0 is a parse error), then the spec
+        // is rewritten to `k = 0` — the seam the arm is reachable through.
+        let inner = r#"count_over_time({env="prod"} | logfmt [1m])"#;
+        for (label, params) in [
+            ("instant", instant_params(60 * NS)),
+            ("range", range_params(0, 2 * STEP)),
+        ] {
+            let query = format!("{op}(3, {inner})");
+            let mp = metric_plan_of(&query, &params);
+            let client = mp.client.as_ref().expect("client-aggregated");
+            let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
+            let window = match mp.step_ns {
+                Some(step_ns) => ClientWindow::Range {
+                    grid_start_ns: mp.grid_start_ns,
+                    end_ns: mp.end_ns,
+                    step_ns,
+                    range_ns: mp.range_ns,
+                },
+                None => ClientWindow::Instant {
+                    start_ns: mp.grid_start_ns,
+                    end_ns: mp.end_ns,
+                },
+            };
+            let zero_k: Vec<_> = mp
+                .vector_aggs
+                .iter()
+                .map(|(o, g, _)| (*o, g.clone(), Some(0.0)))
+                .collect();
+            let result = run_client_agg_rows_folded(
+                &rows,
+                &compiled,
+                &meta_one(),
+                client,
+                window,
+                mp.rate_window_ns,
+                &zero_k,
+            )
+            .unwrap_or_else(|e| panic!("{op}(0) {label} over {n} groups must be Ok, got {e:?}"));
+            match result {
+                QueryResult::Matrix(items) => {
+                    assert!(items.is_empty(), "{op}(0) {label}: {items:?}")
+                }
+                QueryResult::Vector(items) => {
+                    assert!(items.is_empty(), "{op}(0) {label}: {items:?}")
+                }
+                other => panic!("{op}(0) {label}: unexpected {other:?}"),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1089,7 +1344,7 @@ fn points_by_app(result: QueryResult) -> HashMap<String, Vec<(i64, f64)>> {
 #[test]
 fn topk_selects_per_step_preserving_original_series_labels() {
     let aggs = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(2.0))];
-    let by_app = points_by_app(apply_vector_aggs(matrix_fixture(), &aggs));
+    let by_app = points_by_app(apply_vector_aggs_ok(matrix_fixture(), &aggs));
     // Step 0: values 5(a), 5(c), 3(b) — the 5.0 tie breaks by label set
     // ascending (a before c), both fit in k=2, b drops.
     // Step 60: 3(b), 2(c) survive; 1(a) drops.
@@ -1102,7 +1357,7 @@ fn topk_selects_per_step_preserving_original_series_labels() {
 fn topk_tie_break_is_deterministic_by_label_set() {
     // k=1 forces the tie at step 0 to resolve: labels ascending → app=a.
     let aggs = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(1.0))];
-    let by_app = points_by_app(apply_vector_aggs(matrix_fixture(), &aggs));
+    let by_app = points_by_app(apply_vector_aggs_ok(matrix_fixture(), &aggs));
     assert_eq!(by_app["a"], vec![(0, 5.0)]);
     assert_eq!(by_app["b"], vec![(STEP, 3.0)]);
     assert!(!by_app.contains_key("c"), "{by_app:?}");
@@ -1111,7 +1366,7 @@ fn topk_tie_break_is_deterministic_by_label_set() {
 #[test]
 fn bottomk_selects_the_lowest_per_step() {
     let aggs = vec![(pulsus_logql::VectorAggOp::Bottomk, None, Some(1.0))];
-    let by_app = points_by_app(apply_vector_aggs(matrix_fixture(), &aggs));
+    let by_app = points_by_app(apply_vector_aggs_ok(matrix_fixture(), &aggs));
     assert_eq!(by_app["b"], vec![(0, 3.0)]);
     assert_eq!(by_app["a"], vec![(STEP, 1.0)]);
     assert!(!by_app.contains_key("c"));
@@ -1147,20 +1402,20 @@ fn topk_and_bottomk_rank_nan_last_in_both_directions() {
     };
     let topk2 = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(2.0))];
     assert_eq!(
-        by_app(apply_vector_aggs(vector.clone(), &topk2)),
+        by_app(apply_vector_aggs_ok(vector.clone(), &topk2)),
         vec!["b", "c"],
         "topk must not select NaN over finite values"
     );
     let bottomk2 = vec![(pulsus_logql::VectorAggOp::Bottomk, None, Some(2.0))];
     assert_eq!(
-        by_app(apply_vector_aggs(vector.clone(), &bottomk2)),
+        by_app(apply_vector_aggs_ok(vector.clone(), &bottomk2)),
         vec!["b", "c"],
         "bottomk must not select NaN over finite values"
     );
     // NaN is still selectable once every finite value is taken.
     let topk3 = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(3.0))];
     assert_eq!(
-        by_app(apply_vector_aggs(vector, &topk3)),
+        by_app(apply_vector_aggs_ok(vector, &topk3)),
         vec!["a", "b", "c"]
     );
 }
@@ -1179,7 +1434,7 @@ fn range_topk_ranks_nan_last_per_step() {
         },
     ]);
     let topk1 = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(1.0))];
-    let by_app = points_by_app(apply_vector_aggs(matrix, &topk1));
+    let by_app = points_by_app(apply_vector_aggs_ok(matrix, &topk1));
     // Step 0: finite 1.0 (b) beats NaN (a); step 60: finite 2.0 (a)
     // beats NaN (b).
     assert_eq!(by_app["a"], vec![(STEP, 2.0)]);
@@ -1201,10 +1456,10 @@ fn stddev_and_stdvar_vector_aggregations_are_population_flavored() {
     // Oracle transcript: stddev(1,2,3,4) = 1.118033988749895 (population),
     // stdvar = 1.25.
     let aggs = vec![(pulsus_logql::VectorAggOp::Stddev, None, None)];
-    let v = single_vector_value(apply_vector_aggs(vector.clone(), &aggs));
+    let v = single_vector_value(apply_vector_aggs_ok(vector.clone(), &aggs));
     assert_eq!(v, 1.118033988749895);
     let aggs = vec![(pulsus_logql::VectorAggOp::Stdvar, None, None)];
-    let v = single_vector_value(apply_vector_aggs(vector, &aggs));
+    let v = single_vector_value(apply_vector_aggs_ok(vector, &aggs));
     assert_eq!(v, 1.25);
 }
 
@@ -1249,7 +1504,7 @@ fn approx_topk_emits_the_sketch_estimate_not_the_true_value() {
     let input = [("v0095169", 3.0), ("v0125949", 4.0), ("ctrl", 5.0)];
     let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(3.0))];
     assert_eq!(
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &approx)),
         vec![
             ("ctrl".to_string(), 5.0),
             ("v0095169".to_string(), 7.0),
@@ -1259,7 +1514,7 @@ fn approx_topk_emits_the_sketch_estimate_not_the_true_value() {
     );
     let topk = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(3.0))];
     assert_eq!(
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &topk)),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &topk)),
         vec![
             ("ctrl".to_string(), 5.0),
             ("v0095169".to_string(), 3.0),
@@ -1283,8 +1538,8 @@ fn approx_topk_is_exact_when_no_cells_collide() {
     let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(3.0))];
     let topk = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(3.0))];
     assert_eq!(
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)),
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &topk)),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &approx)),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &topk)),
     );
 }
 
@@ -1295,7 +1550,7 @@ fn approx_topk_under_k_returns_every_series() {
     let input = [("a", 3.0), ("b", 2.0), ("c", 1.0)];
     let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(10.0))];
     assert_eq!(
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)).len(),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &approx)).len(),
         3
     );
 }
@@ -1309,11 +1564,11 @@ fn approx_topk_is_insertion_order_independent() {
     let base = [("v0095169", 3.0), ("v0125949", 4.0), ("ctrl", 5.0)];
     let shuffles: [[usize; 3]; 3] = [[0, 1, 2], [2, 0, 1], [1, 2, 0]];
     let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(2.0))];
-    let expect = sorted_pairs(apply_vector_aggs(lvl_vector(&base), &approx));
+    let expect = sorted_pairs(apply_vector_aggs_ok(lvl_vector(&base), &approx));
     for order in shuffles {
         let shuffled: Vec<(&str, f64)> = order.iter().map(|&i| base[i]).collect();
         assert_eq!(
-            sorted_pairs(apply_vector_aggs(lvl_vector(&shuffled), &approx)),
+            sorted_pairs(apply_vector_aggs_ok(lvl_vector(&shuffled), &approx)),
             expect,
         );
     }
@@ -1335,8 +1590,8 @@ fn approx_topk_is_insertion_order_independent() {
             },
         ])
     };
-    let a = apply_vector_aggs(two_labels(false), &approx);
-    let b = apply_vector_aggs(two_labels(true), &approx);
+    let a = apply_vector_aggs_ok(two_labels(false), &approx);
+    let b = apply_vector_aggs_ok(two_labels(true), &approx);
     let flatten = |r: QueryResult| {
         let QueryResult::Vector(items) = r else {
             panic!("expected a vector");
@@ -1366,7 +1621,7 @@ fn approx_topk_retention_cap_is_the_reference_heap_size() {
         None,
         Some((cap + 1) as f64),
     )];
-    let out = sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx));
+    let out = sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &approx));
     assert_eq!(out.len(), cap, "exactly CMS_MAX_LABELS series retained");
     assert!(
         !out.iter().any(|(t, _)| t == "t00000"),
@@ -1398,7 +1653,7 @@ fn eval_scalar_query(query: &str) -> f64 {
                 lhs,
                 rhs,
             } => combine_binary(*op, *return_bool, matching.as_ref(), eval(lhs)?, eval(rhs)?),
-            MetricNode::VectorAgg { aggs, inner } => Ok(apply_vector_aggs(eval(inner)?, aggs)),
+            MetricNode::VectorAgg { aggs, inner } => Ok(apply_vector_aggs_ok(eval(inner)?, aggs)),
             MetricNode::Leaf(_) | MetricNode::Variants { .. } => {
                 panic!("scalar-only trees expected")
             }
@@ -2584,7 +2839,7 @@ fn ordered_apps(result: QueryResult) -> Vec<String> {
 fn sort_orders_the_vector_ascending_with_nan_last() {
     let aggs = vec![(pulsus_logql::VectorAggOp::Sort, None, None)];
     assert_eq!(
-        ordered_apps(apply_vector_aggs(sort_vector_fixture(), &aggs)),
+        ordered_apps(apply_vector_aggs_ok(sort_vector_fixture(), &aggs)),
         vec!["b", "a", "c", "d"]
     );
 }
@@ -2595,7 +2850,7 @@ fn sort_orders_the_vector_ascending_with_nan_last() {
 fn sort_desc_orders_the_vector_descending_with_nan_last() {
     let aggs = vec![(pulsus_logql::VectorAggOp::SortDesc, None, None)];
     assert_eq!(
-        ordered_apps(apply_vector_aggs(sort_vector_fixture(), &aggs)),
+        ordered_apps(apply_vector_aggs_ok(sort_vector_fixture(), &aggs)),
         vec!["a", "c", "b", "d"]
     );
 }
@@ -2618,7 +2873,7 @@ fn range_sort_is_a_passthrough_over_the_matrix() {
         pulsus_logql::VectorAggOp::Sort,
         pulsus_logql::VectorAggOp::SortDesc,
     ] {
-        let out = apply_vector_aggs(matrix.clone(), &[(op, None, None)]);
+        let out = apply_vector_aggs_ok(matrix.clone(), &[(op, None, None)]);
         let QueryResult::Matrix(items) = out else {
             panic!("expected a matrix");
         };
@@ -2677,7 +2932,7 @@ fn eval_node(
                 },
                 mp.rate_window_ns,
             )?;
-            Ok(apply_vector_aggs(result, &mp.vector_aggs))
+            Ok(apply_vector_aggs_ok(result, &mp.vector_aggs))
         }
         MetricNode::Binary {
             op,
@@ -2693,7 +2948,7 @@ fn eval_node(
             eval_node(rhs, rows, meta)?,
         ),
         MetricNode::VectorAgg { aggs, inner } => {
-            Ok(apply_vector_aggs(eval_node(inner, rows, meta)?, aggs))
+            Ok(apply_vector_aggs_ok(eval_node(inner, rows, meta)?, aggs))
         }
         // `variants(...) of (...)` (issue #221): the pure fan-out twin,
         // over the scan plan's (unwrap-truncated) common pipeline.
@@ -3425,4 +3680,246 @@ fn variants_range_matrix_carries_the_index_per_series() {
     // count at the 60s grid point sees both rows; bytes sees 4 bytes.
     assert_eq!(items[0].points.last(), Some(&(60 * NS, 2.0)));
     assert_eq!(items[1].points.last(), Some(&(60 * NS, 4.0)));
+}
+
+/// The suite's own call sites, counted by PARSING it (whole-branch
+/// re-review round 4 `[low]`).
+///
+/// The first two cuts of the census below counted byte sequences —
+/// `"combine_binary("` — which measures SPELLING, not structure.
+/// `combine_binary (lhs, rhs)` is the same call site and a different
+/// string, so a line-broken argument list, a `rustfmt` change or a
+/// `#[rustfmt::skip]` could move the published numbers without a fixture
+/// moving; and a lexical instrument needed hand-written exclusions for
+/// its own literals, which it twice got wrong. This module counts CALL
+/// EXPRESSIONS by callee name instead, following the AC 18 call-graph
+/// census in `logql_post_agg_witness.rs`.
+///
+/// Scope: every function body in this file, at any nesting, with the
+/// bodies named in `skip` omitted. A DEFINITION is not a call, so the
+/// helper-definition exclusion the substring version needed is gone by
+/// construction; so is the self-reference one, because a route name
+/// written as a string literal is not a call expression either.
+///
+/// Known limit: a call is attributed to its callee PATH, so a call through
+/// a binding or a function value (`let f = combine_binary; f(..)`) is
+/// counted against the binding's name. The walk does not resolve bindings;
+/// the census compensates by pinning EXACT counts rather than floors, so
+/// such a miscount shows up as a failure instead of being absorbed.
+mod call_sites {
+    use std::collections::BTreeMap;
+    use syn::visit::Visit;
+
+    /// Call counts by callee name (last path segment), plus every
+    /// function's doc comment as ONE whitespace-normalised line (so a
+    /// reflowed paragraph does not move a phrase out of the text) — the
+    /// census asserts against both.
+    #[derive(Debug, Default)]
+    pub struct Counted {
+        pub calls: BTreeMap<String, usize>,
+        pub docs: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug)]
+    struct Walk {
+        skip: Vec<String>,
+        out: Counted,
+    }
+
+    impl Visit<'_> for Walk {
+        fn visit_item_fn(&mut self, node: &syn::ItemFn) {
+            let name = node.sig.ident.to_string();
+            let doc: String = node
+                .attrs
+                .iter()
+                .filter_map(|a| match &a.meta {
+                    syn::Meta::NameValue(nv) if nv.path.is_ident("doc") => match &nv.value {
+                        syn::Expr::Lit(l) => match &l.lit {
+                            syn::Lit::Str(s) => Some(s.value()),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .flat_map(|line| {
+                    line.split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.out.docs.insert(name.clone(), doc);
+            if self.skip.contains(&name) {
+                return;
+            }
+            syn::visit::visit_item_fn(self, node);
+        }
+        fn visit_expr_call(&mut self, node: &syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*node.func
+                && let Some(seg) = p.path.segments.last()
+            {
+                *self.out.calls.entry(seg.ident.to_string()).or_default() += 1;
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+        fn visit_macro(&mut self, node: &syn::Macro) {
+            // `syn::visit` does not descend into token streams, and most
+            // of this suite's call sites sit inside `assert_eq!`.
+            if let Ok(exprs) = node.parse_body_with(
+                syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
+            ) {
+                for e in &exprs {
+                    self.visit_expr(e);
+                }
+            } else {
+                // A body that is not an expression list (`matches!`'s
+                // pattern) would otherwise hide a call site: count
+                // `ident(` TOKEN pairs there. Still whitespace-blind —
+                // these are tokens, not bytes.
+                token_fallback(node.tokens.clone(), &mut self.out.calls);
+            }
+        }
+    }
+
+    fn token_fallback(tokens: proc_macro2::TokenStream, out: &mut BTreeMap<String, usize>) {
+        let toks: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+        for pair in toks.windows(2) {
+            if let (proc_macro2::TokenTree::Ident(id), proc_macro2::TokenTree::Group(g)) =
+                (&pair[0], &pair[1])
+                && g.delimiter() == proc_macro2::Delimiter::Parenthesis
+            {
+                *out.entry(id.to_string()).or_default() += 1;
+            }
+        }
+        for t in toks {
+            if let proc_macro2::TokenTree::Group(g) = t {
+                token_fallback(g.stream(), out);
+            }
+        }
+    }
+
+    pub fn walk(src: &str, skip: &[&str]) -> Counted {
+        let file = syn::parse_file(src).expect("the suite parses as Rust");
+        let mut w = Walk {
+            skip: skip.iter().map(|s| (*s).to_string()).collect(),
+            out: Counted::default(),
+        };
+        w.visit_file(&file);
+        for name in skip {
+            assert!(
+                w.out.docs.contains_key(*name),
+                "`{name}` is not a function in this file — the census is excluding nothing"
+            );
+        }
+        w.out
+    }
+}
+
+/// AC 7's scope, counted rather than claimed (review round 1 `[low]`).
+///
+/// The bit-equality assertion executes for fixtures routed through
+/// `run_client`; fixtures that drive `materialize_vector_lit`,
+/// `apply_vector_aggs`, `combine_binary` or `run_variants_rows` directly
+/// have no folded twin to compare against. This test parses the suite's
+/// own source and pins both counts, so a sentence claiming "every
+/// fixture" cannot outlive the mechanism again.
+///
+/// Both counts are the populations the sentence NAMES. One exclusion
+/// survives the move to parsing (whole-branch re-review `[low]`, kept):
+/// `run_client`'s internal `apply_vector_aggs_ok` call, which IS the
+/// routed path rather than a direct fixture. And `combine_binary` —
+/// named by the sentence, absent from the first count — is counted.
+///
+/// **What each direction of the biconditional below can be shown by**
+/// (whole-branch re-review round 4 `[low]`): the caveat-deleted mutant is
+/// live and fails. The `direct == 0` direction is NOT reachable by any
+/// small mutation now — under a lexical census, respelling a call site
+/// emptied the count; under this one, only deleting all 76 direct
+/// fixtures does. That arm guards a future state (every direct route
+/// migrated onto `run_client`) in which the caveat must go too, and it is
+/// deliberately not claimed to be mutation-demonstrable.
+///
+/// **The counts are pinned exactly, not floored** (whole-branch re-review
+/// round 5 `[low]`). Every number this file's prose names — 25
+/// `apply_vector_aggs_ok`, 6 `materialize_vector_lit`, 44 `combine_binary`
+/// and 1 `run_variants_rows` direct sites, 76 as their sum, and 38
+/// `run_client` sites — is asserted with `assert_eq!`. Be precise about
+/// what that buys. It does NOT teach the walk to resolve bindings:
+/// `syn::ExprCall` records the callee's PATH, so `let f = combine_binary;
+/// f(lhs, rhs)` is counted against `f`, not against `combine_binary`, and
+/// that blind spot is still open. What the exact pin does is make the
+/// resulting miscount VISIBLE — an exact count fails in BOTH directions,
+/// where a `> 0` floor only fails downward past zero and absorbs a lost
+/// site in silence. The pins are brittle on purpose: tripping one is the
+/// prompt to re-read `run_client`'s scope caveat and confirm the sentence
+/// still describes the population.
+#[test]
+fn every_client_routed_fixture_is_an_equivalence_case() {
+    const CAVEAT: &str = "which is not the same as every fixture in the file";
+    // The direct population, exactly as the doc above enumerates it, with
+    // the site count each name is pinned to.
+    const DIRECT_ROUTES: [(&str, usize); 4] = [
+        ("apply_vector_aggs_ok", 25),
+        ("materialize_vector_lit", 6),
+        ("combine_binary", 44),
+        ("run_variants_rows", 1),
+    ];
+    // 38 real call sites. The floor of 40 the first cut used was met only
+    // because a substring census counted its own `run_client(` literals.
+    const ROUTED_SITES: usize = 38;
+    let src = include_str!("logql_metric_agg_golden.rs");
+    // Nothing inside `run_client` is a fixture — neither a call site
+    // (there are none) nor the `apply_vector_aggs_ok` that builds the
+    // materialised twin.
+    let counted = call_sites::walk(src, &["run_client"]);
+    let site_count = |name: &str| counted.calls.get(name).copied().unwrap_or(0);
+    let routed = site_count("run_client");
+    let per_route: Vec<(&str, usize, usize)> = DIRECT_ROUTES
+        .iter()
+        .map(|(route, pinned)| (*route, site_count(route), *pinned))
+        .collect();
+    let direct: usize = per_route.iter().map(|(_, n, _)| n).sum();
+    // The claim and the mechanism, side by side: the caveat must exist
+    // exactly while the direct fixtures do. `direct` is 25 + 6 + 44 + 1 =
+    // 76. The caveat is read out of `run_client`'s OWN doc comment — the
+    // sentence that makes the claim — so this cannot be satisfied by the
+    // string appearing anywhere else in the file, including here.
+    //
+    // This assertion runs BEFORE the pinned counts below (whole-branch
+    // re-review round 3 `[low]`, kept in round 5): emptying the direct
+    // population also drives every route's count to 0, and migrating those
+    // fixtures onto `run_client` moves `routed`, so a count pinned first
+    // panics and the `direct == 0` direction of this biconditional can
+    // never be reached — leaving a two-way claim with one live direction.
+    let claim = counted
+        .docs
+        .get("run_client")
+        .expect("run_client is documented");
+    assert_eq!(
+        claim.contains(CAVEAT),
+        direct > 0,
+        "AC 7's scope caveat and its {direct} direct fixtures must appear and disappear together"
+    );
+    assert_eq!(
+        routed, ROUTED_SITES,
+        "{routed} fixtures route through run_client, not the pinned {ROUTED_SITES}, which is the \
+         population AC 7's equivalence assertion covers. If you added or removed a run_client \
+         fixture, update this pin AND re-read run_client's scope caveat to check it is still \
+         true; if you did not, this census has drifted from the source it parses"
+    );
+    // Per route, not just in total: the doc names four ways to drive the
+    // engine without a folded twin, and a count that moves under any one
+    // of them makes the sentence wrong even while the others hold `direct`
+    // above zero.
+    for (route, n, pinned) in per_route {
+        assert_eq!(
+            n, pinned,
+            "{route} has {n} direct call sites, not the pinned {pinned}. If you added or removed \
+             a fixture on this route, update the pinned count here AND re-read run_client's scope \
+             caveat to check it is still true — forcing that re-read is why the count is pinned \
+             rather than floored; if you touched no fixture, this census has drifted from the \
+             source it parses"
+        );
+    }
 }

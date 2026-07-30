@@ -568,39 +568,30 @@ mod tests {
         );
     }
 
-    /// Issue #221 (AC 9/10): a `variants(...)` query past the DERIVED
-    /// sub-state backstop plans to `QueryTooBroad(VariantSubStates)` —
-    /// raised at PLAN time, before any state exists — and maps to the
+    /// Issue #221 (AC 9/10): `QueryTooBroad(VariantSubStates)` maps to the
     /// same 422 `query_too_broad` surface as every other too-broad LogQL
-    /// query (via the real `ReadError` → `ApiError` → response path
-    /// `query_range` uses).
+    /// query, via the real `ReadError` → `ApiError` → response path
+    /// `query_range` uses.
+    ///
+    /// **Issue #236 changed how this is driven, not what it asserts.**
+    /// The test used to build a 501-variant query, because the DERIVED
+    /// backstop was then 500. #236 deleted `AggCaps::series`, moving
+    /// `min_field()` onto `MAX_TS_COLLISION_GROUP` = 10 000 — and at
+    /// #279's `MAX_QUERY_BYTES` the largest expressible variants query
+    /// carries 4 368 variants, so the backstop can no longer be reached
+    /// through a parse. The reason is asserted here by CONSTRUCTION
+    /// instead, which is what this test was ever really about (the
+    /// mapping, not the guard); the guard's own arithmetic and its
+    /// unreachability verdict are pinned in
+    /// `plan::tests::variants_past_the_derived_backstop_reject_at_plan_time`.
     #[tokio::test]
     async fn variants_past_the_sub_state_backstop_maps_to_422_query_too_broad() {
-        let query = format!(
-            "variants({}) of ({{app=\"x\"}}[5m])",
-            vec!["count_over_time({app=\"x\"}[5m])"; 501].join(", ")
-        );
-        let expr = pulsus_logql::parse(&query).expect("parse");
-        let params = pulsus_read::logql::QueryParams {
-            spec: pulsus_read::logql::QuerySpec::Instant {
-                at_ns: 60_000_000_000,
+        let err = pulsus_read::logql::ReadError::QueryTooBroad(
+            pulsus_read::logql::TooBroadReason::VariantSubStates {
+                count: 10_001,
+                cap: 10_000,
             },
-            limit: 100,
-            direction: pulsus_read::logql::Direction::Backward,
-        };
-        let ctx = pulsus_read::logql::PlanCtx {
-            db: "pulsus",
-            streams_idx: "log_streams_idx",
-            streams: "log_streams",
-            samples: "log_samples",
-            rollup_table: "log_metrics_5s",
-            rollup_res_ns: 5_000_000_000,
-            scan_budget_bytes: 1024,
-            max_streams: 100_000,
-            pipeline_scan_factor: 10,
-        };
-        let err = pulsus_read::logql::plan(&expr, &params, &ctx)
-            .expect_err("501 variants must reject at plan time");
+        );
         let (status, json) = status_and_body(ApiError::Read(err).into_response()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(json["errorType"], "query_too_broad");
@@ -608,7 +599,7 @@ mod tests {
             json["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("501 variants, exceeding the 500-variant cap"),
+                .contains("10001 variants, exceeding the 10000-variant cap"),
             "the message names the derived cap: {json:?}"
         );
     }

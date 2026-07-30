@@ -38,16 +38,38 @@ pub use timefns::TemplateEnv;
 /// constant-factor string producers) is CHARGED against this budget
 /// BEFORE it happens and the whole budget is released when the render
 /// ends (one render is the line path's peak transient retention).
-/// **Derivation:** this is [`crate::logql::exec::MAX_CLIENT_AGG_GROUP_BYTES`]
-/// (64 MiB) — the crate's established per-query retained-bytes budget
-/// (#104, reused by #221's fan-out charge); a single rendered line may
-/// not allocate more than a whole query is allowed to retain. A breach
-/// aborts the QUERY with the bounded 422
+/// **Value: 64 MiB.** A breach aborts the QUERY with the bounded 422
 /// (`TooBroadReason::TemplateOutputBytes`), never a per-line tag, a
 /// truncation, or an OOM. The reference is unbounded here (measured: a
 /// 17 GB `repeat` OOM-kills it) — a ledgered bounded divergence
 /// (`template-output-budget`).
-pub const MAX_TEMPLATE_RENDER_BYTES: u64 = crate::logql::exec::MAX_CLIENT_AGG_GROUP_BYTES;
+///
+/// **Derivation, and why it is now a standalone constant.** #230 defined
+/// this as `= exec::MAX_CLIENT_AGG_GROUP_BYTES`, which was then also
+/// 64 MiB — a convenience link on the reasoning that "a single rendered
+/// line may not allocate more than a whole query is allowed to retain".
+/// Issue #236 raised `MAX_CLIENT_AGG_GROUP_BYTES` to 256 MiB for a reason
+/// that is specific to the GROUP axis (deleting the mid-scan group-count
+/// cap left that constant carrying the whole load, so it had to admit
+/// high-cardinality aggregations the reference serves). Nothing about
+/// that argument applies to one line's template output, and following
+/// the link would have silently quadrupled an unrelated OOM guard — so
+/// the link is severed and #230's shipped 64 MiB behaviour is preserved
+/// byte-for-byte. The inequality the original rationale wanted still
+/// holds (`64 MiB <= MAX_CLIENT_AGG_GROUP_BYTES`) and is asserted by
+/// the const assertion below.
+pub const MAX_TEMPLATE_RENDER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Issue #236: a COMPILE-TIME gate, not a test — one render may never
+/// out-allocate a whole query's retained-state budget. #230 expressed
+/// this as an equality (`= MAX_CLIENT_AGG_GROUP_BYTES`), which silently
+/// followed #236's group-axis raise to 256 MiB; the inequality is what
+/// that derivation actually wanted, and stating it here means a future
+/// raise of either constant cannot invert it without failing the build.
+const _: () = assert!(
+    MAX_TEMPLATE_RENDER_BYTES <= crate::logql::exec::MAX_CLIENT_AGG_GROUP_BYTES,
+    "one render may not out-allocate a whole query's retention budget"
+);
 
 /// The countdown ledger one render charges against (fresh per render —
 /// the symmetric release point is the render's end).

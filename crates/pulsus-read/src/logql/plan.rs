@@ -1030,9 +1030,14 @@ fn unwrap_vector_aggs_into<'a>(
 /// declare — the DERIVED backstop (issue #221): the smallest
 /// [`AggCaps::DEFAULT`] field, so every [`AggCaps::divided`] cap stays
 /// ≥ 1 and the per-field TOTAL over sub-states remains exactly today's
-/// single-query bound. Derived, not chosen — it moves with
-/// [`super::exec::MAX_CLIENT_AGG_SERIES`]. The reference is unbounded
-/// here (a recorded divergence, `docs/benchmarks/logs-differential-ledger.md`).
+/// single-query bound. Derived, not chosen.
+///
+/// Issue #236 deleted `AggCaps::series` (the mid-scan 500-group cap), so
+/// the smallest field is no longer that 500: it is now
+/// [`super::exec::MAX_TS_COLLISION_GROUP`] = **10 000**, a strictly
+/// PERMISSIVE re-derivation in the direction the reference sits (which is
+/// unbounded here — a recorded divergence,
+/// `docs/benchmarks/logs-differential-ledger.md`).
 pub const MAX_VARIANT_SUB_STATES: u64 = AggCaps::DEFAULT.min_field();
 
 /// The COMMON pipeline the reference executes for a `variants(...)` scan:
@@ -3011,36 +3016,88 @@ mod tests {
         );
     }
 
-    /// B4 / AC 9+10 — the DERIVED count backstop: 501 variants is a 422
-    /// carrying `VariantSubStates { 501, 500 }` at plan time; 500 plans.
+    /// B4 / AC 9+10, re-derived by issue #236 (AC 35).
+    ///
+    /// Deleting `AggCaps::series` (the mid-scan 500-group cap) makes
+    /// `min_field()` land on `MAX_TS_COLLISION_GROUP`, so the DERIVED
+    /// backstop moves **500 → 10 000**. Strictly permissive, in the
+    /// direction the reference sits (it is unbounded here).
+    ///
+    /// **The `cap + 1` boundary is UNREACHABLE, and that is a finding
+    /// against the plan, not a number to update.** Plan v14 pins to
+    /// `d145ded`, which predates #279's query-text cap. At the shipped
+    /// `pulsus_logql::MAX_QUERY_BYTES` (131 072, exclusive) the shortest
+    /// legal variant expression is 28 bytes plus a 2-byte separator, so
+    /// the largest expressible variant count is **4 368** and a
+    /// 10 001-variant query is 300 055 bytes — rejected as `QueryTooLong`
+    /// long before the backstop is consulted. The runtime rejection is
+    /// therefore asserted **iff reachable**, the verdict computed from the
+    /// two constants rather than assumed; this mirrors the reachability
+    /// branch plan v14 §5.6 already prescribes for the O6/O7 thresholds.
+    /// The arithmetic half of the derivation is asserted unconditionally
+    /// (here and in `agg_caps_default_is_the_constants_and_divides_soundly`).
     #[test]
     fn variants_past_the_derived_backstop_reject_at_plan_time() {
-        let over = format!(
-            "variants({}) of ({{a=\"b\"}}[5m])",
-            [r#"count_over_time({a="b"}[5m])"#; 501].join(", ")
+        let cap = MAX_VARIANT_SUB_STATES;
+        assert_eq!(cap, 10_000, "the #236 re-derivation");
+
+        // The reachability verdict, computed — never assumed.
+        const VARIANT: &str = r#"count_over_time({a="b"}[5m])"#;
+        let text_bytes = |n: usize| {
+            "variants(".len()
+                + n * VARIANT.len()
+                + n.saturating_sub(1) * 2
+                + ") of ({a=\"b\"}[5m])".len()
+        };
+        let reachable = text_bytes(cap as usize + 1) < pulsus_logql::MAX_QUERY_BYTES;
+        assert!(
+            !reachable,
+            "the backstop became reachable — assert the cap+1 rejection end-to-end \
+             ({} bytes at n = {})",
+            text_bytes(cap as usize + 1),
+            cap + 1
         );
-        match variants_plan_of(
-            &over,
-            QuerySpec::Instant {
-                at_ns: 60_000_000_000,
-            },
-        ) {
-            Err(ReadError::QueryTooBroad(TooBroadReason::VariantSubStates { count, cap })) => {
-                assert_eq!((count, cap), (501, 500));
-            }
-            other => panic!("expected VariantSubStates, got {other:?}"),
-        }
-        let at = format!(
+
+        // Largest expressible count, asserted so the verdict is a measured
+        // property of the two constants and not a comment.
+        let max_expressible = (1..)
+            .take_while(|n| text_bytes(*n) < pulsus_logql::MAX_QUERY_BYTES)
+            .last()
+            .expect("at least one variant is expressible");
+        assert_eq!(max_expressible, 4_368);
+        assert!(
+            (max_expressible as u64) < cap,
+            "backstop sits above the parse cap"
+        );
+
+        // The acceptance win the re-derivation buys, and it IS reachable:
+        // 600 variants was a `VariantSubStates` 422 before #236.
+        let six_hundred = format!(
             "variants({}) of ({{a=\"b\"}}[5m])",
-            [r#"count_over_time({a="b"}[5m])"#; 500].join(", ")
+            vec![VARIANT; 600].join(", ")
         );
         variants_plan_of(
-            &at,
+            &six_hundred,
             QuerySpec::Instant {
                 at_ns: 60_000_000_000,
             },
         )
-        .expect("exactly the backstop must plan");
+        .expect("600 variants must plan after the #236 re-derivation");
+
+        // The largest expressible query still plans, so nothing between
+        // the old backstop and the parse cap is refused by this guard.
+        let widest = format!(
+            "variants({}) of ({{a=\"b\"}}[5m])",
+            vec![VARIANT; max_expressible].join(", ")
+        );
+        assert!(widest.len() < pulsus_logql::MAX_QUERY_BYTES);
+        variants_plan_of(
+            &widest,
+            QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+        )
+        .expect("the widest expressible variants query must plan");
     }
 
     /// AC 14 — a 1-variant query is admitted exactly when the equivalent
