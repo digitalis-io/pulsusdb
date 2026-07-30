@@ -2373,6 +2373,101 @@ fn shipped_bin(term: BinaryTerm) -> u64 {
     }
 }
 
+/// Every axis the model prices, NAMED. Deleting a `ChainTerm`/
+/// `BinaryTerm` variant stops this literal compiling; adding one stops
+/// [`shipped`]/[`shipped_bin`]'s exhaustive `match` compiling. So a term
+/// cannot leave the model quietly — which matters for
+/// `W_STAGE_SERIES`, whose coefficient is 0 and which a future reader
+/// will otherwise be tempted to delete as dead weight (see its doc: the
+/// zero is contingent on an in-place-collect specialisation, not on the
+/// nature of the computation).
+const ALL_CHAIN_TERMS: [ChainTerm; 7] = [
+    ChainTerm::Series,
+    ChainTerm::Point,
+    ChainTerm::LabelByte,
+    ChainTerm::Pair,
+    ChainTerm::StageSeries,
+    ChainTerm::GroupName,
+    ChainTerm::ApproxTopk,
+];
+
+const ALL_BINARY_TERMS: [BinaryTerm; 6] = [
+    BinaryTerm::Series,
+    BinaryTerm::Point,
+    BinaryTerm::Label,
+    BinaryTerm::Pair,
+    BinaryTerm::Many,
+    BinaryTerm::Include,
+];
+
+/// Every priced axis is either derived by a ladder or is a DECLARED
+/// exception with its reason. A term that is neither has no derivation
+/// behind it, which is the state this issue exists to eliminate.
+#[test]
+fn every_model_term_is_derived_or_a_declared_exception() {
+    // `W_STAGE_SERIES`: measured 0 across 8 shapes x 5 chain lengths
+    // (in-place collect), guarded by
+    // `chain_depth_does_not_multiply_peak_memory`.
+    // `W_APPROX_TOPK`: a FLAT term, so it has no rate and is derived at
+    // the minimal input by `the_flat_approx_topk_term_bounds_a_minimal_input`.
+    // `B_MANY`: plan v14 §6.4's declared exception, discriminated by the
+    // 2x2 difference-of-differences.
+    let chain_exceptions = [ChainTerm::StageSeries, ChainTerm::ApproxTopk];
+    let ladder_terms: Vec<ChainTerm> = chain_ladders().iter().map(|l| l.term).collect();
+    for t in ALL_CHAIN_TERMS {
+        assert!(
+            ladder_terms.contains(&t) || chain_exceptions.contains(&t),
+            "{t:?} is priced by the chain model but has no ladder and no declared exception"
+        );
+    }
+    let bin_exceptions = [BinaryTerm::Many];
+    let bin_ladder_terms: Vec<BinaryTerm> = bin_ladders().iter().map(|l| l.term).collect();
+    for t in ALL_BINARY_TERMS {
+        assert!(
+            bin_ladder_terms.contains(&t) || bin_exceptions.contains(&t),
+            "{t:?} is priced by the binary model but has no ladder and no declared exception"
+        );
+    }
+    // `B_MANY` HAS a ladder as well as its 2x2 — both, not either.
+    assert!(bin_ladder_terms.contains(&BinaryTerm::Many));
+    // Suppressing a term must actually change the model for every term
+    // whose coefficient is non-zero: a `_without` arm that quietly
+    // stopped suppressing would make every necessity assertion vacuous.
+    let m = StageInput::for_derivation(64, 128, 512, 512, 2, 8, 64, 1);
+    let aggs = vec![
+        (
+            VectorAggOp::ApproxTopk,
+            Some(by_clause_of_total_bytes(16)),
+            Some(1.0),
+        ),
+        (VectorAggOp::Sum, None, None),
+    ];
+    for t in ALL_CHAIN_TERMS {
+        let full = post_agg_peak_bytes(&m, &aggs);
+        let without = post_agg_peak_bytes_without(&m, &aggs, t);
+        assert_eq!(
+            without < full,
+            shipped(t) > 0,
+            "{t:?}: suppressing the term must lower the model exactly when its coefficient is \
+             non-zero (shipped = {})",
+            shipped(t)
+        );
+    }
+    let one = StageInput::for_derivation(64, 128, 512, 512, 2, 8, 64, 1);
+    let matching = include_matching_of_names(4);
+    for t in ALL_BINARY_TERMS {
+        let full = binary_peak_bytes(BinOp::Add, Some(&matching), &m, &one);
+        let without = binary_peak_bytes_without(BinOp::Add, Some(&matching), &m, &one, t);
+        assert_eq!(
+            without < full,
+            shipped_bin(t) > 0,
+            "{t:?}: suppressing the term must lower the model exactly when its coefficient is \
+             non-zero (shipped = {})",
+            shipped_bin(t)
+        );
+    }
+}
+
 /// Derives every coefficient from a fresh ladder run and asserts the
 /// SHIPPED constant covers it. The measured `rate_max` is recorded in
 /// each constant's doc comment; regeneration is `zz_witness_report`.

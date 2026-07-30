@@ -10348,10 +10348,33 @@ pub const W_PAIR: u64 = 227;
 /// 1, 2, 4 and 64 — the peak is **21 204 B at every length**, on both
 /// skews, so the rate is 0. Measured further across 8 (shape x grouping x
 /// operator) combinations at lengths 1, 2, 4, 8 and 64: flat from length
-/// 2 onward everywhere. The term is kept in the model's published form
-/// (plan v14 §4) but is inert; what defends the claim is
-/// `chain_depth_does_not_multiply_peak_memory` in the witness, which
-/// reddens if a future change ever makes depth accumulate.
+/// 2 onward everywhere.
+///
+/// # DO NOT DELETE THIS TERM BECAUSE IT IS ZERO
+///
+/// **The zero is contingent on a COMPILER SPECIALISATION, not on the
+/// nature of the computation.** Same-size in-place collect is an
+/// optimisation the standard library is free to apply or not: it holds
+/// because `InstantSeries` and `VectorSample` have identical layout and
+/// because `Zip`/`FilterMap` over `vec::IntoIter` happen to implement
+/// `SourceIter` + `InPlaceIterable` today. Insert an expanding
+/// aggregation arm, change a collect's source shape, or add a stage whose
+/// output type differs in layout from its input, and the second buffer
+/// reappears — at which point a DELETED term would silently under-bound
+/// the model and [`MAX_POST_AGG_BYTES`] would stop covering the real
+/// peak. A bound that is too small is worse than no bound, because it is
+/// trusted.
+///
+/// So the term stays in the model's published form (plan v14 §4), inert,
+/// with `chain_depth_does_not_multiply_peak_memory` in
+/// `tests/logql_post_agg_witness.rs` as the guard: it asserts that depth
+/// beyond TWO stages adds nothing and that at most two stage buffers are
+/// ever concurrent, over 8 shapes, and reddens the moment either stops
+/// being true. Re-derive the coefficient then; do not delete the axis.
+///
+/// (Second occurrence in a week of `vec::IntoIter`'s in-place
+/// specialisation falsifying a stated premise — issue #272's §8.6
+/// correction was the first. It is a genuinely surprising optimisation.)
 pub const W_STAGE_SERIES: u64 = 0;
 
 /// `W_GROUPNAME` — bytes per (series x `by`-clause byte).
