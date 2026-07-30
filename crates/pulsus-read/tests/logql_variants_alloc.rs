@@ -124,7 +124,6 @@
 //! | F-f | ClientAggState::finish absent vs non-absent | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 vs Phi4/Phi5 |
 //! | F-g | absent: the finish-time absent_labels clone (1 + 2k) | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (k = 2 gives 5) |
 //! | F-h | absent instant: present empty vec![sample] vs empty Vector | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (empty-present arm; no rows) |
-//! | F-i | absent RANGE arm of ClientAggState::finish (bucket_grid) | ClientAggState::finish | exec.rs ClientAggState::finish | UNREACH | Instant states are built only for instant windows; a routing change breaks Phi1/Phi3's RangeSlideState-derived constants |
 //! | F-j | non-absent fan_out label_groups vs fp_groups collects | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi5 / Phi4 (0 each: empty maps reserve nothing) |
 //! | F-k | non-absent instant emit | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi4/Phi5 (0) |
 //! | F-l | RangeSlideState finish prologue (flush early-return, cur None) | RangeSlideState::finish, RangeSlideState::finish_in_place, RangeSlideState::flush_collision | exec.rs RangeSlideState::finish_in_place | NIL | Phi1-Phi3 |
@@ -137,8 +136,8 @@
 //! | F-s | per-variant charge release (integer arithmetic) | VariantsAggState::finish_in_place | exec.rs VariantsAggState::finish_in_place | NIL | finish asserts charged == base |
 //! | F-t | the forwarding loop hands each sub-state the SAME slice | VariantsAggState::push_rows | exec.rs VariantsAggState::push_rows | NIL | Phi1-Phi7; row-bearing work is F-d's NOT-EXEC |
 //! | F-u | VariantsAggState::finish delegation + post-condition | VariantsAggState::finish | exec.rs VariantsAggState::finish | NIL | Phi1-Phi7 |
-//! | F-v | non-absent RANGE emit arm of ClientAggState::finish | ClientAggState::finish | exec.rs ClientAggState::finish | UNREACH | same routing citation as F-i |
 //! | F-w | apply_vector_aggs for an aggregation-bearing variant | VariantsAggState::finish_in_place | exec.rs apply_vector_aggs | R4 (iii) | input bounded by AggCaps::divided(n).series; G2/G3 slopes |
+//! | F-z | instant sub-state narrowing refusal (issue #236 Part D) | VariantsAggState::new | exec.rs VariantsAggState::new as_instant/ok_or_else | UNREACH | a stepped window routes to the Range arm above, and the witness cannot be minted from one |
 //! | F-y | one mutating group's cell drain (expanded / delta / sample sweep) | RangeSlideState::drain_group | exec.rs RangeSlideState::drain_group | NOT-EXEC | rows.is_empty() => no mutating group exists => never called (F-d's premise) |
 //! | F-x | issue #236 Part B fold containers (dense slots, live map) | RangeSlideState::finish_in_place | exec.rs RangeSlideState::emit + VectorAggFold | NOT-EXEC | run_variants never calls attach_fold; fold is None here |
 //!
@@ -1456,8 +1455,16 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "exec.rs",
         ty: Some("VariantsAggState"),
         anchor: "new",
-        branches: 11,
+        // Issue #236 Part D: the instant sub-state arm narrows the
+        // window to an `InstantWindow` witness before constructing
+        // (`.as_instant` + the `.ok_or_else` refusal), 11 -> 12
+        // branches. Regenerated with `zz_print_frame_censuses`. W-MEM
+        // disposition: **NIL** — a `match` on a `Copy` enum and an
+        // `Option`; the `.to_string` is inside the refusal arm, which
+        // is unreachable (a stepped window routes to `Range` above).
+        branches: 12,
         callees: &[
+            ".as_instant",
             ".as_u64",
             ".charged_bytes",
             ".client",
@@ -1468,8 +1475,10 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             ".len",
             ".map_err",
             ".max",
+            ".ok_or_else",
             ".push",
             ".rate_window_ns",
+            ".to_string",
             ".window",
             "Instant",
             "Ok",
@@ -1548,17 +1557,17 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "exec.rs",
         ty: Some("ClientAggState"),
         anchor: "new",
-        branches: 3,
+        // Issue #236 Part D: the stepped-grid guard is deleted with the
+        // `InstantWindow` parameter — a stepped window can no longer
+        // reach this constructor, so the branch it defended is gone
+        // (3 -> 1 branches). Regenerated with `zz_print_frame_censuses`.
+        // W-MEM disposition: **unchanged** — row C-e still prices the
+        // `base_labels` snapshot, which is the only allocation here.
+        branches: 1,
         callees: &[
-            ".as_u64",
-            ".end_ns",
             ".insert",
-            ".map",
             ".metric_mutates_labels",
-            ".start_ns",
-            ".step_ns",
             "Ok",
-            "ensure_grid_resolution",
             "new",
             "series_labels",
         ],
@@ -1684,14 +1693,16 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "exec.rs",
         ty: Some("ClientAggState"),
         anchor: "push_rows",
-        // 21st branch: issue #230's `?` on the now-fallible
-        // `run_metric_into` (template render-budget breach → the
-        // bounded 422). Row-path only — covered by F-d's NOT-EXEC
-        // disposition (rows.is_empty() in every W_fin window).
+        // Issue #236 Part D: the per-group `BTreeMap` collapses to one
+        // `BucketAcc`, so the bucket-entry match moves inside each
+        // grouping arm and `bucket_of`/`INSTANT_BUCKET` leave the frame;
+        // `present` becomes a flag, so `.insert` on the bucket set goes
+        // too. Regenerated with `zz_print_frame_censuses`. W-MEM
+        // disposition: **NIL**, unchanged (row F-b) — the fold's
+        // per-row work is the same minus one map lookup.
         branches: 21,
         callees: &[
             ".add",
-            ".as_u64",
             ".collect",
             ".contains_key",
             ".entry",
@@ -1703,15 +1714,12 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             ".key",
             ".len",
             ".map",
-            ".or_default",
             ".run_metric_into",
             ".sort_unstable",
-            ".step_ns",
             ".to_string",
             "Err",
             "Ok",
             "QueryTooBroad",
-            "bucket_of",
             "charge_group_bytes",
             "check_surviving_error",
             "group_entry_bytes",
@@ -1724,37 +1732,25 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "exec.rs",
         ty: Some("ClientAggState"),
         anchor: "finish",
-        // Issue #236 P1: the non-mutating `fp_groups` arm gained its
-        // discharge leg, whose `base_labels.get(&fp)?` adds one
-        // `syn::ExprTry` branch (7 → 8) and the `Some(...)` callee.
-        // Regenerated with `zz_print_frame_censuses`. W-MEM disposition:
-        // **NIL** — the `?` replaces the previous `.map(...)` on the same
-        // `Option`, so the arm's allocation shape is unchanged (one
-        // `labels.clone()` per surviving group, exactly as before); the
-        // added work is one integer subtraction per group.
-        branches: 8,
+        // Issue #236 Part D: the state is instant-only by construction,
+        // so the two stepped arms — the `bucket_grid` absence walk and
+        // the per-bucket `Matrix` emit — are DELETED, not merely unused
+        // (10 -> 5 branches, `bucket_grid`/`Matrix`/`MatrixSeries`/
+        // `INSTANT_BUCKET` leave the frame). Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: rows F-i and
+        // F-v classified exactly those two arms as UNREACH and are
+        // deleted with them.
+        branches: 5,
         callees: &[
-            ".as_u64",
             ".clone",
             ".collect",
-            ".contains",
-            ".end_ns",
-            ".filter",
             ".filter_map",
             ".finish",
             ".get",
             ".into_iter",
-            ".is_empty",
-            ".is_none",
             ".map",
-            ".remove",
-            ".start_ns",
-            ".step_ns",
-            ".unwrap_or",
             "Some",
-            "Matrix",
             "Vector",
-            "bucket_grid",
             "debug_assert_eq!",
             "discharge_group_bytes",
             "group_entry_bytes",
@@ -1954,7 +1950,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
 /// W_ctor + 23 W_fin = 46 rows, each with exactly ONE disposition. The
 /// module-doc tables are a RENDERING of this const (assertion 7), never
 /// the source.
-static INVENTORY: [Row; 48] = [
+static INVENTORY: [Row; 47] = [
     // --- W_plan (11) ---
     Row {
         id: "P-a",
@@ -2252,15 +2248,6 @@ static INVENTORY: [Row; 48] = [
         covered_by: "Phi6/Phi7 (empty-present arm; no rows)",
     },
     Row {
-        id: "F-i",
-        window: Win::Fin,
-        what: "absent RANGE arm of ClientAggState::finish (bucket_grid)",
-        frames: &["ClientAggState::finish"],
-        site: "exec.rs ClientAggState::finish",
-        disp: Disp::Unreach,
-        covered_by: "Instant states are built only for instant windows; a routing change breaks Phi1/Phi3's RangeSlideState-derived constants",
-    },
-    Row {
         id: "F-j",
         window: Win::Fin,
         what: "non-absent fan_out label_groups vs fp_groups collects",
@@ -2379,15 +2366,6 @@ static INVENTORY: [Row; 48] = [
         covered_by: "Phi1-Phi7",
     },
     Row {
-        id: "F-v",
-        window: Win::Fin,
-        what: "non-absent RANGE emit arm of ClientAggState::finish",
-        frames: &["ClientAggState::finish"],
-        site: "exec.rs ClientAggState::finish",
-        disp: Disp::Unreach,
-        covered_by: "same routing citation as F-i",
-    },
-    Row {
         id: "F-w",
         window: Win::Fin,
         what: "apply_vector_aggs for an aggregation-bearing variant",
@@ -2395,6 +2373,15 @@ static INVENTORY: [Row; 48] = [
         site: "exec.rs apply_vector_aggs",
         disp: Disp::R4(3),
         covered_by: "input bounded by AggCaps::divided(n).series; G2/G3 slopes",
+    },
+    Row {
+        id: "F-z",
+        window: Win::Fin,
+        what: "instant sub-state narrowing refusal (issue #236 Part D)",
+        frames: &["VariantsAggState::new"],
+        site: "exec.rs VariantsAggState::new as_instant/ok_or_else",
+        disp: Disp::Unreach,
+        covered_by: "a stepped window routes to the Range arm above, and the witness cannot be minted from one",
     },
     Row {
         id: "F-y",
@@ -2417,7 +2404,7 @@ static INVENTORY: [Row; 48] = [
 ];
 
 /// The 15 delegating boundary callees (see [`Boundary`]).
-static BOUNDARY_CALLEES: [Boundary; 15] = [
+static BOUNDARY_CALLEES: [Boundary; 13] = [
     Boundary {
         callee: ".run_metric_into",
         rows: &["F-d"],
@@ -2430,11 +2417,6 @@ static BOUNDARY_CALLEES: [Boundary; 15] = [
     },
     Boundary {
         callee: ".stage_member",
-        rows: &["F-d"],
-        disp: Disp::NotExec,
-    },
-    Boundary {
-        callee: "bucket_of",
         rows: &["F-d"],
         disp: Disp::NotExec,
     },
@@ -2467,11 +2449,6 @@ static BOUNDARY_CALLEES: [Boundary; 15] = [
         callee: ".covering_k",
         rows: &["F-d", "F-y"],
         disp: Disp::NotExec,
-    },
-    Boundary {
-        callee: "bucket_grid",
-        rows: &["F-i"],
-        disp: Disp::Unreach,
     },
     Boundary {
         callee: "series_labels",
@@ -2572,11 +2549,11 @@ fn g4_frame_census_and_inventory_closure() {
         );
     }
     // (3) inventory size and per-window counts; unique ids.
-    assert_eq!(INVENTORY.len(), 48);
+    assert_eq!(INVENTORY.len(), 47);
     let count = |w: Win| INVENTORY.iter().filter(|r| r.window == w).count();
     assert_eq!(
         (count(Win::Plan), count(Win::Ctor), count(Win::Fin)),
-        (11, 12, 25)
+        (11, 12, 24)
     );
     let mut ids = BTreeSet::new();
     for r in &INVENTORY {
@@ -2621,7 +2598,7 @@ fn g4_frame_census_and_inventory_closure() {
     // ≥1 pinned callee set; its rows exist with the SAME disposition;
     // and every frame whose pinned set contains the name is listed in
     // one of those rows' frames.
-    assert_eq!(BOUNDARY_CALLEES.len(), 15);
+    assert_eq!(BOUNDARY_CALLEES.len(), 13);
     for b in &BOUNDARY_CALLEES {
         let carriers: Vec<String> = PER_VARIANT_FRAMES
             .iter()

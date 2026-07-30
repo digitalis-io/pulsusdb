@@ -1126,12 +1126,23 @@ impl LogQlEngine {
             let folded = range.folded_aggs();
             (MetricAggState::Range(Box::new(range)), folded)
         } else {
+            // `is_range` is `mp.step_ns.is_some()` and `metric_plan_window`
+            // builds a `Range` window exactly then, so this narrowing
+            // cannot fail — but it is expressed as a narrowing rather than
+            // asserted, so the instant state simply cannot be built for a
+            // stepped window (issue #236 Part D).
+            let instant = window
+                .as_instant()
+                .ok_or_else(|| ReadError::PipelineInvalid {
+                    reason: "internal: a stepped window reached the instant aggregation state"
+                        .to_string(),
+                })?;
             (
                 MetricAggState::Instant(Box::new(ClientAggState::new(
                     compiled,
                     &meta,
                     client,
-                    window,
+                    instant,
                     mp.rate_window_ns,
                     AggCaps::DEFAULT,
                 )?)),
@@ -3194,32 +3205,10 @@ fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
     }
 }
 
-/// The instant-mode bucket key (any constant works — there is exactly
-/// one bucket).
-const INSTANT_BUCKET: i64 = 0;
-
 /// How many rows the streaming client-aggregation fetch buffers between
 /// folds into [`ClientAggState`] — bounds transient memory without
 /// per-row fold overhead (review round 1, finding 1).
 const CLIENT_AGG_CHUNK_ROWS: usize = 8_192;
-
-fn bucket_of(ts_ns: i64, step_ns: Option<u64>) -> i64 {
-    match step_ns {
-        Some(step) => {
-            // i128 intermediates (review round 3): for a timestamp near
-            // `i64::MIN` with a non-dividing step, the FLOORED quotient
-            // re-multiplied by step lands up to one step below the
-            // timestamp — which can sit just below `i64::MIN` (e.g.
-            // `i64::MIN + 1` at step 3 floors to `i64::MIN - 1`), a
-            // debug panic / release wrap in i64. `step_ns > 0` and
-            // `<= i64::MAX` are guaranteed by `ClientAggState::new`'s
-            // grid guard before any row is bucketed.
-            let step = step as i128;
-            clamp_bucket((ts_ns as i128).div_euclid(step) * step)
-        }
-        None => INSTANT_BUCKET,
-    }
-}
 
 /// Converts an i128 bucket start back to the i64 point-timestamp domain.
 /// Only the sliver within one step below `i64::MIN` (or, symmetrically,
@@ -3752,18 +3741,80 @@ impl AggCaps {
     }
 }
 
+/// The instant-window witness, in a module of its own so that its field
+/// is private to it (issue #236 Part D).
+///
+/// The nesting is the whole point and is not decoration. A bare
+/// `struct InstantWindow;` is a UNIT struct: any line in `exec.rs` can
+/// write `InstantWindow` and mint one — and every `ClientAggState::new`
+/// call site is in `exec.rs`, so such a guard would be merely
+/// *unreachable today*, not *unrepresentable*. With the field private to
+/// this module, [`InstantWindow::mint`] is the only way to obtain one
+/// anywhere in the crate, INCLUDING this file's own `mod tests`.
+mod instant_window {
+    use super::ClientWindow;
+
+    /// A WITNESS that a [`ClientWindow`] was narrowed to its instant
+    /// case.
+    ///
+    /// `ClientAggState`'s per-group accumulator is a SINGLE `BucketAcc`,
+    /// which is sound only because an instant window has exactly one
+    /// bucket. Requiring this witness at the constructor keeps that true
+    /// without a runtime check nobody re-reads — and it was already true
+    /// at every call site, so nothing is newly forbidden.
+    ///
+    /// It carries NO bounds, a deliberate difference from plan v14's
+    /// "explicit instant bounds": nothing in an instant state reads
+    /// them. The two former readers — the stepped-grid guard in the
+    /// constructor and the `bucket_grid` walk in `finish` — are both
+    /// deleted by Part D, and a field that exists only to look used is
+    /// worse than none. The witness is also the stronger of the two
+    /// shapes: a pair of `i64` bounds can be hand-derived from a stepped
+    /// window, an unforgeable witness cannot.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct InstantWindow(());
+
+    impl InstantWindow {
+        /// The ONE mint. Refuses a stepped window, so a caller has to say
+        /// what it does with one instead of assuming it cannot get one.
+        pub(super) fn mint(window: ClientWindow) -> Option<Self> {
+            match window {
+                ClientWindow::Instant { .. } => Some(InstantWindow(())),
+                ClientWindow::Range { .. } => None,
+            }
+        }
+    }
+}
+
+use instant_window::InstantWindow;
+
+impl ClientWindow {
+    /// Narrows to the INSTANT case, or `None` for a stepped window.
+    fn as_instant(self) -> Option<InstantWindow> {
+        InstantWindow::mint(self)
+    }
+}
+
 /// Streaming client-aggregation state (issue M6-10, review round 1
 /// finding 1): rows fold into reducer state as they arrive so process
-/// memory stays `O(buckets x series)` (+ the caller's bounded chunk)
-/// instead of retaining the whole raw scan. The pure
-/// [`run_client_agg_rows`] wrapper drives it over a slice for the
-/// hermetic golden/allocation suites; the engine drives it chunk-wise
-/// off the live row stream.
+/// memory stays `O(series)` (+ the caller's bounded chunk) instead of
+/// retaining the whole raw scan. The pure [`run_client_agg_rows`]
+/// wrapper drives it over a slice for the hermetic golden/allocation
+/// suites; the engine drives it chunk-wise off the live row stream.
+///
+/// **Instant-only by construction** (issue #236 Part D). It always was —
+/// `run_metric_client` and `run_client_agg_rows` route every stepped
+/// window to [`RangeSlideState`], and `bucket_of` returned the single
+/// [`INSTANT_BUCKET`] with no step — so the per-group
+/// `BTreeMap<i64, BucketAcc>` always held exactly one entry, and the map
+/// (a ~1 KB/group allocation `group_entry_bytes` never saw: an #227
+/// accounting hole) was pure overhead. The constructor now takes an
+/// [`InstantWindow`], so the dead stepped branches are not merely unused
+/// but unrepresentable.
 #[derive(Debug)]
 struct ClientAggState<'q> {
     compiled: &'q super::pipeline::CompiledPipeline,
     client: &'q ClientAgg,
-    window: ClientWindow,
     rate_window_ns: Option<u64>,
     /// Base labels once per fingerprint, in the same shape the SQL
     /// metric path exposes (`series_labels`: canonical JSON labels +
@@ -3771,14 +3822,19 @@ struct ClientAggState<'q> {
     /// sorted).
     base_labels: HashMap<u64, Vec<(String, String)>>,
     fan_out: bool,
-    /// `absent_over_time`'s selector-wide presence set (plan v2 D2).
-    present: BTreeSet<i64>,
+    /// `absent_over_time`'s selector-wide presence (plan v2 D2). A FLAG,
+    /// not a bucket set, since issue #236 Part D: an instant window has
+    /// exactly one bucket, so the set could only ever hold
+    /// `{INSTANT_BUCKET}` and the only question ever asked of it was
+    /// whether it was empty.
+    present: bool,
     /// Non-mutating pipelines group by fingerprint (zero per-row
-    /// allocations — the alloc-gate path).
-    fp_groups: HashMap<u64, BTreeMap<i64, BucketAcc>>,
+    /// allocations — the alloc-gate path). ONE accumulator per group,
+    /// not a bucket map — see [`ClientAggState`]'s instant-only contract.
+    fp_groups: HashMap<u64, BucketAcc>,
     /// Label-mutating/unwrapping pipelines group by the rendered final
     /// label set.
-    label_groups: HashMap<String, (LabelSet, BTreeMap<i64, BucketAcc>)>,
+    label_groups: HashMap<String, (LabelSet, BucketAcc)>,
     /// Total values retained across every quantile accumulator, charged
     /// against [`MAX_QUANTILE_VALUES`].
     quantile_values: u64,
@@ -3799,25 +3855,22 @@ struct ClientAggState<'q> {
 }
 
 impl<'q> ClientAggState<'q> {
-    /// Validates the bucket grid BEFORE any accumulation (finding 2) and
-    /// snapshots the per-fingerprint base labels.
+    /// Snapshots the per-fingerprint base labels.
+    ///
+    /// The former stepped-grid guard is gone with the [`InstantWindow`]
+    /// parameter (issue #236 Part D): it existed to make a stepped window
+    /// that reached here obey the Loki-exact resolution rule, and a
+    /// stepped window can no longer reach here. `Result` is kept because
+    /// the constructor is one of the fallible-by-contract seams the
+    /// variants fan-out charges through.
     fn new(
         compiled: &'q super::pipeline::CompiledPipeline,
         meta: &HashMap<u64, StreamMetaRow>,
         client: &'q ClientAgg,
-        window: ClientWindow,
+        _window: InstantWindow,
         rate_window_ns: Option<u64>,
         caps: AggCaps,
     ) -> Result<Self, ReadError> {
-        if let Some(step) = window.step_ns().map(|d| d.as_u64()) {
-            // Defense-in-depth only: an instant window has no step, and the
-            // range path routes to `RangeSlideState` — but if a stepped
-            // window ever reached here it must obey the SAME Loki-exact
-            // resolution rule as every other grid guard (review round 7,
-            // finding 1: two disagreeing counts turned an admitted request
-            // into a 422).
-            ensure_grid_resolution(window.start_ns(), window.end_ns(), step)?;
-        }
         let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
         for (fp, m) in meta {
             base_labels.insert(*fp, series_labels(m));
@@ -3825,11 +3878,10 @@ impl<'q> ClientAggState<'q> {
         Ok(ClientAggState {
             compiled,
             client,
-            window,
             rate_window_ns,
             base_labels,
             fan_out: compiled.metric_mutates_labels(),
-            present: BTreeSet::new(),
+            present: false,
             fp_groups: HashMap::new(),
             label_groups: HashMap::new(),
             quantile_values: 0,
@@ -3863,11 +3915,11 @@ impl<'q> ClientAggState<'q> {
                 MetricRun::Kept { line, value } => (line, value),
             };
             check_surviving_error(&scratch)?;
-            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns().map(|d| d.as_u64()));
             if is_absent {
-                // Selector-wide presence (plan v2 D2): count surviving
-                // lines per bucket across ALL fingerprints/label sets.
-                self.present.insert(bucket);
+                // Selector-wide presence (plan v2 D2): did ANY line
+                // survive, across every fingerprint and label set. One
+                // bucket, so one flag (issue #236 Part D).
+                self.present = true;
                 continue;
             }
             let v = match self.client.value {
@@ -3909,11 +3961,17 @@ impl<'q> ClientAggState<'q> {
                     }));
                 }
             }
-            let buckets = if self.fan_out {
+            // ONE accumulator per group (issue #236 Part D): an instant
+            // window has a single bucket, so each arm either seeds the
+            // group's accumulator or folds into it — there is no bucket
+            // map to index.
+            if self.fan_out {
                 scratch.sort_unstable();
                 let key = render_labels_json_sorted(&scratch);
                 match self.label_groups.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(e) => &mut e.into_mut().1,
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        e.into_mut().1.add(row.timestamp_ns, v);
+                    }
                     std::collections::hash_map::Entry::Vacant(e) => {
                         let labels: LabelSet = scratch
                             .iter()
@@ -3934,7 +3992,7 @@ impl<'q> ClientAggState<'q> {
                             group_entry_bytes(e.key(), &labels, INSTANT_GROUP_SLOT),
                             self.caps.group_bytes,
                         )?;
-                        &mut e.insert((labels, BTreeMap::new())).1
+                        e.insert((labels, BucketAcc::new(op, row.timestamp_ns, v)));
                     }
                 }
             } else {
@@ -3953,14 +4011,13 @@ impl<'q> ClientAggState<'q> {
                         self.caps.group_bytes,
                     )?;
                 }
-                self.fp_groups.entry(row.fingerprint).or_default()
-            };
-            match buckets.entry(bucket) {
-                std::collections::btree_map::Entry::Occupied(mut e) => {
-                    e.get_mut().add(row.timestamp_ns, v)
-                }
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(BucketAcc::new(op, row.timestamp_ns, v));
+                match self.fp_groups.entry(row.fingerprint) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        e.get_mut().add(row.timestamp_ns, v);
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(BucketAcc::new(op, row.timestamp_ns, v));
+                    }
                 }
             }
         }
@@ -3968,40 +4025,30 @@ impl<'q> ClientAggState<'q> {
     }
 
     /// Finishes every accumulator into the metric result.
-    /// `absent_over_time` emits at most ONE series over the (pre-capped)
-    /// bucket grid; the other reducers emit per surviving group.
+    /// `absent_over_time` emits at most ONE sample; the other reducers
+    /// emit one per surviving group.
+    ///
+    /// Always a `Vector` (issue #236 Part D): the state is instant-only by
+    /// construction, so the former stepped arms — the `bucket_grid` walk
+    /// for absence and the per-bucket `Matrix` emit — were dead, and are
+    /// deleted rather than left as a second reading of a contract the type
+    /// already states.
     fn finish(self) -> QueryResult {
-        let is_instant = self.window.step_ns().is_none();
         if matches!(self.client.range_op, RangeAggOp::AbsentOverTime) {
             let labels: LabelSet = self.client.absent_labels.clone();
-            return if is_instant {
-                if self.present.is_empty() {
-                    QueryResult::Vector(vec![VectorSample { labels, value: 1.0 }])
-                } else {
-                    QueryResult::Vector(Vec::new())
-                }
+            return if self.present {
+                QueryResult::Vector(Vec::new())
             } else {
-                let step = self.window.step_ns().map(|d| d.as_u64()).unwrap_or(0);
-                let points: Vec<(i64, f64)> =
-                    bucket_grid(self.window.start_ns(), self.window.end_ns(), step)
-                        .into_iter()
-                        .filter(|b| !self.present.contains(b))
-                        .map(|b| (b, 1.0))
-                        .collect();
-                if points.is_empty() {
-                    QueryResult::Matrix(Vec::new())
-                } else {
-                    QueryResult::Matrix(vec![MatrixSeries { labels, points }])
-                }
+                QueryResult::Vector(vec![VectorSample { labels, value: 1.0 }])
             };
         }
 
         let base_labels = self.base_labels;
         let mut group_bytes = self.group_bytes;
-        let groups: Vec<(LabelSet, BTreeMap<i64, BucketAcc>)> = if self.fan_out {
+        let groups: Vec<(LabelSet, BucketAcc)> = if self.fan_out {
             self.label_groups
                 .into_iter()
-                .map(|(key, (labels, buckets))| {
+                .map(|(key, (labels, acc))| {
                     // Round 6 symmetry: sized over the same unmodified
                     // key/labels as the charge, released as each entry is
                     // consumed (key dropped, labels move to the output).
@@ -4009,13 +4056,13 @@ impl<'q> ClientAggState<'q> {
                         &mut group_bytes,
                         group_entry_bytes(&key, &labels, INSTANT_GROUP_SLOT),
                     );
-                    (labels, buckets)
+                    (labels, acc)
                 })
                 .collect()
         } else {
             self.fp_groups
                 .into_iter()
-                .filter_map(|(fp, buckets)| {
+                .filter_map(|(fp, acc)| {
                     // Issue #236 P1's discharge leg, with the SAME symmetry
                     // the fan-out arm has had since round 6: sized over the
                     // same `base_labels` value the charge used (empty key,
@@ -4030,7 +4077,7 @@ impl<'q> ClientAggState<'q> {
                         &mut group_bytes,
                         group_entry_bytes("", l, FP_GROUP_SLOT),
                     );
-                    Some((l.clone(), buckets))
+                    Some((l.clone(), acc))
                 })
                 .collect()
         };
@@ -4041,32 +4088,15 @@ impl<'q> ClientAggState<'q> {
         let op = self.client.range_op;
         let rate_window_ns = self.rate_window_ns;
         let param = self.client.param;
-        if is_instant {
-            QueryResult::Vector(
-                groups
-                    .into_iter()
-                    .filter_map(|(labels, mut buckets)| {
-                        buckets.remove(&INSTANT_BUCKET).map(|acc| VectorSample {
-                            labels,
-                            value: acc.finish(op, rate_window_ns, param),
-                        })
-                    })
-                    .collect(),
-            )
-        } else {
-            QueryResult::Matrix(
-                groups
-                    .into_iter()
-                    .map(|(labels, buckets)| MatrixSeries {
-                        labels,
-                        points: buckets
-                            .into_iter()
-                            .map(|(b, acc)| (b, acc.finish(op, rate_window_ns, param)))
-                            .collect(),
-                    })
-                    .collect(),
-            )
-        }
+        QueryResult::Vector(
+            groups
+                .into_iter()
+                .map(|(labels, acc)| VectorSample {
+                    labels,
+                    value: acc.finish(op, rate_window_ns, param),
+                })
+                .collect(),
+        )
     }
 }
 
@@ -4495,14 +4525,14 @@ const MUT_GROUP_SLOT: usize = size_of::<(String, MutGroup)>();
 
 /// The map-entry slot the instant path's group charge sizes
 /// (`label_groups`).
-const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BTreeMap<i64, BucketAcc>))>();
+const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BucketAcc))>();
 
 /// The map-entry slot the non-mutating instant path's group charge sizes
 /// (`fp_groups`) — issue #236 P1. The key is a `u64` fingerprint, not a
 /// rendered string, so the charge passes an empty key to
 /// [`group_entry_bytes`] and the `LabelSet` term prices the hydrated
 /// `base_labels` value the group stands for.
-const FP_GROUP_SLOT: usize = size_of::<(u64, BTreeMap<i64, BucketAcc>)>();
+const FP_GROUP_SLOT: usize = size_of::<(u64, BucketAcc)>();
 
 /// The label set a fingerprint with no hydrated meta stands for — issue
 /// #236 P2 sizes its charge over this so the charge/discharge pair stays
@@ -6121,11 +6151,19 @@ pub fn run_client_agg_rows_folded(
         let result = state.finish()?;
         return Ok(apply_vector_aggs(result, &aggs[..aggs.len() - folded]));
     }
+    // The `Range` arm returned above, so this narrowing cannot fail; it
+    // is a narrowing rather than an assertion so the instant state cannot
+    // be built for a stepped window at all (issue #236 Part D).
+    let instant = window
+        .as_instant()
+        .ok_or_else(|| ReadError::PipelineInvalid {
+            reason: "internal: a stepped window reached the instant aggregation state".to_string(),
+        })?;
     let mut state = ClientAggState::new(
         compiled,
         meta,
         client,
-        window,
+        instant,
         rate_window_ns,
         AggCaps::DEFAULT,
     )?;
@@ -6738,11 +6776,19 @@ impl<'q> VariantsAggState<'q> {
                     caps,
                 )?))
             } else {
+                let instant =
+                    spec.window()
+                        .as_instant()
+                        .ok_or_else(|| ReadError::PipelineInvalid {
+                            reason: "internal: a stepped variant window reached the instant \
+                                     aggregation state"
+                                .to_string(),
+                        })?;
                 MetricAggState::Instant(Box::new(ClientAggState::new(
                     compiled,
                     meta,
                     spec.client(),
-                    spec.window(),
+                    instant,
                     spec.rate_window_ns(),
                     caps,
                 )?))
@@ -10184,6 +10230,16 @@ mod tests {
         }
     }
 
+    /// Narrows an instant `ClientWindow` for [`ClientAggState::new`]
+    /// (issue #236 Part D). Tests cannot fabricate the witness either —
+    /// `InstantWindow`'s field is private to `mod instant_window`, so
+    /// `mint` is the only source anywhere in the crate, `mod tests`
+    /// included; a test that hands a stepped window here fails at the
+    /// `expect`, not silently.
+    fn instant_of(window: ClientWindow) -> InstantWindow {
+        window.as_instant().expect("an instant window")
+    }
+
     fn slide_rows(fp: u64, samples: &[(i64, &str)]) -> Vec<MetricScanRow> {
         samples
             .iter()
@@ -10665,6 +10721,229 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Issue #236 Part D — `ClientAggState` is instant-only.
+    // -----------------------------------------------------------------
+
+    /// AC 16 — a stepped window cannot reach [`ClientAggState`].
+    ///
+    /// The domain is the `ClientWindow` enum, which has exactly two
+    /// variants, so it is enumerated rather than sampled. The guard is
+    /// UNREPRESENTABILITY, not unreachability: `InstantWindow`'s single
+    /// field is private to `mod instant_window`, so no line in the crate
+    /// — including this one — can write the witness directly, and
+    /// `mint` is the only source. A bare unit struct would have been
+    /// merely unreachable, since every `ClientAggState::new` call site
+    /// lives in this file.
+    #[test]
+    fn a_stepped_window_cannot_mint_the_instant_witness() {
+        let instant = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        assert!(
+            instant.as_instant().is_some(),
+            "an instant window must narrow"
+        );
+        // Every stepped shape the constructor could be handed: the
+        // narrowest legal grid and a wide one.
+        for (start, end, step, range) in [(0i64, 0i64, 1u64, 1u64), (0, 1_000, 10, 45)] {
+            let stepped = slide_window(start, end, step, range);
+            assert!(
+                stepped.as_instant().is_none(),
+                "a stepped window must NOT narrow: {stepped:?}"
+            );
+        }
+    }
+
+    /// AC 16 — the state's result is a `Vector`, always.
+    ///
+    /// The former stepped arms of `finish` (the `bucket_grid` absence
+    /// walk and the per-bucket `Matrix` emit) are deleted, so there is no
+    /// input that makes this state emit a matrix. Driven over all four
+    /// shapes: absent and non-absent, fan-out and non-fan-out.
+    #[test]
+    fn the_instant_state_can_only_emit_a_vector() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let rows = slide_rows(1, &[(10, "a=1"), (20, "a=2"), (30, "a=3")]);
+        for (op, value, pipeline) in [
+            // non-absent, non-fan-out
+            (RangeAggOp::CountOverTime, ClientValue::Count, r#"{x="y"}"#),
+            // non-absent, fan-out
+            (
+                RangeAggOp::MaxOverTime,
+                ClientValue::Unwrap,
+                r#"{x="y"} | logfmt | unwrap a"#,
+            ),
+            // absent, non-fan-out
+            (RangeAggOp::AbsentOverTime, ClientValue::Count, r#"{x="y"}"#),
+        ] {
+            for rows in [&rows[..], &[][..]] {
+                let client = ClientAgg {
+                    pipeline: parse_pipeline(pipeline),
+                    value,
+                    range_op: op,
+                    param: None,
+                    absent_labels: vec![("app".to_string(), "a".to_string())],
+                };
+                let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+                let mut state = ClientAggState::new(
+                    &compiled,
+                    &meta,
+                    &client,
+                    instant_of(window),
+                    None,
+                    AggCaps::DEFAULT,
+                )
+                .unwrap();
+                state.push_rows(rows).expect("fold");
+                let out = state.finish();
+                assert!(
+                    matches!(out, QueryResult::Vector(_)),
+                    "{op:?} over {} row(s) must emit a vector, got {out:?}",
+                    rows.len()
+                );
+            }
+        }
+    }
+
+    /// Every row folds into its group's ONE accumulator, on BOTH
+    /// grouping arms.
+    ///
+    /// The collapse of the per-group `BTreeMap` to a single `BucketAcc`
+    /// moved the fold into each arm, so each arm now owns a
+    /// seed-or-accumulate decision of its own. A mutant that made the
+    /// non-fan-out arm REPLACE rather than fold was caught only by six
+    /// `variants(...)` goldens — which drive the same state for an
+    /// unrelated reason and would stop covering it the moment those
+    /// fixtures changed. This pins the property where it lives, on both
+    /// arms and over ops whose value depends on every member.
+    #[test]
+    fn both_grouping_arms_fold_every_row_into_one_accumulator() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        // Four rows, ascending values, all in the one window.
+        let rows = slide_rows(1, &[(10, "a=1"), (20, "a=8"), (30, "a=2"), (40, "a=4")]);
+        // (op, value kind, non-fan-out pipeline, fan-out pipeline, want)
+        // The fan-out pipelines set a CONSTANT label, so both arms
+        // produce exactly one group and the only difference between them
+        // is which map the accumulator lives in.
+        let cases: [(RangeAggOp, ClientValue, &str, &str, f64); 3] = [
+            (
+                RangeAggOp::CountOverTime,
+                ClientValue::Count,
+                r#"{x="y"}"#,
+                r#"{x="y"} | label_format zone="eu""#,
+                4.0,
+            ),
+            (
+                RangeAggOp::BytesOverTime,
+                ClientValue::Bytes,
+                r#"{x="y"} | line_format "abcde""#,
+                r#"{x="y"} | line_format "abcde" | label_format zone="eu""#,
+                20.0,
+            ),
+            (
+                RangeAggOp::BytesOverTime,
+                ClientValue::Bytes,
+                r#"{x="y"}"#,
+                r#"{x="y"} | label_format zone="eu""#,
+                // "a=1" / "a=8" / "a=2" / "a=4" — 3 bytes each.
+                12.0,
+            ),
+        ];
+        for (op, value, plain, mutating, want) in cases {
+            for (arm, query) in [("non-fan-out", plain), ("fan-out", mutating)] {
+                let client = ClientAgg {
+                    pipeline: parse_pipeline(query),
+                    value,
+                    range_op: op,
+                    param: None,
+                    absent_labels: vec![],
+                };
+                let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+                assert_eq!(
+                    compiled.metric_mutates_labels(),
+                    arm == "fan-out",
+                    "{op:?} {arm}: the fixture must take the arm it names"
+                );
+                let mut state = ClientAggState::new(
+                    &compiled,
+                    &meta,
+                    &client,
+                    instant_of(window),
+                    None,
+                    AggCaps::DEFAULT,
+                )
+                .unwrap();
+                state.push_rows(&rows).expect("fold");
+                let QueryResult::Vector(items) = state.finish() else {
+                    panic!("instant results are vectors");
+                };
+                assert_eq!(items.len(), 1, "{op:?} {arm}: one group");
+                assert_eq!(
+                    items[0].value.to_bits(),
+                    want.to_bits(),
+                    "{op:?} {arm}: every row must fold into the group's accumulator"
+                );
+            }
+        }
+    }
+
+    /// `absent_over_time` instant: the presence FLAG that replaced the
+    /// bucket set answers the same question. One surviving line anywhere
+    /// suppresses the absence sample; none emits it.
+    #[test]
+    fn instant_absence_is_a_flag_over_the_whole_selector() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"}"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::AbsentOverTime,
+            param: None,
+            absent_labels: vec![("app".to_string(), "a".to_string())],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let run = |rows: &[MetricScanRow]| -> usize {
+            let mut state = ClientAggState::new(
+                &compiled,
+                &meta,
+                &client,
+                instant_of(window),
+                None,
+                AggCaps::DEFAULT,
+            )
+            .unwrap();
+            state.push_rows(rows).expect("fold");
+            let QueryResult::Vector(items) = state.finish() else {
+                panic!("instant absence is a vector");
+            };
+            items.len()
+        };
+        assert_eq!(run(&[]), 1, "nothing survived => one absence sample");
+        assert_eq!(
+            run(&slide_rows(1, &[(10, "x")])),
+            0,
+            "one surviving line anywhere suppresses absence"
+        );
+        assert_eq!(
+            run(&slide_rows(1, &[(10, "x"), (20, "y"), (90, "z")])),
+            0,
+            "several surviving lines are still just 'present'"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Issue #236 Part C — the mutating range path's cell representation.
     // -----------------------------------------------------------------
 
@@ -10797,6 +11076,22 @@ mod tests {
     /// each sample into every cell `covering_k` gives it, sort each
     /// bucket with `win_order`, reduce. The sweep must produce that
     /// sequence exactly.
+    ///
+    /// **This is WEAKER evidence than leg 1, and the difference is not
+    /// cosmetic.** Leg 1 compares the class-A drain against an
+    /// INDEPENDENT implementation — `FpSlide`, written for a different
+    /// path and untouched by Part C — so a shared misconception cannot
+    /// hide in it. This leg compares the sweep against a
+    /// reimplementation written by the same hand, from the same
+    /// understanding, in the same sitting: it catches transcription
+    /// errors (wrong bucket, missing sort, off-by-one in the pointers —
+    /// mutants 21/22/23 all die here) but it CANNOT catch a
+    /// misunderstanding of what `covering_k` means, because both sides
+    /// would be wrong together. What backs classes B/C against that is
+    /// the untouched corpus and goldens (`b9_range_sliding.test`, every
+    /// range case in `logql_metric_agg_golden.rs`, the `differential_*`
+    /// files), whose values come from the reference. Do not read the two
+    /// legs as the same strength.
     #[test]
     fn the_sample_sweep_reproduces_the_per_cell_reduction() {
         // TWO fingerprints collapsing into ONE output group
@@ -12140,6 +12435,114 @@ mod tests {
         }
     }
 
+    /// Issue #236 P1's charge, gated BEHAVIOURALLY.
+    ///
+    /// The non-mutating instant arm (`fp_groups`) was count-gated only
+    /// before #236; Part A deleted the count cap and P1 put a byte charge
+    /// in its place. Found by a mutant: deleting that charge outright was
+    /// caught by NOTHING except the `logql_variants_alloc` frame census —
+    /// a structural gate that notices the callee set changed, not that
+    /// the bound is gone. `discharge_group_bytes` saturates, so the
+    /// finish-time `group_bytes == 0` post-condition still holds with the
+    /// charge removed, and both existing group-byte tests drive the two
+    /// FAN-OUT arms. Plan v14 AC 14(b) asks for exactly this case; it did
+    /// not land with Part A.
+    #[test]
+    fn instant_fp_groups_are_byte_charged_capped_and_released_at_finish() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | line_format "keep""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(
+            !compiled.metric_mutates_labels(),
+            "must be the NON-fan-out (fp_groups) path"
+        );
+        // Two fingerprints with real label bytes to charge for.
+        let mut meta = slide_meta(1, r#"{"app":"a","region":"eu-west-1"}"#);
+        meta.insert(
+            2,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "svc".to_string(),
+                labels: r#"{"app":"b","region":"eu-west-2"}"#.to_string(),
+            },
+        );
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        let row = |fp: u64, ts: i64| MetricScanRow {
+            fingerprint: fp,
+            timestamp_ns: ts,
+            body: "hello".to_string(),
+        };
+
+        // Trip leg: a tiny cap refuses the FIRST group BEFORE insertion.
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
+        state.caps.group_bytes = 1;
+        match state.push_rows(&[row(1, 5)]) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { bytes, cap })) => {
+                assert_eq!(cap, 1);
+                assert!(bytes > cap, "the error names the byte breach");
+            }
+            other => panic!("expected MetricGroupLabelBytes, got {other:?}"),
+        }
+        assert!(
+            state.fp_groups.is_empty(),
+            "the breaching group was inserted anyway"
+        );
+        assert_eq!(state.group_bytes, 0, "a refused charge must not stick");
+
+        // Charge/release leg: the counter equals the live map (a repeated
+        // fingerprint charged once), then finish releases every charge —
+        // its `debug_assert_eq!(group_bytes, 0)` is the release gate.
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
+        state
+            .push_rows(&[row(1, 5), row(2, 6), row(1, 7)])
+            .expect("under every cap");
+        assert_eq!(state.fp_groups.len(), 2);
+        let live: u64 = state
+            .fp_groups
+            .keys()
+            .map(|fp| {
+                group_entry_bytes(
+                    "",
+                    state.base_labels.get(fp).expect("hydrated"),
+                    FP_GROUP_SLOT,
+                )
+            })
+            .sum();
+        assert!(live > 0, "the fixture must exercise a real charge");
+        assert_eq!(
+            state.group_bytes, live,
+            "every fingerprint charged; the repeated one charged once"
+        );
+        match state.finish() {
+            QueryResult::Vector(samples) => assert_eq!(samples.len(), 2),
+            other => panic!("expected a vector, got {other:?}"),
+        }
+    }
+
     /// Review round 6, class completion: the INSTANT fan-out path retains
     /// the same query-lifetime key/`LabelSet` state in `label_groups`
     /// (count-capped, bytes previously uncharged) — same charge, same
@@ -12164,8 +12567,15 @@ mod tests {
         };
 
         // Trip leg: a tiny cap refuses the FIRST group before insertion.
-        let mut state =
-            ClientAggState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT).unwrap();
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
         state.caps.group_bytes = 1;
         let row = |ts: i64, body: &str| MetricScanRow {
             fingerprint: 1,
@@ -12187,8 +12597,15 @@ mod tests {
 
         // Charge/release leg: the counter equals the live map (repeated
         // group charged once), then finish releases every charge.
-        let mut state =
-            ClientAggState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT).unwrap();
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
         state
             .push_rows(&[row(5, "u=a"), row(6, "u=b"), row(7, "u=a")])
             .expect("under every cap");
@@ -15003,8 +15420,15 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
         };
-        let mut state =
-            ClientAggState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT).unwrap();
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(window),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
         state.quantile_values = MAX_QUANTILE_VALUES - 1;
         let rows = [
             MetricScanRow {
@@ -15124,7 +15548,7 @@ mod tests {
             &compiled,
             &meta,
             &client,
-            window,
+            instant_of(window),
             Some(60_000_000_000),
             AggCaps::DEFAULT,
         )
@@ -15142,38 +15566,34 @@ mod tests {
 
     /// Code review round 3 (M8-LQ3, finding 1 — settled EMPIRICALLY): the
     /// concern was that `counter_values += 1` charges an INPUT ROW before
-    /// `buckets` is derived, so a row copied into MULTIPLE overlapping
-    /// `Counter` accumulators (a range query with `step < range`) would
-    /// consume one quota unit while retaining several points — leaving
-    /// bucket×row retention unbounded.
+    /// the accumulator is derived, so a row copied into MULTIPLE
+    /// accumulators would consume one quota unit while retaining several
+    /// points — leaving retention unbounded.
     ///
-    /// This test drives the real `push_rows` fold for a RANGE
-    /// `rate_counter(...[1m])` at `step = 20s` (`step < range`, the
-    /// reference's overlapping-window shape) with samples spanning THREE
-    /// step buckets, and proves the premise is false: `bucket_of` maps
-    /// each row to exactly one bucket, so the COMBINED length of every
-    /// `Counter` vector equals both the input-row count AND the
-    /// `counter_values` charge. A per-row charge is therefore a true bound
-    /// on total retained points — no under-count is possible. The
-    /// reset-aware per-bucket values are unchanged below the cap, and the
-    /// named `CounterValues` error still trips exactly when the combined
-    /// retention crosses the ceiling.
+    /// **Rewritten by issue #236 Part D, and the reason matters.** The
+    /// original drove this state with a RANGE window at `step < range`
+    /// and asserted the charge held across THREE step buckets. That
+    /// configuration is now unrepresentable: `ClientAggState` takes an
+    /// [`InstantWindow`] witness, and a range `rate_counter` has always
+    /// gone to [`RangeSlideState`] in production — so the old test pinned
+    /// a property of a state the engine never built. The identity it
+    /// existed for survives in its instant form, where it is exact rather
+    /// than merely bounded: every scanned row is retained EXACTLY once,
+    /// so `counter_values` equals the retained point count, so a per-row
+    /// charge is a true bound. The range half of the same invariant is
+    /// pinned on the path that actually serves it, by
+    /// `sliding_mutating_fan_out_charges_and_releases_retention_for_both_cell_kinds`
+    /// and `mutating_retention_is_independent_of_the_window_width`.
     #[test]
-    fn rate_counter_cap_bounds_total_retained_points_across_overlapping_buckets() {
-        let (compiled, client, meta, _instant_window) = rate_counter_state_inputs();
-        // A RANGE query: 20s step, 60s (=1m) range — step < range, so the
-        // reference's per-output-point windows overlap. Six samples land
-        // in three distinct step buckets (0, 20s, 40s).
-        let step_ns = 20_000_000_000u64;
-        let range_ns = 60_000_000_000u64;
-        let window = slide_window(0, range_ns as i64, step_ns, range_ns);
+    fn rate_counter_cap_bounds_total_retained_points() {
+        let (compiled, client, meta, window) = rate_counter_state_inputs();
         let rows = [
-            (10_000_000_000i64, "c=10"), // bucket 0
-            (15_000_000_000, "c=30"),    // bucket 0
-            (25_000_000_000, "c=5"),     // bucket 20s
-            (35_000_000_000, "c=12"),    // bucket 20s
-            (45_000_000_000, "c=7"),     // bucket 40s
-            (55_000_000_000, "c=20"),    // bucket 40s
+            (10_000_000_000i64, "c=10"),
+            (15_000_000_000, "c=30"),
+            (25_000_000_000, "c=5"),
+            (35_000_000_000, "c=12"),
+            (45_000_000_000, "c=7"),
+            (55_000_000_000, "c=20"),
         ]
         .into_iter()
         .map(|(timestamp_ns, body)| MetricScanRow {
@@ -15189,8 +15609,8 @@ mod tests {
             &compiled,
             &meta,
             &client,
-            window,
-            Some(range_ns),
+            instant_of(window),
+            Some(60_000_000_000),
             AggCaps::DEFAULT,
         )
         .unwrap();
@@ -15198,29 +15618,12 @@ mod tests {
 
         // `unwrap` sets the metric fan-out gate, so grouping is by final
         // label set — one group here (the unwrapped `c` is removed, base
-        // labels are shared).
+        // labels are shared), and ONE accumulator in it.
         assert_eq!(state.label_groups.len(), 1, "one series expected");
-        let buckets = &state
-            .label_groups
-            .values()
-            .next()
-            .expect("the one label group's buckets")
-            .1;
-        assert!(
-            buckets.len() > 1,
-            "the case must genuinely span multiple buckets: {} bucket(s)",
-            buckets.len()
-        );
-        assert_eq!(buckets.len(), 3, "samples land in buckets 0, 20s, 40s");
-
-        // The crux: the COMBINED length of every retained `Counter` vector
-        // equals the input-row count AND the per-row charge. Each row is
-        // retained EXACTLY once — overlapping windows do not multiply it.
         let total_retained: usize = state
             .label_groups
             .values()
-            .flat_map(|(_, b)| b.values())
-            .map(|acc| match acc {
+            .map(|(_, acc)| match acc {
                 BucketAcc::Counter(pts) => pts.len(),
                 other => panic!("expected a Counter accumulator, got {other:?}"),
             })
@@ -15228,7 +15631,7 @@ mod tests {
         assert_eq!(
             total_retained,
             rows.len(),
-            "every scanned row is retained exactly once across all buckets"
+            "every scanned row is retained exactly once"
         );
         assert_eq!(
             state.counter_values,
@@ -15236,35 +15639,20 @@ mod tests {
             "the per-row charge equals total retained points (a true bound)"
         );
 
-        // Values below the cap are unaffected by the retention guard: each
-        // bucket's reset-aware increase, scaled by the ns/ms extrapolation
-        // factor `(span_ns/1000 + 60)/(span_ns/1000)` and divided by the 60s
-        // range. b0: 30-10=20, span 5e9 ⇒ factor 1.000012; b20: 12-5=7, span
-        // 10e9 ⇒ factor 1.000006; b40: 20-7=13, span 10e9 ⇒ factor 1.000006.
-        let QueryResult::Matrix(series) = state.finish() else {
-            panic!("a range rate_counter query yields a matrix");
+        // Values below the cap are unaffected by the retention guard.
+        let QueryResult::Vector(items) = state.finish() else {
+            panic!("an instant rate_counter query yields a vector");
         };
-        assert_eq!(series.len(), 1, "one series: {series:?}");
-        assert_eq!(
-            series[0].points,
-            vec![
-                (0, 0.3333373333333333),
-                (step_ns as i64, 0.11666736666666666),
-                (2 * step_ns as i64, 0.21666796666666663),
-            ],
-            "per-bucket reset-aware rates are unaffected by the retention guard"
-        );
+        assert_eq!(items.len(), 1, "one series: {items:?}");
 
-        // The cap bounds the COMBINED retention, not source rows in some
-        // privileged bucket: pre-charged to `MAX - 1`, the second scanned
-        // row (regardless of which bucket it lands in) trips the named
-        // error at `count = MAX + 1`.
+        // The cap bounds the retention: pre-charged to `MAX - 1`, the
+        // second scanned row trips the named error at `count = MAX + 1`.
         let mut capped = ClientAggState::new(
             &compiled,
             &meta,
             &client,
-            window,
-            Some(range_ns),
+            instant_of(window),
+            Some(60_000_000_000),
             AggCaps::DEFAULT,
         )
         .unwrap();

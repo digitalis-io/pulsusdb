@@ -226,11 +226,13 @@ fn logql_source_files() -> Vec<(String, String)> {
 #[test]
 fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
     // Per-file production construction totals, pinned (issue #240 §2 A1:
-    // 31 production sites, by file — 32 since issue #236 Part B added
-    // `fold_off_grid`, the vector-aggregation fold's off-grid
-    // internal-invariant breach, in `exec.rs`).
+    // 31 production sites, by file — 35 after issue #236, which added
+    // `fold_off_grid` (Part B's off-grid internal-invariant breach) and
+    // the three instant-window narrowing refusals Part D introduced at
+    // `run_metric_client`, `run_client_agg_rows_folded` and
+    // `VariantsAggState::new`, all in `exec.rs`).
     let expected: BTreeMap<&str, usize> =
-        BTreeMap::from([("plan.rs", 14), ("exec.rs", 17), ("error.rs", 1)]);
+        BTreeMap::from([("plan.rs", 14), ("exec.rs", 20), ("error.rs", 1)]);
     let mut errors = String::new();
     let mut anchored_hits: Vec<String> = Vec::new();
     for (file, text) in logql_source_files() {
