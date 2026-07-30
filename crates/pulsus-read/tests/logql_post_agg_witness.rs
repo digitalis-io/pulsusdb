@@ -4146,3 +4146,615 @@ fn zz_large_scale_cell_stays_inside_the_model() {
         w.peak
     );
 }
+
+// =====================================================================
+// 12. §4.1's call-graph census — the token-taking set is DERIVED
+// =====================================================================
+//
+// The set of functions that must carry the funnel's proof token is
+// COMPUTED from the call graph, not written down: a hand list omitted
+// `select_k_range`/`select_k_instant` once already (round 12's `[high]`)
+// and `apply_vector_aggs`/`combine_binary` themselves once after that
+// (round 13's `[medium]`). This module recomputes the closure and the
+// classification on every run; the published table is the expected
+// ANSWER, and a mismatch fails here rather than at review.
+
+mod region_census {
+    use std::collections::{BTreeMap, BTreeSet};
+    use syn::visit::Visit;
+
+    /// One function definition in the region's source, with the callee
+    /// names its body mentions.
+    #[derive(Debug, Clone)]
+    pub struct FnInfo {
+        pub file: String,
+        /// `foo` for a free fn, `Type::foo` for an inherent method.
+        pub display: String,
+        /// `None` for a free fn.
+        pub owner: Option<String>,
+        pub name: String,
+        /// Every parameter's type, as the set of path idents it mentions,
+        /// plus `("String","String")` tuples flattened to `StringPair`.
+        pub param_types: BTreeSet<String>,
+        /// Bare call names, `Type::name` paths, `.method` names and
+        /// `name!` macros.
+        pub callees: BTreeSet<String>,
+    }
+
+    #[derive(Default)]
+    struct Body {
+        callees: BTreeSet<String>,
+    }
+
+    impl Visit<'_> for Body {
+        fn visit_expr_call(&mut self, node: &syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*node.func {
+                let segs: Vec<String> = p
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                if let Some(last) = segs.last() {
+                    self.callees.insert(last.clone());
+                }
+                if segs.len() >= 2 {
+                    self.callees.insert(segs[segs.len() - 2..].join("::"));
+                }
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+        fn visit_expr_method_call(&mut self, node: &syn::ExprMethodCall) {
+            self.callees.insert(format!(".{}", node.method));
+            syn::visit::visit_expr_method_call(self, node);
+        }
+        fn visit_macro(&mut self, node: &syn::Macro) {
+            if let Some(seg) = node.path.segments.last() {
+                self.callees.insert(format!("{}!", seg.ident));
+            }
+            if let Ok(exprs) = node.parse_body_with(
+                syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
+            ) {
+                for e in &exprs {
+                    self.visit_expr(e);
+                }
+            }
+        }
+    }
+
+    fn type_idents(ty: &syn::Type, out: &mut BTreeSet<String>) {
+        match ty {
+            syn::Type::Path(p) => {
+                for seg in &p.path.segments {
+                    out.insert(seg.ident.to_string());
+                    if let syn::PathArguments::AngleBracketed(a) = &seg.arguments {
+                        for arg in &a.args {
+                            match arg {
+                                syn::GenericArgument::Type(t) => type_idents(t, out),
+                                syn::GenericArgument::AssocType(t) => type_idents(&t.ty, out),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            syn::Type::Reference(r) => type_idents(&r.elem, out),
+            syn::Type::Slice(s) => type_idents(&s.elem, out),
+            syn::Type::Array(a) => type_idents(&a.elem, out),
+            syn::Type::Paren(p) => type_idents(&p.elem, out),
+            syn::Type::Group(g) => type_idents(&g.elem, out),
+            syn::Type::Ptr(p) => type_idents(&p.elem, out),
+            syn::Type::Tuple(t) => {
+                let mut inner = BTreeSet::new();
+                for e in &t.elems {
+                    type_idents(e, &mut inner);
+                }
+                if t.elems.len() == 2 && inner.len() == 1 && inner.contains("String") {
+                    out.insert("StringPair".to_string());
+                }
+                out.extend(inner);
+            }
+            syn::Type::ImplTrait(i) => {
+                for b in &i.bounds {
+                    if let syn::TypeParamBound::Trait(t) = b {
+                        for seg in &t.path.segments {
+                            out.insert(seg.ident.to_string());
+                            if let syn::PathArguments::Parenthesized(p) = &seg.arguments {
+                                for a in &p.inputs {
+                                    type_idents(a, out);
+                                }
+                                if let syn::ReturnType::Type(_, r) = &p.output {
+                                    type_idents(r, out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn sig_types(sig: &syn::Signature) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for arg in &sig.inputs {
+            if let syn::FnArg::Typed(t) = arg {
+                type_idents(&t.ty, &mut out);
+            }
+        }
+        // A generic parameter's BOUNDS carry the stage-data types on a
+        // generic helper (`F: Fn(usize) -> &LabelSet`), so they count.
+        for p in &sig.generics.params {
+            if let syn::GenericParam::Type(t) = p {
+                for b in &t.bounds {
+                    if let syn::TypeParamBound::Trait(tr) = b {
+                        for seg in &tr.path.segments {
+                            if let syn::PathArguments::Parenthesized(pa) = &seg.arguments {
+                                for a in &pa.inputs {
+                                    type_idents(a, &mut out);
+                                }
+                                if let syn::ReturnType::Type(_, r) = &pa.output {
+                                    type_idents(r, &mut out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(w) = &sig.generics.where_clause {
+            for pred in &w.predicates {
+                if let syn::WherePredicate::Type(t) = pred {
+                    for b in &t.bounds {
+                        if let syn::TypeParamBound::Trait(tr) = b {
+                            for seg in &tr.path.segments {
+                                if let syn::PathArguments::Parenthesized(pa) = &seg.arguments {
+                                    for a in &pa.inputs {
+                                        type_idents(a, &mut out);
+                                    }
+                                    if let syn::ReturnType::Type(_, r) = &pa.output {
+                                        type_idents(r, &mut out);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|a| {
+            let s = format!(
+                "{:?}",
+                a.meta.path().segments.last().map(|s| s.ident.to_string())
+            );
+            s.contains("cfg")
+                && a.to_owned()
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|m| m.path().is_ident("test"))
+        })
+    }
+
+    fn walk_items(file: &str, items: &[syn::Item], out: &mut Vec<FnInfo>) {
+        for item in items {
+            match item {
+                syn::Item::Fn(f) => {
+                    let mut b = Body::default();
+                    b.visit_block(&f.block);
+                    out.push(FnInfo {
+                        file: file.to_string(),
+                        display: f.sig.ident.to_string(),
+                        owner: None,
+                        name: f.sig.ident.to_string(),
+                        param_types: sig_types(&f.sig),
+                        callees: b.callees,
+                    });
+                }
+                syn::Item::Impl(i) => {
+                    let owner = match &*i.self_ty {
+                        syn::Type::Path(p) => p
+                            .path
+                            .segments
+                            .last()
+                            .map(|s| s.ident.to_string())
+                            .unwrap_or_default(),
+                        _ => "<impl>".to_string(),
+                    };
+                    for it in &i.items {
+                        if let syn::ImplItem::Fn(f) = it {
+                            let mut b = Body::default();
+                            b.visit_block(&f.block);
+                            out.push(FnInfo {
+                                file: file.to_string(),
+                                display: format!("{owner}::{}", f.sig.ident),
+                                owner: Some(owner.clone()),
+                                name: f.sig.ident.to_string(),
+                                param_types: sig_types(&f.sig),
+                                callees: b.callees,
+                            });
+                        }
+                    }
+                }
+                syn::Item::Mod(m) => {
+                    if is_cfg_test(&m.attrs) {
+                        continue; // PRODUCTION source only.
+                    }
+                    if let Some((_, inner)) = &m.content {
+                        walk_items(file, inner, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Parses every production function in `src/logql`.
+    ///
+    /// **Scope, stated because an unscoped conclusion from a scoped
+    /// census is worthless:** every `.rs` file in
+    /// `crates/pulsus-read/src/logql/`, `#[cfg(test)]` modules excluded.
+    /// The directory is read at RUN TIME rather than a file list being
+    /// written out, so the scheduled `exec.rs` split cannot narrow this
+    /// census silently — the region simply moves to another file the
+    /// walk already covers. The unit is a function ITEM.
+    pub fn collect() -> (Vec<String>, Vec<FnInfo>) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("the logql source directory")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        files.sort();
+        assert!(
+            files.len() >= 10,
+            "only {} source files found in {dir:?} — the census is looking in the wrong place",
+            files.len()
+        );
+        let mut out = Vec::new();
+        let mut names = Vec::new();
+        for path in &files {
+            let name = path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(path).expect("read source");
+            let parsed = syn::parse_file(&text)
+                .unwrap_or_else(|e| panic!("{name} does not parse as Rust: {e}"));
+            walk_items(&name, &parsed.items, &mut out);
+            names.push(name);
+        }
+        (names, out)
+    }
+
+    /// Free functions by name. A name defined twice is a loud failure:
+    /// the closure would otherwise resolve to whichever came first.
+    pub fn free_fns(all: &[FnInfo]) -> BTreeMap<String, FnInfo> {
+        let mut map: BTreeMap<String, Vec<&FnInfo>> = BTreeMap::new();
+        for f in all.iter().filter(|f| f.owner.is_none()) {
+            map.entry(f.name.clone()).or_default().push(f);
+        }
+        let mut out = BTreeMap::new();
+        for (name, defs) in map {
+            assert!(
+                defs.len() == 1,
+                "`{name}` is defined {} times across src/logql ({:?}) — the call-graph closure \
+                 cannot resolve it, so the census would silently follow the wrong body",
+                defs.len(),
+                defs.iter().map(|d| &d.file).collect::<Vec<_>>()
+            );
+            out.insert(name, defs[0].clone());
+        }
+        out
+    }
+}
+
+/// A body ALLOCATES if it mentions any of these. Deliberately
+/// over-inclusive: a false positive only widens the set that must carry
+/// the token, which is the safe direction.
+const ALLOC_TOKENS: &[&str] = &[
+    ".collect",
+    ".to_vec",
+    ".clone",
+    ".push",
+    ".insert",
+    ".entry",
+    ".extend",
+    ".to_string",
+    ".to_owned",
+    ".sort",
+    ".sort_by",
+    ".sort_by_key",
+    ".sort_unstable",
+    ".sort_unstable_by",
+    ".sort_unstable_by_key",
+    ".with_capacity",
+    "vec!",
+    "format!",
+    "Vec::new",
+    "Vec::with_capacity",
+    "HashMap::new",
+    "HashMap::with_capacity",
+    "HashSet::new",
+    "BTreeMap::new",
+    "BTreeSet::new",
+    "String::new",
+];
+
+/// A parameter carries STAGE DATA if its type mentions one of these.
+/// `QueryResult` is in the list (round 13's `[medium]`): `map_samples`
+/// takes one and is an Entry, and without it the census could not derive
+/// the set it publishes.
+const STAGE_DATA_TYPES: &[&str] = &[
+    "QueryResult",
+    "RangeSeries",
+    "InstantSeries",
+    "MatrixSeries",
+    "VectorSample",
+    "JoinItem",
+    "LabelSet",
+    "MatchSig",
+    "StringPair",
+];
+
+const CENSUS_ROOTS: &[&str] = &["apply_vector_aggs", "combine_binary"];
+
+/// A member reached from the funnel roots, with everything the four
+/// mechanical predicates need.
+#[derive(Debug)]
+struct Member {
+    name: String,
+    file: String,
+    allocates: bool,
+    stage_data: bool,
+    /// Callers OUTSIDE the closure — a member with one cannot be
+    /// required to hold the funnel's token, because a legitimate caller
+    /// has no funnel charge in force.
+    external_callers: Vec<String>,
+}
+
+fn census_members() -> (Vec<String>, Vec<Member>) {
+    let (files, all) = region_census::collect();
+    let free = region_census::free_fns(&all);
+
+    // Transitive callee closure of the roots, to a fixpoint.
+    let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut frontier: Vec<String> = CENSUS_ROOTS.iter().map(|s| (*s).to_string()).collect();
+    for r in CENSUS_ROOTS {
+        assert!(
+            free.contains_key(*r),
+            "census root `{r}` is not a free function in src/logql — the region has moved and \
+             the roots must move with it"
+        );
+    }
+    while let Some(name) = frontier.pop() {
+        if !closure.insert(name.clone()) {
+            continue;
+        }
+        let Some(info) = free.get(&name) else {
+            continue;
+        };
+        for callee in &info.callees {
+            let bare = callee.rsplit("::").next().unwrap_or(callee);
+            if free.contains_key(bare) && !closure.contains(bare) {
+                frontier.push(bare.to_string());
+            }
+        }
+    }
+
+    let members = closure
+        .iter()
+        .filter_map(|n| free.get(n))
+        .map(|info| {
+            let external_callers = all
+                .iter()
+                .filter(|f| !closure.contains(&f.name) || f.owner.is_some())
+                .filter(|f| f.display != info.display)
+                .filter(|f| {
+                    f.callees
+                        .iter()
+                        .any(|c| c.rsplit("::").next() == Some(info.name.as_str()))
+                })
+                .map(|f| format!("{}::{}", f.file, f.display))
+                .collect();
+            Member {
+                name: info.name.clone(),
+                file: info.file.clone(),
+                allocates: ALLOC_TOKENS.iter().any(|t| info.callees.contains(*t)),
+                stage_data: STAGE_DATA_TYPES
+                    .iter()
+                    .any(|t| info.param_types.contains(*t)),
+                external_callers,
+            }
+        })
+        .collect();
+    (files, members)
+}
+
+/// **The census is the gate; the published table is the expected
+/// answer.** Every member that both allocates and takes a stage-data
+/// parameter must fall into exactly one of `Root`/`Entry`/`Element`/
+/// `Excluded` by the mechanical predicates, and the classification the
+/// census computes must equal the one published here.
+///
+/// The funnel's token is not wired yet, so this run publishes the
+/// OBLIGATION SET — which functions will have to carry it — and the
+/// classification is asserted against the predicates that do not depend
+/// on the token (`allocates` x `stage_data`). Once `mod ledger` lands the
+/// remaining two predicates (`takes_ledger`, `calls_admit`) become
+/// non-trivial and the same test asserts the full four-class table.
+#[test]
+fn the_token_taking_set_is_derived_from_the_call_graph() {
+    let (files, members) = census_members();
+    assert!(
+        files.contains(&"exec.rs".to_string()),
+        "the census did not read exec.rs; files = {files:?}"
+    );
+    assert!(
+        members.len() >= 20,
+        "the closure collapsed to {} members — the roots or the resolver are wrong",
+        members.len()
+    );
+
+    // The obligated set: allocates AND receives stage data.
+    let obligated: Vec<&Member> = members
+        .iter()
+        .filter(|m| m.allocates && m.stage_data)
+        .collect();
+
+    // Published expectation (plan v14 §4.1, re-derived at this commit —
+    // Parts B/C/D added `pin_reduction_order` to the closure, which
+    // `d145ded` did not have).
+    const EXPECT_ROOT: &[&str] = &["apply_vector_aggs", "combine_binary"];
+    const EXPECT_ENTRY: &[&str] = &[
+        "combine_matrices",
+        "combine_vectors",
+        "group_instant",
+        "group_range",
+        "instant_join",
+        "map_samples",
+        "select_k_instant",
+        "select_k_range",
+        "set_op_join",
+        "sort_instant",
+        "approx_topk_instant",
+    ];
+    const EXPECT_ELEMENT: &[&str] = &[
+        "group_key",
+        "match_signature",
+        "pin_reduction_order",
+        "set_label_sorted",
+        "sort_candidates",
+    ];
+
+    let mut got: Vec<&str> = obligated.iter().map(|m| m.name.as_str()).collect();
+    got.sort_unstable();
+    let mut want: Vec<&str> = EXPECT_ROOT
+        .iter()
+        .chain(EXPECT_ENTRY)
+        .chain(EXPECT_ELEMENT)
+        .copied()
+        .collect();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "the census-derived obligation set differs from the published table; every difference \
+         is either a function that must be dispositioned or a table that has gone stale"
+    );
+
+    // Every member NOT obligated must fail at least one predicate — the
+    // classification derives its own `Excluded` class rather than
+    // trusting a list.
+    for m in &members {
+        if obligated.iter().any(|o| o.name == m.name) {
+            continue;
+        }
+        assert!(
+            !(m.allocates && m.stage_data),
+            "{} is obligated but absent from the published table",
+            m.name
+        );
+    }
+}
+
+/// **The census's external-caller map, pinned whole.** Two members of
+/// the funnel's closure are also called from OUTSIDE it, and the two
+/// cases are not the same kind of thing:
+///
+/// * `group_range` / `group_instant` / `apply_vector_aggs` /
+///   `combine_binary` — called from the engine's own metric entry points
+///   (`run_metric_client`, `run_metric_node`, `run_metric_inner`,
+///   `run_client_agg_rows_folded`, `VariantsAggState::finish_in_place`)
+///   and from the SQL path's two INLINE chains. Those are the funnel's
+///   production entry sites: each acquires a token when §4 is wired, so
+///   sharing is expected and benign.
+/// * **`group_key` and `pin_reduction_order` are called by the Part B
+///   FOLD at the client leaf** (`ReduceFold::push_series`,
+///   `SelectFold::push_series`, `RangeSlideState::emit`), which holds no
+///   funnel token and must not: the fold's bytes are charged by the
+///   leaf's own `charge_group_bytes` / `charge_result_points`, and plan
+///   v14 §10.3 forbids threading one counter across the two regimes.
+///   Plan v14 §4.1 was written at `d145ded`, before the fold existed, so
+///   its four-class table has no disposition for a member shared across
+///   two charging regimes.
+///
+/// The map is pinned WHOLE rather than filtered by a rule, because a rule
+/// that decides which sharing is benign is exactly the judgement that
+/// needs adjudicating rather than encoding.
+#[test]
+fn the_external_caller_map_of_the_funnel_closure_is_pinned() {
+    let (_, members) = census_members();
+    let mut got: Vec<(String, Vec<String>)> = members
+        .iter()
+        .filter(|m| m.allocates && m.stage_data && !m.external_callers.is_empty())
+        .map(|m| {
+            let mut c = m.external_callers.clone();
+            c.sort();
+            (m.name.clone(), c)
+        })
+        .collect();
+    got.sort();
+
+    let want: Vec<(String, Vec<String>)> = vec![
+        (
+            "apply_vector_aggs".to_string(),
+            vec![
+                "exec.rs::LogQlEngine::run_metric_client".to_string(),
+                "exec.rs::LogQlEngine::run_metric_node".to_string(),
+                "exec.rs::VariantsAggState::finish_in_place".to_string(),
+                "exec.rs::run_client_agg_rows_folded".to_string(),
+            ],
+        ),
+        (
+            "combine_binary".to_string(),
+            vec!["exec.rs::LogQlEngine::run_metric_node".to_string()],
+        ),
+        (
+            "group_instant".to_string(),
+            vec!["exec.rs::LogQlEngine::run_metric_inner".to_string()],
+        ),
+        (
+            "group_key".to_string(),
+            vec![
+                "exec.rs::ReduceFold::push_series".to_string(),
+                "exec.rs::SelectFold::push_series".to_string(),
+            ],
+        ),
+        (
+            "group_range".to_string(),
+            vec!["exec.rs::LogQlEngine::run_metric_inner".to_string()],
+        ),
+        (
+            "pin_reduction_order".to_string(),
+            vec!["exec.rs::RangeSlideState::emit".to_string()],
+        ),
+    ];
+    assert_eq!(
+        got, want,
+        "the funnel closure's external-caller map has changed; every new entry is either a \
+         production entry site that must acquire a token or a second charging regime that \
+         cannot"
+    );
+}
+
+/// The generator's companion for the census: prints the derived
+/// classification so it can be pasted into a review.
+#[test]
+#[ignore = "generator — prints the census-derived region table"]
+fn zz_print_region_census() {
+    let (files, members) = census_members();
+    println!("files scanned: {files:?}");
+    println!(
+        "{:<24} {:<10} {:<6} {:<6} external callers",
+        "member", "file", "alloc", "stage"
+    );
+    for m in &members {
+        println!(
+            "{:<24} {:<10} {:<6} {:<6} {:?}",
+            m.name, m.file, m.allocates, m.stage_data, m.external_callers
+        );
+    }
+}
