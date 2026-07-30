@@ -5264,3 +5264,112 @@ fn zz_print_region_census() {
         );
     }
 }
+
+// =====================================================================
+// 13. AC 34(a) — the half of the flat-`or` class that #236 owns
+// =====================================================================
+
+/// **The accumulated multi-leaf operand, bounded.** A flat `a or b or c …`
+/// chain accumulates into one growing operand: before #236 the
+/// accumulation returned NO error on this path and grew without bound
+/// (plan v14 §11 measured `err = None` in every completed run). It is now
+/// charged per `combine_binary`, so a chain wide enough to matter is a
+/// clean `MetricPostAggBytes` instead.
+///
+/// **What this does NOT claim.** The binding failure mode for a flat
+/// chain is a process ABORT in `plan()` at ≈49 KB of query text — an
+/// order of magnitude before the memory becomes interesting — and that
+/// belongs to the recursion-guard work (#255/#272), not here. This test
+/// pins only the half #236 fixes, at a term count well inside the
+/// planable range.
+#[test]
+fn a_flat_or_accumulation_is_refused_rather_than_grown() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const TERMS: usize = 128; // far inside the ~1 200-term planable range
+    const PER_TERM: u64 = 64;
+    // A cap the accumulator crosses partway through, so the refusal
+    // happens DURING accumulation rather than on the first operand: the
+    // model grows ~125 KB per term at this shape, so 8 MiB is crossed
+    // around term 66 of 128.
+    let cap = 8 * 1024 * 1024u64;
+
+    let term = |t: u64| -> Vec<VectorSample> {
+        (0..PER_TERM)
+            .map(|i| VectorSample {
+                labels: vec![
+                    ("id00".to_string(), pad(t * PER_TERM + i, 8)),
+                    ("t000".to_string(), pad(t, 8)),
+                ],
+                value: (i + 1) as f64,
+            })
+            .collect()
+    };
+
+    let mut acc = Some(QueryResult::Vector(term(0)));
+    let mut refused_at = None;
+    let mut widest = 0usize;
+    let (_, w) = measure(|| {
+        for t in 1..TERMS as u64 {
+            let mut charged = 0u64;
+            let rhs = QueryResult::Vector(term(t));
+            let lhs = acc
+                .take()
+                .expect("the accumulator survives until it is refused");
+            match combine_binary_capped(&mut charged, BinOp::Or, false, None, lhs, rhs, cap) {
+                Ok(next) => {
+                    if let QueryResult::Vector(v) = &next {
+                        widest = widest.max(v.len());
+                    }
+                    acc = Some(next);
+                    assert_eq!(charged, 0, "term {t}: the counter must discharge");
+                }
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricPostAggBytes {
+                    bytes,
+                    cap: got,
+                })) => {
+                    assert_eq!(got, cap);
+                    assert!(bytes > got);
+                    assert_eq!(charged, 0, "a refused acquire must not mutate the counter");
+                    // The accumulator was CONSUMED by the failed call —
+                    // which is the point: the growth stops at the
+                    // refusal, and there is nothing left to grow.
+                    refused_at = Some(t);
+                    break;
+                }
+                Err(other) => panic!("term {t}: unexpected error {other:?}"),
+            }
+        }
+    });
+    assert!(!w.overflow, "cohort table overflowed");
+    let refused_at = refused_at.expect(
+        "the accumulation must be REFUSED before it exhausts the term budget — an unbounded \
+         growth path is exactly what issue #236 closes on this class",
+    );
+    assert!(
+        refused_at > 1 && (refused_at as usize) < TERMS,
+        "the refusal must happen DURING accumulation, not on the first or last term (at {refused_at})"
+    );
+    assert!(
+        widest >= PER_TERM as usize * 2,
+        "the accumulator must genuinely have grown before the refusal (widest = {widest})"
+    );
+}
+
+/// AC 34(c): the flat-chain class carries **no** ledger row. It was
+/// registered as "O9" in an earlier plan revision and withdrawn — a
+/// process abort is a crash, not a divergence, and we do not register
+/// crashes as divergences.
+#[test]
+fn the_flat_chain_class_has_no_ledger_row() {
+    let ledger = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/benchmarks/logs-differential-ledger.md"),
+    )
+    .expect("read the differential ledger");
+    assert!(
+        !ledger.contains("O9"),
+        "the flat-`or` accumulation class must carry no ledger entry: the binding failure mode \
+         is a process abort in plan(), which belongs to #255/#272 as a crash, not here as a \
+         divergence"
+    );
+}
