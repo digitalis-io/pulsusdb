@@ -1,0 +1,103 @@
+# Issue #244 — `/detected_fields` corpus (`eval detected`), reference-captured
+# against the pinned `grafana/loki:3.7.4` container (2026-07-29, config =
+# ci/logql/config.yaml + `limits_config.discover_log_levels: false`; capture
+# procedure and full transcripts in ../PROVENANCE.md). Every case's captured
+# cardinality is <= 100, where the reference's p14 HLL estimate equals the
+# exact count (first divergence at N = 5328 — see
+# tests/golden/detected_cardinality/reference_divergence.tsv), so these are
+# pure hard-gated parity, not divergences.
+#
+# Authoring rules (PROVENANCE.md §244): A0 loaded streams == query scope;
+# A1 one stream per section unless order-insensitive; A2 distinct
+# timestamps (grammar-enforced); A3 the field_limit case introduces each
+# field on a different entry (the reference's Go map order makes a
+# same-entry case invalid); A4 label-sorted expected blocks, fields
+# transcribed as a set, `jsonPath` dropped (#254); A5 a disagreeing case is
+# dropped and filed, never worked around.
+
+# C1 — line_limit >= loaded lines and field_limit >= field count: full
+# exact cardinality over every sampled entry.
+load
+  {app="c1", service_name="svc-c1"} service=svc-c1
+  10s  {"lvl":"info","uid":"u1"}
+  20s  {"lvl":"warn","uid":"u2"}
+  30s  {"lvl":"info","uid":"u3"}
+
+eval detected at 60s {app="c1"}
+  lvl string 2 json
+  uid string 3 json
+
+clear
+
+# C2 — line_limit < loaded lines: the sample is the NEWEST line_limit
+# entries (the reference's Direction: BACKWARD). Discriminating fixture:
+# the newest two entries share one value (captured cardinality 1); an
+# oldest-first sample would report 2.
+load
+  {app="c2", service_name="svc-c2"} service=svc-c2
+  10s  {"uid":"old-1"}
+  20s  {"uid":"old-2"}
+  30s  {"uid":"shared"}
+  40s  {"uid":"shared"}
+
+eval detected at 60s line_limit=2 {app="c2"}
+  uid string 1 json
+
+clear
+
+# C3 — field_limit == field count: every field survives; int type
+# detection on numeric-string values (the pinned int-before-float order).
+load
+  {app="c3", service_name="svc-c3"} service=svc-c3
+  10s  {"alpha":"1","beta":"two"}
+  20s  {"alpha":"3","beta":"four"}
+
+eval detected at 60s field_limit=2 {app="c3"}
+  alpha int 2 json
+  beta string 2 json
+
+clear
+
+# C4 — field_limit < field count, each field FIRST SEEN on a different
+# entry (rule A3): the first-seen field_limit names in newest-first
+# feeding order win; later names are skipped entirely (captured: c_late
+# absent).
+load
+  {app="c4", service_name="svc-c4"} service=svc-c4
+  10s  {"c_late":"x"}
+  20s  {"b_mid":"y"}
+  30s  {"a_new":"z"}
+
+eval detected at 60s field_limit=2 {app="c4"}
+  a_new string 1 json
+  b_mid string 1 json
+
+clear
+
+# C5 — type re-detection is per-observation, LAST wins (the oldest entry
+# is fed last under newest-first order: int from the 20s json entry is
+# overwritten by string from the 10s logfmt entry), and parser
+# attribution accumulates in encounter order, deduped (captured:
+# ["json","logfmt"]).
+load
+  {app="c5", service_name="svc-c5"} service=svc-c5
+  10s  v=notanumber
+  20s  {"v":"7"}
+
+eval detected at 60s {app="c5"}
+  v string 2 json,logfmt
+
+clear
+
+# C6 — repeated values dedupe: three entries, one distinct value, exact
+# cardinality 1.
+load
+  {app="c6", service_name="svc-c6"} service=svc-c6
+  10s  {"k":"same"}
+  20s  {"k":"same"}
+  30s  {"k":"same"}
+
+eval detected at 60s {app="c6"}
+  k string 1 json
+
+clear

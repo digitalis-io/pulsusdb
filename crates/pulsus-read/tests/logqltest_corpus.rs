@@ -95,6 +95,7 @@ fn corpus_is_fully_green_and_exercises_every_directive() {
         totals.vector_cases += run.counts.vector_cases;
         totals.scalar_cases += run.counts.scalar_cases;
         totals.matrix_cases += run.counts.matrix_cases;
+        totals.detected_cases += run.counts.detected_cases;
     }
 
     assert!(
@@ -132,6 +133,10 @@ fn corpus_is_fully_green_and_exercises_every_directive() {
     assert!(
         totals.matrix_cases > 0,
         "corpus never produced a matrix (range) result — issue #227 `eval range`"
+    );
+    assert!(
+        totals.detected_cases > 0,
+        "corpus never produced a detected-fields result — issue #244 `eval detected`"
     );
 }
 

@@ -44,9 +44,9 @@ use pulsus_logql::{Expr, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
-    ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
-    QueryParams, QueryResult, QuerySpec, apply_vector_aggs, combine_binary, materialize_vector_lit,
-    plan, run_client_agg_rows, run_variants_rows,
+    ClientWindow, CompiledPipeline, DetectedFieldOut, DetectedFieldsProbe, Direction, MatrixSeries,
+    MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, apply_vector_aggs,
+    combine_binary, materialize_vector_lit, plan, run_client_agg_rows, run_variants_rows,
 };
 
 /// A sorted label set.
@@ -313,6 +313,15 @@ pub struct RangeEval {
     pub step_ns: u64,
 }
 
+/// An `eval detected` directive's request limits (issue #244). Defaults
+/// mirror the server's `DEFAULT_LINE_LIMIT` (100) / `DEFAULT_FIELD_LIMIT`
+/// (1000) — the reference's own defaults.
+#[derive(Debug, Clone, Copy)]
+pub struct DetectedEval {
+    pub line_limit: u32,
+    pub field_limit: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct EvalCmd {
     pub line: usize,
@@ -321,6 +330,8 @@ pub struct EvalCmd {
     /// matrix result's `(ts, value)` points are compared exactly. `None` =
     /// the instant eval (uses `at_ns`).
     pub range: Option<RangeEval>,
+    /// `Some` for an `eval detected at <T>` directive (issue #244).
+    pub detected: Option<DetectedEval>,
     pub mode: EvalMode,
     pub query: String,
     /// Raw expected result lines (interpreted at compare time by result
@@ -362,6 +373,9 @@ pub struct DirectiveCounts {
     pub scalar_cases: usize,
     /// Range (`eval range`) matrix results (issue #227).
     pub matrix_cases: usize,
+    /// `eval detected` results (issue #244). Also counted in
+    /// `eval_value`, so `count_eval_directives` needs no change.
+    pub detected_cases: usize,
 }
 
 /// One executed case's outcome.
@@ -516,12 +530,98 @@ fn parse_eval(
     lines: &[&str],
     directive_idx: usize,
 ) -> Result<(EvalCmd, usize), String> {
-    let (at_ns, range, query) = if let Some(rest) = rest.strip_prefix("instant at ") {
+    let (at_ns, range, detected, query) = if let Some(rest) = rest.strip_prefix("instant at ") {
         let (at_tok, query) = rest
             .split_once(char::is_whitespace)
             .ok_or_else(|| fmt_err(file, directive_idx, "eval needs `<T> <query>`".into()))?;
         let at_ns = parse_duration_ns(at_tok).map_err(|e| fmt_err(file, directive_idx, e))?;
-        (at_ns, None, query.trim().to_string())
+        (at_ns, None, None, query.trim().to_string())
+    } else if let Some(rest) = rest.strip_prefix("detected at ") {
+        // Issue #244: `eval detected at <T> [line_limit=<N>]
+        // [field_limit=<N>] <query>`. `eval_ordered`/`eval_fail` have no
+        // detected form — the grammar rejects them file-fatally.
+        if mode != EvalMode::Value {
+            return Err(fmt_err(
+                file,
+                directive_idx,
+                "`detected` evals support only the plain `eval` verb (`eval_ordered`/`eval_fail \
+                 detected` are not part of the grammar)"
+                    .into(),
+            ));
+        }
+        let (at_tok, mut tail) = rest.split_once(char::is_whitespace).ok_or_else(|| {
+            fmt_err(
+                file,
+                directive_idx,
+                "eval detected needs `<T> [line_limit=<N>] [field_limit=<N>] <query>`".into(),
+            )
+        })?;
+        let at_ns = parse_duration_ns(at_tok).map_err(|e| fmt_err(file, directive_idx, e))?;
+        let mut line_limit: Option<u32> = None;
+        let mut field_limit: Option<u32> = None;
+        loop {
+            let trimmed = tail.trim_start();
+            let key = if trimmed.starts_with("line_limit=") {
+                "line_limit"
+            } else if trimmed.starts_with("field_limit=") {
+                "field_limit"
+            } else {
+                tail = trimmed;
+                break;
+            };
+            let (tok, next_tail) = trimmed.split_once(char::is_whitespace).ok_or_else(|| {
+                fmt_err(
+                    file,
+                    directive_idx,
+                    format!("eval detected: `{key}=` must be followed by the query"),
+                )
+            })?;
+            let value_str = &tok[key.len() + 1..];
+            let value: u32 = value_str.parse().map_err(|_| {
+                fmt_err(
+                    file,
+                    directive_idx,
+                    format!("eval detected: {key} needs a positive integer, got {value_str:?}"),
+                )
+            })?;
+            if value == 0 || value > 5000 {
+                return Err(fmt_err(
+                    file,
+                    directive_idx,
+                    format!("eval detected: {key} must be in 1..=5000, got {value}"),
+                ));
+            }
+            let slot = if key == "line_limit" {
+                &mut line_limit
+            } else {
+                &mut field_limit
+            };
+            if slot.is_some() {
+                return Err(fmt_err(
+                    file,
+                    directive_idx,
+                    format!("eval detected: repeated {key}"),
+                ));
+            }
+            *slot = Some(value);
+            tail = next_tail;
+        }
+        if !tail.starts_with('{') {
+            return Err(fmt_err(
+                file,
+                directive_idx,
+                format!("eval detected: the query must start with `{{`, got {tail:?}"),
+            ));
+        }
+        (
+            at_ns,
+            None,
+            Some(DetectedEval {
+                line_limit: line_limit.unwrap_or(100),
+                field_limit: field_limit.unwrap_or(1000),
+            }),
+            tail.to_string(),
+        )
     } else if let Some(rest) = rest.strip_prefix("range from ") {
         // `<T0> to <T1> step <S> <query>` (issue #227). The query may contain
         // spaces, so split off exactly the 5 fixed grid tokens first.
@@ -550,13 +650,15 @@ fn parse_eval(
                 end_ns,
                 step_ns: step_i as u64,
             }),
+            None,
             parts[5].trim().to_string(),
         )
     } else {
         return Err(fmt_err(
             file,
             directive_idx,
-            "only `instant at <T>` and `range from <T0> to <T1> step <S>` evals are supported"
+            "only `instant at <T>`, `detected at <T>` and `range from <T0> to <T1> step <S>` \
+             evals are supported"
                 .into(),
         ));
     };
@@ -635,6 +737,7 @@ fn parse_eval(
             line: directive_idx + 1,
             at_ns,
             range,
+            detected,
             mode,
             query,
             expected,
@@ -710,11 +813,92 @@ impl Store {
 // Evaluation.
 // ---------------------------------------------------------------------
 
-/// A resolved query result — either log streams or a metric value.
+/// A resolved query result — log streams, a metric value, or a
+/// detected-fields table (issue #244).
 enum Outcome {
     /// `(sorted labels, timestamp_ns, line)` per surviving entry.
     Streams(Vec<StreamEntry>),
     Metric(QueryResult),
+    /// Label-sorted `/detected_fields` entries (issue #244).
+    Detected(Vec<DetectedFieldOut>),
+}
+
+/// Issue #244, `eval detected` step (d): every loaded sample across the
+/// section's WHOLE unfiltered stream set must carry a distinct timestamp
+/// (authoring rule A2) — newest-first feeding order is otherwise
+/// underdetermined where the engine's keyset order would consult the raw
+/// body. A duplicate is a GRAMMAR error (file-fatal), never a case
+/// failure.
+fn validate_distinct_timestamps(store: &Store) -> Result<(), String> {
+    let mut seen: HashMap<i64, ()> = HashMap::new();
+    for stream in &store.streams {
+        for (ts, _) in &stream.samples {
+            if seen.insert(*ts, ()).is_some() {
+                return Err(format!(
+                    "eval detected requires distinct timestamps across every loaded sample \
+                     (authoring rule A2); {ts}ns is loaded twice"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Issue #244: replays `/detected_fields` over the loaded section through
+/// the engine's own [`DetectedFieldsProbe`] (the production accumulator +
+/// feeder). Matchers are NOT applied — the section's loaded streams ARE
+/// the query scope (the module-doc contract: the real engine resolves
+/// matchers in stage-1 SQL, which this hermetic runner does not execute);
+/// only the pipeline runs. Feeding order is newest-first by
+/// `timestamp_ns` DESC, ties `(fingerprint, body)` ASC — the engine's
+/// stage-3 `ORDER BY … DESC` under `Direction::Backward`, the reference's
+/// `Direction: logproto.BACKWARD`.
+fn evaluate_detected(store: &Store, query: &str, de: DetectedEval) -> Result<Outcome, String> {
+    // (a) parse; a metric expression is a case failure with the engine's
+    // own text.
+    let expr = parse(query).map_err(|e| e.to_string())?;
+    let le = match expr {
+        Expr::Log(le) => le,
+        Expr::Metric(_) => {
+            return Err(
+                "detected_fields requires a log stream selector query (a metric query has no \
+                 per-entry fields)"
+                    .to_string(),
+            );
+        }
+    };
+    // (b) compile; a compile error is a case failure.
+    let compiled = CompiledPipeline::compile(&le.pipeline)
+        .map_err(|e| e.to_string())?
+        .with_template_env(TemplateEnv::default());
+    // (c) flatten EVERY loaded stream's samples (no matcher filtering).
+    let mut rows: Vec<(u64, i64, &str)> = Vec::new();
+    for stream in &store.streams {
+        for (ts, body) in &stream.samples {
+            rows.push((stream.fingerprint, *ts, body.as_str()));
+        }
+    }
+    // (e) newest-first by timestamp DESC, ties (fingerprint, body) ASC.
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| (a.0, a.2).cmp(&(b.0, b.2))));
+    // (f) every loaded stream is registered; (g) feed in order — the
+    // probe applies the `matched >= line_limit` gate. Built with the
+    // PRODUCTION `MAX_DETECTED_FIELD_BYTES`.
+    let mut probe = DetectedFieldsProbe::new(de.line_limit, de.field_limit);
+    for stream in &store.streams {
+        probe.add_stream(stream.fingerprint, &stream.base);
+    }
+    for (fp, ts, body) in rows {
+        probe
+            .feed_row(&compiled, fp, ts, body, "")
+            .map_err(|e| e.to_string())?;
+    }
+    // (h) a budget-capped case is a case failure — no corpus expectation
+    // may depend on the byte budget.
+    let (fields, retention_capped) = probe.finish();
+    if retention_capped {
+        return Err("retention capped — a corpus case must not depend on the byte budget".into());
+    }
+    Ok(Outcome::Detected(fields))
 }
 
 fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, String> {
@@ -863,8 +1047,96 @@ fn judge(cmd: &EvalCmd, outcome: Result<Outcome, String>) -> (bool, String) {
             Err(text) => (false, format!("query errored: {text}")),
             Ok(Outcome::Streams(actual)) => compare_streams(&cmd.expected, actual),
             Ok(Outcome::Metric(result)) => compare_metric(cmd, result),
+            Ok(Outcome::Detected(fields)) => compare_detected(&cmd.expected, &fields),
         },
     }
+}
+
+/// Issue #244: compares a detected-fields table as an ORDERED list (the
+/// engine sorts by label; expected blocks must be label-sorted —
+/// authoring rule A4). One expected line per field: `<label> <type>
+/// <cardinality> <parsers>`, exactly four whitespace-delimited tokens;
+/// `<parsers>` is `-` or a comma-separated list of `json`/`logfmt` in
+/// encounter order.
+fn compare_detected(expected: &[String], actual: &[DetectedFieldOut]) -> (bool, String) {
+    let mut want: Vec<(String, String, u64, Vec<String>)> = Vec::new();
+    for line in expected {
+        match parse_expected_detected(line) {
+            Ok(e) => want.push(e),
+            Err(e) => return (false, format!("bad expected detected line: {e}")),
+        }
+    }
+    let got: Vec<(String, String, u64, Vec<String>)> = actual
+        .iter()
+        .map(|f| {
+            (
+                f.label.clone(),
+                f.field_type.to_string(),
+                f.cardinality,
+                f.parsers.iter().map(|p| p.to_string()).collect(),
+            )
+        })
+        .collect();
+    if want == got {
+        (true, String::new())
+    } else {
+        let fmt = |items: &[(String, String, u64, Vec<String>)]| {
+            items
+                .iter()
+                .map(|(l, t, c, p)| {
+                    let parsers = if p.is_empty() {
+                        "-".to_string()
+                    } else {
+                        p.join(",")
+                    };
+                    format!("{l} {t} {c} {parsers}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        (
+            false,
+            format!(
+                "detected fields mismatch:\n  want ({}): {}\n  got  ({}): {}",
+                want.len(),
+                fmt(&want),
+                got.len(),
+                fmt(&got),
+            ),
+        )
+    }
+}
+
+fn parse_expected_detected(line: &str) -> Result<(String, String, u64, Vec<String>), String> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    if toks.len() != 4 {
+        return Err(format!(
+            "expected exactly `<label> <type> <cardinality> <parsers>`: {line:?}"
+        ));
+    }
+    let cardinality: u64 = toks[2]
+        .parse()
+        .map_err(|e| format!("bad cardinality {:?}: {e}", toks[2]))?;
+    let parsers: Vec<String> = if toks[3] == "-" {
+        Vec::new()
+    } else {
+        toks[3]
+            .split(',')
+            .map(|p| {
+                if p == "json" || p == "logfmt" {
+                    Ok(p.to_string())
+                } else {
+                    Err(format!("unknown parser {p:?} (json/logfmt or `-`)"))
+                }
+            })
+            .collect::<Result<_, String>>()?
+    };
+    Ok((
+        toks[0].to_string(),
+        toks[1].to_string(),
+        cardinality,
+        parsers,
+    ))
 }
 
 fn compare_streams(expected: &[String], actual: Vec<StreamEntry>) -> (bool, String) {
@@ -1158,20 +1430,29 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                     EvalMode::Ordered => counts.eval_ordered += 1,
                     EvalMode::Fail => counts.eval_fail += 1,
                 }
-                let spec = match cmd.range {
-                    Some(r) => QuerySpec::Range {
-                        start_ns: r.start_ns,
-                        end_ns: r.end_ns,
-                        step_ns: r.step_ns,
-                    },
-                    None => QuerySpec::Instant { at_ns: cmd.at_ns },
+                let outcome = if let Some(de) = cmd.detected {
+                    // Issue #244 step (d): the duplicate-timestamp check is
+                    // a GRAMMAR error (file-fatal), not a case failure.
+                    validate_distinct_timestamps(&store)
+                        .map_err(|e| format!("{file}:{}: {e}", cmd.line))?;
+                    evaluate_detected(&store, &cmd.query, de)
+                } else {
+                    let spec = match cmd.range {
+                        Some(r) => QuerySpec::Range {
+                            start_ns: r.start_ns,
+                            end_ns: r.end_ns,
+                            step_ns: r.step_ns,
+                        },
+                        None => QuerySpec::Instant { at_ns: cmd.at_ns },
+                    };
+                    evaluate(&store, &cmd.query, spec)
                 };
-                let outcome = evaluate(&store, &cmd.query, spec);
                 match &outcome {
                     Ok(Outcome::Streams(_)) => counts.streams_cases += 1,
                     Ok(Outcome::Metric(QueryResult::Scalar(_))) => counts.scalar_cases += 1,
                     Ok(Outcome::Metric(QueryResult::Matrix(_))) => counts.matrix_cases += 1,
                     Ok(Outcome::Metric(_)) => counts.vector_cases += 1,
+                    Ok(Outcome::Detected(_)) => counts.detected_cases += 1,
                     Err(_) => {}
                 }
                 let (passed, detail) = judge(cmd, outcome);
@@ -1229,5 +1510,121 @@ mod tests {
     fn empty_labelset_is_valid() {
         let (pairs, _) = parse_labelset("{} 1").unwrap();
         assert!(pairs.is_empty());
+    }
+
+    // -- Issue #244: the `eval detected` directive ------------------------
+
+    const DETECTED_DATASET: &str = "load\n  {app=\"x\", service_name=\"svc\"} service=svc\n\
+                                    \t10s  {\"lvl\":\"info\",\"uid\":\"u1\"}\n\
+                                    \t20s  {\"lvl\":\"warn\",\"uid\":\"u2\"}\n\n";
+
+    #[test]
+    fn eval_detected_defaults_to_line_limit_100_and_field_limit_1000() {
+        let text = format!(
+            "{DETECTED_DATASET}eval detected at 60s {{app=\"x\"}}\n\
+             \tlvl string 2 json\n\tuid string 2 json\n"
+        );
+        let commands = parse_file("inline/detected_defaults.test", &text).expect("parse");
+        let Some(Command::Eval(cmd)) = commands.last() else {
+            panic!("eval command expected");
+        };
+        let de = cmd.detected.expect("detected eval");
+        assert_eq!(de.line_limit, 100, "the server DEFAULT_LINE_LIMIT");
+        assert_eq!(de.field_limit, 1000, "the server DEFAULT_FIELD_LIMIT");
+        let run = run_file("inline/detected_defaults.test", &text).expect("run");
+        assert!(run.cases[0].passed, "{}", run.cases[0].detail);
+        assert_eq!(run.counts.detected_cases, 1);
+        assert_eq!(
+            run.counts.eval_value, 1,
+            "detected counts as eval_value too"
+        );
+    }
+
+    #[test]
+    fn eval_detected_grammar_errors_are_file_fatal() {
+        // (1) repeated key.
+        let text = format!(
+            "{DETECTED_DATASET}eval detected at 60s line_limit=5 line_limit=6 {{app=\"x\"}}\n"
+        );
+        let err = run_file("inline/g1.test", &text).expect_err("repeated key");
+        assert!(err.contains("repeated line_limit"), "{err}");
+        // (2) non-numeric / zero / over-5000 values.
+        let text = format!("{DETECTED_DATASET}eval detected at 60s line_limit=abc {{app=\"x\"}}\n");
+        let err = run_file("inline/g2.test", &text).expect_err("non-numeric");
+        assert!(err.contains("positive integer"), "{err}");
+        let text = format!("{DETECTED_DATASET}eval detected at 60s field_limit=0 {{app=\"x\"}}\n");
+        let err = run_file("inline/g2b.test", &text).expect_err("zero");
+        assert!(err.contains("1..=5000"), "{err}");
+        let text =
+            format!("{DETECTED_DATASET}eval detected at 60s line_limit=5001 {{app=\"x\"}}\n");
+        let err = run_file("inline/g2c.test", &text).expect_err("over 5000");
+        assert!(err.contains("1..=5000"), "{err}");
+        // (3) the query must start with `{`.
+        let text =
+            format!("{DETECTED_DATASET}eval detected at 60s count_over_time({{app=\"x\"}}[1m])\n");
+        let err = run_file("inline/g3.test", &text).expect_err("non-selector query");
+        assert!(err.contains("must start with `{`"), "{err}");
+        // (4) eval_ordered / eval_fail have no detected form.
+        let text = format!("{DETECTED_DATASET}eval_ordered detected at 60s {{app=\"x\"}}\n");
+        let err = run_file("inline/g4.test", &text).expect_err("ordered detected");
+        assert!(err.contains("only the plain `eval` verb"), "{err}");
+        let text = format!("{DETECTED_DATASET}eval_fail detected at 60s {{app=\"x\"}}\n\tmsg: x\n");
+        let err = run_file("inline/g4b.test", &text).expect_err("fail detected");
+        assert!(err.contains("only the plain `eval` verb"), "{err}");
+    }
+
+    #[test]
+    fn eval_detected_duplicate_timestamps_are_a_grammar_error() {
+        let text = "load\n  {app=\"x\", service_name=\"svc\"} service=svc\n\
+                    \t10s  {\"a\":1}\n\t10s  {\"b\":2}\n\n\
+                    eval detected at 60s {app=\"x\"}\n\ta int 1 json\n";
+        let err = run_file("inline/dup_ts.test", text).expect_err("duplicate ts");
+        assert!(err.contains("distinct timestamps"), "{err}");
+    }
+
+    /// The §5 selector-scoping contract, locked so it cannot be silently
+    /// "fixed" into matcher filtering: a section loading TWO streams with
+    /// a selector naming only one still accumulates fields from BOTH (the
+    /// loaded streams ARE the query scope; the real engine resolves
+    /// matchers in stage-1 SQL, which the hermetic runner never executes).
+    #[test]
+    fn eval_detected_accumulates_from_every_loaded_stream_not_just_the_selector_match() {
+        let text = "load\n  {app=\"x\", service_name=\"svc\"} service=svc\n\
+                    \t10s  {\"from_x\":1}\n\n\
+                    load\n  {app=\"y\", service_name=\"svc\"} service=svc\n\
+                    \t20s  {\"from_y\":2}\n\n\
+                    eval detected at 60s {app=\"x\"}\n\
+                    \tfrom_x int 1 json\n\tfrom_y int 1 json\n";
+        let run = run_file("inline/scoping.test", text).expect("run");
+        assert!(
+            run.cases[0].passed,
+            "both loaded streams must contribute: {}",
+            run.cases[0].detail
+        );
+    }
+
+    /// The metric-expression case failure carries the engine's own text,
+    /// and a `{`-prefixed metric query is unreachable (grammar rejects
+    /// non-`{` starts), so this exercises the parse-level arm via a
+    /// selector-shaped query that parses as a log expr — the metric arm is
+    /// pinned by `evaluate_detected` directly.
+    #[test]
+    fn evaluate_detected_rejects_a_metric_query_with_the_engine_text() {
+        let store = Store::default();
+        let err = evaluate_detected(
+            &store,
+            "count_over_time({app=\"x\"}[1m])",
+            DetectedEval {
+                line_limit: 100,
+                field_limit: 1000,
+            },
+        )
+        .err()
+        .expect("metric query must fail");
+        assert_eq!(
+            err,
+            "detected_fields requires a log stream selector query (a metric query has no \
+             per-entry fields)"
+        );
     }
 }

@@ -346,9 +346,10 @@ pub(crate) fn detected_labels_response(
 /// fields already label-sorted by the engine, `parsers` always an array
 /// (`[]` when unattributed — deterministic-shape divergence from the
 /// reference's nil-slice marshaling). `pulsus_partial: true` is the
-/// additive #90-convention truncation signal, **omitted when false** so
-/// complete responses stay byte-identical to the reference shape;
-/// `explain` joins as a sibling key when requested.
+/// additive #90-convention not-the-complete-answer signal — budget-
+/// truncated sampling OR (issue #244) a retention-capped cardinality —
+/// **omitted when false** so complete responses stay byte-identical to
+/// the reference shape; `explain` joins as a sibling key when requested.
 pub(crate) fn detected_fields_response(
     out: DetectedFields,
     limit: u32,
@@ -356,7 +357,7 @@ pub(crate) fn detected_fields_response(
 ) -> Response {
     let prefix = b"{\"fields\":[".to_vec();
     let mut tail = format!("],\"limit\":{limit}");
-    if out.truncated {
+    if out.truncated || out.retention_capped {
         tail.push_str(",\"pulsus_partial\":true");
     }
     let suffix = explain_suffix(tail, explain.as_ref());
@@ -1062,6 +1063,7 @@ mod tests {
                 },
             ],
             truncated: false,
+            retention_capped: false,
         };
         let res = detected_fields_response(out, 1000, None);
         let body = body_string(res).await;
@@ -1078,6 +1080,22 @@ mod tests {
         let out = DetectedFields {
             fields: Vec::new(),
             truncated: true,
+            retention_capped: false,
+        };
+        let res = detected_fields_response(out, 1000, None);
+        let body = body_string(res).await;
+        assert_eq!(body, r#"{"fields":[],"limit":1000,"pulsus_partial":true}"#);
+    }
+
+    /// Issue #244: a retention-capped accumulation (the byte ceiling
+    /// refused a distinct value/name) carries the SAME additive
+    /// `pulsus_partial: true` key, without budget truncation.
+    #[tokio::test]
+    async fn detected_fields_envelope_carries_pulsus_partial_true_on_retention_cap_alone() {
+        let out = DetectedFields {
+            fields: Vec::new(),
+            truncated: false,
+            retention_capped: true,
         };
         let res = detected_fields_response(out, 1000, None);
         let body = body_string(res).await;
@@ -1091,6 +1109,7 @@ mod tests {
         let out = DetectedFields {
             fields: Vec::new(),
             truncated: false,
+            retention_capped: false,
         };
         let res = detected_fields_response(out, 500, Some(explain));
         let body = body_string(res).await;
@@ -1127,6 +1146,7 @@ mod tests {
                         parsers: vec!["logfmt"],
                     }],
                     truncated: false,
+                    retention_capped: false,
                 },
                 1000,
                 None,
