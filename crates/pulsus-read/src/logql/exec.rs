@@ -10261,6 +10261,627 @@ fn group_instant(
         .collect()
 }
 
+// ---------------------------------------------------------------------
+// Issue #236 §4/§5 — the post-aggregation byte model.
+//
+// The coefficients below are MEASURED, not enumerated. Every `W_*`/`B_*`
+// is `WITNESS_MARGIN x rate_max` where `rate_max` is the largest secant
+// slope observed on that axis by the cohort-attributed allocator witness
+// (`crates/pulsus-read/tests/logql_post_agg_witness.rs`). Nothing here
+// enumerates containers, element widths or growth factors: the measured
+// rate absorbs all of them, which is what makes a forgotten container
+// impossible rather than merely unlikely.
+//
+// Every coefficient below is
+//     shipped = ceil(rate_max x WITNESS_MARGIN x 11/10)
+// with WITNESS_MARGIN = 2. The extra tenth is NOT a second safety margin
+// and is not a hand tightening in either direction: an allocation
+// measurement jitters by a few units between runs (hashbrown growth
+// order, in-place-collect eligibility), and a gate of the form
+// `shipped >= 2 x rate_max_measured_now` would redden on a 1 % drift. The
+// tenth is a stated, uniform rounding rule so the CI gate is
+// deterministic. There is no upper-bound gate, so rounding up costs
+// nothing but tightness, which this design deliberately does not pin.
+//
+// Read `MAX_POST_AGG_BYTES`' doc for what the resulting bound does and
+// does NOT claim.
+// ---------------------------------------------------------------------
+
+/// `W_SERIES` — bytes per stage-input series.
+///
+/// Ladder: `topk(k = N)` over a RANGE operand with no grouping, so every
+/// stage retains everything. `N` spans `128 -> 8 192` (64x) with
+/// points-per-series and label pairs scaled as `8 192 / N`, so `points`,
+/// `label_bytes` and `label_pairs` are constant along the ladder.
+/// Measured `rate_max` = **710** B/series (uniform; concentrated 416).
+/// Shipped = `ceil(710 x 2 x 11/10)`.
+pub const W_SERIES: u64 = 1_562;
+
+/// `W_POINT` — bytes per stage-input point.
+///
+/// Ladder: a RANGE operand of 64 series with no grouping, so it collapses
+/// to a SINGLE output group and one `BTreeSet<i64>` step union holds every
+/// point; `steps` spans `4 -> 512` (128x on `points`).
+/// Measured `rate_max` = **53** B/point (concentrated; uniform 42).
+/// Shipped = `ceil(53 x 2 x 11/10)`.
+pub const W_POINT: u64 = 117;
+
+/// `W_LABEL_BYTE` — bytes per raw label content byte.
+///
+/// Ladder: `without(id00)` over 256 instant series of 4 label pairs — one
+/// output group per series, so the retained key mass is maximal; the label
+/// VALUE width spans `4 -> 1 024` bytes (128x on `label_bytes`).
+/// Measured `rate_max` = **1** B/B on both skews.
+/// Shipped = `ceil(1 x 2 x 11/10)`.
+pub const W_LABEL_BYTE: u64 = 3;
+
+/// `W_PAIR` — bytes per label pair.
+///
+/// Ladder: `without(id00)` over 64 instant series, pairs spanning
+/// `4 -> 512` (128x) with the per-pair value width scaled as `2 048 /
+/// pairs` so the byte total stays near constant.
+/// Measured `rate_max` = **103** B/pair (concentrated; uniform 68; the
+/// measurement jitters between 102 and 103 between runs, which is what
+/// the 11/10 rounding covers).
+/// Shipped = `ceil(103 x 2 x 11/10)`.
+pub const W_PAIR: u64 = 227;
+
+/// `W_STAGE_SERIES` — bytes per (series x chain stage).
+///
+/// **MEASURED ZERO, and that is a finding rather than an oversight.**
+/// Plan v14 §6.1 predicted that "the previous stage's buffer is live
+/// while its successor is collected", so a chain of `L` stages would cost
+/// `L` concurrent buffers. It does not:
+///
+/// * `select_k_instant`'s output is
+///   `series.into_iter().zip(keep).filter_map(..).collect()`, and `Zip`
+///   and `FilterMap` over `vec::IntoIter` are `SourceIter` +
+///   `InPlaceIterable`, so the standard library collects the output **in
+///   place, into the input's own buffer** — the second buffer does not
+///   exist at all;
+/// * every vector-aggregation arm is non-expanding in both series and
+///   points (grouping collapses, `topk` selects, `sort` permutes), so a
+///   later stage's input is never larger than an earlier stage's, and the
+///   peak cannot accumulate down the chain.
+///
+/// Ladder: nested `topk(k = N)` over 512 instant series at chain lengths
+/// 1, 2, 4 and 64 — the peak is **21 204 B at every length**, on both
+/// skews, so the rate is 0. Measured further across 8 (shape x grouping x
+/// operator) combinations at lengths 1, 2, 4, 8 and 64: flat from length
+/// 2 onward everywhere. The term is kept in the model's published form
+/// (plan v14 §4) but is inert; what defends the claim is
+/// `chain_depth_does_not_multiply_peak_memory` in the witness, which
+/// reddens if a future change ever makes depth accumulate.
+pub const W_STAGE_SERIES: u64 = 0;
+
+/// `W_GROUPNAME` — bytes per (series x `by`-clause byte).
+///
+/// Ladder: `by(id00, <q-1 names absent from the data>)` over 256 instant
+/// series, `q` spanning `4 -> 256` (64x on `series x
+/// group_name_bytes`). §5.4 named an ALL-absent clause as the maximising
+/// shape; measurement refutes that — every series then collapses into ONE
+/// group, so exactly one key is retained and the peak is flat from `q = 4`
+/// to `q = 16` — and §5.4's actual rule, the shape that maximises the
+/// axis's rate, selects the one-present-name form.
+/// Measured `rate_max` = **11** B per (series x by-byte), both skews.
+/// Shipped = `ceil(11 x 2 x 11/10)`.
+pub const W_GROUPNAME: u64 = 25;
+
+/// `W_APPROX_TOPK` — the flat count-min sketch plus retention heap
+/// (`cms::CMS_DEPTH x cms::CMS_WIDTH` `f64` counters = 7 x 27 183 x 8 B,
+/// fixed and input-independent).
+///
+/// Derived as the measured peak MINUS the model without this term, over
+/// the `approx_topk` cells at the SMALLEST inputs (1, 2, 8 and 64
+/// series). A flat term is masked at a large fixture — the input-scaled
+/// terms already dominate the 1.5 MiB sketch, and the excess reads as 0 —
+/// so it is derived where it is visible, which is also where
+/// under-bounding would be a real safety hole rather than a cosmetic one.
+/// Measured excess = **1 907 298** B at one series.
+/// Shipped = `ceil(1 907 298 x 2 x 11/10)`.
+pub const W_APPROX_TOPK: u64 = 4_196_056;
+
+/// `B_SERIES` — bytes per binary-operand series.
+///
+/// Ladder: one-to-one, `matching = None` (so the join signature is the
+/// FULL label set and `B_MANY`/`B_INCLUDE` are zero in every rung),
+/// instant operands, `N` spanning `64 -> 4 096` per side (64x on
+/// `lhs.series + rhs.series`).
+/// Measured `rate_max` = **578** B/series (concentrated; uniform 458).
+/// Shipped = `ceil(578 x 2 x 11/10)`.
+pub const B_SERIES: u64 = 1_272;
+
+/// `B_POINT` — bytes per binary-operand point.
+///
+/// Ladder: the same matching over MATRIX operands of 16 series, `steps`
+/// spanning `4 -> 512` (128x on the point total). Sixteen series, not the
+/// usual baseline: `combine_matrices` runs an INDEPENDENT per-step join,
+/// so its cost is `steps x series` and the widest rung otherwise
+/// dominates the whole binary's wall time.
+/// Measured `rate_max` = **37** B/point (concentrated; uniform 33).
+/// Shipped = `ceil(37 x 2 x 11/10)`.
+pub const B_POINT: u64 = 82;
+
+/// `B_LABEL` — bytes per binary-operand raw label content byte.
+///
+/// Ladder: the same matching over 256 instant series of 4 pairs, label
+/// VALUE width spanning `4 -> 1 024` bytes (128x).
+/// Measured `rate_max` = **2** B/B on both skews.
+/// Shipped = `ceil(2 x 2 x 11/10)`.
+pub const B_LABEL: u64 = 5;
+
+/// `B_PAIR` — bytes per binary-operand label pair.
+///
+/// Ladder: the same matching over 64 instant series, pairs spanning
+/// `4 -> 512` (128x) with the per-pair width scaled as `2 048 / pairs`.
+/// `matching = None` is load-bearing here: under `on(id00)` the match
+/// signature is a ONE-pair projection, the other pairs are never cloned,
+/// and the measured rate is 0 — the plan's pre-commitment to `None` for
+/// this row is what makes the axis visible at all.
+/// Measured `rate_max` = **107** B/pair (concentrated; uniform 79).
+/// Shipped = `ceil(107 x 2 x 11/10)`.
+pub const B_PAIR: u64 = 236;
+
+/// `B_MANY` — bytes per many-side series under a group modifier. Zero
+/// when there is no group modifier: the one-to-one arm keeps a single
+/// `HashSet<MatchSig>` where the grouped arm keeps a `HashMap<MatchSig,
+/// HashSet<MatchSig>>`.
+///
+/// Ladder: `on(id00) group_left()` with an EMPTY include list, many-side
+/// width spanning `64 -> 4 096` (64x). This is the per-many-side-item
+/// cost of `instant_join`'s `many_matched` map.
+/// Measured `rate_max` = **1 319** B/series (concentrated; uniform
+/// 1 152). Shipped = `ceil(1 319 x 2 x 11/10)`.
+pub const B_MANY: u64 = 2_902;
+
+/// `B_INCLUDE` — bytes per (many-side series x include byte).
+///
+/// Ladder: `on(id00) group_left(inc_1..inc_q)` over 128 instant series,
+/// with the ONE side carrying all 256 include labels in every rung, `q`
+/// spanning `4 -> 256` (64x on `many.series x include_bytes`). This is
+/// `set_label_sorted`'s insert chain — one `Vec::insert` per include name
+/// per many-side series.
+/// Measured `rate_max` = **12** B per (series x include byte), both
+/// skews. Shipped = `ceil(12 x 2 x 11/10)`.
+pub const B_INCLUDE: u64 = 27;
+
+/// **The post-aggregation byte cap** — the smallest power of two at or
+/// above `max(X_chain, X_bin)`, where each `X` is the corresponding model
+/// maximised over the leaf-gated feasible region **at the non-amplifying
+/// corner** (`group_name_bytes = 0`, `include_bytes = 0`, both binary
+/// operands at independent leaf budgets).
+///
+/// **What it buys, exactly:** every client-leaf-sourced stage input with
+/// no `by`-name amplification and no `group_left/right` include
+/// amplification is admitted. Nothing broader. A query carrying either
+/// amplifier may be refused above the thresholds recorded as the O6/O7
+/// ledger entries.
+///
+/// **What it is NOT.** It is not a worst-case proof. It is a bound
+/// "measured-and-margined over a compile-enforced construct space, with a
+/// clean refusal instead of an OOM at the boundary". Anyone reading it as
+/// a worst-case guarantee is reading it wrong: the residual is a
+/// distribution adversarial in a dimension no ladder varies, and the 2x
+/// margin is what covers it.
+///
+/// **Deliberately not pinned from above.** No test asserts
+/// `MAX_POST_AGG_BYTES < k x max(X)`. A change that REDUCES peak memory
+/// (issue #245's Part C deletes two `BTreeMap` indexes and a `BTreeSet`
+/// union from `combine_matrices`) must never redden CI; regenerating is
+/// one command, `zz_witness_report`.
+///
+/// # The generator's numbers
+///
+/// ```text
+/// s_min              = 616 bytes        (min over the four leaf entry slots)
+/// N_max              = 435 771 series   (MAX_CLIENT_AGG_GROUP_BYTES / s_min)
+/// stages             = 64               (min(MAX_DEPTH, MAX_QUERY_BYTES / 4))
+/// X_chain            = 2 847 288 941 bytes   (argmax N = 546)
+/// X_bin              = 5 970 118 644 bytes   (argmax N = 546)
+/// MAX_POST_AGG_BYTES = 8 589 934 592 bytes   (8 GiB)
+/// tightness ratio    = 1.4388           (printed, NOT gated)
+/// ```
+///
+/// # O6 — the `by(...)` amplification threshold
+///
+/// `A_MIN = 597` total `by`-clause bytes, at `N = 435 558`; with
+/// `A_NAME_MIN = 2` that is **at least 299 one-character `by` names**.
+/// Strictly below `A_MIN`, refusal is impossible at ANY group count.
+/// **Reachable**: 597 bytes fits inside `MAX_QUERY_BYTES = 131 072`.
+///
+/// # O7 — the `group_left/right(include)` amplification threshold
+///
+/// `AMP_MIN = 97 030 221`, the smallest `many.series x include_bytes`
+/// PRODUCT at which the binary funnel can refuse, at `N_many = 546`.
+/// **Reachable** within the query-text cap.
+///
+/// Both are the model-level thresholds; the funnel that turns them into
+/// an actual refusal is issue #236's §4 and is not wired yet, so the
+/// divergence ledger does not carry O6/O7 rows until it is.
+pub const MAX_POST_AGG_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// A stage input's measured shape — the raw counted quantities the byte
+/// model multiplies. One `O(series + label pairs)` pass over data that is
+/// already materialised (`Vec::len` is `O(1)`, so **no per-point work**).
+///
+/// Fields are private and every accessor is derived from one exhaustive
+/// destructure ([`StageInput::model_inputs`]), so a new axis cannot be
+/// added without the paired-fixture isolation gate seeing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageInput {
+    /// `N` — top-level series in the stage input.
+    series: u64,
+    /// `Σ labels.len()` over the input's series.
+    label_pairs: u64,
+    /// `Σ (k.len() + v.len())` — RAW label content bytes.
+    label_bytes: u64,
+    /// `Σ label_set_bytes(labels)` — the leaf's own charging vocabulary,
+    /// so the feasible region's operand and the model's input are the
+    /// same quantity.
+    label_block_bytes: u64,
+    /// The widest single series' label-pair count.
+    max_series_pairs: u64,
+    /// The longest single label VALUE, in bytes — read only through
+    /// [`include_bytes`].
+    max_value_bytes: u64,
+    /// `P` — total points (1 per series for an instant vector).
+    points: u64,
+    /// The longest single series, in points.
+    max_series_points: u64,
+}
+
+impl StageInput {
+    /// Every model-relevant input, named, from ONE exhaustive destructure
+    /// — adding a field to [`StageInput`] stops this compiling, which is
+    /// what keeps §6's "every non-target input is byte-identical" gate
+    /// from silently missing a new axis (the `AggCaps` `E0027` precedent).
+    pub fn model_inputs(&self) -> [(&'static str, u64); 8] {
+        let Self {
+            series,
+            label_pairs,
+            label_bytes,
+            label_block_bytes,
+            max_series_pairs,
+            max_value_bytes,
+            points,
+            max_series_points,
+        } = *self;
+        [
+            ("series", series),
+            ("label_pairs", label_pairs),
+            ("label_bytes", label_bytes),
+            ("label_block_bytes", label_block_bytes),
+            ("max_series_pairs", max_series_pairs),
+            ("max_value_bytes", max_value_bytes),
+            ("points", points),
+            ("max_series_points", max_series_points),
+        ]
+    }
+
+    /// `N`.
+    pub fn series(&self) -> u64 {
+        self.series
+    }
+
+    /// `P`.
+    pub fn points(&self) -> u64 {
+        self.points
+    }
+
+    /// `Σ label_set_bytes(labels)` — the quantity the leaf's own
+    /// group-byte charge is denominated in.
+    pub fn label_block_bytes(&self) -> u64 {
+        self.label_block_bytes
+    }
+
+    /// `Σ (k.len() + v.len())`.
+    pub fn label_bytes(&self) -> u64 {
+        self.label_bytes
+    }
+
+    /// `Σ labels.len()`.
+    pub fn label_pairs(&self) -> u64 {
+        self.label_pairs
+    }
+
+    /// The longest single label VALUE — read only through
+    /// [`include_bytes`].
+    pub fn max_value_bytes(&self) -> u64 {
+        self.max_value_bytes
+    }
+
+    /// **Derivation seam, not a measurement.** Builds a [`StageInput`]
+    /// from raw counted quantities so the cap derivation can evaluate the
+    /// model at the feasible region's corners (`N` up to ~4.4e5 series,
+    /// `P` up to 1.2e7 points) without materialising hundreds of MiB of
+    /// synthetic series. Every production charge obtains its `StageInput`
+    /// from [`measure_matrix`]/[`measure_vector`] — this constructor
+    /// measures nothing and must never be used to authorise a charge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_derivation(
+        series: u64,
+        label_pairs: u64,
+        label_bytes: u64,
+        label_block_bytes: u64,
+        max_series_pairs: u64,
+        max_value_bytes: u64,
+        points: u64,
+        max_series_points: u64,
+    ) -> Self {
+        Self {
+            series,
+            label_pairs,
+            label_bytes,
+            label_block_bytes,
+            max_series_pairs,
+            max_value_bytes,
+            points,
+            max_series_points,
+        }
+    }
+}
+
+/// Measures a matrix stage input. `s.points.len()` is `O(1)`, so the pass
+/// is `O(series + label pairs)` and adds nothing per point.
+pub fn measure_matrix(series: &[MatrixSeries]) -> StageInput {
+    let mut m = StageInput {
+        series: series.len() as u64,
+        ..StageInput::default()
+    };
+    for s in series {
+        measure_labels(&mut m, &s.labels);
+        let pts = s.points.len() as u64;
+        m.points = m.points.saturating_add(pts);
+        m.max_series_points = m.max_series_points.max(pts);
+    }
+    m
+}
+
+/// Measures an instant-vector stage input — one point per series, which
+/// is what makes `points == series` here.
+pub fn measure_vector(series: &[VectorSample]) -> StageInput {
+    let mut m = StageInput {
+        series: series.len() as u64,
+        points: series.len() as u64,
+        max_series_points: u64::from(!series.is_empty()),
+        ..StageInput::default()
+    };
+    for s in series {
+        measure_labels(&mut m, &s.labels);
+    }
+    m
+}
+
+/// The label half of a `measure_*` pass, shared so the two entry points
+/// cannot drift.
+fn measure_labels(m: &mut StageInput, labels: &LabelSet) {
+    let pairs = labels.len() as u64;
+    m.label_pairs = m.label_pairs.saturating_add(pairs);
+    m.max_series_pairs = m.max_series_pairs.max(pairs);
+    for (k, v) in labels {
+        m.label_bytes = m
+            .label_bytes
+            .saturating_add(k.len() as u64)
+            .saturating_add(v.len() as u64);
+        m.max_value_bytes = m.max_value_bytes.max(v.len() as u64);
+    }
+    m.label_block_bytes = m.label_block_bytes.saturating_add(label_set_bytes(labels));
+}
+
+/// `Σ_stages Σ_{name ∈ by(...)} (name.len() + 1)` — the grouping-name
+/// amplifier, read off the QUERY TEXT and never off the data.
+///
+/// Counts **every** `by` name, including ones absent from the data: which
+/// names are absent is unknowable before the stage runs, and counting all
+/// of them is the conservative direction. `without(...)` contributes
+/// nothing — `group_key`'s `Without` arm copies the series' own labels,
+/// which the `W_PAIR`/`W_LABEL_BYTE` terms already price.
+pub fn group_name_bytes(aggs: &[plan::VectorAggSpec]) -> u64 {
+    let mut total: u64 = 0;
+    for (_, grouping, _) in aggs {
+        let Some(g) = grouping else { continue };
+        if g.kind != GroupingKind::By {
+            continue;
+        }
+        for name in &g.labels {
+            total = total.saturating_add(name.len() as u64).saturating_add(1);
+        }
+    }
+    total
+}
+
+/// `Σ_{ln ∈ include} (ln.len() + one.max_value_bytes + 1)` — the
+/// `group_left/right(include)` amplifier, per many-side series.
+///
+/// Zero for a set operation ([`is_set_op`] returns before `include` is
+/// read, `instant_join`'s first statement) and zero for one-to-one
+/// matching (`matching.group.is_none()`).
+pub fn include_bytes(matching: Option<&VectorMatching>, op: BinOp, one: &StageInput) -> u64 {
+    if is_set_op(op) {
+        return 0;
+    }
+    let Some(group) = matching.and_then(|m| m.group.as_ref()) else {
+        return 0;
+    };
+    let include = match group {
+        MatchGroup::Left(inc) | MatchGroup::Right(inc) => inc,
+    };
+    let mut total: u64 = 0;
+    for ln in include {
+        total = total
+            .saturating_add(ln.len() as u64)
+            .saturating_add(one.max_value_bytes)
+            .saturating_add(1);
+    }
+    total
+}
+
+/// One term of [`post_agg_peak_bytes`]. `None` evaluates the shipped
+/// model; every other variant zeroes exactly one coefficient.
+///
+/// **A test seam** (the `apply_vector_aggs_capped` / `group_bytes_cap`
+/// precedent): §6's paired fixtures assert a term is NECESSARY by
+/// showing the model WITHOUT it fails to cover the incremental bytes the
+/// pair causes. Discriminating on increments is the only comparison that
+/// survives independently-margined coefficients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainTerm {
+    /// The shipped model, no term suppressed.
+    None,
+    Series,
+    Point,
+    LabelByte,
+    Pair,
+    StageSeries,
+    GroupName,
+    ApproxTopk,
+}
+
+/// One term of [`binary_peak_bytes`]; see [`ChainTerm`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryTerm {
+    /// The shipped model, no term suppressed.
+    None,
+    Series,
+    Point,
+    Label,
+    Pair,
+    Many,
+    Include,
+}
+
+/// An upper bound on the heap bytes the post-aggregation chain may hold
+/// SIMULTANEOUSLY, over and above its input. Contains no container
+/// enumeration and no allocator model — every coefficient is measured
+/// (§5.4) and margined.
+///
+/// All arithmetic saturates: `group_name_bytes` is read off unbounded-
+/// until-#279 query text and stays large after it, so an amplified query
+/// must resolve to `u64::MAX` (⇒ a clean refusal) and never wrap to a
+/// small number that would admit an unbounded allocation.
+pub fn post_agg_peak_bytes(m: &StageInput, aggs: &[plan::VectorAggSpec]) -> u64 {
+    post_agg_peak_bytes_without(m, aggs, ChainTerm::None)
+}
+
+/// [`post_agg_peak_bytes`] with one coefficient forced to zero — §6's
+/// necessity seam. The `match` is exhaustive with no `_` arm, so a new
+/// term must be dispositioned here before it can ship.
+pub fn post_agg_peak_bytes_without(
+    m: &StageInput,
+    aggs: &[plan::VectorAggSpec],
+    drop: ChainTerm,
+) -> u64 {
+    let w = |term: ChainTerm, coeff: u64| if drop == term { 0 } else { coeff };
+    let stages = aggs.len() as u64;
+    let names = group_name_bytes(aggs);
+    let approx = aggs
+        .iter()
+        .any(|(op, _, _)| matches!(op, VectorAggOp::ApproxTopk));
+
+    let mut total = w(ChainTerm::Series, W_SERIES).saturating_mul(m.series);
+    total = total.saturating_add(w(ChainTerm::Point, W_POINT).saturating_mul(m.points));
+    total =
+        total.saturating_add(w(ChainTerm::LabelByte, W_LABEL_BYTE).saturating_mul(m.label_bytes));
+    total = total.saturating_add(w(ChainTerm::Pair, W_PAIR).saturating_mul(m.label_pairs));
+    total = total.saturating_add(
+        w(ChainTerm::StageSeries, W_STAGE_SERIES)
+            .saturating_mul(m.series)
+            .saturating_mul(stages),
+    );
+    total = total.saturating_add(
+        w(ChainTerm::GroupName, W_GROUPNAME)
+            .saturating_mul(m.series)
+            .saturating_mul(names),
+    );
+    if approx {
+        total = total.saturating_add(w(ChainTerm::ApproxTopk, W_APPROX_TOPK));
+    }
+    total
+}
+
+/// The same for a binary combination. `many`/`one` are chosen EXACTLY as
+/// [`instant_join`] chooses them (`MatchGroup::Left` and one-to-one ⇒
+/// many = lhs, `MatchGroup::Right` ⇒ many = rhs), so the include
+/// amplification is never charged against the wrong side.
+pub fn binary_peak_bytes(
+    op: BinOp,
+    matching: Option<&VectorMatching>,
+    lhs: &StageInput,
+    rhs: &StageInput,
+) -> u64 {
+    binary_peak_bytes_without(op, matching, lhs, rhs, BinaryTerm::None)
+}
+
+/// [`binary_peak_bytes`] with one coefficient forced to zero — §6's
+/// necessity seam; see [`post_agg_peak_bytes_without`].
+pub fn binary_peak_bytes_without(
+    op: BinOp,
+    matching: Option<&VectorMatching>,
+    lhs: &StageInput,
+    rhs: &StageInput,
+    drop: BinaryTerm,
+) -> u64 {
+    let b = |term: BinaryTerm, coeff: u64| if drop == term { 0 } else { coeff };
+    // `instant_join`'s own role assignment, transcribed.
+    let group = matching.and_then(|m| m.group.as_ref());
+    let (many, one) = match group {
+        None | Some(MatchGroup::Left(_)) => (lhs, rhs),
+        Some(MatchGroup::Right(_)) => (rhs, lhs),
+    };
+    let inc = include_bytes(matching, op, one);
+    // The `B_MANY` term prices `instant_join`'s `many_matched:
+    // HashMap<MatchSig, HashSet<MatchSig>>`, which exists ONLY on the
+    // grouped arm — the one-to-one arm keeps a single
+    // `HashSet<MatchSig>` and is priced by `B_SERIES`. Without this gate
+    // the term takes the same value with and without a group modifier and
+    // §6.4's difference-of-differences cancels it to zero, which is how
+    // the gate found the omission.
+    let many_series = if group.is_some() { many.series } else { 0 };
+
+    let mut total =
+        b(BinaryTerm::Series, B_SERIES).saturating_mul(lhs.series.saturating_add(rhs.series));
+    total = total.saturating_add(
+        b(BinaryTerm::Point, B_POINT).saturating_mul(lhs.points.saturating_add(rhs.points)),
+    );
+    total = total.saturating_add(
+        b(BinaryTerm::Label, B_LABEL)
+            .saturating_mul(lhs.label_bytes.saturating_add(rhs.label_bytes)),
+    );
+    total = total.saturating_add(
+        b(BinaryTerm::Pair, B_PAIR).saturating_mul(lhs.label_pairs.saturating_add(rhs.label_pairs)),
+    );
+    total = total.saturating_add(b(BinaryTerm::Many, B_MANY).saturating_mul(many_series));
+    total = total.saturating_add(
+        b(BinaryTerm::Include, B_INCLUDE)
+            .saturating_mul(many.series)
+            .saturating_mul(inc),
+    );
+    total
+}
+
+/// `s_min` — the smallest per-entry byte charge any of the four client
+/// leaf group paths levies, computed from live `size_of` through the
+/// leaf's own [`map_entry_bytes`]/[`grown_alloc_bytes`] vocabulary with
+/// the shortest possible key.
+///
+/// It is the feasible region's series operand: a leaf that admitted `N`
+/// groups paid at least `s_min * N` of its
+/// [`MAX_CLIENT_AGG_GROUP_BYTES`] budget, so `N <=
+/// (MAX_CLIENT_AGG_GROUP_BYTES - L̂) / s_min`. Derived, never chosen —
+/// if a slot's layout changes the region moves with it.
+pub fn leaf_min_entry_bytes() -> u64 {
+    [
+        MUT_GROUP_SLOT,
+        INSTANT_GROUP_SLOT,
+        FP_GROUP_SLOT,
+        SERIES_OUT_SLOT,
+    ]
+    .into_iter()
+    .map(|slot| map_entry_bytes(slot).saturating_add(grown_alloc_bytes(0)))
+    .min()
+    .expect("four leaf entry slots")
+}
+
 /// Applies an outer-to-inner vector-aggregation chain to a metric result
 /// (innermost applied first — the `.rev()` matching `MetricPlan.
 /// vector_aggs`' outer-first order). `pub` like [`run_pipeline_rows`]:

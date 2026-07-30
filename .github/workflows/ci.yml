@@ -1104,6 +1104,37 @@ jobs:
           path: target/e2e-artifacts/**
           if-no-files-found: ignore
 
+  # Issue #236 §5/AC 25: the post-aggregation allocation witness' LARGE
+  # SCALE cell. The per-PR `ci` job runs the whole
+  # `logql_post_agg_witness` binary at CI scale (10^3-10^4); this leg adds
+  # the `#[ignore]`d cell at `MAX_METRIC_RESULT_POINTS / 8` points, which
+  # extends the range over which `measured peak <= modelled bytes` is an
+  # OBSERVED property to ~10^6. Same trigger condition as
+  # `e2e-metrics-full` above: scale-invariant gates protect every PR, this
+  # one gathers evidence.
+  logql-post-agg-witness-scale:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+
+      - name: Large-scale post-aggregation witness cell
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          cargo test -p pulsus-read --test logql_post_agg_witness -- \
+            --ignored --nocapture --test-threads=1 \
+            zz_large_scale_cell_stays_inside_the_model
+
   # Issue #16, docs/schemas.md §9's two-tier model, Tier 1 distributed leg:
   # captures per-shard system.query_log + EXPLAIN PIPELINE evidence for the
   # logs-family shard-locality claims (docs/schemas.md §7,

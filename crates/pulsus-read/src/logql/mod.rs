@@ -96,6 +96,13 @@ pub fn terminal_sort(expr: &Expr) -> bool {
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETECTED_FIELD_BYTES};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
+    B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
+    MAX_POST_AGG_BYTES, StageInput, W_APPROX_TOPK, W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT,
+    W_SERIES, W_STAGE_SERIES, binary_peak_bytes, binary_peak_bytes_without, group_name_bytes,
+    include_bytes, leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
+    post_agg_peak_bytes_without,
+};
+pub use exec::{
     ClientWindow, DetectedFieldsProbe, EngineConfig, GridWindow, HistMatrixSeries, HistOrFloat,
     HistVectorSample, LogQlEngine, LogStats, MAX_FEEDER_SCRATCH_BYTES,
     MAX_VARIANT_FANOUT_STATE_BYTES, MatrixSeries, PatternSeries, QueryResult, StreamResult,
