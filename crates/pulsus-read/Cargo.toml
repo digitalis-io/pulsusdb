@@ -89,5 +89,9 @@ uuid = { version = "1", features = ["v4"] }
 # `exec.rs`/`plan.rs` with a syntax-aware visitor (a token/regex rule
 # cannot see generic calls or macro bodies). Never a production
 # dependency — `cargo tree -p pulsus-read -e normal` must not show syn.
+# Issue #236 §4.1's token census and AC 7's call-site census in
+# `tests/logql_metric_agg_golden.rs` are the other two consumers: the
+# latter counts CALL EXPRESSIONS, so respelling a call site cannot move
+# a published count the way a substring census let it.
 syn = { version = "=2.0.118", default-features = false, features = ["full", "parsing", "visit", "clone-impls", "printing"] }
 proc-macro2 = "1"

@@ -3682,56 +3682,176 @@ fn variants_range_matrix_carries_the_index_per_series() {
     assert_eq!(items[1].points.last(), Some(&(60 * NS, 4.0)));
 }
 
+/// The suite's own call sites, counted by PARSING it (whole-branch
+/// re-review round 4 `[low]`).
+///
+/// The first two cuts of the census below counted byte sequences —
+/// `"combine_binary("` — which measures SPELLING, not structure.
+/// `combine_binary (lhs, rhs)` is the same call site and a different
+/// string, so a line-broken argument list, a `rustfmt` change or a
+/// `#[rustfmt::skip]` could move the published numbers without a fixture
+/// moving; and a lexical instrument needed hand-written exclusions for
+/// its own literals, which it twice got wrong. This module counts CALL
+/// EXPRESSIONS by callee name instead, following the AC 18 call-graph
+/// census in `logql_post_agg_witness.rs`.
+///
+/// Scope: every function body in this file, at any nesting, with the
+/// bodies named in `skip` omitted. A DEFINITION is not a call, so the
+/// helper-definition exclusion the substring version needed is gone by
+/// construction; so is the self-reference one, because a route name
+/// written as a string literal is not a call expression either.
+mod call_sites {
+    use std::collections::BTreeMap;
+    use syn::visit::Visit;
+
+    /// Call counts by callee name (last path segment), plus every
+    /// function's doc comment as ONE whitespace-normalised line (so a
+    /// reflowed paragraph does not move a phrase out of the text) — the
+    /// census asserts against both.
+    #[derive(Debug, Default)]
+    pub struct Counted {
+        pub calls: BTreeMap<String, usize>,
+        pub docs: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug)]
+    struct Walk {
+        skip: Vec<String>,
+        out: Counted,
+    }
+
+    impl Visit<'_> for Walk {
+        fn visit_item_fn(&mut self, node: &syn::ItemFn) {
+            let name = node.sig.ident.to_string();
+            let doc: String = node
+                .attrs
+                .iter()
+                .filter_map(|a| match &a.meta {
+                    syn::Meta::NameValue(nv) if nv.path.is_ident("doc") => match &nv.value {
+                        syn::Expr::Lit(l) => match &l.lit {
+                            syn::Lit::Str(s) => Some(s.value()),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .flat_map(|line| {
+                    line.split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.out.docs.insert(name.clone(), doc);
+            if self.skip.contains(&name) {
+                return;
+            }
+            syn::visit::visit_item_fn(self, node);
+        }
+        fn visit_expr_call(&mut self, node: &syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*node.func
+                && let Some(seg) = p.path.segments.last()
+            {
+                *self.out.calls.entry(seg.ident.to_string()).or_default() += 1;
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+        fn visit_macro(&mut self, node: &syn::Macro) {
+            // `syn::visit` does not descend into token streams, and most
+            // of this suite's call sites sit inside `assert_eq!`.
+            if let Ok(exprs) = node.parse_body_with(
+                syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
+            ) {
+                for e in &exprs {
+                    self.visit_expr(e);
+                }
+            } else {
+                // A body that is not an expression list (`matches!`'s
+                // pattern) would otherwise hide a call site: count
+                // `ident(` TOKEN pairs there. Still whitespace-blind —
+                // these are tokens, not bytes.
+                token_fallback(node.tokens.clone(), &mut self.out.calls);
+            }
+        }
+    }
+
+    fn token_fallback(tokens: proc_macro2::TokenStream, out: &mut BTreeMap<String, usize>) {
+        let toks: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+        for pair in toks.windows(2) {
+            if let (proc_macro2::TokenTree::Ident(id), proc_macro2::TokenTree::Group(g)) =
+                (&pair[0], &pair[1])
+                && g.delimiter() == proc_macro2::Delimiter::Parenthesis
+            {
+                *out.entry(id.to_string()).or_default() += 1;
+            }
+        }
+        for t in toks {
+            if let proc_macro2::TokenTree::Group(g) = t {
+                token_fallback(g.stream(), out);
+            }
+        }
+    }
+
+    pub fn walk(src: &str, skip: &[&str]) -> Counted {
+        let file = syn::parse_file(src).expect("the suite parses as Rust");
+        let mut w = Walk {
+            skip: skip.iter().map(|s| (*s).to_string()).collect(),
+            out: Counted::default(),
+        };
+        w.visit_file(&file);
+        for name in skip {
+            assert!(
+                w.out.docs.contains_key(*name),
+                "`{name}` is not a function in this file — the census is excluding nothing"
+            );
+        }
+        w.out
+    }
+}
+
 /// AC 7's scope, counted rather than claimed (review round 1 `[low]`).
 ///
 /// The bit-equality assertion executes for fixtures routed through
 /// `run_client`; fixtures that drive `materialize_vector_lit`,
 /// `apply_vector_aggs`, `combine_binary` or `run_variants_rows` directly
-/// have no folded twin to compare against. This test reads the suite's
+/// have no folded twin to compare against. This test parses the suite's
 /// own source and pins both counts, so a sentence claiming "every
 /// fixture" cannot outlive the mechanism again.
 ///
-/// Both counts are the populations the sentence NAMES, which takes three
-/// exclusions the first cut missed (whole-branch re-review `[low]`): the
-/// census's own pattern literals (every name it greps for appears in the
-/// line that greps for it), `run_client`'s internal `apply_vector_aggs_ok`
-/// call (that one IS the routed path), and the helper DEFINITIONS. And
-/// `combine_binary` — named by the sentence, absent from the first count —
-/// is counted.
+/// Both counts are the populations the sentence NAMES. One exclusion
+/// survives the move to parsing (whole-branch re-review `[low]`, kept):
+/// `run_client`'s internal `apply_vector_aggs_ok` call, which IS the
+/// routed path rather than a direct fixture. And `combine_binary` —
+/// named by the sentence, absent from the first count — is counted.
+///
+/// **What each direction of the biconditional below can be shown by**
+/// (whole-branch re-review round 4 `[low]`): the caveat-deleted mutant is
+/// live and fails. The `direct == 0` direction is NOT reachable by any
+/// small mutation now — under a lexical census, respelling a call site
+/// emptied the count; under this one, only deleting all 76 direct
+/// fixtures does. That arm guards a future state (every direct route
+/// migrated onto `run_client`) in which the caveat must go too, and it is
+/// deliberately not claimed to be mutation-demonstrable.
 #[test]
 fn every_client_routed_fixture_is_an_equivalence_case() {
     const CAVEAT: &str = "which is not the same as every fixture in the file";
     // The direct population, exactly as the doc above enumerates it.
     const DIRECT_ROUTES: [&str; 4] = [
-        "apply_vector_aggs_ok(",
-        "materialize_vector_lit(",
-        "combine_binary(",
-        "run_variants_rows(",
+        "apply_vector_aggs_ok",
+        "materialize_vector_lit",
+        "combine_binary",
+        "run_variants_rows",
     ];
     let src = include_str!("logql_metric_agg_golden.rs");
-    // Everything before this census: its own literals are not fixtures.
-    let suite = src
-        .split_once("fn every_client_routed_fixture_is_an_equivalence_case(")
-        .expect("the census reads the file it lives in")
-        .0;
-    let rc_anchor = "fn run_client(";
-    let rc_start = suite.find(rc_anchor).expect("run_client exists");
-    let after_sig = &suite[rc_start + rc_anchor.len()..];
-    // `run_client`'s body ends at the first column-0 `}`; nothing inside
-    // it is a fixture — neither a call site (there are none) nor the
-    // `apply_vector_aggs_ok` that builds the materialised twin.
-    let rc_body_end = after_sig.find("\n}\n").expect("run_client's body ends");
-    let routed = after_sig[rc_body_end..].matches("run_client(").count();
-    let outside_run_client = format!("{}{}", &suite[..rc_start], &after_sig[rc_body_end..]);
-    let direct_sites = |route: &str| {
-        outside_run_client
-            .match_indices(route)
-            .filter(|(i, _)| !outside_run_client[..*i].ends_with("fn "))
-            .count()
-    };
-    // 38 real call sites. The previous floor of 40 was met only because
-    // the census counted its own two `run_client(` literals — the same
-    // self-reference the direct count made, found by correcting it.
+    // Nothing inside `run_client` is a fixture — neither a call site
+    // (there are none) nor the `apply_vector_aggs_ok` that builds the
+    // materialised twin.
+    let counted = call_sites::walk(src, &["run_client"]);
+    let site_count = |name: &str| counted.calls.get(name).copied().unwrap_or(0);
+    // 38 real call sites. The floor of 40 the first cut used was met only
+    // because a substring census counted its own `run_client(` literals.
+    let routed = site_count("run_client");
     assert!(
         routed >= 38,
         "only {routed} fixtures route through run_client — AC 7's equivalence assertion is \
@@ -3739,21 +3859,26 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
     );
     let per_route: Vec<(&str, usize)> = DIRECT_ROUTES
         .iter()
-        .map(|route| (*route, direct_sites(route)))
+        .map(|route| (*route, site_count(route)))
         .collect();
     let direct: usize = per_route.iter().map(|(_, n)| n).sum();
-    // The claim and the mechanism, side by side, in BOTH directions: the
-    // caveat must exist exactly while the direct fixtures do. One
-    // direction deletes the caveat while `direct` is 25 + 6 + 44 + 1 = 76;
-    // the other keeps the caveat after the direct population is emptied.
+    // The claim and the mechanism, side by side: the caveat must exist
+    // exactly while the direct fixtures do. `direct` is 25 + 6 + 44 + 1 =
+    // 76. The caveat is read out of `run_client`'s OWN doc comment — the
+    // sentence that makes the claim — so this cannot be satisfied by the
+    // string appearing anywhere else in the file, including here.
     //
     // This assertion runs BEFORE the per-route floors below (whole-branch
     // re-review round 3 `[low]`): emptying the direct population also
     // drives every route's count to 0, so a per-route `n > 0` placed first
     // panics and the `direct == 0` direction of this biconditional can
     // never be reached — leaving a two-way claim with one live direction.
+    let claim = counted
+        .docs
+        .get("run_client")
+        .expect("run_client is documented");
     assert_eq!(
-        suite.contains(CAVEAT),
+        claim.contains(CAVEAT),
         direct > 0,
         "AC 7's scope caveat and its {direct} direct fixtures must appear and disappear together"
     );
