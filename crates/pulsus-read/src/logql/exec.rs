@@ -3688,6 +3688,10 @@ pub(crate) struct AggCaps {
     pub counter_values: u64,
     pub collision_members: u64,
     pub collision_bytes: u64,
+    /// Issue #236: fixed-width RESULT point-slots — emitted grid points
+    /// and the fold's dense per-group slots — an ADMISSION counter, see
+    /// [`charge_result_points`].
+    pub result_points: u64,
 }
 
 impl AggCaps {
@@ -3698,6 +3702,7 @@ impl AggCaps {
         counter_values: MAX_COUNTER_VALUES,
         collision_members: MAX_TS_COLLISION_GROUP,
         collision_bytes: MAX_TS_COLLISION_GROUP_BYTES,
+        result_points: MAX_METRIC_RESULT_POINTS,
     };
 
     /// The per-sub-state caps for a `variants(...)` query with `n`
@@ -3714,6 +3719,7 @@ impl AggCaps {
             counter_values: self.counter_values / n,
             collision_members: self.collision_members / n,
             collision_bytes: self.collision_bytes / n,
+            result_points: self.result_points / n,
         }
     }
 
@@ -3736,6 +3742,9 @@ impl AggCaps {
         }
         if self.collision_bytes < min {
             min = self.collision_bytes;
+        }
+        if self.result_points < min {
+            min = self.result_points;
         }
         min
     }
@@ -4512,6 +4521,37 @@ fn charge_group_bytes(charged: &mut u64, bytes: u64, cap: u64) -> Result<(), Rea
     Ok(())
 }
 
+/// **The one result-point gate** (issue #236): every fixed-width point
+/// slot a metric evaluation will RETAIN is reserved here, against
+/// [`MAX_METRIC_RESULT_POINTS`], *before* the allocation that holds it.
+///
+/// An ADMISSION counter, not a concurrent-retention one — there is no
+/// discharge, because the slots it reserves hold the RESULT and live
+/// until the result is returned. `charge_retention`'s counters return to
+/// zero at finish; this one asserts a charge IDENTITY instead (the tests
+/// pin `charged == series x (kmax + 1)`).
+///
+/// **Charged `O(1)` per output series and per fold group, never per
+/// point.** Each reservation is the grid's full width (`kmax + 1`), which
+/// is both an exact upper bound on what one series can emit and the
+/// model [`MAX_METRIC_RESULT_POINTS`] is derived from
+/// (`MAX_QUERY_SERIES x MAX_ADMITTED_GRID_POINTS`) — so the gate and the
+/// constant speak the same units, and the read path gains no per-point
+/// work.
+///
+/// `saturating_add` cannot mask a breach (saturation only grows the sum)
+/// but keeps a pathological reservation from wrapping the comparison.
+fn charge_result_points(charged: &mut u64, points: u64, cap: u64) -> Result<(), ReadError> {
+    let next = charged.saturating_add(points);
+    if next > cap {
+        return Err(ReadError::QueryTooBroad(
+            TooBroadReason::MetricResultPoints { count: next, cap },
+        ));
+    }
+    *charged = next;
+    Ok(())
+}
+
 /// Releases a [`charge_group_bytes`] charge as finish consumes the entry it
 /// paid for. Saturating for panic-proofing only — the pairing is exact
 /// (charge and discharge run [`group_entry_bytes`] over the SAME unmodified
@@ -5184,6 +5224,12 @@ struct RangeSlideState<'q> {
     /// bounded by [`MAX_TS_COLLISION_GROUP_BYTES`] (one group staged at a
     /// time) and freed within the same flush.
     group_bytes: u64,
+    /// Issue #236: RESULT point-slots reserved by this state, through
+    /// [`charge_result_points`]. One grid's width per output series, at
+    /// the moment the series is created — `O(1)`, never per point. An
+    /// ADMISSION counter: it is never discharged, because the points it
+    /// reserves are the result.
+    result_points: u64,
     /// The innermost vector aggregation, applied AS this state emits
     /// (issue #236 Part B) instead of over its materialised output.
     /// `None` — the state's own construction default — is the
@@ -5277,6 +5323,7 @@ impl<'q> RangeSlideState<'q> {
             coll: Vec::new(),
             coll_bytes: 0,
             group_bytes: 0,
+            result_points: 0,
             fold: None,
         })
     }
@@ -5303,7 +5350,7 @@ impl<'q> RangeSlideState<'q> {
     /// keeping it out of `new` leaves that constructor's branch/allocation
     /// census (issue #221 `logql_variants_alloc`) untouched.
     fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
-        self.fold = VectorAggFold::new(spec, self.grid());
+        self.fold = VectorAggFold::new(spec, self.grid(), self.caps.result_points);
     }
 
     /// How many trailing (innermost) specs this leaf has taken over: 0 or
@@ -5601,6 +5648,15 @@ impl<'q> RangeSlideState<'q> {
                 group_entry_bytes("", src.unwrap_or(&EMPTY_LABEL_SET), SERIES_OUT_SLOT),
                 self.caps.group_bytes,
             )?;
+            // Issue #236: this slider will emit at most one point per
+            // grid point, so the grid's width is reserved once, here,
+            // before the slider exists — `O(1)`, and in the same units
+            // `MAX_METRIC_RESULT_POINTS` is derived in.
+            charge_result_points(
+                &mut self.result_points,
+                grid_slot_count(self.kmax),
+                self.caps.result_points,
+            )?;
             let labels = src.cloned().unwrap_or_default();
             self.cur = Some(FpSlide {
                 stream_hash,
@@ -5678,6 +5734,14 @@ impl<'q> RangeSlideState<'q> {
                 &mut self.group_bytes,
                 group_entry_bytes(&key, &labels, MUT_GROUP_SLOT),
                 self.caps.group_bytes,
+            )?;
+            // Issue #236: same reservation as the non-mutating slider —
+            // one grid width per output group, once, before the group
+            // exists.
+            charge_result_points(
+                &mut self.result_points,
+                grid_slot_count(self.kmax),
+                self.caps.result_points,
             )?;
         }
         let per_sample = self.per_sample;
@@ -5798,7 +5862,7 @@ impl<'q> RangeSlideState<'q> {
             self.rotate_slider(prev);
         }
         if self.is_absent {
-            let series = self.finish_absent();
+            let series = self.finish_absent()?;
             return self.emit(series);
         }
         if self.fan_out {
@@ -6051,7 +6115,15 @@ impl<'q> RangeSlideState<'q> {
     /// Returns the series rather than a [`QueryResult`] so the caller can
     /// route them through the issue #236 Part B fold like every other
     /// emit path; the 0-or-1 shape is unchanged.
-    fn finish_absent(&mut self) -> Vec<MatrixSeries> {
+    fn finish_absent(&mut self) -> Result<Vec<MatrixSeries>, ReadError> {
+        // Issue #236: `absent_over_time` emits at most ONE series, whose
+        // points are the grid's empty windows — reserved before the
+        // vector is built, like every other emitted series.
+        charge_result_points(
+            &mut self.result_points,
+            grid_slot_count(self.kmax),
+            self.caps.result_points,
+        )?;
         let mut points: Vec<(i64, f64)> = Vec::new();
         // Same width as the deltas (see `present_cover`'s proof): the running
         // sum is bounded by the total collision-group count, itself bounded by
@@ -6063,14 +6135,14 @@ impl<'q> RangeSlideState<'q> {
                 points.push((self.grid_point(k), 1.0));
             }
         }
-        if points.is_empty() {
+        Ok(if points.is_empty() {
             Vec::new()
         } else {
             vec![MatrixSeries {
                 labels: std::mem::take(&mut self.absent_labels),
                 points,
             }]
-        }
+        })
     }
 }
 
@@ -9420,7 +9492,7 @@ impl FoldGrid {
     /// Slots in one group's dense vector: `kmax + 1`, and 0 for the empty
     /// grid (`kmax == -1`, which `grid_point_count == 0` produces).
     fn slots(&self) -> usize {
-        usize::try_from(self.kmax.saturating_add(1)).unwrap_or(0)
+        usize::try_from(grid_slot_count(self.kmax)).unwrap_or(0)
     }
 
     /// `grid_start + k*step`, narrowed exactly as `FpSlide::grid_point`
@@ -9502,6 +9574,15 @@ fn mut_cells_for(class: ReducerClass, range: i64, step: u64, kmax: i64) -> MutCe
     } else {
         MutCells::IntExpanded(HashMap::new())
     }
+}
+
+/// Grid points on a `kmax`-indexed emit grid: `kmax + 1`, and 0 for the
+/// empty grid. The unit every [`charge_result_points`] reservation is
+/// made in — one series can emit at most this many points, and
+/// [`MAX_METRIC_RESULT_POINTS`] is derived as
+/// `MAX_QUERY_SERIES * MAX_ADMITTED_GRID_POINTS` in exactly these units.
+fn grid_slot_count(kmax: i64) -> u64 {
+    u64::try_from(kmax.saturating_add(1)).unwrap_or(0)
 }
 
 /// The internal-invariant breach [`FoldGrid::index_of`] reports.
@@ -9646,6 +9727,10 @@ struct ReduceFold {
     grouping: Option<Grouping>,
     grid: FoldGrid,
     groups: HashMap<LabelSet, Vec<VectorAccum>>,
+    /// Reserved point-slots, charged through [`charge_result_points`]
+    /// BEFORE the dense vector below is allocated (issue #236).
+    slots: u64,
+    slot_cap: u64,
 }
 
 impl ReduceFold {
@@ -9657,10 +9742,20 @@ impl ReduceFold {
             return Ok(());
         }
         let (op, grid) = (self.op, self.grid);
-        let slots = self
-            .groups
-            .entry(group_key(labels, self.grouping.as_ref()))
-            .or_insert_with(|| vec![VectorAccum::EMPTY; grid.slots()]);
+        // CHARGE, THEN ALLOCATE. `or_insert_with` would allocate inside
+        // its closure, which is why the entry is matched explicitly: the
+        // dense `kmax + 1` vector is reserved against the cap before it
+        // exists, so a breach refuses rather than being observed after
+        // the fact.
+        let charged = &mut self.slots;
+        let cap = self.slot_cap;
+        let slots = match self.groups.entry(group_key(labels, self.grouping.as_ref())) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                charge_result_points(charged, grid.slots() as u64, cap)?;
+                e.insert(vec![VectorAccum::EMPTY; grid.slots()])
+            }
+        };
         for &(t, v) in points {
             let k = grid.index_of(t).ok_or_else(|| fold_off_grid(t))?;
             let Some(slot) = slots.get_mut(k) else {
@@ -9709,6 +9804,11 @@ struct SelectFold {
     live: HashMap<u32, LiveSeries>,
     /// The next push-order id; `select_k_range`'s input index.
     next_series: u32,
+    /// Reserved point-slots (issue #236): the dense per-group vector, and
+    /// one more for each candidate a slot retains beyond its first — the
+    /// `KSel::Many` heap, which the dense reservation does not cover.
+    slots: u64,
+    slot_cap: u64,
 }
 
 impl SelectFold {
@@ -9723,16 +9823,31 @@ impl SelectFold {
         // fill a slot: `k >= 1` here (`k == 0` is `VectorAggFold::Empty`,
         // which never constructs a `SelectFold`), so the first series to
         // reach a fresh group always wins its slots.
-        let slots = self
-            .groups
-            .entry(group_key(labels, self.grouping.as_ref()))
-            .or_insert_with(|| vec![KSel::Empty; grid.slots()]);
+        // CHARGE, THEN ALLOCATE — as `ReduceFold::push_series`.
+        let charged = &mut self.slots;
+        let cap = self.slot_cap;
+        let slots = match self.groups.entry(group_key(labels, self.grouping.as_ref())) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                charge_result_points(charged, grid.slots() as u64, cap)?;
+                e.insert(vec![KSel::Empty; grid.slots()])
+            }
+        };
         let live = &mut self.live;
         for &(t, v) in points {
             let idx = grid.index_of(t).ok_or_else(|| fold_off_grid(t))?;
             let Some(slot) = slots.get_mut(idx) else {
                 return Err(fold_off_grid(t));
             };
+            // CHARGE, THEN ALLOCATE — the reservation must sit AHEAD of
+            // the insertion, not observe it afterwards. The slot's
+            // occupancy grows by exactly one iff it is not already full,
+            // which is known before `insert` runs: below `k` the new
+            // candidate is always accepted, at `k` the insertion is
+            // occupancy-neutral (it either evicts one or is rejected).
+            if slot.as_slice().len() < k {
+                charge_result_points(charged, 1, cap)?;
+            }
             let evicted = {
                 let seen: &HashMap<u32, LiveSeries> = live;
                 // Every candidate already in the slot HOLDS it, so its
@@ -9856,7 +9971,7 @@ impl VectorAggFold {
     /// reducing arm against [`VectorAccum::is_reduction`], so a new
     /// operator is a build failure here rather than a silent
     /// misclassification.
-    fn new(spec: &plan::VectorAggSpec, grid: FoldGrid) -> Option<Self> {
+    fn new(spec: &plan::VectorAggSpec, grid: FoldGrid, slot_cap: u64) -> Option<Self> {
         let (op, grouping, param) = spec;
         match *op {
             VectorAggOp::Sort | VectorAggOp::SortDesc | VectorAggOp::ApproxTopk => None,
@@ -9873,6 +9988,8 @@ impl VectorAggFold {
                     groups: HashMap::new(),
                     live: HashMap::new(),
                     next_series: 0,
+                    slots: 0,
+                    slot_cap,
                 }))
             }
             VectorAggOp::Sum
@@ -9886,6 +10003,8 @@ impl VectorAggFold {
                 grouping: grouping.clone(),
                 grid,
                 groups: HashMap::new(),
+                slots: 0,
+                slot_cap,
             })),
         }
     }
@@ -9923,6 +10042,16 @@ impl VectorAggFold {
         match self {
             VectorAggFold::Reduce(f) => f.groups.values().map(Vec::len).sum(),
             VectorAggFold::Select(f) => f.groups.values().map(Vec::len).sum(),
+            VectorAggFold::Empty => 0,
+        }
+    }
+
+    /// Point-slots reserved so far. Test-only, as [`Self::cells`].
+    #[cfg(test)]
+    fn reserved_slots(&self) -> u64 {
+        match self {
+            VectorAggFold::Reduce(f) => f.slots,
+            VectorAggFold::Select(f) => f.slots,
             VectorAggFold::Empty => 0,
         }
     }
@@ -10718,6 +10847,197 @@ mod tests {
             // Class C: the fold runs in the same canonical order.
             assert_eq!(run(RangeAggOp::SumOverTime, &order), vec![(10, 6.0)]);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #236 §4 — the result-point charge.
+    // -----------------------------------------------------------------
+
+    /// The charge is an ADMISSION counter with an exact IDENTITY: one
+    /// grid width per output series, whatever the data's density.
+    ///
+    /// Stated as an identity rather than an inequality because that is
+    /// what makes it checkable — a charge that merely stayed under the
+    /// cap would pass with the reservation deleted.
+    #[test]
+    fn the_result_point_charge_is_one_grid_width_per_output_series() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        // step 10 over [0, 100] => kmax = 10 => 11 grid points.
+        let window = slide_window(0, 100, 10, 30);
+        let grid = 11u64;
+
+        // Non-mutating: one slider per FINGERPRINT.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | line_format "keep""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(!compiled.metric_mutates_labels());
+        let mut state =
+            RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                .unwrap();
+        // Six rows on ONE fingerprint: density must not move the charge.
+        state
+            .push_rows(&slide_rows(
+                1,
+                &[
+                    (5, "a"),
+                    (6, "b"),
+                    (17, "c"),
+                    (28, "d"),
+                    (39, "e"),
+                    (95, "f"),
+                ],
+            ))
+            .expect("fold");
+        assert_eq!(
+            state.result_points, grid,
+            "one fingerprint => exactly one grid width, whatever its density"
+        );
+
+        // Mutating: one group per distinct OUTPUT LABEL SET.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(compiled.metric_mutates_labels());
+        for groups in [1u64, 3, 7] {
+            let mut state =
+                RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                    .unwrap();
+            // Two rows per group, so the count is groups and not rows.
+            let mut rows: Vec<MetricScanRow> = Vec::new();
+            for g in 0..groups {
+                for r in 0..2u64 {
+                    rows.push(MetricScanRow {
+                        fingerprint: 1,
+                        timestamp_ns: (g * 10 + r) as i64,
+                        body: format!("id={g}"),
+                    });
+                }
+            }
+            state.push_rows(&rows).expect("fold");
+            assert_eq!(
+                state.result_points,
+                groups * grid,
+                "{groups} output groups => {groups} grid widths"
+            );
+        }
+    }
+
+    /// The cap REFUSES, and it refuses BEFORE the allocation it is
+    /// guarding — the group that would breach is never created.
+    #[test]
+    fn the_result_point_cap_refuses_before_the_group_exists() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let mut state =
+            RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                .unwrap();
+        // Room for exactly two groups (11 points each).
+        state.caps.result_points = 22;
+        // FOUR rows: `push_rows` flushes a collision group only when the
+        // next row's `(fingerprint, ts)` differs, so the trailing group
+        // stays staged. The fourth row is what makes the third group
+        // flush — and breach — inside `push_rows` rather than at finish.
+        let rows: Vec<MetricScanRow> = (0..4u64)
+            .map(|g| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: g as i64 * 10,
+                body: format!("id={g}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricResultPoints { count, cap })) => {
+                assert_eq!(cap, 22);
+                assert_eq!(count, 33, "the error names the breaching reservation");
+            }
+            other => panic!("expected MetricResultPoints, got {other:?}"),
+        }
+        assert_eq!(
+            state.groups.len(),
+            2,
+            "the breaching group must never be created"
+        );
+        assert_eq!(state.result_points, 22, "a refused charge must not stick");
+    }
+
+    /// The FOLD reserves its dense slots before the vector exists, and
+    /// the reservation is the vector's own width.
+    #[test]
+    fn the_fold_reserves_its_dense_slots_before_allocating_them() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 10,
+            kmax: 4,
+        };
+        let slots = 5u64;
+        let by_id = Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["id".to_string()],
+        };
+        // Two output groups' worth of room, three groups offered.
+        let mut fold = VectorAggFold::new(&(VectorAggOp::Sum, Some(by_id), None), grid, 2 * slots)
+            .expect("sum folds");
+        for g in 0..2u32 {
+            let labels = fold_labels(&[("id", &g.to_string())]);
+            fold.push_series(&labels, &[(0, 1.0)]).expect("admitted");
+        }
+        assert_eq!(fold.groups(), 2);
+        assert_eq!(
+            fold.cells(),
+            2 * slots as usize,
+            "dense, kmax + 1 per group"
+        );
+        let labels = fold_labels(&[("id", "2")]);
+        match fold.push_series(&labels, &[(0, 1.0)]) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricResultPoints { count, cap })) => {
+                assert_eq!(cap, 2 * slots);
+                assert_eq!(count, 3 * slots);
+            }
+            other => panic!("expected MetricResultPoints, got {other:?}"),
+        }
+        assert_eq!(
+            fold.groups(),
+            2,
+            "the refused group's dense vector must never be allocated"
+        );
+
+        // The selecting fold charges the same dense reservation, plus one
+        // for each candidate a slot retains beyond its first.
+        let mut fold = VectorAggFold::new(&(VectorAggOp::Topk, None, Some(2.0)), grid, 1_000)
+            .expect("topk folds");
+        fold.push_series(&fold_labels(&[("h", "a")]), &[(0, 1.0)])
+            .expect("admitted");
+        // One group's dense vector (5) + one candidate.
+        assert_eq!(fold_slots(&fold), slots + 1);
+        fold.push_series(&fold_labels(&[("h", "b")]), &[(0, 2.0)])
+            .expect("admitted");
+        assert_eq!(fold_slots(&fold), slots + 2, "the slot grew to k = 2");
+        // The slot is now FULL: a third candidate evicts rather than
+        // growing, so it reserves nothing.
+        fold.push_series(&fold_labels(&[("h", "c")]), &[(0, 3.0)])
+            .expect("admitted");
+        assert_eq!(
+            fold_slots(&fold),
+            slots + 2,
+            "an eviction is occupancy-neutral and must charge nothing"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -16494,7 +16814,7 @@ mod tests {
             kmax: 3,
         };
         for op in REDUCING_OPS {
-            let fold = VectorAggFold::new(&(op, None, None), grid)
+            let fold = VectorAggFold::new(&(op, None, None), grid, MAX_METRIC_RESULT_POINTS)
                 .unwrap_or_else(|| panic!("{op:?} is reducing and must fold"));
             assert!(
                 matches!(fold, VectorAggFold::Reduce(_)),
@@ -16514,17 +16834,18 @@ mod tests {
             VectorAggOp::ApproxTopk,
         ] {
             assert!(
-                VectorAggFold::new(&(op, None, Some(3.0)), grid).is_none(),
+                VectorAggFold::new(&(op, None, Some(3.0)), grid, MAX_METRIC_RESULT_POINTS)
+                    .is_none(),
                 "{op:?} must be declined by the leaf"
             );
         }
         for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
             assert!(matches!(
-                VectorAggFold::new(&(op, None, Some(2.0)), grid),
+                VectorAggFold::new(&(op, None, Some(2.0)), grid, MAX_METRIC_RESULT_POINTS),
                 Some(VectorAggFold::Select(_))
             ));
             assert!(matches!(
-                VectorAggFold::new(&(op, None, Some(0.0)), grid),
+                VectorAggFold::new(&(op, None, Some(0.0)), grid, MAX_METRIC_RESULT_POINTS),
                 Some(VectorAggFold::Empty)
             ));
         }
@@ -16533,6 +16854,10 @@ mod tests {
     /// A leaf series as the fold receives it: labels plus grid-aligned
     /// `(timestamp, value)` points.
     type FoldInput = (LabelSet, Vec<(i64, f64)>);
+
+    fn fold_slots(fold: &VectorAggFold) -> u64 {
+        fold.reserved_slots()
+    }
 
     fn fold_labels(pairs: &[(&str, &str)]) -> LabelSet {
         pairs
@@ -16547,7 +16872,8 @@ mod tests {
         grid: FoldGrid,
         input: &[FoldInput],
     ) -> Vec<MatrixSeries> {
-        let mut fold = VectorAggFold::new(spec, grid).expect("this spec folds");
+        let mut fold =
+            VectorAggFold::new(spec, grid, MAX_METRIC_RESULT_POINTS).expect("this spec folds");
         for (labels, points) in input {
             fold.push_series(labels, points).expect("on-grid points");
         }
@@ -16735,9 +17061,12 @@ mod tests {
                 .collect()
         };
         let cells_at = |n: usize| -> (usize, usize, usize) {
-            let mut fold =
-                VectorAggFold::new(&(VectorAggOp::Sum, Some(grouping.clone()), None), grid)
-                    .expect("sum folds");
+            let mut fold = VectorAggFold::new(
+                &(VectorAggOp::Sum, Some(grouping.clone()), None),
+                grid,
+                MAX_METRIC_RESULT_POINTS,
+            )
+            .expect("sum folds");
             for (labels, points) in leaf(n) {
                 fold.push_series(&labels, &points).expect("on-grid");
             }
@@ -16776,8 +17105,12 @@ mod tests {
         let shapes = [None, Some(by_id)];
         for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
             for grouping in &shapes {
-                let mut fold = VectorAggFold::new(&(op, grouping.clone(), Some(0.0)), grid)
-                    .expect("k == 0 still folds");
+                let mut fold = VectorAggFold::new(
+                    &(op, grouping.clone(), Some(0.0)),
+                    grid,
+                    MAX_METRIC_RESULT_POINTS,
+                )
+                .expect("k == 0 still folds");
                 for i in 0..501u32 {
                     let labels = fold_labels(&[("id", &i.to_string())]);
                     let points: Vec<(i64, f64)> =
@@ -16816,8 +17149,12 @@ mod tests {
         for k in 0..=4usize {
             assert_eq!(grid.index_of(grid.point(k)), Some(k), "point/index inverse");
         }
-        let mut fold =
-            VectorAggFold::new(&(VectorAggOp::Sum, None, None), grid).expect("sum folds");
+        let mut fold = VectorAggFold::new(
+            &(VectorAggOp::Sum, None, None),
+            grid,
+            MAX_METRIC_RESULT_POINTS,
+        )
+        .expect("sum folds");
         match fold.push_series(&Vec::new(), &[(105, 1.0)]) {
             Err(ReadError::PipelineInvalid { reason }) => {
                 assert!(reason.contains("off the query grid"), "{reason}");
@@ -17089,6 +17426,38 @@ mod tests {
             ("ip.rs", include_str!("ip.rs")),
         ];
 
+        // **The file set must not be able to shrink silently.**
+        // `include_str!` needs compile-time literals, so `SOURCES` is
+        // written out — which means a source file added to `src/logql`
+        // (the post-aggregation region is scheduled to move into one of
+        // its own after #236 merges) would simply not be searched, and
+        // this census would keep passing while covering less. That is the
+        // gate-weakening shape this issue has hit repeatedly, so it is
+        // closed here rather than noted: the list is compared against the
+        // DIRECTORY at run time and a file it does not name is a loud
+        // failure naming the file, not a quiet reduction in scope.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the logql source directory")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .map(|p| {
+                p.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        on_disk.sort();
+        let mut named: Vec<String> = SOURCES.iter().map(|(n, _)| (*n).to_string()).collect();
+        named.sort();
+        assert_eq!(
+            named, on_disk,
+            "the census file set and `src/logql` have diverged — add the new file to \
+             `SOURCES` (and to any other census scoped to this region) rather than \
+             letting the search quietly cover less than the module"
+        );
+
         /// Everything above the file's `#[cfg(test)]` marker.
         fn production(src: &str) -> &str {
             match src.find("\n#[cfg(test)]") {
@@ -17228,6 +17597,7 @@ mod tests {
         assert_eq!(d.counter_values, MAX_COUNTER_VALUES);
         assert_eq!(d.collision_members, MAX_TS_COLLISION_GROUP);
         assert_eq!(d.collision_bytes, MAX_TS_COLLISION_GROUP_BYTES);
+        assert_eq!(d.result_points, MAX_METRIC_RESULT_POINTS);
         assert_eq!(d.divided(1), d, "divided(1) must be byte-identical");
         // The re-derivation, pinned to the SYMBOL and to the VALUE so a
         // future cap change cannot silently move the backstop.
@@ -17243,6 +17613,7 @@ mod tests {
                 (v.counter_values, d.counter_values),
                 (v.collision_members, d.collision_members),
                 (v.collision_bytes, d.collision_bytes),
+                (v.result_points, d.result_points),
             ] {
                 assert!(field >= 1, "divided({n}) floored a cap to 0");
                 assert!(field * n <= whole, "divided({n}) sum exceeds the whole");
@@ -17255,6 +17626,24 @@ mod tests {
             MAX_TS_COLLISION_GROUP_BYTES / 2
         );
         assert_eq!(d.divided(2).collision_members, MAX_TS_COLLISION_GROUP / 2);
+        // Issue #236 §4: the result-point cap divides like every other
+        // field, so a `variants(...)` query's sub-states SUM to the
+        // single-query bound rather than each getting the whole of it.
+        assert_eq!(d.divided(2).result_points, MAX_METRIC_RESULT_POINTS / 2);
+
+        // The hand-written field lists above are the census's weak point:
+        // a NEW cap added to `AggCaps` would be divided by `divided` and
+        // ignored here. Destructuring is what makes that a build failure
+        // — add a field and this stops compiling until it is listed.
+        let AggCaps {
+            group_bytes: _,
+            retention_points: _,
+            quantile_values: _,
+            counter_values: _,
+            collision_members: _,
+            collision_bytes: _,
+            result_points: _,
+        } = d;
     }
 
     /// (S)-leaf pin: the walk's `Copy ⇒ no owned heap` rule holds for

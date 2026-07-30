@@ -1792,23 +1792,12 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "exec.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish_in_place",
-        // Issue #236 P2: the slider-retirement `if let` moved into
-        // `rotate_slider`, and the non-mutating tail gained a discharge
-        // loop over `series_out` (11 -> 12).
-        //
-        // Issue #236 Part B: the fan-out arm sorts its groups by label
-        // set and routes each either to the fold or to `out`; both arms
-        // finish through the fold, and the absent/non-mutating tails
-        // route through `.emit`.
-        //
-        // Issue #236 Part C: the three-arm cell drain moved out to
-        // `RangeSlideState::drain_group` (its own frame below, so the
-        // census still reads the body rather than losing it behind a
-        // delegating callee) — 15 -> 10 branches here. Regenerated with
-        // `zz_print_frame_censuses`. W-MEM disposition: **NOT-EXEC**
-        // (row F-x) for the fold arms; the group sort is **NIL** (an
-        // in-place sort of a `Vec` the loop was going to drain anyway).
-        branches: 10,
+        // Issue #236 P2 / Part B / Part C history above; the result-point
+        // charge (issue #236 §4) made `finish_absent` fallible, so the
+        // absent arm gains a `?` (10 -> 11 branches). Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — a
+        // propagated `Result`, no allocation.
+        branches: 11,
         callees: &[
             ".as_mut",
             ".cmp",
@@ -1876,31 +1865,38 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "exec.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish_absent",
-        // Issue #236 Part B: returns `Vec<MatrixSeries>` instead of a
-        // `QueryResult` so the caller can route it through the fold like
-        // every other emit path, so `Matrix` leaves this frame (7 → 6
-        // callees, branch count unchanged). Regenerated with
-        // `zz_print_frame_censuses`. W-MEM disposition: **BAND**,
-        // unchanged — row F-m already prices the points vector and the
-        // one-element `vec![series]`, and both are byte-identical.
-        branches: 3,
-        callees: &[".grid_point", ".is_empty", ".push", "new", "take", "vec!"],
+        // Issue #236 Part B made this return `Vec<MatrixSeries>`; the
+        // §4 result-point charge made it fallible and added the
+        // reservation for the one series it may emit (3 -> 4 branches).
+        // Regenerated with `zz_print_frame_censuses`. W-MEM disposition:
+        // **BAND**, unchanged — row F-m already prices the points vector
+        // and the one-element `vec![series]`; the charge is integer
+        // arithmetic ahead of them.
+        branches: 4,
+        callees: &[
+            ".grid_point",
+            ".is_empty",
+            ".push",
+            "Ok",
+            "charge_result_points",
+            "grid_slot_count",
+            "new",
+            "take",
+            "vec!",
+        ],
     },
     Frame {
         file: "exec.rs",
         ty: Some("RangeSlideState"),
         anchor: "flush_collision",
         // Issue #236: Part A deleted the `series_count > caps.series`
-        // rejection (so `Err`/`QueryTooBroad`/`.push` leave this frame);
-        // P2 put a `charge_group_bytes(group_entry_bytes(...))?` in its
-        // place before the `labels` clone, and the slider retirement moved
-        // into `.rotate_slider`. Branch count is unchanged at 12 (one
-        // rejection `if` traded for one charge `?`). Regenerated with
-        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — the
-        // charge is integer arithmetic over an already-materialised label
-        // set, on the same once-per-fingerprint path the deleted check
-        // occupied.
-        branches: 12,
+        // rejection, P2 put a `charge_group_bytes` in its place, and the
+        // §4 result-point charge reserves one grid width per slider
+        // beside it (12 -> 13 branches). Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** —
+        // integer arithmetic on the same once-per-fingerprint path the
+        // deleted check occupied; it allocates nothing.
+        branches: 13,
         callees: &[
             ".as_bytes",
             ".as_mut",
@@ -1925,6 +1921,8 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             "Ok",
             "Some",
             "charge_group_bytes",
+            "charge_result_points",
+            "grid_slot_count",
             "group_entry_bytes",
             "new",
             "take",

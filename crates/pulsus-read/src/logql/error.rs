@@ -236,6 +236,27 @@ pub enum TooBroadReason {
     /// from a ClickHouse error code. Set generously so nothing Loki
     /// reliably serves is rejected.
     MetricRetention { count: u64, cap: u64 },
+    /// Issue #236: a metric evaluation reserved more fixed-width RESULT
+    /// point-slots — grid points a leaf series will emit, and the dense
+    /// per-group slots the streaming vector-aggregation fold retains —
+    /// than [`crate::logql::exec::MAX_METRIC_RESULT_POINTS`].
+    ///
+    /// This is the POINTS half of the bound that replaced the deleted
+    /// mid-scan group-COUNT cap; the bytes half is
+    /// [`Self::MetricGroupLabelBytes`]. It is an ADMISSION counter, not a
+    /// concurrent-retention one: a slot is reserved before the allocation
+    /// that holds it and is never released, because the points it stands
+    /// for ARE the result. The charge is `O(1)` per output series and per
+    /// fold group — never per point — so a breach is refused before the
+    /// allocation rather than observed after it.
+    ///
+    /// The cap is DERIVED from what a servable result can hold
+    /// ([`crate::logql::exec::MAX_QUERY_SERIES`] series x
+    /// [`crate::logql::exec::MAX_ADMITTED_GRID_POINTS`] points), so no
+    /// result the reference serves is refused by it; what it does refuse
+    /// is an INTERMEDIATE wide enough that its point product exceeds
+    /// that, which is a bounded error rather than an OOM.
+    MetricResultPoints { count: u64, cap: u64 },
     /// Issue #227 (review round 6): the label-mutating client-aggregation
     /// path retained more QUERY-LIFETIME bytes of distinct output-group
     /// state — each first-seen group's rendered JSON key plus its cloned
@@ -448,6 +469,13 @@ impl fmt::Display for TooBroadReason {
                     "the sliding-window range evaluation retained {count} concurrent sample \
                      points, exceeding the {cap}-point cap — narrow the [range], the pipeline, \
                      or the time window"
+                )
+            }
+            TooBroadReason::MetricResultPoints { count, cap } => {
+                write!(
+                    f,
+                    "the metric evaluation would reserve {count} result point-slots, exceeding \
+                     the {cap}-point cap — narrow the aggregation, the step, or the time window"
                 )
             }
             TooBroadReason::MetricGroupLabelBytes { bytes, cap } => {
