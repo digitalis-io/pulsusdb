@@ -139,6 +139,7 @@
 //! | F-u | VariantsAggState::finish delegation + post-condition | VariantsAggState::finish | exec.rs VariantsAggState::finish | NIL | Phi1-Phi7 |
 //! | F-v | non-absent RANGE emit arm of ClientAggState::finish | ClientAggState::finish | exec.rs ClientAggState::finish | UNREACH | same routing citation as F-i |
 //! | F-w | apply_vector_aggs for an aggregation-bearing variant | VariantsAggState::finish_in_place | exec.rs apply_vector_aggs | R4 (iii) | input bounded by AggCaps::divided(n).series; G2/G3 slopes |
+//! | F-y | one mutating group's cell drain (expanded / delta / sample sweep) | RangeSlideState::drain_group | exec.rs RangeSlideState::drain_group | NOT-EXEC | rows.is_empty() => no mutating group exists => never called (F-d's premise) |
 //! | F-x | issue #236 Part B fold containers (dense slots, live map) | RangeSlideState::finish_in_place | exec.rs RangeSlideState::emit + VectorAggFold | NOT-EXEC | run_variants never calls attach_fold; fold is None here |
 //!
 //! # G4 — what this gate does NOT catch (eight gaps)
@@ -1289,7 +1290,7 @@ fn parse_source(name: &str) -> syn::File {
 fn zz_print_frame_censuses() {
     let exec = parse_source("exec.rs");
     let plan_f = parse_source("plan.rs");
-    let frames: [(&str, Option<&str>, &str); 26] = [
+    let frames: [(&str, Option<&str>, &str); 27] = [
         ("plan.rs", None, "build_variants_node"),
         ("plan.rs", None, "unwrap_vector_aggs_into"),
         ("plan.rs", None, "parse_vector_agg_params"),
@@ -1313,6 +1314,7 @@ fn zz_print_frame_censuses() {
         ("exec.rs", Some("RangeSlideState"), "push_rows"),
         ("exec.rs", Some("RangeSlideState"), "finish"),
         ("exec.rs", Some("RangeSlideState"), "finish_in_place"),
+        ("exec.rs", Some("RangeSlideState"), "drain_group"),
         ("exec.rs", Some("RangeSlideState"), "finish_absent"),
         ("exec.rs", Some("RangeSlideState"), "flush_collision"),
         ("exec.rs", Some("FpSlide"), "finish"),
@@ -1337,7 +1339,7 @@ fn zz_print_frame_censuses() {
     }
 }
 
-/// The 26 per-variant frames (`W-MEM`): one entry per FUNCTION. The 12
+/// The 27 per-variant frames (`W-MEM`): one entry per FUNCTION. The 12
 /// frames this issue creates are pinned from the implementation-commit
 /// census; the 14 pre-existing frames reproduce the plan's pinned
 /// censuses except where the plan itself edits the body (deviations
@@ -1345,7 +1347,7 @@ fn zz_print_frame_censuses() {
 /// (M1's `.clone` → `.cloned` plus `format_args!`) and
 /// `RangeSlideState::new` (the `vec![0; …]` macro body does not parse as
 /// an expression list, so the token fallback records `max?`).
-static PER_VARIANT_FRAMES: [Frame; 26] = [
+static PER_VARIANT_FRAMES: [Frame; 27] = [
     // --- W_plan (4) ---
     Frame {
         file: "plan.rs",
@@ -1795,55 +1797,83 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         ty: Some("RangeSlideState"),
         anchor: "finish_in_place",
         // Issue #236 P2: the slider-retirement `if let` moved into
-        // `rotate_slider` (so `.finish` leaves this frame and
-        // `.rotate_slider` enters), and the non-mutating tail gained a
-        // discharge loop over `series_out` (11 → 12 branches).
+        // `rotate_slider`, and the non-mutating tail gained a discharge
+        // loop over `series_out` (11 -> 12).
         //
-        // Issue #236 Part B (12 → 15 branches): the fan-out arm sorts its
-        // groups by label set and routes each group either to the fold
-        // (`.as_mut`/`.push_series`) or to `out`; both arms then finish
-        // through the fold (`.finish`), and the absent/non-mutating tails
-        // route through `.emit`. `Matrix` leaves `finish_absent` and stays
-        // here. Regenerated with `zz_print_frame_censuses`. W-MEM
-        // disposition: **NOT-EXEC** (row F-x) — a `variants(...)`
-        // sub-state is never handed a fold (`run_variants` does not call
-        // `attach_fold`), so every fold arm is dead in this window; the
-        // group sort is **NIL** (an in-place sort of a `Vec` the loop was
-        // going to drain anyway).
-        branches: 15,
+        // Issue #236 Part B: the fan-out arm sorts its groups by label
+        // set and routes each either to the fold or to `out`; both arms
+        // finish through the fold, and the absent/non-mutating tails
+        // route through `.emit`.
+        //
+        // Issue #236 Part C: the three-arm cell drain moved out to
+        // `RangeSlideState::drain_group` (its own frame below, so the
+        // census still reads the body rather than losing it behind a
+        // delegating callee) — 15 -> 10 branches here. Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NOT-EXEC**
+        // (row F-x) for the fold arms; the group sort is **NIL** (an
+        // in-place sort of a `Vec` the loop was going to drain anyway).
+        branches: 10,
         callees: &[
             ".as_mut",
             ".cmp",
             ".collect",
+            ".drain_group",
             ".emit",
             ".finish",
             ".finish_absent",
             ".flush_collision",
             ".into_iter",
             ".is_empty",
-            ".iter",
-            ".len",
-            ".map",
             ".push",
             ".push_series",
             ".rotate_slider",
             ".sort_by",
-            ".sort_by_key",
-            ".sum",
             ".take",
             "Matrix",
             "Ok",
-            "clamp_bucket",
             "discharge_group_bytes",
-            "discharge_retention",
             "drop",
-            "grid_point",
             "group_entry_bytes",
-            "matches!",
+            "new",
+            "take",
+        ],
+    },
+    Frame {
+        file: "exec.rs",
+        ty: Some("RangeSlideState"),
+        anchor: "drain_group",
+        // NEW with issue #236 Part C: one mutating group's cells drained
+        // into grid points. Three arms — the class-A expanded map (kept
+        // verbatim), the class-A difference array (C1) and the class-B/C
+        // retained-sample sweep (C2). W-MEM disposition: **BAND** (row
+        // F-y) — the measured windows push an EMPTY row slice, so no
+        // mutating group is ever created and this body never runs, the
+        // same premise F-d rests on. What it WOULD allocate is the
+        // drained `Vec` and, on the C2 arm, the merged
+        // covering-interval `Vec`, both bounded by the retention ALREADY
+        // charged for the cells being drained.
+        branches: 14,
+        callees: &[
+            ".checked_sub",
+            ".collect",
+            ".covering_k",
+            ".get",
+            ".grid_point",
+            ".into_iter",
+            ".last_mut",
+            ".len",
+            ".map_or",
+            ".max",
+            ".min",
+            ".push",
+            ".sort_by",
+            ".sort_by_key",
+            ".unwrap_or",
+            "discharge_retention",
             "new",
             "reduce_int_cell",
             "reduce_window",
-            "take",
+            "try_from",
         ],
     },
     Frame {
@@ -1924,7 +1954,7 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
 /// W_ctor + 23 W_fin = 46 rows, each with exactly ONE disposition. The
 /// module-doc tables are a RENDERING of this const (assertion 7), never
 /// the source.
-static INVENTORY: [Row; 47] = [
+static INVENTORY: [Row; 48] = [
     // --- W_plan (11) ---
     Row {
         id: "P-a",
@@ -2367,6 +2397,15 @@ static INVENTORY: [Row; 47] = [
         covered_by: "input bounded by AggCaps::divided(n).series; G2/G3 slopes",
     },
     Row {
+        id: "F-y",
+        window: Win::Fin,
+        what: "one mutating group's cell drain (expanded / delta / sample sweep)",
+        frames: &["RangeSlideState::drain_group"],
+        site: "exec.rs RangeSlideState::drain_group",
+        disp: Disp::NotExec,
+        covered_by: "rows.is_empty() => no mutating group exists => never called (F-d's premise)",
+    },
+    Row {
         id: "F-x",
         window: Win::Fin,
         what: "issue #236 Part B fold containers (dense slots, live map)",
@@ -2426,7 +2465,7 @@ static BOUNDARY_CALLEES: [Boundary; 15] = [
     },
     Boundary {
         callee: ".covering_k",
-        rows: &["F-d"],
+        rows: &["F-d", "F-y"],
         disp: Disp::NotExec,
     },
     Boundary {
@@ -2501,7 +2540,7 @@ fn g4_frame_census_and_inventory_closure() {
     let exec = parse_source("exec.rs");
     let plan_src = parse_source("plan.rs");
     // (1) 26 unique frames, each resolving to exactly one item.
-    assert_eq!(PER_VARIANT_FRAMES.len(), 26);
+    assert_eq!(PER_VARIANT_FRAMES.len(), 27);
     let mut keys = BTreeSet::new();
     for f in &PER_VARIANT_FRAMES {
         assert!(
@@ -2533,11 +2572,11 @@ fn g4_frame_census_and_inventory_closure() {
         );
     }
     // (3) inventory size and per-window counts; unique ids.
-    assert_eq!(INVENTORY.len(), 47);
+    assert_eq!(INVENTORY.len(), 48);
     let count = |w: Win| INVENTORY.iter().filter(|r| r.window == w).count();
     assert_eq!(
         (count(Win::Plan), count(Win::Ctor), count(Win::Fin)),
-        (11, 12, 24)
+        (11, 12, 25)
     );
     let mut ids = BTreeSet::new();
     for r in &INVENTORY {

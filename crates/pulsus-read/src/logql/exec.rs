@@ -4979,14 +4979,91 @@ impl FpSlide {
     }
 }
 
-/// One mutating/regrouping output group's fan-out cells (keyed by grid
-/// index). Class-A cells keep a running integer; class-B/C cells retain the
-/// window's fixed-width points and reduce at finish.
+/// One class-A grid cell's DELTA (issue #236 Part C, C1): a sample
+/// covering `[k_lo, k_hi]` records `(+value, +1)` at `k_lo` and
+/// `(-value, -1)` at `k_hi + 1`, and the covered cells are recovered by
+/// prefix-summing ascending. Two map touches per sample instead of one
+/// per covered cell — the same difference-array trick `present_cover`
+/// already uses for `absent_over_time`.
+///
+/// `dcount` cannot fold into `dvalue`: `bytes_over_time` over an empty
+/// line contributes value 0 to a cell that is nonetheless COVERED and
+/// must emit `0`, which only a separate coverage count distinguishes from
+/// a gap.
+///
+/// Both fields are `i64` and the arithmetic is exact — class A is the
+/// invert-INTEGER class, so the running value is integral end to end and
+/// `reduce_int_cell` is the only float conversion. Neither can overflow:
+/// each surviving sample contributes one `+`/`-` pair, `|value|` is
+/// either 1 or a line length, and the scan is hard-bounded by
+/// `LOGQL_SCAN_BUDGET_BYTES_CEILING` bytes — so both running totals are
+/// bounded by the scanned byte count, itself `< 2^63` (the same structural
+/// argument `present_cover`'s counter width rests on).
+#[derive(Debug, Clone, Copy, Default)]
+struct IntDelta {
+    dvalue: i64,
+    dcount: i64,
+}
+
+/// How ONE mutating output group accumulates. Which arm a query uses is
+/// fixed once, at state construction, by [`mut_cells_for`] — never per
+/// group and never per sample — so a group cannot hold a mixed
+/// representation and the arms cannot interleave.
+#[derive(Debug)]
+enum MutCells {
+    /// **Class A, non-overlapping windows.** One entry per COVERED grid
+    /// cell, accumulated in place. Kept VERBATIM through issue #236 Part
+    /// C: each sample then covers exactly one cell, so this is already
+    /// `O(1)` per sample, it charges ONE retention point where the delta
+    /// form would charge two, and it collapses repeated samples in the
+    /// same cell into that single entry.
+    IntExpanded(HashMap<i64, u64>),
+    /// **Class A, overlapping windows.** A difference array over grid
+    /// indices ([`IntDelta`]), prefix-summed at finish — two map touches
+    /// per sample instead of `ceil(range/step)`.
+    IntDeltas(HashMap<i64, IntDelta>),
+    /// **Classes B/C.** Every surviving sample, retained ONCE; the
+    /// covering cells are recovered at finish by sorting with
+    /// [`win_order`] and sweeping two pointers over ascending grid
+    /// indices. Retention is `O(samples)` and INDEPENDENT of
+    /// `ceil(range/step)`, where the previous per-cell map retained one
+    /// copy of the sample per covering cell.
+    Samples(Vec<WinSample>),
+}
+
+impl MutCells {
+    /// Retained entries, in the same unit [`charge_retention`] charged
+    /// them in — one point per created class-A entry, `per_sample` points
+    /// per retained class-B/C sample (the caller multiplies).
+    ///
+    /// Test-only observability, like [`VectorAggFold::cells`]: production
+    /// code charges and discharges through the counter itself, so
+    /// exposing a second way to ask would invite the two to drift.
+    #[cfg(test)]
+    fn charged_units(&self) -> u64 {
+        match self {
+            MutCells::IntExpanded(m) => m.len() as u64,
+            MutCells::IntDeltas(m) => m.len() as u64,
+            MutCells::Samples(v) => v.len() as u64,
+        }
+    }
+
+    /// Test-only, as [`MutCells::charged_units`].
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        match self {
+            MutCells::IntExpanded(m) => m.is_empty(),
+            MutCells::IntDeltas(m) => m.is_empty(),
+            MutCells::Samples(v) => v.is_empty(),
+        }
+    }
+}
+
+/// One mutating/regrouping output group's fan-out state.
 #[derive(Debug)]
 struct MutGroup {
     labels: LabelSet,
-    int_cells: HashMap<i64, u64>,
-    pt_cells: HashMap<i64, Vec<WinSample>>,
+    cells: MutCells,
 }
 
 /// The sliding-window range evaluator (issue #227).
@@ -5573,46 +5650,71 @@ impl<'q> RangeSlideState<'q> {
                 self.caps.group_bytes,
             )?;
         }
-        let integer = matches!(self.class, ReducerClass::InvertInteger);
         let per_sample = self.per_sample;
         let cap = self.caps.retention_points;
+        let empty_cells = mut_cells_for(self.class, self.range, self.step, self.kmax);
         let retained = &mut self.retained;
         let group = self.groups.entry(key).or_insert_with(|| MutGroup {
             labels,
-            int_cells: HashMap::new(),
-            pt_cells: HashMap::new(),
+            cells: empty_cells,
         });
-        for k in k_lo..=k_hi {
-            if integer {
-                // Review finding 3: a newly-CREATED integer cell is charged to
-                // the same concurrent-retention counter as a retained point,
-                // so the class-A fan-out obeys the documented invariant
-                // instead of relying on an implicit `groups × grid` product
-                // — which issue #236 has since deleted outright (there is
-                // no group-count cap left to form one).
-                // Updating an existing cell is O(1) and charges nothing.
-                //
-                // ONE point per cell: an `int_cells` entry is an `(i64, u64)`
-                // pair, narrower than the `WinSample` the unit is defined by,
-                // and class A never re-reduces over a scratch
-                // (`per_sample == 1` for every integer op anyway).
-                match group.int_cells.entry(k) {
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        *e.get_mut() += value as u64;
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        // Size → check the cap → allocate, through the ONE
-                        // gate (issue #227 review round 5, finding 2): the
-                        // insert may grow the map, so the cap must refuse
-                        // before it, not after.
-                        charge_retention(retained, 1, cap)?;
-                        e.insert(value as u64);
+        // Review finding 3: a newly-CREATED entry is charged to the same
+        // concurrent-retention counter as a retained point, so the
+        // mutating fan-out obeys the documented invariant instead of
+        // relying on an implicit `groups × grid` product — which issue
+        // #236 has since deleted outright (there is no group-count cap
+        // left to form one). Updating an EXISTING entry is O(1) and
+        // charges nothing. Size → check the cap → allocate, through the
+        // ONE gate (issue #227 review round 5, finding 2): an insert may
+        // grow the map, so the cap must refuse before it, not after.
+        //
+        // ONE point per entry on the class-A arms: an entry is a pair of
+        // integers, narrower than the `WinSample` the unit is defined by,
+        // and class A never re-reduces over a scratch (`per_sample == 1`
+        // for every integer op anyway).
+        match &mut group.cells {
+            // Issue #236 Part C, C1: two touches per SAMPLE — the deltas
+            // at `k_lo` and at the exclusive `k_hi + 1` — instead of one
+            // per covered cell. `k_hi + 1` may be `kmax + 1`, which is a
+            // delta index only and is never emitted.
+            MutCells::IntDeltas(cells) => {
+                for (k, dv, dc) in [(k_lo, value as i64, 1i64), (k_hi + 1, -(value as i64), -1)] {
+                    match cells.entry(k) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let d = e.get_mut();
+                            d.dvalue += dv;
+                            d.dcount += dc;
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            charge_retention(retained, 1, cap)?;
+                            e.insert(IntDelta {
+                                dvalue: dv,
+                                dcount: dc,
+                            });
+                        }
                     }
                 }
-            } else {
-                // Same gate before the map/vector insertion — both allocate.
+            }
+            MutCells::IntExpanded(cells) => {
+                for k in k_lo..=k_hi {
+                    match cells.entry(k) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            *e.get_mut() += value as u64;
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            charge_retention(retained, 1, cap)?;
+                            e.insert(value as u64);
+                        }
+                    }
+                }
+            }
+            // Issue #236 Part C, C2: classes B/C retain each surviving
+            // sample ONCE. The covering cells are recovered at finish by
+            // a two-pointer sweep, so retention no longer scales with
+            // `ceil(range/step)`.
+            MutCells::Samples(samples) => {
                 charge_retention(retained, per_sample, cap)?;
-                group.pt_cells.entry(k).or_default().push(WinSample {
+                samples.push(WinSample {
                     ts,
                     stream_hash,
                     tie_rank,
@@ -5627,21 +5729,7 @@ impl<'q> RangeSlideState<'q> {
     /// points whose window `(grid_t-range, grid_t]` covers `ts`:
     /// `grid_t-range < ts ≤ grid_t` ⟺ `ts ≤ grid_t < ts+range`.
     fn covering_k(&self, ts: i64) -> (i64, i64) {
-        let step = self.step as i128;
-        let gs = self.grid_start as i128;
-        let ts = ts as i128;
-        let range = self.range as i128;
-        // ts ≤ grid_start + k·step  ⇒  k ≥ ceil((ts-gs)/step)
-        let k_lo = ceil_div_i128(ts - gs, step).max(0);
-        // grid_start + k·step < ts+range ⇒ k·step ≤ ts+range-gs-1 ⇒
-        // k ≤ floor((ts+range-gs-1)/step)
-        let k_hi = (ts + range - gs - 1)
-            .div_euclid(step)
-            .min(self.kmax as i128);
-        (
-            i64::try_from(k_lo).unwrap_or(i64::MAX),
-            i64::try_from(k_hi).unwrap_or(i64::MIN),
-        )
+        covering_k_of(ts, self.grid_start, self.step, self.range, self.kmax)
     }
 
     fn grid_point(&self, k: i64) -> i64 {
@@ -5684,15 +5772,6 @@ impl<'q> RangeSlideState<'q> {
             return self.emit(series);
         }
         if self.fan_out {
-            let op = self.op;
-            let class = self.class;
-            let param = self.param;
-            let rate_window_ns = self.rate_window_ns;
-            let grid_start = self.grid_start;
-            let step = self.step;
-            // Saturating narrowing, like `FpSlide::grid_point` (issue #227
-            // arithmetic sweep) — never a silent wrap.
-            let grid_point = |k: i64| clamp_bucket(grid_start as i128 + k as i128 * step as i128);
             // **The reduction-order pin, extended to the fold** (issue
             // #236, task-manager ruling "Option B"). `groups` is a
             // `HashMap` under a per-process randomly-seeded hasher, so
@@ -5725,48 +5804,15 @@ impl<'q> RangeSlideState<'q> {
                 // memory it paid for is still owned by this state.
                 let entry_bytes = group_entry_bytes(&key, &group.labels, MUT_GROUP_SLOT);
                 drop(key);
-                let mut points: Vec<(i64, f64)> = Vec::new();
-                // Both branches drain the group's cells into a `Vec` keyed by
-                // grid index so the points come out ordered. The drain is
-                // bounded by the cells' own charge (one point per created
-                // cell / retained sample) and each element is narrower than
-                // the `WinSample` that charge is denominated in — the `Vec`
-                // moves the inner point vectors, it does not copy them. The
-                // discharge happens AFTER the cells are consumed, so a charge
-                // is never released while the memory it paid for is still
-                // live (issue #227 review round 5, finding 2).
-                if matches!(class, ReducerClass::InvertInteger) {
-                    let mut cells: Vec<(i64, u64)> = group.int_cells.into_iter().collect();
-                    let staged = cells.len() as u64;
-                    cells.sort_by_key(|(k, _)| *k);
-                    for (k, run_int) in cells {
-                        points.push((grid_point(k), reduce_int_cell(op, rate_window_ns, run_int)));
-                    }
-                    discharge_retention(&mut self.retained, staged);
-                } else {
-                    let mut cells: Vec<(i64, Vec<WinSample>)> =
-                        group.pt_cells.into_iter().collect();
-                    let staged: u64 = cells.iter().map(|(_, v)| v.len() as u64).sum();
-                    cells.sort_by_key(|(k, _)| *k);
-                    for (k, mut pts) in cells {
-                        pts.sort_by(win_order);
-                        if let Some(v) = reduce_window(op, class, param, rate_window_ns, 0, &pts) {
-                            points.push((grid_point(k), v));
-                        }
-                    }
-                    discharge_retention(&mut self.retained, staged * self.per_sample);
-                }
+                let (labels, points) = self.drain_group(group);
                 if !points.is_empty() {
                     // Issue #236 Part B: the fold consumes each group AS
                     // it is built, so the `scanned groups x grid points`
                     // materialisation that `out` used to accumulate never
                     // exists — that is the whole point-axis win.
                     match self.fold.as_mut() {
-                        Some(fold) => fold.push_series(&group.labels, &points)?,
-                        None => out.push(MatrixSeries {
-                            labels: group.labels,
-                            points,
-                        }),
+                        Some(fold) => fold.push_series(&labels, &points)?,
+                        None => out.push(MatrixSeries { labels, points }),
                     }
                 }
                 discharge_group_bytes(&mut self.group_bytes, entry_bytes);
@@ -5790,6 +5836,142 @@ impl<'q> RangeSlideState<'q> {
         self.emit(out)
     }
 
+    /// Drains ONE mutating output group's retained cells into its grid
+    /// points, discharging the retention they were charged for (issue
+    /// #236 Part C).
+    ///
+    /// A frame of its own rather than an inline block in
+    /// `finish_in_place`: it holds all three [`MutCells`] arms, and the
+    /// per-variant allocation census (`logql_variants_alloc`) pins a
+    /// FUNCTION's body — folding it into the caller would have made one
+    /// 24-branch frame, and hiding it behind an un-censused helper would
+    /// have made its allocations invisible to a window that genuinely
+    /// executes them (a `variants(...)` sub-state whose pipeline mutates
+    /// labels takes exactly this path).
+    fn drain_group(&mut self, group: MutGroup) -> (LabelSet, Vec<(i64, f64)>) {
+        let mut points: Vec<(i64, f64)> = Vec::new();
+        // Every arm drains the group's cells into a `Vec` keyed by
+        // grid index so the points come out ordered. The drain is
+        // bounded by the cells' own charge (one point per created
+        // cell / retained sample) and each element is narrower than
+        // the `WinSample` that charge is denominated in — the `Vec`
+        // moves, it does not copy. The discharge happens AFTER the
+        // cells are consumed, so a charge is never released while
+        // the memory it paid for is still live (issue #227 review
+        // round 5, finding 2).
+        match group.cells {
+            MutCells::IntExpanded(cells) => {
+                let mut cells: Vec<(i64, u64)> = cells.into_iter().collect();
+                let staged = cells.len() as u64;
+                cells.sort_by_key(|(k, _)| *k);
+                for (k, run_int) in cells {
+                    points.push((
+                        self.grid_point(k),
+                        reduce_int_cell(self.op, self.rate_window_ns, run_int),
+                    ));
+                }
+                discharge_retention(&mut self.retained, staged);
+            }
+            // Issue #236 Part C, C1: prefix-sum the difference
+            // array ascending. Between two consecutive delta
+            // indices the running pair is CONSTANT, so a covered
+            // run emits one point per cell and an uncovered run is
+            // skipped in O(1) — the emitted set and its values are
+            // exactly the expanded form's (`covering_k` is the
+            // half-open interval each `(+1, -1)` pair spans).
+            // `run_count > 0` is the coverage test, which is why
+            // it cannot fold into `run_value`: a covered cell of
+            // value 0 emits `0`, an uncovered one emits nothing.
+            MutCells::IntDeltas(cells) => {
+                let mut cells: Vec<(i64, IntDelta)> = cells.into_iter().collect();
+                let staged = cells.len() as u64;
+                cells.sort_by_key(|(k, _)| *k);
+                let (mut run_value, mut run_count) = (0i64, 0i64);
+                for i in 0..cells.len() {
+                    let (k, d) = cells[i];
+                    run_value += d.dvalue;
+                    run_count += d.dcount;
+                    if run_count <= 0 {
+                        continue;
+                    }
+                    // Constant until the next delta index, and
+                    // never past the last grid point.
+                    let end = cells
+                        .get(i + 1)
+                        .map_or(self.kmax + 1, |(next, _)| *next)
+                        .min(self.kmax + 1);
+                    let run_int = u64::try_from(run_value).unwrap_or(0);
+                    let v = reduce_int_cell(self.op, self.rate_window_ns, run_int);
+                    for cell in k.max(0)..end {
+                        points.push((self.grid_point(cell), v));
+                    }
+                }
+                discharge_retention(&mut self.retained, staged);
+            }
+            // Issue #236 Part C, C2: one sort per GROUP, then a
+            // two-pointer sweep over ascending grid indices. The
+            // slice handed to `reduce_window` is the identical
+            // element sequence the per-cell form produced —
+            // `win_order` is `ts`-major and total on a group's
+            // samples, and the window `(t-range, t]` is exactly
+            // `covering_k`'s inverse. Cells are visited only where
+            // some sample covers them (the merged covering
+            // intervals), so an uncovered stretch of grid costs
+            // nothing, as it did before.
+            MutCells::Samples(mut samples) => {
+                let staged = samples.len() as u64;
+                samples.sort_by(win_order);
+                // `covering_k` is monotone in `ts` and the samples
+                // are now `ts`-ascending, so the covering
+                // intervals arrive sorted and merging them is ONE
+                // pass. Merging is what keeps an uncovered stretch
+                // of grid free, exactly as the per-cell map made
+                // it free.
+                let mut covered: Vec<(i64, i64)> = Vec::new();
+                for s in &samples {
+                    let (a, b) = self.covering_k(s.ts);
+                    if a > b {
+                        continue;
+                    }
+                    match covered.last_mut() {
+                        Some(last) if a <= last.1 + 1 => last.1 = last.1.max(b),
+                        _ => covered.push((a, b)),
+                    }
+                }
+                let (mut lo, mut hi) = (0usize, 0usize);
+                for (a, b) in covered {
+                    for cell in a..=b {
+                        let t = self.grid_point(cell);
+                        while hi < samples.len() && samples[hi].ts <= t {
+                            hi += 1;
+                        }
+                        // `checked_sub` for the same reason
+                        // `FpSlide::emit_at` uses it: an eviction
+                        // bound below the representable domain
+                        // evicts nothing.
+                        if let Some(bound) = t.checked_sub(self.range) {
+                            while lo < hi && samples[lo].ts <= bound {
+                                lo += 1;
+                            }
+                        }
+                        if let Some(v) = reduce_window(
+                            self.op,
+                            self.class,
+                            self.param,
+                            self.rate_window_ns,
+                            0,
+                            &samples[lo..hi],
+                        ) {
+                            points.push((t, v));
+                        }
+                    }
+                }
+                discharge_retention(&mut self.retained, staged * self.per_sample);
+            }
+        }
+        (group.labels, points)
+    }
+
     /// Routes an already-materialised batch of leaf series through the
     /// attached fold (issue #236 Part B), or hands it back unchanged when
     /// nothing folded.
@@ -5804,6 +5986,20 @@ impl<'q> RangeSlideState<'q> {
     ///
     /// Series are consumed one at a time, so a series' points are freed as
     /// they are folded rather than all being held until finish.
+    ///
+    /// **Residual, recorded so it is not rediscovered as a surprise**
+    /// (ledger entry `#236 (c)`). The non-mutating caller has already
+    /// materialised `series_out` by the time it gets here, so this arm
+    /// does NOT collapse that vector the way the fan-out arm collapses
+    /// its groups. Folding at each slider's close instead would, but
+    /// sliders complete in FINGERPRINT order — deterministic, and not the
+    /// label-set order this pins — so the folded value would stop being
+    /// the materialised value. The consequence is deferred, not absent:
+    /// once emitted points are charged
+    /// ([`MAX_METRIC_RESULT_POINTS`], not yet levied) a non-mutating range
+    /// leaf whose `streams x grid points` exceeds the charge is refused
+    /// where the reference serves it. The fix is a step-ordered
+    /// evaluator (issue #250), not a larger constant.
     fn emit(&mut self, mut series: Vec<MatrixSeries>) -> Result<QueryResult, ReadError> {
         match self.fold.take() {
             None => Ok(QueryResult::Matrix(series)),
@@ -9212,6 +9408,56 @@ impl FoldGrid {
     }
 }
 
+/// [`RangeSlideState::covering_k`]'s body as a free function over the
+/// grid scalars, so `finish_in_place`'s C2 sweep can compute the same
+/// intervals without holding a `&self` borrow across its `&mut self`
+/// discharges. ONE implementation, called from both.
+fn covering_k_of(ts: i64, grid_start: i64, step: u64, range: i64, kmax: i64) -> (i64, i64) {
+    let step = step as i128;
+    let gs = grid_start as i128;
+    let ts = ts as i128;
+    let range = range as i128;
+    // ts ≤ grid_start + k·step  ⇒  k ≥ ceil((ts-gs)/step)
+    let k_lo = ceil_div_i128(ts - gs, step).max(0);
+    // grid_start + k·step < ts+range ⇒ k·step ≤ ts+range-gs-1 ⇒
+    // k ≤ floor((ts+range-gs-1)/step)
+    let k_hi = (ts + range - gs - 1).div_euclid(step).min(kmax as i128);
+    (
+        i64::try_from(k_lo).unwrap_or(i64::MAX),
+        i64::try_from(k_hi).unwrap_or(i64::MIN),
+    )
+}
+
+/// The empty [`MutCells`] a query's mutating groups start from — the ONE
+/// place the representation is chosen (issue #236 Part C).
+///
+/// Classes B/C always retain samples. Within class A, the delta form's
+/// win is proportional to `ceil(range/step)` — the number of cells one
+/// sample covers — so it is taken exactly where that exceeds one, i.e.
+/// where the sliding windows OVERLAP. That is the reference's own
+/// `selRange >= step` predicate (`pkg/logql/range_vector.go`'s stepped
+/// iterator), plus `kmax > 0`: on a one-point grid there is nothing to
+/// fan out into and the expanded form is already minimal. Below the
+/// predicate the expanded form is strictly better (one charge per sample
+/// rather than two, and repeated samples in one cell collapse), so it is
+/// kept rather than replaced.
+/// The comparison is over `i128`, not `range >= step as i64`: `step` is a
+/// `u64` and the narrowing form wraps a wide step to a negative number, so
+/// every range would compare `>=` it and take the delta arm. Validated
+/// durations keep that out of reach today — the exhaustive predicate test
+/// found it anyway, which is the argument for enumerating a small domain
+/// rather than sampling it.
+fn mut_cells_for(class: ReducerClass, range: i64, step: u64, kmax: i64) -> MutCells {
+    if !matches!(class, ReducerClass::InvertInteger) {
+        return MutCells::Samples(Vec::new());
+    }
+    if i128::from(range) >= i128::from(step) && kmax > 0 {
+        MutCells::IntDeltas(HashMap::new())
+    } else {
+        MutCells::IntExpanded(HashMap::new())
+    }
+}
+
 /// The internal-invariant breach [`FoldGrid::index_of`] reports.
 fn fold_off_grid(t: i64) -> ReadError {
     ReadError::PipelineInvalid {
@@ -10418,10 +10664,357 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Issue #236 Part C — the mutating range path's cell representation.
+    // -----------------------------------------------------------------
+
+    /// The three [`MutCells`] arms and the C1 branch predicate, pinned at
+    /// the ONE place the representation is chosen.
+    ///
+    /// The domain is small and enumerated rather than sampled: every
+    /// class, and `range` on both sides of `step` plus the exact
+    /// boundary, plus the degenerate one-point grid.
+    #[test]
+    fn the_mutating_cell_representation_is_chosen_by_one_predicate() {
+        let arm =
+            |class, range: i64, step: u64, kmax: i64| match mut_cells_for(class, range, step, kmax)
+            {
+                MutCells::IntExpanded(_) => "expanded",
+                MutCells::IntDeltas(_) => "deltas",
+                MutCells::Samples(_) => "samples",
+            };
+        // Class A: deltas exactly where the windows overlap AND the grid
+        // has more than one point.
+        for (range, step, kmax, want) in [
+            (9i64, 10u64, 10i64, "expanded"), // range < step
+            (10, 10, 10, "deltas"),           // the boundary: range == step
+            (11, 10, 10, "deltas"),           // overlapping
+            (1_000, 10, 10, "deltas"),        // heavily overlapping
+            (1_000, 10, 0, "expanded"),       // one-point grid
+            (1_000, 10, -1, "expanded"),      // empty grid
+            (1, u64::MAX, 10, "expanded"),    // step wider than any range
+        ] {
+            assert_eq!(
+                arm(ReducerClass::InvertInteger, range, step, kmax),
+                want,
+                "class A at range={range} step={step} kmax={kmax}"
+            );
+        }
+        // Every other class retains samples, whatever the geometry.
+        for class in [ReducerClass::CanonicalFold, ReducerClass::ReduceIndependent] {
+            for (range, step, kmax) in [(9i64, 10u64, 10i64), (10, 10, 10), (1_000, 10, 10)] {
+                assert_eq!(arm(class, range, step, kmax), "samples", "{class:?}");
+            }
+        }
+    }
+
+    /// AC 12 — **Part C moves no result**, leg 1: the class-A drain
+    /// against the UNTOUCHED streaming slider.
+    ///
+    /// `FpSlide` (the non-mutating path) is not changed by Part C, so it
+    /// is the oracle the rewritten mutating drain is measured against:
+    /// the same rows through the same reducer, once without a label
+    /// mutation (slider) and once with one constant `label_format` label
+    /// (fan-out), must emit the identical point SEQUENCE on
+    /// `f64::to_bits`. Driven on BOTH C1 branches — `range < step` uses
+    /// the expanded arm, `range >= step` the difference array.
+    ///
+    /// Class A is the only class where both paths exist:
+    /// `metric_mutates_labels()` is `mutates_labels || has_unwrap`, so
+    /// every unwrap query is a fan-out query by construction. Classes
+    /// B/C are covered by the sweep oracle below.
+    #[test]
+    fn the_class_a_drain_reproduces_the_untouched_streaming_slider() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows: Vec<MetricScanRow> = (1..=9)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i * 7,
+                body: format!("body-{i}"),
+            })
+            .collect();
+        for (step, range) in [(10u64, 5u64), (10, 10), (10, 45), (10, 200)] {
+            let window = slide_window(0, 100, step, range);
+            for (op, value) in [
+                (RangeAggOp::CountOverTime, ClientValue::Count),
+                (RangeAggOp::BytesOverTime, ClientValue::Bytes),
+                (RangeAggOp::BytesRate, ClientValue::Bytes),
+                (RangeAggOp::Rate, ClientValue::Count),
+            ] {
+                let run = |query: &str| -> Vec<(i64, u64)> {
+                    let client = ClientAgg {
+                        pipeline: parse_pipeline(query),
+                        value,
+                        range_op: op,
+                        param: None,
+                        absent_labels: vec![],
+                    };
+                    let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+                    let res =
+                        run_client_agg_rows(&rows, &compiled, &meta, &client, window, Some(range))
+                            .unwrap();
+                    let QueryResult::Matrix(items) = res else {
+                        panic!("expected a matrix");
+                    };
+                    assert_eq!(items.len(), 1, "{op:?}: one series");
+                    items[0]
+                        .points
+                        .iter()
+                        .map(|(t, v)| (*t, v.to_bits()))
+                        .collect()
+                };
+                // BOTH a non-empty and an EMPTY rendered line. The empty
+                // one is what makes `dcount` load-bearing: it gives a
+                // COVERED cell the value 0, which must still emit `0`
+                // and which a coverage test folded into the value would
+                // silently drop. (A mutant that folded them passed
+                // against the non-empty fixture alone.)
+                for line in ["keep", ""] {
+                    let sliding = run(&format!(r#"{{x="y"}} | line_format "{line}""#));
+                    let fanned = run(&format!(
+                        r#"{{x="y"}} | line_format "{line}" | label_format zone="eu""#
+                    ));
+                    assert!(
+                        !sliding.is_empty(),
+                        "{op:?}: the fixture must emit (line {line:?})"
+                    );
+                    assert_eq!(
+                        fanned, sliding,
+                        "{op:?} at step={step} range={range} line={line:?}: the rewritten \
+                         class-A drain must reproduce the streaming slider bit for bit"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC 12 — **Part C moves no result**, leg 2: the class-B/C sweep
+    /// against the PER-CELL reduction it replaces.
+    ///
+    /// Classes B/C have no non-mutating path to compare with (every
+    /// unwrap query fans out), so the oracle is the OLD ALGORITHM,
+    /// reimplemented here over the state's own retained samples: bucket
+    /// each sample into every cell `covering_k` gives it, sort each
+    /// bucket with `win_order`, reduce. The sweep must produce that
+    /// sequence exactly.
+    #[test]
+    fn the_sample_sweep_reproduces_the_per_cell_reduction() {
+        // TWO fingerprints collapsing into ONE output group
+        // (`label_format app=...` overrides the only distinguishing
+        // label), fed in the scan's FINGERPRINT-MAJOR order. That is what
+        // makes the group's retained samples arrive out of `win_order`
+        // and the finish-time sort load-bearing: a single-fingerprint
+        // fixture pushes them already sorted, and a mutant deleting the
+        // sort passed against one.
+        let mut meta = slide_meta(1, r#"{"app":"a"}"#);
+        meta.insert(
+            2,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "svc".to_string(),
+                labels: r#"{"app":"b"}"#.to_string(),
+            },
+        );
+        let mut rows: Vec<MetricScanRow> = (1..=9)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i * 7,
+                body: format!("a={}", (i * 13) % 7),
+            })
+            .collect();
+        rows.extend((1..=9).map(|i| MetricScanRow {
+            fingerprint: 2,
+            timestamp_ns: i * 5 + 2,
+            body: format!("a={}", (i * 11) % 5),
+        }));
+        for (step, range) in [(10u64, 5u64), (10, 10), (10, 45), (10, 200)] {
+            let window = slide_window(0, 100, step, range);
+            for op in [
+                RangeAggOp::MaxOverTime,
+                RangeAggOp::MinOverTime,
+                RangeAggOp::SumOverTime,
+                RangeAggOp::AvgOverTime,
+                RangeAggOp::FirstOverTime,
+                RangeAggOp::LastOverTime,
+                RangeAggOp::StddevOverTime,
+                RangeAggOp::QuantileOverTime,
+                RangeAggOp::RateCounter,
+            ] {
+                let client = ClientAgg {
+                    pipeline: parse_pipeline(
+                        r#"{x="y"} | logfmt | label_format app="same" | unwrap a"#,
+                    ),
+                    value: ClientValue::Unwrap,
+                    range_op: op,
+                    param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
+                    absent_labels: vec![],
+                };
+                let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+                let mut state = RangeSlideState::new(
+                    &compiled,
+                    &meta,
+                    &client,
+                    window,
+                    Some(range),
+                    AggCaps::DEFAULT,
+                )
+                .unwrap();
+                state.push_rows(&rows).expect("fold");
+                // Flush the trailing collision group before reading the
+                // retained set: `push_rows` leaves the last
+                // `(fingerprint, ts)` run buffered until finish, so an
+                // oracle built before the flush would be one sample
+                // short (it was, and said so).
+                let base_labels = std::mem::take(&mut state.base_labels);
+                state.flush_collision(&base_labels).expect("flush");
+                state.base_labels = base_labels;
+                // The oracle, computed the PRE-CHANGE way from exactly
+                // the samples the state retained.
+                let mut want: Vec<(LabelSet, Vec<(i64, u64)>)> = Vec::new();
+                for group in state.groups.values() {
+                    let MutCells::Samples(samples) = &group.cells else {
+                        panic!("{op:?} must retain samples");
+                    };
+                    let mut cells: HashMap<i64, Vec<WinSample>> = HashMap::new();
+                    for s in samples {
+                        let (lo, hi) = state.covering_k(s.ts);
+                        for k in lo..=hi {
+                            cells.entry(k).or_default().push(*s);
+                        }
+                    }
+                    let mut keys: Vec<i64> = cells.keys().copied().collect();
+                    keys.sort_unstable();
+                    let mut points: Vec<(i64, u64)> = Vec::new();
+                    for k in keys {
+                        let pts = cells.get_mut(&k).expect("key present");
+                        pts.sort_by(win_order);
+                        if let Some(v) = reduce_window(
+                            op,
+                            state.class,
+                            state.param,
+                            state.rate_window_ns,
+                            0,
+                            pts,
+                        ) {
+                            points.push((state.grid_point(k), v.to_bits()));
+                        }
+                    }
+                    want.push((group.labels.clone(), points));
+                }
+                want.sort();
+                let QueryResult::Matrix(items) = state.finish_in_place().expect("finish") else {
+                    panic!("expected a matrix");
+                };
+                let mut got: Vec<(LabelSet, Vec<(i64, u64)>)> = items
+                    .into_iter()
+                    .map(|s| {
+                        (
+                            s.labels,
+                            s.points
+                                .into_iter()
+                                .map(|(t, v)| (t, v.to_bits()))
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                got.sort();
+                want.retain(|(_, p)| !p.is_empty());
+                assert!(!want.is_empty(), "{op:?}: the fixture must emit");
+                assert_eq!(
+                    got, want,
+                    "{op:?} at step={step} range={range}: the two-pointer sweep must \
+                     reproduce the per-cell reduction it replaces"
+                );
+            }
+        }
+    }
+
+    /// AC 13 — **charged retention is independent of the window width.**
+    ///
+    /// The SAME data at `W = ceil(range/step) = 1, 5, 40` charges the same
+    /// number of retention points, where the pre-change per-cell form
+    /// charged one per covering cell — a `~W x` factor. The expanded
+    /// count is recomputed in-test from `covering_k` so the win is
+    /// measured, not asserted from memory.
+    #[test]
+    fn mutating_retention_is_independent_of_the_window_width() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows: Vec<MetricScanRow> = (1..=6)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i * 13,
+                body: format!("a={i}"),
+            })
+            .collect();
+        for (op, value) in [
+            (RangeAggOp::CountOverTime, ClientValue::Count),
+            (RangeAggOp::MaxOverTime, ClientValue::Unwrap),
+        ] {
+            let unwrap = matches!(value, ClientValue::Unwrap);
+            let query = if unwrap {
+                r#"{x="y"} | logfmt | label_format zone="eu" | unwrap a"#
+            } else {
+                r#"{x="y"} | logfmt | label_format zone="eu""#
+            };
+            let client = ClientAgg {
+                pipeline: parse_pipeline(query),
+                value,
+                range_op: op,
+                param: None,
+                absent_labels: vec![],
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            assert!(compiled.metric_mutates_labels());
+            let mut charged: Vec<u64> = Vec::new();
+            let mut expanded: Vec<u64> = Vec::new();
+            for w in [1u64, 5, 40] {
+                let step = 10u64;
+                let window = slide_window(0, 2_000, step, w * step);
+                let mut state =
+                    RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                        .unwrap();
+                state.push_rows(&rows).expect("fold");
+                charged.push(state.retained);
+                // What the per-cell form WOULD have charged: one unit per
+                // (sample, covering cell), in the same `per_sample` unit.
+                let cells: u64 = rows
+                    .iter()
+                    .map(|r| {
+                        let (lo, hi) = state.covering_k(r.timestamp_ns);
+                        if lo > hi { 0 } else { (hi - lo + 1) as u64 }
+                    })
+                    .sum();
+                expanded.push(cells * state.per_sample);
+                state.finish_in_place().expect("finish");
+                assert_eq!(state.retained, 0, "{op:?} W={w}: charge returns to zero");
+            }
+            assert_eq!(
+                charged[0], charged[1],
+                "{op:?}: W=1 and W=5 must charge the same, got {charged:?}"
+            );
+            assert_eq!(
+                charged[0], charged[2],
+                "{op:?}: W=1 and W=40 must charge the same, got {charged:?}"
+            );
+            // ...and the per-cell form it replaces grew with W.
+            assert!(
+                expanded[2] > 10 * charged[2],
+                "{op:?}: the fixture must actually exercise a wide window \
+                 (per-cell would charge {} vs {} now)",
+                expanded[2],
+                charged[2]
+            );
+        }
+    }
+
     /// AC8 (review round 2 gap): the concurrent-retention invariant on the
-    /// MUTATING path — both `MutGroup.int_cells` (class A) and
-    /// `MutGroup.pt_cells` (class B/C) charge `retained`, and the whole
-    /// charge is released when the state is finished/dropped.
+    /// MUTATING path — every [`MutCells`] arm charges `retained`, and the
+    /// whole charge is released when the state is finished/dropped.
+    ///
+    /// One of the two tests plan v14 permits to change for issue #236 Part
+    /// C: it asserts the REPRESENTATION, which C1/C2 replace (`int_cells`
+    /// → `MutCells::IntExpanded`/`IntDeltas`, `pt_cells` →
+    /// `MutCells::Samples`). The invariant it pins is unchanged.
     #[test]
     fn sliding_mutating_fan_out_charges_and_releases_retention_for_both_cell_kinds() {
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -10429,9 +11022,9 @@ mod tests {
         // A `label_format` makes the output set differ from the base ⇒ the
         // mutating fan-out path (`fan_out == true`).
         for (op, value, expect_int_cells) in [
-            // Class A -> `int_cells`.
+            // Class A -> the integer arms.
             (RangeAggOp::CountOverTime, ClientValue::Count, true),
-            // Class B -> `pt_cells` (retained points).
+            // Class B -> `MutCells::Samples` (retained points).
             (RangeAggOp::MaxOverTime, ClientValue::Unwrap, false),
             // Class B with a per-emit scratch charge (`per_sample == 2`):
             // the fan-out cells must charge in the SAME unit the streaming
@@ -10468,21 +11061,27 @@ mod tests {
                 "{op:?}: the mutating fan-out must CHARGE retention"
             );
             let group = state.groups.values().next().expect("one output group");
+            assert!(!group.cells.is_empty(), "{op:?}: cells populated");
             if expect_int_cells {
-                assert!(!group.int_cells.is_empty(), "{op:?}: int_cells populated");
-                assert!(group.pt_cells.is_empty());
+                // `range (30) >= step (10)` and `kmax > 0`, so class A is
+                // on the DELTA arm here (C1's predicate).
+                assert!(
+                    matches!(group.cells, MutCells::IntDeltas(_)),
+                    "{op:?}: overlapping windows take the delta arm"
+                );
                 assert_eq!(
                     state.retained,
-                    group.int_cells.len() as u64,
+                    group.cells.charged_units(),
                     "{op:?}: every created int cell is charged exactly once"
                 );
             } else {
-                assert!(!group.pt_cells.is_empty(), "{op:?}: pt_cells populated");
-                assert!(group.int_cells.is_empty());
+                assert!(
+                    matches!(group.cells, MutCells::Samples(_)),
+                    "{op:?}: classes B/C retain samples"
+                );
                 assert_eq!(
                     state.retained,
-                    group.pt_cells.values().map(|v| v.len() as u64).sum::<u64>()
-                        * retention_points_per_sample(op),
+                    group.cells.charged_units() * retention_points_per_sample(op),
                     "{op:?}: every retained point is charged exactly once, in `per_sample` units"
                 );
             }
@@ -10668,12 +11267,12 @@ mod tests {
                 .groups
                 .values()
                 .map(|g| {
-                    if integer {
-                        g.int_cells.len() as u64
-                    } else {
-                        g.pt_cells.values().map(|v| v.len() as u64).sum::<u64>()
-                            * retention_points_per_sample(op)
-                    }
+                    g.cells.charged_units()
+                        * if integer {
+                            1
+                        } else {
+                            retention_points_per_sample(op)
+                        }
                 })
                 .sum();
             assert_eq!(

@@ -503,6 +503,35 @@ not "fix" us toward the panic.
   reproducibility; agreement with any single reference run is only
   established where captured.
 
+- **(c) The non-mutating range leaf still materialises its series before
+  aggregating** — the price of (b), recorded as a residual rather than
+  remembered. *Reference:* evaluates a range query step by step, so a
+  `sum(...)` over a very wide non-mutating selector holds one step's
+  vector at a time and serves it. *PulsusDB:* the streaming aggregation
+  fold (issue #236 Part B) collapses the leaf's output to
+  `output groups x grid points` on the label-mutating fan-out path — the
+  shape this issue exists to serve — but the NON-mutating path folds only
+  after its sliders have finished, from `series_out`, so that vector is
+  still materialised at `streams x grid points`.
+
+  **Why, and it is a consequence of (b), not an oversight.** Feeding the
+  fold at each slider's close would be strictly better on memory, but
+  sliders complete in FINGERPRINT order (the scan's physical-key order),
+  which is deterministic yet is not the label-set order (b) pins. Folding
+  in it would make the folded answer differ from the materialised one in
+  the last bit for `sum`/`avg`/`stddev`/`stdvar` — i.e. it would buy
+  memory by breaking the equivalence the fold's correctness argument
+  rests on. Sliders cannot be reordered without buffering, and the buffer
+  IS `series_out`.
+
+  **The price, stated before it bites.** Once emitted points are charged
+  (`MAX_METRIC_RESULT_POINTS`, not yet levied), a non-mutating range leaf
+  wide enough that `streams x grid points` exceeds the charge will be
+  REFUSED where the reference serves it. The bound is the product, so it
+  is reached by breadth and grid fineness together, not by either alone.
+  Removing it needs a step-ordered evaluator (**#250**) or a fold order
+  that a streaming emit can reproduce — not a larger constant.
+
 ## Issue #230 — `line_format`/`label_format` template engine
 
 The full Go `text/template` + reference function-map surface landed in
