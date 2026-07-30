@@ -138,16 +138,17 @@ at 123 bytes; the LogQL corpus runner's pushdown blind spot is #278.
 
 **Transport bound on the query-text cap (#279).** The 131,072-byte row
 above is reachable only where the query arrives in a **POST form body**,
-on one of the five routes that take a query at all: `/query`,
-`/query_range`, `/series` (per `match[]`), `/detected_labels`,
-`/detected_fields` — each on both the native and `/loki/api/v1` prefixes.
-That set is narrower than "the `GET|POST` form routes", of which there are
-six: `/labels` is `GET|POST` form-encoded too but accepts no `query`
-parameter (only `start`/`end`, per the route table above), so no query of
-any length reaches the cap through it. Our HTTP stack caps the whole
-request-target at **65,534 bytes** (`http::Uri`), so on any GET a
-request-target past that is answered `414 URI Too Long` with an empty
-body by hyper, before routing — never the `400 bad_data` envelope above.
+on one of the five routes that **both take a query parameter and accept
+a POST form body**: `/query`, `/query_range`, `/series` (per `match[]`),
+`/detected_labels`, `/detected_fields` — each on both the native and
+`/loki/api/v1` prefixes. That set is narrower than "the `GET|POST` form
+routes", of which there are six: `/labels` is `GET|POST` form-encoded too
+but accepts no `query` parameter (only `start`/`end`, per the route table
+above), so no query of any length reaches the cap through it. Our HTTP
+stack caps the whole request-target at **65,534 bytes** (`http::Uri`), so
+on any GET a request-target past that is answered `414 URI Too Long` with
+an empty body by hyper, before routing — never the `400 bad_data`
+envelope above.
 That ceiling is below the cap, so it also blocks legitimate sub-cap
 queries above roughly 65.5 KB, and it applies to the GET-only routes
 (`/tail`, `/stats`, `/volume`, `/patterns`, `/label/{name}/values`,

@@ -740,11 +740,19 @@ a divergence at a public surface, found while implementing the cap.
   **`/labels` is `GET|POST` and is NOT a carrier:** `labels_impl`
   (`handlers.rs:272`) consumes only `parse_bounds` — `start` and `end`.
   It never reads a `query` parameter, never builds a selector and so
-  never reaches the cap seam; `pulsus_logql::parse`/`parse_selector`
-  occur at `handlers.rs:122` (`/query_range`), `:190` (`/query`), `:365`
-  (`/series`) and `detected.rs:88`, `:153` — the five carriers and nothing
-  else. A query of any length cannot arrive at `/labels`, so listing it
-  would assert a reachability that does not exist.
+  never reaches the cap seam; **among POST-form carriers**
+  `pulsus_logql::parse`/`parse_selector` occur at `handlers.rs:122`
+  (`/query_range`), `:190` (`/query`), `:365` (`/series`) and
+  `detected.rs:88`, `:153` — the five carriers and nothing else. That
+  exclusivity is scoped to the carrier set, not repo-wide: the server
+  crate has **nine** production parse sites, and the other four —
+  `patterns.rs:51`, `stats.rs:50`, `tail.rs:123`, `volume.rs:52` — take a
+  `query` parameter on GET-only routes, so they can never receive an
+  over-cap one (`git grep -nE 'pulsus_logql::parse(_selector)?\('
+  -- crates/pulsus-server/src` = 10 lines, the tenth being the
+  `handlers.rs` in-module test). A query of any length cannot arrive at
+  `/labels`, so listing it would assert a reachability that does not
+  exist.
   **Correction to an earlier reading:
   `/tail` is NOT such a carrier** — `/api/logs/v1/tail` is a GET
   WebSocket upgrade (`logs_api/mod.rs:100,119`), so on the wire it sits
