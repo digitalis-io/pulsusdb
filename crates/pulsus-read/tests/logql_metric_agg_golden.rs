@@ -18,6 +18,18 @@ use pulsus_read::logql::{
     run_client_agg_rows_folded, run_variants_rows,
 };
 
+/// Issue #236 §4: `apply_vector_aggs` is fallible now — it charges the
+/// stage's modelled bytes against `MAX_POST_AGG_BYTES` before it
+/// allocates. Every fixture in this suite is orders of magnitude below
+/// that cap, so a refusal here means the model or the charge is wrong,
+/// not that the fixture is too big; the panic says so.
+fn apply_vector_aggs_ok(
+    result: QueryResult,
+    aggs: &[pulsus_read::logql::plan::VectorAggSpec],
+) -> QueryResult {
+    apply_vector_aggs(result, aggs).expect("a golden-suite fixture is far below MAX_POST_AGG_BYTES")
+}
+
 fn ctx() -> PlanCtx<'static> {
     PlanCtx {
         db: "pulsus",
@@ -160,7 +172,7 @@ fn run_client(
     };
     let materialised =
         run_client_agg_rows(rows, &compiled, meta, client, window, mp.rate_window_ns)
-            .map(|r| apply_vector_aggs(r, &mp.vector_aggs));
+            .map(|r| apply_vector_aggs_ok(r, &mp.vector_aggs));
     let folded = run_client_agg_rows_folded(
         rows,
         &compiled,
@@ -1321,7 +1333,7 @@ fn points_by_app(result: QueryResult) -> HashMap<String, Vec<(i64, f64)>> {
 #[test]
 fn topk_selects_per_step_preserving_original_series_labels() {
     let aggs = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(2.0))];
-    let by_app = points_by_app(apply_vector_aggs(matrix_fixture(), &aggs));
+    let by_app = points_by_app(apply_vector_aggs_ok(matrix_fixture(), &aggs));
     // Step 0: values 5(a), 5(c), 3(b) — the 5.0 tie breaks by label set
     // ascending (a before c), both fit in k=2, b drops.
     // Step 60: 3(b), 2(c) survive; 1(a) drops.
@@ -1334,7 +1346,7 @@ fn topk_selects_per_step_preserving_original_series_labels() {
 fn topk_tie_break_is_deterministic_by_label_set() {
     // k=1 forces the tie at step 0 to resolve: labels ascending → app=a.
     let aggs = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(1.0))];
-    let by_app = points_by_app(apply_vector_aggs(matrix_fixture(), &aggs));
+    let by_app = points_by_app(apply_vector_aggs_ok(matrix_fixture(), &aggs));
     assert_eq!(by_app["a"], vec![(0, 5.0)]);
     assert_eq!(by_app["b"], vec![(STEP, 3.0)]);
     assert!(!by_app.contains_key("c"), "{by_app:?}");
@@ -1343,7 +1355,7 @@ fn topk_tie_break_is_deterministic_by_label_set() {
 #[test]
 fn bottomk_selects_the_lowest_per_step() {
     let aggs = vec![(pulsus_logql::VectorAggOp::Bottomk, None, Some(1.0))];
-    let by_app = points_by_app(apply_vector_aggs(matrix_fixture(), &aggs));
+    let by_app = points_by_app(apply_vector_aggs_ok(matrix_fixture(), &aggs));
     assert_eq!(by_app["b"], vec![(0, 3.0)]);
     assert_eq!(by_app["a"], vec![(STEP, 1.0)]);
     assert!(!by_app.contains_key("c"));
@@ -1379,20 +1391,20 @@ fn topk_and_bottomk_rank_nan_last_in_both_directions() {
     };
     let topk2 = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(2.0))];
     assert_eq!(
-        by_app(apply_vector_aggs(vector.clone(), &topk2)),
+        by_app(apply_vector_aggs_ok(vector.clone(), &topk2)),
         vec!["b", "c"],
         "topk must not select NaN over finite values"
     );
     let bottomk2 = vec![(pulsus_logql::VectorAggOp::Bottomk, None, Some(2.0))];
     assert_eq!(
-        by_app(apply_vector_aggs(vector.clone(), &bottomk2)),
+        by_app(apply_vector_aggs_ok(vector.clone(), &bottomk2)),
         vec!["b", "c"],
         "bottomk must not select NaN over finite values"
     );
     // NaN is still selectable once every finite value is taken.
     let topk3 = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(3.0))];
     assert_eq!(
-        by_app(apply_vector_aggs(vector, &topk3)),
+        by_app(apply_vector_aggs_ok(vector, &topk3)),
         vec!["a", "b", "c"]
     );
 }
@@ -1411,7 +1423,7 @@ fn range_topk_ranks_nan_last_per_step() {
         },
     ]);
     let topk1 = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(1.0))];
-    let by_app = points_by_app(apply_vector_aggs(matrix, &topk1));
+    let by_app = points_by_app(apply_vector_aggs_ok(matrix, &topk1));
     // Step 0: finite 1.0 (b) beats NaN (a); step 60: finite 2.0 (a)
     // beats NaN (b).
     assert_eq!(by_app["a"], vec![(STEP, 2.0)]);
@@ -1433,10 +1445,10 @@ fn stddev_and_stdvar_vector_aggregations_are_population_flavored() {
     // Oracle transcript: stddev(1,2,3,4) = 1.118033988749895 (population),
     // stdvar = 1.25.
     let aggs = vec![(pulsus_logql::VectorAggOp::Stddev, None, None)];
-    let v = single_vector_value(apply_vector_aggs(vector.clone(), &aggs));
+    let v = single_vector_value(apply_vector_aggs_ok(vector.clone(), &aggs));
     assert_eq!(v, 1.118033988749895);
     let aggs = vec![(pulsus_logql::VectorAggOp::Stdvar, None, None)];
-    let v = single_vector_value(apply_vector_aggs(vector, &aggs));
+    let v = single_vector_value(apply_vector_aggs_ok(vector, &aggs));
     assert_eq!(v, 1.25);
 }
 
@@ -1481,7 +1493,7 @@ fn approx_topk_emits_the_sketch_estimate_not_the_true_value() {
     let input = [("v0095169", 3.0), ("v0125949", 4.0), ("ctrl", 5.0)];
     let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(3.0))];
     assert_eq!(
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &approx)),
         vec![
             ("ctrl".to_string(), 5.0),
             ("v0095169".to_string(), 7.0),
@@ -1491,7 +1503,7 @@ fn approx_topk_emits_the_sketch_estimate_not_the_true_value() {
     );
     let topk = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(3.0))];
     assert_eq!(
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &topk)),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &topk)),
         vec![
             ("ctrl".to_string(), 5.0),
             ("v0095169".to_string(), 3.0),
@@ -1515,8 +1527,8 @@ fn approx_topk_is_exact_when_no_cells_collide() {
     let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(3.0))];
     let topk = vec![(pulsus_logql::VectorAggOp::Topk, None, Some(3.0))];
     assert_eq!(
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)),
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &topk)),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &approx)),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &topk)),
     );
 }
 
@@ -1527,7 +1539,7 @@ fn approx_topk_under_k_returns_every_series() {
     let input = [("a", 3.0), ("b", 2.0), ("c", 1.0)];
     let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(10.0))];
     assert_eq!(
-        sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx)).len(),
+        sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &approx)).len(),
         3
     );
 }
@@ -1541,11 +1553,11 @@ fn approx_topk_is_insertion_order_independent() {
     let base = [("v0095169", 3.0), ("v0125949", 4.0), ("ctrl", 5.0)];
     let shuffles: [[usize; 3]; 3] = [[0, 1, 2], [2, 0, 1], [1, 2, 0]];
     let approx = vec![(pulsus_logql::VectorAggOp::ApproxTopk, None, Some(2.0))];
-    let expect = sorted_pairs(apply_vector_aggs(lvl_vector(&base), &approx));
+    let expect = sorted_pairs(apply_vector_aggs_ok(lvl_vector(&base), &approx));
     for order in shuffles {
         let shuffled: Vec<(&str, f64)> = order.iter().map(|&i| base[i]).collect();
         assert_eq!(
-            sorted_pairs(apply_vector_aggs(lvl_vector(&shuffled), &approx)),
+            sorted_pairs(apply_vector_aggs_ok(lvl_vector(&shuffled), &approx)),
             expect,
         );
     }
@@ -1567,8 +1579,8 @@ fn approx_topk_is_insertion_order_independent() {
             },
         ])
     };
-    let a = apply_vector_aggs(two_labels(false), &approx);
-    let b = apply_vector_aggs(two_labels(true), &approx);
+    let a = apply_vector_aggs_ok(two_labels(false), &approx);
+    let b = apply_vector_aggs_ok(two_labels(true), &approx);
     let flatten = |r: QueryResult| {
         let QueryResult::Vector(items) = r else {
             panic!("expected a vector");
@@ -1598,7 +1610,7 @@ fn approx_topk_retention_cap_is_the_reference_heap_size() {
         None,
         Some((cap + 1) as f64),
     )];
-    let out = sorted_pairs(apply_vector_aggs(lvl_vector(&input), &approx));
+    let out = sorted_pairs(apply_vector_aggs_ok(lvl_vector(&input), &approx));
     assert_eq!(out.len(), cap, "exactly CMS_MAX_LABELS series retained");
     assert!(
         !out.iter().any(|(t, _)| t == "t00000"),
@@ -1630,7 +1642,7 @@ fn eval_scalar_query(query: &str) -> f64 {
                 lhs,
                 rhs,
             } => combine_binary(*op, *return_bool, matching.as_ref(), eval(lhs)?, eval(rhs)?),
-            MetricNode::VectorAgg { aggs, inner } => Ok(apply_vector_aggs(eval(inner)?, aggs)),
+            MetricNode::VectorAgg { aggs, inner } => Ok(apply_vector_aggs_ok(eval(inner)?, aggs)),
             MetricNode::Leaf(_) | MetricNode::Variants { .. } => {
                 panic!("scalar-only trees expected")
             }
@@ -2816,7 +2828,7 @@ fn ordered_apps(result: QueryResult) -> Vec<String> {
 fn sort_orders_the_vector_ascending_with_nan_last() {
     let aggs = vec![(pulsus_logql::VectorAggOp::Sort, None, None)];
     assert_eq!(
-        ordered_apps(apply_vector_aggs(sort_vector_fixture(), &aggs)),
+        ordered_apps(apply_vector_aggs_ok(sort_vector_fixture(), &aggs)),
         vec!["b", "a", "c", "d"]
     );
 }
@@ -2827,7 +2839,7 @@ fn sort_orders_the_vector_ascending_with_nan_last() {
 fn sort_desc_orders_the_vector_descending_with_nan_last() {
     let aggs = vec![(pulsus_logql::VectorAggOp::SortDesc, None, None)];
     assert_eq!(
-        ordered_apps(apply_vector_aggs(sort_vector_fixture(), &aggs)),
+        ordered_apps(apply_vector_aggs_ok(sort_vector_fixture(), &aggs)),
         vec!["a", "c", "b", "d"]
     );
 }
@@ -2850,7 +2862,7 @@ fn range_sort_is_a_passthrough_over_the_matrix() {
         pulsus_logql::VectorAggOp::Sort,
         pulsus_logql::VectorAggOp::SortDesc,
     ] {
-        let out = apply_vector_aggs(matrix.clone(), &[(op, None, None)]);
+        let out = apply_vector_aggs_ok(matrix.clone(), &[(op, None, None)]);
         let QueryResult::Matrix(items) = out else {
             panic!("expected a matrix");
         };
@@ -2909,7 +2921,7 @@ fn eval_node(
                 },
                 mp.rate_window_ns,
             )?;
-            Ok(apply_vector_aggs(result, &mp.vector_aggs))
+            Ok(apply_vector_aggs_ok(result, &mp.vector_aggs))
         }
         MetricNode::Binary {
             op,
@@ -2925,7 +2937,7 @@ fn eval_node(
             eval_node(rhs, rows, meta)?,
         ),
         MetricNode::VectorAgg { aggs, inner } => {
-            Ok(apply_vector_aggs(eval_node(inner, rows, meta)?, aggs))
+            Ok(apply_vector_aggs_ok(eval_node(inner, rows, meta)?, aggs))
         }
         // `variants(...) of (...)` (issue #221): the pure fan-out twin,
         // over the scan plan's (unwrap-truncated) common pipeline.

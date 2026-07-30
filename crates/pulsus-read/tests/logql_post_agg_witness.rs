@@ -78,11 +78,11 @@ use pulsus_read::logql::{
     B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
     MAX_POST_AGG_BYTES, MatrixSeries, QueryResult, StageInput, VectorSample, W_APPROX_TOPK,
     W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT, W_SERIES, W_STAGE_SERIES, apply_vector_aggs,
-    binary_peak_bytes, binary_peak_bytes_without, combine_binary, group_name_bytes, include_bytes,
-    leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
-    post_agg_peak_bytes_without,
+    apply_vector_aggs_capped, binary_peak_bytes, binary_peak_bytes_without, combine_binary,
+    combine_binary_capped, group_name_bytes, include_bytes, leaf_min_entry_bytes, measure_matrix,
+    measure_vector, post_agg_peak_bytes, post_agg_peak_bytes_without,
 };
-use pulsus_read::logql::{Direction, PlanCtx, QueryParams, QuerySpec};
+use pulsus_read::logql::{Direction, PlanCtx, QueryParams, QuerySpec, ReadError, TooBroadReason};
 
 // =====================================================================
 // 1. The instrument
@@ -800,7 +800,7 @@ fn run_chain(
     let (result, aggs) = build_chain(op, key, fx, scale);
     let input = measure_result(&result);
     let (out, w) = measure(|| apply_vector_aggs(result, &aggs));
-    drop(out);
+    drop(out.expect("a witness cell must be admitted; a refusal would read as a small peak"));
     (input, aggs, w)
 }
 
@@ -1715,7 +1715,8 @@ fn every_exclusion_is_real() {
     let out = apply_vector_aggs(
         QueryResult::Matrix(items),
         &[(VectorAggOp::Sort, None, None)],
-    );
+    )
+    .expect("a sort passthrough is always admitted");
     match out {
         QueryResult::Matrix(after) => {
             assert_eq!(
@@ -2137,7 +2138,7 @@ fn run_chain_ladder(l: &ChainLadder, skew: Skew) -> LadderRun {
         let input = measure_result(&result);
         let x = (l.axis)(&input, &aggs);
         let (out, w) = measure(|| apply_vector_aggs(result, &aggs));
-        drop(out);
+        drop(out.expect("a witness ladder rung must be admitted"));
         assert!(!w.overflow, "{}: cohort table overflowed", l.name);
         points.push((x, w.peak));
     }
@@ -2821,9 +2822,9 @@ fn each_chain_coefficient_is_necessary_by_its_paired_fixtures() {
         );
 
         let (o1, w_lo) = measure(|| apply_vector_aggs(lo_res, &lo_aggs));
-        drop(o1);
+        drop(o1.expect("a paired fixture must be admitted"));
         let (o2, w_hi) = measure(|| apply_vector_aggs(hi_res, &hi_aggs));
-        drop(o2);
+        drop(o2.expect("a paired fixture must be admitted"));
         assert!(!w_lo.overflow && !w_hi.overflow, "{}: overflow", p.name);
 
         let d_measured = w_hi.peak as i128 - w_lo.peak as i128;
@@ -3238,7 +3239,7 @@ fn the_two_stage_all_retaining_workload_is_inside_the_model() {
             };
             let input = measure_result(&result);
             let (out, w) = measure(|| apply_vector_aggs(result, &aggs));
-            drop(out);
+            drop(out.expect("a witness fixture must be admitted"));
             assert!(!w.overflow, "6.1 {shape:?}: overflow");
             let modelled = post_agg_peak_bytes(&input, &aggs);
             assert!(
@@ -3675,6 +3676,129 @@ fn include_matching_of_names(q: u64) -> VectorMatching {
     }
 }
 
+/// **AC 31's END-TO-END half.** The generator's reachability verdict says
+/// both amplifiers are expressible inside `MAX_QUERY_BYTES`, so the
+/// verdict governs and this asserts the refusal from real QUERY TEXT —
+/// parsed, planned, then driven through the public `apply_vector_aggs` /
+/// `combine_binary` at their shipped cap.
+///
+/// The refusal is exercised at a HERMETIC group count, not at the
+/// derivation's argmin: `A_MIN`/`AMP_MIN` are the smallest amplifiers at
+/// which refusal is possible ANYWHERE in the region, and a wider
+/// amplifier refuses at proportionally fewer series. The test asserts the
+/// amplifier it builds is at or above the published threshold, so it is
+/// anchored to the derivation rather than to a number chosen to pass.
+#[test]
+fn both_amplifiers_are_refused_end_to_end_from_query_text() {
+    let d = derive(Some(MAX_POST_AGG_BYTES));
+    let a_min = d.a_min.expect("O6 threshold");
+    let amp_min = d.amp_min.expect("O7 threshold");
+    let q = pulsus_logql::MAX_QUERY_BYTES as u64;
+
+    // ---- O6: a `by(...)` clause read off the query text ----
+    // One name per 6 bytes ("nnnnn,"), filling the text cap with room for
+    // the rest of the expression.
+    let names: Vec<String> = (0..18_000).map(|i| format!("n{i:05}")).collect();
+    let text = format!(
+        "sum by ({}) (count_over_time({{app=\"a\"}}[5m]))",
+        names.join(",")
+    );
+    assert!(
+        (text.len() as u64) < q,
+        "the O6 probe query must fit inside MAX_QUERY_BYTES ({} vs {q})",
+        text.len()
+    );
+    let expr = pulsus_logql::parse(&text).expect("the by-clause probe must parse");
+    let aggs = match expr {
+        pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Vector { op, grouping, .. }) => {
+            vec![(op, grouping, None)]
+        }
+        other => panic!("expected a vector aggregation, got {other:?}"),
+    };
+    let amplifier = group_name_bytes(&aggs);
+    assert!(
+        amplifier >= a_min,
+        "the probe's by-clause carries {amplifier} bytes, below the published A_MIN = {a_min}"
+    );
+
+    let fx = Fixture {
+        series: 4_096,
+        ..CHAIN_BASE
+    };
+    let result = QueryResult::Vector(build_vector(&fx, false));
+    match apply_vector_aggs(result, &aggs) {
+        Err(ReadError::QueryTooBroad(TooBroadReason::MetricPostAggBytes { bytes, cap })) => {
+            assert_eq!(cap, MAX_POST_AGG_BYTES);
+            assert!(
+                bytes > cap,
+                "the refusal must name a breach: {bytes} vs {cap}"
+            );
+        }
+        other => panic!("O6: expected MetricPostAggBytes, got {other:?}"),
+    }
+
+    // ---- O7: a `group_left(...)` include list read off the query text ----
+    let inc: Vec<String> = (0..6_000).map(|i| format!("i{i:05}")).collect();
+    let btext = format!(
+        "count_over_time({{app=\"a\"}}[5m]) * on (id00) group_left ({}) \
+         count_over_time({{app=\"b\"}}[5m])",
+        inc.join(",")
+    );
+    assert!(
+        (btext.len() as u64) < q,
+        "the O7 probe query must fit inside MAX_QUERY_BYTES ({} vs {q})",
+        btext.len()
+    );
+    let bexpr = pulsus_logql::parse(&btext).expect("the include probe must parse");
+    let matching = match bexpr {
+        pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Binary { modifier, .. }) => modifier
+            .and_then(|m| m.matching)
+            .expect("the probe carries an on/group_left clause"),
+        other => panic!("expected a binary expression, got {other:?}"),
+    };
+
+    // The one side carries a wide label VALUE, which is what makes each
+    // include name expensive; the many side is narrow.
+    let many_fx = Fixture {
+        series: 256,
+        ..BIN_BASE
+    };
+    let many = build_vector(&many_fx, false);
+    let one: Vec<VectorSample> = (0..many_fx.series)
+        .map(|i| VectorSample {
+            labels: vec![
+                ("id00".to_string(), pad(i, many_fx.value_bytes)),
+                ("wide".to_string(), "w".repeat(1_000)),
+            ],
+            value: 1.0,
+        })
+        .collect();
+    let (lm, rm) = (measure_vector(&many), measure_vector(&one));
+    let product = lm
+        .series()
+        .saturating_mul(include_bytes(Some(&matching), BinOp::Mul, &rm));
+    assert!(
+        product >= amp_min,
+        "the probe's include amplification is {product}, below the published AMP_MIN = {amp_min}"
+    );
+    match combine_binary(
+        BinOp::Mul,
+        false,
+        Some(&matching),
+        QueryResult::Vector(many),
+        QueryResult::Vector(one),
+    ) {
+        Err(ReadError::QueryTooBroad(TooBroadReason::MetricPostAggBytes { bytes, cap })) => {
+            assert_eq!(cap, MAX_POST_AGG_BYTES);
+            assert!(
+                bytes > cap,
+                "the refusal must name a breach: {bytes} vs {cap}"
+            );
+        }
+        other => panic!("O7: expected MetricPostAggBytes, got {other:?}"),
+    }
+}
+
 /// A `by(...)` clause whose TOTAL `group_name_bytes` is exactly `total`
 /// (each name contributes `len + 1`).
 fn by_clause_of_total_bytes(total: u64) -> Grouping {
@@ -4088,7 +4212,7 @@ fn chain_depth_does_not_multiply_peak_memory() {
                 Shape::Range => QueryResult::Matrix(build_matrix(&fx, false)),
             };
             let (out, w) = measure(|| apply_vector_aggs(result, &aggs));
-            drop(out);
+            drop(out.expect("a witness fixture must be admitted"));
             assert!(!w.overflow, "depth probe: overflow");
             peaks.push(w.peak);
         }
@@ -4144,6 +4268,244 @@ fn zz_large_scale_cell_stays_inside_the_model() {
         w.peak <= modelled,
         "large-scale peak {} exceeds the model {modelled}",
         w.peak
+    );
+}
+
+// =====================================================================
+// 11b. The funnel itself (ACs 17, 19, 20, 21)
+// =====================================================================
+
+/// AC 17 — an empty chain returns its input BIT-IDENTICALLY and allocates
+/// nothing: the early return happens before measurement and before the
+/// `Vec -> BTreeMap -> Vec` conversion, which is a strict win on the
+/// commonest metric shape.
+#[test]
+fn an_empty_aggregation_chain_is_a_zero_allocation_passthrough() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture {
+        series: 64,
+        ..CHAIN_BASE
+    };
+    for result in [
+        QueryResult::Vector(build_vector(&fx, false)),
+        QueryResult::Matrix(build_matrix(&fx, false)),
+    ] {
+        let before = result.clone();
+        let (out, w) = measure(|| apply_vector_aggs(result, &[]));
+        let out = out.expect("an empty chain is always admitted");
+        assert!(!w.overflow, "overflow");
+        assert_eq!(w.peak, 0, "an empty chain must allocate nothing: {w:?}");
+        assert_eq!(w.count, 0, "an empty chain must not allocate at all: {w:?}");
+        match (&before, &out) {
+            (QueryResult::Vector(a), QueryResult::Vector(b)) => {
+                assert_eq!(a.len(), b.len());
+                for (x, y) in a.iter().zip(b) {
+                    assert_eq!(x.labels, y.labels);
+                    assert_eq!(x.value.to_bits(), y.value.to_bits());
+                }
+            }
+            (QueryResult::Matrix(a), QueryResult::Matrix(b)) => {
+                assert_eq!(a.len(), b.len());
+                for (x, y) in a.iter().zip(b) {
+                    assert_eq!(x.labels, y.labels);
+                    let xb: Vec<(i64, u64)> =
+                        x.points.iter().map(|(t, v)| (*t, v.to_bits())).collect();
+                    let yb: Vec<(i64, u64)> =
+                        y.points.iter().map(|(t, v)| (*t, v.to_bits())).collect();
+                    assert_eq!(xb, yb, "an empty chain must not move a point");
+                }
+            }
+            _ => panic!("the shape changed"),
+        }
+    }
+}
+
+/// AC 20 — **refusal before allocation.** With the cap set below the
+/// modelled value the call returns `MetricPostAggBytes` AND the window's
+/// peak is under one series' worth: the conversion never ran, no group
+/// map was built and no join index exists.
+#[test]
+fn a_refused_charge_allocates_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture {
+        series: 1024,
+        ..CHAIN_BASE
+    };
+    let aggs = vec![(VectorAggOp::Sum, None, None)];
+
+    for shape in [Shape::Instant, Shape::Range] {
+        let result = match shape {
+            Shape::Instant => QueryResult::Vector(build_vector(&fx, false)),
+            Shape::Range => QueryResult::Matrix(build_matrix(&fx, false)),
+        };
+        let input = measure_result(&result);
+        let modelled = post_agg_peak_bytes(&input, &aggs);
+        let mut charged = 0u64;
+        let (out, w) =
+            measure(|| apply_vector_aggs_capped(&mut charged, result, &aggs, modelled - 1));
+        assert!(!w.overflow, "overflow");
+        match out {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricPostAggBytes { bytes, cap })) => {
+                assert_eq!(bytes, modelled);
+                assert_eq!(cap, modelled - 1);
+            }
+            other => panic!(
+                "{}: expected MetricPostAggBytes, got {other:?}",
+                describe(shape)
+            ),
+        }
+        assert!(
+            w.peak < 4096,
+            "{}: a refused charge allocated {} bytes — the conversion ran before the refusal",
+            describe(shape),
+            w.peak
+        );
+        assert_eq!(
+            charged, 0,
+            "a failed acquire must leave the counter unmutated"
+        );
+    }
+}
+
+/// AC 21 — **charge symmetry is structural.** The stage-local counter is
+/// 0 after every return path: `Ok`, a refused `acquire`, and an `Err`
+/// raised by an Entry function partway down the chain. Because the
+/// discharge is `Drop`, a leak is not expressible — this test pins the
+/// property, it does not create it.
+#[test]
+fn the_stage_counter_returns_to_zero_on_every_return_path() {
+    let fx = Fixture {
+        series: 32,
+        ..CHAIN_BASE
+    };
+    let aggs = vec![(VectorAggOp::Sum, None, None)];
+
+    // (1) Ok.
+    let mut charged = 0u64;
+    let ok = apply_vector_aggs_capped(
+        &mut charged,
+        QueryResult::Vector(build_vector(&fx, false)),
+        &aggs,
+        MAX_POST_AGG_BYTES,
+    );
+    assert!(ok.is_ok());
+    assert_eq!(charged, 0, "the Ok path must discharge");
+
+    // (2) a refused acquire.
+    let mut charged = 0u64;
+    let refused = apply_vector_aggs_capped(
+        &mut charged,
+        QueryResult::Vector(build_vector(&fx, false)),
+        &aggs,
+        1,
+    );
+    assert!(refused.is_err());
+    assert_eq!(charged, 0, "a refused acquire must not mutate the counter");
+
+    // (3) an Err raised INSIDE the chain: a duplicate one-side signature
+    // makes `instant_join` fail after the charge is in force.
+    let dup = vec![
+        VectorSample {
+            labels: vec![("id00".to_string(), "a".to_string())],
+            value: 1.0,
+        },
+        VectorSample {
+            labels: vec![("id00".to_string(), "a".to_string())],
+            value: 2.0,
+        },
+    ];
+    let one = vec![VectorSample {
+        labels: vec![("id00".to_string(), "a".to_string())],
+        value: 3.0,
+    }];
+    let mut charged = 0u64;
+    let err = combine_binary_capped(
+        &mut charged,
+        BinOp::Div,
+        false,
+        Some(&VectorMatching {
+            on: true,
+            labels: vec!["id00".to_string()],
+            group: Some(MatchGroup::Left(Vec::new())),
+        }),
+        QueryResult::Vector(one),
+        QueryResult::Vector(dup),
+        MAX_POST_AGG_BYTES,
+    );
+    assert!(err.is_err(), "a duplicate one-side signature must error");
+    assert_eq!(
+        charged, 0,
+        "an early `?` inside the chain must still discharge"
+    );
+}
+
+/// AC 19 — **`admit` is unconditional.** Driving an Entry function with a
+/// collection larger than the charge covers yields a clean
+/// `MetricPostAggBytes`, with no `debug_assert` anywhere in the path: the
+/// same outcome in release as in debug. Reached here through the public
+/// seam by charging for a SMALL operand and then handing the stage a
+/// large one — which is exactly the shape a future uncharged call site
+/// would take.
+#[test]
+fn admit_refuses_a_collection_wider_than_its_charge() {
+    let small = StageInput::for_derivation(1, 1, 4, 32, 1, 4, 1, 1);
+    let aggs = vec![(VectorAggOp::Sum, None, None)];
+    let bytes = post_agg_peak_bytes(&small, &aggs);
+    let wide = Fixture {
+        series: 64,
+        ..CHAIN_BASE
+    };
+    // The seam charges for what it measures, so an under-measured charge
+    // is only reachable by handing `_capped` a cap big enough for the
+    // small shape and an operand of the large one — `admit` is what
+    // stops it, not the acquire.
+    let mut charged = 0u64;
+    let out = apply_vector_aggs_capped(
+        &mut charged,
+        QueryResult::Vector(build_vector(&wide, false)),
+        &aggs,
+        bytes,
+    );
+    match out {
+        Err(ReadError::QueryTooBroad(TooBroadReason::MetricPostAggBytes { .. })) => {}
+        other => panic!("expected MetricPostAggBytes, got {other:?}"),
+    }
+    assert_eq!(charged, 0);
+}
+
+/// The source-level half of AC 19: no `debug_assert` anywhere in the
+/// enforcement path. A `debug_assert` is not an enforcement mechanism, it
+/// is a comment that runs in CI — and release builds are what serve
+/// queries.
+#[test]
+fn the_enforcement_path_contains_no_debug_assert() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql/exec.rs"),
+    )
+    .expect("read exec.rs");
+    let start = src
+        .find("mod ledger {")
+        .expect("the ledger module must exist");
+    let end = src[start..]
+        .find("\nuse ledger::Ledger;")
+        .expect("the ledger module's end")
+        + start;
+    // CODE only: `admit`'s own doc says "no `debug_assert`", and a census
+    // that counted its own prose would fail on the sentence describing
+    // the property it checks. The unit is a non-comment source LINE.
+    let module: String = src[start..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !module.contains("debug_assert"),
+        "`mod ledger` contains a debug_assert — the charge and the admission must hold in \
+         release exactly as in debug"
+    );
+    assert!(
+        module.contains("fn admit(&self, series: u64, points: u64) -> Result<(), ReadError>"),
+        "`admit` must return a Result rather than assert"
     );
 }
 
@@ -4500,7 +4862,30 @@ const STAGE_DATA_TYPES: &[&str] = &[
     "StringPair",
 ];
 
-const CENSUS_ROOTS: &[&str] = &["apply_vector_aggs", "combine_binary"];
+/// **The `Shared` class — enumerated, not predicated** (task-manager
+/// ruling on issue #236).
+///
+/// These two are Element-class members of the funnel's closure AND are
+/// called by the Part B fold at the client leaf (`ReduceFold::push_series`,
+/// `SelectFold::push_series`, `RangeSlideState::emit`), which charges
+/// through `charge_group_bytes`/`charge_result_points` and holds no
+/// funnel token. Requiring `&Ledger` on them would not compile there;
+/// requiring it only sometimes would make the token optional, which is no
+/// token at all.
+///
+/// **Why these two are safe to share**, which is what a third candidate
+/// would have to demonstrate: both are PURE FUNCTIONS OF THEIR ARGUMENTS
+/// that allocate nothing into the funnel's accounting — `group_key`
+/// returns a freshly-built `LabelSet` the caller owns and charges for,
+/// and `pin_reduction_order` sorts a slice IN PLACE. Neither retains
+/// anything, neither is input-scaled beyond the element it is handed, and
+/// neither can outlive the caller's charge.
+///
+/// The list is a NAME LIST on purpose. A membership rule would let a
+/// future function step out of the funnel simply by acquiring a second
+/// caller; with an enumeration a third member fails the census loudly and
+/// by name, and joins only by adjudication.
+const SHARED_WITH_THE_LEAF: &[&str] = &["group_key", "pin_reduction_order"];
 
 /// A member reached from the funnel roots, with everything the four
 /// mechanical predicates need.
@@ -4510,6 +4895,12 @@ struct Member {
     file: String,
     allocates: bool,
     stage_data: bool,
+    /// Reaches `Ledger::acquire` — mints the charge.
+    mints: bool,
+    /// Carries the proof token.
+    takes_ledger: bool,
+    /// Calls `Ledger::admit` on its own input.
+    calls_admit: bool,
     /// Callers OUTSIDE the closure — a member with one cannot be
     /// required to hold the funnel's token, because a legitimate caller
     /// has no funnel charge in force.
@@ -4520,16 +4911,45 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
     let (files, all) = region_census::collect();
     let free = region_census::free_fns(&all);
 
+    // **The roots are DERIVED, not listed**: every free function that
+    // mints a charge. A hand list would silently miss a new one, which is
+    // exactly how the SQL path's two inline chains would have escaped the
+    // census when they started charging.
+    let mut roots: Vec<String> = free
+        .values()
+        .filter(|f| {
+            f.callees
+                .iter()
+                .any(|c| c == "Ledger::acquire" || c == "Ledger::acquire_binary")
+        })
+        .map(|f| f.name.clone())
+        .collect();
+    // Plus the region's PUBLIC boundary. These two mint indirectly
+    // (through their `_capped` seams), so the derived filter above cannot
+    // see them — and without them a `pub fn` that grew an allocation
+    // would sit outside every closure the census walks. `mod.rs` exports
+    // exactly these two, so the list is the API surface, not a guess.
+    for public in ["apply_vector_aggs", "combine_binary"] {
+        let f = free
+            .get(public)
+            .unwrap_or_else(|| panic!("`{public}` is no longer a free fn in src/logql"));
+        assert!(
+            !f.param_types.contains("Ledger"),
+            "`{public}` is the region's public entry point and must MINT the charge, never \
+             receive one"
+        );
+        roots.push(public.to_string());
+    }
+    assert!(
+        roots.len() >= 3,
+        "only {} charge-minting roots found — the token is not wired where the census looks: \
+         {roots:?}",
+        roots.len()
+    );
+
     // Transitive callee closure of the roots, to a fixpoint.
     let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut frontier: Vec<String> = CENSUS_ROOTS.iter().map(|s| (*s).to_string()).collect();
-    for r in CENSUS_ROOTS {
-        assert!(
-            free.contains_key(*r),
-            "census root `{r}` is not a free function in src/logql — the region has moved and \
-             the roots must move with it"
-        );
-    }
+    let mut frontier: Vec<String> = roots.clone();
     while let Some(name) = frontier.pop() {
         if !closure.insert(name.clone()) {
             continue;
@@ -4544,6 +4964,23 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
             }
         }
     }
+
+    // The direct admission helpers, DERIVED: a free fn that takes the
+    // token and whose whole job is to call `Ledger::admit` (`admit_range`
+    // computes `points` as one `O(series)` sum, `admit_instant`/
+    // `admit_join` are `O(1)`). An Entry reaches `admit` through one of
+    // these, and recognising them is what keeps Entry from reading as
+    // Element.
+    let admit_helpers: std::collections::BTreeSet<String> = free
+        .values()
+        .filter(|f| {
+            f.param_types.contains("Ledger")
+                && f.callees
+                    .iter()
+                    .any(|c| c == ".admit" || c == "Ledger::admit")
+        })
+        .map(|f| f.name.clone())
+        .collect();
 
     let members = closure
         .iter()
@@ -4563,6 +5000,15 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
             Member {
                 name: info.name.clone(),
                 file: info.file.clone(),
+                mints: info
+                    .callees
+                    .iter()
+                    .any(|c| c == "Ledger::acquire" || c == "Ledger::acquire_binary"),
+                takes_ledger: info.param_types.contains("Ledger"),
+                calls_admit: info
+                    .callees
+                    .iter()
+                    .any(|c| c == ".admit" || c == "Ledger::admit" || admit_helpers.contains(c)),
                 allocates: ALLOC_TOKENS.iter().any(|t| info.callees.contains(*t)),
                 stage_data: STAGE_DATA_TYPES
                     .iter()
@@ -4574,18 +5020,52 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
     (files, members)
 }
 
+/// The five classes §4.1 admits, `Shared` being the fifth (task-manager
+/// ruling): a member that matches none of them fails the census.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+enum RegionClass {
+    /// Mints the charge: reaches `Ledger::acquire`, takes no `&Ledger`.
+    Root,
+    /// Receives a fresh stage-level collection; admits it unconditionally.
+    Entry,
+    /// Operates on ONE element of an already-admitted collection.
+    Element,
+    /// Element-class, but also reached from the client leaf's own
+    /// charging regime, so it cannot be required to hold the token.
+    Shared,
+}
+
+fn classify(m: &Member) -> Option<RegionClass> {
+    if SHARED_WITH_THE_LEAF.contains(&m.name.as_str()) {
+        return Some(RegionClass::Shared);
+    }
+    match (m.mints, m.takes_ledger, m.calls_admit) {
+        (true, false, _) => Some(RegionClass::Root),
+        (false, true, true) => Some(RegionClass::Entry),
+        (false, true, false) => Some(RegionClass::Element),
+        _ => None,
+    }
+}
+
 /// **The census is the gate; the published table is the expected
 /// answer.** Every member that both allocates and takes a stage-data
 /// parameter must fall into exactly one of `Root`/`Entry`/`Element`/
-/// `Excluded` by the mechanical predicates, and the classification the
+/// `Shared` by the mechanical predicates, and the classification the
 /// census computes must equal the one published here.
 ///
-/// The funnel's token is not wired yet, so this run publishes the
-/// OBLIGATION SET — which functions will have to carry it — and the
-/// classification is asserted against the predicates that do not depend
-/// on the token (`allocates` x `stage_data`). Once `mod ledger` lands the
-/// remaining two predicates (`takes_ledger`, `calls_admit`) become
-/// non-trivial and the same test asserts the full four-class table.
+/// **§7's "which call sites" claim, restated to what it now covers**
+/// (task-manager condition 3 — the sentence changes rather than being
+/// softened in a footnote):
+///
+/// > Every allocating function in the census-derived set requires a
+/// > `&Ledger`, whose only constructor charges, so an uncapped call site
+/// > does not compile — **except for the two functions named in
+/// > `SHARED_WITH_THE_LEAF`, which are also reached from the client
+/// > leaf's own charging regime. For those two the coverage comes from
+/// > whichever caller's charge is in force, and they are safe to share
+/// > because each is a pure function of its arguments that allocates
+/// > nothing into the funnel's accounting.** A third such function fails
+/// > this census by name and joins only by adjudication.
 #[test]
 fn the_token_taking_set_is_derived_from_the_call_graph() {
     let (files, members) = census_members();
@@ -4605,11 +5085,14 @@ fn the_token_taking_set_is_derived_from_the_call_graph() {
         .filter(|m| m.allocates && m.stage_data)
         .collect();
 
-    // Published expectation (plan v14 §4.1, re-derived at this commit —
-    // Parts B/C/D added `pin_reduction_order` to the closure, which
-    // `d145ded` did not have).
-    const EXPECT_ROOT: &[&str] = &["apply_vector_aggs", "combine_binary"];
+    // The obligated set is `allocates AND stage_data`. `charged_*_chain`
+    // and `run_*_chain` are in the closure but allocate NOTHING
+    // themselves — they measure, charge and delegate — so the census
+    // does not obligate them, and publishing them here would be claiming
+    // an obligation the predicates do not derive.
+    const EXPECT_ROOT: &[&str] = &["apply_vector_aggs_capped", "combine_binary_capped"];
     const EXPECT_ENTRY: &[&str] = &[
+        "approx_topk_instant",
         "combine_matrices",
         "combine_vectors",
         "group_instant",
@@ -4620,15 +5103,8 @@ fn the_token_taking_set_is_derived_from_the_call_graph() {
         "select_k_range",
         "set_op_join",
         "sort_instant",
-        "approx_topk_instant",
     ];
-    const EXPECT_ELEMENT: &[&str] = &[
-        "group_key",
-        "match_signature",
-        "pin_reduction_order",
-        "set_label_sorted",
-        "sort_candidates",
-    ];
+    const EXPECT_ELEMENT: &[&str] = &["match_signature", "set_label_sorted", "sort_candidates"];
 
     let mut got: Vec<&str> = obligated.iter().map(|m| m.name.as_str()).collect();
     got.sort_unstable();
@@ -4636,6 +5112,7 @@ fn the_token_taking_set_is_derived_from_the_call_graph() {
         .iter()
         .chain(EXPECT_ENTRY)
         .chain(EXPECT_ELEMENT)
+        .chain(SHARED_WITH_THE_LEAF)
         .copied()
         .collect();
     want.sort_unstable();
@@ -4645,9 +5122,32 @@ fn the_token_taking_set_is_derived_from_the_call_graph() {
          is either a function that must be dispositioned or a table that has gone stale"
     );
 
-    // Every member NOT obligated must fail at least one predicate — the
-    // classification derives its own `Excluded` class rather than
-    // trusting a list.
+    // Every obligated member falls into EXACTLY one class, and into the
+    // one published for it.
+    for m in &obligated {
+        let class = classify(m).unwrap_or_else(|| {
+            panic!(
+                "{} matches none of the five classes (mints = {}, takes_ledger = {}, \
+                 calls_admit = {}) — it must be dispositioned, not left to allocate uncapped",
+                m.name, m.mints, m.takes_ledger, m.calls_admit
+            )
+        });
+        let published = if EXPECT_ROOT.contains(&m.name.as_str()) {
+            RegionClass::Root
+        } else if EXPECT_ENTRY.contains(&m.name.as_str()) {
+            RegionClass::Entry
+        } else if EXPECT_ELEMENT.contains(&m.name.as_str()) {
+            RegionClass::Element
+        } else {
+            RegionClass::Shared
+        };
+        assert_eq!(
+            class, published,
+            "{}: the census computes {class:?} where the table publishes {published:?}",
+            m.name
+        );
+    }
+
     for m in &members {
         if obligated.iter().any(|o| o.name == m.name) {
             continue;
@@ -4658,6 +5158,33 @@ fn the_token_taking_set_is_derived_from_the_call_graph() {
             m.name
         );
     }
+}
+
+/// Condition 2 of the `Shared` ruling: a THIRD member fails loudly and by
+/// name rather than joining silently. `SHARED_WITH_THE_LEAF` is consulted
+/// only for names that are genuinely shared, so a stale entry is a
+/// failure too.
+#[test]
+fn the_shared_class_admits_exactly_its_two_named_members() {
+    let (_, members) = census_members();
+    let genuinely_shared: Vec<&str> = members
+        .iter()
+        .filter(|m| m.allocates && m.stage_data && !m.mints)
+        .filter(|m| {
+            m.external_callers
+                .iter()
+                .any(|c| c.contains("Fold::") || c.contains("RangeSlideState::"))
+        })
+        .map(|m| m.name.as_str())
+        .collect();
+    assert_eq!(
+        genuinely_shared, SHARED_WITH_THE_LEAF,
+        "a function is shared between the funnel and the client leaf's charging regime that \
+         `SHARED_WITH_THE_LEAF` does not name (or names one that is no longer shared). The \
+         Shared class is ENUMERATED, not predicated: a third member needs adjudication, not a \
+         list edit — it must be a pure function of its arguments that allocates nothing into \
+         the funnel's accounting, as `group_key` and `pin_reduction_order` are"
+    );
 }
 
 /// **The census's external-caller map, pinned whole.** Two members of
@@ -4700,32 +5227,11 @@ fn the_external_caller_map_of_the_funnel_closure_is_pinned() {
 
     let want: Vec<(String, Vec<String>)> = vec![
         (
-            "apply_vector_aggs".to_string(),
-            vec![
-                "exec.rs::LogQlEngine::run_metric_client".to_string(),
-                "exec.rs::LogQlEngine::run_metric_node".to_string(),
-                "exec.rs::VariantsAggState::finish_in_place".to_string(),
-                "exec.rs::run_client_agg_rows_folded".to_string(),
-            ],
-        ),
-        (
-            "combine_binary".to_string(),
-            vec!["exec.rs::LogQlEngine::run_metric_node".to_string()],
-        ),
-        (
-            "group_instant".to_string(),
-            vec!["exec.rs::LogQlEngine::run_metric_inner".to_string()],
-        ),
-        (
             "group_key".to_string(),
             vec![
                 "exec.rs::ReduceFold::push_series".to_string(),
                 "exec.rs::SelectFold::push_series".to_string(),
             ],
-        ),
-        (
-            "group_range".to_string(),
-            vec!["exec.rs::LogQlEngine::run_metric_inner".to_string()],
         ),
         (
             "pin_reduction_order".to_string(),

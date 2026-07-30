@@ -1014,7 +1014,7 @@ fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {
             combine_binary(*op, *return_bool, matching.as_ref(), l, r).map_err(|e| e.to_string())
         }
         MetricNode::VectorAgg { aggs, inner } => {
-            Ok(apply_vector_aggs(eval_node(inner, store)?, aggs))
+            apply_vector_aggs(eval_node(inner, store)?, aggs).map_err(|e| e.to_string())
         }
         // `variants(...) of (...)` (issue #221): the pure twin of the
         // live engine's fan-out — the SAME `VariantArena` +

@@ -257,6 +257,26 @@ pub enum TooBroadReason {
     /// is an INTERMEDIATE wide enough that its point product exceeds
     /// that, which is a bounded error rather than an OOM.
     MetricResultPoints { count: u64, cap: u64 },
+    /// Issue #236 §4: the post-aggregation chain or a binary combination
+    /// would hold more heap bytes SIMULTANEOUSLY, over and above its
+    /// input, than [`crate::logql::exec::MAX_POST_AGG_BYTES`].
+    ///
+    /// The bound is charged BEFORE the stage allocates — a refusal means
+    /// the operand was never converted, no group map was built and no
+    /// join index exists — so a query too wide for this stage is a clean
+    /// bounded error rather than an OOM. The modelled byte count is
+    /// `post_agg_peak_bytes`/`binary_peak_bytes` over WITNESS-DERIVED
+    /// coefficients (`tests/logql_post_agg_witness.rs`), not a container
+    /// enumeration.
+    ///
+    /// The cap covers every client-leaf-sourced input with no `by`-name
+    /// and no `group_left/right(include)` amplification; a query carrying
+    /// either amplifier may be refused above the O6/O7 thresholds
+    /// recorded in [`crate::logql::exec::MAX_POST_AGG_BYTES`]' doc. The
+    /// reference has no equivalent bound — it evaluates step-ordered and
+    /// never materialises the inner matrix — so this is a registered
+    /// bounded divergence, not a parity match.
+    MetricPostAggBytes { bytes: u64, cap: u64 },
     /// Issue #227 (review round 6): the label-mutating client-aggregation
     /// path retained more QUERY-LIFETIME bytes of distinct output-group
     /// state — each first-seen group's rendered JSON key plus its cloned
@@ -476,6 +496,13 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "the metric evaluation would reserve {count} result point-slots, exceeding \
                      the {cap}-point cap — narrow the aggregation, the step, or the time window"
+                )
+            }
+            TooBroadReason::MetricPostAggBytes { bytes, cap } => {
+                write!(
+                    f,
+                    "the post-aggregation stage would hold {bytes} bytes, exceeding the {cap}-byte \
+                     cap — narrow the aggregation, the grouping clause, or the time window"
                 )
             }
             TooBroadReason::MetricGroupLabelBytes { bytes, cap } => {

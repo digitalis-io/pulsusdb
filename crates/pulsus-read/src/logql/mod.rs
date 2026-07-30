@@ -98,8 +98,9 @@ pub use error::{ReadError, TooBroadReason};
 pub use exec::{
     B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
     MAX_POST_AGG_BYTES, StageInput, W_APPROX_TOPK, W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT,
-    W_SERIES, W_STAGE_SERIES, binary_peak_bytes, binary_peak_bytes_without, group_name_bytes,
-    include_bytes, leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
+    W_SERIES, W_STAGE_SERIES, apply_vector_aggs_capped, binary_peak_bytes,
+    binary_peak_bytes_without, combine_binary_capped, group_name_bytes, include_bytes,
+    leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
     post_agg_peak_bytes_without,
 };
 pub use exec::{

@@ -532,6 +532,49 @@ not "fix" us toward the panic.
   Removing it needs a step-ordered evaluator (**#250**) or a fold order
   that a streaming emit can reproduce — not a larger constant.
 
+- **(d) O6 — the `by(...)` grouping-name amplifier.** *Reference:* has no
+  post-aggregation byte bound at all: it evaluates step-ordered and never
+  materialises the inner matrix, so a wide `by(...)` clause costs it one
+  step's worth of keys. *PulsusDB:* materialises the stage, so
+  `group_key`'s `By` arm builds one owned pair per `by` NAME per output
+  group; the funnel charges that as `W_GROUPNAME x series x
+  group_name_bytes` against `MAX_POST_AGG_BYTES` (8 GiB) and refuses
+  above it with `MetricPostAggBytes` (HTTP 422). **Threshold, as a
+  number a reader can compare their query against: `A_MIN = 597` total
+  `by`-clause bytes** — with `A_NAME_MIN = 2` (a one-character name plus
+  its separator) that is **at least 299 one-character `by` names** —
+  measured at the argmin `N = 435,558` series. Strictly below `A_MIN`,
+  refusal is impossible at ANY group count; above it, refusal begins at
+  proportionally fewer series. **Reachable**: 597 bytes fits easily
+  inside `MAX_QUERY_BYTES = 131,072`, and
+  `both_amplifiers_are_refused_end_to_end_from_query_text` drives the
+  refusal from real query text. Owner: **#250** (a step-ordered
+  evaluator removes the materialisation this bound exists for).
+
+- **(e) O7 — the `group_left/right(include)` amplifier.** *Reference:*
+  same reason as (d) — no equivalent bound. *PulsusDB:* `instant_join`
+  copies each include label onto every many-side series through
+  `set_label_sorted`'s insert chain, so the cost is `B_INCLUDE x
+  many.series x include_bytes` where `include_bytes = Σ (name.len() +
+  one.max_value_bytes + 1)`. **Threshold: `AMP_MIN = 97,030,221`**, the
+  smallest `many.series x include_bytes` PRODUCT at which refusal is
+  possible, at the argmin `N_many = 546`. **Reachable** within the query
+  text cap — a few thousand include names against a one side carrying a
+  kilobyte-scale label value clears it — and the same test drives that
+  refusal end to end. Owner: **#250**.
+
+  **What the cap does and does not claim, for both (d) and (e).**
+  `MAX_POST_AGG_BYTES` is derived by MEASUREMENT — a cohort-attributed
+  allocator witness (`tests/logql_post_agg_witness.rs`), coefficients =
+  the observed per-unit rates times a stated 2x margin — not by
+  enumerating containers. It guarantees that every client-leaf-sourced
+  input carrying NEITHER amplifier is admitted, and nothing broader. It
+  is not a worst-case proof: the residual is a distribution adversarial
+  in a dimension no ladder varies, and the margin is what covers it.
+  Before #236 this stage had no bound at all and could OOM; the
+  divergence registered here is a clean bounded refusal replacing an
+  unbounded path.
+
 ## Issue #230 — `line_format`/`label_format` template engine
 
 The full Go `text/template` + reference function-map surface landed in

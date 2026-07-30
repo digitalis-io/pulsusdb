@@ -3471,6 +3471,7 @@ mod tests {
         )
         .expect("client aggregation");
         pulsus_read::logql::apply_vector_aggs(result, &mp.vector_aggs)
+            .expect("a differential fixture is far below MAX_POST_AGG_BYTES")
     }
 
     fn evaluate_node_hermetically(
@@ -3494,6 +3495,7 @@ mod tests {
                     evaluate_node_hermetically(corpus, inner, service),
                     aggs,
                 )
+                .expect("a differential fixture is far below MAX_POST_AGG_BYTES")
             }
             pulsus_read::logql::MetricNode::Binary {
                 op,

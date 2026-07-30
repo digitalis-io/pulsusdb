@@ -124,6 +124,8 @@ Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values
 | LogQL query text of **131,072 bytes or more** (`pulsus_logql::MAX_QUERY_BYTES`, an exclusive maximum — the longest accepted query is **131,071 bytes**; the reference's `maxInputSize` at grafana/loki v3.7.4 `pkg/logql/syntax/parser.go:42`, enforced `>=` at `:86`; applies at every LogQL parse, incl. per `match[]` value and `/tail`) | `400` | `bad_data` |
 | Pipeline/plan rejection (bad regex — **including an uncompilable pushed-down line-filter or stream-matcher regex, since #240** — bad parser expression, unwrap-arity, …) | `400` | `bad_data` |
 | Query rejected as too broad (scan-budget or stream-count cap exceeded) | `422` | `query_too_broad` |
+| Metric result over **500 series** (`max_query_series`, the reference's own threshold and `> cap` test, applied to the FINAL result — never to scanned or inner-aggregation groups) | `422` | `query_too_broad` |
+| Metric evaluation over **12,000,000 result point-slots** or over the post-aggregation byte bound **`MAX_POST_AGG_BYTES` (8 GiB)** — both charged BEFORE the allocation they guard, so an over-wide query is a clean refusal rather than an OOM. The byte bound is a registered divergence with no reference equivalent (it evaluates step-ordered and never materialises the inner matrix); its `by(...)` and `group_left/right(include)` amplifier thresholds are in `docs/benchmarks/logs-differential-ledger.md` §"Issue #236" (d)/(e) | `422` | `query_too_broad` |
 | ClickHouse read timed out | `504` | `timeout` |
 | Unclassified ClickHouse/internal failure | `500` | `internal` |
 

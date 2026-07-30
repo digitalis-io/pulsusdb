@@ -1630,7 +1630,17 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         // `Vec::len`, and allocates nothing on either arm (the error arm
         // constructs a fixed-size `TooBroadReason`), so it adds no
         // per-variant allocation for the G-gates to bound.
-        branches: 17,
+        //
+        // Issue #236 §4: `apply_vector_aggs` is fallible now (it charges
+        // the stage's modelled bytes before allocating), so the
+        // per-variant call gains a second `syn::ExprTry` branch
+        // (17 -> 18). The callee set is unchanged. Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — the
+        // charge is integer arithmetic over an already-materialised
+        // `StageInput` and the refusal arm builds one fixed-size
+        // `TooBroadReason`, so the per-variant allocation count does not
+        // move.
+        branches: 18,
         callees: &[
             ".any",
             ".client",

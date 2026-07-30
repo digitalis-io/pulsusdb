@@ -986,9 +986,7 @@ impl LogQlEngine {
                     value,
                 });
             }
-            for (op, grouping, param) in mp.vector_aggs.iter().rev() {
-                series = group_instant(series, *op, grouping.as_ref(), *param);
-            }
+            let series = charged_instant_chain(series, &mp.vector_aggs, MAX_POST_AGG_BYTES)?;
             Ok(QueryResult::Vector(
                 series
                     .into_iter()
@@ -1027,7 +1025,7 @@ impl LogQlEngine {
                     .or_default()
                     .insert(row.step, value);
             }
-            let mut series: Vec<RangeSeries> = by_fp
+            let series: Vec<RangeSeries> = by_fp
                 .into_iter()
                 .filter_map(|(fp, points)| {
                     meta.get(&fp).map(|m| RangeSeries {
@@ -1036,9 +1034,7 @@ impl LogQlEngine {
                     })
                 })
                 .collect();
-            for (op, grouping, param) in mp.vector_aggs.iter().rev() {
-                series = group_range(series, *op, grouping.as_ref(), *param);
-            }
+            let series = charged_range_chain(series, &mp.vector_aggs, MAX_POST_AGG_BYTES)?;
             Ok(QueryResult::Matrix(
                 series
                     .into_iter()
@@ -1165,10 +1161,7 @@ impl LogQlEngine {
         }
         state.push_rows(&chunk)?;
         let result = state.finish()?;
-        Ok(apply_vector_aggs(
-            result,
-            &mp.vector_aggs[..mp.vector_aggs.len() - folded],
-        ))
+        apply_vector_aggs(result, &mp.vector_aggs[..mp.vector_aggs.len() - folded])
     }
 
     /// Executes `variants(...) of (...)` (issue #221): ONE scan (planned
@@ -1293,7 +1286,7 @@ impl LogQlEngine {
                 MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window),
                 MetricNode::VectorAgg { aggs, inner } => {
                     let result = self.run_metric_node(inner, explain.as_deref_mut()).await?;
-                    Ok(apply_vector_aggs(result, aggs))
+                    apply_vector_aggs(result, aggs)
                 }
                 MetricNode::Variants {
                     scan,
@@ -6221,7 +6214,7 @@ pub fn run_client_agg_rows_folded(
             state.push_rows(&sorted)?;
         }
         let result = state.finish()?;
-        return Ok(apply_vector_aggs(result, &aggs[..aggs.len() - folded]));
+        return apply_vector_aggs(result, &aggs[..aggs.len() - folded]);
     }
     // The `Range` arm returned above, so this narrowing cannot fail; it
     // is a narrowing rather than an assertion so the instant state cannot
@@ -6240,7 +6233,7 @@ pub fn run_client_agg_rows_folded(
         AggCaps::DEFAULT,
     )?;
     state.push_rows(rows)?;
-    Ok(apply_vector_aggs(state.finish(), aggs))
+    apply_vector_aggs(state.finish(), aggs)
 }
 
 /// The live engine's per-fold metric-aggregation state: the instant
@@ -6975,7 +6968,7 @@ impl<'q> VariantsAggState<'q> {
             let out = if spec.vector_aggs().is_empty() {
                 out
             } else {
-                apply_vector_aggs(out, spec.vector_aggs())
+                apply_vector_aggs(out, spec.vector_aggs())?
             };
             // Issue #236: the result-series cap is applied PER VARIANT,
             // before the concat — matching the reference's own granularity
@@ -7206,6 +7199,34 @@ pub fn combine_binary(
     lhs: QueryResult,
     rhs: QueryResult,
 ) -> Result<QueryResult, ReadError> {
+    let mut charged = 0u64;
+    combine_binary_capped(
+        &mut charged,
+        op,
+        return_bool,
+        matching,
+        lhs,
+        rhs,
+        MAX_POST_AGG_BYTES,
+    )
+}
+
+/// The binary cap seam; see [`apply_vector_aggs_capped`]. The charge is
+/// levied on the measured operands BEFORE the join builds its one-side
+/// index, its match signatures or its output.
+#[allow(clippy::too_many_arguments)]
+pub fn combine_binary_capped(
+    charged: &mut u64,
+    op: BinOp,
+    return_bool: bool,
+    matching: Option<&VectorMatching>,
+    lhs: QueryResult,
+    rhs: QueryResult,
+    cap: u64,
+) -> Result<QueryResult, ReadError> {
+    let (lm, rm) = (measure_operand(&lhs), measure_operand(&rhs));
+    let bytes = binary_peak_bytes(op, matching, &lm, &rm);
+    let l = Ledger::acquire_binary(charged, &lm, &rm, bytes, cap)?;
     match (lhs, rhs) {
         (QueryResult::Scalar(l), QueryResult::Scalar(r)) => {
             if is_set_op(op) {
@@ -7230,9 +7251,11 @@ pub fn combine_binary(
             if is_set_op(op) {
                 return Err(set_op_scalar_error(op));
             }
-            Ok(map_samples(vector_side, |v| {
-                scalar_apply(op, return_bool, s, v, true)
-            }))
+            map_samples(
+                vector_side,
+                |v| scalar_apply(op, return_bool, s, v, true),
+                &l,
+            )
         }
         (
             vector_side @ (QueryResult::Vector(_) | QueryResult::Matrix(_)),
@@ -7241,15 +7264,17 @@ pub fn combine_binary(
             if is_set_op(op) {
                 return Err(set_op_scalar_error(op));
             }
-            Ok(map_samples(vector_side, |v| {
-                scalar_apply(op, return_bool, s, v, false)
-            }))
+            map_samples(
+                vector_side,
+                |v| scalar_apply(op, return_bool, s, v, false),
+                &l,
+            )
         }
-        (QueryResult::Vector(l), QueryResult::Vector(r)) => Ok(QueryResult::Vector(
-            combine_vectors(op, return_bool, matching, l, r)?,
+        (QueryResult::Vector(a), QueryResult::Vector(b)) => Ok(QueryResult::Vector(
+            combine_vectors(op, return_bool, matching, a, b, &l)?,
         )),
-        (QueryResult::Matrix(l), QueryResult::Matrix(r)) => Ok(QueryResult::Matrix(
-            combine_matrices(op, return_bool, matching, l, r)?,
+        (QueryResult::Matrix(a), QueryResult::Matrix(b)) => Ok(QueryResult::Matrix(
+            combine_matrices(op, return_bool, matching, a, b, &l)?,
         )),
         // Both operands evaluate under the same QuerySpec, so a
         // vector/matrix mix (or a streams/string operand) is structurally
@@ -7272,8 +7297,22 @@ fn set_op_scalar_error(op: BinOp) -> ReadError {
 /// Maps every sample of a vector/matrix result through `f` (`None`
 /// drops the sample — the comparison-filter path), dropping series left
 /// empty.
-fn map_samples(result: QueryResult, f: impl Fn(f64) -> Option<f64>) -> QueryResult {
-    match result {
+fn map_samples(
+    result: QueryResult,
+    f: impl Fn(f64) -> Option<f64>,
+    l: &Ledger<'_>,
+) -> Result<QueryResult, ReadError> {
+    match &result {
+        QueryResult::Vector(items) => l.admit(items.len() as u64, items.len() as u64)?,
+        QueryResult::Matrix(items) => {
+            let points = items
+                .iter()
+                .fold(0u64, |a, s| a.saturating_add(s.points.len() as u64));
+            l.admit(items.len() as u64, points)?;
+        }
+        _ => {}
+    }
+    Ok(match result {
         QueryResult::Vector(items) => QueryResult::Vector(
             items
                 .into_iter()
@@ -7302,7 +7341,7 @@ fn map_samples(result: QueryResult, f: impl Fn(f64) -> Option<f64>) -> QueryResu
                 .collect(),
         ),
         other => other,
-    }
+    })
 }
 
 /// A reduced match signature — the `on`/`ignoring` projection of a
@@ -7325,7 +7364,11 @@ struct JoinItem<'a> {
 /// the listed keys, `ignoring(l)` drops them, `None` keeps the full set
 /// (byte-identical to the pre-#91 full-`LabelSet` key). Input is
 /// key-sorted (aggregation sorts labels), so the output stays sorted.
-fn match_signature(labels: &[(String, String)], matching: Option<&VectorMatching>) -> MatchSig {
+fn match_signature(
+    labels: &[(String, String)],
+    matching: Option<&VectorMatching>,
+    _l: &Ledger<'_>,
+) -> MatchSig {
     match matching {
         None => labels.to_vec(),
         Some(vm) if vm.on => labels
@@ -7344,7 +7387,7 @@ fn match_signature(labels: &[(String, String)], matching: Option<&VectorMatching
 /// Sets `key`=`value` in a key-sorted label vector, replacing an existing
 /// entry or inserting in sorted position (keeps the vector sorted so
 /// downstream identity/equality stays canonical).
-fn set_label_sorted(labels: &mut Vec<(String, String)>, key: &str, value: &str) {
+fn set_label_sorted(labels: &mut Vec<(String, String)>, key: &str, value: &str, _l: &Ledger<'_>) {
     match labels.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
         Ok(i) => labels[i].1 = value.to_string(),
         Err(i) => labels.insert(i, (key.to_string(), value.to_string())),
@@ -7412,9 +7455,11 @@ fn instant_join(
     matching: Option<&VectorMatching>,
     lhs: &[JoinItem<'_>],
     rhs: &[JoinItem<'_>],
+    led: &Ledger<'_>,
 ) -> Result<Vec<VectorSample>, ReadError> {
+    admit_join(lhs, rhs, led)?;
     if is_set_op(op) {
-        return Ok(set_op_join(op, matching, lhs, rhs));
+        return set_op_join(op, matching, lhs, rhs, led);
     }
 
     // Arithmetic/comparison empty-operand short-circuit — BEFORE the
@@ -7439,7 +7484,7 @@ fn instant_join(
     // many-to-many, an error for every cardinality.
     let mut one_by_key: HashMap<MatchSig, &JoinItem<'_>> = HashMap::with_capacity(one.len());
     for r in one {
-        let key = match_signature(r.labels, matching);
+        let key = match_signature(r.labels, matching, led);
         if one_by_key.insert(key, r).is_some() {
             return Err(duplicate_one_side_error(swapped));
         }
@@ -7449,7 +7494,7 @@ fn instant_join(
     let mut many_matched: HashMap<MatchSig, HashSet<MatchSig>> = HashMap::new();
     let mut out: Vec<VectorSample> = Vec::new();
     for l in many {
-        let key = match_signature(l.labels, matching);
+        let key = match_signature(l.labels, matching, led);
         let Some(r) = one_by_key.get(&key) else {
             continue;
         };
@@ -7479,7 +7524,7 @@ fn instant_join(
             if let Some(inc) = include {
                 for ln in inc {
                     match r.labels.iter().find(|(k, _)| k == ln) {
-                        Some((_, v)) if !v.is_empty() => set_label_sorted(&mut labels, ln, v),
+                        Some((_, v)) if !v.is_empty() => set_label_sorted(&mut labels, ln, v, led),
                         _ => remove_label_sorted(&mut labels, ln),
                     }
                 }
@@ -7520,47 +7565,49 @@ fn set_op_join(
     matching: Option<&VectorMatching>,
     lhs: &[JoinItem<'_>],
     rhs: &[JoinItem<'_>],
-) -> Vec<VectorSample> {
+    l: &Ledger<'_>,
+) -> Result<Vec<VectorSample>, ReadError> {
+    admit_join(lhs, rhs, l)?;
     let own = |it: &JoinItem<'_>| VectorSample {
         labels: it.labels.to_vec(),
         value: it.value,
     };
-    match op {
+    Ok(match op {
         BinOp::And => {
             let rhs_sigs: HashSet<MatchSig> = rhs
                 .iter()
-                .map(|s| match_signature(s.labels, matching))
+                .map(|s| match_signature(s.labels, matching, l))
                 .collect();
             lhs.iter()
-                .filter(|l| rhs_sigs.contains(&match_signature(l.labels, matching)))
+                .filter(|it| rhs_sigs.contains(&match_signature(it.labels, matching, l)))
                 .map(own)
                 .collect()
         }
         BinOp::Unless => {
             let rhs_sigs: HashSet<MatchSig> = rhs
                 .iter()
-                .map(|s| match_signature(s.labels, matching))
+                .map(|s| match_signature(s.labels, matching, l))
                 .collect();
             lhs.iter()
-                .filter(|l| !rhs_sigs.contains(&match_signature(l.labels, matching)))
+                .filter(|it| !rhs_sigs.contains(&match_signature(it.labels, matching, l)))
                 .map(own)
                 .collect()
         }
         BinOp::Or => {
             let lhs_sigs: HashSet<MatchSig> = lhs
                 .iter()
-                .map(|s| match_signature(s.labels, matching))
+                .map(|s| match_signature(s.labels, matching, l))
                 .collect();
             let mut out: Vec<VectorSample> = lhs.iter().map(own).collect();
             out.extend(
                 rhs.iter()
-                    .filter(|r| !lhs_sigs.contains(&match_signature(r.labels, matching)))
+                    .filter(|r| !lhs_sigs.contains(&match_signature(r.labels, matching, l)))
                     .map(own),
             );
             out
         }
         _ => unreachable!("is_set_op gates the arm"),
-    }
+    })
 }
 
 /// Vector⊗vector: the [`instant_join`] core over one virtual step.
@@ -7570,7 +7617,12 @@ fn combine_vectors(
     matching: Option<&VectorMatching>,
     lhs: Vec<VectorSample>,
     rhs: Vec<VectorSample>,
+    l: &Ledger<'_>,
 ) -> Result<Vec<VectorSample>, ReadError> {
+    l.admit(
+        (lhs.len() as u64).saturating_add(rhs.len() as u64),
+        (lhs.len() as u64).saturating_add(rhs.len() as u64),
+    )?;
     let lhs_items: Vec<JoinItem<'_>> = lhs
         .iter()
         .map(|s| JoinItem {
@@ -7585,7 +7637,7 @@ fn combine_vectors(
             value: s.value,
         })
         .collect();
-    instant_join(op, return_bool, matching, &lhs_items, &rhs_items)
+    instant_join(op, return_bool, matching, &lhs_items, &rhs_items, l)
 }
 
 /// Matrix⊗matrix: an INDEPENDENT per-step instant join (issue #91 delta
@@ -7599,7 +7651,14 @@ fn combine_matrices(
     matching: Option<&VectorMatching>,
     lhs: Vec<MatrixSeries>,
     rhs: Vec<MatrixSeries>,
+    l: &Ledger<'_>,
 ) -> Result<Vec<MatrixSeries>, ReadError> {
+    let series = (lhs.len() as u64).saturating_add(rhs.len() as u64);
+    let points = lhs
+        .iter()
+        .chain(rhs.iter())
+        .fold(0u64, |a, s| a.saturating_add(s.points.len() as u64));
+    l.admit(series, points)?;
     // Index each side's points by timestamp once (labels stay borrowable
     // from the owned operands for the whole loop).
     let lhs_maps: StepIndex<'_> = lhs
@@ -7637,7 +7696,7 @@ fn combine_matrices(
                 rhs_items.push(JoinItem { labels, value: *v });
             }
         }
-        for sample in instant_join(op, return_bool, matching, &lhs_items, &rhs_items)? {
+        for sample in instant_join(op, return_bool, matching, &lhs_items, &rhs_items, l)? {
             match out.get_mut(&sample.labels) {
                 Some(points) => points.push((t, sample.value)),
                 None => {
@@ -9297,7 +9356,12 @@ fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
 /// directions (compared via `is_nan()`, so a NaN's sign never leaks into
 /// the order the way `f64::total_cmp` alone would); equal values break by
 /// label set ascending — deterministic and hermetically golden-able.
-fn sort_instant(mut series: Vec<InstantSeries>, op: VectorAggOp) -> Vec<InstantSeries> {
+fn sort_instant(
+    mut series: Vec<InstantSeries>,
+    op: VectorAggOp,
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
     let desc = matches!(op, VectorAggOp::SortDesc);
     series.sort_by(|a, b| {
         a.value
@@ -9314,7 +9378,7 @@ fn sort_instant(mut series: Vec<InstantSeries>, op: VectorAggOp) -> Vec<InstantS
             })
             .then_with(|| a.labels.cmp(&b.labels))
     });
-    series
+    Ok(series)
 }
 
 /// The `topk`/`bottomk` `k`: the parameter floored to a count; a missing
@@ -9337,8 +9401,12 @@ fn k_of(param: Option<f64>) -> usize {
 /// (issue #221 memory round: the former `Vec<LabelSet>` parameter was a
 /// deep clone of every label set, input-scaled and uncharged — the
 /// closure reads the identical bytes with zero copies).
-fn sort_candidates<'a, F>(candidates: &mut [(usize, f64)], labels_of: F, largest: bool)
-where
+fn sort_candidates<'a, F>(
+    candidates: &mut [(usize, f64)],
+    labels_of: F,
+    largest: bool,
+    _l: &Ledger<'_>,
+) where
     F: Fn(usize) -> &'a LabelSet,
 {
     candidates.sort_by(|(ai, av), (bi, bv)| {
@@ -9367,10 +9435,12 @@ fn select_k_range(
     op: VectorAggOp,
     grouping: Option<&Grouping>,
     param: Option<f64>,
-) -> Vec<RangeSeries> {
+    l: &Ledger<'_>,
+) -> Result<Vec<RangeSeries>, ReadError> {
+    admit_range(&series, l)?;
     let k = k_of(param);
     if k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let largest = matches!(op, VectorAggOp::Topk);
     let mut groups: HashMap<LabelSet, Vec<usize>> = HashMap::new();
@@ -9391,13 +9461,13 @@ fn select_k_range(
                 .iter()
                 .filter_map(|&i| series[i].points.get(&step).map(|v| (i, *v)))
                 .collect();
-            sort_candidates(&mut candidates, |i| &series[i].labels, largest);
+            sort_candidates(&mut candidates, |i| &series[i].labels, largest, l);
             for (idx, v) in candidates.into_iter().take(k) {
                 keep[idx].insert(step, v);
             }
         }
     }
-    series
+    Ok(series
         .into_iter()
         .zip(keep)
         .filter_map(|(s, points)| {
@@ -9406,7 +9476,7 @@ fn select_k_range(
                 points,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// `topk`/`bottomk` over an instant result: keep the k highest/lowest
@@ -9416,10 +9486,12 @@ fn select_k_instant(
     op: VectorAggOp,
     grouping: Option<&Grouping>,
     param: Option<f64>,
-) -> Vec<InstantSeries> {
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
     let k = k_of(param);
     if k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let largest = matches!(op, VectorAggOp::Topk);
     let mut groups: HashMap<LabelSet, Vec<usize>> = HashMap::new();
@@ -9433,16 +9505,16 @@ fn select_k_instant(
     for members in groups.values() {
         let mut candidates: Vec<(usize, f64)> =
             members.iter().map(|&i| (i, series[i].value)).collect();
-        sort_candidates(&mut candidates, |i| &series[i].labels, largest);
+        sort_candidates(&mut candidates, |i| &series[i].labels, largest, l);
         for (idx, _) in candidates.into_iter().take(k) {
             keep[idx] = true;
         }
     }
-    series
+    Ok(series
         .into_iter()
         .zip(keep)
         .filter_map(|(s, kept)| kept.then_some(s))
-        .collect()
+        .collect())
 }
 
 // =====================================================================
@@ -10124,7 +10196,12 @@ impl VectorAggFold {
 /// stays infallible. `apply_vector_aggs` applies the agg chain
 /// sequentially, so exactly one sketch is live regardless of nesting
 /// (parser `MAX_DEPTH` = 64).
-fn approx_topk_instant(mut series: Vec<InstantSeries>, param: Option<f64>) -> Vec<InstantSeries> {
+fn approx_topk_instant(
+    mut series: Vec<InstantSeries>,
+    param: Option<f64>,
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
     // 1. Canonical, input-order-independent ordering. `sort_unstable*`
     // is load-bearing (rows 1-2 of the accounting table): a stable
     // `sort` here would reintroduce an input-scaled scratch allocation.
@@ -10166,7 +10243,7 @@ fn approx_topk_instant(mut series: Vec<InstantSeries>, param: Option<f64>) -> Ve
         }
     }
     // 5. The existing selection — reused, not reimplemented.
-    select_k_instant(out, VectorAggOp::Topk, None, param)
+    select_k_instant(out, VectorAggOp::Topk, None, param, l)
 }
 
 fn group_range(
@@ -10174,15 +10251,17 @@ fn group_range(
     op: VectorAggOp,
     grouping: Option<&Grouping>,
     param: Option<f64>,
-) -> Vec<RangeSeries> {
+    l: &Ledger<'_>,
+) -> Result<Vec<RangeSeries>, ReadError> {
+    admit_range(&series, l)?;
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
-        return select_k_range(series, op, grouping, param);
+        return select_k_range(series, op, grouping, param, l);
     }
     // A range result (matrix) has no single sortable value per series;
     // `sort`/`sort_desc` are passthrough here (the reference likewise does
     // not value-order matrices — the wire stays label-canonical).
     if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
-        return series;
+        return Ok(series);
     }
     // Issue #236: the same pin as `group_instant`. `members` is walked in
     // push order at every step below, so pinning the push order pins the
@@ -10196,7 +10275,7 @@ fn group_range(
             .or_default()
             .push(s.points);
     }
-    groups
+    Ok(groups
         .into_iter()
         .map(|(labels, members)| {
             let steps: BTreeSet<i64> = members.iter().flat_map(|m| m.keys().copied()).collect();
@@ -10216,7 +10295,7 @@ fn group_range(
                 .collect();
             RangeSeries { labels, points }
         })
-        .collect()
+        .collect())
 }
 
 fn group_instant(
@@ -10224,21 +10303,23 @@ fn group_instant(
     op: VectorAggOp,
     grouping: Option<&Grouping>,
     param: Option<f64>,
-) -> Vec<InstantSeries> {
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
     // approx_topk (issue #221): sketch-estimate the values, then the
     // ordinary topk selection. Grouping is rejected at parse time, so
     // `grouping` is structurally `None` here (pinned by
     // `approx_topk_specs_never_carry_a_grouping` in plan.rs).
     if matches!(op, VectorAggOp::ApproxTopk) {
-        return approx_topk_instant(series, param);
+        return approx_topk_instant(series, param, l);
     }
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
-        return select_k_instant(series, op, grouping, param);
+        return select_k_instant(series, op, grouping, param, l);
     }
     // `sort`/`sort_desc` reorder the vector by value (no grouping —
     // rejected at plan time), preserving each series unchanged.
     if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
-        return sort_instant(series, op);
+        return sort_instant(series, op, l);
     }
     // Issue #236: pin the reduction order before grouping — see
     // `pin_reduction_order`. Welford is order-sensitive and the incoming
@@ -10252,13 +10333,13 @@ fn group_instant(
             .or_default()
             .push(s.value);
     }
-    groups
+    Ok(groups
         .into_iter()
         .map(|(labels, vals)| InstantSeries {
             labels,
             value: reduce(op, &vals),
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------
@@ -10882,6 +10963,190 @@ pub fn binary_peak_bytes_without(
     total
 }
 
+/// Measures a range stage input — the chain's shape once the
+/// `QueryResult` has been converted. `points.len()` on a `BTreeMap` is
+/// `O(1)`, so the pass stays `O(series + label pairs)`.
+fn measure_range(series: &[RangeSeries]) -> StageInput {
+    let mut m = StageInput {
+        series: series.len() as u64,
+        ..StageInput::default()
+    };
+    for s in series {
+        measure_labels(&mut m, &s.labels);
+        let pts = s.points.len() as u64;
+        m.points = m.points.saturating_add(pts);
+        m.max_series_points = m.max_series_points.max(pts);
+    }
+    m
+}
+
+/// Measures an instant stage input — one point per series.
+fn measure_instant(series: &[InstantSeries]) -> StageInput {
+    let mut m = StageInput {
+        series: series.len() as u64,
+        points: series.len() as u64,
+        max_series_points: u64::from(!series.is_empty()),
+        ..StageInput::default()
+    };
+    for s in series {
+        measure_labels(&mut m, &s.labels);
+    }
+    m
+}
+
+/// The funnel's proof token (issue #236 §4.1).
+///
+/// Everything in this module is private to it: [`Ledger`]'s fields, its
+/// only constructors and the charge they perform. A `&Ledger` in a
+/// signature is therefore PROOF that the stage's modelled bytes were
+/// charged against the cap before that function could be reached — an
+/// uncapped call site does not compile, in release exactly as in debug.
+mod ledger {
+    #[cfg(test)]
+    use super::MAX_POST_AGG_BYTES;
+    use super::{ReadError, StageInput, TooBroadReason};
+
+    /// Proof that a stage's modelled bytes were charged, AND the budget
+    /// that charge covers.
+    ///
+    /// The discharge is [`Drop`], so charge/discharge symmetry is
+    /// structural on every return path (`?`, early return, unwind) — a
+    /// leak is not expressible rather than merely tested for.
+    #[derive(Debug)]
+    pub(super) struct Ledger<'a> {
+        charged: &'a mut u64,
+        bytes: u64,
+        cap: u64,
+        admitted_series: u64,
+        admitted_points: u64,
+    }
+
+    impl<'a> Ledger<'a> {
+        /// The chain funnel's charge: atomic check-then-add, and a FAILED
+        /// charge does not mutate the counter (the `charge_group_bytes` /
+        /// `traces::exec::ByteBudget::charge` precedent).
+        pub(super) fn acquire(
+            charged: &'a mut u64,
+            m: &StageInput,
+            bytes: u64,
+            cap: u64,
+        ) -> Result<Self, ReadError> {
+            Self::acquire_for(charged, m.series(), m.points(), bytes, cap)
+        }
+
+        /// The binary funnel's charge. Both operands are live at once and
+        /// both enter the join, so the admitted envelope is their SUM —
+        /// the same quantity `binary_peak_bytes` is evaluated over.
+        pub(super) fn acquire_binary(
+            charged: &'a mut u64,
+            lhs: &StageInput,
+            rhs: &StageInput,
+            bytes: u64,
+            cap: u64,
+        ) -> Result<Self, ReadError> {
+            Self::acquire_for(
+                charged,
+                lhs.series().saturating_add(rhs.series()),
+                lhs.points().saturating_add(rhs.points()),
+                bytes,
+                cap,
+            )
+        }
+
+        fn acquire_for(
+            charged: &'a mut u64,
+            admitted_series: u64,
+            admitted_points: u64,
+            bytes: u64,
+            cap: u64,
+        ) -> Result<Self, ReadError> {
+            let next = charged.saturating_add(bytes);
+            if next > cap {
+                return Err(ReadError::QueryTooBroad(
+                    TooBroadReason::MetricPostAggBytes { bytes: next, cap },
+                ));
+            }
+            *charged = next;
+            Ok(Self {
+                charged,
+                bytes,
+                cap,
+                admitted_series,
+                admitted_points,
+            })
+        }
+
+        /// **UNCONDITIONAL** — no `debug_assert`, no `cfg`. Every
+        /// classified ENTRY function calls this on the collection it is
+        /// about to process; a shortfall is a clean refusal in release
+        /// exactly as in debug, because a `debug_assert` is not an
+        /// enforcement mechanism, it is a comment that runs in CI.
+        ///
+        /// `series` is a `Vec::len` (`O(1)`); `points` is `O(series)` for
+        /// the two matrix entries and `O(1)` for the vector/join entries.
+        /// Nothing per point is added anywhere.
+        pub(super) fn admit(&self, series: u64, points: u64) -> Result<(), ReadError> {
+            if series > self.admitted_series || points > self.admitted_points {
+                return Err(ReadError::QueryTooBroad(
+                    TooBroadReason::MetricPostAggBytes {
+                        bytes: self.bytes,
+                        cap: self.cap,
+                    },
+                ));
+            }
+            Ok(())
+        }
+
+        /// A token whose budget is the whole cap, for the in-module tests
+        /// that drive one region function directly. It charges like any
+        /// other acquisition — there is no unchecked constructor.
+        #[cfg(test)]
+        pub(super) fn for_test(charged: &'a mut u64) -> Self {
+            Self::acquire_for(charged, u64::MAX, u64::MAX, 0, MAX_POST_AGG_BYTES)
+                .expect("a zero-byte charge is always admitted")
+        }
+    }
+
+    impl Drop for Ledger<'_> {
+        fn drop(&mut self) {
+            *self.charged = self.charged.saturating_sub(self.bytes);
+        }
+    }
+}
+
+use ledger::Ledger;
+
+/// One binary operand's measured shape; a scalar/string/streams operand
+/// carries no series and measures empty.
+fn measure_operand(r: &QueryResult) -> StageInput {
+    match r {
+        QueryResult::Vector(items) => measure_vector(items),
+        QueryResult::Matrix(items) => measure_matrix(items),
+        _ => StageInput::default(),
+    }
+}
+
+/// A range collection's admission: `Vec::len` plus one `O(series)` sum of
+/// `BTreeMap::len`. Nothing per point.
+fn admit_range(series: &[RangeSeries], l: &Ledger<'_>) -> Result<(), ReadError> {
+    let points = series
+        .iter()
+        .fold(0u64, |a, s| a.saturating_add(s.points.len() as u64));
+    l.admit(series.len() as u64, points)
+}
+
+/// An instant collection's admission — one point per series, so `O(1)`.
+fn admit_instant(series: &[InstantSeries], l: &Ledger<'_>) -> Result<(), ReadError> {
+    l.admit(series.len() as u64, series.len() as u64)
+}
+
+/// A join operand pair's admission — `O(1)`, run once per step on the
+/// matrix path.
+fn admit_join(lhs: &[JoinItem<'_>], rhs: &[JoinItem<'_>], l: &Ledger<'_>) -> Result<(), ReadError> {
+    let n = (lhs.len() as u64).saturating_add(rhs.len() as u64);
+    l.admit(n, n)
+}
+
 /// `s_min` — the smallest per-entry byte charge any of the four client
 /// leaf group paths levies, computed from live `size_of` through the
 /// leaf's own [`map_entry_bytes`]/[`grown_alloc_bytes`] vocabulary with
@@ -10905,25 +11170,124 @@ pub fn leaf_min_entry_bytes() -> u64 {
     .expect("four leaf entry slots")
 }
 
-/// Applies an outer-to-inner vector-aggregation chain to a metric result
-/// (innermost applied first — the `.rev()` matching `MetricPlan.
-/// vector_aggs`' outer-first order). `pub` like [`run_pipeline_rows`]:
-/// the hermetic golden suite (`tests/logql_metric_agg_golden.rs`) pins
-/// the reducer/selection semantics from outside the crate.
-pub fn apply_vector_aggs(result: QueryResult, aggs: &[plan::VectorAggSpec]) -> QueryResult {
+/// The chain over an already-converted RANGE vector. Entry-class: it
+/// admits the collection it is handed, then applies the stages
+/// innermost-first (the `.rev()` matching `MetricPlan.vector_aggs`'
+/// outer-first order).
+fn run_range_chain(
+    mut series: Vec<RangeSeries>,
+    aggs: &[plan::VectorAggSpec],
+    l: &Ledger<'_>,
+) -> Result<Vec<RangeSeries>, ReadError> {
+    admit_range(&series, l)?;
+    for (op, grouping, param) in aggs.iter().rev() {
+        series = group_range(series, *op, grouping.as_ref(), *param, l)?;
+    }
+    Ok(series)
+}
+
+/// The chain over an already-converted INSTANT vector; see
+/// [`run_range_chain`].
+fn run_instant_chain(
+    mut series: Vec<InstantSeries>,
+    aggs: &[plan::VectorAggSpec],
+    l: &Ledger<'_>,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    admit_instant(&series, l)?;
+    for (op, grouping, param) in aggs.iter().rev() {
+        series = group_instant(series, *op, grouping.as_ref(), *param, l)?;
+    }
+    Ok(series)
+}
+
+/// Charges, then runs the chain over an already-converted range vector.
+///
+/// The SQL metric path holds `Vec<RangeSeries>` directly and reaching
+/// [`apply_vector_aggs`] from there would cost a `BTreeMap -> Vec ->
+/// BTreeMap` round trip per point on the commonest metric shape. This is
+/// the same funnel — measure, charge, run — entered one conversion
+/// earlier.
+fn charged_range_chain(
+    series: Vec<RangeSeries>,
+    aggs: &[plan::VectorAggSpec],
+    cap: u64,
+) -> Result<Vec<RangeSeries>, ReadError> {
+    if aggs.is_empty() {
+        return Ok(series);
+    }
+    let m = measure_range(&series);
+    let bytes = post_agg_peak_bytes(&m, aggs);
+    let mut charged = 0u64;
+    let l = Ledger::acquire(&mut charged, &m, bytes, cap)?;
+    run_range_chain(series, aggs, &l)
+}
+
+/// [`charged_range_chain`] for an instant vector.
+fn charged_instant_chain(
+    series: Vec<InstantSeries>,
+    aggs: &[plan::VectorAggSpec],
+    cap: u64,
+) -> Result<Vec<InstantSeries>, ReadError> {
+    if aggs.is_empty() {
+        return Ok(series);
+    }
+    let m = measure_instant(&series);
+    let bytes = post_agg_peak_bytes(&m, aggs);
+    let mut charged = 0u64;
+    let l = Ledger::acquire(&mut charged, &m, bytes, cap)?;
+    run_instant_chain(series, aggs, &l)
+}
+
+/// Applies an outer-to-inner vector-aggregation chain to a metric result,
+/// charged against [`MAX_POST_AGG_BYTES`] before it allocates.
+///
+/// `pub` like [`run_pipeline_rows`]: the hermetic golden suite
+/// (`tests/logql_metric_agg_golden.rs`) pins the reducer/selection
+/// semantics from outside the crate.
+pub fn apply_vector_aggs(
+    result: QueryResult,
+    aggs: &[plan::VectorAggSpec],
+) -> Result<QueryResult, ReadError> {
+    let mut charged = 0u64;
+    apply_vector_aggs_capped(&mut charged, result, aggs, MAX_POST_AGG_BYTES)
+}
+
+/// The cap seam (the `group_bytes_cap`/`retention_cap` precedent): exists
+/// ONLY so tests can drive the boundary, and takes the counter by
+/// reference so the charge/discharge symmetry is observable.
+///
+/// **The order is the contract.** (1) an empty chain returns its input
+/// before any measurement and before the conversion — which also deletes
+/// an `O(points)` `Vec -> BTreeMap -> Vec` round trip from every
+/// no-aggregation result; (2) measurement happens on the
+/// `MatrixSeries`/`VectorSample` shape, so the conversion is INSIDE its
+/// own charge; (3) a refused charge means nothing is converted, nothing
+/// is grouped and no token exists, so the chain cannot run; (4) every
+/// Entry function admits its own input unconditionally; (5) the token
+/// drops and discharges.
+pub fn apply_vector_aggs_capped(
+    charged: &mut u64,
+    result: QueryResult,
+    aggs: &[plan::VectorAggSpec],
+    cap: u64,
+) -> Result<QueryResult, ReadError> {
+    if aggs.is_empty() {
+        return Ok(result);
+    }
     match result {
         QueryResult::Matrix(items) => {
-            let mut series: Vec<RangeSeries> = items
+            let m = measure_matrix(&items);
+            let bytes = post_agg_peak_bytes(&m, aggs);
+            let l = Ledger::acquire(charged, &m, bytes, cap)?;
+            let series: Vec<RangeSeries> = items
                 .into_iter()
                 .map(|s| RangeSeries {
                     labels: s.labels,
                     points: s.points.into_iter().collect(),
                 })
                 .collect();
-            for (op, grouping, param) in aggs.iter().rev() {
-                series = group_range(series, *op, grouping.as_ref(), *param);
-            }
-            QueryResult::Matrix(
+            let series = run_range_chain(series, aggs, &l)?;
+            Ok(QueryResult::Matrix(
                 series
                     .into_iter()
                     .map(|s| MatrixSeries {
@@ -10931,20 +11295,21 @@ pub fn apply_vector_aggs(result: QueryResult, aggs: &[plan::VectorAggSpec]) -> Q
                         points: s.points.into_iter().collect(),
                     })
                     .collect(),
-            )
+            ))
         }
         QueryResult::Vector(items) => {
-            let mut series: Vec<InstantSeries> = items
+            let m = measure_vector(&items);
+            let bytes = post_agg_peak_bytes(&m, aggs);
+            let l = Ledger::acquire(charged, &m, bytes, cap)?;
+            let series: Vec<InstantSeries> = items
                 .into_iter()
                 .map(|s| InstantSeries {
                     labels: s.labels,
                     value: s.value,
                 })
                 .collect();
-            for (op, grouping, param) in aggs.iter().rev() {
-                series = group_instant(series, *op, grouping.as_ref(), *param);
-            }
-            QueryResult::Vector(
+            let series = run_instant_chain(series, aggs, &l)?;
+            Ok(QueryResult::Vector(
                 series
                     .into_iter()
                     .map(|s| VectorSample {
@@ -10952,11 +11317,11 @@ pub fn apply_vector_aggs(result: QueryResult, aggs: &[plan::VectorAggSpec]) -> Q
                         value: s.value,
                     })
                     .collect(),
-            )
+            ))
         }
         // A vector aggregation over a scalar is rejected at plan time
         // (`build_metric_node`); passthrough is defensive only.
-        other => other,
+        other => Ok(other),
     }
 }
 
@@ -16111,7 +16476,10 @@ mod tests {
             kind: GroupingKind::By,
             labels: vec!["service_name".to_string()],
         };
-        let grouped = group_range(series, VectorAggOp::Sum, Some(&grouping), None);
+        let mut charged = 0u64;
+        let led = Ledger::for_test(&mut charged);
+        let grouped =
+            group_range(series, VectorAggOp::Sum, Some(&grouping), None, &led).expect("grouped");
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].points.get(&0), Some(&4.0));
         assert_eq!(grouped[0].points.get(&60), Some(&2.0));
@@ -17294,6 +17662,8 @@ mod tests {
         let labels_for =
             |v: f64| -> LabelSet { vec![("host".to_string(), format!("h{}", v as u64))] };
 
+        let mut charged = 0u64;
+        let led = Ledger::for_test(&mut charged);
         for op in [VectorAggOp::Stdvar, VectorAggOp::Stddev, VectorAggOp::Avg] {
             let mut instant_seen: BTreeSet<u64> = BTreeSet::new();
             let mut range_seen: BTreeSet<u64> = BTreeSet::new();
@@ -17308,7 +17678,7 @@ mod tests {
                     .collect();
                 // Bare aggregation (`grouping: None`) collapses all four
                 // into ONE group, which is what exposes member order.
-                let out = group_instant(instant, op, None, None);
+                let out = group_instant(instant, op, None, None, &led).expect("grouped");
                 assert_eq!(out.len(), 1);
                 instant_seen.insert(out[0].value.to_bits());
 
@@ -17319,7 +17689,7 @@ mod tests {
                         points: BTreeMap::from([(0i64, vals[i])]),
                     })
                     .collect();
-                let out = group_range(range, op, None, None);
+                let out = group_range(range, op, None, None, &led).expect("grouped");
                 assert_eq!(out.len(), 1);
                 range_seen.insert(out[0].points[&0].to_bits());
             }
@@ -17352,7 +17722,7 @@ mod tests {
                 value: *v,
             })
             .collect();
-        let out = group_instant(instant, VectorAggOp::Stdvar, None, None);
+        let out = group_instant(instant, VectorAggOp::Stdvar, None, None, &led).expect("grouped");
         assert_eq!(
             out[0].value.to_bits(),
             5.0f64.to_bits(),
@@ -17539,7 +17909,10 @@ mod tests {
                 points: points.iter().copied().collect(),
             })
             .collect();
-        select_k_range(series, op, grouping, param)
+        let mut charged = 0u64;
+        let led = Ledger::for_test(&mut charged);
+        select_k_range(series, op, grouping, param, &led)
+            .expect("selected")
             .into_iter()
             .map(|s| (s.labels, s.points.into_iter().collect()))
             .collect()
@@ -17893,6 +18266,8 @@ mod tests {
                 seen.len()
             );
             // ...and it is the SAME value the materialising path gives.
+            let mut charged = 0u64;
+            let led = Ledger::for_test(&mut charged);
             let materialised = group_range(
                 vals.iter()
                     .map(|v| RangeSeries {
@@ -17903,7 +18278,9 @@ mod tests {
                 op,
                 None,
                 None,
-            );
+                &led,
+            )
+            .expect("materialised");
             assert_eq!(
                 seen.iter().copied().collect::<Vec<u64>>(),
                 vec![materialised[0].points[&0].to_bits()],
