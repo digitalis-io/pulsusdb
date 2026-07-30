@@ -101,8 +101,8 @@ pub use exec::{
     MAX_VARIANT_FANOUT_STATE_BYTES, MatrixSeries, PatternSeries, QueryResult, StreamResult,
     TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, VARIANT_LABEL,
     VariantArena, VariantsAggState, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
-    append_variant_label, apply_vector_aggs, combine_binary, materialize_vector_lit,
-    read_query_settings, run_client_agg_rows, run_variants_rows,
+    append_variant_label, apply_vector_aggs, combine_binary, ensure_result_series,
+    materialize_vector_lit, read_query_settings, run_client_agg_rows, run_variants_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{

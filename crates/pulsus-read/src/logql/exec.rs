@@ -204,8 +204,21 @@ impl LogQlEngine {
                 .run_streams_inner(&sp, None)
                 .await
                 .map(|(items, partial)| QueryResult::Streams { items, partial }),
-            Plan::Metric(mp) => self.run_metric_inner(&mp, None).await,
-            Plan::MetricBinary(node) => self.run_metric_node(&node, None).await,
+            // Issue #236: [`MAX_QUERY_SERIES`] is a FINAL-RESULT cap, so it
+            // is applied here — on the whole expression's output — and
+            // never inside `run_metric_inner`/`run_metric_node`/
+            // `apply_vector_aggs`, where it would reject on scanned or
+            // intermediate groups the reference never counts.
+            Plan::Metric(mp) => {
+                let result = self.run_metric_inner(&mp, None).await?;
+                ensure_result_series(&result)?;
+                Ok(result)
+            }
+            Plan::MetricBinary(node) => {
+                let result = self.run_metric_node(&node, None).await?;
+                ensure_result_series(&result)?;
+                Ok(result)
+            }
         }
     }
 
@@ -236,11 +249,13 @@ impl LogQlEngine {
                 };
                 let mut explain = PlanExplain::new(result_type);
                 let result = self.run_metric_inner(&mp, Some(&mut explain)).await?;
+                ensure_result_series(&result)?;
                 Ok((result, explain))
             }
             Plan::MetricBinary(node) => {
                 let mut explain = PlanExplain::new(binary_result_type(&node, params));
                 let result = self.run_metric_node(&node, Some(&mut explain)).await?;
+                ensure_result_series(&result)?;
                 Ok((result, explain))
             }
         }
@@ -3587,20 +3602,67 @@ pub const MAX_QUANTILE_VALUES: u64 = 4_000_000;
 /// `rate_counter_cap_bounds_total_retained_points_across_overlapping_buckets`).
 pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
 
-/// Derived-series cap for client-aggregated metric queries: the number
-/// of distinct output groups (final label sets, or fingerprints on the
-/// non-mutating path) a single query may materialize. Bounds the last
-/// unbounded axis of reducer state — total accumulators are then
-/// `<= MAX_CLIENT_AGG_SERIES x MAX_CLIENT_AGG_BUCKETS`. 500 matches the
-/// reference oracle's default series ceiling (it likewise ERRORS, never
-/// truncates, past it). A documented constant, not a config field (the
-/// `DEFAULT_MAX_STREAMS` / `MAX_CLIENT_AGG_BUCKETS` precedent); operator-
-/// scale tuning routes to #25.
-pub const MAX_CLIENT_AGG_SERIES: u64 = 500;
+/// The reference's `querier.max-query-series` (grafana/loki v3.7.4,
+/// `pkg/validation/limits.go:373`, default 500): the number of distinct
+/// series a metric query may **RETURN**.
+///
+/// Enforced on the **FINAL result of the whole expression**
+/// (`pkg/logql/engine.go:538` instant / first step, `:588` distinct
+/// series accumulated across steps; frontend duplicate at
+/// `pkg/querier/queryrange/limits.go:518`) — **never** on scanned groups,
+/// inner-aggregation groups or binary operands. Live-probed at v3.7.4
+/// over 600 distinct `| logfmt` groups: `sum(...)`, `count(...)`,
+/// `topk(3, ...)`, `sum(topk(600, ...))` and a wide-operand binop
+/// collapsing to one series are all served; a bare leaf over 501 groups,
+/// `sort(...)` and `sum by (id) (...)` are all rejected. Exactly 500
+/// served, 501 rejected.
+///
+/// **Read by [`ensure_result_series`] and by nothing else** (issue #236).
+/// Applying it to an intermediate would reject on a *proxy* rather than
+/// on the resource consumed: an outer `sum` over an inner `sum by (id)`
+/// collapses 501+ inner groups to ONE final series, which the reference
+/// serves. Intermediate aggregation state is bounded by BYTES
+/// ([`MAX_CLIENT_AGG_GROUP_BYTES`]) and POINTS
+/// ([`MAX_METRIC_RESULT_POINTS`]) — and by nothing else.
+pub const MAX_QUERY_SERIES: u64 = 500;
+
+/// Enforces [`MAX_QUERY_SERIES`] on a metric query's **final** result.
+///
+/// Counts TOP-LEVEL series: one per `Vector`/`VectorHist` sample and one
+/// per `Matrix`/`MatrixHist` series (the reference counts distinct series,
+/// not points — `engine.go:588` accumulates a set across steps, and a
+/// PulsusDB matrix already holds one entry per distinct series). `Streams`
+/// is a log query (bounded by `max_entries_limit_per_query` instead),
+/// and `Scalar`/`String` carry no series, so all three pass.
+///
+/// `> cap` is the reference's own test (`engine.go:538`), so exactly 500
+/// is served.
+///
+/// `pub` so the conformance runner (`tests/logqltest/runner.rs`) applies
+/// the identical gate on its own `Expr::Metric` arm and corpus
+/// `eval_fail` cases can pin the reference's body. Exporting the FUNCTION
+/// keeps [`MAX_QUERY_SERIES`] read in exactly one place.
+pub fn ensure_result_series(result: &QueryResult) -> Result<(), ReadError> {
+    let n = match result {
+        QueryResult::Vector(v) => v.len() as u64,
+        QueryResult::Matrix(m) => m.len() as u64,
+        QueryResult::VectorHist(v) => v.len() as u64,
+        QueryResult::MatrixHist(m) => m.len() as u64,
+        QueryResult::Streams { .. } | QueryResult::Scalar(_) | QueryResult::String(_) => {
+            return Ok(());
+        }
+    };
+    if n > MAX_QUERY_SERIES {
+        return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+            cap: MAX_QUERY_SERIES,
+        }));
+    }
+    Ok(())
+}
 
 /// Every per-query retention cap in ONE place (issue #221), so the
 /// `variants(...)` fan-out path can divide them all at a single auditable
-/// point. [`AggCaps::DEFAULT`] is today's seven constants verbatim;
+/// point. [`AggCaps::DEFAULT`] is today's six constants verbatim;
 /// [`AggCaps::divided`] is what a variants query hands each of its `n`
 /// sub-states, so the SUM over sub-states is exactly `DEFAULT` for every
 /// field and the query's total retention bound is INDEPENDENT of the
@@ -3610,7 +3672,6 @@ pub const MAX_CLIENT_AGG_SERIES: u64 = 500;
 /// `DEFAULT`, so its behaviour and every error value are byte-identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AggCaps {
-    pub series: u64,
     pub group_bytes: u64,
     pub retention_points: u64,
     pub quantile_values: u64,
@@ -3621,7 +3682,6 @@ pub(crate) struct AggCaps {
 
 impl AggCaps {
     pub(crate) const DEFAULT: AggCaps = AggCaps {
-        series: MAX_CLIENT_AGG_SERIES,
         group_bytes: MAX_CLIENT_AGG_GROUP_BYTES,
         retention_points: MAX_RETAINED_WINDOW_POINTS,
         quantile_values: MAX_QUANTILE_VALUES,
@@ -3638,7 +3698,6 @@ impl AggCaps {
     /// `1..=MAX_VARIANT_SUB_STATES` at every call site.
     pub(crate) fn divided(self, n: u64) -> AggCaps {
         AggCaps {
-            series: self.series / n,
             group_bytes: self.group_bytes / n,
             retention_points: self.retention_points / n,
             quantile_values: self.quantile_values / n,
@@ -3652,10 +3711,7 @@ impl AggCaps {
     /// a cap to 0. [`super::plan::MAX_VARIANT_SUB_STATES`] is DERIVED from
     /// this (not chosen), so it moves with the caps.
     pub(crate) const fn min_field(self) -> u64 {
-        let mut min = self.series;
-        if self.group_bytes < min {
-            min = self.group_bytes;
-        }
+        let mut min = self.group_bytes;
         if self.retention_points < min {
             min = self.retention_points;
         }
@@ -3835,15 +3891,9 @@ impl<'q> ClientAggState<'q> {
             let buckets = if self.fan_out {
                 scratch.sort_unstable();
                 let key = render_labels_json_sorted(&scratch);
-                let groups = self.label_groups.len() as u64;
                 match self.label_groups.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => &mut e.into_mut().1,
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        if groups >= self.caps.series {
-                            return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                                cap: self.caps.series,
-                            }));
-                        }
                         let labels: LabelSet = scratch
                             .iter()
                             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -3855,9 +3905,9 @@ impl<'q> ClientAggState<'q> {
                         // per-row transients above drop with the error and
                         // the map never holds the entry. (`entry()` has
                         // already reserved the table slot — that growth is
-                        // structurally bounded by the 500-group count cap
-                        // checked above and covered by this charge's slot
-                        // term.)
+                        // covered by this charge's slot term, which since
+                        // issue #236 deleted the group-COUNT cap is the
+                        // whole bound on this map: bytes, never a count.)
                         charge_group_bytes(
                             &mut self.group_bytes,
                             group_entry_bytes(e.key(), &labels, INSTANT_GROUP_SLOT),
@@ -3867,11 +3917,20 @@ impl<'q> ClientAggState<'q> {
                     }
                 }
             } else {
-                let groups = self.fp_groups.len() as u64;
-                if !self.fp_groups.contains_key(&row.fingerprint) && groups >= self.caps.series {
-                    return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                        cap: self.caps.series,
-                    }));
+                // Issue #236 P1 — the premise fix. Before #236 this arm was
+                // count-gated only and its per-group BYTES were never
+                // charged: `base_labels` is hydrated with no charge, so
+                // deleting the count cap (Part A) would have left the
+                // non-mutating instant path with no bound at all. The
+                // charge rides the EXISTING `contains_key` probe (no added
+                // per-row work) and happens BEFORE the entry is created, so
+                // a refusal never leaves the map holding it.
+                if !self.fp_groups.contains_key(&row.fingerprint) {
+                    charge_group_bytes(
+                        &mut self.group_bytes,
+                        group_entry_bytes("", base, FP_GROUP_SLOT),
+                        self.caps.group_bytes,
+                    )?;
                 }
                 self.fp_groups.entry(row.fingerprint).or_default()
             };
@@ -3935,7 +3994,23 @@ impl<'q> ClientAggState<'q> {
         } else {
             self.fp_groups
                 .into_iter()
-                .filter_map(|(fp, buckets)| base_labels.get(&fp).map(|l| (l.clone(), buckets)))
+                .filter_map(|(fp, buckets)| {
+                    // Issue #236 P1's discharge leg, with the SAME symmetry
+                    // the fan-out arm has had since round 6: sized over the
+                    // same `base_labels` value the charge used (empty key,
+                    // `FP_GROUP_SLOT`), released as the entry is consumed.
+                    // `push_rows` only charges a fingerprint it successfully
+                    // resolved in `base_labels`, so every charged entry is
+                    // discharged here and `group_bytes` returns to exactly 0
+                    // — the `filter_map` below can only drop an entry that
+                    // was never charged.
+                    let l = base_labels.get(&fp)?;
+                    discharge_group_bytes(
+                        &mut group_bytes,
+                        group_entry_bytes("", l, FP_GROUP_SLOT),
+                    );
+                    Some((l.clone(), buckets))
+                })
                 .collect()
         };
         debug_assert_eq!(
@@ -4294,10 +4369,18 @@ fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// into the group map, where they live until finish — bytes charged against
 /// NEITHER the collision-group cap (whose counter resets when the group
 /// flushes) nor the retention cap (denominated in fixed-width points). The
-/// group COUNT was already bounded ([`MAX_CLIENT_AGG_SERIES`]), but 500
-/// multi-MiB extracted label sets were a real memory hazard; this cap bounds
-/// their BYTES, charged through [`charge_group_bytes`] BEFORE the insertion
-/// that retains each entry and released as finish consumes it.
+/// group COUNT used to be bounded too, but multi-MiB extracted label sets
+/// were a real memory hazard at any count; this cap bounds their BYTES,
+/// charged through [`charge_group_bytes`] BEFORE the insertion that
+/// retains each entry and released as finish consumes it.
+///
+/// **Since issue #236 this is the ONLY bound on the group axis.** The
+/// mid-scan group-count cap is deleted (it rejected queries the reference
+/// serves — see [`MAX_QUERY_SERIES`]), so every row of the table below
+/// that used to lean on a count now leans on bytes or on the grid.
+/// Raised 64 MiB → 256 MiB with that deletion (owner ruling O1): the
+/// count cap used to keep the group axis small, and the byte cap now
+/// carries the whole load.
 ///
 /// **The query-lifetime container audit** (round 6 — earlier sweeps covered
 /// the per-sample/per-window dimension; this is the per-QUERY one). Every
@@ -4309,8 +4392,9 @@ fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// | `ClientAggState::label_groups` keys + `LabelSet`s | **charged here** (same helpers, same discipline) |
 /// | `MutGroup::int_cells`/`pt_cells`, `FpSlide::win`, `BucketAcc` retention | [`MAX_RETAINED_WINDOW_POINTS`] / [`MAX_QUANTILE_VALUES`] / [`MAX_COUNTER_VALUES`], charge-before-insert |
 /// | `base_labels` / `hashes` (both states) | built once from the stage-2 hydration read, which is scan-budget-capped (`max_bytes_to_read`) and stream-capped (`max_streams`); never grown per row |
-/// | non-mutating output labels (`FpSlide::labels`, `series_out`) | one clone per emitted series (≤ [`MAX_CLIENT_AGG_SERIES`]) of a `base_labels` value — inside the same hydration bound |
-/// | emitted points (`FpSlide::points`, `series_out`, fan-out `points`) | fixed-width `(i64, f64)`, structurally ≤ `MAX_CLIENT_AGG_SERIES × grid` (grid ≤ [`MAX_CLIENT_AGG_BUCKETS`] + 1) ≈ 88 MB worst case, independent of input bytes |
+/// | `ClientAggState::fp_groups` (non-mutating instant) | **charged here** since issue #236 P1 ([`FP_GROUP_SLOT`]), inside the existing `contains_key` probe — before #236 this arm was count-gated only and its bytes were never charged |
+/// | non-mutating output labels (`FpSlide::labels`, `series_out`) | **charged here** since issue #236 P2 ([`SERIES_OUT_SLOT`]), before the `labels` clone; discharged at the slider's no-points drop or as `finish_in_place` releases the vector |
+/// | emitted points (`FpSlide::points`, `series_out`, fan-out `points`) | fixed-width `(i64, f64)`, charged against [`MAX_METRIC_RESULT_POINTS`] — the former `series × grid` product leaned on the deleted count cap |
 /// | `present_cover` / `present` | grid-sized (≤ [`MAX_CLIENT_AGG_BUCKETS`] + 2 entries) |
 /// | `absent_labels` | cloned from the parsed query text — bounded by request size |
 /// | `coll` staging | NOT query-lifetime: one group at a time, ≤ [`MAX_TS_COLLISION_GROUP_BYTES`] |
@@ -4322,11 +4406,44 @@ fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// | variants: per-sub-state growing state (`groups`/retention/collision/quantile/counter) | [`AggCaps::divided`]`(n)` — the per-field SUM over sub-states is exactly the single-query bound above |
 /// | post-aggregation selection/grouping keys (`select_k_*`/`group_*`'s `HashMap<LabelSet, _>` owned `group_key` copies) | **flagged, not yet charged** (issue #241): bounded only indirectly by the upstream hydration/series caps; `approx_topk` itself is exempt structurally (`grouping == None` ⇒ a single empty key) |
 ///
-/// 64 MiB across ≤ 500 groups is ~128 KiB of rendered labels per group —
-/// far beyond real extracted label sets (typically well under a KiB), so
-/// nothing servable is rejected; an adversarial 500 × multi-MiB set trips a
-/// clean 422 instead of holding gigabytes for the query's lifetime.
-pub const MAX_CLIENT_AGG_GROUP_BYTES: u64 = 64 * 1024 * 1024;
+/// **Value: 256 MiB, raised from 64 MiB by issue #236 (owner ruling O1).**
+/// With the group-COUNT cap deleted this became the only bound on the
+/// group axis, so it had to admit the high-cardinality shapes #236 exists
+/// to serve. At the stated 6-pair label model that is ≈ 80 321 admitted
+/// groups — 3.4× the pre-#236 figure and comfortably above the issue's
+/// reported 20 505-group probe shape. The residual, stated rather than
+/// hidden: above ≈ 80 321 groups PulsusDB still refuses where the
+/// reference serves. That is a bounded divergence, not a fix — the real
+/// fix is a step-ordered evaluator (#250). O2 (1 GiB) was rejected
+/// because per-query ceilings do not compose across concurrent queries;
+/// O4 (operator-configurable) routes to #25.
+pub const MAX_CLIENT_AGG_GROUP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The exact upper bound [`ensure_grid_resolution`] can ADMIT, in grid
+/// POINTS. The fence saturates ([`fence_intervals`]) while
+/// [`grid_point_count`] is exact over i128, so a full-domain span at a
+/// step just wide enough to pass the fence admits
+/// `2 * (MAX_CLIENT_AGG_BUCKETS + 1)` points — `ensure_grid_resolution`'s
+/// own doc says so. DERIVED from the fence, never chosen, and it enforces
+/// nothing on its own: the gate is [`MAX_CLIENT_AGG_BUCKETS`] intervals,
+/// which is the reference's rule.
+pub const MAX_ADMITTED_GRID_POINTS: u64 = 2 * (MAX_CLIENT_AGG_BUCKETS + 1); // 22_002
+
+/// The cap on emitted points, fold cells and fold slots — one counter
+/// each, charged before allocation (issue #236).
+///
+/// DERIVED, not chosen: a result the reference will serve carries at most
+/// [`MAX_QUERY_SERIES`] series, and each holds at most
+/// [`MAX_ADMITTED_GRID_POINTS`] points, so every counter's provable
+/// maximum for a servable result is `500 × 22 002 = 11 001 000`. The
+/// shipped value is the next round figure above it, so no servable result
+/// is ever refused by this cap.
+///
+/// It replaces the structural `series × grid` product that the deleted
+/// group-count cap used to supply. Unlike that product it does not reject
+/// on a group COUNT, so a wide scan collapsing to a narrow result passes
+/// it untouched.
+pub const MAX_METRIC_RESULT_POINTS: u64 = 12_000_000;
 
 /// **The one group-byte gate** (round 6): every query-lifetime group-map
 /// insertion is sized by [`group_entry_bytes`], checked against the cap, and
@@ -4359,6 +4476,26 @@ const MUT_GROUP_SLOT: usize = size_of::<(String, MutGroup)>();
 /// (`label_groups`).
 const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BTreeMap<i64, BucketAcc>))>();
 
+/// The map-entry slot the non-mutating instant path's group charge sizes
+/// (`fp_groups`) — issue #236 P1. The key is a `u64` fingerprint, not a
+/// rendered string, so the charge passes an empty key to
+/// [`group_entry_bytes`] and the `LabelSet` term prices the hydrated
+/// `base_labels` value the group stands for.
+const FP_GROUP_SLOT: usize = size_of::<(u64, BTreeMap<i64, BucketAcc>)>();
+
+/// The label set a fingerprint with no hydrated meta stands for — issue
+/// #236 P2 sizes its charge over this so the charge/discharge pair stays
+/// exact on a fingerprint `base_labels` never saw (`cloned().unwrap_or_
+/// default()` yields exactly this).
+static EMPTY_LABEL_SET: LabelSet = Vec::new();
+
+/// A `Vec` element sized through the map-entry helper — issue #236 P2.
+/// `series_out` is a `Vec`, not a map, so this is a deliberate
+/// OVER-charge: both leaf paths then speak ONE vocabulary
+/// ([`group_entry_bytes`]) and the derivation has a single term to reason
+/// about instead of two.
+const SERIES_OUT_SLOT: usize = size_of::<MatrixSeries>();
+
 /// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
 /// output group's map entry retains: the rendered-JSON key, the cloned
 /// `LabelSet` (each owned string plus the element buffer), and the entry's
@@ -4390,9 +4527,10 @@ const INSTANT_GROUP_SLOT: usize = size_of::<(String, (LabelSet, BTreeMap<i64, Bu
 ///   ≤ 2× its request (the [`alloc_block_bytes`] model) that peak is
 ///   ≤ ~6.86 slots per entry — `8×` dominates it for every entry count,
 ///   and the flat pad covers the table's fixed control-group padding
-///   (also ≤ 2×-rounded) many times over. (The table itself is
-///   additionally structurally bounded: the entry COUNT is capped at
-///   [`MAX_CLIENT_AGG_SERIES`] before any insertion.)
+///   (also ≤ 2×-rounded) many times over. (`MAP_GROWTH_FACTOR = 8` is a
+///   LOAD-FACTOR argument and holds for any entry count — issue #236
+///   deleted the group-count cap that used to be quoted here as an
+///   additional structural bound, and the bound is unaffected.)
 ///
 /// Saturating arithmetic throughout — a hostile label set can only make
 /// the charge LARGER, the safe direction.
@@ -4897,8 +5035,6 @@ struct RangeSlideState<'q> {
     /// `absent_presence_counter_cannot_overflow_under_the_scan_budget` pins
     /// the arithmetic.
     present_cover: Vec<i64>,
-    // Distinct output-series count (the 500 cap, non-mutating path).
-    series_count: u64,
     // Current collision run.
     coll_active: bool,
     coll_fp: u64,
@@ -5000,7 +5136,6 @@ impl<'q> RangeSlideState<'q> {
             // `vec![0; 0]` never allocates) so this constructor's censused
             // branch shape is unchanged.
             present_cover: vec![0; (kmax.max(-1) + 2) as usize * (is_absent as usize)],
-            series_count: 0,
             coll_active: false,
             coll_fp: 0,
             coll_ts: 0,
@@ -5282,18 +5417,24 @@ impl<'q> RangeSlideState<'q> {
 
         // Non-mutating: one slider per fingerprint (fingerprints contiguous).
         if self.cur.is_none() || self.cur_fp != fp {
-            if let Some(prev) = self.cur.take()
-                && let Some(series) = prev.finish(&mut self.retained)
-            {
-                self.series_out.push(series);
+            if let Some(prev) = self.cur.take() {
+                self.rotate_slider(prev);
             }
-            self.series_count += 1;
-            if self.series_count > self.caps.series {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                    cap: self.caps.series,
-                }));
-            }
-            let labels = base_labels.get(&fp).cloned().unwrap_or_default();
+            // Issue #236 P2 — the premise fix on the non-mutating RANGE
+            // path. Part A deleted the mid-scan group-count rejection
+            // that used to stand here, and the `labels` clone
+            // below plus the eventual `series_out` element were otherwise
+            // uncharged. Charged BEFORE the clone, so a refusal never
+            // allocates; discharged in the slider rotation's `None` arm
+            // (a series that yields no points) and at the end of
+            // `finish_in_place`'s non-mutating arm.
+            let src = base_labels.get(&fp);
+            charge_group_bytes(
+                &mut self.group_bytes,
+                group_entry_bytes("", src.unwrap_or(&EMPTY_LABEL_SET), SERIES_OUT_SLOT),
+                self.caps.group_bytes,
+            )?;
+            let labels = src.cloned().unwrap_or_default();
             self.cur = Some(FpSlide {
                 stream_hash,
                 labels,
@@ -5327,6 +5468,22 @@ impl<'q> RangeSlideState<'q> {
         Ok(())
     }
 
+    /// Retires the finished non-mutating slider — issue #236 P2's discharge
+    /// leg. A slider that produced points hands its `MatrixSeries` to
+    /// `series_out` and KEEPS its charge (the bytes are still live) until
+    /// `finish_in_place` releases the whole vector; a slider that produced
+    /// NONE is dropped here, so its charge is released here. Sized over the
+    /// same labels P2 charged (`FpSlide::labels` is `base_labels`' value,
+    /// cloned and never mutated), which is what makes `group_bytes == 0` at
+    /// finish an exact identity rather than an inequality.
+    fn rotate_slider(&mut self, prev: FpSlide) {
+        let entry_bytes = group_entry_bytes("", &prev.labels, SERIES_OUT_SLOT);
+        match prev.finish(&mut self.retained) {
+            Some(series) => self.series_out.push(series),
+            None => discharge_group_bytes(&mut self.group_bytes, entry_bytes),
+        }
+    }
+
     /// Fans one ranked sample into every grid cell whose window `(t-range,
     /// t]` covers `ts` (the covering-set identity `t ∈ [ts, ts+range)`).
     fn fan_out_sample(
@@ -5344,11 +5501,6 @@ impl<'q> RangeSlideState<'q> {
         }
         let is_new = !self.groups.contains_key(&key);
         if is_new {
-            if self.groups.len() as u64 >= self.caps.series {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-                    cap: self.caps.series,
-                }));
-            }
             // Issue #227 review round 6: the key + `LabelSet` MOVE into the
             // QUERY-LIFETIME `groups` map below and outlive the collision
             // flush (whose `coll_bytes` charge has already been reset), so
@@ -5375,8 +5527,9 @@ impl<'q> RangeSlideState<'q> {
                 // Review finding 3: a newly-CREATED integer cell is charged to
                 // the same concurrent-retention counter as a retained point,
                 // so the class-A fan-out obeys the documented invariant
-                // instead of relying on the implicit
-                // `MAX_CLIENT_AGG_SERIES × MAX_CLIENT_AGG_BUCKETS` product.
+                // instead of relying on an implicit `groups × grid` product
+                // — which issue #236 has since deleted outright (there is
+                // no group-count cap left to form one).
                 // Updating an existing cell is O(1) and charges nothing.
                 //
                 // ONE point per cell: an `int_cells` entry is an `(i64, u64)`
@@ -5463,10 +5616,8 @@ impl<'q> RangeSlideState<'q> {
         // `&mut self` flush does not clash with a `self.base_labels` borrow.
         let base_labels = std::mem::take(&mut self.base_labels);
         self.flush_collision(&base_labels)?;
-        if let Some(prev) = self.cur.take()
-            && let Some(series) = prev.finish(&mut self.retained)
-        {
-            self.series_out.push(series);
+        if let Some(prev) = self.cur.take() {
+            self.rotate_slider(prev);
         }
         if self.is_absent {
             return Ok(self.finish_absent());
@@ -5535,7 +5686,18 @@ impl<'q> RangeSlideState<'q> {
             }
             return Ok(QueryResult::Matrix(out));
         }
-        Ok(QueryResult::Matrix(std::mem::take(&mut self.series_out)))
+        // Issue #236 P2's other discharge leg: every series that reached
+        // `series_out` still holds its charge, released as the vector
+        // leaves the state. Sized over the same (never-mutated) labels the
+        // charge used, so `group_bytes` returns to exactly 0.
+        let out = std::mem::take(&mut self.series_out);
+        for s in &out {
+            discharge_group_bytes(
+                &mut self.group_bytes,
+                group_entry_bytes("", &s.labels, SERIES_OUT_SLOT),
+            );
+        }
+        Ok(QueryResult::Matrix(out))
     }
 
     /// `absent_over_time`: emit `1.0` at every grid point whose selector-wide
@@ -6349,6 +6511,16 @@ impl<'q> VariantsAggState<'q> {
             } else {
                 apply_vector_aggs(out, spec.vector_aggs())
             };
+            // Issue #236: the result-series cap is applied PER VARIANT,
+            // before the concat — matching the reference's own granularity
+            // (`engine.go:474-506`, `:609-621` apply `maxSeries` per
+            // variant, not to the concatenated whole). Strictly more
+            // permissive than capping the concat: a 3-variant query
+            // returning 400 series each is served (1 200 result series).
+            // The remaining divergence is that the reference SKIPS the
+            // breaching variant with a warning where PulsusDB 422s —
+            // that needs a `warnings` response envelope and is #277.
+            ensure_result_series(&out)?;
             discharge_fanout_bytes(&mut self.charged, self.sub_charged[i]);
             per_variant.push(out);
         }
@@ -14161,14 +14333,244 @@ mod tests {
         format!("variants({list}) of ({common})")
     }
 
-    /// B5 / AC 9 — `AggCaps::DEFAULT` is the seven existing constants
-    /// verbatim; `divided` keeps the per-field sum ≤ the single-query
-    /// bound with every field ≥ 1 for all admissible `n`; the backstop is
-    /// DERIVED (`== min_field() == MAX_CLIENT_AGG_SERIES`).
+    // -----------------------------------------------------------------
+    // Issue #236 — the result-series cap.
+    // -----------------------------------------------------------------
+
+    fn n_vector(n: usize) -> QueryResult {
+        QueryResult::Vector(
+            (0..n)
+                .map(|i| VectorSample {
+                    labels: vec![("id".to_string(), i.to_string())],
+                    value: i as f64,
+                })
+                .collect(),
+        )
+    }
+
+    fn n_matrix(n: usize) -> QueryResult {
+        QueryResult::Matrix(
+            (0..n)
+                .map(|i| MatrixSeries {
+                    labels: vec![("id".to_string(), i.to_string())],
+                    points: vec![(0, i as f64), (1, i as f64)],
+                })
+                .collect(),
+        )
+    }
+
+    /// AC 2 — `ensure_result_series` counts TOP-LEVEL SERIES and uses the
+    /// reference's own `> cap` test, so exactly `MAX_QUERY_SERIES` is
+    /// served and `cap + 1` is refused. Both vector and matrix shapes,
+    /// plus the histogram twins and the three pass-through variants.
+    #[test]
+    fn ensure_result_series_admits_exactly_the_cap_and_refuses_one_more() {
+        let cap = MAX_QUERY_SERIES as usize;
+        assert_eq!(cap, 500);
+
+        for at in [n_vector(cap), n_matrix(cap)] {
+            ensure_result_series(&at).expect("exactly the cap must be served");
+        }
+        for over in [n_vector(cap + 1), n_matrix(cap + 1)] {
+            match ensure_result_series(&over) {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries { cap: got })) => {
+                    assert_eq!(got, MAX_QUERY_SERIES);
+                }
+                other => panic!("expected MetricSeries, got {other:?}"),
+            }
+        }
+
+        // A matrix with FEW series but MANY points is not a breach — the
+        // reference counts distinct series, never points.
+        let deep = QueryResult::Matrix(vec![MatrixSeries {
+            labels: vec![],
+            points: (0..100_000).map(|k| (k, k as f64)).collect(),
+        }]);
+        ensure_result_series(&deep).expect("point count is not the series axis");
+
+        // Non-metric shapes pass: log streams are bounded by the entries
+        // limit instead, and scalar/string carry no series at all.
+        for other in [
+            QueryResult::Streams {
+                items: Vec::new(),
+                partial: false,
+            },
+            QueryResult::Scalar(1.0),
+            QueryResult::String("x".to_string()),
+        ] {
+            ensure_result_series(&other).expect("non-metric shapes carry no series axis");
+        }
+    }
+
+    /// AC 11's static companion, as an executable check rather than a
+    /// review-time grep: `MAX_QUERY_SERIES` is read by
+    /// `ensure_result_series` and by NOTHING else in production source.
+    ///
+    /// This is the property the plan calls normative — a constant that is
+    /// *currently* read once and one that *can only* be read once are
+    /// different guarantees, and the second is what stops the next person
+    /// reintroducing a mid-scan group cap.
+    ///
+    /// **Scope, stated because an unscoped conclusion from a scoped
+    /// census is worthless:** every file in
+    /// `crates/pulsus-read/src/logql/` (the whole tree in which the
+    /// symbol is nameable), truncated at each file's `#[cfg(test)]`
+    /// marker — i.e. PRODUCTION source only. Test code is deliberately
+    /// out of scope: this very test reads the constant, and so does
+    /// `ensure_result_series_admits_exactly_the_cap_and_refuses_one_more`.
+    /// The counted unit is SOURCE LINES mentioning the identifier outside
+    /// a comment or its own definition.
+    #[test]
+    fn max_query_series_is_read_in_exactly_one_place() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("exec.rs", include_str!("exec.rs")),
+            ("error.rs", include_str!("error.rs")),
+            ("plan.rs", include_str!("plan.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("pipeline.rs", include_str!("pipeline.rs")),
+            ("sql.rs", include_str!("sql.rs")),
+            ("detected.rs", include_str!("detected.rs")),
+            ("cms.rs", include_str!("cms.rs")),
+            ("rows.rs", include_str!("rows.rs")),
+            ("params.rs", include_str!("params.rs")),
+            ("explain.rs", include_str!("explain.rs")),
+            ("escape.rs", include_str!("escape.rs")),
+            ("ip.rs", include_str!("ip.rs")),
+        ];
+
+        /// Everything above the file's `#[cfg(test)]` marker.
+        fn production(src: &str) -> &str {
+            match src.find("\n#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => src,
+            }
+        }
+
+        let mut reads: Vec<String> = Vec::new();
+        for (name, src) in SOURCES {
+            for (i, line) in production(src).lines().enumerate() {
+                if !line.contains("MAX_QUERY_SERIES") {
+                    continue;
+                }
+                let t = line.trim();
+                // The definition and doc/line comments are not reads.
+                if t.starts_with("///") || t.starts_with("//") || t.starts_with("pub const") {
+                    continue;
+                }
+                reads.push(format!("{name}:{}: {t}", i + 1));
+            }
+        }
+        // Exactly two production lines mention it, both inside
+        // `ensure_result_series`: the `> cap` test and the error payload.
+        assert_eq!(
+            reads.len(),
+            2,
+            "MAX_QUERY_SERIES must be read only by ensure_result_series; found {reads:#?}"
+        );
+        for r in &reads {
+            assert!(r.starts_with("exec.rs:"), "unexpected reader: {r}");
+        }
+        // ...and the deleted mid-scan group cap must not return, under
+        // its own name, anywhere in the tree (tests included). The
+        // needles are assembled at runtime so this test's OWN source does
+        // not contain them — a literal here would match itself and the
+        // assertion would fail for the wrong reason.
+        let deleted_cap = format!("MAX_CLIENT_AGG{}SERIES", '_');
+        let deleted_field = format!("caps{}series", '.');
+        for (name, src) in SOURCES {
+            assert!(
+                !src.contains(&deleted_cap),
+                "{name} still references the deleted mid-scan group cap"
+            );
+            assert!(
+                !src.contains(&deleted_field),
+                "{name} still reads a per-state series cap"
+            );
+        }
+    }
+
+    /// AC 30 — the query-text premise #236's derivation rests on is
+    /// ENFORCED by this change, not assumed by it. #279 shipped the cap as
+    /// an EXCLUSIVE maximum (`limits.rs:40` rejects `len >= cap`), so the
+    /// boundary is pinned from BOTH sides: `cap - 1` accepted, `cap` and
+    /// `cap + 1` rejected. Plan v14 phrases it as `cap + 1` only; asserting
+    /// the accepted side too is what makes an off-by-one visible.
+    #[test]
+    fn the_query_text_cap_exists_is_finite_and_rejects_at_the_boundary() {
+        let cap = pulsus_logql::MAX_QUERY_BYTES;
+        assert!(cap > 0 && cap < usize::MAX, "the cap must be finite");
+        assert_eq!(cap, 131_072);
+
+        // A selector whose label VALUE is padded to hit an exact byte
+        // length — valid LogQL at every length, so the only thing under
+        // test is the admission check.
+        let pad = |total: usize| {
+            let (head, tail) = (r#"{a=""#, r#""}"#);
+            format!(
+                "{head}{}{tail}",
+                "b".repeat(total - head.len() - tail.len())
+            )
+        };
+
+        let ok = pad(cap - 1);
+        assert_eq!(ok.len(), cap - 1);
+        pulsus_logql::parse(&ok).expect("cap - 1 bytes must be accepted");
+
+        for len in [cap, cap + 1] {
+            let too_long = pad(len);
+            assert_eq!(too_long.len(), len);
+            match pulsus_logql::parse(&too_long) {
+                Err(pulsus_logql::LogQlError::QueryTooLong {
+                    len: got, cap: c, ..
+                }) => {
+                    assert_eq!((got, c), (len, cap));
+                }
+                other => panic!("{len} bytes must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// AC 30's second half — the feasible region's `aggs.len()` operand is
+    /// `min(MAX_DEPTH, Q/4)`, read from BOTH constants rather than a
+    /// literal, so neither can drift without this failing.
+    ///
+    /// `pulsus_logql::MAX_DEPTH` is `pub(crate)`, so the depth is read
+    /// back from the typed error the parser actually raises rather than
+    /// by widening another crate's API — which also pins the value the
+    /// guard ENFORCES, not merely the one it declares.
+    #[test]
+    fn the_aggregation_depth_operand_reads_both_constants() {
+        let q = pulsus_logql::MAX_QUERY_BYTES as u64;
+
+        let too_deep = format!(
+            "{}{}{}",
+            "sum(".repeat(200),
+            r#"count_over_time({a="b"}[1m])"#,
+            ")".repeat(200)
+        );
+        assert!(too_deep.len() < pulsus_logql::MAX_QUERY_BYTES);
+        let depth = match pulsus_logql::parse(&too_deep) {
+            Err(pulsus_logql::LogQlError::RecursionLimitExceeded { limit, .. }) => limit as u64,
+            other => panic!("expected RecursionLimitExceeded, got {other:?}"),
+        };
+        assert_eq!(depth, 64);
+
+        // Every nesting level costs at least `sum(` — four bytes of text.
+        let operand = depth.min(q / 4);
+        assert_eq!(operand, depth, "at Q = {q} the parser depth is binding");
+    }
+
+    /// B5 / AC 9, re-derived by issue #236 (AC 35) — `AggCaps::DEFAULT` is
+    /// the SIX remaining constants verbatim (`series` is deleted: it was
+    /// the mid-scan group cap, and #236 moved the 500 to the final result
+    /// as `MAX_QUERY_SERIES`); `divided` keeps the per-field sum ≤ the
+    /// single-query bound with every field ≥ 1 for all admissible `n`; and
+    /// the backstop is still DERIVED, now landing on
+    /// `MAX_TS_COLLISION_GROUP == 10_000` instead of 500 — a strictly
+    /// PERMISSIVE re-derivation (the reference is unbounded there).
     #[test]
     fn agg_caps_default_is_the_constants_and_divides_soundly() {
         let d = AggCaps::DEFAULT;
-        assert_eq!(d.series, MAX_CLIENT_AGG_SERIES);
         assert_eq!(d.group_bytes, MAX_CLIENT_AGG_GROUP_BYTES);
         assert_eq!(d.retention_points, MAX_RETAINED_WINDOW_POINTS);
         assert_eq!(d.quantile_values, MAX_QUANTILE_VALUES);
@@ -14176,12 +14578,14 @@ mod tests {
         assert_eq!(d.collision_members, MAX_TS_COLLISION_GROUP);
         assert_eq!(d.collision_bytes, MAX_TS_COLLISION_GROUP_BYTES);
         assert_eq!(d.divided(1), d, "divided(1) must be byte-identical");
-        assert_eq!(d.min_field(), MAX_CLIENT_AGG_SERIES);
+        // The re-derivation, pinned to the SYMBOL and to the VALUE so a
+        // future cap change cannot silently move the backstop.
+        assert_eq!(d.min_field(), MAX_TS_COLLISION_GROUP);
+        assert_eq!(d.min_field(), 10_000);
         assert_eq!(plan::MAX_VARIANT_SUB_STATES, d.min_field());
         for n in 1..=plan::MAX_VARIANT_SUB_STATES {
             let v = d.divided(n);
             for (field, whole) in [
-                (v.series, d.series),
                 (v.group_bytes, d.group_bytes),
                 (v.retention_points, d.retention_points),
                 (v.quantile_values, d.quantile_values),

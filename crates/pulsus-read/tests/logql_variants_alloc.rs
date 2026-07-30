@@ -1610,7 +1610,15 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("VariantsAggState"),
         anchor: "finish_in_place",
-        branches: 16,
+        // Issue #236 (§10.5, predicted): the per-variant
+        // `ensure_result_series(&out)?` adds one `syn::ExprTry` branch
+        // (16 → 17) and one callee. Regenerated with
+        // `zz_print_frame_censuses`, not hand-edited. W-MEM inventory
+        // disposition: **NIL** — the call takes `&QueryResult`, reads a
+        // `Vec::len`, and allocates nothing on either arm (the error arm
+        // constructs a fixed-size `TooBroadReason`), so it adds no
+        // per-variant allocation for the G-gates to bound.
+        branches: 17,
         callees: &[
             ".any",
             ".client",
@@ -1636,6 +1644,7 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             "append_variant_label",
             "apply_vector_aggs",
             "discharge_fanout_bytes",
+            "ensure_result_series",
             "matches!",
             "take",
             "with_capacity",
@@ -1712,7 +1721,15 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("ClientAggState"),
         anchor: "finish",
-        branches: 7,
+        // Issue #236 P1: the non-mutating `fp_groups` arm gained its
+        // discharge leg, whose `base_labels.get(&fp)?` adds one
+        // `syn::ExprTry` branch (7 → 8) and the `Some(...)` callee.
+        // Regenerated with `zz_print_frame_censuses`. W-MEM disposition:
+        // **NIL** — the `?` replaces the previous `.map(...)` on the same
+        // `Option`, so the arm's allocation shape is unchanged (one
+        // `labels.clone()` per surviving group, exactly as before); the
+        // added work is one integer subtraction per group.
+        branches: 8,
         callees: &[
             ".as_u64",
             ".clone",
@@ -1731,6 +1748,7 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             ".start_ns",
             ".step_ns",
             ".unwrap_or",
+            "Some",
             "Matrix",
             "Vector",
             "bucket_grid",
@@ -1775,10 +1793,17 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish_in_place",
-        branches: 11,
+        // Issue #236 P2: the slider-retirement `if let` moved into
+        // `rotate_slider` (so `.finish` leaves this frame and
+        // `.rotate_slider` enters), and the non-mutating tail gained a
+        // discharge loop over `series_out` (11 → 12 branches).
+        // Regenerated with `zz_print_frame_censuses`. W-MEM disposition:
+        // **NIL** — the loop reads each emitted series' labels and does
+        // integer arithmetic; it allocates nothing, and the `Vec` it walks
+        // is the one already being returned.
+        branches: 12,
         callees: &[
             ".collect",
-            ".finish",
             ".finish_absent",
             ".flush_collision",
             ".into_iter",
@@ -1787,6 +1812,7 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             ".len",
             ".map",
             ".push",
+            ".rotate_slider",
             ".sort_by",
             ".sort_by_key",
             ".sum",
@@ -1825,6 +1851,16 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("RangeSlideState"),
         anchor: "flush_collision",
+        // Issue #236: Part A deleted the `series_count > caps.series`
+        // rejection (so `Err`/`QueryTooBroad`/`.push` leave this frame);
+        // P2 put a `charge_group_bytes(group_entry_bytes(...))?` in its
+        // place before the `labels` clone, and the slider retirement moved
+        // into `.rotate_slider`. Branch count is unchanged at 12 (one
+        // rejection `if` traded for one charge `?`). Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — the
+        // charge is integer arithmetic over an already-materialised label
+        // set, on the same once-per-fingerprint path the deleted check
+        // occupied.
         branches: 12,
         callees: &[
             ".as_bytes",
@@ -1837,21 +1873,20 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             ".enumerate",
             ".expect",
             ".fan_out_sample",
-            ".finish",
             ".get",
             ".into_iter",
             ".is_empty",
             ".is_none",
             ".load_group",
-            ".push",
+            ".rotate_slider",
             ".sort_by",
             ".take",
             ".unwrap_or",
             ".unwrap_or_default",
-            "Err",
             "Ok",
-            "QueryTooBroad",
             "Some",
+            "charge_group_bytes",
+            "group_entry_bytes",
             "new",
             "take",
         ],

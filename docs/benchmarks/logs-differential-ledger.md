@@ -433,18 +433,32 @@ not "fix" us toward the panic.
   override is gated hermetically.
 - **(b) Fan-out bounds.** *Reference:* unbounded in variant count.
   *PulsusDB:* a clean 422 `query_too_broad` at two DERIVED thresholds —
-  `MAX_VARIANT_SUB_STATES` = `AggCaps::DEFAULT.min_field()` (currently
-  500, the point past which a divided per-sub-state cap would floor to
-  zero; it moves with `MAX_CLIENT_AGG_SERIES`) and
+  `MAX_VARIANT_SUB_STATES` = `AggCaps::DEFAULT.min_field()` and
   `MAX_VARIANT_FANOUT_STATE_BYTES` = `AggCaps::DEFAULT.group_bytes`
-  (64 MiB) of charged fan-out state (plan-time spec clones + arena +
+  (256 MiB) of charged fan-out state (plan-time spec clones + arena +
   per-sub-state snapshots, one counter end to end). The worked
   thresholds are emitted by the charge functions' own unit tests
   (`crates/pulsus-read/src/logql/exec.rs`), never hand-computed here.
+
+  **Re-derived by #236.** Deleting `AggCaps::series` (the mid-scan
+  500-group cap) moved `min_field()` off that 500 and onto
+  `MAX_TS_COLLISION_GROUP`, so `MAX_VARIANT_SUB_STATES` is now
+  **10 000** — strictly permissive, in the direction the reference sits.
+  It is also now **UNREACHABLE**: at #279's `MAX_QUERY_BYTES` (131 072,
+  exclusive) the largest expressible variants query carries **4 368**
+  variants, so no legal query can trip this backstop. The divergence is
+  therefore registered as *unreachable* rather than live —
+  `variants_past_the_derived_backstop_reject_at_plan_time` computes the
+  verdict from the two constants and fails if it ever becomes reachable.
 - **(c) Per-variant series cap.** *Reference:* applies `maxSeries` PER
   VARIANT and SKIPS the breaching variant with a warning. *PulsusDB:*
-  422s on the shared divided cap — the pre-existing #236 class
-  (mid-scan group cap vs result-size cap), not re-litigated here.
+  applies the result-series cap per variant too (#236 — matching the
+  reference's GRANULARITY, a strict acceptance win: a 3-variant query
+  returning 3×400 series is served), but **422s** on breach where the
+  reference skips-and-warns. The remaining divergence is the
+  skip-and-warn behaviour, which needs a `warnings` response-envelope
+  field that exists nowhere in the tree: owned by **#277**, a real
+  parity bug deferred for sequencing, not an accepted shape.
 
 ## Issue #230 — `line_format`/`label_format` template engine
 

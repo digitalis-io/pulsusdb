@@ -46,7 +46,8 @@ use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, DetectedFieldOut, DetectedFieldsProbe, Direction, MatrixSeries,
     MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, apply_vector_aggs,
-    combine_binary, materialize_vector_lit, plan, run_client_agg_rows, run_variants_rows,
+    combine_binary, ensure_result_series, materialize_vector_lit, plan, run_client_agg_rows,
+    run_variants_rows,
 };
 
 /// A sorted label set.
@@ -946,6 +947,13 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
                     return Err("a metric expression planned to a streams query".to_string());
                 }
             };
+            // Issue #236: the SAME final-result series gate the engine
+            // applies on its `Plan::Metric`/`Plan::MetricBinary` arms, so
+            // corpus `eval_fail` cases can pin the reference's verbatim
+            // `maximum number of series (500) …` body. Applied here and
+            // never inside `eval_leaf`/`eval_node`, mirroring the engine:
+            // intermediates are uncapped.
+            ensure_result_series(&result).map_err(|e| e.to_string())?;
             Ok(Outcome::Metric(result))
         }
     }

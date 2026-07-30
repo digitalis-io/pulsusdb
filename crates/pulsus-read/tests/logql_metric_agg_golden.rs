@@ -906,83 +906,71 @@ fn meta_n(n: usize) -> HashMap<u64, StreamMetaRow> {
         .collect()
 }
 
+/// Issue #236, rewritten cap golden (AC 16). Before #236 this asserted a
+/// mid-scan `MetricSeries` 422 at the 501st fan-out group. That rejection
+/// is DELETED: `MAX_QUERY_SERIES` is a final-RESULT cap, so the leaf must
+/// now serve every group it scans and let `ensure_result_series` judge the
+/// finished result at the engine boundary.
+///
+/// `logfmt` is a parser -> `mutates_labels` -> fan-out. Every row carries a
+/// unique `id=<n>` body on the SAME fingerprint, so each survivor's final
+/// label set is distinct -> one `label_groups` entry per row.
+///
+/// Fails on `590220a` (which 422s at the 501st group).
 #[test]
-fn label_groups_fan_out_past_the_series_cap_is_a_named_too_broad_error() {
-    // `logfmt` is a parser -> `mutates_labels` -> fan-out. Every row
-    // carries a unique `id=<n>` body on the SAME fingerprint, so each
-    // survivor's final label set is distinct -> one `label_groups` entry
-    // per row.
-    let cap = pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES as usize;
+fn label_groups_fan_out_past_the_old_series_cap_is_served_by_the_leaf() {
+    let old_cap = 500usize;
     let params = instant_params(60 * NS);
-    let over_cap: Vec<MetricScanRow> = (0..=cap)
-        .map(|n| row(1, 10 * NS, &format!("id={n}")))
-        .collect();
-    let err = run_client(
-        r#"count_over_time({env="prod"} | logfmt [1m])"#,
-        &params,
-        &over_cap,
-        &meta_one(),
-    )
-    .unwrap_err();
-    let ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::MetricSeries { cap: got }) =
-        err
-    else {
-        panic!("expected QueryTooBroad(MetricSeries), got {err:?}");
-    };
-    assert_eq!(got, pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES);
+    let query = r#"count_over_time({env="prod"} | logfmt [1m])"#;
 
-    // Exactly at the cap: `cap` distinct label sets -> Ok, `cap` series.
-    let at_cap: Vec<MetricScanRow> = (0..cap)
-        .map(|n| row(1, 10 * NS, &format!("id={n}")))
-        .collect();
-    let result = run_client(
-        r#"count_over_time({env="prod"} | logfmt [1m])"#,
-        &params,
-        &at_cap,
-        &meta_one(),
-    )
-    .unwrap();
-    let QueryResult::Vector(items) = result else {
-        panic!("expected a vector, got {result:?}");
-    };
-    assert_eq!(items.len(), cap);
+    // One PAST the deleted cap, and far past it: both served, with every
+    // group present in the output.
+    for n in [old_cap + 1, old_cap * 4] {
+        let rows: Vec<MetricScanRow> = (0..n)
+            .map(|i| row(1, 10 * NS, &format!("id={i}")))
+            .collect();
+        let result = run_client(query, &params, &rows, &meta_one())
+            .unwrap_or_else(|e| panic!("{n} fan-out groups must be served by the leaf, got {e:?}"));
+        let QueryResult::Vector(items) = result else {
+            panic!("expected a vector");
+        };
+        assert_eq!(items.len(), n, "every scanned group must reach the result");
+    }
 }
 
+/// Issue #236, rewritten cap golden (AC 16) — the non-mutating twin of the
+/// test above, and AC 14(a)'s premise-fix case.
+///
+/// `line_format` is beyond-line-filter (so the query IS client-aggregated)
+/// but its compile arm sets only `rewrites_line`, never `mutates_labels`
+/// (pipeline.rs) — so `metric_mutates_labels() == false` and the query
+/// lands on the NON-fan-out `fp_groups` branch, keyed by fingerprint. That
+/// branch had NO byte charge before #236; P1 added one, and this pins that
+/// the charge admits a large, ordinary label model rather than rejecting
+/// it.
+///
+/// Fails on `590220a` (422 at the 501st fingerprint).
 #[test]
-fn fp_groups_non_mutating_past_the_series_cap_is_a_named_too_broad_error() {
-    // Plan v2 correction: `line_format` is beyond-line-filter (so the
-    // query IS client-aggregated) but its compile arm sets only
-    // `rewrites_line`, never `mutates_labels` (pipeline.rs) — so
-    // `metric_mutates_labels() == false` and the query lands on the
-    // NON-fan-out `fp_groups` branch, keyed by fingerprint. Driven with
-    // one row per distinct fingerprint.
-    let cap = pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES as usize;
+fn fp_groups_non_mutating_past_the_old_series_cap_is_served_by_the_leaf() {
+    let old_cap = 500usize;
     let params = instant_params(60 * NS);
     let query = r#"count_over_time({env="prod"} | line_format "keep" [1m])"#;
 
-    let over_cap_meta = meta_n(cap + 1);
-    let over_cap_rows: Vec<MetricScanRow> = (1..=(cap as u64 + 1))
-        .map(|fp| row(fp, 10 * NS, "hello"))
-        .collect();
-    let err = run_client(query, &params, &over_cap_rows, &over_cap_meta).unwrap_err();
-    let ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::MetricSeries { cap: got }) =
-        err
-    else {
-        panic!("expected QueryTooBroad(MetricSeries), got {err:?}");
-    };
-    assert_eq!(got, pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES);
-
-    // Exactly at the cap: `cap` distinct fingerprints -> Ok, `cap`
-    // series.
-    let at_cap_meta = meta_n(cap);
-    let at_cap_rows: Vec<MetricScanRow> = (1..=cap as u64)
-        .map(|fp| row(fp, 10 * NS, "hello"))
-        .collect();
-    let result = run_client(query, &params, &at_cap_rows, &at_cap_meta).unwrap();
-    let QueryResult::Vector(items) = result else {
-        panic!("expected a vector, got {result:?}");
-    };
-    assert_eq!(items.len(), cap);
+    for n in [old_cap + 1, old_cap * 4] {
+        let meta = meta_n(n);
+        let rows: Vec<MetricScanRow> = (1..=n as u64).map(|fp| row(fp, 10 * NS, "hello")).collect();
+        let result = run_client(query, &params, &rows, &meta).unwrap_or_else(|e| {
+            panic!("{n} fingerprint groups must be served by the leaf, got {e:?}")
+        });
+        let QueryResult::Vector(items) = result else {
+            panic!("expected a vector");
+        };
+        assert_eq!(
+            items.len(),
+            n,
+            "every scanned fingerprint must reach the result"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------
