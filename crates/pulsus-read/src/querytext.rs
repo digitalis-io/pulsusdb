@@ -44,6 +44,11 @@
 /// and the pre-dispatch admission cap [`ensure_query_text_fits`] enforces
 /// against the FINAL rendered SQL text (after any placeholder-escaping).
 /// See the module doc for the sizing argument.
+///
+/// NOT to be confused with `pulsus_logql::MAX_QUERY_BYTES` (131,072,
+/// issue #279), which caps the **LogQL source text** a client submits —
+/// a different quantity at a different layer; this constant bounds the
+/// **rendered ClickHouse SQL**.
 pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Rejects `sql` pre-dispatch when its rendered byte length would not fit

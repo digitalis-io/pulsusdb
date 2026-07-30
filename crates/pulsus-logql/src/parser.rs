@@ -9,6 +9,14 @@
 //! **paren nesting only**: flat `or`/`and` chains are parsed iteratively
 //! at depth 1 and are not counted.
 //!
+//! Before any of that, both public entry points run the #279 query-text
+//! admission cap: input of [`crate::MAX_QUERY_BYTES`] (131,072) bytes or
+//! more is rejected as `QueryTooLong` before tokenization, via the
+//! [`crate::limits::CheckedQuery`] seam `lexer::tokenize` requires
+//! (grafana/loki v3.7.4 `pkg/logql/syntax/parser.go:86`). Like the depth
+//! guards, the cap is necessary but NOT sufficient for deep nesting —
+//! 131,071 bytes of `(` is still far past the recursion limits above.
+//!
 //! Disambiguation of the overloaded `!=`/`!~` tokens (selector matcher,
 //! line filter, or — `!=` only — a binary comparison) is purely
 //! positional: the selector-matcher loop, the pipeline-stage loop, and
@@ -25,11 +33,12 @@ use crate::ast::{
 use crate::duration;
 use crate::error::{LABEL_FILTER_MAX_DEPTH, LogQlError, MAX_DEPTH};
 use crate::lexer;
+use crate::limits::CheckedQuery;
 use crate::token::{Span, Token, TokenKind};
 
 /// Parses a full LogQL query into an [`Expr`] — the #11 planner contract.
 pub fn parse(input: &str) -> Result<Expr, LogQlError> {
-    let tokens = lexer::tokenize(input)?;
+    let tokens = lexer::tokenize(CheckedQuery::new(input)?)?;
     let mut cursor = Cursor::new(&tokens);
     let expr = parse_expr(&mut cursor, 0)?;
     expect_eof(&cursor)?;
@@ -40,7 +49,7 @@ pub fn parse(input: &str) -> Result<Expr, LogQlError> {
 /// point `/series` and `/label/{name}/values` (#13) use, since those
 /// endpoints never see a full LogQL pipeline.
 pub fn parse_selector(input: &str) -> Result<StreamSelector, LogQlError> {
-    let tokens = lexer::tokenize(input)?;
+    let tokens = lexer::tokenize(CheckedQuery::new(input)?)?;
     let mut cursor = Cursor::new(&tokens);
     let selector = parse_stream_selector(&mut cursor)?;
     expect_eof(&cursor)?;

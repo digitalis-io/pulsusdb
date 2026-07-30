@@ -121,6 +121,7 @@ Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|
 | Malformed params, malformed LogQL, empty/contradictory matchers, invalid `step` | `400` | `bad_data` |
+| LogQL query text of **131,072 bytes or more** (`pulsus_logql::MAX_QUERY_BYTES`, an exclusive maximum — the longest accepted query is **131,071 bytes**; the reference's `maxInputSize` at grafana/loki v3.7.4 `pkg/logql/syntax/parser.go:42`, enforced `>=` at `:86`; applies at every LogQL parse, incl. per `match[]` value and `/tail`) | `400` | `bad_data` |
 | Pipeline/plan rejection (bad regex — **including an uncompilable pushed-down line-filter or stream-matcher regex, since #240** — bad parser expression, unwrap-arity, …) | `400` | `bad_data` |
 | Query rejected as too broad (scan-budget or stream-count cap exceeded) | `422` | `query_too_broad` |
 | ClickHouse read timed out | `504` | `timeout` |
@@ -134,6 +135,27 @@ divergence, owner-ruled: status, container and accept/reject decision must
 match; message prose need not). The JSON-vs-`text/plain` response-container
 divergence is tracked in #264; the WebSocket close frame truncates reasons
 at 123 bytes; the LogQL corpus runner's pushdown blind spot is #278.
+
+**Transport bound on the query-text cap (#279).** The 131,072-byte row
+above is reachable only where the query arrives in a **POST form body**,
+on one of the five routes that **both take a query parameter and accept
+a POST form body**: `/query`, `/query_range`, `/series` (per `match[]`),
+`/detected_labels`, `/detected_fields` — each on both the native and
+`/loki/api/v1` prefixes. That set is narrower than "the `GET|POST` form
+routes", of which there are six: `/labels` is `GET|POST` form-encoded too
+but accepts no `query` parameter (only `start`/`end`, per the route table
+above), so no query of any length reaches the cap through it. Our HTTP
+stack caps the whole request-target at **65,534 bytes** (`http::Uri`), so
+on any GET a request-target past that is answered `414 URI Too Long` with
+an empty body by hyper, before routing — never the `400 bad_data`
+envelope above.
+That ceiling is below the cap, so it also blocks legitimate sub-cap
+queries above roughly 65.5 KB, and it applies to the GET-only routes
+(`/tail`, `/stats`, `/volume`, `/patterns`, `/label/{name}/values`,
+`/index/*`) as a whole. The reference serves such GETs; measured
+divergence and re-derivation in
+docs/benchmarks/logs-differential-ledger.md
+(`get-request-target-uri-bound`).
 
 ### 2.4 `GET /api/logs/v1/tail` (WebSocket)
 

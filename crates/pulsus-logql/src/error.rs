@@ -111,6 +111,19 @@ pub enum LogQlError {
     /// appended).
     #[error("grouping not allowed for {op} aggregation at byte {}", .span.start)]
     GroupingNotAllowed { op: String, span: Span },
+
+    /// The query source exceeded [`crate::MAX_QUERY_BYTES`]. The inner text
+    /// is the reference's verbatim (grafana/loki v3.7.4
+    /// `pkg/logql/syntax/parser.go:87`), the same treatment
+    /// `InvalidAggregationParam` and its siblings already get. At exactly
+    /// the cap this renders `(131072 > 131072)` — the reference's own
+    /// artifact of printing `len > cap` while comparing `>=`, not a defect.
+    /// No `at byte N` suffix (the reference reports line=col=0, and
+    /// `EmptySelector`/`RecursionLimitExceeded` set the same house
+    /// precedent); `span` is zero-width at 0 so the envelope's `position`
+    /// stays well-formed.
+    #[error("input size too long ({len} > {cap})")]
+    QueryTooLong { len: usize, cap: usize, span: Span },
 }
 
 impl LogQlError {
@@ -130,7 +143,8 @@ impl LogQlError {
             | LogQlError::TrailingInput { span }
             | LogQlError::InvalidAggregationParam { span, .. }
             | LogQlError::AggregationParamNotPositive { span, .. }
-            | LogQlError::GroupingNotAllowed { span, .. } => *span,
+            | LogQlError::GroupingNotAllowed { span, .. }
+            | LogQlError::QueryTooLong { span, .. } => *span,
         }
     }
 }
@@ -265,6 +279,21 @@ mod tests {
         assert!(msg.contains("byte 3"), "{msg}");
     }
 
+    /// Issue #279: the over-cap message is the reference's verbatim
+    /// `input size too long (<len> > <cap>)` (grafana/loki v3.7.4
+    /// `pkg/logql/syntax/parser.go:87`) with NO `at byte N` suffix — the
+    /// reference reports line=col=0 for this rejection.
+    #[test]
+    fn query_too_long_message_embeds_the_reference_text_with_no_position_suffix() {
+        let err = LogQlError::QueryTooLong {
+            len: 131_072,
+            cap: 131_072,
+            span: Span { start: 0, end: 0 },
+        };
+        let msg = err.to_string();
+        assert_eq!(msg, "input size too long (131072 > 131072)");
+    }
+
     #[test]
     fn span_returns_the_carried_span_for_every_variant() {
         let cases = [
@@ -305,6 +334,11 @@ mod tests {
             },
             LogQlError::GroupingNotAllowed {
                 op: "approx_topk".to_string(),
+                span: span(),
+            },
+            LogQlError::QueryTooLong {
+                len: 131_072,
+                cap: 131_072,
                 span: span(),
             },
         ];

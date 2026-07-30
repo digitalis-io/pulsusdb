@@ -250,6 +250,20 @@ mod tests {
 
     const SELECTOR: &str = "query=%7Bservice_name%3D%22checkout%22%7D";
 
+    /// Issue #279: a valid selector of exactly 131,072 bytes —
+    /// `MAX_QUERY_BYTES`, the reference's `maxInputSize` — one byte past
+    /// the longest accepted query.
+    fn oversized_query_param() -> String {
+        format!(r#"query={{app="{}"}}"#, "a".repeat(131_072 - 8))
+    }
+
+    fn assert_query_too_long(status: StatusCode, json: &serde_json::Value) {
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(json["error"], "input size too long (131072 > 131072)");
+        assert_eq!(json["position"], 0);
+    }
+
     // -- detected_labels ---------------------------------------------------
 
     /// An absent `query` is the UNSCOPED form — valid, so with no pool it
@@ -287,6 +301,32 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
         assert!(json.get("position").is_some());
+    }
+
+    /// Issue #279 (AC4): `/detected_labels` — an over-cap `query=` (the
+    /// param is optional; the cap applies when present) is 400 against a
+    /// POOLLESS state, while a valid selector is 503 — the parse precedes
+    /// the pool check, so the 400 is the cap.
+    #[tokio::test]
+    async fn detected_labels_rejects_an_over_cap_query_400_before_the_pool_check() {
+        let (status, json) = labels_get(Some(&oversized_query_param())).await;
+        assert_query_too_long(status, &json);
+
+        let (status, json) = labels_get(Some(SELECTOR)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["errorType"], "unavailable");
+    }
+
+    /// Issue #279 (AC4): `/detected_fields` — over-cap 400 vs valid 503,
+    /// poolless.
+    #[tokio::test]
+    async fn detected_fields_rejects_an_over_cap_query_400_before_the_pool_check() {
+        let (status, json) = fields_get(Some(&oversized_query_param())).await;
+        assert_query_too_long(status, &json);
+
+        let (status, json) = fields_get(Some(SELECTOR)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["errorType"], "unavailable");
     }
 
     // -- detected_fields ---------------------------------------------------

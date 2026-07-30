@@ -6,6 +6,7 @@
 //! surface (architect plan: "String forms").
 
 use crate::error::LogQlError;
+use crate::limits::CheckedQuery;
 use crate::token::{Span, Token, TokenKind};
 
 /// Walks a `&str` by `char`, tracking byte offsets — indexing by `char`
@@ -66,7 +67,13 @@ fn push(tokens: &mut Vec<Token>, kind: TokenKind, start: usize, end: usize) {
 /// Tokenizes a full LogQL query. Never panics on any input, including
 /// arbitrary bytes/UTF-8 that do not form a valid query — malformed input
 /// always resolves to a `LogQlError`.
-pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, LogQlError> {
+///
+/// Takes [`CheckedQuery`], not `&str` (issue #279): the only constructor
+/// is the `MAX_QUERY_BYTES` admission check, so a token stream cannot be
+/// produced from unchecked input — a new parse entry point that forgets
+/// the cap does not compile.
+pub(crate) fn tokenize(input: CheckedQuery<'_>) -> Result<Vec<Token>, LogQlError> {
+    let input = input.as_str();
     let mut sc = Scanner::new(input);
     let mut tokens = Vec::new();
 
@@ -437,12 +444,14 @@ fn scan_number_or_duration(sc: &mut Scanner<'_>, start: usize) -> TokenKind {
 mod tests {
     use super::*;
 
+    /// Test shim over the #279 `CheckedQuery` seam — every lexer-test
+    /// input is far below `MAX_QUERY_BYTES`.
+    fn tok(input: &str) -> Result<Vec<Token>, LogQlError> {
+        tokenize(CheckedQuery::new(input)?)
+    }
+
     fn kinds(input: &str) -> Vec<TokenKind> {
-        tokenize(input)
-            .unwrap()
-            .into_iter()
-            .map(|t| t.kind)
-            .collect()
+        tok(input).unwrap().into_iter().map(|t| t.kind).collect()
     }
 
     #[test]
@@ -628,25 +637,25 @@ mod tests {
 
     #[test]
     fn unterminated_double_quoted_string_is_an_error_not_a_panic() {
-        let err = tokenize(r#""abc"#).unwrap_err();
+        let err = tok(r#""abc"#).unwrap_err();
         assert!(matches!(err, LogQlError::UnterminatedString { .. }));
     }
 
     #[test]
     fn unterminated_backtick_string_is_an_error_not_a_panic() {
-        let err = tokenize("`abc").unwrap_err();
+        let err = tok("`abc").unwrap_err();
         assert!(matches!(err, LogQlError::UnterminatedString { .. }));
     }
 
     #[test]
     fn a_lone_bang_is_a_lexer_error_not_a_panic() {
-        let err = tokenize("{a!b}").unwrap_err();
+        let err = tok("{a!b}").unwrap_err();
         assert!(matches!(err, LogQlError::UnexpectedToken { .. }));
     }
 
     #[test]
     fn an_unsupported_byte_is_a_lexer_error_not_a_panic() {
-        let err = tokenize("{a=\"b\"} #").unwrap_err();
+        let err = tok("{a=\"b\"} #").unwrap_err();
         assert!(matches!(err, LogQlError::UnexpectedToken { .. }));
     }
 
@@ -654,13 +663,13 @@ mod tests {
     fn multi_byte_utf8_never_panics_the_scanner() {
         // Arbitrary non-ASCII input, including inside and outside
         // strings — must error cleanly, never panic on a slice boundary.
-        assert!(tokenize("日本語").is_err());
-        assert!(tokenize(r#"{app="日本語"}"#).is_ok());
+        assert!(tok("日本語").is_err());
+        assert!(tok(r#"{app="日本語"}"#).is_ok());
     }
 
     #[test]
     fn spans_are_byte_offsets_not_char_offsets() {
-        let tokens = tokenize(r#"{app="日本語"}"#).unwrap();
+        let tokens = tok(r#"{app="日本語"}"#).unwrap();
         // '{' at byte 0, ident at 1..4, '=' at 4, the string token spans
         // the multi-byte value plus both quote bytes.
         assert_eq!(tokens[0].span, Span { start: 0, end: 1 });

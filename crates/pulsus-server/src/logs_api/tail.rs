@@ -2219,6 +2219,28 @@ mod tests {
         ));
     }
 
+    /// Issue #279 (AC4): `/tail` cannot use the poolless-router probe the
+    /// other surfaces get — axum's `WebSocketUpgrade` extractor rejects a
+    /// plain `GET` with its own 400 (`Connection header did not include
+    /// 'upgrade'`) BEFORE the handler body runs, so an HTTP probe never
+    /// reaches `parse`. The cap is therefore gated here, directly on
+    /// `parse_tail_params`: a valid selector of exactly 131,072 bytes
+    /// (`MAX_QUERY_BYTES`, the reference's `maxInputSize`; one byte past
+    /// the longest accepted query) rejects as the cap, before any
+    /// socket/pool work.
+    #[test]
+    fn tail_params_reject_an_over_cap_query_as_query_too_long() {
+        let pairs = vec![(
+            "query".to_string(),
+            format!(r#"{{app="{}"}}"#, "a".repeat(131_072 - 8)),
+        )];
+        let err = parse_tail_params(&pairs, &cfg_default()).expect_err("over-cap query");
+        assert!(matches!(
+            err,
+            ApiError::LogQl(pulsus_logql::LogQlError::QueryTooLong { .. })
+        ));
+    }
+
     #[test]
     fn tail_params_reject_zero_and_non_numeric_limits_but_clamp_large_ones() {
         let base = "query=%7Ba%3D%22x%22%7D";

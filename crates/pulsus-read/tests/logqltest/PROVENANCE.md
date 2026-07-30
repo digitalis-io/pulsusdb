@@ -291,6 +291,28 @@ earlier with `only label matchers are supported`, still 400):
 | S2 | {app=~"("} | /loki/api/v1/index/stats | 400 |
 ```
 
+Query-text-cap boundary capture (issue #279 AC9 — the source-derived
+boundary is CONFIRMED on the wire: `maxInputSize = 131072`,
+`pkg/logql/syntax/parser.go:42`, compared `>=` at `:86`, so the bound is
+an exclusive maximum and the longest accepted query is 131,071 bytes).
+Captured 2026-07-29 against `grafana/loki:3.7.4`
+(`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`),
+`curl --data-urlencode query@<file>` (POST form) on `/loki/api/v1/query`;
+query text built as `count_over_time({app="a…a"}[1m])` padded to the exact
+byte length (and, corroborating, the bare-selector shape `{app="a…a"}`).
+The 400 body is exactly 51 bytes with **no trailing newline** (`od -c`
+verified), and the headers were `Content-Type: text/plain; charset=utf-8`
++ `X-Content-Type-Options: nosniff` — PulsusDB's JSON envelope container
+divergence is #264's, not this row's.
+
+```pulsus-279-cap
+| id | query-bytes | shape | surface | reference-status | body |
+| C1 | 131071 | count_over_time(...[1m]) | /loki/api/v1/query | 200 | {"status":"success",...} (empty vector) |
+| C2 | 131072 | count_over_time(...[1m]) | /loki/api/v1/query | 400 | parse error : input size too long (131072 > 131072) |
+| C3 | 131071 | bare selector | /loki/api/v1/query | 400 | log queries are not supported as an instant query type, ... (parser ACCEPTED the text; the rejection is the instant-log-query type check downstream of parse) |
+| C4 | 131072 | bare selector | /loki/api/v1/query | 400 | parse error : input size too long (131072 > 131072) |
+```
+
 ## Issue #244 — `/detected_fields` corpus (`b14_detected_fields.test`)
 
 ### The `eval detected` directive
