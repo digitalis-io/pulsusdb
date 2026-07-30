@@ -8597,43 +8597,208 @@ fn group_key(labels: &[(String, String)], grouping: Option<&Grouping>) -> LabelS
     kv
 }
 
-/// Population variance (the reference oracle's `stdvar` semantics —
-/// live-probed: `stdvar` of `1,2,3,4` is `1.25`, i.e. `/n`, not the
-/// sample `/(n-1)`).
-fn population_variance(vals: &[f64]) -> f64 {
-    let n = vals.len() as f64;
-    let mean = vals.iter().sum::<f64>() / n;
-    vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n
+/// **The reduction-order pin** (issue #236 Part B, task-manager ruling
+/// "Option B").
+///
+/// [`VectorAccum`] transcribes the reference's Welford recurrence, which
+/// is **order-sensitive**: a group's `avg`/`stddev`/`stdvar` depends on
+/// the order its members are accumulated in. PulsusDB's member order is
+/// the order series arrive from the leaf, and the leaf emits by walking a
+/// `HashMap` (`ClientAggState::finish` over `label_groups`/`fp_groups`).
+/// Rust's default hasher is randomly seeded PER PROCESS, so without this
+/// pin the same query returns different bits on different runs —
+/// measured at 6 failures in 20 runs of `logqltest_corpus` before the pin
+/// existed.
+///
+/// So the members are put in a total order that is a property of the
+/// DATA, not of a hash seed: ascending by label set, which is the series'
+/// own identity and the canonical order used throughout this crate.
+/// Applied once per stage, immediately before grouping — never inside a
+/// group's reduce (that would be `O(k log k)` per group on the read hot
+/// path) — and AFTER the selection/reorder early returns, so
+/// `select_k_*`/`sort_instant` keep their existing order contracts
+/// untouched.
+///
+/// **Residual, stated because "deterministic" must not be read as
+/// "identical".** This makes PulsusDB reproducible; it does not make it
+/// order-identical to the reference, which walks a Go map and is itself
+/// nondeterministic here (measured 10/2 over 12 runs on identical data).
+/// The committed `b4_vector_aggs.test` captures land in a wide majority
+/// basin — enumerating all 24 member orders of `{2,4,6,8}`, 20 of them
+/// (including ascending) produce exactly the captured
+/// `stdvar=5.0`/`stddev=2.23606797749979` — so the green corpus is real
+/// evidence that this pin agrees with the reference on that data. It is
+/// NOT proof that the sorted order is the reference's: on other data a
+/// different member order could differ in the last bit. Plan v14's risk
+/// #6 called these values "not capturable"; the accurate statement,
+/// established by that enumeration, is **capturable but not
+/// order-independent**.
+fn pin_reduction_order<T>(series: &mut [T], labels_of: impl Fn(&T) -> &LabelSet) {
+    series.sort_by(|a, b| labels_of(a).cmp(labels_of(b)));
 }
 
-fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
-    match op {
-        VectorAggOp::Sum => vals.iter().sum(),
-        VectorAggOp::Avg => vals.iter().sum::<f64>() / vals.len() as f64,
-        VectorAggOp::Min => vals.iter().cloned().fold(f64::INFINITY, f64::min),
-        VectorAggOp::Max => vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-        VectorAggOp::Count => vals.len() as f64,
-        VectorAggOp::Stddev => population_variance(vals).sqrt(),
-        VectorAggOp::Stdvar => population_variance(vals),
-        // Documented invariant: topk/bottomk are per-step SELECTIONS, not
-        // reductions — `group_range`/`group_instant` branch to
-        // `select_k_*` before ever calling `reduce`.
-        VectorAggOp::Topk | VectorAggOp::Bottomk => {
-            unreachable!("topk/bottomk are selections, dispatched before reduce")
-        }
-        // approx_topk is an instant-only selection (issue #221): the
-        // planner rejects it for range specs (`parse_vector_agg_params`),
-        // so it can never reach a matrix, and `group_instant` dispatches
-        // it before `reduce` — same contract as the arms above.
-        VectorAggOp::ApproxTopk => {
-            unreachable!("approx_topk is an instant-only selection, dispatched before reduce")
-        }
-        // sort/sort_desc reorder the result vector — `group_instant`
-        // (reorder) / `group_range` (passthrough) branch before `reduce`.
-        VectorAggOp::Sort | VectorAggOp::SortDesc => {
-            unreachable!("sort/sort_desc reorder, dispatched before reduce")
+/// The reference's per-op STREAMING accumulator, transcribed arm for arm
+/// from grafana/loki v3.7.4 `pkg/logql/evaluator.go` — seed `:479-486`
+/// (plus the `Stddev`/`Stdvar` zeroing at `:491-492`), update `:522-580`,
+/// finish `:586-596`.
+///
+/// Used by BOTH [`reduce`] and the range fold, so instant and range can
+/// never disagree on a value. It is simultaneously:
+///
+/// * **the parity fix.** PulsusDB previously computed `avg` as
+///   `sum/len` and `stddev`/`stdvar` through a two-pass
+///   `population_variance`; the reference uses Welford's online
+///   recurrence, which produces DIFFERENT bits. And an all-NaN `min`/`max`
+///   group folded to `±INF` here where the reference yields `NaN` (its
+///   `group.value < s.F || IsNaN(group.value)` test seeds from the first
+///   member and only ever replaces a NaN accumulator).
+/// * **the enabler.** It is O(1) per group, which is what lets the fold
+///   retain state proportional to OUTPUT groups rather than scanned ones.
+///
+/// Order-sensitivity, stated: Welford is not associative, so a group's
+/// value depends on member order. The reference iterates a Go map and is
+/// therefore order-NONDETERMINISTIC for `avg`/`stddev`/`stdvar` (measured
+/// 10/2 over 12 runs on identical data), which is why those ops are
+/// proved here by source-cited unit goldens and are NOT capturable from a
+/// container. PulsusDB pins a deterministic order — the same treatment
+/// the instant `first_over_time`/`last_over_time` tie already gets.
+#[derive(Clone, Copy, Debug)]
+struct VectorAccum {
+    value: f64,
+    mean: f64,
+    count: u64,
+}
+
+impl VectorAccum {
+    /// `evaluator.go:479-486` — the first member seeds `value` AND `mean`
+    /// with its own sample and `groupCount` with 1; `:491-492` then zeroes
+    /// `value` for `stddev`/`stdvar` (their `value` accumulates M2, not a
+    /// running total).
+    fn seed(op: VectorAggOp, f: f64) -> Self {
+        let value = match op {
+            VectorAggOp::Stddev | VectorAggOp::Stdvar => 0.0,
+            _ => f,
+        };
+        VectorAccum {
+            value,
+            mean: f,
+            count: 1,
         }
     }
+
+    /// `evaluator.go:522-580`, arm for arm.
+    fn update(&mut self, op: VectorAggOp, f: f64) {
+        match op {
+            // `:527` group.value += s.F
+            VectorAggOp::Sum => self.value += f,
+            // `:530-531` groupCount++; mean += (s.F - mean) / groupCount
+            VectorAggOp::Avg => {
+                self.count += 1;
+                self.mean += (f - self.mean) / self.count as f64;
+            }
+            // `:534-536` if group.value < s.F || IsNaN(group.value)
+            VectorAggOp::Max => {
+                if self.value < f || self.value.is_nan() {
+                    self.value = f;
+                }
+            }
+            // `:539-541` if group.value > s.F || IsNaN(group.value)
+            VectorAggOp::Min => {
+                if self.value > f || self.value.is_nan() {
+                    self.value = f;
+                }
+            }
+            // `:544` groupCount++
+            VectorAggOp::Count => self.count += 1,
+            // `:547-550` Welford: delta = s.F - mean; mean += delta/n;
+            //            value += delta * (s.F - mean)   [the NEW mean]
+            VectorAggOp::Stddev | VectorAggOp::Stdvar => {
+                self.count += 1;
+                let delta = f - self.mean;
+                self.mean += delta / self.count as f64;
+                self.value += delta * (f - self.mean);
+            }
+            // Selections and reorders never reach a reducing accumulator —
+            // `group_range`/`group_instant` and the fold dispatch them to
+            // `select_k_*`/`sort_instant` first. Guarded by
+            // `is_reduction`, whose exhaustive match is the single source
+            // of truth for this partition.
+            VectorAggOp::Topk
+            | VectorAggOp::Bottomk
+            | VectorAggOp::ApproxTopk
+            | VectorAggOp::Sort
+            | VectorAggOp::SortDesc => {
+                unreachable!("{op:?} is a selection/reorder, dispatched before any accumulator")
+            }
+        }
+    }
+
+    /// `evaluator.go:586-596`.
+    fn finish(self, op: VectorAggOp) -> f64 {
+        match op {
+            // `:588` aggr.value = aggr.mean
+            VectorAggOp::Avg => self.mean,
+            // `:591` aggr.value = float64(aggr.groupCount)
+            VectorAggOp::Count => self.count as f64,
+            // `:594` sqrt(value / groupCount)
+            VectorAggOp::Stddev => (self.value / self.count as f64).sqrt(),
+            // `:596` value / groupCount
+            VectorAggOp::Stdvar => self.value / self.count as f64,
+            // Sum/Min/Max carry their answer in `value` untouched.
+            VectorAggOp::Sum | VectorAggOp::Min | VectorAggOp::Max => self.value,
+            VectorAggOp::Topk
+            | VectorAggOp::Bottomk
+            | VectorAggOp::ApproxTopk
+            | VectorAggOp::Sort
+            | VectorAggOp::SortDesc => {
+                unreachable!("{op:?} is a selection/reorder, dispatched before any accumulator")
+            }
+        }
+    }
+
+    /// The reducing/selecting partition over `VectorAggOp`, as ONE
+    /// exhaustive match with no `_` arm — a new operator is a build
+    /// failure here until it is dispositioned, rather than silently
+    /// landing in whichever branch the caller happened to write.
+    fn is_reduction(op: VectorAggOp) -> bool {
+        match op {
+            VectorAggOp::Sum
+            | VectorAggOp::Avg
+            | VectorAggOp::Min
+            | VectorAggOp::Max
+            | VectorAggOp::Count
+            | VectorAggOp::Stddev
+            | VectorAggOp::Stdvar => true,
+            VectorAggOp::Topk
+            | VectorAggOp::Bottomk
+            | VectorAggOp::ApproxTopk
+            | VectorAggOp::Sort
+            | VectorAggOp::SortDesc => false,
+        }
+    }
+}
+
+/// Reduces a materialised group through [`VectorAccum`], so the
+/// materialising path and the streaming fold compute the SAME bits.
+///
+/// `vals` is never empty at any call site (a group exists because a
+/// member created it), which is what makes the `seed`-then-`update`
+/// shape total; the `unwrap_or(f64::NAN)` is defence-in-depth, matching
+/// the reference's own behaviour of emitting no group at all rather than
+/// a sentinel.
+fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
+    debug_assert!(
+        VectorAccum::is_reduction(op),
+        "reduce called with the selection/reorder op {op:?}"
+    );
+    let Some((first, rest)) = vals.split_first() else {
+        return f64::NAN;
+    };
+    let mut acc = VectorAccum::seed(op, *first);
+    for v in rest {
+        acc.update(op, *v);
+    }
+    acc.finish(op)
 }
 
 /// `sort`/`sort_desc` order an instant result vector by value: ascending
@@ -8906,6 +9071,11 @@ fn group_range(
     if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
         return series;
     }
+    // Issue #236: the same pin as `group_instant`. `members` is walked in
+    // push order at every step below, so pinning the push order pins the
+    // per-step accumulation order for every step at once.
+    let mut series = series;
+    pin_reduction_order(&mut series, |s| &s.labels);
     let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new();
     for s in series {
         groups
@@ -8957,6 +9127,11 @@ fn group_instant(
     if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
         return sort_instant(series, op);
     }
+    // Issue #236: pin the reduction order before grouping — see
+    // `pin_reduction_order`. Welford is order-sensitive and the incoming
+    // order is a hash walk.
+    let mut series = series;
+    pin_reduction_order(&mut series, |s| &s.labels);
     let mut groups: HashMap<LabelSet, Vec<f64>> = HashMap::new();
     for s in series {
         groups
@@ -14331,6 +14506,254 @@ mod tests {
     fn n_variant_query(n: usize, variant: &str, common: &str) -> String {
         let list = vec![variant; n].join(", ");
         format!("variants({list}) of ({common})")
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #236 Part B — `VectorAccum`, the reference's streaming
+    // accumulator.
+    // -----------------------------------------------------------------
+
+    /// AC 6 — every reducing arm reproduces grafana/loki v3.7.4
+    /// `pkg/logql/evaluator.go` at the EXACT BITS, with each assertion
+    /// carrying its line cite.
+    ///
+    /// The three datasets are chosen so each op DISCRIMINATES against the
+    /// pre-#236 formula (`sum/len` for avg, a two-pass
+    /// `population_variance` for stddev/stdvar): reverting any one arm
+    /// changes the asserted bits. Compared through `to_bits`, never `==`
+    /// — one float rendering is a prefix of another and `assert_eq!` on
+    /// `f64` hides a last-bit difference in the printed output.
+    #[test]
+    fn vector_accum_reproduces_the_reference_recurrence_bit_for_bit() {
+        fn run(op: VectorAggOp, vals: &[f64]) -> f64 {
+            let mut acc = VectorAccum::seed(op, vals[0]);
+            for v in &vals[1..] {
+                acc.update(op, *v);
+            }
+            acc.finish(op)
+        }
+
+        // `:530-531` avg — Welford mean, NOT `sum/len`. Two-pass gives
+        // 4610184818551597739; the recurrence gives one ULP below.
+        assert_eq!(
+            run(VectorAggOp::Avg, &[1.0, 1.0, 3.0]).to_bits(),
+            4610184818551597738u64,
+            "avg must be the Welford mean (evaluator.go:530-531, :588)"
+        );
+
+        // `:547-550` + `:596` stdvar — M2/n. Two-pass gives
+        // 4597174419628082972.
+        assert_eq!(
+            run(VectorAggOp::Stdvar, &[1.0, 1.0, 2.0]).to_bits(),
+            4597174419628082973u64,
+            "stdvar must be Welford M2/n (evaluator.go:547-550, :596)"
+        );
+
+        // `:547-550` + `:594` stddev — sqrt(M2/n). Two-pass gives
+        // 4612489961860455552.
+        assert_eq!(
+            run(VectorAggOp::Stddev, &[1.0, 1.0, 6.0]).to_bits(),
+            4612489961860455551u64,
+            "stddev must be sqrt(Welford M2/n) (evaluator.go:547-550, :594)"
+        );
+
+        // `:527` sum, `:544`+`:591` count — unchanged by the port.
+        assert_eq!(run(VectorAggOp::Sum, &[1.0, 2.0, 4.0]), 7.0);
+        assert_eq!(run(VectorAggOp::Count, &[9.0, 9.0, 9.0]), 3.0);
+
+        // `:534-541` min/max over an ALL-NaN group is NaN, not ±INF.
+        //
+        // **Where the behavioural difference actually lives — measured,
+        // not assumed.** The defect was the SEED, not the comparison:
+        // PulsusDB's old `fold(f64::INFINITY, f64::min)` started from an
+        // infinity that no member could displace, because Rust's
+        // `f64::min` prefers the non-NaN operand. Seeding from the first
+        // member (as `evaluator.go:481` does) is what fixes it.
+        //
+        // The `|| IsNaN(group.value)` disjunct is transcription fidelity
+        // rather than a second behavioural fix: substituting
+        // `self.value.min(f)` for the whole arm leaves every assertion
+        // below passing, because Rust's `f64::min`/`max` already agree
+        // with the reference's comparison on all three NaN placements.
+        // Recorded so nobody reads these cases as pinning the disjunct —
+        // they pin the seed.
+        let nans = [f64::NAN, f64::NAN, f64::NAN];
+        assert!(
+            run(VectorAggOp::Min, &nans).is_nan(),
+            "all-NaN min must be NaN (evaluator.go:539-541)"
+        );
+        assert!(
+            run(VectorAggOp::Max, &nans).is_nan(),
+            "all-NaN max must be NaN (evaluator.go:534-536)"
+        );
+
+        // ...but a NaN seed followed by a real sample takes the real one
+        // (the `IsNaN(group.value)` disjunct), and a real seed followed by
+        // NaN keeps the real one (every comparison with NaN is false).
+        assert_eq!(run(VectorAggOp::Max, &[f64::NAN, 5.0]), 5.0);
+        assert_eq!(run(VectorAggOp::Min, &[f64::NAN, 5.0]), 5.0);
+        assert_eq!(run(VectorAggOp::Max, &[5.0, f64::NAN]), 5.0);
+        assert_eq!(run(VectorAggOp::Min, &[5.0, f64::NAN]), 5.0);
+    }
+
+    /// Issue #236 Part B — the reduction-order pin is a GATE, not a
+    /// convention.
+    ///
+    /// Welford is order-sensitive, so a hash-walk member order makes
+    /// `avg`/`stddev`/`stdvar` vary between runs. This drives
+    /// `group_instant`/`group_range` over EVERY permutation of a dataset
+    /// known to discriminate (`{2,4,6,8}`: 20 of its 24 orders give
+    /// `stdvar` exactly `5.0`, the other 4 give `4.999999999999999`) and
+    /// asserts one single output value across all of them.
+    ///
+    /// Without the pin this fails on 4 of the 24 inputs; the assertion
+    /// therefore cannot pass vacuously, and the unit is PERMUTATIONS OF
+    /// THE INPUT SERIES VECTOR, not runs of the process — which makes it
+    /// deterministic in CI rather than a 1-in-6 flake.
+    #[test]
+    fn the_reduction_order_pin_makes_welford_input_order_independent() {
+        /// Every permutation of `[0, 1, 2, 3]` (Heap's algorithm,
+        /// iterative). Written out rather than pulling in a combinatorics
+        /// dependency the plan does not specify.
+        fn permutations_of_four() -> Vec<[usize; 4]> {
+            let mut out = Vec::with_capacity(24);
+            let mut a = [0usize, 1, 2, 3];
+            let mut c = [0usize; 4];
+            out.push(a);
+            let mut i = 1;
+            while i < 4 {
+                if c[i] < i {
+                    if i % 2 == 0 {
+                        a.swap(0, i);
+                    } else {
+                        a.swap(c[i], i);
+                    }
+                    out.push(a);
+                    c[i] += 1;
+                    i = 1;
+                } else {
+                    c[i] = 0;
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        let vals = [2.0f64, 4.0, 6.0, 8.0];
+        let perms = permutations_of_four();
+        assert_eq!(
+            perms.len(),
+            24,
+            "the unit is PERMUTATIONS of the input vector"
+        );
+        // Distinct label sets, so the pin has a total order to impose and
+        // every permutation is a genuinely different input vector.
+        let labels_for =
+            |v: f64| -> LabelSet { vec![("host".to_string(), format!("h{}", v as u64))] };
+
+        for op in [VectorAggOp::Stdvar, VectorAggOp::Stddev, VectorAggOp::Avg] {
+            let mut instant_seen: BTreeSet<u64> = BTreeSet::new();
+            let mut range_seen: BTreeSet<u64> = BTreeSet::new();
+
+            for perm in &perms {
+                let instant: Vec<InstantSeries> = perm
+                    .iter()
+                    .map(|&i| InstantSeries {
+                        labels: labels_for(vals[i]),
+                        value: vals[i],
+                    })
+                    .collect();
+                // Bare aggregation (`grouping: None`) collapses all four
+                // into ONE group, which is what exposes member order.
+                let out = group_instant(instant, op, None, None);
+                assert_eq!(out.len(), 1);
+                instant_seen.insert(out[0].value.to_bits());
+
+                let range: Vec<RangeSeries> = perm
+                    .iter()
+                    .map(|&i| RangeSeries {
+                        labels: labels_for(vals[i]),
+                        points: BTreeMap::from([(0i64, vals[i])]),
+                    })
+                    .collect();
+                let out = group_range(range, op, None, None);
+                assert_eq!(out.len(), 1);
+                range_seen.insert(out[0].points[&0].to_bits());
+            }
+
+            assert_eq!(
+                instant_seen.len(),
+                1,
+                "group_instant {op:?} produced {} distinct values across the 24 \
+                 member orders — the reduction-order pin is not holding: {instant_seen:?}",
+                instant_seen.len()
+            );
+            assert_eq!(
+                range_seen.len(),
+                1,
+                "group_range {op:?} produced {} distinct values across the 24 \
+                 member orders — the reduction-order pin is not holding: {range_seen:?}",
+                range_seen.len()
+            );
+            // Instant and range must also agree with EACH OTHER — the
+            // whole point of both routing through `VectorAccum`.
+            assert_eq!(instant_seen, range_seen, "{op:?} instant/range disagree");
+        }
+
+        // ...and the pinned value is the one the committed corpus
+        // captured from the reference (the 20-of-24 majority basin).
+        let instant: Vec<InstantSeries> = vals
+            .iter()
+            .map(|v| InstantSeries {
+                labels: labels_for(*v),
+                value: *v,
+            })
+            .collect();
+        let out = group_instant(instant, VectorAggOp::Stdvar, None, None);
+        assert_eq!(
+            out[0].value.to_bits(),
+            5.0f64.to_bits(),
+            "the pin must reproduce b4_vector_aggs.test's captured stdvar"
+        );
+    }
+
+    /// `reduce` and the accumulator are the SAME computation — the
+    /// property that lets the range fold and the materialising instant
+    /// path never disagree. Asserted on bits over every reducing op.
+    #[test]
+    fn reduce_routes_through_the_accumulator_for_every_reducing_op() {
+        const OPS: [VectorAggOp; 7] = [
+            VectorAggOp::Sum,
+            VectorAggOp::Avg,
+            VectorAggOp::Min,
+            VectorAggOp::Max,
+            VectorAggOp::Count,
+            VectorAggOp::Stddev,
+            VectorAggOp::Stdvar,
+        ];
+        let vals = [1.0, 1.0, 3.0, -2.5, 7.25];
+        for op in OPS {
+            assert!(VectorAccum::is_reduction(op), "{op:?}");
+            let mut acc = VectorAccum::seed(op, vals[0]);
+            for v in &vals[1..] {
+                acc.update(op, *v);
+            }
+            assert_eq!(
+                reduce(op, &vals).to_bits(),
+                acc.finish(op).to_bits(),
+                "reduce and VectorAccum must agree bit-for-bit on {op:?}"
+            );
+        }
+        // The partition is total and the selecting side is disjoint.
+        for op in [
+            VectorAggOp::Topk,
+            VectorAggOp::Bottomk,
+            VectorAggOp::ApproxTopk,
+            VectorAggOp::Sort,
+            VectorAggOp::SortDesc,
+        ] {
+            assert!(!VectorAccum::is_reduction(op), "{op:?}");
+        }
     }
 
     // -----------------------------------------------------------------

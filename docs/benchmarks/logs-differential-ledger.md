@@ -460,6 +460,49 @@ not "fix" us toward the panic.
   field that exists nowhere in the tree: owned by **#277**, a real
   parity bug deferred for sequencing, not an accepted shape.
 
+## Issue #236 — high-cardinality aggregations: the result-size cap
+
+- **(a) Result-series cap semantics.** *Reference:* `querier.max-query-series`
+  (default 500, `pkg/validation/limits.go:373`) counts the series a metric
+  query RETURNS, enforced on the final result (`pkg/logql/engine.go:538`
+  instant, `:588` accumulated across steps); nothing anywhere caps scanned
+  or inner-aggregation groups. *PulsusDB:* identical semantics, threshold
+  and `> cap` test, enforced by `ensure_result_series` on the whole
+  expression's output and read in exactly one place (gated by
+  `max_query_series_is_read_in_exactly_one_place`). Before #236 PulsusDB
+  applied its 500 MID-SCAN, rejecting a broad class of aggregations the
+  reference serves (`sum(...)` over 20,505 groups returned `{} 20505`
+  there and a 422 here); that divergence is CLOSED. The remaining
+  difference is the HTTP status — 422 `query_too_broad` where the
+  reference returns 400 — carrying the reference's verbatim body, under
+  the established matching-error-status precedent.
+
+- **(b) `avg`/`stddev`/`stdvar` member order.** *Reference:* computes these
+  with Welford's online recurrence (`pkg/logql/evaluator.go:547-550`,
+  finish `:586-596`), which is ORDER-SENSITIVE, and accumulates in Go map
+  order — so the reference is nondeterministic run to run on identical
+  data (measured 10/2 over 12 runs). *PulsusDB:* ports the recurrence
+  bit-for-bit (so the values are the reference's, not the former
+  `sum/len` + two-pass `population_variance`) and then PINS the member
+  order ascending by label set, one sort per stage before grouping
+  (`pin_reduction_order`), because PulsusDB's own incoming order is a
+  randomly-seeded `HashMap` walk. Without the pin the same query returned
+  different bits on different runs — 6 failures in 20 runs of
+  `logqltest_corpus`; with it, 20/20.
+
+  **Residual, and it must not be over-read.** Deterministic is not the
+  same as order-identical to the reference. The committed
+  `b4_vector_aggs.test` captures sit in a wide majority basin —
+  enumerating all 24 member orders of `{2,4,6,8}`, 20 of them (including
+  ascending) yield exactly the captured `stdvar=5.0` /
+  `stddev=2.23606797749979` — so the green corpus is genuine evidence
+  that the pin agrees with the reference on that data. It is NOT proof
+  that the sorted order IS the reference's: on other data a different
+  member order could differ in the last bit, and no order can match a
+  source that does not reproduce itself. What PulsusDB guarantees is
+  reproducibility; agreement with any single reference run is only
+  established where captured.
+
 ## Issue #230 — `line_format`/`label_format` template engine
 
 The full Go `text/template` + reference function-map surface landed in
