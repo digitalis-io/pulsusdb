@@ -3700,6 +3700,12 @@ fn variants_range_matrix_carries_the_index_per_series() {
 /// helper-definition exclusion the substring version needed is gone by
 /// construction; so is the self-reference one, because a route name
 /// written as a string literal is not a call expression either.
+///
+/// Known limit: a call is attributed to its callee PATH, so a call through
+/// a binding or a function value (`let f = combine_binary; f(..)`) is
+/// counted against the binding's name. The walk does not resolve bindings;
+/// the census compensates by pinning EXACT counts rather than floors, so
+/// such a miscount shows up as a failure instead of being absorbed.
 mod call_sites {
     use std::collections::BTreeMap;
     use syn::visit::Visit;
@@ -3833,44 +3839,57 @@ mod call_sites {
 /// fixtures does. That arm guards a future state (every direct route
 /// migrated onto `run_client`) in which the caveat must go too, and it is
 /// deliberately not claimed to be mutation-demonstrable.
+///
+/// **The counts are pinned exactly, not floored** (whole-branch re-review
+/// round 5 `[low]`). Every number this file's prose names — 25
+/// `apply_vector_aggs_ok`, 6 `materialize_vector_lit`, 44 `combine_binary`
+/// and 1 `run_variants_rows` direct sites, 76 as their sum, and 38
+/// `run_client` sites — is asserted with `assert_eq!`. Be precise about
+/// what that buys. It does NOT teach the walk to resolve bindings:
+/// `syn::ExprCall` records the callee's PATH, so `let f = combine_binary;
+/// f(lhs, rhs)` is counted against `f`, not against `combine_binary`, and
+/// that blind spot is still open. What the exact pin does is make the
+/// resulting miscount VISIBLE — an exact count fails in BOTH directions,
+/// where a `> 0` floor only fails downward past zero and absorbs a lost
+/// site in silence. The pins are brittle on purpose: tripping one is the
+/// prompt to re-read `run_client`'s scope caveat and confirm the sentence
+/// still describes the population.
 #[test]
 fn every_client_routed_fixture_is_an_equivalence_case() {
     const CAVEAT: &str = "which is not the same as every fixture in the file";
-    // The direct population, exactly as the doc above enumerates it.
-    const DIRECT_ROUTES: [&str; 4] = [
-        "apply_vector_aggs_ok",
-        "materialize_vector_lit",
-        "combine_binary",
-        "run_variants_rows",
+    // The direct population, exactly as the doc above enumerates it, with
+    // the site count each name is pinned to.
+    const DIRECT_ROUTES: [(&str, usize); 4] = [
+        ("apply_vector_aggs_ok", 25),
+        ("materialize_vector_lit", 6),
+        ("combine_binary", 44),
+        ("run_variants_rows", 1),
     ];
+    // 38 real call sites. The floor of 40 the first cut used was met only
+    // because a substring census counted its own `run_client(` literals.
+    const ROUTED_SITES: usize = 38;
     let src = include_str!("logql_metric_agg_golden.rs");
     // Nothing inside `run_client` is a fixture — neither a call site
     // (there are none) nor the `apply_vector_aggs_ok` that builds the
     // materialised twin.
     let counted = call_sites::walk(src, &["run_client"]);
     let site_count = |name: &str| counted.calls.get(name).copied().unwrap_or(0);
-    // 38 real call sites. The floor of 40 the first cut used was met only
-    // because a substring census counted its own `run_client(` literals.
     let routed = site_count("run_client");
-    assert!(
-        routed >= 38,
-        "only {routed} fixtures route through run_client — AC 7's equivalence assertion is \
-         narrower than it looks"
-    );
-    let per_route: Vec<(&str, usize)> = DIRECT_ROUTES
+    let per_route: Vec<(&str, usize, usize)> = DIRECT_ROUTES
         .iter()
-        .map(|route| (*route, site_count(route)))
+        .map(|(route, pinned)| (*route, site_count(route), *pinned))
         .collect();
-    let direct: usize = per_route.iter().map(|(_, n)| n).sum();
+    let direct: usize = per_route.iter().map(|(_, n, _)| n).sum();
     // The claim and the mechanism, side by side: the caveat must exist
     // exactly while the direct fixtures do. `direct` is 25 + 6 + 44 + 1 =
     // 76. The caveat is read out of `run_client`'s OWN doc comment — the
     // sentence that makes the claim — so this cannot be satisfied by the
     // string appearing anywhere else in the file, including here.
     //
-    // This assertion runs BEFORE the per-route floors below (whole-branch
-    // re-review round 3 `[low]`): emptying the direct population also
-    // drives every route's count to 0, so a per-route `n > 0` placed first
+    // This assertion runs BEFORE the pinned counts below (whole-branch
+    // re-review round 3 `[low]`, kept in round 5): emptying the direct
+    // population also drives every route's count to 0, and migrating those
+    // fixtures onto `run_client` moves `routed`, so a count pinned first
     // panics and the `direct == 0` direction of this biconditional can
     // never be reached — leaving a two-way claim with one live direction.
     let claim = counted
@@ -3882,14 +3901,25 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
         direct > 0,
         "AC 7's scope caveat and its {direct} direct fixtures must appear and disappear together"
     );
+    assert_eq!(
+        routed, ROUTED_SITES,
+        "{routed} fixtures route through run_client, not the pinned {ROUTED_SITES}, which is the \
+         population AC 7's equivalence assertion covers. If you added or removed a run_client \
+         fixture, update this pin AND re-read run_client's scope caveat to check it is still \
+         true; if you did not, this census has drifted from the source it parses"
+    );
     // Per route, not just in total: the doc names four ways to drive the
-    // engine without a folded twin, and a name that no longer has one
-    // makes the sentence wrong even while the others keep `direct > 0`.
-    for (route, n) in per_route {
-        assert!(
-            n > 0,
-            "no fixture drives {route} directly any more — AC 7's caveat still names it, so \
-             either the doc's enumeration or this census is stale"
+    // engine without a folded twin, and a count that moves under any one
+    // of them makes the sentence wrong even while the others hold `direct`
+    // above zero.
+    for (route, n, pinned) in per_route {
+        assert_eq!(
+            n, pinned,
+            "{route} has {n} direct call sites, not the pinned {pinned}. If you added or removed \
+             a fixture on this route, update the pinned count here AND re-read run_client's scope \
+             caveat to check it is still true — forcing that re-read is why the count is pinned \
+             rather than floored; if you touched no fixture, this census has drifted from the \
+             source it parses"
         );
     }
 }
