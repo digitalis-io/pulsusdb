@@ -3737,29 +3737,34 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
         "only {routed} fixtures route through run_client — AC 7's equivalence assertion is \
          narrower than it looks"
     );
-    // Per route, not just in total: the doc names four ways to drive the
-    // engine without a folded twin, and a name that no longer has one
-    // makes the sentence wrong even while the others keep `direct > 0`.
-    let direct: usize = DIRECT_ROUTES
+    let per_route: Vec<(&str, usize)> = DIRECT_ROUTES
         .iter()
-        .map(|route| {
-            let n = direct_sites(route);
-            assert!(
-                n > 0,
-                "no fixture drives {route} directly any more — AC 7's caveat still names it, so \
-                 either the doc's enumeration or this census is stale"
-            );
-            n
-        })
-        .sum();
+        .map(|route| (*route, direct_sites(route)))
+        .collect();
+    let direct: usize = per_route.iter().map(|(_, n)| n).sum();
     // The claim and the mechanism, side by side, in BOTH directions: the
-    // caveat must exist exactly while the direct fixtures do. Today the
-    // failing direction is deleting the caveat while `direct` is 25 + 6 +
-    // 44 + 1 = 76; the other direction retires the caveat if the direct
-    // population is ever emptied.
+    // caveat must exist exactly while the direct fixtures do. One
+    // direction deletes the caveat while `direct` is 25 + 6 + 44 + 1 = 76;
+    // the other keeps the caveat after the direct population is emptied.
+    //
+    // This assertion runs BEFORE the per-route floors below (whole-branch
+    // re-review round 3 `[low]`): emptying the direct population also
+    // drives every route's count to 0, so a per-route `n > 0` placed first
+    // panics and the `direct == 0` direction of this biconditional can
+    // never be reached — leaving a two-way claim with one live direction.
     assert_eq!(
         suite.contains(CAVEAT),
         direct > 0,
         "AC 7's scope caveat and its {direct} direct fixtures must appear and disappear together"
     );
+    // Per route, not just in total: the doc names four ways to drive the
+    // engine without a folded twin, and a name that no longer has one
+    // makes the sentence wrong even while the others keep `direct > 0`.
+    for (route, n) in per_route {
+        assert!(
+            n > 0,
+            "no fixture drives {route} directly any more — AC 7's caveat still names it, so \
+             either the doc's enumeration or this census is stale"
+        );
+    }
 }

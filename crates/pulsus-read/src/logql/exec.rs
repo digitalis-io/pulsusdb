@@ -9223,7 +9223,14 @@ impl Drop for GroupKeyCharge<'_> {
 /// `retained + one transient`, which is what charging before allocating
 /// necessarily costs.
 ///
-/// `the_fold_charges_before_it_builds_a_group_key` pins the statement
+/// The guard is built IMMEDIATELY after the charge lands and BEFORE
+/// `group_key` runs, because a guard cannot refund a charge it does not
+/// yet own: `group_key` allocates, so an unwinding panic inside it would
+/// otherwise unwind past a charge with nothing holding the refund. Three
+/// steps, in this order — charge, guard, build — and no fallible or
+/// allocating step between the first two.
+///
+/// `the_fold_charges_before_it_builds_a_group_key` pins that statement
 /// ORDER inside this function: a behavioural test cannot see the
 /// inversion (the transient key is built either way), so the ordering is
 /// checked where it is written.
@@ -9235,8 +9242,9 @@ fn charged_group_key<'a>(
 ) -> Result<(LabelSet, GroupKeyCharge<'a>), ReadError> {
     let bytes = group_key_bytes(labels, grouping).saturating_add(map_entry_bytes(FOLD_GROUP_SLOT));
     charge_group_bytes(charged, bytes, cap)?;
+    let charge = GroupKeyCharge { charged, bytes };
     let key = group_key(labels, grouping);
-    Ok((key, GroupKeyCharge { charged, bytes }))
+    Ok((key, charge))
 }
 
 fn group_key(labels: &[(String, String)], grouping: Option<&Grouping>) -> LabelSet {
@@ -12230,10 +12238,11 @@ mod tests {
     /// **The ordering, checked where it is written.** A behavioural test
     /// cannot distinguish charge-then-build from build-then-charge — the
     /// transient key is allocated either way and the refusal lands at the
-    /// same point — so the statement order inside `charged_group_key` is
-    /// asserted directly, and the fold is asserted to reach `group_key`
-    /// through NOTHING ELSE and to commit its [`GroupKeyCharge`] only
-    /// after the insertion that retains the key.
+    /// same point — so the three-step order inside `charged_group_key`
+    /// (charge, guard, build) is asserted directly, and the fold is
+    /// asserted to reach `group_key` through NOTHING ELSE and to commit
+    /// its [`GroupKeyCharge`] only after the insertion that retains the
+    /// key.
     #[test]
     fn the_fold_charges_before_it_builds_a_group_key() {
         let src = include_str!("exec.rs");
@@ -12248,6 +12257,9 @@ mod tests {
         let charge = body
             .find("charge_group_bytes(")
             .expect("charged_group_key must charge");
+        let guard = body
+            .find("GroupKeyCharge { charged, bytes }")
+            .expect("charged_group_key must build the refund guard");
         let build = body
             .find("group_key(labels, grouping)")
             .expect("charged_group_key must build the key");
@@ -12255,6 +12267,17 @@ mod tests {
             charge < build,
             "charged_group_key builds the key BEFORE charging for it — the charge must precede \
              the allocation, not observe it"
+        );
+        // And the guard sits BETWEEN them. `group_key` allocates, so a
+        // guard constructed after it leaves a window in which an
+        // unwinding panic passes a charge that nothing owns: the guard
+        // cannot refund a charge it does not yet have. Compiles either
+        // way — `group_key` does not touch `charged` — so the position
+        // is asserted where it is written.
+        assert!(
+            charge < guard && guard < build,
+            "charged_group_key must construct its GroupKeyCharge between the charge and the key \
+             — a guard built after group_key cannot refund a charge it does not yet own"
         );
 
         // And the two fold bodies reach `group_key` only through it: a
