@@ -93,15 +93,16 @@ pub fn terminal_sort(expr: &Expr) -> bool {
     )
 }
 
-pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut};
+pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETECTED_FIELD_BYTES};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
-    ClientWindow, EngineConfig, GridWindow, HistMatrixSeries, HistOrFloat, HistVectorSample,
-    LogQlEngine, LogStats, MAX_VARIANT_FANOUT_STATE_BYTES, MatrixSeries, PatternSeries,
-    QueryResult, StreamResult, TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage,
-    TailSetup, VARIANT_LABEL, VariantArena, VariantsAggState, VectorSample, VolumeAggregateBy,
-    VolumeEntry, VolumeQuery, append_variant_label, apply_vector_aggs, combine_binary,
-    materialize_vector_lit, read_query_settings, run_client_agg_rows, run_variants_rows,
+    ClientWindow, DetectedFieldsProbe, EngineConfig, GridWindow, HistMatrixSeries, HistOrFloat,
+    HistVectorSample, LogQlEngine, LogStats, MAX_FEEDER_SCRATCH_BYTES,
+    MAX_VARIANT_FANOUT_STATE_BYTES, MatrixSeries, PatternSeries, QueryResult, StreamResult,
+    TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, VARIANT_LABEL,
+    VariantArena, VariantsAggState, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
+    append_variant_label, apply_vector_aggs, combine_binary, materialize_vector_lit,
+    read_query_settings, run_client_agg_rows, run_variants_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{

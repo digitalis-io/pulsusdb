@@ -1,0 +1,15 @@
+# Issue #244/#261 — the registered `/detected_fields` cardinality divergence:
+# PulsusDB reports the EXACT distinct-value count; the reference reports a
+# p14 HyperLogLog estimate (grafana/loki v3.7.4 = b318f2829f0ae2094ab3a1e90780450e9e4b03be,
+# vendored github.com/axiomhq/hyperloglog, `New()` = p14 sparse). Values
+# inserted per row: "v0".."v{n-1}", fresh sketch per n (capture procedure in
+# tests/logqltest/PROVENANCE.md §244; program deleted, checkout byte-clean).
+# The estimate equals the exact count for every n <= 5327; the first
+# divergence is n = 5328. Every kept row DISAGREES by construction (AC 19).
+# columns: n_distinct <TAB> reference_estimate <TAB> pulsus_exact <TAB> ledger_id <TAB> note
+5328	5327	5328	detected-cardinality-exact-not-estimated	sparse-key collision "v2888"/"v5327" (key 52686402) — the first off-by-one
+7708	7719	7708	detected-cardinality-exact-not-estimated	first dense n for this family
+8192	8230	8192	detected-cardinality-exact-not-estimated	dense estimator
+10000	10049	10000	detected-cardinality-exact-not-estimated	dense estimator
+20000	20155	20000	detected-cardinality-exact-not-estimated	dense estimator
+50000	49894	50000	detected-cardinality-exact-not-estimated	dense estimator (under-estimate)

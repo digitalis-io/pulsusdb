@@ -169,6 +169,49 @@ Out of this ledger's scope by design:
 
 ## Entries
 
+### detected-cardinality-exact-not-estimated (issues #244, #261)
+
+- **Construct:** `/detected_fields`' per-field `cardinality` (and, when
+  issue #261 lands its sibling audit, `/detected_labels`' — cross-reference
+  #261). Informational note, not a gate downgrade.
+- **Direction:** **PulsusDB reports the EXACT distinct-value count** over
+  the sampled entries; the reference reports a **p14 HyperLogLog
+  estimate** (`grafana/loki` v3.7.4 =
+  `b318f2829f0ae2094ab3a1e90780450e9e4b03be`,
+  `pkg/querier/queryrange/detected_fields.go` `parsedFields.sketch`,
+  vendored `github.com/axiomhq/hyperloglog` `New()` = precision 14,
+  sparse). The estimate equals the exact count for every `N <= 5327`;
+  the first divergence is `N = 5328` (sparse-key collision
+  `"v2888"`/`"v5327"`), captured with the pre-committed larger points in
+  `crates/pulsus-read/tests/golden/detected_cardinality/reference_divergence.tsv`
+  and pinned by `detected_fields_witness.rs`'s AC 19 gate (our side is
+  recomputed through the production accumulator; the reference column is
+  the recorded estimate).
+- **Reachability — NOT ESTABLISHED.** The divergence is real and is
+  registered here at the ESTIMATOR level; the largest per-field
+  cardinality reachable through the HTTP endpoint is **not established,
+  and no bound is claimed**. An earlier revision of this entry asserted
+  that `N >= 5328` was unreachable at default limits, reasoning from
+  "one value per key per entry" and `line_limit <= 5000`. **That premise
+  is false:** a SINGLE sampled row can contribute distinct values for
+  the same key more than once — once from its structured-metadata pairs
+  and again from the auto-parse pass over the post-pipeline line (both
+  call `observe_pair` for the same row; `crates/pulsus-read/src/logql/exec.rs`,
+  `observe_detected_row` / `auto_parse_observe`) — so 5 328 distinct
+  values fit comfortably inside 5 000 sampled rows. Deriving the true
+  maximum needs that per-row multiplicity argued exactly, on both
+  stores; a second wrong bound in this entry would be worse than an
+  acknowledged gap, so none is given. What IS established: every
+  `crates/pulsus-read/tests/logqltest/corpus/b14_detected_fields.test`
+  case captures a cardinality `<= 100`, far inside the agreeing range,
+  so every corpus case is pure hard-gated parity rather than a
+  divergence.
+- **Fixture status:** `/detected_fields` has no case in
+  `test/fixtures/logs/differential.json`, so this entry is not referenced
+  from the fixture (`informational_cases_are_recorded_in_the_committed_ledger`
+  guards fixture-referenced entries only); it is registered here so the
+  divergence has a ledger identity before any future fixture case lands.
+
 ### tumbling-vs-sliding-rate — RESOLVED (issue #227)
 
 - **Status:** RESOLVED. The former tumbling divergence is fixed — RANGE

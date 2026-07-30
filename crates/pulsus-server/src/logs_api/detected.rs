@@ -10,8 +10,11 @@
 //!   matching** entries (structured metadata + pipeline extractions +
 //!   json/logfmt auto-detection); `query` is required and accepts the
 //!   full log-selector grammar including pipelines; metric queries are
-//!   400. Budget-truncated sampling is signaled by the additive
-//!   `pulsus_partial: true` response key (omitted when false).
+//!   400. Budget-truncated sampling OR a retention-capped cardinality
+//!   (issue #244: the server-side `MAX_DETECTED_FIELD_BYTES` ceiling
+//!   refused a distinct value/name — clamped and served, never an error)
+//!   is signaled by the additive `pulsus_partial: true` response key
+//!   (omitted when false).
 //!
 //! Both are `GET|POST` form-encoded (the house `/labels`/`/series`
 //! precedent — a documented deviation from api.md's earlier GET-only
