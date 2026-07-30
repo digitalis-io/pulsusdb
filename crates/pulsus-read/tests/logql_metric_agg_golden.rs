@@ -140,15 +140,26 @@ fn bit_canonical(result: &QueryResult) -> Vec<BitSeries> {
 /// compile → aggregate → vector aggs — exactly the engine's post-fetch
 /// sequence.
 ///
-/// **Issue #236 AC 7 rides here, on EVERY fixture in this file.** The
+/// **Issue #236 AC 7 rides here — on every fixture that goes THROUGH
+/// this helper, which is not the same as every fixture in the file.** The
 /// engine folds the innermost vector aggregation at the range leaf
 /// (`run_client_agg_rows_folded`) instead of materialising the leaf's
 /// output and aggregating it afterwards (`run_client_agg_rows` +
 /// `apply_vector_aggs`). Those two must agree BIT FOR BIT — the fold
 /// changes memory, not values — so this helper runs both and asserts it,
-/// then returns the folded one (what the engine actually returns). A
-/// fixture added to this file is an equivalence case automatically; there
-/// is no list of "the range fixtures" to keep in step with the file.
+/// then returns the folded one (what the engine actually returns). Any
+/// fixture routed here is an equivalence case automatically; there is no
+/// list of "the range fixtures" to keep in step.
+///
+/// **The scope, stated because the earlier wording overstated it**
+/// (review round 1 `[low]`): fixtures that drive the engine by another
+/// door — `materialize_vector_lit` for `vector(...)`, the direct
+/// `apply_vector_aggs` reducer/selection goldens, the `combine_binary`
+/// cases and the `run_variants_rows` fan-out — never reach the folded
+/// leaf, so there is no second path to compare them against and they
+/// execute no bit-equality assertion here.
+/// `every_client_routed_fixture_is_an_equivalence_case` counts what does
+/// ride, so the claim and the mechanism cannot drift apart.
 fn run_client(
     query: &str,
     params: &QueryParams,
@@ -3669,4 +3680,42 @@ fn variants_range_matrix_carries_the_index_per_series() {
     // count at the 60s grid point sees both rows; bytes sees 4 bytes.
     assert_eq!(items[0].points.last(), Some(&(60 * NS, 2.0)));
     assert_eq!(items[1].points.last(), Some(&(60 * NS, 4.0)));
+}
+
+/// AC 7's scope, counted rather than claimed (review round 1 `[low]`).
+///
+/// The bit-equality assertion executes for fixtures routed through
+/// `run_client`; fixtures that drive `materialize_vector_lit`,
+/// `apply_vector_aggs`, `combine_binary` or `run_variants_rows` directly
+/// have no folded twin to compare against. This test reads the suite's
+/// own source and pins both counts, so a sentence claiming "every
+/// fixture" cannot outlive the mechanism again.
+#[test]
+fn every_client_routed_fixture_is_an_equivalence_case() {
+    let src = include_str!("logql_metric_agg_golden.rs");
+    let body = src
+        .split_once("fn run_client(")
+        .expect("run_client exists")
+        .1;
+    let routed = body.matches("run_client(").count();
+    let direct = src.matches("apply_vector_aggs_ok(").count()
+        + src.matches("materialize_vector_lit(").count()
+        + src.matches("run_variants_rows(").count();
+    assert!(
+        routed >= 40,
+        "only {routed} fixtures route through run_client — AC 7's equivalence assertion is \
+         narrower than it looks"
+    );
+    assert!(
+        direct > 0,
+        "if nothing drives the engine directly any more, AC 7's scope caveat is stale and the \
+         doc should say `every fixture` again"
+    );
+    // The claim and the mechanism, side by side: the caveat must exist
+    // exactly while the direct fixtures do.
+    assert!(
+        body.contains("which is not the same as every fixture in the file")
+            || src.contains("which is not the same as every fixture in the file"),
+        "AC 7's scope caveat has been removed while direct fixtures still exist"
+    );
 }

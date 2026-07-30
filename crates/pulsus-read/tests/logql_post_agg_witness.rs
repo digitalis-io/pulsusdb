@@ -4873,13 +4873,29 @@ const STAGE_DATA_TYPES: &[&str] = &[
 /// requiring it only sometimes would make the token optional, which is no
 /// token at all.
 ///
-/// **Why these two are safe to share**, which is what a third candidate
-/// would have to demonstrate: both are PURE FUNCTIONS OF THEIR ARGUMENTS
-/// that allocate nothing into the funnel's accounting — `group_key`
-/// returns a freshly-built `LabelSet` the caller owns and charges for,
-/// and `pin_reduction_order` sorts a slice IN PLACE. Neither retains
-/// anything, neither is input-scaled beyond the element it is handed, and
-/// neither can outlive the caller's charge.
+/// **Why these two are safe to share, restated to what is TRUE** (review
+/// round 1's `[high]`: the first version of this reason said `group_key`
+/// returns a `LabelSet` "the caller owns and charges for", and the FOLD
+/// caller did not charge for it — a property true of the funnel path and
+/// false of the fold path, which is the path the class exists for).
+///
+/// * `pin_reduction_order` sorts a slice **in place** and allocates
+///   nothing beyond the sort's own scratch. It is safe under any
+///   charging regime because it adds no retained bytes to either.
+/// * `group_key` **does** allocate — one owned `String` per `by` name,
+///   read off the query text. It is safe to share because **every** route
+///   to it charges first, in its own regime: the funnel's callers are
+///   covered by `Ledger::acquire`'s `W_GROUPNAME · series ·
+///   group_name_bytes` term, and the fold reaches it only through
+///   `charged_group_key`, which charges `group_key_bytes(...) +
+///   map_entry_bytes(FOLD_GROUP_SLOT)` against the leaf's
+///   `MAX_CLIENT_AGG_GROUP_BYTES` **before** building the key
+///   (`exec.rs`, pinned by `the_fold_charges_before_it_builds_a_group_key`
+///   and `the_fold_charges_a_group_key_before_group_key_allocates_it`).
+///
+/// So the property a third candidate must demonstrate is not "allocates
+/// nothing" — it is **"every calling regime charges for what it
+/// allocates, before it allocates it"**, named per regime.
 ///
 /// The list is a NAME LIST on purpose. A membership rule would let a
 /// future function step out of the funnel simply by acquiring a second
@@ -5171,9 +5187,19 @@ fn the_shared_class_admits_exactly_its_two_named_members() {
         .iter()
         .filter(|m| m.allocates && m.stage_data && !m.mints)
         .filter(|m| {
+            // The client leaf's own charging regime, by its entry points:
+            // the two fold states, the slider that drives them, and
+            // `charged_group_key` — the fold's single charged route to
+            // `group_key` (review round 1's `[high]`).
+            const LEAF_REGIME: [&str; 4] = [
+                "ReduceFold::",
+                "SelectFold::",
+                "RangeSlideState::",
+                "charged_group_key",
+            ];
             m.external_callers
                 .iter()
-                .any(|c| c.contains("Fold::") || c.contains("RangeSlideState::"))
+                .any(|c| LEAF_REGIME.iter().any(|r| c.contains(r)))
         })
         .map(|m| m.name.as_str())
         .collect();
@@ -5227,11 +5253,11 @@ fn the_external_caller_map_of_the_funnel_closure_is_pinned() {
 
     let want: Vec<(String, Vec<String>)> = vec![
         (
+            // Since review round 1's `[high]` the fold reaches `group_key`
+            // through ONE charging route instead of two direct call
+            // sites, which is why this entry shrank.
             "group_key".to_string(),
-            vec![
-                "exec.rs::ReduceFold::push_series".to_string(),
-                "exec.rs::SelectFold::push_series".to_string(),
-            ],
+            vec!["exec.rs::charged_group_key".to_string()],
         ),
         (
             "pin_reduction_order".to_string(),

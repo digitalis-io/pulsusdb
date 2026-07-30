@@ -3613,12 +3613,24 @@ pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
 /// (`pkg/logql/engine.go:538` instant / first step, `:588` distinct
 /// series accumulated across steps; frontend duplicate at
 /// `pkg/querier/queryrange/limits.go:518`) — **never** on scanned groups,
-/// inner-aggregation groups or binary operands. Live-probed at v3.7.4
-/// over 600 distinct `| logfmt` groups: `sum(...)`, `count(...)`,
-/// `topk(3, ...)`, `sum(topk(600, ...))` and a wide-operand binop
-/// collapsing to one series are all served; a bare leaf over 501 groups,
-/// `sort(...)` and `sum by (id) (...)` are all rejected. Exactly 500
-/// served, 501 rejected.
+/// inner-aggregation groups or binary operands — **that is the LIMIT's
+/// documented meaning, and it is what PulsusDB implements.**
+///
+/// **What the reference actually does, captured at 501 groups** (the
+/// `b15_wide_aggregation.test` capture, boundary confirmed at 499 / 500 /
+/// 501): it serves `sum`, `count`, `min`, `max`, `avg`,
+/// `sum by (<low-cardinality>)` and `sum(sum by (id) (...))`, and it
+/// REJECTS `topk(k)`, `bottomk(k)`, `stddev`, `stdvar`, `sort`,
+/// `sum by (id)`, the bare leaf and `sum(topk(600, ...))` — the last of
+/// these even though its result is one series. The split is
+/// SHARDABILITY, not result size: the reference's frontend rewrites the
+/// associative aggregations into per-shard sub-queries so the wide inner
+/// vector never materialises, while the others materialise it and trip
+/// the cap on that intermediate. PulsusDB applies the limit to the final
+/// result only and therefore SERVES the non-shardable ones — an
+/// over-acceptance registered as ledger entry `#236 (f)`, in the
+/// direction that matters: PulsusDB rejects nothing the reference
+/// serves. Exactly 500 served, 501 rejected, on both sides.
 ///
 /// **Read by [`ensure_result_series`] and by nothing else** (issue #236).
 /// Applying it to an intermediate would reject on a *proxy* rather than
@@ -4573,6 +4585,17 @@ const FP_GROUP_SLOT: usize = size_of::<(u64, BucketAcc)>();
 /// default()` yields exactly this).
 static EMPTY_LABEL_SET: LabelSet = Vec::new();
 
+/// The map-entry slot a FOLD group occupies. Both fold maps are keyed by
+/// the `LabelSet` the grouping projects; the value differs per fold, so
+/// the larger of the two is charged (over-charging is the safe
+/// direction, and one constant keeps the two sites speaking one
+/// vocabulary).
+const FOLD_GROUP_SLOT: usize = {
+    let reduce = size_of::<(LabelSet, Vec<VectorAccum>)>();
+    let select = size_of::<(LabelSet, Vec<KSel>)>();
+    if reduce > select { reduce } else { select }
+};
+
 /// A `Vec` element sized through the map-entry helper — issue #236 P2.
 /// `series_out` is a `Vec`, not a map, so this is a deliberate
 /// OVER-charge: both leaf paths then speak ONE vocabulary
@@ -5343,7 +5366,12 @@ impl<'q> RangeSlideState<'q> {
     /// keeping it out of `new` leaves that constructor's branch/allocation
     /// census (issue #221 `logql_variants_alloc`) untouched.
     fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
-        self.fold = VectorAggFold::new(spec, self.grid(), self.caps.result_points);
+        self.fold = VectorAggFold::new(
+            spec,
+            self.grid(),
+            self.caps.result_points,
+            self.caps.group_bytes,
+        );
     }
 
     /// How many trailing (innermost) specs this leaf has taken over: 0 or
@@ -6091,7 +6119,11 @@ impl<'q> RangeSlideState<'q> {
         match self.fold.take() {
             None => Ok(QueryResult::Matrix(series)),
             Some(mut fold) => {
-                pin_reduction_order(&mut series, |s| &s.labels);
+                pin_reduction_order(
+                    &mut series,
+                    |s| &s.labels,
+                    |a, b| range_payload_cmp(a.points.iter().copied(), b.points.iter().copied()),
+                );
                 for s in series {
                     fold.push_series(&s.labels, &s.points)?;
                 }
@@ -9090,6 +9122,81 @@ struct InstantSeries {
     value: f64,
 }
 
+/// The bytes [`group_key`] is ABOUT TO allocate for `labels`/`grouping`,
+/// computed without allocating them — the fold's charge-before-allocate
+/// needs the size before the key exists.
+///
+/// It mirrors `group_key`'s projection arm for arm and prices the result
+/// through the leaf's own vocabulary ([`alloc_block_bytes`] per owned
+/// `String`, one exactly-reserved element buffer), which is
+/// [`label_set_bytes`] evaluated on a `LabelSet` that has not been built.
+/// `group_key_bytes_matches_group_key` pins the two together, so the
+/// sizing cannot drift from the thing it sizes.
+fn group_key_bytes(labels: &[(String, String)], grouping: Option<&Grouping>) -> u64 {
+    let Some(g) = grouping else {
+        // `group_key` returns `Vec::new()`, which allocates nothing.
+        return 0;
+    };
+    let mut bytes: u64 = 0;
+    let mut pairs: u64 = 0;
+    match g.kind {
+        GroupingKind::By => {
+            for name in &g.labels {
+                let value_len = labels
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map_or(0, |(_, v)| v.len());
+                bytes = bytes
+                    .saturating_add(alloc_block_bytes(name.len() as u64))
+                    .saturating_add(alloc_block_bytes(value_len as u64));
+                pairs += 1;
+            }
+        }
+        GroupingKind::Without => {
+            for (k, v) in labels {
+                if g.labels.contains(k) {
+                    continue;
+                }
+                bytes = bytes
+                    .saturating_add(alloc_block_bytes(k.len() as u64))
+                    .saturating_add(alloc_block_bytes(v.len() as u64));
+                pairs += 1;
+            }
+        }
+    }
+    // `group_key` collects into an exactly-reserved buffer and then
+    // `sort()`s it in place; the sort allocates a scratch of at most the
+    // same size, which the `grown_alloc_bytes` growth model covers.
+    let elems = pairs.saturating_mul(size_of::<(String, String)>() as u64);
+    bytes.saturating_add(grown_alloc_bytes(elems))
+}
+
+/// **The fold's only route to [`group_key`]** — charge, THEN allocate,
+/// in ONE place so the ordering is read once rather than repeated at
+/// every call site (issue #236 review round 1 `[high]`).
+///
+/// Returns the key and the bytes charged for it; a caller that finds the
+/// group already present refunds them, because the key is transient
+/// there and the counter tracks what is RETAINED. The bound therefore
+/// covers `retained + one transient`, which is what charging before
+/// allocating necessarily costs.
+///
+/// `the_fold_charges_before_it_builds_a_group_key` pins the statement
+/// ORDER inside this function: a behavioural test cannot see the
+/// inversion (the transient key is built either way), so the ordering is
+/// checked where it is written.
+fn charged_group_key(
+    labels: &[(String, String)],
+    grouping: Option<&Grouping>,
+    charged: &mut u64,
+    cap: u64,
+) -> Result<(LabelSet, u64), ReadError> {
+    let bytes = group_key_bytes(labels, grouping).saturating_add(map_entry_bytes(FOLD_GROUP_SLOT));
+    charge_group_bytes(charged, bytes, cap)?;
+    let key = group_key(labels, grouping);
+    Ok((key, bytes))
+}
+
 fn group_key(labels: &[(String, String)], grouping: Option<&Grouping>) -> LabelSet {
     let Some(g) = grouping else {
         return Vec::new();
@@ -9158,8 +9265,45 @@ fn group_key(labels: &[(String, String)], grouping: Option<&Grouping>) -> LabelS
 /// #6 called these values "not capturable"; the accurate statement,
 /// established by that enumeration, is **capturable but not
 /// order-independent**.
-fn pin_reduction_order<T>(series: &mut [T], labels_of: impl Fn(&T) -> &LabelSet) {
-    series.sort_by(|a, b| labels_of(a).cmp(labels_of(b)));
+fn pin_reduction_order<T>(
+    series: &mut [T],
+    labels_of: impl Fn(&T) -> &LabelSet,
+    payload_cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
+    series.sort_by(|a, b| {
+        labels_of(a)
+            .cmp(labels_of(b))
+            .then_with(|| payload_cmp(a, b))
+    });
+}
+
+/// A total order on an instant series' payload — its value's BITS, so
+/// `NaN` orders too (`total_cmp`, never `partial_cmp`).
+fn instant_payload_cmp(a: &InstantSeries, b: &InstantSeries) -> std::cmp::Ordering {
+    a.value.total_cmp(&b.value)
+}
+
+/// A total order on a range series' payload: the `(timestamp, value)`
+/// sequence, lexicographically, values by BITS. Allocates nothing.
+fn range_payload_cmp(
+    a: impl Iterator<Item = (i64, f64)>,
+    b: impl Iterator<Item = (i64, f64)>,
+) -> std::cmp::Ordering {
+    let mut a = a;
+    let mut b = b;
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some((ta, va)), Some((tb, vb))) => {
+                let o = ta.cmp(&tb).then_with(|| va.total_cmp(&vb));
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+        }
+    }
 }
 
 /// The reference's per-op STREAMING accumulator, transcribed arm for arm
@@ -9803,6 +9947,13 @@ struct ReduceFold {
     /// BEFORE the dense vector below is allocated (issue #236).
     slots: u64,
     slot_cap: u64,
+    /// Retained group-key bytes, charged through [`charge_group_bytes`]
+    /// BEFORE [`group_key`] builds the key (issue #236 review round 1
+    /// `[high]`). A `by(...)` clause is read off the QUERY TEXT, so
+    /// without this the fold retained query-text-derived label bytes with
+    /// nothing bounding them.
+    group_bytes: u64,
+    group_cap: u64,
 }
 
 impl ReduceFold {
@@ -9821,8 +9972,25 @@ impl ReduceFold {
         // the fact.
         let charged = &mut self.slots;
         let cap = self.slot_cap;
-        let slots = match self.groups.entry(group_key(labels, self.grouping.as_ref())) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        // The KEY's bytes are charged before `group_key` builds it —
+        // `group_key` allocates one owned `String` per `by` NAME, read
+        // off the query text, and the entry expression would otherwise
+        // evaluate it before any charge (review round 1 `[high]`). A
+        // group that turns out to be Occupied refunds immediately: the
+        // key is transient there, and the counter tracks what is
+        // RETAINED.
+        let (key, key_bytes) = charged_group_key(
+            labels,
+            self.grouping.as_ref(),
+            &mut self.group_bytes,
+            self.group_cap,
+        )?;
+        let group_bytes = &mut self.group_bytes;
+        let slots = match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                discharge_group_bytes(group_bytes, key_bytes);
+                e.into_mut()
+            }
             std::collections::hash_map::Entry::Vacant(e) => {
                 charge_result_points(charged, grid.slots() as u64, cap)?;
                 e.insert(vec![VectorAccum::EMPTY; grid.slots()])
@@ -9881,6 +10049,9 @@ struct SelectFold {
     /// `KSel::Many` heap, which the dense reservation does not cover.
     slots: u64,
     slot_cap: u64,
+    /// Retained group-key bytes — see [`ReduceFold::group_bytes`].
+    group_bytes: u64,
+    group_cap: u64,
 }
 
 impl SelectFold {
@@ -9898,8 +10069,20 @@ impl SelectFold {
         // CHARGE, THEN ALLOCATE — as `ReduceFold::push_series`.
         let charged = &mut self.slots;
         let cap = self.slot_cap;
-        let slots = match self.groups.entry(group_key(labels, self.grouping.as_ref())) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        // CHARGE, THEN ALLOCATE — as `ReduceFold::push_series`, and for
+        // the same reason.
+        let (key, key_bytes) = charged_group_key(
+            labels,
+            self.grouping.as_ref(),
+            &mut self.group_bytes,
+            self.group_cap,
+        )?;
+        let group_bytes = &mut self.group_bytes;
+        let slots = match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                discharge_group_bytes(group_bytes, key_bytes);
+                e.into_mut()
+            }
             std::collections::hash_map::Entry::Vacant(e) => {
                 charge_result_points(charged, grid.slots() as u64, cap)?;
                 e.insert(vec![KSel::Empty; grid.slots()])
@@ -10043,7 +10226,12 @@ impl VectorAggFold {
     /// reducing arm against [`VectorAccum::is_reduction`], so a new
     /// operator is a build failure here rather than a silent
     /// misclassification.
-    fn new(spec: &plan::VectorAggSpec, grid: FoldGrid, slot_cap: u64) -> Option<Self> {
+    fn new(
+        spec: &plan::VectorAggSpec,
+        grid: FoldGrid,
+        slot_cap: u64,
+        group_cap: u64,
+    ) -> Option<Self> {
         let (op, grouping, param) = spec;
         match *op {
             VectorAggOp::Sort | VectorAggOp::SortDesc | VectorAggOp::ApproxTopk => None,
@@ -10062,6 +10250,8 @@ impl VectorAggFold {
                     next_series: 0,
                     slots: 0,
                     slot_cap,
+                    group_bytes: 0,
+                    group_cap,
                 }))
             }
             VectorAggOp::Sum
@@ -10077,6 +10267,8 @@ impl VectorAggFold {
                 groups: HashMap::new(),
                 slots: 0,
                 slot_cap,
+                group_bytes: 0,
+                group_cap,
             })),
         }
     }
@@ -10267,7 +10459,16 @@ fn group_range(
     // push order at every step below, so pinning the push order pins the
     // per-step accumulation order for every step at once.
     let mut series = series;
-    pin_reduction_order(&mut series, |s| &s.labels);
+    pin_reduction_order(
+        &mut series,
+        |s| &s.labels,
+        |a, b| {
+            range_payload_cmp(
+                a.points.iter().map(|(t, v)| (*t, *v)),
+                b.points.iter().map(|(t, v)| (*t, *v)),
+            )
+        },
+    );
     let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new();
     for s in series {
         groups
@@ -10325,7 +10526,7 @@ fn group_instant(
     // `pin_reduction_order`. Welford is order-sensitive and the incoming
     // order is a hash walk.
     let mut series = series;
-    pin_reduction_order(&mut series, |s| &s.labels);
+    pin_reduction_order(&mut series, |s| &s.labels, instant_payload_cmp);
     let mut groups: HashMap<LabelSet, Vec<f64>> = HashMap::new();
     for s in series {
         groups
@@ -11986,6 +12187,202 @@ mod tests {
         assert_eq!(state.result_points, 22, "a refused charge must not stick");
     }
 
+    /// **The ordering, checked where it is written.** A behavioural test
+    /// cannot distinguish charge-then-build from build-then-charge — the
+    /// transient key is allocated either way and the refusal lands at the
+    /// same point — so the statement order inside `charged_group_key` is
+    /// asserted directly, and the fold is asserted to reach `group_key`
+    /// through NOTHING ELSE.
+    #[test]
+    fn the_fold_charges_before_it_builds_a_group_key() {
+        let src = include_str!("exec.rs");
+        let start = src
+            .find("fn charged_group_key(")
+            .expect("the fold's charged route to group_key");
+        let end = src[start..]
+            .find("\nfn group_key(")
+            .expect("the end of charged_group_key")
+            + start;
+        let body = &src[start..end];
+        let charge = body
+            .find("charge_group_bytes(")
+            .expect("charged_group_key must charge");
+        let build = body
+            .find("group_key(labels, grouping)")
+            .expect("charged_group_key must build the key");
+        assert!(
+            charge < build,
+            "charged_group_key builds the key BEFORE charging for it — the charge must precede \
+             the allocation, not observe it"
+        );
+
+        // And the two fold bodies reach `group_key` only through it: a
+        // direct call there would reintroduce the reviewed defect at a
+        // site this census does not read.
+        for anchor in ["impl ReduceFold {", "impl SelectFold {"] {
+            let s = src.find(anchor).unwrap_or_else(|| panic!("{anchor} moved"));
+            let e = src[s + anchor.len()..]
+                .find("\nimpl ")
+                .map_or(src.len(), |o| s + anchor.len() + o);
+            let region = &src[s..e];
+            assert!(
+                region.contains("charged_group_key("),
+                "{anchor} must reach group_key through charged_group_key"
+            );
+            assert!(
+                !region.contains("group_key(labels, self.grouping"),
+                "{anchor} calls group_key DIRECTLY — the fold has no funnel token and must \
+                 charge in its own regime first"
+            );
+        }
+    }
+
+    /// `group_key_bytes` sizes exactly what `group_key` allocates. If the
+    /// two drift the charge stops meaning anything, so they are pinned
+    /// against each other over both grouping kinds, absent names, empty
+    /// values and the no-grouping case.
+    #[test]
+    fn group_key_bytes_matches_group_key() {
+        let labels = fold_labels(&[("id", "abc"), ("host", ""), ("zone", "eu-west-1")]);
+        let cases: Vec<Option<Grouping>> = vec![
+            None,
+            Some(Grouping {
+                kind: GroupingKind::By,
+                labels: vec!["id".to_string()],
+            }),
+            Some(Grouping {
+                kind: GroupingKind::By,
+                labels: vec!["id".to_string(), "absent".to_string(), "host".to_string()],
+            }),
+            Some(Grouping {
+                kind: GroupingKind::By,
+                labels: (0..64).map(|i| format!("absent{i:03}")).collect(),
+            }),
+            Some(Grouping {
+                kind: GroupingKind::Without,
+                labels: vec!["id".to_string()],
+            }),
+            Some(Grouping {
+                kind: GroupingKind::Without,
+                labels: vec!["nothing".to_string()],
+            }),
+        ];
+        for g in &cases {
+            let built = group_key(&labels, g.as_ref());
+            let sized = group_key_bytes(&labels, g.as_ref());
+            let actual = if built.is_empty() && g.is_none() {
+                0
+            } else {
+                label_set_bytes(&built)
+            };
+            assert!(
+                sized >= actual,
+                "{g:?}: sized {sized} under-charges the {actual} bytes group_key allocates"
+            );
+            // And it must not be a blanket over-charge either: the only
+            // slack is `grown_alloc_bytes` vs `alloc_block_bytes` on the
+            // element buffer, a factor of 3 on one term.
+            assert!(
+                sized <= actual.saturating_mul(3).saturating_add(96),
+                "{g:?}: sized {sized} is not a tight bound on {actual}"
+            );
+        }
+    }
+
+    /// **Review round 1's `[high]`, as a gate.** The fold charges a
+    /// group's KEY bytes before `group_key` builds it: a refused key is
+    /// never retained, the map never grows, and the counter does not
+    /// stick. Mutant shape: moving the charge after the `entry`
+    /// expression, or deleting it, reddens here.
+    #[test]
+    fn the_fold_charges_a_group_key_before_group_key_allocates_it() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 10,
+            kmax: 4,
+        };
+        // A `by(...)` clause whose names come from the QUERY TEXT — the
+        // bytes that were unbounded before this charge existed.
+        // One PRESENT distinguishing name, so distinct series land in
+        // distinct groups; the other 64 are absent from the data and
+        // exist only in the query text — which is the mass this charge
+        // exists to bound.
+        let wide = Grouping {
+            kind: GroupingKind::By,
+            labels: std::iter::once("id".to_string())
+                .chain((0..64).map(|i| format!("qtext{i:04}")))
+                .collect(),
+        };
+        let labels = fold_labels(&[("id", "a")]);
+        let key_bytes =
+            group_key_bytes(&labels, Some(&wide)).saturating_add(map_entry_bytes(FOLD_GROUP_SLOT));
+        assert!(key_bytes > 0, "a 64-name by-clause must cost something");
+
+        for op in [VectorAggOp::Sum, VectorAggOp::Topk] {
+            let param = matches!(op, VectorAggOp::Topk).then_some(2.0);
+            // One byte short of the first key.
+            let mut fold = VectorAggFold::new(
+                &(op, Some(wide.clone()), param),
+                grid,
+                u64::MAX,
+                key_bytes - 1,
+            )
+            .expect("folds");
+            match fold.push_series(&labels, &[(0, 1.0)]) {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes {
+                    bytes,
+                    cap,
+                })) => {
+                    assert_eq!(cap, key_bytes - 1);
+                    assert_eq!(bytes, key_bytes);
+                }
+                other => panic!("{op:?}: expected MetricGroupLabelBytes, got {other:?}"),
+            }
+            assert_eq!(
+                fold.groups(),
+                0,
+                "{op:?}: the refused group's key must never be retained"
+            );
+            assert_eq!(
+                fold.cells(),
+                0,
+                "{op:?}: nothing may be allocated behind a refused key"
+            );
+
+            // Room for ONE retained key plus the one TRANSIENT key a push
+            // must be able to build before it can be compared: the charge
+            // precedes the allocation, so the bound necessarily covers
+            // `retained + 1`. A second DISTINCT group needs a third and
+            // breaches.
+            let mut fold = VectorAggFold::new(
+                &(op, Some(wide.clone()), param),
+                grid,
+                u64::MAX,
+                2 * key_bytes,
+            )
+            .expect("folds");
+            fold.push_series(&labels, &[(0, 1.0)])
+                .expect("the first group fits");
+            assert_eq!(fold.groups(), 1);
+            // Re-pushing the SAME group REFUNDS its transient key: without
+            // the refund the counter would climb on every row of an
+            // existing group and the fold would refuse its own data.
+            fold.push_series(&labels, &[(10, 2.0)])
+                .expect("an existing group refunds its transient key");
+            assert_eq!(fold.groups(), 1);
+            let second = fold_labels(&[("id", "b")]);
+            fold.push_series(&second, &[(0, 1.0)])
+                .expect("a second retained group fits the two-key budget");
+            assert_eq!(fold.groups(), 2);
+            let third = fold_labels(&[("id", "c")]);
+            match fold.push_series(&third, &[(0, 1.0)]) {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { .. })) => {}
+                other => panic!("{op:?}: a third group must breach, got {other:?}"),
+            }
+            assert_eq!(fold.groups(), 2, "{op:?}: the refusal must not evict");
+        }
+    }
+
     /// The FOLD reserves its dense slots before the vector exists, and
     /// the reservation is the vector's own width.
     #[test]
@@ -12001,8 +12398,13 @@ mod tests {
             labels: vec!["id".to_string()],
         };
         // Two output groups' worth of room, three groups offered.
-        let mut fold = VectorAggFold::new(&(VectorAggOp::Sum, Some(by_id), None), grid, 2 * slots)
-            .expect("sum folds");
+        let mut fold = VectorAggFold::new(
+            &(VectorAggOp::Sum, Some(by_id), None),
+            grid,
+            2 * slots,
+            u64::MAX,
+        )
+        .expect("sum folds");
         for g in 0..2u32 {
             let labels = fold_labels(&[("id", &g.to_string())]);
             fold.push_series(&labels, &[(0, 1.0)]).expect("admitted");
@@ -12029,8 +12431,9 @@ mod tests {
 
         // The selecting fold charges the same dense reservation, plus one
         // for each candidate a slot retains beyond its first.
-        let mut fold = VectorAggFold::new(&(VectorAggOp::Topk, None, Some(2.0)), grid, 1_000)
-            .expect("topk folds");
+        let mut fold =
+            VectorAggFold::new(&(VectorAggOp::Topk, None, Some(2.0)), grid, 1_000, u64::MAX)
+                .expect("topk folds");
         fold.push_series(&fold_labels(&[("h", "a")]), &[(0, 1.0)])
             .expect("admitted");
         // One group's dense vector (5) + one candidate.
@@ -17659,58 +18062,77 @@ mod tests {
         );
         // Distinct label sets, so the pin has a total order to impose and
         // every permutation is a genuinely different input vector.
-        let labels_for =
+        //
+        // **Two label models, and the second is the one that matters**
+        // (review round 1 `[medium]`). With DISTINCT label sets the sort
+        // key alone is total, so the sweep could not see a pin that
+        // ordered only by labels — and equal label sets are exactly where
+        // Welford stays order-dependent, because `LabelSet::cmp` returns
+        // `Equal` and a stable sort then keeps the INPUT order. `Shared`
+        // is the case the sweep exists for, and it was the case the
+        // sweep excluded.
+        let distinct =
             |v: f64| -> LabelSet { vec![("host".to_string(), format!("h{}", v as u64))] };
+        let identical = |_: f64| -> LabelSet { vec![("host".to_string(), "same".to_string())] };
+        let models: [(&str, &dyn Fn(f64) -> LabelSet); 2] = [
+            ("distinct label sets", &distinct),
+            ("EQUAL label sets", &identical),
+        ];
 
         let mut charged = 0u64;
         let led = Ledger::for_test(&mut charged);
-        for op in [VectorAggOp::Stdvar, VectorAggOp::Stddev, VectorAggOp::Avg] {
-            let mut instant_seen: BTreeSet<u64> = BTreeSet::new();
-            let mut range_seen: BTreeSet<u64> = BTreeSet::new();
+        for (model, labels_for) in models {
+            for op in [VectorAggOp::Stdvar, VectorAggOp::Stddev, VectorAggOp::Avg] {
+                let mut instant_seen: BTreeSet<u64> = BTreeSet::new();
+                let mut range_seen: BTreeSet<u64> = BTreeSet::new();
 
-            for perm in &perms {
-                let instant: Vec<InstantSeries> = perm
-                    .iter()
-                    .map(|&i| InstantSeries {
-                        labels: labels_for(vals[i]),
-                        value: vals[i],
-                    })
-                    .collect();
-                // Bare aggregation (`grouping: None`) collapses all four
-                // into ONE group, which is what exposes member order.
-                let out = group_instant(instant, op, None, None, &led).expect("grouped");
-                assert_eq!(out.len(), 1);
-                instant_seen.insert(out[0].value.to_bits());
+                for perm in &perms {
+                    let instant: Vec<InstantSeries> = perm
+                        .iter()
+                        .map(|&i| InstantSeries {
+                            labels: labels_for(vals[i]),
+                            value: vals[i],
+                        })
+                        .collect();
+                    // Bare aggregation (`grouping: None`) collapses all four
+                    // into ONE group, which is what exposes member order.
+                    let out = group_instant(instant, op, None, None, &led).expect("grouped");
+                    assert_eq!(out.len(), 1);
+                    instant_seen.insert(out[0].value.to_bits());
 
-                let range: Vec<RangeSeries> = perm
-                    .iter()
-                    .map(|&i| RangeSeries {
-                        labels: labels_for(vals[i]),
-                        points: BTreeMap::from([(0i64, vals[i])]),
-                    })
-                    .collect();
-                let out = group_range(range, op, None, None, &led).expect("grouped");
-                assert_eq!(out.len(), 1);
-                range_seen.insert(out[0].points[&0].to_bits());
-            }
+                    let range: Vec<RangeSeries> = perm
+                        .iter()
+                        .map(|&i| RangeSeries {
+                            labels: labels_for(vals[i]),
+                            points: BTreeMap::from([(0i64, vals[i])]),
+                        })
+                        .collect();
+                    let out = group_range(range, op, None, None, &led).expect("grouped");
+                    assert_eq!(out.len(), 1);
+                    range_seen.insert(out[0].points[&0].to_bits());
+                }
 
-            assert_eq!(
-                instant_seen.len(),
-                1,
-                "group_instant {op:?} produced {} distinct values across the 24 \
+                assert_eq!(
+                    instant_seen.len(),
+                    1,
+                    "group_instant {op:?} over {model} produced {} distinct values across the 24 \
                  member orders — the reduction-order pin is not holding: {instant_seen:?}",
-                instant_seen.len()
-            );
-            assert_eq!(
-                range_seen.len(),
-                1,
-                "group_range {op:?} produced {} distinct values across the 24 \
+                    instant_seen.len()
+                );
+                assert_eq!(
+                    range_seen.len(),
+                    1,
+                    "group_range {op:?} over {model} produced {} distinct values across the 24 \
                  member orders — the reduction-order pin is not holding: {range_seen:?}",
-                range_seen.len()
-            );
-            // Instant and range must also agree with EACH OTHER — the
-            // whole point of both routing through `VectorAccum`.
-            assert_eq!(instant_seen, range_seen, "{op:?} instant/range disagree");
+                    range_seen.len()
+                );
+                // Instant and range must also agree with EACH OTHER — the
+                // whole point of both routing through `VectorAccum`.
+                assert_eq!(
+                    instant_seen, range_seen,
+                    "{op:?} over {model}: instant/range disagree"
+                );
+            }
         }
 
         // ...and the pinned value is the one the committed corpus
@@ -17718,7 +18140,7 @@ mod tests {
         let instant: Vec<InstantSeries> = vals
             .iter()
             .map(|v| InstantSeries {
-                labels: labels_for(*v),
+                labels: distinct(*v),
                 value: *v,
             })
             .collect();
@@ -17828,8 +18250,9 @@ mod tests {
             kmax: 3,
         };
         for op in REDUCING_OPS {
-            let fold = VectorAggFold::new(&(op, None, None), grid, MAX_METRIC_RESULT_POINTS)
-                .unwrap_or_else(|| panic!("{op:?} is reducing and must fold"));
+            let fold =
+                VectorAggFold::new(&(op, None, None), grid, MAX_METRIC_RESULT_POINTS, u64::MAX)
+                    .unwrap_or_else(|| panic!("{op:?} is reducing and must fold"));
             assert!(
                 matches!(fold, VectorAggFold::Reduce(_)),
                 "{op:?} must be a ReduceFold"
@@ -17848,18 +18271,33 @@ mod tests {
             VectorAggOp::ApproxTopk,
         ] {
             assert!(
-                VectorAggFold::new(&(op, None, Some(3.0)), grid, MAX_METRIC_RESULT_POINTS)
-                    .is_none(),
+                VectorAggFold::new(
+                    &(op, None, Some(3.0)),
+                    grid,
+                    MAX_METRIC_RESULT_POINTS,
+                    u64::MAX
+                )
+                .is_none(),
                 "{op:?} must be declined by the leaf"
             );
         }
         for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
             assert!(matches!(
-                VectorAggFold::new(&(op, None, Some(2.0)), grid, MAX_METRIC_RESULT_POINTS),
+                VectorAggFold::new(
+                    &(op, None, Some(2.0)),
+                    grid,
+                    MAX_METRIC_RESULT_POINTS,
+                    u64::MAX
+                ),
                 Some(VectorAggFold::Select(_))
             ));
             assert!(matches!(
-                VectorAggFold::new(&(op, None, Some(0.0)), grid, MAX_METRIC_RESULT_POINTS),
+                VectorAggFold::new(
+                    &(op, None, Some(0.0)),
+                    grid,
+                    MAX_METRIC_RESULT_POINTS,
+                    u64::MAX
+                ),
                 Some(VectorAggFold::Empty)
             ));
         }
@@ -17886,8 +18324,8 @@ mod tests {
         grid: FoldGrid,
         input: &[FoldInput],
     ) -> Vec<MatrixSeries> {
-        let mut fold =
-            VectorAggFold::new(spec, grid, MAX_METRIC_RESULT_POINTS).expect("this spec folds");
+        let mut fold = VectorAggFold::new(spec, grid, MAX_METRIC_RESULT_POINTS, u64::MAX)
+            .expect("this spec folds");
         for (labels, points) in input {
             fold.push_series(labels, points).expect("on-grid points");
         }
@@ -18082,6 +18520,7 @@ mod tests {
                 &(VectorAggOp::Sum, Some(grouping.clone()), None),
                 grid,
                 MAX_METRIC_RESULT_POINTS,
+                u64::MAX,
             )
             .expect("sum folds");
             for (labels, points) in leaf(n) {
@@ -18126,6 +18565,7 @@ mod tests {
                     &(op, grouping.clone(), Some(0.0)),
                     grid,
                     MAX_METRIC_RESULT_POINTS,
+                    u64::MAX,
                 )
                 .expect("k == 0 still folds");
                 for i in 0..501u32 {
@@ -18170,6 +18610,7 @@ mod tests {
             &(VectorAggOp::Sum, None, None),
             grid,
             MAX_METRIC_RESULT_POINTS,
+            u64::MAX,
         )
         .expect("sum folds");
         match fold.push_series(&Vec::new(), &[(105, 1.0)]) {
