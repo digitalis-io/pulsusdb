@@ -29,7 +29,7 @@
 //!
 //! Evaluation drives the SAME pure functions the engine executes — for a
 //! log query `CompiledPipeline::run` per loaded line; for a metric query
-//! `plan()` → `run_client_agg_rows`/`apply_vector_aggs`/`combine_binary`
+//! `plan()` → `run_client_agg_rows_folded`/`apply_vector_aggs`/`combine_binary`
 //! at `QuerySpec::Instant` — and compares with EXACT-f64 equality
 //! (`f64::to_bits`, no tolerance — the #218 discipline). No ClickHouse.
 //!
@@ -46,7 +46,7 @@ use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, DetectedFieldOut, DetectedFieldsProbe, Direction, MatrixSeries,
     MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, apply_vector_aggs,
-    combine_binary, ensure_result_series, materialize_vector_lit, plan, run_client_agg_rows,
+    combine_binary, ensure_result_series, materialize_vector_lit, plan, run_client_agg_rows_folded,
     run_variants_rows,
 };
 
@@ -968,7 +968,11 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
     let compiled = CompiledPipeline::compile(&client.pipeline)
         .map_err(|e| e.to_string())?
         .with_template_env(TemplateEnv::default());
-    let result = run_client_agg_rows(
+    // Issue #236 Part B: the folded seam, so the corpus exercises the
+    // engine's ACTUAL sequence — innermost aggregation folded at the leaf
+    // on a range query, the remaining prefix materialised — rather than a
+    // materialising approximation of it.
+    run_client_agg_rows_folded(
         &store.rows,
         &compiled,
         &store.meta,
@@ -986,9 +990,9 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
             },
         },
         mp.rate_window_ns,
+        &mp.vector_aggs,
     )
-    .map_err(|e| e.to_string())?;
-    Ok(apply_vector_aggs(result, &mp.vector_aggs))
+    .map_err(|e| e.to_string())
 }
 
 fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {

@@ -102,7 +102,8 @@ pub use exec::{
     TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, VARIANT_LABEL,
     VariantArena, VariantsAggState, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
     append_variant_label, apply_vector_aggs, combine_binary, ensure_result_series,
-    materialize_vector_lit, read_query_settings, run_client_agg_rows, run_variants_rows,
+    materialize_vector_lit, read_query_settings, run_client_agg_rows, run_client_agg_rows_folded,
+    run_variants_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{

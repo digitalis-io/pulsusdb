@@ -139,6 +139,7 @@
 //! | F-u | VariantsAggState::finish delegation + post-condition | VariantsAggState::finish | exec.rs VariantsAggState::finish | NIL | Phi1-Phi7 |
 //! | F-v | non-absent RANGE emit arm of ClientAggState::finish | ClientAggState::finish | exec.rs ClientAggState::finish | UNREACH | same routing citation as F-i |
 //! | F-w | apply_vector_aggs for an aggregation-bearing variant | VariantsAggState::finish_in_place | exec.rs apply_vector_aggs | R4 (iii) | input bounded by AggCaps::divided(n).series; G2/G3 slopes |
+//! | F-x | issue #236 Part B fold containers (dense slots, live map) | RangeSlideState::finish_in_place | exec.rs RangeSlideState::emit + VectorAggFold | NOT-EXEC | run_variants never calls attach_fold; fold is None here |
 //!
 //! # G4 — what this gate does NOT catch (eight gaps)
 //!
@@ -1797,13 +1798,25 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         // `rotate_slider` (so `.finish` leaves this frame and
         // `.rotate_slider` enters), and the non-mutating tail gained a
         // discharge loop over `series_out` (11 → 12 branches).
-        // Regenerated with `zz_print_frame_censuses`. W-MEM disposition:
-        // **NIL** — the loop reads each emitted series' labels and does
-        // integer arithmetic; it allocates nothing, and the `Vec` it walks
-        // is the one already being returned.
-        branches: 12,
+        //
+        // Issue #236 Part B (12 → 15 branches): the fan-out arm sorts its
+        // groups by label set and routes each group either to the fold
+        // (`.as_mut`/`.push_series`) or to `out`; both arms then finish
+        // through the fold (`.finish`), and the absent/non-mutating tails
+        // route through `.emit`. `Matrix` leaves `finish_absent` and stays
+        // here. Regenerated with `zz_print_frame_censuses`. W-MEM
+        // disposition: **NOT-EXEC** (row F-x) — a `variants(...)`
+        // sub-state is never handed a fold (`run_variants` does not call
+        // `attach_fold`), so every fold arm is dead in this window; the
+        // group sort is **NIL** (an in-place sort of a `Vec` the loop was
+        // going to drain anyway).
+        branches: 15,
         callees: &[
+            ".as_mut",
+            ".cmp",
             ".collect",
+            ".emit",
+            ".finish",
             ".finish_absent",
             ".flush_collision",
             ".into_iter",
@@ -1812,6 +1825,7 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
             ".len",
             ".map",
             ".push",
+            ".push_series",
             ".rotate_slider",
             ".sort_by",
             ".sort_by_key",
@@ -1836,16 +1850,15 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
         file: "exec.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish_absent",
+        // Issue #236 Part B: returns `Vec<MatrixSeries>` instead of a
+        // `QueryResult` so the caller can route it through the fold like
+        // every other emit path, so `Matrix` leaves this frame (7 → 6
+        // callees, branch count unchanged). Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **BAND**,
+        // unchanged — row F-m already prices the points vector and the
+        // one-element `vec![series]`, and both are byte-identical.
         branches: 3,
-        callees: &[
-            ".grid_point",
-            ".is_empty",
-            ".push",
-            "Matrix",
-            "new",
-            "take",
-            "vec!",
-        ],
+        callees: &[".grid_point", ".is_empty", ".push", "new", "take", "vec!"],
     },
     Frame {
         file: "exec.rs",
@@ -1911,7 +1924,7 @@ static PER_VARIANT_FRAMES: [Frame; 26] = [
 /// W_ctor + 23 W_fin = 46 rows, each with exactly ONE disposition. The
 /// module-doc tables are a RENDERING of this const (assertion 7), never
 /// the source.
-static INVENTORY: [Row; 46] = [
+static INVENTORY: [Row; 47] = [
     // --- W_plan (11) ---
     Row {
         id: "P-a",
@@ -2353,6 +2366,15 @@ static INVENTORY: [Row; 46] = [
         disp: Disp::R4(3),
         covered_by: "input bounded by AggCaps::divided(n).series; G2/G3 slopes",
     },
+    Row {
+        id: "F-x",
+        window: Win::Fin,
+        what: "issue #236 Part B fold containers (dense slots, live map)",
+        frames: &["RangeSlideState::finish_in_place"],
+        site: "exec.rs RangeSlideState::emit + VectorAggFold",
+        disp: Disp::NotExec,
+        covered_by: "run_variants never calls attach_fold; fold is None here",
+    },
 ];
 
 /// The 15 delegating boundary callees (see [`Boundary`]).
@@ -2511,11 +2533,11 @@ fn g4_frame_census_and_inventory_closure() {
         );
     }
     // (3) inventory size and per-window counts; unique ids.
-    assert_eq!(INVENTORY.len(), 46);
+    assert_eq!(INVENTORY.len(), 47);
     let count = |w: Win| INVENTORY.iter().filter(|r| r.window == w).count();
     assert_eq!(
         (count(Win::Plan), count(Win::Ctor), count(Win::Fin)),
-        (11, 12, 23)
+        (11, 12, 24)
     );
     let mut ids = BTreeSet::new();
     for r in &INVENTORY {

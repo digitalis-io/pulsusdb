@@ -1102,24 +1102,41 @@ impl LogQlEngine {
         // `QueryTooBroad(ScanBudgetBytes)` — complete-or-error holds
         // without buffering-driven OOM risk.
         let window = metric_plan_window(mp);
-        let mut state = if is_range {
-            MetricAggState::Range(Box::new(RangeSlideState::new(
+        // Issue #236 Part B: on a range query the INNERMOST vector
+        // aggregation is folded at the leaf. `vector_aggs` is outer-first
+        // (`unwrap_vector_aggs`) and collapses onto the leaf whenever the
+        // base is a range expr, so `.last()` is the innermost one and
+        // `apply_vector_aggs`' `.rev()` walk over the remaining prefix
+        // continues exactly where the fold stopped. `folded` — not the
+        // caller's intent — records what the leaf actually took: the fold
+        // declines the specs it cannot own (`sort`/`sort_desc`/
+        // `approx_topk`), and those must still be applied here.
+        let (mut state, folded) = if is_range {
+            let mut range = RangeSlideState::new(
                 compiled,
                 &meta,
                 client,
                 window,
                 mp.rate_window_ns,
                 AggCaps::DEFAULT,
-            )?))
+            )?;
+            if let Some(spec) = mp.vector_aggs.last() {
+                range.attach_fold(spec);
+            }
+            let folded = range.folded_aggs();
+            (MetricAggState::Range(Box::new(range)), folded)
         } else {
-            MetricAggState::Instant(Box::new(ClientAggState::new(
-                compiled,
-                &meta,
-                client,
-                window,
-                mp.rate_window_ns,
-                AggCaps::DEFAULT,
-            )?))
+            (
+                MetricAggState::Instant(Box::new(ClientAggState::new(
+                    compiled,
+                    &meta,
+                    client,
+                    window,
+                    mp.rate_window_ns,
+                    AggCaps::DEFAULT,
+                )?)),
+                0,
+            )
         };
         let mut chunk: Vec<MetricScanRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
         {
@@ -1136,7 +1153,11 @@ impl LogQlEngine {
             }
         }
         state.push_rows(&chunk)?;
-        Ok(apply_vector_aggs(state.finish()?, &mp.vector_aggs))
+        let result = state.finish()?;
+        Ok(apply_vector_aggs(
+            result,
+            &mp.vector_aggs[..mp.vector_aggs.len() - folded],
+        ))
     }
 
     /// Executes `variants(...) of (...)` (issue #221): ONE scan (planned
@@ -5056,6 +5077,13 @@ struct RangeSlideState<'q> {
     /// bounded by [`MAX_TS_COLLISION_GROUP_BYTES`] (one group staged at a
     /// time) and freed within the same flush.
     group_bytes: u64,
+    /// The innermost vector aggregation, applied AS this state emits
+    /// (issue #236 Part B) instead of over its materialised output.
+    /// `None` — the state's own construction default — is the
+    /// materialising path this leaf has always taken; it is attached by
+    /// [`RangeSlideState::attach_fold`] after construction, so the
+    /// constructor's shape (and its allocation census) is unchanged.
+    fold: Option<VectorAggFold>,
 }
 
 impl<'q> RangeSlideState<'q> {
@@ -5142,7 +5170,39 @@ impl<'q> RangeSlideState<'q> {
             coll: Vec::new(),
             coll_bytes: 0,
             group_bytes: 0,
+            fold: None,
         })
+    }
+
+    /// The grid this state emits on — the fold indexes its dense slots by
+    /// the same triple, so a slot and a grid point are two views of one
+    /// value.
+    fn grid(&self) -> FoldGrid {
+        FoldGrid {
+            start: self.grid_start,
+            step: self.step,
+            kmax: self.kmax,
+        }
+    }
+
+    /// Hands the INNERMOST vector aggregation to the leaf (issue #236
+    /// Part B). A no-op for the specs the leaf cannot own
+    /// ([`VectorAggFold::new`] returns `None`), which is why
+    /// [`RangeSlideState::folded_aggs`] — not the caller's intent —
+    /// decides how many specs the caller must still apply.
+    ///
+    /// Attached AFTER `new` rather than taken as a constructor parameter:
+    /// the grid is only known once `ensure_grid_resolution` has run, and
+    /// keeping it out of `new` leaves that constructor's branch/allocation
+    /// census (issue #221 `logql_variants_alloc`) untouched.
+    fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
+        self.fold = VectorAggFold::new(spec, self.grid());
+    }
+
+    /// How many trailing (innermost) specs this leaf has taken over: 0 or
+    /// 1. The caller applies the remaining prefix.
+    fn folded_aggs(&self) -> usize {
+        usize::from(self.fold.is_some())
     }
 
     /// Folds one batch of (physical-key-ordered) rows: runs the pipeline,
@@ -5620,7 +5680,8 @@ impl<'q> RangeSlideState<'q> {
             self.rotate_slider(prev);
         }
         if self.is_absent {
-            return Ok(self.finish_absent());
+            let series = self.finish_absent();
+            return self.emit(series);
         }
         if self.fan_out {
             let op = self.op;
@@ -5632,7 +5693,26 @@ impl<'q> RangeSlideState<'q> {
             // Saturating narrowing, like `FpSlide::grid_point` (issue #227
             // arithmetic sweep) — never a silent wrap.
             let grid_point = |k: i64| clamp_bucket(grid_start as i128 + k as i128 * step as i128);
-            let groups = std::mem::take(&mut self.groups);
+            // **The reduction-order pin, extended to the fold** (issue
+            // #236, task-manager ruling "Option B"). `groups` is a
+            // `HashMap` under a per-process randomly-seeded hasher, so
+            // draining it directly would hand the fold a member order
+            // that varies run to run — and Welford, and float addition,
+            // are order-SENSITIVE. Sorting by label set here is the same
+            // total order `pin_reduction_order` applies immediately
+            // before grouping on the materialising path, so the folded
+            // and materialised values are the same bits, and both are
+            // reproducible. One sort per stage, never per group.
+            //
+            // Applied whether or not a fold is attached — unlike
+            // `emit`'s, which is inside the folding arm. A fan-out result
+            // came out in `HashMap` walk order before, which no test
+            // could assert and no user could rely on; making it
+            // label-ascending is the same order the wire already carries
+            // everywhere else.
+            let mut groups: Vec<(String, MutGroup)> =
+                std::mem::take(&mut self.groups).into_iter().collect();
+            groups.sort_by(|(_, a), (_, b)| a.labels.cmp(&b.labels));
             let mut out: Vec<MatrixSeries> = Vec::new();
             for (key, group) in groups {
                 // Round 6 symmetry: the discharge is sized over the SAME
@@ -5677,14 +5757,24 @@ impl<'q> RangeSlideState<'q> {
                     discharge_retention(&mut self.retained, staged * self.per_sample);
                 }
                 if !points.is_empty() {
-                    out.push(MatrixSeries {
-                        labels: group.labels,
-                        points,
-                    });
+                    // Issue #236 Part B: the fold consumes each group AS
+                    // it is built, so the `scanned groups x grid points`
+                    // materialisation that `out` used to accumulate never
+                    // exists — that is the whole point-axis win.
+                    match self.fold.as_mut() {
+                        Some(fold) => fold.push_series(&group.labels, &points)?,
+                        None => out.push(MatrixSeries {
+                            labels: group.labels,
+                            points,
+                        }),
+                    }
                 }
                 discharge_group_bytes(&mut self.group_bytes, entry_bytes);
             }
-            return Ok(QueryResult::Matrix(out));
+            return Ok(QueryResult::Matrix(match self.fold.take() {
+                Some(fold) => fold.finish(),
+                None => out,
+            }));
         }
         // Issue #236 P2's other discharge leg: every series that reached
         // `series_out` still holds its charge, released as the vector
@@ -5697,14 +5787,45 @@ impl<'q> RangeSlideState<'q> {
                 group_entry_bytes("", &s.labels, SERIES_OUT_SLOT),
             );
         }
-        Ok(QueryResult::Matrix(out))
+        self.emit(out)
+    }
+
+    /// Routes an already-materialised batch of leaf series through the
+    /// attached fold (issue #236 Part B), or hands it back unchanged when
+    /// nothing folded.
+    ///
+    /// **The reduction-order pin, extended to the fold.** The batch is put
+    /// in label-set order before folding — the same total order
+    /// `pin_reduction_order` applies immediately before grouping on the
+    /// materialising path — so the folded value is the materialised value
+    /// bit for bit, and both are reproducible. The sort is inside the
+    /// folding arm so a query that does NOT fold keeps its existing output
+    /// order byte for byte.
+    ///
+    /// Series are consumed one at a time, so a series' points are freed as
+    /// they are folded rather than all being held until finish.
+    fn emit(&mut self, mut series: Vec<MatrixSeries>) -> Result<QueryResult, ReadError> {
+        match self.fold.take() {
+            None => Ok(QueryResult::Matrix(series)),
+            Some(mut fold) => {
+                pin_reduction_order(&mut series, |s| &s.labels);
+                for s in series {
+                    fold.push_series(&s.labels, &s.points)?;
+                }
+                Ok(QueryResult::Matrix(fold.finish()))
+            }
+        }
     }
 
     /// `absent_over_time`: emit `1.0` at every grid point whose selector-wide
     /// window `(t-range, t]` is EMPTY (Loki's one emit-on-empty reducer).
     /// Prefix-sums the O(grid) coverage difference array (review finding 1):
     /// a running sum > 0 means at least one sample covers that grid point.
-    fn finish_absent(&mut self) -> QueryResult {
+    ///
+    /// Returns the series rather than a [`QueryResult`] so the caller can
+    /// route them through the issue #236 Part B fold like every other
+    /// emit path; the 0-or-1 shape is unchanged.
+    fn finish_absent(&mut self) -> Vec<MatrixSeries> {
         let mut points: Vec<(i64, f64)> = Vec::new();
         // Same width as the deltas (see `present_cover`'s proof): the running
         // sum is bounded by the total collision-group count, itself bounded by
@@ -5717,12 +5838,12 @@ impl<'q> RangeSlideState<'q> {
             }
         }
         if points.is_empty() {
-            QueryResult::Matrix(Vec::new())
+            Vec::new()
         } else {
-            QueryResult::Matrix(vec![MatrixSeries {
+            vec![MatrixSeries {
                 labels: std::mem::take(&mut self.absent_labels),
                 points,
-            }])
+            }]
         }
     }
 }
@@ -5733,7 +5854,9 @@ impl<'q> RangeSlideState<'q> {
 /// of buffering the scan — review round 1, finding 1).
 ///
 /// Vector aggregations are NOT applied here — the caller finishes them
-/// (`apply_vector_aggs`), mirroring the SQL path.
+/// (`apply_vector_aggs`), mirroring the SQL path. Callers that want the
+/// engine's ACTUAL sequence, with the innermost aggregation folded at the
+/// leaf (issue #236 Part B), use [`run_client_agg_rows_folded`].
 pub fn run_client_agg_rows(
     rows: &[MetricScanRow],
     compiled: &super::pipeline::CompiledPipeline,
@@ -5741,6 +5864,30 @@ pub fn run_client_agg_rows(
     client: &ClientAgg,
     window: ClientWindow,
     rate_window_ns: Option<u64>,
+) -> Result<QueryResult, ReadError> {
+    run_client_agg_rows_folded(rows, compiled, meta, client, window, rate_window_ns, &[])
+}
+
+/// [`run_client_agg_rows`] plus the whole vector-aggregation chain, run
+/// the way [`LogQlEngine::run_metric_client`] runs it (issue #236 Part
+/// B): on a RANGE query the innermost spec is handed to the leaf, which
+/// folds it AS it emits, and only the remaining prefix is materialised
+/// through [`apply_vector_aggs`]. On an instant query, and for the specs
+/// the leaf cannot own (`sort`/`sort_desc`/`approx_topk`), every spec goes
+/// to `apply_vector_aggs` — i.e. exactly today's path.
+///
+/// `pub` so the hermetic suites and the conformance runner drive the same
+/// sequence the engine does, rather than a materialising approximation of
+/// it: the fold's equivalence with `apply_vector_aggs` is a property that
+/// has to be EXERCISED, not asserted.
+pub fn run_client_agg_rows_folded(
+    rows: &[MetricScanRow],
+    compiled: &super::pipeline::CompiledPipeline,
+    meta: &HashMap<u64, StreamMetaRow>,
+    client: &ClientAgg,
+    window: ClientWindow,
+    rate_window_ns: Option<u64>,
+    aggs: &[plan::VectorAggSpec],
 ) -> Result<QueryResult, ReadError> {
     if matches!(window, ClientWindow::Range { .. }) {
         // Issue #227: a range query evaluates Loki's sliding windows, which
@@ -5757,6 +5904,10 @@ pub fn run_client_agg_rows(
             rate_window_ns,
             AggCaps::DEFAULT,
         )?;
+        if let Some(spec) = aggs.last() {
+            state.attach_fold(spec);
+        }
+        let folded = state.folded_aggs();
         let ordered = rows.windows(2).all(|w| {
             (w[0].fingerprint, w[0].timestamp_ns) <= (w[1].fingerprint, w[1].timestamp_ns)
         });
@@ -5771,7 +5922,8 @@ pub fn run_client_agg_rows(
             });
             state.push_rows(&sorted)?;
         }
-        return state.finish();
+        let result = state.finish()?;
+        return Ok(apply_vector_aggs(result, &aggs[..aggs.len() - folded]));
     }
     let mut state = ClientAggState::new(
         compiled,
@@ -5782,7 +5934,7 @@ pub fn run_client_agg_rows(
         AggCaps::DEFAULT,
     )?;
     state.push_rows(rows)?;
-    Ok(state.finish())
+    Ok(apply_vector_aggs(state.finish(), aggs))
 }
 
 /// The live engine's per-fold metric-aggregation state: the instant
@@ -8670,6 +8822,31 @@ struct VectorAccum {
 }
 
 impl VectorAccum {
+    /// The "no member yet" state of a [`ReduceFold`] slot.
+    ///
+    /// `count == 0` is a SENTINEL, not a reachable accumulator: [`seed`]
+    /// sets `count: 1` for **every** op and [`update`] never decrements,
+    /// so a slot that has taken a value can never be mistaken for an
+    /// empty one. Pinned by
+    /// `vector_accum_seed_always_leaves_a_nonzero_count`, which drives
+    /// every reducing op — the sentinel is what lets the fold hold a
+    /// dense `Vec<VectorAccum>` (24 B/slot) instead of a
+    /// `Vec<Option<VectorAccum>>` (32 B/slot) across a grid of up to
+    /// [`MAX_ADMITTED_GRID_POINTS`] slots per group.
+    ///
+    /// [`seed`]: VectorAccum::seed
+    /// [`update`]: VectorAccum::update
+    const EMPTY: Self = VectorAccum {
+        value: 0.0,
+        mean: 0.0,
+        count: 0,
+    };
+
+    /// Whether this slot has taken a value yet — see [`VectorAccum::EMPTY`].
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// `evaluator.go:479-486` — the first member seeds `value` AND `mean`
     /// with its own sample and `groupCount` with 1; `:491-492` then zeroes
     /// `value` for `stddev`/`stdvar` (their `value` accumulates M2, not a
@@ -8952,6 +9129,521 @@ fn select_k_instant(
         .zip(keep)
         .filter_map(|(s, kept)| kept.then_some(s))
         .collect()
+}
+
+// =====================================================================
+// Issue #236 Part B — the streaming vector-aggregation fold at the range
+// leaf.
+//
+// `apply_vector_aggs` MATERIALISES: the leaf builds one `MatrixSeries`
+// per scanned group and the aggregation collapses that vector afterwards,
+// so peak retention is `scanned groups x grid points` even when the
+// result is one series. The fold applies the INNERMOST aggregation as the
+// leaf emits, so retention is `OUTPUT groups x grid points` — the
+// reference's own bound.
+//
+// **The fold applies NO group-count rejection** (plan v14 §3 Part B, the
+// round-13 `[high]`). [`MAX_QUERY_SERIES`] is a FINAL-result cap: an
+// outer `sum` over an inner `sum by (id)` collapsing 501+ inner groups to
+// ONE series is served by the reference, so rejecting an intermediate
+// would reject on a proxy rather than on the resource consumed. Fold
+// state is bounded by BYTES and by POINTS — and by nothing else.
+//
+// **The point half of that bound is NOT YET LEVIED**, and this comment
+// says so rather than letting the sentence above be read as enforcement.
+// A group's slots are DENSE — `kmax + 1` per output group, whatever the
+// data's sparsity — so a fold over `G` output groups holds
+// `G x (kmax + 1)` cells. Plan v14 §4's `charge_result_points` charges
+// exactly that against [`MAX_METRIC_RESULT_POINTS`] BEFORE the vector is
+// allocated; until it lands, the ceiling on a fold's retention is the
+// leaf's own group-byte charge and the grid guard, and a query whose
+// INTERMEDIATE grouping is very wide over a very fine grid can retain
+// more than the finished result would. `MAX_METRIC_RESULT_POINTS` and
+// [`MAX_ADMITTED_GRID_POINTS`] are defined but uncharged — do not read
+// them as live gates.
+// =====================================================================
+
+/// The output grid a [`VectorAggFold`] indexes its dense slots by: the
+/// same `(grid_start, step, kmax)` triple `RangeSlideState` emits its
+/// points from, so a slot index and a grid point are two views of one
+/// value.
+#[derive(Clone, Copy, Debug)]
+struct FoldGrid {
+    start: i64,
+    step: u64,
+    kmax: i64,
+}
+
+impl FoldGrid {
+    /// Slots in one group's dense vector: `kmax + 1`, and 0 for the empty
+    /// grid (`kmax == -1`, which `grid_point_count == 0` produces).
+    fn slots(&self) -> usize {
+        usize::try_from(self.kmax.saturating_add(1)).unwrap_or(0)
+    }
+
+    /// `grid_start + k*step`, narrowed exactly as `FpSlide::grid_point`
+    /// does — one arithmetic, so a folded point and a materialised point
+    /// carry the same timestamp bits.
+    fn point(&self, k: usize) -> i64 {
+        clamp_bucket(self.start as i128 + k as i128 * self.step as i128)
+    }
+
+    /// The inverse of [`Self::point`]: `None` when `t` is not one of this
+    /// grid's points. Every producer that feeds the fold emits at
+    /// `grid_point(k)` for `k in 0..=kmax` (`FpSlide::emit_at`,
+    /// `finish_in_place`'s fan-out arm, `finish_absent`), so `None` is an
+    /// internal-invariant breach, not a user-reachable input — it is
+    /// reported as an error rather than dropped, because a dropped point
+    /// is a silently wrong result.
+    fn index_of(&self, t: i64) -> Option<usize> {
+        let step = i128::from(self.step);
+        if step <= 0 {
+            return None;
+        }
+        let delta = i128::from(t) - i128::from(self.start);
+        if delta < 0 || delta % step != 0 {
+            return None;
+        }
+        let k = delta / step;
+        if k > i128::from(self.kmax) {
+            return None;
+        }
+        usize::try_from(k).ok()
+    }
+}
+
+/// The internal-invariant breach [`FoldGrid::index_of`] reports.
+fn fold_off_grid(t: i64) -> ReadError {
+    ReadError::PipelineInvalid {
+        reason: format!(
+            "internal: vector-aggregation fold received a point at {t} off the query grid"
+        ),
+    }
+}
+
+/// One `topk`/`bottomk` candidate holding a grid slot: the sample value
+/// and the id of the series it came from. Ids are assigned in PUSH order,
+/// which is what makes [`SelectFold`]'s emission order `select_k_range`'s
+/// (whose survivors come out in the input vector's order).
+#[derive(Clone, Copy, Debug)]
+struct Cand {
+    value: f64,
+    series: u32,
+}
+
+/// One grid slot's surviving candidates, best first.
+///
+/// `Empty`/`One` keep the common cases allocation-free — a slot no series
+/// reached, and `topk(1, …)` or a slot only one series reached. `Many` is
+/// the only arm that allocates and holds at most `k` elements, so a
+/// group's whole selection state is `O(grid x k)` and never `O(scanned
+/// series x grid)`.
+#[derive(Clone, Debug)]
+enum KSel {
+    Empty,
+    One(Cand),
+    Many(Vec<Cand>),
+}
+
+impl KSel {
+    fn as_slice(&self) -> &[Cand] {
+        match self {
+            KSel::Empty => &[],
+            KSel::One(c) => std::slice::from_ref(c),
+            KSel::Many(v) => v,
+        }
+    }
+
+    /// Inserts `cand`, keeping the slot ordered best-first under `order`
+    /// and at most `k` long. Returns the candidate that lost its place —
+    /// which is `cand` itself when the slot is full and `cand` is worse
+    /// than every survivor.
+    ///
+    /// Equivalent to `sort_candidates(all).take(k)` because `order` is a
+    /// TOTAL order (see [`cand_order`]): the k best elements of a set are
+    /// the same set whatever sequence they arrive in.
+    fn insert<F>(&mut self, cand: Cand, k: usize, order: &F) -> Option<Cand>
+    where
+        F: Fn(&Cand, &Cand) -> std::cmp::Ordering,
+    {
+        match self {
+            KSel::Empty => {
+                *self = KSel::One(cand);
+                None
+            }
+            KSel::One(cur) => {
+                if k == 1 {
+                    if order(&cand, cur) == std::cmp::Ordering::Less {
+                        let evicted = *cur;
+                        *self = KSel::One(cand);
+                        Some(evicted)
+                    } else {
+                        Some(cand)
+                    }
+                } else {
+                    let pair = if order(&cand, cur) == std::cmp::Ordering::Less {
+                        vec![cand, *cur]
+                    } else {
+                        vec![*cur, cand]
+                    };
+                    *self = KSel::Many(pair);
+                    None
+                }
+            }
+            KSel::Many(v) => {
+                let pos = v.partition_point(|c| order(c, &cand) == std::cmp::Ordering::Less);
+                if pos >= k {
+                    // The slot is full (`pos <= v.len() <= k`) and `cand`
+                    // sorts after every survivor.
+                    return Some(cand);
+                }
+                v.insert(pos, cand);
+                if v.len() > k { v.pop() } else { None }
+            }
+        }
+    }
+}
+
+/// A series that currently holds at least one selection slot. Dropped the
+/// moment its refcount reaches 0, so `live` is bounded by `output groups
+/// x k` rather than by the number of series pushed.
+#[derive(Debug)]
+struct LiveSeries {
+    labels: LabelSet,
+    slots: u64,
+}
+
+/// [`sort_candidates`]' order, as a comparator over [`Cand`] and extended
+/// with the series id ascending as a final tiebreak.
+///
+/// The tiebreak is not cosmetic and it is not a divergence: `sort_by` is
+/// STABLE and `select_k_range` collects its candidates in ascending input
+/// index, so two candidates that tie on `(is_nan, value, labels)` already
+/// come out in ascending input order there. Naming it makes the fold's
+/// order TOTAL, which is what lets an incremental top-k equal a full sort
+/// plus `take(k)`. It is reachable: a fingerprint with no hydrated meta
+/// gets an EMPTY label set, so two such series tie on labels.
+fn cand_order<'a, F>(a: &Cand, b: &Cand, largest: bool, labels_of: &F) -> std::cmp::Ordering
+where
+    F: Fn(u32) -> &'a LabelSet,
+{
+    a.value
+        .is_nan()
+        .cmp(&b.value.is_nan())
+        .then_with(|| {
+            if a.value.is_nan() {
+                std::cmp::Ordering::Equal
+            } else if largest {
+                b.value.total_cmp(&a.value)
+            } else {
+                a.value.total_cmp(&b.value)
+            }
+        })
+        .then_with(|| labels_of(a.series).cmp(labels_of(b.series)))
+        .then_with(|| a.series.cmp(&b.series))
+}
+
+/// The reducing fold (`sum`/`avg`/`min`/`max`/`count`/`stddev`/`stdvar`):
+/// one dense `Vec<VectorAccum>` of `kmax + 1` slots per OUTPUT group,
+/// each slot the same [`VectorAccum`] `reduce` uses — so a folded value
+/// and a materialised one are the same bits by construction, not by
+/// coincidence.
+#[derive(Debug)]
+struct ReduceFold {
+    op: VectorAggOp,
+    grouping: Option<Grouping>,
+    grid: FoldGrid,
+    groups: HashMap<LabelSet, Vec<VectorAccum>>,
+}
+
+impl ReduceFold {
+    fn push_series(&mut self, labels: &LabelSet, points: &[(i64, f64)]) -> Result<(), ReadError> {
+        // A group materialises on the first accumulated VALUE, never on
+        // first sight of a member (plan v14 §3 Part B): a series with no
+        // points must not create — or charge for — a group.
+        if points.is_empty() {
+            return Ok(());
+        }
+        let (op, grid) = (self.op, self.grid);
+        let slots = self
+            .groups
+            .entry(group_key(labels, self.grouping.as_ref()))
+            .or_insert_with(|| vec![VectorAccum::EMPTY; grid.slots()]);
+        for &(t, v) in points {
+            let k = grid.index_of(t).ok_or_else(|| fold_off_grid(t))?;
+            let Some(slot) = slots.get_mut(k) else {
+                return Err(fold_off_grid(t));
+            };
+            if slot.is_empty() {
+                *slot = VectorAccum::seed(op, v);
+            } else {
+                slot.update(op, v);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<MatrixSeries> {
+        let (op, grid) = (self.op, self.grid);
+        self.groups
+            .into_iter()
+            .filter_map(|(labels, slots)| {
+                let points: Vec<(i64, f64)> = slots
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, acc)| !acc.is_empty())
+                    .map(|(k, acc)| (grid.point(k), acc.finish(op)))
+                    .collect();
+                (!points.is_empty()).then_some(MatrixSeries { labels, points })
+            })
+            .collect()
+    }
+}
+
+/// The selecting fold (`topk`/`bottomk`): one dense `Vec<KSel>` of
+/// `kmax + 1` slots per output group, each holding at most `k`
+/// candidates, plus the label sets of the series currently holding a
+/// slot. `select_k_range` materialises `scanned series x steps` before
+/// applying `k`; this never holds more than `output groups x grid x k`.
+#[derive(Debug)]
+struct SelectFold {
+    /// `topk` keeps the largest, `bottomk` the smallest.
+    largest: bool,
+    k: usize,
+    grouping: Option<Grouping>,
+    grid: FoldGrid,
+    groups: HashMap<LabelSet, Vec<KSel>>,
+    /// Refcounted by held slots — see [`LiveSeries`].
+    live: HashMap<u32, LiveSeries>,
+    /// The next push-order id; `select_k_range`'s input index.
+    next_series: u32,
+}
+
+impl SelectFold {
+    fn push_series(&mut self, labels: &LabelSet, points: &[(i64, f64)]) -> Result<(), ReadError> {
+        let id = self.next_series;
+        self.next_series = self.next_series.saturating_add(1);
+        if points.is_empty() {
+            return Ok(());
+        }
+        let (grid, k, largest) = (self.grid, self.k, self.largest);
+        // A group's slot vector is created on the first push that can
+        // fill a slot: `k >= 1` here (`k == 0` is `VectorAggFold::Empty`,
+        // which never constructs a `SelectFold`), so the first series to
+        // reach a fresh group always wins its slots.
+        let slots = self
+            .groups
+            .entry(group_key(labels, self.grouping.as_ref()))
+            .or_insert_with(|| vec![KSel::Empty; grid.slots()]);
+        let live = &mut self.live;
+        for &(t, v) in points {
+            let idx = grid.index_of(t).ok_or_else(|| fold_off_grid(t))?;
+            let Some(slot) = slots.get_mut(idx) else {
+                return Err(fold_off_grid(t));
+            };
+            let evicted = {
+                let seen: &HashMap<u32, LiveSeries> = live;
+                // Every candidate already in the slot HOLDS it, so its
+                // series is live; the pushing series may not be yet.
+                // `EMPTY_LABEL_SET` is the defensive arm, never a
+                // reachable one.
+                let labels_of = |sid: u32| {
+                    if sid == id {
+                        labels
+                    } else {
+                        seen.get(&sid).map_or(&EMPTY_LABEL_SET, |s| &s.labels)
+                    }
+                };
+                let order = |a: &Cand, b: &Cand| cand_order(a, b, largest, &labels_of);
+                slot.insert(
+                    Cand {
+                        value: v,
+                        series: id,
+                    },
+                    k,
+                    &order,
+                )
+            };
+            // A series pushes at most one candidate per slot (its points
+            // carry distinct timestamps), so an evicted candidate from
+            // THIS series can only be the one just offered and rejected.
+            if let Some(ev) = evicted
+                && ev.series == id
+            {
+                continue;
+            }
+            if let Some(ev) = evicted {
+                let dropped = match live.get_mut(&ev.series) {
+                    Some(held) => {
+                        held.slots = held.slots.saturating_sub(1);
+                        held.slots == 0
+                    }
+                    None => false,
+                };
+                if dropped {
+                    live.remove(&ev.series);
+                }
+            }
+            // The label set is cloned on the first slot this series
+            // actually wins, never on first sight of it.
+            live.entry(id)
+                .or_insert_with(|| LiveSeries {
+                    labels: labels.clone(),
+                    slots: 0,
+                })
+                .slots += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<MatrixSeries> {
+        let grid = self.grid;
+        // A series belongs to exactly one group (its `group_key` is a
+        // function of its labels), and each group's slots are walked in
+        // ascending grid index, so a survivor's points come out
+        // TIMESTAMP-ASCENDING — the order `select_k_range`'s per-survivor
+        // `BTreeMap` yields.
+        let mut by_series: HashMap<u32, Vec<(i64, f64)>> = HashMap::new();
+        for slots in self.groups.into_values() {
+            for (k, sel) in slots.iter().enumerate() {
+                let t = grid.point(k);
+                for cand in sel.as_slice() {
+                    by_series
+                        .entry(cand.series)
+                        .or_default()
+                        .push((t, cand.value));
+                }
+            }
+        }
+        // Survivors in ORIGINAL PUSH ORDER — `select_k_range` emits
+        // `series.into_iter().zip(keep).filter_map(..)`, i.e. the input
+        // vector's order, and ids are the input index.
+        let mut survivors: Vec<(u32, LiveSeries)> = self.live.into_iter().collect();
+        survivors.sort_by_key(|(id, _)| *id);
+        survivors
+            .into_iter()
+            .filter_map(|(id, held)| {
+                by_series
+                    .remove(&id)
+                    .filter(|points| !points.is_empty())
+                    .map(|points| MatrixSeries {
+                        labels: held.labels,
+                        points,
+                    })
+            })
+            .collect()
+    }
+}
+
+/// The innermost vector aggregation, applied AS the range leaf emits
+/// rather than over its materialised output. See the module-section
+/// comment above for the bound this replaces.
+#[derive(Debug)]
+enum VectorAggFold {
+    Reduce(ReduceFold),
+    Select(SelectFold),
+    /// `topk(0, …)`/`bottomk(0, …)`: the result is empty whatever the
+    /// input, so no group is ever constructed and no point is ever
+    /// retained. Its reason is purely charge discipline — do not charge
+    /// for a group that emits nothing; the group-count rejection whose
+    /// premise it used to protect is gone (plan v14 §3 Part B).
+    Empty,
+}
+
+impl VectorAggFold {
+    /// `None` when the leaf cannot own the aggregation:
+    ///
+    /// * `sort`/`sort_desc` — a range matrix is a PASSTHROUGH at
+    ///   `group_range` (there is no single sortable value per series), so
+    ///   there is nothing to fold;
+    /// * `approx_topk` — instant-only, rejected for a range query at
+    ///   plan time (`plan.rs`'s `approx_topk` range check).
+    ///
+    /// The match is exhaustive with no `_` arm, and
+    /// `vector_agg_fold_partitions_every_op_like_is_reduction` pins the
+    /// reducing arm against [`VectorAccum::is_reduction`], so a new
+    /// operator is a build failure here rather than a silent
+    /// misclassification.
+    fn new(spec: &plan::VectorAggSpec, grid: FoldGrid) -> Option<Self> {
+        let (op, grouping, param) = spec;
+        match *op {
+            VectorAggOp::Sort | VectorAggOp::SortDesc | VectorAggOp::ApproxTopk => None,
+            VectorAggOp::Topk | VectorAggOp::Bottomk => {
+                let k = k_of(*param);
+                if k == 0 {
+                    return Some(VectorAggFold::Empty);
+                }
+                Some(VectorAggFold::Select(SelectFold {
+                    largest: matches!(*op, VectorAggOp::Topk),
+                    k,
+                    grouping: grouping.clone(),
+                    grid,
+                    groups: HashMap::new(),
+                    live: HashMap::new(),
+                    next_series: 0,
+                }))
+            }
+            VectorAggOp::Sum
+            | VectorAggOp::Avg
+            | VectorAggOp::Min
+            | VectorAggOp::Max
+            | VectorAggOp::Count
+            | VectorAggOp::Stddev
+            | VectorAggOp::Stdvar => Some(VectorAggFold::Reduce(ReduceFold {
+                op: *op,
+                grouping: grouping.clone(),
+                grid,
+                groups: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Folds one COMPLETE leaf series. `points` must be this grid's
+    /// points, timestamp-ascending — which is what every emit site
+    /// produces.
+    ///
+    /// Fallible today only through [`FoldGrid::index_of`]; the signature
+    /// is the seam plan v14 §4's `charge_result_points` charges through,
+    /// so it is `Result` from the start rather than widened later across
+    /// every call site.
+    fn push_series(&mut self, labels: &LabelSet, points: &[(i64, f64)]) -> Result<(), ReadError> {
+        match self {
+            VectorAggFold::Reduce(f) => f.push_series(labels, points),
+            VectorAggFold::Select(f) => f.push_series(labels, points),
+            VectorAggFold::Empty => Ok(()),
+        }
+    }
+
+    fn finish(self) -> Vec<MatrixSeries> {
+        match self {
+            VectorAggFold::Reduce(f) => f.finish(),
+            VectorAggFold::Select(f) => f.finish(),
+            VectorAggFold::Empty => Vec::new(),
+        }
+    }
+
+    /// Retained cells: the quantity plan v14 §4's `charge_result_points`
+    /// will charge, and the one AC 8 pins as `output groups x steps`.
+    /// Test-only until that counter exists — nothing in the engine reads
+    /// it, and exposing it now would suggest it were enforced.
+    #[cfg(test)]
+    fn cells(&self) -> usize {
+        match self {
+            VectorAggFold::Reduce(f) => f.groups.values().map(Vec::len).sum(),
+            VectorAggFold::Select(f) => f.groups.values().map(Vec::len).sum(),
+            VectorAggFold::Empty => 0,
+        }
+    }
+
+    /// Output groups currently materialised. Test-only, as [`Self::cells`].
+    #[cfg(test)]
+    fn groups(&self) -> usize {
+        match self {
+            VectorAggFold::Reduce(f) => f.groups.len(),
+            VectorAggFold::Select(f) => f.groups.len(),
+            VectorAggFold::Empty => 0,
+        }
+    }
 }
 
 /// `approx_topk(k, inner)` over an instant result (issue #221) — the
@@ -14754,6 +15446,555 @@ mod tests {
         ] {
             assert!(!VectorAccum::is_reduction(op), "{op:?}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #236 Part B — the streaming fold.
+    // -----------------------------------------------------------------
+
+    const REDUCING_OPS: [VectorAggOp; 7] = [
+        VectorAggOp::Sum,
+        VectorAggOp::Avg,
+        VectorAggOp::Min,
+        VectorAggOp::Max,
+        VectorAggOp::Count,
+        VectorAggOp::Stddev,
+        VectorAggOp::Stdvar,
+    ];
+
+    const SELECTING_OPS: [VectorAggOp; 5] = [
+        VectorAggOp::Topk,
+        VectorAggOp::Bottomk,
+        VectorAggOp::ApproxTopk,
+        VectorAggOp::Sort,
+        VectorAggOp::SortDesc,
+    ];
+
+    /// The dense `Vec<VectorAccum>` a `ReduceFold` slot lives in uses
+    /// `count == 0` as its "no member yet" sentinel. That is only sound
+    /// because a SEEDED accumulator can never have `count == 0` — for
+    /// EVERY reducing op, including the four that never touch `count`
+    /// again. Break the seed's `count: 1` and this fails.
+    #[test]
+    fn vector_accum_seed_always_leaves_a_nonzero_count() {
+        assert!(
+            VectorAccum::EMPTY.is_empty(),
+            "the sentinel must read as empty"
+        );
+        for op in REDUCING_OPS {
+            for v in [0.0f64, -0.0, 1.5, f64::NAN, f64::INFINITY] {
+                let mut acc = VectorAccum::seed(op, v);
+                assert!(
+                    !acc.is_empty(),
+                    "{op:?} seeded from {v} must not read as the EMPTY sentinel"
+                );
+                acc.update(op, 2.0);
+                assert!(!acc.is_empty(), "{op:?} after update");
+            }
+        }
+    }
+
+    /// The fold's op partition is the SAME partition
+    /// [`VectorAccum::is_reduction`] states, plus the two the leaf cannot
+    /// own. Both matches are exhaustive with no `_` arm, so a new
+    /// operator is a build failure; this pins that they agree with each
+    /// other rather than each being separately exhaustive and wrong.
+    #[test]
+    fn vector_agg_fold_partitions_every_op_like_is_reduction() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 1,
+            kmax: 3,
+        };
+        for op in REDUCING_OPS {
+            let fold = VectorAggFold::new(&(op, None, None), grid)
+                .unwrap_or_else(|| panic!("{op:?} is reducing and must fold"));
+            assert!(
+                matches!(fold, VectorAggFold::Reduce(_)),
+                "{op:?} must be a ReduceFold"
+            );
+            assert!(VectorAccum::is_reduction(op));
+        }
+        for op in SELECTING_OPS {
+            assert!(!VectorAccum::is_reduction(op));
+        }
+        // `sort`/`sort_desc` are a matrix PASSTHROUGH at `group_range`,
+        // and `approx_topk` is rejected for a range query at plan time —
+        // the leaf declines all three and the caller materialises.
+        for op in [
+            VectorAggOp::Sort,
+            VectorAggOp::SortDesc,
+            VectorAggOp::ApproxTopk,
+        ] {
+            assert!(
+                VectorAggFold::new(&(op, None, Some(3.0)), grid).is_none(),
+                "{op:?} must be declined by the leaf"
+            );
+        }
+        for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
+            assert!(matches!(
+                VectorAggFold::new(&(op, None, Some(2.0)), grid),
+                Some(VectorAggFold::Select(_))
+            ));
+            assert!(matches!(
+                VectorAggFold::new(&(op, None, Some(0.0)), grid),
+                Some(VectorAggFold::Empty)
+            ));
+        }
+    }
+
+    /// A leaf series as the fold receives it: labels plus grid-aligned
+    /// `(timestamp, value)` points.
+    type FoldInput = (LabelSet, Vec<(i64, f64)>);
+
+    fn fold_labels(pairs: &[(&str, &str)]) -> LabelSet {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Drives `input` through a fold, in the given order.
+    fn drive_fold(
+        spec: &plan::VectorAggSpec,
+        grid: FoldGrid,
+        input: &[FoldInput],
+    ) -> Vec<MatrixSeries> {
+        let mut fold = VectorAggFold::new(spec, grid).expect("this spec folds");
+        for (labels, points) in input {
+            fold.push_series(labels, points).expect("on-grid points");
+        }
+        fold.finish()
+    }
+
+    /// Drives the same input through `select_k_range`, the materialising
+    /// implementation the fold must reproduce.
+    fn drive_select_k_range(
+        op: VectorAggOp,
+        grouping: Option<&Grouping>,
+        param: Option<f64>,
+        input: &[FoldInput],
+    ) -> Vec<(LabelSet, Vec<(i64, f64)>)> {
+        let series: Vec<RangeSeries> = input
+            .iter()
+            .map(|(labels, points)| RangeSeries {
+                labels: labels.clone(),
+                points: points.iter().copied().collect(),
+            })
+            .collect();
+        select_k_range(series, op, grouping, param)
+            .into_iter()
+            .map(|s| (s.labels, s.points.into_iter().collect()))
+            .collect()
+    }
+
+    fn as_pairs(series: Vec<MatrixSeries>) -> Vec<(LabelSet, Vec<(i64, f64)>)> {
+        series.into_iter().map(|s| (s.labels, s.points)).collect()
+    }
+
+    /// AC 9 — the SELECTION ORDER, not merely the selected set.
+    ///
+    /// `SelectFold`'s output SEQUENCE (survivors in original push order,
+    /// each survivor's points ascending) and its values must be identical
+    /// to `select_k_range` over the same explicit input vector, including
+    /// the four adversarial shapes: equal values across series, a group
+    /// where every value is equal, two series with identical EMPTY label
+    /// sets (which is what makes the series-id tiebreak reachable), and
+    /// NaN candidates.
+    #[test]
+    fn select_fold_reproduces_select_k_range_sequence_and_values() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 10,
+            kmax: 2,
+        };
+        let pts = |vals: [f64; 3]| vec![(0i64, vals[0]), (10, vals[1]), (20, vals[2])];
+        let cases: Vec<(&str, Vec<FoldInput>)> = vec![
+            (
+                "distinct values",
+                vec![
+                    (fold_labels(&[("h", "a")]), pts([1.0, 5.0, 3.0])),
+                    (fold_labels(&[("h", "b")]), pts([4.0, 2.0, 9.0])),
+                    (fold_labels(&[("h", "c")]), pts([7.0, 8.0, 0.5])),
+                ],
+            ),
+            (
+                "equal values ACROSS series (label tiebreak)",
+                vec![
+                    (fold_labels(&[("h", "c")]), pts([1.0, 1.0, 1.0])),
+                    (fold_labels(&[("h", "a")]), pts([1.0, 1.0, 1.0])),
+                    (fold_labels(&[("h", "b")]), pts([1.0, 1.0, 1.0])),
+                ],
+            ),
+            (
+                "an all-equal group of two",
+                vec![
+                    (fold_labels(&[("h", "a")]), pts([2.0, 2.0, 2.0])),
+                    (fold_labels(&[("h", "b")]), pts([2.0, 2.0, 2.0])),
+                ],
+            ),
+            (
+                "two series with IDENTICAL EMPTY label sets (series-id tiebreak)",
+                vec![
+                    (Vec::new(), pts([3.0, 1.0, 4.0])),
+                    (Vec::new(), pts([1.0, 5.0, 9.0])),
+                    (fold_labels(&[("h", "z")]), pts([2.0, 6.0, 5.0])),
+                ],
+            ),
+            (
+                // THE discriminating shape for the series-id tiebreak.
+                // Two series that tie need no tiebreak (both the fold and
+                // the stable sort keep the earlier one), and three that
+                // tie at EVERY step are indistinguishable in the output.
+                // It takes THREE series with identical labels tying at
+                // ONE step and differing at another for the choice to be
+                // observable: at step 0 all three hold 2.0 with `k = 2`,
+                // and which two survive decides who owns that point.
+                "three IDENTICAL-label series tying at one step only",
+                vec![
+                    (Vec::new(), pts([2.0, 1.0, 1.0])),
+                    (Vec::new(), pts([2.0, 2.0, 2.0])),
+                    (Vec::new(), pts([2.0, 3.0, 3.0])),
+                ],
+            ),
+            (
+                "NaN candidates rank last in BOTH directions",
+                vec![
+                    (fold_labels(&[("h", "a")]), pts([f64::NAN, 5.0, 1.0])),
+                    (fold_labels(&[("h", "b")]), pts([5.0, f64::NAN, 2.0])),
+                    (fold_labels(&[("h", "c")]), pts([1.0, 2.0, f64::NAN])),
+                ],
+            ),
+            (
+                "every candidate NaN",
+                vec![
+                    (fold_labels(&[("h", "a")]), pts([f64::NAN; 3])),
+                    (fold_labels(&[("h", "b")]), pts([f64::NAN; 3])),
+                ],
+            ),
+        ];
+
+        let bits = |v: Vec<(LabelSet, Vec<(i64, f64)>)>| -> Vec<(LabelSet, Vec<(i64, u64)>)> {
+            v.into_iter()
+                .map(|(l, p)| (l, p.into_iter().map(|(t, x)| (t, x.to_bits())).collect()))
+                .collect()
+        };
+
+        for (name, input) in &cases {
+            for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
+                for k in [1.0f64, 2.0, 3.0, 9.0] {
+                    let folded = bits(as_pairs(drive_fold(&(op, None, Some(k)), grid, input)));
+                    let materialised = bits(drive_select_k_range(op, None, Some(k), input));
+                    assert_eq!(
+                        folded, materialised,
+                        "{op:?}({k}) over `{name}`: the fold must reproduce \
+                         select_k_range's SEQUENCE and values"
+                    );
+                }
+            }
+            // ...and with a grouping, so the group key is exercised too.
+            let grouping = Grouping {
+                kind: GroupingKind::By,
+                labels: vec!["h".to_string()],
+            };
+            let folded = bits(as_pairs(drive_fold(
+                &(VectorAggOp::Topk, Some(grouping.clone()), Some(1.0)),
+                grid,
+                input,
+            )));
+            let materialised = bits(drive_select_k_range(
+                VectorAggOp::Topk,
+                Some(&grouping),
+                Some(1.0),
+                input,
+            ));
+            assert_eq!(folded, materialised, "topk(1) by (h) over `{name}`");
+        }
+    }
+
+    /// AC 8 — the fold's state is bounded by the OUTPUT, not by the scan.
+    ///
+    /// A range query over `N` leaf groups collapsing to `G` output groups
+    /// over `S` steps retains exactly `G x S` cells, and running at `N`
+    /// and `10N` retains the IDENTICAL number. Under the materialising
+    /// path the same input holds `N x S` points before the aggregation
+    /// runs, which is the quantity this replaces.
+    #[test]
+    fn the_fold_retains_output_groups_times_steps_whatever_the_scan_width() {
+        const STEPS: usize = 7;
+        let grid = FoldGrid {
+            start: 0,
+            step: 10,
+            kmax: STEPS as i64 - 1,
+        };
+        // Two output groups (`by (tier)`), `n` leaf series feeding them.
+        let grouping = Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["tier".to_string()],
+        };
+        let leaf = |n: usize| -> Vec<FoldInput> {
+            (0..n)
+                .map(|i| {
+                    (
+                        fold_labels(&[
+                            ("tier", if i % 2 == 0 { "hot" } else { "cold" }),
+                            ("id", &i.to_string()),
+                        ]),
+                        (0..STEPS)
+                            .map(|k| ((k as i64) * 10, (i + k) as f64))
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        let cells_at = |n: usize| -> (usize, usize, usize) {
+            let mut fold =
+                VectorAggFold::new(&(VectorAggOp::Sum, Some(grouping.clone()), None), grid)
+                    .expect("sum folds");
+            for (labels, points) in leaf(n) {
+                fold.push_series(&labels, &points).expect("on-grid");
+            }
+            let cells = fold.cells();
+            let groups = fold.groups();
+            let out = fold.finish().len();
+            (cells, groups, out)
+        };
+        let small = cells_at(20);
+        let wide = cells_at(200);
+        assert_eq!(small, (2 * STEPS, 2, 2), "G x S cells, G output series");
+        assert_eq!(
+            small, wide,
+            "10x the leaf groups must retain the IDENTICAL cell count — the \
+             fold is bounded by the OUTPUT, not by the scan"
+        );
+    }
+
+    /// AC 10 — `topk(0, …)`/`bottomk(0, …)`: no group is ever
+    /// constructed and no cell is ever retained, however wide the scan.
+    /// A fold that counted groups before consulting `k` would build 501
+    /// of them here.
+    #[test]
+    fn zero_k_fold_constructs_no_group_and_retains_no_cell() {
+        let grid = FoldGrid {
+            start: 0,
+            step: 1,
+            kmax: 100,
+        };
+        // Bare AND `by (id)`: the grouped shape is the one that would
+        // build 501 groups if `k` were consulted after the group.
+        let by_id = Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["id".to_string()],
+        };
+        let shapes = [None, Some(by_id)];
+        for op in [VectorAggOp::Topk, VectorAggOp::Bottomk] {
+            for grouping in &shapes {
+                let mut fold = VectorAggFold::new(&(op, grouping.clone(), Some(0.0)), grid)
+                    .expect("k == 0 still folds");
+                for i in 0..501u32 {
+                    let labels = fold_labels(&[("id", &i.to_string())]);
+                    let points: Vec<(i64, f64)> =
+                        (0..101).map(|k| (k, (i + k as u32) as f64)).collect();
+                    fold.push_series(&labels, &points).expect("no-op push");
+                }
+                // The RESOURCE claim first, so a mutant that keeps a real
+                // selection state at `k == 0` fails on what actually matters
+                // rather than on the enum's shape.
+                assert_eq!(fold.groups(), 0, "{op:?}: no group may be constructed");
+                assert_eq!(fold.cells(), 0, "{op:?}: no cell may be retained");
+                assert!(
+                    matches!(fold, VectorAggFold::Empty),
+                    "{op:?}: k == 0 is the structurally-empty fold"
+                );
+                assert!(fold.finish().is_empty(), "{op:?}: the result is empty");
+            }
+        }
+    }
+
+    /// A point that is not on the query grid is an internal-invariant
+    /// breach and is REPORTED, never silently dropped — a dropped point
+    /// is a silently wrong result.
+    #[test]
+    fn a_point_off_the_query_grid_is_an_error_not_a_dropped_point() {
+        let grid = FoldGrid {
+            start: 100,
+            step: 10,
+            kmax: 4,
+        };
+        assert_eq!(grid.index_of(100), Some(0));
+        assert_eq!(grid.index_of(140), Some(4));
+        assert_eq!(grid.index_of(150), None, "past kmax");
+        assert_eq!(grid.index_of(105), None, "between grid points");
+        assert_eq!(grid.index_of(90), None, "before the grid");
+        for k in 0..=4usize {
+            assert_eq!(grid.index_of(grid.point(k)), Some(k), "point/index inverse");
+        }
+        let mut fold =
+            VectorAggFold::new(&(VectorAggOp::Sum, None, None), grid).expect("sum folds");
+        match fold.push_series(&Vec::new(), &[(105, 1.0)]) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert!(reason.contains("off the query grid"), "{reason}");
+            }
+            other => panic!("expected an off-grid error, got {other:?}"),
+        }
+    }
+
+    /// Issue #236 Part B — **the reduction-order pin extends to the
+    /// fold**, and the gate is exhaustive rather than sampled.
+    ///
+    /// `RangeSlideState::emit` puts the leaf's series in label-set order
+    /// before folding, which is the same total order `pin_reduction_order`
+    /// imposes on the materialising path. This drives `emit` over ALL 24
+    /// permutations of the discriminating `{2,4,6,8}` dataset (unit:
+    /// permutations of the emitted series vector, not runs of the
+    /// process) and asserts one single value — and that it is the value
+    /// `group_range` produces over the same data.
+    ///
+    /// Emptying the sort makes this fail on 4 of the 24 inputs, every
+    /// run.
+    #[test]
+    fn the_reduction_order_pin_extends_to_the_fold() {
+        fn permutations_of_four() -> Vec<[usize; 4]> {
+            let mut out = Vec::with_capacity(24);
+            let mut a = [0usize, 1, 2, 3];
+            let mut c = [0usize; 4];
+            out.push(a);
+            let mut i = 1;
+            while i < 4 {
+                if c[i] < i {
+                    if i % 2 == 0 {
+                        a.swap(0, i);
+                    } else {
+                        a.swap(c[i], i);
+                    }
+                    out.push(a);
+                    c[i] += 1;
+                    i = 1;
+                } else {
+                    c[i] = 0;
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        let vals = [2.0f64, 4.0, 6.0, 8.0];
+        let perms = permutations_of_four();
+        assert_eq!(
+            perms.len(),
+            24,
+            "the unit is PERMUTATIONS of the emitted series vector"
+        );
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 0, 10, 10);
+
+        for op in [VectorAggOp::Stdvar, VectorAggOp::Stddev, VectorAggOp::Avg] {
+            let mut seen: BTreeSet<u64> = BTreeSet::new();
+            for perm in &perms {
+                let mut state =
+                    RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                        .expect("state");
+                state.attach_fold(&(op, None, None));
+                assert_eq!(state.folded_aggs(), 1);
+                let emitted: Vec<MatrixSeries> = perm
+                    .iter()
+                    .map(|&i| MatrixSeries {
+                        labels: vec![("host".to_string(), format!("h{}", vals[i] as u64))],
+                        points: vec![(0i64, vals[i])],
+                    })
+                    .collect();
+                let QueryResult::Matrix(out) = state.emit(emitted).expect("emit") else {
+                    panic!("a range leaf emits a matrix");
+                };
+                assert_eq!(out.len(), 1, "a bare aggregation collapses to one series");
+                seen.insert(out[0].points[0].1.to_bits());
+            }
+            assert_eq!(
+                seen.len(),
+                1,
+                "the fold produced {} distinct {op:?} values across the 24 emission \
+                 orders — the reduction-order pin is not holding in the fold: {seen:?}",
+                seen.len()
+            );
+            // ...and it is the SAME value the materialising path gives.
+            let materialised = group_range(
+                vals.iter()
+                    .map(|v| RangeSeries {
+                        labels: vec![("host".to_string(), format!("h{}", *v as u64))],
+                        points: BTreeMap::from([(0i64, *v)]),
+                    })
+                    .collect(),
+                op,
+                None,
+                None,
+            );
+            assert_eq!(
+                seen.iter().copied().collect::<Vec<u64>>(),
+                vec![materialised[0].points[&0].to_bits()],
+                "{op:?}: folded and materialised must be the same bits"
+            );
+        }
+    }
+
+    /// The mutating (fan-out) arm hands the fold its groups in label-set
+    /// order, so the fold's member order is a property of the DATA and
+    /// not of a per-process hash seed.
+    ///
+    /// Observable without a fold too: the emitted series come out
+    /// label-ascending where they used to come out in `HashMap` walk
+    /// order. With 6 distinct groups a walk order that happens to be
+    /// sorted has probability 1/720, so removing the sort reddens this on
+    /// essentially every run — stated rather than implied.
+    #[test]
+    fn the_mutating_finish_emits_its_groups_in_label_order() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{app="a"} | logfmt"#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(
+            compiled.metric_mutates_labels(),
+            "this fixture must take the fan-out arm"
+        );
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        // Bodies chosen so the rendered group labels do NOT sort the way
+        // the insertion order does.
+        let rows = slide_rows(
+            1,
+            &[
+                (10, "id=zeta"),
+                (11, "id=mike"),
+                (12, "id=alpha"),
+                (13, "id=romeo"),
+                (14, "id=bravo"),
+                (15, "id=xray"),
+            ],
+        );
+        let window = slide_window(0, 20, 10, 20);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let QueryResult::Matrix(out) = res else {
+            panic!("expected a matrix");
+        };
+        assert_eq!(out.len(), 6, "one group per distinct id");
+        let labels: Vec<LabelSet> = out.iter().map(|s| s.labels.clone()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(
+            labels, sorted,
+            "the fan-out arm must emit label-ascending — that ordering is what \
+             pins the fold's member order"
+        );
     }
 
     // -----------------------------------------------------------------

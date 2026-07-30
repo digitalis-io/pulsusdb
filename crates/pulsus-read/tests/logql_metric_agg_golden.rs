@@ -15,7 +15,7 @@ use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
     QueryParams, QueryResult, ReadError, SAMPLE_EXTRACTION_ERROR, TooBroadReason, VectorSample,
     apply_vector_aggs, combine_binary, materialize_vector_lit, plan, run_client_agg_rows,
-    run_variants_rows,
+    run_client_agg_rows_folded, run_variants_rows,
 };
 
 fn ctx() -> PlanCtx<'static> {
@@ -95,9 +95,48 @@ fn row(fp: u64, ts_ns: i64, body: &str) -> MetricScanRow {
     }
 }
 
+/// One series in the EXACT-comparison rendering: its label set and its
+/// points with every value as raw bits.
+type BitSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
+
+/// A `QueryResult` rendered for EXACT comparison: series sorted, every
+/// value as `f64::to_bits` (no tolerance, and `2` never a prefix of
+/// `2.5`). Sorting is over the whole `(labels, points)` tuple so two
+/// series sharing a label set still order deterministically.
+fn bit_canonical(result: &QueryResult) -> Vec<BitSeries> {
+    let mut out: Vec<BitSeries> = match result {
+        QueryResult::Matrix(items) => items
+            .iter()
+            .map(|s| {
+                (
+                    s.labels.clone(),
+                    s.points.iter().map(|(t, v)| (*t, v.to_bits())).collect(),
+                )
+            })
+            .collect(),
+        QueryResult::Vector(items) => items
+            .iter()
+            .map(|s| (s.labels.clone(), vec![(0i64, s.value.to_bits())]))
+            .collect(),
+        other => panic!("bit_canonical: unsupported result {other:?}"),
+    };
+    out.sort();
+    out
+}
+
 /// Runs the full client-aggregated path for `query` over `rows`: plan →
 /// compile → aggregate → vector aggs — exactly the engine's post-fetch
 /// sequence.
+///
+/// **Issue #236 AC 7 rides here, on EVERY fixture in this file.** The
+/// engine folds the innermost vector aggregation at the range leaf
+/// (`run_client_agg_rows_folded`) instead of materialising the leaf's
+/// output and aggregating it afterwards (`run_client_agg_rows` +
+/// `apply_vector_aggs`). Those two must agree BIT FOR BIT — the fold
+/// changes memory, not values — so this helper runs both and asserts it,
+/// then returns the folded one (what the engine actually returns). A
+/// fixture added to this file is an equivalence case automatically; there
+/// is no list of "the range fixtures" to keep in step with the file.
 fn run_client(
     query: &str,
     params: &QueryParams,
@@ -107,26 +146,48 @@ fn run_client(
     let mp = metric_plan_of(query, params);
     let client = mp.client.as_ref().expect("client-aggregated plan");
     let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
-    let result = run_client_agg_rows(
+    let window = match mp.step_ns {
+        Some(step_ns) => ClientWindow::Range {
+            grid_start_ns: mp.grid_start_ns,
+            end_ns: mp.end_ns,
+            step_ns,
+            range_ns: mp.range_ns,
+        },
+        None => ClientWindow::Instant {
+            start_ns: mp.grid_start_ns,
+            end_ns: mp.end_ns,
+        },
+    };
+    let materialised =
+        run_client_agg_rows(rows, &compiled, meta, client, window, mp.rate_window_ns)
+            .map(|r| apply_vector_aggs(r, &mp.vector_aggs));
+    let folded = run_client_agg_rows_folded(
         rows,
         &compiled,
         meta,
         client,
-        match mp.step_ns {
-            Some(step_ns) => ClientWindow::Range {
-                grid_start_ns: mp.grid_start_ns,
-                end_ns: mp.end_ns,
-                step_ns,
-                range_ns: mp.range_ns,
-            },
-            None => ClientWindow::Instant {
-                start_ns: mp.grid_start_ns,
-                end_ns: mp.end_ns,
-            },
-        },
+        window,
         mp.rate_window_ns,
-    )?;
-    Ok(apply_vector_aggs(result, &mp.vector_aggs))
+        &mp.vector_aggs,
+    );
+    match (&folded, &materialised) {
+        (Ok(f), Ok(m)) => assert_eq!(
+            bit_canonical(f),
+            bit_canonical(m),
+            "issue #236 AC 7: the folded leaf and the materialising path \
+             must agree bit for bit — {query}"
+        ),
+        (Err(f), Err(m)) => assert_eq!(
+            f.to_string(),
+            m.to_string(),
+            "issue #236 AC 7: both paths must refuse the same way — {query}"
+        ),
+        (f, m) => panic!(
+            "issue #236 AC 7: the folded leaf and the materialising path \
+             disagree on admission — {query}\n  folded: {f:?}\n  materialised: {m:?}"
+        ),
+    }
+    folded
 }
 
 /// One series expected: returns its points sorted by step.
@@ -970,6 +1031,189 @@ fn fp_groups_non_mutating_past_the_old_series_cap_is_served_by_the_leaf() {
             n,
             "every scanned fingerprint must reach the result"
         );
+    }
+}
+
+/// Issue #236 AC 11 — **no group-count rejection before the final
+/// result**, on the range path where the fold owns the inner aggregation.
+///
+/// The INNER `sum by (id)` produces 501 groups; the OUTER `sum` collapses
+/// them to ONE series, which the reference serves. `MAX_QUERY_SERIES` is a
+/// final-RESULT cap, so nothing may reject on the intermediate — not the
+/// leaf (Part A deleted that), and not the fold (plan v14 §3 Part B: fold
+/// state is bounded by bytes and points and nothing else).
+///
+/// Fails on `7754844` under any fold that rejects at
+/// `groups > MAX_QUERY_SERIES`, and on `590220a` at the 501st scanned
+/// group. `run_client`'s AC-7 assertion additionally proves the folded and
+/// materialised answers are the same bits at this width.
+#[test]
+fn a_range_chain_whose_inner_grouping_is_wide_and_result_is_one_series_is_served() {
+    let inner_groups = 501usize;
+    let params = range_params(0, 2 * STEP);
+    let query = r#"sum(sum by (id) (count_over_time({env="prod"} | logfmt [1m])))"#;
+    let rows: Vec<MetricScanRow> = (0..inner_groups)
+        .map(|i| row(1, 30 * NS, &format!("id={i}")))
+        .collect();
+
+    let result = run_client(query, &params, &rows, &meta_one())
+        .unwrap_or_else(|e| panic!("{inner_groups} inner groups must be served, got {e:?}"));
+    let QueryResult::Matrix(items) = result else {
+        panic!("expected a matrix");
+    };
+    assert_eq!(items.len(), 1, "the FINAL result is one series");
+    // Every scanned group contributes exactly 1 to each covering step.
+    for (_, v) in &items[0].points {
+        assert_eq!(
+            v.to_bits(),
+            (inner_groups as f64).to_bits(),
+            "every inner group must reach the outer sum"
+        );
+    }
+
+    // The same shape one group narrower is served identically — the
+    // boundary is not a boundary at all on an intermediate.
+    let rows: Vec<MetricScanRow> = (0..inner_groups - 2)
+        .map(|i| row(1, 30 * NS, &format!("id={i}")))
+        .collect();
+    let result = run_client(query, &params, &rows, &meta_one()).expect("499 inner groups");
+    let QueryResult::Matrix(items) = result else {
+        panic!("expected a matrix");
+    };
+    assert_eq!(items.len(), 1);
+}
+
+/// Issue #236 Part B — the shape the rest of this file did not have:
+/// **several leaf series merging into ONE fold group at the SAME step**.
+///
+/// Every other range fixture here either has one stream or keeps one
+/// output group per leaf group, so the fold's per-slot ACCUMULATION —
+/// second and later members reaching a slot that already holds one — was
+/// never exercised, and `run_client`'s AC-7 equivalence gate therefore
+/// could not see a defect in it. Found by a mutant (last-value-wins in
+/// place of `VectorAccum::update`) that this file passed; the gap was in
+/// the fixtures, not in the claim, so the fixture is added rather than the
+/// claim softened.
+///
+/// Three streams with DIFFERENT line counts in the same window, so `sum`,
+/// `avg`, `min`, `max` and `count` each discriminate a different way, and
+/// the AC-7 assertion inside `run_client` proves the folded and
+/// materialised answers agree over all five.
+#[test]
+fn a_range_aggregation_merging_several_streams_into_one_group_accumulates() {
+    let meta: HashMap<u64, StreamMetaRow> = (1u64..=3)
+        .map(|fp| {
+            (
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: format!("svc{fp}"),
+                    labels: format!(r#"{{"env":"prod","service_name":"svc{fp}"}}"#),
+                },
+            )
+        })
+        .collect();
+    // Stream 1 → 1 line, stream 2 → 2 lines, stream 3 → 4 lines, all
+    // inside the window `(0, 60s]` so all three land on the SAME grid
+    // point with the same group key.
+    let mut rows = vec![row(1, 10 * NS, "x")];
+    rows.extend((0..2).map(|i| row(2, (10 + i) * NS, "x")));
+    rows.extend((0..4).map(|i| row(3, (10 + i) * NS, "x")));
+    let params = range_params(0, STEP);
+
+    // (query, the value at t = 60s over members {1, 2, 4})
+    let cases: [(&str, f64); 5] = [
+        (r#"sum(count_over_time({env="prod"}[1m]))"#, 7.0),
+        (r#"count(count_over_time({env="prod"}[1m]))"#, 3.0),
+        (r#"min(count_over_time({env="prod"}[1m]))"#, 1.0),
+        (r#"max(count_over_time({env="prod"}[1m]))"#, 4.0),
+        (r#"avg(count_over_time({env="prod"}[1m]))"#, 7.0f64 / 3.0f64),
+    ];
+    for (query, want) in cases {
+        let result = run_client(query, &params, &rows, &meta).expect(query);
+        let QueryResult::Matrix(items) = result else {
+            panic!("expected a matrix for {query}");
+        };
+        assert_eq!(items.len(), 1, "{query}: one collapsed series");
+        let at_step = items[0]
+            .points
+            .iter()
+            .find(|(t, _)| *t == STEP)
+            .unwrap_or_else(|| panic!("{query}: no point at 60s in {:?}", items[0].points));
+        assert_eq!(
+            at_step.1.to_bits(),
+            want.to_bits(),
+            "{query}: every member must reach the slot"
+        );
+    }
+}
+
+/// Issue #236 AC 10 — `topk(0, …)`/`bottomk(0, …)` through the LEAF SEAM
+/// over 501 distinct groups, range and instant: `Ok(empty)`, never a
+/// group-count rejection.
+///
+/// `topk(0, …)` is a reference-verbatim 400 at PARSE in both
+/// implementations, so this arm is reachable only through the programmatic
+/// seam — which is exactly why it is pinned here as well as end-to-end
+/// (`pulsus-logql/tests/errors.rs`): the two levels cannot swap without
+/// one of them reddening. Fails on `590220a` (422 `MetricSeries` at the
+/// 501st group) and under a fold that counts groups before consulting `k`.
+#[test]
+fn zero_k_over_501_groups_is_empty_not_a_rejection() {
+    let n = 501usize;
+    let rows: Vec<MetricScanRow> = (0..n)
+        .map(|i| row(1, 30 * NS, &format!("id={i}")))
+        .collect();
+
+    for op in ["topk", "bottomk"] {
+        // Planned with a positive `k` (0 is a parse error), then the spec
+        // is rewritten to `k = 0` — the seam the arm is reachable through.
+        let inner = r#"count_over_time({env="prod"} | logfmt [1m])"#;
+        for (label, params) in [
+            ("instant", instant_params(60 * NS)),
+            ("range", range_params(0, 2 * STEP)),
+        ] {
+            let query = format!("{op}(3, {inner})");
+            let mp = metric_plan_of(&query, &params);
+            let client = mp.client.as_ref().expect("client-aggregated");
+            let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
+            let window = match mp.step_ns {
+                Some(step_ns) => ClientWindow::Range {
+                    grid_start_ns: mp.grid_start_ns,
+                    end_ns: mp.end_ns,
+                    step_ns,
+                    range_ns: mp.range_ns,
+                },
+                None => ClientWindow::Instant {
+                    start_ns: mp.grid_start_ns,
+                    end_ns: mp.end_ns,
+                },
+            };
+            let zero_k: Vec<_> = mp
+                .vector_aggs
+                .iter()
+                .map(|(o, g, _)| (*o, g.clone(), Some(0.0)))
+                .collect();
+            let result = run_client_agg_rows_folded(
+                &rows,
+                &compiled,
+                &meta_one(),
+                client,
+                window,
+                mp.rate_window_ns,
+                &zero_k,
+            )
+            .unwrap_or_else(|e| panic!("{op}(0) {label} over {n} groups must be Ok, got {e:?}"));
+            match result {
+                QueryResult::Matrix(items) => {
+                    assert!(items.is_empty(), "{op}(0) {label}: {items:?}")
+                }
+                QueryResult::Vector(items) => {
+                    assert!(items.is_empty(), "{op}(0) {label}: {items:?}")
+                }
+                other => panic!("{op}(0) {label}: unexpected {other:?}"),
+            }
+        }
     }
 }
 
