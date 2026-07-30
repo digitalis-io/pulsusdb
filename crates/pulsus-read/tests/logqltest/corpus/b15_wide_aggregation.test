@@ -1,0 +1,616 @@
+# B15 — the high-cardinality aggregation corpus (issue #236).
+#
+# Issue #236 is about a class PulsusDB used to REJECT and the reference
+# serves: an aggregation that SCANS many groups and collapses to few
+# output series. Before #236 the engine applied its 500 mid-scan, so the
+# whole of this file was a 422; the reference applies its 500 to the
+# RESULT and serves it.
+#
+# Dataset: 501 distinct `id` groups from one stream through `| logfmt`,
+# one line per id plus three extra lines so min/max are not ties
+# (id=0 -> 4 lines, id=1 -> 3, id=2 -> 2, every other id -> 1;
+# 507 lines, 501 groups). `bucket = id % 5` gives a low-cardinality
+# grouping label. Lines are spread 100ms apart across the window so a
+# sliding range eval sees a different subset at each grid point.
+#
+# CAPTURE: every expected value below is a bit-exact capture from
+# grafana/loki:3.7.4
+# (digest sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc),
+# default single-binary config, captured 2026-07-30 by the PROVENANCE.md
+# procedure. The 500 boundary was verified by capture at 499 / 500 / 501
+# groups: everything is served at 500 and the rejections below begin at
+# exactly 501.
+#
+# ===================================================================
+# TWO CASES ARE DELIBERATELY ABSENT, AND THIS IS WHY
+# ===================================================================
+#
+# 1. `topk(3, ...)` — plan v14 AC 4 lists it as a case to capture, and
+#    THE REFERENCE REJECTS IT at 501 groups (400, the same message as the
+#    `eval_fail` rows below). It is BLOCKED rather than captured from a
+#    narrower dataset: a row asserting provenance it does not have is
+#    worse than a missing row. Measured on the pinned image at exactly
+#    501 inner groups, the reference serves `sum`/`count`/`min`/`max`/
+#    `avg`/`sum by (bucket)` and rejects `topk`/`bottomk`/`stddev`/
+#    `stdvar`/`sort`/`sum by (id)`/the bare leaf — the split is
+#    SHARDABILITY (Loki's frontend rewrites the associative aggregations
+#    into per-shard sub-queries so the wide inner vector never
+#    materialises; the others materialise it and trip `max_query_series`
+#    on the intermediate). PulsusDB SERVES the non-shardable ones, which
+#    is an over-acceptance divergence recorded in the differential
+#    ledger.
+#
+# 2. `avg` / `stddev` / `stdvar` over these 501 differently-valued
+#    members — excluded by AC 4 itself. The reference computes them with
+#    an ORDER-SENSITIVE Welford recurrence over a Go map walk and does
+#    not reproduce itself run to run; PulsusDB pins the member order
+#    (`pin_reduction_order`). The captured `avg` here is
+#    1.0119760479041917, but capturing it would pin OUR order as if it
+#    were the reference's. See ledger entry #236 (b).
+
+load
+  {env="prod", service_name="wide"}
+  50ms  id=0 bucket=0
+  60ms  id=0 bucket=0
+  70ms  id=0 bucket=0
+  80ms  id=1 bucket=1
+  90ms  id=1 bucket=1
+  95ms  id=2 bucket=2
+  100ms  id=0 bucket=0
+  200ms  id=1 bucket=1
+  300ms  id=2 bucket=2
+  400ms  id=3 bucket=3
+  500ms  id=4 bucket=4
+  600ms  id=5 bucket=0
+  700ms  id=6 bucket=1
+  800ms  id=7 bucket=2
+  900ms  id=8 bucket=3
+  1000ms  id=9 bucket=4
+  1100ms  id=10 bucket=0
+  1200ms  id=11 bucket=1
+  1300ms  id=12 bucket=2
+  1400ms  id=13 bucket=3
+  1500ms  id=14 bucket=4
+  1600ms  id=15 bucket=0
+  1700ms  id=16 bucket=1
+  1800ms  id=17 bucket=2
+  1900ms  id=18 bucket=3
+  2000ms  id=19 bucket=4
+  2100ms  id=20 bucket=0
+  2200ms  id=21 bucket=1
+  2300ms  id=22 bucket=2
+  2400ms  id=23 bucket=3
+  2500ms  id=24 bucket=4
+  2600ms  id=25 bucket=0
+  2700ms  id=26 bucket=1
+  2800ms  id=27 bucket=2
+  2900ms  id=28 bucket=3
+  3000ms  id=29 bucket=4
+  3100ms  id=30 bucket=0
+  3200ms  id=31 bucket=1
+  3300ms  id=32 bucket=2
+  3400ms  id=33 bucket=3
+  3500ms  id=34 bucket=4
+  3600ms  id=35 bucket=0
+  3700ms  id=36 bucket=1
+  3800ms  id=37 bucket=2
+  3900ms  id=38 bucket=3
+  4000ms  id=39 bucket=4
+  4100ms  id=40 bucket=0
+  4200ms  id=41 bucket=1
+  4300ms  id=42 bucket=2
+  4400ms  id=43 bucket=3
+  4500ms  id=44 bucket=4
+  4600ms  id=45 bucket=0
+  4700ms  id=46 bucket=1
+  4800ms  id=47 bucket=2
+  4900ms  id=48 bucket=3
+  5000ms  id=49 bucket=4
+  5100ms  id=50 bucket=0
+  5200ms  id=51 bucket=1
+  5300ms  id=52 bucket=2
+  5400ms  id=53 bucket=3
+  5500ms  id=54 bucket=4
+  5600ms  id=55 bucket=0
+  5700ms  id=56 bucket=1
+  5800ms  id=57 bucket=2
+  5900ms  id=58 bucket=3
+  6000ms  id=59 bucket=4
+  6100ms  id=60 bucket=0
+  6200ms  id=61 bucket=1
+  6300ms  id=62 bucket=2
+  6400ms  id=63 bucket=3
+  6500ms  id=64 bucket=4
+  6600ms  id=65 bucket=0
+  6700ms  id=66 bucket=1
+  6800ms  id=67 bucket=2
+  6900ms  id=68 bucket=3
+  7000ms  id=69 bucket=4
+  7100ms  id=70 bucket=0
+  7200ms  id=71 bucket=1
+  7300ms  id=72 bucket=2
+  7400ms  id=73 bucket=3
+  7500ms  id=74 bucket=4
+  7600ms  id=75 bucket=0
+  7700ms  id=76 bucket=1
+  7800ms  id=77 bucket=2
+  7900ms  id=78 bucket=3
+  8000ms  id=79 bucket=4
+  8100ms  id=80 bucket=0
+  8200ms  id=81 bucket=1
+  8300ms  id=82 bucket=2
+  8400ms  id=83 bucket=3
+  8500ms  id=84 bucket=4
+  8600ms  id=85 bucket=0
+  8700ms  id=86 bucket=1
+  8800ms  id=87 bucket=2
+  8900ms  id=88 bucket=3
+  9000ms  id=89 bucket=4
+  9100ms  id=90 bucket=0
+  9200ms  id=91 bucket=1
+  9300ms  id=92 bucket=2
+  9400ms  id=93 bucket=3
+  9500ms  id=94 bucket=4
+  9600ms  id=95 bucket=0
+  9700ms  id=96 bucket=1
+  9800ms  id=97 bucket=2
+  9900ms  id=98 bucket=3
+  10000ms  id=99 bucket=4
+  10100ms  id=100 bucket=0
+  10200ms  id=101 bucket=1
+  10300ms  id=102 bucket=2
+  10400ms  id=103 bucket=3
+  10500ms  id=104 bucket=4
+  10600ms  id=105 bucket=0
+  10700ms  id=106 bucket=1
+  10800ms  id=107 bucket=2
+  10900ms  id=108 bucket=3
+  11000ms  id=109 bucket=4
+  11100ms  id=110 bucket=0
+  11200ms  id=111 bucket=1
+  11300ms  id=112 bucket=2
+  11400ms  id=113 bucket=3
+  11500ms  id=114 bucket=4
+  11600ms  id=115 bucket=0
+  11700ms  id=116 bucket=1
+  11800ms  id=117 bucket=2
+  11900ms  id=118 bucket=3
+  12000ms  id=119 bucket=4
+  12100ms  id=120 bucket=0
+  12200ms  id=121 bucket=1
+  12300ms  id=122 bucket=2
+  12400ms  id=123 bucket=3
+  12500ms  id=124 bucket=4
+  12600ms  id=125 bucket=0
+  12700ms  id=126 bucket=1
+  12800ms  id=127 bucket=2
+  12900ms  id=128 bucket=3
+  13000ms  id=129 bucket=4
+  13100ms  id=130 bucket=0
+  13200ms  id=131 bucket=1
+  13300ms  id=132 bucket=2
+  13400ms  id=133 bucket=3
+  13500ms  id=134 bucket=4
+  13600ms  id=135 bucket=0
+  13700ms  id=136 bucket=1
+  13800ms  id=137 bucket=2
+  13900ms  id=138 bucket=3
+  14000ms  id=139 bucket=4
+  14100ms  id=140 bucket=0
+  14200ms  id=141 bucket=1
+  14300ms  id=142 bucket=2
+  14400ms  id=143 bucket=3
+  14500ms  id=144 bucket=4
+  14600ms  id=145 bucket=0
+  14700ms  id=146 bucket=1
+  14800ms  id=147 bucket=2
+  14900ms  id=148 bucket=3
+  15000ms  id=149 bucket=4
+  15100ms  id=150 bucket=0
+  15200ms  id=151 bucket=1
+  15300ms  id=152 bucket=2
+  15400ms  id=153 bucket=3
+  15500ms  id=154 bucket=4
+  15600ms  id=155 bucket=0
+  15700ms  id=156 bucket=1
+  15800ms  id=157 bucket=2
+  15900ms  id=158 bucket=3
+  16000ms  id=159 bucket=4
+  16100ms  id=160 bucket=0
+  16200ms  id=161 bucket=1
+  16300ms  id=162 bucket=2
+  16400ms  id=163 bucket=3
+  16500ms  id=164 bucket=4
+  16600ms  id=165 bucket=0
+  16700ms  id=166 bucket=1
+  16800ms  id=167 bucket=2
+  16900ms  id=168 bucket=3
+  17000ms  id=169 bucket=4
+  17100ms  id=170 bucket=0
+  17200ms  id=171 bucket=1
+  17300ms  id=172 bucket=2
+  17400ms  id=173 bucket=3
+  17500ms  id=174 bucket=4
+  17600ms  id=175 bucket=0
+  17700ms  id=176 bucket=1
+  17800ms  id=177 bucket=2
+  17900ms  id=178 bucket=3
+  18000ms  id=179 bucket=4
+  18100ms  id=180 bucket=0
+  18200ms  id=181 bucket=1
+  18300ms  id=182 bucket=2
+  18400ms  id=183 bucket=3
+  18500ms  id=184 bucket=4
+  18600ms  id=185 bucket=0
+  18700ms  id=186 bucket=1
+  18800ms  id=187 bucket=2
+  18900ms  id=188 bucket=3
+  19000ms  id=189 bucket=4
+  19100ms  id=190 bucket=0
+  19200ms  id=191 bucket=1
+  19300ms  id=192 bucket=2
+  19400ms  id=193 bucket=3
+  19500ms  id=194 bucket=4
+  19600ms  id=195 bucket=0
+  19700ms  id=196 bucket=1
+  19800ms  id=197 bucket=2
+  19900ms  id=198 bucket=3
+  20000ms  id=199 bucket=4
+  20100ms  id=200 bucket=0
+  20200ms  id=201 bucket=1
+  20300ms  id=202 bucket=2
+  20400ms  id=203 bucket=3
+  20500ms  id=204 bucket=4
+  20600ms  id=205 bucket=0
+  20700ms  id=206 bucket=1
+  20800ms  id=207 bucket=2
+  20900ms  id=208 bucket=3
+  21000ms  id=209 bucket=4
+  21100ms  id=210 bucket=0
+  21200ms  id=211 bucket=1
+  21300ms  id=212 bucket=2
+  21400ms  id=213 bucket=3
+  21500ms  id=214 bucket=4
+  21600ms  id=215 bucket=0
+  21700ms  id=216 bucket=1
+  21800ms  id=217 bucket=2
+  21900ms  id=218 bucket=3
+  22000ms  id=219 bucket=4
+  22100ms  id=220 bucket=0
+  22200ms  id=221 bucket=1
+  22300ms  id=222 bucket=2
+  22400ms  id=223 bucket=3
+  22500ms  id=224 bucket=4
+  22600ms  id=225 bucket=0
+  22700ms  id=226 bucket=1
+  22800ms  id=227 bucket=2
+  22900ms  id=228 bucket=3
+  23000ms  id=229 bucket=4
+  23100ms  id=230 bucket=0
+  23200ms  id=231 bucket=1
+  23300ms  id=232 bucket=2
+  23400ms  id=233 bucket=3
+  23500ms  id=234 bucket=4
+  23600ms  id=235 bucket=0
+  23700ms  id=236 bucket=1
+  23800ms  id=237 bucket=2
+  23900ms  id=238 bucket=3
+  24000ms  id=239 bucket=4
+  24100ms  id=240 bucket=0
+  24200ms  id=241 bucket=1
+  24300ms  id=242 bucket=2
+  24400ms  id=243 bucket=3
+  24500ms  id=244 bucket=4
+  24600ms  id=245 bucket=0
+  24700ms  id=246 bucket=1
+  24800ms  id=247 bucket=2
+  24900ms  id=248 bucket=3
+  25000ms  id=249 bucket=4
+  25100ms  id=250 bucket=0
+  25200ms  id=251 bucket=1
+  25300ms  id=252 bucket=2
+  25400ms  id=253 bucket=3
+  25500ms  id=254 bucket=4
+  25600ms  id=255 bucket=0
+  25700ms  id=256 bucket=1
+  25800ms  id=257 bucket=2
+  25900ms  id=258 bucket=3
+  26000ms  id=259 bucket=4
+  26100ms  id=260 bucket=0
+  26200ms  id=261 bucket=1
+  26300ms  id=262 bucket=2
+  26400ms  id=263 bucket=3
+  26500ms  id=264 bucket=4
+  26600ms  id=265 bucket=0
+  26700ms  id=266 bucket=1
+  26800ms  id=267 bucket=2
+  26900ms  id=268 bucket=3
+  27000ms  id=269 bucket=4
+  27100ms  id=270 bucket=0
+  27200ms  id=271 bucket=1
+  27300ms  id=272 bucket=2
+  27400ms  id=273 bucket=3
+  27500ms  id=274 bucket=4
+  27600ms  id=275 bucket=0
+  27700ms  id=276 bucket=1
+  27800ms  id=277 bucket=2
+  27900ms  id=278 bucket=3
+  28000ms  id=279 bucket=4
+  28100ms  id=280 bucket=0
+  28200ms  id=281 bucket=1
+  28300ms  id=282 bucket=2
+  28400ms  id=283 bucket=3
+  28500ms  id=284 bucket=4
+  28600ms  id=285 bucket=0
+  28700ms  id=286 bucket=1
+  28800ms  id=287 bucket=2
+  28900ms  id=288 bucket=3
+  29000ms  id=289 bucket=4
+  29100ms  id=290 bucket=0
+  29200ms  id=291 bucket=1
+  29300ms  id=292 bucket=2
+  29400ms  id=293 bucket=3
+  29500ms  id=294 bucket=4
+  29600ms  id=295 bucket=0
+  29700ms  id=296 bucket=1
+  29800ms  id=297 bucket=2
+  29900ms  id=298 bucket=3
+  30000ms  id=299 bucket=4
+  30100ms  id=300 bucket=0
+  30200ms  id=301 bucket=1
+  30300ms  id=302 bucket=2
+  30400ms  id=303 bucket=3
+  30500ms  id=304 bucket=4
+  30600ms  id=305 bucket=0
+  30700ms  id=306 bucket=1
+  30800ms  id=307 bucket=2
+  30900ms  id=308 bucket=3
+  31000ms  id=309 bucket=4
+  31100ms  id=310 bucket=0
+  31200ms  id=311 bucket=1
+  31300ms  id=312 bucket=2
+  31400ms  id=313 bucket=3
+  31500ms  id=314 bucket=4
+  31600ms  id=315 bucket=0
+  31700ms  id=316 bucket=1
+  31800ms  id=317 bucket=2
+  31900ms  id=318 bucket=3
+  32000ms  id=319 bucket=4
+  32100ms  id=320 bucket=0
+  32200ms  id=321 bucket=1
+  32300ms  id=322 bucket=2
+  32400ms  id=323 bucket=3
+  32500ms  id=324 bucket=4
+  32600ms  id=325 bucket=0
+  32700ms  id=326 bucket=1
+  32800ms  id=327 bucket=2
+  32900ms  id=328 bucket=3
+  33000ms  id=329 bucket=4
+  33100ms  id=330 bucket=0
+  33200ms  id=331 bucket=1
+  33300ms  id=332 bucket=2
+  33400ms  id=333 bucket=3
+  33500ms  id=334 bucket=4
+  33600ms  id=335 bucket=0
+  33700ms  id=336 bucket=1
+  33800ms  id=337 bucket=2
+  33900ms  id=338 bucket=3
+  34000ms  id=339 bucket=4
+  34100ms  id=340 bucket=0
+  34200ms  id=341 bucket=1
+  34300ms  id=342 bucket=2
+  34400ms  id=343 bucket=3
+  34500ms  id=344 bucket=4
+  34600ms  id=345 bucket=0
+  34700ms  id=346 bucket=1
+  34800ms  id=347 bucket=2
+  34900ms  id=348 bucket=3
+  35000ms  id=349 bucket=4
+  35100ms  id=350 bucket=0
+  35200ms  id=351 bucket=1
+  35300ms  id=352 bucket=2
+  35400ms  id=353 bucket=3
+  35500ms  id=354 bucket=4
+  35600ms  id=355 bucket=0
+  35700ms  id=356 bucket=1
+  35800ms  id=357 bucket=2
+  35900ms  id=358 bucket=3
+  36000ms  id=359 bucket=4
+  36100ms  id=360 bucket=0
+  36200ms  id=361 bucket=1
+  36300ms  id=362 bucket=2
+  36400ms  id=363 bucket=3
+  36500ms  id=364 bucket=4
+  36600ms  id=365 bucket=0
+  36700ms  id=366 bucket=1
+  36800ms  id=367 bucket=2
+  36900ms  id=368 bucket=3
+  37000ms  id=369 bucket=4
+  37100ms  id=370 bucket=0
+  37200ms  id=371 bucket=1
+  37300ms  id=372 bucket=2
+  37400ms  id=373 bucket=3
+  37500ms  id=374 bucket=4
+  37600ms  id=375 bucket=0
+  37700ms  id=376 bucket=1
+  37800ms  id=377 bucket=2
+  37900ms  id=378 bucket=3
+  38000ms  id=379 bucket=4
+  38100ms  id=380 bucket=0
+  38200ms  id=381 bucket=1
+  38300ms  id=382 bucket=2
+  38400ms  id=383 bucket=3
+  38500ms  id=384 bucket=4
+  38600ms  id=385 bucket=0
+  38700ms  id=386 bucket=1
+  38800ms  id=387 bucket=2
+  38900ms  id=388 bucket=3
+  39000ms  id=389 bucket=4
+  39100ms  id=390 bucket=0
+  39200ms  id=391 bucket=1
+  39300ms  id=392 bucket=2
+  39400ms  id=393 bucket=3
+  39500ms  id=394 bucket=4
+  39600ms  id=395 bucket=0
+  39700ms  id=396 bucket=1
+  39800ms  id=397 bucket=2
+  39900ms  id=398 bucket=3
+  40000ms  id=399 bucket=4
+  40100ms  id=400 bucket=0
+  40200ms  id=401 bucket=1
+  40300ms  id=402 bucket=2
+  40400ms  id=403 bucket=3
+  40500ms  id=404 bucket=4
+  40600ms  id=405 bucket=0
+  40700ms  id=406 bucket=1
+  40800ms  id=407 bucket=2
+  40900ms  id=408 bucket=3
+  41000ms  id=409 bucket=4
+  41100ms  id=410 bucket=0
+  41200ms  id=411 bucket=1
+  41300ms  id=412 bucket=2
+  41400ms  id=413 bucket=3
+  41500ms  id=414 bucket=4
+  41600ms  id=415 bucket=0
+  41700ms  id=416 bucket=1
+  41800ms  id=417 bucket=2
+  41900ms  id=418 bucket=3
+  42000ms  id=419 bucket=4
+  42100ms  id=420 bucket=0
+  42200ms  id=421 bucket=1
+  42300ms  id=422 bucket=2
+  42400ms  id=423 bucket=3
+  42500ms  id=424 bucket=4
+  42600ms  id=425 bucket=0
+  42700ms  id=426 bucket=1
+  42800ms  id=427 bucket=2
+  42900ms  id=428 bucket=3
+  43000ms  id=429 bucket=4
+  43100ms  id=430 bucket=0
+  43200ms  id=431 bucket=1
+  43300ms  id=432 bucket=2
+  43400ms  id=433 bucket=3
+  43500ms  id=434 bucket=4
+  43600ms  id=435 bucket=0
+  43700ms  id=436 bucket=1
+  43800ms  id=437 bucket=2
+  43900ms  id=438 bucket=3
+  44000ms  id=439 bucket=4
+  44100ms  id=440 bucket=0
+  44200ms  id=441 bucket=1
+  44300ms  id=442 bucket=2
+  44400ms  id=443 bucket=3
+  44500ms  id=444 bucket=4
+  44600ms  id=445 bucket=0
+  44700ms  id=446 bucket=1
+  44800ms  id=447 bucket=2
+  44900ms  id=448 bucket=3
+  45000ms  id=449 bucket=4
+  45100ms  id=450 bucket=0
+  45200ms  id=451 bucket=1
+  45300ms  id=452 bucket=2
+  45400ms  id=453 bucket=3
+  45500ms  id=454 bucket=4
+  45600ms  id=455 bucket=0
+  45700ms  id=456 bucket=1
+  45800ms  id=457 bucket=2
+  45900ms  id=458 bucket=3
+  46000ms  id=459 bucket=4
+  46100ms  id=460 bucket=0
+  46200ms  id=461 bucket=1
+  46300ms  id=462 bucket=2
+  46400ms  id=463 bucket=3
+  46500ms  id=464 bucket=4
+  46600ms  id=465 bucket=0
+  46700ms  id=466 bucket=1
+  46800ms  id=467 bucket=2
+  46900ms  id=468 bucket=3
+  47000ms  id=469 bucket=4
+  47100ms  id=470 bucket=0
+  47200ms  id=471 bucket=1
+  47300ms  id=472 bucket=2
+  47400ms  id=473 bucket=3
+  47500ms  id=474 bucket=4
+  47600ms  id=475 bucket=0
+  47700ms  id=476 bucket=1
+  47800ms  id=477 bucket=2
+  47900ms  id=478 bucket=3
+  48000ms  id=479 bucket=4
+  48100ms  id=480 bucket=0
+  48200ms  id=481 bucket=1
+  48300ms  id=482 bucket=2
+  48400ms  id=483 bucket=3
+  48500ms  id=484 bucket=4
+  48600ms  id=485 bucket=0
+  48700ms  id=486 bucket=1
+  48800ms  id=487 bucket=2
+  48900ms  id=488 bucket=3
+  49000ms  id=489 bucket=4
+  49100ms  id=490 bucket=0
+  49200ms  id=491 bucket=1
+  49300ms  id=492 bucket=2
+  49400ms  id=493 bucket=3
+  49500ms  id=494 bucket=4
+  49600ms  id=495 bucket=0
+  49700ms  id=496 bucket=1
+  49800ms  id=497 bucket=2
+  49900ms  id=498 bucket=3
+  50000ms  id=499 bucket=4
+  50100ms  id=500 bucket=0
+
+# --- served: collapse-to-few over 501 scanned groups -------------------
+# Each of these is a 422 on the pre-#236 engine (mid-scan cap at the
+# 501st group) and a 200 here and in the reference.
+
+# sum: 507 lines across 501 groups
+eval instant at 60s sum(count_over_time({service_name="wide"} | logfmt [1m]))
+  {} 507
+
+# count: the number of GROUPS, not lines
+eval instant at 60s count(count_over_time({service_name="wide"} | logfmt [1m]))
+  {} 501
+
+# min / max over the per-group counts (id=0 has 4 lines, most have 1)
+eval instant at 60s min(count_over_time({service_name="wide"} | logfmt [1m]))
+  {} 1
+
+eval instant at 60s max(count_over_time({service_name="wide"} | logfmt [1m]))
+  {} 4
+
+# sum by a LOW-cardinality label: 501 scanned groups -> 5 result series
+eval instant at 60s sum by (bucket) (count_over_time({service_name="wide"} | logfmt [1m]))
+  {bucket="0"} 104
+  {bucket="1"} 102
+  {bucket="2"} 101
+  {bucket="3"} 100
+  {bucket="4"} 100
+
+# AC 11: an OUTER sum over an INNER `sum by (id)` producing 501 groups
+# and collapsing to ONE series. The reference serves this (the inner
+# never materialises) while rejecting the bare `sum by (id)` below — the
+# case that proves the cap belongs on the RESULT, not on an intermediate.
+eval instant at 60s sum(sum by (id) (count_over_time({service_name="wide"} | logfmt [1m])))
+  {} 507
+
+# --- served: a sliding RANGE eval, range > step ------------------------
+# grid {60s, 90s, 120s}, window (t-1m, t]. At 60s every line is in
+# window (507); at 90s only the lines at offsets in (30s, 90s] remain
+# (ids 300..500, one line each = 201); at 120s the window is empty and
+# no point is emitted. Exercises the streaming fold AND the class-A
+# delta-index branch (range >= step).
+eval range from 60s to 120s step 30s sum(count_over_time({service_name="wide"} | logfmt [1m]))
+  {} 60s 507 90s 201
+
+# --- rejected: the RESULT itself exceeds 500 series --------------------
+# The reference's own message, verbatim.
+
+eval_fail instant at 60s count_over_time({service_name="wide"} | logfmt [1m])
+  msg: maximum number of series (500) reached for a single query; consider reducing query cardinality by adding more specific stream selectors, reducing the time range, or aggregating results with functions like sum(), count() or topk()
+
+eval_fail instant at 60s sort(count_over_time({service_name="wide"} | logfmt [1m]))
+  msg: maximum number of series (500) reached for a single query; consider reducing query cardinality by adding more specific stream selectors, reducing the time range, or aggregating results with functions like sum(), count() or topk()
+
+eval_fail instant at 60s sum by (id) (count_over_time({service_name="wide"} | logfmt [1m]))
+  msg: maximum number of series (500) reached for a single query; consider reducing query cardinality by adding more specific stream selectors, reducing the time range, or aggregating results with functions like sum(), count() or topk()
+
+clear

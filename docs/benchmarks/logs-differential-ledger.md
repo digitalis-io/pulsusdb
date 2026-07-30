@@ -575,6 +575,36 @@ not "fix" us toward the panic.
   divergence registered here is a clean bounded refusal replacing an
   unbounded path.
 
+- **(f) The reference's 500 is NOT a pure result-size cap for
+  NON-SHARDABLE aggregations — PulsusDB over-accepts there.** *Measured*
+  on `grafana/loki:3.7.4` (digest `sha256:87f0a0…56cfcc`, default config)
+  at exactly 501 distinct inner groups, with the boundary confirmed by
+  capture at 499 / 500 / 501: the reference **serves** `sum`, `count`,
+  `min`, `max`, `avg` (bare and grouped), `sum by (<low-cardinality>)`
+  and `sum(sum by (id) (…))`, and **rejects** `topk(k)`, `bottomk(k)`,
+  `stddev`, `stdvar`, `sort`, `sum by (id)`, the bare leaf,
+  `sum(topk(600, …))` and `count(topk(3, …))` — all with the same
+  `maximum number of series (500) reached for a single query…` body,
+  even where the FINAL result is 1 or 3 series. The split is
+  shardability: Loki's frontend rewrites the associative aggregations
+  into per-shard sub-queries so the wide inner vector never materialises,
+  while the others materialise it and trip `max_query_series` on that
+  intermediate. *PulsusDB:* applies the 500 to the final result only, so
+  it **serves** `topk(3, …)`/`stddev(…)`/`bottomk(…)` over 501+ inner
+  groups where the reference refuses. That is **over-acceptance**, the
+  same direction (and the same disposition) as the SQL instant path's
+  missing series cap: PulsusDB answers a query the reference declines,
+  which no user query breaks. It is registered rather than fixed because
+  matching it would mean reintroducing an intermediate group cap — the
+  exact rejection surface issue #236 exists to delete — and because the
+  reference's own behaviour here is an artefact of its sharding plan, not
+  of its documented limit semantics (`pkg/validation/limits.go:373`
+  describes series "returned by a metric query").
+
+  **This corrects plan v14 §1's live probe**, which recorded `stddev`,
+  `topk(3, …)`, `approx_topk(3, …)` and `sum(topk(600, …))` as served
+  over 600 groups. They are not, on the pinned image.
+
 ## Issue #230 — `line_format`/`label_format` template engine
 
 The full Go `text/template` + reference function-map surface landed in

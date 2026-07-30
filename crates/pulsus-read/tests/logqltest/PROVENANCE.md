@@ -137,6 +137,54 @@ This is done **once** per case, offline; CI runs only the hermetic runner.
    digest / date in the `.test` file's header comment if the value is
    non-obvious (e.g. the `rate_counter` ns/ms extrapolation captures).
 
+## `b15_wide_aggregation.test` — the issue #236 high-cardinality capture
+
+- **Image:** `grafana/loki:3.7.4`, digest
+  `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+  **default single-binary config** (no `ci/logql/config.yaml` deltas — none
+  of these constructs needs one). Captured 2026-07-30.
+- **Dataset:** 507 lines / 501 distinct `| logfmt` `id` groups on one
+  stream, spread 100 ms apart so a sliding range eval sees a different
+  subset at each grid point; `bucket = id % 5` supplies a
+  low-cardinality grouping label.
+- **Anchoring:** the DSL's `at 60s` was mapped to a wall clock instant on
+  an exact 30 s boundary. That matters only for the `eval range` case:
+  Loki's `/query_range` grid is anchored on absolute time, so an
+  unaligned anchor puts the container's grid points between the DSL's and
+  the captured values do not correspond to any DSL instant. (Observed
+  before the alignment: 485/322/22 where the aligned capture gives
+  507/201.)
+- **Boundary verified, not assumed:** the same dataset was captured at
+  **499, 500 and 501** groups. Everything is served at 499 and 500; the
+  rejections begin at exactly 501.
+
+### The `topk(3, …)` row is BLOCKED, not captured
+
+Plan v14 AC 4 lists `topk(3, …)` among the cases to capture as SERVED.
+**The reference rejects it at 501 groups** — HTTP 400, the same
+`maximum number of series (500) reached…` body as the `eval_fail` rows.
+It is therefore absent from the file rather than captured from a
+narrower dataset: a row asserting provenance it does not have is worse
+than a missing row (the #240 discipline).
+
+Measured at exactly 501 inner groups on the pinned image:
+
+| served (200) | rejected (400) |
+|---|---|
+| `sum`, `count`, `min`, `max`, `avg` (bare and `by(bucket)`), `sum by (bucket)`, `sum(sum by (id) (…))` | `topk(k)`, `bottomk(k)`, `stddev`, `stdvar`, `sort`, `sum by (id)`, the bare leaf, `sum(topk(600, …))`, `count(topk(3, …))` |
+
+The split is **shardability**: Loki's frontend rewrites the associative
+aggregations into per-shard sub-queries, so the wide inner vector never
+materialises in one evaluator; the others materialise it and trip
+`max_query_series` on that intermediate. `sum(sum by (id) (…))` being
+served while bare `sum by (id)` is rejected is the same mechanism, and it
+is the case plan v14 AC 11 exists for.
+
+**This contradicts plan v14 §1's live probe**, which recorded
+`stddev(…)`, `topk(3, …)`, `approx_topk(3, …)` and `sum(topk(600, …))`
+as 200 over 600 groups. Registered as a divergence in
+`docs/benchmarks/logs-differential-ledger.md` (issue #236 entry (f)).
+
 ## Batch 0 seed provenance
 
 Batch 0 ports the **instant-eval subset** of the 39 differential cases in
