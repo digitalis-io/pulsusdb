@@ -3690,32 +3690,76 @@ fn variants_range_matrix_carries_the_index_per_series() {
 /// have no folded twin to compare against. This test reads the suite's
 /// own source and pins both counts, so a sentence claiming "every
 /// fixture" cannot outlive the mechanism again.
+///
+/// Both counts are the populations the sentence NAMES, which takes three
+/// exclusions the first cut missed (whole-branch re-review `[low]`): the
+/// census's own pattern literals (every name it greps for appears in the
+/// line that greps for it), `run_client`'s internal `apply_vector_aggs_ok`
+/// call (that one IS the routed path), and the helper DEFINITIONS. And
+/// `combine_binary` — named by the sentence, absent from the first count —
+/// is counted.
 #[test]
 fn every_client_routed_fixture_is_an_equivalence_case() {
+    const CAVEAT: &str = "which is not the same as every fixture in the file";
+    // The direct population, exactly as the doc above enumerates it.
+    const DIRECT_ROUTES: [&str; 4] = [
+        "apply_vector_aggs_ok(",
+        "materialize_vector_lit(",
+        "combine_binary(",
+        "run_variants_rows(",
+    ];
     let src = include_str!("logql_metric_agg_golden.rs");
-    let body = src
-        .split_once("fn run_client(")
-        .expect("run_client exists")
-        .1;
-    let routed = body.matches("run_client(").count();
-    let direct = src.matches("apply_vector_aggs_ok(").count()
-        + src.matches("materialize_vector_lit(").count()
-        + src.matches("run_variants_rows(").count();
+    // Everything before this census: its own literals are not fixtures.
+    let suite = src
+        .split_once("fn every_client_routed_fixture_is_an_equivalence_case(")
+        .expect("the census reads the file it lives in")
+        .0;
+    let rc_anchor = "fn run_client(";
+    let rc_start = suite.find(rc_anchor).expect("run_client exists");
+    let after_sig = &suite[rc_start + rc_anchor.len()..];
+    // `run_client`'s body ends at the first column-0 `}`; nothing inside
+    // it is a fixture — neither a call site (there are none) nor the
+    // `apply_vector_aggs_ok` that builds the materialised twin.
+    let rc_body_end = after_sig.find("\n}\n").expect("run_client's body ends");
+    let routed = after_sig[rc_body_end..].matches("run_client(").count();
+    let outside_run_client = format!("{}{}", &suite[..rc_start], &after_sig[rc_body_end..]);
+    let direct_sites = |route: &str| {
+        outside_run_client
+            .match_indices(route)
+            .filter(|(i, _)| !outside_run_client[..*i].ends_with("fn "))
+            .count()
+    };
+    // 38 real call sites. The previous floor of 40 was met only because
+    // the census counted its own two `run_client(` literals — the same
+    // self-reference the direct count made, found by correcting it.
     assert!(
-        routed >= 40,
+        routed >= 38,
         "only {routed} fixtures route through run_client — AC 7's equivalence assertion is \
          narrower than it looks"
     );
-    assert!(
+    // Per route, not just in total: the doc names four ways to drive the
+    // engine without a folded twin, and a name that no longer has one
+    // makes the sentence wrong even while the others keep `direct > 0`.
+    let direct: usize = DIRECT_ROUTES
+        .iter()
+        .map(|route| {
+            let n = direct_sites(route);
+            assert!(
+                n > 0,
+                "no fixture drives {route} directly any more — AC 7's caveat still names it, so \
+                 either the doc's enumeration or this census is stale"
+            );
+            n
+        })
+        .sum();
+    // The claim and the mechanism, side by side, in BOTH directions: the
+    // caveat must exist exactly while the direct fixtures do. Today the
+    // failing direction is deleting the caveat while `direct` is 25 + 6 +
+    // 44 + 1 = 76; the other direction retires the caveat if the direct
+    // population is ever emptied.
+    assert_eq!(
+        suite.contains(CAVEAT),
         direct > 0,
-        "if nothing drives the engine directly any more, AC 7's scope caveat is stale and the \
-         doc should say `every fixture` again"
-    );
-    // The claim and the mechanism, side by side: the caveat must exist
-    // exactly while the direct fixtures do.
-    assert!(
-        body.contains("which is not the same as every fixture in the file")
-            || src.contains("which is not the same as every fixture in the file"),
-        "AC 7's scope caveat has been removed while direct fixtures still exist"
+        "AC 7's scope caveat and its {direct} direct fixtures must appear and disappear together"
     );
 }

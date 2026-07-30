@@ -9171,30 +9171,72 @@ fn group_key_bytes(labels: &[(String, String)], grouping: Option<&Grouping>) -> 
     bytes.saturating_add(grown_alloc_bytes(elems))
 }
 
+/// **The refund, by construction** — the RAII half of
+/// [`charged_group_key`]. The key's bytes are charged BEFORE the key
+/// exists, so the charge is only correct once the key is RETAINED; until
+/// then it is transient and owed back. Pairing a `discharge_group_bytes`
+/// call with each non-retaining exit is what let the points-charge error
+/// path leak (issue #236 whole-branch re-review `[low]`), so the refund
+/// is `Drop`'s job instead: the charge sticks ONLY through
+/// [`GroupKeyCharge::commit`], called immediately after the insertion
+/// that retains the key. Every other exit between the charge and that
+/// insertion — including ones added later — refunds by construction.
+///
+/// The guarantee is this `Drop` impl plus the absence of any other route
+/// from the fold to `group_key`
+/// (`the_fold_charges_before_it_builds_a_group_key`), NOT a behavioural
+/// test: on the leaking path `push_series` returns `Err`, the query
+/// aborts and no finish post-condition runs, so nothing observable
+/// distinguishes a refunded charge from a leaked one and a test asserting
+/// the refund could not fail.
+#[derive(Debug)]
+#[must_use = "the guard refunds the key charge when it drops; hold it until the key is retained"]
+struct GroupKeyCharge<'a> {
+    charged: &'a mut u64,
+    /// The bytes owed back. [`GroupKeyCharge::commit`] zeroes it, which
+    /// is how a committed charge becomes a no-op refund.
+    bytes: u64,
+}
+
+impl GroupKeyCharge<'_> {
+    /// The key is RETAINED — the charge belongs to the counter now.
+    fn commit(mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for GroupKeyCharge<'_> {
+    fn drop(&mut self) {
+        discharge_group_bytes(self.charged, self.bytes);
+    }
+}
+
 /// **The fold's only route to [`group_key`]** — charge, THEN allocate,
 /// in ONE place so the ordering is read once rather than repeated at
 /// every call site (issue #236 review round 1 `[high]`).
 ///
-/// Returns the key and the bytes charged for it; a caller that finds the
-/// group already present refunds them, because the key is transient
-/// there and the counter tracks what is RETAINED. The bound therefore
-/// covers `retained + one transient`, which is what charging before
-/// allocating necessarily costs.
+/// Returns the key and a [`GroupKeyCharge`] guard for the bytes charged
+/// for it. The counter tracks what is RETAINED, so the charge survives
+/// only if the caller RETAINS the key ([`GroupKeyCharge::commit`]); every
+/// other exit — the group was already present, or an intervening charge
+/// refused — refunds when the guard drops. The bound therefore covers
+/// `retained + one transient`, which is what charging before allocating
+/// necessarily costs.
 ///
 /// `the_fold_charges_before_it_builds_a_group_key` pins the statement
 /// ORDER inside this function: a behavioural test cannot see the
 /// inversion (the transient key is built either way), so the ordering is
 /// checked where it is written.
-fn charged_group_key(
+fn charged_group_key<'a>(
     labels: &[(String, String)],
     grouping: Option<&Grouping>,
-    charged: &mut u64,
+    charged: &'a mut u64,
     cap: u64,
-) -> Result<(LabelSet, u64), ReadError> {
+) -> Result<(LabelSet, GroupKeyCharge<'a>), ReadError> {
     let bytes = group_key_bytes(labels, grouping).saturating_add(map_entry_bytes(FOLD_GROUP_SLOT));
     charge_group_bytes(charged, bytes, cap)?;
     let key = group_key(labels, grouping);
-    Ok((key, bytes))
+    Ok((key, GroupKeyCharge { charged, bytes }))
 }
 
 fn group_key(labels: &[(String, String)], grouping: Option<&Grouping>) -> LabelSet {
@@ -9975,25 +10017,25 @@ impl ReduceFold {
         // The KEY's bytes are charged before `group_key` builds it —
         // `group_key` allocates one owned `String` per `by` NAME, read
         // off the query text, and the entry expression would otherwise
-        // evaluate it before any charge (review round 1 `[high]`). A
-        // group that turns out to be Occupied refunds immediately: the
-        // key is transient there, and the counter tracks what is
-        // RETAINED.
-        let (key, key_bytes) = charged_group_key(
+        // evaluate it before any charge (review round 1 `[high]`). The
+        // counter tracks what is RETAINED, so `key_charge` only sticks
+        // where the key does: an Occupied group lets the guard drop and
+        // refunds (the key is transient there), and the Vacant arm's
+        // point reservation can still refuse AFTER the key charge — the
+        // guard refunds that exit too.
+        let (key, key_charge) = charged_group_key(
             labels,
             self.grouping.as_ref(),
             &mut self.group_bytes,
             self.group_cap,
         )?;
-        let group_bytes = &mut self.group_bytes;
         let slots = match self.groups.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => {
-                discharge_group_bytes(group_bytes, key_bytes);
-                e.into_mut()
-            }
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 charge_result_points(charged, grid.slots() as u64, cap)?;
-                e.insert(vec![VectorAccum::EMPTY; grid.slots()])
+                let slots = e.insert(vec![VectorAccum::EMPTY; grid.slots()]);
+                key_charge.commit();
+                slots
             }
         };
         for &(t, v) in points {
@@ -10071,21 +10113,19 @@ impl SelectFold {
         let cap = self.slot_cap;
         // CHARGE, THEN ALLOCATE — as `ReduceFold::push_series`, and for
         // the same reason.
-        let (key, key_bytes) = charged_group_key(
+        let (key, key_charge) = charged_group_key(
             labels,
             self.grouping.as_ref(),
             &mut self.group_bytes,
             self.group_cap,
         )?;
-        let group_bytes = &mut self.group_bytes;
         let slots = match self.groups.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => {
-                discharge_group_bytes(group_bytes, key_bytes);
-                e.into_mut()
-            }
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 charge_result_points(charged, grid.slots() as u64, cap)?;
-                e.insert(vec![KSel::Empty; grid.slots()])
+                let slots = e.insert(vec![KSel::Empty; grid.slots()]);
+                key_charge.commit();
+                slots
             }
         };
         let live = &mut self.live;
@@ -12192,12 +12232,13 @@ mod tests {
     /// transient key is allocated either way and the refusal lands at the
     /// same point — so the statement order inside `charged_group_key` is
     /// asserted directly, and the fold is asserted to reach `group_key`
-    /// through NOTHING ELSE.
+    /// through NOTHING ELSE and to commit its [`GroupKeyCharge`] only
+    /// after the insertion that retains the key.
     #[test]
     fn the_fold_charges_before_it_builds_a_group_key() {
         let src = include_str!("exec.rs");
         let start = src
-            .find("fn charged_group_key(")
+            .find("fn charged_group_key<'a>(")
             .expect("the fold's charged route to group_key");
         let end = src[start..]
             .find("\nfn group_key(")
@@ -12233,6 +12274,29 @@ mod tests {
                 !region.contains("group_key(labels, self.grouping"),
                 "{anchor} calls group_key DIRECTLY — the fold has no funnel token and must \
                  charge in its own regime first"
+            );
+            // The same class, one statement later: `GroupKeyCharge`
+            // refunds unless `commit` runs, so a `commit` hoisted above
+            // the insertion it pays for would put the fallible point
+            // reservation back INSIDE the committed window and leak the
+            // key charge on refusal. Compiles either way, and — as
+            // above — nothing observable would show it, so the order is
+            // asserted where it is written.
+            let insert = region
+                .find(".insert(vec![")
+                .unwrap_or_else(|| panic!("{anchor} must insert its dense slot vector"));
+            let commit = region
+                .find("key_charge.commit();")
+                .unwrap_or_else(|| panic!("{anchor} must commit the key charge it retains"));
+            assert!(
+                insert < commit,
+                "{anchor} commits the key charge BEFORE the insertion that retains the key — \
+                 every fallible step ahead of the insertion must still be able to refund"
+            );
+            assert_eq!(
+                region.matches("key_charge.commit();").count(),
+                1,
+                "{anchor} must commit the key charge exactly once — on the retaining path only"
             );
         }
     }
