@@ -43,3 +43,4 @@ deploy/charts/pulsusdb/tests/bdd/.kubeconfig-*
 *.pyc
 codex.pid
 .cargo/config.toml
+AGENT.md

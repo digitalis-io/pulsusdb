@@ -1787,10 +1787,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulsus-ruler"
-version = "0.0.0"
-
-[[package]]
 name = "pulsus-schema"
 version = "0.0.0"
 dependencies = [
