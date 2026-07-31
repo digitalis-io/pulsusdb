@@ -80,8 +80,8 @@ use pulsus_logql::{
     NumericLiteral, ParserStage, Stage,
 };
 
-use super::exec::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
 use super::ip::{IpMatcher, line_has_ip_in};
+use super::labels::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
 use super::template::{self, Part as TmplPart, Template, TemplateEnv, TemplateKind};
 // Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
 // Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go

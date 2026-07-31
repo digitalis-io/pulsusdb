@@ -1,0 +1,1239 @@
+//! `variants(...) of (...)` — the fan-out aggregation of issue #221.
+//!
+//! [`VariantArena`] interns the sub-query pipelines a variants query
+//! fans out to, [`VariantsAggState`] drives one sub-state per variant,
+//! and the byte model here prices the fan-out before it exists so a wide
+//! query is refused rather than served from a swollen heap.
+
+use super::error::{ReadError, TooBroadReason};
+use super::pipeline::CompiledPipeline;
+use super::plan::{self};
+use super::rows::{MetricScanRow, StreamMetaRow};
+use pulsus_logql::{
+    LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, Matcher, MetricExpr, NumericLiteral,
+    ParserStage, RangeAggOp, Stage, StreamSelector,
+};
+use std::collections::HashMap;
+
+use super::agg::LabelSet;
+use super::charge::{
+    AggCaps, alloc_block_bytes, ensure_result_series, grown_alloc_bytes, label_set_bytes,
+    map_entry_bytes,
+};
+use super::client_agg::{ClientAggState, MetricAggState, RangeSlideState};
+use super::exec::{MatrixSeries, QueryResult, VectorSample};
+use super::post_agg::apply_vector_aggs;
+use super::window::{ClientWindow, grid_point_count};
+
+/// The reference's variant-index label (`__variant__`), set to the plain
+/// decimal `index.to_string()` — no padding.
+pub const VARIANT_LABEL: &str = "__variant__";
+
+/// The variants fan-out state budget — DERIVED, not chosen: one extra
+/// query-lifetime group-bytes budget ([`AggCaps::DEFAULT`]`.group_bytes`
+/// == [`MAX_CLIENT_AGG_GROUP_BYTES`]). It moves with that cap. One
+/// counter spans plan-time spec state and exec-time arena/sub-state
+/// state — the budget is never doubled.
+pub const MAX_VARIANT_FANOUT_STATE_BYTES: u64 = AggCaps::DEFAULT.group_bytes;
+
+/// A CLONE of a source stage list, per SOURCE byte `S`
+/// ([`stage_source_bytes`]): content ≤ 2S ([`alloc_block_bytes`]'s
+/// size-class model) + per-allocation floor ≤ 32S ([`MIN_ALLOC_BYTES`];
+/// each allocation needs ≥ 1 source byte — an empty-string clone
+/// allocates nothing) + inner element slots
+/// ≤ 2 × size_of::<(String, String)>() × S = 96S ⇒ ≤ 130S. Over-charging
+/// is the safe direction: a breach is a clean 422, never an OOM.
+const STAGE_CLONE_BYTES_PER_SOURCE_BYTE: u64 = 130;
+
+/// A cloned/compiled stage list's retained heap per SOURCE byte — the
+/// clone factor above plus the `Vec<CompiledStage>` slot term (the widest
+/// arm is `Regexp(regex::Regex)`, so the slot width is DERIVED from the
+/// real private enum via [`super::pipeline::COMPILED_STAGE_SLOT_BYTES`],
+/// never hard-coded: a flat literal silently under-charges if the enum
+/// widens). ≤ 2 slots per source byte covers the exactly-reserved buffer
+/// at the [`alloc_block_bytes`] 2× rounding.
+const COMPILED_STAGE_BYTES_PER_SOURCE_BYTE: u64 =
+    STAGE_CLONE_BYTES_PER_SOURCE_BYTE + 2 * super::pipeline::COMPILED_STAGE_SLOT_BYTES as u64;
+
+/// One `regex::Regex` CLONE's own retained heap: a fresh, lazily
+/// populated cache pool — the lazy-DFA cache capacity (2 MiB, the regex
+/// crate's default `hybrid_cache_capacity`) plus the meta engine's other
+/// per-`Cache` structures (one-pass DFA, backtracker visited set,
+/// PikeVM). The compiled PROGRAM is shared through the `Arc`
+/// ([`CompiledPipeline::extended_with`]) and is NOT charged again.
+const REGEX_CACHE_STATE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A provable UPPER BOUND on the heap ONE **exactly reserved**
+/// (`Vec::with_capacity(n)`) buffer of `n` `T` slots retains. The payload
+/// behind any pointer inside `T` is charged SEPARATELY (the C/H split) —
+/// this is the container line only.
+///
+/// No growth term is needed *because* every N-scaled buffer this path
+/// introduces is `with_capacity`-reserved before the first push, with `n`
+/// known up front; there is no realloc peak. A buffer whose count is NOT
+/// known up front must use [`grown_alloc_bytes`] instead
+/// (`Grouping::labels`, which `__variant__` is pushed into, does).
+pub(crate) fn vec_buffer_bytes<T>(n: u64) -> u64 {
+    alloc_block_bytes(n.saturating_mul(size_of::<T>() as u64))
+}
+
+/// The four driver-owned N-scaled BUFFERS, charged together as one term
+/// BEFORE the first of them is allocated: [`VariantArena`]'s
+/// `pipelines`/`slot` and [`VariantsAggState`]'s `subs`/`sub_charged`.
+/// Charged in one place because `VariantsAggState` inherits the arena's
+/// charge as its floor (`base`), so a single charge at the top of
+/// [`VariantArena::build`] provably precedes every one of the four
+/// allocations.
+pub(in crate::logql) fn variant_driver_buffer_bytes(n: u64) -> u64 {
+    vec_buffer_bytes::<usize>(n)
+        .saturating_add(vec_buffer_bytes::<CompiledPipeline>(n.saturating_add(1)))
+        .saturating_add(vec_buffer_bytes::<MetricAggState<'_>>(n))
+        .saturating_add(vec_buffer_bytes::<u64>(n))
+}
+
+/// Total OWNED-STRING bytes in a SOURCE stage list — the `S` the clone
+/// factors above multiply. An exhaustive `match` with **no `_` arm**: a
+/// new `Stage` variant is a compile error here, forcing the sizing walk
+/// to be re-run for it before it can ship.
+pub(crate) fn stage_source_bytes(stages: &[Stage]) -> u64 {
+    fn matcher_bytes(m: &Matcher) -> u64 {
+        (m.name.len() as u64).saturating_add(m.value.len() as u64)
+    }
+    fn label_filter_bytes(e: &LabelFilterExpr) -> u64 {
+        match e {
+            LabelFilterExpr::Match(m) => matcher_bytes(m),
+            LabelFilterExpr::Compare { name, rhs, .. } => {
+                let rhs_len = match rhs {
+                    NumericLiteral::Number(raw) | NumericLiteral::DurationOrBytes(raw) => {
+                        raw.len() as u64
+                    }
+                };
+                (name.len() as u64).saturating_add(rhs_len)
+            }
+            LabelFilterExpr::Ip { name, value, .. } => {
+                (name.len() as u64).saturating_add(value.len() as u64)
+            }
+            LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => {
+                label_filter_bytes(a).saturating_add(label_filter_bytes(b))
+            }
+        }
+    }
+    let mut bytes: u64 = 0;
+    for stage in stages {
+        let stage_bytes = match stage {
+            Stage::LineFilter(lf) => lf
+                .alternatives()
+                .fold(0u64, |acc, (v, _)| acc.saturating_add(v.len() as u64)),
+            Stage::Parser(p) => match p {
+                ParserStage::Json { extractions } => extractions.iter().fold(0u64, |acc, e| {
+                    acc.saturating_add(e.label.len() as u64)
+                        .saturating_add(e.expression.len() as u64)
+                }),
+                ParserStage::Logfmt { extractions, .. } => {
+                    extractions.iter().fold(0u64, |acc, e| {
+                        acc.saturating_add(e.label.len() as u64)
+                            .saturating_add(e.expression.len() as u64)
+                    })
+                }
+                ParserStage::Regexp(raw) | ParserStage::Pattern(raw) => raw.len() as u64,
+            },
+            Stage::LabelFilter(expr) => label_filter_bytes(expr),
+            Stage::LineFormat(tmpl) => tmpl.len() as u64,
+            Stage::LabelFormat(fmts) => fmts.iter().fold(0u64, |acc, f| match f {
+                LabelFmt::Rename { dst, src } => acc
+                    .saturating_add(dst.len() as u64)
+                    .saturating_add(src.len() as u64),
+                LabelFmt::Template { dst, tmpl } => acc
+                    .saturating_add(dst.len() as u64)
+                    .saturating_add(tmpl.len() as u64),
+            }),
+            Stage::Unwrap(u) => (u.label.len() as u64)
+                .saturating_add(u.conversion.as_deref().map_or(0, |c| c.len() as u64)),
+            Stage::Unpack | Stage::Decolorize => 0,
+            Stage::Drop(elems) | Stage::Keep(elems) => elems.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(e.label.len() as u64)
+                    .saturating_add(e.matcher.as_ref().map_or(0, |m| m.value.len() as u64))
+            }),
+        };
+        bytes = bytes.saturating_add(stage_bytes);
+    }
+    bytes
+}
+
+/// Regex-compiling stage forms in a SOURCE list (the compiled internals
+/// are private to `pipeline.rs`), enumerated from the five
+/// `compile_regex`/`compile_anchored_regex` call sites: `LineFilter`
+/// alternatives under `|~`/`!~` (non-`ip` heads and `or` alternatives),
+/// `| regexp`, label-filter `Match` nodes with `=~`/`!~` (recursing
+/// through `and`/`or`), `| decolorize`, and `drop`/`keep` elements with a
+/// `=~`/`!~` matcher.
+pub(crate) fn regex_stage_count(stages: &[Stage]) -> u64 {
+    fn label_filter_regexes(e: &LabelFilterExpr) -> u64 {
+        match e {
+            LabelFilterExpr::Match(m) => u64::from(matches!(m.op, MatchOp::Re | MatchOp::Nre)),
+            LabelFilterExpr::Compare { .. } | LabelFilterExpr::Ip { .. } => 0,
+            LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => {
+                label_filter_regexes(a).saturating_add(label_filter_regexes(b))
+            }
+        }
+    }
+    let mut count: u64 = 0;
+    for stage in stages {
+        let stage_count = match stage {
+            Stage::LineFilter(lf)
+                if matches!(lf.op, LineFilterOp::Regex | LineFilterOp::NotRegex) =>
+            {
+                lf.alternatives().fold(0u64, |acc, (_, is_ip)| {
+                    acc.saturating_add(u64::from(!is_ip))
+                })
+            }
+            Stage::LineFilter(_) => 0,
+            Stage::Parser(ParserStage::Regexp(_)) => 1,
+            Stage::Parser(_) => 0,
+            Stage::LabelFilter(expr) => label_filter_regexes(expr),
+            Stage::Decolorize => 1,
+            Stage::Drop(elems) | Stage::Keep(elems) => elems.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(u64::from(
+                    e.matcher
+                        .as_ref()
+                        .is_some_and(|m| matches!(m.op, MatchOp::Re | MatchOp::Nre)),
+                ))
+            }),
+            Stage::LineFormat(_) | Stage::LabelFormat(_) | Stage::Unwrap(_) | Stage::Unpack => 0,
+        };
+        count = count.saturating_add(stage_count);
+    }
+    count
+}
+
+/// The charge for ONE additional [`VariantArena`] entry (a distinct
+/// non-empty unwrap tail): the cloned common stages + compiled tail
+/// (source-byte factors) plus one fresh regex cache pool per regex in
+/// EITHER list — the compiled programs themselves are `Arc`-shared by
+/// [`CompiledPipeline::extended_with`] and never recompiled.
+pub(crate) fn variant_pipeline_entry_bytes(common: &[Stage], tail: &[Stage]) -> u64 {
+    stage_source_bytes(common)
+        .saturating_add(stage_source_bytes(tail))
+        .saturating_mul(COMPILED_STAGE_BYTES_PER_SOURCE_BYTE)
+        .saturating_add(
+            regex_stage_count(common)
+                .saturating_add(regex_stage_count(tail))
+                .saturating_mul(REGEX_CACHE_STATE_BYTES),
+        )
+}
+
+/// EXACT bytes one variants sub-state's construction-time `meta` snapshot
+/// retains, with the C/H split explicit — per map, the TABLE share and
+/// the element payload are separate terms:
+///
+/// - `base_labels`: `entries × map_entry_bytes(size_of::<(u64, LabelSet)>())`
+///   (C) + `Σ label_set_bytes(labels)` (H);
+/// - `hashes` (the sliding kind only): `entries ×
+///   map_entry_bytes(size_of::<(u64, u64)>())` (C; the payload is `Copy`).
+///
+/// Walked over the FIRST sub-state's ALREADY-BUILT maps, so the sizing
+/// pass is one O(streams) traversal with no re-parse and no allocation,
+/// and runs only when a query declares ≥ 2 variants.
+fn variant_meta_snapshot_bytes(base_labels: &HashMap<u64, LabelSet>, with_hashes: bool) -> u64 {
+    let mut bytes: u64 = 0;
+    for labels in base_labels.values() {
+        bytes = bytes
+            .saturating_add(map_entry_bytes(size_of::<(u64, LabelSet)>()))
+            .saturating_add(label_set_bytes(labels));
+    }
+    if with_hashes {
+        bytes = bytes.saturating_add(
+            (base_labels.len() as u64).saturating_mul(map_entry_bytes(size_of::<(u64, u64)>())),
+        );
+    }
+    bytes
+}
+
+/// The per-sub-state charge, for sub-state index ≥ 1 (index 0 costs
+/// exactly what the equivalent single-extractor query already allocates
+/// and is charged ZERO — so a 1-variant query is admitted exactly when
+/// the plain query is): the boxed state slot (the kind actually built),
+/// the `meta` snapshot, the range kind's construction-time
+/// `absent_labels` clone (zero when the list is empty — an empty `Vec`
+/// clone allocates nothing), and `present_cover` for an
+/// `absent_over_time` range sub-state (structurally absent otherwise).
+pub(in crate::logql) fn variant_state_bytes(
+    is_range: bool,
+    is_absent: bool,
+    absent_labels: &LabelSet,
+    meta_bytes: u64,
+    kmax: i64,
+) -> u64 {
+    let slot = if is_range {
+        alloc_block_bytes(size_of::<RangeSlideState<'_>>() as u64)
+    } else {
+        alloc_block_bytes(size_of::<ClientAggState<'_>>() as u64)
+    };
+    let mut bytes = slot.saturating_add(meta_bytes);
+    if is_range && !absent_labels.is_empty() {
+        bytes = bytes.saturating_add(label_set_bytes(absent_labels));
+    }
+    if is_range && is_absent {
+        bytes = bytes.saturating_add(alloc_block_bytes(8 * (kmax.max(-1) + 2) as u64));
+    }
+    bytes
+}
+
+/// Every byte one [`plan::VariantSpec`] retains, sized from BORROWED AST
+/// pieces the planner already holds — no container is constructed to
+/// compute this bound, and the whole charge precedes the first clone
+/// (issue #221 review rounds 4–5).
+///
+/// **The walk that produced this bound (W-MEM, verbatim so it is
+/// re-runnable).** The accounting domain is the OWNED-TYPE CLOSURE of the
+/// per-variant roots (`VariantSpec`, `VariantArena`, `VariantsAggState`,
+/// `ClientAggState`, `RangeSlideState`) **plus their construction path**
+/// (every function executed en route to producing them, walked in call
+/// order, each allocating statement classified). Buckets: (S) `Copy`
+/// scalar in the slot; (B) borrowed; (C) container buffer/table — charged
+/// via [`vec_buffer_bytes`]/[`map_entry_bytes`]/[`grown_alloc_bytes`];
+/// (H) element payload — charged before allocation; (G) grows during the
+/// scan — governed by a **divided** [`AggCaps`] field. Residues (an
+/// explicit byte bound, or N-neutrality, never a bare count): **R1** the
+/// once-per-query common-range plan products (one synthetic
+/// `MetricExpr::Range` + `metric_plan`'s usual allocations — zero slope
+/// in N, so outside a per-variant boundary); **R2** per-fingerprint
+/// transients inside the sub-state constructors (`series_labels`
+/// scratch) — sub-states are constructed sequentially, so the peak is
+/// N-independent and the retained result is charged by
+/// [`variant_meta_snapshot_bytes`]; **R4** the three no-count-band
+/// branches (meta hydration, a distinct-tail arena compile, an
+/// aggregation-bearing `apply_vector_aggs`), named with their
+/// compensating controls in `tests/logql_variants_alloc.rs`.
+///
+/// Terms, in table order (each isolated by a one-axis fixture pair in
+/// the I-series tests):
+/// - the tail buffer (C) + its `Stage` payload (H, the clone factor);
+/// - the `absent_labels` buffer + strings (C+H, `absent_over_time` only —
+///   Δ2: sourced from the VARIANT's own selector);
+/// - the `vector_aggs` buffer (C — [`grown_alloc_bytes`], because
+///   `Result<Vec<_>>`-collect grows by pushes, never one reservation);
+/// - per vector layer, grouping present OR CREATED (member M3):
+///   the `Grouping::labels` buffer ([`grown_alloc_bytes`] over `len + 1` —
+///   `__variant__` is PUSHED into it, the one N-scaled buffer that
+///   reallocs) + each cloned label + the injected `__variant__` string.
+pub(crate) fn variant_spec_bytes(
+    tail: &[Stage],
+    selector: &StreamSelector,
+    is_absent: bool,
+    agg_chain: &MetricExpr,
+) -> u64 {
+    let mut bytes: u64 = 0;
+    if !tail.is_empty() {
+        bytes = bytes
+            .saturating_add(vec_buffer_bytes::<Stage>(tail.len() as u64))
+            .saturating_add(
+                stage_source_bytes(tail).saturating_mul(STAGE_CLONE_BYTES_PER_SOURCE_BYTE),
+            );
+    }
+    if is_absent {
+        let mut eq_count: u64 = 0;
+        for m in selector.matchers.iter().filter(|m| m.op == MatchOp::Eq) {
+            eq_count += 1;
+            bytes = bytes
+                .saturating_add(alloc_block_bytes(m.name.len() as u64))
+                .saturating_add(alloc_block_bytes(m.value.len() as u64));
+        }
+        if eq_count > 0 {
+            bytes = bytes.saturating_add(vec_buffer_bytes::<(String, String)>(eq_count));
+        }
+    }
+    let mut layers: u64 = 0;
+    let mut cur = agg_chain;
+    while let MetricExpr::Vector {
+        grouping, inner, ..
+    } = cur
+    {
+        layers += 1;
+        let declared = grouping.as_ref().map_or(0, |g| g.labels.len() as u64);
+        bytes = bytes.saturating_add(grown_alloc_bytes(
+            (declared + 1).saturating_mul(size_of::<String>() as u64),
+        ));
+        if let Some(g) = grouping {
+            for l in &g.labels {
+                bytes = bytes.saturating_add(alloc_block_bytes(l.len() as u64));
+            }
+        }
+        bytes = bytes.saturating_add(alloc_block_bytes(VARIANT_LABEL.len() as u64));
+        cur = inner;
+    }
+    if layers > 0 {
+        bytes = bytes.saturating_add(grown_alloc_bytes(
+            layers.saturating_mul(size_of::<plan::VectorAggSpec>() as u64),
+        ));
+    }
+    bytes
+}
+
+/// The one variants fan-out gate: every charged allocation is sized,
+/// checked against the cap, and accounted HERE — before the allocation it
+/// pays for. Mirrors [`charge_group_bytes`] exactly (same shape, same
+/// `saturating_add` rationale, same post-condition); returns the
+/// `(next, cap)` pair on breach so each caller wraps it in ITS reason
+/// ([`TooBroadReason::VariantSpecBytes`] at plan time,
+/// [`TooBroadReason::VariantStateBytes`] at exec time) without a second
+/// implementation.
+pub(crate) fn charge_fanout_bytes(
+    charged: &mut u64,
+    bytes: u64,
+    cap: u64,
+) -> Result<(), (u64, u64)> {
+    let next = charged.saturating_add(bytes);
+    if next > cap {
+        return Err((next, cap));
+    }
+    *charged = next;
+    Ok(())
+}
+
+/// Releases a [`charge_fanout_bytes`] charge as `finish` consumes the
+/// state it paid for. Saturating for panic-proofing only — the pairing is
+/// exact, which `finish`'s `charged == base` post-condition asserts.
+fn discharge_fanout_bytes(charged: &mut u64, bytes: u64) {
+    *charged = charged.saturating_sub(bytes);
+}
+
+fn variant_state_breach((bytes, cap): (u64, u64)) -> ReadError {
+    ReadError::QueryTooBroad(TooBroadReason::VariantStateBytes { bytes, cap })
+}
+
+/// The compiled-pipeline arena for ONE variants query (issue #221).
+/// Entry 0 is the COMMON pipeline; each further entry is
+/// `entry0.extended_with(tail)` for one DISTINCT non-empty unwrap tail.
+/// Built and OWNED by the driver BEFORE [`VariantsAggState`], which only
+/// BORROWS from it — the arena and its borrowers are never owned by the
+/// same struct, so there is no self-reference.
+#[derive(Debug)]
+pub struct VariantArena {
+    pipelines: Vec<CompiledPipeline>,
+    slot: Vec<usize>,
+    charged: u64,
+}
+
+impl VariantArena {
+    /// ORDER (normative — every allocation is preceded by its charge):
+    /// 1. count gate (defense in depth — the planner already gated it;
+    ///    `build` is reachable from tests and the pure
+    ///    [`run_variants_rows`] seam);
+    /// 2. ONE [`variant_driver_buffer_bytes`] charge covering all four
+    ///    driver buffers, levied before any of them exists
+    ///    (`base_charged` = the planner's `spec_bytes`, so plan-time and
+    ///    exec-time share one counter and one cap);
+    /// 3. the two exact reservations;
+    /// 4. entry 0 (`compile(common)`), charged ZERO — a single-extractor
+    ///    query pays it too;
+    /// 5. per variant with a NON-EMPTY tail, in index order: dedup by
+    ///    backward scan over the TAIL slices already processed (no
+    ///    auxiliary container, and `common ++ tail` is NEVER materialized
+    ///    to compare — that would be one allocation per variant); on a
+    ///    miss, charge [`variant_pipeline_entry_bytes`] BEFORE
+    ///    `extended_with`.
+    pub fn build(
+        common: &[Stage],
+        variants: &[plan::VariantSpec],
+        cap: u64,
+        base_charged: u64,
+    ) -> Result<Self, ReadError> {
+        let n = variants.len() as u64;
+        if n > plan::MAX_VARIANT_SUB_STATES {
+            return Err(ReadError::QueryTooBroad(TooBroadReason::VariantSubStates {
+                count: n,
+                cap: plan::MAX_VARIANT_SUB_STATES,
+            }));
+        }
+        let mut charged = base_charged;
+        // AC 14: at N = 1 the arena charge is exactly 0 — a 1-variant
+        // query is admitted exactly when the equivalent single-extractor
+        // query is; the driver buffers are charged only when the fan-out
+        // is real (N >= 2).
+        if n >= 2 {
+            charge_fanout_bytes(&mut charged, variant_driver_buffer_bytes(n), cap)
+                .map_err(variant_state_breach)?;
+        }
+        let mut pipelines: Vec<CompiledPipeline> = Vec::with_capacity(variants.len() + 1);
+        let mut slot: Vec<usize> = Vec::with_capacity(variants.len());
+        pipelines.push(CompiledPipeline::compile(common)?);
+        for (i, spec) in variants.iter().enumerate() {
+            let tail = &spec.client().pipeline;
+            if tail.is_empty() {
+                slot.push(0);
+                continue;
+            }
+            // Dedup key is the variant's TAIL slice alone: entry_i ==
+            // entry0.extended_with(tail_i), so equal tails give equal
+            // entries (the common prefix is fixed for the query).
+            let mut shared = None;
+            for j in 0..i {
+                if variants[j].client().pipeline == *tail {
+                    shared = Some(slot[j]);
+                    break;
+                }
+            }
+            if let Some(s) = shared {
+                slot.push(s);
+                continue;
+            }
+            charge_fanout_bytes(
+                &mut charged,
+                variant_pipeline_entry_bytes(common, tail),
+                cap,
+            )
+            .map_err(variant_state_breach)?;
+            let extended = pipelines[0].extended_with(tail)?;
+            pipelines.push(extended);
+            slot.push(pipelines.len() - 1);
+        }
+        Ok(VariantArena {
+            pipelines,
+            slot,
+            charged,
+        })
+    }
+
+    /// The compiled pipeline variant `variant_index` runs (`common ++
+    /// tail`, shared for empty/duplicate tails).
+    fn get(&self, variant_index: usize) -> &CompiledPipeline {
+        &self.pipelines[self.slot.get(variant_index).copied().unwrap_or(0)]
+    }
+
+    pub fn charged_bytes(&self) -> u64 {
+        self.charged
+    }
+
+    pub fn len(&self) -> usize {
+        self.pipelines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pipelines.is_empty()
+    }
+}
+
+/// The variants driver: ONE scan, N sub-states (issue #221). Owns the
+/// per-sub-state charges and releases them as `finish` consumes each
+/// sub-state.
+#[derive(Debug)]
+pub struct VariantsAggState<'q> {
+    arena: &'q VariantArena,
+    variants: &'q [plan::VariantSpec],
+    subs: Vec<MetricAggState<'q>>,
+    sub_charged: Vec<u64>,
+    /// Running fan-out charge; starts at (and returns to) `base`.
+    charged: u64,
+    /// The arena's charge (which already includes the planner's
+    /// `spec_bytes` and the driver buffers) — the floor `finish` returns
+    /// to.
+    base: u64,
+    cap: u64,
+}
+
+impl<'q> VariantsAggState<'q> {
+    /// Builds sub-state 0 uncharged (a 1-variant query is admitted
+    /// exactly when the equivalent single-extractor query is), sizes the
+    /// `meta` snapshot from ITS already-built maps, then charges
+    /// [`variant_state_bytes`] BEFORE constructing each further
+    /// sub-state. The state kind comes from each spec's window (all
+    /// variants share the grid, so all are the same kind); every
+    /// sub-state gets `AggCaps::DEFAULT.divided(n)`, so the per-field SUM
+    /// over sub-states is exactly the single-query bound.
+    pub fn new(
+        arena: &'q VariantArena,
+        variants: &'q [plan::VariantSpec],
+        meta: &HashMap<u64, StreamMetaRow>,
+        cap: u64,
+    ) -> Result<Self, ReadError> {
+        let n = variants.len() as u64;
+        let caps = AggCaps::DEFAULT.divided(n.max(1));
+        let base = arena.charged_bytes();
+        let mut charged = base;
+        let mut subs: Vec<MetricAggState<'q>> = Vec::with_capacity(variants.len());
+        let mut sub_charged: Vec<u64> = Vec::with_capacity(variants.len());
+        let mut meta_bytes: u64 = 0;
+        for (i, spec) in variants.iter().enumerate() {
+            let compiled = arena.get(i);
+            let is_range = matches!(spec.window(), ClientWindow::Range { .. });
+            let is_absent = matches!(spec.client().range_op, RangeAggOp::AbsentOverTime);
+            if i > 0 {
+                let kmax = match spec.window() {
+                    ClientWindow::Range {
+                        grid_start_ns,
+                        end_ns,
+                        step_ns,
+                        ..
+                    } => grid_point_count(grid_start_ns, end_ns, step_ns.as_u64()) as i64 - 1,
+                    ClientWindow::Instant { .. } => -1,
+                };
+                let bytes = variant_state_bytes(
+                    is_range,
+                    is_absent,
+                    &spec.client().absent_labels,
+                    meta_bytes,
+                    kmax,
+                );
+                charge_fanout_bytes(&mut charged, bytes, cap).map_err(variant_state_breach)?;
+                sub_charged.push(bytes);
+            } else {
+                sub_charged.push(0);
+            }
+            let state = if is_range {
+                MetricAggState::Range(Box::new(RangeSlideState::new(
+                    compiled,
+                    meta,
+                    spec.client(),
+                    spec.window(),
+                    spec.rate_window_ns(),
+                    caps,
+                )?))
+            } else {
+                let instant =
+                    spec.window()
+                        .as_instant()
+                        .ok_or_else(|| ReadError::PipelineInvalid {
+                            reason: "internal: a stepped variant window reached the instant \
+                                     aggregation state"
+                                .to_string(),
+                        })?;
+                MetricAggState::Instant(Box::new(ClientAggState::new(
+                    compiled,
+                    meta,
+                    spec.client(),
+                    instant,
+                    spec.rate_window_ns(),
+                    caps,
+                )?))
+            };
+            if i == 0 {
+                // Sized from the FIRST sub-state's already-built maps —
+                // one O(streams) walk, no re-parse, no allocation; the
+                // hashes half exists only on the sliding kind.
+                meta_bytes = match &state {
+                    MetricAggState::Range(s) => variant_meta_snapshot_bytes(&s.base_labels, true),
+                    MetricAggState::Instant(s) => {
+                        variant_meta_snapshot_bytes(&s.base_labels, false)
+                    }
+                };
+            }
+            subs.push(state);
+        }
+        Ok(VariantsAggState {
+            arena,
+            variants,
+            subs,
+            sub_charged,
+            charged,
+            base,
+            cap,
+        })
+    }
+
+    /// Test/gate accessor for the measured-vs-charged slope gates.
+    pub fn charged_bytes(&self) -> u64 {
+        self.charged
+    }
+
+    /// Forwards one chunk to every sub-state in INDEX ORDER (so a
+    /// surviving-`__error__` failure is raised by the lowest-indexed
+    /// variant — deterministic). A Range sub-state receives the whole
+    /// slice (its own sliding `(t-range, t]` windows apply the variant's
+    /// `[range]`); an Instant sub-state receives maximal in-window runs
+    /// of the SAME slice (no per-variant buffer): the scan is bounded by
+    /// the COMMON range only, so a variant with a shorter `[range]` must
+    /// exclude the older rows here.
+    pub fn push_rows(&mut self, rows: &[MetricScanRow]) -> Result<(), ReadError> {
+        for (i, sub) in self.subs.iter_mut().enumerate() {
+            match sub {
+                MetricAggState::Range(s) => s.push_rows(rows)?,
+                MetricAggState::Instant(s) => {
+                    let spec = &self.variants[i];
+                    let mut k = 0usize;
+                    while k < rows.len() {
+                        if !spec.admits_instant(rows[k].timestamp_ns) {
+                            k += 1;
+                            continue;
+                        }
+                        let start = k;
+                        while k < rows.len() && spec.admits_instant(rows[k].timestamp_ns) {
+                            k += 1;
+                        }
+                        s.push_rows(&rows[start..k])?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The finish body, in place so the `charged == base` post-condition
+    /// is OBSERVABLE (the `RangeSlideState::finish_in_place` precedent).
+    /// Order is NORMATIVE (issue #221): per variant, in index order —
+    /// (1) reduce; (2) [`append_variant_label`] on every series
+    /// (overriding any common-pipeline `__variant__`); (3) that variant's
+    /// (already `__variant__`-injected) vector aggregations — SKIPPED
+    /// when it carries none (`apply_vector_aggs` would round-trip every
+    /// matrix series' points through a `BTreeMap` for an identity
+    /// transform); (4) concatenate in index order into one pre-sized
+    /// output; (5) **range only**: drop every series whose label set has
+    /// no `__variant__` (reference `engine.go:485-487`); instant keeps
+    /// them (`engine.go:620-634`) — the reference's instant/range
+    /// asymmetry.
+    fn finish_in_place(&mut self) -> Result<QueryResult, ReadError> {
+        let is_range = matches!(
+            self.variants.first().map(plan::VariantSpec::window),
+            Some(ClientWindow::Range { .. })
+        );
+        let subs = std::mem::take(&mut self.subs);
+        let mut per_variant: Vec<QueryResult> = Vec::with_capacity(subs.len());
+        for (i, sub) in subs.into_iter().enumerate() {
+            let spec = &self.variants[i];
+            let mut out = sub.finish()?;
+            // Adjudicated correction (issue #221, capture-governed): the
+            // reference attaches `__variant__` per EXTRACTED SAMPLE (the
+            // consolidated extractor), so an `absent_over_time` variant's
+            // SYNTHETIC series never carries it — index-less (and kept)
+            // at instant, dropped by the range filter below, grouped as
+            // `{}` under an outer aggregation. Container-captured
+            // (`b13_variants.test` absent cases); the approved plan's
+            // append-to-every-series order was wrong here.
+            if !matches!(spec.client().range_op, RangeAggOp::AbsentOverTime) {
+                match &mut out {
+                    QueryResult::Vector(items) => {
+                        for s in items.iter_mut() {
+                            append_variant_label(&mut s.labels, spec.index());
+                        }
+                    }
+                    QueryResult::Matrix(items) => {
+                        for s in items.iter_mut() {
+                            append_variant_label(&mut s.labels, spec.index());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let out = if spec.vector_aggs().is_empty() {
+                out
+            } else {
+                apply_vector_aggs(out, spec.vector_aggs())?
+            };
+            // Issue #236: the result-series cap is applied PER VARIANT,
+            // before the concat — matching the reference's own granularity
+            // (`engine.go:474-506`, `:609-621` apply `maxSeries` per
+            // variant, not to the concatenated whole). Strictly more
+            // permissive than capping the concat: a 3-variant query
+            // returning 400 series each is served (1 200 result series).
+            // The remaining divergence is that the reference SKIPS the
+            // breaching variant with a warning where PulsusDB 422s —
+            // that needs a `warnings` response envelope and is #277.
+            ensure_result_series(&out)?;
+            discharge_fanout_bytes(&mut self.charged, self.sub_charged[i]);
+            per_variant.push(out);
+        }
+        if is_range {
+            let total: usize = per_variant
+                .iter()
+                .map(|r| match r {
+                    QueryResult::Matrix(items) => items.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut out: Vec<MatrixSeries> = Vec::with_capacity(total);
+            for r in per_variant {
+                if let QueryResult::Matrix(items) = r {
+                    out.extend(
+                        items
+                            .into_iter()
+                            .filter(|s| s.labels.iter().any(|(k, _)| k == VARIANT_LABEL)),
+                    );
+                }
+            }
+            Ok(QueryResult::Matrix(out))
+        } else {
+            let total: usize = per_variant
+                .iter()
+                .map(|r| match r {
+                    QueryResult::Vector(items) => items.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut out: Vec<VectorSample> = Vec::with_capacity(total);
+            for r in per_variant {
+                if let QueryResult::Vector(items) = r {
+                    out.extend(items);
+                }
+            }
+            Ok(QueryResult::Vector(out))
+        }
+    }
+
+    /// Finalizes, asserting every per-sub-state charge was released.
+    pub fn finish(mut self) -> Result<QueryResult, ReadError> {
+        let out = self.finish_in_place()?;
+        debug_assert_eq!(
+            self.charged, self.base,
+            "every variants fan-out charge must be discharged at finish"
+        );
+        let _ = self.cap;
+        let _ = self.arena;
+        Ok(out)
+    }
+}
+
+/// Sets `__variant__` to the plain decimal `index`, OVERRIDING any
+/// existing `__variant__` the common pipeline produced (the reference
+/// appends a DUPLICATE label there and then mis-routes samples by
+/// re-parsing the two-valued set — provably wrong output, deliberately
+/// not reproduced; ledgered), keeping the vector key-sorted. Writes the
+/// value `String` ONCE — `set_label_sorted`'s shape with the `String`
+/// moved into whichever arm takes it (that helper allocates
+/// `value.to_string()` in both arms and is deliberately left untouched).
+pub fn append_variant_label(labels: &mut Vec<(String, String)>, index: usize) {
+    let value = index.to_string();
+    match labels.binary_search_by(|(k, _)| k.as_str().cmp(VARIANT_LABEL)) {
+        Ok(i) => labels[i].1 = value,
+        Err(i) => labels.insert(i, (VARIANT_LABEL.to_string(), value)),
+    }
+}
+
+/// The pure, slice-driven variants evaluation — the twin of
+/// [`run_client_agg_rows`] the hermetic corpus runner drives, through the
+/// SAME [`VariantArena`] + [`VariantsAggState`], so the corpus exercises
+/// the identical charging path. Checks order ONCE and sorts ONCE into at
+/// most one local `Vec` pushed into every sub-state — it never delegates
+/// to `run_client_agg_rows`, whose per-sub-state re-sort would clone
+/// every scanned body N times (issue #221 member Δ6.2.4).
+pub fn run_variants_rows(
+    rows: &[MetricScanRow],
+    meta: &HashMap<u64, StreamMetaRow>,
+    common: &[Stage],
+    variants: &[plan::VariantSpec],
+) -> Result<QueryResult, ReadError> {
+    let arena = VariantArena::build(common, variants, MAX_VARIANT_FANOUT_STATE_BYTES, 0)?;
+    let mut state = VariantsAggState::new(&arena, variants, meta, MAX_VARIANT_FANOUT_STATE_BYTES)?;
+    let is_range = matches!(
+        variants.first().map(plan::VariantSpec::window),
+        Some(ClientWindow::Range { .. })
+    );
+    if is_range {
+        let ordered = rows.windows(2).all(|w| {
+            (w[0].fingerprint, w[0].timestamp_ns) <= (w[1].fingerprint, w[1].timestamp_ns)
+        });
+        if ordered {
+            state.push_rows(rows)?;
+        } else {
+            let mut sorted: Vec<MetricScanRow> = rows.to_vec();
+            sorted.sort_by(|a, b| {
+                a.fingerprint
+                    .cmp(&b.fingerprint)
+                    .then(a.timestamp_ns.cmp(&b.timestamp_ns))
+            });
+            state.push_rows(&sorted)?;
+        }
+    } else {
+        state.push_rows(rows)?;
+    }
+    state.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::labels::series_labels;
+    use super::super::params::{Direction, PlanCtx, QueryParams, QuerySpec};
+    use super::super::plan::{MetricNode, MetricPlan, Plan};
+    use super::*;
+    use crate::logql::testkit::*;
+
+    // -----------------------------------------------------------------
+    // Issue #221: variants fan-out — caps, charges, arena, guards.
+    // -----------------------------------------------------------------
+
+    fn variants_ctx() -> PlanCtx<'static> {
+        PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1024,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        }
+    }
+
+    fn variants_range_spec() -> QuerySpec {
+        QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 60 * VSEC,
+            step_ns: 60 * VSEC as u64 as i64 as u64,
+        }
+    }
+
+    /// Plans a variants query and returns `(scan, specs, spec_bytes)`.
+    fn variants_fixture(query: &str, spec: QuerySpec) -> (MetricPlan, Vec<plan::VariantSpec>, u64) {
+        let expr = pulsus_logql::parse(query).expect("parse");
+        let params = QueryParams {
+            spec,
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        match plan::plan(&expr, &params, &variants_ctx()).expect("plan") {
+            Plan::MetricBinary(MetricNode::Variants {
+                scan,
+                variants,
+                spec_bytes,
+            }) => (*scan, variants, spec_bytes),
+            other => panic!("expected a variants plan, got {other:?}"),
+        }
+    }
+
+    /// `variants(<v>, <v>, …xN) of (<common>)`.
+    fn n_variant_query(n: usize, variant: &str, common: &str) -> String {
+        let list = vec![variant; n].join(", ");
+        format!("variants({list}) of ({common})")
+    }
+
+    /// I1 — CHARGE: the driver-buffer term. Pair: N = 64 vs 65 tail-free
+    /// variants (single axis: N). Deleting the
+    /// `variant_driver_buffer_bytes` charge makes the measured delta 0
+    /// while the expected formula stays > 0.
+    #[test]
+    fn i1_driver_buffer_term_is_charged() {
+        let common = r#"{app="x"}[5m]"#;
+        let arena_charged = |n: usize| {
+            let (scan, variants, _) = variants_fixture(
+                &n_variant_query(n, r#"count_over_time({app="x"}[5m])"#, common),
+                variants_range_spec(),
+            );
+            let cp = scan.client.expect("client scan");
+            VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0)
+                .expect("build")
+                .charged_bytes()
+        };
+        let expected = variant_driver_buffer_bytes(65) - variant_driver_buffer_bytes(64);
+        assert!(expected > 0);
+        assert_eq!(arena_charged(65) - arena_charged(64), expected);
+    }
+
+    /// I2 — CHARGE: the arena-entry term. Pair: variant 1's tail
+    /// identical to variant 0's vs distinct with EQUAL source bytes
+    /// (single axis: tail identity). Deleting the per-entry charge before
+    /// `extended_with` zeroes the measured delta.
+    #[test]
+    fn i2_arena_entry_term_is_charged() {
+        let charged = |second: &str| {
+            let q = format!(
+                r#"variants(sum_over_time({{app="x"}} | unwrap aa [5m]), sum_over_time({{app="x"}} | unwrap {second} [5m])) of ({{app="x"}} | logfmt [5m])"#
+            );
+            let (scan, variants, _) = variants_fixture(&q, variants_range_spec());
+            let cp = scan.client.expect("client scan");
+            let tail1 = variants[1].client().pipeline.clone();
+            let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+            (arena.charged_bytes(), arena.len(), cp.pipeline, tail1)
+        };
+        let (same, same_len, _, _) = charged("aa");
+        let (distinct, distinct_len, common, tail_bb) = charged("bb");
+        assert_eq!(same_len, 2, "identical tails share one entry");
+        assert_eq!(distinct_len, 3, "distinct tails add one entry each");
+        let expected = variant_pipeline_entry_bytes(&common, &tail_bb);
+        assert!(expected > 0);
+        assert_eq!(distinct - same, expected);
+    }
+
+    /// I3 — CHARGE: the boxed sub-state slot. Pair: N = 2 vs 3, empty
+    /// meta, `count_over_time`, no absent labels (single axis: N; every
+    /// other `variant_state_bytes` term is 0).
+    #[test]
+    fn i3_sub_state_slot_term_is_charged() {
+        let sub_charges = |n: usize| {
+            let (scan, variants, _) = variants_fixture(
+                &n_variant_query(n, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#),
+                variants_range_spec(),
+            );
+            let cp = scan.client.expect("client scan");
+            let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+            let st =
+                VariantsAggState::new(&arena, &variants, &HashMap::new(), u64::MAX).expect("state");
+            st.charged_bytes() - arena.charged_bytes()
+        };
+        let expected = alloc_block_bytes(size_of::<RangeSlideState<'_>>() as u64);
+        assert!(expected > 0);
+        assert_eq!(sub_charges(3) - sub_charges(2), expected);
+    }
+
+    fn k_stream_meta(k: u64) -> HashMap<u64, StreamMetaRow> {
+        (0..k)
+            .map(|i| {
+                (
+                    i + 1,
+                    StreamMetaRow {
+                        fingerprint: i + 1,
+                        service: format!("svc{i}"),
+                        labels: format!(r#"{{"env":"prod","idx":"{i}"}}"#),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The I4/I5 expected meta term, built INDEPENDENTLY of
+    /// `variant_meta_snapshot_bytes` (same inputs, formula spelled out) so
+    /// deleting the runtime charge fails the equality.
+    fn expected_meta_term(meta: &HashMap<u64, StreamMetaRow>, with_hashes: bool) -> u64 {
+        let mut bytes = 0u64;
+        for m in meta.values() {
+            let labels = series_labels(m);
+            bytes += map_entry_bytes(size_of::<(u64, LabelSet)>()) + label_set_bytes(&labels);
+        }
+        if with_hashes {
+            bytes += meta.len() as u64 * map_entry_bytes(size_of::<(u64, u64)>());
+        }
+        bytes
+    }
+
+    /// I4 — CHARGE: the `base_labels` half of the meta snapshot. Pair:
+    /// INSTANT kind (state type and constructor fixed), meta K = 4 vs 0.
+    #[test]
+    fn i4_meta_base_labels_term_is_charged() {
+        let sub_charges = |meta: &HashMap<u64, StreamMetaRow>| {
+            let (scan, variants, _) = variants_fixture(
+                &n_variant_query(2, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#),
+                QuerySpec::Instant { at_ns: 60 * VSEC },
+            );
+            let cp = scan.client.expect("client scan");
+            let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+            let st = VariantsAggState::new(&arena, &variants, meta, u64::MAX).expect("state");
+            st.charged_bytes() - arena.charged_bytes()
+        };
+        let meta = k_stream_meta(4);
+        let expected = expected_meta_term(&meta, false);
+        assert!(expected > 0);
+        assert_eq!(sub_charges(&meta) - sub_charges(&HashMap::new()), expected);
+    }
+
+    /// I5 — CHARGE: the `hashes` TABLE share, isolated from I4: the RANGE
+    /// kind over the same meta pair adds exactly the `(u64, u64)` table
+    /// term on top of I4's expression — so I5 fails alone when only the
+    /// hashes half is deleted (I4 still passing).
+    #[test]
+    fn i5_meta_hashes_table_share_is_charged() {
+        let sub_charges = |meta: &HashMap<u64, StreamMetaRow>| {
+            let (scan, variants, _) = variants_fixture(
+                &n_variant_query(2, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#),
+                variants_range_spec(),
+            );
+            let cp = scan.client.expect("client scan");
+            let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+            let st = VariantsAggState::new(&arena, &variants, meta, u64::MAX).expect("state");
+            st.charged_bytes() - arena.charged_bytes()
+        };
+        let meta = k_stream_meta(4);
+        let expected = expected_meta_term(&meta, true);
+        assert!(expected > expected_meta_term(&meta, false));
+        assert_eq!(sub_charges(&meta) - sub_charges(&HashMap::new()), expected);
+    }
+
+    /// I6 — CHARGE: the range kind's construction-time `absent_labels`
+    /// clone. Pair: same absent op, same (empty) meta, same grid; the
+    /// variant's own selector carries 3 Eq matchers vs 1.
+    #[test]
+    fn i6_absent_labels_term_is_charged() {
+        let sub_charges = |selector: &str| {
+            let q = format!(
+                r#"variants(absent_over_time({selector}[5m]), absent_over_time({selector}[5m])) of ({{app="x"}}[5m])"#
+            );
+            let (scan, variants, _) = variants_fixture(&q, variants_range_spec());
+            let cp = scan.client.expect("client scan");
+            let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+            let st =
+                VariantsAggState::new(&arena, &variants, &HashMap::new(), u64::MAX).expect("state");
+            st.charged_bytes() - arena.charged_bytes()
+        };
+        let three = sub_charges(r#"{a="1", b="2", c="3"}"#);
+        let one = sub_charges(r#"{a="1"}"#);
+        let labels3: LabelSet = vec![
+            ("a".into(), "1".into()),
+            ("b".into(), "2".into()),
+            ("c".into(), "3".into()),
+        ];
+        let labels1: LabelSet = vec![("a".into(), "1".into())];
+        let expected = label_set_bytes(&labels3) - label_set_bytes(&labels1);
+        assert!(expected > 0);
+        assert_eq!(three - one, expected);
+    }
+
+    /// I7 — CHARGE: the `present_cover` term. Pair: same range grid, the
+    /// variant selector carries NO Eq matcher (absent labels empty in
+    /// both), op `absent_over_time` vs `count_over_time` — the single
+    /// moving term is the grid array.
+    #[test]
+    fn i7_present_cover_term_is_charged() {
+        let sub_charges = |op: &str| {
+            let q = format!(
+                r#"variants({op}({{app=~"x.*"}}[5m]), {op}({{app=~"x.*"}}[5m])) of ({{app="x"}}[5m])"#
+            );
+            let (scan, variants, _) = variants_fixture(&q, variants_range_spec());
+            let cp = scan.client.expect("client scan");
+            let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+            let st =
+                VariantsAggState::new(&arena, &variants, &HashMap::new(), u64::MAX).expect("state");
+            st.charged_bytes() - arena.charged_bytes()
+        };
+        // Grid 0..60s step 60s ⇒ points {0, 60} ⇒ kmax = 1 ⇒ 8·(kmax+2).
+        let expected = alloc_block_bytes(8 * 3);
+        assert_eq!(
+            sub_charges("absent_over_time") - sub_charges("count_over_time"),
+            expected
+        );
+    }
+
+    /// B10 / AC 17 — the arena shares, never recompiles: tail-free
+    /// variants all share entry 0 (no entry charge — at N = 1 the whole
+    /// arena charge is exactly 0, AC 14); identical tails share an entry;
+    /// distinct tails add one each (pinned by I2's lengths too).
+    #[test]
+    fn arena_dedups_on_the_tail_slice_alone() {
+        let arena_of = |q: &str| {
+            let (scan, variants, _) = variants_fixture(q, variants_range_spec());
+            let cp = scan.client.expect("client scan");
+            let n = variants.len() as u64;
+            let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+            (arena.len(), arena.charged_bytes(), n)
+        };
+        let (len, charged, _) =
+            arena_of(r#"variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m])"#);
+        assert_eq!((len, charged), (1, 0), "AC 14: a 1-variant arena charges 0");
+        let (len, charged, n) = arena_of(&n_variant_query(
+            3,
+            r#"count_over_time({app="x"}[5m])"#,
+            r#"{app="x"}[5m]"#,
+        ));
+        assert_eq!(len, 1, "tail-free variants all share entry 0");
+        assert_eq!(
+            charged,
+            variant_driver_buffer_bytes(n),
+            "no entry term for shared tails"
+        );
+    }
+
+    /// B6 — charge-before-allocate at the state boundary: a cap that
+    /// admits the arena but not the first extra sub-state trips
+    /// `VariantStateBytes` BEFORE that sub-state is constructed.
+    #[test]
+    fn b6_tiny_cap_trips_before_the_extra_sub_state_exists() {
+        let (scan, variants, _) = variants_fixture(
+            &n_variant_query(2, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#),
+            variants_range_spec(),
+        );
+        let cp = scan.client.expect("client scan");
+        let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+        // Cap == the arena's own charge: sub-state 0 is free, sub-state 1's
+        // slot charge breaches.
+        let err = VariantsAggState::new(&arena, &variants, &HashMap::new(), arena.charged_bytes())
+            .expect_err("the extra sub-state must breach");
+        match err {
+            ReadError::QueryTooBroad(TooBroadReason::VariantStateBytes { bytes, cap }) => {
+                assert!(bytes > cap);
+            }
+            other => panic!("expected VariantStateBytes, got {other:?}"),
+        }
+        // And the driver-buffer charge itself trips first under a
+        // near-zero cap (B6b) — before any reservation.
+        let err = VariantArena::build(&cp.pipeline, &variants, 1, 0)
+            .expect_err("the driver buffers must breach");
+        assert!(matches!(
+            err,
+            ReadError::QueryTooBroad(TooBroadReason::VariantStateBytes { .. })
+        ));
+    }
+
+    /// AC 24 + the D5.5 field-addition guard: exhaustive destructuring
+    /// (no `..`), every container exactly reserved. Adding a field to
+    /// either driver struct breaks this test's compilation, forcing the
+    /// W-MEM walk to be re-run for it. Buckets: pipelines/slot/subs/
+    /// sub_charged (C, charged via `variant_driver_buffer_bytes`),
+    /// charged/base/cap (S), arena/variants (B).
+    #[test]
+    fn every_driver_container_field_is_accounted() {
+        let (scan, variants, _) = variants_fixture(
+            &n_variant_query(3, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#),
+            variants_range_spec(),
+        );
+        let cp = scan.client.expect("client scan");
+        let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+        {
+            let mut st =
+                VariantsAggState::new(&arena, &variants, &HashMap::new(), u64::MAX).expect("state");
+            st.push_rows(&[]).expect("empty push");
+            let VariantsAggState {
+                arena: _b_arena,     // B
+                variants: _b_specs,  // B
+                subs,                // C — with_capacity(n)
+                sub_charged,         // C — with_capacity(n)
+                charged: _s_charged, // S
+                base: _s_base,       // S
+                cap: _s_cap,         // S
+            } = st;
+            assert_eq!(subs.capacity(), 3);
+            assert_eq!(sub_charged.capacity(), 3);
+        }
+        let n = variants.len() as u64;
+        let VariantArena {
+            pipelines,        // C — with_capacity(n + 1)
+            slot,             // C — with_capacity(n)
+            charged: a_bytes, // S
+        } = arena;
+        assert_eq!(pipelines.capacity(), 4);
+        assert_eq!(slot.capacity(), 3);
+        assert!(a_bytes >= variant_driver_buffer_bytes(n));
+    }
+
+    /// AC 51 census — `extended_with(` has exactly ONE production call
+    /// site (the arena), and `VariantArena::build`'s body materializes no
+    /// `common ++ tail` (no `.concat(`/`.to_vec()`/`chain(`): the dedup
+    /// key is the tail slice alone. Production text = everything before
+    /// the column-0 `#[cfg(test)]`, `//` comment text stripped (the
+    /// `search_sql.rs` census precedent).
+    #[test]
+    fn variants_exec_census() {
+        let src = include_str!("variants.rs");
+        let production = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            production.matches("extended_with(").count(),
+            1,
+            "exactly one extended_with call (the arena)"
+        );
+        let build_body = {
+            let start = production.find("    pub fn build(").expect("build fn");
+            let tail = &production[start..];
+            let end = tail.find("\n    }").expect("build end");
+            &tail[..end]
+        };
+        for forbidden in [".concat(", ".to_vec()", "chain("] {
+            assert!(
+                !build_body.contains(forbidden),
+                "VariantArena::build must not materialize common ++ tail ({forbidden})"
+            );
+        }
+        // The exec-side charge funnel has exactly 3 call sites: the
+        // driver buffers, the arena entry, the sub-state. Counted over a
+        // WHITESPACE-STRIPPED copy so rustfmt line wrapping cannot move
+        // the census; the raw token also matches
+        // `discharge_fanout_bytes(&mut` as a substring, so the release
+        // sites are subtracted.
+        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        let charges = compact.matches("charge_fanout_bytes(&mut").count()
+            - compact.matches("discharge_fanout_bytes(&mut").count();
+        assert_eq!(charges, 3, "exec charge-site census");
+    }
+}

@@ -1277,7 +1277,8 @@ fn census_of(file: &syn::File, f: &Frame) -> (u32, BTreeSet<String>) {
 
 fn parse_source(name: &str) -> syn::File {
     let src = match name {
-        "exec.rs" => include_str!("../src/logql/exec.rs"),
+        "client_agg.rs" => include_str!("../src/logql/client_agg.rs"),
+        "variants.rs" => include_str!("../src/logql/variants.rs"),
         "plan.rs" => include_str!("../src/logql/plan.rs"),
         other => panic!("unknown frame file {other}"),
     };
@@ -1287,8 +1288,6 @@ fn parse_source(name: &str) -> syn::File {
 #[test]
 #[ignore = "generator: prints the frame censuses to pin"]
 fn zz_print_frame_censuses() {
-    let exec = parse_source("exec.rs");
-    let plan_f = parse_source("plan.rs");
     let frames: [(&str, Option<&str>, &str); 27] = [
         ("plan.rs", None, "build_variants_node"),
         ("plan.rs", None, "unwrap_vector_aggs_into"),
@@ -1326,7 +1325,8 @@ fn zz_print_frame_censuses() {
             branches: 0,
             callees: &[],
         };
-        let src = if file == "exec.rs" { &exec } else { &plan_f };
+        let parsed = parse_source(file);
+        let src = &parsed;
         let (br, callees) = census_of(src, &f);
         let list: Vec<String> = callees.into_iter().collect();
         println!(
@@ -1427,7 +1427,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
     },
     // --- W_ctor (8) ---
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: Some("VariantArena"),
         anchor: "build",
         branches: 11,
@@ -1452,7 +1452,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: Some("VariantsAggState"),
         anchor: "new",
         // Issue #236 Part D: the instant sub-state arm narrows the
@@ -1493,7 +1493,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: None,
         anchor: "variant_pipeline_entry_bytes",
         branches: 0,
@@ -1505,7 +1505,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: None,
         anchor: "stage_source_bytes",
         branches: 6,
@@ -1523,7 +1523,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: None,
         anchor: "regex_stage_count",
         branches: 6,
@@ -1540,7 +1540,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: None,
         anchor: "variant_state_bytes",
         branches: 3,
@@ -1554,7 +1554,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("ClientAggState"),
         anchor: "new",
         // Issue #236 Part D: the stepped-grid guard is deleted with the
@@ -1573,7 +1573,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "new",
         branches: 6,
@@ -1598,7 +1598,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
     },
     // --- W_fin (14) ---
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: Some("VariantsAggState"),
         anchor: "push_rows",
         branches: 7,
@@ -1612,14 +1612,14 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: Some("VariantsAggState"),
         anchor: "finish",
         branches: 1,
         callees: &[".finish_in_place", "Ok", "debug_assert_eq!"],
     },
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: Some("VariantsAggState"),
         anchor: "finish_in_place",
         // Issue #236 (§10.5, predicted): the per-variant
@@ -1673,7 +1673,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "variants.rs",
         ty: None,
         anchor: "append_variant_label",
         branches: 1,
@@ -1686,21 +1686,21 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("MetricAggState"),
         anchor: "push_rows",
         branches: 1,
         callees: &[".push_rows"],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("MetricAggState"),
         anchor: "finish",
         branches: 1,
         callees: &[".finish", "Ok"],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("ClientAggState"),
         anchor: "push_rows",
         // Issue #236 Part D: the per-group `BTreeMap` collapses to one
@@ -1739,7 +1739,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("ClientAggState"),
         anchor: "finish",
         // Issue #236 Part D: the state is instant-only by construction,
@@ -1770,7 +1770,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "push_rows",
         branches: 8,
@@ -1792,14 +1792,14 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish",
         branches: 1,
         callees: &[".finish_in_place", "Ok", "debug_assert_eq!"],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish_in_place",
         // Issue #236 P2 / Part B / Part C history above; the result-point
@@ -1834,7 +1834,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "drain_group",
         // NEW with issue #236 Part C: one mutating group's cells drained
@@ -1872,7 +1872,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish_absent",
         // Issue #236 Part B made this return `Vec<MatrixSeries>`; the
@@ -1896,7 +1896,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "flush_collision",
         // Issue #236: Part A deleted the `series_count > caps.series`
@@ -1939,7 +1939,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ],
     },
     Frame {
-        file: "exec.rs",
+        file: "client_agg.rs",
         ty: Some("FpSlide"),
         anchor: "finish",
         branches: 2,
@@ -2522,8 +2522,6 @@ fn module_doc() -> String {
 #[test]
 fn g4_frame_census_and_inventory_closure() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let exec = parse_source("exec.rs");
-    let plan_src = parse_source("plan.rs");
     // (1) 26 unique frames, each resolving to exactly one item.
     assert_eq!(PER_VARIANT_FRAMES.len(), 27);
     let mut keys = BTreeSet::new();
@@ -2536,11 +2534,8 @@ fn g4_frame_census_and_inventory_closure() {
     }
     // (2) per-frame census == the pin.
     for f in &PER_VARIANT_FRAMES {
-        let src = if f.file == "exec.rs" {
-            &exec
-        } else {
-            &plan_src
-        };
+        let parsed = parse_source(f.file);
+        let src = &parsed;
         let (branches, callees) = census_of(src, f);
         let pinned: BTreeSet<String> = f.callees.iter().map(|s| s.to_string()).collect();
         assert_eq!(

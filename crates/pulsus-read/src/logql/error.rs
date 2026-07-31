@@ -122,7 +122,7 @@ pub enum TooBroadReason {
     MetricFanout { matched: usize, cap: u64 },
     /// Issue M6-10 (review round 1): a client-aggregated LogQL metric
     /// query's `(end - start) / step` bucket grid exceeded
-    /// [`crate::logql::exec::MAX_CLIENT_AGG_BUCKETS`] — rejected BEFORE
+    /// [`crate::logql::window::MAX_CLIENT_AGG_BUCKETS`] — rejected BEFORE
     /// any grid/accumulator materialization (an `absent_over_time` over
     /// a huge range with a tiny step must never allocate an
     /// attacker-sized grid outside the scan budget). A Rust-side
@@ -130,7 +130,7 @@ pub enum TooBroadReason {
     MetricBuckets { buckets: u64, cap: u64 },
     /// Issue M6-10 (review round 1): a `quantile_over_time` evaluation
     /// retained more exact sample values than
-    /// [`crate::logql::exec::MAX_QUANTILE_VALUES`] across its buckets —
+    /// [`crate::logql::charge::MAX_QUANTILE_VALUES`] across its buckets —
     /// the one client-side reducer whose state grows with surviving
     /// rows rather than with `buckets × series`. Complete-or-error: the
     /// query aborts with this named error, never an OOM and never a
@@ -138,7 +138,7 @@ pub enum TooBroadReason {
     QuantileValues { count: u64, cap: u64 },
     /// Issue M8-LQ3 (code review round 2): a `rate_counter` evaluation
     /// retained more timestamped counter samples than
-    /// [`crate::logql::exec::MAX_COUNTER_VALUES`] across its buckets — the
+    /// [`crate::logql::charge::MAX_COUNTER_VALUES`] across its buckets — the
     /// reset walk is order-dependent, so (like `quantile_over_time`) the
     /// raw `(ts, value)` points are held until `finish`, making its state
     /// grow with surviving rows rather than with `buckets × series`.
@@ -148,7 +148,7 @@ pub enum TooBroadReason {
     /// the cap.
     CounterValues { count: u64, cap: u64 },
     /// A LogQL metric query's **FINAL result** carried more distinct
-    /// series than [`crate::logql::exec::MAX_QUERY_SERIES`] — the
+    /// series than [`crate::logql::charge::MAX_QUERY_SERIES`] — the
     /// reference's `querier.max-query-series` (grafana/loki v3.7.4,
     /// `pkg/validation/limits.go:373`, default 500), enforced on the whole
     /// expression's output at `pkg/logql/engine.go:538` (instant) and
@@ -209,7 +209,7 @@ pub enum TooBroadReason {
     /// Issue #227: a consecutive same-`(fingerprint, timestamp_ns)` run in
     /// the sliding-window range evaluator (the collision group that the
     /// full-body `tie_rank` order is imposed over) exceeded
-    /// [`crate::logql::exec::MAX_TS_COLLISION_GROUP`]. A same-nanosecond,
+    /// [`crate::logql::charge::MAX_TS_COLLISION_GROUP`]. A same-nanosecond,
     /// same-stream run this large is pathological/adversarial, never real
     /// data; the transient full-body buffer that ranks it is bounded by
     /// this clean error rather than growing without limit. A Rust-side
@@ -226,7 +226,7 @@ pub enum TooBroadReason {
     },
     /// Issue #227: the sliding-window range evaluator's **concurrent**
     /// retained window (charge-on-load / discharge-on-evict) exceeded
-    /// [`crate::logql::exec::MAX_RETAINED_WINDOW_POINTS`] — the single
+    /// [`crate::logql::charge::MAX_RETAINED_WINDOW_POINTS`] — the single
     /// invariant `retained ≤ cap` that generalizes the instant path's
     /// per-reducer `QuantileValues`/`CounterValues` total-retention proofs.
     /// The charge is per-load, so it trips as the FIRST oversized window
@@ -239,7 +239,7 @@ pub enum TooBroadReason {
     /// Issue #236: a metric evaluation reserved more fixed-width RESULT
     /// point-slots — grid points a leaf series will emit, and the dense
     /// per-group slots the streaming vector-aggregation fold retains —
-    /// than [`crate::logql::exec::MAX_METRIC_RESULT_POINTS`].
+    /// than [`crate::logql::charge::MAX_METRIC_RESULT_POINTS`].
     ///
     /// This is the POINTS half of the bound that replaced the deleted
     /// mid-scan group-COUNT cap; the bytes half is
@@ -251,15 +251,15 @@ pub enum TooBroadReason {
     /// allocation rather than observed after it.
     ///
     /// The cap is DERIVED from what a servable result can hold
-    /// ([`crate::logql::exec::MAX_QUERY_SERIES`] series x
-    /// [`crate::logql::exec::MAX_ADMITTED_GRID_POINTS`] points), so no
+    /// ([`crate::logql::charge::MAX_QUERY_SERIES`] series x
+    /// [`crate::logql::window::MAX_ADMITTED_GRID_POINTS`] points), so no
     /// result the reference serves is refused by it; what it does refuse
     /// is an INTERMEDIATE wide enough that its point product exceeds
     /// that, which is a bounded error rather than an OOM.
     MetricResultPoints { count: u64, cap: u64 },
     /// Issue #236 §4: the post-aggregation chain or a binary combination
     /// would hold more heap bytes SIMULTANEOUSLY, over and above its
-    /// input, than [`crate::logql::exec::MAX_POST_AGG_BYTES`].
+    /// input, than [`crate::logql::post_agg::MAX_POST_AGG_BYTES`].
     ///
     /// The bound is charged BEFORE the stage allocates — a refusal means
     /// the operand was never converted, no group map was built and no
@@ -272,7 +272,7 @@ pub enum TooBroadReason {
     /// The cap covers every client-leaf-sourced input with no `by`-name
     /// and no `group_left/right(include)` amplification; a query carrying
     /// either amplifier may be refused above the O6/O7 thresholds
-    /// recorded in [`crate::logql::exec::MAX_POST_AGG_BYTES`]' doc. The
+    /// recorded in [`crate::logql::post_agg::MAX_POST_AGG_BYTES`]' doc. The
     /// reference has no equivalent bound — it evaluates step-ordered and
     /// never materialises the inner matrix — so this is a registered
     /// bounded divergence, not a parity match.
@@ -281,7 +281,7 @@ pub enum TooBroadReason {
     /// path retained more QUERY-LIFETIME bytes of distinct output-group
     /// state — each first-seen group's rendered JSON key plus its cloned
     /// final `LabelSet`, which live in the group map until finish — than
-    /// [`crate::logql::exec::MAX_CLIENT_AGG_GROUP_BYTES`]. The group
+    /// [`crate::logql::charge::MAX_CLIENT_AGG_GROUP_BYTES`]. The group
     /// COUNT was already capped ([`Self::MetricSeries`]) but the BYTES
     /// behind each key/label set were charged to neither the
     /// collision-group counter (reset when its group flushes) nor the
@@ -293,7 +293,7 @@ pub enum TooBroadReason {
     MetricGroupLabelBytes { bytes: u64, cap: u64 },
     /// Issue #221: a `variants(...) of (...)` query declared more variants
     /// than [`crate::logql::plan::MAX_VARIANT_SUB_STATES`] — the DERIVED
-    /// backstop (the smallest [`crate::logql::exec::AggCaps::DEFAULT`]
+    /// backstop (the smallest [`crate::logql::charge::AggCaps::DEFAULT`]
     /// field) past which `AggCaps::divided(n)` would floor a per-sub-state
     /// cap to zero. Checked at plan time before any per-variant
     /// allocation. The reference is unbounded here (a recorded
@@ -303,7 +303,7 @@ pub enum TooBroadReason {
     /// Issue #221: the charged per-variant PLAN-time state (each
     /// `VariantSpec`'s cloned unwrap tail, absent labels and injected
     /// grouping, plus the spec vector's own buffer) exceeded
-    /// [`crate::logql::exec::MAX_VARIANT_FANOUT_STATE_BYTES`]. Charged
+    /// [`crate::logql::variants::MAX_VARIANT_FANOUT_STATE_BYTES`]. Charged
     /// from borrowed AST slices BEFORE the clone that would retain the
     /// bytes — a clean 422, never an OOM.
     VariantSpecBytes { bytes: u64, cap: u64 },
@@ -311,7 +311,7 @@ pub enum TooBroadReason {
     /// compiled-pipeline arena, the driver buffers, and each additional
     /// sub-state's boxed slot / meta snapshot / absent labels /
     /// `present_cover`) exceeded
-    /// [`crate::logql::exec::MAX_VARIANT_FANOUT_STATE_BYTES`]. Every term
+    /// [`crate::logql::variants::MAX_VARIANT_FANOUT_STATE_BYTES`]. Every term
     /// is charged BEFORE the allocation it pays for and released as
     /// `finish` consumes the state — a clean 422, never an OOM.
     VariantStateBytes { bytes: u64, cap: u64 },

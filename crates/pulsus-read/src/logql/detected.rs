@@ -122,7 +122,7 @@ pub(super) fn determine_type(value: &str) -> &'static str {
 /// the SAME model as `super::exec::{alloc_block_bytes, grown_alloc_bytes,
 /// map_entry_bytes}`. 64 MiB was the house per-query retained-state
 /// ceiling when #244 chose it; issue #236 later raised
-/// `super::exec::MAX_CLIENT_AGG_GROUP_BYTES` to 256 MiB for a reason
+/// `super::charge::MAX_CLIENT_AGG_GROUP_BYTES` to 256 MiB for a reason
 /// specific to the aggregation GROUP axis, which does not apply here, so
 /// this stays an independent 64 MiB (a literal, never a derived link —
 /// the same treatment `super::template::MAX_TEMPLATE_RENDER_BYTES` got).
@@ -192,25 +192,25 @@ struct FieldState {
 /// A provable upper bound on the retained heap one admitted field NAME
 /// costs: the map entry's table share, the owned key `String` (map
 /// insertion may route through growth paths, so the geometric
-/// [`super::exec::grown_alloc_bytes`] bound is used), and the `parsers`
+/// [`super::charge::grown_alloc_bytes`] bound is used), and the `parsers`
 /// vector's `with_capacity(2)` buffer — which NEVER reallocates because
 /// the parser universe is the closed pair `json`/`logfmt`.
 fn field_entry_bytes(name: &str) -> u64 {
-    super::exec::map_entry_bytes(size_of::<(String, FieldState)>())
-        .saturating_add(super::exec::grown_alloc_bytes(name.len() as u64))
-        .saturating_add(super::exec::alloc_block_bytes(
+    super::charge::map_entry_bytes(size_of::<(String, FieldState)>())
+        .saturating_add(super::charge::grown_alloc_bytes(name.len() as u64))
+        .saturating_add(super::charge::alloc_block_bytes(
             2 * size_of::<&'static str>() as u64,
         ))
 }
 
 /// `HashSet<String>` is `HashMap<String, ()>`; `()` is a ZST, so the slot is
-/// `size_of::<String>()` and [`super::exec::map_entry_bytes`] applies
+/// `size_of::<String>()` and [`super::charge::map_entry_bytes`] applies
 /// verbatim. `to_string()` reserves EXACTLY the length —
-/// [`super::exec::alloc_block_bytes`] is the precedented bound
+/// [`super::charge::alloc_block_bytes`] is the precedented bound
 /// (`label_set_bytes`).
 fn value_entry_bytes(value: &str) -> u64 {
-    super::exec::map_entry_bytes(size_of::<String>())
-        .saturating_add(super::exec::alloc_block_bytes(value.len() as u64))
+    super::charge::map_entry_bytes(size_of::<String>())
+        .saturating_add(super::charge::alloc_block_bytes(value.len() as u64))
 }
 
 /// The post-admission tail of [`FieldAccumulator::observe_pair`], factored

@@ -129,7 +129,7 @@ pub const MAX_DURATION_NS: i64 = i64::MAX;
 ///
 /// The inner field is private to this module and the only public way to mint
 /// a non-zero value is [`validate_duration_ns`], so it is **impossible by
-/// construction** to build a [`super::exec::ClientWindow`] — or to reach the
+/// construction** to build a [`super::window::ClientWindow`] — or to reach the
 /// sliding evaluator through the public `run_client_agg_rows` entry point —
 /// carrying an unvalidated client duration. The funnel cannot be walked
 /// around: there is no other constructor, and the field cannot be assigned

@@ -45,7 +45,7 @@ pub use timefns::TemplateEnv;
 /// (`template-output-budget`).
 ///
 /// **Derivation, and why it is now a standalone constant.** #230 defined
-/// this as `= exec::MAX_CLIENT_AGG_GROUP_BYTES`, which was then also
+/// this as `= crate::logql::charge::MAX_CLIENT_AGG_GROUP_BYTES`, which was then also
 /// 64 MiB — a convenience link on the reasoning that "a single rendered
 /// line may not allocate more than a whole query is allowed to retain".
 /// Issue #236 raised `MAX_CLIENT_AGG_GROUP_BYTES` to 256 MiB for a reason
@@ -67,7 +67,7 @@ pub const MAX_TEMPLATE_RENDER_BYTES: u64 = 64 * 1024 * 1024;
 /// that derivation actually wanted, and stating it here means a future
 /// raise of either constant cannot invert it without failing the build.
 const _: () = assert!(
-    MAX_TEMPLATE_RENDER_BYTES <= crate::logql::exec::MAX_CLIENT_AGG_GROUP_BYTES,
+    MAX_TEMPLATE_RENDER_BYTES <= crate::logql::charge::MAX_CLIENT_AGG_GROUP_BYTES,
     "one render may not out-allocate a whole query's retention budget"
 );
 

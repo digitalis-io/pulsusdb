@@ -44,9 +44,10 @@ static ALLOCATOR: CountingAlloc = CountingAlloc;
 
 use std::borrow::Cow;
 
-use pulsus_read::logql::exec::{run_client_agg_rows, run_pipeline_rows};
+use pulsus_read::logql::exec::run_pipeline_rows;
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::rows::{MetricScanRow, SampleRow, StreamMetaRow};
+use pulsus_read::logql::run_client_agg_rows;
 use pulsus_read::logql::{ClientWindow, Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 const ROWS: u64 = 20_000;

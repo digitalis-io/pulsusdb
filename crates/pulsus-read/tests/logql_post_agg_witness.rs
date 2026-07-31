@@ -70,9 +70,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use pulsus_logql::{BinOp, Grouping, GroupingKind, MatchGroup, VectorAggOp, VectorMatching};
-use pulsus_read::logql::exec::{
-    MAX_CLIENT_AGG_BUCKETS, MAX_CLIENT_AGG_GROUP_BYTES, MAX_METRIC_RESULT_POINTS,
-};
+use pulsus_read::logql::MAX_CLIENT_AGG_BUCKETS;
 use pulsus_read::logql::plan::VectorAggSpec;
 use pulsus_read::logql::{
     B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
@@ -83,6 +81,7 @@ use pulsus_read::logql::{
     measure_vector, post_agg_peak_bytes, post_agg_peak_bytes_without,
 };
 use pulsus_read::logql::{Direction, PlanCtx, QueryParams, QuerySpec, ReadError, TooBroadReason};
+use pulsus_read::logql::{MAX_CLIENT_AGG_GROUP_BYTES, MAX_METRIC_RESULT_POINTS};
 
 // =====================================================================
 // 1. The instrument
@@ -868,7 +867,7 @@ const NO_GROUPING_CITE: &str = "pulsus-logql/src/ast.rs:907-912 (sort/sort_desc)
                                 (approx_topk): grouping is rejected at parse";
 const APPROX_RANGE_CITE: &str = "crates/pulsus-read/src/logql/plan.rs:529 — approx_topk is \
                                  instant-only, rejected for a range query";
-const SORT_RANGE_CITE: &str = "crates/pulsus-read/src/logql/exec.rs group_range — sort/sort_desc \
+const SORT_RANGE_CITE: &str = "crates/pulsus-read/src/logql/post_agg.rs group_range — sort/sort_desc \
                                are a matrix passthrough (the reference does not value-order a \
                                matrix)";
 
@@ -4480,7 +4479,7 @@ fn admit_refuses_a_collection_wider_than_its_charge() {
 #[test]
 fn the_enforcement_path_contains_no_debug_assert() {
     let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql/exec.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql/post_agg.rs"),
     )
     .expect("read exec.rs");
     let start = src
@@ -4756,12 +4755,15 @@ mod region_census {
     /// Parses every production function in `src/logql`.
     ///
     /// **Scope, stated because an unscoped conclusion from a scoped
-    /// census is worthless:** every `.rs` file in
-    /// `crates/pulsus-read/src/logql/`, `#[cfg(test)]` modules excluded.
-    /// The directory is read at RUN TIME rather than a file list being
-    /// written out, so the scheduled `exec.rs` split cannot narrow this
-    /// census silently — the region simply moves to another file the
-    /// walk already covers. The unit is a function ITEM.
+    /// census is worthless:** every `.rs` file **directly in**
+    /// `crates/pulsus-read/src/logql/` — the flat level only, with
+    /// `#[cfg(test)]` modules excluded. The walk is NON-RECURSIVE, so
+    /// subdirectory modules such as `template/` are not scanned; making
+    /// it recursive is #302. The directory is read at RUN TIME rather
+    /// than a file list being written out, which is why issue #299's
+    /// `exec.rs` split did not narrow this census — the region simply
+    /// moved to other files the walk already covers. The unit is a
+    /// function ITEM.
     pub fn collect() -> (Vec<String>, Vec<FnInfo>) {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
@@ -5257,11 +5259,11 @@ fn the_external_caller_map_of_the_funnel_closure_is_pinned() {
             // through ONE charging route instead of two direct call
             // sites, which is why this entry shrank.
             "group_key".to_string(),
-            vec!["exec.rs::charged_group_key".to_string()],
+            vec!["fold.rs::charged_group_key".to_string()],
         ),
         (
             "pin_reduction_order".to_string(),
-            vec!["exec.rs::RangeSlideState::emit".to_string()],
+            vec!["client_agg.rs::RangeSlideState::emit".to_string()],
         ),
     ];
     assert_eq!(

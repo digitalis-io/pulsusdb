@@ -1239,13 +1239,13 @@ type FrameKey = (&'static str, Option<&'static str>, &'static str);
 /// The DECLARED closure of `DetectedRowFeeder::feed_row` (13 frames,
 /// under the ~30 cap).
 const FRAMES: [FrameKey; 13] = [
-    ("exec.rs", Some("DetectedRowFeeder"), "feed_row"),
-    ("exec.rs", Some("DetectedRowFeeder"), "trim"),
-    ("exec.rs", None, "observe_detected_row"),
-    ("exec.rs", None, "auto_parse_observe"),
-    ("exec.rs", None, "merge_labels_with_structured_metadata"),
-    ("exec.rs", None, "parse_flat_labels_into"),
-    ("exec.rs", None, "recycle_label_scratch"),
+    ("detected_probe.rs", Some("DetectedRowFeeder"), "feed_row"),
+    ("detected_probe.rs", Some("DetectedRowFeeder"), "trim"),
+    ("detected_probe.rs", None, "observe_detected_row"),
+    ("detected_probe.rs", None, "auto_parse_observe"),
+    ("labels.rs", None, "merge_labels_with_structured_metadata"),
+    ("labels.rs", None, "parse_flat_labels_into"),
+    ("detected_probe.rs", None, "recycle_label_scratch"),
     ("detected.rs", Some("FieldAccumulator"), "observe_pair"),
     ("detected.rs", None, "observe_admitted"),
     ("detected.rs", None, "field_entry_bytes"),
@@ -1256,7 +1256,8 @@ const FRAMES: [FrameKey; 13] = [
 
 fn parse_frame_source(name: &str) -> syn::File {
     let src = match name {
-        "exec.rs" => include_str!("../src/logql/exec.rs"),
+        "labels.rs" => include_str!("../src/logql/labels.rs"),
+        "detected_probe.rs" => include_str!("../src/logql/detected_probe.rs"),
         "detected.rs" => include_str!("../src/logql/detected.rs"),
         other => panic!("unknown frame file {other}"),
     };
@@ -1352,19 +1353,19 @@ fn ac14_frame_census_pins_the_explanatory_account() {
 /// The pinned callee multisets (regenerate with `zz_print_frame_censuses`).
 #[rustfmt::skip]
 const EXPECTED_CENSUS: [(FrameKey, &str); 13] = [
-    (("exec.rs", Some("DetectedRowFeeder"), "feed_row"),
+    (("detected_probe.rs", Some("DetectedRowFeeder"), "feed_row"),
      ".getx1 .is_emptyx1 .trimx1 Errx1 Okx2 Somex1 merge_labels_with_structured_metadatax1 observe_detected_rowx1 takex1"),
-    (("exec.rs", Some("DetectedRowFeeder"), "trim"),
+    (("detected_probe.rs", Some("DetectedRowFeeder"), "trim"),
      ".capacityx2 .clearx2 newx2 trim_strx2 trim_vecx3"),
-    (("exec.rs", None, "observe_detected_row"),
+    (("detected_probe.rs", None, "observe_detected_row"),
      ".anyx1 .as_refx4 .as_strx1 .clearx3 .intox1 .iterx3 .observe_pairx2 .run_into_with_smx1 Errx1 Okx2 auto_parse_observex1 parse_flat_labels_intox1 recycle_label_scratchx2"),
-    (("exec.rs", None, "auto_parse_observe"),
+    (("detected_probe.rs", None, "auto_parse_observe"),
      ".as_refx2 .clearx1 .iterx1 .observe_pairx1 Somex1 auto_parse_intox1 recycle_label_scratchx1"),
-    (("exec.rs", None, "merge_labels_with_structured_metadata"),
+    (("labels.rs", None, "merge_labels_with_structured_metadata"),
      ".anyx1 .clearx4 .clonedx1 .drainx1 .extendx1 .findx1 .is_emptyx1 .iterx2 .iter_mutx1 .lenx1 .pushx1 .push_strx1 parse_flat_labels_intox1"),
-    (("exec.rs", None, "parse_flat_labels_into"),
+    (("labels.rs", None, "parse_flat_labels_into"),
      ".charsx1 .nextx3 .peekx3 .peekablex1 .pushx1 Somex1 parse_json_stringx2 skip_wsx3"),
-    (("exec.rs", None, "recycle_label_scratch"),
+    (("detected_probe.rs", None, "recycle_label_scratch"),
      ".clearx1 .collectx1 .into_iterx1 .into_ownedx2 .mapx1 Ownedx2"),
     (("detected.rs", Some("FieldAccumulator"), "observe_pair"),
      ".chargex1 .contains_keyx1 .get_mutx1 .insertx1 .lenx1 .to_stringx1 field_entry_bytesx1 newx1 observe_admittedx1 with_capacityx1"),

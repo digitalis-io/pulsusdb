@@ -19,14 +19,15 @@ use pulsus_logql::{
     VectorMatching,
 };
 
+use super::charge::AggCaps;
 use super::error::{ReadError, TooBroadReason};
 use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
-use super::exec::{AggCaps, ClientWindow, GridWindow};
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
 use super::pipeline::PipelineError;
 use super::sql::ScanLowerBound;
+use super::window::{ClientWindow, GridWindow};
 
 /// A pure fetch plan for either query shape. See the module docs for why
 /// stage 2/3 aren't pre-rendered here. `MetricBinary` (issue M6-10) is
@@ -267,7 +268,7 @@ pub enum MetricNode {
         variants: Vec<VariantSpec>,
         /// The plan-time fan-out charge (`Σ variant_spec_bytes` plus the
         /// spec vector's own buffer), carried so
-        /// [`super::exec::VariantArena::build`] CONTINUES the same
+        /// [`super::variants::VariantArena::build`] CONTINUES the same
         /// counter — one budget for plan-time + exec-time state, never
         /// two.
         spec_bytes: u64,
@@ -1034,7 +1035,7 @@ fn unwrap_vector_aggs_into<'a>(
 ///
 /// Issue #236 deleted `AggCaps::series` (the mid-scan 500-group cap), so
 /// the smallest field is no longer that 500: it is now
-/// [`super::exec::MAX_TS_COLLISION_GROUP`] = **10 000**, a strictly
+/// [`super::charge::MAX_TS_COLLISION_GROUP`] = **10 000**, a strictly
 /// PERMISSIVE re-derivation in the direction the reference sits (which is
 /// unbounded here — a recorded divergence,
 /// `docs/benchmarks/logs-differential-ledger.md`).
@@ -1094,7 +1095,7 @@ mod variant_spec {
         /// `client.pipeline` is this variant's UNWRAP TAIL ONLY (empty
         /// for every non-unwrap reducer) — NEVER the common pipeline,
         /// which lives once in the scan plan's `client.pipeline`. exec
-        /// runs `common ++ tail` through the [`super::super::exec::VariantArena`];
+        /// runs `common ++ tail` through the [`super::super::variants::VariantArena`];
         /// nothing may compile `client.pipeline` on its own.
         client: ClientAgg,
         /// This variant's OWN evaluation window (its `[range]`) on the
@@ -1118,7 +1119,7 @@ mod variant_spec {
     impl VariantSpec {
         /// The SOLE `VariantSpec` construction site in the crate. Order
         /// (normative, single body): size from borrowed inputs
-        /// ([`super::super::exec::variant_spec_bytes`]) → charge
+        /// ([`super::super::variants::variant_spec_bytes`]) → charge
         /// (`charge_fanout_bytes`, a 422
         /// [`TooBroadReason::VariantSpecBytes`] on breach) → clone →
         /// construct. Allocates nothing before the charge returns `Ok`.
@@ -1143,8 +1144,8 @@ mod variant_spec {
         ) -> Result<Self, ReadError> {
             let is_absent = matches!(range_op, RangeAggOp::AbsentOverTime);
             let bytes =
-                super::super::exec::variant_spec_bytes(tail, selector, is_absent, agg_chain);
-            super::super::exec::charge_fanout_bytes(charged, bytes, cap).map_err(
+                super::super::variants::variant_spec_bytes(tail, selector, is_absent, agg_chain);
+            crate::logql::variants::charge_fanout_bytes(charged, bytes, cap).map_err(
                 |(bytes, cap)| {
                     ReadError::QueryTooBroad(TooBroadReason::VariantSpecBytes { bytes, cap })
                 },
@@ -1161,7 +1162,8 @@ mod variant_spec {
                     kind: GroupingKind::By,
                     labels: Vec::new(),
                 });
-                g.labels.push(super::super::exec::VARIANT_LABEL.to_string());
+                g.labels
+                    .push(super::super::variants::VARIANT_LABEL.to_string());
                 g.labels.sort_unstable();
             }
             // `absent_over_time`'s synthetic labels come from the
@@ -1239,7 +1241,7 @@ mod variant_spec {
 
     /// The W-MEM field-addition guard (issue #221): adding a field to
     /// `VariantSpec` breaks this test's compilation, forcing the
-    /// type-closure walk (charged in [`super::super::exec::variant_spec_bytes`])
+    /// type-closure walk (charged in [`super::super::variants::variant_spec_bytes`])
     /// to be re-run for it before it can ship. Lives INSIDE the module
     /// because the fields are deliberately private (the sole-constructor
     /// invariant); the indented `cfg(test)` stays out of the column-0
@@ -1315,14 +1317,14 @@ fn build_variants_node(
             cap: MAX_VARIANT_SUB_STATES,
         }));
     }
-    let cap = super::exec::MAX_VARIANT_FANOUT_STATE_BYTES;
+    let cap = super::variants::MAX_VARIANT_FANOUT_STATE_BYTES;
     let mut charged: u64 = 0;
     // C2: the spec vector's own buffer, charged after the count gate and
     // before the exact reservation below — no P5 residue remains in the
     // plan-time list.
-    super::exec::charge_fanout_bytes(
+    crate::logql::variants::charge_fanout_bytes(
         &mut charged,
-        super::exec::vec_buffer_bytes::<VariantSpec>(n),
+        super::variants::vec_buffer_bytes::<VariantSpec>(n),
         cap,
     )
     .map_err(|(bytes, cap)| {
@@ -2885,8 +2887,6 @@ mod tests {
     // charges (I8–I13) and censuses.
     // -----------------------------------------------------------------
 
-    use super::super::exec;
-
     fn variants_plan_of(query: &str, spec: QuerySpec) -> Result<Plan, ReadError> {
         let params = QueryParams {
             spec,
@@ -3116,7 +3116,10 @@ mod tests {
             spec,
         );
         assert_eq!(variants.len(), 1);
-        assert_eq!(spec_bytes, exec::vec_buffer_bytes::<VariantSpec>(1));
+        assert_eq!(
+            spec_bytes,
+            crate::logql::variants::vec_buffer_bytes::<VariantSpec>(1)
+        );
     }
 
     /// I8 — CHARGE: the spec's tail terms (buffer + clone factor). Pair:
@@ -3141,9 +3144,11 @@ mod tests {
         );
         let long_tail = &long_specs[0].client().pipeline;
         let short_tail = &short_specs[0].client().pipeline;
-        let expected = (exec::vec_buffer_bytes::<Stage>(long_tail.len() as u64)
-            - exec::vec_buffer_bytes::<Stage>(short_tail.len() as u64))
-            + (exec::stage_source_bytes(long_tail) - exec::stage_source_bytes(short_tail)) * 130;
+        let expected = (crate::logql::variants::vec_buffer_bytes::<Stage>(long_tail.len() as u64)
+            - crate::logql::variants::vec_buffer_bytes::<Stage>(short_tail.len() as u64))
+            + (crate::logql::variants::stage_source_bytes(long_tail)
+                - crate::logql::variants::stage_source_bytes(short_tail))
+                * 130;
         assert!(expected > 0);
         assert_eq!(long - short, expected);
     }
@@ -3156,9 +3161,10 @@ mod tests {
             r#"variants(absent_over_time({a="1", b="2", c="3"}[5m])) of ({a="1"}[5m])"#,
         );
         let one = spec_bytes_of(r#"variants(absent_over_time({a="1"}[5m])) of ({a="1"}[5m])"#);
-        let expected = (exec::vec_buffer_bytes::<(String, String)>(3)
-            - exec::vec_buffer_bytes::<(String, String)>(1))
-            + 2 * (exec::alloc_block_bytes(1) + exec::alloc_block_bytes(1));
+        let expected = (crate::logql::variants::vec_buffer_bytes::<(String, String)>(3)
+            - crate::logql::variants::vec_buffer_bytes::<(String, String)>(1))
+            + 2 * (crate::logql::charge::alloc_block_bytes(1)
+                + crate::logql::charge::alloc_block_bytes(1));
         assert!(expected > 0);
         assert_eq!(three - one, expected);
     }
@@ -3173,8 +3179,9 @@ mod tests {
         );
         let bare = spec_bytes_of(r#"variants(sum(count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#);
         let ptr = size_of::<String>() as u64;
-        let expected = (exec::grown_alloc_bytes(4 * ptr) - exec::grown_alloc_bytes(ptr))
-            + 3 * exec::alloc_block_bytes(2);
+        let expected = (crate::logql::charge::grown_alloc_bytes(4 * ptr)
+            - crate::logql::charge::grown_alloc_bytes(ptr))
+            + 3 * crate::logql::charge::alloc_block_bytes(2);
         assert!(expected > 0);
         assert_eq!(declared - bare, expected);
     }
@@ -3189,9 +3196,11 @@ mod tests {
             spec_bytes_of(r#"variants(sum(count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#);
         let bare = spec_bytes_of(r#"variants(count_over_time({a="b"}[5m])) of ({a="b"}[5m])"#);
         let ptr = size_of::<String>() as u64;
-        let expected = exec::grown_alloc_bytes(size_of::<VectorAggSpec>() as u64)
-            + exec::grown_alloc_bytes(ptr)
-            + exec::alloc_block_bytes(exec::VARIANT_LABEL.len() as u64);
+        let expected = crate::logql::charge::grown_alloc_bytes(size_of::<VectorAggSpec>() as u64)
+            + crate::logql::charge::grown_alloc_bytes(ptr)
+            + crate::logql::charge::alloc_block_bytes(
+                crate::logql::variants::VARIANT_LABEL.len() as u64
+            );
         assert_eq!(one_layer - bare, expected);
     }
 
@@ -3214,7 +3223,8 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
         };
-        let sized = exec::variant_spec_bytes(tail, &range.selector.selector, false, me);
+        let sized =
+            crate::logql::variants::variant_spec_bytes(tail, &range.selector.selector, false, me);
         assert!(sized > 0);
         let mut charged = 0u64;
         VariantSpec::try_new(
@@ -3270,7 +3280,8 @@ mod tests {
         );
         assert_eq!(
             spec_bytes_of(&q3) - spec_bytes_of(&q2),
-            exec::vec_buffer_bytes::<VariantSpec>(3) - exec::vec_buffer_bytes::<VariantSpec>(2)
+            crate::logql::variants::vec_buffer_bytes::<VariantSpec>(3)
+                - crate::logql::variants::vec_buffer_bytes::<VariantSpec>(2)
         );
     }
 
@@ -3312,7 +3323,9 @@ mod tests {
         // (The v6 census text predates C2's second site — flagged in the
         // implementation notes.)
         let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
-        let charges = compact.matches("exec::charge_fanout_bytes(").count();
+        let charges = compact
+            .matches("crate::logql::variants::charge_fanout_bytes(")
+            .count();
         assert_eq!(charges, 2, "plan charge-site census");
         // The sole `VariantSpec { .. }` construction literal (the struct
         // declaration subtracted).
