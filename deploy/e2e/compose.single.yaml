@@ -89,100 +89,6 @@ services:
     # harness process itself, which runs on the host.
     ports: [ "4318:4318" ]
 
-  # The M2 differential-accuracy scenario's reference backend (issue #33
-  # architect plan, `e2e/src/metrics.rs`'s `metrics_differential`): the
-  # collector's second `prometheusremotewrite` exporter target
-  # (`otel-config.single.yaml`) receives the same OTLP-derived corpus
-  # PulsusDB does, so the two can be diffed. Same image `#32`'s golden
-  # fixtures are captured from — pin/digest kept in sync with that issue's
-  # own image reference. `--web.enable-remote-write-receiver` is what
-  # makes `POST /api/v1/write` accept the collector's export (KISS: no
-  # TLS, static IP, no DNS — same convention as every other service on
-  # this network).
-  prometheus:
-    image: prom/prometheus:v3.13.0
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --web.enable-remote-write-receiver
-      # Issue #84 (M6-08b): duration expressions are gated behind this
-      # feature flag at v3.13.0 (OFF by default) — the oracle's feature
-      # set must match the pulsus experimental gate the differential
-      # harness evaluates under.
-      - --enable-feature=promql-duration-expr
-      # Issue #86 (M6-08d): delayed __name__ removal is PulsusDB's sole,
-      # unconditional evaluation model (the corpus oracle's own mode,
-      # promqltest test.go:111) — the reference backend must run the same
-      # opt-in flag so the differential validates live parity under
-      # matching flag state (adjudicated on #86).
-      - --enable-feature=promql-delayed-name-removal
-      # Issue #82 (M6-05b): the info() matrix rows are experimental at
-      # v3.13.0 — without this flag the oracle cannot execute info() at
-      # all (verified: flag-off is a 400 parse error). Flag parity with
-      # the pulsusdb service's PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS
-      # below (#82 adjudication 5, the duration-expr precedent).
-      - --enable-feature=promql-experimental-functions
-    volumes:
-      - ${PULSUS_E2E_ROOT}/deploy/e2e/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    networks:
-      pulsus-e2e-single:
-        ipv4_address: 172.29.0.14
-    # Published so the harness's completeness/query-matrix HTTP client
-    # (running on the host, like every other Ctx.http call) can drive
-    # `/api/v1/*` directly against it — same rationale as `pulsusdb`'s own
-    # `:3100` publish above.
-    ports: [ "9090:9090" ]
-
-  # The M4 traces-differential reference backend (issue #60,
-  # `e2e/src/traces.rs`'s `traces_differential`): receives the identical
-  # OTLP traces corpus via the collector's `otlp/tempo` exporter
-  # (`otel-config.single.yaml`) so trace-by-ID span sets and search
-  # trace-ID sets can be diffed. Pinned by tag AND digest (task-manager
-  # adjudication 2, the prom/prometheus:v3.13.0 precedent) — grafana/tempo
-  # 3.0.2, multi-arch manifest digest recorded below; upgrades are
-  # deliberate future commits, never floating. Single-variant only
-  # (adjudication 1: the differential rides e2e-single; the cluster
-  # overlay ships no tempo service). Config notes: deploy/e2e/tempo.yaml.
-  tempo:
-    image: grafana/tempo:3.0.2@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3
-    command:
-      - -config.file=/etc/tempo.yaml
-    volumes:
-      - ${PULSUS_E2E_ROOT}/deploy/e2e/tempo.yaml:/etc/tempo.yaml:ro
-    networks:
-      pulsus-e2e-single:
-        ipv4_address: 172.29.0.15
-    # Published so the harness's differential HTTP client (running on
-    # the host, like every other Ctx.http call) can drive
-    # `/api/traces/{id}` + `/api/search` directly — same rationale as
-    # `prometheus`'s `:9090` publish above.
-    ports: [ "3200:3200" ]
-
-  # The M6-09 LogQL-pipeline differential's reference backend
-  # (`e2e/src/logs.rs`'s `logs_pipeline_differential`, nightly/dispatch
-  # tier): receives the identical OTLP logs corpus via the collector's
-  # `otlphttp/loki` exporter fan-out (`otel-config.single.yaml`) so
-  # pipeline query results can be diffed set-equal. Pinned by tag AND
-  # digest (the grafana/tempo:3.0.2 / prom/prometheus:v3.13.0 precedent
-  # — multi-arch manifest-list digest recorded at pull time; upgrades
-  # are deliberate future commits, never floating). Single-variant only,
-  # like `tempo`. Host publish is `3101` (pulsusdb owns host `3100`;
-  # distinct static IPs mean no in-network conflict). Config notes:
-  # deploy/e2e/loki.yaml.
-  loki:
-    image: grafana/loki:3.4.2@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08
-    command:
-      - -config.file=/etc/loki/config.yaml
-    volumes:
-      - ${PULSUS_E2E_ROOT}/deploy/e2e/loki.yaml:/etc/loki/config.yaml:ro
-    networks:
-      pulsus-e2e-single:
-        ipv4_address: 172.29.0.16
-    # Published so the harness's differential HTTP client (running on the
-    # host, like every other Ctx.http call) can drive
-    # `/loki/api/v1/query_range` directly — same rationale as `tempo`'s
-    # `:3200` publish above.
-    ports: [ "3101:3100" ]
-
   # Grafana, provisioned with a Loki datasource pointed at pulsusdb's compat
   # surface (issue #14, task-manager-approved option A): proves alias
   # routing + Loki-datasource compatibility end to end via
@@ -191,7 +97,7 @@ services:
   # drive `/api/ds/query`. Single-variant only (not part of the cluster
   # overlay).
   grafana:
-    image: grafana/grafana:11.1.0
+    image: grafana/grafana:13.1
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Editor"

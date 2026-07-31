@@ -70,35 +70,3 @@ services:
     # `compose.single.yaml`'s identical port mapping.
     ports: [ "4318:4318" ]
 
-  # The M2 differential-accuracy scenario's reference backend (issue #33
-  # architect plan) — same role/rationale as `compose.single.yaml`'s
-  # `prometheus` service, on this variant's `pulsus-schema-it` subnet
-  # instead.
-  prometheus:
-    image: prom/prometheus:v3.13.0
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --web.enable-remote-write-receiver
-      # Issue #84 (M6-08b): duration expressions are gated behind this
-      # feature flag at v3.13.0 (OFF by default) — the oracle's feature
-      # set must match the pulsus experimental gate the differential
-      # harness evaluates under.
-      - --enable-feature=promql-duration-expr
-      # Issue #86 (M6-08d): delayed __name__ removal is PulsusDB's sole,
-      # unconditional evaluation model (the corpus oracle's own mode,
-      # promqltest test.go:111) — the reference backend must run the same
-      # opt-in flag so the differential validates live parity under
-      # matching flag state (adjudicated on #86).
-      - --enable-feature=promql-delayed-name-removal
-      # Issue #82 (M6-05b): the info() matrix rows are experimental at
-      # v3.13.0 — without this flag the oracle cannot execute info() at
-      # all (verified: flag-off is a 400 parse error). Flag parity with
-      # the pulsusdb service's PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS
-      # above (#82 adjudication 5, the duration-expr precedent).
-      - --enable-feature=promql-experimental-functions
-    volumes:
-      - ${PULSUS_E2E_ROOT}/deploy/e2e/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    networks:
-      pulsus-schema-it:
-        ipv4_address: 172.28.0.22
-    ports: [ "9090:9090" ]
