@@ -21,6 +21,9 @@
 #     `detected_level` structured-metadata field per entry, which its
 #     query results surface as an extra label and which PulsusDB
 #     deliberately does not synthesize.
+#   - `split_queries_by_interval: 0` (issue #301) — the oracle must
+#     evaluate the range query it was ASKED, not the step-aligned one its
+#     query-frontend rewrites it into; see the inline note below.
 
 auth_enabled: false
 
@@ -53,6 +56,23 @@ schema_config:
 limits_config:
   allow_structured_metadata: true
   discover_log_levels: false
+  # Issue #301 — take the query-FRONTEND's request rewrite out of the
+  # range differential's path. Loki's metric splitter
+  # (`pkg/querier/queryrange/splitters.go`, `metricQuerySplitter.split`,
+  # v3.4.2 L242 / v3.7.4 L236) calls `alignStartEnd` UNCONDITIONALLY,
+  # flooring the request `start` to a multiple of `step` and ceiling
+  # `end` — even when the query yields a single split, and regardless of
+  # `align_queries_with_step` (false here, and it governs a different
+  # middleware). Its LogQL engine is start-anchored `{start + k·step}`,
+  # like PulsusDB, so under the 1h default the reference answers a
+  # DIFFERENT query than the one asked: an epoch-aligned grid that can
+  # carry points outside the requested `[start, end]` (measured — see
+  # docs/benchmarks/logs-differential-ledger.md `frontend-step-alignment`).
+  # `0` is the only switch: `split_by_interval.go`'s `Do` returns
+  # `h.next.Do` before the splitter runs. Measured blast radius: only the
+  # five `metric_range` cases change; all 32 other shipped cases
+  # (streams, instant, error) are byte-identical either way.
+  split_queries_by_interval: 0
   otlp_config:
     resource_attributes:
       attributes_config:
