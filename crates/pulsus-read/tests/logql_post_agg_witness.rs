@@ -3708,9 +3708,10 @@ fn both_amplifiers_are_refused_end_to_end_from_query_text() {
         text.len()
     );
     let expr = pulsus_logql::parse(&text).expect("the by-clause probe must parse");
-    let aggs = match expr {
+    // Issue #272: E0509 — re-bind through a reference and clone.
+    let aggs = match &expr {
         pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Vector { op, grouping, .. }) => {
-            vec![(op, grouping, None)]
+            vec![(*op, grouping.clone(), None)]
         }
         other => panic!("expected a vector aggregation, got {other:?}"),
     };
@@ -3749,8 +3750,10 @@ fn both_amplifiers_are_refused_end_to_end_from_query_text() {
         btext.len()
     );
     let bexpr = pulsus_logql::parse(&btext).expect("the include probe must parse");
-    let matching = match bexpr {
+    // Issue #272: E0509 — re-bind through a reference and clone.
+    let matching = match &bexpr {
         pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Binary { modifier, .. }) => modifier
+            .clone()
             .and_then(|m| m.matching)
             .expect("the probe carries an on/group_left clause"),
         other => panic!("expected a binary expression, got {other:?}"),

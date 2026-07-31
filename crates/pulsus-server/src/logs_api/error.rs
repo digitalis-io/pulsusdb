@@ -316,6 +316,21 @@ mod tests {
         assert_eq!(json["errorType"], "query_too_broad");
     }
 
+    /// Issue #272: the walk-admission reason rides the same
+    /// `QueryTooBroad(_)` wildcard — no mapper arm changes, and this
+    /// proves it.
+    #[tokio::test]
+    async fn read_error_walk_transient_bytes_maps_to_422_query_too_broad() {
+        let err =
+            ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::WalkTransientBytes {
+                estimate: 900_000_000,
+                cap: 80_000_000,
+            });
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "query_too_broad");
+    }
+
     #[tokio::test]
     async fn read_error_clickhouse_timeout_maps_to_504() {
         let err = ReadError::Clickhouse(ChError::Timeout("deadline".to_string()));

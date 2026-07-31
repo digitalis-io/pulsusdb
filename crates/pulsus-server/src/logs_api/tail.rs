@@ -120,7 +120,7 @@ fn retention_floor_ns(retention_days: u32, now_ns: i64) -> i64 {
 
 fn parse_tail_params(pairs: &[(String, String)], cfg: &Config) -> Result<TailParams, ApiError> {
     let query = params::get(pairs, "query").ok_or(ParamError::MissingQuery)?;
-    let expr = pulsus_logql::parse(query)?;
+    let expr = super::parse_logql(query)?;
     if !matches!(expr, Expr::Log(_)) {
         return Err(ParamError::MetricQueryUnsupported { endpoint: "tail" }.into());
     }

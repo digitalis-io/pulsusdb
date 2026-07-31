@@ -12,6 +12,15 @@ use crate::token::Span;
 /// The nested-vector-aggregation recursion guard (`sum(sum(sum(...)))`).
 /// Exceeding it is a parse error, never a stack overflow (architect plan:
 /// "Duration & recursion as panic vectors").
+///
+/// **#272 does not remove this constant.** It converts the AST/plan
+/// walks (`Debug`, `Clone`, `PartialEq`, `Hash`, `Display`, drop, and
+/// the planner/executor walks) to iterative form; the PARSER's own
+/// recursive descent is untouched, so this guard is still the only thing
+/// bounding it. **#256 owns its removal**, and cannot simply raise it to
+/// the query-text cap: 131,071 bytes of `(` is roughly 65,000 parser
+/// recursion levels, far past any stack — the parser must be converted
+/// or frame-bounded first.
 pub(crate) const MAX_DEPTH: usize = 64;
 
 /// The label-filter *parenthesis*-nesting recursion guard
@@ -25,9 +34,12 @@ pub(crate) const MAX_DEPTH: usize = 64;
 /// with this guard's `depth` parameter in place; `364 / 4 = 91` — divided
 /// by a safety factor of 4. That factor is in LEVELS; the accepted worst
 /// case consumes 1,029 KiB of the 2 MiB stack (1.99x), because the metric
-/// prefix alone costs a fixed 694 KiB. Interim: #272 converts these walks
-/// to iterative form, after which this limit should be raised to the
-/// reference's own (it bounds this shape only by its 131,072-byte cap).
+/// prefix alone costs a fixed 694 KiB.
+///
+/// **#272 does not remove this constant either.** It is a PARSER depth
+/// guard, and #272 converts the AST/plan walks rather than the parser.
+/// **#256 owns its removal**, under the same arithmetic recorded on
+/// [`MAX_DEPTH`].
 pub(crate) const LABEL_FILTER_MAX_DEPTH: usize = 91;
 
 /// Errors from `pulsus-logql`'s lexer and parser.

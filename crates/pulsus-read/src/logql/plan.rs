@@ -12,10 +12,13 @@
 //! [`super::sql`]'s stage 2/3/metric builders once fingerprints are known.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::ops::ControlFlow;
 
+use pulsus_logql::walk;
 use pulsus_logql::{
-    BinModifier, BinOp, Expr, Grouping, GroupingKind, LineFilter, LineFilterOp, LogExpr, LogRange,
-    MatchOp, Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
+    BinOp, Expr, Grouping, GroupingKind, LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp,
+    Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
     VectorMatching,
 };
 
@@ -231,7 +234,13 @@ pub enum ClientValue {
 /// covers a vector aggregation over a *binary* operand (`sum(a + b)`) —
 /// a thin post-combination layer reusing the same reducer code as
 /// [`MetricPlan::vector_aggs`].
-#[derive(Debug, Clone, PartialEq)]
+/// **Issue #272 — no `#[derive]`.** `Binary::lhs`, `Binary::rhs` and
+/// `VectorAgg::inner` are SCC-internal child slots spelled
+/// [`walk::Child`], which implements no derivable trait, so a
+/// `#[derive]` here is a compile error (C3). `Debug`, `Clone`,
+/// `PartialEq` and `Drop` are hand-written below and iterative;
+/// `Leaf`/`Variants`' boxed `MetricPlan` leaves the cycle and is
+/// untouched.
 pub enum MetricNode {
     Leaf(Box<MetricPlan>),
     Scalar(f64),
@@ -251,12 +260,12 @@ pub enum MetricNode {
         /// clause (issue #91); `None` = default full-label one-to-one
         /// matching (the pre-#91 behavior, byte-identical).
         matching: Option<VectorMatching>,
-        lhs: Box<MetricNode>,
-        rhs: Box<MetricNode>,
+        lhs: walk::Child<MetricNode>,
+        rhs: walk::Child<MetricNode>,
     },
     VectorAgg {
         aggs: Vec<VectorAggSpec>,
-        inner: Box<MetricNode>,
+        inner: walk::Child<MetricNode>,
     },
     /// `variants(...) of (...)` (issue #221): ONE scan feeding N
     /// reducers. `scan` is planned from the COMMON log range alone
@@ -284,21 +293,21 @@ impl MetricNode {
         out
     }
 
+    /// Issue #272: a driver consumer. Pre-order left-to-right visits the
+    /// same nodes in the same order the recursion did, so the leaf
+    /// sequence is unchanged.
     fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a MetricPlan>) {
-        match self {
+        walk::preorder::<MetricNodeScc>(self, |n| match n {
             MetricNode::Leaf(mp) => out.push(mp),
             MetricNode::Scalar(_) => {}
             // A `vector(n)` literal is series-producing but reads no DB
             // leaf (mirrors `Scalar` for leaf collection — see
             // `produces_series`).
             MetricNode::VectorLit { .. } => {}
-            MetricNode::Binary { lhs, rhs, .. } => {
-                lhs.collect_leaves(out);
-                rhs.collect_leaves(out);
-            }
-            MetricNode::VectorAgg { inner, .. } => inner.collect_leaves(out),
+            MetricNode::Binary { .. } => {}
+            MetricNode::VectorAgg { .. } => {}
             MetricNode::Variants { scan, .. } => out.push(scan),
-        }
+        });
     }
 
     /// Whether the tree produces a series result (vector/matrix) rather
@@ -307,15 +316,417 @@ impl MetricNode {
     /// which yields `{} => n`); false for a pure-literal tree (`5`,
     /// `5+3`). Drives `binary_result_type`'s scalar-vs-vector/matrix
     /// classification (issue #221).
+    ///
+    /// Issue #272: a driver consumer with an early break, so the
+    /// short-circuit the `||` gave is preserved — the walk stops at the
+    /// first series-producing node.
     pub fn produces_series(&self) -> bool {
-        match self {
+        walk::find_preorder::<MetricNodeScc, ()>(self, |n| match n {
             MetricNode::Leaf(_) | MetricNode::VectorLit { .. } | MetricNode::Variants { .. } => {
-                true
+                ControlFlow::Break(())
             }
-            MetricNode::Scalar(_) => false,
-            MetricNode::Binary { lhs, rhs, .. } => lhs.produces_series() || rhs.produces_series(),
-            MetricNode::VectorAgg { inner, .. } => inner.produces_series(),
+            MetricNode::Scalar(_) => ControlFlow::Continue(walk::Step::Descend),
+            MetricNode::Binary { .. } | MetricNode::VectorAgg { .. } => {
+                ControlFlow::Continue(walk::Step::Descend)
+            }
+        })
+        .is_some()
+    }
+}
+
+// ---------------------------------------------------------------------
+// SCC-3: `MetricNode` (issue #272)
+// ---------------------------------------------------------------------
+
+/// The zero-sized tag naming SCC-3 in [`walk::Scc`]'s type position.
+/// SCC-3 is homogeneous — every SCC-internal child of a `MetricNode` is a
+/// `MetricNode` — so its kinds are the trivial ones.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricNodeScc;
+
+/// A same-kind, non-allocating `MetricNode` the planner can never
+/// produce, written over a stolen child so the emptied parent's own drop
+/// is free.
+#[inline]
+fn mn_placeholder() -> MetricNode {
+    MetricNode::Scalar(f64::NAN)
+}
+
+impl walk::Scc for MetricNodeScc {
+    type Ref<'a> = walk::Ref<'a, MetricNode>;
+    type Node<'a> = &'a MetricNode;
+    type Slot<'a> = walk::Slot<'a, MetricNode>;
+    type SlotNode<'a> = &'a mut MetricNode;
+    type Val = MetricNode;
+
+    #[inline]
+    fn wrap<'a>(n: &'a MetricNode) -> walk::Ref<'a, MetricNode>
+    where
+        Self: 'a,
+    {
+        walk::Ref::new(n)
+    }
+
+    #[inline]
+    fn open<'a>(r: walk::Ref<'a, MetricNode>, w: &walk::Walk) -> &'a MetricNode
+    where
+        Self: 'a,
+    {
+        r.open(w)
+    }
+
+    #[inline]
+    fn open_slot<'a>(s: walk::Slot<'a, MetricNode>, w: &walk::Walk) -> &'a mut MetricNode
+    where
+        Self: 'a,
+    {
+        s.open(w)
+    }
+
+    #[inline]
+    fn slot_node_ref<'x>(s: &'x &mut MetricNode) -> &'x MetricNode
+    where
+        Self: 'x,
+    {
+        s
+    }
+
+    #[inline]
+    fn child<'a>(n: &'a MetricNode, i: usize) -> Option<walk::Ref<'a, MetricNode>>
+    where
+        Self: 'a,
+    {
+        match n {
+            MetricNode::Leaf(_)
+            | MetricNode::Scalar(_)
+            | MetricNode::VectorLit { .. }
+            | MetricNode::Variants { .. } => None,
+            MetricNode::Binary { lhs, rhs, .. } => match i {
+                0 => Some(lhs.peek()),
+                1 => Some(rhs.peek()),
+                _ => None,
+            },
+            MetricNode::VectorAgg { inner, .. } => match i {
+                0 => Some(inner.peek()),
+                _ => None,
+            },
         }
+    }
+
+    fn shallow_eq(a: &MetricNode, b: &MetricNode) -> bool {
+        match (a, b) {
+            (MetricNode::Leaf(a), MetricNode::Leaf(b)) => a == b,
+            (MetricNode::Scalar(a), MetricNode::Scalar(b)) => a == b,
+            (
+                MetricNode::VectorLit {
+                    value: av,
+                    window: aw,
+                },
+                MetricNode::VectorLit {
+                    value: bv,
+                    window: bw,
+                },
+            ) => av == bv && aw == bw,
+            (
+                MetricNode::Binary {
+                    op: ao,
+                    return_bool: ab,
+                    matching: am,
+                    ..
+                },
+                MetricNode::Binary {
+                    op: bo,
+                    return_bool: bb,
+                    matching: bm,
+                    ..
+                },
+            ) => ao == bo && ab == bb && am == bm,
+            (MetricNode::VectorAgg { aggs: a, .. }, MetricNode::VectorAgg { aggs: b, .. }) => {
+                a == b
+            }
+            (
+                MetricNode::Variants {
+                    scan: asc,
+                    variants: av,
+                    spec_bytes: ab,
+                },
+                MetricNode::Variants {
+                    scan: bsc,
+                    variants: bv,
+                    spec_bytes: bb,
+                },
+            ) => asc == bsc && av == bv && ab == bb,
+            (MetricNode::Leaf(_), _)
+            | (MetricNode::Scalar(_), _)
+            | (MetricNode::VectorLit { .. }, _)
+            | (MetricNode::Binary { .. }, _)
+            | (MetricNode::VectorAgg { .. }, _)
+            | (MetricNode::Variants { .. }, _) => false,
+        }
+    }
+
+    fn rebuild(n: &MetricNode, kids: &mut Vec<MetricNode>) -> MetricNode {
+        match n {
+            MetricNode::Leaf(mp) => MetricNode::Leaf(mp.clone()),
+            MetricNode::Scalar(v) => MetricNode::Scalar(*v),
+            MetricNode::VectorLit { value, window } => MetricNode::VectorLit {
+                value: *value,
+                window: *window,
+            },
+            MetricNode::Binary {
+                op,
+                return_bool,
+                matching,
+                ..
+            } => {
+                // The tail of `kids` is [.., lhs, rhs].
+                let rhs = drain_node(kids);
+                let lhs = drain_node(kids);
+                MetricNode::Binary {
+                    op: *op,
+                    return_bool: *return_bool,
+                    matching: matching.clone(),
+                    lhs: walk::Child::new(lhs),
+                    rhs: walk::Child::new(rhs),
+                }
+            }
+            MetricNode::VectorAgg { aggs, .. } => MetricNode::VectorAgg {
+                aggs: aggs.clone(),
+                inner: walk::Child::new(drain_node(kids)),
+            },
+            MetricNode::Variants {
+                scan,
+                variants,
+                spec_bytes,
+            } => MetricNode::Variants {
+                scan: scan.clone(),
+                variants: variants.clone(),
+                spec_bytes: *spec_bytes,
+            },
+        }
+    }
+
+    fn take_own_fields(s: &mut &mut MetricNode) {
+        match &mut **s {
+            MetricNode::Leaf(_)
+            | MetricNode::Scalar(_)
+            | MetricNode::VectorLit { .. }
+            | MetricNode::Variants { .. } => {}
+            MetricNode::Binary { matching, .. } => {
+                *matching = None;
+            }
+            MetricNode::VectorAgg { aggs, .. } => {
+                aggs.clear();
+                aggs.shrink_to_fit();
+            }
+        }
+    }
+
+    fn steal_children(s: &mut &mut MetricNode, out: &mut walk::ChunkStack<MetricNode>) {
+        match &mut **s {
+            MetricNode::Leaf(_)
+            | MetricNode::Scalar(_)
+            | MetricNode::VectorLit { .. }
+            | MetricNode::Variants { .. } => {}
+            MetricNode::Binary { lhs, rhs, .. } => {
+                // Right-to-left, so LIFO pop order is left-to-right.
+                out.push(rhs.replace(mn_placeholder()));
+                out.push(lhs.replace(mn_placeholder()));
+            }
+            MetricNode::VectorAgg { inner, .. } => {
+                out.push(inner.replace(mn_placeholder()));
+            }
+        }
+    }
+
+    #[inline]
+    fn val_ref(v: &MetricNode) -> walk::Ref<'_, MetricNode> {
+        walk::Ref::new(v)
+    }
+
+    #[inline]
+    fn val_slot(v: &mut MetricNode) -> walk::Slot<'_, MetricNode> {
+        walk::Slot::new(v)
+    }
+}
+
+/// Drains one child value off the tail of a rebuild value stack.
+#[inline]
+fn drain_node(kids: &mut Vec<MetricNode>) -> MetricNode {
+    match kids.pop() {
+        Some(v) => v,
+        // Unreachable by construction: post-order leaves exactly
+        // `arity(n)` child values on the tail. Clone path, never a `Drop`
+        // path, so a release panic is correct.
+        None => unreachable!("expected a `MetricNode` child value on the rebuild stack"),
+    }
+}
+
+/// The tree in post-order (children before parents, left to right) plus
+/// the exact high-water mark a post-order value stack reaches over it —
+/// which is what `run_metric_node` reserves, once, before evaluating.
+/// Post-order (children before parents, left to right) plus the exact
+/// high-water mark a post-order value stack reaches over it, with
+/// **every allocating step charged before it happens** — the work stack's next chunk and the node
+/// vector's next reallocation alike. Leg B's entry point: a refusal
+/// stops the walk before the allocation it refused, rather than after
+/// (issue #272 memory L1).
+pub(crate) fn metric_node_postorder_charged<'a>(
+    root: &'a MetricNode,
+    budget: &mut super::walkbound::WalkBudget,
+) -> Result<(Vec<&'a MetricNode>, usize), ReadError> {
+    let mut nodes = Vec::new();
+    walk::try_postorder_into::<MetricNodeScc, ReadError>(root, &mut nodes, |bytes| {
+        budget.charge(bytes)
+    })?;
+    Ok(postorder_peak(nodes))
+}
+
+/// The exact high-water mark a post-order value stack reaches over
+/// `nodes` — what `run_metric_node` reserves, once, before evaluating.
+pub(crate) fn postorder_peak(nodes: Vec<&MetricNode>) -> (Vec<&MetricNode>, usize) {
+    let mut live = 0usize;
+    let mut peak = 0usize;
+    for n in &nodes {
+        let arity = walk::arity::<MetricNodeScc>(n);
+        live -= arity;
+        live += 1;
+        peak = peak.max(live);
+    }
+    (nodes, peak)
+}
+
+impl Drop for MetricNode {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        drop_order::note_visited(self);
+        walk::dismantle::<MetricNodeScc>(walk::Slot::new(self));
+    }
+}
+
+impl Clone for MetricNode {
+    fn clone(&self) -> Self {
+        walk::clone_iter::<MetricNodeScc>(self)
+    }
+}
+
+impl PartialEq for MetricNode {
+    fn eq(&self, other: &Self) -> bool {
+        walk::eq_iter::<MetricNodeScc>(self, other)
+    }
+}
+
+/// Step indices for `MetricNode`'s `Debug` step machine.
+mod mn_dbg_step {
+    pub(super) const ENTER: u32 = 0;
+    pub(super) const AFTER_FIRST: u32 = 1;
+    pub(super) const AFTER_SECOND: u32 = 2;
+}
+
+impl fmt::Debug for MetricNode {
+    /// Byte-equivalent to the deleted `#[derive(Debug)]` in both modes.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let alt = f.alternate();
+        walk::emit::<MetricNodeScc, fmt::Error>(self, |n, step, level| match n {
+            MetricNode::Leaf(mp) => {
+                walk::dbg_open_tuple(f, "Leaf", alt, level)?;
+                walk::dbg_own(f, mp, alt, level + 1)?;
+                walk::dbg_close_tuple(f, alt, level)?;
+                Ok(walk::Emit::Done)
+            }
+            MetricNode::Scalar(v) => {
+                walk::dbg_open_tuple(f, "Scalar", alt, level)?;
+                walk::dbg_own(f, v, alt, level + 1)?;
+                walk::dbg_close_tuple(f, alt, level)?;
+                Ok(walk::Emit::Done)
+            }
+            MetricNode::VectorLit { value, window } => {
+                walk::dbg_open_struct(f, "VectorLit", alt, level)?;
+                f.write_str("value: ")?;
+                walk::dbg_own(f, value, alt, level + 1)?;
+                walk::dbg_sep(f, alt, level)?;
+                f.write_str("window: ")?;
+                walk::dbg_own(f, window, alt, level + 1)?;
+                walk::dbg_close_struct(f, alt, level)?;
+                Ok(walk::Emit::Done)
+            }
+            MetricNode::Variants {
+                scan,
+                variants,
+                spec_bytes,
+            } => {
+                walk::dbg_open_struct(f, "Variants", alt, level)?;
+                f.write_str("scan: ")?;
+                walk::dbg_own(f, scan, alt, level + 1)?;
+                walk::dbg_sep(f, alt, level)?;
+                f.write_str("variants: ")?;
+                walk::dbg_own(f, variants, alt, level + 1)?;
+                walk::dbg_sep(f, alt, level)?;
+                f.write_str("spec_bytes: ")?;
+                walk::dbg_own(f, spec_bytes, alt, level + 1)?;
+                walk::dbg_close_struct(f, alt, level)?;
+                Ok(walk::Emit::Done)
+            }
+            MetricNode::VectorAgg { aggs, inner } => {
+                if step == mn_dbg_step::ENTER {
+                    walk::dbg_open_struct(f, "VectorAgg", alt, level)?;
+                    f.write_str("aggs: ")?;
+                    walk::dbg_own(f, aggs, alt, level + 1)?;
+                    walk::dbg_sep(f, alt, level)?;
+                    f.write_str("inner: ")?;
+                    Ok(walk::Emit::Descend {
+                        next_step: mn_dbg_step::AFTER_FIRST,
+                        child: inner.peek(),
+                        child_step: mn_dbg_step::ENTER,
+                        child_level: level + 1,
+                    })
+                } else {
+                    walk::dbg_close_struct(f, alt, level)?;
+                    Ok(walk::Emit::Done)
+                }
+            }
+            MetricNode::Binary {
+                op,
+                return_bool,
+                matching,
+                lhs,
+                rhs,
+            } => match step {
+                mn_dbg_step::ENTER => {
+                    walk::dbg_open_struct(f, "Binary", alt, level)?;
+                    f.write_str("op: ")?;
+                    walk::dbg_own(f, op, alt, level + 1)?;
+                    walk::dbg_sep(f, alt, level)?;
+                    f.write_str("return_bool: ")?;
+                    walk::dbg_own(f, return_bool, alt, level + 1)?;
+                    walk::dbg_sep(f, alt, level)?;
+                    f.write_str("matching: ")?;
+                    walk::dbg_own(f, matching, alt, level + 1)?;
+                    walk::dbg_sep(f, alt, level)?;
+                    f.write_str("lhs: ")?;
+                    Ok(walk::Emit::Descend {
+                        next_step: mn_dbg_step::AFTER_FIRST,
+                        child: lhs.peek(),
+                        child_step: mn_dbg_step::ENTER,
+                        child_level: level + 1,
+                    })
+                }
+                mn_dbg_step::AFTER_FIRST => {
+                    walk::dbg_sep(f, alt, level)?;
+                    f.write_str("rhs: ")?;
+                    Ok(walk::Emit::Descend {
+                        next_step: mn_dbg_step::AFTER_SECOND,
+                        child: rhs.peek(),
+                        child_step: mn_dbg_step::ENTER,
+                        child_level: level + 1,
+                    })
+                }
+                _ => {
+                    walk::dbg_close_struct(f, alt, level)?;
+                    Ok(walk::Emit::Done)
+                }
+            },
+        })
     }
 }
 
@@ -380,75 +791,6 @@ fn plan_metric_expr(
                 validate_duration_ns(step_ns, "step")?;
             }
             Ok(Plan::MetricBinary(build_metric_node(metric_expr, p, ctx)?))
-        }
-    }
-}
-
-/// Recursively plans a binary/literal metric expression into a
-/// [`MetricNode`] tree. Every (vector-agg-wrapped) range-aggregation
-/// operand becomes a [`MetricNode::Leaf`] via the ordinary
-/// [`metric_plan`] path, so per-leaf routing/rollup decisions are exactly
-/// what the same expression would get standalone.
-fn build_metric_node(
-    metric_expr: &MetricExpr,
-    p: &QueryParams,
-    ctx: &PlanCtx<'_>,
-) -> Result<MetricNode, ReadError> {
-    match metric_expr {
-        MetricExpr::Literal(raw) => Ok(MetricNode::Scalar(parse_plan_number(
-            raw,
-            format_args!("scalar literal"),
-        )?)),
-        MetricExpr::VectorFn(raw) => Ok(MetricNode::VectorLit {
-            value: parse_plan_number(raw, format_args!("vector() value"))?,
-            window: window_from(p)?,
-        }),
-        MetricExpr::Variants(v) => build_variants_node(v, p, ctx),
-        MetricExpr::Binary {
-            op,
-            modifier,
-            lhs,
-            rhs,
-        } => Ok(MetricNode::Binary {
-            op: *op,
-            return_bool: matches!(
-                modifier,
-                Some(BinModifier {
-                    return_bool: true,
-                    ..
-                })
-            ),
-            matching: modifier.as_ref().and_then(|m| m.matching.clone()),
-            lhs: Box::new(build_metric_node(lhs, p, ctx)?),
-            rhs: Box::new(build_metric_node(rhs, p, ctx)?),
-        }),
-        MetricExpr::Range { .. } => Ok(MetricNode::Leaf(Box::new(metric_plan(
-            metric_expr,
-            p,
-            ctx,
-            false,
-        )?))),
-        MetricExpr::Vector { .. } => {
-            let (base, raw_aggs) = unwrap_vector_aggs(metric_expr);
-            match base {
-                MetricExpr::Range { .. } => Ok(MetricNode::Leaf(Box::new(metric_plan(
-                    metric_expr,
-                    p,
-                    ctx,
-                    false,
-                )?))),
-                MetricExpr::Literal(_) => Err(ReadError::PipelineInvalid {
-                    reason: "a vector aggregation cannot aggregate a bare scalar literal"
-                        .to_string(),
-                }),
-                inner => Ok(MetricNode::VectorAgg {
-                    aggs: parse_vector_agg_params(
-                        &raw_aggs,
-                        matches!(p.spec, QuerySpec::Range { .. }),
-                    )?,
-                    inner: Box::new(build_metric_node(inner, p, ctx)?),
-                }),
-            }
         }
     }
 }
@@ -1013,18 +1355,39 @@ fn unwrap_vector_aggs_into<'a>(
     out: &mut Vec<RawVectorAggSpec<'a>>,
 ) -> &'a MetricExpr {
     out.clear();
-    let mut cur = expr;
-    while let MetricExpr::Vector {
-        op,
-        grouping,
-        param,
-        inner,
-    } = cur
-    {
-        out.push((*op, grouping.as_ref(), param.as_deref()));
-        cur = inner;
+    // Issue #272: an ALLOCATION-FREE spine descent — one loop variable,
+    // no `ChunkStack`, no heap on any path — so the only allocations in
+    // this window remain `out`'s own growth.
+    let d = walk::descend_spine::<pulsus_logql::MetricScc, &'a MetricExpr>(
+        pulsus_logql::MeNode::Expr(expr),
+        |n| match n {
+            pulsus_logql::MeNode::Expr(MetricExpr::Vector {
+                op,
+                grouping,
+                param,
+                ..
+            }) => {
+                out.push((*op, grouping.as_ref(), param.as_deref()));
+                ControlFlow::Continue(())
+            }
+            // Every other `MetricExpr` ends the vector chain — the base.
+            pulsus_logql::MeNode::Expr(e) => ControlFlow::Break(e),
+            // Unreachable: the only `Continue` arm is `Expr(Vector)`,
+            // whose sole child is an `Expr`; a `Var` node is reached only
+            // by descending through `MetricExpr::Variants`, which the arm
+            // above breaks at.
+            pulsus_logql::MeNode::Var(_) => {
+                unreachable!("descent breaks at `Variants` before its child")
+            }
+        },
+    );
+    match d {
+        walk::Descent::Broke(base) => base,
+        // Unreachable: `Vector` always has arity 1, so descent cannot
+        // exhaust while `f` continues. Not a `debug_assert` — a release
+        // panic here is correct and this is not a `Drop` path.
+        walk::Descent::Exhausted(_) => unreachable!("`Vector` always has exactly one child"),
     }
-    cur
 }
 
 /// The number of sub-states (variants) a single `variants(...)` query may
@@ -1359,7 +1722,7 @@ fn build_variants_node(
     // ONE raw handle buffer, reused (cleared) across the variant loop —
     // never the allocating wrapper here (issue #221 member M5).
     let mut raw_buf: Vec<RawVectorAggSpec<'_>> = Vec::new();
-    for (index, variant) in v.variants.iter().enumerate() {
+    for (index, variant) in walk::slice_of(v.variants.peek()).iter().enumerate() {
         let base = unwrap_vector_aggs_into(variant, &mut raw_buf);
         // One rejection for every non-conforming shape — the reference
         // 500s (three different texts plus a nil-pointer panic), which is
@@ -1859,6 +2222,21 @@ pub fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<String> {
     out
 }
 
+// NOTE: the file is a `plan_`-prefixed sibling, not `plan/drop_order.rs`.
+// A `plan/` directory is swallowed by a common global gitignore rule, so
+// the source would never be committed.
+// Issue #272: the ONE walk this issue leaves recursive (#293 converts
+// it) plus the two accessors it needs, in a module of their own so the
+// COMPILER — not a source scan — bounds who can call them. See that
+// file's own documentation for why the guarantee moved here.
+#[path = "plan_legacy_descent.rs"]
+mod legacy_descent;
+use legacy_descent::build_metric_node;
+
+#[cfg(test)]
+#[path = "plan_drop_order.rs"]
+mod drop_order;
+
 #[cfg(test)]
 mod tests {
     use pulsus_logql::{parse, parse_selector};
@@ -2067,7 +2445,8 @@ mod tests {
             },
         )
         .expect("plan");
-        let Plan::MetricBinary(MetricNode::VectorAgg { aggs, .. }) = p else {
+        // Issue #272: E0509 — re-bind through a reference.
+        let Plan::MetricBinary(MetricNode::VectorAgg { aggs, .. }) = &p else {
             panic!("expected a VectorAgg node");
         };
         assert!(
@@ -2811,7 +3190,16 @@ mod tests {
         };
         assert_eq!(aggs.len(), 1);
         assert_eq!(aggs[0].0, VectorAggOp::Sum);
-        assert!(matches!(&**inner, MetricNode::Binary { .. }));
+        // Issue #272: reached through a driver, not the `child_of`
+        // escape hatch — census check (j) pins that hatch to
+        // `build_metric_node`'s two accessors and nothing else.
+        let _ = inner;
+        let mut kids: Vec<&MetricNode> = Vec::new();
+        walk::postorder_into::<MetricNodeScc>(&node, &mut kids);
+        assert!(
+            kids.iter().any(|n| matches!(n, MetricNode::Binary { .. })),
+            "the VectorAgg's inner node is the Binary"
+        );
     }
 
     #[test]
@@ -2898,12 +3286,15 @@ mod tests {
     }
 
     fn variants_parts(query: &str, spec: QuerySpec) -> (MetricPlan, Vec<VariantSpec>, u64) {
-        match variants_plan_of(query, spec).expect("plan") {
+        // Issue #272: E0509 — re-bind through a reference and take the
+        // owned pieces out of the borrow.
+        let mut planned = variants_plan_of(query, spec).expect("plan");
+        match &mut planned {
             Plan::MetricBinary(MetricNode::Variants {
                 scan,
                 variants,
                 spec_bytes,
-            }) => (*scan, variants, spec_bytes),
+            }) => ((**scan).clone(), std::mem::take(variants), *spec_bytes),
             other => panic!("expected a variants plan, got {other:?}"),
         }
     }

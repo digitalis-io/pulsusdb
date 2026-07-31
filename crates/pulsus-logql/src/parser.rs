@@ -35,6 +35,7 @@ use crate::error::{LABEL_FILTER_MAX_DEPTH, LogQlError, MAX_DEPTH};
 use crate::lexer;
 use crate::limits::CheckedQuery;
 use crate::token::{Span, Token, TokenKind};
+use crate::walk;
 
 /// Parses a full LogQL query into an [`Expr`] — the #11 planner contract.
 pub fn parse(input: &str) -> Result<Expr, LogQlError> {
@@ -363,8 +364,8 @@ fn parse_binary_expr(
         lhs = MetricExpr::Binary {
             op,
             modifier,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
+            lhs: walk::Child::new(lhs),
+            rhs: walk::Child::new(rhs),
         };
     }
     Ok(lhs)
@@ -857,7 +858,7 @@ fn parse_label_filter_or(
     while matches!(&cursor.peek().kind, TokenKind::Ident(name) if name == "or") {
         cursor.advance();
         let right = parse_label_filter_and(cursor, depth)?;
-        left = LabelFilterExpr::Or(Box::new(left), Box::new(right));
+        left = LabelFilterExpr::Or(walk::Child::new(left), walk::Child::new(right));
     }
     Ok(left)
 }
@@ -878,7 +879,7 @@ fn parse_label_filter_and(
         }
         cursor.advance();
         let right = parse_label_filter_factor(cursor, depth)?;
-        left = LabelFilterExpr::And(Box::new(left), Box::new(right));
+        left = LabelFilterExpr::And(walk::Child::new(left), walk::Child::new(right));
     }
 }
 
@@ -1196,8 +1197,8 @@ fn parse_variants_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricEx
     cursor.expect(&TokenKind::LParen, "'('")?;
     let range = parse_log_range(cursor)?;
     cursor.expect(&TokenKind::RParen, "')'")?;
-    Ok(MetricExpr::Variants(Box::new(ast::VariantsExpr {
-        variants,
+    Ok(MetricExpr::Variants(walk::Child::new(ast::VariantsExpr {
+        variants: walk::ChildVec::new(variants),
         range,
     })))
 }
@@ -1277,7 +1278,7 @@ fn parse_vector_agg_call(
         op,
         grouping,
         param,
-        inner: Box::new(inner),
+        inner: walk::Child::new(inner),
     })
 }
 

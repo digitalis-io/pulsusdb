@@ -446,12 +446,17 @@ fn n_variant_query(n: usize, variant: &str, common: &str) -> String {
 
 fn plan_variants(query: &str, params: &QueryParams) -> (MetricPlan, Vec<VariantSpec>, u64) {
     let expr = parse(query).expect("parse");
-    match plan(&expr, params, &ctx()).expect("plan") {
+    // Issue #272: `impl Drop for MetricNode` forbids moving out of a
+    // field (E0509), so this re-binds through a reference and takes the
+    // owned pieces out of the borrow. It sits OUTSIDE `count_plan`'s and
+    // `count_ctor`'s measured windows, so no band's quantity moves.
+    let mut planned = plan(&expr, params, &ctx()).expect("plan");
+    match &mut planned {
         Plan::MetricBinary(MetricNode::Variants {
             scan,
             variants,
             spec_bytes,
-        }) => (*scan, variants, spec_bytes),
+        }) => ((**scan).clone(), std::mem::take(variants), *spec_bytes),
         other => panic!("expected a variants plan, got {other:?}"),
     }
 }
@@ -1363,7 +1368,15 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             ".iter",
             ".len",
             ".map_err",
+            // Issue #272: `v.variants` is a `ChildVec`, so the variant
+            // list is read as an inert handle opened by the driver
+            // (`walk::slice_of(v.variants.peek())`) rather than by
+            // `.iter()` on a `Vec`. Branch count unchanged at 26; two
+            // callees join. W-MEM disposition: **NIL** — both are
+            // `#[inline]` newtype/reference maps with no allocation.
+            ".peek",
             ".push",
+            "slice_of",
             ".to_string",
             ".to_vec",
             "Err",
@@ -1393,8 +1406,26 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "plan.rs",
         ty: None,
         anchor: "unwrap_vector_aggs_into",
-        branches: 1,
-        callees: &[".as_deref", ".as_ref", ".clear", ".push"],
+        // Issue #272: the `while let` became `walk::descend_spine` — one
+        // closure `match` plus one `match` on the `Descent`, 1 -> 2
+        // branches, and the driver plus its two `unreachable!()` arms
+        // join the callee set. Regenerated with `zz_print_frame_censuses`.
+        // W-MEM disposition: **NIL** — `descend_spine` holds one loop
+        // variable and allocates nothing on any path, so the only
+        // allocations left in this frame are `out`'s own growth, exactly
+        // as before.
+        branches: 2,
+        callees: &[
+            ".as_deref",
+            ".as_ref",
+            ".clear",
+            ".push",
+            "Break",
+            "Continue",
+            "Expr",
+            "descend_spine",
+            "unreachable!",
+        ],
     },
     Frame {
         file: "plan.rs",
@@ -1508,6 +1539,14 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "variants.rs",
         ty: None,
         anchor: "stage_source_bytes",
+        // Issue #272: `label_filter_bytes` became a driver consumer
+        // (`for_each_label_filter`) rather than a recursion over
+        // `LabelFilterExpr`'s now-`Child` slots, so the driver joins the
+        // callee set. Branch count unchanged at 6. Regenerated with
+        // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — the
+        // driver descends a sole-child spine in-loop and touches a
+        // `ChunkStack` only at `arity >= 2`; the sum it accumulates is
+        // identical to the recursion's.
         branches: 6,
         callees: &[
             ".alternatives",
@@ -1518,6 +1557,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             ".len",
             ".map_or",
             ".saturating_add",
+            "for_each_label_filter",
             "label_filter_bytes",
             "matcher_bytes",
         ],
@@ -1527,6 +1567,12 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ty: None,
         anchor: "regex_stage_count",
         branches: 6,
+        // Issue #272: `label_filter_regexes` became a driver consumer
+        // (`for_each_label_filter`) rather than a recursion over
+        // `LabelFilterExpr`'s now-`Child` slots. Branch count unchanged
+        // at 6. Regenerated with `zz_print_frame_censuses`. W-MEM
+        // disposition: **NIL** — the driver allocates nothing on an
+        // `arity <= 1` tree and the count it accumulates is identical.
         callees: &[
             ".alternatives",
             ".as_ref",
@@ -1534,6 +1580,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             ".is_some_and",
             ".iter",
             ".saturating_add",
+            "for_each_label_filter",
             "from",
             "label_filter_regexes",
             "matches!",

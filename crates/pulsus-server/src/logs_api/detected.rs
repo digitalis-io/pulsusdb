@@ -153,7 +153,7 @@ async fn detected_fields_impl(
         None | Some("") => return Err(ParamError::MissingQuery.into()),
         Some(q) => q,
     };
-    let expr = pulsus_logql::parse(query)?;
+    let expr = super::parse_logql(query)?;
     if !matches!(expr, Expr::Log(_)) {
         return Err(ParamError::MetricQueryUnsupported {
             endpoint: "detected_fields",

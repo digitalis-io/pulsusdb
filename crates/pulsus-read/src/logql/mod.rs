@@ -102,6 +102,7 @@ pub mod template;
 #[cfg(test)]
 mod testkit;
 pub(crate) mod variants;
+pub(crate) mod walkbound;
 pub(crate) mod window;
 
 /// True iff the OUTERMOST node of `expr` is a terminal `sort`/`sort_desc`
@@ -139,9 +140,14 @@ pub use params::{
     ValidatedDuration, validate_duration_ns,
 };
 pub use pipeline::{CompiledPipeline, EntryOut, MetricRun, PipelineError, SAMPLE_EXTRACTION_ERROR};
+pub use walkbound::{
+    MAX_LOGQL_WALK_TRANSIENT_BYTES, REFERENCE_MAX_QUERY_BYTES, admit_logql_walk,
+    walk_transient_bound,
+};
+
 pub use plan::{
-    ClientAgg, ClientValue, MAX_VARIANT_SUB_STATES, MetricNode, MetricPlan, Plan, ProbePlan,
-    RouteChoice, RoutingDecision, StreamsPlan, VariantSpec, plan,
+    ClientAgg, ClientValue, MAX_VARIANT_SUB_STATES, MetricNode, MetricNodeScc, MetricPlan, Plan,
+    ProbePlan, RouteChoice, RoutingDecision, StreamsPlan, VariantSpec, plan,
 };
 pub use post_agg::{
     B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,

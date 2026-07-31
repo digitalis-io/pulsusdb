@@ -42,6 +42,9 @@ use thiserror::Error;
 ///   (`max_memory_usage` + `max_bytes_before_external_group_by = 0`,
 ///   throw — code 241) set **only** on generator reads; no other path
 ///   sets a memory limit, and no other code maps code 241.
+/// - [`TooBroadReason::WalkTransientBytes`] — issue #272: the iterative
+///   AST/plan walkers' transient heap, admitted from `query.len()` before
+///   the walks run. Rust-side; never a ClickHouse error code.
 /// - [`TooBroadReason::QueryTextBytes`] — issue #35: the FINAL rendered
 ///   SQL text (after placeholder-doubling) reached [`crate::querytext::MAX_QUERY_TEXT_BYTES`]
 ///   — a Rust-side pre-dispatch admission check
@@ -198,6 +201,22 @@ pub enum TooBroadReason {
     /// [`crate::querytext::ensure_query_text_fits`], never by a ClickHouse
     /// server error code.
     QueryTextBytes { rendered_bytes: u64, cap: u64 },
+    /// Issue #272: the iterative LogQL walkers' transient heap for this
+    /// query would exceed
+    /// [`crate::logql::MAX_LOGQL_WALK_TRANSIENT_BYTES`] — a Rust-side
+    /// admission check on `query.len()`
+    /// ([`crate::logql::admit_logql_walk`]), never a ClickHouse error
+    /// code. `estimate` is
+    /// [`crate::logql::walk_transient_bound`]`(query.len())`, an upper
+    /// bound computed before any allocation is requested.
+    ///
+    /// **Execution-dead through the HTTP surface**: #279's query-text cap
+    /// runs inside `pulsus_logql::parse`, which the request paths call
+    /// first, and this threshold sits above `2 x MAX_QUERY_BYTES` — so no
+    /// parse-accepted query reaches it. The variant exists for the
+    /// `const` unreachability proof and for any future caller that does
+    /// not route through `parse`.
+    WalkTransientBytes { estimate: u64, cap: u64 },
     /// Issue #138: the per-query fetched-sample budget
     /// (`reader.promql_max_samples`) was exceeded while draining
     /// `metric_samples`/`metric_hist_samples` rows. Rust-side, per-row,
@@ -447,6 +466,13 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "info() metadata family matched more than {cap} series, exceeding the \
                      cardinality cap (reader.promql_max_info_series)"
+                )
+            }
+            TooBroadReason::WalkTransientBytes { estimate, cap } => {
+                write!(
+                    f,
+                    "query would need up to {estimate} bytes of transient walker state, \
+                     exceeding the {cap}-byte cap — shorten the query"
                 )
             }
             TooBroadReason::QueryTextBytes {

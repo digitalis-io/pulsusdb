@@ -19,6 +19,10 @@
 //! [`BinModifier`] drops its `Copy` derive to own the label list.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::mem;
+
+use crate::walk::{self, Child, ChildVec, ChunkStack, Emit, Ref, Scc, Slot, Walk};
 
 /// A parsed LogQL query: either a log-stream query (`resultType: streams`
 /// in the query API) or a metric query over a log range (`resultType:
@@ -300,7 +304,12 @@ pub struct LabelExtraction {
 /// A label-filter expression: string matchers, numeric comparisons, and
 /// the `and`/`or`/`,` boolean mini-grammar (`,` and `and` both AND; `and`
 /// binds tighter than `or`; parentheses group).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// **Issue #272 — no `#[derive]`.** `And`/`Or`'s operands are
+/// SCC-internal child slots spelled [`Child`], so a `#[derive]` here is a
+/// compile error (C3). A flat `a or b or c …` chain parses at depth 1
+/// into a LEFT-DEEP tree — the parenthesis-depth guard bounds paren
+/// nesting only, never term width — so this type carried a reachable
+/// crash vector until every edge below became iterative.
 pub enum LabelFilterExpr {
     /// String form: `name =|!=|=~|!~ "value"`.
     Match(Matcher),
@@ -319,47 +328,453 @@ pub enum LabelFilterExpr {
         value: String,
         negated: bool,
     },
-    And(Box<LabelFilterExpr>, Box<LabelFilterExpr>),
-    Or(Box<LabelFilterExpr>, Box<LabelFilterExpr>),
+    And(Child<LabelFilterExpr>, Child<LabelFilterExpr>),
+    Or(Child<LabelFilterExpr>, Child<LabelFilterExpr>),
 }
 
-impl LabelFilterExpr {
-    /// Renders a child of a boolean node, parenthesizing nested boolean
-    /// children so `Display` round-trips the exact tree shape (the parser
-    /// is left-associative; an unparenthesized nested right child would
-    /// re-associate on reparse).
-    fn fmt_child(child: &LabelFilterExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match child {
-            LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => write!(f, "({child})"),
-            leaf => write!(f, "{leaf}"),
+// ---------------------------------------------------------------------
+// SCC-1: `LabelFilterExpr` (issue #272)
+// ---------------------------------------------------------------------
+//
+// A homogeneous SCC: every SCC-internal child of a `LabelFilterExpr` is a
+// `LabelFilterExpr`, so the kinds are the trivial ones.
+
+/// The zero-sized tag naming SCC-1 in [`walk::Scc`]'s type position.
+#[derive(Debug, Clone, Copy)]
+pub struct LabelFilterScc;
+
+/// A same-kind, non-allocating `LabelFilterExpr` the parser can never
+/// produce, written over a stolen child so the emptied parent's own drop
+/// is free. `Ip` is chosen over `Match`/`Compare` because its fields are
+/// two empty `String`s and a `bool` — nothing to allocate.
+#[inline]
+fn lf_placeholder() -> LabelFilterExpr {
+    LabelFilterExpr::Ip {
+        name: String::new(),
+        value: String::new(),
+        negated: false,
+    }
+}
+
+impl Scc for LabelFilterScc {
+    type Ref<'a> = walk::Ref<'a, LabelFilterExpr>;
+    type Node<'a> = &'a LabelFilterExpr;
+    type Slot<'a> = walk::Slot<'a, LabelFilterExpr>;
+    type SlotNode<'a> = &'a mut LabelFilterExpr;
+    type Val = LabelFilterExpr;
+
+    #[inline]
+    fn wrap<'a>(n: &'a LabelFilterExpr) -> walk::Ref<'a, LabelFilterExpr>
+    where
+        Self: 'a,
+    {
+        walk::Ref::new(n)
+    }
+
+    #[inline]
+    fn open<'a>(r: walk::Ref<'a, LabelFilterExpr>, w: &Walk) -> &'a LabelFilterExpr
+    where
+        Self: 'a,
+    {
+        r.open(w)
+    }
+
+    #[inline]
+    fn open_slot<'a>(s: walk::Slot<'a, LabelFilterExpr>, w: &Walk) -> &'a mut LabelFilterExpr
+    where
+        Self: 'a,
+    {
+        s.open(w)
+    }
+
+    #[inline]
+    fn slot_node_ref<'x>(s: &'x &mut LabelFilterExpr) -> &'x LabelFilterExpr
+    where
+        Self: 'x,
+    {
+        s
+    }
+
+    #[inline]
+    fn child<'a>(n: &'a LabelFilterExpr, i: usize) -> Option<walk::Ref<'a, LabelFilterExpr>>
+    where
+        Self: 'a,
+    {
+        match n {
+            LabelFilterExpr::Match(_)
+            | LabelFilterExpr::Compare { .. }
+            | LabelFilterExpr::Ip { .. } => None,
+            LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => match i {
+                0 => Some(a.peek()),
+                1 => Some(b.peek()),
+                _ => None,
+            },
+        }
+    }
+
+    fn shallow_eq(a: &LabelFilterExpr, b: &LabelFilterExpr) -> bool {
+        match (a, b) {
+            (LabelFilterExpr::Match(a), LabelFilterExpr::Match(b)) => a == b,
+            (
+                LabelFilterExpr::Compare {
+                    name: an,
+                    op: ao,
+                    rhs: ar,
+                },
+                LabelFilterExpr::Compare {
+                    name: bn,
+                    op: bo,
+                    rhs: br,
+                },
+            ) => an == bn && ao == bo && ar == br,
+            (
+                LabelFilterExpr::Ip {
+                    name: an,
+                    value: av,
+                    negated: ag,
+                },
+                LabelFilterExpr::Ip {
+                    name: bn,
+                    value: bv,
+                    negated: bg,
+                },
+            ) => an == bn && av == bv && ag == bg,
+            (LabelFilterExpr::And(..), LabelFilterExpr::And(..)) => true,
+            (LabelFilterExpr::Or(..), LabelFilterExpr::Or(..)) => true,
+            (LabelFilterExpr::Match(_), _)
+            | (LabelFilterExpr::Compare { .. }, _)
+            | (LabelFilterExpr::Ip { .. }, _)
+            | (LabelFilterExpr::And(..), _)
+            | (LabelFilterExpr::Or(..), _) => false,
+        }
+    }
+
+    fn rebuild(n: &LabelFilterExpr, kids: &mut Vec<LabelFilterExpr>) -> LabelFilterExpr {
+        match n {
+            LabelFilterExpr::Match(m) => LabelFilterExpr::Match(m.clone()),
+            LabelFilterExpr::Compare { name, op, rhs } => LabelFilterExpr::Compare {
+                name: name.clone(),
+                op: *op,
+                rhs: rhs.clone(),
+            },
+            LabelFilterExpr::Ip {
+                name,
+                value,
+                negated,
+            } => LabelFilterExpr::Ip {
+                name: name.clone(),
+                value: value.clone(),
+                negated: *negated,
+            },
+            // The tail of `kids` is [.., lhs, rhs].
+            LabelFilterExpr::And(..) => {
+                let b = drain_lf(kids);
+                let a = drain_lf(kids);
+                LabelFilterExpr::And(Child::new(a), Child::new(b))
+            }
+            LabelFilterExpr::Or(..) => {
+                let b = drain_lf(kids);
+                let a = drain_lf(kids);
+                LabelFilterExpr::Or(Child::new(a), Child::new(b))
+            }
+        }
+    }
+
+    fn take_own_fields(s: &mut &mut LabelFilterExpr) {
+        match &mut **s {
+            // `And`/`Or` carry no own fields; the leaves are never
+            // emptied (`dismantle` only empties nodes that have
+            // children), which is what keeps a real `Ip` leaf
+            // distinguishable from the placeholder.
+            LabelFilterExpr::Match(_)
+            | LabelFilterExpr::Compare { .. }
+            | LabelFilterExpr::Ip { .. }
+            | LabelFilterExpr::And(..)
+            | LabelFilterExpr::Or(..) => {}
+        }
+    }
+
+    fn steal_children(s: &mut &mut LabelFilterExpr, out: &mut ChunkStack<LabelFilterExpr>) {
+        match &mut **s {
+            LabelFilterExpr::Match(_)
+            | LabelFilterExpr::Compare { .. }
+            | LabelFilterExpr::Ip { .. } => {}
+            LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => {
+                // Right-to-left, so LIFO pop order is left-to-right.
+                out.push(b.replace(lf_placeholder()));
+                out.push(a.replace(lf_placeholder()));
+            }
+        }
+    }
+
+    #[inline]
+    fn val_ref(v: &LabelFilterExpr) -> walk::Ref<'_, LabelFilterExpr> {
+        walk::Ref::new(v)
+    }
+
+    #[inline]
+    fn val_slot(v: &mut LabelFilterExpr) -> walk::Slot<'_, LabelFilterExpr> {
+        walk::Slot::new(v)
+    }
+}
+
+#[inline]
+fn drain_lf(kids: &mut Vec<LabelFilterExpr>) -> LabelFilterExpr {
+    match kids.pop() {
+        Some(v) => v,
+        // Unreachable by construction; clone path, never a `Drop` path.
+        None => unreachable!("expected a `LabelFilterExpr` child value on the rebuild stack"),
+    }
+}
+
+/// Visits every SCC-1 node reachable from `root`, pre-order, left to
+/// right. The consumer never names a handle or a [`walk::Walk`].
+pub fn for_each_label_filter<'a>(root: &'a LabelFilterExpr, f: impl FnMut(&'a LabelFilterExpr)) {
+    walk::preorder::<LabelFilterScc>(root, f);
+}
+
+impl Drop for LabelFilterExpr {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        drop_order::note_visited_lf(self);
+        walk::dismantle::<LabelFilterScc>(walk::Slot::new(self));
+    }
+}
+
+impl Clone for LabelFilterExpr {
+    fn clone(&self) -> Self {
+        walk::clone_iter::<LabelFilterScc>(self)
+    }
+}
+
+impl PartialEq for LabelFilterExpr {
+    fn eq(&self, other: &Self) -> bool {
+        walk::eq_iter::<LabelFilterScc>(self, other)
+    }
+}
+
+impl Eq for LabelFilterExpr {}
+
+mod lf_step {
+    pub(super) const ENTER: u32 = 0;
+    pub(super) const AFTER_FIRST: u32 = 1;
+    pub(super) const AFTER_SECOND: u32 = 2;
+    /// `Display`: entered as a boolean operand, which parenthesises a
+    /// nested boolean child exactly as the old `fmt_child` did.
+    pub(super) const OPERAND: u32 = 3;
+    pub(super) const OPERAND_CLOSE: u32 = 4;
+}
+
+impl Hash for LabelFilterExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let done: Result<(), ()> = walk::emit::<LabelFilterScc, ()>(self, |n, step, _| {
+            // The derive writes `mem::discriminant(self)` EXACTLY ONCE
+            // per node, before its fields. A resumable frame is entered
+            // once per child plus once, so the discriminant belongs to
+            // the ENTER step alone — hashing it on every step would
+            // write it three times for `And`/`Or` and silently diverge
+            // from every caller written against the derive.
+            if step == lf_step::ENTER {
+                mem::discriminant(n).hash(state);
+            }
+            match n {
+                LabelFilterExpr::Match(m) => {
+                    if step == lf_step::ENTER {
+                        m.hash(state);
+                    }
+                    Ok(Emit::Done)
+                }
+                LabelFilterExpr::Compare { name, op, rhs } => {
+                    if step == lf_step::ENTER {
+                        name.hash(state);
+                        op.hash(state);
+                        rhs.hash(state);
+                    }
+                    Ok(Emit::Done)
+                }
+                LabelFilterExpr::Ip {
+                    name,
+                    value,
+                    negated,
+                } => {
+                    if step == lf_step::ENTER {
+                        name.hash(state);
+                        value.hash(state);
+                        negated.hash(state);
+                    }
+                    Ok(Emit::Done)
+                }
+                LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => match step {
+                    lf_step::ENTER => Ok(Emit::Descend {
+                        next_step: lf_step::AFTER_FIRST,
+                        child: a.peek(),
+                        child_step: lf_step::ENTER,
+                        child_level: 0,
+                    }),
+                    lf_step::AFTER_FIRST => Ok(Emit::Descend {
+                        next_step: lf_step::AFTER_SECOND,
+                        child: b.peek(),
+                        child_step: lf_step::ENTER,
+                        child_level: 0,
+                    }),
+                    _ => Ok(Emit::Done),
+                },
+            }
+        });
+        match done {
+            Ok(()) => {}
+            Err(()) => unreachable!("the hash step machine never fails"),
         }
     }
 }
 
-impl fmt::Display for LabelFilterExpr {
+impl fmt::Debug for LabelFilterExpr {
+    /// Byte-equivalent to the deleted `#[derive(Debug)]` in both modes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LabelFilterExpr::Match(m) => write!(f, "{m}"),
-            LabelFilterExpr::Compare { name, op, rhs } => write!(f, "{name} {op} {rhs}"),
+        let alt = f.alternate();
+        walk::emit::<LabelFilterScc, fmt::Error>(self, |n, step, level| match n {
+            LabelFilterExpr::Match(m) => {
+                walk::dbg_open_tuple(f, "Match", alt, level)?;
+                walk::dbg_own(f, m, alt, level + 1)?;
+                walk::dbg_close_tuple(f, alt, level)?;
+                Ok(Emit::Done)
+            }
+            LabelFilterExpr::Compare { name, op, rhs } => {
+                walk::dbg_open_struct(f, "Compare", alt, level)?;
+                f.write_str("name: ")?;
+                walk::dbg_own(f, name, alt, level + 1)?;
+                walk::dbg_sep(f, alt, level)?;
+                f.write_str("op: ")?;
+                walk::dbg_own(f, op, alt, level + 1)?;
+                walk::dbg_sep(f, alt, level)?;
+                f.write_str("rhs: ")?;
+                walk::dbg_own(f, rhs, alt, level + 1)?;
+                walk::dbg_close_struct(f, alt, level)?;
+                Ok(Emit::Done)
+            }
             LabelFilterExpr::Ip {
                 name,
                 value,
                 negated,
             } => {
-                let op = if *negated { "!=" } else { "=" };
-                write!(f, "{name} {op} ip({})", quote(value))
+                walk::dbg_open_struct(f, "Ip", alt, level)?;
+                f.write_str("name: ")?;
+                walk::dbg_own(f, name, alt, level + 1)?;
+                walk::dbg_sep(f, alt, level)?;
+                f.write_str("value: ")?;
+                walk::dbg_own(f, value, alt, level + 1)?;
+                walk::dbg_sep(f, alt, level)?;
+                f.write_str("negated: ")?;
+                walk::dbg_own(f, negated, alt, level + 1)?;
+                walk::dbg_close_struct(f, alt, level)?;
+                Ok(Emit::Done)
             }
-            LabelFilterExpr::And(a, b) => {
-                Self::fmt_child(a, f)?;
-                write!(f, " and ")?;
-                Self::fmt_child(b, f)
+            LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => {
+                let name = if matches!(n, LabelFilterExpr::And(..)) {
+                    "And"
+                } else {
+                    "Or"
+                };
+                match step {
+                    lf_step::ENTER => {
+                        walk::dbg_open_tuple(f, name, alt, level)?;
+                        Ok(Emit::Descend {
+                            next_step: lf_step::AFTER_FIRST,
+                            child: a.peek(),
+                            child_step: lf_step::ENTER,
+                            child_level: level + 1,
+                        })
+                    }
+                    lf_step::AFTER_FIRST => {
+                        walk::dbg_sep(f, alt, level)?;
+                        Ok(Emit::Descend {
+                            next_step: lf_step::AFTER_SECOND,
+                            child: b.peek(),
+                            child_step: lf_step::ENTER,
+                            child_level: level + 1,
+                        })
+                    }
+                    _ => {
+                        walk::dbg_close_tuple(f, alt, level)?;
+                        Ok(Emit::Done)
+                    }
+                }
             }
-            LabelFilterExpr::Or(a, b) => {
-                Self::fmt_child(a, f)?;
-                write!(f, " or ")?;
-                Self::fmt_child(b, f)
-            }
+        })
+    }
+}
+
+impl fmt::Display for LabelFilterExpr {
+    /// The old `fmt_child`'s parenthesisation becomes explicit open/close
+    /// tokens: a boolean child is entered at `OPERAND`, which writes `(`
+    /// when the child is itself boolean, descends into that very node at
+    /// `ENTER`, and closes on the way back.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[inline]
+        fn is_bool(n: &LabelFilterExpr) -> bool {
+            matches!(n, LabelFilterExpr::And(..) | LabelFilterExpr::Or(..))
         }
+        walk::emit::<LabelFilterScc, fmt::Error>(self, |n, step, _| {
+            if step == lf_step::OPERAND {
+                if is_bool(n) {
+                    f.write_str("(")?;
+                }
+                return Ok(Emit::Descend {
+                    next_step: lf_step::OPERAND_CLOSE,
+                    child: LabelFilterScc::wrap(n),
+                    child_step: lf_step::ENTER,
+                    child_level: 0,
+                });
+            }
+            if step == lf_step::OPERAND_CLOSE {
+                if is_bool(n) {
+                    f.write_str(")")?;
+                }
+                return Ok(Emit::Done);
+            }
+            match n {
+                LabelFilterExpr::Match(m) => {
+                    write!(f, "{m}")?;
+                    Ok(Emit::Done)
+                }
+                LabelFilterExpr::Compare { name, op, rhs } => {
+                    write!(f, "{name} {op} {rhs}")?;
+                    Ok(Emit::Done)
+                }
+                LabelFilterExpr::Ip {
+                    name,
+                    value,
+                    negated,
+                } => {
+                    let op = if *negated { "!=" } else { "=" };
+                    write!(f, "{name} {op} ip({})", quote(value))?;
+                    Ok(Emit::Done)
+                }
+                LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => match step {
+                    lf_step::ENTER => Ok(Emit::Descend {
+                        next_step: lf_step::AFTER_FIRST,
+                        child: a.peek(),
+                        child_step: lf_step::OPERAND,
+                        child_level: 0,
+                    }),
+                    lf_step::AFTER_FIRST => {
+                        let sep = if matches!(n, LabelFilterExpr::And(..)) {
+                            " and "
+                        } else {
+                            " or "
+                        };
+                        f.write_str(sep)?;
+                        Ok(Emit::Descend {
+                            next_step: lf_step::AFTER_SECOND,
+                            child: b.peek(),
+                            child_step: lf_step::OPERAND,
+                            child_level: 0,
+                        })
+                    }
+                    _ => Ok(Emit::Done),
+                },
+            }
+        })
     }
 }
 
@@ -514,7 +929,13 @@ impl fmt::Display for LineFilterOp {
 /// (architect plan amendment 1 §2); `Literal`/`Binary` and
 /// `Vector::param` are the adjudicated M6-10 additive growth points (see
 /// the module doc).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// **Issue #272 — no `#[derive]`.** `Vector::inner`, `Binary::lhs`,
+/// `Binary::rhs` and `Variants.0` are SCC-internal child slots spelled
+/// [`Child`], which implements no derivable trait, so a `#[derive]` here
+/// is a compile error (C3) and every per-child dispatch must go through
+/// an iterative driver. `Debug`, `Clone`, `PartialEq`, `Eq`, `Hash`,
+/// `Display` and `Drop` are hand-written below and are byte-equivalent to
+/// what the derive produced.
 pub enum MetricExpr {
     Range {
         op: RangeAggOp,
@@ -531,7 +952,7 @@ pub enum MetricExpr {
         /// kept as raw text for the same `Eq`/`Hash` reason as
         /// `Range::param`. `None` for every other vector aggregation.
         param: Option<String>,
-        inner: Box<MetricExpr>,
+        inner: Child<MetricExpr>,
     },
     /// A bare scalar number (`2`, `0.95`) as a metric-expression operand
     /// (issue M6-10), raw text — parsed to `f64` by the planner.
@@ -548,8 +969,8 @@ pub enum MetricExpr {
     Binary {
         op: BinOp,
         modifier: Option<BinModifier>,
-        lhs: Box<MetricExpr>,
-        rhs: Box<MetricExpr>,
+        lhs: Child<MetricExpr>,
+        rhs: Child<MetricExpr>,
     },
     /// `variants(<metricExpr>, …) of (<logRangeExpr>)` (issue #221): N
     /// metric extractors over ONE log range, each result tagged
@@ -560,94 +981,980 @@ pub enum MetricExpr {
     /// positional `allow_variants` parser rule keeps it out of every
     /// nested position the reference grammar rejects (`sum(variants(…))`,
     /// `(variants(…))`, another `variants` argument list).
-    Variants(Box<VariantsExpr>),
+    Variants(Child<VariantsExpr>),
 }
 
 /// `variants(<metricExpr>, …) of (<logRangeExpr>)` (issue #221). Mirrors
 /// the reference's `MultiVariantExpr`: N metric extractors over ONE log
 /// range, each result tagged with an index-based `__variant__` label.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// **Issue #272 — no `#[derive]`**: `variants` is an N-ary SCC-internal
+/// child slot spelled [`ChildVec`]. Every trait below is hand-written and
+/// iterative. `VariantsExpr` carries **no** `impl Drop`: after conversion
+/// its only recursive edge is `MetricExpr::drop`, which is iterative.
 pub struct VariantsExpr {
     /// At least one (the parser cannot produce an empty list); each is
     /// validated at PLAN time to be a range aggregation optionally
     /// wrapped in exactly ONE vector aggregation.
-    pub variants: Vec<MetricExpr>,
+    pub variants: ChildVec<MetricExpr>,
     /// The single common log range — the ONLY selector/pipeline that
     /// selects and transforms data (a variant's own selector, line
     /// filters and parsers are dead syntax in the reference).
     pub range: LogRange,
 }
 
-impl fmt::Display for VariantsExpr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "variants(")?;
-        for (i, v) in self.variants.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{v}")?;
-        }
-        write!(f, ") of ({})", self.range)
+// ---------------------------------------------------------------------
+// SCC-2: `MetricExpr` + `VariantsExpr` (issue #272)
+// ---------------------------------------------------------------------
+//
+// The two types are ONE strongly-connected component of the "contains"
+// graph — `MetricExpr::Variants` holds a `VariantsExpr` and
+// `VariantsExpr::variants` holds `MetricExpr`s — so they are walked as one
+// heterogeneous node algebra rather than two self-typed ones.
+//
+// Ordering (normative): a node's children are its SCC-internal slots in
+// DECLARATION order, left to right. `MetricExpr::Variants` has exactly ONE
+// child (the `VariantsExpr` node); `VariantsExpr` has N children
+// (`variants[0..n]` in index order) and `range` is an own field that
+// FOLLOWS them, which is why the emitters interleave rather than emit
+// "own fields then children".
+
+/// The zero-sized tag naming SCC-2 in [`walk::Scc`]'s type position.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricScc;
+
+/// SCC-2's inert handle kind. Derives ONLY `Clone`/`Copy` — copying a
+/// handle traverses nothing.
+#[derive(Clone, Copy)]
+pub enum MeRef<'a> {
+    Expr(Ref<'a, MetricExpr>),
+    Var(Ref<'a, VariantsExpr>),
+}
+
+/// SCC-2's opened node kind — what every driver callback receives.
+#[derive(Clone, Copy)]
+pub enum MeNode<'a> {
+    Expr(&'a MetricExpr),
+    Var(&'a VariantsExpr),
+}
+
+/// SCC-2's inert mutable handle kind.
+pub enum MeSlot<'a> {
+    Expr(Slot<'a, MetricExpr>),
+    Var(Slot<'a, VariantsExpr>),
+}
+
+/// SCC-2's opened mutable node kind.
+pub enum MeSlotNode<'a> {
+    Expr(&'a mut MetricExpr),
+    Var(&'a mut VariantsExpr),
+}
+
+/// SCC-2's owned kind.
+pub enum MeVal {
+    Expr(MetricExpr),
+    Var(VariantsExpr),
+}
+
+/// A same-kind, non-allocating `MetricExpr` the parser can never produce,
+/// written over a stolen child so the emptied parent's own drop is free.
+#[inline]
+fn me_placeholder() -> MetricExpr {
+    MetricExpr::Literal(String::new())
+}
+
+/// The `VariantsExpr` placeholder: every `Vec` empty, so it allocates
+/// nothing.
+#[inline]
+fn ve_placeholder() -> VariantsExpr {
+    VariantsExpr {
+        variants: ChildVec::new(Vec::new()),
+        range: empty_log_range(),
     }
 }
 
-impl MetricExpr {
-    /// Renders a binary operand, parenthesizing nested binary children so
-    /// `Display` round-trips the exact tree shape (same convention as
-    /// [`LabelFilterExpr::fmt_child`]: precedence/associativity would
-    /// otherwise re-associate on reparse).
-    fn fmt_operand(child: &MetricExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match child {
-            MetricExpr::Binary { .. } => write!(f, "({child})"),
-            other => write!(f, "{other}"),
-        }
-    }
-}
-
-impl fmt::Display for MetricExpr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MetricExpr::Range { op, range, param } => match param {
-                Some(p) => write!(f, "{op}({p}, {range})"),
-                None => write!(f, "{op}({range})"),
+#[inline]
+fn empty_log_range() -> LogRange {
+    LogRange {
+        selector: LogExpr {
+            selector: StreamSelector {
+                matchers: Vec::new(),
             },
+            pipeline: Vec::new(),
+        },
+        range: Duration::from_nanos(0),
+        unwrap: None,
+    }
+}
+
+impl Scc for MetricScc {
+    type Ref<'a> = MeRef<'a>;
+    type Node<'a> = MeNode<'a>;
+    type Slot<'a> = MeSlot<'a>;
+    type SlotNode<'a> = MeSlotNode<'a>;
+    type Val = MeVal;
+
+    #[inline]
+    fn wrap<'a>(n: MeNode<'a>) -> MeRef<'a>
+    where
+        Self: 'a,
+    {
+        match n {
+            MeNode::Expr(e) => MeRef::Expr(Ref::new(e)),
+            MeNode::Var(v) => MeRef::Var(Ref::new(v)),
+        }
+    }
+
+    #[inline]
+    fn open<'a>(r: MeRef<'a>, w: &Walk) -> MeNode<'a>
+    where
+        Self: 'a,
+    {
+        match r {
+            MeRef::Expr(r) => MeNode::Expr(r.open(w)),
+            MeRef::Var(r) => MeNode::Var(r.open(w)),
+        }
+    }
+
+    #[inline]
+    fn open_slot<'a>(s: MeSlot<'a>, w: &Walk) -> MeSlotNode<'a>
+    where
+        Self: 'a,
+    {
+        match s {
+            MeSlot::Expr(s) => MeSlotNode::Expr(s.open(w)),
+            MeSlot::Var(s) => MeSlotNode::Var(s.open(w)),
+        }
+    }
+
+    #[inline]
+    fn slot_node_ref<'x>(s: &'x MeSlotNode<'_>) -> MeNode<'x>
+    where
+        Self: 'x,
+    {
+        match s {
+            MeSlotNode::Expr(e) => MeNode::Expr(e),
+            MeSlotNode::Var(v) => MeNode::Var(v),
+        }
+    }
+
+    #[inline]
+    fn child<'a>(n: MeNode<'a>, i: usize) -> Option<MeRef<'a>>
+    where
+        Self: 'a,
+    {
+        match n {
+            MeNode::Expr(MetricExpr::Range { .. })
+            | MeNode::Expr(MetricExpr::Literal(_))
+            | MeNode::Expr(MetricExpr::VectorFn(_)) => None,
+            MeNode::Expr(MetricExpr::Vector { inner, .. }) => match i {
+                0 => Some(MeRef::Expr(inner.peek())),
+                _ => None,
+            },
+            MeNode::Expr(MetricExpr::Binary { lhs, rhs, .. }) => match i {
+                0 => Some(MeRef::Expr(lhs.peek())),
+                1 => Some(MeRef::Expr(rhs.peek())),
+                _ => None,
+            },
+            MeNode::Expr(MetricExpr::Variants(v)) => match i {
+                0 => Some(MeRef::Var(v.peek())),
+                _ => None,
+            },
+            MeNode::Var(v) => v.variants.peek().get(i).map(MeRef::Expr),
+        }
+    }
+
+    fn shallow_eq(a: MeNode<'_>, b: MeNode<'_>) -> bool {
+        match (a, b) {
+            (MeNode::Expr(a), MeNode::Expr(b)) => match (a, b) {
+                (
+                    MetricExpr::Range {
+                        op: ao,
+                        range: ar,
+                        param: ap,
+                    },
+                    MetricExpr::Range {
+                        op: bo,
+                        range: br,
+                        param: bp,
+                    },
+                ) => ao == bo && ar == br && ap == bp,
+                (
+                    MetricExpr::Vector {
+                        op: ao,
+                        grouping: ag,
+                        param: ap,
+                        ..
+                    },
+                    MetricExpr::Vector {
+                        op: bo,
+                        grouping: bg,
+                        param: bp,
+                        ..
+                    },
+                ) => ao == bo && ag == bg && ap == bp,
+                (MetricExpr::Literal(a), MetricExpr::Literal(b)) => a == b,
+                (MetricExpr::VectorFn(a), MetricExpr::VectorFn(b)) => a == b,
+                (
+                    MetricExpr::Binary {
+                        op: ao,
+                        modifier: am,
+                        ..
+                    },
+                    MetricExpr::Binary {
+                        op: bo,
+                        modifier: bm,
+                        ..
+                    },
+                ) => ao == bo && am == bm,
+                (MetricExpr::Variants(_), MetricExpr::Variants(_)) => true,
+                (MetricExpr::Range { .. }, _)
+                | (MetricExpr::Vector { .. }, _)
+                | (MetricExpr::Literal(_), _)
+                | (MetricExpr::VectorFn(_), _)
+                | (MetricExpr::Binary { .. }, _)
+                | (MetricExpr::Variants(_), _) => false,
+            },
+            (MeNode::Var(a), MeNode::Var(b)) => {
+                a.variants.len() == b.variants.len() && a.range == b.range
+            }
+            (MeNode::Expr(_), MeNode::Var(_)) | (MeNode::Var(_), MeNode::Expr(_)) => false,
+        }
+    }
+
+    fn rebuild(n: MeNode<'_>, kids: &mut Vec<MeVal>) -> MeVal {
+        match n {
+            MeNode::Expr(MetricExpr::Range { op, range, param }) => {
+                MeVal::Expr(MetricExpr::Range {
+                    op: *op,
+                    range: range.clone(),
+                    param: param.clone(),
+                })
+            }
+            MeNode::Expr(MetricExpr::Literal(raw)) => MeVal::Expr(MetricExpr::Literal(raw.clone())),
+            MeNode::Expr(MetricExpr::VectorFn(raw)) => {
+                MeVal::Expr(MetricExpr::VectorFn(raw.clone()))
+            }
+            MeNode::Expr(MetricExpr::Vector {
+                op,
+                grouping,
+                param,
+                ..
+            }) => MeVal::Expr(MetricExpr::Vector {
+                op: *op,
+                grouping: grouping.clone(),
+                param: param.clone(),
+                inner: Child::new(drain_expr(kids)),
+            }),
+            MeNode::Expr(MetricExpr::Binary { op, modifier, .. }) => {
+                // The tail of `kids` is [.., lhs, rhs].
+                let rhs = drain_expr(kids);
+                let lhs = drain_expr(kids);
+                MeVal::Expr(MetricExpr::Binary {
+                    op: *op,
+                    modifier: modifier.clone(),
+                    lhs: Child::new(lhs),
+                    rhs: Child::new(rhs),
+                })
+            }
+            MeNode::Expr(MetricExpr::Variants(_)) => {
+                let v = match kids.pop() {
+                    Some(MeVal::Var(v)) => v,
+                    // Unreachable by construction: `Variants`' sole child
+                    // is the `VariantsExpr` node. This is the clone path,
+                    // never a `Drop` path, so a release panic is correct.
+                    _ => unreachable!("`Variants`' child rebuilds to a `VariantsExpr`"),
+                };
+                MeVal::Expr(MetricExpr::Variants(Child::new(v)))
+            }
+            MeNode::Var(v) => {
+                let n = v.variants.len();
+                let at = kids.len() - n;
+                let mut out = Vec::with_capacity(n);
+                for k in kids.drain(at..) {
+                    match k {
+                        MeVal::Expr(e) => out.push(e),
+                        // Unreachable: every `VariantsExpr` child is a
+                        // `MetricExpr`.
+                        MeVal::Var(_) => {
+                            unreachable!("a `VariantsExpr` child rebuilds to a `MetricExpr`")
+                        }
+                    }
+                }
+                MeVal::Var(VariantsExpr {
+                    variants: ChildVec::new(out),
+                    range: v.range.clone(),
+                })
+            }
+        }
+    }
+
+    fn take_own_fields(s: &mut MeSlotNode<'_>) {
+        match s {
+            MeSlotNode::Expr(e) => match &mut **e {
+                MetricExpr::Range { .. }
+                | MetricExpr::Literal(_)
+                | MetricExpr::VectorFn(_)
+                | MetricExpr::Variants(_) => {}
+                MetricExpr::Vector {
+                    grouping, param, ..
+                } => {
+                    *grouping = None;
+                    *param = None;
+                }
+                MetricExpr::Binary { modifier, .. } => {
+                    *modifier = None;
+                }
+            },
+            MeSlotNode::Var(v) => {
+                v.range = empty_log_range();
+            }
+        }
+    }
+
+    fn steal_children(s: &mut MeSlotNode<'_>, out: &mut ChunkStack<MeVal>) {
+        match s {
+            MeSlotNode::Expr(e) => match &mut **e {
+                MetricExpr::Range { .. } | MetricExpr::Literal(_) | MetricExpr::VectorFn(_) => {}
+                MetricExpr::Vector { inner, .. } => {
+                    out.push(MeVal::Expr(inner.replace(me_placeholder())));
+                }
+                MetricExpr::Binary { lhs, rhs, .. } => {
+                    // Right-to-left, so LIFO pop order is left-to-right.
+                    out.push(MeVal::Expr(rhs.replace(me_placeholder())));
+                    out.push(MeVal::Expr(lhs.replace(me_placeholder())));
+                }
+                MetricExpr::Variants(v) => {
+                    out.push(MeVal::Var(v.replace(ve_placeholder())));
+                }
+            },
+            MeSlotNode::Var(v) => {
+                let taken = v.variants.take();
+                for e in taken.into_iter().rev() {
+                    out.push(MeVal::Expr(e));
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn val_ref(v: &MeVal) -> MeRef<'_> {
+        match v {
+            MeVal::Expr(e) => MeRef::Expr(Ref::new(e)),
+            MeVal::Var(v) => MeRef::Var(Ref::new(v)),
+        }
+    }
+
+    #[inline]
+    fn val_slot(v: &mut MeVal) -> MeSlot<'_> {
+        match v {
+            MeVal::Expr(e) => MeSlot::Expr(Slot::new(e)),
+            MeVal::Var(v) => MeSlot::Var(Slot::new(v)),
+        }
+    }
+}
+
+/// Drains one `MetricExpr` off the tail of a rebuild value stack.
+#[inline]
+fn drain_expr(kids: &mut Vec<MeVal>) -> MetricExpr {
+    match kids.pop() {
+        Some(MeVal::Expr(e)) => e,
+        // Unreachable by construction; clone path, never a `Drop` path.
+        _ => unreachable!("expected a `MetricExpr` child value on the rebuild stack"),
+    }
+}
+
+/// Visits every SCC-2 node reachable from `root`, pre-order, left to
+/// right. The consumer never names a handle or a [`walk::Walk`].
+pub fn for_each_metric_expr<'a>(root: &'a MetricExpr, f: impl FnMut(MeNode<'a>)) {
+    walk::preorder::<MetricScc>(MeNode::Expr(root), f);
+}
+
+// ---------------------------------------------------------------------
+// SCC-2: `Drop`
+// ---------------------------------------------------------------------
+
+impl Drop for MetricExpr {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        drop_order::note_visited_expr(self);
+        walk::dismantle::<MetricScc>(MeSlot::Expr(Slot::new(self)));
+    }
+}
+
+// ---------------------------------------------------------------------
+// SCC-2: `Clone`, `PartialEq`, `Eq`
+// ---------------------------------------------------------------------
+
+impl Clone for MetricExpr {
+    fn clone(&self) -> Self {
+        match walk::clone_iter::<MetricScc>(MeNode::Expr(self)) {
+            MeVal::Expr(e) => e,
+            // Unreachable: the root kind is preserved by `rebuild`.
+            MeVal::Var(_) => unreachable!("cloning a `MetricExpr` yields a `MetricExpr`"),
+        }
+    }
+}
+
+impl Clone for VariantsExpr {
+    fn clone(&self) -> Self {
+        match walk::clone_iter::<MetricScc>(MeNode::Var(self)) {
+            MeVal::Var(v) => v,
+            // Unreachable: the root kind is preserved by `rebuild`.
+            MeVal::Expr(_) => unreachable!("cloning a `VariantsExpr` yields a `VariantsExpr`"),
+        }
+    }
+}
+
+impl PartialEq for MetricExpr {
+    fn eq(&self, other: &Self) -> bool {
+        walk::eq_iter::<MetricScc>(MeNode::Expr(self), MeNode::Expr(other))
+    }
+}
+
+impl Eq for MetricExpr {}
+
+impl PartialEq for VariantsExpr {
+    fn eq(&self, other: &Self) -> bool {
+        walk::eq_iter::<MetricScc>(MeNode::Var(self), MeNode::Var(other))
+    }
+}
+
+impl Eq for VariantsExpr {}
+
+// ---------------------------------------------------------------------
+// SCC-2: `Hash`
+// ---------------------------------------------------------------------
+//
+// The derive's write sequence, transcribed: `mem::discriminant(self)` for
+// an enum, then each field in DECLARATION order; `Vec<T>` writes its
+// length through `write_usize` (the stable spelling of
+// `Hasher::write_length_prefix`) and then each element. `VariantsExpr`
+// declares `variants` BEFORE `range`, so the length prefix and the N
+// children are emitted before the own field that follows them.
+
+/// Step indices for the hash step machine.
+mod hash_step {
+    pub(super) const ENTER: u32 = 0;
+    /// After the sole child of `Vector`/`Variants`, or after the `lhs` of
+    /// `Binary`.
+    pub(super) const AFTER_FIRST: u32 = 1;
+    /// After the `rhs` of `Binary`.
+    pub(super) const AFTER_SECOND: u32 = 2;
+    /// `VariantsExpr`: step `VAR_BASE + i` is "about to emit child `i`".
+    pub(super) const VAR_BASE: u32 = 3;
+}
+
+fn hash_scc<H: Hasher>(root: MeNode<'_>, state: &mut H) {
+    let done: Result<(), ()> = walk::emit::<MetricScc, ()>(root, |n, step, _depth| {
+        match n {
+            MeNode::Expr(e) => match e {
+                MetricExpr::Range { op, range, param } => {
+                    mem::discriminant(e).hash(state);
+                    op.hash(state);
+                    range.hash(state);
+                    param.hash(state);
+                    Ok(Emit::Done)
+                }
+                MetricExpr::Literal(raw) => {
+                    mem::discriminant(e).hash(state);
+                    raw.hash(state);
+                    Ok(Emit::Done)
+                }
+                MetricExpr::VectorFn(raw) => {
+                    mem::discriminant(e).hash(state);
+                    raw.hash(state);
+                    Ok(Emit::Done)
+                }
+                MetricExpr::Vector {
+                    op,
+                    grouping,
+                    param,
+                    inner,
+                } => {
+                    if step == hash_step::ENTER {
+                        mem::discriminant(e).hash(state);
+                        op.hash(state);
+                        grouping.hash(state);
+                        param.hash(state);
+                        Ok(Emit::Descend {
+                            next_step: hash_step::AFTER_FIRST,
+                            child: MeRef::Expr(inner.peek()),
+                            child_step: hash_step::ENTER,
+                            child_level: 0,
+                        })
+                    } else {
+                        Ok(Emit::Done)
+                    }
+                }
+                MetricExpr::Binary {
+                    op,
+                    modifier,
+                    lhs,
+                    rhs,
+                } => match step {
+                    hash_step::ENTER => {
+                        mem::discriminant(e).hash(state);
+                        op.hash(state);
+                        modifier.hash(state);
+                        Ok(Emit::Descend {
+                            next_step: hash_step::AFTER_FIRST,
+                            child: MeRef::Expr(lhs.peek()),
+                            child_step: hash_step::ENTER,
+                            child_level: 0,
+                        })
+                    }
+                    hash_step::AFTER_FIRST => Ok(Emit::Descend {
+                        next_step: hash_step::AFTER_SECOND,
+                        child: MeRef::Expr(rhs.peek()),
+                        child_step: hash_step::ENTER,
+                        child_level: 0,
+                    }),
+                    _ => Ok(Emit::Done),
+                },
+                MetricExpr::Variants(v) => {
+                    if step == hash_step::ENTER {
+                        mem::discriminant(e).hash(state);
+                        Ok(Emit::Descend {
+                            next_step: hash_step::AFTER_FIRST,
+                            child: MeRef::Var(v.peek()),
+                            child_step: hash_step::ENTER,
+                            child_level: 0,
+                        })
+                    } else {
+                        Ok(Emit::Done)
+                    }
+                }
+            },
+            MeNode::Var(v) => {
+                let kids = v.variants.peek();
+                if step == hash_step::ENTER {
+                    // `impl Hash for [T]` writes the length prefix first.
+                    state.write_usize(kids.len());
+                }
+                let i = if step == hash_step::ENTER {
+                    0
+                } else {
+                    (step - hash_step::VAR_BASE) as usize
+                };
+                match kids.get(i) {
+                    Some(c) => Ok(Emit::Descend {
+                        next_step: hash_step::VAR_BASE + i as u32 + 1,
+                        child: MeRef::Expr(c),
+                        child_step: hash_step::ENTER,
+                        child_level: 0,
+                    }),
+                    None => {
+                        v.range.hash(state);
+                        Ok(Emit::Done)
+                    }
+                }
+            }
+        }
+    });
+    match done {
+        Ok(()) => {}
+        // Unreachable: the step machine's error type is uninhabited in
+        // practice — no step above returns `Err`.
+        Err(()) => unreachable!("the hash step machine never fails"),
+    }
+}
+
+impl Hash for MetricExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_scc(MeNode::Expr(self), state);
+    }
+}
+
+impl Hash for VariantsExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_scc(MeNode::Var(self), state);
+    }
+}
+
+// ---------------------------------------------------------------------
+// SCC-2: `Debug` (both modes)
+// ---------------------------------------------------------------------
+//
+// Byte-equivalent to `#[derive(Debug)]`: `Name { k: v, k: v }` /
+// `Name(v)` compact, and the `debug_struct`/`debug_tuple`/`debug_list`
+// alternate layouts, whose indentation is `4 * depth` — exactly the
+// driver's frame depth. Non-recursive own fields are rendered through
+// [`walk::PadWriter`] at that depth so a nested derived value indents as
+// `debug_struct` would.
+
+mod dbg_step {
+    pub(super) const ENTER: u32 = 0;
+    pub(super) const AFTER_FIRST: u32 = 1;
+    pub(super) const AFTER_SECOND: u32 = 2;
+    pub(super) const VAR_BASE: u32 = 3;
+}
+
+fn debug_scc(root: MeNode<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let alt = f.alternate();
+    walk::emit::<MetricScc, fmt::Error>(root, |n, step, depth| match n {
+        MeNode::Expr(e) => match e {
+            MetricExpr::Range { op, range, param } => {
+                walk::dbg_open_struct(f, "Range", alt, depth)?;
+                f.write_str("op: ")?;
+                walk::dbg_own(f, op, alt, depth + 1)?;
+                walk::dbg_sep(f, alt, depth)?;
+                f.write_str("range: ")?;
+                walk::dbg_own(f, range, alt, depth + 1)?;
+                walk::dbg_sep(f, alt, depth)?;
+                f.write_str("param: ")?;
+                walk::dbg_own(f, param, alt, depth + 1)?;
+                walk::dbg_close_struct(f, alt, depth)?;
+                Ok(Emit::Done)
+            }
+            MetricExpr::Literal(raw) => {
+                walk::dbg_open_tuple(f, "Literal", alt, depth)?;
+                walk::dbg_own(f, raw, alt, depth + 1)?;
+                walk::dbg_close_tuple(f, alt, depth)?;
+                Ok(Emit::Done)
+            }
+            MetricExpr::VectorFn(raw) => {
+                walk::dbg_open_tuple(f, "VectorFn", alt, depth)?;
+                walk::dbg_own(f, raw, alt, depth + 1)?;
+                walk::dbg_close_tuple(f, alt, depth)?;
+                Ok(Emit::Done)
+            }
             MetricExpr::Vector {
                 op,
                 grouping,
                 param,
                 inner,
             } => {
-                match grouping {
-                    Some(g) => write!(f, "{op} {g}(")?,
-                    None => write!(f, "{op}(")?,
+                if step == dbg_step::ENTER {
+                    walk::dbg_open_struct(f, "Vector", alt, depth)?;
+                    f.write_str("op: ")?;
+                    walk::dbg_own(f, op, alt, depth + 1)?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("grouping: ")?;
+                    walk::dbg_own(f, grouping, alt, depth + 1)?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("param: ")?;
+                    walk::dbg_own(f, param, alt, depth + 1)?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("inner: ")?;
+                    Ok(Emit::Descend {
+                        next_step: dbg_step::AFTER_FIRST,
+                        child: MeRef::Expr(inner.peek()),
+                        child_step: dbg_step::ENTER,
+                        child_level: depth + 1,
+                    })
+                } else {
+                    walk::dbg_close_struct(f, alt, depth)?;
+                    Ok(Emit::Done)
                 }
-                if let Some(p) = param {
-                    write!(f, "{p}, ")?;
-                }
-                write!(f, "{inner})")
             }
-            MetricExpr::Literal(raw) => write!(f, "{raw}"),
-            MetricExpr::VectorFn(raw) => write!(f, "vector({raw})"),
-            MetricExpr::Variants(v) => write!(f, "{v}"),
             MetricExpr::Binary {
                 op,
                 modifier,
                 lhs,
                 rhs,
-            } => {
-                Self::fmt_operand(lhs, f)?;
-                write!(f, " {op} ")?;
-                if let Some(m) = modifier {
-                    if m.return_bool {
-                        write!(f, "bool ")?;
-                    }
-                    if let Some(vm) = &m.matching {
-                        write!(f, "{vm} ")?;
-                    }
+            } => match step {
+                dbg_step::ENTER => {
+                    walk::dbg_open_struct(f, "Binary", alt, depth)?;
+                    f.write_str("op: ")?;
+                    walk::dbg_own(f, op, alt, depth + 1)?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("modifier: ")?;
+                    walk::dbg_own(f, modifier, alt, depth + 1)?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("lhs: ")?;
+                    Ok(Emit::Descend {
+                        next_step: dbg_step::AFTER_FIRST,
+                        child: MeRef::Expr(lhs.peek()),
+                        child_step: dbg_step::ENTER,
+                        child_level: depth + 1,
+                    })
                 }
-                Self::fmt_operand(rhs, f)
+                dbg_step::AFTER_FIRST => {
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("rhs: ")?;
+                    Ok(Emit::Descend {
+                        next_step: dbg_step::AFTER_SECOND,
+                        child: MeRef::Expr(rhs.peek()),
+                        child_step: dbg_step::ENTER,
+                        child_level: depth + 1,
+                    })
+                }
+                _ => {
+                    walk::dbg_close_struct(f, alt, depth)?;
+                    Ok(Emit::Done)
+                }
+            },
+            MetricExpr::Variants(v) => {
+                if step == dbg_step::ENTER {
+                    walk::dbg_open_tuple(f, "Variants", alt, depth)?;
+                    Ok(Emit::Descend {
+                        next_step: dbg_step::AFTER_FIRST,
+                        child: MeRef::Var(v.peek()),
+                        child_step: dbg_step::ENTER,
+                        child_level: depth + 1,
+                    })
+                } else {
+                    walk::dbg_close_tuple(f, alt, depth)?;
+                    Ok(Emit::Done)
+                }
+            }
+        },
+        MeNode::Var(v) => {
+            let kids = v.variants.peek();
+            if step == dbg_step::ENTER {
+                walk::dbg_open_struct(f, "VariantsExpr", alt, depth)?;
+                f.write_str("variants: ")?;
+                if kids.is_empty() {
+                    // `debug_list` renders an empty list as `[]` in both
+                    // modes.
+                    f.write_str("[]")?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("range: ")?;
+                    walk::dbg_own(f, &v.range, alt, depth + 1)?;
+                    walk::dbg_close_struct(f, alt, depth)?;
+                    return Ok(Emit::Done);
+                }
+                if alt {
+                    f.write_str("[\n")?;
+                    walk::write_pad(f, depth + 2)?;
+                } else {
+                    f.write_str("[")?;
+                }
+                return Ok(Emit::Descend {
+                    next_step: dbg_step::VAR_BASE + 1,
+                    child: MeRef::Expr(kids.get(0).unwrap_or_else(|| {
+                        unreachable!("the non-empty branch always has a child at 0")
+                    })),
+                    child_step: dbg_step::ENTER,
+                    child_level: depth + 2,
+                });
+            }
+            let i = (step - dbg_step::VAR_BASE) as usize;
+            match kids.get(i) {
+                Some(c) => {
+                    if alt {
+                        f.write_str(",\n")?;
+                        walk::write_pad(f, depth + 2)?;
+                    } else {
+                        f.write_str(", ")?;
+                    }
+                    Ok(Emit::Descend {
+                        next_step: dbg_step::VAR_BASE + i as u32 + 1,
+                        child: MeRef::Expr(c),
+                        child_step: dbg_step::ENTER,
+                        child_level: depth + 2,
+                    })
+                }
+                None => {
+                    if alt {
+                        f.write_str(",\n")?;
+                        walk::write_pad(f, depth + 1)?;
+                        f.write_str("]")?;
+                    } else {
+                        f.write_str("]")?;
+                    }
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("range: ")?;
+                    walk::dbg_own(f, &v.range, alt, depth + 1)?;
+                    walk::dbg_close_struct(f, alt, depth)?;
+                    Ok(Emit::Done)
+                }
             }
         }
+    })
+}
+
+impl fmt::Debug for MetricExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_scc(MeNode::Expr(self), f)
+    }
+}
+
+impl fmt::Debug for VariantsExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_scc(MeNode::Var(self), f)
+    }
+}
+
+// ---------------------------------------------------------------------
+// SCC-2: `Display`
+// ---------------------------------------------------------------------
+//
+// `fmt_operand`'s parenthesisation becomes explicit open/close tokens.
+// A node reached as a binary operand is entered at `OPERAND`, which
+// writes `(` when the node is itself a `Binary`, descends into the very
+// same node at `ENTER`, and closes the parenthesis on the way back —
+// exactly the pre-change `fmt_operand` predicate, one frame per operand
+// rather than one call.
+
+mod disp_step {
+    pub(super) const ENTER: u32 = 0;
+    pub(super) const AFTER_FIRST: u32 = 1;
+    pub(super) const AFTER_SECOND: u32 = 2;
+    pub(super) const OPERAND: u32 = 3;
+    pub(super) const OPERAND_CLOSE: u32 = 4;
+    pub(super) const VAR_BASE: u32 = 5;
+}
+
+#[inline]
+fn is_binary(n: MeNode<'_>) -> bool {
+    matches!(n, MeNode::Expr(MetricExpr::Binary { .. }))
+}
+
+fn display_scc(root: MeNode<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    walk::emit::<MetricScc, fmt::Error>(root, |n, step, _depth| {
+        if step == disp_step::OPERAND {
+            if is_binary(n) {
+                f.write_str("(")?;
+            }
+            return Ok(Emit::Descend {
+                next_step: disp_step::OPERAND_CLOSE,
+                child: MetricScc::wrap(n),
+                child_step: disp_step::ENTER,
+                child_level: 0,
+            });
+        }
+        if step == disp_step::OPERAND_CLOSE {
+            if is_binary(n) {
+                f.write_str(")")?;
+            }
+            return Ok(Emit::Done);
+        }
+        match n {
+            MeNode::Expr(e) => match e {
+                MetricExpr::Range { op, range, param } => {
+                    match param {
+                        Some(p) => write!(f, "{op}({p}, {range})")?,
+                        None => write!(f, "{op}({range})")?,
+                    }
+                    Ok(Emit::Done)
+                }
+                MetricExpr::Literal(raw) => {
+                    write!(f, "{raw}")?;
+                    Ok(Emit::Done)
+                }
+                MetricExpr::VectorFn(raw) => {
+                    write!(f, "vector({raw})")?;
+                    Ok(Emit::Done)
+                }
+                MetricExpr::Vector {
+                    op,
+                    grouping,
+                    param,
+                    inner,
+                } => {
+                    if step == disp_step::ENTER {
+                        match grouping {
+                            Some(g) => write!(f, "{op} {g}(")?,
+                            None => write!(f, "{op}(")?,
+                        }
+                        if let Some(p) = param {
+                            write!(f, "{p}, ")?;
+                        }
+                        Ok(Emit::Descend {
+                            next_step: disp_step::AFTER_FIRST,
+                            child: MeRef::Expr(inner.peek()),
+                            child_step: disp_step::ENTER,
+                            child_level: 0,
+                        })
+                    } else {
+                        f.write_str(")")?;
+                        Ok(Emit::Done)
+                    }
+                }
+                MetricExpr::Binary {
+                    op,
+                    modifier,
+                    lhs,
+                    rhs,
+                } => match step {
+                    disp_step::ENTER => Ok(Emit::Descend {
+                        next_step: disp_step::AFTER_FIRST,
+                        child: MeRef::Expr(lhs.peek()),
+                        child_step: disp_step::OPERAND,
+                        child_level: 0,
+                    }),
+                    disp_step::AFTER_FIRST => {
+                        write!(f, " {op} ")?;
+                        if let Some(m) = modifier {
+                            if m.return_bool {
+                                write!(f, "bool ")?;
+                            }
+                            if let Some(vm) = &m.matching {
+                                write!(f, "{vm} ")?;
+                            }
+                        }
+                        Ok(Emit::Descend {
+                            next_step: disp_step::AFTER_SECOND,
+                            child: MeRef::Expr(rhs.peek()),
+                            child_step: disp_step::OPERAND,
+                            child_level: 0,
+                        })
+                    }
+                    _ => Ok(Emit::Done),
+                },
+                MetricExpr::Variants(v) => {
+                    if step == disp_step::ENTER {
+                        Ok(Emit::Descend {
+                            next_step: disp_step::AFTER_FIRST,
+                            child: MeRef::Var(v.peek()),
+                            child_step: disp_step::ENTER,
+                            child_level: 0,
+                        })
+                    } else {
+                        Ok(Emit::Done)
+                    }
+                }
+            },
+            MeNode::Var(v) => {
+                let kids = v.variants.peek();
+                if step == disp_step::ENTER {
+                    f.write_str("variants(")?;
+                    match kids.get(0) {
+                        Some(c) => {
+                            return Ok(Emit::Descend {
+                                next_step: disp_step::VAR_BASE + 1,
+                                child: MeRef::Expr(c),
+                                child_step: disp_step::ENTER,
+                                child_level: 0,
+                            });
+                        }
+                        None => {
+                            write!(f, ") of ({})", v.range)?;
+                            return Ok(Emit::Done);
+                        }
+                    }
+                }
+                let i = (step - disp_step::VAR_BASE) as usize;
+                match kids.get(i) {
+                    Some(c) => {
+                        f.write_str(", ")?;
+                        Ok(Emit::Descend {
+                            next_step: disp_step::VAR_BASE + i as u32 + 1,
+                            child: MeRef::Expr(c),
+                            child_step: disp_step::ENTER,
+                            child_level: 0,
+                        })
+                    }
+                    None => {
+                        write!(f, ") of ({})", v.range)?;
+                        Ok(Emit::Done)
+                    }
+                }
+            }
+        }
+    })
+}
+
+impl fmt::Display for MetricExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        display_scc(MeNode::Expr(self), f)
+    }
+}
+
+impl fmt::Display for VariantsExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        display_scc(MeNode::Var(self), f)
     }
 }
 
@@ -1238,3 +2545,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod drop_order;

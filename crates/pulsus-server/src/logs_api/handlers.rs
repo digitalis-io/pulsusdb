@@ -119,7 +119,7 @@ async fn query_range_impl(
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
-    let expr = pulsus_logql::parse(query)?;
+    let expr = super::parse_logql(query)?;
     let (start_ns, end_ns) = parse_bounds(&pairs)?;
     let step_ns = params::parse_step(params::get(&pairs, "step"), start_ns, end_ns)?;
     // Issue #227: Loki's `(end-start)/step > 11000` resolution limit — a hard
@@ -187,7 +187,7 @@ async fn query_impl(
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
-    let expr = pulsus_logql::parse(query)?;
+    let expr = super::parse_logql(query)?;
     let at_ns = match params::get(&pairs, "time") {
         Some(v) => params::parse_ts(v)?,
         None => params::now_ns(),

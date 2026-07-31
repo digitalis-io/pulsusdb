@@ -4681,12 +4681,15 @@ mod tests {
     /// boundary (a 4M-row fixture would be pure waste).
     #[test]
     fn quantile_value_retention_past_the_cap_is_a_named_too_broad_error() {
-        let stages = match pulsus_logql::parse(
-            r#"quantile_over_time(0.5, {a="b"} | logfmt | unwrap v [1m])"#,
-        )
-        .expect("parse")
-        {
-            Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => range.selector.pipeline,
+        let parsed =
+            pulsus_logql::parse(r#"quantile_over_time(0.5, {a="b"} | logfmt | unwrap v [1m])"#)
+                .expect("parse");
+        // Issue #272: `impl Drop for MetricExpr` forbids moving out of a
+        // field (E0509), so this re-binds through a reference.
+        let stages = match &parsed {
+            Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => {
+                range.selector.pipeline.clone()
+            }
             other => panic!("unexpected expr: {other:?}"),
         };
         let compiled = super::super::pipeline::CompiledPipeline::compile(&stages).expect("compile");
@@ -4750,10 +4753,14 @@ mod tests {
         HashMap<u64, StreamMetaRow>,
         ClientWindow,
     ) {
-        let stages = match pulsus_logql::parse(r#"rate_counter({a="b"} | logfmt | unwrap c [1m])"#)
-            .expect("parse")
-        {
-            Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => range.selector.pipeline,
+        let parsed = pulsus_logql::parse(r#"rate_counter({a="b"} | logfmt | unwrap c [1m])"#)
+            .expect("parse");
+        // Issue #272: `impl Drop for MetricExpr` forbids moving out of a
+        // field (E0509), so this re-binds through a reference.
+        let stages = match &parsed {
+            Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => {
+                range.selector.pipeline.clone()
+            }
             other => panic!("unexpected expr: {other:?}"),
         };
         let compiled = super::super::pipeline::CompiledPipeline::compile(&stages).expect("compile");

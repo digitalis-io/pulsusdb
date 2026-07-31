@@ -2639,6 +2639,8 @@ async fn run_sm_case(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::ControlFlow;
+
     use super::*;
     use crate::logs_corpus::{CASE_IDS, METRIC_CASE_IDS};
 
@@ -3402,37 +3404,101 @@ mod tests {
     }
 
     /// The `service_name` the case's (single) selector pins.
+    ///
+    /// Issue #272: a driver consumer (`walk::find_preorder`), not a
+    /// recursion. Pre-order left-to-right with an early break reproduces
+    /// the old `walk(lhs).or_else(|| walk(rhs))` order exactly, and
+    /// `Step::Prune` at `MetricExpr::Variants` reproduces the old arm,
+    /// which read ONLY the common range and never descended into the
+    /// variant expressions (issue #221: only the common range selects
+    /// data). Without the prune, a variant's own selector would be
+    /// consulted and the answer would change.
     fn first_selector_service(expr: &pulsus_logql::Expr) -> String {
-        fn walk(me: &pulsus_logql::MetricExpr) -> Option<String> {
-            match me {
-                pulsus_logql::MetricExpr::Range { range, .. } => range
-                    .selector
-                    .selector
-                    .matchers
-                    .iter()
-                    .find(|m| m.name == "service_name")
-                    .map(|m| m.value.clone()),
-                pulsus_logql::MetricExpr::Vector { inner, .. } => walk(inner),
-                pulsus_logql::MetricExpr::Binary { lhs, rhs, .. } => {
-                    walk(lhs).or_else(|| walk(rhs))
-                }
-                pulsus_logql::MetricExpr::Literal(_) => None,
-                pulsus_logql::MetricExpr::VectorFn(_) => None,
-                // issue #221: only the COMMON range selects data.
-                pulsus_logql::MetricExpr::Variants(v) => v
-                    .range
-                    .selector
-                    .selector
-                    .matchers
-                    .iter()
-                    .find(|m| m.name == "service_name")
-                    .map(|m| m.value.clone()),
-            }
+        fn service_of(sel: &pulsus_logql::StreamSelector) -> Option<String> {
+            sel.matchers
+                .iter()
+                .find(|m| m.name == "service_name")
+                .map(|m| m.value.clone())
         }
         let pulsus_logql::Expr::Metric(me) = expr else {
             panic!("metric expr expected");
         };
-        walk(me).expect("metric case selectors pin a service")
+        pulsus_logql::walk::find_preorder::<pulsus_logql::MetricScc, String>(
+            pulsus_logql::MeNode::Expr(me),
+            |n| match n {
+                pulsus_logql::MeNode::Expr(pulsus_logql::MetricExpr::Range { range, .. }) => {
+                    match service_of(&range.selector.selector) {
+                        Some(s) => ControlFlow::Break(s),
+                        None => ControlFlow::Continue(pulsus_logql::walk::Step::Descend),
+                    }
+                }
+                // issue #221: only the COMMON range selects data, so the
+                // variant expressions are pruned rather than visited.
+                pulsus_logql::MeNode::Expr(pulsus_logql::MetricExpr::Variants(_)) => {
+                    ControlFlow::Continue(pulsus_logql::walk::Step::Descend)
+                }
+                pulsus_logql::MeNode::Var(v) => match service_of(&v.range.selector.selector) {
+                    Some(s) => ControlFlow::Break(s),
+                    None => ControlFlow::Continue(pulsus_logql::walk::Step::Prune),
+                },
+                pulsus_logql::MeNode::Expr(_) => {
+                    ControlFlow::Continue(pulsus_logql::walk::Step::Descend)
+                }
+            },
+        )
+        .expect("metric case selectors pin a service")
+    }
+
+    /// Issue #272 AC 32: `Step::Prune` is load-bearing.
+    ///
+    /// The common range carries NO `service_name`, and a variant
+    /// expression carries the WRONG one. The pre-#272 recursive arm read
+    /// only `v.range` and returned `None` for the whole `Variants`
+    /// subtree, so the answer came from the `Binary`'s rhs. Pre-order
+    /// left-to-right reaches the variant's selector first, so without the
+    /// prune the answer would be `"wrong"`.
+    #[test]
+    fn first_selector_service_prunes_variant_selectors() {
+        use pulsus_logql::walk::{Child, ChildVec};
+
+        fn range_of(service: Option<&str>) -> pulsus_logql::LogRange {
+            let template = format!(
+                "count_over_time({{{}}}[5m])",
+                match service {
+                    Some(s) => format!("service_name=\"{s}\", app=\"a\""),
+                    None => "app=\"a\"".to_string(),
+                }
+            );
+            let expr = pulsus_logql::parse(&template).expect("fixture parses");
+            match &expr {
+                pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => {
+                    range.clone()
+                }
+                other => panic!("unexpected fixture shape: {other:?}"),
+            }
+        }
+        fn range_expr(service: Option<&str>) -> pulsus_logql::MetricExpr {
+            pulsus_logql::MetricExpr::Range {
+                op: pulsus_logql::RangeAggOp::CountOverTime,
+                range: range_of(service),
+                param: None,
+            }
+        }
+
+        let fixture = pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Binary {
+            op: pulsus_logql::BinOp::Add,
+            modifier: None,
+            lhs: Child::new(pulsus_logql::MetricExpr::Variants(Child::new(
+                pulsus_logql::VariantsExpr {
+                    variants: ChildVec::new(vec![range_expr(Some("wrong"))]),
+                    // The COMMON range has no `service_name`.
+                    range: range_of(None),
+                },
+            ))),
+            rhs: Child::new(range_expr(Some("right"))),
+        });
+
+        assert_eq!(first_selector_service(&fixture), "right");
     }
 
     /// Runs one leaf `MetricPlan`'s client-aggregation over the corpus
@@ -3488,47 +3554,53 @@ mod tests {
         node: &pulsus_read::logql::MetricNode,
         service: &str,
     ) -> pulsus_read::logql::QueryResult {
-        match node {
-            pulsus_read::logql::MetricNode::Leaf(mp) => {
-                evaluate_leaf_hermetically(corpus, mp, service)
-            }
-            pulsus_read::logql::MetricNode::Scalar(v) => {
-                pulsus_read::logql::QueryResult::Scalar(*v)
-            }
-            pulsus_read::logql::MetricNode::VectorLit { value, window } => {
-                pulsus_read::logql::materialize_vector_lit(*value, window)
-                    .expect("vector() grid within bucket cap")
-            }
-            pulsus_read::logql::MetricNode::VectorAgg { aggs, inner } => {
-                pulsus_read::logql::apply_vector_aggs(
-                    evaluate_node_hermetically(corpus, inner, service),
-                    aggs,
-                )
-                .expect("a differential fixture is far below MAX_POST_AGG_BYTES")
-            }
-            pulsus_read::logql::MetricNode::Binary {
-                op,
-                return_bool,
-                matching,
-                lhs,
-                rhs,
-            } => pulsus_read::logql::combine_binary(
-                *op,
-                *return_bool,
-                matching.as_ref(),
-                evaluate_node_hermetically(corpus, lhs, service),
-                evaluate_node_hermetically(corpus, rhs, service),
-            )
-            .expect("combine"),
-            // No differential fixture declares a `variants(...)` case (the
-            // approx_topk precedent set the bar at hermetic corpus + syntax
-            // differential; a live case would additionally need the
-            // per-tenant flag on the e2e oracle deployment) — reaching this
-            // arm means a fixture drifted (issue #221).
-            pulsus_read::logql::MetricNode::Variants { .. } => {
-                panic!("no differential fixture declares variants (issue #221)")
-            }
+        // Issue #272: a post-order fold over a value stack, mirroring the
+        // engine's `run_metric_node`; left-to-right post-order evaluates
+        // `lhs`'s whole subtree before `rhs`'s, so every expectation is
+        // unchanged.
+        let mut nodes = Vec::new();
+        pulsus_logql::walk::postorder_into::<pulsus_read::logql::MetricNodeScc>(node, &mut nodes);
+        let mut vals: Vec<pulsus_read::logql::QueryResult> = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let v = match node {
+                pulsus_read::logql::MetricNode::Leaf(mp) => {
+                    evaluate_leaf_hermetically(corpus, mp, service)
+                }
+                pulsus_read::logql::MetricNode::Scalar(v) => {
+                    pulsus_read::logql::QueryResult::Scalar(*v)
+                }
+                pulsus_read::logql::MetricNode::VectorLit { value, window } => {
+                    pulsus_read::logql::materialize_vector_lit(*value, window)
+                        .expect("vector() grid within bucket cap")
+                }
+                pulsus_read::logql::MetricNode::VectorAgg { aggs, .. } => {
+                    let inner = vals.pop().expect("post-order pushes inner");
+                    pulsus_read::logql::apply_vector_aggs(inner, aggs)
+                        .expect("a differential fixture is far below MAX_POST_AGG_BYTES")
+                }
+                pulsus_read::logql::MetricNode::Binary {
+                    op,
+                    return_bool,
+                    matching,
+                    ..
+                } => {
+                    let r = vals.pop().expect("post-order pushes rhs");
+                    let l = vals.pop().expect("post-order pushes lhs");
+                    pulsus_read::logql::combine_binary(*op, *return_bool, matching.as_ref(), l, r)
+                        .expect("combine")
+                }
+                // No differential fixture declares a `variants(...)` case (the
+                // approx_topk precedent set the bar at hermetic corpus + syntax
+                // differential; a live case would additionally need the
+                // per-tenant flag on the e2e oracle deployment) — reaching this
+                // arm means a fixture drifted (issue #221).
+                pulsus_read::logql::MetricNode::Variants { .. } => {
+                    panic!("no differential fixture declares variants (issue #221)")
+                }
+            };
+            vals.push(v);
         }
+        vals.pop().expect("a post-order fold leaves one value")
     }
 
     /// The corpus's expected sets agree with running the SHIPPED
