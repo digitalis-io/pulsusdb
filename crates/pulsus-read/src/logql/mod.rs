@@ -13,6 +13,19 @@
 //! [`rows`] (`ChClient` result-row shapes), and [`exec`] (`LogQlEngine`,
 //! the only module here that talks to ClickHouse).
 //!
+//! **The execution region** (issue #299) is ten flat sibling modules cut
+//! along the subsystems the code already was, not one 19k-line file:
+//! [`exec`] (the engine and its ClickHouse-facing helpers), [`window`]
+//! (window/grid arithmetic), [`charge`] (the byte-charge model and the
+//! admission caps), [`agg`] (the shared aggregation vocabulary),
+//! [`labels`] (the label/JSON codec), [`client_agg`] (the streaming
+//! per-row aggregation state — the only O(rows) path), [`fold`] (the
+//! bounded grid fold), [`variants`] (`variants(...) of (...)`),
+//! [`detected_probe`] (detected-fields probing and the tail cursor) and
+//! [`post_agg`] (post-aggregation and its byte ledger). Flat, never a
+//! subdirectory: the censuses over this directory are non-recursive, so a
+//! nested module would be invisible to them.
+//!
 //! **Range-query semantics (issue #227): Loki-exact SLIDING windows.**
 //! A range metric query re-evaluates the `[range]` window `(t - range, t]` at
 //! every start-anchored grid point `{start + k·step ≤ end}`, streamed off raw
@@ -61,19 +74,35 @@
 
 use pulsus_logql::{Expr, MetricExpr, VectorAggOp};
 
+pub(crate) mod agg;
+pub(crate) mod charge;
+pub(crate) mod client_agg;
 mod cms;
 pub mod detected;
+pub(crate) mod detected_probe;
 pub mod error;
 pub mod escape;
 pub mod exec;
 pub mod explain;
+pub(crate) mod fold;
 mod ip;
+pub(crate) mod labels;
 pub mod params;
 pub mod pipeline;
 pub mod plan;
+pub(crate) mod post_agg;
 pub mod rows;
 pub mod sql;
 pub mod template;
+/// Test-only helpers shared by more than one region module's
+/// `#[cfg(test)] mod tests` (issue #299). A SUBDIRECTORY, never a flat
+/// `.rs`: both directory censuses over `src/logql/` are non-recursive and
+/// filter on `.rs`, so a flat test-only file would be walked as production
+/// source while a subdirectory is invisible to them by construction.
+#[cfg(test)]
+mod testkit;
+pub(crate) mod variants;
+pub(crate) mod window;
 
 /// True iff the OUTERMOST node of `expr` is a terminal `sort`/`sort_desc`
 /// vector aggregation (issue M8-LQ3). Mirrors PromQL's
@@ -93,25 +122,16 @@ pub fn terminal_sort(expr: &Expr) -> bool {
     )
 }
 
+pub use charge::{MAX_CLIENT_AGG_GROUP_BYTES, MAX_METRIC_RESULT_POINTS, ensure_result_series};
+pub use client_agg::{run_client_agg_rows, run_client_agg_rows_folded};
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETECTED_FIELD_BYTES};
+pub use detected_probe::{DetectedFieldsProbe, MAX_FEEDER_SCRATCH_BYTES};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
-    B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
-    MAX_POST_AGG_BYTES, StageInput, W_APPROX_TOPK, W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT,
-    W_SERIES, W_STAGE_SERIES, apply_vector_aggs_capped, binary_peak_bytes,
-    binary_peak_bytes_without, combine_binary_capped, group_name_bytes, include_bytes,
-    leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
-    post_agg_peak_bytes_without,
-};
-pub use exec::{
-    ClientWindow, DetectedFieldsProbe, EngineConfig, GridWindow, HistMatrixSeries, HistOrFloat,
-    HistVectorSample, LogQlEngine, LogStats, MAX_FEEDER_SCRATCH_BYTES,
-    MAX_VARIANT_FANOUT_STATE_BYTES, MatrixSeries, PatternSeries, QueryResult, StreamResult,
-    TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, VARIANT_LABEL,
-    VariantArena, VariantsAggState, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
-    append_variant_label, apply_vector_aggs, combine_binary, ensure_result_series,
-    materialize_vector_lit, read_query_settings, run_client_agg_rows, run_client_agg_rows_folded,
-    run_variants_rows,
+    EngineConfig, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine, LogStats,
+    MatrixSeries, PatternSeries, QueryResult, StreamResult, TAIL_REGISTRATION_GRACE_NS, TailCursor,
+    TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
+    read_query_settings, run_pipeline_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{
@@ -123,6 +143,20 @@ pub use plan::{
     ClientAgg, ClientValue, MAX_VARIANT_SUB_STATES, MetricNode, MetricPlan, Plan, ProbePlan,
     RouteChoice, RoutingDecision, StreamsPlan, VariantSpec, plan,
 };
+pub use post_agg::{
+    B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
+    MAX_POST_AGG_BYTES, StageInput, W_APPROX_TOPK, W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT,
+    W_SERIES, W_STAGE_SERIES, apply_vector_aggs, apply_vector_aggs_capped, binary_peak_bytes,
+    binary_peak_bytes_without, combine_binary, combine_binary_capped, group_name_bytes,
+    include_bytes, leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
+    post_agg_peak_bytes_without,
+};
+pub use variants::{
+    MAX_VARIANT_FANOUT_STATE_BYTES, VARIANT_LABEL, VariantArena, VariantsAggState,
+    append_variant_label, run_variants_rows,
+};
+pub use window::MAX_ADMITTED_GRID_POINTS;
+pub use window::{ClientWindow, GridWindow, MAX_CLIENT_AGG_BUCKETS, materialize_vector_lit};
 
 #[cfg(test)]
 mod tests {

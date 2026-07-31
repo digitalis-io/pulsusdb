@@ -5,7 +5,7 @@
 //! (pkg/logql/optimize.go): every inner series' value is replaced by a
 //! count-min-sketch **estimate** keyed by that series' label bytes, and
 //! ordinary `topk` selects over the estimates. This module holds the pure
-//! sketch/retention port; `exec::approx_topk_instant` drives it.
+//! sketch/retention port; `crate::logql::post_agg::approx_topk_instant` drives it.
 //!
 //! Every constant here is a **reference constant**, none is a PulsusDB
 //! tuning knob, and every algorithm is a line-for-line port:
@@ -41,7 +41,7 @@
 //! [`SeriesKey`] is 16 `Copy` bytes, and the two retention containers are
 //! `with_capacity`-reserved at the compile-time `CMS_MAX_LABELS + 1` and
 //! never grow past it. See the accounting table on
-//! `exec::approx_topk_instant`.
+//! `crate::logql::post_agg::approx_topk_instant`.
 
 use std::collections::HashSet;
 

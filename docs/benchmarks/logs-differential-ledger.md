@@ -196,7 +196,8 @@ Out of this ledger's scope by design:
   is false:** a SINGLE sampled row can contribute distinct values for
   the same key more than once — once from its structured-metadata pairs
   and again from the auto-parse pass over the post-pipeline line (both
-  call `observe_pair` for the same row; `crates/pulsus-read/src/logql/exec.rs`,
+  call `observe_pair` for the same row;
+  `crates/pulsus-read/src/logql/detected_probe.rs`,
   `observe_detected_row` / `auto_parse_observe`) — so 5 328 distinct
   values fit comfortably inside 5 000 sampled rows. Deriving the true
   maximum needs that per-row multiplicity argued exactly, on both
@@ -438,7 +439,7 @@ not "fix" us toward the panic.
   (256 MiB) of charged fan-out state (plan-time spec clones + arena +
   per-sub-state snapshots, one counter end to end). The worked
   thresholds are emitted by the charge functions' own unit tests
-  (`crates/pulsus-read/src/logql/exec.rs`), never hand-computed here.
+  (`crates/pulsus-read/src/logql/charge.rs`), never hand-computed here.
 
   **Re-derived by #236.** Deleting `AggCaps::series` (the mid-scan
   500-group cap) moved `min_field()` off that 500 and onto

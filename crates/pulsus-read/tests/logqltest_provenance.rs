@@ -230,9 +230,21 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
     // `fold_off_grid` (Part B's off-grid internal-invariant breach) and
     // the three instant-window narrowing refusals Part D introduced at
     // `run_metric_client`, `run_client_agg_rows_folded` and
-    // `VariantsAggState::new`, all in `exec.rs`).
-    let expected: BTreeMap<&str, usize> =
-        BTreeMap::from([("plan.rs", 14), ("exec.rs", 20), ("error.rs", 1)]);
+    // `VariantsAggState::new`).
+    //
+    // Issue #299 split `exec.rs` into ten flat modules, so `exec.rs`'s 20
+    // are now spread over five of them. The TOTAL is unchanged at 20, and
+    // #240's sweep numbers stand: this is a redistribution, not a new
+    // construction site.
+    let expected: BTreeMap<&str, usize> = BTreeMap::from([
+        ("plan.rs", 14),
+        ("exec.rs", 12),
+        ("client_agg.rs", 1),
+        ("fold.rs", 1),
+        ("post_agg.rs", 5),
+        ("variants.rs", 1),
+        ("error.rs", 1),
+    ]);
     let mut errors = String::new();
     let mut anchored_hits: Vec<String> = Vec::new();
     for (file, text) in logql_source_files() {

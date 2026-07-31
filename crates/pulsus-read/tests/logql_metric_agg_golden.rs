@@ -448,7 +448,7 @@ fn an_oversized_bucket_grid_is_a_named_too_broad_error_before_any_allocation() {
     else {
         panic!("expected QueryTooBroad(MetricBuckets), got {err:?}");
     };
-    assert_eq!(cap, pulsus_read::logql::exec::MAX_CLIENT_AGG_BUCKETS);
+    assert_eq!(cap, pulsus_read::logql::MAX_CLIENT_AGG_BUCKETS);
     assert!(buckets > cap, "{buckets} vs {cap}");
     // The same guard covers every client-aggregated op, not just absent.
     let err = run_client(
