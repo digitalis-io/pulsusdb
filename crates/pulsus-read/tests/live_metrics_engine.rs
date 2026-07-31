@@ -34,7 +34,7 @@ use pulsus_promql::parser::parse;
 use pulsus_read::{
     DataWindow, DiscoveryFilter, ExplainStage, FetchProbe, LabelCache, LabelCacheConfig,
     LabelMatcher, MatchOp, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
-    QueryResult,
+    QueryResult, ReadError,
 };
 use pulsus_schema::{RenderCtx, run_init};
 
@@ -2098,6 +2098,194 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
         .await
         .expect("series (wide window)");
     assert_eq!(wide_series.len(), 2);
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #280: upstream Prometheus (the metrics API's reference of
+/// record, issue #283) compiles every label-matcher regex with Go's
+/// `regexp` — RE2 — inside `promql/parser`, so a pattern RE2 rejects is
+/// a **400 `bad_data`** there. This engine cannot reach that verdict at
+/// plan time: the vendored parser compiles with the Rust `regex` crate,
+/// which ACCEPTS `\p{Alphabetic}` (a Unicode property RE2 has no table
+/// for) — asserted below, so the premise of this test cannot rot
+/// silently. The pattern therefore reaches ClickHouse *by design* (RE2
+/// is the authority — `metrics::sql`'s `PromqlRe2Fallback` exemption),
+/// and before this fix ClickHouse's `Code: 427 CANNOT_COMPILE_REGEXP`
+/// came back as a bare `ReadError::Clickhouse` → **500 `internal`**.
+///
+/// Asserted on every metrics surface that renders a user matcher into
+/// SQL: the three discovery reads (always SQL — `MetricsEngine::series`'s
+/// own doc: never the cache fast path) and the degraded `SqlFallback`
+/// sample fetch, reached with an out-of-cache-window query on the
+/// `info_cardinality_cap_..._sql_fallback_path` precedent.
+///
+/// The control closing the test is the other half of the invariant:
+/// `a{bbb}c` is the REVERSE asymmetry (RE2 accepts it; the Rust `regex`
+/// crate rejects it, which is why `RegexCache` yields
+/// `FallbackReason::RegexUnsupported` and routes it to SQL). It must
+/// still ANSWER — the classification must not have turned the
+/// RE2-authority fallback into a rejection.
+#[tokio::test]
+async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error() {
+    skip_unless_live!();
+
+    // RE2 has no table for this Unicode property; the Rust `regex` crate
+    // does. If a future toolchain bump made `regex` reject it too, the
+    // vendored parser would reject at plan time and this test would be
+    // exercising nothing — so pin the premise.
+    const RE2_REJECTED: &str = r"\p{Alphabetic}";
+    assert!(
+        regex::Regex::new(&format!("^(?:{RE2_REJECTED})$")).is_ok(),
+        "premise: the Rust `regex` crate must ACCEPT {RE2_REJECTED:?}"
+    );
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_re2_rejected_matcher";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    // 2 days back: outside the 24h cache window (forcing `SqlFallback` on
+    // the query path), inside the 7-day raw retention TTL.
+    let old_bucket = ((now - 2 * 24 * 3_600_000) / bucket) * bucket;
+    seed_series(
+        &client,
+        &[SeedSeriesRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: old_bucket,
+            labels: r#"{"job":"api"}"#.to_string(),
+        }],
+    )
+    .await;
+    seed_samples(
+        &client,
+        &[SeedSampleRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: old_bucket,
+            value: 1.0,
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let window = DataWindow {
+        start_ms: old_bucket,
+        end_ms: old_bucket,
+    };
+
+    // The `/api/v1/series` route verbatim: parse -> series_selector ->
+    // DiscoveryFilter (`prom_api::handlers::parse_match_selectors`).
+    let expr = parse(&format!(r#"up{{job=~"\{RE2_REJECTED}"}}"#)).expect(
+        "the vendored parser must ACCEPT this matcher (it compiles with the Rust `regex` crate)",
+    );
+    let (metric_name, name_matchers, matchers) =
+        pulsus_promql::series_selector(&expr).expect("series_selector");
+    assert_eq!(matchers.len(), 1);
+    assert_eq!(matchers[0].value, RE2_REJECTED, "matcher reaches SQL raw");
+    let filters = vec![DiscoveryFilter {
+        metric_name,
+        name_matchers,
+        matchers,
+    }];
+
+    let expect_rejection = |err: ReadError, surface: &str| {
+        match err {
+            ReadError::Promql(pulsus_promql::PromqlError::InvalidRegexMatcher { detail }) => {
+                // ClickHouse's own framing, its RE2 wiki pointer and its
+                // version banner must not reach the client body.
+                for leak in ["DB::Exception", "Code: 427", "wiki/Syntax", "version "] {
+                    assert!(
+                        !detail.contains(leak),
+                        "{surface}: {leak:?} leaked: {detail:?}"
+                    );
+                }
+                assert!(
+                    detail.contains(RE2_REJECTED),
+                    "{surface}: detail must name the pattern, got {detail:?}"
+                );
+            }
+            other => panic!("{surface}: expected InvalidRegexMatcher, got {other:?}"),
+        }
+    };
+
+    expect_rejection(
+        engine.series(&filters, window).await.expect_err("series"),
+        "series",
+    );
+    expect_rejection(
+        engine
+            .label_names(&filters, window)
+            .await
+            .expect_err("label_names"),
+        "label_names",
+    );
+    expect_rejection(
+        engine
+            .label_values("job", &filters, window)
+            .await
+            .expect_err("label_values"),
+        "label_values",
+    );
+
+    // The sample-fetch path: an out-of-cache-window instant query routes
+    // through `SqlFallback`, which renders the same matcher into SQL.
+    let params = MetricQueryParams {
+        start_ms: old_bucket,
+        end_ms: old_bucket,
+        step_ms: 0,
+    };
+    expect_rejection(
+        engine.query(&expr, &params).await.expect_err("query"),
+        "query",
+    );
+
+    // Control: RE2 accepts `a{bbb}c`, the Rust `regex` crate does not —
+    // the asymmetry the SQL fallback exists to serve. It must ANSWER.
+    const RE2_ACCEPTED: &str = "a{bbb}c";
+    assert!(
+        regex::Regex::new(&format!("^(?:{RE2_ACCEPTED})$")).is_err(),
+        "premise: the Rust `regex` crate must REJECT {RE2_ACCEPTED:?}"
+    );
+    let control_expr = parse(&format!(r#"up{{job=~"{RE2_ACCEPTED}"}}"#)).expect("parse (control)");
+    let (c_name, c_name_matchers, c_matchers) =
+        pulsus_promql::series_selector(&control_expr).expect("series_selector (control)");
+    let control_filters = vec![DiscoveryFilter {
+        metric_name: c_name,
+        name_matchers: c_name_matchers,
+        matchers: c_matchers,
+    }];
+    let control = engine
+        .series(&control_filters, window)
+        .await
+        .expect("an RE2-valid pattern must still be answered, not rejected");
+    assert!(
+        control.is_empty(),
+        "`a{{bbb}}c` matches no seeded job, but the query must SUCCEED: {control:?}"
+    );
+    engine
+        .query(&control_expr, &params)
+        .await
+        .expect("an RE2-valid pattern must still be answered on the query path too");
 
     drop_database(&bootstrap, db).await;
 }

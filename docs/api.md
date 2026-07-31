@@ -309,10 +309,15 @@ GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|
 | Malformed params, malformed PromQL (parser position **in the message**), 11,000-point cap exceeded | `400` | `bad_data` |
+| A label-matcher regex **RE2 rejects**, on any path that reaches storage (issue #280) — see the note below | `400` | `bad_data` |
 | Out-of-subset construct / binary-op matching failure / histogram-bucket error | `422` | `execution` |
 | ClickHouse read timed out | `503` | `timeout` |
 | Pool or label cache not yet ready, ClickHouse unreachable | `503` | `unavailable` |
 | Unclassified internal failure | `500` | `internal` |
+
+**Label-matcher regexes are RE2's, not the Rust `regex` crate's (issue #280).** Upstream Prometheus compiles every `=~`/`!~` matcher with Go's `regexp` — RE2 — so RE2's syntax is the accepted set, and a pattern RE2 rejects is a `400 bad_data`. PulsusDB matches that boundary rather than its host language's: patterns the Rust `regex` crate cannot compile but RE2 can (e.g. `a{bbb}c`) are pushed to ClickHouse's RE2 and **answered**, and patterns RE2 rejects (e.g. `\p{Alphabetic}`, which the Rust crate accepts) are a `400 bad_data` carrying RE2's own reason — never a `500`. The verdict is ClickHouse's, so the rejection is reported at execution rather than at parse; the status, `errorType` and accepted set are Prometheus's, the message prose is not. A `427` body that does not carry ClickHouse's recognised `cannot compile re2: … . Look at …` framing is reported with a generic reason instead, never echoed — an unrecognised body's tail carries the executed SQL.
+
+**Scope of that rejection, and a known gap (issue #309).** It covers every path that reaches storage: `/series`, `/labels`, `/label/{name}/values` (always SQL), and `/query`/`/query_range` whenever the selector resolves through the degraded `SqlFallback` (cold / stale / out-of-window / regex-cache-full label cache). It does **not** cover a `/query`/`/query_range` selector resolved in-process by a **warm, in-window** label cache: that path evaluates matchers with the Rust `regex` crate and never asks ClickHouse, so an RE2-rejected pattern the Rust crate accepts is answered `200` there rather than rejected. Tracked as issue #309; closing it needs an RE2-authority check at plan time, not a Rust-crate one (which would reject the `a{bbb}c` class the fallback exists to serve).
 
 ---
 
