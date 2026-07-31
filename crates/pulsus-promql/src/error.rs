@@ -104,6 +104,24 @@ pub enum PromqlError {
     #[error("{modifier} modifier is not supported with histograms")]
     ExtendedHistogram { modifier: &'static str },
 
+    /// A label-matcher regex the storage engine's RE2 refused to compile
+    /// (issue #280). Upstream Prometheus (the reference of record for the
+    /// metrics API, issue #283) compiles every matcher with Go's `regexp`
+    /// — RE2 — inside `promql/parser`, so a pattern RE2 rejects is a
+    /// **400 `bad_data`** there, never a server fault. This engine cannot
+    /// reach that verdict at plan time: the vendored parser compiles with
+    /// the Rust `regex` crate, whose accepted set differs from RE2's in
+    /// BOTH directions, and the SQL path exists precisely so RE2 — not
+    /// `regex` — stays the authority (`metrics::labels`'
+    /// `FallbackReason::RegexUnsupported`). The verdict therefore arrives
+    /// from ClickHouse, and this variant carries it back to the same
+    /// status Prometheus would have returned. Prose is NOT upstream's
+    /// (issue #280 scope item 5: status and rejection boundary must
+    /// match, message text need not); `detail` is the pattern RE2 saw
+    /// plus RE2's own reason.
+    #[error("invalid regexp: {detail}")]
+    InvalidRegexMatcher { detail: String },
+
     /// The evaluation was cancelled by a live [`crate::eval::CancelToken`]
     /// (issue #93) — observed at a per-step/per-grid-point checkpoint after
     /// the awaiting request future was dropped (client disconnect, or the
@@ -142,6 +160,23 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "many-to-one match without group_left/group_right"
+        );
+    }
+
+    /// Issue #280: the rendered form is the whole `error` body on the
+    /// `/api/v1` envelope (`prom_api::error` delegates
+    /// `ReadError::Promql(inner)` to the inner's `Display`), so the
+    /// prefix is fixed here and nowhere else.
+    #[test]
+    fn invalid_regex_matcher_display_prefixes_the_re2_reason() {
+        let err = PromqlError::InvalidRegexMatcher {
+            detail: "^(?:\\p{Alphabetic})$, error: invalid character class range: \\p{Alphabetic}"
+                .to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid regexp: ^(?:\\p{Alphabetic})$, error: invalid character class range: \
+             \\p{Alphabetic}"
         );
     }
 

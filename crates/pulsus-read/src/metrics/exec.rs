@@ -36,9 +36,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 
-use futures::StreamExt;
 use futures::future::join_all;
-use pulsus_clickhouse::{ChClient, ChRow, ChRowStream, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
 use pulsus_model::{Fingerprint, LabelSet, NativeHistogram};
 use pulsus_promql::parser::Expr;
 use pulsus_promql::{
@@ -53,7 +52,6 @@ use super::sample_sql;
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::exec::{
     HistMatrixSeries, HistOrFloat, HistVectorSample, MatrixSeries, QueryResult, VectorSample,
-    escape_query_placeholders,
 };
 use crate::logql::explain::PlanExplain;
 
@@ -338,7 +336,7 @@ impl Drop for ProbeGuard<'_> {
 /// drain. Charging must stay per-row inside the drain loop — a post-drain
 /// total would reopen the unbounded single-fetch hole this guard closes.
 #[derive(Debug)]
-struct SampleBudget {
+pub(super) struct SampleBudget {
     used: std::sync::atomic::AtomicU64,
     cap: u64,
 }
@@ -358,7 +356,7 @@ impl SampleBudget {
     /// (exactly `cap` charges ever succeed); `Relaxed` suffices because
     /// only the counter itself is synchronized — no other memory is
     /// published through it.
-    fn charge_one(&self) -> Result<(), TooBroadReason> {
+    pub(super) fn charge_one(&self) -> Result<(), TooBroadReason> {
         let prior = self.used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if prior >= self.cap {
             return Err(TooBroadReason::MetricSamples { cap: self.cap });
@@ -376,7 +374,12 @@ impl SampleBudget {
 }
 
 pub struct MetricsEngine {
-    client: ChClient,
+    /// Issue #280: the ClickHouse handle lives behind
+    /// [`super::dispatch::MetricsDispatch`], whose own field is private to
+    /// that module — so no fetch path added here can reach `query_stream`
+    /// without going through the `ChError` classification that turns an
+    /// RE2-rejected user matcher into Prometheus's 400 rather than a 500.
+    dispatch: super::dispatch::MetricsDispatch,
     resolver: std::sync::Arc<super::labels::LabelCache>,
     config: MetricsConfig,
     /// Issue #101: the process-wide eval-concurrency permit bounding the
@@ -402,7 +405,7 @@ impl MetricsEngine {
         config: MetricsConfig,
     ) -> Self {
         Self {
-            client,
+            dispatch: super::dispatch::MetricsDispatch::new(client),
             resolver,
             config,
             eval_gate: std::sync::Arc::new(crate::eval_gate::EvalGate::new(
@@ -1026,59 +1029,17 @@ impl MetricsEngine {
             .await
     }
 
-    /// Wraps [`ChClient::query_stream`] with the placeholder-escaping fix
-    /// [`crate::logql::exec::escape_query_placeholders`] applies — the
-    /// `SqlFallback` sub-query's `^(?:...)$` regex predicates always carry
-    /// a literal `?`, and the `clickhouse` crate's `SqlBuilder` treats a
-    /// bare `?` as an unbound bind placeholder unless doubled. Still no
-    /// scan-budget concept in M2's metrics scope (unlike `logql::exec`'s
-    /// own `query_stream` wrapper) — that stays a standing out-of-scope
-    /// decision; every non-guard `ChError` passes through as
-    /// [`ReadError::Clickhouse`] unmapped. Issue #35 closes a live gap:
-    /// this path previously sent NO settings at all, so a broad selector's
-    /// rendered `IN` lists could trip ClickHouse's 262,144-byte
-    /// `max_query_size` default with an opaque parse error — now every
-    /// dispatch carries a settings object AND is guarded pre-dispatch by
-    /// [`crate::querytext::ensure_query_text_fits`] (checked against the
-    /// FINAL escaped text, same ordering `logql::exec` uses). Issue #136
-    /// threads the settings in explicitly (rather than always computing
-    /// [`metrics_read_settings`] internally) so the `SqlFallback` fetches
-    /// can carry the extra `distributed_product_mode` setting without a
-    /// second, near-duplicate dispatch method.
-    ///
-    /// Issue #138: `budget` is `Some` on the six sample dispatches only
-    /// (the same `Option` seam precedent as [`FetchProbe`]) and is charged
-    /// per row INSIDE the drain loop, before the push — the guard bounds
-    /// actual materialization, aborting (and dropping the `ChRowStream`,
-    /// releasing its pooled-connection lease) on the first over-cap row,
-    /// never a post-hoc total. Cost when charged: one relaxed `fetch_add`
-    /// and compare per row, dwarfed by the poll, RowBinary decode, and
-    /// `Vec` push already on this loop; when `None`, one predictable
-    /// branch.
+    /// Delegates to the sealed [`MetricsDispatch::fetch_rows_with`] —
+    /// the metrics path's only ClickHouse dispatch, and (issue #280) the
+    /// only place a metrics `ChError` is classified. See that module's
+    /// header for why the handle is sealed rather than held here.
     async fn fetch_rows_with<R: ChRow>(
         &self,
         sql: String,
         settings: &QuerySettings,
         budget: Option<&SampleBudget>,
     ) -> Result<Vec<R>, ReadError> {
-        let sql = escape_query_placeholders(&sql);
-        if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
-            return Err(ReadError::QueryTooBroad(reason));
-        }
-        let mut stream: ChRowStream<'_, R> = self
-            .client
-            .query_stream::<R>(&sql, settings)
-            .await
-            .map_err(ReadError::Clickhouse)?;
-        let mut out = Vec::new();
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(ReadError::Clickhouse)?;
-            if let Some(b) = budget {
-                b.charge_one().map_err(ReadError::QueryTooBroad)?;
-            }
-            out.push(row);
-        }
-        Ok(out)
+        self.dispatch.fetch_rows_with(sql, settings, budget).await
     }
 
     /// Discovery resolution shared by [`MetricsEngine::label_names`],

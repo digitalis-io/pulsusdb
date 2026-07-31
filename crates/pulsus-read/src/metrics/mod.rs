@@ -54,6 +54,7 @@
 //! #30 — see the architecture.md §5.2 amendment for both roles stated
 //! explicitly).
 
+mod dispatch;
 pub mod exec;
 pub mod labels;
 pub mod matcher;

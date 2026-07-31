@@ -100,7 +100,20 @@ impl IntoResponse for ApiError {
 /// | `PromqlError::Cancelled` (issue #93, unreachable in practice) | 408 | `timeout` |
 fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
     match e {
-        PromqlError::Parse(_) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
+        // Issue #280: an RE2-rejected label-matcher regex. Upstream
+        // Prometheus compiles every matcher with Go's `regexp` (RE2)
+        // inside `promql/parser`, so this input is a **parse-time 400
+        // `bad_data`** there — never a 5xx. This engine only learns the
+        // verdict from ClickHouse (RE2 is deliberately the authority, not
+        // the Rust `regex` crate — see the variant's own doc), so it
+        // arrives via `ReadError::Promql` at execution time; the status
+        // and `errorType` still have to be Prometheus's, which is why
+        // this rides the `Parse` arm's mapping and NOT the 422
+        // `execution` class below (an invalid regex is a malformed
+        // request, not a well-formed query the engine declined).
+        PromqlError::Parse(_) | PromqlError::InvalidRegexMatcher { .. } => {
+            (StatusCode::BAD_REQUEST, "bad_data", e.to_string())
+        }
         // `InvalidParameter` (issue #67: an out-of-range
         // `double_exponential_smoothing` factor) maps like
         // `HistogramBucket`: a well-formed query whose evaluation is
@@ -339,6 +352,27 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("unexpected token at char 3")
+        );
+    }
+
+    /// Issue #280: an RE2-rejected matcher regex is upstream
+    /// Prometheus's 400 `bad_data`, reached here through
+    /// `ReadError::Promql` because the verdict comes from ClickHouse —
+    /// never the 500 `internal` a raw `ChError::Server` passthrough gave,
+    /// and never the 422 `execution` the other non-`Parse` variants take.
+    #[tokio::test]
+    async fn read_error_invalid_regex_matcher_maps_to_400_bad_data() {
+        let err = ReadError::Promql(PromqlError::InvalidRegexMatcher {
+            detail: "^(?:\\p{Alphabetic})$, error: invalid character class range: \\p{Alphabetic}"
+                .to_string(),
+        });
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(
+            json["error"],
+            "invalid regexp: ^(?:\\p{Alphabetic})$, error: invalid character class range: \
+             \\p{Alphabetic}"
         );
     }
 
