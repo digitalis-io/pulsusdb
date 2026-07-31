@@ -977,11 +977,13 @@ fn boolean_label_filters_default_to_and_binding_tighter_than_or() {
         panic!("expected a label filter stage");
     };
     // `or` is loosest: x or (y and z).
-    let pulsus_logql::LabelFilterExpr::Or(left, right) = filter else {
-        panic!("expected Or at the root, got {filter:?}");
-    };
-    assert!(matches!(**left, pulsus_logql::LabelFilterExpr::Match(_)));
-    assert!(matches!(**right, pulsus_logql::LabelFilterExpr::And(..)));
+    // Issue #272: reached through the driver — `Or(Match, And(Match,
+    // Match))` in pre-order — which pins the whole tree rather than two
+    // operands.
+    assert_eq!(
+        label_filter_shape(filter),
+        ["Or", "Match", "And", "Match", "Match"]
+    );
 }
 
 #[test]
@@ -1305,64 +1307,55 @@ fn vector_function_rejects_a_non_number_argument() {
 /// as `2 ^ (2 ^ 3)`, never `(2 ^ 2) ^ 3`.
 #[test]
 fn caret_is_right_associative() {
-    use pulsus_logql::{BinOp, MetricExpr};
     let expr = parse("2 ^ 2 ^ 3").unwrap();
-    let pulsus_logql::Expr::Metric(MetricExpr::Binary { op, lhs, rhs, .. }) = &expr else {
-        panic!("expected a binary expr");
-    };
-    assert_eq!(*op, BinOp::Pow);
-    assert_eq!(**lhs, MetricExpr::Literal("2".to_string()));
-    let MetricExpr::Binary {
-        op: inner_op,
-        lhs: inner_lhs,
-        rhs: inner_rhs,
-        ..
-    } = &**rhs
-    else {
-        panic!("expected the RIGHT side to nest: {rhs:?}");
-    };
-    assert_eq!(*inner_op, BinOp::Pow);
-    assert_eq!(**inner_lhs, MetricExpr::Literal("2".to_string()));
-    assert_eq!(**inner_rhs, MetricExpr::Literal("3".to_string()));
+    // Right-associative: the RIGHT operand nests. Left-associativity
+    // would read ["Binary(^)", "Binary(^)", "Literal(2)", ...].
+    assert_eq!(
+        metric_shape(metric_root(&expr)),
+        [
+            "Binary(^)",
+            "Literal(2)",
+            "Binary(^)",
+            "Literal(2)",
+            "Literal(3)"
+        ]
+    );
 }
 
 /// AC4c (parser half): `*` binds tighter than `+` — `a + b * c` parses
 /// as `a + (b * c)`.
 #[test]
 fn multiplication_binds_tighter_than_addition() {
-    use pulsus_logql::{BinOp, MetricExpr};
     let expr = parse("1 + 2 * 3").unwrap();
-    let pulsus_logql::Expr::Metric(MetricExpr::Binary { op, lhs, rhs, .. }) = &expr else {
-        panic!("expected a binary expr");
-    };
-    assert_eq!(*op, BinOp::Add);
-    assert_eq!(**lhs, MetricExpr::Literal("1".to_string()));
-    assert!(matches!(&**rhs, MetricExpr::Binary { op: BinOp::Mul, .. }));
+    assert_eq!(
+        metric_shape(metric_root(&expr)),
+        [
+            "Binary(+)",
+            "Literal(1)",
+            "Binary(*)",
+            "Literal(2)",
+            "Literal(3)"
+        ]
+    );
 }
 
 /// Comparisons bind looser than arithmetic and `and` looser still:
 /// `a > b + c and d` parses as `(a > (b + c)) and d`.
 #[test]
 fn comparison_and_set_operator_precedence_nests_correctly() {
-    use pulsus_logql::{BinOp, MetricExpr};
     let expr = parse("1 > 2 + 3 and 4").unwrap();
-    let pulsus_logql::Expr::Metric(MetricExpr::Binary { op, lhs, .. }) = &expr else {
-        panic!("expected a binary expr");
-    };
-    assert_eq!(*op, BinOp::And);
-    let MetricExpr::Binary {
-        op: cmp_op,
-        rhs: cmp_rhs,
-        ..
-    } = &**lhs
-    else {
-        panic!("expected the left side to be the comparison: {lhs:?}");
-    };
-    assert_eq!(*cmp_op, BinOp::Gt);
-    assert!(matches!(
-        &**cmp_rhs,
-        MetricExpr::Binary { op: BinOp::Add, .. }
-    ));
+    assert_eq!(
+        metric_shape(metric_root(&expr)),
+        [
+            "Binary(and)",
+            "Binary(>)",
+            "Literal(1)",
+            "Binary(+)",
+            "Literal(2)",
+            "Literal(3)",
+            "Literal(4)"
+        ]
+    );
 }
 
 #[test]
@@ -1540,13 +1533,17 @@ fn a_label_shared_by_on_and_group_clauses_parses_matching_the_loki_oracle() {
 /// round-trips through the paren-preserving `Display`.
 #[test]
 fn explicit_parens_override_precedence() {
-    use pulsus_logql::{BinOp, MetricExpr};
     let expr = parse("(1 + 2) * 3").unwrap();
-    let pulsus_logql::Expr::Metric(MetricExpr::Binary { op, lhs, .. }) = &expr else {
-        panic!("expected a binary expr");
-    };
-    assert_eq!(*op, BinOp::Mul);
-    assert!(matches!(&**lhs, MetricExpr::Binary { op: BinOp::Add, .. }));
+    assert_eq!(
+        metric_shape(metric_root(&expr)),
+        [
+            "Binary(*)",
+            "Binary(+)",
+            "Literal(1)",
+            "Literal(2)",
+            "Literal(3)"
+        ]
+    );
     assert_eq!(expr.to_string(), "(1 + 2) * 3");
 }
 
@@ -1595,10 +1592,10 @@ fn every_m1_subset_query_shape_from_features_md_section_2_parses() {
 fn a_single_variant_variants_expression_parses_and_round_trips() {
     let query = r#"variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m])"#;
     let expr = parse(query).unwrap();
-    let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Variants(v)) = &expr else {
-        panic!("expected MetricExpr::Variants, got {expr:?}");
-    };
-    assert_eq!(v.variants.len(), 1);
+    assert_eq!(
+        metric_shape(metric_root(&expr)),
+        ["Variants", "VariantsExpr(1)", "Range(count_over_time)"]
+    );
     assert_round_trip(query);
 }
 
@@ -1632,15 +1629,25 @@ fn variants_is_a_legal_top_level_binary_operand() {
         ),
     ] {
         let expr = parse(q).unwrap_or_else(|e| panic!("expected {q:?} to parse, got {e}"));
-        let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Binary { lhs, rhs, .. }) = &expr
-        else {
-            panic!("expected a Binary root for {q:?}, got {expr:?}");
+        let shape = metric_shape(metric_root(&expr));
+        let expected = if left {
+            vec![
+                "Binary(+)".to_string(),
+                "Variants".to_string(),
+                "VariantsExpr(1)".to_string(),
+                "Range(count_over_time)".to_string(),
+                "Literal(1)".to_string(),
+            ]
+        } else {
+            vec![
+                "Binary(+)".to_string(),
+                "Literal(1)".to_string(),
+                "Variants".to_string(),
+                "VariantsExpr(1)".to_string(),
+                "Range(count_over_time)".to_string(),
+            ]
         };
-        let operand = if left { lhs } else { rhs };
-        assert!(
-            matches!(**operand, pulsus_logql::MetricExpr::Variants(_)),
-            "expected a Variants operand for {q:?}"
-        );
+        assert_eq!(shape, expected, "expected a Variants operand for {q:?}");
         assert_round_trip(q);
     }
 }
@@ -1652,4 +1659,49 @@ fn variants_or_variants_parses() {
     assert_round_trip(
         r#"variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m]) or variants(bytes_over_time({app="x"}[5m])) of ({app="x"}[5m])"#,
     );
+}
+
+/// Pre-order node kinds of a metric expression, reached through the #272
+/// iterative driver — a consumer cannot open a child handle any other
+/// way. Strictly more shape than the pre-#272 positional destructuring:
+/// the whole tree is pinned, not two operands.
+fn metric_shape(root: &pulsus_logql::MetricExpr) -> Vec<String> {
+    use pulsus_logql::{MeNode, MetricExpr};
+    let mut out = Vec::new();
+    pulsus_logql::for_each_metric_expr(root, |n| {
+        out.push(match n {
+            MeNode::Expr(MetricExpr::Range { op, .. }) => format!("Range({op})"),
+            MeNode::Expr(MetricExpr::Vector { op, .. }) => format!("Vector({op})"),
+            MeNode::Expr(MetricExpr::Literal(raw)) => format!("Literal({raw})"),
+            MeNode::Expr(MetricExpr::VectorFn(raw)) => format!("VectorFn({raw})"),
+            MeNode::Expr(MetricExpr::Binary { op, .. }) => format!("Binary({op})"),
+            MeNode::Expr(MetricExpr::Variants(_)) => "Variants".to_string(),
+            MeNode::Var(v) => format!("VariantsExpr({})", v.variants.len()),
+        });
+    });
+    out
+}
+
+fn metric_root(expr: &pulsus_logql::Expr) -> &pulsus_logql::MetricExpr {
+    match expr {
+        pulsus_logql::Expr::Metric(m) => m,
+        pulsus_logql::Expr::Log(_) => panic!("expected a metric expression"),
+    }
+}
+
+/// Pre-order node kinds of a label-filter tree, reached through the #272
+/// iterative driver — a consumer cannot open a child handle any other way.
+fn label_filter_shape(root: &pulsus_logql::LabelFilterExpr) -> Vec<&'static str> {
+    use pulsus_logql::LabelFilterExpr as L;
+    let mut out = Vec::new();
+    pulsus_logql::for_each_label_filter(root, |n| {
+        out.push(match n {
+            L::Match(_) => "Match",
+            L::Compare { .. } => "Compare",
+            L::Ip { .. } => "Ip",
+            L::And(..) => "And",
+            L::Or(..) => "Or",
+        });
+    });
+    out
 }

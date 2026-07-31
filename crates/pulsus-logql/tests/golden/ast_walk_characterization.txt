@@ -1,0 +1,1904 @@
+=== range plain ===
+--- Debug {:?} ---
+Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }
+--- Debug {:#?} ---
+Range {
+    op: Rate,
+    range: LogRange {
+        selector: LogExpr {
+            selector: StreamSelector {
+                matchers: [
+                    Matcher {
+                        name: "app",
+                        op: Eq,
+                        value: "x",
+                    },
+                ],
+            },
+            pipeline: [],
+        },
+        range: Duration(
+            300000000000,
+        ),
+        unwrap: None,
+    },
+    param: None,
+}
+--- Display ---
+rate({app="x"}[5m])
+--- Hash calls ---
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+
+=== range with param and pipeline ===
+--- Debug {:?} ---
+Range { op: QuantileOverTime, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None }, param: Some("0.95") }
+--- Debug {:#?} ---
+Range {
+    op: QuantileOverTime,
+    range: LogRange {
+        selector: LogExpr {
+            selector: StreamSelector {
+                matchers: [
+                    Matcher {
+                        name: "app",
+                        op: Eq,
+                        value: "x",
+                    },
+                ],
+            },
+            pipeline: [
+                LineFormat(
+                    "{{.a}}",
+                ),
+            ],
+        },
+        range: Duration(
+            300000000000,
+        ),
+        unwrap: None,
+    },
+    param: Some(
+        "0.95",
+    ),
+}
+--- Display ---
+quantile_over_time(0.95, {app="x"} | line_format "{{.a}}"[5m])
+--- Hash calls ---
+write_isize(0)
+write_isize(10)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write([48, 46, 57, 53])
+write_u8(255)
+
+=== literal ===
+--- Debug {:?} ---
+Literal("2")
+--- Debug {:#?} ---
+Literal(
+    "2",
+)
+--- Display ---
+2
+--- Hash calls ---
+write_isize(2)
+write([50])
+write_u8(255)
+
+=== vector fn ===
+--- Debug {:?} ---
+VectorFn("0.5")
+--- Debug {:#?} ---
+VectorFn(
+    "0.5",
+)
+--- Display ---
+vector(0.5)
+--- Hash calls ---
+write_isize(3)
+write([48, 46, 53])
+write_u8(255)
+
+=== vector no grouping ===
+--- Debug {:?} ---
+Vector { op: Sum, grouping: None, param: None, inner: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None } }
+--- Debug {:#?} ---
+Vector {
+    op: Sum,
+    grouping: None,
+    param: None,
+    inner: Range {
+        op: Rate,
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+        param: None,
+    },
+}
+--- Display ---
+sum(rate({app="x"}[5m]))
+--- Hash calls ---
+write_isize(1)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+
+=== vector by ===
+--- Debug {:?} ---
+Vector { op: Max, grouping: Some(Grouping { kind: By, labels: ["env", "app"] }), param: None, inner: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None } }
+--- Debug {:#?} ---
+Vector {
+    op: Max,
+    grouping: Some(
+        Grouping {
+            kind: By,
+            labels: [
+                "env",
+                "app",
+            ],
+        },
+    ),
+    param: None,
+    inner: Range {
+        op: Rate,
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+        param: None,
+    },
+}
+--- Display ---
+max by(env, app)(rate({app="x"}[5m]))
+--- Hash calls ---
+write_isize(1)
+write_isize(3)
+write_isize(1)
+write_isize(0)
+write_usize(2)
+write([101, 110, 118])
+write_u8(255)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+
+=== vector without and param ===
+--- Debug {:?} ---
+Vector { op: Topk, grouping: Some(Grouping { kind: Without, labels: ["pod"] }), param: Some("3"), inner: Range { op: QuantileOverTime, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None }, param: Some("0.95") } }
+--- Debug {:#?} ---
+Vector {
+    op: Topk,
+    grouping: Some(
+        Grouping {
+            kind: Without,
+            labels: [
+                "pod",
+            ],
+        },
+    ),
+    param: Some(
+        "3",
+    ),
+    inner: Range {
+        op: QuantileOverTime,
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [
+                    LineFormat(
+                        "{{.a}}",
+                    ),
+                ],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+        param: Some(
+            "0.95",
+        ),
+    },
+}
+--- Display ---
+topk without(pod)(3, quantile_over_time(0.95, {app="x"} | line_format "{{.a}}"[5m]))
+--- Hash calls ---
+write_isize(1)
+write_isize(7)
+write_isize(1)
+write_isize(1)
+write_usize(1)
+write([112, 111, 100])
+write_u8(255)
+write_isize(1)
+write([51])
+write_u8(255)
+write_isize(0)
+write_isize(10)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write([48, 46, 57, 53])
+write_u8(255)
+
+=== binary plain ===
+--- Debug {:?} ---
+Binary { op: Add, modifier: None, lhs: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, rhs: Literal("1") }
+--- Debug {:#?} ---
+Binary {
+    op: Add,
+    modifier: None,
+    lhs: Range {
+        op: Rate,
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+        param: None,
+    },
+    rhs: Literal(
+        "1",
+    ),
+}
+--- Display ---
+rate({app="x"}[5m]) + 1
+--- Hash calls ---
+write_isize(4)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(2)
+write([49])
+write_u8(255)
+
+=== binary with bool modifier ===
+--- Debug {:?} ---
+Binary { op: Gt, modifier: Some(BinModifier { return_bool: true, matching: None }), lhs: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, rhs: Literal("1") }
+--- Debug {:#?} ---
+Binary {
+    op: Gt,
+    modifier: Some(
+        BinModifier {
+            return_bool: true,
+            matching: None,
+        },
+    ),
+    lhs: Range {
+        op: Rate,
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+        param: None,
+    },
+    rhs: Literal(
+        "1",
+    ),
+}
+--- Display ---
+rate({app="x"}[5m]) > bool 1
+--- Hash calls ---
+write_isize(4)
+write_isize(8)
+write_isize(1)
+write_u8(1)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(2)
+write([49])
+write_u8(255)
+
+=== binary with on/group_left ===
+--- Debug {:?} ---
+Binary { op: Div, modifier: Some(BinModifier { return_bool: false, matching: Some(VectorMatching { on: true, labels: ["env"], group: Some(Left(["pod"])) }) }), lhs: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, rhs: Range { op: QuantileOverTime, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None }, param: Some("0.95") } }
+--- Debug {:#?} ---
+Binary {
+    op: Div,
+    modifier: Some(
+        BinModifier {
+            return_bool: false,
+            matching: Some(
+                VectorMatching {
+                    on: true,
+                    labels: [
+                        "env",
+                    ],
+                    group: Some(
+                        Left(
+                            [
+                                "pod",
+                            ],
+                        ),
+                    ),
+                },
+            ),
+        },
+    ),
+    lhs: Range {
+        op: Rate,
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+        param: None,
+    },
+    rhs: Range {
+        op: QuantileOverTime,
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [
+                    LineFormat(
+                        "{{.a}}",
+                    ),
+                ],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+        param: Some(
+            "0.95",
+        ),
+    },
+}
+--- Display ---
+rate({app="x"}[5m]) / on(env) group_left(pod) quantile_over_time(0.95, {app="x"} | line_format "{{.a}}"[5m])
+--- Hash calls ---
+write_isize(4)
+write_isize(3)
+write_isize(1)
+write_u8(0)
+write_isize(1)
+write_u8(1)
+write_usize(1)
+write([101, 110, 118])
+write_u8(255)
+write_isize(1)
+write_isize(0)
+write_usize(1)
+write([112, 111, 100])
+write_u8(255)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(10)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write([48, 46, 57, 53])
+write_u8(255)
+
+=== binary with ignoring/group_right ===
+--- Debug {:?} ---
+Binary { op: Mul, modifier: Some(BinModifier { return_bool: false, matching: Some(VectorMatching { on: false, labels: ["a", "b"], group: Some(Right([])) }) }), lhs: Literal("2"), rhs: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None } }
+--- Debug {:#?} ---
+Binary {
+    op: Mul,
+    modifier: Some(
+        BinModifier {
+            return_bool: false,
+            matching: Some(
+                VectorMatching {
+                    on: false,
+                    labels: [
+                        "a",
+                        "b",
+                    ],
+                    group: Some(
+                        Right(
+                            [],
+                        ),
+                    ),
+                },
+            ),
+        },
+    ),
+    lhs: Literal(
+        "2",
+    ),
+    rhs: Range {
+        op: Rate,
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+        param: None,
+    },
+}
+--- Display ---
+2 * ignoring(a, b) group_right rate({app="x"}[5m])
+--- Hash calls ---
+write_isize(4)
+write_isize(2)
+write_isize(1)
+write_u8(0)
+write_isize(1)
+write_u8(0)
+write_usize(2)
+write([97])
+write_u8(255)
+write([98])
+write_u8(255)
+write_isize(1)
+write_isize(1)
+write_usize(0)
+write_isize(2)
+write([50])
+write_u8(255)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+
+=== left-deep binary chain ===
+--- Debug {:?} ---
+Binary { op: Or, modifier: None, lhs: Binary { op: Or, modifier: None, lhs: Binary { op: Or, modifier: None, lhs: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, rhs: Literal("1") }, rhs: Range { op: QuantileOverTime, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None }, param: Some("0.95") } }, rhs: VectorFn("7") }
+--- Debug {:#?} ---
+Binary {
+    op: Or,
+    modifier: None,
+    lhs: Binary {
+        op: Or,
+        modifier: None,
+        lhs: Binary {
+            op: Or,
+            modifier: None,
+            lhs: Range {
+                op: Rate,
+                range: LogRange {
+                    selector: LogExpr {
+                        selector: StreamSelector {
+                            matchers: [
+                                Matcher {
+                                    name: "app",
+                                    op: Eq,
+                                    value: "x",
+                                },
+                            ],
+                        },
+                        pipeline: [],
+                    },
+                    range: Duration(
+                        300000000000,
+                    ),
+                    unwrap: None,
+                },
+                param: None,
+            },
+            rhs: Literal(
+                "1",
+            ),
+        },
+        rhs: Range {
+            op: QuantileOverTime,
+            range: LogRange {
+                selector: LogExpr {
+                    selector: StreamSelector {
+                        matchers: [
+                            Matcher {
+                                name: "app",
+                                op: Eq,
+                                value: "x",
+                            },
+                        ],
+                    },
+                    pipeline: [
+                        LineFormat(
+                            "{{.a}}",
+                        ),
+                    ],
+                },
+                range: Duration(
+                    300000000000,
+                ),
+                unwrap: None,
+            },
+            param: Some(
+                "0.95",
+            ),
+        },
+    },
+    rhs: VectorFn(
+        "7",
+    ),
+}
+--- Display ---
+((rate({app="x"}[5m]) or 1) or quantile_over_time(0.95, {app="x"} | line_format "{{.a}}"[5m])) or vector(7)
+--- Hash calls ---
+write_isize(4)
+write_isize(13)
+write_isize(0)
+write_isize(4)
+write_isize(13)
+write_isize(0)
+write_isize(4)
+write_isize(13)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(2)
+write([49])
+write_u8(255)
+write_isize(0)
+write_isize(10)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write([48, 46, 57, 53])
+write_u8(255)
+write_isize(3)
+write([55])
+write_u8(255)
+
+=== right-deep binary chain ===
+--- Debug {:?} ---
+Binary { op: Add, modifier: None, lhs: Literal("1"), rhs: Binary { op: Sub, modifier: None, lhs: VectorFn("2"), rhs: Binary { op: Pow, modifier: None, lhs: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, rhs: Range { op: QuantileOverTime, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None }, param: Some("0.95") } } } }
+--- Debug {:#?} ---
+Binary {
+    op: Add,
+    modifier: None,
+    lhs: Literal(
+        "1",
+    ),
+    rhs: Binary {
+        op: Sub,
+        modifier: None,
+        lhs: VectorFn(
+            "2",
+        ),
+        rhs: Binary {
+            op: Pow,
+            modifier: None,
+            lhs: Range {
+                op: Rate,
+                range: LogRange {
+                    selector: LogExpr {
+                        selector: StreamSelector {
+                            matchers: [
+                                Matcher {
+                                    name: "app",
+                                    op: Eq,
+                                    value: "x",
+                                },
+                            ],
+                        },
+                        pipeline: [],
+                    },
+                    range: Duration(
+                        300000000000,
+                    ),
+                    unwrap: None,
+                },
+                param: None,
+            },
+            rhs: Range {
+                op: QuantileOverTime,
+                range: LogRange {
+                    selector: LogExpr {
+                        selector: StreamSelector {
+                            matchers: [
+                                Matcher {
+                                    name: "app",
+                                    op: Eq,
+                                    value: "x",
+                                },
+                            ],
+                        },
+                        pipeline: [
+                            LineFormat(
+                                "{{.a}}",
+                            ),
+                        ],
+                    },
+                    range: Duration(
+                        300000000000,
+                    ),
+                    unwrap: None,
+                },
+                param: Some(
+                    "0.95",
+                ),
+            },
+        },
+    },
+}
+--- Display ---
+1 + (vector(2) - (rate({app="x"}[5m]) ^ quantile_over_time(0.95, {app="x"} | line_format "{{.a}}"[5m])))
+--- Hash calls ---
+write_isize(4)
+write_isize(0)
+write_isize(0)
+write_isize(2)
+write([49])
+write_u8(255)
+write_isize(4)
+write_isize(1)
+write_isize(0)
+write_isize(3)
+write([50])
+write_u8(255)
+write_isize(4)
+write_isize(5)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(10)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write([48, 46, 57, 53])
+write_u8(255)
+
+=== binary under vector ===
+--- Debug {:?} ---
+Vector { op: Sum, grouping: None, param: None, inner: Binary { op: Add, modifier: None, lhs: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, rhs: Literal("4") } }
+--- Debug {:#?} ---
+Vector {
+    op: Sum,
+    grouping: None,
+    param: None,
+    inner: Binary {
+        op: Add,
+        modifier: None,
+        lhs: Range {
+            op: Rate,
+            range: LogRange {
+                selector: LogExpr {
+                    selector: StreamSelector {
+                        matchers: [
+                            Matcher {
+                                name: "app",
+                                op: Eq,
+                                value: "x",
+                            },
+                        ],
+                    },
+                    pipeline: [],
+                },
+                range: Duration(
+                    300000000000,
+                ),
+                unwrap: None,
+            },
+            param: None,
+        },
+        rhs: Literal(
+            "4",
+        ),
+    },
+}
+--- Display ---
+sum(rate({app="x"}[5m]) + 4)
+--- Hash calls ---
+write_isize(1)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(4)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(2)
+write([52])
+write_u8(255)
+
+=== variants empty ===
+--- Debug {:?} ---
+Variants(VariantsExpr { variants: [], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } })
+--- Debug {:#?} ---
+Variants(
+    VariantsExpr {
+        variants: [],
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+    },
+)
+--- Display ---
+variants() of ({app="x"}[5m])
+--- Hash calls ---
+write_isize(5)
+write_usize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+
+=== variants one ===
+--- Debug {:?} ---
+Variants(VariantsExpr { variants: [Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } })
+--- Debug {:#?} ---
+Variants(
+    VariantsExpr {
+        variants: [
+            Range {
+                op: Rate,
+                range: LogRange {
+                    selector: LogExpr {
+                        selector: StreamSelector {
+                            matchers: [
+                                Matcher {
+                                    name: "app",
+                                    op: Eq,
+                                    value: "x",
+                                },
+                            ],
+                        },
+                        pipeline: [],
+                    },
+                    range: Duration(
+                        300000000000,
+                    ),
+                    unwrap: None,
+                },
+                param: None,
+            },
+        ],
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+    },
+)
+--- Display ---
+variants(rate({app="x"}[5m])) of ({app="x"}[5m])
+--- Hash calls ---
+write_isize(5)
+write_usize(1)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+
+=== variants two ===
+--- Debug {:?} ---
+Variants(VariantsExpr { variants: [Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, Range { op: QuantileOverTime, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None }, param: Some("0.95") }], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None } })
+--- Debug {:#?} ---
+Variants(
+    VariantsExpr {
+        variants: [
+            Range {
+                op: Rate,
+                range: LogRange {
+                    selector: LogExpr {
+                        selector: StreamSelector {
+                            matchers: [
+                                Matcher {
+                                    name: "app",
+                                    op: Eq,
+                                    value: "x",
+                                },
+                            ],
+                        },
+                        pipeline: [],
+                    },
+                    range: Duration(
+                        300000000000,
+                    ),
+                    unwrap: None,
+                },
+                param: None,
+            },
+            Range {
+                op: QuantileOverTime,
+                range: LogRange {
+                    selector: LogExpr {
+                        selector: StreamSelector {
+                            matchers: [
+                                Matcher {
+                                    name: "app",
+                                    op: Eq,
+                                    value: "x",
+                                },
+                            ],
+                        },
+                        pipeline: [
+                            LineFormat(
+                                "{{.a}}",
+                            ),
+                        ],
+                    },
+                    range: Duration(
+                        300000000000,
+                    ),
+                    unwrap: None,
+                },
+                param: Some(
+                    "0.95",
+                ),
+            },
+        ],
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [
+                    LineFormat(
+                        "{{.a}}",
+                    ),
+                ],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+    },
+)
+--- Display ---
+variants(rate({app="x"}[5m]), quantile_over_time(0.95, {app="x"} | line_format "{{.a}}"[5m])) of ({app="x"} | line_format "{{.a}}"[5m])
+--- Hash calls ---
+write_isize(5)
+write_usize(2)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(10)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write([48, 46, 57, 53])
+write_u8(255)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+
+=== variants many ===
+--- Debug {:?} ---
+Variants(VariantsExpr { variants: [Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, Range { op: QuantileOverTime, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None }, param: Some("0.95") }, Vector { op: Sum, grouping: None, param: None, inner: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None } }, Literal("9"), VectorFn("8")], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } })
+--- Debug {:#?} ---
+Variants(
+    VariantsExpr {
+        variants: [
+            Range {
+                op: Rate,
+                range: LogRange {
+                    selector: LogExpr {
+                        selector: StreamSelector {
+                            matchers: [
+                                Matcher {
+                                    name: "app",
+                                    op: Eq,
+                                    value: "x",
+                                },
+                            ],
+                        },
+                        pipeline: [],
+                    },
+                    range: Duration(
+                        300000000000,
+                    ),
+                    unwrap: None,
+                },
+                param: None,
+            },
+            Range {
+                op: QuantileOverTime,
+                range: LogRange {
+                    selector: LogExpr {
+                        selector: StreamSelector {
+                            matchers: [
+                                Matcher {
+                                    name: "app",
+                                    op: Eq,
+                                    value: "x",
+                                },
+                            ],
+                        },
+                        pipeline: [
+                            LineFormat(
+                                "{{.a}}",
+                            ),
+                        ],
+                    },
+                    range: Duration(
+                        300000000000,
+                    ),
+                    unwrap: None,
+                },
+                param: Some(
+                    "0.95",
+                ),
+            },
+            Vector {
+                op: Sum,
+                grouping: None,
+                param: None,
+                inner: Range {
+                    op: Rate,
+                    range: LogRange {
+                        selector: LogExpr {
+                            selector: StreamSelector {
+                                matchers: [
+                                    Matcher {
+                                        name: "app",
+                                        op: Eq,
+                                        value: "x",
+                                    },
+                                ],
+                            },
+                            pipeline: [],
+                        },
+                        range: Duration(
+                            300000000000,
+                        ),
+                        unwrap: None,
+                    },
+                    param: None,
+                },
+            },
+            Literal(
+                "9",
+            ),
+            VectorFn(
+                "8",
+            ),
+        ],
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+    },
+)
+--- Display ---
+variants(rate({app="x"}[5m]), quantile_over_time(0.95, {app="x"} | line_format "{{.a}}"[5m]), sum(rate({app="x"}[5m])), 9, vector(8)) of ({app="x"}[5m])
+--- Hash calls ---
+write_isize(5)
+write_usize(5)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(10)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write([48, 46, 57, 53])
+write_u8(255)
+write_isize(1)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(2)
+write([57])
+write_u8(255)
+write_isize(3)
+write([56])
+write_u8(255)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+
+=== variants as a binary operand (left) ===
+--- Debug {:?} ---
+Binary { op: Add, modifier: None, lhs: Variants(VariantsExpr { variants: [Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } }), rhs: Literal("1") }
+--- Debug {:#?} ---
+Binary {
+    op: Add,
+    modifier: None,
+    lhs: Variants(
+        VariantsExpr {
+            variants: [
+                Range {
+                    op: Rate,
+                    range: LogRange {
+                        selector: LogExpr {
+                            selector: StreamSelector {
+                                matchers: [
+                                    Matcher {
+                                        name: "app",
+                                        op: Eq,
+                                        value: "x",
+                                    },
+                                ],
+                            },
+                            pipeline: [],
+                        },
+                        range: Duration(
+                            300000000000,
+                        ),
+                        unwrap: None,
+                    },
+                    param: None,
+                },
+            ],
+            range: LogRange {
+                selector: LogExpr {
+                    selector: StreamSelector {
+                        matchers: [
+                            Matcher {
+                                name: "app",
+                                op: Eq,
+                                value: "x",
+                            },
+                        ],
+                    },
+                    pipeline: [],
+                },
+                range: Duration(
+                    300000000000,
+                ),
+                unwrap: None,
+            },
+        },
+    ),
+    rhs: Literal(
+        "1",
+    ),
+}
+--- Display ---
+variants(rate({app="x"}[5m])) of ({app="x"}[5m]) + 1
+--- Hash calls ---
+write_isize(4)
+write_isize(0)
+write_isize(0)
+write_isize(5)
+write_usize(1)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(2)
+write([49])
+write_u8(255)
+
+=== variants as a binary operand (right) ===
+--- Debug {:?} ---
+Binary { op: Add, modifier: None, lhs: Literal("1"), rhs: Variants(VariantsExpr { variants: [Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } }) }
+--- Debug {:#?} ---
+Binary {
+    op: Add,
+    modifier: None,
+    lhs: Literal(
+        "1",
+    ),
+    rhs: Variants(
+        VariantsExpr {
+            variants: [
+                Range {
+                    op: Rate,
+                    range: LogRange {
+                        selector: LogExpr {
+                            selector: StreamSelector {
+                                matchers: [
+                                    Matcher {
+                                        name: "app",
+                                        op: Eq,
+                                        value: "x",
+                                    },
+                                ],
+                            },
+                            pipeline: [],
+                        },
+                        range: Duration(
+                            300000000000,
+                        ),
+                        unwrap: None,
+                    },
+                    param: None,
+                },
+            ],
+            range: LogRange {
+                selector: LogExpr {
+                    selector: StreamSelector {
+                        matchers: [
+                            Matcher {
+                                name: "app",
+                                op: Eq,
+                                value: "x",
+                            },
+                        ],
+                    },
+                    pipeline: [],
+                },
+                range: Duration(
+                    300000000000,
+                ),
+                unwrap: None,
+            },
+        },
+    ),
+}
+--- Display ---
+1 + variants(rate({app="x"}[5m])) of ({app="x"}[5m])
+--- Hash calls ---
+write_isize(4)
+write_isize(0)
+write_isize(0)
+write_isize(2)
+write([49])
+write_u8(255)
+write_isize(5)
+write_usize(1)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+
+=== variants nested inside variants ===
+--- Debug {:?} ---
+Variants(VariantsExpr { variants: [Variants(VariantsExpr { variants: [Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }, Range { op: QuantileOverTime, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None }, param: Some("0.95") }], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } }), Vector { op: Sum, grouping: None, param: None, inner: Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None } }], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [LineFormat("{{.a}}")] }, range: Duration(300000000000), unwrap: None } })
+--- Debug {:#?} ---
+Variants(
+    VariantsExpr {
+        variants: [
+            Variants(
+                VariantsExpr {
+                    variants: [
+                        Range {
+                            op: Rate,
+                            range: LogRange {
+                                selector: LogExpr {
+                                    selector: StreamSelector {
+                                        matchers: [
+                                            Matcher {
+                                                name: "app",
+                                                op: Eq,
+                                                value: "x",
+                                            },
+                                        ],
+                                    },
+                                    pipeline: [],
+                                },
+                                range: Duration(
+                                    300000000000,
+                                ),
+                                unwrap: None,
+                            },
+                            param: None,
+                        },
+                        Range {
+                            op: QuantileOverTime,
+                            range: LogRange {
+                                selector: LogExpr {
+                                    selector: StreamSelector {
+                                        matchers: [
+                                            Matcher {
+                                                name: "app",
+                                                op: Eq,
+                                                value: "x",
+                                            },
+                                        ],
+                                    },
+                                    pipeline: [
+                                        LineFormat(
+                                            "{{.a}}",
+                                        ),
+                                    ],
+                                },
+                                range: Duration(
+                                    300000000000,
+                                ),
+                                unwrap: None,
+                            },
+                            param: Some(
+                                "0.95",
+                            ),
+                        },
+                    ],
+                    range: LogRange {
+                        selector: LogExpr {
+                            selector: StreamSelector {
+                                matchers: [
+                                    Matcher {
+                                        name: "app",
+                                        op: Eq,
+                                        value: "x",
+                                    },
+                                ],
+                            },
+                            pipeline: [],
+                        },
+                        range: Duration(
+                            300000000000,
+                        ),
+                        unwrap: None,
+                    },
+                },
+            ),
+            Vector {
+                op: Sum,
+                grouping: None,
+                param: None,
+                inner: Range {
+                    op: Rate,
+                    range: LogRange {
+                        selector: LogExpr {
+                            selector: StreamSelector {
+                                matchers: [
+                                    Matcher {
+                                        name: "app",
+                                        op: Eq,
+                                        value: "x",
+                                    },
+                                ],
+                            },
+                            pipeline: [],
+                        },
+                        range: Duration(
+                            300000000000,
+                        ),
+                        unwrap: None,
+                    },
+                    param: None,
+                },
+            },
+        ],
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [
+                    LineFormat(
+                        "{{.a}}",
+                    ),
+                ],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+    },
+)
+--- Display ---
+variants(variants(rate({app="x"}[5m]), quantile_over_time(0.95, {app="x"} | line_format "{{.a}}"[5m])) of ({app="x"}[5m]), sum(rate({app="x"}[5m]))) of ({app="x"} | line_format "{{.a}}"[5m])
+--- Hash calls ---
+write_isize(5)
+write_usize(2)
+write_isize(5)
+write_usize(2)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(10)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write([48, 46, 57, 53])
+write_u8(255)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(1)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(1)
+write_isize(3)
+write([123, 123, 46, 97, 125, 125])
+write_u8(255)
+write_u64(300000000000)
+write_isize(0)
+
+=== variants three deep ===
+--- Debug {:?} ---
+Variants(VariantsExpr { variants: [Variants(VariantsExpr { variants: [Variants(VariantsExpr { variants: [Range { op: Rate, range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None }, param: None }], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } })], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } })], range: LogRange { selector: LogExpr { selector: StreamSelector { matchers: [Matcher { name: "app", op: Eq, value: "x" }] }, pipeline: [] }, range: Duration(300000000000), unwrap: None } })
+--- Debug {:#?} ---
+Variants(
+    VariantsExpr {
+        variants: [
+            Variants(
+                VariantsExpr {
+                    variants: [
+                        Variants(
+                            VariantsExpr {
+                                variants: [
+                                    Range {
+                                        op: Rate,
+                                        range: LogRange {
+                                            selector: LogExpr {
+                                                selector: StreamSelector {
+                                                    matchers: [
+                                                        Matcher {
+                                                            name: "app",
+                                                            op: Eq,
+                                                            value: "x",
+                                                        },
+                                                    ],
+                                                },
+                                                pipeline: [],
+                                            },
+                                            range: Duration(
+                                                300000000000,
+                                            ),
+                                            unwrap: None,
+                                        },
+                                        param: None,
+                                    },
+                                ],
+                                range: LogRange {
+                                    selector: LogExpr {
+                                        selector: StreamSelector {
+                                            matchers: [
+                                                Matcher {
+                                                    name: "app",
+                                                    op: Eq,
+                                                    value: "x",
+                                                },
+                                            ],
+                                        },
+                                        pipeline: [],
+                                    },
+                                    range: Duration(
+                                        300000000000,
+                                    ),
+                                    unwrap: None,
+                                },
+                            },
+                        ),
+                    ],
+                    range: LogRange {
+                        selector: LogExpr {
+                            selector: StreamSelector {
+                                matchers: [
+                                    Matcher {
+                                        name: "app",
+                                        op: Eq,
+                                        value: "x",
+                                    },
+                                ],
+                            },
+                            pipeline: [],
+                        },
+                        range: Duration(
+                            300000000000,
+                        ),
+                        unwrap: None,
+                    },
+                },
+            ),
+        ],
+        range: LogRange {
+            selector: LogExpr {
+                selector: StreamSelector {
+                    matchers: [
+                        Matcher {
+                            name: "app",
+                            op: Eq,
+                            value: "x",
+                        },
+                    ],
+                },
+                pipeline: [],
+            },
+            range: Duration(
+                300000000000,
+            ),
+            unwrap: None,
+        },
+    },
+)
+--- Display ---
+variants(variants(variants(rate({app="x"}[5m])) of ({app="x"}[5m])) of ({app="x"}[5m])) of ({app="x"}[5m])
+--- Hash calls ---
+write_isize(5)
+write_usize(1)
+write_isize(5)
+write_usize(1)
+write_isize(5)
+write_usize(1)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+write_usize(1)
+write([97, 112, 112])
+write_u8(255)
+write_isize(0)
+write([120])
+write_u8(255)
+write_usize(0)
+write_u64(300000000000)
+write_isize(0)
+

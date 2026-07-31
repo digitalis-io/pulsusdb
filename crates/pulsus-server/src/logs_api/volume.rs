@@ -49,7 +49,7 @@ async fn volume_impl(
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
-    let expr = pulsus_logql::parse(query)?;
+    let expr = super::parse_logql(query)?;
     validate_volume_query(&expr)?;
     let (start_ns, end_ns) = parse_bounds(&pairs)?;
     if end_ns < start_ns {

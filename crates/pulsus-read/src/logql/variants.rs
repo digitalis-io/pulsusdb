@@ -14,6 +14,7 @@ use pulsus_logql::{
     ParserStage, RangeAggOp, Stage, StreamSelector,
 };
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 
 use super::agg::LabelSet;
 use super::charge::{
@@ -99,24 +100,28 @@ pub(crate) fn stage_source_bytes(stages: &[Stage]) -> u64 {
     fn matcher_bytes(m: &Matcher) -> u64 {
         (m.name.len() as u64).saturating_add(m.value.len() as u64)
     }
+    /// Issue #272: a driver consumer. Summing over a pre-order walk is
+    /// the same total as summing over the recursion it replaces.
     fn label_filter_bytes(e: &LabelFilterExpr) -> u64 {
-        match e {
-            LabelFilterExpr::Match(m) => matcher_bytes(m),
-            LabelFilterExpr::Compare { name, rhs, .. } => {
-                let rhs_len = match rhs {
-                    NumericLiteral::Number(raw) | NumericLiteral::DurationOrBytes(raw) => {
-                        raw.len() as u64
-                    }
-                };
-                (name.len() as u64).saturating_add(rhs_len)
-            }
-            LabelFilterExpr::Ip { name, value, .. } => {
-                (name.len() as u64).saturating_add(value.len() as u64)
-            }
-            LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => {
-                label_filter_bytes(a).saturating_add(label_filter_bytes(b))
-            }
-        }
+        let mut bytes: u64 = 0;
+        pulsus_logql::for_each_label_filter(e, |n| {
+            bytes = bytes.saturating_add(match n {
+                LabelFilterExpr::Match(m) => matcher_bytes(m),
+                LabelFilterExpr::Compare { name, rhs, .. } => {
+                    let rhs_len = match rhs {
+                        NumericLiteral::Number(raw) | NumericLiteral::DurationOrBytes(raw) => {
+                            raw.len() as u64
+                        }
+                    };
+                    (name.len() as u64).saturating_add(rhs_len)
+                }
+                LabelFilterExpr::Ip { name, value, .. } => {
+                    (name.len() as u64).saturating_add(value.len() as u64)
+                }
+                LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => 0,
+            });
+        });
+        bytes
     }
     let mut bytes: u64 = 0;
     for stage in stages {
@@ -168,14 +173,19 @@ pub(crate) fn stage_source_bytes(stages: &[Stage]) -> u64 {
 /// through `and`/`or`), `| decolorize`, and `drop`/`keep` elements with a
 /// `=~`/`!~` matcher.
 pub(crate) fn regex_stage_count(stages: &[Stage]) -> u64 {
+    /// Issue #272: a driver consumer, same total as the recursion.
     fn label_filter_regexes(e: &LabelFilterExpr) -> u64 {
-        match e {
-            LabelFilterExpr::Match(m) => u64::from(matches!(m.op, MatchOp::Re | MatchOp::Nre)),
-            LabelFilterExpr::Compare { .. } | LabelFilterExpr::Ip { .. } => 0,
-            LabelFilterExpr::And(a, b) | LabelFilterExpr::Or(a, b) => {
-                label_filter_regexes(a).saturating_add(label_filter_regexes(b))
-            }
-        }
+        let mut count: u64 = 0;
+        pulsus_logql::for_each_label_filter(e, |n| {
+            count = count.saturating_add(match n {
+                LabelFilterExpr::Match(m) => u64::from(matches!(m.op, MatchOp::Re | MatchOp::Nre)),
+                LabelFilterExpr::Compare { .. }
+                | LabelFilterExpr::Ip { .. }
+                | LabelFilterExpr::And(..)
+                | LabelFilterExpr::Or(..) => 0,
+            });
+        });
+        count
     }
     let mut count: u64 = 0;
     for stage in stages {
@@ -344,24 +354,27 @@ pub(crate) fn variant_spec_bytes(
         }
     }
     let mut layers: u64 = 0;
-    let mut cur = agg_chain;
-    while let MetricExpr::Vector {
-        grouping, inner, ..
-    } = cur
-    {
-        layers += 1;
-        let declared = grouping.as_ref().map_or(0, |g| g.labels.len() as u64);
-        bytes = bytes.saturating_add(grown_alloc_bytes(
-            (declared + 1).saturating_mul(size_of::<String>() as u64),
-        ));
-        if let Some(g) = grouping {
-            for l in &g.labels {
-                bytes = bytes.saturating_add(alloc_block_bytes(l.len() as u64));
+    // Issue #272: an allocation-free spine descent over the vector chain.
+    let _ = pulsus_logql::walk::descend_spine::<pulsus_logql::MetricScc, ()>(
+        pulsus_logql::MeNode::Expr(agg_chain),
+        |n| {
+            let pulsus_logql::MeNode::Expr(MetricExpr::Vector { grouping, .. }) = n else {
+                return ControlFlow::Break(());
+            };
+            layers += 1;
+            let declared = grouping.as_ref().map_or(0, |g| g.labels.len() as u64);
+            bytes = bytes.saturating_add(grown_alloc_bytes(
+                (declared + 1).saturating_mul(size_of::<String>() as u64),
+            ));
+            if let Some(g) = grouping {
+                for l in &g.labels {
+                    bytes = bytes.saturating_add(alloc_block_bytes(l.len() as u64));
+                }
             }
-        }
-        bytes = bytes.saturating_add(alloc_block_bytes(VARIANT_LABEL.len() as u64));
-        cur = inner;
-    }
+            bytes = bytes.saturating_add(alloc_block_bytes(VARIANT_LABEL.len() as u64));
+            ControlFlow::Continue(())
+        },
+    );
     if layers > 0 {
         bytes = bytes.saturating_add(grown_alloc_bytes(
             layers.saturating_mul(size_of::<plan::VectorAggSpec>() as u64),
@@ -880,12 +893,15 @@ mod tests {
             limit: 100,
             direction: Direction::Backward,
         };
-        match plan::plan(&expr, &params, &variants_ctx()).expect("plan") {
+        // Issue #272: E0509 — re-bind through a reference and take the
+        // owned pieces out of the borrow.
+        let mut planned = plan::plan(&expr, &params, &variants_ctx()).expect("plan");
+        match &mut planned {
             Plan::MetricBinary(MetricNode::Variants {
                 scan,
                 variants,
                 spec_bytes,
-            }) => (*scan, variants, spec_bytes),
+            }) => ((**scan).clone(), std::mem::take(variants), *spec_bytes),
             other => panic!("expected a variants plan, got {other:?}"),
         }
     }

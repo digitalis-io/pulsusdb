@@ -48,7 +48,7 @@ async fn patterns_impl(
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
-    let expr = pulsus_logql::parse(query)?;
+    let expr = super::parse_logql(query)?;
     validate_patterns_query(&expr)?;
     let (start_ns, end_ns) = parse_bounds(&pairs)?;
     // Floor to 10s + reject an over-11k grid, in pure param parsing — BEFORE

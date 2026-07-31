@@ -75,6 +75,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::net::IpAddr;
 
+use pulsus_logql::walk;
 use pulsus_logql::{
     CompareOp, DropKeepElem, LabelFilterExpr, LabelFmt, LabelMatch, LineFilterOp, MatchOp,
     NumericLiteral, ParserStage, Stage,
@@ -380,8 +381,15 @@ enum LineMatcher {
     Ip(IpMatcher),
 }
 
+/// One node of a compiled label filter, in **post-order**.
+///
+/// The three leaf variants keep byte-identical variant names, field
+/// names and field order to the tree this replaced, so leaf rendering
+/// stays derive-generated and `CompiledPipeline`'s `Debug` bytes are
+/// unchanged (pinned by `tests/golden/plan_walk_characterization.txt`,
+/// captured from the derive before this conversion).
 #[derive(Debug, Clone)]
-enum CompiledLabelFilter {
+enum LfOp {
     Match {
         name: String,
         op: MatchOp,
@@ -407,8 +415,114 @@ enum CompiledLabelFilter {
         matcher: IpMatcher,
         negated: bool,
     },
-    And(Box<CompiledLabelFilter>, Box<CompiledLabelFilter>),
-    Or(Box<CompiledLabelFilter>, Box<CompiledLabelFilter>),
+    And,
+    Or,
+}
+
+/// The inline verdict-stack width.
+///
+/// **Derived so that NO parser-admissible filter can spill**, which is
+/// what makes the zero-allocation-per-row claim true for every shape we
+/// accept rather than for the common one. Post-order over a LEFT-DEEP
+/// chain — what `parse_label_filter_or`'s `while` builds — has
+/// `max_stack == 2` regardless of width; the worst case is full RIGHT
+/// nesting, whose verdict stack is one deeper than the parse depth, and
+/// `pulsus-logql`'s `LABEL_FILTER_MAX_DEPTH` bounds that at 91. 96
+/// leaves headroom and costs 96 bytes of stack (`Option<bool>` is one
+/// byte).
+///
+/// `max_stack_never_spills_for_any_parser_admissible_filter` measures
+/// the deepest filter the parser accepts and asserts it fits, so raising
+/// the parser guard without raising this reddens a named test rather
+/// than silently reintroducing a per-row allocation.
+const LF_INLINE_STACK: usize = 96;
+
+/// A compiled label filter, **flattened** (issue #272).
+///
+/// The tree this replaced recursed on `compile`, on `Debug`/`Clone`
+/// glue, and once per node per row in `eval` — and a flat
+/// `a or b or c …` chain compiles into a LEFT-DEEP tree, so query WIDTH
+/// became compiled DEPTH. Measured before this change: `compile` aborted
+/// a 2 MiB stack at **3,000 terms / 33,696 bytes**, well inside #279's
+/// 131,072-byte admission cap.
+///
+/// Flat post-order removes the recursion AND the per-row allocation a
+/// tree walk needs: evaluation is a linear scan over `ops` with an
+/// on-stack verdict array.
+#[derive(Clone)]
+struct CompiledLabelFilter {
+    ops: Vec<LfOp>,
+    /// The verdict stack's exact high-water mark.
+    max_stack: u32,
+    /// Precomputed replacement for the former `filter_contains_compare`
+    /// walk. Not rendered by `Debug` — the bytes must not move.
+    has_compare: bool,
+}
+
+impl CompiledLabelFilter {
+    /// The index of each internal node's two operands, recovered from
+    /// post-order in one linear pass, plus the root index. Used only by
+    /// `Debug`, which is not a hot path.
+    fn tree_shape(&self) -> (Vec<(usize, usize)>, usize) {
+        let mut pending: Vec<usize> = Vec::new();
+        let mut kids: Vec<(usize, usize)> = vec![(0, 0); self.ops.len()];
+        for (i, op) in self.ops.iter().enumerate() {
+            if matches!(op, LfOp::And | LfOp::Or) {
+                let r = pending.pop().unwrap_or(0);
+                let l = pending.pop().unwrap_or(0);
+                kids[i] = (l, r);
+            }
+            pending.push(i);
+        }
+        let root = pending.pop().unwrap_or(0);
+        (kids, root)
+    }
+}
+
+impl fmt::Debug for CompiledLabelFilter {
+    /// Byte-equivalent to the `#[derive(Debug)]` on the TREE this
+    /// replaced, in both modes: leaves delegate to `LfOp`'s own derive
+    /// (same variant/field names and order), and `And`/`Or` are rendered
+    /// as the two-field tuple variants they were. Iterative — an
+    /// explicit frame stack, never one machine frame per node.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let alt = f.alternate();
+        let (kids, root) = self.tree_shape();
+        if self.ops.is_empty() {
+            return f.write_str("<empty>");
+        }
+        // (op index, step, indentation level)
+        let mut stack: Vec<(usize, u8, usize)> = vec![(root, 0, 0)];
+        while let Some((i, step, level)) = stack.pop() {
+            match &self.ops[i] {
+                leaf @ (LfOp::Match { .. } | LfOp::Compare { .. } | LfOp::Ip { .. }) => {
+                    walk::dbg_own(f, leaf, alt, level)?;
+                }
+                LfOp::And | LfOp::Or => {
+                    let name = if matches!(self.ops[i], LfOp::And) {
+                        "And"
+                    } else {
+                        "Or"
+                    };
+                    let (l, r) = kids[i];
+                    match step {
+                        0 => {
+                            walk::dbg_open_tuple(f, name, alt, level)?;
+                            stack.push((i, 1, level));
+                            stack.push((l, 0, level + 1));
+                        }
+                        1 => {
+                            walk::dbg_sep(f, alt, level)?;
+                            stack.push((i, 2, level));
+                            stack.push((r, 0, level + 1));
+                        }
+                        _ => walk::dbg_close_tuple(f, alt, level)?,
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One `json` extraction path segment (`a.b[0].c` / `a["k"]` shapes).
@@ -661,7 +775,7 @@ fn compile_stage(
             // it must route through the fan-out path (correctness
             // refinement over the plan's parser/label_format-only
             // trigger; flagged in the implementation notes).
-            if filter_contains_compare(&filter) {
+            if filter.has_compare {
                 st.mutates_labels = true;
             }
             Ok(Some(CompiledStage::LabelFilter(filter)))
@@ -817,6 +931,94 @@ impl CompiledPipeline {
             seen_line_format: st.seen_line_format,
             all_line_filter_source: st.all_line_filter_source,
         }
+    }
+
+    /// Structural equality of two compiled pipelines' LABEL-FILTER
+    /// programs — **including the two fields `Debug` does not render**,
+    /// `max_stack` and `has_compare`.
+    ///
+    /// Test-support, and narrowly scoped: it exists because #272's
+    /// widest-chain stack gate must prove a `Clone` carried the whole
+    /// program, and a rendered-length comparison catches OMISSION but
+    /// not same-width CORRUPTION — a clone that kept `ops.len()` while
+    /// changing an op, or that dropped either unrendered field, renders
+    /// identically. Compiled regex programs are compared by their source
+    /// pattern, which is the only stable identity a `regex::Regex` has.
+    #[doc(hidden)]
+    pub fn label_filter_programs_eq(&self, other: &Self) -> bool {
+        fn programs(p: &CompiledPipeline) -> Vec<&CompiledLabelFilter> {
+            p.stages
+                .iter()
+                .filter_map(|s| match s {
+                    CompiledStage::LabelFilter(f) => Some(f),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn op_eq(a: &LfOp, b: &LfOp) -> bool {
+            match (a, b) {
+                (
+                    LfOp::Match {
+                        name: an,
+                        op: ao,
+                        value: av,
+                        re: ar,
+                    },
+                    LfOp::Match {
+                        name: bn,
+                        op: bo,
+                        value: bv,
+                        re: br,
+                    },
+                ) => {
+                    an == bn
+                        && ao == bo
+                        && av == bv
+                        && ar.as_ref().map(regex::Regex::as_str)
+                            == br.as_ref().map(regex::Regex::as_str)
+                }
+                (
+                    LfOp::Compare {
+                        name: an,
+                        op: ao,
+                        kind: ak,
+                        threshold: at,
+                    },
+                    LfOp::Compare {
+                        name: bn,
+                        op: bo,
+                        kind: bk,
+                        threshold: bt,
+                    },
+                ) => an == bn && ao == bo && ak == bk && at.to_bits() == bt.to_bits(),
+                (
+                    LfOp::Ip {
+                        name: an,
+                        matcher: am,
+                        negated: ag,
+                    },
+                    LfOp::Ip {
+                        name: bn,
+                        matcher: bm,
+                        negated: bg,
+                    },
+                ) => an == bn && am == bm && ag == bg,
+                (LfOp::And, LfOp::And) | (LfOp::Or, LfOp::Or) => true,
+                (LfOp::Match { .. }, _)
+                | (LfOp::Compare { .. }, _)
+                | (LfOp::Ip { .. }, _)
+                | (LfOp::And, _)
+                | (LfOp::Or, _) => false,
+            }
+        }
+        let (a, b) = (programs(self), programs(other));
+        a.len() == b.len()
+            && a.iter().zip(b.iter()).all(|(x, y)| {
+                x.max_stack == y.max_stack
+                    && x.has_compare == y.has_compare
+                    && x.ops.len() == y.ops.len()
+                    && x.ops.iter().zip(y.ops.iter()).all(|(p, q)| op_eq(p, q))
+            })
     }
 
     /// Overrides the template execution environment (tests + the
@@ -1776,61 +1978,83 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternTok>, PipelineError> {
     Ok(tokens)
 }
 
+/// Issue #272: emits the flat post-order program directly.
+///
+/// The AST walk is iterative (`walk::postorder_into` over SCC-1), so a
+/// flat `a or b or c …` chain — a LEFT-DEEP `LabelFilterExpr` — no
+/// longer costs one machine frame per term. `ops` is reserved once at
+/// the exact node count; the FIRST error still wins in source order,
+/// because post-order visits the leaves left to right and `?` returns on
+/// the first failing one.
 fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, PipelineError> {
-    Ok(match expr {
-        LabelFilterExpr::Match(m) => CompiledLabelFilter::Match {
-            name: m.name.clone(),
-            op: m.op,
-            value: m.value.clone(),
-            re: match m.op {
-                MatchOp::Re | MatchOp::Nre => Some(compile_anchored_regex(&m.value)?),
-                MatchOp::Eq | MatchOp::Neq => None,
-            },
-        },
-        LabelFilterExpr::Compare { name, op, rhs } => {
-            let (kind, threshold) = classify_numeric_literal(rhs)?;
-            CompiledLabelFilter::Compare {
-                name: name.clone(),
-                op: *op,
-                kind,
-                threshold,
-            }
-        }
-        LabelFilterExpr::Ip {
-            name,
-            value,
-            negated,
-        } => {
-            let matcher =
-                IpMatcher::parse(value).map_err(|e| PipelineError::BadIpFilter(e.to_string()))?;
-            CompiledLabelFilter::Ip {
-                name: name.clone(),
-                matcher,
-                negated: *negated,
-            }
-        }
-        LabelFilterExpr::And(a, b) => CompiledLabelFilter::And(
-            Box::new(compile_label_filter(a)?),
-            Box::new(compile_label_filter(b)?),
-        ),
-        LabelFilterExpr::Or(a, b) => CompiledLabelFilter::Or(
-            Box::new(compile_label_filter(a)?),
-            Box::new(compile_label_filter(b)?),
-        ),
-    })
-}
-
-fn filter_contains_compare(f: &CompiledLabelFilter) -> bool {
-    match f {
-        CompiledLabelFilter::Match { .. } => false,
-        CompiledLabelFilter::Compare { .. } => true,
-        // The IP label filter never mutates the label set (it cannot error),
-        // so it does not force the label-mutating fan-out path.
-        CompiledLabelFilter::Ip { .. } => false,
-        CompiledLabelFilter::And(a, b) | CompiledLabelFilter::Or(a, b) => {
-            filter_contains_compare(a) || filter_contains_compare(b)
-        }
+    // A single-leaf filter — `| x="1"`, by far the common shape — needs
+    // no traversal at all, so it costs exactly ONE allocation (the `ops`
+    // vector), matching the pre-#272 profile of zero `Box`es plus this
+    // one. Without it the walk's own node vector and work-stack chunk
+    // would land on every per-variant compile.
+    let mut nodes: Vec<&LabelFilterExpr> = Vec::new();
+    let leaf_only = !matches!(expr, LabelFilterExpr::And(..) | LabelFilterExpr::Or(..));
+    if leaf_only {
+        nodes.push(expr);
+    } else {
+        walk::postorder_into::<pulsus_logql::LabelFilterScc>(expr, &mut nodes);
     }
+    let mut ops: Vec<LfOp> = Vec::with_capacity(nodes.len());
+    let mut has_compare = false;
+    let mut live: u32 = 0;
+    let mut max_stack: u32 = 0;
+    for n in nodes {
+        let op = match n {
+            LabelFilterExpr::Match(m) => LfOp::Match {
+                name: m.name.clone(),
+                op: m.op,
+                value: m.value.clone(),
+                re: match m.op {
+                    MatchOp::Re | MatchOp::Nre => Some(compile_anchored_regex(&m.value)?),
+                    MatchOp::Eq | MatchOp::Neq => None,
+                },
+            },
+            LabelFilterExpr::Compare { name, op, rhs } => {
+                let (kind, threshold) = classify_numeric_literal(rhs)?;
+                has_compare = true;
+                LfOp::Compare {
+                    name: name.clone(),
+                    op: *op,
+                    kind,
+                    threshold,
+                }
+            }
+            LabelFilterExpr::Ip {
+                name,
+                value,
+                negated,
+            } => {
+                let matcher = IpMatcher::parse(value)
+                    .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?;
+                // The IP label filter never mutates the label set (it
+                // cannot error), so it does not force the label-mutating
+                // fan-out path — `has_compare` stays as it was.
+                LfOp::Ip {
+                    name: name.clone(),
+                    matcher,
+                    negated: *negated,
+                }
+            }
+            LabelFilterExpr::And(..) => LfOp::And,
+            LabelFilterExpr::Or(..) => LfOp::Or,
+        };
+        live = match op {
+            LfOp::And | LfOp::Or => live.saturating_sub(2).saturating_add(1),
+            _ => live.saturating_add(1),
+        };
+        max_stack = max_stack.max(live);
+        ops.push(op);
+    }
+    Ok(CompiledLabelFilter {
+        ops,
+        max_stack,
+        has_compare,
+    })
 }
 
 /// Classifies a numeric RHS literal (plan edge case 4: `5xz` is a named
@@ -2474,116 +2698,170 @@ fn render_template_with_errors(
 /// `Some(false)`/`Some(true)` (masked, no label ever set), so the owned
 /// detail `String` is deferred to the caller's `None` arm — the only
 /// place a label is actually written.
+/// Issue #272: a LINEAR SCAN over the flat post-order program.
+///
+/// **Contract 3 is preserved exactly**: post-order visits the leaves in
+/// SOURCE order and evaluates BOTH operands of every `And`/`Or`
+/// unconditionally, so `failed` still records the LEFTMOST conversion
+/// failure and the Kleene tables below are transcribed unchanged. No
+/// Sethi-Ullman reordering, no associativity normalisation, no rank
+/// side-table.
+///
+/// **Per-row cost.** Strictly less than the tree walk it replaces: a
+/// contiguous `Vec<LfOp>` instead of `Box`-pointer chasing plus a call
+/// frame per node, and an on-stack `[Option<bool>; LF_INLINE_STACK]`
+/// verdict array instead of any allocation. A left-deep chain — what the
+/// parser builds for `a or b or c …` — has `max_stack == 2` regardless
+/// of width, so width never spills to the heap.
 fn eval_label_filter<'v>(
-    f: &CompiledLabelFilter,
+    filter: &CompiledLabelFilter,
     labels: &'v [(Cow<'_, str>, Cow<'_, str>)],
     errs: &ErrorSlots<'_>,
     failed: &mut Option<(UnitKind, &'v str)>,
 ) -> Option<bool> {
-    match f {
-        CompiledLabelFilter::Match {
-            name,
-            op,
-            value,
-            re,
-        } => {
-            // `labelValue` (`label_filter.go:418-424`): `__error__` — and
-            // ONLY `__error__` — resolves the out-of-band slot; every other
-            // name, INCLUDING `__error_details__`, falls through to the
-            // vector (issue #238, live-probed: `| json | __error_details__
-            // != ""` matches nothing on an errored line). Prometheus
-            // matcher semantics otherwise: a missing label matches as the
-            // empty string — which an unset slot also reads as.
-            let v = if name == ERROR_LABEL {
-                errs.err_str()
-            } else {
-                get_label(labels, name).unwrap_or("")
-            };
-            Some(match op {
-                MatchOp::Eq => v == value,
-                MatchOp::Neq => v != value,
-                MatchOp::Re => re.as_ref().is_some_and(|re| re.is_match(v)),
-                MatchOp::Nre => !re.as_ref().is_some_and(|re| re.is_match(v)),
-            })
-        }
-        CompiledLabelFilter::Compare {
-            name,
-            op,
-            kind,
-            threshold,
-        } => {
-            // A missing label never satisfies a numeric comparison
-            // (dropped, no error); an unconvertible value is the error
-            // class.
-            let Some(raw) = get_label(labels, name) else {
-                return Some(false);
-            };
-            let Some(v) = convert_label_value(*kind, raw) else {
-                // Record the leftmost conversion failure as a borrow —
-                // no allocation here. A sibling `And`/`Or` combinator may
-                // still absorb this `None` into a definite outcome (the
-                // line is masked and no label is ever set), so the owned
-                // detail string is built by the caller, only once, only
-                // on the surviving `None` outcome.
-                if failed.is_none() {
-                    *failed = Some((*kind, raw));
+    let mut inline = [None; LF_INLINE_STACK];
+    // Unreachable for any parser-produced filter (see
+    // `LF_INLINE_STACK`); retained for programmatically constructed
+    // trees, which the corpus runner and `extended_with` can both carry.
+    // `max_stack <= ops.len() <= N`, itself bounded by admission.
+    let mut spill: Vec<Option<bool>> = if filter.max_stack as usize > LF_INLINE_STACK {
+        vec![None; filter.max_stack as usize]
+    } else {
+        Vec::new()
+    };
+    let vals: &mut [Option<bool>] = if spill.is_empty() {
+        &mut inline
+    } else {
+        &mut spill
+    };
+    let mut top = 0usize;
+    for op in &filter.ops {
+        let v = match op {
+            LfOp::Match {
+                name,
+                op,
+                value,
+                re,
+            } => {
+                // `labelValue` (`label_filter.go:418-424`): `__error__` — and
+                // ONLY `__error__` — resolves the out-of-band slot; every other
+                // name, INCLUDING `__error_details__`, falls through to the
+                // vector (issue #238, live-probed: `| json | __error_details__
+                // != ""` matches nothing on an errored line). Prometheus
+                // matcher semantics otherwise: a missing label matches as the
+                // empty string — which an unset slot also reads as.
+                let v = if name == ERROR_LABEL {
+                    errs.err_str()
+                } else {
+                    get_label(labels, name).unwrap_or("")
+                };
+                Some(match op {
+                    MatchOp::Eq => v == value,
+                    MatchOp::Neq => v != value,
+                    MatchOp::Re => re.as_ref().is_some_and(|re| re.is_match(v)),
+                    MatchOp::Nre => !re.as_ref().is_some_and(|re| re.is_match(v)),
+                })
+            }
+            LfOp::Compare {
+                name,
+                op,
+                kind,
+                threshold,
+            } => {
+                // A missing label never satisfies a numeric comparison
+                // (dropped, no error); an unconvertible value is the error
+                // class.
+                // Issue #272: the leaf arms used to be a recursive call, so
+                // an early `return` exited only that leaf. In the linear scan
+                // it would exit the whole program, so each is now the arm's
+                // VALUE.
+                let Some(raw) = get_label(labels, name) else {
+                    vals[top] = Some(false);
+                    top += 1;
+                    continue;
+                };
+                let Some(v) = convert_label_value(*kind, raw) else {
+                    // Record the leftmost conversion failure as a borrow —
+                    // no allocation here. A sibling `And`/`Or` combinator may
+                    // still absorb this `None` into a definite outcome (the
+                    // line is masked and no label is ever set), so the owned
+                    // detail string is built by the caller, only once, only
+                    // on the surviving `None` outcome.
+                    if failed.is_none() {
+                        *failed = Some((*kind, raw));
+                    }
+                    vals[top] = None;
+                    top += 1;
+                    continue;
+                };
+                Some(match op {
+                    CompareOp::Eq => v == *threshold,
+                    CompareOp::Neq => v != *threshold,
+                    CompareOp::Gt => v > *threshold,
+                    CompareOp::Gte => v >= *threshold,
+                    CompareOp::Lt => v < *threshold,
+                    CompareOp::Lte => v <= *threshold,
+                })
+            }
+            LfOp::Ip {
+                name,
+                matcher,
+                negated,
+            } => {
+                // `ip.go:123-127`: an errored line passes the ip filter
+                // UNCONDITIONALLY — for `=` AND `!=` alike — and the
+                // short-circuit reads the SLOT, not the vector (issue #238,
+                // live-probed: `| json | addr = ip(...)` and `!= ip(...)` both
+                // keep the errored line; after `drop __error__` both drop it,
+                // and a stream label `__error__` does NOT trip it).
+                if errs.has_err() {
+                    vals[top] = Some(true);
+                    top += 1;
+                    continue;
                 }
-                return None;
-            };
-            Some(match op {
-                CompareOp::Eq => v == *threshold,
-                CompareOp::Neq => v != *threshold,
-                CompareOp::Gt => v > *threshold,
-                CompareOp::Gte => v >= *threshold,
-                CompareOp::Lt => v < *threshold,
-                CompareOp::Lte => v <= *threshold,
-            })
-        }
-        CompiledLabelFilter::Ip {
-            name,
-            matcher,
-            negated,
-        } => {
-            // `ip.go:123-127`: an errored line passes the ip filter
-            // UNCONDITIONALLY — for `=` AND `!=` alike — and the
-            // short-circuit reads the SLOT, not the vector (issue #238,
-            // live-probed: `| json | addr = ip(...)` and `!= ip(...)` both
-            // keep the errored line; after `drop __error__` both drop it,
-            // and a stream label `__error__` does NOT trip it).
-            if errs.has_err() {
-                return Some(true);
+                // Reference v3.7.3 semantics (differential-authoritative): parse the
+                // label value as an IP and test range membership. A missing label OR
+                // an unparseable value is `match = false` — NEVER an error, so no
+                // `__error__`/`__error_details__` is set (this is the key divergence
+                // from the numeric label filter, which DOES error on bad values).
+                // `=` returns the line iff matched; `!=` iff not matched.
+                let matched = get_label(labels, name)
+                    .and_then(|raw| raw.parse::<IpAddr>().ok())
+                    .is_some_and(|ip| matcher.contains(&ip));
+                Some(if *negated { !matched } else { matched })
             }
-            // Reference v3.7.3 semantics (differential-authoritative): parse the
-            // label value as an IP and test range membership. A missing label OR
-            // an unparseable value is `match = false` — NEVER an error, so no
-            // `__error__`/`__error_details__` is set (this is the key divergence
-            // from the numeric label filter, which DOES error on bad values).
-            // `=` returns the line iff matched; `!=` iff not matched.
-            let matched = get_label(labels, name)
-                .and_then(|raw| raw.parse::<IpAddr>().ok())
-                .is_some_and(|ip| matcher.contains(&ip));
-            Some(if *negated { !matched } else { matched })
-        }
-        CompiledLabelFilter::And(a, b) => {
-            match (
-                eval_label_filter(a, labels, errs, failed),
-                eval_label_filter(b, labels, errs, failed),
-            ) {
-                (Some(false), _) | (_, Some(false)) => Some(false),
-                (Some(true), Some(true)) => Some(true),
-                _ => None,
+            LfOp::And => {
+                // Post-order leaves [.., lhs, rhs] on the tail; BOTH were
+                // evaluated, in source order, before this op runs.
+                let rhs = vals[top - 1];
+                let lhs = vals[top - 2];
+                top -= 2;
+                match (lhs, rhs) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
             }
-        }
-        CompiledLabelFilter::Or(a, b) => {
-            match (
-                eval_label_filter(a, labels, errs, failed),
-                eval_label_filter(b, labels, errs, failed),
-            ) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                (Some(false), Some(false)) => Some(false),
-                _ => None,
+            LfOp::Or => {
+                let rhs = vals[top - 1];
+                let lhs = vals[top - 2];
+                top -= 2;
+                match (lhs, rhs) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
             }
-        }
+        };
+        vals[top] = v;
+        top += 1;
+    }
+    match top {
+        1 => vals[0],
+        // Unreachable: a post-order program consumes exactly two
+        // verdicts per boolean op and pushes one, so exactly one
+        // survives an `ops` list built by `compile_label_filter`.
+        _ => unreachable!("a post-order label-filter program leaves exactly one verdict"),
     }
 }
 
@@ -3179,11 +3457,12 @@ mod tests {
 
     fn stages_of(query: &str) -> Vec<Stage> {
         let expr = pulsus_logql::parse(query).expect("parse");
-        match expr {
+        // Issue #272: E0509 — re-bind through a reference.
+        match &expr {
             pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => {
-                range.selector.pipeline
+                range.selector.pipeline.clone()
             }
-            pulsus_logql::Expr::Log(log) => log.pipeline,
+            pulsus_logql::Expr::Log(log) => log.pipeline.clone(),
             other => panic!("unexpected expr shape: {other:?}"),
         }
     }
@@ -3399,6 +3678,63 @@ mod tests {
     // `eval_label_filter`'s `failed` capture must never allocate on that
     // path, and a genuinely-surviving error must stay byte-exact.
     // -----------------------------------------------------------------
+
+    /// Issue #272 finding 3: the zero-allocation-per-row claim must hold
+    /// for every shape the parser ADMITS, not just the common one.
+    ///
+    /// Full right nesting is the worst case for the verdict stack. This
+    /// finds the deepest filter the parser accepts and asserts its
+    /// `max_stack` fits inline — so raising `LABEL_FILTER_MAX_DEPTH`
+    /// without raising `LF_INLINE_STACK` reddens this rather than
+    /// silently reintroducing a per-row heap allocation.
+    #[test]
+    fn max_stack_never_spills_for_any_parser_admissible_filter() {
+        let mut deepest: Option<(usize, u32)> = None;
+        for depth in 1..400usize {
+            // `x="0" and (x="1" and (x="2" and …))` — full right
+            // nesting, the worst case for the verdict stack.
+            let mut q = String::from(r#"{a="b"} | "#);
+            for i in 0..depth {
+                q.push_str(&format!("x=\"{i}\""));
+                if i + 1 < depth {
+                    q.push_str(" and (");
+                }
+            }
+            for _ in 0..depth.saturating_sub(1) {
+                q.push(')');
+            }
+            let Ok(expr) = pulsus_logql::parse(&q) else {
+                break; // the parser's own depth guard rejected it
+            };
+            let stages = match &expr {
+                pulsus_logql::Expr::Log(l) => l.pipeline.clone(),
+                other => panic!("unexpected fixture shape: {other:?}"),
+            };
+            let compiled = CompiledPipeline::compile(&stages).expect("compile");
+            let ms = compiled
+                .stages
+                .iter()
+                .filter_map(|s| match s {
+                    CompiledStage::LabelFilter(f) => Some(f.max_stack),
+                    _ => None,
+                })
+                .max()
+                .expect("a label-filter stage");
+            deepest = Some((depth, ms));
+        }
+        let (depth, max_stack) = deepest.expect("at least one filter parsed");
+        assert!(
+            depth > 64,
+            "the probe stopped at depth {depth}, below the old inline width — it would not \
+             have seen a spill"
+        );
+        assert!(
+            (max_stack as usize) <= LF_INLINE_STACK,
+            "the deepest parser-admissible filter (depth {depth}) needs a verdict stack of \
+             {max_stack}, above LF_INLINE_STACK = {LF_INLINE_STACK} — per-row evaluation \
+             would allocate"
+        );
+    }
 
     #[test]
     fn masked_and_drops_the_line_and_emits_no_error_label_streams() {

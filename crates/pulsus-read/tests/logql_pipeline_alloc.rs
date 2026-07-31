@@ -125,12 +125,38 @@ fn per_row_allocation_bounds_hold() {
         .map(|i| format!("GET /api/items {} {}ms", 200 + i % 400, 100 + i))
         .collect();
 
+    // Issue #272 finding 3: a fully RIGHT-NESTED boolean filter is the
+    // worst case for the flattened evaluator's verdict stack, and the
+    // shape the old inline width could not hold. Built at the deepest
+    // nesting the parser admits (`LABEL_FILTER_MAX_DEPTH`), so this case
+    // covers the shape the zero-per-row claim is made about — not just
+    // the flat one.
+    let deep_filter: String = {
+        let depth = 91usize;
+        let mut q = String::from(r#"{a="b"} | "#);
+        for i in 0..depth {
+            q.push_str(&format!("level != \"x{i}\""));
+            if i + 1 < depth {
+                q.push_str(" and (");
+            }
+        }
+        for _ in 0..depth - 1 {
+            q.push(')');
+        }
+        q
+    };
+
     // --- Evaluator fast paths (`run_into` + reused scratch): ZERO
     // --- allocations per row.
     for (name, query, bodies) in [
         (
             "string label filter (drop path)",
             r#"{a="b"} | level = "error""#,
+            &logfmt_bodies,
+        ),
+        (
+            "right-nested boolean label filter at the parser's depth limit",
+            deep_filter.as_str(),
             &logfmt_bodies,
         ),
         (

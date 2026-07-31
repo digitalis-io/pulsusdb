@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use pulsus_logql::{BinOp, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
-    ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
-    QueryParams, QueryResult, ReadError, SAMPLE_EXTRACTION_ERROR, TooBroadReason, VectorSample,
-    apply_vector_aggs, combine_binary, materialize_vector_lit, plan, run_client_agg_rows,
-    run_client_agg_rows_folded, run_variants_rows,
+    ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricNodeScc, MetricPlan,
+    Plan, PlanCtx, QueryParams, QueryResult, ReadError, SAMPLE_EXTRACTION_ERROR, TooBroadReason,
+    VectorSample, apply_vector_aggs, combine_binary, materialize_vector_lit, plan,
+    run_client_agg_rows, run_client_agg_rows_folded, run_variants_rows,
 };
 
 /// Issue #236 §4: `apply_vector_aggs` is fallible now — it charges the
@@ -1634,6 +1634,40 @@ fn approx_topk_retention_cap_is_the_reference_heap_size() {
 // mixed precedence, `bool`, comparisons, set ops.
 // ---------------------------------------------------------------------
 
+/// Issue #272: hoisted to module level and converted to a post-order
+/// fold over a value stack (mirroring the engine's `run_metric_node`), so
+/// the walker consumes heap rather than machine stack.
+fn eval_scalar_node(node: &MetricNode) -> Result<QueryResult, ReadError> {
+    let mut nodes = Vec::new();
+    pulsus_logql::walk::postorder_into::<MetricNodeScc>(node, &mut nodes);
+    let mut vals: Vec<QueryResult> = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let v = match n {
+            MetricNode::Scalar(v) => QueryResult::Scalar(*v),
+            MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window)?,
+            MetricNode::Binary {
+                op,
+                return_bool,
+                matching,
+                ..
+            } => {
+                let r = vals.pop().expect("post-order pushes rhs");
+                let l = vals.pop().expect("post-order pushes lhs");
+                combine_binary(*op, *return_bool, matching.as_ref(), l, r)?
+            }
+            MetricNode::VectorAgg { aggs, .. } => {
+                let inner = vals.pop().expect("post-order pushes inner");
+                apply_vector_aggs_ok(inner, aggs)
+            }
+            MetricNode::Leaf(_) | MetricNode::Variants { .. } => {
+                panic!("scalar-only trees expected")
+            }
+        };
+        vals.push(v);
+    }
+    Ok(vals.pop().expect("a post-order fold leaves one value"))
+}
+
 /// Hermetic evaluator over LEAFLESS node trees (scalar arithmetic goes
 /// through the REAL parser + planner + `combine_binary`).
 fn eval_scalar_query(query: &str) -> f64 {
@@ -1642,24 +1676,7 @@ fn eval_scalar_query(query: &str) -> f64 {
     let Plan::MetricBinary(node) = p else {
         panic!("expected a MetricBinary plan for {query}");
     };
-    fn eval(node: &MetricNode) -> Result<QueryResult, ReadError> {
-        match node {
-            MetricNode::Scalar(v) => Ok(QueryResult::Scalar(*v)),
-            MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window),
-            MetricNode::Binary {
-                op,
-                return_bool,
-                matching,
-                lhs,
-                rhs,
-            } => combine_binary(*op, *return_bool, matching.as_ref(), eval(lhs)?, eval(rhs)?),
-            MetricNode::VectorAgg { aggs, inner } => Ok(apply_vector_aggs_ok(eval(inner)?, aggs)),
-            MetricNode::Leaf(_) | MetricNode::Variants { .. } => {
-                panic!("scalar-only trees expected")
-            }
-        }
-    }
-    match eval(&node).expect("eval") {
+    match eval_scalar_node(&node).expect("eval") {
         QueryResult::Scalar(v) => v,
         other => panic!("expected a scalar, got {other:?}"),
     }
@@ -2902,64 +2919,72 @@ fn metric_node_of(query: &str, params: &QueryParams) -> MetricNode {
 
 /// Evaluates a full `MetricNode` tree the engine's way: leaves run the
 /// client-aggregation over `rows`, everything else combines in-Rust.
+/// Issue #272: a post-order fold over a value stack, mirroring the
+/// engine's `run_metric_node`. Left-to-right post-order evaluates `lhs`'s
+/// whole subtree before `rhs`'s, so the expectations are unchanged.
 fn eval_node(
     node: &MetricNode,
     rows: &[MetricScanRow],
     meta: &HashMap<u64, StreamMetaRow>,
 ) -> Result<QueryResult, ReadError> {
-    match node {
-        MetricNode::Scalar(v) => Ok(QueryResult::Scalar(*v)),
-        MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window),
-        MetricNode::Leaf(mp) => {
-            let client = mp.client.as_ref().expect("client-aggregated plan");
-            let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
-            let result = run_client_agg_rows(
-                rows,
-                &compiled,
-                meta,
-                client,
-                match mp.step_ns {
-                    Some(step_ns) => ClientWindow::Range {
-                        grid_start_ns: mp.grid_start_ns,
-                        end_ns: mp.end_ns,
-                        step_ns,
-                        range_ns: mp.range_ns,
+    let mut nodes = Vec::new();
+    pulsus_logql::walk::postorder_into::<MetricNodeScc>(node, &mut nodes);
+    let mut vals: Vec<QueryResult> = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let v = match n {
+            MetricNode::Scalar(v) => QueryResult::Scalar(*v),
+            MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window)?,
+            MetricNode::Leaf(mp) => {
+                let client = mp.client.as_ref().expect("client-aggregated plan");
+                let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
+                let result = run_client_agg_rows(
+                    rows,
+                    &compiled,
+                    meta,
+                    client,
+                    match mp.step_ns {
+                        Some(step_ns) => ClientWindow::Range {
+                            grid_start_ns: mp.grid_start_ns,
+                            end_ns: mp.end_ns,
+                            step_ns,
+                            range_ns: mp.range_ns,
+                        },
+                        None => ClientWindow::Instant {
+                            start_ns: mp.grid_start_ns,
+                            end_ns: mp.end_ns,
+                        },
                     },
-                    None => ClientWindow::Instant {
-                        start_ns: mp.grid_start_ns,
-                        end_ns: mp.end_ns,
-                    },
-                },
-                mp.rate_window_ns,
-            )?;
-            Ok(apply_vector_aggs_ok(result, &mp.vector_aggs))
-        }
-        MetricNode::Binary {
-            op,
-            return_bool,
-            matching,
-            lhs,
-            rhs,
-        } => combine_binary(
-            *op,
-            *return_bool,
-            matching.as_ref(),
-            eval_node(lhs, rows, meta)?,
-            eval_node(rhs, rows, meta)?,
-        ),
-        MetricNode::VectorAgg { aggs, inner } => {
-            Ok(apply_vector_aggs_ok(eval_node(inner, rows, meta)?, aggs))
-        }
-        // `variants(...) of (...)` (issue #221): the pure fan-out twin,
-        // over the scan plan's (unwrap-truncated) common pipeline.
-        MetricNode::Variants { scan, variants, .. } => {
-            let common = scan
-                .client
-                .as_ref()
-                .expect("variants scan is client-aggregated");
-            run_variants_rows(rows, meta, &common.pipeline, variants)
-        }
+                    mp.rate_window_ns,
+                )?;
+                apply_vector_aggs_ok(result, &mp.vector_aggs)
+            }
+            MetricNode::Binary {
+                op,
+                return_bool,
+                matching,
+                ..
+            } => {
+                let r = vals.pop().expect("post-order pushes rhs");
+                let l = vals.pop().expect("post-order pushes lhs");
+                combine_binary(*op, *return_bool, matching.as_ref(), l, r)?
+            }
+            MetricNode::VectorAgg { aggs, .. } => {
+                let inner = vals.pop().expect("post-order pushes inner");
+                apply_vector_aggs_ok(inner, aggs)
+            }
+            // `variants(...) of (...)` (issue #221): the pure fan-out twin,
+            // over the scan plan's (unwrap-truncated) common pipeline.
+            MetricNode::Variants { scan, variants, .. } => {
+                let common = scan
+                    .client
+                    .as_ref()
+                    .expect("variants scan is client-aggregated");
+                run_variants_rows(rows, meta, &common.pipeline, variants)?
+            }
+        };
+        vals.push(v);
     }
+    Ok(vals.pop().expect("a post-order fold leaves one value"))
 }
 
 #[test]

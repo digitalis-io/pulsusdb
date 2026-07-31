@@ -95,6 +95,28 @@ fn mount_detected_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
 /// drilldown routes via [`mount_detected_routes`] (issue #170), plus
 /// `/tail` (WebSocket, issue #74), `/stats`, and `/volume` (issue #169)
 /// mounted explicitly (all `GET`-only).
+/// Parses a LogQL query and admits its iterative walks (issue #272).
+///
+/// **ORDER IS LOAD-BEARING.** #279's 131,072-byte query-text cap lives
+/// INSIDE `parse` (`pulsus-logql`'s `limits.rs`, reached from
+/// `parser.rs`) and answers 400 `bad_data` with the reference's verbatim
+/// message. Admission therefore runs only on input `parse` has ACCEPTED,
+/// so its 422 can never pre-empt that 400.
+///
+/// Every accepted query is `< MAX_QUERY_BYTES` and the walk threshold is
+/// above `2 x` that, so the refusal below is **execution-dead** through
+/// this function (AC 6 clauses 3b/3c prove it: an exhaustive
+/// monotonicity sweep plus a `const` endpoint relation). It is kept, not
+/// deleted, because it is the runtime half of the L1-L5 memory argument
+/// and because a future caller that does not go through `parse` must
+/// still be refused rather than abort.
+pub(crate) fn parse_logql(query: &str) -> Result<pulsus_logql::Expr, error::ApiError> {
+    let expr = pulsus_logql::parse(query)?;
+    pulsus_read::logql::admit_logql_walk(query)
+        .map_err(pulsus_read::logql::ReadError::QueryTooBroad)?;
+    Ok(expr)
+}
+
 pub(crate) fn router() -> Router<AppState> {
     let router = mount_log_query_routes(Router::new(), "/api/logs/v1")
         .route("/api/logs/v1/tail", get(tail::tail))
@@ -222,6 +244,76 @@ mod tests {
     /// `get-request-target-uri-bound` in
     /// docs/benchmarks/logs-differential-ledger.md — over a socket it
     /// surfaces as hyper's `414 URI Too Long`, before routing.
+    /// Issue #272 AC 6 — the drift guard. Every request path must reach
+    /// the parser through [`parse_logql`], so the walk admission cannot
+    /// be bypassed by a new handler that calls the parser directly. The
+    /// two allowlisted shapes are `parse_selector` (a selector is not a
+    /// full query) and the `#[cfg(test)]` probe in `handlers.rs`.
+    #[test]
+    fn no_request_path_calls_the_logql_parser_directly() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logs_api");
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("the logs_api source directory") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned();
+            let src = std::fs::read_to_string(&path).expect("source");
+            // `mod.rs` declares the seam itself; the test region of
+            // `handlers.rs` carries an allowlisted probe.
+            let production = match src.find("\n#[cfg(test)]\nmod tests {") {
+                Some(i) => &src[..i],
+                None => &src[..],
+            };
+            for (i, line) in production.lines().enumerate() {
+                if line.contains("pulsus_logql::parse(") && name != "mod.rs" {
+                    offenders.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these request paths bypass `parse_logql` (issue #272 memory L5 Leg A): {offenders:?}"
+        );
+    }
+
+    /// Issue #272 AC 6 clause 3d — the ordering at the wire.
+    ///
+    /// `parse_logql` parses BEFORE it admits, so #279's 400 `bad_data`
+    /// wins and our 422 can never pre-empt the reference's answer. The
+    /// guard is the MODEL relation, independent of `admit_logql_walk`
+    /// (clause 3a owns the implementation half), so the two clauses catch
+    /// different failures.
+    ///
+    /// POST, because the GET target-URI ceiling is an already-ledgered
+    /// divergence (`get-request-target-uri-bound`, see the module test
+    /// above).
+    #[tokio::test]
+    async fn an_over_cap_query_answers_the_references_400_not_our_422() {
+        let query = "a".repeat(4 * pulsus_logql::MAX_QUERY_BYTES);
+        assert!(
+            pulsus_read::logql::walk_transient_bound(query.len() as u64)
+                > pulsus_read::logql::MAX_LOGQL_WALK_TRANSIENT_BYTES,
+            "probe must sit above the walk threshold, or this test cannot observe the ordering"
+        );
+        let (status, body) = routed(
+            router(),
+            form_post("/api/logs/v1/query_range", format!("query={query}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("error envelope is JSON");
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(json["error"], "input size too long (524288 > 131072)");
+        assert_eq!(json["position"], 0);
+    }
+
     #[tokio::test]
     async fn alias_surfaces_reject_an_over_cap_query_identically_to_native() {
         // Pure prefix swap, genuine over-cap payload via POST.

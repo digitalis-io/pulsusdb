@@ -1105,8 +1105,13 @@ fn a_range_spanning_a_month_boundary_resolves_both_partitions() {
 /// The variants scan plan for `query` (the `MetricNode::Variants` leaf).
 fn variants_scan(query: &str, params: &QueryParams) -> pulsus_read::logql::MetricPlan {
     let expr = parse(query).expect("parse");
-    match plan(&expr, params, &ctx()).expect("plan") {
-        Plan::MetricBinary(pulsus_read::logql::MetricNode::Variants { scan, .. }) => *scan,
+    // Issue #272: `impl Drop for MetricNode` forbids moving out of a
+    // field (E0509), so this re-binds through a reference and clones.
+    let planned = plan(&expr, params, &ctx()).expect("plan");
+    match &planned {
+        Plan::MetricBinary(pulsus_read::logql::MetricNode::Variants { scan, .. }) => {
+            (**scan).clone()
+        }
         other => panic!("expected a variants plan, got {other:?}"),
     }
 }

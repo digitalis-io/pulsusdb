@@ -764,7 +764,7 @@ struct StoredStream {
 }
 
 #[derive(Debug, Default)]
-struct Store {
+pub struct Store {
     meta: HashMap<u64, StreamMetaRow>,
     rows: Vec<MetricScanRow>,
     streams: Vec<StoredStream>,
@@ -995,41 +995,53 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
     .map_err(|e| e.to_string())
 }
 
-fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {
-    match node {
-        MetricNode::Scalar(v) => Ok(QueryResult::Scalar(*v)),
-        MetricNode::VectorLit { value, window } => {
-            materialize_vector_lit(*value, window).map_err(|e| e.to_string())
-        }
-        MetricNode::Leaf(mp) => eval_leaf(mp, store),
-        MetricNode::Binary {
-            op,
-            return_bool,
-            matching,
-            lhs,
-            rhs,
-        } => {
-            let l = eval_node(lhs, store)?;
-            let r = eval_node(rhs, store)?;
-            combine_binary(*op, *return_bool, matching.as_ref(), l, r).map_err(|e| e.to_string())
-        }
-        MetricNode::VectorAgg { aggs, inner } => {
-            apply_vector_aggs(eval_node(inner, store)?, aggs).map_err(|e| e.to_string())
-        }
-        // `variants(...) of (...)` (issue #221): the pure twin of the
-        // live engine's fan-out — the SAME `VariantArena` +
-        // `VariantsAggState`, so corpus cases exercise the identical
-        // charging path. The common pipeline comes from the scan plan
-        // (already truncated at any dead common-range `unwrap`).
-        MetricNode::Variants { scan, variants, .. } => {
-            let common = scan
-                .client
-                .as_ref()
-                .ok_or_else(|| "variants scan plan must be client-aggregated".to_string())?;
-            run_variants_rows(&store.rows, &store.meta, &common.pipeline, variants)
-                .map_err(|e| e.to_string())
-        }
+/// Issue #272: a post-order fold over a value stack, mirroring the
+/// engine's `run_metric_node`. Left-to-right post-order evaluates `lhs`'s
+/// whole subtree before `rhs`'s, so every corpus expectation is
+/// unchanged.
+pub fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {
+    let mut nodes = Vec::new();
+    pulsus_logql::walk::postorder_into::<pulsus_read::logql::MetricNodeScc>(node, &mut nodes);
+    let mut vals: Vec<QueryResult> = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let v = match n {
+            MetricNode::Scalar(v) => QueryResult::Scalar(*v),
+            MetricNode::VectorLit { value, window } => {
+                materialize_vector_lit(*value, window).map_err(|e| e.to_string())?
+            }
+            MetricNode::Leaf(mp) => eval_leaf(mp, store)?,
+            MetricNode::Binary {
+                op,
+                return_bool,
+                matching,
+                ..
+            } => {
+                let r = vals.pop().expect("post-order pushes rhs");
+                let l = vals.pop().expect("post-order pushes lhs");
+                combine_binary(*op, *return_bool, matching.as_ref(), l, r)
+                    .map_err(|e| e.to_string())?
+            }
+            MetricNode::VectorAgg { aggs, .. } => {
+                let inner = vals.pop().expect("post-order pushes inner");
+                apply_vector_aggs(inner, aggs).map_err(|e| e.to_string())?
+            }
+            // `variants(...) of (...)` (issue #221): the pure twin of the
+            // live engine's fan-out — the SAME `VariantArena` +
+            // `VariantsAggState`, so corpus cases exercise the identical
+            // charging path. The common pipeline comes from the scan plan
+            // (already truncated at any dead common-range `unwrap`).
+            MetricNode::Variants { scan, variants, .. } => {
+                let common = scan
+                    .client
+                    .as_ref()
+                    .ok_or_else(|| "variants scan plan must be client-aggregated".to_string())?;
+                run_variants_rows(&store.rows, &store.meta, &common.pipeline, variants)
+                    .map_err(|e| e.to_string())?
+            }
+        };
+        vals.push(v);
     }
+    Ok(vals.pop().expect("a post-order fold leaves one value"))
 }
 
 // ---------------------------------------------------------------------

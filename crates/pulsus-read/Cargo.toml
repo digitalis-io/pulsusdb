@@ -93,5 +93,6 @@ uuid = { version = "1", features = ["v4"] }
 # `tests/logql_metric_agg_golden.rs` are the other two consumers: the
 # latter counts CALL EXPRESSIONS, so respelling a call site cannot move
 # a published count the way a substring census let it.
+sha2.workspace = true
 syn = { version = "=2.0.118", default-features = false, features = ["full", "parsing", "visit", "clone-impls", "printing"] }
 proc-macro2 = "1"

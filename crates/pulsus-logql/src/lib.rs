@@ -24,13 +24,15 @@ mod lexer;
 mod limits;
 mod parser;
 mod token;
+pub mod walk;
 
 pub use ast::{
     BINARY_OP_KEYWORDS, BinModifier, BinOp, CompareOp, DropKeepElem, Duration, Expr, Grouping,
-    GroupingKind, LabelExtraction, LabelFilterExpr, LabelFmt, LabelMatch, LineFilter, LineFilterOp,
-    LineMatch, LogExpr, LogRange, MatchGroup, MatchOp, Matcher, MetricExpr, NumericLiteral,
-    ParserStage, REMAINING_UNSUPPORTED_STAGES, RangeAggOp, Stage, StreamSelector,
-    UNWRAP_CONVERSIONS, Unwrap, VariantsExpr, VectorAggOp, VectorMatching,
+    GroupingKind, LabelExtraction, LabelFilterExpr, LabelFilterScc, LabelFmt, LabelMatch,
+    LineFilter, LineFilterOp, LineMatch, LogExpr, LogRange, MatchGroup, MatchOp, Matcher, MeNode,
+    MeRef, MeSlot, MeSlotNode, MeVal, MetricExpr, MetricScc, NumericLiteral, ParserStage,
+    REMAINING_UNSUPPORTED_STAGES, RangeAggOp, Stage, StreamSelector, UNWRAP_CONVERSIONS, Unwrap,
+    VariantsExpr, VectorAggOp, VectorMatching, for_each_label_filter, for_each_metric_expr,
 };
 pub use error::LogQlError;
 pub use limits::MAX_QUERY_BYTES;

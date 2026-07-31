@@ -237,7 +237,14 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
     // #240's sweep numbers stand: this is a redistribution, not a new
     // construction site.
     let expected: BTreeMap<&str, usize> = BTreeMap::from([
-        ("plan.rs", 14),
+        // Issue #272 moved `build_metric_node` — and with it ONE
+        // `PipelineInvalid` construction, the `Vector`-over-`Literal`
+        // rejection — into `plan_legacy_descent.rs`, the private module
+        // that holds the one walk this issue leaves recursive (#293
+        // deletes it whole). A redistribution, not a new construction
+        // site: 14 -> 13 + 1, total unchanged.
+        ("plan.rs", 13),
+        ("plan_legacy_descent.rs", 1),
         ("exec.rs", 12),
         ("client_agg.rs", 1),
         ("fold.rs", 1),

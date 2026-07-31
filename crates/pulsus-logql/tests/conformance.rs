@@ -33,6 +33,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use pulsus_logql::MeNode;
 use pulsus_logql::{
     BINARY_OP_KEYWORDS, BinOp, CompareOp, Expr, GroupingKind, LabelFilterExpr, LabelFmt,
     LineFilterOp, LogExpr, LogQlError, MatchGroup, MatchOp, MetricExpr, NumericLiteral,
@@ -413,8 +414,12 @@ fn walk_stage(stage: &Stage, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Issue #272: a driver consumer, not a recursion. `for_each_label_filter`
+/// walks the whole SCC-1 closure pre-order on the heap, so a flat
+/// `and`/`or` chain cannot abort this census. The construct set is
+/// unchanged (it is a `BTreeSet`, so visit order was never observable).
 fn walk_label_filter(lfe: &LabelFilterExpr, out: &mut BTreeSet<String>) {
-    match lfe {
+    pulsus_logql::for_each_label_filter(lfe, |lfe| match lfe {
         LabelFilterExpr::Match(m) => {
             out.insert("statics.string".to_string());
             match m.name.as_str() {
@@ -437,57 +442,42 @@ fn walk_label_filter(lfe: &LabelFilterExpr, out: &mut BTreeSet<String>) {
             out.insert("labelfilter.ip".to_string());
             out.insert("statics.string".to_string());
         }
-        LabelFilterExpr::And(a, b) => {
+        LabelFilterExpr::And(..) => {
             out.insert("labelfilter.and".to_string());
-            walk_label_filter(a, out);
-            walk_label_filter(b, out);
         }
-        LabelFilterExpr::Or(a, b) => {
+        LabelFilterExpr::Or(..) => {
             out.insert("labelfilter.or".to_string());
-            walk_label_filter(a, out);
-            walk_label_filter(b, out);
         }
-    }
+    });
 }
 
+/// Issue #272: a driver consumer, not a recursion. `for_each_metric_expr`
+/// walks the whole SCC-2 closure pre-order on the heap, so this census
+/// cannot abort on a wide `or` chain. The construct set is unchanged (it
+/// is a `BTreeSet`, so visit order was never observable).
 fn walk_metric(me: &MetricExpr, out: &mut BTreeSet<String>) {
-    match me {
-        MetricExpr::Range { op, range, .. } => {
+    pulsus_logql::for_each_metric_expr(me, |n| match n {
+        MeNode::Expr(MetricExpr::Range { op, range, .. }) => {
             out.insert(range_id(*op).to_string());
             out.insert("range.duration_literal".to_string());
             walk_log(&range.selector, out);
         }
-        MetricExpr::Vector {
-            op,
-            grouping,
-            inner,
-            ..
-        } => {
+        MeNode::Expr(MetricExpr::Vector { op, grouping, .. }) => {
             out.insert(vector_id(*op).to_string());
             if let Some(g) = grouping {
                 out.insert(grouping_id(g.kind).to_string());
             }
-            walk_metric(inner, out);
         }
-        MetricExpr::Literal(_) => {
+        MeNode::Expr(MetricExpr::Literal(_)) => {
             out.insert("statics.number".to_string());
         }
-        MetricExpr::VectorFn(_) => {
+        MeNode::Expr(MetricExpr::VectorFn(_)) => {
             out.insert("func.vector".to_string());
         }
-        MetricExpr::Variants(v) => {
+        MeNode::Expr(MetricExpr::Variants(_)) => {
             out.insert("func.variants".to_string());
-            for variant in &v.variants {
-                walk_metric(variant, out);
-            }
-            walk_log(&v.range.selector, out);
         }
-        MetricExpr::Binary {
-            op,
-            modifier,
-            lhs,
-            rhs,
-        } => {
+        MeNode::Expr(MetricExpr::Binary { op, modifier, .. }) => {
             out.insert(binop_id(*op).to_string());
             if let Some(m) = modifier {
                 if m.return_bool {
@@ -500,10 +490,11 @@ fn walk_metric(me: &MetricExpr, out: &mut BTreeSet<String>) {
                     }
                 }
             }
-            walk_metric(lhs, out);
-            walk_metric(rhs, out);
         }
-    }
+        MeNode::Var(v) => {
+            walk_log(&v.range.selector, out);
+        }
+    });
 }
 
 fn range_id(op: RangeAggOp) -> &'static str {

@@ -1,0 +1,723 @@
+##### MetricNode #####
+=== scalar ===
+--- Debug {:?} ---
+Scalar(3.0)
+--- Debug {:#?} ---
+Scalar(
+    3.0,
+)
+=== vector literal ===
+--- Debug {:?} ---
+VectorLit { value: 1.5, window: GridWindow { start_ns: 1000, end_ns: 2000, step_ns: None } }
+--- Debug {:#?} ---
+VectorLit {
+    value: 1.5,
+    window: GridWindow {
+        start_ns: 1000,
+        end_ns: 2000,
+        step_ns: None,
+    },
+}
+=== vector agg over a scalar ===
+--- Debug {:?} ---
+VectorAgg { aggs: [], inner: Scalar(7.0) }
+--- Debug {:#?} ---
+VectorAgg {
+    aggs: [],
+    inner: Scalar(
+        7.0,
+    ),
+}
+=== binary plain ===
+--- Debug {:?} ---
+Binary { op: Add, return_bool: false, matching: None, lhs: Scalar(1.0), rhs: Scalar(2.0) }
+--- Debug {:#?} ---
+Binary {
+    op: Add,
+    return_bool: false,
+    matching: None,
+    lhs: Scalar(
+        1.0,
+    ),
+    rhs: Scalar(
+        2.0,
+    ),
+}
+=== binary with the bool modifier ===
+--- Debug {:?} ---
+Binary { op: Gt, return_bool: true, matching: None, lhs: Scalar(1.0), rhs: VectorLit { value: 1.5, window: GridWindow { start_ns: 1000, end_ns: 2000, step_ns: None } } }
+--- Debug {:#?} ---
+Binary {
+    op: Gt,
+    return_bool: true,
+    matching: None,
+    lhs: Scalar(
+        1.0,
+    ),
+    rhs: VectorLit {
+        value: 1.5,
+        window: GridWindow {
+            start_ns: 1000,
+            end_ns: 2000,
+            step_ns: None,
+        },
+    },
+}
+=== left-deep chain ===
+--- Debug {:?} ---
+Binary { op: Or, return_bool: false, matching: None, lhs: Binary { op: Or, return_bool: false, matching: None, lhs: Scalar(1.0), rhs: VectorLit { value: 1.5, window: GridWindow { start_ns: 1000, end_ns: 2000, step_ns: None } } }, rhs: VectorAgg { aggs: [], inner: Scalar(2.0) } }
+--- Debug {:#?} ---
+Binary {
+    op: Or,
+    return_bool: false,
+    matching: None,
+    lhs: Binary {
+        op: Or,
+        return_bool: false,
+        matching: None,
+        lhs: Scalar(
+            1.0,
+        ),
+        rhs: VectorLit {
+            value: 1.5,
+            window: GridWindow {
+                start_ns: 1000,
+                end_ns: 2000,
+                step_ns: None,
+            },
+        },
+    },
+    rhs: VectorAgg {
+        aggs: [],
+        inner: Scalar(
+            2.0,
+        ),
+    },
+}
+=== right-deep chain ===
+--- Debug {:?} ---
+Binary { op: Add, return_bool: false, matching: None, lhs: Scalar(1.0), rhs: Binary { op: Sub, return_bool: false, matching: None, lhs: VectorLit { value: 1.5, window: GridWindow { start_ns: 1000, end_ns: 2000, step_ns: None } }, rhs: VectorAgg { aggs: [], inner: Scalar(4.0) } } }
+--- Debug {:#?} ---
+Binary {
+    op: Add,
+    return_bool: false,
+    matching: None,
+    lhs: Scalar(
+        1.0,
+    ),
+    rhs: Binary {
+        op: Sub,
+        return_bool: false,
+        matching: None,
+        lhs: VectorLit {
+            value: 1.5,
+            window: GridWindow {
+                start_ns: 1000,
+                end_ns: 2000,
+                step_ns: None,
+            },
+        },
+        rhs: VectorAgg {
+            aggs: [],
+            inner: Scalar(
+                4.0,
+            ),
+        },
+    },
+}
+=== vector agg over a binary ===
+--- Debug {:?} ---
+VectorAgg { aggs: [], inner: Binary { op: Mul, return_bool: false, matching: None, lhs: Scalar(5.0), rhs: VectorLit { value: 1.5, window: GridWindow { start_ns: 1000, end_ns: 2000, step_ns: None } } } }
+--- Debug {:#?} ---
+VectorAgg {
+    aggs: [],
+    inner: Binary {
+        op: Mul,
+        return_bool: false,
+        matching: None,
+        lhs: Scalar(
+            5.0,
+        ),
+        rhs: VectorLit {
+            value: 1.5,
+            window: GridWindow {
+                start_ns: 1000,
+                end_ns: 2000,
+                step_ns: None,
+            },
+        },
+    },
+}
+
+##### CompiledPipeline (pre-Wave-2) #####
+=== {a="b"} | x="1" ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [LabelFilter(Match { name: "x", op: Eq, value: "1", re: None })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: false, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        LabelFilter(
+            Match {
+                name: "x",
+                op: Eq,
+                value: "1",
+                re: None,
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: false,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | x=~"1.*" ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [LabelFilter(Match { name: "x", op: Re, value: "1.*", re: Some(Regex("^(?:1.*)$")) })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: false, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        LabelFilter(
+            Match {
+                name: "x",
+                op: Re,
+                value: "1.*",
+                re: Some(
+                    Regex(
+                        "^(?:1.*)$",
+                    ),
+                ),
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: false,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | x!="1" ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [LabelFilter(Match { name: "x", op: Neq, value: "1", re: None })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: false, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        LabelFilter(
+            Match {
+                name: "x",
+                op: Neq,
+                value: "1",
+                re: None,
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: false,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | x!~"1.*" ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [LabelFilter(Match { name: "x", op: Nre, value: "1.*", re: Some(Regex("^(?:1.*)$")) })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: false, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        LabelFilter(
+            Match {
+                name: "x",
+                op: Nre,
+                value: "1.*",
+                re: Some(
+                    Regex(
+                        "^(?:1.*)$",
+                    ),
+                ),
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: false,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | logfmt | dur > 1s ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [Logfmt { strict: false, keep_empty: false, extractions: [] }, LabelFilter(Compare { name: "dur", op: Gt, kind: Duration, threshold: 1.0 })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: true, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: [],
+        },
+        LabelFilter(
+            Compare {
+                name: "dur",
+                op: Gt,
+                kind: Duration,
+                threshold: 1.0,
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: true,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | logfmt | n >= 2 ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [Logfmt { strict: false, keep_empty: false, extractions: [] }, LabelFilter(Compare { name: "n", op: Gte, kind: Number, threshold: 2.0 })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: true, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: [],
+        },
+        LabelFilter(
+            Compare {
+                name: "n",
+                op: Gte,
+                kind: Number,
+                threshold: 2.0,
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: true,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | logfmt | n < 3 or n > 9 ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [Logfmt { strict: false, keep_empty: false, extractions: [] }, LabelFilter(Or(Compare { name: "n", op: Lt, kind: Number, threshold: 3.0 }, Compare { name: "n", op: Gt, kind: Number, threshold: 9.0 }))], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: true, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: [],
+        },
+        LabelFilter(
+            Or(
+                Compare {
+                    name: "n",
+                    op: Lt,
+                    kind: Number,
+                    threshold: 3.0,
+                },
+                Compare {
+                    name: "n",
+                    op: Gt,
+                    kind: Number,
+                    threshold: 9.0,
+                },
+            ),
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: true,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | logfmt | n = 1 and m = 2 ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [Logfmt { strict: false, keep_empty: false, extractions: [] }, LabelFilter(And(Compare { name: "n", op: Eq, kind: Number, threshold: 1.0 }, Compare { name: "m", op: Eq, kind: Number, threshold: 2.0 }))], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: true, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: [],
+        },
+        LabelFilter(
+            And(
+                Compare {
+                    name: "n",
+                    op: Eq,
+                    kind: Number,
+                    threshold: 1.0,
+                },
+                Compare {
+                    name: "m",
+                    op: Eq,
+                    kind: Number,
+                    threshold: 2.0,
+                },
+            ),
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: true,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | logfmt | n = 1, m = 2 ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [Logfmt { strict: false, keep_empty: false, extractions: [] }, LabelFilter(And(Compare { name: "n", op: Eq, kind: Number, threshold: 1.0 }, Compare { name: "m", op: Eq, kind: Number, threshold: 2.0 }))], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: true, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: [],
+        },
+        LabelFilter(
+            And(
+                Compare {
+                    name: "n",
+                    op: Eq,
+                    kind: Number,
+                    threshold: 1.0,
+                },
+                Compare {
+                    name: "m",
+                    op: Eq,
+                    kind: Number,
+                    threshold: 2.0,
+                },
+            ),
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: true,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | logfmt | (n = 1 or m = 2) and o = 3 ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [Logfmt { strict: false, keep_empty: false, extractions: [] }, LabelFilter(And(Or(Compare { name: "n", op: Eq, kind: Number, threshold: 1.0 }, Compare { name: "m", op: Eq, kind: Number, threshold: 2.0 }), Compare { name: "o", op: Eq, kind: Number, threshold: 3.0 }))], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: true, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: [],
+        },
+        LabelFilter(
+            And(
+                Or(
+                    Compare {
+                        name: "n",
+                        op: Eq,
+                        kind: Number,
+                        threshold: 1.0,
+                    },
+                    Compare {
+                        name: "m",
+                        op: Eq,
+                        kind: Number,
+                        threshold: 2.0,
+                    },
+                ),
+                Compare {
+                    name: "o",
+                    op: Eq,
+                    kind: Number,
+                    threshold: 3.0,
+                },
+            ),
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: true,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | logfmt | n = 1 or (m = 2 and o = 3) ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [Logfmt { strict: false, keep_empty: false, extractions: [] }, LabelFilter(Or(Compare { name: "n", op: Eq, kind: Number, threshold: 1.0 }, And(Compare { name: "m", op: Eq, kind: Number, threshold: 2.0 }, Compare { name: "o", op: Eq, kind: Number, threshold: 3.0 })))], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: true, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: [],
+        },
+        LabelFilter(
+            Or(
+                Compare {
+                    name: "n",
+                    op: Eq,
+                    kind: Number,
+                    threshold: 1.0,
+                },
+                And(
+                    Compare {
+                        name: "m",
+                        op: Eq,
+                        kind: Number,
+                        threshold: 2.0,
+                    },
+                    Compare {
+                        name: "o",
+                        op: Eq,
+                        kind: Number,
+                        threshold: 3.0,
+                    },
+                ),
+            ),
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: true,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | ip_field = ip("1.2.3.4") ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [LabelFilter(Ip { name: "ip_field", matcher: V4 { start: 16909060, end: 16909060 }, negated: false })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: false, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        LabelFilter(
+            Ip {
+                name: "ip_field",
+                matcher: V4 {
+                    start: 16909060,
+                    end: 16909060,
+                },
+                negated: false,
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: false,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | ip_field != ip("1.2.3.0/24") ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [LabelFilter(Ip { name: "ip_field", matcher: V4 { start: 16909056, end: 16909311 }, negated: true })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: false, rewrites_line: false, line_filter_only: false, has_unwrap: false, seen_line_format: false, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        LabelFilter(
+            Ip {
+                name: "ip_field",
+                matcher: V4 {
+                    start: 16909056,
+                    end: 16909311,
+                },
+                negated: true,
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: false,
+    rewrites_line: false,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: false,
+    all_line_filter_source: false,
+}
+=== {a="b"} | line_format "{{.a}}" | x="1" ===
+--- Debug {:?} ---
+CompiledPipeline { stages: [LineFormat { tmpl: Simple("a"), reads_err: false }, LabelFilter(Match { name: "x", op: Eq, value: "1", re: None })], template_env: TemplateEnv { local: Some(UTC), local_name: Some("Local"), now_ns: Some(1700000000000000000) }, mutates_labels: false, rewrites_line: true, line_filter_only: false, has_unwrap: false, seen_line_format: true, all_line_filter_source: false }
+--- Debug {:#?} ---
+CompiledPipeline {
+    stages: [
+        LineFormat {
+            tmpl: Simple(
+                "a",
+            ),
+            reads_err: false,
+        },
+        LabelFilter(
+            Match {
+                name: "x",
+                op: Eq,
+                value: "1",
+                re: None,
+            },
+        ),
+    ],
+    template_env: TemplateEnv {
+        local: Some(
+            UTC,
+        ),
+        local_name: Some(
+            "Local",
+        ),
+        now_ns: Some(
+            1700000000000000000,
+        ),
+    },
+    mutates_labels: false,
+    rewrites_line: true,
+    line_filter_only: false,
+    has_unwrap: false,
+    seen_line_format: true,
+    all_line_filter_source: false,
+}
