@@ -1593,6 +1593,15 @@ async fn run_metric_instant_ordered_case(
 /// oracle comparison keeps the standard gated/informational split plus its
 /// anti-rot (no range case is ledgered as divergent any more — #227
 /// resolved the one entry that was).
+///
+/// The oracle comparison REQUIRES `deploy/e2e/loki.yaml`'s
+/// `split_queries_by_interval: 0` (issue #301): with the reference's
+/// default the query-frontend floors the request `start` to a multiple of
+/// `step` before its engine runs, so it answers on an epoch-aligned grid
+/// and every start-anchored expectation misses. If this case turns red
+/// with the oracle's timestamps all whole multiples of `step_s` while
+/// PulsusDB's carry the request's sub-second offset, that limit is what
+/// regressed — see the ledger's `frontend-step-alignment`.
 async fn run_metric_range_case(
     ctx: &Ctx,
     corpus: &LogCorpus,

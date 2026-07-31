@@ -255,6 +255,58 @@ Out of this ledger's scope by design:
   and a hermetic test evaluates every committed range case through the
   shipped sliding evaluator and requires the two to agree.
 
+### frontend-step-alignment (issue #301, oracle-config note — no case downgraded)
+
+- **What diverges:** the reference's **query-frontend**, not its LogQL
+  engine. `metricQuerySplitter.split`
+  (`pkg/querier/queryrange/splitters.go`, v3.4.2 L242, unchanged at
+  v3.7.4 L236) calls `alignStartEnd(step, start, end)` on every RANGE
+  metric request before the engine sees it: `start` is floored to a
+  multiple of `step` **in absolute epoch time** and `end` is ceilinged.
+  It is unconditional — it runs even when the query produces a single
+  split, and it is NOT `align_queries_with_step` (that limit is `false`
+  here and gates a different middleware). The only switch is
+  `split_queries_by_interval`: `split_by_interval.go`'s `Do` returns
+  `h.next.Do(ctx, r)` before the splitter when the interval is `0`.
+- **Measured** against the pinned `grafana/loki:3.4.2` image
+  (digest `sha256:58a6c186…`), one corpus, two containers differing only
+  in that limit, `rate({…}[1m])`, `step=60`, request `start` off a
+  60s boundary by `…157567938ns`:
+  - default `1h`: points at `…760, …820, …` — exact multiples of 60,
+    i.e. the requested `start` discarded;
+  - `0`: points at `…715.157, …775.157, …` — `start + k·step`, byte-equal
+    to PulsusDB and to the corpus expectation, including both partial
+    edge windows.
+  - With the default, a request for `[t₀, t₁]` returned a point BEFORE
+    `t₀` and one AFTER `t₁` (requested `1785483001.158 → 1785483200.158`,
+    returned `1785483000` and `1785483240`).
+- **Verdict — PulsusDB is correct, the frontend rewrite is the defect.**
+  Returning samples outside the requested `[start, end]`, at timestamps
+  that are not `start + k·step`, breaks the Prometheus `query_range`
+  contract the endpoint mirrors, and contradicts the reference's OWN
+  engine (`pkg/logql`, start-anchored — the semantics issue #227 ported
+  and the `logqltest` corpus pins). Same binary, two answers, decided by
+  a tenant limit. PulsusDB does **not** implement the rewrite and must
+  not: it would make our answer depend on config and put points outside
+  the window a client asked for.
+- **Consequence for the differential:** `deploy/e2e/loki.yaml` sets
+  `split_queries_by_interval: 0`, so the oracle answers the range query
+  it was asked and the five `metric_range` cases stay **`gated`** with
+  their full value comparison (both edge buckets on an off-boundary
+  grid — the most sensitive points of a sliding-window implementation).
+  No case is downgraded and no ledger id is referenced from the fixture.
+  Blast radius measured on the same two containers: only the five
+  `metric_range` cases differ between the two configs; the other 32
+  shipped cases (streams, `streams_limited`, instant, ordered-instant,
+  error) are byte-identical.
+- **History:** this is why `e2e-metrics-full (single)` was red from the
+  2026-07-27 nightly (first scheduled run after issue #227 landed on
+  07-26) — #227 moved the expectation from a tumbling, step-aligned grid
+  (which coincided with the frontend's rewrite) to the start-anchored
+  one, so the oracle's aligned timestamps stopped matching. Failure mode
+  was `oracle diverged from the corpus expectation` on
+  `metric_rate_sliding`, the first of the five range cases to run.
+
 ### matching-error-status-divergence (informational note, not a gate downgrade)
 
 - **Cases:** `metric_match_multiple_err`, `metric_match_duplicate_err`
