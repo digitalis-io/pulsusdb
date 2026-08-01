@@ -33,6 +33,18 @@
 //!
 //! Injection boundary: every user-controlled key/value/regex flows
 //! through [`crate::logql::escape`] before it reaches a SQL fragment.
+//!
+//! **Regex half of the #240 invariant (issue #282).** Every renderer here
+//! that turns a user regex into a `match()` argument goes through
+//! [`escape::ch_regex_anchored_checked`], which compiles byte-for-byte
+//! the pattern it escapes. Rendering IS the validation, so the two can
+//! never disagree, and the fallibility that follows from that is threaded
+//! outward: [`physical_sql`], [`value_pred_sql`] and the generator
+//! builders return [`PlanError`], and their callers in
+//! [`super::search_plan`] / [`super::metrics_sql`] discharge it at plan
+//! time. TraceQL therefore no longer holds a capability token for the raw
+//! escapers — those are private to `logql::escape`, so a regex rendered
+//! anywhere in `traces/` without validation does not compile.
 
 use pulsus_traceql::{
     ArithOp, AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, Operand, SpanKindValue,
@@ -40,6 +52,7 @@ use pulsus_traceql::{
 };
 
 use crate::logql::escape;
+use crate::logql::pipeline::PipelineError;
 
 use super::search_sql::byte_cap_expr;
 
@@ -391,12 +404,35 @@ fn string_op_leaf(
     }
 }
 
+/// The ONE regex→SQL renderer on the TraceQL path (issue #282): the
+/// checked escaper compiles `^(?:pat)$` — byte-for-byte the string it
+/// escapes — so an uncompilable pattern is a plan-time [`PlanError`]
+/// (`400`) rather than a mid-query ClickHouse error, and no second
+/// validator can disagree with what the SQL actually says.
+///
+/// The message keeps this module's `invalid regex {pat:?}: …` shape. Only
+/// the inner reason moves: `escape::ch_regex_anchored_checked` reports the
+/// error of the pattern the CLIENT wrote when that alone fails to compile
+/// (the #240 rule), instead of the `^(?:…)$` rewrite's error.
+fn anchored_regex_sql(pat: &str) -> Result<String, PlanError> {
+    escape::ch_regex_anchored_checked(pat).map_err(|e| {
+        let PipelineError::BadRegex(reason) = e else {
+            // `ch_regex_anchored_checked` constructs no other variant;
+            // rendering defensively keeps this total without a panic.
+            return PlanError::TypeMismatch(format!("invalid regex {pat:?}: {e}"));
+        };
+        PlanError::TypeMismatch(format!("invalid regex {pat:?}: {reason}"))
+    })
+}
+
 /// Renders a physical predicate as its pre-escaped SQL fragment (used by
 /// the generator queries; Phase-2 evaluation uses the typed form).
-pub(crate) fn physical_sql(p: &PhysicalPredicate) -> String {
-    match p {
-        PhysicalPredicate::Name { op, value } => string_column_sql("name", *op, value),
-        PhysicalPredicate::Service { op, value } => string_column_sql("service", *op, value),
+/// Fallible because the regex operators validate as they render (issue
+/// #282).
+pub(crate) fn physical_sql(p: &PhysicalPredicate) -> Result<String, PlanError> {
+    Ok(match p {
+        PhysicalPredicate::Name { op, value } => string_column_sql("name", *op, value)?,
+        PhysicalPredicate::Service { op, value } => string_column_sql("service", *op, value)?,
         PhysicalPredicate::DurationNs { op, nanos } => {
             let sym = sql_op(*op).expect("duration ops are ordering/equality by construction");
             format!("duration_ns {sym} {nanos}")
@@ -418,22 +454,22 @@ pub(crate) fn physical_sql(p: &PhysicalPredicate) -> String {
             // whose capped rendering equals the literal). No index is
             // lost: `status_message` has none (SpanScan class — the
             // bounded time-window scan prunes on `timestamp_ns` alone).
-            string_column_sql(&byte_cap_expr("status_message"), *op, value)
+            string_column_sql(&byte_cap_expr("status_message"), *op, value)?
         }
-        PhysicalPredicate::SpanIdHex { op, value } => hex_column_sql("span_id", *op, value),
-        PhysicalPredicate::ParentIdHex { op, value } => hex_column_sql("parent_id", *op, value),
+        PhysicalPredicate::SpanIdHex { op, value } => hex_column_sql("span_id", *op, value)?,
+        PhysicalPredicate::ParentIdHex { op, value } => hex_column_sql("parent_id", *op, value)?,
         PhysicalPredicate::InstrumentationName { op, value } => {
             // Issue #192: compare the CAPPED column (the `statusMessage`
             // precedent) so Phase-1 candidate selection agrees byte-for-byte
             // with the capped `scope_name` Phase 2 hydrates and evaluates. No
             // index is lost: `scope_name` has none (SpanScan class — the
             // bounded time-window scan prunes on `timestamp_ns` alone).
-            string_column_sql(&byte_cap_expr("scope_name"), *op, value)
+            string_column_sql(&byte_cap_expr("scope_name"), *op, value)?
         }
         PhysicalPredicate::InstrumentationVersion { op, value } => {
-            string_column_sql(&byte_cap_expr("scope_version"), *op, value)
+            string_column_sql(&byte_cap_expr("scope_version"), *op, value)?
         }
-    }
+    })
 }
 
 /// The all-zero `parent_id`/`trace_id` sentinel rendering the codebase uses
@@ -446,62 +482,39 @@ pub(crate) const ZERO_PARENT_SQL: &str = "toFixedString(unhex('0000000000000000'
 /// (`span_id`/`parent_id`) — `lower(hex(col))` vs the (Eq/Neq: lowercased,
 /// Re/Nre: raw) value, so the SQL predicate matches the engine-side hex
 /// comparison in [`crate::traces::search_eval`].
-fn hex_column_sql(column: &str, op: ComparisonOp, value: &str) -> String {
-    match op {
+fn hex_column_sql(column: &str, op: ComparisonOp, value: &str) -> Result<String, PlanError> {
+    Ok(match op {
         ComparisonOp::Eq => format!("lower(hex({column})) = {}", escape::ch_string(value)),
         ComparisonOp::Neq => format!("lower(hex({column})) != {}", escape::ch_string(value)),
         ComparisonOp::Re => format!(
             "match(lower(hex({column})), {})",
-            escape::ch_regex_anchored_traceql_prevalidated(
-                crate::traces::TraceqlPrevalidated::new(),
-                value
-            )
+            anchored_regex_sql(value)?
         ),
         ComparisonOp::Nre => format!(
             "NOT match(lower(hex({column})), {})",
-            escape::ch_regex_anchored_traceql_prevalidated(
-                crate::traces::TraceqlPrevalidated::new(),
-                value
-            )
+            anchored_regex_sql(value)?
         ),
         _ => unreachable!("hex id columns accept only = != =~ !~ (checked at compile_leaf)"),
-    }
+    })
 }
 
-fn string_column_sql(column: &str, op: ComparisonOp, value: &str) -> String {
-    match op {
+fn string_column_sql(column: &str, op: ComparisonOp, value: &str) -> Result<String, PlanError> {
+    Ok(match op {
         ComparisonOp::Eq => format!("{column} = {}", escape::ch_string(value)),
         ComparisonOp::Neq => format!("{column} != {}", escape::ch_string(value)),
-        ComparisonOp::Re => format!(
-            "match({column}, {})",
-            escape::ch_regex_anchored_traceql_prevalidated(
-                crate::traces::TraceqlPrevalidated::new(),
-                value
-            )
-        ),
-        ComparisonOp::Nre => format!(
-            "NOT match({column}, {})",
-            escape::ch_regex_anchored_traceql_prevalidated(
-                crate::traces::TraceqlPrevalidated::new(),
-                value
-            )
-        ),
+        ComparisonOp::Re => format!("match({column}, {})", anchored_regex_sql(value)?),
+        ComparisonOp::Nre => format!("NOT match({column}, {})", anchored_regex_sql(value)?),
         _ => unreachable!("string columns accept only = != =~ !~ (checked at compile_leaf)"),
-    }
+    })
 }
 
 /// Renders an attribute probe's value predicate as its pre-escaped SQL
-/// fragment.
-pub(crate) fn value_pred_sql(pred: &ValuePred) -> String {
-    match pred {
+/// fragment. Fallible for the same reason as [`physical_sql`] (issue
+/// #282): the regex arm validates as it renders.
+pub(crate) fn value_pred_sql(pred: &ValuePred) -> Result<String, PlanError> {
+    Ok(match pred {
         ValuePred::StringEq(v) => format!("val = {}", escape::ch_string(v)),
-        ValuePred::Regex(pat) => format!(
-            "match(val, {})",
-            escape::ch_regex_anchored_traceql_prevalidated(
-                crate::traces::TraceqlPrevalidated::new(),
-                pat
-            )
-        ),
+        ValuePred::Regex(pat) => format!("match(val, {})", anchored_regex_sql(pat)?),
         ValuePred::Num { op, value } => {
             let sym = sql_op(*op).expect("numeric ops are ordering/equality by construction");
             format!("val_num {sym} {}", render_num(*value))
@@ -511,7 +524,7 @@ pub(crate) fn value_pred_sql(pred: &ValuePred) -> String {
         ValuePred::KeyExists => "1".to_string(),
         // A pre-rendered `val_num` arithmetic predicate (issue #185).
         ValuePred::NumExpr(sql) => sql.clone(),
-    }
+    })
 }
 
 fn attr_scope_literal(scope: AttrScope) -> Option<&'static str> {
@@ -667,7 +680,7 @@ fn compile_attr_probe_leaf(
         LeafGenerator {
             class,
             table: GenTable::Attrs,
-            predicate: attr_generator_predicate(&probe, class),
+            predicate: attr_generator_predicate(&probe, class)?,
             prewhere: None,
         }
     };
@@ -681,13 +694,13 @@ fn compile_attr_probe_leaf(
 /// scoped) plus the value predicate — the value side is prefix-served for
 /// [`GenClass::AttrEq`] and a key-only filter for
 /// [`GenClass::AttrKeyScan`] (docs/schemas.md §4.2's generator table).
-fn attr_generator_predicate(probe: &AttrProbe, _class: GenClass) -> String {
+fn attr_generator_predicate(probe: &AttrProbe, _class: GenClass) -> Result<String, PlanError> {
     let mut parts = vec![format!("key = {}", escape::ch_string(&probe.key))];
-    parts.push(value_pred_sql(&probe.pred));
+    parts.push(value_pred_sql(&probe.pred)?);
     if let Some(scope) = probe.scope {
         parts.push(format!("scope = {}", escape::ch_string(scope)));
     }
-    parts.join(" AND ")
+    Ok(parts.join(" AND "))
 }
 
 /// Compiles the `resource.service.name` fast path (adjudication 5: only
@@ -718,7 +731,7 @@ fn compile_service_leaf(op: ComparisonOp, value: &Value) -> Result<CompiledLeaf,
             LeafGenerator {
                 class: GenClass::AttrKeyScan,
                 table: GenTable::Attrs,
-                predicate: attr_generator_predicate(&probe, GenClass::AttrKeyScan),
+                predicate: attr_generator_predicate(&probe, GenClass::AttrKeyScan)?,
                 prewhere: None,
             }
         }
@@ -757,7 +770,7 @@ fn compile_span_hex_leaf(
         SpanHexColumn::ParentId => PhysicalPredicate::ParentIdHex { op, value: stored },
     };
     Ok(CompiledLeaf {
-        generator: spans_generator_for(&physical),
+        generator: spans_generator_for(&physical)?,
         eval: LeafEval::Physical(physical),
     })
 }
@@ -894,17 +907,11 @@ fn compile_trace_id_leaf(op: ComparisonOp, value: &Value) -> Result<CompiledLeaf
         ComparisonOp::Neq => format!("trace_id != unhex({})", escape::ch_string(&stored)),
         ComparisonOp::Re => format!(
             "match(lower(hex(trace_id)), {})",
-            escape::ch_regex_anchored_traceql_prevalidated(
-                crate::traces::TraceqlPrevalidated::new(),
-                &stored
-            )
+            anchored_regex_sql(&stored)?
         ),
         ComparisonOp::Nre => format!(
             "NOT match(lower(hex(trace_id)), {})",
-            escape::ch_regex_anchored_traceql_prevalidated(
-                crate::traces::TraceqlPrevalidated::new(),
-                &stored
-            )
+            anchored_regex_sql(&stored)?
         ),
         _ => unreachable!("trace:id accepts only = != =~ !~"),
     };
@@ -931,7 +938,7 @@ pub fn compile_leaf(
             let (op, s) = string_op_leaf("name", op, value)?;
             let physical = PhysicalPredicate::Name { op, value: s };
             Ok(CompiledLeaf {
-                generator: spans_generator_for(&physical),
+                generator: spans_generator_for(&physical)?,
                 eval: LeafEval::Physical(physical),
             })
         }
@@ -954,7 +961,7 @@ pub fn compile_leaf(
                 generator: LeafGenerator {
                     class: GenClass::Duration,
                     table: GenTable::Spans,
-                    predicate: physical_sql(&physical),
+                    predicate: physical_sql(&physical)?,
                     prewhere: None,
                 },
                 eval: LeafEval::Physical(physical),
@@ -976,7 +983,7 @@ pub fn compile_leaf(
                 code: status_code(*s),
             };
             Ok(CompiledLeaf {
-                generator: spans_generator_for(&physical),
+                generator: spans_generator_for(&physical)?,
                 eval: LeafEval::Physical(physical),
             })
         }
@@ -996,7 +1003,7 @@ pub fn compile_leaf(
                 code: kind_code(*k),
             };
             Ok(CompiledLeaf {
-                generator: spans_generator_for(&physical),
+                generator: spans_generator_for(&physical)?,
                 eval: LeafEval::Physical(physical),
             })
         }
@@ -1014,7 +1021,7 @@ pub fn compile_leaf(
             let (op, s) = string_op_leaf("statusMessage", op, value)?;
             let physical = PhysicalPredicate::StatusMessage { op, value: s };
             Ok(CompiledLeaf {
-                generator: spans_generator_for(&physical),
+                generator: spans_generator_for(&physical)?,
                 eval: LeafEval::Physical(physical),
             })
         }
@@ -1041,7 +1048,7 @@ pub fn compile_leaf(
             let (op, s) = string_op_leaf("instrumentation:name", op, value)?;
             let physical = PhysicalPredicate::InstrumentationName { op, value: s };
             Ok(CompiledLeaf {
-                generator: spans_generator_for(&physical),
+                generator: spans_generator_for(&physical)?,
                 eval: LeafEval::Physical(physical),
             })
         }
@@ -1049,7 +1056,7 @@ pub fn compile_leaf(
             let (op, s) = string_op_leaf("instrumentation:version", op, value)?;
             let physical = PhysicalPredicate::InstrumentationVersion { op, value: s };
             Ok(CompiledLeaf {
-                generator: spans_generator_for(&physical),
+                generator: spans_generator_for(&physical)?,
                 eval: LeafEval::Physical(physical),
             })
         }
@@ -1244,7 +1251,7 @@ fn compile_exists(field: &Field) -> Result<CompiledLeaf, PlanError> {
     let generator = LeafGenerator {
         class: GenClass::AttrKeyScan,
         table: GenTable::Attrs,
-        predicate: attr_generator_predicate(&probe, GenClass::AttrKeyScan),
+        predicate: attr_generator_predicate(&probe, GenClass::AttrKeyScan)?,
         prewhere: None,
     };
     Ok(CompiledLeaf {
@@ -1395,7 +1402,7 @@ fn compile_field_arith(
             LeafGenerator {
                 class: GenClass::AttrKeyScan,
                 table: GenTable::Attrs,
-                predicate: attr_generator_predicate(&probe, GenClass::AttrKeyScan),
+                predicate: attr_generator_predicate(&probe, GenClass::AttrKeyScan)?,
                 prewhere: None,
             }
         };
@@ -1571,13 +1578,13 @@ fn flip_comparison(op: ComparisonOp) -> ComparisonOp {
 /// `name`/`status`/`kind` generators: no selective index — a bounded
 /// time-window span scan with the predicate applied (complete over the
 /// window; the scan budget bounds its cost — docs/schemas.md §4.2).
-fn spans_generator_for(physical: &PhysicalPredicate) -> LeafGenerator {
-    LeafGenerator {
+fn spans_generator_for(physical: &PhysicalPredicate) -> Result<LeafGenerator, PlanError> {
+    Ok(LeafGenerator {
         class: GenClass::SpanScan,
         table: GenTable::Spans,
-        predicate: physical_sql(physical),
+        predicate: physical_sql(physical)?,
         prewhere: None,
-    }
+    })
 }
 
 /// Compiles every comparison of one `{...}` spanset filter in pre-order
@@ -2420,5 +2427,105 @@ mod tests {
             sql.contains(r"val = 'x\'; DROP TABLE trace_spans; --'"),
             "quote must be escaped, got {sql}"
         );
+    }
+
+    // --- issue #282: rendering a regex IS validating it ---------------
+
+    /// Every regex rendering site in this module, one query each: the
+    /// physical string columns (plain and byte-capped), both hex id
+    /// columns, `trace:id`, and an attribute value — plus the physical
+    /// negations, which render `NOT match(…)` and so validate here too.
+    /// `(` is uncompilable in the Rust `regex` crate and in RE2 alike, so
+    /// each must be a `PlanError` from **this module**, at the public
+    /// [`compile_span_filter`] entry point, with no planner involved.
+    ///
+    /// Before issue #282 every one of these returned `Ok` carrying
+    /// `match(<col>, '^(?:()$')` in its generator SQL and relied on a
+    /// later `search_plan`/`metrics_sql` call to reject; a caller of this
+    /// public API that skipped those got the broken predicate.
+    ///
+    /// (Two negations take the time-range generator branch and render
+    /// nothing here — `{ .k !~ … }` and `{ resource.service.name !~ … }`.
+    /// Both are rejected at plan time, pinned by `search_plan`'s
+    /// `negated_regexes_that_render_no_generator_still_fail_at_plan_time`.)
+    #[test]
+    fn every_regex_rendering_site_rejects_an_uncompilable_pattern_at_compile_time() {
+        for q in [
+            r#"{ name =~ "(" }"#,
+            r#"{ name !~ "(" }"#,
+            r#"{ resource.service.name =~ "(" }"#,
+            r#"{ span:statusMessage =~ "(" }"#,
+            r#"{ instrumentation:name =~ "(" }"#,
+            r#"{ instrumentation:version =~ "(" }"#,
+            r#"{ span:id =~ "(" }"#,
+            r#"{ span:parentID =~ "(" }"#,
+            r#"{ trace:id =~ "(" }"#,
+            r#"{ .k =~ "(" }"#,
+        ] {
+            match compile_span_filter(&first_filter(q)) {
+                Err(PlanError::TypeMismatch(msg)) => {
+                    assert!(
+                        msg.starts_with(r#"invalid regex "(": "#),
+                        "{q}: unexpected message {msg:?}"
+                    );
+                    // The #240 rule: the reported error is the CLIENT's
+                    // pattern's, never the `^(?:…)$` rewrite's.
+                    assert!(!msg.contains("^(?:"), "{q}: leaked the rewrite: {msg:?}");
+                }
+                other => panic!("{q} must be a plan-time rejection, got {other:?}"),
+            }
+        }
+    }
+
+    /// A valid pattern still renders byte-identically — the migration is
+    /// a fallibility change, not a rendering change.
+    #[test]
+    fn a_valid_regex_renders_exactly_as_before() {
+        let compiled = compile_span_filter(&first_filter(r#"{ name =~ "che.*" }"#)).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "match(name, '^(?:che.*)$')"
+        );
+        let compiled = compile_span_filter(&first_filter(r#"{ .k =~ "che.*" }"#)).unwrap();
+        assert!(
+            compiled.generators[0]
+                .predicate
+                .contains("match(val, '^(?:che.*)$')")
+        );
+    }
+
+    /// A pattern the checked escaper accepts renders SQL; the acceptance
+    /// SET is unchanged from the `compile_anchored` validator this
+    /// replaced (both compile `^(?:pat)$` with the same crate), so the
+    /// migration rejects nothing new. Spot-checked on the constructs most
+    /// likely to differ between a bare and an anchored compile.
+    #[test]
+    fn the_checked_escaper_accepts_exactly_what_the_previous_validator_did() {
+        for pat in [
+            "che.*",
+            "^a$",
+            "a|b",
+            "(a)(b)",
+            r"\d+",
+            "[a-z]{2,4}",
+            "",
+            "a$b",
+            "^",
+            "$",
+            "(?i)x",
+            r"\p{Alphabetic}",
+            r"\p{Nonsense}",
+            "a{2,1}",
+            "[",
+            "*",
+            r"(?P<n>a)",
+        ] {
+            let via_escaper = anchored_regex_sql(pat).is_ok();
+            let via_previous_validator = regex::Regex::new(&format!("^(?:{pat})$")).is_ok();
+            assert_eq!(
+                via_escaper, via_previous_validator,
+                "{pat:?}: the two validations disagree"
+            );
+        }
     }
 }

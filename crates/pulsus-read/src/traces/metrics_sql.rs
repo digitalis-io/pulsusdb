@@ -34,7 +34,6 @@ use pulsus_traceql::{AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, Value};
 use crate::logql::escape;
 
 use super::filter::{self, AttrProbe, LeafEval, PlanError, ValuePred};
-use super::search_plan::compile_anchored;
 use super::search_sql::{byte_cap_expr, date_literal, root_ordering_tuple};
 
 /// The snapped, left-closed/right-open metrics evaluation window
@@ -82,8 +81,10 @@ pub struct FilterSql {
 
 /// Compiles one `{...}` filter body into its metrics `PREWHERE`/`WHERE`
 /// fragments. `body: None` is the `{}` match-all (time-only) filter.
-/// Regexes are validated here at plan time (`compile_anchored`) so a bad
-/// pattern is a `400`, never a mid-query server error.
+/// Regexes are validated at plan time — since issue #282 by the act of
+/// rendering them (`filter.rs`'s checked escaper), not by a separate
+/// pre-check — so a bad pattern is a `400`, never a mid-query server
+/// error.
 pub fn compile_filter_predicate(
     body: Option<&FieldExpr>,
     attrs_table: &str,
@@ -181,13 +182,13 @@ fn render_expr(
         FieldExpr::Comparison { field, op, value } => {
             let leaf = filter::compile_leaf(field, *op, value)?;
             match &leaf.eval {
-                LeafEval::Physical(p) => {
-                    validate_physical_regex(p)?;
-                    Ok(filter::physical_sql(p))
-                }
+                // Issue #282: the renderers below validate every regex as
+                // they escape it, so the two separate pre-render
+                // validators this arm used to call are gone — one act, no
+                // second opinion to drift from the emitted SQL.
+                LeafEval::Physical(p) => filter::physical_sql(p),
                 LeafEval::Attr { probe, negated } => {
-                    validate_probe_regex(probe)?;
-                    Ok(semi_join_sql(probe, *negated, attrs_table, window))
+                    semi_join_sql(probe, *negated, attrs_table, window)
                 }
                 // Nested-set intrinsics (issue #181) are query-time
                 // structural properties with no SQL column — unsupported
@@ -239,7 +240,7 @@ fn render_expr(
                     ));
                 }
             };
-            Ok(semi_join_sql(&probe, false, attrs_table, window))
+            semi_join_sql(&probe, false, attrs_table, window)
         }
         // Arithmetic comparisons (issue #185) are a search-surface
         // construct; the metrics filter path does not support them yet
@@ -272,52 +273,31 @@ fn render_expr(
     }
 }
 
-fn validate_physical_regex(p: &filter::PhysicalPredicate) -> Result<(), PlanError> {
-    let (op, value) = match p {
-        filter::PhysicalPredicate::Name { op, value }
-        | filter::PhysicalPredicate::Service { op, value }
-        | filter::PhysicalPredicate::StatusMessage { op, value }
-        | filter::PhysicalPredicate::SpanIdHex { op, value }
-        | filter::PhysicalPredicate::ParentIdHex { op, value }
-        | filter::PhysicalPredicate::InstrumentationName { op, value }
-        | filter::PhysicalPredicate::InstrumentationVersion { op, value } => (op, value),
-        _ => return Ok(()),
-    };
-    if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
-        compile_anchored(value)?;
-    }
-    Ok(())
-}
-
-fn validate_probe_regex(probe: &AttrProbe) -> Result<(), PlanError> {
-    if let ValuePred::Regex(pat) = &probe.pred {
-        compile_anchored(pat)?;
-    }
-    Ok(())
-}
-
 /// One attribute leaf's index-served membership semi-join, confined to
 /// its `(key[, val][, scope])` prefix plus the window's date/time
 /// pruning. `negated` renders `NOT IN` around the **positive** predicate
-/// — the ratified absent-key rule.
+/// — the ratified absent-key rule. Fallible since issue #282: the
+/// positive predicate is rendered by the checked escaper (a negated regex
+/// leaf still renders — and therefore still validates — its positive
+/// form).
 fn semi_join_sql(
     probe: &AttrProbe,
     negated: bool,
     attrs_table: &str,
     window: SnappedWindow,
-) -> String {
+) -> Result<String, PlanError> {
     let mut predicate = format!("key = {}", escape::ch_string(&probe.key));
-    predicate.push_str(&format!(" AND {}", filter::value_pred_sql(&probe.pred)));
+    predicate.push_str(&format!(" AND {}", filter::value_pred_sql(&probe.pred)?));
     if let Some(scope) = probe.scope {
         predicate.push_str(&format!(" AND scope = {}", escape::ch_string(scope)));
     }
     let membership = if negated { "NOT IN" } else { "IN" };
-    format!(
+    Ok(format!(
         "(trace_id, span_id) {membership} (SELECT trace_id, span_id FROM {attrs_table} \
          WHERE {} AND {} AND {predicate})",
         date_clause(window),
         time_clause(window)
-    )
+    ))
 }
 
 /// The range query — one fully-pushed-down, time-bucketed, replay-deduped

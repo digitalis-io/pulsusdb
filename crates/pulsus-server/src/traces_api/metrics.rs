@@ -60,7 +60,7 @@ fn now_unix_seconds() -> i64 {
 
 async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<Response, ApiError> {
     let params = params::parse_metrics_params(raw, now_unix_seconds())?;
-    let query = pulsus_traceql::parse(&params.q).map_err(ApiError::Query)?;
+    let query = pulsus_traceql::parse(params.q.as_str()).map_err(ApiError::Query)?;
 
     // Plan BEFORE acquiring the pool: planning needs only config-derived
     // table names/budgets, so parse/param/plan failures (including the
