@@ -25,10 +25,12 @@
 //! makes the bound hold in release without checking the capacity the
 //! allocator actually returned. **push** charges then allocates, **pop**
 //! releases nothing (chunks are retained, so the charge is
-//! cumulative-peak, not live). The RAII wrapper that carries that state
-//! machine in production arrives with its only consumer, #293's
-//! `try_dfs`; this issue's Leg B charges two exactly-sized reservations
-//! and needs no release.
+//! cumulative-peak, not live). Leg B charges two exactly-sized
+//! reservations and needs no release, so no RAII ledger wrapper is
+//! shipped: #293 converted the last recursive walk without needing one —
+//! its two passes are sized by the same `N` this module bounds and are
+//! PRICED below rather than charged at run time (see "Not charged,
+//! stated plainly").
 //!
 //! # L2 — `N <= query.len() + 1`, structurally
 //!
@@ -79,20 +81,31 @@
 //! [`TooBroadReason::WalkTransientBytes`], which the existing wildcard
 //! maps to 422 `query_too_broad`.
 //!
-//! # What this issue does NOT close, stated plainly
+//! # The last recursive walk, closed (#293 / #285)
 //!
-//! `plan::build_metric_node` is the one walk #272 leaves recursive (by
-//! ruling: converting it needs **#293**'s `Step::Only(SpineTo)`). A flat
-//! `rate(…) or rate(…) or …` chain still aborts the process inside
-//! `plan()` — measured on a 2 MiB stack, release: ok at 1,200 terms /
-//! 44,486 bytes, **abort at 1,250** — which is inside the query-text cap,
-//! so neither that cap nor the bound below prevents it. Tracked in #293
-//! and #285. Nothing in this module should be read as closing it.
+//! `plan::build_metric_node` was the one walk #272 left recursive. A flat
+//! `count_over_time(…) or …` chain aborted the process inside `plan()` —
+//! measured on a 2 MiB stack, release: ok at 1,200 terms,
+//! `fatal runtime error: stack overflow` at 1,250, tens of kilobytes
+//! inside the query-text cap, so neither that cap nor the bound below
+//! prevented it. #293 converted it to a
+//! [`pulsus_logql::walk::find_preorder`] emission pass plus a reverse
+//! fold; the widest chain the cap admits now plans on a 256 KiB stack.
+//! The measurement above, the paired stack gate and the control that
+//! reddens on a reintroduced per-node recursion all live in
+//! `plan_recursive_control.rs` — the control is `ae66648`'s
+//! `build_metric_node` BODY with two substituted child accessors, not
+//! the historical function itself; see that module for why the
+//! substitution is necessary and what it costs the claim. It calls
+//! `plan.rs`-private items and so cannot be driven from `tests/`.
 //!
 //! # Not charged, stated plainly
 //!
 //! The `MetricExpr`/`MetricNode` trees themselves — `O(query text)` heap
-//! with no budget, exactly as before this issue. The heap *behind* a
+//! with no budget, exactly as before this issue. The plan program and its
+//! fold value stack (#293) are the same class: `O(query text)`, priced in
+//! [`WALK_BYTES_PER_NODE`] so Leg A's model covers them, never charged at
+//! run time. The heap *behind* a
 //! `QueryResult` value-stack entry is #245; SQL-path leaf
 //! materialisation is #257; concurrency composition of a per-query
 //! ceiling is #260; variants fan-out state is #221's own budget.
@@ -103,7 +116,7 @@ use pulsus_logql::walk::{INDEX_INIT, WALK_ALLOC_ENVELOPE_BYTES, WALK_CHUNK_ITEMS
 
 use super::error::{ReadError, TooBroadReason};
 use super::exec::QueryResult;
-use super::plan::MetricNode;
+use super::plan::{MetricNode, PlanOp};
 
 /// The reference's LogQL query-text cap, **owned by #279 and imported,
 /// never restated**: `pulsus_logql::MAX_QUERY_BYTES`
@@ -176,12 +189,16 @@ const fn max_of(xs: &[u64]) -> u64 {
 /// | `size_of::<MetricNode>()` | SCC-3 dismantle/clone value |
 /// | `2 * size_of::<MeRef>()` | `PartialEq`'s pair-stack entry |
 /// | `size_of::<(MeRef, u32, usize)>()` | the largest emitter step frame |
+/// | `2 * size_of::<PlanOp>()` | `build_metric_node`'s plan program (#293) — a push-grown `Vec`, so `old + new` can be live across one reallocation |
+/// | `size_of::<MetricNode>()` | `build_metric_node`'s fold value stack (#293) — reserved once at the program's length, so exactly one slot per node |
 /// | [`WALK_INDEX_BYTES_PER_NODE`] | the amortised chunk index |
 /// | [`WALK_ALLOC_OVERHEAD_PER_NODE`] | the amortised allocation envelope |
 ///
-/// Wave 2 adds SCC-1's and SCC-4's own terms (`LfOp`, the label-filter
-/// pair stack); this constant grows with them, and every `const`
-/// assertion below re-derives rather than being re-chosen.
+/// The last two terms arrived with #293: converting `build_metric_node`
+/// moved a machine-stack frame per node onto the heap as one emitted
+/// [`PlanOp`] plus one folded value. Every `const` assertion below
+/// re-derives from this constant rather than being re-chosen, so the
+/// figures moved with it.
 pub const WALK_BYTES_PER_NODE: u64 = size_of::<pulsus_logql::MeRef<'static>>() as u64
     + size_of::<&'static MetricNode>() as u64
     + size_of::<&'static MetricNode>() as u64
@@ -190,6 +207,8 @@ pub const WALK_BYTES_PER_NODE: u64 = size_of::<pulsus_logql::MeRef<'static>>() a
     + size_of::<MetricNode>() as u64
     + 2 * size_of::<pulsus_logql::MeRef<'static>>() as u64
     + size_of::<(pulsus_logql::MeRef<'static>, u32, usize)>() as u64
+    + 2 * size_of::<PlanOp>() as u64
+    + size_of::<MetricNode>() as u64
     + WALK_INDEX_BYTES_PER_NODE
     + WALK_ALLOC_OVERHEAD_PER_NODE;
 

@@ -663,31 +663,24 @@ pub fn find_preorder<'a, S: Scc, B>(
     }
 }
 
-/// Opens one child of `n`, by index, left to right — O(1), no
-/// allocation.
+/// Opens an N-ary child slot's contents as a slice.
 ///
 /// **Narrowing, stated because it is one.** Every other route to a child
-/// reference is a driver loop; this one hands a consumer a single opened
-/// child and therefore lets a consumer keep a hand-written recursion.
-/// It exists for exactly one caller: `build_metric_node`
-/// (`crates/pulsus-read/src/logql/plan.rs`), which issue #272 leaves
-/// recursive by ruling and **#293** converts. Retyping SCC-2's slots
-/// forces every `MetricExpr` consumer to change, and that function is a
-/// consumer, so it cannot both stay recursive and stay untouched.
-///
-/// It adds no capability class C1 did not already concede: `#[derive]`,
+/// reference is a driver loop; this one hands the whole slice to a
+/// consumer. It exists for one caller — `build_variants_node`
+/// (`crates/pulsus-read/src/logql/plan.rs`), whose per-variant loop is
+/// FLAT: it never re-enters itself, so no recursion rides on it. It adds
+/// no capability class C1 did not already concede — `#[derive]`,
 /// `write!(f, "{child}")`, `child.clone()`, `child == other` and
-/// `child.hash(state)` on a [`Child`] field remain compile errors, and
-/// [`find_preorder`] already yields whole nodes to a callback that may
-/// capture them. When #293 lands, its only caller goes away and so
-/// should this function.
-pub fn child_of<'a, S: Scc>(n: S::Node<'a>, i: usize) -> Option<S::Node<'a>> {
-    let w = Walk::new();
-    S::child(n, i).map(|r| S::open(r, &w))
-}
-
-/// Opens an N-ary child slot's contents as a slice, for the same single
-/// consumer and with the same narrowing as [`child_of`].
+/// `child.hash(state)` on a [`ChildVec`] field remain compile errors,
+/// and [`find_preorder`] already yields whole nodes to a callback that
+/// may capture them.
+///
+/// Issue #293 deleted its sibling `child_of` (single opened child by
+/// index), which was the accessor `build_metric_node` needed while it
+/// stayed recursive; that walk is now a [`find_preorder`] consumer and
+/// the accessor has no callers left. This one survives because its
+/// consumer is not a walk.
 pub fn slice_of<'a, T>(s: RefSlice<'a, T>) -> &'a [T] {
     let w = Walk::new();
     s.open(&w)
