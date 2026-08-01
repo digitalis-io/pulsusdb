@@ -130,10 +130,23 @@ const ZERO_ALLOC_NEW: &[&str] = &["Vec", "String", "HashMap", "Cell"];
 /// Macros whose bodies MUST parse and be visited (the closure tables).
 const DESCEND_MACROS: &[&str] = &["f", "def", "sig", "vec", "format", "write", "matches"];
 
-/// Calls counted as charge evidence: `RenderBudget::charge` itself plus
-/// the two State wrappers whose whole body is a charge (the test
+/// Calls counted as charge evidence: the two `RenderBudget` PRIMITIVES
+/// plus the two State wrappers whose whole body is a charge (the test
 /// asserts each wrapper scope really contains a `charge` call).
-const CHARGE_FNS: &[&str] = &["charge", "charge_print_family", "charge_escaper"];
+const CHARGE_FNS: &[&str] = &[
+    "charge",
+    // Issue #260: `RenderBudget::charge_retained` is the ledger
+    // operation itself — `charge` is its message-building twin, so the
+    // two share one countdown and either is real charge evidence.
+    "charge_retained",
+    "charge_print_family",
+    "charge_escaper",
+];
+
+/// The [`CHARGE_FNS`] that ARE the ledger operation rather than wrappers
+/// around another charge. Exempt from the wrapper assertion below, which
+/// would otherwise demand that a primitive call itself.
+const PRIMITIVE_CHARGE_FNS: &[&str] = &["charge", "charge_retained"];
 
 type CensusMap = BTreeMap<(String, String), BTreeSet<String>>;
 
@@ -423,7 +436,11 @@ static VIA: &[Via] = &[
     },
     Via {
         func: "lossy_repaired",
-        chargers: &["lossy_charged", "compile_regex"],
+        // Issue #260: `Retained::from_engine` is the third charger — the
+        // pipeline boundary where the engine's BYTES become the row's
+        // retained `String`, whose repair expansion it charges before
+        // allocating (it was free while it lived in a caller's `Vec`).
+        chargers: &["lossy_charged", "compile_regex", "from_engine"],
         other_callers: &[],
     },
     Via {
@@ -1746,6 +1763,80 @@ static PINS: &[Pin] = &[
         disposition: COMPILE_TIME,
         why: "literal regex list ≤ template text",
     },
+    // ------------------------------------------------------- retained.rs
+    // Issue #260 review round 2: the charging TYPE. Every constructor
+    // charges in its own scope BEFORE it allocates, which is exactly
+    // what `CHARGED` asserts — so the census is the evidence for the
+    // module's whole claim, not a separate promise about it.
+    Pin {
+        file: "retained.rs",
+        func: "copy",
+        callees: &[".to_string"],
+        disposition: CHARGED,
+        why: "charges src.len() — the exact copy — before making it",
+    },
+    Pin {
+        file: "retained.rs",
+        func: "concat",
+        callees: &[".clone", ".push_str", "String::with_capacity"],
+        disposition: CHARGED,
+        why: "sizes the pieces ITSELF (the `.clone` is the sizing walk of the same iterator, \
+              which allocates nothing for the `Map`-over-slice the pipeline passes), charges \
+              that sum, then allocates exactly it; the written length is reconciled against \
+              the charge unconditionally, so an overrun is charged rather than assumed away \
+              (round 3)",
+    },
+    Pin {
+        file: "retained.rs",
+        func: "render_full",
+        callees: &["format!"],
+        disposition: ERROR_PATH,
+        why: "the fixed breach message, built once as the render aborts (issue #260)",
+    },
+    Pin {
+        file: "retained.rs",
+        func: "from_engine",
+        callees: &["String::from_utf8"],
+        disposition: CHARGED,
+        why: "valid UTF-8 MOVES the engine's already-charged buffer (from_utf8 does not \
+              allocate); the invalid path charges the repair EXPANSION before \
+              lossy_repaired allocates it",
+    },
+    Pin {
+        file: "retained.rs",
+        func: "take",
+        callees: &[".to_vec"],
+        disposition: CHARGED,
+        why: "charges the owned halves plus the element buffer before the deep copy",
+    },
+    Pin {
+        file: "retained.rs",
+        func: "every_constructor_charges_exactly_what_it_retains",
+        callees: &[".to_vec", "vec!"],
+        disposition: CONST,
+        why: "test region: fixed short byte cases",
+    },
+    Pin {
+        file: "retained.rs",
+        func: "a_refused_charge_produces_no_value_and_poisons_the_budget",
+        callees: &[".repeat"],
+        disposition: CONST,
+        why: "test region: one budget-derived string, allocated once and dropped",
+    },
+    Pin {
+        file: "retained.rs",
+        func: "concat_refuses_when_the_overrun_crosses_the_budget",
+        callees: &[".repeat"],
+        disposition: CONST,
+        why: "test region: one budget-derived string, allocated once and dropped",
+    },
+    Pin {
+        file: "retained.rs",
+        func: "a_snapshot_charges_the_bytes_it_deep_copies",
+        callees: &[".repeat", "vec!"],
+        disposition: CONST,
+        why: "test region: one fixed 1 000-byte label pair",
+    },
     // ---------------------------------------------------------- parse.rs
     Pin {
         file: "parse.rs",
@@ -2164,7 +2255,10 @@ fn every_template_allocation_site_is_classified() {
     );
     // The charge WRAPPERS must themselves contain a real charge call
     // (their callers inherit charge evidence from them).
-    for wrapper in CHARGE_FNS.iter().filter(|f| **f != "charge") {
+    for wrapper in CHARGE_FNS
+        .iter()
+        .filter(|f| !PRIMITIVE_CHARGE_FNS.contains(f))
+    {
         if !census.charged_scopes.iter().any(|(_, f)| f == wrapper) {
             let _ = writeln!(
                 errors,

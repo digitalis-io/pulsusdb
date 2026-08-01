@@ -243,7 +243,14 @@ impl<'a> ErrorSlots<'a> {
 struct StageMap<'a> {
     /// Present ONLY when the #231 compile-time `needs_snapshot` gate is set;
     /// `None` = render against the live vector (the zero-copy fast path).
-    snapshot: Option<Vec<(Cow<'a, str>, Cow<'a, str>)>>,
+    ///
+    /// A [`template::LabelSnapshot`], not a bare `Vec` (issue #260 review
+    /// round 2): the copy duplicates every OWNED value in the label set —
+    /// including template output this row already charged for — and its
+    /// only constructor charges the row budget for exactly what it
+    /// duplicates. The field's type is what makes an uncharged snapshot
+    /// unrepresentable rather than merely absent.
+    snapshot: Option<template::LabelSnapshot<'a>>,
     /// The error-pair AS THE MAP FROZE IT (issue #230): pre-#230 the slot
     /// values were invariant inside a `label_format` stage (the old U5
     /// note), so a gate bool sufficed; a FULL template can now fail per
@@ -1197,6 +1204,18 @@ impl CompiledPipeline {
         // loop — only label filters can follow `unwrap` (parser rule), so
         // this is exactly the reference's ordering.
         let mut unwrapped: Option<&str> = None;
+        // **The template render budget's lifetime is the ROW** (issue
+        // #260). Every render this row performs — the `line_format`
+        // rewrite and each `Template::Full` `label_format` destination —
+        // charges against THIS ledger, because every one of those outputs
+        // is RETAINED (into `line`, or into the label set via
+        // `set_label`) and they are all live at the same time. A budget
+        // constructed per `render_full` bounded one output while the
+        // NUMBER of live outputs was bounded only by the query-text cap
+        // (>4 000 destinations of 64 MiB each fit inside 131 072 bytes).
+        // Two `Cell`s on the stack — no allocation, so the per-row
+        // allocation gates are untouched.
+        let render_budget = template::RenderBudget::default();
         labels.clear();
         labels.extend(
             base.iter()
@@ -1371,64 +1390,96 @@ impl CompiledPipeline {
                     // line UNCHANGED and tags `TemplateFormatErr` + the
                     // byte-exact detail (`fmt.go:252-256`) — the query
                     // succeeds.
-                    match tmpl {
-                        Template::Simple(name) => {
-                            let errors_visible = errs.dirty || errs.has_err();
-                            let v = if *reads_err && errors_visible {
-                                errs.raw_slot(name)
-                            } else {
-                                None
-                            };
-                            let v = v.or_else(|| get_label(labels, name)).unwrap_or("");
-                            line = Cow::Owned(v.to_string());
-                        }
-                        Template::Parts(parts) => {
-                            line = Cow::Owned(if *reads_err {
+                    // **One TYPE, not one charge per site** (issue #260
+                    // review round 2). Every arm yields a
+                    // `template::Retained`, which can only be built by a
+                    // constructor that charges the row budget first — so
+                    // a fourth render shape is an arm that will not
+                    // compile until it charges, rather than a site a
+                    // sweep has to find.
+                    let rendered: Result<template::Retained, template::TemplateExecError> =
+                        match tmpl {
+                            Template::Simple(name) => {
                                 let errors_visible = errs.dirty || errs.has_err();
-                                render_template_with_errors(parts, labels, &errs, errors_visible)
-                            } else {
-                                render_template(parts, labels)
-                            });
-                        }
-                        Template::Full(prog) => {
-                            let errors_visible = errs.dirty || errs.has_err();
-                            let (pair_err, pair_details) = if errors_visible {
-                                (
-                                    errs.has_err().then(|| errs.err_str().to_string()),
-                                    errs.has_details().then(|| errs.details_str().to_string()),
-                                )
-                            } else {
-                                (None, None)
-                            };
-                            let mut out = Vec::new();
-                            let rendered = template::render_full(
-                                prog,
-                                labels,
-                                pair_err.as_deref(),
-                                pair_details.as_deref(),
-                                &line,
-                                ts_ns,
-                                &self.template_env,
-                                &mut out,
-                            );
-                            match rendered {
-                                Ok(()) => {
-                                    // Byte model internally, U+FFFD at the
-                                    // boundary (owner-ratified, issue #230
-                                    // adjudication 2). The valid-UTF-8 case
-                                    // is a move, not a copy.
-                                    line = Cow::Owned(lossy_string(out));
-                                }
-                                Err(e) if e.budget_breach => {
-                                    // Render-budget breach: abort the QUERY
-                                    // (bounded 422) — never a per-line tag.
-                                    return Err(TemplateBudgetExceeded::new());
-                                }
-                                Err(e) => {
-                                    errs.set_err(Cow::Borrowed(TEMPLATE_FORMAT_ERROR));
-                                    errs.set_details(Cow::Owned(e.msg));
+                                let v = if *reads_err && errors_visible {
+                                    errs.raw_slot(name)
+                                } else {
+                                    None
+                                };
+                                let v = v.or_else(|| get_label(labels, name)).unwrap_or("");
+                                match template::Retained::copy(&render_budget, v) {
+                                    Ok(r) => Ok(r),
+                                    Err(template::BudgetExhausted) => {
+                                        return Err(TemplateBudgetExceeded::new());
+                                    }
                                 }
                             }
+                            Template::Parts(parts) => {
+                                let errors_visible = errs.dirty || errs.has_err();
+                                // SHARED reborrows so the lookup closure
+                                // is `Clone` — `Retained::concat` walks
+                                // the piece iterator twice (that is what
+                                // removes the caller-supplied length),
+                                // and a `&mut` capture is not cloneable.
+                                let read_labels: &[(Cow<'a, str>, Cow<'a, str>)] = labels;
+                                let read_errs: &ErrorSlots<'a> = &errs;
+                                let lookup = move |name: &str| -> &str {
+                                    if *reads_err
+                                        && errors_visible
+                                        && let Some(v) = read_errs.raw_slot(name)
+                                    {
+                                        return v;
+                                    }
+                                    get_label(read_labels, name).unwrap_or("")
+                                };
+                                match template::Retained::concat(
+                                    &render_budget,
+                                    part_pieces(parts, lookup),
+                                ) {
+                                    Ok(r) => Ok(r),
+                                    Err(template::BudgetExhausted) => {
+                                        return Err(TemplateBudgetExceeded::new());
+                                    }
+                                }
+                            }
+                            Template::Full(prog) => {
+                                let errors_visible = errs.dirty || errs.has_err();
+                                let (pair_err, pair_details) = if errors_visible {
+                                    (
+                                        errs.has_err().then(|| errs.err_str().to_string()),
+                                        errs.has_details().then(|| errs.details_str().to_string()),
+                                    )
+                                } else {
+                                    (None, None)
+                                };
+                                template::render_full(
+                                    prog,
+                                    labels,
+                                    pair_err.as_deref(),
+                                    pair_details.as_deref(),
+                                    &line,
+                                    ts_ns,
+                                    &self.template_env,
+                                    &render_budget,
+                                )
+                            }
+                        };
+                    match rendered {
+                        // Byte model internally, U+FFFD at the boundary
+                        // (owner-ratified, issue #230 adjudication 2);
+                        // the valid-UTF-8 case is a move, not a copy.
+                        Ok(rendered) => line = rendered.into_cow(),
+                        Err(e) if e.budget_breach => {
+                            // Render-budget breach: abort the QUERY
+                            // (bounded 422) — never a per-line tag.
+                            return Err(TemplateBudgetExceeded::new());
+                        }
+                        Err(e) => {
+                            // Only the full engine has a per-line failure
+                            // mode; the fast paths cannot fail except on
+                            // the budget, which returned above.
+                            errs.set_err(Cow::Borrowed(TEMPLATE_FORMAT_ERROR));
+                            errs.set_details(Cow::Owned(e.msg));
                         }
                     }
                 }
@@ -1513,8 +1564,22 @@ impl CompiledPipeline {
                                     let m_empty = labels.is_empty() && ve.is_none() && vd.is_none();
                                     if !m_empty {
                                         let gate = errs.dirty || errs.has_err();
+                                        let snapshot = match needs_snapshot
+                                            .then(|| {
+                                                template::LabelSnapshot::take(
+                                                    &render_budget,
+                                                    labels,
+                                                )
+                                            })
+                                            .transpose()
+                                        {
+                                            Ok(snapshot) => snapshot,
+                                            Err(template::BudgetExhausted) => {
+                                                return Err(TemplateBudgetExceeded::new());
+                                            }
+                                        };
                                         map = Some(StageMap {
-                                            snapshot: needs_snapshot.then(|| labels.clone()),
+                                            snapshot,
                                             // Freeze the pair VALUES at map
                                             // build (issue #230): a failing
                                             // Full template overwrites the
@@ -1530,25 +1595,37 @@ impl CompiledPipeline {
                                 }
                                 let render_labels: &[(Cow<'a, str>, Cow<'a, str>)] = map
                                     .as_ref()
-                                    .and_then(|m| m.snapshot.as_deref())
-                                    .unwrap_or(labels);
+                                    .and_then(|m| m.snapshot.as_ref())
+                                    .map_or(&*labels, template::LabelSnapshot::as_slice);
                                 let pair_err = map.as_ref().and_then(|m| m.frozen_err.as_deref());
                                 let pair_details =
                                     map.as_ref().and_then(|m| m.frozen_details.as_deref());
-                                let rendered: Result<String, template::TemplateExecError> =
-                                    match tmpl {
-                                        Template::Simple(name) => {
-                                            let slot = if *reads_err {
-                                                frozen_slot(name, pair_err, pair_details)
-                                            } else {
-                                                None
-                                            };
-                                            let v = slot
-                                                .or_else(|| get_label(render_labels, name))
-                                                .unwrap_or("");
-                                            Ok(v.to_string())
+                                // As the `line_format` arm: ONE type,
+                                // charged on construction, so a new
+                                // render shape cannot reach a retained
+                                // destination uncharged.
+                                let rendered: Result<
+                                    template::Retained,
+                                    template::TemplateExecError,
+                                > = match tmpl {
+                                    Template::Simple(name) => {
+                                        let slot = if *reads_err {
+                                            frozen_slot(name, pair_err, pair_details)
+                                        } else {
+                                            None
+                                        };
+                                        let v = slot
+                                            .or_else(|| get_label(render_labels, name))
+                                            .unwrap_or("");
+                                        match template::Retained::copy(&render_budget, v) {
+                                            Ok(r) => Ok(r),
+                                            Err(template::BudgetExhausted) => {
+                                                return Err(TemplateBudgetExceeded::new());
+                                            }
                                         }
-                                        Template::Parts(parts) => Ok(render_with(parts, |n| {
+                                    }
+                                    Template::Parts(parts) => {
+                                        let lookup = move |n: &str| -> &str {
                                             if *reads_err
                                                 && let Some(v) =
                                                     frozen_slot(n, pair_err, pair_details)
@@ -1556,25 +1633,31 @@ impl CompiledPipeline {
                                                 return v;
                                             }
                                             get_label(render_labels, n).unwrap_or("")
-                                        })),
-                                        Template::Full(prog) => {
-                                            let mut out = Vec::new();
-                                            template::render_full(
-                                                prog,
-                                                render_labels,
-                                                pair_err,
-                                                pair_details,
-                                                &line,
-                                                ts_ns,
-                                                &self.template_env,
-                                                &mut out,
-                                            )
-                                            .map(|()| lossy_string(out))
+                                        };
+                                        match template::Retained::concat(
+                                            &render_budget,
+                                            part_pieces(parts, lookup),
+                                        ) {
+                                            Ok(r) => Ok(r),
+                                            Err(template::BudgetExhausted) => {
+                                                return Err(TemplateBudgetExceeded::new());
+                                            }
                                         }
-                                    };
+                                    }
+                                    Template::Full(prog) => template::render_full(
+                                        prog,
+                                        render_labels,
+                                        pair_err,
+                                        pair_details,
+                                        &line,
+                                        ts_ns,
+                                        &self.template_env,
+                                        &render_budget,
+                                    ),
+                                };
                                 match rendered {
                                     Ok(rendered) => {
-                                        set_label(labels, Cow::Borrowed(dst), Cow::Owned(rendered));
+                                        set_label(labels, Cow::Borrowed(dst), rendered.into_cow());
                                         // Every template assignment is a
                                         // `Set` (`fmt.go:431`) — dirty.
                                         errs.dirty = true;
@@ -2607,29 +2690,28 @@ fn sanitize_label_key(key: &str) -> String {
     out
 }
 
-/// The shared renderer, generic over the field lookup so BOTH callers
-/// monomorphize to a branch-free loop (issue #238). Exact presize (one
-/// sizing pass over tiny part/label lists) so the render is a single
-/// allocation per row, never a growth series — the allocation-regression
-/// suite pins this (review round 2).
-fn render_with<'l>(parts: &[TmplPart], lookup: impl Fn(&str) -> &'l str) -> String {
-    let cap: usize = parts
-        .iter()
-        .map(|part| match part {
-            TmplPart::Lit(s) => s.len(),
-            TmplPart::Field(name) => lookup(name).len(),
-        })
-        .sum();
-    let mut out = String::with_capacity(cap);
-    for part in parts {
-        match part {
-            TmplPart::Lit(s) => out.push_str(s),
-            // A missing field renders empty (pinned semantics, plan v3
-            // delta 8 / AC2).
-            TmplPart::Field(name) => out.push_str(lookup(name)),
-        }
-    }
-    out
+/// A `Parts` render as the PIECE SEQUENCE it is — text literals verbatim,
+/// field actions resolved through `lookup`.
+///
+/// Issue #260 review round 3: the former `presize_parts`/`fill_parts`
+/// pair handed `Retained::assemble` a length AND a writer, which made the
+/// charge something the constructor had to TRUST. Handing it the pieces
+/// instead lets it size and write from the same source, so there is no
+/// number for a caller to get wrong. The iterator is `Clone` (the
+/// constructor walks it twice, exactly as the split pair did) and cheap —
+/// a `Map` over a slice, no allocation, so the single-allocation render
+/// the alloc gates pin is unchanged.
+fn part_pieces<'p, 'l, F>(parts: &'p [TmplPart], lookup: F) -> impl Iterator<Item = &'l str> + Clone
+where
+    F: Fn(&str) -> &'l str + Clone + 'p,
+    'p: 'l,
+{
+    parts.iter().map(move |part| match part {
+        TmplPart::Lit(s) => s.as_str(),
+        // A missing field renders empty (pinned semantics, plan v3
+        // delta 8 / AC2).
+        TmplPart::Field(name) => lookup(name),
+    })
 }
 
 /// `convertBytes` for the `bytes` template function (issue #230). The
@@ -2642,15 +2724,6 @@ pub(crate) fn convert_bytes_value(raw: &str) -> Result<f64, String> {
         .ok_or_else(|| label_filter_error_details(UnitKind::Bytes, raw))
 }
 
-/// Byte render → `String` at the pipeline boundary: valid UTF-8 moves,
-/// invalid bytes become U+FFFD (owner-ratified lossy boundary, #230).
-fn lossy_string(bytes: Vec<u8>) -> String {
-    match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    }
-}
-
 /// The FROZEN error-pair lookup for `label_format` templates (issue
 /// #230; see [`StageMap`]): a non-empty frozen slot overrides the
 /// same-named vector entry.
@@ -2660,32 +2733,6 @@ fn frozen_slot<'m>(name: &str, err: Option<&'m str>, details: Option<&'m str>) -
         ERROR_DETAILS_LABEL => details,
         _ => None,
     }
-}
-
-fn render_template(parts: &[TmplPart], labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> String {
-    render_with(parts, |name| get_label(labels, name).unwrap_or(""))
-}
-
-/// [`render_template`] with the out-of-band error pair in the data map
-/// (issue #238): when the gate captured at map-build time is open, a
-/// NON-EMPTY slot overrides a same-named vector entry (the reference
-/// appends the slots LAST — `labels.go:516-521`); an empty slot falls
-/// through to the vector, matching `appendErrors` never appending an
-/// empty slot. Selected only for templates whose compile-time `reads_err`
-/// flag is set.
-fn render_template_with_errors(
-    parts: &[TmplPart],
-    labels: &[(Cow<'_, str>, Cow<'_, str>)],
-    errs: &ErrorSlots<'_>,
-    errors_visible: bool,
-) -> String {
-    render_with(parts, |name| {
-        if errors_visible && let Some(v) = errs.raw_slot(name) {
-            v
-        } else {
-            get_label(labels, name).unwrap_or("")
-        }
-    })
 }
 
 /// Three-valued label-filter evaluation: `Some(true)` keep, `Some(false)`
@@ -3435,7 +3482,11 @@ mod tests {
             (Cow::Borrowed("method"), Cow::Borrowed("GET")),
             (Cow::Borrowed("path"), Cow::Borrowed("/x")),
         ];
-        assert_eq!(render_template(&parts, &labels), "GET -> /x!");
+        let budget = template::RenderBudget::default();
+        let lookup = |name: &str| get_label(&labels, name).unwrap_or("");
+        let rendered = template::Retained::concat(&budget, part_pieces(&parts, lookup))
+            .expect("well inside the budget");
+        assert_eq!(rendered.as_str(), "GET -> /x!");
     }
 
     #[test]

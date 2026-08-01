@@ -13,7 +13,7 @@ use pulsus_logql::RangeAggOp;
 use std::borrow::Cow;
 
 use super::agg::{LabelSet, VectorAccum};
-use super::client_agg::{BucketAcc, MutGroup};
+use super::client_agg::{BucketAcc, MutGroup, WinSample};
 use super::exec::{MatrixSeries, QueryResult};
 use super::fold::KSel;
 
@@ -509,11 +509,18 @@ pub const MAX_CLIENT_AGG_GROUP_BYTES: u64 = 256 * 1024 * 1024;
 /// it untouched.
 pub const MAX_METRIC_RESULT_POINTS: u64 = 12_000_000;
 
-/// **The one group-byte gate** (round 6): every query-lifetime group-map
-/// insertion is sized by [`group_entry_bytes`], checked against the cap, and
-/// accounted HERE — *before* the insertion that retains the entry, so the
-/// map never holds a refused group. `saturating_add` cannot mask a breach
-/// (saturation only grows the sum).
+/// **The one group-byte gate FUNCTION — N counters** (round 6; the
+/// counter count made explicit by issue #260): every query-lifetime
+/// group-map insertion is sized by [`group_entry_bytes`], checked against
+/// the cap, and accounted HERE — *before* the insertion that retains the
+/// entry, so the map never holds a refused group. `saturating_add` cannot
+/// mask a breach (saturation only grows the sum).
+///
+/// "One gate" is a statement about the FUNCTION, never about the counter:
+/// a leaf can hold [`LEAF_COUNTERS`]`.group_bytes` independent counters
+/// against this cap at once, so the bytes the cap proves are the SUM over
+/// them — see the [`CounterPlurality`] table and
+/// [`MAX_LEAF_RETAINED_BYTES`].
 pub(in crate::logql) fn charge_group_bytes(
     charged: &mut u64,
     bytes: u64,
@@ -529,9 +536,13 @@ pub(in crate::logql) fn charge_group_bytes(
     Ok(())
 }
 
-/// **The one result-point gate** (issue #236): every fixed-width point
+/// **The one result-point gate FUNCTION — N counters** (issue #236; the
+/// counter count made explicit by issue #260): every fixed-width point
 /// slot a metric evaluation will RETAIN is reserved here, against
 /// [`MAX_METRIC_RESULT_POINTS`], *before* the allocation that holds it.
+/// A leaf holds [`LEAF_COUNTERS`]`.result_points` of them at once, at
+/// DIFFERENT slot widths ([`RESULT_POINT_SLOT_BYTES`]) — see
+/// [`MAX_LEAF_RETAINED_BYTES`].
 ///
 /// An ADMISSION counter, not a concurrent-retention one — there is no
 /// discharge, because the slots it reserves hold the RESULT and live
@@ -684,6 +695,286 @@ pub(crate) fn label_set_bytes(labels: &LabelSet) -> u64 {
     }
     let elems = (labels.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
     bytes.saturating_add(alloc_block_bytes(elems))
+}
+
+// =====================================================================
+// Issue #260 — the COMPOSED bound.
+//
+// Each gate above is "the one gate" in the sense that a whole class of
+// allocation passes through a single FUNCTION. It is not one COUNTER:
+// one metric leaf can hold several independent counters against the SAME
+// cap at the same time, so the bytes a cap actually proves are the SUM
+// over its live counters, not the cap. The pluralities are small and
+// fixed, and the owner ruled 2026-08-01 that the counters stay separate
+// — sharing one pot would save ~0.8 GB of ~1.8 GB, the same operational
+// band, at the price of rejecting the `sum by (many-names)`
+// high-cardinality shape #236 deliberately enabled. So the deliverable
+// is the honest total, DERIVED from the caps and the slot widths rather
+// than written down.
+//
+// **What holds this together, split by WHO holds it** — stated this way
+// because two review rounds faulted a claim that ran ahead of its
+// mechanism.
+//
+// **The compiler holds** that every [`AggCaps`] axis has a multiplicity
+// AND a term in the sum. `AggCaps` is, by its #221 contract, every
+// per-query retention cap in one place; [`CounterPlurality`] mirrors its
+// fields, and BOTH are destructured with explicit field lists in
+// [`leaf_retained_bytes`] itself and in
+// `the_plurality_table_mirrors_every_agg_caps_axis`. Adding an axis is a
+// build failure in the derivation, not a silently missing term (review
+// round 2, finding 2: the previous version enumerated the axes but
+// field-ACCESSED them in the arithmetic, so a new one could pass every
+// table and still be absent from the total).
+//
+// **The censuses are TRIPWIRES, not proofs.** They are lexical, so a
+// destructured or aliased cap read, or a qualified call, evades them:
+//   * `every_cap_read_is_enumerated` — every production `caps.<field>`
+//     read, with the counter it enforces. This is what catches a counter
+//     charged INLINE rather than through a gate function — the shape
+//     that hid `quantile_values`/`counter_values` in round 1.
+//   * `every_charge_counter_is_enumerated` — the four gate functions'
+//     first arguments, naming the counter EXPRESSION behind each.
+//
+// **Nothing here holds** that a declared multiplicity is the true one,
+// or that a retained structure governed by NO cap is accounted for. The
+// residual list on [`MAX_LEAF_RETAINED_BYTES`] names the known ones.
+// =====================================================================
+
+/// How many LIVE counters enforce each cap inside ONE metric leaf
+/// (issue #260). One field per [`AggCaps`] axis, in the same order.
+///
+/// | cap | live counters | max live at once |
+/// |---|---|---|
+/// | [`MAX_CLIENT_AGG_GROUP_BYTES`] | `ClientAggState::group_bytes` (instant) **XOR** `RangeSlideState::group_bytes` (range) — the two arms of `MetricAggState`; plus `ReduceFold::group_bytes` **XOR** `SelectFold::group_bytes` (the two arms of `VectorAggFold`), whose cap is fed from the slider's own `caps.group_bytes` at `attach_fold`; plus `VariantsAggState::charged` against [`super::variants::MAX_VARIANT_FANOUT_STATE_BYTES`] (`== AggCaps::DEFAULT.group_bytes`), whose sub-states are `AggCaps::divided(n)` and never take a fold | **2** — `{slider, fold}` on the folded range path, `{fan-out, Σ sub-states}` on the variants path |
+/// | [`MAX_RETAINED_WINDOW_POINTS`] | `RangeSlideState::retained` | **1** |
+/// | [`MAX_QUANTILE_VALUES`] | `ClientAggState::quantile_values` — the instant path's `BucketAcc::Values(Vec<f64>)` retention. (The RANGE path's `quantile_over_time` retention is charged into `RangeSlideState::retained` instead, at [`retention_points_per_sample`] = 2, so it is inside the retention term, not this one.) | **1** |
+/// | [`MAX_COUNTER_VALUES`] | `ClientAggState::counter_values` — the instant path's `BucketAcc::Counter(Vec<(i64, f64)>)` retention; the range path's is likewise inside the retention term | **1** |
+/// | [`MAX_TS_COLLISION_GROUP`] | `RangeSlideState`'s staged member COUNT — a count cap whose members' BYTES are charged into `coll_bytes` in the same guard, so it contributes no bytes of its own (see [`leaf_retained_bytes`]) | **1** |
+/// | [`MAX_TS_COLLISION_GROUP_BYTES`] | `RangeSlideState::coll_bytes` | **1** |
+/// | [`MAX_METRIC_RESULT_POINTS`] | `RangeSlideState::result_points`; `ReduceFold::slots` **XOR** `SelectFold::slots` | **2**, at the two DIFFERENT widths in [`RESULT_POINT_SLOT_BYTES`] |
+///
+/// The instant and range arms of `MetricAggState` are mutually
+/// exclusive, so several of these rows can never be live together. The
+/// bound SUMS them anyway: a max-over-arms figure would be smaller but
+/// would depend on an arm analysis a future change could silently
+/// invalidate, and over-stating a memory ceiling is the safe direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::logql) struct CounterPlurality {
+    pub group_bytes: u64,
+    pub retention_points: u64,
+    pub quantile_values: u64,
+    pub counter_values: u64,
+    pub collision_members: u64,
+    pub collision_bytes: u64,
+    pub result_points: u64,
+}
+
+/// The multiplicity table above, as the value [`MAX_LEAF_RETAINED_BYTES`]
+/// consumes.
+pub(in crate::logql) const LEAF_COUNTERS: CounterPlurality = CounterPlurality {
+    group_bytes: 2,
+    retention_points: 1,
+    quantile_values: 1,
+    counter_values: 1,
+    collision_members: 1,
+    collision_bytes: 1,
+    result_points: 2,
+};
+
+/// The fixed slot width each [`charge_result_points`] counter reserves,
+/// one entry per counter in [`LEAF_COUNTERS`]`.result_points`. The two
+/// counters price DIFFERENT things — the slider reserves emitted
+/// `(timestamp, value)` grid points, the fold reserves dense accumulator
+/// slots — so the composed bound sums the terms rather than multiplying
+/// one of them by the count.
+pub(in crate::logql) const RESULT_POINT_SLOT_BYTES: [u64; 2] = [
+    // `RangeSlideState::result_points` / `FpSlide::points` / `series_out`.
+    size_of::<(i64, f64)>() as u64,
+    // `ReduceFold::slots` (a `VectorAccum`) XOR `SelectFold::slots` (a
+    // `KSel`) — the wider of the two, since only one can be live.
+    fold_slot_bytes(),
+];
+
+/// One [`MAX_RETAINED_WINDOW_POINTS`] point is one [`WinSample`].
+pub(in crate::logql) const RETENTION_POINT_BYTES: u64 = size_of::<WinSample>() as u64;
+
+/// One [`MAX_QUANTILE_VALUES`] value is one `f64` in the
+/// `BucketAcc::Values` vector.
+pub(in crate::logql) const QUANTILE_VALUE_BYTES: u64 = size_of::<f64>() as u64;
+
+/// One [`MAX_COUNTER_VALUES`] value is one `(timestamp, value)` pair in
+/// the `BucketAcc::Counter` vector.
+pub(in crate::logql) const COUNTER_VALUE_BYTES: u64 = size_of::<(i64, f64)>() as u64;
+
+/// A staged collision MEMBER's own contribution to the bound: NONE.
+/// Every member is sized by `RangeSlideState::member_stage_bytes` and
+/// refused unless it fits `coll_bytes` in the SAME guard, so the
+/// [`MAX_TS_COLLISION_GROUP`] count cap admits no byte the
+/// [`MAX_TS_COLLISION_GROUP_BYTES`] term has not already priced.
+///
+/// Named and multiplied through rather than omitted: the axis stays
+/// visibly accounted for in [`leaf_retained_bytes`], and a future change
+/// that gives members memory of their own has one place to land.
+pub(in crate::logql) const COLLISION_MEMBER_BYTES: u64 = 0;
+
+/// The wider of the two [`VectorAggFold`] arms' slot types
+/// ([`super::agg::VectorAccum`] / [`super::fold::KSel`]). `Ord::max` is
+/// not `const`, so the comparison is spelled out — the same shape
+/// [`FOLD_GROUP_SLOT`] uses.
+///
+/// [`VectorAggFold`]: super::fold::VectorAggFold
+const fn fold_slot_bytes() -> u64 {
+    let reduce = size_of::<VectorAccum>() as u64;
+    let select = size_of::<KSel>() as u64;
+    if reduce > select { reduce } else { select }
+}
+
+/// The array and the declared multiplicity are the SAME number, checked
+/// at compile time: adding a result-point counter without pricing its
+/// slot (or the reverse) fails the build rather than silently changing
+/// the bound by one term.
+const _: () = assert!(
+    RESULT_POINT_SLOT_BYTES.len() as u64 == LEAF_COUNTERS.result_points,
+    "every result-point counter needs exactly one slot width"
+);
+
+/// The variants fan-out counter shares the group-byte cap's value, which
+/// is what makes it a second counter against ONE ceiling rather than a
+/// ceiling of its own — the premise the `group_bytes: 2` row rests on.
+const _: () = assert!(
+    super::variants::MAX_VARIANT_FANOUT_STATE_BYTES <= MAX_CLIENT_AGG_GROUP_BYTES,
+    "the variants fan-out counter must not exceed the group-byte ceiling it composes with"
+);
+
+/// **The widest query-lifetime retained bytes ONE metric leaf's shipped
+/// ceilings prove** (issue #260) — the honest total, not any single cap.
+///
+/// Derived, never written down: one term per [`AggCaps`] axis, each
+/// `multiplicity × cap` with the fixed-width slot terms priced through
+/// this module's own [`alloc_block_bytes`] 2× allocator-rounding model,
+/// exactly as the charge sites price the allocations they gate.
+///
+/// ```text
+/// group bytes      2 × 268,435,456                        =   536,870,912
+/// window retention alloc(4e6 × WinSample = 32)            =   256,000,000
+/// quantile values  alloc(4e6 × f64 = 8)                   =    64,000,000
+/// counter values   alloc(4e6 × (i64, f64) = 16)           =   128,000,000
+/// collision members                    (bytes: see below) =             0
+/// collision stage  1 × 8,388,608                          =     8,388,608
+/// result slots     alloc(12e6×16) + alloc(12e6×24)        =   960,000,000
+///                                                           -------------
+///                                                           1,953,259,520  (1.819 GiB)
+/// ```
+///
+/// **Scope of the claim.** This is a sum over the ENUMERATED counters —
+/// the [`CounterPlurality`] table, which mirrors every [`AggCaps`] axis
+/// (compiler-pinned) and whose per-axis multiplicity is census-pinned
+/// against production source. A retained structure governed by NO cap is
+/// outside it by construction.
+///
+/// **Known residuals, stated rather than hidden:** accumulated leaf
+/// RESULTS across a binary chain are charged by nothing (#257 on the SQL
+/// path, #285 for the chain); post-aggregation selection/grouping keys
+/// are flagged-not-charged (#241); a streams response accumulates one
+/// row's template output per entry across up to the entries limit
+/// (#312); and process RSS is still `N ×` this under concurrency, which
+/// #245's closure ruled an operational concern rather than a per-query
+/// bound.
+pub const MAX_LEAF_RETAINED_BYTES: u64 = leaf_retained_bytes();
+
+/// [`MAX_LEAF_RETAINED_BYTES`] plus ONE row's template render budget —
+/// the whole per-query retained-byte figure (issue #260).
+///
+/// The template term is a per-ROW budget since #260 moved its lifetime
+/// off the individual render (whose output the caller RETAINS, so a
+/// per-render budget bounded one buffer while the number of live buffers
+/// was bounded only by the query-text cap). One row is live at a time on
+/// the metric path; the per-row OUTPUTS still accumulate into a streams
+/// result across up to the entries limit (#312), which this figure does
+/// not cover and #260 deliberately did not close.
+pub const MAX_QUERY_RETAINED_BYTES: u64 =
+    MAX_LEAF_RETAINED_BYTES + super::template::MAX_TEMPLATE_RENDER_BYTES;
+
+/// [`MAX_LEAF_RETAINED_BYTES`]'s terms — one per [`AggCaps`] axis, in
+/// `AggCaps` order. A `const fn` so the total moves with any cap, any
+/// multiplicity and any slot width; there is no second place holding the
+/// number.
+///
+/// **Both operand sets are DESTRUCTURED** (review round 2, finding 2),
+/// not field-accessed: adding an axis to [`AggCaps`] fails to compile
+/// HERE, in the derivation, as well as in the plurality table. Before
+/// this, a new axis could pass both tables and both censuses and still
+/// be absent from the sum — the enumeration was complete, and the
+/// arithmetic over it was not. Reading the caps out of
+/// [`AggCaps::DEFAULT`] rather than the `MAX_*` constants also ties the
+/// bound to the values the states are actually handed.
+const fn leaf_retained_bytes() -> u64 {
+    let AggCaps {
+        group_bytes: group_bytes_cap,
+        retention_points: retention_points_cap,
+        quantile_values: quantile_values_cap,
+        counter_values: counter_values_cap,
+        collision_members: collision_members_cap,
+        collision_bytes: collision_bytes_cap,
+        result_points: result_points_cap,
+    } = AggCaps::DEFAULT;
+    let CounterPlurality {
+        group_bytes: group_bytes_n,
+        retention_points: retention_points_n,
+        quantile_values: quantile_values_n,
+        counter_values: counter_values_n,
+        collision_members: collision_members_n,
+        collision_bytes: collision_bytes_n,
+        result_points: result_points_n,
+    } = LEAF_COUNTERS;
+
+    // Group bytes are already a BYTE cap, so the multiplicity multiplies
+    // it directly; no slot model applies.
+    let group_bytes = group_bytes_n * group_bytes_cap;
+
+    // Retention is a POINT cap in `WinSample` units.
+    let retention =
+        retention_points_n * alloc_block_bytes(retention_points_cap * RETENTION_POINT_BYTES);
+
+    // The two instant-path reducers whose state grows with surviving
+    // rows, charged INLINE rather than through a gate function — the
+    // pair review round 1 found missing from this sum.
+    let quantile =
+        quantile_values_n * alloc_block_bytes(quantile_values_cap * QUANTILE_VALUE_BYTES);
+    let counter = counter_values_n * alloc_block_bytes(counter_values_cap * COUNTER_VALUE_BYTES);
+
+    // The collision member COUNT contributes no bytes of its own — see
+    // [`COLLISION_MEMBER_BYTES`]. `saturating_mul` (not `*`) because a
+    // literal-zero product is a lint, and because it is this module's
+    // idiom everywhere else. The cap is READ so that the axis cannot be
+    // silently dropped from the destructure.
+    let collision_members = collision_members_n
+        .saturating_mul(COLLISION_MEMBER_BYTES)
+        .saturating_mul(if collision_members_cap > 0 { 1 } else { 0 });
+
+    // The collision stage is a byte cap on ONE staged group at a time.
+    let collision_bytes = collision_bytes_n * collision_bytes_cap;
+
+    // Result points are a SLOT cap, and the two counters reserve slots of
+    // different widths — one `alloc_block_bytes` term each. The
+    // multiplicity is the array's length (a compile-time assertion above
+    // pins the two equal), so a third width is a third term.
+    let mut result_points = 0u64;
+    let mut i = 0;
+    while i < RESULT_POINT_SLOT_BYTES.len() {
+        result_points += alloc_block_bytes(result_points_cap * RESULT_POINT_SLOT_BYTES[i]);
+        i += 1;
+    }
+    let _ = result_points_n;
+
+    group_bytes
+        + retention
+        + quantile
+        + counter
+        + collision_members
+        + collision_bytes
+        + result_points
 }
 
 #[cfg(test)]
@@ -997,86 +1288,10 @@ mod tests {
     /// a comment or its own definition.
     #[test]
     fn max_query_series_is_read_in_exactly_one_place() {
-        const SOURCES: &[(&str, &str)] = &[
-            ("exec.rs", include_str!("exec.rs")),
-            ("error.rs", include_str!("error.rs")),
-            ("plan.rs", include_str!("plan.rs")),
-            // Issue #272: the one walk this issue leaves recursive
-            // (#293 converts it) plus the two accessors it needs, in a
-            // module of their own so the compiler bounds their callers.
-            (
-                "plan_legacy_descent.rs",
-                include_str!("plan_legacy_descent.rs"),
-            ),
-            // Issue #272: `MetricNode`'s drop oracle. A `plan_`-prefixed
-            // sibling rather than `plan/drop_order.rs`, because a
-            // `plan/` directory is swallowed by a common global
-            // gitignore rule and the source would never be committed.
-            ("plan_drop_order.rs", include_str!("plan_drop_order.rs")),
-            ("mod.rs", include_str!("mod.rs")),
-            ("pipeline.rs", include_str!("pipeline.rs")),
-            ("sql.rs", include_str!("sql.rs")),
-            ("detected.rs", include_str!("detected.rs")),
-            ("cms.rs", include_str!("cms.rs")),
-            ("rows.rs", include_str!("rows.rs")),
-            ("params.rs", include_str!("params.rs")),
-            ("explain.rs", include_str!("explain.rs")),
-            ("escape.rs", include_str!("escape.rs")),
-            ("ip.rs", include_str!("ip.rs")),
-            ("agg.rs", include_str!("agg.rs")),
-            ("charge.rs", include_str!("charge.rs")),
-            ("client_agg.rs", include_str!("client_agg.rs")),
-            ("detected_probe.rs", include_str!("detected_probe.rs")),
-            ("fold.rs", include_str!("fold.rs")),
-            ("labels.rs", include_str!("labels.rs")),
-            ("post_agg.rs", include_str!("post_agg.rs")),
-            ("variants.rs", include_str!("variants.rs")),
-            ("walkbound.rs", include_str!("walkbound.rs")),
-            ("window.rs", include_str!("window.rs")),
-        ];
-
-        // **The file set must not be able to shrink silently.**
-        // `include_str!` needs compile-time literals, so `SOURCES` is
-        // written out — which means a source file added to `src/logql`
-        // (the post-aggregation region is scheduled to move into one of
-        // its own after #236 merges) would simply not be searched, and
-        // this census would keep passing while covering less. That is the
-        // gate-weakening shape this issue has hit repeatedly, so it is
-        // closed here rather than noted: the list is compared against the
-        // DIRECTORY at run time and a file it does not name is a loud
-        // failure naming the file, not a quiet reduction in scope.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
-        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
-            .expect("the logql source directory")
-            .map(|e| e.expect("dir entry").path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .map(|p| {
-                p.file_name()
-                    .expect("file name")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        on_disk.sort();
-        let mut named: Vec<String> = SOURCES.iter().map(|(n, _)| (*n).to_string()).collect();
-        named.sort();
-        assert_eq!(
-            named, on_disk,
-            "the census file set and `src/logql` have diverged — add the new file to \
-             `SOURCES` (and to any other census scoped to this region) rather than \
-             letting the search quietly cover less than the module"
-        );
-
-        /// Everything above the file's `#[cfg(test)]` marker.
-        fn production(src: &str) -> &str {
-            match src.find("\n#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => src,
-            }
-        }
+        let sources = census_sources();
 
         let mut reads: Vec<String> = Vec::new();
-        for (name, src) in SOURCES {
+        for (name, src) in sources {
             for (i, line) in production(src).lines().enumerate() {
                 if !line.contains("MAX_QUERY_SERIES") {
                     continue;
@@ -1115,7 +1330,7 @@ mod tests {
         );
         let deleted_cap = format!("MAX_CLIENT_AGG{}SERIES", '_');
         let deleted_field = format!("caps{}series", '.');
-        for (name, src) in SOURCES {
+        for (name, src) in sources {
             assert!(
                 !src.contains(&deleted_cap),
                 "{name} still references the deleted mid-scan group cap"
@@ -1262,5 +1477,681 @@ mod tests {
             collision_bytes: _,
             result_points: _,
         } = d;
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #260 — the composed bound.
+    // -----------------------------------------------------------------
+
+    /// AC 2 — the total is its TERMS, not a written-down number. Both
+    /// constants are pinned to their decimal values (so a change is
+    /// visible in the diff and in the docs that quote them) AND
+    /// recomputed from the caps, the multiplicities and the slot widths
+    /// (so raising any cap, widening any slot or changing a listed
+    /// multiplicity MOVES the number rather than leaving the two out of
+    /// step).
+    ///
+    /// What it does NOT catch, said plainly: a counter that was never
+    /// listed. `the_plurality_table_mirrors_every_agg_caps_axis` and
+    /// `every_cap_read_is_enumerated` are what close that.
+    #[test]
+    fn the_composed_bound_equals_its_terms() {
+        // The slot widths the derivation prices, pinned explicitly: a
+        // struct that widens moves the bound, and a bound that did not
+        // move would be wrong.
+        assert_eq!(RETENTION_POINT_BYTES, 32);
+        assert_eq!(QUANTILE_VALUE_BYTES, 8);
+        assert_eq!(COUNTER_VALUE_BYTES, 16);
+        assert_eq!(size_of::<VectorAccum>(), 24);
+        assert_eq!(size_of::<KSel>(), 24);
+        assert_eq!(RESULT_POINT_SLOT_BYTES, [16, 24]);
+
+        // Every term, recomputed here from the CAPS and the declared
+        // multiplicity — independently of `leaf_retained_bytes`, and one
+        // per `AggCaps` axis so a missing term is a missing line here.
+        let group_bytes = LEAF_COUNTERS.group_bytes * MAX_CLIENT_AGG_GROUP_BYTES;
+        let retention = LEAF_COUNTERS.retention_points
+            * alloc_block_bytes(MAX_RETAINED_WINDOW_POINTS * RETENTION_POINT_BYTES);
+        let quantile = LEAF_COUNTERS.quantile_values
+            * alloc_block_bytes(MAX_QUANTILE_VALUES * QUANTILE_VALUE_BYTES);
+        let counter = LEAF_COUNTERS.counter_values
+            * alloc_block_bytes(MAX_COUNTER_VALUES * COUNTER_VALUE_BYTES);
+        // The count cap's members are priced by `collision_bytes` in the
+        // same guard, so its own term is zero BY DERIVATION, not by
+        // omission.
+        let collision_members = LEAF_COUNTERS
+            .collision_members
+            .saturating_mul(COLLISION_MEMBER_BYTES);
+        let collision_bytes = LEAF_COUNTERS.collision_bytes * MAX_TS_COLLISION_GROUP_BYTES;
+        let result_points: u64 = RESULT_POINT_SLOT_BYTES
+            .iter()
+            .map(|w| alloc_block_bytes(MAX_METRIC_RESULT_POINTS * w))
+            .sum();
+        assert_eq!(group_bytes, 536_870_912);
+        assert_eq!(retention, 256_000_000);
+        assert_eq!(quantile, 64_000_000);
+        assert_eq!(counter, 128_000_000);
+        assert_eq!(collision_members, 0);
+        assert_eq!(collision_bytes, 8_388_608);
+        assert_eq!(result_points, 960_000_000);
+        assert_eq!(
+            MAX_LEAF_RETAINED_BYTES,
+            group_bytes
+                + retention
+                + quantile
+                + counter
+                + collision_members
+                + collision_bytes
+                + result_points,
+            "the leaf bound must equal the sum of its terms"
+        );
+        assert_eq!(MAX_LEAF_RETAINED_BYTES, 1_953_259_520);
+
+        // The query bound adds exactly ONE row's render budget.
+        assert_eq!(
+            MAX_QUERY_RETAINED_BYTES,
+            MAX_LEAF_RETAINED_BYTES + crate::logql::template::MAX_TEMPLATE_RENDER_BYTES
+        );
+        assert_eq!(MAX_QUERY_RETAINED_BYTES, 2_020_368_384);
+
+        // The variants leaf is strictly smaller, so the sum above really
+        // is an upper bound for it too: its fan-out counter shares the
+        // group-byte ceiling, its sub-states divide every cap, and it
+        // never attaches a fold.
+        let variants_leaf = crate::logql::variants::MAX_VARIANT_FANOUT_STATE_BYTES
+            + MAX_CLIENT_AGG_GROUP_BYTES
+            + alloc_block_bytes(MAX_METRIC_RESULT_POINTS * RESULT_POINT_SLOT_BYTES[0])
+            + alloc_block_bytes(MAX_RETAINED_WINDOW_POINTS * RETENTION_POINT_BYTES)
+            + alloc_block_bytes(MAX_QUANTILE_VALUES * QUANTILE_VALUE_BYTES)
+            + alloc_block_bytes(MAX_COUNTER_VALUES * COUNTER_VALUE_BYTES)
+            + MAX_TS_COLLISION_GROUP_BYTES;
+        assert_eq!(variants_leaf, 1_377_259_520);
+        assert!(
+            variants_leaf < MAX_LEAF_RETAINED_BYTES,
+            "the variants leaf must be inside the stated bound"
+        );
+    }
+
+    /// Review round 1, finding 2 — the structural half of the
+    /// completeness claim, and the one the first version lacked.
+    ///
+    /// `AggCaps` is, by its own contract (issue #221), EVERY per-query
+    /// retention cap in one place. Destructuring both it and
+    /// [`CounterPlurality`] with explicit field lists means a cap added
+    /// to `AggCaps` stops this file compiling until it is given a
+    /// multiplicity and a term — the compiler, not a reviewer, is what
+    /// keeps the enumeration complete over the cap axes.
+    #[test]
+    fn the_plurality_table_mirrors_every_agg_caps_axis() {
+        let AggCaps {
+            group_bytes: cap_group_bytes,
+            retention_points: cap_retention_points,
+            quantile_values: cap_quantile_values,
+            counter_values: cap_counter_values,
+            collision_members: cap_collision_members,
+            collision_bytes: cap_collision_bytes,
+            result_points: cap_result_points,
+        } = AggCaps::DEFAULT;
+        let CounterPlurality {
+            group_bytes,
+            retention_points,
+            quantile_values,
+            counter_values,
+            collision_members,
+            collision_bytes,
+            result_points,
+        } = LEAF_COUNTERS;
+
+        // Every axis carries at least one live counter — a zero would
+        // mean an unpriced cap, which is the omission this test exists
+        // to make impossible.
+        for (axis, cap, plurality) in [
+            ("group_bytes", cap_group_bytes, group_bytes),
+            ("retention_points", cap_retention_points, retention_points),
+            ("quantile_values", cap_quantile_values, quantile_values),
+            ("counter_values", cap_counter_values, counter_values),
+            (
+                "collision_members",
+                cap_collision_members,
+                collision_members,
+            ),
+            ("collision_bytes", cap_collision_bytes, collision_bytes),
+            ("result_points", cap_result_points, result_points),
+        ] {
+            assert!(cap > 0, "{axis}: a zero cap is not a cap");
+            assert!(
+                plurality >= 1,
+                "{axis}: every AggCaps axis needs at least one enumerated counter"
+            );
+        }
+    }
+
+    /// AC 8 — the published bound is the SHIPPED one. `docs/features.md`
+    /// quotes both constants, and a number a doc quotes is a number that
+    /// drifts, so it is read back from the committed file and compared
+    /// against the derivation.
+    ///
+    /// Also pins the two documentation corrections issue #260 made in
+    /// passing: the variants fan-out budget is 256 MiB (it was documented
+    /// as 64 MiB, which source never said), and the ledger's
+    /// `template-output-budget` entry describes a per-ROW lifetime.
+    #[test]
+    fn the_docs_quote_the_shipped_bound() {
+        /// `1828368384` → `"1,828,368,384"`, the spelling the docs use.
+        fn grouped(mut n: u64) -> String {
+            let mut parts = Vec::new();
+            while n >= 1_000 {
+                parts.push(format!("{:03}", n % 1_000));
+                n /= 1_000;
+            }
+            parts.push(n.to_string());
+            parts.reverse();
+            parts.join(",")
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let features =
+            std::fs::read_to_string(root.join("docs/features.md")).expect("features.md readable");
+        for c in [MAX_LEAF_RETAINED_BYTES, MAX_QUERY_RETAINED_BYTES] {
+            let spelled = grouped(c);
+            assert!(
+                features.contains(&spelled),
+                "docs/features.md does not quote {spelled} — the published bound has drifted \
+                 from the derived one"
+            );
+        }
+        // The stale variants-fan-out figure, corrected here.
+        assert!(
+            !features.contains("one 64 MiB budget before each allocation"),
+            "docs/features.md still calls the variants fan-out budget 64 MiB; source says \
+             {}",
+            super::super::variants::MAX_VARIANT_FANOUT_STATE_BYTES
+        );
+
+        let ledger =
+            std::fs::read_to_string(root.join("docs/benchmarks/logs-differential-ledger.md"))
+                .expect("ledger readable");
+        assert!(ledger.contains("cumulative per-ROW budget"));
+        assert!(
+            !ledger.contains("cumulative per-render budget"),
+            "the ledger still describes the pre-#260 per-render lifetime"
+        );
+    }
+
+    /// AC 1 — the multiplicity table is not a claim, it is a CENSUS: the
+    /// first argument of every production call to the four charge gates
+    /// is extracted from source and matched against a pinned list, so a
+    /// counter added anywhere in the flat `src/logql/` region either
+    /// appears here or fails the test by name.
+    ///
+    /// **Scope**, stated because an unscoped conclusion from a scoped
+    /// census is worthless: the same flat, non-recursive `src/logql/*.rs`
+    /// PRODUCTION region `max_query_series_is_read_in_exactly_one_place`
+    /// walks — reusing its `SOURCES` list, its directory guard and its
+    /// `#[cfg(test)]` truncation. Subdirectories (`template/`, `testkit/`)
+    /// hold no charge site; the directory guard is what stops the region
+    /// shrinking silently.
+    ///
+    /// Fails CLOSED: an occurrence whose first argument is not in the
+    /// pinned list is a failure naming the file and the token, not a
+    /// silent omission.
+    #[test]
+    fn every_charge_counter_is_enumerated() {
+        /// `(file, gate, first argument, occurrences)` — one row per
+        /// distinct counter expression. The counters this sums to are
+        /// [`LEAF_COUNTERS`]; see its table for which are simultaneously
+        /// live.
+        const EXPECTED: &[(&str, &str, &str, usize)] = &[
+            // `ClientAggState::group_bytes` (instant, ×2: the
+            // label-group and fingerprint-group arms) and
+            // `RangeSlideState::group_bytes` (range, ×2: the
+            // non-mutating `series_out` and mutating `groups` arms).
+            (
+                "client_agg.rs",
+                "charge_group_bytes",
+                "&mut self.group_bytes",
+                4,
+            ),
+            // `ReduceFold::group_bytes` XOR `SelectFold::group_bytes`,
+            // reached through `charged_group_key`'s `&mut u64` parameter.
+            ("fold.rs", "charge_group_bytes", "charged", 1),
+            // `RangeSlideState::result_points` (×3: the two slider
+            // creations and the absent-series emit).
+            (
+                "client_agg.rs",
+                "charge_result_points",
+                "&mut self.result_points",
+                3,
+            ),
+            // `ReduceFold::slots` XOR `SelectFold::slots`, through the
+            // `let charged = &mut self.slots` local (×3: the two dense
+            // vectors and `SelectFold`'s per-candidate slot).
+            ("fold.rs", "charge_result_points", "charged", 3),
+            // `RangeSlideState::retained`, through `&mut u64` parameters
+            // and the `let retained = &mut self.retained` local.
+            ("client_agg.rs", "charge_retention", "retained", 4),
+            // `VariantsAggState::charged` / `VariantArena::charged`.
+            ("variants.rs", "charge_fanout_bytes", "&mut charged", 3),
+            // The plan-time continuation of the SAME fan-out counter.
+            ("plan.rs", "charge_fanout_bytes", "charged", 1),
+            ("plan.rs", "charge_fanout_bytes", "&mut charged", 1),
+        ];
+        const GATES: &[&str] = &[
+            "charge_group_bytes",
+            "charge_result_points",
+            "charge_retention",
+            "charge_fanout_bytes",
+        ];
+
+        let sources = census_sources();
+        let mut found: Vec<(&str, &str, String)> = Vec::new();
+        for (name, src) in sources {
+            // Whitespace-normalised so a multi-line call's first argument
+            // is on the same "line" as its gate — the call sites are
+            // rustfmt-wrapped, so a line-oriented scan would see the gate
+            // and the argument separately.
+            let compact = compact_ws(&code_only(production(src)));
+            for gate in GATES {
+                let needle = format!("{gate}(");
+                let mut at = 0usize;
+                while let Some(i) = compact[at..].find(&needle) {
+                    let start = at + i;
+                    at = start + needle.len();
+                    // `discharge_<gate>` ends in an identifier character,
+                    // so the preceding byte separates a call from a
+                    // longer name that merely contains one.
+                    let prev = compact[..start].chars().next_back().unwrap_or(' ');
+                    if prev.is_alphanumeric() || prev == '_' {
+                        continue;
+                    }
+                    // The definition is not a call.
+                    if compact[..start].ends_with("fn ") {
+                        continue;
+                    }
+                    found.push((name, gate, first_argument(&compact[at..])));
+                }
+            }
+        }
+
+        // Every occurrence must be a KNOWN counter — an unknown token is
+        // a new counter, which changes the bound.
+        for (file, gate, arg) in &found {
+            assert!(
+                EXPECTED
+                    .iter()
+                    .any(|(f, g, a, _)| f == file && g == gate && a == arg),
+                "unenumerated {gate} counter in {file}: first argument {arg:?} — a new \
+                 counter against a shipped cap changes MAX_LEAF_RETAINED_BYTES; add it to \
+                 `LEAF_COUNTERS` and to this census"
+            );
+        }
+        // ...and every pinned counter must still exist, at its count.
+        for (file, gate, arg, count) in EXPECTED {
+            let seen = found
+                .iter()
+                .filter(|(f, g, a)| f == file && g == gate && a == arg)
+                .count();
+            assert_eq!(
+                seen, *count,
+                "{file}: {gate}({arg}) occurs {seen}×, expected {count}×"
+            );
+        }
+        assert_eq!(
+            found.len(),
+            EXPECTED.iter().map(|(_, _, _, n)| n).sum::<usize>(),
+            "the census and the pinned table disagree on the total: {found:#?}"
+        );
+
+        // The INDIRECTIONS the census cannot see through (the fold passes
+        // a parameter and a local, not a field), pinned by count so a
+        // third fold counter cannot hide behind the same token.
+        let fold = compact_ws(&code_only(production(include_str!("fold.rs"))));
+        assert_eq!(
+            fold.matches("&mut self.group_bytes").count(),
+            LEAF_COUNTERS.group_bytes as usize,
+            "fold.rs must route exactly the enumerated group-byte counters into \
+             `charged_group_key`"
+        );
+        assert_eq!(
+            fold.matches("&mut self.slots").count(),
+            LEAF_COUNTERS.result_points as usize,
+            "fold.rs must route exactly the enumerated slot counters into `charge_result_points`"
+        );
+    }
+
+    /// Review round 1, finding 2 — a source-derived TRIPWIRE over cap
+    /// enforcement. Not a proof: it matches literal `caps.<field>`
+    /// tokens, so a destructured or aliased read evades it (review round
+    /// 2). What is proved by the compiler is that every axis has a
+    /// multiplicity and a term — see
+    /// `the_plurality_table_mirrors_every_agg_caps_axis` and the
+    /// destructure inside [`leaf_retained_bytes`].
+    ///
+    /// The gate census below can only see counters that pass through one
+    /// of the four charge FUNCTIONS. `ClientAggState::quantile_values`
+    /// and `counter_values` do not: they compare inline
+    /// (`self.x > self.caps.x`), which is exactly how they escaped the
+    /// first version of [`LEAF_COUNTERS`].
+    ///
+    /// This census is derived from the one thing every enforcement has
+    /// in common, gated or not: **enforcing a cap means READING one.**
+    /// Every production read of an [`AggCaps`] field in the flat
+    /// `src/logql/` region is enumerated here, with the counter it
+    /// enforces named. A new counter — inline, gated, in a new struct or
+    /// a new file — must read a cap, so it lands in this table or fails
+    /// the test by name.
+    ///
+    /// (`caps.name(...)` in `pipeline.rs` is a regex captures binding,
+    /// not an `AggCaps` field; the scan matches only the seven field
+    /// names, so it is not a special case.)
+    #[test]
+    fn every_cap_read_is_enumerated() {
+        /// `(file, AggCaps field, reads, the counter each read enforces)`.
+        const EXPECTED: &[(&str, &str, usize, &str)] = &[
+            // 4 reads feed `charge_group_bytes` (2 in `ClientAggState`,
+            // 2 in `RangeSlideState`); the 5th hands the cap to the fold
+            // at `attach_fold`, which is the SECOND counter.
+            (
+                "client_agg.rs",
+                "group_bytes",
+                5,
+                "ClientAggState::group_bytes | RangeSlideState::group_bytes | the fold's cap",
+            ),
+            (
+                "client_agg.rs",
+                "retention_points",
+                2,
+                "RangeSlideState::retained",
+            ),
+            (
+                "client_agg.rs",
+                "quantile_values",
+                2,
+                "ClientAggState::quantile_values (INLINE — no gate function)",
+            ),
+            (
+                "client_agg.rs",
+                "counter_values",
+                2,
+                "ClientAggState::counter_values (INLINE — no gate function)",
+            ),
+            (
+                "client_agg.rs",
+                "collision_members",
+                2,
+                "RangeSlideState::coll member count",
+            ),
+            (
+                "client_agg.rs",
+                "collision_bytes",
+                2,
+                "RangeSlideState::coll_bytes",
+            ),
+            (
+                "client_agg.rs",
+                "result_points",
+                4,
+                "RangeSlideState::result_points | the fold's cap",
+            ),
+        ];
+
+        let fields = [
+            "group_bytes",
+            "retention_points",
+            "quantile_values",
+            "counter_values",
+            "collision_members",
+            "collision_bytes",
+            "result_points",
+        ];
+        // The scan's field list must BE `AggCaps`'s. Destructuring is
+        // what makes a new cap a compile error here rather than a field
+        // this census silently never looks for.
+        let AggCaps {
+            group_bytes: _,
+            retention_points: _,
+            quantile_values: _,
+            counter_values: _,
+            collision_members: _,
+            collision_bytes: _,
+            result_points: _,
+        } = AggCaps::DEFAULT;
+        assert_eq!(fields.len(), 7, "one scanned name per AggCaps field");
+
+        let mut found: Vec<(&str, &str)> = Vec::new();
+        for (name, src) in census_sources() {
+            let compact = compact_ws(&code_only(production(src)));
+            for field in fields {
+                let needle = format!("caps.{field}");
+                let mut at = 0usize;
+                while let Some(i) = compact[at..].find(&needle) {
+                    let start = at + i;
+                    at = start + needle.len();
+                    // `caps.result_points` must not also count as a read
+                    // of a longer field name that ends the same way.
+                    let next = compact[at..].chars().next().unwrap_or(' ');
+                    if next.is_alphanumeric() || next == '_' {
+                        continue;
+                    }
+                    found.push((name, field));
+                }
+            }
+        }
+
+        for (file, field) in &found {
+            assert!(
+                EXPECTED.iter().any(|(f, x, _, _)| f == file && x == field),
+                "unenumerated `caps.{field}` read in {file} — a cap read is a counter, and a \
+                 counter changes MAX_LEAF_RETAINED_BYTES; add it to `LEAF_COUNTERS` and to \
+                 this census"
+            );
+        }
+        for (file, field, count, enforces) in EXPECTED {
+            let seen = found
+                .iter()
+                .filter(|(f, x)| f == file && x == field)
+                .count();
+            assert_eq!(
+                seen, *count,
+                "{file}: `caps.{field}` is read {seen}×, expected {count}× ({enforces})"
+            );
+        }
+        assert_eq!(
+            found.len(),
+            EXPECTED.iter().map(|(_, _, n, _)| n).sum::<usize>(),
+            "the cap-read census and the pinned table disagree: {found:#?}"
+        );
+
+        // Every enumerated axis is actually enforced somewhere — an axis
+        // with no reads is a cap nothing checks, which the bound would
+        // be pricing for no reason.
+        for field in fields {
+            assert!(
+                found.iter().any(|(_, x)| *x == field),
+                "`caps.{field}` is never read: the bound prices an axis nothing enforces"
+            );
+        }
+    }
+
+    /// AC 4, lexical half — a DRIFT TRIPWIRE over `attach_fold`'s call
+    /// sites, and deliberately not more than that.
+    ///
+    /// **What it proves:** no new `.attach_fold(` call has appeared in
+    /// the flat production region. **What it does not:** a
+    /// fully-qualified call, a method alias, a macro expansion or a
+    /// future dispatch arrangement is invisible to it (review round 1,
+    /// C6). The claim that the variants path takes no fold — the premise
+    /// [`LEAF_COUNTERS`]`.group_bytes == 2` rests on — is carried by
+    /// `super::super::variants::tests::the_variants_sub_states_take_no_fold`,
+    /// which builds a real `VariantsAggState` through the production
+    /// constructor and asserts `sub_folded_aggs() == 0`, shows the
+    /// outer-aggregation composition that would supply a fold is a 400,
+    /// and shows the fold mechanism itself is live on a plain leaf.
+    #[test]
+    fn the_variants_path_attaches_no_fold() {
+        let callers: Vec<(&str, usize)> = census_sources()
+            .iter()
+            .map(|(name, src)| {
+                (
+                    *name,
+                    compact_ws(&code_only(production(src)))
+                        .matches(".attach_fold(")
+                        .count(),
+                )
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        assert_eq!(
+            callers,
+            vec![("exec.rs", 1), ("client_agg.rs", 1)],
+            "a new `attach_fold` caller may put a fold on the variants path, which would \
+             make the group-byte multiplicity 3 — re-run the runtime leg named above before \
+             re-pinning this list"
+        );
+        // Neither caller is in `variants.rs`, and the fan-out driver
+        // constructs its sub-states through `MetricAggState` alone.
+        let variants = compact_ws(&code_only(production(include_str!("variants.rs"))));
+        assert!(!variants.contains("attach_fold"));
+    }
+
+    /// The `SOURCES` list plus its directory guard, shared by the censuses
+    /// scoped to the flat `src/logql/` production region (issue #260 adds
+    /// the second and third readers of it).
+    fn census_sources() -> &'static [(&'static str, &'static str)] {
+        const SOURCES: &[(&str, &str)] = &[
+            ("exec.rs", include_str!("exec.rs")),
+            ("error.rs", include_str!("error.rs")),
+            ("plan.rs", include_str!("plan.rs")),
+            // Issue #272: the one walk that issue leaves recursive (#293
+            // converts it) plus the two accessors it needs, in a module
+            // of their own so the compiler bounds their callers.
+            (
+                "plan_legacy_descent.rs",
+                include_str!("plan_legacy_descent.rs"),
+            ),
+            // Issue #272: `MetricNode`'s drop oracle. A `plan_`-prefixed
+            // sibling rather than `plan/drop_order.rs`, because a `plan/`
+            // directory is swallowed by a common global gitignore rule
+            // and the source would never be committed.
+            ("plan_drop_order.rs", include_str!("plan_drop_order.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("pipeline.rs", include_str!("pipeline.rs")),
+            ("sql.rs", include_str!("sql.rs")),
+            ("detected.rs", include_str!("detected.rs")),
+            ("cms.rs", include_str!("cms.rs")),
+            ("rows.rs", include_str!("rows.rs")),
+            ("params.rs", include_str!("params.rs")),
+            ("explain.rs", include_str!("explain.rs")),
+            ("escape.rs", include_str!("escape.rs")),
+            ("ip.rs", include_str!("ip.rs")),
+            ("agg.rs", include_str!("agg.rs")),
+            ("charge.rs", include_str!("charge.rs")),
+            ("client_agg.rs", include_str!("client_agg.rs")),
+            ("detected_probe.rs", include_str!("detected_probe.rs")),
+            ("fold.rs", include_str!("fold.rs")),
+            ("labels.rs", include_str!("labels.rs")),
+            ("post_agg.rs", include_str!("post_agg.rs")),
+            ("variants.rs", include_str!("variants.rs")),
+            ("walkbound.rs", include_str!("walkbound.rs")),
+            ("window.rs", include_str!("window.rs")),
+        ];
+        assert_source_set_matches_the_directory(SOURCES);
+        SOURCES
+    }
+
+    /// **The file set must not be able to shrink silently.** `include_str!`
+    /// needs compile-time literals, so the list is written out — which
+    /// means a source file added to `src/logql` would simply not be
+    /// searched, and a census would keep passing while covering less. The
+    /// list is therefore compared against the DIRECTORY at run time and a
+    /// file it does not name is a loud failure naming the file, not a
+    /// quiet reduction in scope.
+    fn assert_source_set_matches_the_directory(sources: &[(&str, &str)]) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the logql source directory")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .map(|p| {
+                p.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        on_disk.sort();
+        let mut named: Vec<String> = sources.iter().map(|(n, _)| (*n).to_string()).collect();
+        named.sort();
+        assert_eq!(
+            named, on_disk,
+            "the census file set and `src/logql` have diverged — add the new file to \
+             `SOURCES` (and to any other census scoped to this region) rather than \
+             letting the search quietly cover less than the module"
+        );
+    }
+
+    /// Everything above the file's `#[cfg(test)]` marker.
+    fn production(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// Production source with every FULL-LINE comment dropped, so a
+    /// census cannot match its own prose. (`charge.rs`'s doc comments
+    /// name `caps.group_bytes` and the charge gates by hand; without
+    /// this the censuses would count their own documentation.) Dropping
+    /// whole comment lines also improves the compaction below: a comment
+    /// between a call and its first argument no longer separates them.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every run of whitespace collapsed to one space, so a
+    /// rustfmt-wrapped call and its arguments read as one string.
+    fn compact_ws(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut space = false;
+        for c in src.chars() {
+            if c.is_whitespace() {
+                space = true;
+                continue;
+            }
+            if space && !out.is_empty() {
+                out.push(' ');
+            }
+            space = false;
+            out.push(c);
+        }
+        out
+    }
+
+    /// The first argument of a call whose opening `(` has just been
+    /// consumed: everything up to the first depth-0 `,` (or `)`).
+    fn first_argument(rest: &str) -> String {
+        let mut depth = 0i32;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                ',' if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        rest[..end].trim().to_string()
     }
 }

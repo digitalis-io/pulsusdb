@@ -59,10 +59,14 @@ fn render_env(tmpl: &str, ts_ns: i64, env: &TemplateEnv) -> Result<String, Strin
     ];
     match compiled {
         Template::Full(prog) => {
-            let mut out = Vec::new();
-            template::render_full(&prog, &labels, None, None, "the line", ts_ns, env, &mut out)
-                .map_err(|e| e.msg)?;
-            Ok(String::from_utf8_lossy(&out).into_owned())
+            // One render per call here, so a fresh budget is the same
+            // thing the pipeline's per-ROW budget gives a single-template
+            // row (issue #260).
+            let budget = template::RenderBudget::default();
+            let rendered =
+                template::render_full(&prog, &labels, None, None, "the line", ts_ns, env, &budget)
+                    .map_err(|e| e.msg)?;
+            Ok(rendered.as_str().to_string())
         }
         other => panic!("expected a Full template for {tmpl:?}, got {other:?}"),
     }
@@ -688,9 +692,12 @@ fn full_templates_route_the_metric_path_through_fan_out_grouping() {
 }
 
 // ---------------------------------------------------------------------
-// The per-render output budget (issue #230 follow-up): charge before
+// The template output budget (issue #230 follow-up): charge before
 // allocate, breach to the bounded 422 — never an OOM (the reference is
-// unbounded here; ledgered `template-output-budget`).
+// unbounded here; ledgered `template-output-budget`). Its lifetime is
+// the ROW since issue #260; the cases below each perform ONE render per
+// row, so their boundaries are unchanged. The composition across a
+// row's several renders is `tests/logql_render_budget_composes.rs`.
 // ---------------------------------------------------------------------
 
 #[test]

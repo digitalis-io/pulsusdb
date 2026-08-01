@@ -245,7 +245,7 @@ fn lossy_charged<'v>(ctx: &FuncCtx<'_, '_>, v: &'v [u8]) -> Result<Cow<'v, str>,
 /// The exact byte length of `String::from_utf8_lossy(v)` — same
 /// substitution granularity as std (one U+FFFD per maximal invalid
 /// sequence, per `Utf8Error::error_len`), computed without allocating.
-fn lossy_repaired_len(v: &[u8]) -> usize {
+pub(super) fn lossy_repaired_len(v: &[u8]) -> usize {
     let mut rest = v;
     let mut len = 0usize;
     loop {
@@ -266,7 +266,7 @@ fn lossy_repaired_len(v: &[u8]) -> usize {
 /// Builds the lossy repair in ONE allocation of exactly `cap` bytes
 /// (byte-identical to `String::from_utf8_lossy(v)` — pinned by a unit
 /// test below, including the truncated-tail and interleaved cases).
-fn lossy_repaired(v: &[u8], cap: usize) -> String {
+pub(super) fn lossy_repaired(v: &[u8], cap: usize) -> String {
     let mut out = String::with_capacity(cap);
     let mut rest = v;
     loop {
