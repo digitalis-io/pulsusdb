@@ -24,8 +24,12 @@ use pulsus_schema::{
     Family, RenderCtx, SchemaParams, apply_ttl, check_version, reconcile, run_init,
 };
 
+/// `true` when the gated half of this suite should run. Skips cleanly on a
+/// developer machine with no container; **panics** rather than skipping when
+/// the gate is absent in a live CI job, so a lost `env:` block reddens the
+/// build instead of reporting green (issue #320).
 fn should_run() -> bool {
-    std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
+    pulsus_testkit::live_clickhouse_enabled()
 }
 
 fn test_config() -> ChConnConfig {
@@ -596,6 +600,10 @@ struct VersionRow {
 /// real multi-shard cluster is `tests/live_cluster.rs`, CI-side).
 #[test]
 fn family_sharding_expr_is_the_single_source_of_truth() {
+    // Hermetic, but it lives in a gated binary: without this the guard
+    // would be per-suite-entry, and `--test <suite> <this test>` would
+    // still exit 0 in a live CI job with the gate missing (issue #320).
+    pulsus_testkit::require_live_gate(pulsus_testkit::CLICKHOUSE_GATE);
     assert_eq!(
         Family::Metrics.sharding_expr(),
         "cityHash64(metric_name, fingerprint)"

@@ -510,7 +510,7 @@ async fn nestedset_value_differential() {
     let (Ok(api_base), Ok(otlp_base), true) = (
         std::env::var("PULSUSDB_NESTEDSET_DIFF_URL"),
         std::env::var("PULSUSDB_NESTEDSET_OTLP_URL"),
-        std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1"),
+        pulsus_testkit::live_clickhouse_enabled(),
     ) else {
         eprintln!(
             "skipping the nested-set value differential — set PULSUS_TEST_CLICKHOUSE=1, \

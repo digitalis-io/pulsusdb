@@ -40,8 +40,12 @@ use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::writer::{BlockInserter, ChBlockInserter, TraceWriter, TraceWriterTables};
 use pulsus_write::{AttrRecord, ParsedTraces, SpanRecord, TraceAttrRow, TraceSink};
 
+/// `true` when the gated half of this suite should run. Skips cleanly on a
+/// developer machine with no container; **panics** rather than skipping when
+/// the gate is absent in a live CI job, so a lost `env:` block reddens the
+/// build instead of reporting green (issue #320).
 fn should_run() -> bool {
-    std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
+    pulsus_testkit::live_clickhouse_enabled()
 }
 
 fn test_config(database: &str) -> ChConnConfig {

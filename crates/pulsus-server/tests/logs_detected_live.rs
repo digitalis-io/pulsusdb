@@ -37,8 +37,12 @@ use std::time::{Duration, Instant};
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 
+/// `true` when the gated half of this suite should run. Skips cleanly on a
+/// developer machine with no container; **panics** rather than skipping when
+/// the gate is absent in a live CI job, so a lost `env:` block reddens the
+/// build instead of reporting green (issue #320).
 fn should_run() -> bool {
-    std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
+    pulsus_testkit::live_clickhouse_enabled()
 }
 
 fn ch_host() -> String {
