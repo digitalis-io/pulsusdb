@@ -539,7 +539,7 @@ async fn traces_search_grouping_differential() {
     let (Ok(api_base), Ok(otlp_base), true) = (
         std::env::var("PULSUSDB_GROUPING_DIFF_URL"),
         std::env::var("PULSUSDB_GROUPING_OTLP_URL"),
-        std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1"),
+        pulsus_testkit::live_clickhouse_enabled(),
     ) else {
         eprintln!(
             "skipping the by()/coalesce() grouping differential — set PULSUS_TEST_CLICKHOUSE=1, \

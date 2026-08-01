@@ -78,6 +78,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Issue #320: the shared live-gate guard for the environment-gated
+# suites in this crate — with `PULSUS_TEST_CLICKHOUSE` absent they used to
+# exit 0, so a CI wiring regression was silent.
+pulsus-testkit = { path = "../pulsus-testkit" }
 # `#[derive(clickhouse::Row)]` (via `pulsus_clickhouse::Row`) expands
 # referencing the `clickhouse` crate name directly, so `tests/
 # prom_api_live.rs`'s seed-row structs need it in scope even though

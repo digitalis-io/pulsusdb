@@ -321,49 +321,6 @@ fn curated_corpus_still_carries_the_discovered_divergence_classes() {
     );
 }
 
-/// The GitHub Actions job id of the **hermetic** lane — the one that runs
-/// `cargo test --workspace` with no ClickHouse and is therefore allowed to
-/// skip this suite. Every other job that reaches this binary is a live job.
-const HERMETIC_CI_JOB: &str = "ci";
-
-/// Why this run is, or is not, allowed to skip the live half.
-#[derive(Debug)]
-enum LiveGate {
-    /// `PULSUS_TEST_CLICKHOUSE=1` — run against the container.
-    Run,
-    /// No gate, and nothing claims there should be one: a developer
-    /// machine, or the hermetic CI lane. Skip cleanly.
-    SkipUngated,
-    /// No gate, but this is a CI job that exists to provide the container.
-    /// Skipping here is the silent failure this variant exists to prevent.
-    MissingInLiveCiJob { job: String },
-}
-
-/// Issue #309 review round 2: with the gate unset this suite exited `0`,
-/// so a wiring regression in `.github/workflows/ci.yml` would disable it
-/// **silently** — the same class as the provenance step that never ran
-/// (#272). GitHub Actions sets `GITHUB_JOB` to the job id, which separates
-/// the hermetic `cargo test --workspace` lane (allowed to skip) from a job
-/// that exists to stand up ClickHouse (must not).
-///
-/// Deliberately fail-closed on the brittle edge: if `HERMETIC_CI_JOB` is
-/// ever renamed, this starts failing the hermetic lane *loudly* rather than
-/// quietly excusing a live job — a wrong guess about which job we are in
-/// can only ever produce noise, never a silent pass.
-///
-/// **Scope:** this suite only. The skip-when-ungated idiom is repo-wide
-/// (57 gated suites) and generalising it is issue **#320**'s job — see the
-/// note there before copying this anywhere else.
-fn live_gate() -> LiveGate {
-    if std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1") {
-        return LiveGate::Run;
-    }
-    match std::env::var("GITHUB_JOB") {
-        Ok(job) if job != HERMETIC_CI_JOB => LiveGate::MissingInLiveCiJob { job },
-        _ => LiveGate::SkipUngated,
-    }
-}
-
 /// Called first by **every** test in this binary, not just the live one.
 ///
 /// Issue #309 review round 3: round 2 put this check inside the live test
@@ -372,40 +329,24 @@ fn live_gate() -> LiveGate {
 /// `0` with the gate absent. Every test now refuses to run in a live CI job
 /// without the gate.
 ///
-/// **Exactly what this covers:** in a live CI job with the gate absent,
-/// every test in this binary panics, so any invocation that executes **at
-/// least one** test exits non-zero. An invocation whose filter selects *no*
-/// test executes nothing at all, and a harness binary has no hook that runs
-/// in that case — `cargo test` exits `0` there, while nextest (which the
-/// hermetic workspace lane uses) exits `4`, `no tests to run`. Closing that
-/// last case would need `harness = false`, and nextest cannot list a
-/// non-harness binary (measured: `creating test list failed`), so it would
-/// break the very lane this guard protects.
-fn live_gate_or_panic() -> LiveGate {
-    let gate = live_gate();
-    if let LiveGate::MissingInLiveCiJob { job } = &gate {
-        panic!(
-            "PULSUS_TEST_CLICKHOUSE is not set, but this is CI job {job:?}, which exists to \
-             provide ClickHouse — the RE2 screen differential would have skipped silently. \
-             Restore the gate on the 'RE2 screen differential suite' step in \
-             .github/workflows/ci.yml (issue #320 owns generalising this check)."
-        );
-    }
-    gate
+/// Issue #320 generalised the mechanism this suite pioneered into
+/// [`pulsus_testkit`]; the coverage statement and the one residual it does
+/// not close (a filter that selects no test at all) live in that crate's
+/// module docs.
+fn live_gate_or_panic() {
+    pulsus_testkit::require_live_gate(pulsus_testkit::CLICKHOUSE_GATE);
 }
 
 /// `true` when the live half should execute.
 fn should_run() -> bool {
-    match live_gate_or_panic() {
-        LiveGate::Run => true,
-        _ => {
-            eprintln!(
-                "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
-                 (see crates/pulsus-read/tests/re2_screen_differential.rs for setup)"
-            );
-            false
-        }
+    if pulsus_testkit::live_clickhouse_enabled() {
+        return true;
     }
+    eprintln!(
+        "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+         (see crates/pulsus-read/tests/re2_screen_differential.rs for setup)"
+    );
+    false
 }
 
 fn test_config() -> ChConnConfig {

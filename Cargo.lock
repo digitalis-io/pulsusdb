@@ -1684,6 +1684,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "pulsus-config",
+ "pulsus-testkit",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -1735,6 +1736,7 @@ dependencies = [
  "clickhouse",
  "futures",
  "pulsus-clickhouse",
+ "pulsus-testkit",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1772,6 +1774,7 @@ dependencies = [
  "pulsus-model",
  "pulsus-promql",
  "pulsus-schema",
+ "pulsus-testkit",
  "pulsus-traceql",
  "pulsus-write",
  "regex",
@@ -1794,6 +1797,7 @@ dependencies = [
  "clickhouse",
  "futures",
  "pulsus-clickhouse",
+ "pulsus-testkit",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -1823,6 +1827,7 @@ dependencies = [
  "pulsus-promql",
  "pulsus-read",
  "pulsus-schema",
+ "pulsus-testkit",
  "pulsus-traceql",
  "pulsus-write",
  "rcgen",
@@ -1841,6 +1846,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "pulsus-testkit"
+version = "0.0.0"
 
 [[package]]
 name = "pulsus-traceql"
@@ -1868,6 +1877,7 @@ dependencies = [
  "pulsus-config",
  "pulsus-model",
  "pulsus-schema",
+ "pulsus-testkit",
  "serde",
  "serde_bytes",
  "serde_json",

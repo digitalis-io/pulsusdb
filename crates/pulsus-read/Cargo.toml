@@ -72,6 +72,10 @@ tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# Issue #320: the shared live-gate guard for the environment-gated
+# suites in this crate — with `PULSUS_TEST_CLICKHOUSE` absent they used to
+# exit 0, so a CI wiring regression was silent.
+pulsus-testkit = { path = "../pulsus-testkit" }
 pulsus-schema = { path = "../pulsus-schema" }
 # DEV-ONLY, and must stay dev-only (issue #167): the deferred #139 L-T1
 # executor proof (`tests/traces_search_heal_live.rs`) drives the real

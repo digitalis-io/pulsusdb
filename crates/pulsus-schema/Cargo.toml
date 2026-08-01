@@ -16,4 +16,8 @@ serde.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+# Issue #320: the shared live-gate guard for the environment-gated
+# suites in this crate — with `PULSUS_TEST_CLICKHOUSE` absent they used to
+# exit 0, so a CI wiring regression was silent.
+pulsus-testkit = { path = "../pulsus-testkit" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

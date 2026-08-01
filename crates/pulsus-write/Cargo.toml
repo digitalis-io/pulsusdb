@@ -27,6 +27,10 @@ tracing.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+# Issue #320: the shared live-gate guard for the environment-gated
+# suites in this crate — with `PULSUS_TEST_CLICKHOUSE` absent they used to
+# exit 0, so a CI wiring regression was silent.
+pulsus-testkit = { path = "../pulsus-testkit" }
 # Issue #16 `ingest_fidelity.rs`: brings up a real schema (`run_init`) to
 # assert both ingest paths against a live ClickHouse, test-only (same
 # pattern as `pulsus-read`'s `explain_indexes.rs`).

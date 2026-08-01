@@ -43,8 +43,12 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
 
+/// `true` when the gated half of this suite should run. Skips cleanly on a
+/// developer machine with no container; **panics** rather than skipping when
+/// the gate is absent in a live CI job, so a lost `env:` block reddens the
+/// build instead of reporting green (issue #320).
 fn should_run() -> bool {
-    std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
+    pulsus_testkit::live_clickhouse_enabled()
 }
 
 const PORT: u16 = 31_130;
@@ -1238,6 +1242,10 @@ async fn duration_seconds_reach_the_wire_exactly_as_the_reference_emits_them() {
 /// and rides the workspace test step on every PR.
 #[test]
 fn wire_literal_occurs_in_is_delimiter_sensitive() {
+    // Hermetic, but it lives in a gated binary: without this the guard
+    // would be per-suite-entry, and `--test <suite> <this test>` would
+    // still exit 0 in a live CI job with the gate missing (issue #320).
+    pulsus_testkit::require_live_gate(pulsus_testkit::CLICKHOUSE_GATE);
     for (ns, want, s_lit, t_lit) in REFERENCE_DURATION_SECONDS {
         assert!(s_lit.denotes(*want), "{ns}: transcription");
         for lit in [s_lit, t_lit] {

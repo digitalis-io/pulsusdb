@@ -187,8 +187,9 @@
 //! TABLE, not an unbounded allocation.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pulsus_logql::{Grouping, GroupingKind, VectorAggOp, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
@@ -201,18 +202,89 @@ static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
-static MEASURING: AtomicBool = AtomicBool::new(false);
 
-/// The counters are process-global: every test in this binary serializes
-/// on this lock so no parallel test's allocations pollute a measured
-/// window (the single-`#[test]` precedent, expressed as a lock because
-/// G4 is a second, allocation-heavy test in the same binary).
+thread_local! {
+    /// Issue #297: **thread-confined**, where it used to be a process-wide
+    /// `AtomicBool`. A measured window asks a question about the work the
+    /// measuring thread does inside it; while the flag was global the
+    /// counters answered a different question — "what did the whole
+    /// process allocate during that interval" — and the harness's own
+    /// per-test machinery, running on other threads, landed inside the
+    /// window. That is the observed `--test-threads=2` flake (a stray 48
+    /// bytes in G0's window, ~1 run in 7).
+    ///
+    /// Everything a window measures (`plan`, the state constructors,
+    /// `push_rows`/`finish`, `run_variants_rows`) runs synchronously on
+    /// the calling thread, so confining the flag removes interference
+    /// without removing a single first-party allocation.
+    ///
+    /// `const`-initialised and non-`Drop`, so reading it from inside the
+    /// global allocator is a plain TLS load: no lazy initialisation, no
+    /// destructor registration, and therefore no re-entry into the
+    /// allocator. `try_with` covers the one remaining edge — a thread
+    /// allocating during TLS teardown — by reporting "not measuring".
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
+
+    /// A per-thread identity for the [`SERIAL`] ownership check, since
+    /// `ThreadId` has no stable integer projection. Assigned lazily from
+    /// [`NEXT_THREAD_KEY`]; never read from inside the allocator.
+    static THREAD_KEY: Cell<u64> = const { Cell::new(0) };
+}
+
+fn measuring() -> bool {
+    MEASURING.try_with(Cell::get).unwrap_or(false)
+}
+
+static NEXT_THREAD_KEY: AtomicU64 = AtomicU64::new(1);
+
+fn thread_key() -> u64 {
+    THREAD_KEY.with(|k| {
+        let mut key = k.get();
+        if key == 0 {
+            key = NEXT_THREAD_KEY.fetch_add(1, Ordering::Relaxed);
+            k.set(key);
+        }
+        key
+    })
+}
+
+/// The four counters are still process-global (only the *window flag* is
+/// thread-confined), so two threads measuring at once would interleave
+/// their totals. Every test that opens a window holds this lock.
+///
+/// Issue #297 defect (2): holding it was a convention, and a convention a
+/// new test can forget is not a guarantee. [`serialize`] is now the only
+/// way to obtain a window ([`measured`] asserts the current thread owns
+/// the lock), so a test added without it fails loudly instead of racing.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The thread that currently holds [`SERIAL`], as a [`thread_key`]; `0`
+/// when the lock is free.
+static SERIAL_OWNER: AtomicU64 = AtomicU64::new(0);
+
+/// RAII proof that the calling thread holds [`SERIAL`]. Poison is
+/// deliberately ignored: a panicking test leaves no state behind that a
+/// later one could misread — the counters are reset at every window open.
+struct Serialized {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+fn serialize() -> Serialized {
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    SERIAL_OWNER.store(thread_key(), Ordering::SeqCst);
+    Serialized { _guard: guard }
+}
+
+impl Drop for Serialized {
+    fn drop(&mut self) {
+        SERIAL_OWNER.store(0, Ordering::SeqCst);
+    }
+}
 
 struct TripleCounterAlloc;
 
 fn on_alloc(size: u64) {
-    if MEASURING.load(Ordering::Relaxed) {
+    if measuring() {
         TOTAL_BYTES.fetch_add(size, Ordering::Relaxed);
         ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
         let now = LIVE.fetch_add(size, Ordering::Relaxed) + size;
@@ -221,7 +293,7 @@ fn on_alloc(size: u64) {
 }
 
 fn on_dealloc(size: u64) {
-    if MEASURING.load(Ordering::Relaxed) {
+    if measuring() {
         // Saturating: a pre-window allocation freed inside the window
         // would push `LIVE` negative; clamping at 0 only ever over-states
         // the peak — the safe direction for a `≤ charge` assertion.
@@ -237,7 +309,8 @@ fn on_dealloc(size: u64) {
 }
 
 // SAFETY: delegates verbatim to the system allocator; the only side
-// effects are relaxed atomic updates (gated by `MEASURING`) which
+// effects are relaxed atomic updates (gated by the `MEASURING` TLS flag,
+// whose `const`-init non-`Drop` slot is read without allocating) which
 // allocate nothing and cannot re-enter the allocator.
 unsafe impl GlobalAlloc for TripleCounterAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -261,14 +334,24 @@ unsafe impl GlobalAlloc for TripleCounterAlloc {
 static ALLOCATOR: TripleCounterAlloc = TripleCounterAlloc;
 
 /// One measured window: `(alloc_calls, total_bytes, peak)`.
+///
+/// Refuses to open a window unless the calling thread holds [`SERIAL`]
+/// (via [`serialize`]) — issue #297's "a test added without the mutex
+/// must fail rather than silently race".
 fn measured<T>(f: impl FnOnce() -> T) -> (u64, u64, u64, T) {
+    assert_eq!(
+        SERIAL_OWNER.load(Ordering::SeqCst),
+        thread_key(),
+        "measured() opens a window over process-global counters: the calling test must hold \
+         SERIAL. Start the test with `let _serial = serialize();`"
+    );
     TOTAL_BYTES.store(0, Ordering::SeqCst);
     ALLOC_CALLS.store(0, Ordering::SeqCst);
     LIVE.store(0, Ordering::SeqCst);
     PEAK.store(0, Ordering::SeqCst);
-    MEASURING.store(true, Ordering::SeqCst);
+    MEASURING.set(true);
     let out = f();
-    MEASURING.store(false, Ordering::SeqCst);
+    MEASURING.set(false);
     (
         ALLOC_CALLS.load(Ordering::SeqCst),
         TOTAL_BYTES.load(Ordering::SeqCst),
@@ -373,6 +456,11 @@ const EXEC_FIN_ALLOCS_PER_VARIANT_ABS_OVERRIDE: u64 = 6; // Φ7 (was 7 pre-corre
 
 /// The two-sided band residue (`logql_pipeline_alloc.rs` precedent).
 const STRAY_ALLOC_RESIDUE: u64 = 20;
+
+// G0's retained-delta ceiling is derived in-test (`bytes / calls`, one
+// transient's cost) rather than declared here: a constant would be a byte
+// literal, and the standing rule wants the ceiling scale-free — see the
+// comment at the assertion.
 
 fn assert_band(slope: u64, per_variant: u64, n: u64, what: &str) {
     let expected = per_variant * (n - 1);
@@ -550,15 +638,32 @@ fn count_fin(f: &ExecFixture) -> (u64, u64, u64) {
 
 #[test]
 fn variants_allocation_gates() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = serialize();
     // --- G0: instrument-validity control (direction-neutral). The new
     // instrument SEES a dropped transient; the v6 retained quantity
     // cannot.
     let n_ctl: u64 = 64;
+    // The ceiling below is the heap cost of ONE transient, taken from a
+    // probe built OUTSIDE the window (issue #320 review round 2, finding
+    // 2). The previous attempt divided the window's own totals — a MEAN,
+    // which the in-test `calls` guard bounds only from below, so a single
+    // dropped 128-byte stray inside the window raised the divisor enough
+    // (1408/65 = 21) to let a retained 20-byte transient through. Derived
+    // from the fixture instead, nothing that happens inside the window can
+    // move it. `{i:04}` is fixed-width, so every transient in the loop
+    // allocates exactly what this probe does.
+    let per_transient = {
+        let probe = format!("transient-{:04}", 0);
+        probe.capacity() as u64
+    };
+    assert!(
+        per_transient > 0,
+        "G0: the control transient must be heap-allocated"
+    );
     let live_at_open = LIVE.load(Ordering::SeqCst);
     let (calls, bytes, _, _) = measured(|| {
         for i in 0..n_ctl {
-            let s = format!("transient-{i}");
+            let s = format!("transient-{i:04}");
             std::hint::black_box(&s);
             drop(s);
         }
@@ -569,11 +674,27 @@ fn variants_allocation_gates() {
         "G0: ALLOC_CALLS must see {n_ctl} dropped transients, saw {calls}"
     );
     assert!(bytes > 0, "G0: TOTAL_BYTES must see dropped transients");
-    assert_eq!(
-        live_at_close.saturating_sub(live_at_open),
-        0,
-        "G0: the retained-delta quantity is blind to transients — which is \
-         exactly why it is no longer a decision gate"
+    // Issue #297: a CEILING, never exact equality against a process-global
+    // counter. What G0 claims is that the retained delta cannot SEE the
+    // transients while TOTAL_BYTES/ALLOC_CALLS see all of them.
+    //
+    // `per_transient` is scale-free (it is the `String` buffer the fixture
+    // itself allocates, never a byte literal, so it carries no
+    // pointer-width or allocator assumption) and window-independent, so
+    // retaining a SINGLE one of the 64 lands the delta exactly ON the
+    // ceiling and reddens, whatever else the window allocates.
+    //
+    // The interference the ceiling used to have to absorb is gone at the
+    // source anyway — `MEASURING` is thread-confined (see its
+    // declaration), so this delta measures only this thread's window and
+    // observes 0.
+    let retained = live_at_close.saturating_sub(live_at_open);
+    assert!(
+        retained < per_transient,
+        "G0: the retained-delta quantity must stay blind to {calls} allocations totalling \
+         {bytes} bytes — it observed {retained}, at or above the cost of a single transient \
+         ({per_transient} bytes, taken from the fixture, not from this window). Either the \
+         window now retains what it allocates, or the counters are no longer window-confined."
     );
 
     // --- G1-proof: every plan fixture is ADMITTED and provably executed
@@ -2568,7 +2689,7 @@ fn module_doc() -> String {
 /// of the 26 frame bodies.
 #[test]
 fn g4_frame_census_and_inventory_closure() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = serialize();
     // (1) 26 unique frames, each resolving to exactly one item.
     assert_eq!(PER_VARIANT_FRAMES.len(), 27);
     let mut keys = BTreeSet::new();
