@@ -134,14 +134,18 @@ impl MatcherCache {
                 let re = match self.compiled.get(&m.value) {
                     Some(re) => re,
                     None => {
-                        let re = regex::Regex::new(&format!("^(?:{})$", m.value)).map_err(|e| {
-                            PromqlError::LabelSet {
-                                detail: format!(
-                                    "invalid matcher regex in info(): {:?}: {e}",
-                                    m.value
-                                ),
-                            }
-                        })?;
+                        // Issue #317: RE2's reading of the pattern, not the
+                        // Rust crate's superset grammar.
+                        let translated = crate::re2_syntax::re2_pattern_to_rust(&m.value);
+                        let re =
+                            regex::Regex::new(&format!("^(?:{translated})$")).map_err(|e| {
+                                PromqlError::LabelSet {
+                                    detail: format!(
+                                        "invalid matcher regex in info(): {:?}: {e}",
+                                        m.value
+                                    ),
+                                }
+                            })?;
                         self.compiled.entry(m.value.clone()).or_insert(re)
                     }
                 };

@@ -41,8 +41,8 @@ use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
 use pulsus_model::{Fingerprint, LabelSet, NativeHistogram};
 use pulsus_promql::parser::Expr;
 use pulsus_promql::{
-    DEFAULT_LOOKBACK_MS, FetchedSeries, InstantSample, Labels, PlanParams, QueryValue, RangeSeries,
-    Sample, SelectorSpec, SeriesData,
+    DEFAULT_LOOKBACK_MS, FetchedSeries, InstantSample, Labels, PlanParams, PromqlError, QueryValue,
+    RangeSeries, Sample, SelectorSpec, SeriesData,
 };
 
 use super::labels::{LabelledResolution, MetricSeriesGroup, MultiMetricResolution};
@@ -550,9 +550,18 @@ impl MetricsEngine {
                     continue;
                 }
                 Err(reason) => {
-                    return Err(ReadError::NamelessSelectorUnresolvable {
-                        reason: format!("{reason:?}"),
-                    });
+                    // Issue #316: an uncompilable `__name__` regex is a
+                    // malformed request, not a degraded cache — and this
+                    // site has no SQL fallback to learn that from. The
+                    // ordinary label matchers below still do, so they are
+                    // deliberately not screened here.
+                    return Err(
+                        invalid_name_matcher_error(&sel.name_matchers).unwrap_or_else(|| {
+                            ReadError::NamelessSelectorUnresolvable {
+                                reason: format!("{reason:?}"),
+                            }
+                        }),
+                    );
                 }
             }
 
@@ -773,20 +782,51 @@ impl MetricsEngine {
             self.config.max_cache_scan,
         );
         let groups: Vec<MetricSeriesGroup> = match resolution {
-            MultiMetricResolution::Groups(groups) => groups,
-            MultiMetricResolution::Unresolvable { reason } => {
-                return Err(ReadError::NamelessSelectorUnresolvable {
-                    reason: format!("{reason:?}"),
-                });
-            }
-            MultiMetricResolution::FanoutExceeded { matched, cap } => {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricFanout {
-                    matched,
-                    cap,
-                }));
-            }
-            MultiMetricResolution::ScanBudgetExceeded { cap, .. } => {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::CacheScan { cap }));
+            // Issue #316: a NON-EMPTY resolution is its own proof that
+            // every regex matcher compiled — a group exists only if some
+            // metric name passed every name matcher and some series passed
+            // every label matcher, and both walks short-circuit on the
+            // first matcher that cannot be evaluated. So the hot path
+            // needs no check and pays nothing; a compile costs tens of
+            // microseconds and would otherwise be duplicated per matcher
+            // per query, against a resolution the memoized `RegexCache`
+            // has already paid for.
+            MultiMetricResolution::Groups(groups) if !groups.is_empty() => groups,
+            // Every other outcome leaves at least one matcher unproven, and
+            // this path has no SQL fallback to learn the verdict from
+            // (#85). Upstream Prometheus compiles every matcher in its
+            // parser, so an uncompilable one is a 400 `bad_data` there
+            // whatever the cache is doing — including the two shapes that
+            // used to answer differently: a cold/out-of-window cache
+            // (`422`) and name matchers matching nothing, which left the
+            // label matchers uncompiled and answered `200` with an empty
+            // result.
+            outcome => {
+                if let Some(detail) = super::re2_authority::first_invalid_regex_detail(&[
+                    &sel.name_matchers,
+                    &sel.matchers,
+                ]) {
+                    return Err(ReadError::Promql(PromqlError::InvalidRegexMatcher {
+                        detail,
+                    }));
+                }
+                match outcome {
+                    MultiMetricResolution::Groups(groups) => groups,
+                    MultiMetricResolution::Unresolvable { reason } => {
+                        return Err(ReadError::NamelessSelectorUnresolvable {
+                            reason: format!("{reason:?}"),
+                        });
+                    }
+                    MultiMetricResolution::FanoutExceeded { matched, cap } => {
+                        return Err(ReadError::QueryTooBroad(TooBroadReason::MetricFanout {
+                            matched,
+                            cap,
+                        }));
+                    }
+                    MultiMetricResolution::ScanBudgetExceeded { cap, .. } => {
+                        return Err(ReadError::QueryTooBroad(TooBroadReason::CacheScan { cap }));
+                    }
+                }
             }
         };
 
@@ -1184,9 +1224,16 @@ impl MetricsEngine {
         match super::labels::concrete_name_matches(&filter.name_matchers, name) {
             Ok(true) => Ok(Some(discovery_query())),
             Ok(false) => Ok(None),
-            Err(reason) => Err(ReadError::NamelessSelectorUnresolvable {
-                reason: format!("{reason:?}"),
-            }),
+            // Issue #316: same reading as the query path's concrete-name
+            // arm — an uncompilable `__name__` regex is a 400, not a
+            // degraded-cache 422.
+            Err(reason) => Err(
+                invalid_name_matcher_error(&filter.name_matchers).unwrap_or_else(|| {
+                    ReadError::NamelessSelectorUnresolvable {
+                        reason: format!("{reason:?}"),
+                    }
+                }),
+            ),
         }
     }
 
@@ -1566,6 +1613,16 @@ enum SelectorFetchPlan {
     /// selector whose `name_matchers` exclude its own name (issue #85),
     /// or a fan-out that matched zero metric names.
     Empty,
+}
+
+/// Issue #316: the 400 `bad_data` an uncompilable `__name__` regex earns,
+/// for the two concrete-name sites that evaluate name matchers in-process
+/// with nothing to delegate to. `None` when every name matcher compiles —
+/// the caller then keeps its degraded-cache `422`, which is what a screened
+/// (rather than invalid) pattern genuinely is.
+fn invalid_name_matcher_error(name_matchers: &[super::matcher::LabelMatcher]) -> Option<ReadError> {
+    super::re2_authority::first_invalid_regex_detail(&[name_matchers])
+        .map(|detail| ReadError::Promql(PromqlError::InvalidRegexMatcher { detail }))
 }
 
 /// The concrete metric name a [`SelectorFetchPlan::Chunks`]/`Fallback`
