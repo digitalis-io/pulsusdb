@@ -2187,6 +2187,19 @@ impl MetricAggState<'_> {
             MetricAggState::Range(s) => s.finish(),
         }
     }
+
+    /// How many vector aggregations this state has taken over — a test
+    /// seam (issue #260) so "the variants path attaches no fold", the
+    /// premise the group-byte multiplicity of 2 rests on, can be asserted
+    /// on a REAL constructed state rather than only lexically. The
+    /// instant arm has no fold to take.
+    #[cfg(test)]
+    pub(in crate::logql) fn folded_aggs(&self) -> usize {
+        match self {
+            MetricAggState::Instant(_) => 0,
+            MetricAggState::Range(s) => s.folded_aggs(),
+        }
+    }
 }
 
 // =====================================================================
@@ -2263,6 +2276,7 @@ fn mut_cells_for(class: ReducerClass, range: i64, step: u64, kmax: i64) -> MutCe
 mod tests {
     use super::*;
     use crate::logql::CompiledPipeline;
+    use crate::logql::charge::MAX_CLIENT_AGG_GROUP_BYTES;
     use crate::logql::charge::MAX_COUNTER_VALUES;
     use crate::logql::charge::MAX_QUANTILE_VALUES;
     use crate::logql::charge::MAX_TS_COLLISION_GROUP_BYTES;
@@ -4122,6 +4136,111 @@ mod tests {
             "the breaching group was inserted anyway"
         );
         assert_eq!(state.group_bytes, 0, "a refused charge must not stick");
+    }
+
+    /// Issue #260 AC 3 — the group-byte multiplicity of **2** is
+    /// EXERCISED, not claimed: on a folded range query the slider and the
+    /// fold hold two independent counters against
+    /// [`MAX_CLIENT_AGG_GROUP_BYTES`] at the same time, so the bytes the
+    /// cap proves are the SUM ([`MAX_LEAF_RETAINED_BYTES`]'s first term),
+    /// never the cap.
+    ///
+    /// The fold takes its cap from `caps.group_bytes` at `attach_fold`,
+    /// so attaching under a tight cap and restoring the slider's
+    /// afterwards gives the two counters DIFFERENT ceilings — which is
+    /// what makes their independence observable. Two groups sized so the
+    /// first fits the fold's cap and the second does not: at the breach
+    /// BOTH counters are non-zero, and the error names the FOLD's cap
+    /// while the slider's is untouched.
+    ///
+    /// *Rejects a claim of 2 that is really 1* — one shared counter would
+    /// report the slider's cap, or would already have breached.
+    #[test]
+    fn the_slider_and_the_fold_hold_two_independent_group_byte_counters() {
+        const FOLD_GROUP_CAP: u64 = 5_000;
+
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format keep="1""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 100, 10, 30);
+        let mut state =
+            RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                .unwrap();
+
+        // The fold is attached under the tight cap; the slider keeps the
+        // shipped one. Two ceilings, one constant.
+        state.caps.group_bytes = FOLD_GROUP_CAP;
+        let spec: plan::VectorAggSpec = (
+            VectorAggOp::Sum,
+            Some(pulsus_logql::Grouping {
+                kind: GroupingKind::By,
+                labels: vec!["u".to_string()],
+            }),
+            None,
+        );
+        state.attach_fold(&spec);
+        state.caps.group_bytes = MAX_CLIENT_AGG_GROUP_BYTES;
+        assert_eq!(
+            state
+                .fold
+                .as_ref()
+                .and_then(|f| f.group_byte_counter())
+                .map(|(_, cap)| cap),
+            Some(FOLD_GROUP_CAP),
+            "the fold must carry its own cap"
+        );
+
+        // Group "a" is tiny and fits; group "b…" carries a 10 000-byte
+        // value, so its key alone exceeds the fold's cap. `finish_in_place`
+        // hands groups to the fold in label-ascending order, so "a" lands
+        // first.
+        let big = "b".repeat(10_000);
+        let rows = slide_rows(1, &[(10, "u=a"), (20, &format!("u={big}"))]);
+        state
+            .push_rows(&rows)
+            .expect("the slider's own cap is ample");
+        assert!(
+            state.group_bytes > 0,
+            "the slider must be holding its own group bytes"
+        );
+
+        let err = state
+            .finish_in_place()
+            .expect_err("the fold's cap must refuse the wide group");
+        match err {
+            ReadError::QueryTooBroad(TooBroadReason::MetricGroupLabelBytes { bytes, cap }) => {
+                assert_eq!(cap, FOLD_GROUP_CAP, "the breach names the FOLD's cap");
+                assert!(bytes > cap);
+            }
+            other => panic!("expected MetricGroupLabelBytes, got {other:?}"),
+        }
+        // BOTH counters are live at the moment of breach — the whole
+        // point: the slider's bytes are invisible to the fold's ceiling
+        // and vice versa.
+        let (fold_bytes, fold_cap) = state
+            .fold
+            .as_ref()
+            .and_then(|f| f.group_byte_counter())
+            .expect("the fold survives a refused push");
+        assert!(
+            fold_bytes > 0,
+            "the fold's counter must hold the group that DID fit"
+        );
+        assert!(
+            state.group_bytes > 0,
+            "the slider's counter must still hold the un-drained group"
+        );
+        assert_ne!(
+            fold_cap, state.caps.group_bytes,
+            "two counters, two ceilings — collapsing them would make this one"
+        );
+        assert_eq!(state.caps.group_bytes, MAX_CLIENT_AGG_GROUP_BYTES);
     }
 
     /// Review round 6 symmetry: every insertion into the query-lifetime

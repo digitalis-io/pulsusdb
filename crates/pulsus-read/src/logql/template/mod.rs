@@ -21,23 +21,41 @@ pub mod golayout;
 pub mod lex;
 pub mod methods;
 pub mod parse;
+pub mod retained;
 pub mod timefns;
 pub mod value;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
 pub use eval::ExecError as TemplateExecError;
+pub use retained::{LabelSnapshot, Retained, render_full};
 pub use timefns::TemplateEnv;
 
-/// The per-RENDER output-byte budget (issue #230 follow-up): every
-/// allocation whose size a template argument multiplies (`repeat`,
-/// `indent`/`nindent`, `alignLeft`/`alignRight`, `printf` padding
-/// widths/precisions, `Replace`-with-empty-needle expansion, and the
-/// constant-factor string producers) is CHARGED against this budget
-/// BEFORE it happens and the whole budget is released when the render
-/// ends (one render is the line path's peak transient retention).
+/// The per-ROW output-byte budget (issue #230 follow-up; lifetime moved
+/// from per-render to per-row by issue #260): every allocation whose
+/// size a template argument multiplies (`repeat`, `indent`/`nindent`,
+/// `alignLeft`/`alignRight`, `printf` padding widths/precisions,
+/// `Replace`-with-empty-needle expansion, and the constant-factor string
+/// producers) is CHARGED against this budget BEFORE it happens and the
+/// whole budget is released when the ROW's pipeline run ends.
+///
+/// **Why the row and not the render** (issue #260). A render's output is
+/// RETAINED by its caller — `line_format` moves it into `line`, and each
+/// `label_format` destination `set_label`s it — so a budget whose
+/// lifetime ended with the render bounded one live buffer while an
+/// unbounded number of them stayed live: a `label_format` stage's
+/// destination count is limited only by [`pulsus_logql::MAX_QUERY_BYTES`]
+/// (131 072), and a `,x="{{repeat N .a}}"` destination costs ~26 text
+/// bytes — so >4 000 simultaneously-live 64 MiB outputs fitted inside the
+/// query-text cap. A sum over an unbounded multiplicity is not a bound,
+/// so the budget now lives for the whole of
+/// `CompiledPipeline::run_mode_into` — the smallest lifetime that
+/// contains every render one row performs. Renders of DIFFERENT rows
+/// still get their own budget (the per-row outputs' accumulation into the
+/// streams result across up to `MAX_LIMIT` entries is a separate, larger
+/// hole, deliberately not closed here).
+///
 /// **Value: 64 MiB.** A breach aborts the QUERY with the bounded 422
 /// (`TooBroadReason::TemplateOutputBytes`), never a per-line tag, a
 /// truncation, or an OOM. The reference is unbounded here (measured: a
@@ -71,8 +89,9 @@ const _: () = assert!(
     "one render may not out-allocate a whole query's retention budget"
 );
 
-/// The countdown ledger one render charges against (fresh per render —
-/// the symmetric release point is the render's end).
+/// The countdown ledger a row's renders charge against (fresh per ROW
+/// since issue #260 — the symmetric release point is the end of the
+/// row's pipeline run, and every render the row performs shares it).
 #[derive(Debug)]
 pub struct RenderBudget {
     remaining: std::cell::Cell<u64>,
@@ -88,19 +107,41 @@ impl Default for RenderBudget {
     }
 }
 
+/// A refused [`RenderBudget`] charge, carrying no message (issue #260).
+///
+/// The engine's own breaches surface as an [`TemplateExecError`] whose
+/// `msg` the caller may show; the pipeline's `Simple`/`Parts` fast paths
+/// abort the query with a fixed-text error instead, so building a message
+/// for them would be an allocation on the abort path and a second place
+/// holding the wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetExhausted;
+
 impl RenderBudget {
     /// Charges `bytes` BEFORE the allocation it pays for. On breach the
     /// budget is poisoned (`breached`) — the evaluator turns that into
     /// the query-aborting error class, never a per-line
     /// `TemplateFormatErr`.
     pub fn charge(&self, bytes: usize) -> Result<(), String> {
+        self.charge_retained(bytes).map_err(|BudgetExhausted| {
+            format!("template output exceeded the {MAX_TEMPLATE_RENDER_BYTES}-byte render budget")
+        })
+    }
+
+    /// [`RenderBudget::charge`] without the message — the SAME ledger and
+    /// the SAME poison flag, for callers that map a breach onto their own
+    /// fixed error (issue #260's `Simple`/`Parts` fast paths, whose
+    /// output is retained exactly as the full engine's is and must
+    /// therefore be charged the same way).
+    ///
+    /// One implementation, two surfaces: a second countdown would be a
+    /// second ceiling, which is the defect this issue exists to close.
+    pub fn charge_retained(&self, bytes: usize) -> Result<(), BudgetExhausted> {
         let need = bytes as u64;
         let left = self.remaining.get();
         if need > left {
             self.breached.set(true);
-            return Err(format!(
-                "template output exceeded the {MAX_TEMPLATE_RENDER_BYTES}-byte render budget"
-            ));
+            return Err(BudgetExhausted);
         }
         self.remaining.set(left - need);
         Ok(())
@@ -232,39 +273,6 @@ pub fn compile(text: &str, kind: TemplateKind) -> Result<Template, TemplateCompi
         needs_ts: flags.needs_ts,
         regex_cache,
     })))
-}
-
-/// Renders a FULL template. `labels` is the SNAPSHOT the caller decided
-/// on (the #231 once-per-stage map rule); `err`/`err_details` are the
-/// gate-resolved #238 out-of-band pair; `line`/`ts_ns` back
-/// `__line__`/`__timestamp__`.
-#[allow(clippy::too_many_arguments)]
-pub fn render_full(
-    prog: &Program,
-    labels: &[(Cow<'_, str>, Cow<'_, str>)],
-    err: Option<&str>,
-    err_details: Option<&str>,
-    line: &str,
-    ts_ns: i64,
-    env: &TemplateEnv,
-    out: &mut Vec<u8>,
-) -> Result<(), TemplateExecError> {
-    let budget = RenderBudget::default();
-    let input = eval::EvalInput {
-        text: &prog.text,
-        parse_name: prog.kind.parse_name(),
-        root: &prog.root,
-        defines: &prog.defines,
-        labels,
-        err,
-        err_details,
-        line,
-        ts_ns,
-        env,
-        regex_cache: &prog.regex_cache,
-        budget: &budget,
-    };
-    eval::render(&input, out)
 }
 
 // ---------------------------------------------------------------------

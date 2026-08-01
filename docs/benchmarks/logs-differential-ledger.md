@@ -795,8 +795,37 @@ clients only display it).
   (measured); `printf` padding widths up to 2^30 allocate eagerly.
 - **PulsusDB behaviour:** every RETAINABLE render production — any
   string/bytes/list/map a template value can hold — is CHARGED against
-  a cumulative per-render budget BEFORE it is built, and the budget is
-  released when the render ends. That covers the multipliers
+  a cumulative per-ROW budget BEFORE it is built, and the budget is
+  released when the row's pipeline run ends. (Per-ROW since issue #260,
+  which moved the lifetime off the individual render: a render's output
+  is RETAINED by its caller — `line_format` into the line, every
+  `label_format` destination via `set_label` — so a per-render budget
+  bounded ONE live buffer while the number of simultaneously-live
+  buffers was bounded only by the query-text cap. A `label_format`
+  destination costs ~26 source bytes, so >4 000 of them, each holding a
+  64 MiB output, fitted inside 131 072 bytes. Every render one row
+  performs now shares one budget; renders of different rows do not.
+  Every retention point on that path is a `template::Retained` or a
+  `template::LabelSnapshot` — private-field types in a leaf module that
+  holds only those types and their constructors, each of which charges
+  before it allocates and none of whose PUBLIC constructors takes a
+  length, a writer or a buffer from its caller (a charge the callee
+  cannot verify is not a
+  charge, and a charge reconciled after the allocation it pays for is
+  not charge-before-allocate — the concatenating constructor charges
+  each piece BEFORE pushing it, so a source that writes more than it
+  sized refuses without the buffer ever growing) — so the set is the
+  COMPILER's rather than a swept list: the two compile-time fast paths
+  (`line_format "{{.a}}"` derives a single-substitution `Simple`,
+  `label_format d="{{.a}}"` a text+field `Parts`; each copies straight
+  into the retained destination at an exactly known length), the
+  full-engine render, its byte→`String` repair at the pipeline boundary
+  (invalid UTF-8 expands, and inside a caller's `Vec<u8>` that expansion
+  was nobody's), and the once-per-stage `label_format` data-map
+  snapshot, which deep-copies every OWNED value in the label set —
+  including output the row was already charged for — while a
+  `Cow::Borrowed` clone is a free pointer copy and costs nothing.)
+  That covers the multipliers
   (`repeat`'s `count × len`, `indent`/`nindent`, `align*`, `printf`
   padding widths/precisions, `Replace`-with-empty-needle, the
   regex-replace bound, case mapping, `fromJson`'s 35× tree ceiling,
@@ -840,24 +869,31 @@ clients only display it).
   upstream is otherwise indistinguishable from a shape that passed. A breach aborts the query with the bounded
   `422 query_too_broad` (`TooBroadReason::TemplateOutputBytes`) — never
   a per-line `TemplateFormatErr`, never a truncation, never an OOM.
-- **Threshold (derived, not chosen):**
-  `MAX_TEMPLATE_RENDER_BYTES = MAX_CLIENT_AGG_GROUP_BYTES` (64 MiB) —
-  the crate's established per-query retained-bytes budget (#104, reused
-  by #221's fan-out charge): one render is the line path's peak
-  transient retention, so it may not allocate more than a whole query
-  is allowed to retain. The budget is CUMULATIVE over the render and a
+- **Threshold:** `MAX_TEMPLATE_RENDER_BYTES` = 64 MiB, a standalone
+  constant asserted at compile time to stay
+  `<= MAX_CLIENT_AGG_GROUP_BYTES` — one row's template output may not
+  out-allocate what a whole query is allowed to retain. (#230 spelled
+  this as an equality with that constant; #236 raised the group-byte
+  cap to 256 MiB for a reason specific to the GROUP axis, so the link
+  was severed and #230's shipped 64 MiB preserved byte-for-byte.) The
+  budget is CUMULATIVE over the row and a
   maximal output line is charged twice (once when the value is built,
   once when it is printed), so the single-`repeat` rejection boundary
   sits at budget/2 = 32 MiB of output: `tests/logql_template_engine.rs`
   pins both directions — a `repeat` of exactly budget/2 renders, one
   byte past it is the clean 422 on the streams, metric and
-  `label_format` paths alike.
+  `label_format` paths alike. `tests/logql_render_budget_composes.rs`
+  pins the per-ROW half: a `label_format` stage whose destinations each
+  fit comfortably but whose SUM does not is the same clean 422, and the
+  identical fixture is shown to be ACCEPTED under a reconstructed
+  per-render lifetime, so the gate fails if the lifetime regresses.
 - **Why deliberate:** the reference has no bound, so no finite cap can
   match it (the #236 O1 shape); the standing charge-before-allocate
   rule (#227) and the "never copy the reference where it is wrong"
   ruling both require the bound. Consequences inside the same class:
   templates whose CUMULATIVE productions cross 64 MiB reject even when
-  each individual value is small, and a dynamic (per-line-computed)
+  each individual value — and, since #260, each individual RENDER — is
+  small, and a dynamic (per-line-computed)
   regex pattern whose compiled program exceeds the 1 MiB ceiling gets
   the per-line `error parsing regexp: Compiled regex exceeds size
   limit…` where the unbounded reference would compile it. Overflowing

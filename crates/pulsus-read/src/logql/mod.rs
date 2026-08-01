@@ -123,7 +123,10 @@ pub fn terminal_sort(expr: &Expr) -> bool {
     )
 }
 
-pub use charge::{MAX_CLIENT_AGG_GROUP_BYTES, MAX_METRIC_RESULT_POINTS, ensure_result_series};
+pub use charge::{
+    MAX_CLIENT_AGG_GROUP_BYTES, MAX_LEAF_RETAINED_BYTES, MAX_METRIC_RESULT_POINTS,
+    MAX_QUERY_RETAINED_BYTES, ensure_result_series,
+};
 pub use client_agg::{run_client_agg_rows, run_client_agg_rows_folded};
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETECTED_FIELD_BYTES};
 pub use detected_probe::{DetectedFieldsProbe, MAX_FEEDER_SCRATCH_BYTES};

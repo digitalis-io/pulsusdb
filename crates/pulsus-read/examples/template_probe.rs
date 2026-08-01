@@ -64,37 +64,36 @@ fn main() {
                 continue;
             }
         };
-        let mut buf = Vec::new();
-        let result = match &compiled {
-            Template::Simple(name) => {
-                let v = labels
-                    .iter()
-                    .find(|(k, _)| k == name)
-                    .map(|(_, v)| v.to_string())
-                    .unwrap_or_default();
-                buf.extend_from_slice(v.as_bytes());
-                Ok(())
-            }
+        // One budget per probed line — the same per-ROW lifetime the
+        // pipeline gives a real row (issue #260).
+        let budget = template::RenderBudget::default();
+        let result: Result<String, _> = match &compiled {
+            Template::Simple(name) => Ok(labels
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()),
             Template::Parts(parts) => {
+                let mut rendered = String::new();
                 for part in parts {
                     match part {
-                        template::Part::Lit(s) => buf.extend_from_slice(s.as_bytes()),
+                        template::Part::Lit(s) => rendered.push_str(s),
                         template::Part::Field(name) => {
                             if let Some((_, v)) = labels.iter().find(|(k, _)| k == name) {
-                                buf.extend_from_slice(v.as_bytes());
+                                rendered.push_str(v);
                             }
                         }
                     }
                 }
-                Ok(())
+                Ok(rendered)
             }
             Template::Full(prog) => {
-                template::render_full(prog, &labels, None, None, body, ts_ns, &env, &mut buf)
+                template::render_full(prog, &labels, None, None, body, ts_ns, &env, &budget)
+                    .map(|r| r.as_str().to_string())
             }
         };
         match result {
-            Ok(()) => {
-                let rendered = String::from_utf8_lossy(&buf).into_owned();
+            Ok(rendered) => {
                 let _ = writeln!(out, "{}", serde_json::json!({ "out": rendered }));
             }
             Err(e) => {

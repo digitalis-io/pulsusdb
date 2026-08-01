@@ -32,9 +32,21 @@ pub const VARIANT_LABEL: &str = "__variant__";
 
 /// The variants fan-out state budget — DERIVED, not chosen: one extra
 /// query-lifetime group-bytes budget ([`AggCaps::DEFAULT`]`.group_bytes`
-/// == [`MAX_CLIENT_AGG_GROUP_BYTES`]). It moves with that cap. One
-/// counter spans plan-time spec state and exec-time arena/sub-state
-/// state — the budget is never doubled.
+/// == [`MAX_CLIENT_AGG_GROUP_BYTES`]). It moves with that cap.
+///
+/// **One COUNTER, a SECOND ceiling** (corrected by issue #260; the
+/// former wording, "the budget is never doubled", was false). ONE counter
+/// spans plan-time spec state and exec-time arena/sub-state state — that
+/// is the property this constant guarantees, and it is what
+/// `charge_fanout_bytes`'s single `charged` field enforces. But that
+/// counter sits BESIDE the sub-states' own group-byte counters (each on
+/// [`AggCaps::divided`]`(n)`, summing to the whole), so a variants query
+/// holds two live counters against the group-byte cap's VALUE — the
+/// `group_bytes: 2` row of [`super::charge::CounterPlurality`], and the
+/// reason the composed bound
+/// ([`super::charge::MAX_LEAF_RETAINED_BYTES`]) counts this cap twice.
+/// The variants leaf is still strictly the narrower of the two shapes it
+/// covers (no fold, and every other cap divided).
 pub const MAX_VARIANT_FANOUT_STATE_BYTES: u64 = AggCaps::DEFAULT.group_bytes;
 
 /// A CLONE of a source stage list, per SOURCE byte `S`
@@ -649,6 +661,18 @@ impl<'q> VariantsAggState<'q> {
         self.charged
     }
 
+    /// How many vector aggregations the sub-states have taken over —
+    /// zero, always (issue #260): the fan-out never calls `attach_fold`,
+    /// so a variants query's live group-byte counters are
+    /// `{fan-out, Σ sub-states}` and NOT a third fold counter, which is
+    /// what keeps [`super::charge::LEAF_COUNTERS`]`.group_bytes` at 2.
+    /// Asserted on a really-constructed state by
+    /// `the_variants_sub_states_take_no_fold`.
+    #[cfg(test)]
+    pub(in crate::logql) fn sub_folded_aggs(&self) -> usize {
+        self.subs.iter().map(MetricAggState::folded_aggs).sum()
+    }
+
     /// Forwards one chunk to every sub-state in INDEX ORDER (so a
     /// surviving-`__error__` failure is raised by the lowest-indexed
     /// variant — deterministic). A Range sub-state receives the whole
@@ -1008,6 +1032,88 @@ mod tests {
             bytes += meta.len() as u64 * map_entry_bytes(size_of::<(u64, u64)>());
         }
         bytes
+    }
+
+    /// Issue #260 AC 4, runtime leg (review round 1, C6: the lexical
+    /// `attach_fold` census cannot see a qualified call, an alias or a
+    /// future dispatch arrangement, so it is a tripwire and not the
+    /// proof).
+    ///
+    /// A REALLY CONSTRUCTED variants state, for a RANGE query, reports
+    /// zero folds across its sub-states — which is what keeps
+    /// [`super::super::charge::LEAF_COUNTERS`]`.group_bytes` at 2 rather
+    /// than 3.
+    ///
+    /// Two independent reasons, both asserted rather than argued:
+    ///
+    /// 1. the fan-out never attaches one (`sub_folded_aggs() == 0` on a
+    ///    state built through the production constructor), and
+    /// 2. the only thing a leaf ever folds — an OUTER vector aggregation
+    ///    — cannot syntactically wrap a variants query at all
+    ///    (`sum by (…) (variants(…))` is the reference-exact 400, issue
+    ///    #221), so there is nothing to attach even if a caller wanted
+    ///    to.
+    ///
+    /// Non-vacuous by construction: the last leg attaches a fold to a
+    /// plain `RangeSlideState` and shows it reports 1, so the zero above
+    /// is the variants path declining a mechanism that works, not the
+    /// mechanism being absent.
+    #[test]
+    fn the_variants_sub_states_take_no_fold() {
+        let query = n_variant_query(3, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#);
+        let (scan, variants, _) = variants_fixture(&query, variants_range_spec());
+        let cp = scan.client.expect("client scan");
+        let meta = k_stream_meta(2);
+        let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
+        let st = VariantsAggState::new(&arena, &variants, &meta, u64::MAX).expect("state");
+        assert_eq!(st.subs.len(), 3, "one sub-state per variant");
+        assert_eq!(
+            st.sub_folded_aggs(),
+            0,
+            "a variants sub-state took a fold — that is a THIRD live group-byte counter, and \
+             MAX_LEAF_RETAINED_BYTES prices two"
+        );
+
+        // (2) An outer vector aggregation cannot reach a variants
+        // sub-state: the composition is rejected before planning.
+        assert!(
+            pulsus_logql::parse(&format!("sum by (app) ({query})")).is_err(),
+            "an outer vector aggregation over variants must stay a 400 — if it became legal, \
+             something would have to decide whether its fold reaches the sub-states"
+        );
+
+        // (3) The mechanism the sub-states decline is live and reachable.
+        let client = plan::ClientAgg {
+            pipeline: cp.pipeline.clone(),
+            value: plan::ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
+        let mut plain = RangeSlideState::new(
+            &compiled,
+            &meta,
+            &client,
+            slide_window(0, 100, 10, 30),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .expect("plain range leaf");
+        assert_eq!(plain.folded_aggs(), 0);
+        plain.attach_fold(&(
+            pulsus_logql::VectorAggOp::Sum,
+            Some(pulsus_logql::Grouping {
+                kind: pulsus_logql::GroupingKind::By,
+                labels: vec!["app".to_string()],
+            }),
+            None,
+        ));
+        assert_eq!(
+            plain.folded_aggs(),
+            1,
+            "the fold mechanism must be live, or the zero above proves nothing"
+        );
     }
 
     /// I4 — CHARGE: the `base_labels` half of the meta snapshot. Pair:

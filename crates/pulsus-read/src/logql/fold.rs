@@ -676,6 +676,20 @@ pub(in crate::logql) enum VectorAggFold {
 }
 
 impl VectorAggFold {
+    /// The fold's OWN group-byte counter and the cap it checks against
+    /// — a test seam (issue #260) so the "two live counters against
+    /// [`super::charge::MAX_CLIENT_AGG_GROUP_BYTES`]" claim can be
+    /// OBSERVED at the moment of breach rather than asserted. `Empty`
+    /// holds no groups and therefore no counter.
+    #[cfg(test)]
+    pub(in crate::logql) fn group_byte_counter(&self) -> Option<(u64, u64)> {
+        match self {
+            VectorAggFold::Reduce(f) => Some((f.group_bytes, f.group_cap)),
+            VectorAggFold::Select(f) => Some((f.group_bytes, f.group_cap)),
+            VectorAggFold::Empty => None,
+        }
+    }
+
     /// `None` when the leaf cannot own the aggregation:
     ///
     /// * `sort`/`sort_desc` — a range matrix is a PASSTHROUGH at
