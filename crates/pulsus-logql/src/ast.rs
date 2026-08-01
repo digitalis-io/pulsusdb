@@ -1958,25 +1958,54 @@ impl fmt::Display for VariantsExpr {
     }
 }
 
-/// The M6-10 binary operators: arithmetic, comparison, and the
-/// `and`/`or`/`unless` set operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Pow,
-    Eq,
-    Neq,
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-    And,
-    Or,
-    Unless,
+/// Declares [`BinOp`], its rendering and its COMPLETE variant list from
+/// one source (issue #293 review round 3).
+///
+/// A hand-maintained `ALL` slice beside a hand-written enum is two
+/// sources: a wildcard-free `match` elsewhere forces an author to touch
+/// the file when a variant is added, but that edit can satisfy the match
+/// while leaving the variant out of the slice — and out of every census
+/// and corpus that enumerates the operator space through it. Emitting
+/// both from one invocation makes that omission unrepresentable.
+macro_rules! bin_ops {
+    ($($variant:ident => $symbol:literal,)+) => {
+        /// The M6-10 binary operators: arithmetic, comparison, and the
+        /// `and`/`or`/`unless` set operations.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum BinOp { $($variant),+ }
+
+        impl BinOp {
+            /// Every variant, in declaration order — emitted by the same
+            /// invocation that declares them, so no enumeration driven by
+            /// this slice can miss an operator the enum has.
+            pub const ALL: &'static [BinOp] = &[$(BinOp::$variant),+];
+        }
+
+        impl fmt::Display for BinOp {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let s = match self { $(BinOp::$variant => $symbol),+ };
+                write!(f, "{s}")
+            }
+        }
+    };
+}
+
+bin_ops! {
+    Add => "+",
+    Sub => "-",
+    Mul => "*",
+    Div => "/",
+    Mod => "%",
+    Pow => "^",
+    Eq => "==",
+    Neq => "!=",
+    Gt => ">",
+    Gte => ">=",
+    Lt => "<",
+    Lte => "<=",
+    And => "and",
+    Or => "or",
+    Unless => "unless",
 }
 
 impl BinOp {
@@ -1987,29 +2016,6 @@ impl BinOp {
             self,
             BinOp::Eq | BinOp::Neq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte
         )
-    }
-}
-
-impl fmt::Display for BinOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            BinOp::Add => "+",
-            BinOp::Sub => "-",
-            BinOp::Mul => "*",
-            BinOp::Div => "/",
-            BinOp::Mod => "%",
-            BinOp::Pow => "^",
-            BinOp::Eq => "==",
-            BinOp::Neq => "!=",
-            BinOp::Gt => ">",
-            BinOp::Gte => ">=",
-            BinOp::Lt => "<",
-            BinOp::Lte => "<=",
-            BinOp::And => "and",
-            BinOp::Or => "or",
-            BinOp::Unless => "unless",
-        };
-        write!(f, "{s}")
     }
 }
 

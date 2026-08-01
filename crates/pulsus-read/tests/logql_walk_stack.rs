@@ -5,6 +5,15 @@
 //! `metric_node_postorder`) complete over an `N`-node tree on a pinned
 //! `S`-byte stack; a per-node-recursive walk of the same shape over the
 //! same tree overflows at `N/4` on the same `S`.
+//!
+//! The PLANNER's own walk (#293, #285) is gated the same way but not
+//! here: its control is the BODY of the recursive `build_metric_node`
+//! that issue deleted, with two substituted child accessors — not the
+//! historical function itself; see `plan_recursive_control.rs`. That
+//! body calls six
+//! `plan.rs`-private items — so the pairing lives in
+//! `crates/pulsus-read/src/logql/plan_recursive_control.rs`, which is
+//! compiled inside the module that can see them.
 
 #[path = "stackgate/mod.rs"]
 mod stackgate;

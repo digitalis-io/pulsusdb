@@ -45,14 +45,11 @@
 //! * **(i)** no `cfg` attribute appears on an item inside the `Scc` trait
 //!   block or inside any `impl Scc` block, so the trait surface is
 //!   identical in every build mode and in every dependent crate;
-//! * **(j)** the accessors `build_metric_node` needs while it stays
-//!   recursive (`scc2_child`/`scc2_variants`) are still module-private
-//!   `fn`s in `plan_legacy_descent.rs`, whose only export is
-//!   `build_metric_node`, and `plan.rs` still imports nothing else from
-//!   it. **(j) does NOT establish that they have one caller** — a
-//!   lexical scan cannot, and the COMPILER holds that instead, because
-//!   the accessors are private to that module. (j) notices drift in the
-//!   arrangement, nothing more. **#293 deletes the module whole.**
+//! * **(j)** the single-opened-child escape hatch stays deleted: neither
+//!   source tree declares or calls `walk::child_of`, and the module that
+//!   existed only to hold its two callers (`plan_legacy_descent.rs`) is
+//!   gone. Issue #293 converted `build_metric_node`, which was the sole
+//!   consumer; this notices a regrowth.
 
 use std::collections::BTreeSet;
 
@@ -629,134 +626,55 @@ fn check_i_no_cfg_attribute_appears_inside_the_scc_trait_or_any_impl_scc() {
 }
 
 // ---------------------------------------------------------------------
-// (j) — the deferred walk's accessors, bounded by the COMPILER
+// (j) — the single-opened-child hatch stays deleted
 // ---------------------------------------------------------------------
 
-/// **A lexical scan cannot establish "only this call site."** It does not
-/// see a caller in a nested module, under an import alias, behind a
-/// macro expansion, or in a file its own directory walk missed. Two
-/// rounds of patching a scanner did not change that, so the guarantee
-/// moved to a place that holds it: `scc2_child`/`scc2_variants` are
-/// **module-private `fn`s** in `plan_legacy_descent.rs`, whose only
-/// other item is `build_metric_node`. The compiler bounds their callers.
+/// `walk::child_of` handed a consumer ONE opened child by index, which is
+/// what let `build_metric_node` keep a hand-written per-node recursion
+/// after #272 retyped SCC-2's slots. #293 converted that walk to a
+/// [`walk::find_preorder`] consumer, so the hatch has no callers and is
+/// deleted along with `plan_legacy_descent.rs`, the module that existed
+/// only to bound them.
 ///
-/// What this test can still do — and all it claims — is notice DRIFT in
-/// that arrangement: that the module still exists, that the accessors
-/// are still private to it, and that `plan.rs` still takes only
-/// `build_metric_node` from it.
+/// **What this asserts is absence, and a lexical scan can do that** where
+/// it could not establish "exactly one caller": the declaration is gone,
+/// so any call site anywhere — nested module, alias, macro — is a
+/// COMPILE error, and this test's job is only to notice the declaration
+/// regrowing. `walk::slice_of` deliberately survives: its consumer
+/// (`build_variants_node`'s per-variant loop) is flat, not a walk.
 #[test]
-fn check_j_the_deferred_walks_accessors_stay_module_private() {
+fn check_j_the_single_child_escape_hatch_stays_deleted() {
     let files = sweep();
-    let legacy = source_of(&files, "plan_legacy_descent.rs");
-
-    for accessor in ["fn scc2_child(", "fn scc2_variants("] {
-        assert!(
-            legacy.contains(accessor),
-            "{accessor} left `plan_legacy_descent.rs`; the compiler-held bound on its callers \
-             went with it"
-        );
-        for vis in ["pub fn ", "pub(crate) fn ", "pub(super) fn "] {
-            assert!(
-                !legacy.contains(&format!("{vis}{}", accessor.trim_start_matches("fn "))),
-                "{accessor} became `{vis}`: its callers are no longer bounded by the module"
-            );
+    let mut sites: Vec<String> = Vec::new();
+    for (name, src) in &files {
+        for (i, line) in code_only(src).lines().enumerate() {
+            if line.contains("child_of") {
+                sites.push(format!("{name}:{}: {}", i + 1, line.trim()));
+            }
         }
     }
-
-    // The module's ONLY exported item is the deferred walk itself.
-    let exported: Vec<&str> = legacy
-        .lines()
-        .map(str::trim)
-        .filter(|l| {
-            l.starts_with("pub fn ")
-                || l.starts_with("pub(super) fn ")
-                || l.starts_with("pub(crate) fn ")
-        })
+    assert!(
+        sites.is_empty(),
+        "`walk::child_of` regrew — a single opened child by index is what lets a consumer \
+         keep a per-node recursion, and #293 deleted it: {sites:#?}"
+    );
+    assert!(
+        !files
+            .iter()
+            .any(|(n, _)| n.ends_with("plan_legacy_descent.rs")),
+        "`plan_legacy_descent.rs` is back; it existed only to bound the deleted hatch's callers"
+    );
+    // The surviving N-ary opener has exactly one consuming file.
+    let consumers: BTreeSet<&str> = files
+        .iter()
+        .filter(|(n, _)| !n.ends_with("walk.rs"))
+        .filter(|(_, s)| code_only(s).contains("slice_of("))
+        .map(|(n, _)| n.as_str())
         .collect();
     assert_eq!(
-        exported,
-        vec!["pub(super) fn build_metric_node("],
-        "`plan_legacy_descent.rs` grew a second export; it exists to hold ONE deferred walk \
-         and #293 deletes it whole"
+        consumers,
+        BTreeSet::from(["pulsus-read/src/logql/plan.rs"]),
+        "`walk::slice_of` gained a consumer; it is kept only for `build_variants_node`'s FLAT \
+         per-variant loop"
     );
-
-    // `plan.rs` takes only that one item from it.
-    let plan = source_of(&files, "plan.rs");
-    assert!(
-        plan.contains("use legacy_descent::build_metric_node;"),
-        "`plan.rs` no longer imports the deferred walk by name"
-    );
-    assert!(
-        !plan.contains("use legacy_descent::{"),
-        "`plan.rs` imports more than the deferred walk from the legacy module"
-    );
-}
-
-/// The reason the "only consumer" condition is no longer load-bearing,
-/// asserted rather than argued: `walk::child_of` reproduces exactly what
-/// a consumer can already get from `walk::find_preorder`, which every
-/// consumer has and which C1 records as an accepted residue. It differs
-/// only by allocating nothing at `arity >= 2`.
-#[test]
-fn walk_child_of_grants_nothing_find_preorder_does_not() {
-    use std::ops::ControlFlow;
-
-    use pulsus_logql::walk::{self, Step};
-    use pulsus_logql::{MeNode, MetricExpr, MetricScc};
-
-    let queries = [
-        r#"rate({app="x"}[5m])"#,
-        r#"sum(rate({app="x"}[5m]))"#,
-        r#"rate({app="x"}[5m]) + 1"#,
-        r#"1 + (2 * 3)"#,
-        r#"sum by (env) (rate({app="x"}[5m])) / sum(rate({app="y"}[5m]))"#,
-        r#"variants(count_over_time({app="x"}[5m])) of ({app="x"}[5m])"#,
-    ];
-    let mut checked = 0usize;
-    for q in queries {
-        let expr = pulsus_logql::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
-        let pulsus_logql::Expr::Metric(root) = &expr else {
-            panic!("{q}: expected a metric expression");
-        };
-        let mut nodes: Vec<MeNode<'_>> = Vec::new();
-        walk::preorder::<MetricScc>(MeNode::Expr(root), |n| nodes.push(n));
-        for n in nodes {
-            // What `find_preorder` yields: the node's DIRECT children,
-            // reached by pruning at depth 1.
-            let mut first = true;
-            let mut via_driver: Vec<*const ()> = Vec::new();
-            walk::find_preorder::<MetricScc, ()>(n, |x| {
-                if first {
-                    first = false;
-                    return ControlFlow::Continue(Step::Descend);
-                }
-                via_driver.push(node_addr(x));
-                ControlFlow::Continue(Step::Prune)
-            });
-            // What the hatch yields.
-            let mut via_hatch: Vec<*const ()> = Vec::new();
-            let mut i = 0;
-            while let Some(c) = walk::child_of::<MetricScc>(n, i) {
-                via_hatch.push(node_addr(c));
-                i += 1;
-            }
-            assert_eq!(
-                via_driver, via_hatch,
-                "`child_of` and `find_preorder` disagree for {q} — the equivalence this \
-                 census rests on is not real"
-            );
-            checked += 1;
-        }
-    }
-    assert!(
-        checked >= 15,
-        "the equivalence probe covered only {checked} nodes"
-    );
-
-    fn node_addr(n: MeNode<'_>) -> *const () {
-        match n {
-            MeNode::Expr(e) => std::ptr::from_ref::<MetricExpr>(e).cast(),
-            MeNode::Var(v) => std::ptr::from_ref::<pulsus_logql::VariantsExpr>(v).cast(),
-        }
-    }
 }

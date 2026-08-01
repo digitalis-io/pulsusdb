@@ -17,8 +17,8 @@ use std::ops::ControlFlow;
 
 use pulsus_logql::walk;
 use pulsus_logql::{
-    BinOp, Expr, Grouping, GroupingKind, LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp,
-    Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
+    BinModifier, BinOp, Expr, Grouping, GroupingKind, LineFilter, LineFilterOp, LogExpr, LogRange,
+    MatchOp, Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
     VectorMatching,
 };
 
@@ -792,6 +792,258 @@ fn plan_metric_expr(
             }
             Ok(Plan::MetricBinary(build_metric_node(metric_expr, p, ctx)?))
         }
+    }
+}
+
+/// One step of the linearised planner program [`build_metric_node`]
+/// emits (issue #293), in PRE-ORDER — the order the recursion it replaced
+/// ran its fallible work in.
+///
+/// `pub(crate)` only so [`super::walkbound`] can price a slot; nothing
+/// outside this module constructs or matches one.
+pub(crate) enum PlanOp {
+    /// A finished subtree — a leaf plan, a scalar, a `vector(n)` literal
+    /// or a `variants(...)` node. Consumes no operand value.
+    Node(MetricNode),
+    /// Consumes the two values its operands left, `lhs` then `rhs`.
+    Binary {
+        op: BinOp,
+        return_bool: bool,
+        matching: Option<VectorMatching>,
+    },
+    /// Consumes the one value its operand left.
+    VectorAgg { aggs: Vec<VectorAggSpec> },
+}
+
+/// Plans a binary/literal metric expression into a [`MetricNode`] tree.
+/// Every (vector-agg-wrapped) range-aggregation operand becomes a
+/// [`MetricNode::Leaf`] via the ordinary [`metric_plan`] path, so
+/// per-leaf routing/rollup decisions are exactly what the same expression
+/// would get standalone.
+///
+/// **Issue #293 — ITERATIVE.** This was the one LogQL walk #272 left
+/// recursive, and it recursed on `lhs`: a flat `a or b or c …` chain
+/// parses at depth 1 into a LEFT-DEEP `MetricExpr`, so query WIDTH is
+/// tree DEPTH and a single request aborted the process (measured on a
+/// 2 MiB stack, release: ok at 1,200 terms / 44,486 bytes, `fatal
+/// runtime error: stack overflow` at 1,250 — well inside
+/// [`pulsus_logql::MAX_QUERY_BYTES`]). It is now two loops: a
+/// [`walk::find_preorder`] emission pass that runs every node's own
+/// fallible work in the recursion's order, and a reverse fold over the
+/// emitted program. Neither costs a machine-stack frame per node.
+fn build_metric_node(
+    metric_expr: &MetricExpr,
+    p: &QueryParams,
+    ctx: &PlanCtx<'_>,
+) -> Result<MetricNode, ReadError> {
+    let mut ops: Vec<PlanOp> = Vec::new();
+    match emit_plan_ops(metric_expr, p, ctx, &mut ops) {
+        Some(err) => Err(err),
+        None => Ok(fold_plan_ops(ops)),
+    }
+}
+
+/// Emission pass. Pre-order, left-to-right — the exact order the
+/// recursion evaluated in, so the FIRST error a malformed expression
+/// produces is unchanged: a node's own fallible work runs before its
+/// operands are visited, and `lhs` before `rhs`.
+///
+/// **The vector chain.** The recursion collapsed a whole
+/// `sum(max(…))` spine in ONE step (`unwrap_vector_aggs`) and emitted a
+/// single [`MetricNode::VectorAgg`] carrying every layer, so a walk that
+/// visited each link and emitted per link would build a different tree.
+/// `pending_aggs` carries the collapsed layers instead: it is non-empty
+/// EXACTLY while the previously visited node was a `Vector` this walk
+/// descended into. A `Vector` has exactly one child and a pre-order walk
+/// visits a node's sole child immediately after the node, so the next
+/// node is either the next link of the same chain (which emits nothing —
+/// its layers are already collected) or the chain's base, which flushes.
+fn emit_plan_ops(
+    root: &MetricExpr,
+    p: &QueryParams,
+    ctx: &PlanCtx<'_>,
+    ops: &mut Vec<PlanOp>,
+) -> Option<ReadError> {
+    let is_range = matches!(p.spec, QuerySpec::Range { .. });
+    let mut pending_aggs: Vec<RawVectorAggSpec<'_>> = Vec::new();
+
+    walk::find_preorder::<pulsus_logql::MetricScc, ReadError>(
+        pulsus_logql::MeNode::Expr(root),
+        |n| {
+            let expr = match n {
+                pulsus_logql::MeNode::Expr(e) => e,
+                // Reached ONLY as the sole child of
+                // `MetricExpr::Variants`, whose arm descends one link
+                // rather than reaching into the slot itself — which is
+                // why this walk needs no child accessor of its own.
+                pulsus_logql::MeNode::Var(v) => {
+                    return match build_variants_node(v, p, ctx) {
+                        Ok(node) => {
+                            ops.push(PlanOp::Node(node));
+                            ControlFlow::Continue(walk::Step::Prune)
+                        }
+                        Err(err) => ControlFlow::Break(err),
+                    };
+                }
+            };
+
+            if let MetricExpr::Vector { .. } = expr {
+                if pending_aggs.is_empty() {
+                    // A chain HEAD: the collapsed base decides the shape,
+                    // exactly as the recursion's `Vector` arm did.
+                    let base = unwrap_vector_aggs_into(expr, &mut pending_aggs);
+                    match base {
+                        MetricExpr::Range { .. } => {
+                            // The whole chain plans as one ordinary leaf.
+                            pending_aggs.clear();
+                            return match metric_plan(expr, p, ctx, false) {
+                                Ok(mp) => {
+                                    ops.push(PlanOp::Node(MetricNode::Leaf(Box::new(mp))));
+                                    ControlFlow::Continue(walk::Step::Prune)
+                                }
+                                Err(err) => ControlFlow::Break(err),
+                            };
+                        }
+                        MetricExpr::Literal(_) => {
+                            return ControlFlow::Break(ReadError::PipelineInvalid {
+                                reason: "a vector aggregation cannot aggregate a bare scalar \
+                                         literal"
+                                    .to_string(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                // A head with a planable base, or an inner link whose
+                // layer the head already collected: descend to the base.
+                return ControlFlow::Continue(walk::Step::Descend);
+            }
+
+            // Not a `Vector`, so this node is the base of the chain above
+            // it, if any. The layers are validated HERE — before the
+            // base's own work, exactly where the recursion validated them.
+            if !pending_aggs.is_empty() {
+                match parse_vector_agg_params(&pending_aggs, is_range) {
+                    Ok(aggs) => ops.push(PlanOp::VectorAgg { aggs }),
+                    Err(err) => return ControlFlow::Break(err),
+                }
+                pending_aggs.clear();
+            }
+
+            match expr {
+                MetricExpr::Literal(raw) => {
+                    match parse_plan_number(raw, format_args!("scalar literal")) {
+                        Ok(value) => {
+                            ops.push(PlanOp::Node(MetricNode::Scalar(value)));
+                            ControlFlow::Continue(walk::Step::Prune)
+                        }
+                        Err(err) => ControlFlow::Break(err),
+                    }
+                }
+                MetricExpr::VectorFn(raw) => {
+                    let value = match parse_plan_number(raw, format_args!("vector() value")) {
+                        Ok(v) => v,
+                        Err(err) => return ControlFlow::Break(err),
+                    };
+                    match window_from(p) {
+                        Ok(window) => {
+                            ops.push(PlanOp::Node(MetricNode::VectorLit { value, window }));
+                            ControlFlow::Continue(walk::Step::Prune)
+                        }
+                        Err(err) => ControlFlow::Break(err),
+                    }
+                }
+                // Infallible here: the `VariantsExpr` child arm above does
+                // the work, one link down.
+                MetricExpr::Variants(_) => ControlFlow::Continue(walk::Step::Descend),
+                MetricExpr::Binary { op, modifier, .. } => {
+                    ops.push(PlanOp::Binary {
+                        op: *op,
+                        return_bool: matches!(
+                            modifier,
+                            Some(BinModifier {
+                                return_bool: true,
+                                ..
+                            })
+                        ),
+                        matching: modifier.as_ref().and_then(|m| m.matching.clone()),
+                    });
+                    ControlFlow::Continue(walk::Step::Descend)
+                }
+                MetricExpr::Range { .. } => match metric_plan(expr, p, ctx, false) {
+                    Ok(mp) => {
+                        ops.push(PlanOp::Node(MetricNode::Leaf(Box::new(mp))));
+                        ControlFlow::Continue(walk::Step::Prune)
+                    }
+                    Err(err) => ControlFlow::Break(err),
+                },
+                // Unreachable: every `Vector` returns above, before the
+                // chain flush.
+                MetricExpr::Vector { .. } => {
+                    unreachable!("a `Vector` node is handled by the chain arm above")
+                }
+            }
+        },
+    )
+}
+
+/// Fold pass. Consumes the pre-order program in REVERSE, which is a
+/// bottom-up order: a parent's op precedes its operands' ops, so popping
+/// from the tail reaches every operand before the op that combines them.
+/// A `Binary`'s two operand values arrive `rhs` first (its right subtree
+/// is the nearer tail), so the value popped first is `lhs`.
+///
+/// One loop, one value stack — no frame per node. The stack is reserved
+/// at `ops.len()`, which is a hard upper bound on its depth (every op
+/// pushes one value), so it allocates ONCE and never reallocates; a
+/// three-op plan reserves three slots rather than a segmented stack's
+/// whole first chunk.
+fn fold_plan_ops(ops: Vec<PlanOp>) -> MetricNode {
+    let mut vals: Vec<MetricNode> = Vec::with_capacity(ops.len());
+    for op in ops.into_iter().rev() {
+        match op {
+            PlanOp::Node(node) => vals.push(node),
+            PlanOp::Binary {
+                op,
+                return_bool,
+                matching,
+            } => {
+                let lhs = pop_operand(&mut vals);
+                let rhs = pop_operand(&mut vals);
+                vals.push(MetricNode::Binary {
+                    op,
+                    return_bool,
+                    matching,
+                    lhs: walk::Child::new(lhs),
+                    rhs: walk::Child::new(rhs),
+                });
+            }
+            PlanOp::VectorAgg { aggs } => {
+                let inner = pop_operand(&mut vals);
+                vals.push(MetricNode::VectorAgg {
+                    aggs,
+                    inner: walk::Child::new(inner),
+                });
+            }
+        }
+    }
+    match vals.pop() {
+        Some(root) if vals.is_empty() => root,
+        // Unreachable by construction: every op pushes exactly one value
+        // and consumes exactly the operands its emitting arm descended
+        // into, so exactly one value survives. Not a `Drop` path, so a
+        // release panic here is the correct failure.
+        _ => unreachable!("the plan program leaves exactly one root value"),
+    }
+}
+
+/// Pops one operand value off the fold's value stack.
+#[inline]
+fn pop_operand(vals: &mut Vec<MetricNode>) -> MetricNode {
+    match vals.pop() {
+        Some(v) => v,
+        // Unreachable: see `fold_plan_ops`.
+        None => unreachable!("expected an operand value on the plan fold stack"),
     }
 }
 
@@ -2225,17 +2477,18 @@ pub fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<String> {
 // NOTE: the file is a `plan_`-prefixed sibling, not `plan/drop_order.rs`.
 // A `plan/` directory is swallowed by a common global gitignore rule, so
 // the source would never be committed.
-// Issue #272: the ONE walk this issue leaves recursive (#293 converts
-// it) plus the two accessors it needs, in a module of their own so the
-// COMPILER — not a source scan — bounds who can call them. See that
-// file's own documentation for why the guarantee moved here.
-#[path = "plan_legacy_descent.rs"]
-mod legacy_descent;
-use legacy_descent::build_metric_node;
-
 #[cfg(test)]
 #[path = "plan_drop_order.rs"]
 mod drop_order;
+
+// Issue #293: the paired pinned-stack gate, including the BODY of the
+// recursive `build_metric_node` this issue deleted, with two substituted
+// child accessors — not the historical function itself. It has
+// to be compiled in this module because it calls six `plan.rs`-private
+// items; see that file's header.
+#[cfg(test)]
+#[path = "plan_recursive_control.rs"]
+mod recursive_control;
 
 #[cfg(test)]
 mod tests {
@@ -3190,9 +3443,9 @@ mod tests {
         };
         assert_eq!(aggs.len(), 1);
         assert_eq!(aggs[0].0, VectorAggOp::Sum);
-        // Issue #272: reached through a driver, not the `child_of`
-        // escape hatch — census check (j) pins that hatch to
-        // `build_metric_node`'s two accessors and nothing else.
+        // Issue #272: reached through a driver. The single-opened-child
+        // escape hatch this once went around is gone with #293 — census
+        // check (j) now asserts its absence.
         let _ = inner;
         let mut kids: Vec<&MetricNode> = Vec::new();
         walk::postorder_into::<MetricNodeScc>(&node, &mut kids);
@@ -3733,10 +3986,13 @@ mod tests {
         // outside the sole `grouping.cloned()` in `parse_vector_agg_params`.
         assert_eq!(compact.matches("grouping.clone()").count(), 0);
         assert_eq!(compact.matches("grouping.cloned()").count(), 1);
-        // M5: the reused buffer's producer has exactly two production
-        // call sites (the allocating single-shot wrapper and the variant
-        // loop), and `build_variants_node` never calls the wrapper.
-        assert_eq!(compact.matches("unwrap_vector_aggs_into(").count(), 2);
+        // M5: the reused buffer's producer has exactly three production
+        // call sites — the allocating single-shot wrapper, the variant
+        // loop, and (issue #293) `emit_plan_ops`' vector-chain head,
+        // which reuses ONE buffer across every chain in the expression
+        // where the recursion it replaced allocated a fresh `Vec` per
+        // chain. `build_variants_node` still never calls the wrapper.
+        assert_eq!(compact.matches("unwrap_vector_aggs_into(").count(), 3);
         let bvn = {
             let start = production
                 .find("fn build_variants_node(")

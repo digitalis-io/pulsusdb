@@ -2022,18 +2022,20 @@ mod tests {
             ("exec.rs", include_str!("exec.rs")),
             ("error.rs", include_str!("error.rs")),
             ("plan.rs", include_str!("plan.rs")),
-            // Issue #272: the one walk that issue leaves recursive (#293
-            // converts it) plus the two accessors it needs, in a module
-            // of their own so the compiler bounds their callers.
-            (
-                "plan_legacy_descent.rs",
-                include_str!("plan_legacy_descent.rs"),
-            ),
             // Issue #272: `MetricNode`'s drop oracle. A `plan_`-prefixed
             // sibling rather than `plan/drop_order.rs`, because a `plan/`
             // directory is swallowed by a common global gitignore rule
             // and the source would never be committed.
             ("plan_drop_order.rs", include_str!("plan_drop_order.rs")),
+            // Issue #293: the plan walk's paired stack gate, holding the
+            // BODY of the recursive `build_metric_node` this issue deleted,
+            // with two substituted child accessors, as its control.
+            // Entirely `#[cfg(test)]`, so its production region
+            // is empty by construction.
+            (
+                "plan_recursive_control.rs",
+                include_str!("plan_recursive_control.rs"),
+            ),
             ("mod.rs", include_str!("mod.rs")),
             ("pipeline.rs", include_str!("pipeline.rs")),
             ("sql.rs", include_str!("sql.rs")),
