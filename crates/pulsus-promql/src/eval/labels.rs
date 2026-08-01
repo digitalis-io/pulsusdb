@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use pulsus_model::{LabelMatcher, MatchOp};
 
 use crate::error::PromqlError;
+use crate::re2_syntax::re2_pattern_to_rust;
 use crate::value::{InstantSample, Labels};
 
 /// Compiles `label_replace`'s regex with upstream's exact anchoring —
@@ -23,71 +24,10 @@ use crate::value::{InstantSample, Labels};
 /// fetch) and again per evaluation step (the eval arm recompiles; a rare
 /// rewrite, not an aggregation hot path — plan edge case 5).
 pub fn compile_label_replace_regex(regex: &str) -> Result<regex::Regex, PromqlError> {
-    let translated = re2_ascii_perl_classes(regex);
+    let translated = re2_pattern_to_rust(regex);
     regex::Regex::new(&format!("^(?s:{translated})$")).map_err(|_| PromqlError::LabelSet {
         detail: format!("invalid regular expression in label_replace(): {regex}"),
     })
-}
-
-/// Rewrites the Perl character classes and word boundaries to their
-/// **ASCII** definitions before handing the pattern to the `regex` crate
-/// (#68 review rounds 1–2): Go RE2's `\d`/`\w`/`\s` (and negations) and
-/// `\b`/`\B` are ASCII-only, while Rust `regex` defaults them to Unicode
-/// — so e.g. the Arabic-Indic digit `٣` matches Rust's `\d` but not
-/// Go's, and Rust's Unicode `\b` sees no boundary in `e\bé` where Go
-/// does. Escape-aware single pass:
-///
-/// - an **unescaped** `\d`/`\D`/`\w`/`\W`/`\s`/`\S` becomes its explicit
-///   ASCII class (`[0-9]`, `[0-9A-Za-z_]`, RE2's `\s` = `[\t\n\f\r ]` —
-///   note: no `\v`, unlike POSIX `space`); the bracketed replacement is
-///   valid both bare and inside a character class, because `regex`
-///   supports nested classes (`[a[0-9]]`, `[^[^0-9]]`);
-/// - an unescaped `\b`/`\B` **outside a character class** becomes
-///   `(?-u:\b)`/`(?-u:\B)` — the crate's ASCII-boundary syntax, exactly
-///   RE2's semantics. Class-interior `\b` is NEVER a boundary: RE2 reads
-///   `[\b]` as a BACKSPACE literal, which the `regex` crate spells
-///   `\x08` (it rejects `[\b]` outright — verified by test — so leaving
-///   it verbatim would turn a valid RE2 pattern into a compile error);
-///   the pass tracks unescaped `[`…`]` (a boolean suffices — RE2 has no
-///   nested classes in its *input* syntax, and `]` directly after
-///   `[`/`[^` is an error there, not a literal);
-/// - any other `\x` escape pair is copied verbatim, so an escaped
-///   backslash (`\\d`, `\\b` = literal `\` then letter) is untouched;
-/// - everything else (Unicode literals, `.`, case-folding rules, which
-///   already agree between the engines) passes through byte-for-byte.
-fn re2_ascii_perl_classes(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len() + 16);
-    let mut chars = pattern.chars();
-    let mut in_class = false;
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            match c {
-                '[' => in_class = true,
-                ']' => in_class = false,
-                _ => {}
-            }
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('d') => out.push_str("[0-9]"),
-            Some('D') => out.push_str("[^0-9]"),
-            Some('w') => out.push_str("[0-9A-Za-z_]"),
-            Some('W') => out.push_str("[^0-9A-Za-z_]"),
-            Some('s') => out.push_str(r"[\t\n\f\r ]"),
-            Some('S') => out.push_str(r"[^\t\n\f\r ]"),
-            Some('b') => out.push_str(if in_class { r"\x08" } else { r"(?-u:\b)" }),
-            Some('B') if !in_class => out.push_str(r"(?-u:\B)"),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            // A trailing lone backslash: copy through; the compiler
-            // rejects it, matching RE2 (error parity via LabelSet).
-            None => out.push('\\'),
-        }
-    }
-    out
 }
 
 /// Upstream `model.LabelName.IsValid()` under v3.13's default UTF-8
@@ -753,8 +693,10 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    // --- re2_ascii_perl_classes (#68 review, finding 2): Go RE2's
-    // \d/\w/\s are ASCII-only; Rust `regex` defaults them to Unicode ---
+    // --- RE2 syntax parity (#68 review finding 2, extended by #317):
+    // Go RE2's \d/\w/\s are ASCII-only and Rust `regex` defaults them to
+    // Unicode. The rewrite itself lives in `crate::re2_syntax`; these
+    // pin what `label_replace` callers observe. ---
 
     #[test]
     fn perl_classes_are_ascii_only_matching_re2() {
@@ -841,26 +783,16 @@ mod tests {
 
     #[test]
     fn class_interior_and_escaped_word_boundaries_are_not_boundaries() {
-        // RE2 reads class-interior \b as a BACKSPACE literal — never a
-        // boundary. The `regex` crate spells that `\x08` (it REJECTS
-        // `[\b]` — pinned below — which is why "leave verbatim" is not
-        // an option for a valid-RE2 input).
-        // (Built via format! so clippy::invalid_regex doesn't reject the
-        // deliberately-invalid literal at lint time.)
-        let untranslated = format!("[{}b]", '\\');
-        assert!(
-            regex::Regex::new(&untranslated).is_err(),
-            "premise check: the regex crate rejects class-interior \\b"
-        );
-        assert_eq!(re2_ascii_perl_classes(r"[\b]"), r"[\x08]");
-        let re = compile_label_replace_regex(r"[\b]").unwrap();
-        assert!(re.is_match("\u{8}"), "backspace semantics, as in RE2");
-        assert!(!re.is_match("b"));
-        // …including after other class members, and back OUTSIDE the
-        // class the translation resumes.
-        assert_eq!(re2_ascii_perl_classes(r"[a\b]x\b"), r"[a\x08]x(?-u:\b)");
+        // Class-interior \b is not a boundary — and, correcting this
+        // test's original #68 premise, not a BACKSPACE literal either:
+        // that is Perl's reading, while RE2 answers `invalid escape
+        // sequence: \b` (measured on ClickHouse 24.8 by the issue #317
+        // differential, which caught the old \x08 rewrite as a pattern
+        // this engine answered and RE2 refused). Both engines therefore
+        // reject it, which is the parity that matters.
+        assert!(compile_label_replace_regex(r"[\b]").is_err());
+        assert!(compile_label_replace_regex(r"[\B]").is_err());
         // Escaped backslash before b: literal `\` then `b`, untouched.
-        assert_eq!(re2_ascii_perl_classes(r"\\b"), r"\\b");
         let re = compile_label_replace_regex(r"\\b").unwrap();
         assert!(re.is_match(r"\b"));
         assert!(!re.is_match("b"));
@@ -868,14 +800,10 @@ mod tests {
 
     #[test]
     fn translation_passes_everything_else_through_verbatim() {
-        assert_eq!(
-            re2_ascii_perl_classes(r"a\.b(?i)ünïcode.*\n\x7f$1"),
-            r"a\.b(?i)ünïcode.*\n\x7f$1"
-        );
-        assert_eq!(
-            re2_ascii_perl_classes(r"\d[\w]\\S"),
-            r"[0-9][[0-9A-Za-z_]]\\S"
-        );
+        // The rewrite itself is pinned in `re2_syntax`; here only its
+        // observable effect on `label_replace` compilation matters.
+        let re = compile_label_replace_regex(r"a\.b(?i)ünïcode.*\n\x7f").unwrap();
+        assert!(re.is_match("a.bÜNÏCODE\n\x7f"));
         // A trailing lone backslash still fails compilation (error parity).
         assert!(compile_label_replace_regex("\\").is_err());
     }

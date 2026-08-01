@@ -9,6 +9,7 @@ pub mod eval;
 pub mod math;
 pub mod parser;
 pub mod plan;
+pub mod re2_syntax;
 pub mod value;
 
 pub use annotations::{Annotation, AnnotationKind, Annotations, ForcedMonotonicityDetail};
@@ -21,6 +22,7 @@ pub use plan::{
     OverTimeParamFn, PlanExpr, PlanParams, QueryPlan, RangeFn, ScalarFn, SelectorId, SelectorSpec,
     SetOp, plan, series_selector,
 };
+pub use re2_syntax::re2_pattern_to_rust;
 pub use value::{
     FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
 };

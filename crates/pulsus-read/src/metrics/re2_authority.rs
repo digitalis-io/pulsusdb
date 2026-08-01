@@ -54,11 +54,17 @@
 //! divergence is one of meaning rather than acceptance: `\d`/`\w`/`\s` are
 //! Unicode-aware in Rust and ASCII-only in RE2, and character-class set
 //! operations (`[a&&b]`, `[a--b]`) are operators in Rust and literals in
-//! RE2. Those are value divergences on a path both engines answer — a
-//! separate defect class from this issue's status divergence, tracked as
-//! follow-ups rather than folded in here (screening them would push
-//! `\d`-shaped patterns, which are common, off the cache for no
-//! status-correctness gain).
+//! RE2. Screening those would push `\d`-shaped patterns — which are common
+//! — off the cache for no status-correctness gain. Issue #317 settles them
+//! at the other end instead: [`pulsus_promql::re2_pattern_to_rust`]
+//! rewrites the pattern into RE2's reading of it before any in-process
+//! compile, so the two engines agree on **meaning** here and this module is
+//! left with **acceptance** alone. The rewrite also changes what this
+//! module's callers can compile at all (`a{bbb}c`, a literal brace in RE2,
+//! now compiles), which is why the differential defines the screen's scope
+//! against the rewritten form.
+
+use pulsus_promql::re2_pattern_to_rust;
 
 use super::matcher::{LabelMatcher, MatchOp};
 
@@ -197,6 +203,65 @@ pub(crate) fn first_matcher_requiring_re2_authority(
     matchers.iter().find(|m| {
         matches!(m.op, MatchOp::Re | MatchOp::Nre) && pattern_requires_re2_authority(&m.value)
     })
+}
+
+/// Issue #316: the `detail` for a [`pulsus_promql::PromqlError::
+/// InvalidRegexMatcher`] when one of `matcher_sets`' `Re`/`Nre` patterns
+/// cannot be compiled at all, in RE2's reading of it
+/// ([`re2_pattern_to_rust`]).
+///
+/// Upstream Prometheus compiles every matcher in `promql/parser`, so an
+/// uncompilable pattern is a **400 `bad_data`** there. Every path that
+/// reaches storage already returns that status by way of #280's classifier,
+/// and the name-less selector path — which has no SQL fallback by design
+/// (#85) — is the one that could not: it surfaced the same input as a
+/// `422 execution` degraded-cache error, or (when the name matchers matched
+/// nothing, so the label matchers were never compiled) as `200` with an
+/// empty result.
+///
+/// The verdict is the *in-process engine's*, deliberately: after the #317
+/// rewrite the Rust crate reads the pattern the way RE2 does, so the two
+/// disagree only over the acceptance divergences
+/// ([`pattern_requires_re2_authority`]'s subject), and only in the
+/// direction the module header calls harmless. The residual is a pattern
+/// the Rust crate rejects and RE2 accepts: with the rewrite that is no
+/// longer the `a{bbb}c` family (RE2's literal braces, now rewritten), but
+/// shapes such as `\Q…\E`, which upstream would answer and this path
+/// rejects. It answered neither before, so nothing that worked stops
+/// working — it moves from `422` to `400`.
+///
+/// Rendered as `^(?:pattern)$, error: reason` — the shape #280's ClickHouse
+/// classifier produces, so both routes render one `invalid regexp: …` body.
+/// The pattern quoted is the user's, never the rewrite.
+pub(crate) fn first_invalid_regex_detail(matcher_sets: &[&[LabelMatcher]]) -> Option<String> {
+    matcher_sets
+        .iter()
+        .flat_map(|ms| ms.iter())
+        .filter(|m| matches!(m.op, MatchOp::Re | MatchOp::Nre))
+        .find_map(|m| {
+            let rewritten = re2_pattern_to_rust(&m.value);
+            let err = regex::Regex::new(&format!("^(?:{rewritten})$")).err()?;
+            Some(format!(
+                "^(?:{})$, error: {}",
+                m.value,
+                rust_regex_reason(&err)
+            ))
+        })
+}
+
+/// The one-line reason out of a `regex::Error`, whose `Display` is a
+/// multi-line diagram ending in `error: <reason>`. Falls back to the whole
+/// rendering rather than dropping information if that shape ever changes.
+fn rust_regex_reason(err: &regex::Error) -> String {
+    let rendered = err.to_string();
+    rendered
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("error: "))
+        .map_or_else(
+            || rendered.split_whitespace().collect::<Vec<_>>().join(" "),
+            str::to_string,
+        )
 }
 
 /// `bytes` begins immediately after a `(?`. `Some(len)` — the byte length
@@ -462,6 +527,81 @@ mod tests {
                 "{pattern:?} is a class of literals in both engines"
             );
         }
+    }
+
+    /// Issue #316: the 400 verdict is the in-process engine's, and only
+    /// for a pattern it genuinely cannot compile in RE2's reading of it.
+    #[test]
+    fn only_a_pattern_the_engine_cannot_compile_earns_a_rejection() {
+        let re = |value: &str| LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Re,
+            value: value.to_string(),
+        };
+
+        // A backwards range: RE2 rejects `[a--b]` (`a`..`-`), and so does
+        // the rewrite. The detail carries #280's shape, quoting the USER's
+        // pattern and not the rewrite.
+        let detail = first_invalid_regex_detail(&[&[re("[a--b]")]]).expect("a rejection");
+        assert!(
+            detail.starts_with(r"^(?:[a--b])$, error: "),
+            "got {detail:?}"
+        );
+        assert!(!detail.contains(r"\-"), "the rewrite leaked: {detail:?}");
+
+        // Nothing else earns one: patterns both engines read the same, a
+        // pattern only RE2 can adjudicate (screened, not invalid), and the
+        // literal-brace family the rewrite now compiles.
+        for pattern in [
+            "api|web",
+            ".*",
+            r"\d+",
+            "[a&&b]",
+            "[]a]",
+            r"\p{Alphabetic}",
+            "a{1001}",
+            "a{bbb}c",
+            "a{,5}",
+        ] {
+            assert_eq!(
+                first_invalid_regex_detail(&[&[re(pattern)]]),
+                None,
+                "{pattern:?} must not be called invalid"
+            );
+        }
+
+        // `Eq`/`Neq` values are literals, never compiled.
+        assert_eq!(
+            first_invalid_regex_detail(&[&[LabelMatcher {
+                key: "job".to_string(),
+                op: MatchOp::Eq,
+                value: "[a--b]".to_string(),
+            }]]),
+            None
+        );
+
+        // Every set is searched, in order, and the FIRST offender wins.
+        let detail = first_invalid_regex_detail(&[&[re("api")], &[re("[a--b]"), re("[z-a]")]])
+            .expect("a rejection");
+        assert!(detail.starts_with(r"^(?:[a--b])$"), "got {detail:?}");
+    }
+
+    /// The reason is the compiler's one-line explanation, never its
+    /// multi-line diagram (which repeats the pattern and would double it
+    /// into the client-facing body).
+    #[test]
+    fn the_rejection_reason_is_a_single_line() {
+        let detail = first_invalid_regex_detail(&[&[LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Re,
+            value: "[a--b]".to_string(),
+        }]])
+        .expect("a rejection");
+        assert!(!detail.contains('\n'), "got {detail:?}");
+        assert!(
+            detail.ends_with("the start must be <= the end"),
+            "{detail:?}"
+        );
     }
 
     #[test]

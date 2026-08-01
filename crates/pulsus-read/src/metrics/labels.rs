@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::ChClient;
 use pulsus_model::{Fingerprint, LabelSet};
+use pulsus_promql::re2_pattern_to_rust;
 use regex::Regex;
 
 use super::matcher::{DataWindow, LabelMatcher, MatchOp};
@@ -253,7 +254,9 @@ pub(crate) fn concrete_name_matches(
                 if pattern_requires_re2_authority(&m.value) {
                     return Err(FallbackReason::RegexUnsupported { key: m.key.clone() });
                 }
-                let re = Regex::new(&format!("^(?:{})$", m.value))
+                // Issue #317: RE2's reading of the pattern (the storage
+                // path's own), never the Rust crate's superset grammar.
+                let re = Regex::new(&format!("^(?:{})$", re2_pattern_to_rust(&m.value)))
                     .map_err(|_| FallbackReason::RegexUnsupported { key: m.key.clone() })?;
                 let is_match = re.is_match(name);
                 if m.op == MatchOp::Re {
@@ -587,7 +590,10 @@ impl RegexCache {
             guard.insert(pattern.to_string(), CachedPattern::Re2Authority);
             return None;
         }
-        let anchored = format!("^(?:{pattern})$");
+        // Issue #317: compile RE2's reading of the pattern, not the Rust
+        // crate's superset grammar. Once per distinct pattern, behind the
+        // memo, so the per-series loop never sees it.
+        let anchored = format!("^(?:{})$", re2_pattern_to_rust(pattern));
         let re = Arc::new(Regex::new(&anchored).ok()?);
         guard.insert(
             pattern.to_string(),
@@ -1629,20 +1635,35 @@ mod tests {
             }
         }
 
-        // The reverse asymmetry (`a{bbb}c`: RE2 accepts, the Rust crate
-        // rejects) keeps its pre-existing route to the same authority.
+        // Issue #317: a brace that opens no repetition is a LITERAL in
+        // RE2, which the Rust crate used to reject outright — so
+        // `a{bbb}c` took the storage round-trip this asymmetry existed to
+        // serve. The rewrite gives the crate RE2's reading, so it is now
+        // answered in-process, correctly, as a pattern matching neither
+        // `api` nor `web`.
+        for pattern in ["a{bbb}c", "a{,5}", r"a\{bbb\}c"] {
+            let m = LabelMatcher {
+                key: "job".to_string(),
+                op: MatchOp::Re,
+                value: pattern.to_string(),
+            };
+            match resolve(&snap, &config(), "up", &[m], window(0, 1_000)) {
+                Resolution::Fingerprints(fps) => assert!(fps.is_empty(), "{pattern}: {fps:?}"),
+                other => panic!("{pattern}: expected in-process Fingerprints, got {other:?}"),
+            }
+        }
+        // …and `a{bbb}c` really does match the literal string, both here
+        // and (per the live differential) in RE2.
         let m = LabelMatcher {
             key: "job".to_string(),
             op: MatchOp::Re,
             value: "a{bbb}c".to_string(),
         };
-        assert!(matches!(
-            resolve(&snap, &config(), "up", &[m], window(0, 1_000)),
-            Resolution::SqlFallback {
-                reason: FallbackReason::RegexUnsupported { .. },
-                ..
-            }
-        ));
+        let literal = snapshot(vec![("up", 7, &[("job", "a{bbb}c")])], 0, BASE_SWEEP_MS, 1);
+        match resolve(&literal, &config(), "up", &[m], window(0, 1_000)) {
+            Resolution::Fingerprints(fps) => assert_eq!(fps, vec![7]),
+            other => panic!("expected in-process Fingerprints, got {other:?}"),
+        }
     }
 
     #[test]

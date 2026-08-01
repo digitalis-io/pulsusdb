@@ -2410,11 +2410,14 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
         "the warm cache must never disagree with the storage authority"
     );
 
-    // Control: RE2 accepts `a{bbb}c`; the warm cache must still answer.
+    // Control: RE2 accepts `a{bbb}c` (a literal brace). The Rust crate
+    // rejects the raw text, which is why this used to take the storage
+    // round-trip; issue #317's rewrite gives it RE2's reading, so the warm
+    // cache now answers it in-process. Either way it must ANSWER.
     const RE2_ACCEPTED: &str = "a{bbb}c";
     assert!(
         regex::Regex::new(&format!("^(?:{RE2_ACCEPTED})$")).is_err(),
-        "premise: the Rust `regex` crate must REJECT {RE2_ACCEPTED:?}"
+        "premise: the Rust `regex` crate must REJECT the RAW {RE2_ACCEPTED:?}"
     );
     for pattern in [RE2_ACCEPTED, "ap.*", "api|web"] {
         let expr = parse(&format!(r#"up{{job=~"{pattern}"}}"#)).expect("parse (control)");
@@ -3297,6 +3300,215 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
             );
         }
         other => panic!("expected MatrixHist, got {other:?}"),
+    }
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #316: a name-less (`{__name__=~"…"}`) selector has **no SQL
+/// fallback** by design (issue #85), so an uncompilable matcher regex could
+/// not reach #280's ClickHouse classifier — it surfaced as a `422
+/// execution` degraded-cache error, or, when the name matchers matched
+/// nothing so the label matchers were never compiled, as `200` with an
+/// empty result. Upstream Prometheus compiles every matcher in its parser
+/// and answers `400 bad_data` (reference of record, #283).
+///
+/// Pinned across the three fixtures that used to give three different
+/// answers — a name matcher that matches, one that matches nothing, and a
+/// window the cache cannot serve at all — plus the boundary this fix
+/// deliberately does not cross: a pattern that is merely *screened*
+/// (undecidable, not invalid) keeps its named `422`, because claiming
+/// `invalid regexp` for a pattern RE2 may well accept would be the
+/// over-rejection this engine avoids everywhere else.
+#[tokio::test]
+async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execution() {
+    skip_unless_live!();
+
+    // `[a--b]` is a backwards range `a`..`-` in RE2, which rejects it —
+    // and a *difference* operator in the Rust crate, which accepts it, so
+    // the vendored parser admits the query and the pattern reaches the
+    // engine. Issue #317's rewrite gives the crate RE2's reading, under
+    // which it no longer compiles; this is the shape that makes the
+    // name-less path's verdict reference-matching rather than a guess.
+    const INVALID: &str = "[a--b]";
+    assert!(
+        regex::Regex::new(&format!("^(?:{INVALID})$")).is_ok(),
+        "premise: the RAW {INVALID:?} must compile, or the parser rejects it first"
+    );
+    assert!(
+        pulsus_promql::parse(&format!(r#"up{{job=~"{INVALID}"}}"#)).is_ok(),
+        "premise: the query must parse, or the engine never sees the matcher"
+    );
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_nameless_invalid_regex";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+    seed_series(
+        &client,
+        &[SeedSeriesRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            labels: r#"{"job":"api"}"#.to_string(),
+        }],
+    )
+    .await;
+    seed_samples(
+        &client,
+        &[SeedSampleRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            value: 1.0,
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let warm = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+        step_ms: 0,
+    };
+    // Reaches back before the cache's covered window: `Unresolvable` before
+    // a single matcher is examined.
+    let out_of_window = MetricQueryParams {
+        start_ms: recent_bucket - 2 * 24 * 3_600_000,
+        end_ms: recent_bucket - 2 * 24 * 3_600_000,
+        step_ms: 0,
+    };
+
+    fn expect_bad_data<T: std::fmt::Debug>(result: Result<T, ReadError>, case: &str) {
+        match result {
+            Err(ReadError::Promql(pulsus_promql::PromqlError::InvalidRegexMatcher { detail })) => {
+                assert!(
+                    detail.starts_with(r"^(?:[a--b])$, error: "),
+                    "{case}: detail must carry #280's shape, got {detail:?}"
+                );
+            }
+            Err(other) => panic!("{case}: expected InvalidRegexMatcher, got {other:?}"),
+            Ok(value) => panic!("{case}: an uncompilable matcher must not answer: {value:?}"),
+        }
+    }
+
+    // (a) the name matcher matches a resident metric — used to be `422`.
+    expect_bad_data(
+        engine
+            .query(
+                &parse(&format!(r#"{{__name__=~"up.*",job=~"{INVALID}"}}"#)).expect("parse"),
+                &warm,
+            )
+            .await,
+        "name matcher matches",
+    );
+    // (b) the name matcher matches nothing, so the label matcher was never
+    // compiled — used to be `200` with an empty result.
+    expect_bad_data(
+        engine
+            .query(
+                &parse(&format!(r#"{{__name__=~"nothing.*",job=~"{INVALID}"}}"#)).expect("parse"),
+                &warm,
+            )
+            .await,
+        "name matcher matches nothing",
+    );
+    // (c) the `__name__` regex itself, and (d) a window the cache cannot
+    // serve — the check runs before the resolver, so a cold/out-of-window
+    // cache cannot mask a malformed request.
+    expect_bad_data(
+        engine
+            .query(
+                &parse(&format!(r#"{{__name__=~"{INVALID}"}}"#)).expect("parse"),
+                &warm,
+            )
+            .await,
+        "invalid __name__ regex",
+    );
+    expect_bad_data(
+        engine
+            .query(
+                &parse(&format!(r#"{{__name__=~"up.*",job=~"{INVALID}"}}"#)).expect("parse"),
+                &out_of_window,
+            )
+            .await,
+        "out-of-window cache",
+    );
+    // (e) a CONCRETE-name selector's second, regex `__name__` matcher:
+    // evaluated in-process by `concrete_name_matches`, which likewise has
+    // no storage path to delegate the verdict to. (The selector's ordinary
+    // label matchers are untouched — those still fall back to SQL.)
+    expect_bad_data(
+        engine
+            .query(
+                &parse(&format!(r#"{{__name__="up",__name__=~"{INVALID}"}}"#)).expect("parse"),
+                &warm,
+            )
+            .await,
+        "concrete name with an invalid __name__ regex",
+    );
+    // The discovery surface reaches the same verdict for a concrete-name
+    // selector's `__name__` matcher, which likewise has nothing to delegate
+    // to.
+    // A concrete metric name carrying a second, regex `__name__` matcher —
+    // `concrete_name_matches`' own input, and the only spelling the parser
+    // accepts for it.
+    let expr = parse(&format!(r#"{{__name__="up",__name__=~"{INVALID}"}}"#)).expect("parse");
+    let (metric_name, name_matchers, matchers) =
+        pulsus_promql::series_selector(&expr).expect("series_selector");
+    let filters = vec![DiscoveryFilter {
+        metric_name,
+        name_matchers,
+        matchers,
+    }];
+    let window = DataWindow {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+    };
+    expect_bad_data(engine.series(&filters, window).await, "series");
+
+    // Boundary: SCREENED is not INVALID. `\p{Alphabetic}` compiles here and
+    // only RE2 can say whether it is valid, so this path — which cannot ask
+    // — keeps its named `422` rather than inventing a rejection.
+    match engine
+        .query(
+            &parse(r#"{__name__=~"up.*",job=~"\\p{Alphabetic}"}"#).expect("parse"),
+            &warm,
+        )
+        .await
+    {
+        Err(ReadError::NamelessSelectorUnresolvable { reason }) => {
+            assert!(reason.contains("RegexUnsupported"), "got {reason:?}");
+        }
+        other => panic!("a screened pattern must stay a named 422, got {other:?}"),
+    }
+
+    // Controls: valid name-less selectors still answer.
+    for selector in [r#"{__name__=~"up.*"}"#, r#"{__name__=~"up",job=~"ap.*"}"#] {
+        engine
+            .query(&parse(selector).expect("parse (control)"), &warm)
+            .await
+            .unwrap_or_else(|e| panic!("{selector}: a valid selector must answer, got {e:?}"));
     }
 
     drop_database(&bootstrap, db).await;
