@@ -28,22 +28,14 @@ pub mod search_eval;
 pub mod search_plan;
 pub mod search_sql;
 
-/// Capability token (issue #240) — identical sealing form to
-/// `crate::metrics::PromqlRe2Fallback`, same "do not tidy" rule: the tuple
-/// field and `new` carry NO visibility modifier (`traces` is declared at
-/// the crate root, so `pub(super)` on either would equal `pub(crate)` and
-/// silently unseal the token to `logql`). Placeholder: TraceQL regexes are
-/// already Rust-compiled before planning (`search_plan.rs:568`, issue
-/// #59: a bad pattern must be a 400, never a mid-query server error);
-/// **#282** migrates the `filter.rs` call sites to `_checked` and deletes
-/// this token.
-pub(crate) struct TraceqlPrevalidated(());
+// Issue #282 deleted this module's `TraceqlPrevalidated` capability token
+// (issue #240). `filter.rs` now renders every user regex through
+// `logql::escape::ch_regex_anchored_checked`, which compiles the exact
+// string it escapes, so nothing in `traces/` needs — or can obtain —
+// access to the raw escapers: they are private to `logql::escape` and a
+// call from here is an `E0603`. The exemption list is PromQL only, and
+// that one is permanent by design.
 
-impl TraceqlPrevalidated {
-    fn new() -> Self {
-        TraceqlPrevalidated(())
-    }
-}
 pub mod sql;
 pub mod tags_sql;
 

@@ -9,6 +9,8 @@
 
 use thiserror::Error;
 
+use super::querytext::{QueryTextError, TraceQlText};
+
 /// Errors from parsing the `{traceId}` path parameter — mapped to `400
 /// bad_data` by `error::ApiError`.
 #[derive(Debug, Error)]
@@ -60,14 +62,22 @@ pub(crate) enum SearchParamError {
          exclusive: supply one or the other, never both"
     )]
     ConflictingQuery,
+    /// The `q` expression exceeded the reference's cap (issue #284).
+    #[error(transparent)]
+    QueryText(#[from] QueryTextError),
 }
 
 /// The raw, percent-decoded search request — `q` XOR the legacy params
 /// (validated here; compilation of either into a TraceQL AST is
 /// `search.rs`/`legacy.rs`'s job).
+///
+/// `q` is a [`TraceQlText`], so it cannot be populated without running
+/// the issue #284 length cap. The legacy fields stay plain `String`s on
+/// purpose: the reference caps only the `q`/`query` parameter, never the
+/// expression its legacy params compile to.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RawSearchParams {
-    pub q: Option<String>,
+    pub q: Option<TraceQlText>,
     pub tags: Option<String>,
     pub min_duration: Option<String>,
     pub max_duration: Option<String>,
@@ -83,8 +93,20 @@ pub(crate) struct RawSearchParams {
 pub(crate) fn parse_search_params(raw: &str) -> Result<RawSearchParams, SearchParamError> {
     let pairs = parse_pairs(raw);
     let q = get(&pairs, "q")
-        .map(str::to_string)
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(TraceQlText::new)
+        .transpose()?;
+    // Issue #284 review: the reference's frontend validator runs on the
+    // SEARCH pipeline too, and it reads `q` and then `query`
+    // (`async_query_validator_middleware.go:38-41`) — so `query` carries
+    // the cap on this route even though the search REQUEST parser reads
+    // `q` alone (`pkg/api/http.go:180`, `urlParamQuery = "q"`; a lone
+    // `query` is folded into the legacy tag map at `:222`, never treated
+    // as TraceQL). Capping it here, and NOT making it an alias for `q`,
+    // is what keeps both halves of that faithful.
+    if let Some(query) = get(&pairs, "query").filter(|s| !s.is_empty()) {
+        TraceQlText::new(query)?;
+    }
     let tags = get(&pairs, "tags")
         .map(str::to_string)
         .filter(|s| !s.is_empty());
@@ -191,14 +213,21 @@ pub(crate) enum MetricsParamError {
     InvalidSince(String),
     #[error("invalid 'step' {0:?}: expected positive whole seconds (e.g. 60, 60s, 5m, 1h)")]
     InvalidStep(String),
+    /// The `q`/`query` expression exceeded the reference's cap (issue
+    /// #284).
+    #[error(transparent)]
+    QueryText(#[from] QueryTextError),
 }
 
 /// The parsed metrics request: the TraceQL expression plus the validated
 /// window and step. `step_s` is already defaulted via the committed
 /// derivation formula (docs/api.md §4.4) when the request omitted `step`.
+///
+/// `q` is a [`TraceQlText`] for the same reason the search params' is
+/// (issue #284): the cap runs or the struct cannot be built.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RawMetricsParams {
-    pub q: String,
+    pub q: TraceQlText,
     pub start_ns: i64,
     pub end_ns: i64,
     pub step_s: i64,
@@ -223,7 +252,7 @@ pub(crate) fn parse_metrics_params(
     let query_key = get(&pairs, "query").filter(|s| !s.is_empty());
     let q = match (q_key, query_key) {
         (Some(_), Some(_)) => return Err(MetricsParamError::ConflictingQueryKeys),
-        (Some(q), None) | (None, Some(q)) => q.to_string(),
+        (Some(q), None) | (None, Some(q)) => TraceQlText::new(q)?,
         (None, None) => return Err(MetricsParamError::MissingQuery),
     };
 
@@ -593,7 +622,7 @@ mod tests {
     #[test]
     fn a_minimal_q_request_parses_with_defaults() {
         let p = parse_search_params("q=%7B%7D&start=100&end=200").unwrap();
-        assert_eq!(p.q.as_deref(), Some("{}"));
+        assert_eq!(p.q.as_ref().map(TraceQlText::as_str), Some("{}"));
         assert_eq!(p.start_ns, 100_000_000_000);
         assert_eq!(p.end_ns, 200_000_000_000);
         assert_eq!(p.limit, DEFAULT_LIMIT);
@@ -745,7 +774,7 @@ mod tests {
             NOW_S,
         )
         .unwrap();
-        assert_eq!(p.q, "{} | rate()");
+        assert_eq!(p.q.as_str(), "{} | rate()");
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
         // Derivation: max(1, 3600 / DEFAULT_METRICS_POINTS(100)) = 36.
@@ -761,11 +790,270 @@ mod tests {
     #[test]
     fn the_query_alias_key_is_accepted_and_the_pair_conflicts() {
         let p = parse_metrics_params("query=%7B%7D&start=1&end=2", NOW_S).unwrap();
-        assert_eq!(p.q, "{}");
+        assert_eq!(p.q.as_str(), "{}");
         assert!(matches!(
             parse_metrics_params("q=%7B%7D&query=%7B%7D&start=1&end=2", NOW_S),
             Err(MetricsParamError::ConflictingQueryKeys)
         ));
+    }
+
+    // --- issue #284: the TraceQL expression cap, at the reference's
+    // layer (the `q`/`query` parameter) and on the reference's boundary
+    // (`len > cap`, an INCLUSIVE maximum).
+
+    /// A `q` value of `len` bytes, percent-encoded so `parse_pairs`
+    /// decodes back to exactly `len` bytes: `%7B%7D` is the `{}` prefix
+    /// (2 decoded bytes), padded with a comment-free run of `x`.
+    ///
+    /// The padded form is NOT valid TraceQL, which is fine for the pure
+    /// LENGTH-boundary tests below — the reference measures length before
+    /// it parses (`async_query_validator_middleware.go:45` precedes the
+    /// `ParseNoOptimizations` call at `:50`), so an over-cap value is
+    /// rejected on length whatever it contains. It is NOT fine for any
+    /// test that reasons about what the reference would ACCEPT; those use
+    /// [`valid_q_of_decoded_len`] (issue #284 review round 3).
+    fn q_of_decoded_len(len: usize) -> String {
+        assert!(len >= 2);
+        format!("%7B%7D{}", "x".repeat(len - 2))
+    }
+
+    /// A **parse-valid** TraceQL expression of exactly `len` decoded
+    /// bytes, returned percent-encoded. Shape: `{ .k = "xx…x" }` — 11
+    /// bytes of frame plus the padding. Round-tripped through the real
+    /// parser by `the_valid_fixture_helper_really_produces_parseable_traceql`,
+    /// so a test that claims "the reference would accept this" is backed
+    /// by a fixture that can actually be accepted.
+    fn valid_q_of_decoded_len(len: usize) -> String {
+        const FRAME: usize = 11; // `{ .k = "` + `" }`
+        assert!(len >= FRAME);
+        let decoded = format!(r#"{{ .k = "{}" }}"#, "x".repeat(len - FRAME));
+        assert_eq!(decoded.len(), len);
+        percent_encode_query_value(&decoded)
+    }
+
+    /// Encodes every byte that is not an unreserved URL character, so the
+    /// value survives `parse_pairs` unchanged (`&`, `=`, `+`, `%`, space,
+    /// quotes and braces all matter here).
+    fn percent_encode_query_value(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_valid_fixture_helper_really_produces_parseable_traceql() {
+        for len in [11usize, 32, 1024, 131_072, 131_073] {
+            let encoded = valid_q_of_decoded_len(len);
+            let pairs = parse_pairs(&format!("q={encoded}"));
+            let decoded = get(&pairs, "q").expect("q survives the round trip");
+            assert_eq!(decoded.len(), len, "decoded length must be exact");
+            assert!(
+                pulsus_traceql::parse(decoded).is_ok(),
+                "fixture of {len} bytes must parse: {:?}…",
+                &decoded[..decoded.len().min(40)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_q_of_exactly_the_cap_is_accepted_and_one_byte_more_is_rejected() {
+        let cap = super::super::querytext::MAX_QUERY_EXPRESSION_BYTES;
+        let ok = parse_search_params(&format!("q={}&start=1&end=2", q_of_decoded_len(cap)))
+            .expect("exactly the cap is accepted — the reference compares `>`");
+        assert_eq!(
+            ok.q.as_ref().map(TraceQlText::as_str).map(str::len),
+            Some(cap)
+        );
+
+        let err = parse_search_params(&format!("q={}&start=1&end=2", q_of_decoded_len(cap + 1)))
+            .expect_err("one byte over the cap is rejected");
+        assert!(
+            matches!(
+                err,
+                SearchParamError::QueryText(QueryTextError::TooLong { len, cap: c })
+                    if len == cap + 1 && c == cap
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Issue #284 review, contested `[high]` — SETTLED FROM SOURCE, run 1
+    /// was right on the fact. grafana/tempo v3.0.2 wires
+    /// `queryValidatorWare` at `modules/frontend/frontend.go:159` (the
+    /// SEARCH pipeline), `:215` (query_range) and `:229` (query_instant),
+    /// and the middleware reads `q` then `query`
+    /// (`async_query_validator_middleware.go:38-41`) regardless of which
+    /// pipeline it sits in. So `/api/search?query=<over-cap>` is a `400`
+    /// in the reference; before this fix PulsusDB ignored `query` on
+    /// search entirely and served a time-only search `200`.
+    ///
+    /// The cap is where the parity is; the SELECTION is not. Tempo's
+    /// search request parser reads `q` alone (`pkg/api/http.go:180`,
+    /// `urlParamQuery = "q"`), and a lone `query` falls into the legacy
+    /// tag map at `:222` — so `query` must NOT become an alias that
+    /// drives the search.
+    #[test]
+    fn a_search_query_parameter_is_capped_but_never_becomes_the_search_expression() {
+        let cap = super::super::querytext::MAX_QUERY_EXPRESSION_BYTES;
+
+        // At the cap: accepted, and it does NOT populate `q`.
+        let ok = parse_search_params(&format!("query={}&start=1&end=2", q_of_decoded_len(cap)))
+            .expect("exactly the cap is accepted");
+        assert!(
+            ok.q.is_none(),
+            "`query` must not become the search expression"
+        );
+
+        // One byte over: rejected, as the reference's validator rejects it.
+        let err = parse_search_params(&format!(
+            "query={}&start=1&end=2",
+            q_of_decoded_len(cap + 1)
+        ))
+        .expect_err("over-cap `query` is a 400 on the search route");
+        assert!(
+            matches!(
+                err,
+                SearchParamError::QueryText(QueryTextError::TooLong { len, cap: c })
+                    if len == cap + 1 && c == cap
+            ),
+            "got {err:?}"
+        );
+
+        // An empty `query` is not measured — the reference's `if
+        // traceQLQuery != ""` guard — and stays a plain time-only search.
+        assert!(parse_search_params("query=&start=1&end=2").is_ok());
+    }
+
+    /// PulsusDB caps BOTH search query parameters; the reference caps
+    /// only the one its last-write-wins selection lands on. This is the
+    /// test that pins that deliberate divergence, so it has to be able to
+    /// fail — review round 3 found the earlier version could not.
+    ///
+    /// Two fixes, both load-bearing:
+    ///
+    /// 1. **Parse-valid fixtures.** The old version padded with `x`,
+    ///    which is not TraceQL, so the reference would have rejected the
+    ///    selected `query` at parse time and the "the reference accepts
+    ///    this" premise was false. Both values now parse.
+    /// 2. **Both directions.** The rejection in the `q`-over-cap case
+    ///    comes from the `q` cap, so deleting the `query` cap could never
+    ///    redden it. The `query`-over-cap direction is added, and that
+    ///    half does redden when the `query` cap is deleted. Between them
+    ///    the assertion "we cap both" has a mutant for each conjunct:
+    ///    adopting the reference's selection reddens the first, dropping
+    ///    the `query` cap reddens the second.
+    ///
+    /// The divergence itself: the reference reads `q` and then lets
+    /// `query` overwrite it, so an over-cap `q` beside an under-cap
+    /// `query` is never measured — and the search handler, which reads
+    /// `q` alone, then executes that unbounded text. That is the
+    /// validator and the handler disagreeing about which parameter
+    /// matters. PulsusDB bounds both: strictly safer, divergent only on
+    /// this shape, and unreachable over the wire anyway (`http::Uri` caps
+    /// the request target at 65,534 bytes on these GET-only routes).
+    #[test]
+    fn both_search_query_parameters_are_capped_where_the_reference_caps_only_the_selected_one() {
+        let cap = super::super::querytext::MAX_QUERY_EXPRESSION_BYTES;
+        let over = valid_q_of_decoded_len(cap + 1);
+        let under = valid_q_of_decoded_len(64);
+
+        // Direction A — the divergence. The reference selects `query`
+        // (under cap, parses fine), never measures `q`, and then runs the
+        // over-cap `q`. We reject.
+        let err = parse_search_params(&format!("q={over}&query={under}&start=1&end=2"))
+            .expect_err("PulsusDB bounds the expression it will actually execute");
+        assert!(
+            matches!(
+                err,
+                SearchParamError::QueryText(QueryTextError::TooLong { len, .. })
+                    if len == cap + 1
+            ),
+            "direction A: got {err:?}"
+        );
+
+        // Direction B — plain parity, and the half that binds the `query`
+        // cap: the reference selects the over-cap `query` and rejects, and
+        // so do we.
+        let err = parse_search_params(&format!("q={under}&query={over}&start=1&end=2"))
+            .expect_err("an over-cap `query` is rejected, as the reference rejects it");
+        assert!(
+            matches!(
+                err,
+                SearchParamError::QueryText(QueryTextError::TooLong { len, .. })
+                    if len == cap + 1
+            ),
+            "direction B: got {err:?}"
+        );
+
+        // Control: both under the cap and both parse — accepted, and `q`
+        // (never `query`) is what the search will run.
+        let ok = parse_search_params(&format!("q={under}&query={under}&start=1&end=2"))
+            .expect("two under-cap expressions are fine");
+        assert_eq!(
+            ok.q.as_ref().map(TraceQlText::as_str).map(str::len),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn both_metrics_query_keys_are_capped_on_the_same_boundary() {
+        let cap = super::super::querytext::MAX_QUERY_EXPRESSION_BYTES;
+        for key in ["q", "query"] {
+            let ok = parse_metrics_params(
+                &format!("{key}={}&start=1&end=2", q_of_decoded_len(cap)),
+                NOW_S,
+            )
+            .unwrap_or_else(|e| panic!("{key} at the cap must be accepted, got {e:?}"));
+            assert_eq!(ok.q.as_str().len(), cap);
+
+            let err = parse_metrics_params(
+                &format!("{key}={}&start=1&end=2", q_of_decoded_len(cap + 1)),
+                NOW_S,
+            )
+            .expect_err("one byte over the cap is rejected");
+            assert!(
+                matches!(
+                    err,
+                    MetricsParamError::QueryText(QueryTextError::TooLong { len, .. })
+                        if len == cap + 1
+                ),
+                "{key}: got {err:?}"
+            );
+        }
+    }
+
+    /// SCOPE, not just value: the reference's middleware measures the
+    /// `q`/`query` parameter only, so the expression the LEGACY params
+    /// compile to is uncapped there — and legacy compilation expands its
+    /// input enough to cross the cap on its own. Capping it would be a
+    /// rejection the reference does not have.
+    #[test]
+    fn a_legacy_tags_request_is_not_capped_even_when_it_compiles_over_the_cap() {
+        let cap = super::super::querytext::MAX_QUERY_EXPRESSION_BYTES;
+        // ONE logfmt pair with a long value — `a=<x…>` decoded,
+        // `{ .a="<x…>" }` compiled, ten bytes wider than its input and
+        // comfortably past the cap. Deliberately one conjunct, not many:
+        // this test is about the cap's SCOPE, not about conjunct counts.
+        let tags = format!("a%3D{}", "x".repeat(cap));
+        let p = parse_search_params(&format!("tags={tags}&start=1&end=2"))
+            .expect("legacy params carry no TraceQL expression to cap");
+        assert!(p.q.is_none());
+
+        let compiled = super::super::legacy::compile_legacy(p.tags.as_deref(), None, None)
+            .expect("logfmt compiles");
+        assert!(
+            compiled.len() > cap,
+            "the fixture must actually exceed the cap to be a scope test, got {}",
+            compiled.len()
+        );
+        // And it still parses — i.e. the request is genuinely served.
+        assert!(pulsus_traceql::parse(&compiled).is_ok());
     }
 
     #[test]

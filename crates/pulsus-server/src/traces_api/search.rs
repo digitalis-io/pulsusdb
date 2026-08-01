@@ -30,7 +30,7 @@ async fn search_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
     // `q` XOR legacy (both present is already a 400 in the parser);
     // neither present compiles to the `{}` time-only search.
     let q_string = match &params.q {
-        Some(q) => q.clone(),
+        Some(q) => q.as_str().to_string(),
         None => legacy::compile_legacy(
             params.tags.as_deref(),
             params.min_duration.as_deref(),

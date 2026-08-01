@@ -15,11 +15,13 @@
 //! **The regex half of the invariant (issue #240):** every path that turns
 //! a user-supplied regex into ClickHouse SQL validates it first, by
 //! compiling exactly the form it will emit. The raw regex escapers are
-//! therefore PRIVATE to this module; `logql/` renders regexes only through
-//! the `_checked` forms below, and the two non-LogQL consumers each hold a
-//! named capability token carrying their justification (PromQL's SQL path
-//! deliberately defers to ClickHouse's RE2 as the regex authority; TraceQL
-//! Rust-compiles every pattern upstream — #282 migrates it to `_checked`).
+//! therefore PRIVATE to this module; `logql/` and `traces/` render regexes
+//! only through the `_checked` forms below, and the single remaining
+//! non-LogQL consumer holds a named capability token carrying its
+//! justification (PromQL's SQL path deliberately defers to ClickHouse's
+//! RE2 as the regex authority). Issue #282 retired TraceQL's placeholder
+//! token by migrating `traces/filter.rs` to `_checked`, so the exemption
+//! list shrank rather than ossified.
 //!
 //! CONSTRAINED MODULE (issue #240). `tests/logqltest_provenance.rs` check D
 //! enforces BOTH halves of this, fail-closed:
@@ -117,22 +119,14 @@ pub(crate) fn ch_regex_unanchored_checked(pat: &str) -> Result<String, PipelineE
     Ok(ch_regex_unanchored(pat))
 }
 
-/// EXEMPTION 1 — PromQL. Its SQL path is by design where a pattern the Rust
-/// `regex` crate cannot compile is *sent* (`metrics/labels.rs:496-506`,
+/// THE ONE EXEMPTION — PromQL, and permanently so (the numbering this
+/// comment used to carry existed only because TraceQL held the second;
+/// #282 retired that one). Its SQL path is by design where a pattern the
+/// Rust `regex` crate cannot compile is *sent* (`metrics/labels.rs:496-506`,
 /// `:521-526`; `metrics/sql.rs:264-266`). Rust-validating here would reject
 /// exactly the queries that fallback exists to serve.
 pub(crate) fn ch_regex_anchored_promql_re2(
     _authority: crate::metrics::PromqlRe2Fallback,
-    pat: &str,
-) -> String {
-    ch_regex_anchored(pat)
-}
-
-/// EXEMPTION 2 — TraceQL, PLACEHOLDER. Every TraceQL regex is already
-/// Rust-compiled before planning (`traces/search_plan.rs:568`, issue #59).
-/// **#282** migrates these call sites to `_checked` and removes this fn.
-pub(crate) fn ch_regex_anchored_traceql_prevalidated(
-    _authority: crate::traces::TraceqlPrevalidated,
     pat: &str,
 ) -> String {
     ch_regex_anchored(pat)

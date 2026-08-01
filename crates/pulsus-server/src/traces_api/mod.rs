@@ -46,6 +46,7 @@ mod metrics;
 mod metrics_response;
 mod negotiate;
 mod params;
+mod querytext;
 mod search;
 mod search_response;
 mod tags;

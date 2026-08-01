@@ -347,7 +347,6 @@ const ESCAPE_ITEMS: &[&str] = &[
     "pub(crate) fn ch_regex_anchored_checked(pat: &str) -> Result<String, PipelineError>",
     "pub(crate) fn ch_regex_unanchored_checked(pat: &str) -> Result<String, PipelineError>",
     "pub(crate) fn ch_regex_anchored_promql_re2(_authority: crate::metrics::PromqlRe2Fallback, pat: &str) -> String",
-    "pub(crate) fn ch_regex_anchored_traceql_prevalidated(_authority: crate::traces::TraceqlPrevalidated, pat: &str) -> String",
     "mod tests",
 ];
 
@@ -576,18 +575,12 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
 }
 
 /// D7 (secondary; D1–D6 cannot see other files): the exemption
-/// call-site table.
+/// call-site table. One entry since issue #282 retired TraceQL's
+/// placeholder token — `traces/filter.rs` renders through
+/// `ch_regex_anchored_checked` and holds no capability at all.
 #[test]
 fn check_d7_exemption_call_sites_match_the_committed_table() {
-    let cases = [
-        ("src/metrics/sql.rs", "ch_regex_anchored_promql_re2(", 4, 2),
-        (
-            "src/traces/filter.rs",
-            "ch_regex_anchored_traceql_prevalidated(",
-            7,
-            0,
-        ),
-    ];
+    let cases = [("src/metrics/sql.rs", "ch_regex_anchored_promql_re2(", 4, 2)];
     for (rel, needle, want_prod, want_test) in cases {
         let text = read(rel);
         let split = text.find("mod tests {").unwrap_or(text.len());

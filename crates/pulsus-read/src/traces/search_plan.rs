@@ -18,7 +18,7 @@ use crate::logql::sql::TimeWindow;
 
 use super::filter::{
     self, ArithNode, AttrProbe, CompareOperand, LeafEval, NestedSetField, PhysicalPredicate,
-    PlanError, SpanFilterCtx, TraceCtxPred, ValuePred,
+    PlanError, SpanFilterCtx, TraceCtxPred,
 };
 use super::search_sql;
 
@@ -370,6 +370,13 @@ pub struct SearchPlan {
     pub(crate) child_count: bool,
     /// Distinct attribute membership probes (batch reads).
     pub(crate) probes: Vec<AttrProbe>,
+    /// Each probe's pre-escaped positive predicate, index-aligned with
+    /// [`Self::probes`] and rendered AT PLAN TIME (issue #282). Rendering
+    /// is what validates a probe's regex, so it has to happen where a
+    /// rejection is still a `400`; caching the result keeps
+    /// [`Self::membership_sql_for`] — a per-batch, mid-execution call —
+    /// infallible.
+    pub(crate) probe_predicates: Vec<String>,
     /// Distinct attribute aggregate `val_num` reads.
     pub(crate) agg_fields: Vec<AttrFieldRef>,
     /// Distinct attribute `select()` `val` reads.
@@ -471,10 +478,9 @@ impl SearchPlan {
     /// One membership read's SQL for a candidate batch (exposed for the
     /// golden suite; `exec` drives the same builder).
     pub fn membership_sql_for(&self, probe_idx: usize, trace_ids: &[[u8; 16]]) -> String {
-        let probe = &self.probes[probe_idx];
         search_sql::membership_sql(
             &self.attrs_table,
-            &membership_predicate(probe),
+            &self.probe_predicates[probe_idx],
             trace_ids,
             self.window,
         )
@@ -551,37 +557,74 @@ impl SearchPlan {
 }
 
 /// The full positive predicate of one membership probe, pre-escaped.
-fn membership_predicate(probe: &AttrProbe) -> String {
+/// Fallible since issue #282 — `value_pred_sql`'s regex arm renders
+/// through the checked escaper, so this call IS the probe's regex
+/// validation and runs once, at plan time.
+fn membership_predicate(probe: &AttrProbe) -> Result<String, PlanError> {
     let mut parts = vec![format!("key = {}", escape::ch_string(&probe.key))];
-    parts.push(filter::value_pred_sql(&probe.pred));
+    parts.push(filter::value_pred_sql(&probe.pred)?);
     if let Some(scope) = probe.scope {
         parts.push(format!("scope = {}", escape::ch_string(scope)));
     }
-    parts.join(" AND ")
+    Ok(parts.join(" AND "))
 }
 
-/// Compiles the anchored full-value regex a `=~`/`!~` leaf evaluates
-/// engine-side (physical columns only; attribute regexes evaluate in
-/// ClickHouse via `match()`). `pub(crate)`: the metrics planner reuses it
-/// as its plan-time regex validator (a bad pattern must be a `400`, never
-/// a mid-query server error — issue #59).
-pub(crate) fn compile_anchored(pat: &str) -> Result<Regex, PlanError> {
-    Regex::new(&format!("^(?:{pat})$"))
-        .map_err(|e| PlanError::TypeMismatch(format!("invalid regex {pat:?}: {e}")))
-}
+use eval_compile::planned_str_op;
 
-fn planned_str_op(op: ComparisonOp, value: &str) -> Result<StrOp, PlanError> {
-    Ok(match op {
-        ComparisonOp::Eq => StrOp::Eq,
-        ComparisonOp::Neq => StrOp::Neq,
-        ComparisonOp::Re => StrOp::Re(compile_anchored(value)?),
-        ComparisonOp::Nre => StrOp::Nre(compile_anchored(value)?),
-        _ => {
-            return Err(PlanError::TypeMismatch(
-                "string fields support only = != =~ !~".to_string(),
-            ));
-        }
-    })
+/// **Leaf module — its entire contents are the Phase-2 regex compile and
+/// its one legitimate caller. Nothing else may be added here** (issue
+/// #282 review, finding 1).
+///
+/// Making `compile_anchored` merely private was not a seal: *private is a
+/// scope, not a restriction*, so every other `fn` in `search_plan.rs`
+/// could still call it and re-create the second plan-time regex validator
+/// issue #282 removed — the one that could drift from what
+/// `filter.rs` actually emits. Inside this module `compile_anchored` is
+/// reachable; outside it, provably not.
+///
+/// The one thing that survives here is the Phase-2 EVALUATOR's compile:
+/// `search_eval` needs a real [`Regex`] object to run `=~`/`!~` against
+/// hydrated spans, which is a different job from deciding whether a
+/// pattern may reach SQL. Returning `StrOp` rather than `Regex` is what
+/// makes the second half hold — no caller can obtain the compiler itself.
+///
+/// Measured, in this file: a second `fn` outside this module calling
+/// `compile_anchored(..)` fails with `E0425` (the name is not in scope);
+/// following rustc's own suggested repair — `use eval_compile::…` — then
+/// fails with `E0603: function compile_anchored is private`. Moving that
+/// same `fn` inside `eval_compile` compiles it, which is exactly what
+/// `tests/traces_regex_seal.rs` pins the contents of this module against.
+mod eval_compile {
+    use regex::Regex;
+
+    use pulsus_traceql::ComparisonOp;
+
+    use super::super::filter::PlanError;
+    use super::StrOp;
+
+    /// Compiles the anchored full-value regex a `=~`/`!~` leaf evaluates
+    /// engine-side (physical columns only; attribute regexes evaluate in
+    /// ClickHouse via `match()`). NOT a validator: `filter.rs` validates
+    /// every regex as it renders it (issue #282), and this compile must
+    /// never become a second opinion about which patterns are acceptable.
+    fn compile_anchored(pat: &str) -> Result<Regex, PlanError> {
+        Regex::new(&format!("^(?:{pat})$"))
+            .map_err(|e| PlanError::TypeMismatch(format!("invalid regex {pat:?}: {e}")))
+    }
+
+    pub(super) fn planned_str_op(op: ComparisonOp, value: &str) -> Result<StrOp, PlanError> {
+        Ok(match op {
+            ComparisonOp::Eq => StrOp::Eq,
+            ComparisonOp::Neq => StrOp::Neq,
+            ComparisonOp::Re => StrOp::Re(compile_anchored(value)?),
+            ComparisonOp::Nre => StrOp::Nre(compile_anchored(value)?),
+            _ => {
+                return Err(PlanError::TypeMismatch(
+                    "string fields support only = != =~ !~".to_string(),
+                ));
+            }
+        })
+    }
 }
 
 fn plan_physical(p: &PhysicalPredicate) -> Result<PhysicalEval, PlanError> {
@@ -677,14 +720,21 @@ fn plan_trace_ctx(
     })
 }
 
-/// Validates a probe's regex at plan time even though ClickHouse
-/// evaluates it — a bad pattern must be a `400`, not a mid-query server
-/// error.
-fn validate_probe(probe: &AttrProbe) -> Result<(), PlanError> {
-    if let ValuePred::Regex(pat) = &probe.pred {
-        compile_anchored(pat)?;
+/// Interns one membership probe and, when it is new, renders its
+/// positive predicate — the act that validates its regex (issue #282;
+/// this replaces the separate `validate_probe` pre-check, at the same
+/// point in the leaf walk, so rejection ordering is unchanged). A bad
+/// pattern is a `400` here, never a mid-query server error.
+fn intern_probe(
+    probe: &AttrProbe,
+    probes: &mut Vec<AttrProbe>,
+    predicates: &mut Vec<String>,
+) -> Result<usize, PlanError> {
+    let idx = intern(probes, probe);
+    if predicates.len() < probes.len() {
+        predicates.push(membership_predicate(probe)?);
     }
-    Ok(())
+    Ok(idx)
 }
 
 fn collect_filters<'q>(expr: &'q SpansetExpr, out: &mut Vec<&'q SpansetFilter>) {
@@ -1147,6 +1197,7 @@ pub fn plan_search(
     collect_filters(&query.spanset, &mut spanset_filters);
 
     let mut probes: Vec<AttrProbe> = Vec::new();
+    let mut probe_predicates: Vec<String> = Vec::new();
     let mut filters = Vec::new();
     let mut generator_sqls: Vec<String> = Vec::new();
     let mut nested_set = false;
@@ -1165,13 +1216,10 @@ pub fn plan_search(
         for leaf in &compiled.leaves {
             let planned = match &leaf.eval {
                 LeafEval::Physical(p) => PlannedLeafEval::Physical(plan_physical(p)?),
-                LeafEval::Attr { probe, negated } => {
-                    validate_probe(probe)?;
-                    PlannedLeafEval::Attr {
-                        probe_idx: intern(&mut probes, probe),
-                        negated: *negated,
-                    }
-                }
+                LeafEval::Attr { probe, negated } => PlannedLeafEval::Attr {
+                    probe_idx: intern_probe(probe, &mut probes, &mut probe_predicates)?,
+                    negated: *negated,
+                },
                 LeafEval::NestedSet { field, op, value } => {
                     nested_set = true;
                     PlannedLeafEval::NestedSet {
@@ -1274,6 +1322,7 @@ pub fn plan_search(
         trace_ctx,
         child_count,
         probes,
+        probe_predicates,
         agg_fields,
         select_attrs,
         aggregates: pipeline.aggregates,
@@ -1464,6 +1513,54 @@ mod tests {
             plan_search(&query, &PARAMS, &ctx()),
             Err(PlanError::TypeMismatch(_))
         ));
+    }
+
+    /// Issue #282: the two negated regex forms that render NO generator
+    /// predicate (both take the time-range branch), so `filter.rs`'s
+    /// render-time check cannot see them. `{ .k !~ … }` is caught here
+    /// because its POSITIVE predicate — what `membership_sql_for` sends
+    /// per Phase-2 batch — is now rendered at plan time; the negated
+    /// service regex is caught by the Phase-2 eval compile. Either way
+    /// the rejection lands as a `400` before any query is dispatched.
+    #[test]
+    fn negated_regexes_that_render_no_generator_still_fail_at_plan_time() {
+        for q in [r#"{ .k !~ "(" }"#, r#"{ resource.service.name !~ "(" }"#] {
+            // The leaf really does compile — this is the case the
+            // render-time check in `filter.rs` does not see.
+            let f = match parse(q).expect("parse").spanset {
+                SpansetExpr::Filter(f) => f,
+                other => panic!("expected one filter, got {other:?}"),
+            };
+            assert!(
+                filter::compile_span_filter(&f).is_ok(),
+                "{q}: expected a time-range leaf with no rendered predicate"
+            );
+
+            match plan_search(&parse(q).expect("parse"), &PARAMS, &ctx()) {
+                Err(PlanError::TypeMismatch(msg)) => {
+                    assert!(msg.starts_with(r#"invalid regex "(": "#), "{q}: {msg:?}");
+                }
+                other => panic!("{q}: expected a plan-time rejection, got {other:?}"),
+            }
+        }
+    }
+
+    /// The probe predicates a plan carries are rendered ONCE, at plan
+    /// time, and are what `membership_sql_for` emits — so the SQL a
+    /// Phase-2 batch sends can never contain a pattern that was not
+    /// compiled first.
+    #[test]
+    fn membership_sql_uses_the_plan_time_rendered_probe_predicate() {
+        let p = plan(r#"{ .k =~ "che.*" }"#);
+        assert_eq!(p.probe_predicates.len(), p.probes.len());
+        assert_eq!(
+            p.probe_predicates[0],
+            "key = 'k' AND match(val, '^(?:che.*)$')"
+        );
+        assert!(
+            p.membership_sql_for(0, &[[0u8; 16]])
+                .contains("match(val, '^(?:che.*)$')")
+        );
     }
 
     /// AC4 (issue #172): a structural plan's Phase-1 SQL is BYTE-IDENTICAL
