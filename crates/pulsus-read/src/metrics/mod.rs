@@ -21,6 +21,10 @@
 //!   [`labels::LabelledResolution`] (issue #31's labelled variant),
 //!   [`labels::FallbackReason`]. In-process matcher evaluation (incl. a
 //!   bounded compiled-regex cache) lives here.
+//! - [`re2_authority`] *(issue #309)* — the conservative screen deciding
+//!   which matcher patterns the warm cache may evaluate in-process at all;
+//!   anything whose Rust-vs-RE2 acceptance is undecidable here degrades to
+//!   the storage path, where issue #280's classifier owns the verdict.
 //! - [`sql`] — pure fallback SQL builders, the snapshot-testing surface for
 //!   the `metric_series` historical/JOIN fallback and (issue #31) the
 //!   `SqlFallback` sample-fetch path's label hydration query.
@@ -58,6 +62,7 @@ mod dispatch;
 pub mod exec;
 pub mod labels;
 pub mod matcher;
+mod re2_authority;
 pub mod refresh;
 pub mod rows;
 pub mod sample_rows;
@@ -96,6 +101,8 @@ pub use labels::{
     SeriesResolver, TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot,
 };
 pub use matcher::{DataWindow, DiscoveryFilter, LabelMatcher, MatchOp};
+#[doc(hidden)]
+pub use re2_authority::pattern_requires_re2_authority_for_test;
 pub use refresh::spawn_refresh_loop;
 pub use rows::SeriesRow;
 pub use sample_rows::SampleRow;

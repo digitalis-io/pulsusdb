@@ -27,6 +27,7 @@ use pulsus_model::{Fingerprint, LabelSet};
 use regex::Regex;
 
 use super::matcher::{DataWindow, LabelMatcher, MatchOp};
+use super::re2_authority::{first_matcher_requiring_re2_authority, pattern_requires_re2_authority};
 use super::stats::{CacheMetrics, CacheMetricsSnapshot};
 
 /// The documented staleness constant (task-manager resolution #2 on issue
@@ -136,10 +137,15 @@ pub enum FallbackReason {
     /// The in-process match exceeded `cache_max_series` (a per-selector
     /// guard, not a resident-cache cap — reading 1).
     OverCardinality { matched: usize, cap: u64 },
-    /// A `Re`/`Nre` matcher's pattern was uncompilable, or the bounded
-    /// compiled-regex cache had no room to admit a new pattern. `key` is
-    /// the offending matcher's label key; the pattern/value is deliberately
-    /// omitted (architect plan amendment §1).
+    /// A `Re`/`Nre` matcher's pattern could not be evaluated in-process:
+    /// the Rust `regex` crate could not compile it, the bounded
+    /// compiled-regex cache had no room to admit a new pattern, or (issue
+    /// #309) the pattern uses syntax whose Rust-vs-RE2 acceptance is
+    /// undecidable here, so the storage engine's RE2 — the authority, per
+    /// #280 — must return the verdict
+    /// ([`super::re2_authority`]). `key` is the offending matcher's label
+    /// key; the pattern/value is deliberately omitted (architect plan
+    /// amendment §1).
     RegexUnsupported { key: String },
 }
 
@@ -230,9 +236,9 @@ pub enum MultiMetricResolution {
 /// candidate metric name. Regexes compile directly (anchored `^(?:…)$`,
 /// the same anchoring as [`RegexCache`]/the SQL path) rather than through
 /// the bounded cache — this runs once per query per matcher, never
-/// per-series. `Err` carries the uncompilable pattern's label key
-/// (unreachable through `parse()`, which validates matcher regexes —
-/// kept total rather than trusting that upstream invariant).
+/// per-series. `Err` carries the label key of the first pattern that
+/// cannot be evaluated in-process: uncompilable by the Rust `regex` crate,
+/// or (issue #309) screened as needing the storage engine's RE2 verdict.
 pub(crate) fn concrete_name_matches(
     name_matchers: &[LabelMatcher],
     name: &str,
@@ -242,6 +248,11 @@ pub(crate) fn concrete_name_matches(
             MatchOp::Eq => name == m.value,
             MatchOp::Neq => name != m.value,
             MatchOp::Re | MatchOp::Nre => {
+                // Issue #309: the same screen the cached path applies —
+                // this site compiles directly, so it must ask on its own.
+                if pattern_requires_re2_authority(&m.value) {
+                    return Err(FallbackReason::RegexUnsupported { key: m.key.clone() });
+                }
                 let re = Regex::new(&format!("^(?:{})$", m.value))
                     .map_err(|_| FallbackReason::RegexUnsupported { key: m.key.clone() })?;
                 let is_match = re.is_match(name);
@@ -369,6 +380,17 @@ pub(crate) fn resolve_multi_metric_over(
         };
     }
 
+    // Issue #309: the RE2-authority screen covers BOTH matcher sets — a
+    // `__name__` regex is compiled here exactly like a label regex. There is
+    // no SQL fallback on this path by design (#85), so an undecidable
+    // pattern is a named, loud failure rather than a silent empty result.
+    if let Some(reason) = re2_authority_fallback(name_matchers, metrics) {
+        return MultiMetricResolution::Unresolvable { reason };
+    }
+    if let Some(reason) = re2_authority_fallback(matchers, metrics) {
+        return MultiMetricResolution::Unresolvable { reason };
+    }
+
     // Issue #89 fix: walk `by_metric` directly in native `HashMap` order —
     // NO pre-loop `keys().collect()`/sort. The old sorted-name walk
     // allocated and sorted every resident name before either the fan-out
@@ -493,6 +515,19 @@ pub trait SeriesResolver {
     ) -> Resolution;
 }
 
+/// One admitted pattern's in-process verdict.
+#[derive(Debug)]
+enum CachedPattern {
+    /// Compiled, and its acceptance agrees with RE2's — safe to answer
+    /// from the snapshot.
+    InProcess(Arc<Regex>),
+    /// Issue #309: the Rust `regex` crate compiled it, but whether RE2
+    /// would is undecidable here ([`super::re2_authority`]). Memoized
+    /// alongside the compiled patterns so the screen costs one byte-scan
+    /// per distinct pattern, never one per candidate series.
+    Re2Authority,
+}
+
 /// A bounded compiled-regex cache: `pattern -> compiled ^(?:pattern)$`.
 /// Once at capacity, a pattern not already present is never admitted (no
 /// eviction) — [`RegexCache::is_match`] returns `None`, which
@@ -504,10 +539,19 @@ pub trait SeriesResolver {
 /// here despite `resolve` taking `&self`: the critical section is entirely
 /// synchronous (a hashmap lookup/insert plus a regex compile), never held
 /// across an `.await`.
+///
+/// Issue #309: every per-series in-process match goes through here (the
+/// only other compile site is [`concrete_name_matches`], which screens on
+/// its own), so the RE2-authority screen lives here too — a screened
+/// pattern can never be answered from the snapshot even if a future call
+/// site forgets the selector-level check ([`re2_authority_fallback`]). That
+/// selector-level check is still required, not redundant: it fires before
+/// the short-circuits that return an empty result without consulting a
+/// single matcher.
 #[derive(Debug)]
 pub(crate) struct RegexCache {
     capacity: usize,
-    compiled: Mutex<HashMap<String, Arc<Regex>>>,
+    compiled: Mutex<HashMap<String, CachedPattern>>,
 }
 
 impl RegexCache {
@@ -518,25 +562,37 @@ impl RegexCache {
         }
     }
 
-    /// `None` means "cannot evaluate this pattern in-process" — either it
-    /// failed to compile, or the cache has no room for it. Never panics: a
-    /// poisoned lock (only reachable if a prior holder panicked while
-    /// holding it, which nothing in this short, infallible critical section
-    /// does) still degrades gracefully rather than propagating a panic.
+    /// `None` means "cannot evaluate this pattern in-process" — it failed
+    /// to compile, the cache has no room for it, or (issue #309) only the
+    /// storage engine's RE2 can decide whether it is even a valid pattern.
+    /// Never panics: a poisoned lock (only reachable if a prior holder
+    /// panicked while holding it, which nothing in this short, infallible
+    /// critical section does) still degrades gracefully rather than
+    /// propagating a panic.
     fn is_match(&self, pattern: &str, value: &str) -> Option<bool> {
         let mut guard = match self.compiled.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(re) = guard.get(pattern) {
-            return Some(re.is_match(value));
+        if let Some(entry) = guard.get(pattern) {
+            return match entry {
+                CachedPattern::InProcess(re) => Some(re.is_match(value)),
+                CachedPattern::Re2Authority => None,
+            };
         }
         if guard.len() >= self.capacity {
             return None;
         }
+        if pattern_requires_re2_authority(pattern) {
+            guard.insert(pattern.to_string(), CachedPattern::Re2Authority);
+            return None;
+        }
         let anchored = format!("^(?:{pattern})$");
         let re = Arc::new(Regex::new(&anchored).ok()?);
-        guard.insert(pattern.to_string(), Arc::clone(&re));
+        guard.insert(
+            pattern.to_string(),
+            CachedPattern::InProcess(Arc::clone(&re)),
+        );
         Some(re.is_match(value))
     }
 }
@@ -590,6 +646,28 @@ fn sql_fallback_sql(
         config.bucket_ms,
         matchers,
     )
+}
+
+/// Issue #309: the selector-level RE2-authority screen. Run **once per
+/// resolution, before the snapshot walk** — not per candidate series, and
+/// crucially not after the "metric name absent from the snapshot"
+/// short-circuit, which would otherwise answer an undecidable selector with
+/// an empty `200` without ever looking at a matcher. `Some` names the first
+/// matcher the storage engine's RE2 must adjudicate
+/// ([`super::re2_authority`]); the caller degrades to the SQL path, where
+/// issue #280's classifier turns an RE2 rejection into a 400.
+///
+/// Cost is one byte-scan per `Re`/`Nre` matcher per query — the hot
+/// per-series loop ([`matches`]) is untouched.
+fn re2_authority_fallback(
+    matchers: &[LabelMatcher],
+    metrics: &CacheMetrics,
+) -> Option<FallbackReason> {
+    let m = first_matcher_requiring_re2_authority(matchers)?;
+    metrics
+        .miss_regex_unsupported_total
+        .fetch_add(1, Ordering::Relaxed);
+    Some(FallbackReason::RegexUnsupported { key: m.key.clone() })
 }
 
 fn sql_fallback(
@@ -689,6 +767,10 @@ pub(crate) fn resolve_over(
             matchers,
             FallbackReason::StaleCache { age_ms },
         );
+    }
+
+    if let Some(reason) = re2_authority_fallback(matchers, metrics) {
+        return sql_fallback(config, metric_name, window, matchers, reason);
     }
 
     let Some(candidates) = snapshot.by_metric.get(metric_name) else {
@@ -795,6 +877,10 @@ pub(crate) fn resolve_labelled_over(
             matchers,
             FallbackReason::StaleCache { age_ms },
         );
+    }
+
+    if let Some(reason) = re2_authority_fallback(matchers, metrics) {
+        return labelled_sql_fallback(config, metric_name, window, matchers, reason);
     }
 
     let Some(candidates) = snapshot.by_metric.get(metric_name) else {
@@ -1410,6 +1496,153 @@ mod tests {
             }
             other => panic!("expected SqlFallback, got {other:?}"),
         }
+    }
+
+    /// Issue #309: `\p{Alphabetic}` compiles in the Rust `regex` crate and
+    /// has no table in RE2, so a **warm, in-window** cache used to answer it
+    /// in-process — `200` with an empty result where upstream Prometheus
+    /// (reference of record, #283) answers `400`. Every resolution path must
+    /// instead degrade to storage, where #280's classifier owns the verdict.
+    ///
+    /// The metric-absent case is the load-bearing one: `resolve`/
+    /// `resolve_labelled` return an empty result *without consulting a
+    /// single matcher* when the name is not resident, so a per-series screen
+    /// would miss it entirely.
+    #[test]
+    fn an_re2_undecidable_regex_is_never_answered_in_process() {
+        const UNDECIDABLE: &str = r"\p{Alphabetic}";
+        assert!(
+            Regex::new(&format!("^(?:{UNDECIDABLE})$")).is_ok(),
+            "premise: the Rust `regex` crate must ACCEPT {UNDECIDABLE:?}, \
+             or this test guards nothing"
+        );
+        let m = LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Re,
+            value: UNDECIDABLE.to_string(),
+        };
+        let expected = FallbackReason::RegexUnsupported {
+            key: "job".to_string(),
+        };
+
+        let resident = snapshot(vec![("up", 1, &[("job", "api")])], 0, BASE_SWEEP_MS, 1);
+        let absent = snapshot(vec![], 0, BASE_SWEEP_MS, 1);
+
+        for (label, snap) in [("resident metric", &resident), ("absent metric", &absent)] {
+            match resolve(
+                snap,
+                &config(),
+                "up",
+                std::slice::from_ref(&m),
+                window(0, 1_000),
+            ) {
+                Resolution::SqlFallback { reason, sql } => {
+                    assert_eq!(reason, expected, "{label}");
+                    assert!(sql.contains("metric_series"), "{label}");
+                }
+                other => panic!("{label}: expected SqlFallback, got {other:?}"),
+            }
+            match resolve_labelled(
+                snap,
+                &config(),
+                "up",
+                std::slice::from_ref(&m),
+                window(0, 1_000),
+            ) {
+                LabelledResolution::SqlFallback { reason, .. } => {
+                    assert_eq!(reason, expected, "{label} (labelled)")
+                }
+                other => panic!("{label}: expected SqlFallback, got {other:?}"),
+            }
+        }
+
+        // The name-less path: both matcher sets are screened. It has no SQL
+        // fallback by design (#85), so the degradation is a named, loud
+        // failure — never a silent empty result.
+        match resolve_multi(
+            &resident,
+            &config(),
+            &[name_re(UNDECIDABLE)],
+            &[],
+            window(0, 1_000),
+            1_000,
+            u64::MAX,
+        ) {
+            MultiMetricResolution::Unresolvable { reason } => assert_eq!(
+                reason,
+                FallbackReason::RegexUnsupported {
+                    key: "__name__".to_string()
+                }
+            ),
+            other => panic!("expected Unresolvable, got {other:?}"),
+        }
+        match resolve_multi(
+            &resident,
+            &config(),
+            &[],
+            std::slice::from_ref(&m),
+            window(0, 1_000),
+            1_000,
+            u64::MAX,
+        ) {
+            MultiMetricResolution::Unresolvable { reason } => assert_eq!(reason, expected),
+            other => panic!("expected Unresolvable, got {other:?}"),
+        }
+
+        // The direct-compile site (a concrete-name selector's `__name__`
+        // matchers) screens on its own — it never touches `RegexCache`.
+        assert_eq!(
+            concrete_name_matches(&[name_re(UNDECIDABLE)], "up"),
+            Err(FallbackReason::RegexUnsupported {
+                key: "__name__".to_string()
+            })
+        );
+
+        // ... and the compiled-regex cache refuses it too, so no future
+        // call site can reach an in-process verdict for it.
+        assert_eq!(
+            RegexCache::new(REGEX_CACHE_CAPACITY).is_match(UNDECIDABLE, "api"),
+            None
+        );
+    }
+
+    /// The other half, and the one that matters more: over-rejecting breaks
+    /// valid queries. A pattern both engines read identically must still be
+    /// answered from the warm cache — no fallback, no rejection.
+    #[test]
+    fn a_portable_regex_is_still_answered_from_the_warm_cache() {
+        let snap = snapshot(
+            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "web")])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        for pattern in ["ap.*", r"(?i)API", r"\d+|api", "a{1,1000}pi"] {
+            let m = LabelMatcher {
+                key: "job".to_string(),
+                op: MatchOp::Re,
+                value: pattern.to_string(),
+            };
+            match resolve(&snap, &config(), "up", &[m], window(0, 1_000)) {
+                Resolution::Fingerprints(fps) => assert_eq!(fps, vec![1], "{pattern}"),
+                other => panic!("{pattern}: expected in-process Fingerprints, got {other:?}"),
+            }
+        }
+
+        // The reverse asymmetry (`a{bbb}c`: RE2 accepts, the Rust crate
+        // rejects) keeps its pre-existing route to the same authority.
+        let m = LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Re,
+            value: "a{bbb}c".to_string(),
+        };
+        assert!(matches!(
+            resolve(&snap, &config(), "up", &[m], window(0, 1_000)),
+            Resolution::SqlFallback {
+                reason: FallbackReason::RegexUnsupported { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
