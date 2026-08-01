@@ -309,7 +309,7 @@ GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|
 | Malformed params, malformed PromQL (parser position **in the message**), 11,000-point cap exceeded | `400` | `bad_data` |
-| A label-matcher regex **RE2 rejects**, on any path that reaches storage (issue #280) — see the note below | `400` | `bad_data` |
+| A label-matcher regex **RE2 rejects** (issues #280, #309) — see the note below | `400` | `bad_data` |
 | Out-of-subset construct / binary-op matching failure / histogram-bucket error | `422` | `execution` |
 | ClickHouse read timed out | `503` | `timeout` |
 | Pool or label cache not yet ready, ClickHouse unreachable | `503` | `unavailable` |
@@ -317,7 +317,9 @@ GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 
 **Label-matcher regexes are RE2's, not the Rust `regex` crate's (issue #280).** Upstream Prometheus compiles every `=~`/`!~` matcher with Go's `regexp` — RE2 — so RE2's syntax is the accepted set, and a pattern RE2 rejects is a `400 bad_data`. PulsusDB matches that boundary rather than its host language's: patterns the Rust `regex` crate cannot compile but RE2 can (e.g. `a{bbb}c`) are pushed to ClickHouse's RE2 and **answered**, and patterns RE2 rejects (e.g. `\p{Alphabetic}`, which the Rust crate accepts) are a `400 bad_data` carrying RE2's own reason — never a `500`. The verdict is ClickHouse's, so the rejection is reported at execution rather than at parse; the status, `errorType` and accepted set are Prometheus's, the message prose is not. A `427` body that does not carry ClickHouse's recognised `cannot compile re2: … . Look at …` framing is reported with a generic reason instead, never echoed — an unrecognised body's tail carries the executed SQL.
 
-**Scope of that rejection, and a known gap (issue #309).** It covers every path that reaches storage: `/series`, `/labels`, `/label/{name}/values` (always SQL), and `/query`/`/query_range` whenever the selector resolves through the degraded `SqlFallback` (cold / stale / out-of-window / regex-cache-full label cache). It does **not** cover a `/query`/`/query_range` selector resolved in-process by a **warm, in-window** label cache: that path evaluates matchers with the Rust `regex` crate and never asks ClickHouse, so an RE2-rejected pattern the Rust crate accepts is answered `200` there rather than rejected. Tracked as issue #309; closing it needs an RE2-authority check at plan time, not a Rust-crate one (which would reject the `a{bbb}c` class the fallback exists to serve).
+**The warm label cache defers to that same authority (issue #309).** A `/query`/`/query_range` selector resolved in-process by a warm, in-window label cache never asks ClickHouse, so it used to answer `200` for a pattern RE2 rejects. It no longer evaluates such a pattern at all: before the cache is consulted, every `=~`/`!~` pattern is screened for the constructs where the Rust crate's accepted grammar is known to exceed RE2's (`\p{…}`/`\P{…}`, `\u`/`\U`/`\<`/`\>`/`\b{…}` escapes, group heads other than `(?:` and `i`/`m`/`s`/`U` flags, repetition bounds above 1000, a repetition of a repetition), and a screened pattern degrades to the storage path where ClickHouse returns the verdict. The screen is deliberately conservative and **never rejects on its own**: a pattern RE2 accepts but the screen defers is still answered, one ClickHouse round-trip slower.
+
+One boundary remains, and it is storage's, not the cache's: ClickHouse compiles a matcher regex only when it evaluates `match()` on a row, so a selector naming a metric with **no stored rows in the queried window** is answered `200` with an empty result on every path — degraded and warm alike — whatever the pattern.
 
 ---
 

@@ -2290,6 +2290,143 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
     drop_database(&bootstrap, db).await;
 }
 
+/// Issue #309: #280 closed the RE2-rejected matcher only on paths that
+/// reach storage. A **warm, in-window** cache resolves matchers in-process
+/// via `metrics::labels`' compiled-regex cache and never asks ClickHouse,
+/// so `\p{Alphabetic}` came back `200` with an empty vector — a silently
+/// wrong answer where upstream Prometheus (reference of record, #283)
+/// answers `400`.
+///
+/// The fixture is the mirror image of the #280 test above: the series is
+/// seeded in the CURRENT bucket and the cache is refreshed, so
+/// `cache.is_warm()` AND the query window sits inside the cache window —
+/// the exact configuration that used to answer in-process.
+///
+/// The metric-absent case is asserted as a **differential against the
+/// degraded path**, not as an absolute rejection: ClickHouse compiles a
+/// matcher regex only when it actually evaluates `match()` on a row, so a
+/// selector naming a metric with no stored rows is answered `200` on the
+/// degraded `SqlFallback` path too (measured on 24.8.14.39). The contract
+/// this fix owes is that the warm cache never disagrees with the authority
+/// — which is what is pinned here.
+///
+/// Control (the half that matters more — over-rejecting breaks valid
+/// queries): `a{bbb}c`, which RE2 accepts and the Rust crate rejects, must
+/// still ANSWER on the same warm cache.
+#[tokio::test]
+async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
+    skip_unless_live!();
+
+    const RE2_REJECTED: &str = r"\p{Alphabetic}";
+    assert!(
+        regex::Regex::new(&format!("^(?:{RE2_REJECTED})$")).is_ok(),
+        "premise: the Rust `regex` crate must ACCEPT {RE2_REJECTED:?}"
+    );
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_warm_cache_re2_matcher";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+    seed_series(
+        &client,
+        &[SeedSeriesRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            labels: r#"{"job":"api"}"#.to_string(),
+        }],
+    )
+    .await;
+    seed_samples(
+        &client,
+        &[SeedSampleRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            value: 1.0,
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm(), "the defect only exists on a WARM cache");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    // In-window on both edges: the cache is authoritative here, so nothing
+    // degrades to `SqlFallback` for a cold/stale/out-of-window reason.
+    let params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+        step_ms: 0,
+    };
+
+    let expr = parse(&format!(r#"up{{job=~"\{RE2_REJECTED}"}}"#)).expect("parse");
+    match engine.query(&expr, &params).await {
+        Err(ReadError::Promql(pulsus_promql::PromqlError::InvalidRegexMatcher { detail })) => {
+            assert!(
+                detail.contains(RE2_REJECTED),
+                "detail must name the pattern, got {detail:?}"
+            );
+            for leak in ["DB::Exception", "Code: 427", "wiki/Syntax", "version "] {
+                assert!(!detail.contains(leak), "{leak:?} leaked: {detail:?}");
+            }
+        }
+        other => {
+            panic!("a warm cache must not answer an RE2-rejected matcher in-process, got {other:?}")
+        }
+    }
+
+    // The metric-absent selector: warm cache vs the degraded path must
+    // agree. The degraded path is reached with a window reaching back
+    // before `covered_from_ms` (the #280 test's own `SqlFallback` route).
+    let absent = parse(&format!(r#"absent_metric{{job=~"\{RE2_REJECTED}"}}"#)).expect("parse");
+    let degraded_params = MetricQueryParams {
+        start_ms: recent_bucket - 2 * 24 * 3_600_000,
+        end_ms: recent_bucket - 2 * 24 * 3_600_000,
+        step_ms: 0,
+    };
+    let warm = engine.query(&absent, &params).await;
+    let degraded = engine.query(&absent, &degraded_params).await;
+    assert_eq!(
+        format!("{warm:?}"),
+        format!("{degraded:?}"),
+        "the warm cache must never disagree with the storage authority"
+    );
+
+    // Control: RE2 accepts `a{bbb}c`; the warm cache must still answer.
+    const RE2_ACCEPTED: &str = "a{bbb}c";
+    assert!(
+        regex::Regex::new(&format!("^(?:{RE2_ACCEPTED})$")).is_err(),
+        "premise: the Rust `regex` crate must REJECT {RE2_ACCEPTED:?}"
+    );
+    for pattern in [RE2_ACCEPTED, "ap.*", "api|web"] {
+        let expr = parse(&format!(r#"up{{job=~"{pattern}"}}"#)).expect("parse (control)");
+        engine
+            .query(&expr, &params)
+            .await
+            .unwrap_or_else(|e| panic!("{pattern}: an RE2-valid pattern must answer, got {e:?}"));
+    }
+
+    drop_database(&bootstrap, db).await;
+}
+
 /// AC: an empty `match[]` (`filters == []`) for `/labels`/
 /// `/label/{name}/values` is Prometheus's own "no filter" contract —
 /// every series in the window, unfiltered.
