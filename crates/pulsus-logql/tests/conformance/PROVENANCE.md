@@ -44,9 +44,37 @@ Files:
 
 ## Oracle & language pin
 
-The language target is **LogQL v3.7.3**. "Pinning v3.7.3" here means a
-documented *version reference for the language*, **not** pinning, fetching,
-adapting, or vendoring any reference-implementation source.
+The language target is **LogQL v3.7.4**; the differential container in this
+directory is still digest-pinned to **v3.7.3**. "Pinning a version" here
+means a documented *version reference for the language*, **not** pinning,
+fetching, adapting, or vendoring any reference-implementation source.
+
+> **The target and the oracle digest are not the same version — read this
+> before treating an oracle probe as the target's behaviour** (issue #339).
+> The target moved to v3.7.4 (owner-approved 2026-07-25 with the corpus
+> epic): `docs/api.md` and `docs/features.md` cite v3.7.4,
+> `crates/pulsus-read/tests/logqltest/` captures against v3.7.4, and
+> issue #287's capture gate refuses any other version. This directory's
+> oracle digest still resolves to v3.7.3, because re-pinning it moves
+> accept/reject surfaces across the whole registry and is scheduled as its
+> own work with its own sweep. The lagging side is this directory as a
+> whole — the container digest, `registry-logql-v3.7.3.json`'s `target`
+> field, and the `EXPECTED_TARGET` constant that checks it all still say
+> v3.7.3, deliberately and together, so they stay self-consistent until
+> that re-pin happens.
+>
+> The two versions do not always agree. The measured case: **byte-size
+> literal spellings**. v3.7.3's lexer admits exactly 21 case-sensitive
+> spellings (`B k kB ki kiB K KB Ki KiB M MB Mi MiB G GB Gi GiB T TB Ti
+> TiB`) and 400s `1b`/`1kb`/`1pb`/`1024b`; v3.7.4 accepts the full
+> case-insensitive `humanize.ParseBytes` set, which is what PulsusDB
+> implements (issue #226) and what
+> `crates/pulsus-read/tests/logqltest/corpus/b8_byte_parity.test` captures
+> as accepted. An adjudication on #339 was made from an oracle probe alone
+> and concluded PulsusDB was over-accepting; it was not. Where the oracle
+> and a v3.7.4 capture disagree, **the capture wins** — see
+> `crates/pulsus-logql/tests/case_folding.rs`, whose residual census
+> labels that class explicitly.
 
 The oracle is:
 

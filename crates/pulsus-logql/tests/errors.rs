@@ -602,17 +602,20 @@ fn variants_in_a_nested_position_is_a_positional_parse_error() {
 }
 
 /// A5 — the grammar-shape rejections: empty argument list, trailing
-/// comma, missing `of`, unparenthesised range, and uppercase keywords
-/// (PulsusDB is case-sensitive for EVERY keyword — the reference's
-/// case-insensitive lexer is a workspace-wide pre-existing gap, issue
-/// #221 plan §risk 6; pinned here as PulsusDB-rejects).
+/// comma, missing `of`, unparenthesised range.
+///
+/// **`VARIANTS(...) OF (...)` used to be pinned here as a rejection**
+/// (issue #221 plan §risk 6 recorded the reference's case-insensitive
+/// lexer as a known gap). Issue #339 closed that gap across the whole
+/// keyword surface, so the uppercase spelling now parses and has moved
+/// to `tests/case_folding.rs`; keeping it here would have left a stale
+/// expectation contradicting the fix.
 #[test]
 fn variants_grammar_shape_rejections() {
     for q in [
         r#"variants() of ({app="x"}[5m])"#,
         r#"variants(count_over_time({app="x"}[5m]),) of ({app="x"}[5m])"#,
         r#"variants(count_over_time({app="x"}[5m])) of {app="x"}[5m]"#,
-        r#"VARIANTS(count_over_time({app="x"}[5m])) OF ({app="x"}[5m])"#,
     ] {
         match parse(q) {
             Err(LogQlError::UnexpectedToken { .. } | LogQlError::UnexpectedEof { .. }) => {}
@@ -656,12 +659,10 @@ fn label_replace_grammar_shape_rejections() {
         // Empty argument list / missing operand.
         r#"label_replace()"#,
         r#"label_replace"#,
-        // Uppercase keyword: the reference's case-insensitive lexer
-        // accepts `LABEL_REPLACE(...)` (probed 200); PulsusDB is
-        // case-sensitive for EVERY keyword — the workspace-wide
-        // pre-existing gap (issue #221 plan §risk 6), pinned here as
-        // PulsusDB-rejects exactly like `VARIANTS(...) OF (...)`.
-        r#"LABEL_REPLACE(rate({app="x"}[5m]), "dst", "v", "src", ".*")"#,
+        // `LABEL_REPLACE(...)` used to be pinned here as a rejection.
+        // It is the case that SURFACED issue #339 — the reference
+        // accepts it (probed 200) — so it now parses and its assertion
+        // lives in `tests/case_folding.rs`.
     ] {
         match parse(q) {
             Err(LogQlError::UnexpectedToken { .. } | LogQlError::UnexpectedEof { .. }) => {}
