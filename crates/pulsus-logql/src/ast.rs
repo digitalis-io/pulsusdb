@@ -2303,8 +2303,13 @@ pub enum RangeAggOp {
 }
 
 impl RangeAggOp {
+    /// Resolves a range-aggregation KEYWORD. Case-insensitive, because
+    /// the reference's lexer resolves keywords case-insensitively
+    /// (issue #339: `RATE(...)`/`Rate(...)` are 200s there). Folding
+    /// lives here rather than at the call sites so a new caller cannot
+    /// reintroduce the case-sensitive lookup.
     pub(crate) fn from_ident(name: &str) -> Option<Self> {
-        match name {
+        match name.to_ascii_lowercase().as_str() {
             "rate" => Some(Self::Rate),
             "count_over_time" => Some(Self::CountOverTime),
             "bytes_rate" => Some(Self::BytesRate),
@@ -2381,8 +2386,10 @@ pub enum VectorAggOp {
 }
 
 impl VectorAggOp {
+    /// Resolves a vector-aggregation KEYWORD — case-insensitive for the
+    /// same reason as [`RangeAggOp::from_ident`] (issue #339).
     pub(crate) fn from_ident(name: &str) -> Option<Self> {
-        match name {
+        match name.to_ascii_lowercase().as_str() {
             "sum" => Some(Self::Sum),
             "avg" => Some(Self::Avg),
             "min" => Some(Self::Min),

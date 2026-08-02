@@ -66,6 +66,43 @@ fn expect_eof(cursor: &Cursor<'_>) -> Result<(), LogQlError> {
     }
 }
 
+/// **The ONE case-folding point for LogQL keywords** (issue #339).
+///
+/// The reference's lexer resolves a keyword by looking its text up
+/// case-insensitively, so `RATE(...)`, `SUM BY (...)`, `| JSON` and
+/// `LABEL_REPLACE(...)` are all accepted there (probed against the pinned
+/// v3.7.3 container: every keyword position returns 200 in upper, lower
+/// and mixed case). PulsusDB used to compare each keyword with `==`
+/// against its lowercase spelling, so every one of those was a 400 — a
+/// whole-surface rejection divergence, not a per-construct one.
+///
+/// **Folding happens here and nowhere else, and it applies ONLY at
+/// grammar positions that expect a keyword.** Identifier *payloads* — a
+/// label name in a selector, a grouping list, a label filter, `drop`/
+/// `keep`, a `label_format` source or destination, an `unwrap`
+/// identifier — keep their original case, because the reference keeps
+/// theirs: `| json | RATE = "R"` does NOT match a field named `rate`
+/// (semantically probed, 0 hits vs 1 for the lowercase spelling), and
+/// `sum by (Env)` groups on `Env`, not `env`. Folding an identifier
+/// payload would silently change which series a query selects — strictly
+/// worse than the rejection this fixes.
+///
+/// ASCII-only, matching the reference: a keyword is ASCII by
+/// construction, and `str::to_ascii_lowercase` cannot fold a non-ASCII
+/// identifier into one (no Kelvin-sign / dotless-i surprises).
+fn kw(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// `name` is the keyword `want`, compared the way the reference's lexer
+/// compares it. `want` must already be lowercase — asserted by
+/// [`tests::every_keyword_literal_in_this_file_is_lowercase`], since a
+/// mixed-case `want` could never match a folded name.
+fn is_kw(name: &str, want: &str) -> bool {
+    debug_assert_eq!(want, want.to_ascii_lowercase(), "keyword must be lowercase");
+    name.eq_ignore_ascii_case(want)
+}
+
 /// A read-only cursor over the token stream. Tokens always end with
 /// `Eof`, so `peek`/`peek_at` never index out of bounds.
 struct Cursor<'a> {
@@ -293,8 +330,8 @@ fn peek_binop(cursor: &Cursor<'_>) -> Option<(BinOp, u8, bool)> {
         // The identifier-shaped operators come from the one recognition
         // table (`ast::BINARY_OP_KEYWORDS`) so the documented operator
         // inventory and the parser cannot drift.
-        TokenKind::Ident(name) if ast::BINARY_OP_KEYWORDS.contains(&name.as_str()) => {
-            match name.as_str() {
+        TokenKind::Ident(name) if ast::BINARY_OP_KEYWORDS.iter().any(|k| is_kw(name, k)) => {
+            match kw(name).as_str() {
                 "or" => BinOp::Or,
                 "and" => BinOp::And,
                 "unless" => BinOp::Unless,
@@ -385,7 +422,7 @@ fn parse_bin_modifier(
 ) -> Result<Option<BinModifier>, LogQlError> {
     let mut return_bool = false;
     if let TokenKind::Ident(name) = &cursor.peek().kind
-        && name == "bool"
+        && is_kw(name, "bool")
         && op.is_comparison()
     {
         cursor.advance();
@@ -410,9 +447,9 @@ fn parse_vector_matching(
     cursor: &mut Cursor<'_>,
 ) -> Result<Option<ast::VectorMatching>, LogQlError> {
     let on = match &cursor.peek().kind {
-        TokenKind::Ident(name) if name == "on" => true,
-        TokenKind::Ident(name) if name == "ignoring" => false,
-        TokenKind::Ident(name) if name == "group_left" || name == "group_right" => {
+        TokenKind::Ident(name) if is_kw(name, "on") => true,
+        TokenKind::Ident(name) if is_kw(name, "ignoring") => false,
+        TokenKind::Ident(name) if is_kw(name, "group_left") || is_kw(name, "group_right") => {
             let tok = cursor.peek();
             return Err(LogQlError::UnexpectedToken {
                 found: format!("identifier {name:?}"),
@@ -426,8 +463,8 @@ fn parse_vector_matching(
     let labels = parse_label_list_parens(cursor)?;
 
     let group = match &cursor.peek().kind {
-        TokenKind::Ident(name) if name == "group_left" || name == "group_right" => {
-            let left = name == "group_left";
+        TokenKind::Ident(name) if is_kw(name, "group_left") || is_kw(name, "group_right") => {
+            let left = is_kw(name, "group_left");
             cursor.advance();
             // The include-label list is optional: `group_left` or
             // `group_left(a, b)`.
@@ -533,7 +570,7 @@ fn parse_log_expr(cursor: &mut Cursor<'_>) -> Result<LogExpr, LogQlError> {
             // metric-level `or` binary op (which appears after the range
             // closes, outside this log expression).
             let mut or_matches = Vec::new();
-            while matches!(&cursor.peek().kind, TokenKind::Ident(n) if n == "or") {
+            while matches!(&cursor.peek().kind, TokenKind::Ident(n) if is_kw(n, "or")) {
                 cursor.advance();
                 let (v, is_ip) = parse_line_match(cursor, op)?;
                 or_matches.push(ast::LineMatch { value: v, is_ip });
@@ -584,7 +621,7 @@ fn parse_line_match(
     cursor: &mut Cursor<'_>,
     op: LineFilterOp,
 ) -> Result<(String, bool), LogQlError> {
-    if matches!(&cursor.peek().kind, TokenKind::Ident(n) if n == "ip")
+    if matches!(&cursor.peek().kind, TokenKind::Ident(n) if is_kw(n, "ip"))
         && matches!(cursor.peek2().kind, TokenKind::LParen)
     {
         let ip_tok = cursor.peek().clone();
@@ -613,7 +650,7 @@ fn parse_line_match(
 fn parse_pipe_stage(cursor: &mut Cursor<'_>) -> Result<Stage, LogQlError> {
     let tok = cursor.peek().clone();
     match &tok.kind {
-        TokenKind::Ident(name) => match name.as_str() {
+        TokenKind::Ident(name) => match kw(name).as_str() {
             "json" => {
                 cursor.advance();
                 Ok(Stage::Parser(ParserStage::Json {
@@ -817,7 +854,9 @@ fn parse_label_format_list(cursor: &mut Cursor<'_>) -> Result<Vec<LabelFmt>, Log
 fn parse_unwrap(cursor: &mut Cursor<'_>) -> Result<Unwrap, LogQlError> {
     let (first, first_span) = cursor.expect_ident()?;
     if matches!(cursor.peek().kind, TokenKind::LParen) {
-        if !ast::UNWRAP_CONVERSIONS.contains(&first.as_str()) {
+        // The conversion name is a KEYWORD (folds); the label name it
+        // wraps is an identifier payload (never folded) — issue #339.
+        if !ast::UNWRAP_CONVERSIONS.iter().any(|c| is_kw(&first, c)) {
             return Err(LogQlError::UnexpectedToken {
                 found: format!("identifier {first:?}"),
                 expected: "an unwrap conversion: 'duration', 'duration_seconds', or 'bytes'"
@@ -830,7 +869,7 @@ fn parse_unwrap(cursor: &mut Cursor<'_>) -> Result<Unwrap, LogQlError> {
         cursor.expect(&TokenKind::RParen, "')'")?;
         Ok(Unwrap {
             label,
-            conversion: Some(first),
+            conversion: Some(kw(&first)),
         })
     } else {
         Ok(Unwrap {
@@ -855,7 +894,7 @@ fn parse_label_filter_or(
         });
     }
     let mut left = parse_label_filter_and(cursor, depth)?;
-    while matches!(&cursor.peek().kind, TokenKind::Ident(name) if name == "or") {
+    while matches!(&cursor.peek().kind, TokenKind::Ident(name) if is_kw(name, "or")) {
         cursor.advance();
         let right = parse_label_filter_and(cursor, depth)?;
         left = LabelFilterExpr::Or(walk::Child::new(left), walk::Child::new(right));
@@ -871,7 +910,7 @@ fn parse_label_filter_and(
     loop {
         let is_and = match &cursor.peek().kind {
             TokenKind::Comma => true,
-            TokenKind::Ident(name) if name == "and" => true,
+            TokenKind::Ident(name) if is_kw(name, "and") => true,
             _ => false,
         };
         if !is_and {
@@ -982,7 +1021,7 @@ fn parse_label_filter_predicate(cursor: &mut Cursor<'_>) -> Result<LabelFilterEx
             // Only `=`/`!=` accept an `ip()` RHS; `=~`/`!~`/numeric ops keep
             // rejecting it via their own arms below.
             TokenKind::Ident(n)
-                if n == "ip" && matches!(cursor.peek2().kind, TokenKind::LParen) =>
+                if is_kw(n, "ip") && matches!(cursor.peek2().kind, TokenKind::LParen) =>
             {
                 cursor.advance(); // `ip`
                 cursor.expect(&TokenKind::LParen, "'('")?;
@@ -1094,7 +1133,7 @@ fn parse_metric_expr(
     // `vector(<NUMBER>)` (issue #221): promotes a scalar to a vector result
     // (`{} => n`). Only a `NUMBER` arg — mirrors Loki v3.7.4's `vectorExpr`
     // grammar (`vector "(" NUMBER ")"`), which rejects an inner expression.
-    if name == "vector" {
+    if is_kw(&name, "vector") {
         cursor.advance();
         cursor.expect(&TokenKind::LParen, "'('")?;
         let (raw, _) = cursor.expect_number("the vector value (e.g. vector(0))")?;
@@ -1115,11 +1154,10 @@ fn parse_metric_expr(
     // unexpected ,`). Arity/argument-type mistakes fall out of the
     // `expect` calls as plain positional 400s, matching the reference's
     // `unexpected ), expecting ,` / `unexpected IDENTIFIER, expecting
-    // STRING` class. The keyword is matched as the exact lowercase
-    // identifier, consistent with every other PulsusDB keyword (the
-    // reference's case-insensitive lexer is the workspace-wide
-    // pre-existing gap, issue #221 plan §risk 6).
-    if name == "label_replace" {
+    // STRING` class. The keyword is matched case-insensitively through
+    // [`is_kw`], like every other PulsusDB keyword since issue #339 —
+    // `LABEL_REPLACE(...)` is the case that surfaced that gap.
+    if is_kw(&name, "label_replace") {
         cursor.advance();
         return parse_label_replace_call(cursor, depth);
     }
@@ -1129,7 +1167,7 @@ fn parse_metric_expr(
     // through to the ordinary `UnexpectedToken` below — a plain 400, the
     // same shape the reference's `syntax error: unexpected )` carries,
     // never `NotYetSupported`.
-    if name == "variants" && allow_variants {
+    if is_kw(&name, "variants") && allow_variants {
         cursor.advance();
         return parse_variants_expr(cursor, depth);
     }
@@ -1198,13 +1236,11 @@ fn parse_variants_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricEx
         variants.push(parse_binary_expr(cursor, depth + 1, 0, false)?);
     }
     cursor.expect(&TokenKind::RParen, "')'")?;
-    // The `of` keyword is matched as the exact lowercase identifier,
+    // The `of` keyword is matched case-insensitively through [`is_kw`],
     // consistent with every other PulsusDB keyword (`sum`, `by`,
-    // `unwrap`) — the reference's case-insensitive lexer is a
-    // workspace-wide pre-existing gap, deliberately not special-cased
-    // here (issue #221 plan §risk 6).
+    // `unwrap`) since issue #339 closed the whole-surface folding gap.
     match &cursor.peek().kind {
-        TokenKind::Ident(name) if name == "of" => {
+        TokenKind::Ident(name) if is_kw(name, "of") => {
             cursor.advance();
         }
         other => {
@@ -1338,7 +1374,7 @@ fn parse_vector_agg_call(
 /// expression; the parser accepts either and normalizes to one
 /// `Grouping` value.
 fn maybe_grouping(cursor: &mut Cursor<'_>) -> Result<Option<Grouping>, LogQlError> {
-    let is_grouping_keyword = matches!(&cursor.peek().kind, TokenKind::Ident(name) if name == "by" || name == "without")
+    let is_grouping_keyword = matches!(&cursor.peek().kind, TokenKind::Ident(name) if is_kw(name, "by") || is_kw(name, "without"))
         && matches!(cursor.peek2().kind, TokenKind::LParen);
     if is_grouping_keyword {
         Ok(Some(parse_grouping(cursor)?))
@@ -1349,7 +1385,7 @@ fn maybe_grouping(cursor: &mut Cursor<'_>) -> Result<Option<Grouping>, LogQlErro
 
 fn parse_grouping(cursor: &mut Cursor<'_>) -> Result<Grouping, LogQlError> {
     let (name, span) = cursor.expect_ident()?;
-    let kind = match name.as_str() {
+    let kind = match kw(&name).as_str() {
         "by" => GroupingKind::By,
         "without" => GroupingKind::Without,
         _ => {
@@ -1362,4 +1398,54 @@ fn parse_grouping(cursor: &mut Cursor<'_>) -> Result<Grouping, LogQlError> {
     };
     let labels = parse_label_list_parens(cursor)?;
     Ok(Grouping { kind, labels })
+}
+
+#[cfg(test)]
+mod tests {
+    /// [`is_kw`] compares `name` case-insensitively against a `want` that
+    /// must already be lowercase — a mixed-case `want` would silently
+    /// never match, and `debug_assert` only catches it if that call site
+    /// is exercised. This is the static half: every keyword literal in
+    /// this file, extracted from the source, must be lowercase.
+    ///
+    /// It is a census, not a spot check: it reads the file rather than a
+    /// hand-maintained list, so a new `is_kw(..., "By")` fails here
+    /// without anyone remembering to add it.
+    #[test]
+    fn every_keyword_literal_in_this_file_is_lowercase() {
+        let src = include_str!("parser.rs");
+        let mut offenders = Vec::new();
+        let mut found = 0usize;
+        for (n, line) in src.lines().enumerate() {
+            // Strip comments first: this very test documents the shape
+            // `is_kw(..., "By")` in prose, and a census that flagged its
+            // own documentation would be noise, not a finding.
+            let code = line.split_once("//").map_or(line, |(before, _)| before);
+            let mut rest = code;
+            while let Some(at) = rest.find("is_kw(") {
+                rest = &rest[at + "is_kw(".len()..];
+                // The keyword is the quoted literal argument.
+                let Some(open) = rest.find('"') else { break };
+                let after = &rest[open + 1..];
+                let Some(close) = after.find('"') else { break };
+                let literal = &after[..close];
+                found += 1;
+                if literal != literal.to_ascii_lowercase() {
+                    offenders.push(format!("{}: is_kw(..., {literal:?})", n + 1));
+                }
+                rest = &after[close + 1..];
+            }
+        }
+        // The extractor must actually be finding call sites: a rename
+        // that made it match nothing would leave this green forever.
+        assert!(
+            found >= 15,
+            "expected the parser's keyword call sites, found {found} — the extractor is stale"
+        );
+        assert!(
+            offenders.is_empty(),
+            "keyword literals must be lowercase (is_kw folds the INPUT, not the expectation):\n{}",
+            offenders.join("\n")
+        );
+    }
 }
