@@ -14,15 +14,22 @@
 //! | `metric_name = '<name>'` | ClickHouse string literal | [`ch_string`] |
 //! | label key in `JSONExtractString(labels, '<key>')` | string literal (a *value argument*, never an identifier) | [`ch_string`] |
 //! | Eq/Neq value `... = '<val>'` / `!= '<val>'` | string literal | [`ch_string`] |
-//! | Re/Nre pattern `match(JSONExtractString(labels,'<key>'), '<pat>')` | fully-anchored `'^(?:pat)$'` literal | [`ch_regex_anchored_promql_re2`] (the issue #240 PromQL RE2-authority exemption) |
+//! | Re/Nre pattern `match(JSONExtractString(labels,'<key>'), '<pat>')` | fully-anchored `'(?-s)^(?:pat)$'` literal | the issue #240 PromQL RE2-authority exemption, callable ONLY from [`super::series_where`]'s sealed renderer — this file can name the escaper but cannot present the token its signature demands (`E0624`, measured) |
+//!
+//! The `(?-s)` prefix is issue #324: ClickHouse's `match()` sets RE2's
+//! `dot_nl` option, so `.` matches a newline there and does not in RE2
+//! itself — the escaper's own doc carries the measurement. Issue #315 adds
+//! a constant, analysis-time [`re2_compile_probe`] alongside every regex
+//! predicate, so a pattern RE2 rejects is rejected even when the query
+//! window holds no rows for `match()` to run on.
 //!
 //! Absent-label semantics are unchanged from the in-process path:
 //! `JSONExtractString` returns `''` for a missing key, matching
 //! [`super::labels`]'s `""` rule for a missing [`pulsus_model::LabelSet`]
 //! entry (load-bearing for the cache-vs-SQL differential test).
 //!
-//! **Placeholder-doubling is NOT this module's concern.** `ch_regex_anchored_promql_re2`
-//! always emits a literal `?` (the `^(?:...)$` template) — the `clickhouse`
+//! **Placeholder-doubling is NOT this module's concern.** The anchored
+//! literal always carries a literal `?` (the `(?-s)^(?:...)$` template) — the `clickhouse`
 //! crate's `SqlBuilder` treats a bare `?` as an unbound bind placeholder
 //! unless doubled. The canonical SQL text this module returns is
 //! deliberately un-doubled (snapshot-testable, matches `logql::sql`'s own
@@ -31,55 +38,29 @@
 //! engine must apply it before this text reaches `ChClient::query_stream`,
 //! exactly as `logql::exec` already does for its own regex SQL.
 
-use crate::logql::escape::{ch_regex_anchored_promql_re2, ch_string};
-use crate::metrics::PromqlRe2Fallback;
-use pulsus_model::floor_to_activity_bucket;
+use crate::logql::escape::ch_string;
 
-use super::matcher::{DataWindow, DiscoveryFilter, LabelMatcher, MatchOp};
+use super::matcher::{DataWindow, DiscoveryFilter, LabelMatcher};
+use super::series_where::{MatcherTarget, SeriesWhere};
 
-/// `intDiv({ms}, {bucket_ms}) * {bucket_ms}` — the literal bound
-/// docs/schemas.md §2.1 renders, computed via the shared
-/// [`floor_to_activity_bucket`] (not re-derived here) so the rendered
-/// number is byte-identical to what the writer's own registration gate
-/// computes (issue #26 precedent; cross-crate pinned by
-/// `tests/metrics_bucket_floor.rs`).
-fn floored_bound(ms: i64, bucket_ms: i64) -> i64 {
-    floor_to_activity_bucket(ms, bucket_ms)
-}
-
-/// Renders one matcher as a `JSONExtractString(labels, '<key>')` predicate.
-/// The key is always a string literal (see this module's escaping table) —
-/// never `ch_ident`, which is reserved for trusted schema identifiers.
-fn matcher_predicate(m: &LabelMatcher) -> String {
-    let target = format!("JSONExtractString(labels, {})", ch_string(&m.key));
-    match m.op {
-        MatchOp::Eq => format!("{target} = {}", ch_string(&m.value)),
-        MatchOp::Neq => format!("{target} != {}", ch_string(&m.value)),
-        MatchOp::Re => format!(
-            "match({target}, {})",
-            ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), &m.value)
-        ),
-        MatchOp::Nre => format!(
-            "NOT match({target}, {})",
-            ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), &m.value)
-        ),
-    }
-}
-
-fn base_where(series_table: &str, metric_name: &str, window: DataWindow, bucket_ms: i64) -> String {
-    let lower = floored_bound(window.start_ms, bucket_ms);
-    let upper = floored_bound(window.end_ms, bucket_ms);
+/// The `FROM`/`WHERE` head every metric-scoped builder shares, with the
+/// window bound, its issue #315 compile probe and the matcher conjuncts
+/// supplied as one inseparable fragment by [`SeriesWhere`] — so "a user
+/// regex rendered without its probe" is not expressible here from the
+/// sanctioned components (see `super::series_where`'s module doc, which
+/// also states the one unsealed crossing rustc does not police).
+fn base_where(
+    series_table: &str,
+    metric_name: &str,
+    window: DataWindow,
+    bucket_ms: i64,
+    matchers: &[LabelMatcher],
+) -> String {
     format!(
-        "FROM {series_table}\nWHERE metric_name = {}\n  AND unix_milli >= {lower} AND unix_milli <= {upper}",
-        ch_string(metric_name)
+        "FROM {series_table}\nWHERE metric_name = {}\n  AND {}",
+        ch_string(metric_name),
+        SeriesWhere::new(window, bucket_ms, matchers, MatcherTarget::Labels).where_tail()
     )
-}
-
-fn append_matchers(sql: &mut String, matchers: &[LabelMatcher]) {
-    for m in matchers {
-        sql.push_str("\n  AND ");
-        sql.push_str(&matcher_predicate(m));
-    }
 }
 
 /// The injection-safe `metric_series` sub-query issue #31 inlines verbatim
@@ -96,12 +77,10 @@ pub fn historical_series_subquery(
     bucket_ms: i64,
     matchers: &[LabelMatcher],
 ) -> String {
-    let mut sql = format!(
+    format!(
         "SELECT fingerprint\n{}",
-        base_where(series_table, metric_name, window, bucket_ms)
-    );
-    append_matchers(&mut sql, matchers);
-    sql
+        base_where(series_table, metric_name, window, bucket_ms, matchers)
+    )
 }
 
 /// Issue #82 (retroactive re-review, Finding 1): bounds an `info()`
@@ -147,9 +126,8 @@ pub fn historical_resolution_query(
 ) -> String {
     let mut sql = format!(
         "SELECT fingerprint, labels\n{}",
-        base_where(series_table, metric_name, window, bucket_ms)
+        base_where(series_table, metric_name, window, bucket_ms, matchers)
     );
-    append_matchers(&mut sql, matchers);
     sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
     sql
 }
@@ -196,23 +174,20 @@ pub fn discovery_query(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    let lower = floored_bound(window.start_ms, bucket_ms);
-    let upper = floored_bound(window.end_ms, bucket_ms);
+    let tail = SeriesWhere::new(window, bucket_ms, &filter.matchers, MatcherTarget::Labels);
     let mut sql = format!("SELECT fingerprint, metric_name, labels\nFROM {series_table}\n");
     match &filter.metric_name {
         Some(name) => {
             sql.push_str(&format!(
-                "WHERE metric_name = {}\n  AND unix_milli >= {lower} AND unix_milli <= {upper}",
-                ch_string(name)
+                "WHERE metric_name = {}\n  AND {}",
+                ch_string(name),
+                tail.where_tail()
             ));
         }
         None => {
-            sql.push_str(&format!(
-                "WHERE unix_milli >= {lower} AND unix_milli <= {upper}"
-            ));
+            sql.push_str(&format!("WHERE {}", tail.where_tail()));
         }
     }
-    append_matchers(&mut sql, &filter.matchers);
     sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
     sql
 }
@@ -242,8 +217,6 @@ pub fn discovery_fetch_multi(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    let lower = floored_bound(window.start_ms, bucket_ms);
-    let upper = floored_bound(window.end_ms, bucket_ms);
     let name_list = metric_names
         .iter()
         .map(|n| ch_string(n))
@@ -254,36 +227,13 @@ pub fn discovery_fetch_multi(
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
+    // No matchers: the resolved `(name, fingerprint)` set IS the answer, so
+    // the tail is a bare window bound and carries no probe.
+    let tail = SeriesWhere::new(window, bucket_ms, &[], MatcherTarget::Labels);
     format!(
-        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND fingerprint IN ({fp_list})\n  AND unix_milli >= {lower} AND unix_milli <= {upper}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
+        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND fingerprint IN ({fp_list})\n  AND {}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
+        tail.where_tail()
     )
-}
-
-/// Renders one `__name__` matcher as a predicate against the
-/// **`metric_name` column** (issue #96's degraded-cache discovery probe) —
-/// the leading primary-key column of `metric_series`, NOT
-/// `JSONExtractString(labels, …)` (`__name__` is never a stored label,
-/// docs/schemas.md §2.1). Only ever fed the non-`Eq` name matchers a
-/// regex/negated-`__name__` selector carries (`Neq`/`Re`/`Nre`); the `Eq`
-/// arm is the concrete-name route, which never reaches this builder — kept
-/// total (rendered identically to `metric_name = '<v>'`) rather than
-/// panicking on an unreachable input. Reuses the same [`ch_string`]/
-/// [`ch_regex_anchored_promql_re2`] injection primitives and `^(?:…)$` anchoring as
-/// [`matcher_predicate`], so a regex here carries the accepted RE2-vs-Rust
-/// differential this module's header already documents.
-fn metric_name_predicate(m: &LabelMatcher) -> String {
-    match m.op {
-        MatchOp::Eq => format!("metric_name = {}", ch_string(&m.value)),
-        MatchOp::Neq => format!("metric_name != {}", ch_string(&m.value)),
-        MatchOp::Re => format!(
-            "match(metric_name, {})",
-            ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), &m.value)
-        ),
-        MatchOp::Nre => format!(
-            "NOT match(metric_name, {})",
-            ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), &m.value)
-        ),
-    }
 }
 
 /// Issue #96's degraded-cache discovery **probe**: the bounded
@@ -315,16 +265,17 @@ pub fn distinct_metric_names_probe(
     bucket_ms: i64,
     fanout_cap: u64,
 ) -> String {
-    let lower = floored_bound(window.start_ms, bucket_ms);
-    let upper = floored_bound(window.end_ms, bucket_ms);
     let limit = fanout_cap.saturating_add(1);
-    let mut sql = format!(
-        "SELECT DISTINCT metric_name\nFROM {series_table}\nWHERE unix_milli >= {lower} AND unix_milli <= {upper}"
+    let tail = SeriesWhere::new(
+        window,
+        bucket_ms,
+        name_matchers,
+        MatcherTarget::MetricNameColumn,
     );
-    for m in name_matchers {
-        sql.push_str("\n  AND ");
-        sql.push_str(&metric_name_predicate(m));
-    }
+    let mut sql = format!(
+        "SELECT DISTINCT metric_name\nFROM {series_table}\nWHERE {}",
+        tail.where_tail()
+    );
     sql.push_str(&format!("\nORDER BY metric_name\nLIMIT {limit}"));
     sql
 }
@@ -348,17 +299,16 @@ pub fn discovery_fetch_by_names(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
-    let lower = floored_bound(window.start_ms, bucket_ms);
-    let upper = floored_bound(window.end_ms, bucket_ms);
     let name_list = metric_names
         .iter()
         .map(|n| ch_string(n))
         .collect::<Vec<_>>()
         .join(", ");
+    let tail = SeriesWhere::new(window, bucket_ms, matchers, MatcherTarget::Labels);
     let mut sql = format!(
-        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND unix_milli >= {lower} AND unix_milli <= {upper}"
+        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND {}",
+        tail.where_tail()
     );
-    append_matchers(&mut sql, matchers);
     sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
     sql
 }
@@ -389,6 +339,8 @@ pub fn metadata_query(metadata_table: &str, metric: Option<&str>, limit: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::anchored_re2_literal_for_test;
+    use crate::metrics::matcher::MatchOp;
 
     fn window() -> DataWindow {
         DataWindow {
@@ -513,7 +465,7 @@ mod tests {
             value: "5..".to_string(),
         };
         let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
-        assert!(sql.contains("match(JSONExtractString(labels, 'status'), '^(?:5..)$')"));
+        assert!(sql.contains("match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')"));
     }
 
     #[test]
@@ -524,7 +476,174 @@ mod tests {
             value: "5..".to_string(),
         };
         let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
-        assert!(sql.contains("NOT match(JSONExtractString(labels, 'status'), '^(?:5..)$')"));
+        assert!(sql.contains("NOT match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')"));
+    }
+
+    fn re(key: &str, value: &str) -> LabelMatcher {
+        LabelMatcher {
+            key: key.to_string(),
+            op: MatchOp::Re,
+            value: value.to_string(),
+        }
+    }
+
+    /// Issue #324: every pattern this module hands ClickHouse carries RE2's
+    /// `(?-s)` flag ahead of the anchor, so `match()`'s `dot_nl` default
+    /// cannot make `.` match a newline. Pinned on the rendered SQL, not on
+    /// the escaper, because the escaper demands a token only
+    /// `series_where` can construct.
+    #[test]
+    fn every_rendered_pattern_carries_re2s_dot_excludes_newline_flag() {
+        let sql = historical_series_subquery(
+            "metric_series",
+            "up",
+            window(),
+            3_600_000,
+            &[re("status", "5..")],
+        );
+        assert_eq!(sql.matches("'(?-s)^(?:5..)$'").count(), 2, "got: {sql}");
+        assert!(
+            !sql.contains("'^(?:"),
+            "an unprefixed anchored literal survived: {sql}"
+        );
+        assert_eq!(anchored_re2_literal_for_test("5.."), "'(?-s)^(?:5..)$'");
+    }
+
+    /// Issue #315: the compile probe is a **constant** `match()` folded at
+    /// analysis time, spliced into the floored lower bound so it adds no
+    /// conjunct (which would cost a duplicated PREWHERE filter — see
+    /// [`re2_compile_probe`]'s doc) and no index-relevant change.
+    #[test]
+    fn a_regex_matcher_adds_a_constant_compile_probe_to_the_lower_bound() {
+        let sql = historical_series_subquery(
+            "metric_series",
+            "up",
+            window(),
+            3_600_000,
+            &[re("status", "5..")],
+        );
+        assert!(
+            sql.contains(
+                "AND unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000"
+            ),
+            "got: {sql}"
+        );
+    }
+
+    /// The probe names EVERY regex matcher, in matcher order — ClickHouse
+    /// folds the sum left to right, so the first invalid pattern is the one
+    /// reported, matching upstream's own order.
+    #[test]
+    fn the_compile_probe_names_every_regex_matcher_in_order() {
+        let nre = LabelMatcher {
+            key: "env".to_string(),
+            op: MatchOp::Nre,
+            value: "dev".to_string(),
+        };
+        let sql = historical_series_subquery(
+            "metric_series",
+            "up",
+            window(),
+            3_600_000,
+            &[re("status", "5.."), eq("job", "api"), nre],
+        );
+        assert!(
+            sql.contains(
+                "unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$') + \
+                 match('', '(?-s)^(?:dev)$')) AND"
+            ),
+            "got: {sql}"
+        );
+    }
+
+    /// The other half, and the one that keeps the probe free: a matcher set
+    /// with no regex renders byte-identically to before issue #315, so no
+    /// EXPLAIN plan or snapshot moves for the common case.
+    #[test]
+    fn a_matcher_set_without_a_regex_renders_no_probe_at_all() {
+        for matchers in [
+            vec![],
+            vec![eq("job", "api")],
+            vec![LabelMatcher {
+                key: "job".to_string(),
+                op: MatchOp::Neq,
+                value: "api".to_string(),
+            }],
+        ] {
+            let sql =
+                historical_series_subquery("metric_series", "up", window(), 3_600_000, &matchers);
+            assert!(
+                sql.contains("AND unix_milli >= 0 AND unix_milli <= 3600000"),
+                "got: {sql}"
+            );
+            assert!(!sql.contains("match("), "got: {sql}");
+        }
+    }
+
+    /// End-to-end shape check over today's builders. **Not** the guarantee
+    /// that probe coverage is complete — this is a hand-maintained list,
+    /// and review round 1 correctly rejected it as the primary defence: a
+    /// seventh builder could be added without extending it. The guarantee
+    /// is structural and lives in `super::series_where`, whose renderer is
+    /// the only source of a bound or a `match()` predicate *from the
+    /// sanctioned components* — the `_for_test` literal seam stays
+    /// splicable by hand, per that module doc's "what rustc does not
+    /// enforce" (`a_rendered_regex_and_its_compile_probe_are_inseparable`
+    /// states the property; the module doc records the compile errors a
+    /// builder gets for recombining the components). What this test still
+    /// earns is that each
+    /// builder actually *routes through* that renderer and splices the tail
+    /// into the right place in its own statement.
+    #[test]
+    fn every_builder_that_renders_a_user_regex_also_renders_the_probe() {
+        let filter = DiscoveryFilter {
+            metric_name: Some("up".to_string()),
+            name_matchers: vec![],
+            matchers: vec![re("status", "5..")],
+        };
+        let nameless = DiscoveryFilter {
+            metric_name: None,
+            name_matchers: vec![],
+            matchers: vec![re("status", "5..")],
+        };
+        let name_matcher = LabelMatcher {
+            key: "__name__".to_string(),
+            op: MatchOp::Re,
+            value: "up.*".to_string(),
+        };
+        let built = [
+            historical_series_subquery(
+                "metric_series",
+                "up",
+                window(),
+                3_600_000,
+                &[re("status", "5..")],
+            ),
+            historical_resolution_query(
+                "metric_series",
+                "up",
+                window(),
+                3_600_000,
+                &[re("status", "5..")],
+            ),
+            discovery_query("metric_series", &filter, window(), 3_600_000),
+            discovery_query("metric_series", &nameless, window(), 3_600_000),
+            discovery_fetch_by_names(
+                "metric_series",
+                &["up".to_string()],
+                &[re("status", "5..")],
+                window(),
+                3_600_000,
+            ),
+            distinct_metric_names_probe("metric_series", &[name_matcher], window(), 3_600_000, 10),
+        ];
+        for sql in built {
+            assert!(sql.contains("match("), "no user regex rendered: {sql}");
+            assert!(
+                sql.contains("+ 0 * (match('', "),
+                "a user regex reached SQL with no compile probe: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -539,15 +658,6 @@ mod tests {
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
         assert!(sql.contains("JSONExtractString(labels, 'env') = 'prod'"));
         assert_eq!(sql.matches("JSONExtractString(labels,").count(), 2);
-    }
-
-    #[test]
-    fn floored_bound_matches_the_shared_model_definition() {
-        assert_eq!(floored_bound(3_600_001, 3_600_000), 3_600_000);
-        assert_eq!(
-            floored_bound(3_600_001, 3_600_000),
-            floor_to_activity_bucket(3_600_001, 3_600_000)
-        );
     }
 
     // --- injection tests (architect plan amendment §3) ---
@@ -581,7 +691,7 @@ mod tests {
             value: payload.to_string(),
         };
         let sql = historical_series_subquery("metric_series", "up", window(), 3_600_000, &[m]);
-        let expected = ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), payload);
+        let expected = anchored_re2_literal_for_test(payload);
         assert_no_unescaped_quote(&expected);
         assert!(sql.contains(&format!(
             "match(JSONExtractString(labels, 'status'), {expected})"
@@ -761,8 +871,9 @@ mod tests {
             sql,
             "SELECT DISTINCT metric_name\n\
              FROM metric_series\n\
-             WHERE unix_milli >= 0 AND unix_milli <= 3600000\n\
-             \x20 AND match(metric_name, '^(?:up.*)$')\n\
+             WHERE unix_milli >= 0 + 0 * (match('', '(?-s)^(?:up.*)$')) \
+             AND unix_milli <= 3600000\n\
+             \x20 AND match(metric_name, '(?-s)^(?:up.*)$')\n\
              ORDER BY metric_name\n\
              LIMIT 3"
         );
@@ -782,7 +893,7 @@ mod tests {
         };
         let sql = distinct_metric_names_probe("metric_series", &[neq, nre], window(), 3_600_000, 5);
         assert!(sql.contains("AND metric_name != 'up'"));
-        assert!(sql.contains("AND NOT match(metric_name, '^(?:down.*)$')"));
+        assert!(sql.contains("AND NOT match(metric_name, '(?-s)^(?:down.*)$')"));
         assert!(!sql.contains("JSONExtractString"));
     }
 
@@ -818,7 +929,10 @@ mod tests {
             3_600_000,
             10,
         );
-        assert!(sql.contains("unix_milli >= 3600000 AND unix_milli <= 7200000"));
+        // The floored lower bound carries issue #315's constant probe; the
+        // bound itself is still the bucket floor.
+        assert!(sql.contains("unix_milli >= 3600000 + 0 * (match("));
+        assert!(sql.contains(" AND unix_milli <= 7200000"));
     }
 
     #[test]
@@ -831,7 +945,7 @@ mod tests {
             3_600_000,
             2,
         );
-        let expected = ch_regex_anchored_promql_re2(PromqlRe2Fallback::new(), payload);
+        let expected = anchored_re2_literal_for_test(payload);
         assert_no_unescaped_quote(&expected);
         assert!(sql.contains(&format!("match(metric_name, {expected})")));
     }

@@ -2114,7 +2114,7 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
 /// which ACCEPTS `\p{Alphabetic}` (a Unicode property RE2 has no table
 /// for) — asserted below, so the premise of this test cannot rot
 /// silently. The pattern therefore reaches ClickHouse *by design* (RE2
-/// is the authority — `metrics::sql`'s `PromqlRe2Fallback` exemption),
+/// is the authority — `metrics::series_where`'s `PromqlRe2Fallback` exemption),
 /// and before this fix ClickHouse's `Code: 427 CANNOT_COMPILE_REGEXP`
 /// came back as a bare `ReadError::Clickhouse` → **500 `internal`**.
 ///
@@ -2381,25 +2381,47 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
         step_ms: 0,
     };
 
-    let expr = parse(&format!(r#"up{{job=~"\{RE2_REJECTED}"}}"#)).expect("parse");
-    match engine.query(&expr, &params).await {
-        Err(ReadError::Promql(pulsus_promql::PromqlError::InvalidRegexMatcher { detail })) => {
-            assert!(
-                detail.contains(RE2_REJECTED),
-                "detail must name the pattern, got {detail:?}"
-            );
-            for leak in ["DB::Exception", "Code: 427", "wiki/Syntax", "version "] {
-                assert!(!detail.contains(leak), "{leak:?} leaked: {detail:?}");
+    /// The client-facing rejection every path here owes: a `400`-class
+    /// `InvalidRegexMatcher` naming the user's pattern and leaking none of
+    /// ClickHouse's framing. Issue #324 note: the detail must carry the
+    /// pattern the USER wrote, never the `(?-s)` flag the SQL renderer
+    /// prefixes — both routes render one body.
+    fn expect_re2_rejection<T: std::fmt::Debug>(result: Result<T, ReadError>, surface: &str) {
+        match result {
+            Err(ReadError::Promql(pulsus_promql::PromqlError::InvalidRegexMatcher { detail })) => {
+                assert!(
+                    detail.contains(RE2_REJECTED),
+                    "{surface}: detail must name the pattern, got {detail:?}"
+                );
+                assert!(
+                    detail.starts_with("^(?:"),
+                    "{surface}: the rendered SQL flag leaked into the client body: {detail:?}"
+                );
+                for leak in ["DB::Exception", "Code: 427", "wiki/Syntax", "version "] {
+                    assert!(
+                        !detail.contains(leak),
+                        "{surface}: {leak:?} leaked: {detail:?}"
+                    );
+                }
             }
-        }
-        other => {
-            panic!("a warm cache must not answer an RE2-rejected matcher in-process, got {other:?}")
+            other => panic!("{surface}: expected InvalidRegexMatcher, got {other:?}"),
         }
     }
+
+    let expr = parse(&format!(r#"up{{job=~"\{RE2_REJECTED}"}}"#)).expect("parse");
+    expect_re2_rejection(engine.query(&expr, &params).await, "warm cache, in-process");
 
     // The metric-absent selector: warm cache vs the degraded path must
     // agree. The degraded path is reached with a window reaching back
     // before `covered_from_ms` (the #280 test's own `SqlFallback` route).
+    //
+    // Issue #315 upgraded what they must agree ON. ClickHouse compiles a
+    // `match()` pattern only when it evaluates it on a row, so with no
+    // stored rows for this metric NOTHING compiled and both paths answered
+    // an empty `200` — honest agreement with a wrong answer, since upstream
+    // Prometheus answers `400`. The constant compile probe
+    // (`metrics::sql::re2_compile_probe`) makes RE2 adjudicate the pattern
+    // during query analysis instead, so both paths now reject.
     let absent = parse(&format!(r#"absent_metric{{job=~"\{RE2_REJECTED}"}}"#)).expect("parse");
     let degraded_params = MetricQueryParams {
         start_ms: recent_bucket - 2 * 24 * 3_600_000,
@@ -2413,6 +2435,21 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
         format!("{degraded:?}"),
         "the warm cache must never disagree with the storage authority"
     );
+    expect_re2_rejection(warm, "metric-absent, warm");
+    expect_re2_rejection(degraded, "metric-absent, degraded");
+
+    // The control that keeps the probe honest: an RE2-VALID pattern against
+    // the same absent metric must still answer an empty result, not a 400.
+    // Over-rejecting is the worse failure — a pattern the reference accepts
+    // has to keep working.
+    for pattern in ["ap.*", "api|web", "a{bbb}c", ".+"] {
+        let expr = parse(&format!(r#"absent_metric{{job=~"{pattern}"}}"#)).expect("parse");
+        for (label, p) in [("warm", &params), ("degraded", &degraded_params)] {
+            engine.query(&expr, p).await.unwrap_or_else(|e| {
+                panic!("{label}: {pattern:?} is RE2-valid and must answer, got {e:?}")
+            });
+        }
+    }
 
     // Control: RE2 accepts `a{bbb}c` (a literal brace). The Rust crate
     // rejects the raw text, which is why this used to take the storage

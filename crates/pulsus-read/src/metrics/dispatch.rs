@@ -3,7 +3,8 @@
 //! # Why the handle lives in a leaf module
 //!
 //! A PromQL label-matcher regex reaches ClickHouse uncompiled *on
-//! purpose*: `super::sql` renders `match(<target>, '^(?:pat)$')` with the
+//! purpose*: `super::series_where` renders `match(<target>,
+//! '(?-s)^(?:pat)$')` with the
 //! user's pattern verbatim, because RE2 — ClickHouse's engine, and Go's,
 //! and therefore upstream Prometheus's — is the authority for what a
 //! matcher may contain, not the Rust `regex` crate this process links
@@ -74,6 +75,16 @@ const RE2_REJECT_SUFFIX: &str = ". Look at ";
 const RE2_REJECT_OPAQUE_DETAIL: &str =
     "the storage engine could not compile a label-matcher regex (RE2 syntax)";
 
+/// Issue #324: `super::sql` prefixes every pattern it renders with RE2's
+/// `(?-s)` flag group, because ClickHouse's `match()` otherwise lets `.`
+/// match a newline. ClickHouse echoes the pattern it was handed, so the
+/// flag would reach the client body — and the in-process route
+/// (`super::re2_authority::first_invalid_regex_detail`) quotes the user's
+/// pattern without it. Stripping it here keeps the two routes rendering
+/// ONE `invalid regexp: ^(?:…)$, error: …` body, and keeps the quoted
+/// pattern the one the client actually sent.
+const RE2_SQL_FLAG_PREFIX: &str = "(?-s)";
+
 /// Extracts the client-facing core — the pattern RE2 was handed plus
 /// RE2's own reason — from a `CANNOT_COMPILE_REGEXP` body, dropping
 /// ClickHouse's `Code:`/`DB::Exception:` framing, its documentation
@@ -98,7 +109,12 @@ fn re2_reject_detail(message: &str) -> String {
     if core.is_empty() {
         return RE2_REJECT_OPAQUE_DETAIL.to_string();
     }
-    core.to_string()
+    // Only the flag WE render is stripped, and only where we render it —
+    // at the very start. A `(?-s)` the user wrote inside their own pattern
+    // sits after the `^(?:` anchor and is untouched.
+    core.strip_prefix(RE2_SQL_FLAG_PREFIX)
+        .unwrap_or(core)
+        .to_string()
 }
 
 /// The metrics path's `ChError` mapper, mirroring
@@ -303,6 +319,32 @@ mod tests {
                 "{leak:?} leaked into {rendered:?}"
             );
         }
+    }
+
+    /// Issue #324: the SQL renderer's `(?-s)` prefix is ClickHouse-facing
+    /// only — the client sees the pattern it sent, in the same shape the
+    /// in-process route (`re2_authority::first_invalid_regex_detail`)
+    /// produces, so one input cannot render two different bodies depending
+    /// on which path answered it.
+    #[test]
+    fn the_sql_paths_dot_semantics_flag_never_reaches_the_client() {
+        let body = LIVE_427_BODY.replace("cannot compile re2: ^", "cannot compile re2: (?-s)^");
+        assert!(body.contains("(?-s)"), "premise: the flag is in the body");
+        assert_eq!(
+            rejection_detail(&body),
+            "^(?:\\p{Alphabetic})$, error: invalid character class range: \\p{Alphabetic}"
+        );
+
+        // A `(?-s)` the USER wrote is inside their own pattern, after the
+        // anchor, and must survive verbatim.
+        let user_flag = LIVE_427_BODY.replace(
+            "cannot compile re2: ^(?:\\p{Alphabetic})$",
+            "cannot compile re2: (?-s)^(?:(?-s)\\p{Alphabetic})$",
+        );
+        assert_eq!(
+            rejection_detail(&user_flag),
+            "^(?:(?-s)\\p{Alphabetic})$, error: invalid character class range: \\p{Alphabetic}"
+        );
     }
 
     /// Issue #280 review, finding 2: an unrecognised body is NOT echoed.

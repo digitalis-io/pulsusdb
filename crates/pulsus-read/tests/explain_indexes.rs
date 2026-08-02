@@ -1452,6 +1452,89 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
     );
 }
 
+/// Issue #315 — the compile probe must be **free**. The probe is a
+/// constant `match()` over an empty subject, spliced into the bucket-floored
+/// lower bound (`metrics::sql::re2_compile_probe`) so ClickHouse folds it
+/// during query analysis. This gate is the evidence that the folding
+/// happens *before* index analysis: the `metric_series` fallback subquery
+/// with a regex matcher must engage exactly the same MinMax/Partition/
+/// PrimaryKey conditions as the same subquery with an `Eq` matcher, digits
+/// normalised — a fold that arrived too late would drop `unix_milli` from
+/// the primary-key condition and turn the fallback into a wider scan.
+///
+/// A standalone `AND <constant>` conjunct was rejected for the same reason
+/// in reverse: it preserves these conditions but stops the matcher
+/// predicate from moving *fully* into PREWHERE, leaving a `Filter` step
+/// that re-evaluates `JSONExtractString` + `match` on every surviving row
+/// (measured with `EXPLAIN actions=1` on 24.8.14.39).
+#[tokio::test]
+async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagement() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_metrics_compile_probe";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    seed_metric_series(&client, db, now_ms).await;
+
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: now_ms - 3_600_000,
+        end_ms: now_ms,
+    };
+    let table = format!("{db}.metric_series");
+    let matcher = |op| pulsus_read::metrics::LabelMatcher {
+        key: "job".to_string(),
+        op,
+        value: "api".to_string(),
+    };
+    let subquery = |op| {
+        pulsus_read::metrics::sql::historical_series_subquery(
+            &table,
+            "sv",
+            window,
+            1,
+            &[matcher(op)],
+        )
+    };
+
+    let with_probe = subquery(pulsus_read::metrics::MatchOp::Re);
+    let without_probe = subquery(pulsus_read::metrics::MatchOp::Eq);
+    // Premise: the two SQL texts genuinely differ, and only the regex one
+    // carries a probe — otherwise this compares a query with itself.
+    assert!(
+        with_probe.contains("+ 0 * (match('', "),
+        "the regex subquery must carry the probe: {with_probe}"
+    );
+    assert!(
+        !without_probe.contains("match("),
+        "the Eq subquery must carry no regex at all: {without_probe}"
+    );
+
+    assert_eq!(
+        explain(&client, &with_probe).await,
+        explain(&client, &without_probe).await,
+        "the compile probe changed the metric_series index analysis"
+    );
+
+    // And the absolute shape, so "identical" cannot mean "both degraded".
+    assert_eq!(
+        explain(&client, &with_probe).await,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "metric_name",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in ['sv', 'sv'])))",
+        ]),
+        "the bucket-floored window must still prune on unix_milli and metric_name"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Issue M6-10 (AC3, the launch's named rollup-vs-raw gate): an un-piped
 // `count_over_time` stays rollup-served (`log_metrics_<res>`); an

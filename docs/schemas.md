@@ -194,10 +194,14 @@ Partition pruning (daily) → primary-index pruning (metric, then fingerprints) 
 ... AND fingerprint IN (
     SELECT fingerprint FROM metric_series
     WHERE metric_name = 'http_requests_total'
+      AND unix_milli >= {lower} + 0 * (match('', '(?-s)^(?:5..)$'))
+      AND unix_milli <= {upper}
       AND JSONExtractString(labels, 'job') = 'api'
-      AND match(JSONExtractString(labels, 'status'), '^(?:5..)$')
+      AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')
 )
 ```
+
+**Two details in that regex predicate.** ClickHouse's `match()` compiles with RE2's `dot_nl` option set, so `.` matches a newline there and does not in RE2 — and therefore not in Prometheus, which compiles matchers with Go's `regexp`. Every pattern this path renders is prefixed with RE2's own `(?-s)` flag group to restore the reference reading; a `(?s)` the user wrote still overrides it. And because ClickHouse compiles a pattern only when it evaluates `match()` on a row, a selector naming a metric with **no rows in the window** would never reach RE2 at all and an invalid pattern would answer an empty `200` instead of Prometheus's `400`. The lower bound therefore carries one constant `match()` per regex matcher: ClickHouse folds it during query analysis (so the primary-key condition, partition pruning and the PREWHERE move are all unchanged — EXPLAIN-gated) and rejects an uncompilable pattern before reading a part. A matcher set with no regex renders no probe at all.
 
 **Clustered honesty:** on a clustered deployment this fallback fetch reads `_dist` names throughout — `metric_samples_dist`, and the nested subquery's `metric_series_dist` — and additionally injects `distributed_product_mode = 'local'`, rewriting that nested subquery to each shard's **local** `metric_series` table (exact under `metric_samples`/`metric_series`'s shared `cityHash64(metric_name, fingerprint)` co-sharding, §7; the same rewrite already applied to the traces metrics semi-join). Without it, ClickHouse's default `distributed_product_mode = 'deny'` rejects the nested `_dist`-inside-`_dist` shape as a double-distributed `IN` (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
 

@@ -28,6 +28,16 @@
 //! - [`sql`] — pure fallback SQL builders, the snapshot-testing surface for
 //!   the `metric_series` historical/JOIN fallback and (issue #31) the
 //!   `SqlFallback` sample-fetch path's label hydration query.
+//! - [`series_where`] *(issue #315)* — the leaf renderer for
+//!   `metric_series` window bounds and matcher predicates. [`sql`]'s
+//!   builders obtain the two only together, so the sanctioned components
+//!   cannot render a user regex without the RE2 compile probe that makes
+//!   an invalid pattern a 400 even when the window holds no rows. The
+//!   #240 capability token is defined there too (review round 2), so no
+//!   other module — descendants of `metrics` included — can construct it
+//!   and reach the escaper directly. One boundary crossing is NOT
+//!   sealed: the `_for_test` literal seam (the leaf's boundary inventory
+//!   states what it permits; issue #328's D1 retires it).
 //! - [`refresh`] — the only ClickHouse-touching code: the §5.2 sweep and
 //!   [`refresh::spawn_refresh_loop`].
 //! - [`rows`] — `ChClient` result-row shapes for the sweep.
@@ -67,30 +77,19 @@ pub mod refresh;
 pub mod rows;
 pub mod sample_rows;
 pub mod sample_sql;
+mod series_where;
 pub mod sql;
 pub mod stats;
 
-/// Capability token (issue #240). Possession proves the caller is on the
-/// PromQL fallback path, where ClickHouse's RE2 — not the Rust `regex`
-/// crate — is the regex authority (`labels.rs:496-506`, `:521-526`).
-///
-/// SEALING FORM IS LOAD-BEARING — do not "tidy" either line:
-///  * the tuple field has NO visibility modifier, so it is visible only in
-///    `crate::metrics` and its descendants;
-///  * `new` has NO visibility modifier, for the same reason.
-///
-/// `pub(super)` on either is WRONG here: `metrics` is declared at the crate
-/// root (`lib.rs:6`), so `super` IS the crate root and `pub(super)` ==
-/// `pub(crate)` — which would let `logql` construct the token. Measured:
-/// that spelling compiles from `logql`; this one is rejected with
-/// `E0603` (field) / `E0624` (constructor).
-pub(crate) struct PromqlRe2Fallback(());
-
-impl PromqlRe2Fallback {
-    fn new() -> Self {
-        PromqlRe2Fallback(())
-    }
-}
+/// The issue #240 capability token, re-exported so
+/// [`crate::logql::escape::ch_regex_anchored_promql_re2`]'s pinned
+/// signature can keep naming it as `crate::metrics::PromqlRe2Fallback`.
+/// Only the NAME travels: the definition — private tuple field, private
+/// `new` — lives in [`series_where`], so the token is constructible in
+/// that leaf alone (issue #315, review round 2). Its full sealing
+/// argument, with the measured rustc rejections for every other module,
+/// is on the type itself.
+pub(crate) use series_where::PromqlRe2Fallback;
 
 pub use exec::{
     FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, TsdbStatus,
@@ -106,6 +105,10 @@ pub use re2_authority::pattern_requires_re2_authority_for_test;
 pub use refresh::spawn_refresh_loop;
 pub use rows::SeriesRow;
 pub use sample_rows::SampleRow;
+// Unsealed by design — exists because `tests/re2_screen_differential.rs`
+// is an external binary; issue #328's D1 `pulsus-re2` extraction retires it.
+#[doc(hidden)]
+pub use series_where::anchored_re2_literal_for_test;
 pub use stats::{CacheMetrics, CacheMetricsSnapshot};
 
 #[cfg(test)]
