@@ -31,8 +31,10 @@
 //! nanoseconds.
 //!
 //! This crate is purely syntactic: no planning, no SQL generation, no
-//! query evaluation, no regex compilation — the planner and SQL
-//! generator that consume [`Query`] land in T5.
+//! query evaluation — the planner and SQL generator that consume
+//! [`Query`] land in T5. The one exception is the post-parse semantic
+//! pass ([`validate`], issue #328), which compiles regex literals
+//! through `pulsus-re2`.
 
 mod ast;
 mod duration;
@@ -40,6 +42,7 @@ mod error;
 mod lexer;
 mod parser;
 mod token;
+mod validate;
 
 pub use ast::{
     AggregateOp, ArithOp, AttrScope, BOUNDARY_CONSTRUCTS, BoolOp, ComparisonOp, Duration, Field,
@@ -50,6 +53,7 @@ pub use ast::{
 pub use error::TraceQlError;
 pub use parser::parse;
 pub use token::{Span, Token, TokenKind};
+pub use validate::{VALIDATE_RULES, ValidateError, validate};
 
 /// Exposed solely so the golden-corpus gate (`tests/corpus.rs`) can prove
 /// every grammar-reachable [`TokenKind`] appears in at least one accept
