@@ -1746,3 +1746,36 @@ fn label_filter_shape(root: &pulsus_logql::LabelFilterExpr) -> Vec<&'static str>
     });
     out
 }
+
+/// Issue #288 — the parser KEEPS repeated grouping labels in the AST,
+/// exactly as the reference's grammar does (its `labels:` rule appends
+/// verbatim and `Grouping.String()` renders the duplicates back), so
+/// `by (fp, fp)` and `by (fp)` are two DIFFERENT parsed queries that
+/// evaluate identically: deduplication is a `pulsus-read` plan-time
+/// normalization, never a parse-time rewrite. Round-trip pins the
+/// duplicated rendering for both grouping kinds and both positions.
+#[test]
+fn repeated_grouping_labels_survive_the_parse_and_round_trip() {
+    for (query, labels) in [
+        (
+            r#"sum by(fp, fp)(count_over_time({app="x"}[5m]))"#,
+            vec!["fp", "fp"],
+        ),
+        (
+            r#"sum without(env, fp, env)(count_over_time({app="x"}[5m]))"#,
+            vec!["env", "fp", "env"],
+        ),
+        (
+            r#"sum(count_over_time({app="x"}[5m])) by(fp, fp, fp)"#,
+            vec!["fp", "fp", "fp"],
+        ),
+    ] {
+        assert_round_trip(query);
+        let expr = parse(query).expect("parse");
+        let pulsus_logql::MetricExpr::Vector { ref grouping, .. } = *metric_root(&expr) else {
+            panic!("expected a vector aggregation for {query}");
+        };
+        let got = &grouping.as_ref().expect("grouping").labels;
+        assert_eq!(got, &labels, "{query}: the AST must keep the duplicates");
+    }
+}

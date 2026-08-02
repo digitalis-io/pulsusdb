@@ -11,7 +11,7 @@
 //! bucket/aggregate expressions [`super::exec::LogQlEngine`] needs to call
 //! [`super::sql`]'s stage 2/3/metric builders once fingerprints are known.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::ControlFlow;
 
@@ -1319,9 +1319,78 @@ fn parse_vector_agg_params(
                 }
                 (false, None) => None,
             };
-            Ok((*op, grouping.cloned(), parsed))
+            Ok((*op, grouping.cloned().map(dedup_grouping), parsed))
         })
         .collect()
+}
+
+/// Deduplicates repeated grouping-label names (issue #288), preserving
+/// first occurrence. The reference KEEPS duplicates in the parsed AST
+/// (its `labels` grammar rule appends verbatim and `Grouping.String()`
+/// renders them back) but they have no evaluation effect: the v3.7.4
+/// `VectorAggEvaluator` builds each `by` group's label set from the
+/// METRIC's own (sorted, unique) labels, taking a name at most once
+/// (`metric.Range` + `break` on first membership hit), and `without`
+/// deletes idempotently — live-probed, `sum by (fp, fp)` ==
+/// `sum by (fp)` on the pinned container, for every aggregation and for
+/// the grouping `variants` injects into. PulsusDB mirrors that split:
+/// the parser keeps the AST faithful (duplicates render back), and this
+/// SOLE `VectorAggSpec` producer normalizes what evaluation sees, so
+/// `group_key` — whose absent-label `name=""` materialisation is owned
+/// by #241 and deliberately untouched here — never receives a repeated
+/// name. Names are matched byte-exactly: label names are case-sensitive
+/// in the reference (`by (FP, fp)` probed as two distinct names, the
+/// absent one omitted).
+///
+/// Two-tier, so BOTH standing constraints hold (fix round 1, U5):
+/// * at or below [`DEDUP_LINEAR_SCAN_MAX`] names — every real-world
+///   grouping — the pairwise scan allocates NOTHING, keeping the
+///   `logql_variants_alloc` per-variant plan-time allocation bands
+///   unmoved (its fixtures group by one label);
+/// * above it, a hash-set pass keeps the whole thing `O(n)` expected:
+///   the query-text cap admits ~20k grouping names, where the earlier
+///   pairwise form cost ~80× the parse of the same query (measured,
+///   release — the read-path-performance directive forbids that). The
+///   probe `zz_print_dedup_grouping_timings` reproduces the
+///   measurement; it prints, and never asserts wall time (CI gates stay
+///   scale-invariant).
+fn dedup_grouping(mut g: Grouping) -> Grouping {
+    /// ≤ 16 names ⇒ ≤ 120 short-string comparisons — cheaper than one
+    /// hash-set allocation, and allocation-free where the alloc gates
+    /// look.
+    const DEDUP_LINEAR_SCAN_MAX: usize = 16;
+    fn first_occurrence_before(labels: &[String], i: usize) -> bool {
+        labels[..i].iter().any(|l| *l == labels[i])
+    }
+    if g.labels.len() <= DEDUP_LINEAR_SCAN_MAX {
+        if !(0..g.labels.len()).any(|i| first_occurrence_before(&g.labels, i)) {
+            return g;
+        }
+        let mut i = 0;
+        while i < g.labels.len() {
+            if first_occurrence_before(&g.labels, i) {
+                g.labels.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        return g;
+    }
+    // The big-list tier: one keep-mask pass over a borrowed set (no
+    // per-name clones), then an order-preserving in-place retain.
+    let mut keep = Vec::with_capacity(g.labels.len());
+    {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(g.labels.len());
+        for name in &g.labels {
+            keep.push(seen.insert(name.as_str()));
+        }
+    }
+    if keep.iter().all(|k| *k) {
+        return g;
+    }
+    let mut kept = keep.iter();
+    g.labels.retain(|_| *kept.next().unwrap_or(&false));
+    g
 }
 
 fn streams_plan(
@@ -1953,14 +2022,22 @@ mod variant_spec {
                 // `by` and `without` (under `without` this deliberately
                 // STRIPS it), creating `by (__variant__)` when the
                 // aggregation had none — the reference's non-nil default
-                // `Grouping` (`mustNewVectorAggregationExpr`).
+                // `Grouping` (`mustNewVectorAggregationExpr`). Guarded
+                // (issue #288): a variant that already groups
+                // `by (__variant__)` must not gain a DUPLICATE entry —
+                // the specs are deduplicated by `parse_vector_agg_params`
+                // and re-duplicating here would re-open the emitted-dupe
+                // defect (live-probed: the reference returns a single
+                // `__variant__` for that shape).
                 let g = grouping.get_or_insert_with(|| Grouping {
                     kind: GroupingKind::By,
                     labels: Vec::new(),
                 });
-                g.labels
-                    .push(super::super::variants::VARIANT_LABEL.to_string());
-                g.labels.sort_unstable();
+                let variant_label = super::super::variants::VARIANT_LABEL;
+                if !g.labels.iter().any(|l| l == variant_label) {
+                    g.labels.push(variant_label.to_string());
+                    g.labels.sort_unstable();
+                }
             }
             // `absent_over_time`'s synthetic labels come from the
             // VARIANT'S OWN (otherwise dead) selector, not the common one
@@ -2721,6 +2798,207 @@ mod tests {
             direction: Direction::Backward,
         };
         plan(&parse(query).expect("parse"), &params, &test_ctx())
+    }
+
+    // --- Issue #288: repeated grouping labels are deduplicated at the
+    // --- SOLE `VectorAggSpec` producer (`parse_vector_agg_params`), so
+    // --- both plan routes and the variants fan-out see unique names,
+    // --- while the AST keeps the duplicates the reference's parser also
+    // --- keeps (pinned in pulsus-logql's snapshots).
+
+    /// Extracts the grouping label lists of a planned metric query's
+    /// vector-aggregation specs, whichever plan shape it took.
+    fn planned_grouping_labels(query: &str, spec: QuerySpec) -> Vec<Vec<String>> {
+        let aggs: Vec<VectorAggSpec> = match plan_at(query, spec).expect("plan") {
+            Plan::Metric(mp) => mp.vector_aggs,
+            Plan::MetricBinary(ref node) => match node {
+                MetricNode::VectorAgg { aggs, .. } => aggs.clone(),
+                other => panic!("expected a VectorAgg node, got {other:?}"),
+            },
+            Plan::Streams(_) => panic!("expected a metric plan"),
+        };
+        aggs.into_iter()
+            .map(|(_, grouping, _)| grouping.map(|g| g.labels).unwrap_or_default())
+            .collect()
+    }
+
+    /// `by (fp, fp)`, `by (fp, fp, fp)` and the postfix form all plan to
+    /// the single deduped name (reference-probed: identical results to
+    /// `by (fp)` on grafana/loki:3.7.4); a repeat combined with a
+    /// distinct name keeps first-occurrence order; `without` repeats
+    /// collapse the same way. Case-sensitive: `FP` and `fp` are two
+    /// distinct names, both kept.
+    #[test]
+    fn repeated_grouping_labels_are_deduplicated_in_the_planned_spec() {
+        let instant = QuerySpec::Instant {
+            at_ns: 1_000_000_000_000,
+        };
+        for (query, want) in [
+            (
+                r#"sum by (fp, fp) (count_over_time({service_name="x"}[5m]))"#,
+                vec!["fp"],
+            ),
+            (
+                r#"sum by (fp, fp, fp) (count_over_time({service_name="x"}[5m]))"#,
+                vec!["fp"],
+            ),
+            (
+                r#"sum (count_over_time({service_name="x"}[5m])) by (fp, fp)"#,
+                vec!["fp"],
+            ),
+            (
+                r#"sum by (fp, env, fp) (count_over_time({service_name="x"}[5m]))"#,
+                vec!["fp", "env"],
+            ),
+            (
+                r#"sum without (env, fp, env) (count_over_time({service_name="x"}[5m]))"#,
+                vec!["env", "fp"],
+            ),
+            (
+                r#"topk by (fp, fp) (2, count_over_time({service_name="x"}[5m]))"#,
+                vec!["fp"],
+            ),
+            (
+                r#"sum by (FP, fp) (count_over_time({service_name="x"}[5m]))"#,
+                vec!["FP", "fp"],
+            ),
+        ] {
+            assert_eq!(
+                planned_grouping_labels(query, instant),
+                vec![want.iter().map(|s| s.to_string()).collect::<Vec<_>>()],
+                "{query}"
+            );
+        }
+    }
+
+    /// The hash-set tier (fix round 1, U5): lists past the linear-scan
+    /// threshold dedupe identically — first occurrence kept, order
+    /// preserved — and a duplicate-free big list passes through whole.
+    #[test]
+    fn big_grouping_lists_dedupe_through_the_hash_set_tier() {
+        let dup: Vec<String> = (0..40).map(|i| format!("l{}", i % 10)).collect();
+        let g = dedup_grouping(Grouping {
+            kind: GroupingKind::By,
+            labels: dup,
+        });
+        let want: Vec<String> = (0..10).map(|i| format!("l{i}")).collect();
+        assert_eq!(g.labels, want, "first occurrence, order preserved");
+
+        let distinct: Vec<String> = (0..40).map(|i| format!("l{i}")).collect();
+        let g = dedup_grouping(Grouping {
+            kind: GroupingKind::By,
+            labels: distinct.clone(),
+        });
+        assert_eq!(g.labels, distinct, "a duplicate-free big list is untouched");
+    }
+
+    /// Fix round 1, U5 — the reproduction probe for the reviewer's
+    /// measurement. PRINT-ONLY (wall-time asserts never gate CI): run
+    /// with `cargo test --release -p pulsus-read --lib -- --ignored
+    /// zz_print_dedup_grouping_timings --nocapture`. Builds the widest
+    /// grouping lists the 131,072-byte query-text cap admits (distinct
+    /// `l0..lN` names, and the all-duplicate `fp,fp,…` form), times the
+    /// parse of the maximal query as the baseline, then times
+    /// `dedup_grouping` on each shape.
+    #[test]
+    #[ignore = "generator: prints release-mode dedup timings for the U5 record"]
+    fn zz_print_dedup_grouping_timings() {
+        use std::time::Instant;
+
+        // The widest distinct-name grouping the cap admits.
+        let mut query = String::from("sum by (");
+        let suffix = r#") (count_over_time({a="b"}[5m]))"#;
+        let mut n_distinct = 0usize;
+        loop {
+            let name = format!("l{n_distinct}");
+            if query.len() + name.len() + 1 + suffix.len() + 1 >= pulsus_logql::MAX_QUERY_BYTES {
+                break;
+            }
+            if n_distinct > 0 {
+                query.push(',');
+            }
+            query.push_str(&name);
+            n_distinct += 1;
+        }
+        query.push_str(suffix);
+        let t = Instant::now();
+        let expr = parse(&query).expect("maximal query parses");
+        let parse_ms = t.elapsed().as_secs_f64() * 1e3;
+        let Expr::Metric(MetricExpr::Vector { ref grouping, .. }) = expr else {
+            panic!("expected a vector aggregation");
+        };
+        let g = grouping.clone().expect("grouping");
+        println!("distinct names: {n_distinct}; parse: {parse_ms:.1} ms");
+        let t = Instant::now();
+        let out = dedup_grouping(g);
+        println!(
+            "dedup (all-distinct): {:.3} ms -> {} names",
+            t.elapsed().as_secs_f64() * 1e3,
+            out.labels.len()
+        );
+
+        // The widest all-duplicate list the cap admits (`fp,` = 3 bytes).
+        let n_dup = (pulsus_logql::MAX_QUERY_BYTES - 1 - 8 - suffix.len()) / 3;
+        let g = Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["fp".to_string(); n_dup],
+        };
+        let t = Instant::now();
+        let out = dedup_grouping(g);
+        println!(
+            "dedup (all-duplicate, {n_dup} names): {:.3} ms -> {} names",
+            t.elapsed().as_secs_f64() * 1e3,
+            out.labels.len()
+        );
+    }
+
+    /// The `MetricBinary` route dedupes through the same funnel: a
+    /// vector-agg layer over a binary tree carries the deduped spec.
+    #[test]
+    fn repeated_grouping_labels_are_deduplicated_on_the_binary_route() {
+        let got = planned_grouping_labels(
+            r#"sum by (fp, fp) (count_over_time({service_name="x"}[5m]) + count_over_time({service_name="y"}[5m]))"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        );
+        assert_eq!(got, vec![vec!["fp".to_string()]]);
+    }
+
+    /// The variants `__variant__` injection is guarded (issue #288): a
+    /// variant that already groups `by (__variant__)` gains NO duplicate
+    /// entry, and a deduped user grouping keeps exactly one of each name
+    /// plus the injected index label.
+    #[test]
+    fn variants_injection_does_not_duplicate_the_variant_label() {
+        let instant = QuerySpec::Instant {
+            at_ns: 60_000_000_000,
+        };
+        for (query, want) in [
+            (
+                r#"variants(sum by (__variant__) (count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#,
+                vec!["__variant__"],
+            ),
+            (
+                r#"variants(sum by (fp, fp) (count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#,
+                vec!["__variant__", "fp"],
+            ),
+        ] {
+            let plan = plan_at(query, instant).expect("plan");
+            let Plan::MetricBinary(MetricNode::Variants { ref variants, .. }) = plan else {
+                panic!("expected a variants plan for {query}");
+            };
+            let got: Vec<Vec<String>> = variants[0]
+                .vector_aggs()
+                .iter()
+                .map(|(_, g, _)| g.as_ref().map(|g| g.labels.clone()).unwrap_or_default())
+                .collect();
+            assert_eq!(
+                got,
+                vec![want.iter().map(|s| s.to_string()).collect::<Vec<_>>()],
+                "{query}"
+            );
+        }
     }
 
     // --- issue #240 AC7(b): the §3 invariant on both LogQL paths — an
