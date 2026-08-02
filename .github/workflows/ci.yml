@@ -237,6 +237,12 @@ jobs:
       - name: TraceQL Tempo differential leg (syntax)
         env:
           PULSUSDB_TEMPO_DIFF_URL: "http://localhost:13200"
+          # Issue #328: the semantic validator's container capture,
+          # re-verified live against the same pinned oracle. FAIL-CLOSED:
+          # `require_live_gate` panics if this env block is dropped in
+          # this job (the #320 class), so an absent capture cannot
+          # report green.
+          PULSUSDB_TEMPO_VECTORS: "1"
         run: cargo test -p pulsus-traceql --test tempo_differential
 
       # Issue #335: the parser accept-surface audit. Replays the whole

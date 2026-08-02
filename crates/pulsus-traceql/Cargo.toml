@@ -6,9 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Issue #328: the semantic validator's regex-literal check reaches the
+# shared RE2-compatibility machinery (the #309 screen + #317 rewrite +
+# the three-valued verdict); a direct pulsus-read edge would be a cargo
+# cycle, which is why the crate exists.
+pulsus-re2 = { path = "../pulsus-re2" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# Issue #328: the live validate-vectors leg is fail-closed — absent gate
+# in a live CI job panics instead of skipping (the #320 class).
+pulsus-testkit = { path = "../pulsus-testkit" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
