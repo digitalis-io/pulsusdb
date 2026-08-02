@@ -142,7 +142,10 @@ pub use params::{
     DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec, TimeBounds,
     ValidatedDuration, validate_duration_ns,
 };
-pub use pipeline::{CompiledPipeline, EntryOut, MetricRun, PipelineError, SAMPLE_EXTRACTION_ERROR};
+pub use pipeline::{
+    CompiledPipeline, EntryOut, MAX_JSON_FLATTEN_KEY_BYTES, MetricRun, PipelineError, RowBudget,
+    RowBudgetExceeded, SAMPLE_EXTRACTION_ERROR,
+};
 pub use walkbound::{
     MAX_LOGQL_WALK_TRANSIENT_BYTES, REFERENCE_MAX_QUERY_BYTES, admit_logql_walk,
     walk_transient_bound,

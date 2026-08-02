@@ -2912,13 +2912,21 @@ pub fn run_pipeline_rows(
     Ok(acc.into_streams())
 }
 
-/// Issue #230 follow-up: a template-render output-budget breach is the
-/// bounded 422 (the same complete-or-error class as every other
-/// `QueryTooBroad` reason — never a truncation, never an OOM).
-impl From<super::pipeline::TemplateBudgetExceeded> for ReadError {
-    fn from(e: super::pipeline::TemplateBudgetExceeded) -> Self {
-        ReadError::QueryTooBroad(TooBroadReason::TemplateOutputBytes {
-            budget_bytes: e.budget_bytes,
+/// Issue #230 follow-up / issue #287: a per-row output-budget breach is
+/// the bounded 422 (the same complete-or-error class as every other
+/// `QueryTooBroad` reason — never a truncation, never an OOM). Each
+/// ledger keeps its OWN reason, so the 422 body names the counter that
+/// actually refused.
+impl From<super::pipeline::RowBudgetExceeded> for ReadError {
+    fn from(e: super::pipeline::RowBudgetExceeded) -> Self {
+        let budget_bytes = e.budget_bytes;
+        ReadError::QueryTooBroad(match e.budget {
+            super::pipeline::RowBudget::TemplateRender => {
+                TooBroadReason::TemplateOutputBytes { budget_bytes }
+            }
+            super::pipeline::RowBudget::JsonFlattenKeys => {
+                TooBroadReason::JsonFlattenKeyBytes { budget_bytes }
+            }
         })
     }
 }

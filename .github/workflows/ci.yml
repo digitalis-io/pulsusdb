@@ -296,6 +296,21 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-logql --test logql_differential
 
+      # Issue #287 (fix round 3): the `| json` key-name capture drift leg.
+      # Re-pushes every probe of tests/fixtures/json_key_sanitization/
+      # capture.json to this job's reference container and asserts the
+      # fresh responses derive the same labels as the committed artifact,
+      # so the artifact provably stays a capture, not a hand-written
+      # expectation (regenerating it is separately gated on a container
+      # reporting exactly the pinned v3.7.4; this leg deliberately also
+      # cross-checks that capture against the digest-pinned v3.7.3
+      # oracle). Runs after the syntax leg so the pushed streams cannot
+      # precede it.
+      - name: LogQL json key capture drift leg (issue #287)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_json_key_sanitization
+
       - name: Stop LogQL differential oracle
         if: always()
         run: docker rm -f pulsus-logql-diff || true
