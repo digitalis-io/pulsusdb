@@ -1,2 +1,23 @@
 # Placeholder for future per-lint thresholds. M0 clippy strictness is
 # enforced by CI's `-- -D warnings` invocation, not by config here.
+
+# Issue #311: the host's local timezone must never reach a query result.
+#
+# `disallowed-types` matches on the RESOLVED path, so this one entry also
+# catches every alias and re-export — `use chrono::Local as HostZone;` is
+# denied, which a lexical grep structurally cannot see.
+#
+# `chrono::offset::Local` needs no entry of its own: `chrono::Local` is a
+# re-export of it, so both spellings resolve to the same type and this
+# single entry denies both. Probed with the two evasions written against
+# each path plus an inline `chrono::Local::now()`; all three fail at
+# clippy exit 101, and the diagnostic prints `chrono::Local` — the path as
+# written here, not a canonicalised one.
+#
+# Nothing in the workspace has a legitimate use: every instant is UNIX
+# nanoseconds, and the one place a zone is applied (the LogQL template time
+# functions) takes it from `reader.template_timezone` through `chrono-tz`,
+# never from the host.
+disallowed-types = [
+    { path = "chrono::Local", reason = "the host's local zone must not influence query results — use UTC, or the configured `reader.template_timezone` (issue #311)" },
+]

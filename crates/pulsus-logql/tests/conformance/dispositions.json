@@ -503,6 +503,11 @@
       "oracle": "accept"
     },
     {
+      "construct": "func.label_replace",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
       "construct": "statics.string",
       "status": "supported",
       "oracle": "accept"

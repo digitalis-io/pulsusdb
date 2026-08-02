@@ -88,6 +88,27 @@ The committed M4 surface, not any external parser:
   query-wide budget of `MAX_DEPTH` (64) shared across the spanset and
   field levels; `reject/field_chain_over_limit` and
   `reject/spanset_chain_over_limit` pin the boundary.
+- An attribute path is a single unbroken token: no whitespace on either
+  side of any `.` separator, for every scope (`.attr`, `span.`,
+  `resource.`, `parent.`, `event.`, `link.`, `instrumentation.`, and each
+  `.`-separated key segment). Pinned by `reject/attr_dot_space_after`,
+  `reject/attr_dot_space_after_scope` and
+  `reject/attr_dot_space_before_scope` (issue #327); enforced once in
+  `src/lexer.rs::reject_split_attribute_path`, which carries the observed
+  accept/reject vectors. Derived from observed behavior, not docs: the
+  black-box oracle (`grafana/tempo:3.0.2` over `/api/search`) answers
+  `400` to every gap spelling and `200` to the tight one.
+- A colon-scoped intrinsic (`span:id`, `trace:duration`, `event:name`,
+  `link:spanID`, `instrumentation:version`) binds its scope keyword to
+  the `:` **on the left only** — `{ span :id }` is an error, `{ span: id }`
+  is valid. That asymmetry with `.` is genuine reference behavior, not an
+  oversight: the same oracle answers `400` to every pre-colon gap and
+  `200` to every post-colon gap (spaces, tabs and newlines alike), for
+  every colon scope and every operand position. Pinned in BOTH directions
+  by `reject/intrinsic_colon_space_before` and
+  `accept/intrinsic_colon_space_after` (issue #327); enforced in
+  `src/lexer.rs::reject_split_scoped_intrinsic`, whose doc comment says
+  the asymmetry must not be "fixed" into consistency.
 
 ## Regenerating
 

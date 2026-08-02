@@ -1101,6 +1101,28 @@ fn parse_metric_expr(
         cursor.expect(&TokenKind::RParen, "')'")?;
         return Ok(MetricExpr::VectorFn(raw));
     }
+    // `label_replace(<metricExpr>, "<dst>", "<replacement>", "<src>",
+    // "<regex>")` (issue #276) — mirrors Loki v3.7.4's `labelReplaceExpr`
+    // grammar rule (`LABEL_REPLACE "(" metricExpr "," STRING "," STRING
+    // "," STRING "," STRING ")"`, pkg/logql/syntax/syntax.y). A
+    // `metricExpr` alternative, so it is legal in EVERY metric position
+    // (oracle-probed: inside `sum(...)`/`topk(...)`, parenthesized, as a
+    // binary operand, and nested in another `label_replace` are all
+    // reference 200s). The inner expression is a full binary-capable
+    // metric expression; `variants` stays illegal inside the argument
+    // list (`allow_variants = false` — the reference 400s
+    // `label_replace(variants(...) of (...), ...)` with `syntax error:
+    // unexpected ,`). Arity/argument-type mistakes fall out of the
+    // `expect` calls as plain positional 400s, matching the reference's
+    // `unexpected ), expecting ,` / `unexpected IDENTIFIER, expecting
+    // STRING` class. The keyword is matched as the exact lowercase
+    // identifier, consistent with every other PulsusDB keyword (the
+    // reference's case-insensitive lexer is the workspace-wide
+    // pre-existing gap, issue #221 plan §risk 6).
+    if name == "label_replace" {
+        cursor.advance();
+        return parse_label_replace_call(cursor, depth);
+    }
     // `variants(...) of (...)` (issue #221) — recognized ONLY in the
     // positions the reference grammar admits (`allow_variants`, see
     // `parse_binary_expr`). In a disallowed position the identifier falls
@@ -1201,6 +1223,35 @@ fn parse_variants_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricEx
         variants: walk::ChildVec::new(variants),
         range,
     })))
+}
+
+/// `label_replace "(" metricExpr "," STRING "," STRING "," STRING ","
+/// STRING ")"` (issue #276). The keyword itself has already been
+/// consumed. A separate function — NOT inlined into `parse_metric_expr`
+/// — so its argument locals never enlarge the recursion-path frame the
+/// #255/#293 pinned-stack gates budget.
+fn parse_label_replace_call(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+) -> Result<MetricExpr, LogQlError> {
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    let inner = parse_binary_expr(cursor, depth + 1, 0, false)?;
+    cursor.expect(&TokenKind::Comma, "','")?;
+    let (dst, _) = cursor.expect_string()?;
+    cursor.expect(&TokenKind::Comma, "','")?;
+    let (replacement, _) = cursor.expect_string()?;
+    cursor.expect(&TokenKind::Comma, "','")?;
+    let (src, _) = cursor.expect_string()?;
+    cursor.expect(&TokenKind::Comma, "','")?;
+    let (regex, _) = cursor.expect_string()?;
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    Ok(MetricExpr::LabelReplace {
+        inner: walk::Child::new(inner),
+        dst,
+        replacement,
+        src,
+        regex,
+    })
 }
 
 fn parse_vector_agg_call(

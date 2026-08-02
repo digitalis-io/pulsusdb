@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "whitespace after '.'",
+    expected: "an attribute name immediately after '.' (an attribute path is a single unbroken token)",
+    span: Span {
+        start: 2,
+        end: 3,
+    },
+}

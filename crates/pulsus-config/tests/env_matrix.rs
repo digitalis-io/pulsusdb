@@ -1,5 +1,5 @@
 //! Exhaustive, table-driven proof that every documented environment
-//! variable (docs/configuration.md §§1–8, 67 variables) parses. Each row
+//! variable (docs/configuration.md §§1–8, 70 variables) parses. Each row
 //! clears the environment, sets only its own variable, calls `parse()`
 //! (not `load()` — see issue #2 architect plan amendment 2), and asserts
 //! the target field. `PULSUS_AUTH_USER`/`PULSUS_AUTH_PASSWORD` need no
@@ -297,6 +297,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.logql_pipeline_scan_factor == 25,
     },
     Row {
+        var: "PULSUS_TEMPLATE_TIMEZONE",
+        value: "Europe/London",
+        check: |c| c.reader.template_timezone.name() == "Europe/London",
+    },
+    Row {
         var: "PULSUS_TRACEQL_MAX_CANDIDATES",
         value: "77",
         check: |c| c.reader.traceql_max_candidates == 77,
@@ -396,8 +401,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        69,
-        "docs/configuration.md §§1-8 document exactly 69 variables"
+        70,
+        "docs/configuration.md §§1-8 document exactly 70 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

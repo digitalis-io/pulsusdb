@@ -27,10 +27,69 @@ pub mod value;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::OnceLock;
 
 pub use eval::ExecError as TemplateExecError;
 pub use retained::{LabelSnapshot, Retained, render_full};
 pub use timefns::TemplateEnv;
+
+/// The server-configured template timezone (`reader.template_timezone`,
+/// issue #311). Installed once at startup by `pulsus-server`; unset means
+/// the documented default, `UTC`.
+///
+/// **Why a process-wide slot rather than a per-query parameter.** The
+/// value is server configuration — immutable for the process lifetime and
+/// identical for every query it answers — and the defect being fixed is a
+/// value that *varied per host*. A single install point cannot be
+/// half-applied: there is no call site that can forget to pass the zone
+/// and silently fall back, which is exactly how the reference's
+/// per-process resolution goes wrong. The read is a plain `OnceLock::get`
+/// (never `get_or_init`), so an early read cannot latch `UTC` in and make
+/// a later install fail.
+static TEMPLATE_TIMEZONE: OnceLock<chrono_tz::Tz> = OnceLock::new();
+
+/// The template timezone was installed twice — a startup bug, never an
+/// operator error (issue #311).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the LogQL template timezone is already installed as {installed} (attempted {attempted}); \
+     it is server configuration and must be installed exactly once at startup"
+)]
+pub struct TemplateTimezoneAlreadyInstalled {
+    pub installed: &'static str,
+    pub attempted: &'static str,
+}
+
+/// Installs the server-configured template timezone. Called exactly once,
+/// at startup, from the configuration the whole cluster shares — so two
+/// nodes with the same configuration render identically, and neither
+/// consults `$TZ` or `/etc/localtime` to find out what to do.
+pub fn install_template_timezone(
+    tz: chrono_tz::Tz,
+) -> Result<(), TemplateTimezoneAlreadyInstalled> {
+    TEMPLATE_TIMEZONE
+        .set(tz)
+        .map_err(|attempted| TemplateTimezoneAlreadyInstalled {
+            installed: template_timezone().name(),
+            attempted: attempted.name(),
+        })
+}
+
+/// The effective template timezone: whatever startup installed, else the
+/// documented default `UTC`.
+pub fn template_timezone() -> chrono_tz::Tz {
+    TEMPLATE_TIMEZONE
+        .get()
+        .copied()
+        .unwrap_or(chrono_tz::Tz::UTC)
+}
+
+/// The template execution environment every compiled pipeline runs
+/// against (issue #311): derived from [`template_timezone`], with a live
+/// wall clock. Nothing in this path reads the host environment.
+pub fn configured_env() -> TemplateEnv {
+    TemplateEnv::for_timezone(template_timezone())
+}
 
 /// The per-ROW output-byte budget (issue #230 follow-up; lifetime moved
 /// from per-render to per-row by issue #260): every allocation whose

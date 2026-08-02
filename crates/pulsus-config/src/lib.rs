@@ -18,6 +18,7 @@ mod error;
 mod load;
 mod model;
 mod secret;
+mod timezone;
 mod units;
 mod validate;
 
@@ -30,6 +31,7 @@ pub use model::{
     WriterConfig,
 };
 pub use secret::Secret;
+pub use timezone::{TemplateTimezone, UnknownTimezone};
 pub use units::{ByteSize, HumanDuration, UnitError};
 pub use validate::{
     BATCH_BYTES_CEILING, BATCH_MS_CEILING, CACHE_MAX_SERIES_CEILING, INGEST_QUEUE_BYTES_CEILING,
