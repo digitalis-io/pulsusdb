@@ -3,20 +3,20 @@ Query {
         SpansetFilter {
             body: Some(
                 Binary {
-                    op: Or,
-                    lhs: Comparison {
-                        field: Attribute {
-                            scope: Unscoped,
-                            key: "a",
-                        },
-                        op: Eq,
-                        value: Number(
-                            "1",
-                        ),
-                    },
-                    rhs: Binary {
-                        op: And,
+                    op: And,
+                    lhs: Binary {
+                        op: Or,
                         lhs: Comparison {
+                            field: Attribute {
+                                scope: Unscoped,
+                                key: "a",
+                            },
+                            op: Eq,
+                            value: Number(
+                                "1",
+                            ),
+                        },
+                        rhs: Comparison {
                             field: Attribute {
                                 scope: Unscoped,
                                 key: "b",
@@ -26,16 +26,16 @@ Query {
                                 "2",
                             ),
                         },
-                        rhs: Comparison {
-                            field: Attribute {
-                                scope: Unscoped,
-                                key: "c",
-                            },
-                            op: Eq,
-                            value: Number(
-                                "3",
-                            ),
+                    },
+                    rhs: Comparison {
+                        field: Attribute {
+                            scope: Unscoped,
+                            key: "c",
                         },
+                        op: Eq,
+                        value: Number(
+                            "3",
+                        ),
                     },
                 },
             ),
