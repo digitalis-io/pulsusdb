@@ -74,6 +74,11 @@ const WRITER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 /// still-draining writer flush.
 pub async fn run(config: Config) -> ExitCode {
     init_tracing(config.log_level);
+    // Issue #311: the LogQL template zone comes from configuration, before
+    // any query can compile a pipeline. Nothing downstream reads `$TZ` or
+    // `/etc/localtime`, so this is the only thing that decides it — and
+    // every node sharing this configuration renders identically.
+    install_template_timezone(&config);
 
     let metrics = install_metrics_recorder();
     let config = Arc::new(config);
@@ -709,6 +714,28 @@ fn install_metrics_recorder() -> PrometheusHandle {
     }
 }
 
+/// Installs `reader.template_timezone` as the process's LogQL template
+/// zone (issue #311). The zone is process-global — server configuration,
+/// fixed for the process lifetime — so, exactly like the Prometheus
+/// recorder above, a second install within one process (several tests in
+/// one binary) is expected rather than fatal. It is only *reported* when
+/// the second install disagrees with the first, since a real process
+/// installs one configuration once.
+fn install_template_timezone(config: &Config) {
+    let tz = config.reader.template_timezone;
+    match pulsus_read::logql::template::install_template_timezone(tz.tz()) {
+        Ok(()) => tracing::info!(
+            template_timezone = tz.name(),
+            "LogQL template time functions render in the configured timezone"
+        ),
+        Err(err) if err.installed != err.attempted => tracing::warn!(
+            error = %err,
+            "LogQL template timezone left at the already-installed zone"
+        ),
+        Err(_) => {}
+    }
+}
+
 /// Waits for SIGINT (Ctrl+C) or, on Unix, SIGTERM — whichever arrives
 /// first. `axum::serve(...).with_graceful_shutdown` awaits this future
 /// before draining in-flight requests and returning.
@@ -1173,5 +1200,42 @@ mod tests {
     fn init_tracing_does_not_panic_when_called_twice() {
         init_tracing(LogLevel::Debug);
         init_tracing(LogLevel::Debug);
+    }
+
+    /// Issue #311: the wiring test — the value in `reader.template_timezone`
+    /// really reaches the read path's process setting, rather than being a
+    /// config field nothing consumes.
+    ///
+    /// Scope, stated exactly: this covers `Config → process setting`. That
+    /// `serve::run` invokes it is a single unconditional line at the top of
+    /// `run`, not covered here (no test boots `run`); an end-to-end check
+    /// belongs in the e2e harness, which drives the real binary.
+    ///
+    /// The zone slot is process-wide and install-once, so this is the ONLY
+    /// installer in this test binary (`serve::run` is never called from a
+    /// test) — the assertion is exact, and a second installer appearing
+    /// here later would redden it rather than weaken it.
+    #[test]
+    fn install_template_timezone_wires_the_configured_zone_into_the_read_path() {
+        use pulsus_read::logql::template::template_timezone;
+
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.reader.template_timezone,
+            pulsus_config::TemplateTimezone::UTC,
+            "the shipped default is UTC"
+        );
+        cfg.reader.template_timezone = "Europe/London".parse().expect("known zone");
+
+        install_template_timezone(&cfg);
+        assert_eq!(
+            template_timezone().name(),
+            "Europe/London",
+            "the configured zone must reach the read path's process setting"
+        );
+
+        // Idempotent: a repeat install in the same process must not panic.
+        install_template_timezone(&cfg);
+        assert_eq!(template_timezone().name(), "Europe/London");
     }
 }

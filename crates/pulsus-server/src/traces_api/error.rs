@@ -32,6 +32,7 @@ use super::params::{
 /// | variant | HTTP | `errorType` |
 /// |---|---|---|
 /// | `Param` / `SearchParam` / `MetricsParam` / `GraphParam` / `TagsParam` / `TagPath` | 400 | `bad_data` |
+/// | `SearchParam(QueryText(Invalid))` (search `query` parse, carries `position`) | 400 | `bad_data` |
 /// | `Plan` (except the point cap) | 400 | `bad_data` |
 /// | `Query` (TraceQL parse, carries `position`) | 400 | `bad_data` |
 /// | `Legacy` (strict logfmt, carries `position` into `tags`) | 400 | `bad_data` |
@@ -143,7 +144,17 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error_type, message, position) = match &self {
             ApiError::Param(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
-            ApiError::SearchParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
+            // `position` only when the failure is the query-frontend
+            // validator's parse step on the search `query` parameter
+            // (issue #326) — the same byte offset `ApiError::Query`
+            // reports for a malformed `q`, so a TraceQL parse error looks
+            // the same whichever parameter carried it.
+            ApiError::SearchParam(e) => (
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                e.to_string(),
+                e.position(),
+            ),
             ApiError::MetricsParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::GraphParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::TagsParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),

@@ -72,6 +72,7 @@
 //!   builder-dirty bit (`hasDel() || hasAdd()`, `labels.go:554-563`).
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fmt;
 use std::net::IpAddr;
 
@@ -270,36 +271,68 @@ struct StageMap<'a> {
 /// them); those are ledgered off-corpus, not reproduced.
 const JSON_ERROR_DETAILS: &str = "Value looks like object, but can't find closing '}' symbol";
 
-/// A `line_format`/`label_format` render breached the per-render
-/// output-byte budget (issue #230 follow-up;
-/// [`super::template::MAX_TEMPLATE_RENDER_BYTES`]). Query-aborting: the
-/// exec layer maps it to the bounded 422
-/// (`TooBroadReason::TemplateOutputBytes`) — never a per-line
-/// `TemplateFormatErr`, never a truncation, never an OOM.
+/// WHICH per-row output budget a row breached — the two are separate
+/// ledgers with separate ceilings and separate 422 reasons, and this
+/// field is what keeps each error's wording tied to the counter that
+/// actually refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TemplateBudgetExceeded {
+pub enum RowBudget {
+    /// The `line_format`/`label_format` render output the row RETAINS
+    /// (issues #230/#260; [`super::template::MAX_TEMPLATE_RENDER_BYTES`]).
+    TemplateRender,
+    /// The flattened label KEYS a bare `| json` builds for the row
+    /// (issue #287; [`MAX_JSON_FLATTEN_KEY_BYTES`]).
+    JsonFlattenKeys,
+}
+
+/// A row breached one of the two per-row output-byte budgets.
+/// Query-aborting: the exec layer maps it to the bounded 422
+/// ([`super::error::TooBroadReason::TemplateOutputBytes`] /
+/// [`super::error::TooBroadReason::JsonFlattenKeyBytes`]) — never a
+/// per-line `__error__` tag, never a truncation, never an OOM.
+///
+/// One type rather than two so the six `run*` entrypoints keep one error
+/// channel; `budget` names the ledger and `budget_bytes` its ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowBudgetExceeded {
+    pub budget: RowBudget,
     pub budget_bytes: u64,
 }
 
-impl TemplateBudgetExceeded {
-    pub(crate) fn new() -> Self {
-        TemplateBudgetExceeded {
+impl RowBudgetExceeded {
+    pub(crate) fn template() -> Self {
+        RowBudgetExceeded {
+            budget: RowBudget::TemplateRender,
             budget_bytes: super::template::MAX_TEMPLATE_RENDER_BYTES,
+        }
+    }
+
+    pub(crate) fn json_flatten_keys() -> Self {
+        RowBudgetExceeded {
+            budget: RowBudget::JsonFlattenKeys,
+            budget_bytes: MAX_JSON_FLATTEN_KEY_BYTES,
         }
     }
 }
 
-impl fmt::Display for TemplateBudgetExceeded {
+impl fmt::Display for RowBudgetExceeded {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "template render exceeded the {}-byte output budget",
-            self.budget_bytes
-        )
+        match self.budget {
+            RowBudget::TemplateRender => write!(
+                f,
+                "template render exceeded the {}-byte output budget",
+                self.budget_bytes
+            ),
+            RowBudget::JsonFlattenKeys => write!(
+                f,
+                "`| json` flattened-key expansion exceeded the {}-byte per-line budget",
+                self.budget_bytes
+            ),
+        }
     }
 }
 
-impl std::error::Error for TemplateBudgetExceeded {}
+impl std::error::Error for RowBudgetExceeded {}
 
 /// Errors from compiling a pipeline — all client-caused, surfaced as
 /// [`super::error::ReadError::PipelineInvalid`] (400-class).
@@ -676,7 +709,9 @@ enum CompiledLabelFmt {
 pub struct CompiledPipeline {
     stages: Vec<CompiledStage>,
     /// The template execution environment (issue #230): the `Local`
-    /// zone + wall clock the reference resolves from the process.
+    /// zone + wall clock. The zone is SERVER CONFIGURATION
+    /// (`reader.template_timezone`, default UTC — issue #311), not the
+    /// host's, so two nodes sharing a config render identically.
     /// Tests/the corpus runner override it via
     /// [`CompiledPipeline::with_template_env`] to pin determinism.
     template_env: TemplateEnv,
@@ -930,7 +965,9 @@ impl CompiledPipeline {
         let line_filter_only = stages.is_empty() && st.all_line_filter_source;
         CompiledPipeline {
             stages,
-            template_env: TemplateEnv::process(),
+            // Issue #311: the SERVER-CONFIGURED zone (default UTC), never
+            // the host's `$TZ`/`/etc/localtime`.
+            template_env: template::configured_env(),
             mutates_labels: st.mutates_labels,
             rewrites_line: st.rewrites_line,
             line_filter_only,
@@ -1076,7 +1113,7 @@ impl CompiledPipeline {
         body: &'a str,
         base: &'a [(String, String)],
         ts_ns: i64,
-    ) -> Result<Option<EntryOut<'a>>, TemplateBudgetExceeded> {
+    ) -> Result<Option<EntryOut<'a>>, RowBudgetExceeded> {
         let mut labels = Vec::new();
         let Some(line) = self.run_into(body, base, ts_ns, &mut labels)? else {
             return Ok(None);
@@ -1102,7 +1139,7 @@ impl CompiledPipeline {
         base: &'a [(String, String)],
         ts_ns: i64,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    ) -> Result<Option<Cow<'a, str>>, TemplateBudgetExceeded> {
+    ) -> Result<Option<Cow<'a, str>>, RowBudgetExceeded> {
         self.run_into_with_sm(body, base, ts_ns, &EMPTY_STRUCTURED_METADATA, labels)
     }
 
@@ -1124,7 +1161,7 @@ impl CompiledPipeline {
         ts_ns: i64,
         sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    ) -> Result<Option<Cow<'a, str>>, TemplateBudgetExceeded> {
+    ) -> Result<Option<Cow<'a, str>>, RowBudgetExceeded> {
         match self.run_mode_into(body, base, ts_ns, sm, labels, false)? {
             (MetricRun::Dropped, _) => Ok(None),
             (MetricRun::Kept { line, .. }, _) => Ok(Some(line)),
@@ -1150,7 +1187,7 @@ impl CompiledPipeline {
         base: &'a [(String, String)],
         ts_ns: i64,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    ) -> Result<(Option<Cow<'a, str>>, bool), TemplateBudgetExceeded> {
+    ) -> Result<(Option<Cow<'a, str>>, bool), RowBudgetExceeded> {
         match self.run_mode_into(body, base, ts_ns, &EMPTY_STRUCTURED_METADATA, labels, false)? {
             (MetricRun::Dropped, has_err) => Ok((None, has_err)),
             (MetricRun::Kept { line, .. }, has_err) => Ok((Some(line), has_err)),
@@ -1173,7 +1210,7 @@ impl CompiledPipeline {
         base: &'a [(String, String)],
         ts_ns: i64,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    ) -> Result<MetricRun<'a>, TemplateBudgetExceeded> {
+    ) -> Result<MetricRun<'a>, RowBudgetExceeded> {
         // `MetricScanRow` carries no structured metadata (issue #249), so the
         // metric path always seeds empty slots.
         Ok(self
@@ -1192,7 +1229,7 @@ impl CompiledPipeline {
         sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
         metric: bool,
-    ) -> Result<(MetricRun<'a>, bool), TemplateBudgetExceeded> {
+    ) -> Result<(MetricRun<'a>, bool), RowBudgetExceeded> {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
         let mut value: Option<f64> = None;
         // A successfully-unwrapped label pending deletion (issue #221): the
@@ -1216,6 +1253,11 @@ impl CompiledPipeline {
         // Two `Cell`s on the stack — no allocation, so the per-row
         // allocation gates are untouched.
         let render_budget = template::RenderBudget::default();
+        // The `| json` full-flatten key budget's lifetime is the ROW too,
+        // and for the same reason (issue #287): every `| json` stage's
+        // flattened keys are retained in the label set simultaneously,
+        // and the number of stages is bounded only by the query-text cap.
+        let json_key_budget = JsonKeyBudget::default();
         labels.clear();
         labels.extend(
             base.iter()
@@ -1250,7 +1292,7 @@ impl CompiledPipeline {
                     }
                 }
                 CompiledStage::Json { extractions } => {
-                    run_json(&line, extractions, labels, &mut errs)
+                    run_json(&line, extractions, labels, &mut errs, &json_key_budget)?
                 }
                 CompiledStage::Logfmt {
                     strict,
@@ -1410,7 +1452,7 @@ impl CompiledPipeline {
                                 match template::Retained::copy(&render_budget, v) {
                                     Ok(r) => Ok(r),
                                     Err(template::BudgetExhausted) => {
-                                        return Err(TemplateBudgetExceeded::new());
+                                        return Err(RowBudgetExceeded::template());
                                     }
                                 }
                             }
@@ -1438,7 +1480,7 @@ impl CompiledPipeline {
                                 ) {
                                     Ok(r) => Ok(r),
                                     Err(template::BudgetExhausted) => {
-                                        return Err(TemplateBudgetExceeded::new());
+                                        return Err(RowBudgetExceeded::template());
                                     }
                                 }
                             }
@@ -1472,7 +1514,7 @@ impl CompiledPipeline {
                         Err(e) if e.budget_breach => {
                             // Render-budget breach: abort the QUERY
                             // (bounded 422) — never a per-line tag.
-                            return Err(TemplateBudgetExceeded::new());
+                            return Err(RowBudgetExceeded::template());
                         }
                         Err(e) => {
                             // Only the full engine has a per-line failure
@@ -1575,7 +1617,7 @@ impl CompiledPipeline {
                                         {
                                             Ok(snapshot) => snapshot,
                                             Err(template::BudgetExhausted) => {
-                                                return Err(TemplateBudgetExceeded::new());
+                                                return Err(RowBudgetExceeded::template());
                                             }
                                         };
                                         map = Some(StageMap {
@@ -1620,7 +1662,7 @@ impl CompiledPipeline {
                                         match template::Retained::copy(&render_budget, v) {
                                             Ok(r) => Ok(r),
                                             Err(template::BudgetExhausted) => {
-                                                return Err(TemplateBudgetExceeded::new());
+                                                return Err(RowBudgetExceeded::template());
                                             }
                                         }
                                     }
@@ -1640,7 +1682,7 @@ impl CompiledPipeline {
                                         ) {
                                             Ok(r) => Ok(r),
                                             Err(template::BudgetExhausted) => {
-                                                return Err(TemplateBudgetExceeded::new());
+                                                return Err(RowBudgetExceeded::template());
                                             }
                                         }
                                     }
@@ -1666,7 +1708,7 @@ impl CompiledPipeline {
                                         // Render-budget breach: abort the
                                         // QUERY (bounded 422 — issue #230
                                         // follow-up), never a per-line tag.
-                                        return Err(TemplateBudgetExceeded::new());
+                                        return Err(RowBudgetExceeded::template());
                                     }
                                     Err(e) => {
                                         // `fmt.go:426-429`: destination NOT
@@ -1855,10 +1897,13 @@ impl CompiledPipeline {
 /// size-limit-class failure of the wrapped form is never misreported.
 /// Issue #246 replaces this body and nowhere else.
 ///
-/// NOTE: `label_replace` is not in PulsusDB's LogQL grammar today
-/// (`plan.rs` rejects it at parse) — see issue #276, which adds it. The
-/// reference genuinely DOES report the WRAPPED form at that one site, so
-/// once #276 lands this seam must NOT be "consistency fixed" to wrap.
+/// NOTE: `label_replace` (issue #276) is the ONE deliberate exception —
+/// LIVE, not dormant: the reference genuinely reports the WRAPPED
+/// `^(?:…)$` form at that single site, so
+/// `plan::LabelReplaceSpec::compile` deliberately does NOT route through
+/// this seam, and neither side may be "consistency fixed" toward the
+/// other (pinned by
+/// `label_replace_bad_regex_reports_the_wrapped_form_not_the_users_pattern`).
 fn bad_regex(user_pattern: &str, observed: &regex::Error) -> PipelineError {
     let msg = match regex::Regex::new(user_pattern) {
         Err(e) => e.to_string(),
@@ -2916,16 +2961,127 @@ fn eval_label_filter<'v>(
 // json
 // ---------------------------------------------------------------------
 
+/// The per-ROW ceiling on the bytes of flattened label KEYS a bare
+/// `| json` may build (issue #287). **Value: 64 MiB.**
+///
+/// **What it bounds, exactly:** the sum of
+/// [`super::charge::alloc_block_bytes`]`(key.len())` over every key
+/// string [`flatten_json`] allocates while the row is in the pipeline —
+/// the emitted leaf label names AND the intermediate object prefixes
+/// they are built from, across ALL `| json` stages of the row. It
+/// bounds nothing else: not the extracted VALUES (their bytes are
+/// linear in the line — each scalar's text appears once in the input),
+/// not the parsed `serde_json::Value`, not the targeted-extraction form
+/// `| json a="b.c"` (whose label names come from the compiled stage and
+/// are never derived from the line). Charged BEFORE each key
+/// allocation, and never released within the row.
+///
+/// The charge is the retained BLOCK, not the request (review round 1,
+/// finding 1 as re-judged in round 2): `String::with_capacity(n)`
+/// guarantees `capacity >= n` and nothing more, so a bare-length charge
+/// would have left the allocator's slop uncounted.
+/// `alloc_block_bytes` is this crate's pinned over-approximation of
+/// that block for ONE exactly-reserved allocation — the shape
+/// [`flatten_json`] builds. Above its 32-byte floor it is `2 x`, so the
+/// 64 MiB ceiling admits **32 MiB of key CONTENT** per row.
+///
+/// **Why a BYTE bound and not a key COUNT.** The reference builds each
+/// leaf label name by joining the whole ancestor path
+/// (grafana/loki v3.7.4, `pkg/logql/log/parser.go` —
+/// `JSONParser.parseLabelValue` interns
+/// `buildSanitizedPrefixFromBuffer()`'s `_`-joined prefix buffer), and
+/// PulsusDB emits the identical names, so this expansion is PARITY and
+/// the names must not change. But it makes the emitted key bytes grow
+/// as `Θ(L²)` in the line length `L`: for `{"<p bytes>":{"k00000":0, …
+/// ×m}}` the input is `p + 11m + 6` bytes and the keys are `m·(p + 7)`
+/// bytes, maximised at `≈ L²/44`. Measured: a 65 536-byte line yields
+/// 97 615 872 key bytes (1 489.5×), and 1 MiB extrapolates to ~23.3 GiB.
+/// A cap on the NUMBER of keys is therefore not a bound at all — the
+/// 64 KiB construction emits only 2 979 of them.
+///
+/// The reference is UNBOUNDED here (no cap in `JSONParser`, none in
+/// `LabelsBuilder.Set`, `pkg/logql/log/labels.go:344`) — the same shape
+/// as [`super::template::MAX_TEMPLATE_RENDER_BYTES`]: a bounded 422 is
+/// the ruled behaviour where the reference OOMs. The ceiling is the
+/// template budget's, for the template budget's reason ("one line may
+/// not out-allocate a whole query's retained state"); at 64 MiB of
+/// charged blocks — 32 MiB of key content — the worst-SHAPED line it
+/// refuses is ~38 KiB, while a normally-shaped line, whose key bytes
+/// are a small multiple of `L`, passes at tens of MiB.
+pub const MAX_JSON_FLATTEN_KEY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The same compile-time inequality the template budget carries: one
+/// line's key expansion may never out-allocate a whole query's
+/// retained-state budget.
+const _: () = assert!(
+    MAX_JSON_FLATTEN_KEY_BYTES <= super::charge::MAX_CLIENT_AGG_GROUP_BYTES,
+    "one line's json key expansion may not out-allocate a whole query's retention budget"
+);
+
+/// The countdown ledger [`flatten_json`] charges against, fresh per ROW
+/// and SHARED by every `| json` stage the row runs — the issue #260
+/// lesson applied to the parser axis: a per-STAGE ledger would bound one
+/// stage while the NUMBER of stages is bounded only by the query-text
+/// cap, and each `| json` after the first re-flattens the same line into
+/// a fresh set of `_extracted`-suffixed labels that are all live at once.
+///
+/// One `Cell` on the stack, like [`template::RenderBudget`] — no
+/// allocation, so the per-row allocation gates are untouched — and
+/// interior mutability so the charge is callable behind a shared borrow
+/// while the row's label vector is mutably borrowed.
+#[derive(Debug)]
+struct JsonKeyBudget {
+    remaining: Cell<u64>,
+}
+
+impl Default for JsonKeyBudget {
+    fn default() -> Self {
+        JsonKeyBudget {
+            remaining: Cell::new(MAX_JSON_FLATTEN_KEY_BYTES),
+        }
+    }
+}
+
+impl JsonKeyBudget {
+    /// Charges the heap BLOCK a `content_bytes`-long key will retain,
+    /// BEFORE the string holding it exists. Refuses on the ledger, so a
+    /// breach means the key was never allocated.
+    ///
+    /// The conversion from content length to retained block lives HERE
+    /// and nowhere else, so no caller can charge a bare length (issue
+    /// #287 review round 1, finding 1 as re-judged in round 2: `len` is
+    /// the request size, and `String::with_capacity(len).capacity()` is
+    /// only guaranteed `>= len` — the allocator's slop on top of the
+    /// request is real and has to be inside the charge).
+    /// [`super::charge::alloc_block_bytes`] is this crate's pinned
+    /// over-approximation of that block for ONE exactly-reserved
+    /// allocation, which is exactly the shape the caller builds.
+    fn charge_key(&self, content_bytes: usize) -> Result<(), RowBudgetExceeded> {
+        let block = super::charge::alloc_block_bytes(content_bytes as u64);
+        let remaining = self.remaining.get();
+        if block > remaining {
+            return Err(RowBudgetExceeded::json_flatten_keys());
+        }
+        self.remaining.set(remaining - block);
+        Ok(())
+    }
+}
+
 /// Owned key/value output by design: extracted values live inside the
 /// per-line `serde_json::Value`, which drops at the end of this stage —
 /// the parse itself dominates the cost (bounded to pushdown-surviving
 /// rows).
+///
+/// `budget` is the ROW's ([`MAX_JSON_FLATTEN_KEY_BYTES`]); only the
+/// full-flatten arm spends from it, since only that arm derives label
+/// names from the line.
 fn run_json<'a>(
     line: &str,
     extractions: &'a [(String, Vec<JsonPathSeg>)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     errs: &mut ErrorSlots<'a>,
-) {
+    budget: &JsonKeyBudget,
+) -> Result<(), RowBudgetExceeded> {
     let parsed: serde_json::Value = match serde_json::from_str(line) {
         Ok(v @ serde_json::Value::Object(_)) => v,
         // A non-object top level (or a parse failure) is the malformed
@@ -2937,15 +3093,11 @@ fn run_json<'a>(
         _ => {
             errs.set_err(Cow::Borrowed("JSONParserErr"));
             errs.set_details(Cow::Borrowed(JSON_ERROR_DETAILS));
-            return;
+            return Ok(());
         }
     };
     if extractions.is_empty() {
-        let mut extracted = Vec::new();
-        flatten_json("", &parsed, &mut extracted);
-        for (k, v) in extracted {
-            add_extracted(labels, Cow::Owned(k), Cow::Owned(v), &mut errs.dirty);
-        }
+        flatten_json("", Depth::Root, &parsed, labels, &mut errs.dirty, budget)?;
     } else {
         for (label, path) in extractions {
             let value = lookup_json_path(&parsed, path)
@@ -2959,25 +3111,333 @@ fn run_json<'a>(
             );
         }
     }
+    Ok(())
 }
 
 /// Full-flatten: nested objects join with `_`; scalars stringify; arrays
 /// and nulls are skipped (pinned semantics).
-fn flatten_json(prefix: &str, value: &serde_json::Value, out: &mut Vec<(String, String)>) {
+///
+/// **Key names are the reference's** (issue #287 review round 2, finding
+/// 3 — grafana/loki v3.7.4, `pkg/logql/log/parser.go`
+/// `buildSanitizedPrefixFromBuffer` over `pkg/logql/log/util.go:42`
+/// `appendSanitized`), built by [`push_sanitized_part`]. Before this,
+/// raw JSON keys were joined and the whole result sanitized afterwards
+/// by `add_extracted`, which agrees with the reference for every key
+/// that needs no trimming but not otherwise — container-captured
+/// divergences, all now fixed: `{" a ":1}` gave `_a_` (reference `a`),
+/// `{"x":{" b ":1}}` gave `x__b_` (`x_b`), `{"  ":{"b":1}}` gave `___b`
+/// (`b`), `{"x":{"  ":1}}` gave `x___` (`x`), `{"x":{"":1}}` gave `x_`
+/// (`x`), `{"":1}` emitted a label with an EMPTY NAME (the reference
+/// drops the field).
+///
+/// **Collision renames are path-aware too** (fix round 2). A leaf whose
+/// built key already exists in the label set is renamed with
+/// `_extracted`, and WHERE the suffix lands depends on depth, because
+/// the reference has two code paths: a top-level field appends it to
+/// the SANITIZED key (`parser.go:152-153`), while a nested field
+/// appends it to the RAW final path part and rebuilds the sanitized
+/// path (`parser.go:183-187`), so trimming and rune-mapping run over
+/// the suffixed part. The orders differ observably: for base label
+/// `x`, `{"x":{"":1}}` is `x__extracted` (the part trimmed empty, but
+/// suffixed it survives as `_extracted` plus its separator), and for
+/// base `x_y`, `{"x":{" y ":1}}` is `x_y__extracted` (the trailing
+/// space, trimmed in the unsuffixed build, now sanitizes to `_`) —
+/// both container-captured, with the depth-0 counterpart `{" x ":1}`
+/// → `x_extracted` pinning the asymmetry. Insertion therefore happens
+/// HERE, leaf by leaf during the walk ([`insert_flattened`], replacing
+/// the earlier flatten-then-`add_extracted` two-phase): the rename
+/// needs `(prefix, raw part, depth)`, which only the walk knows, and
+/// the collision check must see leaves already inserted by THIS walk
+/// (`{"a-b":1,"a.b":2}` suffixes the second — the recorded #334
+/// divergence, byte-for-byte unchanged by this restructure). A breach
+/// mid-walk can leave earlier leaves in `labels`; every caller
+/// propagates [`RowBudgetExceeded`] into the whole query's 422, so a
+/// partial set is never observed. `add_extracted` itself is untouched
+/// and stays there for the other parsers.
+///
+/// Every key string this builds — the leaf label names and the
+/// intermediate object prefixes alike — is charged to `budget` BEFORE it
+/// is allocated, so a breach returns with the key never having existed
+/// (see [`MAX_JSON_FLATTEN_KEY_BYTES`] for what that bound is and is
+/// not). Skipped values (`null`, arrays) build no key and so are charged
+/// nothing.
+///
+/// **What the charge covers** (issue #287 review round 1, finding 1, as
+/// re-judged in round 2): the charge is
+/// [`super::charge::alloc_block_bytes`] of the key's byte length, the
+/// same provable over-approximation of a retained heap block every other
+/// charge site in this crate uses. Its documented precondition is ONE
+/// exactly-reserved allocation, which is what
+/// `String::with_capacity(len)` + appends totalling exactly `len` is —
+/// the capacity cannot be less than `len`, so no reallocation happens,
+/// and whatever slop the allocator adds on top of the single `len`-byte
+/// request is inside the model. The earlier version charged the bare
+/// `len` and asserted `capacity == len`, which the language does not
+/// guarantee. A `format!` join would instead make TWO requests
+/// (`prefix.len()` then a doubled `2·prefix.len()`), breaking the
+/// precondition rather than the arithmetic —
+/// `tests/logql_json_key_alloc_gate.rs` measures the requests and fails
+/// on that shape.
+fn flatten_json<'a>(
+    prefix: &str,
+    depth: Depth,
+    value: &serde_json::Value,
+    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    dirty: &mut bool,
+    budget: &JsonKeyBudget,
+) -> Result<(), RowBudgetExceeded> {
     if let serde_json::Value::Object(map) = value {
         for (k, v) in map {
-            let key = if prefix.is_empty() {
-                k.clone()
-            } else {
-                format!("{prefix}_{k}")
-            };
+            if matches!(v, serde_json::Value::Null | serde_json::Value::Array(_)) {
+                continue;
+            }
+            // `bytes.TrimSpace` per part. Rust's `str::trim` and Go's
+            // `unicode.IsSpace` are both the Unicode `White_Space`
+            // property, so the trimmed part is the reference's.
+            let part = k.trim();
+            if part.is_empty() {
+                // The reference's `buildSanitizedPrefixFromBuffer`
+                // `continue`s on a part that trims empty, so it
+                // contributes neither characters NOR a separator.
+                match v {
+                    // Transparent: the child is named by the prefix alone.
+                    serde_json::Value::Object(_) => {
+                        flatten_json(prefix, Depth::Nested, v, labels, dirty, budget)?;
+                    }
+                    // At depth 0 the reference's `parseLabelValue` takes
+                    // `sanitizeLabelKey(key, true) == ""` as `!ok` and
+                    // DROPS the field; deeper, the key is the prefix —
+                    // and a collision rename still suffixes the RAW
+                    // (empty-trimming) part, so it stops vanishing
+                    // (container cell: base `x`, `{"x":{"":1}}` →
+                    // `x__extracted`).
+                    scalar if !prefix.is_empty() => {
+                        budget.charge_key(prefix.len())?;
+                        insert_flattened(
+                            labels,
+                            dirty,
+                            prefix.to_string(),
+                            prefix,
+                            k,
+                            Depth::Nested,
+                            json_scalar_to_string(scalar),
+                            budget,
+                        )?;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let len = sanitized_part_len(prefix, part);
+            budget.charge_key(len)?;
+            let mut key = String::with_capacity(len);
+            push_sanitized_part(&mut key, prefix, part);
+            debug_assert_eq!(
+                key.len(),
+                len,
+                "the charged length must be the built length"
+            );
             match v {
-                serde_json::Value::Object(_) => flatten_json(&key, v, out),
-                serde_json::Value::Null | serde_json::Value::Array(_) => {}
-                scalar => out.push((key, json_scalar_to_string(scalar))),
+                serde_json::Value::Object(_) => {
+                    flatten_json(&key, Depth::Nested, v, labels, dirty, budget)?;
+                }
+                scalar => insert_flattened(
+                    labels,
+                    dirty,
+                    key,
+                    prefix,
+                    k,
+                    depth,
+                    json_scalar_to_string(scalar),
+                    budget,
+                )?,
             }
         }
     }
+    Ok(())
+}
+
+/// Which of the reference's two key-construction paths a leaf is on:
+/// `parseLabelValue`'s empty-prefix-buffer branch for a top-level field
+/// (`parser.go:139`) versus the buffer-built branch for anything deeper
+/// (`parser.go:171`). NOT derivable from `prefix.is_empty()`: a nested
+/// field whose ancestor parts all trimmed empty (`{"  ":{" b ":1}}`)
+/// has an empty prefix but sits on the nested branch, and its collision
+/// rename follows the nested rule (container cell: base `b` →
+/// `b__extracted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Depth {
+    Root,
+    Nested,
+}
+
+/// The reference's `_extracted` collision suffix (`parser.go:25`).
+const DUPLICATE_SUFFIX: &str = "_extracted";
+
+/// Inserts one flattened leaf, applying the reference's depth-aware
+/// collision rename (see [`flatten_json`]'s doc for the two orders and
+/// the container cells pinning them). The collision check runs against
+/// the EVOLVING label set — base labels, structured metadata (merged
+/// upstream under their post-rename names, which is where the
+/// reference's `BaseHas || HasInCategory(StructuredMetadataLabel)`
+/// check reads them too) and every label set earlier in the pipeline,
+/// including this walk's own earlier leaves. Like `add_extracted`, a
+/// rename that lands on a name already present OVERWRITES that slot,
+/// and every leaf marks the builder dirty (`labels.go:216-222`).
+///
+/// The renamed key is a fresh exactly-reserved allocation charged
+/// before it is built — the unsuffixed `key` it replaces was already
+/// charged when built, which the budget's sentence covers (every key
+/// string the flatten allocates, not every key it emits).
+#[allow(clippy::too_many_arguments)]
+fn insert_flattened<'a>(
+    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    dirty: &mut bool,
+    key: String,
+    prefix: &str,
+    raw_part: &str,
+    depth: Depth,
+    value: String,
+    budget: &JsonKeyBudget,
+) -> Result<(), RowBudgetExceeded> {
+    *dirty = true;
+    if get_label(labels, &key).is_none() {
+        labels.push((Cow::Owned(key), Cow::Owned(value)));
+        return Ok(());
+    }
+    let renamed = match depth {
+        // Top level: suffix the SANITIZED key (`parser.go:152-153`).
+        Depth::Root => {
+            let len = key.len() + DUPLICATE_SUFFIX.len();
+            budget.charge_key(len)?;
+            let mut s = String::with_capacity(len);
+            s.push_str(&key);
+            s.push_str(DUPLICATE_SUFFIX);
+            s
+        }
+        // Nested: suffix the RAW final part and rebuild the sanitized
+        // path (`parser.go:183-187`).
+        Depth::Nested => {
+            let len = suffixed_part_len(prefix, raw_part);
+            budget.charge_key(len)?;
+            let mut s = String::with_capacity(len);
+            push_suffixed_part(&mut s, prefix, raw_part);
+            debug_assert_eq!(s.len(), len, "the charged length must be the built length");
+            s
+        }
+    };
+    set_label(labels, Cow::Owned(renamed), Cow::Owned(value));
+    Ok(())
+}
+
+/// Whether `part` passes through the reference's sanitizer byte for
+/// byte — the memcpy fast path, and the reason the char-wise walk below
+/// costs nothing on ordinary keys.
+fn is_clean_label_part(part: &str) -> bool {
+    part.as_bytes()
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// The byte length [`push_sanitized_part`] will write, computed without
+/// allocating so the ledger can charge first.
+///
+/// Every rune the sanitizer rejects becomes exactly ONE `_`, so the
+/// output length is the RUNE count of `part` (its byte length when the
+/// part is clean), plus the `_` separator when `prefix` is non-empty,
+/// plus the leading `_` the reference adds for a digit-initial part when
+/// nothing has been emitted yet.
+fn sanitized_part_len(prefix: &str, part: &str) -> usize {
+    let body = if is_clean_label_part(part) {
+        part.len()
+    } else {
+        part.chars().count()
+    };
+    let separator = usize::from(!prefix.is_empty());
+    let digit_guard =
+        usize::from(prefix.is_empty() && part.as_bytes().first().is_some_and(u8::is_ascii_digit));
+    prefix.len() + separator + digit_guard + body
+}
+
+/// Appends `prefix` + `_` + sanitized `part` — the reference's
+/// `buildSanitizedPrefixFromBuffer`/`appendSanitized` pair, with the
+/// separator and the digit guard keyed on whether anything has been
+/// emitted yet (`len(to) == 0` there, `prefix.is_empty()` here).
+///
+/// `part` must already be trimmed and non-empty (the caller's
+/// `continue` handles the other case).
+fn push_sanitized_part(out: &mut String, prefix: &str, part: &str) {
+    if prefix.is_empty() {
+        if part.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            out.push('_');
+        }
+    } else {
+        out.push_str(prefix);
+        out.push('_');
+    }
+    if is_clean_label_part(part) {
+        out.push_str(part);
+        return;
+    }
+    for c in part.chars() {
+        out.push(if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        });
+    }
+}
+
+/// The byte length [`push_suffixed_part`] will write, computed without
+/// allocating so the ledger can charge first. The suffixed part is
+/// `raw_part` + `_extracted` put through the same trim + rune map as any
+/// other part; since the suffix ends in a letter, `TrimSpace(raw +
+/// suffix)` strips only `raw_part`'s LEADING whitespace — its trailing
+/// whitespace is now interior and counts one `_` per rune, and a part
+/// that trimmed empty contributes exactly `_extracted`.
+fn suffixed_part_len(prefix: &str, raw_part: &str) -> usize {
+    let part = raw_part.trim_start();
+    let body = if is_clean_label_part(part) {
+        part.len()
+    } else {
+        part.chars().count()
+    };
+    let separator = usize::from(!prefix.is_empty());
+    let digit_guard =
+        usize::from(prefix.is_empty() && part.as_bytes().first().is_some_and(u8::is_ascii_digit));
+    prefix.len() + separator + digit_guard + body + DUPLICATE_SUFFIX.len()
+}
+
+/// Appends `prefix` + `_` + sanitized (`raw_part` + `_extracted`) — the
+/// reference's nested collision rebuild: `parseLabelValue` replaces the
+/// final prefix-buffer entry with the RAW key plus `duplicateSuffix`
+/// (`parser.go:183-187`) and reruns `buildSanitizedPrefixFromBuffer`,
+/// so the separator and the digit guard key on whether anything has
+/// been emitted yet, exactly as in [`push_sanitized_part`] — but over
+/// the SUFFIXED part, which is never empty even when `raw_part` trims
+/// empty.
+fn push_suffixed_part(out: &mut String, prefix: &str, raw_part: &str) {
+    let part = raw_part.trim_start();
+    if prefix.is_empty() {
+        if part.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            out.push('_');
+        }
+    } else {
+        out.push_str(prefix);
+        out.push('_');
+    }
+    if is_clean_label_part(part) {
+        out.push_str(part);
+    } else {
+        for c in part.chars() {
+            out.push(if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            });
+        }
+    }
+    out.push_str(DUPLICATE_SUFFIX);
 }
 
 fn lookup_json_path<'v>(

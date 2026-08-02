@@ -3597,6 +3597,14 @@ mod tests {
                 pulsus_read::logql::MetricNode::Variants { .. } => {
                     panic!("no differential fixture declares variants (issue #221)")
                 }
+                // `label_replace(...)` (issue #276): the engine's exact
+                // post-fetch transform, so a future fixture case replays
+                // hermetically like every other combinator.
+                pulsus_read::logql::MetricNode::LabelReplace { spec, .. } => {
+                    let inner = vals.pop().expect("post-order pushes inner");
+                    pulsus_read::logql::apply_label_replace(inner, spec)
+                        .expect("a differential fixture is far below MAX_POST_AGG_BYTES")
+                }
             };
             vals.push(v);
         }

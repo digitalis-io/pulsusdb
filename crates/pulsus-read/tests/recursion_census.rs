@@ -353,18 +353,20 @@ fn check_a_and_b_the_slot_census_matches_the_pinned_inventory() {
          a recursive walk: {unconverted:#?}"
     );
 
-    // 12 SLOTS across 10 declaration LINES — the post-Wave-2 inventory:
-    // SCC-1 `LabelFilterExpr` 4 slots / 2 lines, SCC-2 `MetricExpr` +
-    // `VariantsExpr` 5 / 5, SCC-3 `MetricNode` 3 / 3. SCC-4's 4 slots
-    // and 2 lines ceased to exist with the flattening.
+    // 14 SLOTS across 12 declaration LINES — the post-Wave-2 inventory
+    // plus issue #276's `label_replace`: SCC-1 `LabelFilterExpr` 4 slots
+    // / 2 lines, SCC-2 `MetricExpr` + `VariantsExpr` 6 / 6
+    // (`MetricExpr::LabelReplace.inner` joined with #276), SCC-3
+    // `MetricNode` 4 / 4 (`MetricNode::LabelReplace.inner` likewise).
+    // SCC-4's 4 slots and 2 lines ceased to exist with the flattening.
     let lines: BTreeSet<(&str, usize)> = slots.iter().map(|s| (s.file.as_str(), s.line)).collect();
-    assert_eq!(slots.len(), 12, "12 SLOTS (slots, not lines): {slots:#?}");
-    assert_eq!(lines.len(), 10, "10 declaration LINES (lines, not slots)");
+    assert_eq!(slots.len(), 14, "14 SLOTS (slots, not lines): {slots:#?}");
+    assert_eq!(lines.len(), 12, "12 declaration LINES (lines, not slots)");
     let by_decl = |d: &str| slots.iter().filter(|s| s.decl == d).count();
     assert_eq!(by_decl("LabelFilterExpr"), 4);
-    assert_eq!(by_decl("MetricExpr"), 4);
+    assert_eq!(by_decl("MetricExpr"), 5);
     assert_eq!(by_decl("VariantsExpr"), 1);
-    assert_eq!(by_decl("MetricNode"), 3);
+    assert_eq!(by_decl("MetricNode"), 4);
 }
 
 // ---------------------------------------------------------------------

@@ -73,12 +73,13 @@ use pulsus_logql::{BinOp, Grouping, GroupingKind, MatchGroup, VectorAggOp, Vecto
 use pulsus_read::logql::MAX_CLIENT_AGG_BUCKETS;
 use pulsus_read::logql::plan::VectorAggSpec;
 use pulsus_read::logql::{
-    B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
+    B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm, LabelReplaceSpec,
     MAX_POST_AGG_BYTES, MatrixSeries, QueryResult, StageInput, VectorSample, W_APPROX_TOPK,
     W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT, W_SERIES, W_STAGE_SERIES, apply_vector_aggs,
     apply_vector_aggs_capped, binary_peak_bytes, binary_peak_bytes_without, combine_binary,
-    combine_binary_capped, group_name_bytes, include_bytes, leaf_min_entry_bytes, measure_matrix,
-    measure_vector, post_agg_peak_bytes, post_agg_peak_bytes_without,
+    combine_binary_capped, group_name_bytes, include_bytes, label_replace_peak_bytes,
+    leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
+    post_agg_peak_bytes_without,
 };
 use pulsus_read::logql::{Direction, PlanCtx, QueryParams, QuerySpec, ReadError, TooBroadReason};
 use pulsus_read::logql::{MAX_CLIENT_AGG_GROUP_BYTES, MAX_METRIC_RESULT_POINTS};
@@ -3487,11 +3488,49 @@ fn the_feasible_region_operands_are_read_from_the_shipped_constants() {
         2 * (MAX_CLIENT_AGG_BUCKETS + 1),
         "the local grid-point ceiling must track the shipped fence"
     );
-    // Every nesting level costs at least `sum(` in the query text, so the
-    // region's stage operand is `min(MAX_DEPTH, Q/4)` read from the two
-    // constants rather than a literal.
+    // Every nesting level costs at least `sum(` (4 bytes) of query
+    // text, so the region's stage operand is `min(MAX_DEPTH, Q/4)`.
+    // Each term is exercised WHERE IT BINDS (fix round 5's `[medium]`:
+    // the former `max_stages(q, 64) == 64.min(q / 4)` restated the
+    // function body at a point where MAX_DEPTH dominates — `q/4 =
+    // 32 768` and `q/8 = 16 384` both clamp to 64 — so a `/ 8` mutant
+    // stayed green; a gate must have an input at which the guarded
+    // thing changing gives a different answer).
     let q = pulsus_logql::MAX_QUERY_BYTES as u64;
-    assert_eq!(max_stages(q, 64), 64.min(q / 4));
+    // Depth ceiling out of the way -> the DIVISOR decides, at the real
+    // shipped `q`: 131 072 / 4 nesting levels. A `/ 8` body answers
+    // 16 384 here (tripped for real, fix round 5).
+    assert_eq!(max_stages(q, u64::MAX), 32_768, "Q / 4 where Q binds");
+    // Divisor out of the way -> the DEPTH ceiling decides.
+    assert_eq!(max_stages(q, 64), 64, "MAX_DEPTH where it binds");
+
+    // The derivation's NON-AMPLIFYING corner is genuinely the zero
+    // corner, gated on the BUILT values rather than the constructors'
+    // word (fix round 5 re-examination: a corner that silently carried
+    // amplifier bytes would shift the X baseline and the O-threshold
+    // brackets EQUALLY, so the bracket tests alone cannot detect it —
+    // the same same-shift blindness the divisor gate had).
+    let stages = max_stages(q, 64) as usize;
+    assert_eq!(
+        group_name_bytes(&corner_chain(0, stages)),
+        0,
+        "the chain corner must carry zero by-name bytes"
+    );
+    assert_eq!(
+        include_bytes(Some(&corner_matching(0)), BinOp::Add, &corner_operand(1)),
+        0,
+        "the binary corner must carry zero include bytes"
+    );
+    let l0 = lr_template_of_len(0);
+    assert_eq!(
+        l0.dst.len() + l0.replacement.len(),
+        0,
+        "the label_replace corner must carry a zero-length template"
+    );
+    assert!(
+        !l0.replacement.contains('$'),
+        "the label_replace corner must carry no `$` reference"
+    );
 }
 
 /// **The cap is derived, and only the safety direction gates.** There is
@@ -3650,6 +3689,107 @@ fn o6_and_o7_are_numbers_that_bound_where_refusal_is_possible() {
     }
 }
 
+/// O8's derived numbers (issue #276 fix round 2): the `label_replace`
+/// TEMPLATE threshold, in O6's vocabulary. `L = dst.len() +
+/// replacement.len() + #'$' × max_value_bytes` is the per-series
+/// template length `label_replace_peak_bytes` prices at `2 ×
+/// W_LABEL_BYTE × L × N` exactly, so the smallest refusable `L` at each
+/// `N` is `(CAP − X_lr(N)) / (2 × W_LABEL_BYTE × N) + 1`.
+struct O8 {
+    /// `max_N X_lr(N)` at the non-amplifying template corner (`L = 0`).
+    x_lr: u64,
+    x_lr_argmax: u64,
+    /// The smallest `L` anywhere in `D` at which refusal is possible.
+    l_min: Option<u64>,
+    l_min_argmin: u64,
+}
+
+fn derive_o8(cap: u64) -> O8 {
+    let l0 = lr_template_of_len(0);
+    let mut o = O8 {
+        x_lr: 0,
+        x_lr_argmax: 1,
+        l_min: None,
+        l_min_argmin: 0,
+    };
+    for n in 1..=n_max() {
+        let v = label_replace_peak_bytes(&corner_operand(n), &l0);
+        if v > o.x_lr {
+            o.x_lr = v;
+            o.x_lr_argmax = n;
+        }
+        if v <= cap {
+            let head = (cap - v) / (2 * W_LABEL_BYTE).saturating_mul(n) + 1;
+            if o.l_min.is_none_or(|cur| head < cur) {
+                o.l_min = Some(head);
+                o.l_min_argmin = n;
+            }
+        }
+    }
+    o
+}
+
+/// A `label_replace` spec whose template length `L` is exactly `l`: an
+/// empty destination and a `$`-free replacement of `l` bytes. The model
+/// reads only the LENGTHS and the `$` count, so this stands for every
+/// spec of that `L`.
+fn lr_template_of_len(l: usize) -> LabelReplaceSpec {
+    LabelReplaceSpec::compile("", &"r".repeat(l), "s", ".*").expect("a $-free template compiles")
+}
+
+/// O8 — `label_replace`'s template amplification, gated in O6's idiom
+/// (issue #276 fix round 2, which found the published guarantee FALSE
+/// as previously worded: the `2·per_series·series` term scales with a
+/// quantity the ceiling's generator never varied). Three claims, each
+/// the mechanism behind one sentence of `MAX_POST_AGG_BYTES`' doc:
+/// at `L = 0` the WHOLE region is admitted (the guarantee's third
+/// clause); strictly below `L_MIN` refusal is impossible anywhere in
+/// `D`; at `L_MIN` it is possible. Unlike O6/O7 this funnel is WIRED
+/// (`apply_label_replace` refuses live), so the divergence carries a
+/// ledger row now: `label-replace-template-amplification`.
+#[test]
+fn o8_the_label_replace_template_threshold_bounds_where_refusal_is_possible() {
+    let o = derive_o8(MAX_POST_AGG_BYTES);
+    assert!(
+        o.x_lr <= MAX_POST_AGG_BYTES,
+        "the guarantee's third clause: a template-free label_replace over every \
+         client-leaf-sourced input must be admitted (X_lr = {}, argmax N = {})",
+        o.x_lr,
+        o.x_lr_argmax
+    );
+    let l_min = o.l_min.expect("an empty domain D — see O6");
+    let at = lr_template_of_len(l_min as usize);
+    let below = lr_template_of_len(l_min as usize - 1);
+    assert!(
+        label_replace_peak_bytes(&corner_operand(o.l_min_argmin), &at) > MAX_POST_AGG_BYTES,
+        "O8: a template of {l_min} bytes must be refusable at N = {}",
+        o.l_min_argmin
+    );
+    // Strictly below L_MIN, refusal is impossible ANYWHERE in D —
+    // enumerated over the whole domain, not sampled at its corners.
+    for n in 1..=n_max() {
+        assert!(
+            label_replace_peak_bytes(&corner_operand(n), &below) <= MAX_POST_AGG_BYTES,
+            "O8: refusal must be impossible below L_MIN = {l_min} at any series count (N = {n})"
+        );
+    }
+    // L is REACHABLE inside the query-text cap.
+    assert!(
+        l_min <= pulsus_logql::MAX_QUERY_BYTES as u64,
+        "O8: L_MIN = {l_min} must fit inside MAX_QUERY_BYTES"
+    );
+    // The published `L` includes the `$` gearing: one `$` prices the
+    // input's widest label VALUE per series, exactly.
+    let m = corner_operand(1);
+    let with_ref = LabelReplaceSpec::compile("", "$1", "s", "(.*)").expect("compiles");
+    let plain = lr_template_of_len(2);
+    assert_eq!(
+        label_replace_peak_bytes(&m, &with_ref) - label_replace_peak_bytes(&m, &plain),
+        2 * W_LABEL_BYTE * m.max_value_bytes(),
+        "each `$` must add max_value_bytes to L"
+    );
+}
+
 /// The same operand with a different longest label VALUE. Only
 /// [`include_bytes`] reads that field, so this changes the include
 /// amplifier's granularity and nothing else in the model.
@@ -3672,6 +3812,295 @@ fn include_matching_of_names(q: u64) -> VectorMatching {
         on: true,
         labels: vec!["id00".to_string()],
         group: Some(MatchGroup::Left((0..q).map(|_| "i".to_string()).collect())),
+    }
+}
+
+// =====================================================================
+// Fix round 3 (issue #276): the published figures are PINNED to the
+// derivation
+// =====================================================================
+
+/// The `///` doc block of `MAX_POST_AGG_BYTES`, read from the SOURCE.
+/// The published figures live in that prose and the derivation computes
+/// the same quantities; until fix round 3 nothing asserted the two
+/// equal, so the doc's `2 413` could drift to `2 414` with the suite
+/// green — two sources of truth, and O6/O7 had carried the identical
+/// gap since #236.
+fn max_post_agg_doc() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql/post_agg.rs");
+    let text = std::fs::read_to_string(&path).expect("read src/logql/post_agg.rs");
+    let end = text
+        .find("pub const MAX_POST_AGG_BYTES")
+        .expect("MAX_POST_AGG_BYTES exists");
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text[..end].lines().rev() {
+        let Some(rest) = line.trim_start().strip_prefix("///") else {
+            break;
+        };
+        lines.push(rest.strip_prefix(' ').unwrap_or(rest));
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
+/// The O8 row of the divergence ledger — the SAME figures are published
+/// there, so the same pins read it (a digit drifting in the ledger
+/// alone would be the identical hole one file over).
+fn ledger_o8_row() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/benchmarks/logs-differential-ledger.md");
+    let text = std::fs::read_to_string(&path).expect("read the divergence ledger");
+    let start = text
+        .find("### `label-replace-template-amplification`")
+        .expect("the O8 ledger row exists");
+    let rest = &text[start..];
+    let end = rest[4..].find("\n## ").map(|i| i + 4).unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// The section of `doc` under `header`, ending at the next `# ` header.
+fn doc_section<'a>(doc: &'a str, header: &str) -> &'a str {
+    let start = doc
+        .find(header)
+        .unwrap_or_else(|| panic!("doc section `{header}` is missing"));
+    let rest = &doc[start + header.len()..];
+    match rest.find("\n# ") {
+        Some(end) => &rest[..end],
+        None => rest,
+    }
+}
+
+/// The first line of `scope` containing `key`.
+fn doc_line<'a>(scope: &'a str, key: &str) -> &'a str {
+    scope
+        .lines()
+        .find(|l| l.contains(key))
+        .unwrap_or_else(|| panic!("no published line contains `{key}`"))
+}
+
+/// The first published figure after `key`: skips to the first ASCII
+/// digit, then reads digit groups joined by single spaces (the prose
+/// writes `2 847 288 941`).
+fn figure(scope: &str, key: &str) -> u64 {
+    let at = scope
+        .find(key)
+        .unwrap_or_else(|| panic!("`{key}` is not in the published text"));
+    let bytes = &scope.as_bytes()[at + key.len()..];
+    let mut i = 0;
+    while i < bytes.len() && !bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut digits = String::new();
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            digits.push(bytes[i] as char);
+            i += 1;
+        } else if bytes[i] == b' ' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            i += 1; // a thousands separator inside one figure
+        } else {
+            break;
+        }
+    }
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("no figure after `{key}`"))
+}
+
+/// A figure in the prose's thousands-spaced rendering (`2 413`).
+fn spaced(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Fix round 3's `[high]` (issue #276): every published O6/O7/O8 figure
+/// — value AND argmin/argmax where the prose states one — plus the
+/// generator's numbers block and O8's ledger row, asserted equal to
+/// what the derivation computes. The figures are read OUT OF the
+/// shipped prose, so a mutant changing any published digit reddens
+/// here (verified by mutation for O6, O7, O8 and the ledger row).
+///
+/// Fix round 4 extended it to every REMAINING figure: the
+/// `MAX_QUERY_BYTES` cross-references (pinned against the constant
+/// itself, never a retyped number), the cap's GiB restatements, the
+/// prose margin factor, the tightness ratio's VALUE, and a
+/// stated-exactly-once pin on each threshold — a figure published twice
+/// drifts eventually, and a drifted second copy beside a pinned first
+/// would make the prose contradict itself while this test reports the
+/// figure checked.
+///
+/// This does not conflict with "deliberately not pinned from above":
+/// that note bars a TIGHTNESS assertion on the cap (`MAX_POST_AGG_BYTES
+/// < k x max(X)`), which would punish a memory improvement. These are
+/// EQUALITIES on the published figures: a coefficient change moves
+/// prose and derivation in the same commit, and regeneration stays one
+/// command (`zz_witness_report`). The tightness ratio follows the same
+/// split: its printed VALUE is pinned, no bound on it is gated.
+#[test]
+fn the_published_figures_are_pinned_to_the_derivation() {
+    let doc = max_post_agg_doc();
+    let d = derive(Some(MAX_POST_AGG_BYTES));
+    let o8 = derive_o8(MAX_POST_AGG_BYTES);
+
+    // -- the generator's numbers block --
+    let block = doc_section(&doc, "# The generator's numbers");
+    assert_eq!(figure(block, "s_min"), d.s_min, "published s_min");
+    assert_eq!(figure(block, "N_max"), d.n_max, "published N_max");
+    assert_eq!(figure(block, "stages"), d.stages, "published stages");
+    for (key, value, argmax) in [
+        ("X_chain", d.x_chain, d.x_chain_argmax),
+        ("X_bin", d.x_bin, d.x_bin_argmax),
+        ("X_lr (L = 0)", o8.x_lr, o8.x_lr_argmax),
+    ] {
+        let line = doc_line(block, key);
+        assert_eq!(figure(line, key), value, "published {key}");
+        assert_eq!(figure(line, "argmax N ="), argmax, "published {key} argmax");
+    }
+    assert_eq!(
+        figure(block, "MAX_POST_AGG_BYTES ="),
+        MAX_POST_AGG_BYTES,
+        "published cap"
+    );
+
+    // -- O6 --
+    let o6 = doc_section(&doc, "# O6");
+    let a_min = d.a_min.expect("O6 threshold exists");
+    assert_eq!(figure(o6, "A_MIN ="), a_min, "published A_MIN");
+    assert_eq!(
+        figure(o6, "at `N ="),
+        d.a_min_argmin,
+        "published A_MIN argmin"
+    );
+    assert_eq!(
+        figure(o6, "A_NAME_MIN ="),
+        A_NAME_MIN,
+        "published A_NAME_MIN"
+    );
+    assert_eq!(
+        figure(o6, "at least"),
+        a_min.div_ceil(A_NAME_MIN),
+        "published one-character name count"
+    );
+
+    // -- O7 --
+    let o7 = doc_section(&doc, "# O7");
+    let amp_min = d.amp_min.expect("O7 threshold exists");
+    assert_eq!(figure(o7, "AMP_MIN ="), amp_min, "published AMP_MIN");
+    assert_eq!(
+        figure(o7, "N_many ="),
+        d.amp_min_argmin,
+        "published AMP_MIN argmin"
+    );
+
+    // -- O8, in the doc --
+    let o8s = doc_section(&doc, "# O8");
+    let l_min = o8.l_min.expect("O8 threshold exists");
+    let product_cap = MAX_POST_AGG_BYTES / (2 * W_LABEL_BYTE);
+    let crossing_at_n_max = product_cap / d.n_max + 1;
+    assert_eq!(figure(o8s, "L_MIN ="), l_min, "published L_MIN");
+    assert_eq!(
+        figure(o8s, "at `N ="),
+        o8.l_min_argmin,
+        "published L_MIN argmin"
+    );
+    assert_eq!(
+        figure(o8s, "W_LABEL_BYTE) ="),
+        product_cap,
+        "published amplifier-alone product cap"
+    );
+    assert_eq!(figure(o8s, "N_max ="), d.n_max, "published O8 N_max");
+    assert_eq!(
+        figure(o8s, "replacement of"),
+        crossing_at_n_max,
+        "published crossing at N_max"
+    );
+
+    // -- O8, in the divergence ledger --
+    let row = ledger_o8_row();
+    assert_eq!(figure(&row, "below `L ="), l_min, "ledger L_MIN");
+    assert_eq!(
+        figure(&row, "`L_MIN`, at `N ="),
+        o8.l_min_argmin,
+        "ledger L_MIN argmin"
+    );
+    assert_eq!(
+        figure(&row, "L × series >"),
+        product_cap,
+        "ledger product cap"
+    );
+    assert_eq!(
+        figure(&row, "replacement of"),
+        crossing_at_n_max,
+        "ledger crossing at N_max"
+    );
+    assert_eq!(figure(&row, "N_max ="), d.n_max, "ledger N_max");
+
+    // -- fix round 4: cross-referenced constants, restatements, the
+    // tightness ratio, and stated-exactly-once --
+
+    // `MAX_QUERY_BYTES` is a real constant; nothing may retype it.
+    let q = pulsus_logql::MAX_QUERY_BYTES as u64;
+    assert_eq!(figure(o6, "MAX_QUERY_BYTES ="), q, "O6 MAX_QUERY_BYTES");
+    assert_eq!(figure(o8s, "MAX_QUERY_BYTES ="), q, "O8 MAX_QUERY_BYTES");
+    assert_eq!(
+        figure(&row, "bounded only by the"),
+        q,
+        "ledger query-text cap"
+    );
+
+    // The cap's `(8 GiB)` restatements track the pinned byte figure.
+    let gib = MAX_POST_AGG_BYTES >> 30;
+    assert_eq!(
+        figure(doc_line(block, "MAX_POST_AGG_BYTES ="), "bytes"),
+        gib,
+        "published cap in GiB"
+    );
+    assert_eq!(
+        figure(&row, "MAX_POST_AGG_BYTES` ("),
+        gib,
+        "ledger cap in GiB"
+    );
+
+    // The prose margin factor is the ladders' WITNESS_MARGIN.
+    assert!(
+        doc.contains(&format!("the {WITNESS_MARGIN}x")),
+        "the doc's margin factor must be WITNESS_MARGIN = {WITNESS_MARGIN}"
+    );
+
+    // The tightness ratio's VALUE is pinned; no BOUND on it is gated —
+    // bounding it is exactly what "deliberately not pinned from above"
+    // forbids, because a memory improvement loosens it.
+    let published_ratio = doc_line(block, "tightness ratio")
+        .split('=')
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .expect("a tightness ratio figure");
+    let derived_ratio = format!(
+        "{:.4}",
+        MAX_POST_AGG_BYTES as f64 / d.x_chain.max(d.x_bin) as f64
+    );
+    assert_eq!(published_ratio, derived_ratio, "published tightness ratio");
+
+    // Each threshold is stated EXACTLY once per document (fix round 4's
+    // `[high]`: two second copies existed, and a drifted copy beside a
+    // pinned one makes the prose contradict itself while this test
+    // reports the figure checked).
+    for (scope, name, value) in [
+        (o6, "A_MIN in the O6 section", a_min),
+        (o8s, "L_MIN in the O8 section", l_min),
+        (row.as_str(), "L_MIN in the ledger row", l_min),
+    ] {
+        assert_eq!(
+            scope.matches(&spaced(value)).count(),
+            1,
+            "{name} must be published exactly once"
+        );
     }
 }
 
@@ -4097,6 +4526,25 @@ fn zz_witness_report() {
             <= (d.n_max as u128)
                 * (q as u128 + (q / 2) as u128 * MAX_CLIENT_AGG_GROUP_BYTES as u128)),
         d.amp_min
+    );
+    let o8 = derive_o8(d.cap);
+    println!(
+        "O8  X_lr(L = 0)      = {} bytes (argmax N = {})",
+        o8.x_lr, o8.x_lr_argmax
+    );
+    match o8.l_min {
+        Some(l) => println!(
+            "O8  L_MIN            = {l} template bytes (argmin N = {}); amplifier-alone \
+             product cap = {} byte-series",
+            o8.l_min_argmin,
+            d.cap / (2 * W_LABEL_BYTE)
+        ),
+        None => println!("O8  L_MIN            = None (domain D is empty)"),
+    }
+    println!(
+        "O8 reachability      = {} (L_MIN = {:?} vs Q = {q})",
+        o8.l_min.is_some_and(|l| l <= q),
+        o8.l_min
     );
     println!("\nwall time = {:?}", started.elapsed());
 }
@@ -4797,6 +5245,71 @@ mod region_census {
         (names, out)
     }
 
+    /// The names `mod.rs` re-exports from `post_agg` — the region's
+    /// public boundary, read off the `pub use post_agg::{…}` source so
+    /// the census cannot drift from it (fix round 1's `[low]`: a
+    /// hand-maintained list of what exists cannot detect a new export
+    /// nobody added to it).
+    pub fn post_agg_exports() -> BTreeSet<String> {
+        fn walk(tree: &syn::UseTree, in_post_agg: bool, out: &mut BTreeSet<String>) {
+            match tree {
+                syn::UseTree::Path(p) => {
+                    walk(&p.tree, in_post_agg || p.ident == "post_agg", out);
+                }
+                syn::UseTree::Group(g) => {
+                    for t in &g.items {
+                        walk(t, in_post_agg, out);
+                    }
+                }
+                // Outside a `post_agg::` prefix the name is another
+                // module's export and out of this census's scope.
+                syn::UseTree::Name(n) => {
+                    if in_post_agg {
+                        out.insert(n.ident.to_string());
+                    }
+                }
+                // A rename would hide the DEFINED name the call-graph
+                // resolves, so record the source ident, not the alias.
+                syn::UseTree::Rename(r) => {
+                    if in_post_agg {
+                        out.insert(r.ident.to_string());
+                    }
+                }
+                // A glob cannot be enumerated from the use tree alone —
+                // that takes name resolution this census does not have —
+                // and silently skipping it is exactly how an export
+                // would escape (fix round 2's `[low]`: the former
+                // `_ => {}` under-reported `pub use post_agg::*;`). A
+                // parser must reject what it does not understand,
+                // LOUDLY. The match is EXHAUSTIVE on purpose: a new
+                // `syn` use-tree form stops this compiling instead of
+                // falling through.
+                syn::UseTree::Glob(_) => panic!(
+                    "src/logql/mod.rs carries a glob re-export{} — the export census cannot \
+                     enumerate a glob; write the names out",
+                    if in_post_agg { " of post_agg::*" } else { "" }
+                ),
+            }
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql/mod.rs");
+        let text = std::fs::read_to_string(&path).expect("read src/logql/mod.rs");
+        let parsed = syn::parse_file(&text).expect("mod.rs parses as Rust");
+        let mut out = BTreeSet::new();
+        for item in &parsed.items {
+            if let syn::Item::Use(u) = item
+                && matches!(u.vis, syn::Visibility::Public(_))
+            {
+                walk(&u.tree, false, &mut out);
+            }
+        }
+        assert!(
+            out.contains("apply_vector_aggs"),
+            "no `pub use post_agg::{{…}}` block found in mod.rs — the boundary derivation is \
+             reading the wrong file: {out:?}"
+        );
+        out
+    }
+
     /// Free functions by name. A name defined twice is a loud failure:
     /// the closure would otherwise resolve to whichever came first.
     pub fn free_fns(all: &[FnInfo]) -> BTreeMap<String, FnInfo> {
@@ -4945,21 +5458,52 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
         })
         .map(|f| f.name.clone())
         .collect();
-    // Plus the region's PUBLIC boundary. These two mint indirectly
-    // (through their `_capped` seams), so the derived filter above cannot
-    // see them — and without them a `pub fn` that grew an allocation
-    // would sit outside every closure the census walks. `mod.rs` exports
-    // exactly these two, so the list is the API surface, not a guess.
-    for public in ["apply_vector_aggs", "combine_binary"] {
-        let f = free
-            .get(public)
-            .unwrap_or_else(|| panic!("`{public}` is no longer a free fn in src/logql"));
+    // Plus the region's PUBLIC boundary, DERIVED from `mod.rs`'s
+    // `pub use post_agg::{…}` block (fix round 1's `[low]`: the former
+    // hand list could not detect a new export nobody added to it). The
+    // uncapped wrappers mint INDIRECTLY (through their `_capped` seams),
+    // so the direct filter above cannot see them; here every exported
+    // free fn that transitively reaches a minter joins the roots.
+    // Coverage stated exactly: an export that neither mints nor
+    // delegates to one — today the measure/peak-bytes model helpers,
+    // which authorise no charge and are themselves callees of the
+    // minting seams — is walked only if the closure reaches it.
+    let reaches_a_minter: std::collections::BTreeSet<String> = {
+        let mut set: std::collections::BTreeSet<String> = roots.iter().cloned().collect();
+        loop {
+            let before = set.len();
+            for f in free.values() {
+                if !set.contains(&f.name)
+                    && f.callees
+                        .iter()
+                        .any(|c| set.contains(c.rsplit("::").next().unwrap_or(c)))
+                {
+                    set.insert(f.name.clone());
+                }
+            }
+            if set.len() == before {
+                break;
+            }
+        }
+        set
+    };
+    let public_roots: Vec<String> = region_census::post_agg_exports()
+        .into_iter()
+        .filter(|n| free.contains_key(n) && reaches_a_minter.contains(n))
+        .collect();
+    assert!(
+        public_roots.iter().any(|n| n == "apply_label_replace"),
+        "the derived public boundary lost a known transform — the mod.rs parse or the \
+         reaches-a-minter closure is wrong: {public_roots:?}"
+    );
+    for public in public_roots {
+        let f = &free[&public];
         assert!(
             !f.param_types.contains("Ledger"),
-            "`{public}` is the region's public entry point and must MINT the charge, never \
+            "`{public}` is a public entry point of the region and must MINT the charge, never \
              receive one"
         );
-        roots.push(public.to_string());
+        roots.push(public);
     }
     assert!(
         roots.len() >= 3,
@@ -5120,12 +5664,24 @@ fn the_token_taking_set_is_derived_from_the_call_graph() {
         "group_range",
         "instant_join",
         "map_samples",
+        // Issue #276: the label_replace collision merge — admits the
+        // relabeled operand (whose envelope is the measured input's)
+        // before its rebuilt containers allocate.
+        "merge_matrix_collisions",
         "select_k_instant",
         "select_k_range",
         "set_op_join",
         "sort_instant",
     ];
-    const EXPECT_ELEMENT: &[&str] = &["match_signature", "set_label_sorted", "sort_candidates"];
+    const EXPECT_ELEMENT: &[&str] = &[
+        "match_signature",
+        // Issue #276: one series' in-place `label_replace` rewrite; its
+        // expansion/insert allocations are priced per series by
+        // `label_replace_peak_bytes`.
+        "relabel",
+        "set_label_sorted",
+        "sort_candidates",
+    ];
 
     let mut got: Vec<&str> = obligated.iter().map(|m| m.name.as_str()).collect();
     got.sort_unstable();

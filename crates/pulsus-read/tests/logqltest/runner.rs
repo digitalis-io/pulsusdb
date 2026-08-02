@@ -45,9 +45,9 @@ use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, DetectedFieldOut, DetectedFieldsProbe, Direction, MatrixSeries,
-    MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, apply_vector_aggs,
-    combine_binary, ensure_result_series, materialize_vector_lit, plan, run_client_agg_rows_folded,
-    run_variants_rows,
+    MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec,
+    apply_label_replace, apply_vector_aggs, combine_binary, ensure_result_series,
+    materialize_vector_lit, plan, run_client_agg_rows_folded, run_variants_rows,
 };
 
 /// A sorted label set.
@@ -1024,6 +1024,12 @@ pub fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String
             MetricNode::VectorAgg { aggs, .. } => {
                 let inner = vals.pop().expect("post-order pushes inner");
                 apply_vector_aggs(inner, aggs).map_err(|e| e.to_string())?
+            }
+            // `label_replace(...)` (issue #276): the engine's exact
+            // post-fetch transform, charging path included.
+            MetricNode::LabelReplace { spec, .. } => {
+                let inner = vals.pop().expect("post-order pushes inner");
+                apply_label_replace(inner, spec).map_err(|e| e.to_string())?
             }
             // `variants(...) of (...)` (issue #221): the pure twin of the
             // live engine's fan-out — the SAME `VariantArena` +

@@ -296,6 +296,21 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-logql --test logql_differential
 
+      # Issue #287 (fix round 3): the `| json` key-name capture drift leg.
+      # Re-pushes every probe of tests/fixtures/json_key_sanitization/
+      # capture.json to this job's reference container and asserts the
+      # fresh responses derive the same labels as the committed artifact,
+      # so the artifact provably stays a capture, not a hand-written
+      # expectation (regenerating it is separately gated on a container
+      # reporting exactly the pinned v3.7.4; this leg deliberately also
+      # cross-checks that capture against the digest-pinned v3.7.3
+      # oracle). Runs after the syntax leg so the pushed streams cannot
+      # precede it.
+      - name: LogQL json key capture drift leg (issue #287)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_json_key_sanitization
+
       - name: Stop LogQL differential oracle
         if: always()
         run: docker rm -f pulsus-logql-diff || true
@@ -758,6 +773,20 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run logs_tail_live -p pulsus-server --test logs_tail_live
+
+      # Issue #311: the config→wire seam for `reader.template_timezone`.
+      # Boots the real binary three times against one seeded row — with
+      # PULSUS_TEMPLATE_TIMEZONE=Pacific/Kiritimati (UTC+14, a whole-day
+      # shift), without it, and configured again — and asserts the
+      # `| line_format "{{ __timestamp__ }}"` response text. The hermetic
+      # suites cannot see this: removing the install call from serve::run
+      # leaves every one of them green. Ports 31170-31172. Reuses this
+      # job's ClickHouse 24.8 container.
+      - name: Live LogQL template timezone suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run template_timezone_live -p pulsus-server --test template_timezone_live
 
       # Issue #74: /api/logs/v1/stats — seeded exact counters (chunks =
       # the adjudicated partition-count proxy), the Tier-1 rollup-vs-raw

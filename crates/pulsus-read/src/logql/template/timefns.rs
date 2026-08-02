@@ -8,11 +8,14 @@
 //! tzdata skew vs the reference's Go 1.26.5 database is a ledgered
 //! residual — plan v1 §8.3).
 //!
-//! `TemplateEnv` carries what Go resolves from the process: the `Local`
-//! zone and the wall clock (`now_ns` injectable for tests, per plan v1
-//! §5). On the stock reference container `initLocal` degenerates
-//! `Local` to the all-nil "UTC" form (`local: None` here) — the
-//! PROVENANCE capture precondition.
+//! `TemplateEnv` carries the `Local` zone and the wall clock (`now_ns`
+//! injectable for tests, per plan v1 §5). The reference resolves the zone
+//! from the *process* (`initLocal`: `$TZ`, else `/etc/localtime`);
+//! PulsusDB resolves it from *server configuration* instead (issue #311 —
+//! see [`super::install_template_timezone`]), so nothing here reads the
+//! host environment. The default zone, `UTC`, is Go's degenerate all-nil
+//! `Local` form (`local: None` here) — the PROVENANCE capture
+//! precondition, and what the stock reference container also produces.
 
 use std::str::FromStr;
 
@@ -33,60 +36,40 @@ pub const MIN_DURATION: i64 = i64::MIN;
 pub const MAX_DURATION: i64 = i64::MAX;
 
 /// The execution environment (plan v1 §5). `local`: `None` = the
-/// degenerate "UTC" Local (no TZ, the stock container); `Some(tz)` = a
-/// TZ-resolved Local whose location NAME is "Local" (Go `initLocal`).
+/// degenerate "UTC" Local (Go's all-nil form); `Some(tz)` = a resolved
+/// Local whose location NAME is the zone's own IANA name.
 #[derive(Debug, Clone, Default)]
 pub struct TemplateEnv {
     pub local: Option<chrono_tz::Tz>,
-    /// What `time.Local.String()` reports (`initLocal`): the LOADED
-    /// zone name when `$TZ` named it, `"Local"` when it came from
-    /// `/etc/localtime`, `"UTC"` for the degenerate fallback. `None`
-    /// falls back to "UTC".
+    /// What `time.Local.String()` reports: the configured zone's IANA
+    /// name, matching the reference's `$TZ=<name>` branch (which keeps
+    /// the loaded zone's own name — only its `/etc/localtime` branch
+    /// renames the result to `"Local"`, and PulsusDB has no such
+    /// branch). `None` falls back to "UTC".
     pub local_name: Option<String>,
     /// Injectable wall clock for `now` (tests); `None` = system time.
     pub now_ns: Option<i64>,
 }
 
 impl TemplateEnv {
-    /// The process environment, matching a reference process on the
-    /// same host: `$TZ` resolves Local (unset/empty/"UTC" → the
-    /// degenerate UTC form; an unloadable name falls back to UTC, like
-    /// Go's `initLocal`).
-    pub fn process() -> Self {
-        match std::env::var("TZ") {
-            Ok(tz) => {
-                let name = tz.strip_prefix(':').unwrap_or(&tz);
-                if name.is_empty() || name == "UTC" {
-                    return TemplateEnv::default();
-                }
-                match chrono_tz::Tz::from_str(name) {
-                    // `$TZ=<name>` keeps the loaded zone's own name
-                    // (`initLocal` only renames the /etc/localtime path).
-                    Ok(tz) => TemplateEnv {
-                        local: Some(tz),
-                        local_name: Some(tz.name().to_string()),
-                        now_ns: None,
-                    },
-                    Err(_) => TemplateEnv::default(),
-                }
-            }
-            Err(_) => {
-                // No $TZ: Go consults /etc/localtime and names the
-                // result "Local".
-                if let Ok(target) = std::fs::read_link("/etc/localtime")
-                    && let Some(pos) = target.to_string_lossy().find("zoneinfo/")
-                {
-                    let name = target.to_string_lossy()[pos + "zoneinfo/".len()..].to_string();
-                    if let Ok(tz) = chrono_tz::Tz::from_str(&name) {
-                        return TemplateEnv {
-                            local: Some(tz),
-                            local_name: Some("Local".to_string()),
-                            now_ns: None,
-                        };
-                    }
-                }
-                TemplateEnv::default()
-            }
+    /// The environment for an explicitly chosen zone (issue #311): the
+    /// server-configured `reader.template_timezone`, never anything read
+    /// from the host.
+    ///
+    /// `UTC` maps to the all-nil degenerate `Local` Go itself produces
+    /// when no zone is configured, so the default deployment's rendered
+    /// output is byte-identical to what it was before the setting
+    /// existed. Every other zone keeps its own IANA name, matching the
+    /// reference's `$TZ=<name>` resolution — a fleet that configures its
+    /// zone gets exactly what the reference gave it.
+    pub fn for_timezone(tz: chrono_tz::Tz) -> Self {
+        if tz == chrono_tz::Tz::UTC {
+            return TemplateEnv::default();
+        }
+        TemplateEnv {
+            local: Some(tz),
+            local_name: Some(tz.name().to_string()),
+            now_ns: None,
         }
     }
 
@@ -574,8 +557,10 @@ pub fn is_dst(t: &GoTime, env: &TemplateEnv) -> bool {
 }
 
 /// `Location.String()` — what `$t.Location` prints. The degenerate
-/// Local prints "UTC"; a `$TZ`-loaded Local keeps the zone's own name;
-/// an `/etc/localtime` Local prints "Local" (`initLocal`).
+/// Local (the default, unconfigured zone) prints "UTC"; a configured
+/// Local keeps the zone's own IANA name, which is what the reference's
+/// `$TZ=<name>` branch also prints. Its `/etc/localtime` branch — the
+/// one that prints "Local" — has no counterpart here (issue #311).
 pub fn location_name(loc: &GoLoc, env: &TemplateEnv) -> String {
     match loc {
         GoLoc::Utc => "UTC".to_string(),

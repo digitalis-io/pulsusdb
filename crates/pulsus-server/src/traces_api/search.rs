@@ -171,6 +171,84 @@ mod tests {
         );
     }
 
+    // --- issue #326: the query-frontend validator's parse step ----------
+
+    /// The reference validates the `query` parameter on the search
+    /// pipeline even though its request parser never reads it as TraceQL
+    /// (`async_query_validator_middleware.go:49-55` vs
+    /// `pkg/api/http.go:180`). PulsusDB served this `200` before; it is a
+    /// `400` now, with the same envelope a malformed `q` produces.
+    ///
+    /// Reachable over the wire, unlike the issue #284 length cap: a
+    /// malformed expression is short, so `http::Uri`'s 65,534-byte
+    /// request-target limit (#296) never intercepts it.
+    #[tokio::test]
+    async fn a_malformed_query_parameter_is_400_bad_data_with_a_position() {
+        let (status, json) = run("query=%7B&start=1&end=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(json["position"], 1, "body {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("invalid TraceQL query: ")),
+            "the reference's wrapping, got {json}"
+        );
+    }
+
+    /// The rejection is about admission, not about routing: a `query`
+    /// that parses is accepted and the search still runs the time-only
+    /// `{}` (503 here only because no pool is configured). Were `query`
+    /// wrongly aliased to `q`, this would still be 503 — so the
+    /// not-an-alias half stays pinned by
+    /// `params::tests::a_malformed_search_query_parameter_is_rejected_though_it_never_runs`,
+    /// which asserts `q` is `None`.
+    #[tokio::test]
+    async fn a_parseable_query_parameter_is_admitted_and_the_search_still_runs() {
+        let (status, json) =
+            run("query=%7B%20resource.service.name%20%3D%20%22checkout%22%20%7D&start=1&end=2")
+                .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {json}");
+    }
+
+    /// DIVERGENCE PIN (issue #326). The reference's validator is
+    /// `ParseNoOptimizations` **and then** `traceql.Validate`
+    /// (`async_query_validator_middleware.go:49-52`). Only the parse half
+    /// is reproduced: PulsusDB's semantic rejections live in
+    /// `pulsus_read::plan_search`, which is route-specific — planning the
+    /// `query` parameter would reject `{} | rate()`, which the reference's
+    /// validator accepts.
+    ///
+    /// The contrast is the whole point, and it is why this test can fail:
+    /// ONE expression, a regex literal that does not compile
+    /// (`ast_validate.go:222-245` rejects it; the reference's own
+    /// middleware test pins that shape as `400`). As `q` — executed, so
+    /// planned — it is a `400` here. As `query` — validated only — it is
+    /// accepted, where the reference rejects it. A route-independent
+    /// validator would turn the second half RED and retire the
+    /// divergence note in `querytext.rs`.
+    #[tokio::test]
+    async fn a_query_parameter_failing_only_the_reference_semantic_validation_is_accepted() {
+        // `{ span.a =~ "[" }` — an unterminated character class.
+        const EXPR: &str = "%7B%20span.a%20%3D~%20%22%5B%22%20%7D";
+
+        let (status, json) = run(&format!("q={EXPR}&start=1&end=2")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("invalid regex")),
+            "the planner is what sees it, got {json}"
+        );
+
+        let (status, json) = run(&format!("query={EXPR}&start=1&end=2")).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "accepted today — the `traceql.Validate` half is not reproduced; body {json}"
+        );
+    }
+
     #[tokio::test]
     async fn a_well_formed_request_without_a_pool_is_503_unavailable() {
         let (status, json) = run("q=%7B%7D&start=1&end=2").await;

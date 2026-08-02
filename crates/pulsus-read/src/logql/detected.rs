@@ -33,7 +33,8 @@ use std::sync::LazyLock;
 use pulsus_logql::{ParserStage, Stage};
 
 use super::pipeline::{
-    CompiledPipeline, ERROR_DETAILS_LABEL, ERROR_LABEL, parse_bytes_value, parse_duration_seconds,
+    CompiledPipeline, ERROR_DETAILS_LABEL, ERROR_LABEL, RowBudgetExceeded, parse_bytes_value,
+    parse_duration_seconds,
 };
 
 /// One `/detected_labels` response entry: a kept stream-index key and its
@@ -401,24 +402,30 @@ static LOGFMT_PARSER: LazyLock<CompiledPipeline> = LazyLock::new(|| {
 /// cleared (issue #244 — no per-row owned `Vec<(String, String)>` is
 /// built; a slot `__error_details__` never leaks — an erroring parser is
 /// a failure wholesale).
+///
+/// A [`RowBudgetExceeded`] PROPAGATES rather than counting as "not this
+/// format" (issue #287). The json probe runs on every sampled line
+/// whether or not the user's query mentions `| json`, so it is the one
+/// place that pays the flatten unconditionally; swallowing its breach
+/// would fall through to logfmt and answer `/detected_fields` from
+/// logfmt's reading of a JSON line instead of refusing. The template
+/// budget stays unreachable here (the probe pipelines are bare parsers
+/// with no templates) — only the key budget can fire.
 pub(super) fn auto_parse_into<'l>(
     line: &'l str,
     out: &mut Vec<(Cow<'l, str>, Cow<'l, str>)>,
-) -> Option<&'static str> {
+) -> Result<Option<&'static str>, RowBudgetExceeded> {
     for (name, parser) in [("json", &*JSON_PARSER), ("logfmt", &*LOGFMT_PARSER)] {
-        // Auto-detection probes carry no row timestamp; the probe
-        // pipelines are bare parsers (no templates), so 0 is inert and a
-        // template render-budget breach is unreachable — a defensive Err
-        // maps to "not this format" (plan v1 §4: detected.rs passes 0).
-        let (kept, has_err) = parser
-            .run_into_reporting_err(line, &[], 0, out)
-            .unwrap_or((None, false));
+        // Auto-detection probes carry no row timestamp (plan v1 §4:
+        // detected.rs passes 0) — the probe pipelines are bare parsers,
+        // so `__timestamp__` is unreachable and 0 is inert.
+        let (kept, has_err) = parser.run_into_reporting_err(line, &[], 0, out)?;
         if kept.is_some() && !has_err {
-            return Some(name);
+            return Ok(Some(name));
         }
     }
     out.clear();
-    None
+    Ok(None)
 }
 
 /// AC 13's baseline ONLY (issue #244): the pre-#244 owned-return form of
@@ -463,7 +470,8 @@ mod tests {
     /// which the scratch-reuse refactor did not change.
     fn auto_parse(line: &str) -> Option<(&'static str, Vec<(String, String)>)> {
         let mut out = Vec::new();
-        let parser = auto_parse_into(line, &mut out)?;
+        let parser =
+            auto_parse_into(line, &mut out).expect("no budget breach in these fixtures")?;
         let pairs = out
             .into_iter()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))

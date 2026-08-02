@@ -112,6 +112,79 @@ pub type VectorAggSpec = (VectorAggOp, Option<Grouping>, Option<f64>);
 /// stays the sole producer of the OWNED [`VectorAggSpec`].
 type RawVectorAggSpec<'a> = (VectorAggOp, Option<&'a Grouping>, Option<&'a str>);
 
+/// The compiled `label_replace(...)` transform (issue #276), carried on
+/// [`MetricNode::LabelReplace`] and applied by
+/// [`super::post_agg::apply_label_replace`].
+///
+/// The regex is compiled ONCE, at plan time, with Loki's exact anchoring
+/// — `^(?:regex)$`, NO dot-all flag (v3.7.4 `pkg/logql/syntax/ast.go`
+/// `mustNewLabelReplaceExpr`; contrast Prometheus `label_replace`'s
+/// `^(?s:…)$`) — after the #317 RE2→Rust rewrite
+/// ([`pulsus_promql::re2_pattern_to_rust`]) so `\d`/`\w`/`\s` and the
+/// class-set constructs keep RE2's meaning in-engine. The pattern never
+/// reaches SQL: the transform runs over the already-evaluated result.
+#[derive(Debug, Clone)]
+pub struct LabelReplaceSpec {
+    pub dst: String,
+    pub replacement: String,
+    pub src: String,
+    /// The user's raw pattern — the `PartialEq` witness (`re` is derived
+    /// from it deterministically) and the `Display`/explain text.
+    pub regex: String,
+    re: regex::Regex,
+}
+
+impl LabelReplaceSpec {
+    /// Compiles the four raw `label_replace` arguments. An uncompilable
+    /// regex is the reference's parse-time 400, and — the issue #240
+    /// asymmetry, pinned as DELIBERATE — its message reports the
+    /// **wrapped** `^(?:…)$` form, because the reference compiles exactly
+    /// that string and surfaces the compiler's error verbatim
+    /// (live-probed, v3.7.4: `invalid regex in label_replace: error
+    /// parsing regexp: missing closing ): `^(?:()$``). Every other LogQL
+    /// site reports the USER's pattern via `pipeline::bad_regex` — this
+    /// constructor must NOT be "consistency fixed" to match them, and
+    /// deliberately does not route through that seam. (The error wording
+    /// after the prefix is rust-regex's, not Go's — the ledgered
+    /// `template-error-wording-residuals` class.)
+    pub fn compile(
+        dst: &str,
+        replacement: &str,
+        src: &str,
+        regex: &str,
+    ) -> Result<Self, ReadError> {
+        let translated = pulsus_promql::re2_pattern_to_rust(regex);
+        let re = regex::Regex::new(&format!("^(?:{translated})$")).map_err(|e| {
+            ReadError::PipelineInvalid {
+                reason: format!("invalid regex in label_replace: {e}"),
+            }
+        })?;
+        Ok(LabelReplaceSpec {
+            dst: dst.to_string(),
+            replacement: replacement.to_string(),
+            src: src.to_string(),
+            regex: regex.to_string(),
+            re,
+        })
+    }
+
+    /// The compiled, anchored matcher.
+    pub(in crate::logql) fn re(&self) -> &regex::Regex {
+        &self.re
+    }
+}
+
+/// `re` is a deterministic function of `regex`, so field equality over
+/// the four strings is full equality.
+impl PartialEq for LabelReplaceSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.dst == other.dst
+            && self.replacement == other.replacement
+            && self.src == other.src
+            && self.regex == other.regex
+    }
+}
+
 /// The rollup-vs-raw routing decision for one metric query, computed once
 /// in [`metric_plan`] and carried on both [`MetricPlan`] (for [`super::exec`]
 /// to act on) and [`super::explain::PlanExplain`] (for #13's
@@ -282,6 +355,13 @@ pub enum MetricNode {
         /// two.
         spec_bytes: u64,
     },
+    /// `label_replace(...)` (issue #276): a pure label transform over the
+    /// inner node's evaluated result — no scan of its own, SQL/pushdown
+    /// untouched.
+    LabelReplace {
+        spec: LabelReplaceSpec,
+        inner: walk::Child<MetricNode>,
+    },
 }
 
 impl MetricNode {
@@ -307,6 +387,9 @@ impl MetricNode {
             MetricNode::Binary { .. } => {}
             MetricNode::VectorAgg { .. } => {}
             MetricNode::Variants { scan, .. } => out.push(scan),
+            // A pure label transform: its leaves are its inner's, which
+            // the walk reaches through the child slot.
+            MetricNode::LabelReplace { .. } => {}
         });
     }
 
@@ -326,9 +409,9 @@ impl MetricNode {
                 ControlFlow::Break(())
             }
             MetricNode::Scalar(_) => ControlFlow::Continue(walk::Step::Descend),
-            MetricNode::Binary { .. } | MetricNode::VectorAgg { .. } => {
-                ControlFlow::Continue(walk::Step::Descend)
-            }
+            MetricNode::Binary { .. }
+            | MetricNode::VectorAgg { .. }
+            | MetricNode::LabelReplace { .. } => ControlFlow::Continue(walk::Step::Descend),
         })
         .is_some()
     }
@@ -410,6 +493,10 @@ impl walk::Scc for MetricNodeScc {
                 0 => Some(inner.peek()),
                 _ => None,
             },
+            MetricNode::LabelReplace { inner, .. } => match i {
+                0 => Some(inner.peek()),
+                _ => None,
+            },
         }
     }
 
@@ -456,12 +543,17 @@ impl walk::Scc for MetricNodeScc {
                     spec_bytes: bb,
                 },
             ) => asc == bsc && av == bv && ab == bb,
+            (
+                MetricNode::LabelReplace { spec: a, .. },
+                MetricNode::LabelReplace { spec: b, .. },
+            ) => a == b,
             (MetricNode::Leaf(_), _)
             | (MetricNode::Scalar(_), _)
             | (MetricNode::VectorLit { .. }, _)
             | (MetricNode::Binary { .. }, _)
             | (MetricNode::VectorAgg { .. }, _)
-            | (MetricNode::Variants { .. }, _) => false,
+            | (MetricNode::Variants { .. }, _)
+            | (MetricNode::LabelReplace { .. }, _) => false,
         }
     }
 
@@ -503,6 +595,10 @@ impl walk::Scc for MetricNodeScc {
                 variants: variants.clone(),
                 spec_bytes: *spec_bytes,
             },
+            MetricNode::LabelReplace { spec, .. } => MetricNode::LabelReplace {
+                spec: spec.clone(),
+                inner: walk::Child::new(drain_node(kids)),
+            },
         }
     }
 
@@ -519,6 +615,9 @@ impl walk::Scc for MetricNodeScc {
                 aggs.clear();
                 aggs.shrink_to_fit();
             }
+            // The spec's own fields drop shallowly with the emptied node
+            // (the `Leaf`/`Variants` precedent) — nothing to take.
+            MetricNode::LabelReplace { .. } => {}
         }
     }
 
@@ -534,6 +633,9 @@ impl walk::Scc for MetricNodeScc {
                 out.push(lhs.replace(mn_placeholder()));
             }
             MetricNode::VectorAgg { inner, .. } => {
+                out.push(inner.replace(mn_placeholder()));
+            }
+            MetricNode::LabelReplace { inner, .. } => {
                 out.push(inner.replace(mn_placeholder()));
             }
         }
@@ -685,6 +787,24 @@ impl fmt::Debug for MetricNode {
                     Ok(walk::Emit::Done)
                 }
             }
+            MetricNode::LabelReplace { spec, inner } => {
+                if step == mn_dbg_step::ENTER {
+                    walk::dbg_open_struct(f, "LabelReplace", alt, level)?;
+                    f.write_str("spec: ")?;
+                    walk::dbg_own(f, spec, alt, level + 1)?;
+                    walk::dbg_sep(f, alt, level)?;
+                    f.write_str("inner: ")?;
+                    Ok(walk::Emit::Descend {
+                        next_step: mn_dbg_step::AFTER_FIRST,
+                        child: inner.peek(),
+                        child_step: mn_dbg_step::ENTER,
+                        child_level: level + 1,
+                    })
+                } else {
+                    walk::dbg_close_struct(f, alt, level)?;
+                    Ok(walk::Emit::Done)
+                }
+            }
             MetricNode::Binary {
                 op,
                 return_bool,
@@ -813,6 +933,8 @@ pub(crate) enum PlanOp {
     },
     /// Consumes the one value its operand left.
     VectorAgg { aggs: Vec<VectorAggSpec> },
+    /// Consumes the one value its operand left (issue #276).
+    LabelReplace { spec: LabelReplaceSpec },
 }
 
 /// Plans a binary/literal metric expression into a [`MetricNode`] tree.
@@ -839,7 +961,7 @@ fn build_metric_node(
     let mut ops: Vec<PlanOp> = Vec::new();
     match emit_plan_ops(metric_expr, p, ctx, &mut ops) {
         Some(err) => Err(err),
-        None => Ok(fold_plan_ops(ops)),
+        None => fold_plan_ops(ops),
     }
 }
 
@@ -977,6 +1099,25 @@ fn emit_plan_ops(
                     }
                     Err(err) => ControlFlow::Break(err),
                 },
+                // `label_replace(...)` (issue #276): compile the regex
+                // here in the pre-order pass — the reference surfaces its
+                // parse-time regex error during validation, before the
+                // evaluator factory ever sees a scalar operand
+                // (live-probed ordering), and emission errors precede the
+                // fold's scalar-operand rejection the same way.
+                MetricExpr::LabelReplace {
+                    dst,
+                    replacement,
+                    src,
+                    regex,
+                    ..
+                } => match LabelReplaceSpec::compile(dst, replacement, src, regex) {
+                    Ok(spec) => {
+                        ops.push(PlanOp::LabelReplace { spec });
+                        ControlFlow::Continue(walk::Step::Descend)
+                    }
+                    Err(err) => ControlFlow::Break(err),
+                },
                 // Unreachable: every `Vector` returns above, before the
                 // chain flush.
                 MetricExpr::Vector { .. } => {
@@ -998,37 +1139,77 @@ fn emit_plan_ops(
 /// pushes one value), so it allocates ONCE and never reallocates; a
 /// three-op plan reserves three slots rather than a segmented stack's
 /// whole first chunk.
-fn fold_plan_ops(ops: Vec<PlanOp>) -> MetricNode {
-    let mut vals: Vec<MetricNode> = Vec::with_capacity(ops.len());
+///
+/// Fallible since issue #276: each value carries its series-typing bit
+/// (folded bottom-up in `O(ops)` total — never a per-node subtree walk),
+/// and `PlanOp::LabelReplace` over a scalar-typed operand is the ONE
+/// fold-time rejection. The reference 500s that operand (`unexpected
+/// expr type (*syntax.LiteralExpr) for Evaluator type
+/// (*logql.DefaultEvaluator)`, live-probed); PulsusDB keeps its
+/// consistent plan-time 400 — the ledgered
+/// `label-replace-scalar-operand-status` divergence, same class as
+/// `variants-nonconforming-shape-status`.
+fn fold_plan_ops(ops: Vec<PlanOp>) -> Result<MetricNode, ReadError> {
+    // `(node, produces_series)` — the bool mirrors
+    // `MetricNode::produces_series` incrementally: the `Node` ops are
+    // childless prebuilt subtrees (`Leaf`/`Scalar`/`VectorLit`/
+    // `Variants`), so their classification is O(1).
+    let mut vals: Vec<(MetricNode, bool)> = Vec::with_capacity(ops.len());
     for op in ops.into_iter().rev() {
         match op {
-            PlanOp::Node(node) => vals.push(node),
+            PlanOp::Node(node) => {
+                let series = !matches!(node, MetricNode::Scalar(_));
+                vals.push((node, series));
+            }
             PlanOp::Binary {
                 op,
                 return_bool,
                 matching,
             } => {
-                let lhs = pop_operand(&mut vals);
-                let rhs = pop_operand(&mut vals);
-                vals.push(MetricNode::Binary {
-                    op,
-                    return_bool,
-                    matching,
-                    lhs: walk::Child::new(lhs),
-                    rhs: walk::Child::new(rhs),
-                });
+                let (lhs, ls) = pop_operand(&mut vals);
+                let (rhs, rs) = pop_operand(&mut vals);
+                vals.push((
+                    MetricNode::Binary {
+                        op,
+                        return_bool,
+                        matching,
+                        lhs: walk::Child::new(lhs),
+                        rhs: walk::Child::new(rhs),
+                    },
+                    ls || rs,
+                ));
             }
             PlanOp::VectorAgg { aggs } => {
-                let inner = pop_operand(&mut vals);
-                vals.push(MetricNode::VectorAgg {
-                    aggs,
-                    inner: walk::Child::new(inner),
-                });
+                let (inner, series) = pop_operand(&mut vals);
+                vals.push((
+                    MetricNode::VectorAgg {
+                        aggs,
+                        inner: walk::Child::new(inner),
+                    },
+                    series,
+                ));
+            }
+            PlanOp::LabelReplace { spec } => {
+                let (inner, series) = pop_operand(&mut vals);
+                if !series {
+                    return Err(ReadError::PipelineInvalid {
+                        reason: "label_replace requires a vector operand, got a scalar \
+                                 expression"
+                            .to_string(),
+                    });
+                }
+                vals.push((
+                    MetricNode::LabelReplace {
+                        spec,
+                        inner: walk::Child::new(inner),
+                    },
+                    true,
+                ));
             }
         }
     }
     match vals.pop() {
-        Some(root) if vals.is_empty() => root,
+        Some((root, _)) if vals.is_empty() => Ok(root),
         // Unreachable by construction: every op pushes exactly one value
         // and consumes exactly the operands its emitting arm descended
         // into, so exactly one value survives. Not a `Drop` path, so a
@@ -1039,7 +1220,7 @@ fn fold_plan_ops(ops: Vec<PlanOp>) -> MetricNode {
 
 /// Pops one operand value off the fold's value stack.
 #[inline]
-fn pop_operand(vals: &mut Vec<MetricNode>) -> MetricNode {
+fn pop_operand(vals: &mut Vec<(MetricNode, bool)>) -> (MetricNode, bool) {
     match vals.pop() {
         Some(v) => v,
         // Unreachable: see `fold_plan_ops`.
@@ -2614,6 +2795,126 @@ mod tests {
         }
     }
 
+    // --- issue #276: `label_replace(...)` planning ---------------------
+
+    /// The #240 asymmetry, pinned as DELIBERATE: an uncompilable
+    /// `label_replace` regex reports the WRAPPED `^(?:…)$` form — the
+    /// reference compiles exactly that string and surfaces its compiler's
+    /// error verbatim (live-probed, v3.7.4: `invalid regex in
+    /// label_replace: error parsing regexp: missing closing ): `^(?:()$``)
+    /// — while every other LogQL site reports the USER's raw pattern via
+    /// `pipeline::bad_regex`. A "consistency fix" toward the raw pattern
+    /// here would be a NEW divergence. Wording after the prefix is
+    /// rust-regex's (the ledgered error-wording class); the STRUCTURE —
+    /// prefix + wrapped pattern — is the pinned reference fact.
+    #[test]
+    fn label_replace_bad_regex_reports_the_wrapped_form_not_the_users_pattern() {
+        match plan_at(
+            r#"label_replace(count_over_time({service_name="x"}[5m]), "d", "r", "s", "(")"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        ) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert!(
+                    reason.starts_with("invalid regex in label_replace: "),
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains("^(?:()$"),
+                    "must report the WRAPPED `^(?:…)$` form (issue #240 asymmetry): {reason}"
+                );
+                assert!(
+                    !reason.starts_with("bad regex: "),
+                    "must not route through the raw-pattern `bad_regex` seam: {reason}"
+                );
+            }
+            other => panic!("expected the wrapped-regex rejection, got {other:?}"),
+        }
+    }
+
+    /// A scalar-typed operand is a plan-time 400 (the reference 500s
+    /// `unexpected expr type (*syntax.LiteralExpr) …` — ledgered
+    /// `label-replace-scalar-operand-status`). Both the bare literal and
+    /// a folded literal-only arithmetic tree reject; a series-producing
+    /// operand anywhere in the tree (`vector(1) + 1`) plans.
+    #[test]
+    fn label_replace_over_a_scalar_typed_operand_is_rejected_at_plan_time() {
+        let instant = QuerySpec::Instant {
+            at_ns: 1_000_000_000_000,
+        };
+        for q in [
+            r#"label_replace(2, "d", "r", "s", ".*")"#,
+            r#"label_replace(1 + 1, "d", "r", "s", ".*")"#,
+        ] {
+            match plan_at(q, instant) {
+                Err(ReadError::PipelineInvalid { reason }) => assert_eq!(
+                    reason, "label_replace requires a vector operand, got a scalar expression",
+                    "{q}"
+                ),
+                other => panic!("{q}: expected the scalar-operand rejection, got {other:?}"),
+            }
+        }
+        assert!(
+            plan_at(
+                r#"label_replace(vector(1) + 1, "d", "r", "s", ".*")"#,
+                instant
+            )
+            .is_ok(),
+            "a series-producing operand must plan"
+        );
+    }
+
+    /// Emission errors precede the fold's scalar-operand rejection — the
+    /// reference's ordering (its parse-time regex error surfaces before
+    /// the evaluator factory sees the literal operand).
+    #[test]
+    fn label_replace_regex_error_wins_over_the_scalar_operand_error() {
+        match plan_at(
+            r#"label_replace(2, "d", "r", "s", "(")"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000_000,
+            },
+        ) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert!(
+                    reason.starts_with("invalid regex in label_replace: "),
+                    "the regex error must win: {reason}"
+                );
+            }
+            other => panic!("expected the regex rejection, got {other:?}"),
+        }
+    }
+
+    /// Plan shape: `label_replace` over a range aggregation routes to
+    /// `Plan::MetricBinary` with a `LabelReplace` node over an ordinary
+    /// leaf, and composes under a vector aggregation.
+    #[test]
+    fn label_replace_plans_to_a_label_replace_node_over_the_ordinary_leaf() {
+        let instant = QuerySpec::Instant {
+            at_ns: 1_000_000_000_000,
+        };
+        match plan_at(
+            r#"label_replace(count_over_time({service_name="x"}[5m]), "d", "r-$1", "s", "(.*)")"#,
+            instant,
+        ) {
+            Ok(Plan::MetricBinary(MetricNode::LabelReplace { ref spec, .. })) => {
+                assert_eq!(spec.dst, "d");
+                assert_eq!(spec.replacement, "r-$1");
+                assert_eq!(spec.src, "s");
+                assert_eq!(spec.regex, "(.*)");
+            }
+            other => panic!("expected a LabelReplace plan, got {other:?}"),
+        }
+        match plan_at(
+            r#"sum(label_replace(count_over_time({service_name="x"}[5m]), "d", "r", "s", ".*"))"#,
+            instant,
+        ) {
+            Ok(Plan::MetricBinary(MetricNode::VectorAgg { .. })) => {}
+            other => panic!("expected a VectorAgg over LabelReplace, got {other:?}"),
+        }
+    }
+
     /// The shape that bypassed the v1 design's gate: a vector chain
     /// bottoming at `MetricExpr::Range` goes through `metric_plan`, not
     /// `build_metric_node`.
@@ -3563,10 +3864,10 @@ mod tests {
     }
 
     /// B1 / AC 4 — every non-conforming variant shape (binary, literal,
-    /// `vector(1)`, doubly-nested vector agg, `approx_topk`) is rejected
-    /// at PLAN time with the single named message. (`label_replace` is
-    /// not in PulsusDB's grammar at all — it rejects at parse, covered in
-    /// `pulsus-logql`'s error tests.)
+    /// `vector(1)`, doubly-nested vector agg, `approx_topk`, and — since
+    /// issue #276 put it in the grammar — `label_replace`, on which the
+    /// reference nil-panics like the binary shape) is rejected at PLAN
+    /// time with the single named message.
     #[test]
     fn variants_rejects_every_nonconforming_variant_shape() {
         for q in [
@@ -3575,6 +3876,7 @@ mod tests {
             r#"variants(vector(1)) of ({a="b"}[5m])"#,
             r#"variants(sum(sum(count_over_time({a="b"}[5m])))) of ({a="b"}[5m])"#,
             r#"variants(approx_topk(1, count_over_time({a="b"}[5m]))) of ({a="b"}[5m])"#,
+            r#"variants(label_replace(count_over_time({a="b"}[5m]), "d", "r", "s", ".*")) of ({a="b"}[5m])"#,
         ] {
             match variants_plan_of(
                 q,

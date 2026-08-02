@@ -368,24 +368,38 @@ fn observe_detected_row<'a>(
     scratch.clear();
     let scratch: LabelScratch<'static> = recycle_label_scratch(scratch);
     // D2 (explanatory, #244 plan §6): the auto-parse pass.
-    (true, Ok(auto_parse_observe(line.as_ref(), acc, scratch)))
+    (true, auto_parse_observe(line.as_ref(), acc, scratch))
 }
 
 /// The auto-parse pass over the post-pipeline line, reusing the SAME
 /// (recycled) scratch the pipeline pass used (issue #244).
+///
+/// This pass runs the bare `| json` flatten on EVERY sampled line, so it
+/// is where `/detected_fields` pays the expansion unconditionally
+/// (issue #287); a key-budget breach fails the sampling query with the
+/// bounded 422, exactly as the user-pipeline pass above does. The
+/// scratch is cleared on BOTH paths before it crosses back to
+/// `'static` (rule R2) — on the breach path it is then dropped, and
+/// `feed_row`'s `trim()` (which runs on every exit) is what accounts
+/// for the capacity.
 fn auto_parse_observe<'l>(
     line: &'l str,
     acc: &mut FieldAccumulator,
     scratch: LabelScratch<'l>,
-) -> LabelScratch<'static> {
+) -> Result<LabelScratch<'static>, ReadError> {
     let mut scratch = scratch;
-    if let Some(parser) = detected::auto_parse_into(line, &mut scratch) {
+    let parsed = detected::auto_parse_into(line, &mut scratch);
+    if let Ok(Some(parser)) = parsed {
         for (k, v) in scratch.iter() {
             acc.observe_pair(k.as_ref(), v.as_ref(), Some(parser));
         }
     }
     scratch.clear();
-    recycle_label_scratch(scratch)
+    let scratch = recycle_label_scratch(scratch);
+    match parsed {
+        Ok(_) => Ok(scratch),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// AC 13's baseline (issue #244): a TEST-ONLY TRANSCRIPTION of the

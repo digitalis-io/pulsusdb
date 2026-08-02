@@ -36,8 +36,8 @@ use super::labels::{
     StructuredMetadataCtx, merge_labels_with_structured_metadata, parse_flat_labels, series_labels,
 };
 use super::post_agg::{
-    MAX_POST_AGG_BYTES, apply_vector_aggs, charged_instant_chain, charged_range_chain,
-    combine_binary,
+    MAX_POST_AGG_BYTES, apply_label_replace, apply_vector_aggs, charged_instant_chain,
+    charged_range_chain, combine_binary,
 };
 use super::variants::{MAX_VARIANT_FANOUT_STATE_BYTES, VariantArena, VariantsAggState};
 use super::window::{ClientWindow, materialize_vector_lit};
@@ -1319,6 +1319,10 @@ impl LogQlEngine {
                 MetricNode::VectorAgg { aggs, .. } => {
                     let inner = pop_value(&mut vals);
                     apply_vector_aggs(inner, aggs)?
+                }
+                MetricNode::LabelReplace { spec, .. } => {
+                    let inner = pop_value(&mut vals);
+                    apply_label_replace(inner, spec)?
                 }
                 MetricNode::Variants {
                     scan,
@@ -2912,13 +2916,21 @@ pub fn run_pipeline_rows(
     Ok(acc.into_streams())
 }
 
-/// Issue #230 follow-up: a template-render output-budget breach is the
-/// bounded 422 (the same complete-or-error class as every other
-/// `QueryTooBroad` reason — never a truncation, never an OOM).
-impl From<super::pipeline::TemplateBudgetExceeded> for ReadError {
-    fn from(e: super::pipeline::TemplateBudgetExceeded) -> Self {
-        ReadError::QueryTooBroad(TooBroadReason::TemplateOutputBytes {
-            budget_bytes: e.budget_bytes,
+/// Issue #230 follow-up / issue #287: a per-row output-budget breach is
+/// the bounded 422 (the same complete-or-error class as every other
+/// `QueryTooBroad` reason — never a truncation, never an OOM). Each
+/// ledger keeps its OWN reason, so the 422 body names the counter that
+/// actually refused.
+impl From<super::pipeline::RowBudgetExceeded> for ReadError {
+    fn from(e: super::pipeline::RowBudgetExceeded) -> Self {
+        let budget_bytes = e.budget_bytes;
+        ReadError::QueryTooBroad(match e.budget {
+            super::pipeline::RowBudget::TemplateRender => {
+                TooBroadReason::TemplateOutputBytes { budget_bytes }
+            }
+            super::pipeline::RowBudget::JsonFlattenKeys => {
+                TooBroadReason::JsonFlattenKeyBytes { budget_bytes }
+            }
         })
     }
 }

@@ -142,22 +142,26 @@ pub use params::{
     DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec, TimeBounds,
     ValidatedDuration, validate_duration_ns,
 };
-pub use pipeline::{CompiledPipeline, EntryOut, MetricRun, PipelineError, SAMPLE_EXTRACTION_ERROR};
+pub use pipeline::{
+    CompiledPipeline, EntryOut, MAX_JSON_FLATTEN_KEY_BYTES, MetricRun, PipelineError, RowBudget,
+    RowBudgetExceeded, SAMPLE_EXTRACTION_ERROR,
+};
 pub use walkbound::{
     MAX_LOGQL_WALK_TRANSIENT_BYTES, REFERENCE_MAX_QUERY_BYTES, admit_logql_walk,
     walk_transient_bound,
 };
 
 pub use plan::{
-    ClientAgg, ClientValue, MAX_VARIANT_SUB_STATES, MetricNode, MetricNodeScc, MetricPlan, Plan,
-    ProbePlan, RouteChoice, RoutingDecision, StreamsPlan, VariantSpec, plan,
+    ClientAgg, ClientValue, LabelReplaceSpec, MAX_VARIANT_SUB_STATES, MetricNode, MetricNodeScc,
+    MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision, StreamsPlan, VariantSpec, plan,
 };
 pub use post_agg::{
     B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
     MAX_POST_AGG_BYTES, StageInput, W_APPROX_TOPK, W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT,
-    W_SERIES, W_STAGE_SERIES, apply_vector_aggs, apply_vector_aggs_capped, binary_peak_bytes,
-    binary_peak_bytes_without, combine_binary, combine_binary_capped, group_name_bytes,
-    include_bytes, leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
+    W_SERIES, W_STAGE_SERIES, apply_label_replace, apply_label_replace_capped, apply_vector_aggs,
+    apply_vector_aggs_capped, binary_peak_bytes, binary_peak_bytes_without, combine_binary,
+    combine_binary_capped, group_name_bytes, include_bytes, label_replace_peak_bytes,
+    leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
     post_agg_peak_bytes_without,
 };
 pub use variants::{

@@ -1659,7 +1659,7 @@ fn eval_scalar_node(node: &MetricNode) -> Result<QueryResult, ReadError> {
                 let inner = vals.pop().expect("post-order pushes inner");
                 apply_vector_aggs_ok(inner, aggs)
             }
-            MetricNode::Leaf(_) | MetricNode::Variants { .. } => {
+            MetricNode::Leaf(_) | MetricNode::Variants { .. } | MetricNode::LabelReplace { .. } => {
                 panic!("scalar-only trees expected")
             }
         };
@@ -2980,6 +2980,12 @@ fn eval_node(
                     .as_ref()
                     .expect("variants scan is client-aggregated");
                 run_variants_rows(rows, meta, &common.pipeline, variants)?
+            }
+            // `label_replace(...)` (issue #276): the engine's exact
+            // post-fetch transform.
+            MetricNode::LabelReplace { spec, .. } => {
+                let inner = vals.pop().expect("post-order pushes inner");
+                pulsus_read::logql::apply_label_replace(inner, spec)?
             }
         };
         vals.push(v);

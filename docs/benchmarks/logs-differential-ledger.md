@@ -513,6 +513,80 @@ not "fix" us toward the panic.
   field that exists nowhere in the tree: owned by **#277**, a real
   parity bug deferred for sequencing, not an accepted shape.
 
+### `label-replace-scalar-operand-status` (issue #276)
+
+- **Reference behaviour (probed, `grafana/loki:3.7.4`):**
+  `label_replace(2, "d", "r", "s", ".*")` — and any other scalar-typed
+  operand, including a folded `1 + 1` — returns **500 `unexpected expr
+  type (*syntax.LiteralExpr) for Evaluator type
+  (*logql.DefaultEvaluator)`**: the evaluator factory has no arm for a
+  literal where a sample expression is required.
+- **PulsusDB behaviour:** a plan-time **400** `label_replace requires a
+  vector operand, got a scalar expression`, decided in `fold_plan_ops`
+  from the operand's series typing — before any DB read. The regex
+  compile error keeps priority over it (the reference's own ordering:
+  its parse-time regex error surfaces first).
+- **Why deliberate:** both sides reject; the reference's body is an
+  internal Go type-assertion message, the head-of-group rule
+  (`variants-nonconforming-shape-status`) applies — we match the
+  REJECTION, never the crash-shaped surface. Gated by
+  `b16_label_replace.test`'s `eval_fail` cases and
+  `label_replace_over_a_scalar_typed_operand_is_rejected_at_plan_time`.
+
+### `label-replace-collision-tie-order` (issue #276)
+
+- **Reference behaviour (probed):** when `label_replace` maps several
+  range-query series onto ONE label set, the engine's per-step
+  accumulation merges them into a single series whose points repeat per
+  timestamp (`{src="same"} [[t,1],[t,1],[t,1],[t,1]] …` on the wire).
+  The SAME-timestamp intra-order is the evaluator's per-step vector
+  order — for an aggregated operand, a Go map walk the reference cannot
+  reproduce even against itself.
+- **PulsusDB behaviour:** the identical merged shape (timestamp-
+  ascending, duplicates kept), with the same-timestamp tie pinned to
+  the DETERMINISTIC input-series order — the ratified treatment of every
+  irreproducible reference tie (instant `first/last_over_time`,
+  `approx_topk` beyond the retention cap). Values and multiset of
+  points are reference-exact; only the intra-timestamp ordering is
+  pinned rather than mirrored. Instant queries return the duplicate
+  samples unmerged, exactly as the reference does (no divergence
+  there). Gated by `b16_label_replace.test` (r2, c14) and
+  `label_replace_range_collisions_merge_with_input_order_ties`.
+
+### `label-replace-template-amplification` (issue #276 fix round 2 — the O8 threshold, WIRED)
+
+- **Reference behaviour:** no cap exists on this path. The evaluator
+  rewrites and retains every series' label set with no budget, so a
+  large replacement template times a large series count materialises
+  gigabytes of labels and exhausts process memory.
+- **PulsusDB behaviour:** `apply_label_replace` charges
+  `2 × W_LABEL_BYTE × L` bytes per series *before* allocating, `L =
+  dst.len() + replacement.len() + #'$' × max_value_bytes` (each `$` can
+  expand to the input's widest label value), against
+  `MAX_POST_AGG_BYTES` (8 GiB); a breach is a clean **422**
+  `query_too_broad`, never an OOM. **Where refusal begins, concretely:**
+  impossible below `L = 2 413` template bytes at any series count
+  (`L_MIN`, at `N = 435 645`); guaranteed from the amplifying term alone
+  once `L × series > 1 431 655 765` byte·series
+  (`MAX_POST_AGG_BYTES / (2 × W_LABEL_BYTE)`) — e.g. a `$`-free
+  replacement of 3 286 bytes at the region's `N_max = 435 771` series;
+  between the two, the input's own envelope terms decide and only lower
+  the point of refusal.
+- **Why deliberate:** folding `replacement.len()` into the ceiling was
+  considered and rejected (fix round 2 ruling): the replacement is
+  bounded only by the 131 072-byte query-text cap, so an absorbing
+  ceiling would sit in the tens of gigabytes and stop protecting
+  anything. Refusing where the reference OOMs is PulsusDB being correct
+  — the reference being unbounded is not copied (the
+  `template-output-budget` precedent). Unlike O6/O7 this funnel is
+  wired today, which is why the row exists now. Gated by
+  `o8_the_label_replace_template_threshold_bounds_where_refusal_is_possible`
+  (below `L_MIN` admitted over the whole feasible region, refusable at
+  `L_MIN`, `$` gearing exact) and
+  `label_replace_charges_the_collision_merge_clone_before_it_allocates`
+  (charge lands before the allocation it prices); numbers regenerated
+  by `zz_witness_report`.
+
 ## Issue #236 — high-cardinality aggregations: the result-size cap
 
 - **(a) Result-series cap semantics.** *Reference:* `querier.max-query-series`
@@ -775,18 +849,41 @@ clients only display it).
   signature rejects and coercion errors — proved byte-exact in the
   captured corpus and stays in it.
 
-### `template-local-zone-environment` (issue #230, adjudication 3)
+### `template-timezone-configured` (issue #311, supersedes `template-local-zone-environment` from #230 adjudication 3)
 
-- The `Local` zone (`__timestamp__`, `date`, `toDate`) resolves from
-  the process environment exactly like a reference process on the same
-  host (`$TZ` name → that zone; no `$TZ` → `/etc/localtime`, named
-  "Local"; else the degenerate UTC form). The hermetic corpus and its
-  captures pin the degenerate-UTC form (stock container, PROVENANCE
-  precondition). Residuals inside this class: `chrono-tz` 0.10.4's
-  IANA tables vs the reference toolchain's (mainstream post-1970 zones
-  agree), zone-abbreviation lookups for layout PARSING approximate
-  Go's `lookupName` with instant±6-month probes, and zone-offset
-  lookups clamp beyond chrono's ±262k-year range.
+- **Reference behaviour:** the `Local` zone used by the template time
+  functions (`__timestamp__`, `now`, `date`, `toDate`) is resolved from
+  the PROCESS — `$TZ` names the zone, else `/etc/localtime` is read and
+  the result is named "Local", else the degenerate UTC form.
+- **PulsusDB behaviour:** the zone is resolved from SERVER
+  CONFIGURATION — `reader.template_timezone` / `PULSUS_TEMPLATE_TIMEZONE`
+  (docs/configuration.md §6), defaulting to `UTC`. `$TZ` and
+  `/etc/localtime` are never read on any path that can reach a query
+  result. An unknown zone name fails config load; there is no fallback.
+- **Why we diverge:** host-resolved state makes one query return
+  different text depending on which server in a cluster answered it —
+  a defect in a database, and one that already reddened CI once (a
+  fixture generated under `Europe/London` failed under `Etc/UTC`,
+  #272). Configuration is not the same thing as ambient inheritance:
+  it is declared once and uniform across the fleet, rather than
+  discovered per machine.
+- **The same behaviour remains available, it merely has to be stated
+  rather than inherited.** A deployment that deliberately runs in a
+  local zone sets `template_timezone` to it once and gets exactly what
+  the reference gave it: a configured zone keeps its own IANA name,
+  which is precisely the reference's `$TZ=<name>` branch. Only its
+  `/etc/localtime` branch — the one that renames the zone to "Local" —
+  has no counterpart here, because nothing reads that file.
+- **Invisible in the common deployment:** the shipped default, `UTC`,
+  produces Go's degenerate all-nil `Local`, which is also what a stock
+  reference container (no `$TZ`, no host zoneinfo) produces. The
+  hermetic corpus and its captures pin that form (PROVENANCE
+  precondition) and are unchanged.
+- Residuals inside this class, unchanged from #230: `chrono-tz`
+  0.10.4's IANA tables vs the reference toolchain's (mainstream
+  post-1970 zones agree), zone-abbreviation lookups for layout PARSING
+  approximate Go's `lookupName` with instant±6-month probes, and
+  zone-offset lookups clamp beyond chrono's ±262k-year range.
 
 ### `template-output-budget` (issue #230 follow-up, bounded divergence)
 
@@ -900,6 +997,114 @@ clients only display it).
   `int` still panics with the reference's exact `strings: Repeat
   output length overflow` per line (that surface is bounded and
   correct).
+
+### `json-flatten-key-budget` (issue #287, bounded divergence)
+
+- **Reference behaviour — the FLATTEN itself is parity, only the
+  ceiling diverges.** grafana/loki v3.7.4, `pkg/logql/log/parser.go`:
+  `JSONParser.parseLabelValue` names every leaf label with
+  `buildSanitizedPrefixFromBuffer()`'s `_`-joined ancestor path, so a
+  nested object's whole prefix is repeated into each of its leaves.
+  PulsusDB emits the identical names — the label semantics must NOT
+  change. What the reference does not have is any ceiling on the
+  result: no cap in `JSONParser`, none in `LabelsBuilder.Set`
+  (`pkg/logql/log/labels.go:344`).
+- **Name parity was NOT free, and is now held by capture** (review
+  round 2). PulsusDB used to join RAW keys and sanitize the joined
+  result, which agrees with `appendSanitized`
+  (`pkg/logql/log/util.go:42`) only for keys needing no trimming. The
+  reference trims each part, drops a part that trims empty WITHOUT its
+  separator, applies the leading-digit `_` only when nothing has been
+  emitted yet, maps each rejected RUNE to one `_`, and DROPS a
+  top-level field whose key sanitizes to nothing. Container-captured
+  divergences, all fixed: `{" a ":1}` gave `_a_` (reference `a`),
+  `{"x":{" b ":1}}` gave `x__b_` (`x_b`), `{"  ":{"b":1}}` gave `___b`
+  (`b`), `{"x":{"":1}}` gave `x_` (`x`), `{"a":{"b":{" ":{"c":1}}}}`
+  gave `a_b___c` (`a_b_c`), and `{"":1}` emitted a label with an EMPTY
+  NAME. 51 probes captured from `grafana/loki:3.7.4` — 28 construction
+  rows, a 19-cell collision matrix covering the depth × label-category ×
+  dropped-or-live product, and 4 recorded divergences — with the RAW
+  container responses committed as
+  `tests/fixtures/json_key_sanitization/capture.json`;
+  `tests/logql_json_key_sanitization.rs` derives every assertion about
+  what a probe yields from that artifact (the four recorded divergences
+  are asserted as relations between the artifact-derived reference side
+  and our computed output, values included; the literals left in the
+  suite fall into five machine-inventoried classes — probe inputs, the
+  extractor's response-schema names and constants, pins and plumbing
+  such as the artifact path and image pin, the `_extracted` rule
+  constant, and pre-fix `was` records asserted only as differing —
+  plus assertion-message prose). The artifact's PROVENANCE is attested by
+  the CI drift leg's live re-capture of all 51 probes against the
+  digest-pinned oracle on every run; the extractor's nanosecond
+  timestamp and execution-stats checks are local schema-plausibility
+  sanity, not a provenance proof. Regeneration is
+  gated on a live container reporting exactly v3.7.4. **Still
+  divergent, out of scope and recorded there (artifact-evidenced, filed
+  on #334) rather than claimed:** parsed-vs-parsed key COLLISIONS —
+  `{"a-b":1,"a.b":2}` is `a_b="1"` for the reference
+  (`ParserHints.Extracted`, first wins) and `a_b="1"` plus
+  `a_b_extracted="2"` for PulsusDB (`add_extracted`'s suffix) — and
+  `drop <base-label>` before `| json` on a recolliding key at EITHER
+  depth (the reference's `BaseHas` reads the original stream labels and
+  still renames; our collision check reads the evolving set and does
+  not). Both rules predate this issue and are shared by every parser.
+- **Why that matters:** the emitted key bytes are `Θ(L²)` in the line
+  length. For `{"<p bytes>":{"k00000":0,… ×m}}` the input is
+  `p + 11m + 6` bytes and the keys are `m·(p + 7)` bytes, maximised at
+  `≈ L²/44`. Measured end to end: **65 536 input bytes → 97 615 872 key
+  bytes (1 489.5×)**; 1 MiB extrapolates to ~23.3 GiB by the same
+  closed form. `/query_range` pays this whenever the query carries
+  `| json`; `/detected_fields` pays it on every sampled line
+  unconditionally, through its auto-parse probe.
+- **PulsusDB behaviour:** every key string the full-flatten allocates —
+  the emitted leaf label names AND the intermediate object prefixes
+  they are built from — is CHARGED before it is allocated against a
+  per-ROW ledger shared by all of the row's `| json` stages (the #260
+  lifetime lesson: a per-STAGE ledger would bound one stage while the
+  number of stages is bounded only by the query-text cap, and each
+  extra `| json` re-flattens the line into another simultaneously-live
+  `_extracted` label set). A breach aborts the query with the bounded
+  `422 query_too_broad` (`TooBroadReason::JsonFlattenKeyBytes`) —
+  never a per-line `__error__`, never a truncated label set, never an
+  OOM. It bounds key bytes and nothing else: extracted VALUES are
+  linear in the line (each scalar's text appears once in the input),
+  `null`/array fields build no key and are charged nothing, and the
+  targeted form `| json v="a.b"` takes its label names from the
+  compiled stage and is charged nothing — it still serves the very
+  line the full-flatten refuses.
+- **Threshold:** `MAX_JSON_FLATTEN_KEY_BYTES` = 64 MiB, the template
+  budget's value for the template budget's reason, asserted at compile
+  time to stay `<= MAX_CLIENT_AGG_GROUP_BYTES`. What is spent against
+  it is `alloc_block_bytes(key_len)` — the crate's pinned bound on the
+  block a real allocator RETAINS for one exactly-reserved allocation,
+  not the request size, because `String::with_capacity(n)` guarantees
+  only `capacity >= n` — so the ceiling admits 32 MiB of key CONTENT
+  per row and the worst-SHAPED line it refuses is ~38 KiB. It is a TERM
+  of the published per-query retained-byte figure
+  (`MAX_QUERY_RETAINED_BYTES` = 2,087,477,248 B): #260's row term was a
+  free-standing addend that lost this ledger entirely, and is now a
+  destructured `RowBudgets` table. That table is a convention with a
+  compiler-checked back half, NOT a proof — a new variant answered with
+  an existing field still compiles (verified by mutant); a lexical
+  tripwire (`tests/logql_row_budget_enumeration.rs`) catches that shape
+  and cannot catch a ledger that never declares a variant. A key COUNT cap
+  would not be a bound at all here — the 64 KiB construction emits only
+  2 979 keys — while a normally-shaped line, whose key bytes are a small
+  multiple of `L`, passes at tens of MiB against the ~38 KiB
+  worst-SHAPED refusal above. `tests/logql_json_flatten_budget.rs` pins the
+  closed forms by measurement, the exact ±1 byte boundary, the
+  intermediate-prefix charge (with the leaf-only counterfactual
+  asserted, so a ledger that charged only what it emits fails it), the
+  per-row shared lifetime and its reset, and the streams, metric and
+  `/detected_fields` surfaces.
+- **Why deliberate:** the reference is unbounded, so no finite cap can
+  match it (the #236 O1 shape); "never copy the reference where it is
+  wrong" and the standing charge-before-allocate rule both require the
+  bound. Consequence inside the same class: a line whose flattened keys
+  cross 64 MiB is refused where the reference would serve it (or die
+  trying) — reachable in practice only from adversarially-shaped JSON,
+  since it needs a multi-KiB parent key over thousands of leaves.
 
 ### `logql-error-envelope` (issue #240)
 

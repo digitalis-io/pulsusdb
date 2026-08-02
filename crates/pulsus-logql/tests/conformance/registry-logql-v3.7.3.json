@@ -716,6 +716,13 @@
       "syntax": "variants(<metricExpr>, ...) of (<logRangeExpr>)",
       "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#multiple-metric-queries-variants",
       "probe": "variants(count_over_time({app=\"x\"}[5m])) of ({app=\"x\"}[5m])"
+    },
+    {
+      "id": "func.label_replace",
+      "category": "functions",
+      "syntax": "label_replace(<metricExpr>, \"dst\", \"replacement\", \"src\", \"regex\")",
+      "doc": "https://grafana.com/docs/loki/latest/query/query_reference/#label_replace",
+      "probe": "label_replace(rate({app=\"x\"}[5m]), \"foo\", \"$1\", \"service\", \"(.*):.*\")"
     }
   ]
 }

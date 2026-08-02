@@ -230,7 +230,10 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
     // `fold_off_grid` (Part B's off-grid internal-invariant breach) and
     // the three instant-window narrowing refusals Part D introduced at
     // `run_metric_client`, `run_client_agg_rows_folded` and
-    // `VariantsAggState::new`).
+    // `VariantsAggState::new` — 37 after issue #276, which added
+    // `label_replace`'s two rejections in `plan.rs`: the wrapped-form
+    // regex error in `LabelReplaceSpec::compile` and the scalar-operand
+    // rejection in `fold_plan_ops`).
     //
     // Issue #299 split `exec.rs` into ten flat modules, so `exec.rs`'s 20
     // are now spread over five of them. The TOTAL is unchanged at 20, and
@@ -242,7 +245,7 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // rejection — into `plan_legacy_descent.rs`. Issue #293 converted
         // that walk and deleted the module, moving the construction back:
         // 13 + 1 -> 14, total unchanged both times.
-        ("plan.rs", 14),
+        ("plan.rs", 16),
         ("exec.rs", 12),
         ("client_agg.rs", 1),
         ("fold.rs", 1),
@@ -314,19 +317,28 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         }
     }
     // §3.4: the interpolating anchored template may exist at exactly the
-    // two committed sites — the escaper and the validator.
+    // three committed sites — the escaper, the validator, and (issue
+    // #276) `plan.rs`'s `LabelReplaceSpec::compile`. The third is
+    // deliberately OUTSIDE the checked-escape seam: `label_replace`'s
+    // pattern never reaches SQL (the transform runs over the evaluated
+    // result), the anchored text it compiles is the #317 RE2→Rust
+    // REWRITE of the user's pattern (not the bytes the SQL seam
+    // validates), and its compile error must surface the WRAPPED form —
+    // the #240 asymmetry — which the `bad_regex`-routed seams must never
+    // produce.
     anchored_hits.sort();
-    let allowed = ["escape.rs", "pipeline.rs"];
-    if anchored_hits.len() != 2
+    let allowed = ["escape.rs", "pipeline.rs", "plan.rs"];
+    if anchored_hits.len() != allowed.len()
         || !allowed
             .iter()
             .all(|f| anchored_hits.iter().filter(|h| h.starts_with(f)).count() == 1)
     {
         let _ = writeln!(
             errors,
-            "anchoring guard: `^(?:{{` must occur at exactly two sites (escape.rs's \
-             escaper and pipeline.rs's validator), found {anchored_hits:?} — build the \
-             anchored form through `escape::ch_regex_anchored_checked`, never by hand"
+            "anchoring guard: `^(?:{{` must occur at exactly three sites (escape.rs's \
+             escaper, pipeline.rs's validator, and plan.rs's `LabelReplaceSpec::compile`), \
+             found {anchored_hits:?} — every OTHER site must build the anchored form \
+             through `escape::ch_regex_anchored_checked`, never by hand"
         );
     }
     assert!(errors.is_empty(), "{errors}");

@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# `reader.template_timezone` (issue #311) is parsed to a `chrono_tz::Tz` at
+# config load, so an unknown zone name is a startup error instead of a
+# server silently rendering LogQL templates in the wrong zone. Same version
+# as `pulsus-read`, which consumes the resolved zone — the two must agree on
+# the bundled tzdata for a configured name to resolve identically.
+chrono-tz = "0.10"
 serde.workspace = true
 serde_norway.workspace = true
 thiserror.workspace = true
