@@ -36,6 +36,7 @@ mod shadow {
             op: RangeAggOp,
             range: LogRange,
             param: Option<String>,
+            grouping: Option<Grouping>,
         },
         Vector {
             op: VectorAggOp,
@@ -122,6 +123,9 @@ fn build(s: &Shape) -> MetricExpr {
             op: *op,
             range: log_range(*spec),
             param: param.map(str::to_string),
+            // The walk characterization is about CHILD slots; a grouping is
+            // an owned leaf like `param`, so `None` keeps the shapes fixed.
+            grouping: None,
         },
         Shape::Literal(raw) => MetricExpr::Literal((*raw).to_string()),
         Shape::VectorFn(raw) => MetricExpr::VectorFn((*raw).to_string()),
@@ -150,6 +154,7 @@ fn build_shadow(s: &Shape) -> shadow::MetricExpr {
             op: *op,
             range: log_range(*spec),
             param: param.map(str::to_string),
+            grouping: None,
         },
         Shape::Literal(raw) => shadow::MetricExpr::Literal((*raw).to_string()),
         Shape::VectorFn(raw) => shadow::MetricExpr::VectorFn((*raw).to_string()),

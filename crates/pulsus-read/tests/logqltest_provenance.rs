@@ -245,7 +245,13 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // rejection — into `plan_legacy_descent.rs`. Issue #293 converted
         // that walk and deleted the module, moving the construction back:
         // 13 + 1 -> 14, total unchanged both times.
-        ("plan.rs", 16),
+        // Issue #344 added TWO: the range-aggregation grouping refusal in
+        // `metric_plan` and its `variants(...)`-arm twin, both built from
+        // the single `RANGE_GROUPING_UNSUPPORTED` constant so the two
+        // cannot drift. 16 -> 18; #240's sweep numbers stand, since both
+        // are ordinary `PipelineInvalid` reasons carrying no regex and no
+        // reference-verbatim text.
+        ("plan.rs", 18),
         ("exec.rs", 12),
         ("client_agg.rs", 1),
         ("fold.rs", 1),

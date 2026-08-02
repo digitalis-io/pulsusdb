@@ -508,6 +508,20 @@
       "probe": "sum without(app)(rate({app=\"x\"}[5m]))"
     },
     {
+      "id": "grouping.range_agg",
+      "category": "grouping",
+      "syntax": "<range_agg>(<log_range>) by(labels) | without(labels)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#unwrapped-range-aggregations",
+      "probe": "max_over_time({app=\"x\"} | unwrap v [5m]) by(fp)"
+    },
+    {
+      "id": "grouping.range_agg_disallowed",
+      "category": "grouping",
+      "syntax": "count_over_time(<log_range>) by(labels)  [rejected]",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#unwrapped-range-aggregations",
+      "probe": "count_over_time({app=\"x\"}[5m]) by(fp)"
+    },
+    {
       "id": "binop.add",
       "category": "binary-ops",
       "syntax": "expr + expr",

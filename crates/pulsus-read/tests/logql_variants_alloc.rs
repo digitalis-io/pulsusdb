@@ -1478,7 +1478,17 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "plan.rs",
         ty: None,
         anchor: "build_variants_node",
-        branches: 26,
+        // Issue #344: 26 -> 27. The range-aggregation grouping is parsed
+        // but not executed, so the per-variant arm refuses it by name
+        // (`if grouping.is_some()`), which is one new branch. W-MEM
+        // disposition: **NIL on the taken path, BAND on the untaken one** —
+        // the guard itself allocates nothing (`Option::is_some` on a field
+        // already owned by the AST), and the refusal it guards allocates
+        // exactly one `String` from an existing `&'static str` constant on
+        // a path that returns `Err` immediately and plans nothing, so it
+        // adds no term to any per-variant band. No callee joins the set:
+        // `.is_some`, `Err` and `.to_string` are all already pinned.
+        branches: 27,
         callees: &[
             ".any",
             ".as_nanos",

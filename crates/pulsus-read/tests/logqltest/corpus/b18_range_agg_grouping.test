@@ -1,0 +1,151 @@
+# b18 — grouping on a RANGE aggregation (issue #344).
+#
+# Reference of record: grafana/loki:3.7.4. Captured 2026-08-02 against a
+# container whose identity was READ FROM THE RUNNING PROCESS, not from any
+# committed header: `/loki/api/v1/status/buildinfo` answered
+# {"version":"3.7.4","revision":"b318f282","branch":"release-3.7.x"}.
+# (Issue #350 is fixing a header that claimed a capture never taken, and a
+# concurrent branch is re-pinning the comparison container 3.7.3 -> 3.7.4;
+# neither was trusted here.)
+#
+# WHICH OPS TAKE IT — probed, not reasoned about. All fifteen range
+# aggregations were sent in both directions (`by (fp)` and `without (fp)`,
+# over a log range and over an unwrapped range). Eight accept:
+#
+#   avg_over_time  min_over_time  max_over_time  stddev_over_time
+#   stdvar_over_time  quantile_over_time  first_over_time  last_over_time
+#
+# Seven reject, each with `grouping not allowed for <op> aggregation`:
+#
+#   rate  rate_counter  count_over_time  bytes_rate  bytes_over_time
+#   sum_over_time  absent_over_time
+#
+# `sum_over_time` and an unwrapped `rate` are the trap: both consume the
+# same numeric sample stream the eight do, and both are rejected. A list
+# derived from "which ones look like they should" gets those two wrong.
+#
+# PLACEMENT: postfix ONLY. `max_over_time by (fp) ({app="x"} | unwrap v
+# [5m])` is `syntax error: unexpected by, expecting (` — the reference has
+# no prefix production here, unlike its vector aggregations, which take
+# both. `BY`/`WITHOUT` fold case-insensitively, as everywhere else.
+#
+# ORDER OF CHECKS: the grouping rejection fires BEFORE the unwrap-arity
+# check. `sum_over_time({app="x"} [5m]) by (fp)` answers the grouping
+# error, not `invalid aggregation sum_over_time without unwrap`; and
+# `bytes_over_time({app="x"} | unwrap v [5m]) by (fp)` answers the grouping
+# error, not `... with unwrap`. (For an op that DOES allow grouping the
+# unwrap check is reached normally: `max_over_time({app="x"} [5m]) by (fp)`
+# answers `invalid aggregation max_over_time without unwrap`.)
+#
+# SEMANTICS — captured against the same container over three streams,
+# {app=x,fp=1,region=eu} with samples 1 and 5, {app=x,fp=2,region=eu} with
+# 10, {app=x,fp=1,region=us} with 7:
+#
+#   * `by (L)` reduces the output labels to L alone and merges every series
+#     sharing L: `max_over_time(...) by (fp)` is {fp="1"}=7, {fp="2"}=10.
+#   * The merge is over the group's RAW SAMPLES, not over per-series
+#     results. `stddev_over_time(...) by (fp)` is 2.494438257849294 for
+#     fp=1 — the population stddev of {1,5,7} — where a stddev of the
+#     per-series stddevs would be 1. This is what makes the construct more
+#     than sugar for an outer vector aggregation.
+#   * `without (L)` keeps every label except L, including parser-derived
+#     ones (`msg`, `detected_level`, `service_name`).
+#   * `by ()` collapses everything into one series with an EMPTY label set;
+#     `without ()` is the identity.
+#   * `by (absent_label)` collapses into `{}` — the absent name is not
+#     materialised as an empty-string label.
+#   * Duplicates dedupe, the same as issue #288 established for vector
+#     aggregations — `by (fp, fp)` == `by (fp)`, `without (region, region)`
+#     == `without (region)` — but that was CONFIRMED here rather than
+#     carried over.
+#
+# STATE OF THIS FILE. The grammar half has landed: the seven rejections
+# carry the reference's wording, and the eight accepted forms now parse.
+# EXECUTION has not — re-keying the client aggregator's groups needs a
+# total sample order across merged streams for first/last_over_time — so
+# the eight currently stop at a named planner refusal, pinned below. The
+# semantics above are that work's acceptance criteria, captured while the
+# container was in hand; when execution lands, the eight `eval_fail` rows
+# become `eval` rows with those values and this note goes.
+
+load
+  {env="prod", service_name="rg", fp="1", region="eu"}
+  0s  v=1
+  30s v=5
+  {env="prod", service_name="rg", fp="2", region="eu"}
+  0s  v=10
+  {env="prod", service_name="rg", fp="1", region="us"}
+  30s v=7
+
+# --- the seven that reject, with the reference's wording ---
+
+eval_fail instant at 60s rate({service_name="rg"}[1m]) by (fp)
+  msg: grouping not allowed for rate aggregation
+
+eval_fail instant at 60s rate_counter({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: grouping not allowed for rate_counter aggregation
+
+eval_fail instant at 60s count_over_time({service_name="rg"}[1m]) by (fp)
+  msg: grouping not allowed for count_over_time aggregation
+
+eval_fail instant at 60s bytes_rate({service_name="rg"}[1m]) by (fp)
+  msg: grouping not allowed for bytes_rate aggregation
+
+eval_fail instant at 60s bytes_over_time({service_name="rg"}[1m]) without (fp)
+  msg: grouping not allowed for bytes_over_time aggregation
+
+# The trap case: it consumes the same sample stream the accepted eight do.
+eval_fail instant at 60s sum_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: grouping not allowed for sum_over_time aggregation
+
+eval_fail instant at 60s absent_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: grouping not allowed for absent_over_time aggregation
+
+# The grouping rejection wins over the unwrap-arity check, both directions.
+eval_fail instant at 60s sum_over_time({service_name="rg"}[1m]) by (fp)
+  msg: grouping not allowed for sum_over_time aggregation
+
+eval_fail instant at 60s bytes_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: grouping not allowed for bytes_over_time aggregation
+
+# …and for an op that DOES allow grouping, the unwrap check is still reached.
+eval_fail instant at 60s max_over_time({service_name="rg"}[1m]) by (fp)
+  msg: invalid aggregation max_over_time without unwrap
+
+# --- placement: postfix only, so the prefix form is a plain syntax error ---
+
+eval_fail instant at 60s max_over_time by (fp) ({service_name="rg"} | logfmt | unwrap v [1m])
+  msg: unexpected
+
+# --- the eight that parse; execution pending (issue #344) ---
+
+eval_fail instant at 60s avg_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: not yet executed
+
+eval_fail instant at 60s min_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: not yet executed
+
+eval_fail instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: not yet executed
+
+eval_fail instant at 60s stddev_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: not yet executed
+
+eval_fail instant at 60s stdvar_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: not yet executed
+
+eval_fail instant at 60s quantile_over_time(0.99, {service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: not yet executed
+
+eval_fail instant at 60s first_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  msg: not yet executed
+
+eval_fail instant at 60s last_over_time({service_name="rg"} | logfmt | unwrap v [1m]) without (region)
+  msg: not yet executed
+
+# `BY`/`WITHOUT` fold, and the postfix clause is still recognised.
+eval_fail instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [1m]) BY (fp)
+  msg: not yet executed
+
+eval_fail instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [1m]) WITHOUT (region)
+  msg: not yet executed

@@ -381,8 +381,16 @@ mod tests {
     fn the_fixed_slack_is_derived_from_the_measured_maximum_entry() {
         // THE single source for the measured figure: it appears in no
         // comment, so no comment can go stale against it.
+        // 136 -> 168 (issue #344): `MetricExpr::Range` gained
+        // `grouping: Option<Grouping>`, and `Grouping` is a `GroupingKind`
+        // plus a `Vec<String>` (8 + 24 = 32 bytes), which widens `MeVal`,
+        // still the largest entry. The consequences are re-derived, not
+        // assumed: `WALK_FIXED_SLACK_BYTES` is computed from this constant,
+        // the ceiling assert still holds at compile time, and
+        // `the_four_times_probe_clears_the_threshold_with_stated_headroom`
+        // re-checks `B*(C-1) > S` and `B*(2C-1) > S` against the new S.
         assert_eq!(
-            MAX_WALK_ENTRY_BYTES, 136,
+            MAX_WALK_ENTRY_BYTES, 168,
             "the largest `ChunkStack` entry moved; re-derive \
              `WALK_FIXED_SLACK_BYTES`'s consequences before re-pinning"
         );
