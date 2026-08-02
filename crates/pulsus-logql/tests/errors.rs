@@ -631,3 +631,53 @@ fn variants_grammar_shape_rejections() {
         other => panic!("expected a missing-`of` parse error, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #276: `label_replace(...)` grammar rejections. Every rejection
+// is a plain positional `UnexpectedToken`/`UnexpectedEof` — never
+// `NotYetSupported` — matching the reference's 400 class (probed,
+// v3.7.4: 4 args → `unexpected ), expecting ,`; 6 args → `unexpected ,,
+// expecting )`; a bare-identifier argument → `unexpected IDENTIFIER,
+// expecting STRING`).
+// ---------------------------------------------------------------------
+
+/// Arity/argument-type shapes the reference grammar rejects.
+#[test]
+fn label_replace_grammar_shape_rejections() {
+    for q in [
+        // 4 arguments.
+        r#"label_replace(rate({app="x"}[5m]), "dst", "v", "src")"#,
+        // 6 arguments.
+        r#"label_replace(rate({app="x"}[5m]), "dst", "v", "src", ".*", "extra")"#,
+        // A bare identifier where a STRING is required.
+        r#"label_replace(rate({app="x"}[5m]), dst, "v", "src", ".*")"#,
+        // Trailing comma.
+        r#"label_replace(rate({app="x"}[5m]), "dst", "v", "src", ".*",)"#,
+        // Empty argument list / missing operand.
+        r#"label_replace()"#,
+        r#"label_replace"#,
+        // Uppercase keyword: the reference's case-insensitive lexer
+        // accepts `LABEL_REPLACE(...)` (probed 200); PulsusDB is
+        // case-sensitive for EVERY keyword — the workspace-wide
+        // pre-existing gap (issue #221 plan §risk 6), pinned here as
+        // PulsusDB-rejects exactly like `VARIANTS(...) OF (...)`.
+        r#"LABEL_REPLACE(rate({app="x"}[5m]), "dst", "v", "src", ".*")"#,
+    ] {
+        match parse(q) {
+            Err(LogQlError::UnexpectedToken { .. } | LogQlError::UnexpectedEof { .. }) => {}
+            other => panic!("expected a positional parse error for {q:?}, got {other:?}"),
+        }
+    }
+}
+
+/// A syntax error elsewhere in the query wins over anything about the
+/// `label_replace` arguments themselves (the reference's ordering: its
+/// embedded regex error surfaces only after a clean parse — probed:
+/// `label_replace(…, "(") + (` → `syntax error: unexpected $end`).
+#[test]
+fn label_replace_trailing_syntax_error_wins_over_argument_content() {
+    match parse(r#"label_replace(rate({app="x"}[5m]), "d", "r", "s", "(") + ("#) {
+        Err(LogQlError::UnexpectedToken { .. } | LogQlError::UnexpectedEof { .. }) => {}
+        other => panic!("expected a positional parse error, got {other:?}"),
+    }
+}

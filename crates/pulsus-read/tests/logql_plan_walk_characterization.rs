@@ -319,6 +319,7 @@ fn post_order_is_children_before_parents_left_to_right() {
                 MetricNode::Binary { .. } => "Binary",
                 MetricNode::VectorAgg { .. } => "VectorAgg",
                 MetricNode::Variants { .. } => "Variants",
+                MetricNode::LabelReplace { .. } => "LabelReplace",
             })
             .collect();
         let mut want = Vec::new();

@@ -1661,6 +1661,46 @@ fn variants_or_variants_parses() {
     );
 }
 
+/// Issue #276 — `label_replace(<metricExpr>, "dst", "replacement",
+/// "src", "regex")` is a `metricExpr` alternative in the reference
+/// grammar, so it round-trips in EVERY metric position (each shape a
+/// reference-probed 200): bare, parenthesized, under vector
+/// aggregations, as a binary operand, nested in itself, and over a
+/// binary/`vector(n)` inner expression.
+#[test]
+fn label_replace_round_trips_in_every_metric_position() {
+    for q in [
+        r#"label_replace(rate({app="x"}[5m]), "dst", "v-$1", "src", "x-(.*)")"#,
+        r#"(label_replace(rate({app="x"}[5m]), "dst", "v", "src", ".*"))"#,
+        r#"sum(label_replace(rate({app="x"}[5m]), "dst", "v", "src", ".*"))"#,
+        r#"sum by(dst)(label_replace(rate({app="x"}[5m]), "dst", "$1", "src", "(.*)"))"#,
+        r#"topk(2, label_replace(rate({app="x"}[5m]), "dst", "v", "src", ".*"))"#,
+        r#"label_replace(rate({app="x"}[5m]), "dst", "v", "src", ".*") + 1"#,
+        r#"1 + label_replace(rate({app="x"}[5m]), "dst", "v", "src", ".*")"#,
+        r#"label_replace(label_replace(rate({app="x"}[5m]), "a", "b", "c", "d"), "e", "f", "g", "h")"#,
+        r#"label_replace(rate({app="x"}[5m]) + rate({app="y"}[5m]), "dst", "v", "src", ".*")"#,
+        r#"label_replace(vector(1), "dst", "v", "src", ".*")"#,
+        // Empty-string arguments are grammatical (their semantics are a
+        // pulsus-read concern).
+        r#"label_replace(rate({app="x"}[5m]), "", "", "", "")"#,
+    ] {
+        assert_round_trip(q);
+    }
+}
+
+/// The parsed shape: a `LabelReplace` node whose sole child is the inner
+/// metric expression, reached through the #272 iterative driver.
+#[test]
+fn label_replace_parses_to_a_label_replace_node() {
+    let expr = parse(r#"label_replace(rate({app="x"}[5m]), "dst", "v-$1", "src", "x-(.*)")"#)
+        .expect("parse");
+    let shape = metric_shape(metric_root(&expr));
+    assert_eq!(
+        shape,
+        vec!["LabelReplace(dst)".to_string(), "Range(rate)".to_string()]
+    );
+}
+
 /// Pre-order node kinds of a metric expression, reached through the #272
 /// iterative driver — a consumer cannot open a child handle any other
 /// way. Strictly more shape than the pre-#272 positional destructuring:
@@ -1676,6 +1716,7 @@ fn metric_shape(root: &pulsus_logql::MetricExpr) -> Vec<String> {
             MeNode::Expr(MetricExpr::VectorFn(raw)) => format!("VectorFn({raw})"),
             MeNode::Expr(MetricExpr::Binary { op, .. }) => format!("Binary({op})"),
             MeNode::Expr(MetricExpr::Variants(_)) => "Variants".to_string(),
+            MeNode::Expr(MetricExpr::LabelReplace { dst, .. }) => format!("LabelReplace({dst})"),
             MeNode::Var(v) => format!("VariantsExpr({})", v.variants.len()),
         });
     });

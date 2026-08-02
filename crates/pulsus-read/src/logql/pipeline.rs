@@ -1859,10 +1859,13 @@ impl CompiledPipeline {
 /// size-limit-class failure of the wrapped form is never misreported.
 /// Issue #246 replaces this body and nowhere else.
 ///
-/// NOTE: `label_replace` is not in PulsusDB's LogQL grammar today
-/// (`plan.rs` rejects it at parse) — see issue #276, which adds it. The
-/// reference genuinely DOES report the WRAPPED form at that one site, so
-/// once #276 lands this seam must NOT be "consistency fixed" to wrap.
+/// NOTE: `label_replace` (issue #276) is the ONE deliberate exception —
+/// LIVE, not dormant: the reference genuinely reports the WRAPPED
+/// `^(?:…)$` form at that single site, so
+/// `plan::LabelReplaceSpec::compile` deliberately does NOT route through
+/// this seam, and neither side may be "consistency fixed" toward the
+/// other (pinned by
+/// `label_replace_bad_regex_reports_the_wrapped_form_not_the_users_pattern`).
 fn bad_regex(user_pattern: &str, observed: &regex::Error) -> PipelineError {
     let msg = match regex::Regex::new(user_pattern) {
         Err(e) => e.to_string(),
