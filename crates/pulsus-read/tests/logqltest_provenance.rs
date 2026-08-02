@@ -317,28 +317,34 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         }
     }
     // §3.4: the interpolating anchored template may exist at exactly the
-    // three committed sites — the escaper, the validator, and (issue
-    // #276) `plan.rs`'s `LabelReplaceSpec::compile`. The third is
-    // deliberately OUTSIDE the checked-escape seam: `label_replace`'s
-    // pattern never reaches SQL (the transform runs over the evaluated
-    // result), the anchored text it compiles is the #317 RE2→Rust
-    // REWRITE of the user's pattern (not the bytes the SQL seam
-    // validates), and its compile error must surface the WRAPPED form —
-    // the #240 asymmetry — which the `bad_regex`-routed seams must never
-    // produce.
+    // four committed sites — the escaper, the byte-identity replica in
+    // the escaper's OWN tests (issue #331 fix round 1: the corpus-wide
+    // crossing that pins `ch_regex_anchored`'s Verbatim output against
+    // the pre-#331 construction has to spell that construction, and it
+    // lives beside the module-private escaper because nothing outside
+    // the module can call it), the validator, and (issue #276)
+    // `plan.rs`'s `LabelReplaceSpec::compile`. The last is deliberately
+    // OUTSIDE the checked-escape seam: `label_replace`'s pattern never
+    // reaches SQL (the transform runs over the evaluated result), the
+    // anchored text it compiles is the #317 RE2→Rust REWRITE of the
+    // user's pattern (not the bytes the SQL seam validates), and its
+    // compile error must surface the WRAPPED form — the #240 asymmetry
+    // — which the `bad_regex`-routed seams must never produce.
     anchored_hits.sort();
-    let allowed = ["escape.rs", "pipeline.rs", "plan.rs"];
-    if anchored_hits.len() != allowed.len()
+    let allowed: &[(&str, usize)] = &[("escape.rs", 2), ("pipeline.rs", 1), ("plan.rs", 1)];
+    let total: usize = allowed.iter().map(|(_, n)| n).sum();
+    if anchored_hits.len() != total
         || !allowed
             .iter()
-            .all(|f| anchored_hits.iter().filter(|h| h.starts_with(f)).count() == 1)
+            .all(|(f, n)| anchored_hits.iter().filter(|h| h.starts_with(f)).count() == *n)
     {
         let _ = writeln!(
             errors,
-            "anchoring guard: `^(?:{{` must occur at exactly three sites (escape.rs's \
-             escaper, pipeline.rs's validator, and plan.rs's `LabelReplaceSpec::compile`), \
-             found {anchored_hits:?} — every OTHER site must build the anchored form \
-             through `escape::ch_regex_anchored_checked`, never by hand"
+            "anchoring guard: `^(?:{{` must occur at exactly four sites (escape.rs's \
+             escaper and its tests' pre-#331 replica, pipeline.rs's validator, and \
+             plan.rs's `LabelReplaceSpec::compile`), found {anchored_hits:?} — every \
+             OTHER site must build the anchored form through \
+             `escape::ch_regex_anchored_checked`, never by hand"
         );
     }
     assert!(errors.is_empty(), "{errors}");
@@ -352,8 +358,11 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
 /// top-level item, private ones included.
 const ESCAPE_ITEMS: &[&str] = &[
     "use super::pipeline::PipelineError",
+    "use pulsus_re2::ClickhouseMatchStrategy",
     "pub fn ch_string(s: &str) -> String",
     "pub fn ch_ident(s: &str) -> String",
+    "fn anchored_match_regex(pat: &str) -> String",
+    "fn unanchored_match_regex(pat: &str) -> String",
     "fn ch_regex_anchored(pat: &str) -> String",
     "fn ch_regex_unanchored(pat: &str) -> String",
     "pub(crate) fn ch_regex_anchored_checked(pat: &str) -> Result<String, PipelineError>",

@@ -64,6 +64,12 @@ use std::borrow::Cow;
 mod re2_syntax;
 
 pub use re2_syntax::re2_pattern_to_rust;
+// Issue #331: the ClickHouse `match()` flag-group-head strategy — the
+// fourth RE2-compatibility surface, landed alongside the #328
+// extraction and living here with the walker helpers it shares.
+pub use re2_syntax::{
+    ClickhouseMatchStrategy, clickhouse_match_head_rewrite, clickhouse_match_strategy,
+};
 
 /// RE2's repetition ceiling — `kMaxRepeat` in `re2/parse.cc`, `maxRepeat`
 /// in Go's `regexp/syntax/parse.go`. The Rust crate has no equivalent

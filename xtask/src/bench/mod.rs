@@ -19,6 +19,11 @@
 //!   `system.query_log` evidence for the two-phase TraceQL search +
 //!   trace-by-ID, verdicted (hard errors) against a client-computed
 //!   `cityHash64(trace_id) % total_weight` roster. See [`traces_read`].
+//! - `match-flag-head` (issue #331) — the ClickHouse `match()`
+//!   flag-group-head remedy benchmark, committed so the
+//!   rewrite-vs-defeat comparison is reproducible on any machine
+//!   rather than argued from unshared runs. Printing only, asserts
+//!   nothing. See [`match_flag_head`].
 //!
 //! Example:
 //! ```text
@@ -40,6 +45,7 @@
 
 pub mod dataset;
 pub mod logs_hydration;
+pub mod match_flag_head;
 pub mod metrics_labels;
 pub mod queries;
 mod query_log;
@@ -170,9 +176,10 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         "metrics-labels" => metrics_labels::run(args).await,
         "logs-hydration" => logs_hydration::run(args).await,
         "traces-read" => traces_read::run(args).await,
+        "match-flag-head" => match_flag_head::run(args).await,
         other => anyhow::bail!(
             "unknown bench scenario {other:?} (expected \"logs-read\", \"metrics-labels\", \
-             \"logs-hydration\", or \"traces-read\")"
+             \"logs-hydration\", \"traces-read\", or \"match-flag-head\")"
         ),
     }
 }

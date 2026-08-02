@@ -33,6 +33,10 @@ rustls-pemfile = "2"
 # schema — justifying xtask's dependency on these product crates alongside
 # the two ClickHouse client candidates above.
 pulsus-clickhouse = { path = "../crates/pulsus-clickhouse" }
+# `bench match-flag-head` (issue #331) takes the rewrite text from the
+# production classifier so the benchmark measures what the read path
+# actually emits, never a hand-copy.
+pulsus-re2 = { path = "../crates/pulsus-re2" }
 pulsus-model = { path = "../crates/pulsus-model" }
 pulsus-logql = { path = "../crates/pulsus-logql" }
 pulsus-read = { path = "../crates/pulsus-read" }
