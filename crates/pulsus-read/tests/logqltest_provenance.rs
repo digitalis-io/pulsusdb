@@ -578,9 +578,39 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
 /// call-site table. One entry since issue #282 retired TraceQL's
 /// placeholder token — `traces/filter.rs` renders through
 /// `ch_regex_anchored_checked` and holds no capability at all.
+///
+/// Issue #315 moved the entry from `metrics/sql.rs` to
+/// `metrics/series_where.rs`. The replaced row pinned `sql.rs` at
+/// `(4, 2)`: 4 production spellings — the `Re`/`Nre` arms of its two
+/// predicate renderers, `matcher_predicate` and `metric_name_predicate` —
+/// plus 2 in its tests. This table pins the single production call inside
+/// the leaf's `anchored_re2_literal`; the test sites are gone because
+/// tests now obtain the rendering through the `_for_test` seam. A rise,
+/// or a second file appearing, is still the review event.
 #[test]
 fn check_d7_exemption_call_sites_match_the_committed_table() {
-    let cases = [("src/metrics/sql.rs", "ch_regex_anchored_promql_re2(", 4, 2)];
+    let cases = [(
+        "src/metrics/series_where.rs",
+        "ch_regex_anchored_promql_re2(",
+        1,
+        0,
+    )];
+    // The builders' own file must hold NO escaper spelling. This is a
+    // textual CENSUS, deliberately: it catches drift — the call pasted
+    // back — never capability, since a `use … as` alias evades any grep.
+    // The capability claim is rustc's (issue #315 review round 2): the
+    // escaper's token has a private field and private `new` inside
+    // series_where.rs, so the aliased call this census cannot see fails
+    // to compile — `E0624` — from sql.rs and every other module alike
+    // (series_where.rs's module doc carries the measured battery).
+    assert_eq!(
+        read("src/metrics/sql.rs")
+            .matches("ch_regex_anchored_promql_re2(")
+            .count(),
+        0,
+        "src/metrics/sql.rs must reach the escaper only through \
+         series_where.rs's sealed renderer"
+    );
     for (rel, needle, want_prod, want_test) in cases {
         let text = read(rel);
         let split = text.find("mod tests {").unwrap_or(text.len());

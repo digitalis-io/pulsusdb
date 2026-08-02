@@ -537,8 +537,12 @@ enum CachedPattern {
 /// [`resolve_over`] maps to [`FallbackReason::RegexUnsupported`]. Regexes
 /// are always rendered fully anchored (`^(?:...)$`), mirroring ClickHouse
 /// RE2's `match()` semantics on the SQL fallback path
-/// (`escape::ch_regex_anchored`) — load-bearing for the cache-vs-SQL
-/// differential test. Interior mutability via a `std::sync::Mutex` is sound
+/// (`escape::ch_regex_anchored_promql_re2`) — load-bearing for the
+/// cache-vs-SQL differential test. Issue #324: the SQL side additionally
+/// carries a `(?-s)` prefix, which is not a divergence but the correction
+/// that makes the two agree — ClickHouse's `match()` sets RE2's `dot_nl`
+/// option, while the Rust crate's `.` already excludes a newline exactly as
+/// RE2 does. Interior mutability via a `std::sync::Mutex` is sound
 /// here despite `resolve` taking `&self`: the critical section is entirely
 /// synchronous (a hashmap lookup/insert plus a regex compile), never held
 /// across an `.await`.

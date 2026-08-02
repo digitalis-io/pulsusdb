@@ -20,18 +20,27 @@
 //!   `cargo test --workspace` lane. The curated half is a hand list, so it
 //!   is checked for *content* — that the named divergence classes are still
 //!   present — never for byte identity, which would mean nothing there.
-//! * **Live** (`PULSUS_TEST_CLICKHOUSE=1`) — two crossings against a real
-//!   RE2, neither of which can be hermetic because there is no in-process
-//!   RE2:
+//! * **Live** (`PULSUS_TEST_CLICKHOUSE=1`) — three crossings against a real
+//!   RE2, none of which can be hermetic because there is no in-process RE2:
 //!   * **acceptance** (issue #309) — every corpus pattern the in-process
 //!     path can compile is compiled by ClickHouse's RE2 (`SELECT match('x',
-//!     '^(?:…)$')`, the anchored form the read path renders) and the two
+//!     …)` over the literal the read path actually renders) and the two
 //!     verdicts are crossed with the screen's;
 //!   * **meaning** (issue #317) — every corpus pattern *both* engines
 //!     accept is evaluated against a fixed subject alphabet by both, and
 //!     the two answers must agree bit for bit. This is what proves the
 //!     `pulsus_promql::re2_pattern_to_rust` rewrite: the same test with the
 //!     rewrite removed reports the divergences it exists to close.
+//!   * **SQL meaning** (issue #324) — for every corpus pattern RE2 accepts,
+//!     `match()` — the function the read path's predicates use, and which
+//!     goes through ClickHouse's `OptimizedRegularExpression` wrapper
+//!     before reaching RE2 — must select the same subjects as RE2 itself.
+//!     It did not: `match('\n', '^(?:.)$')` is `1` while `replaceRegexpOne`
+//!     on the same inputs reports no match, because the wrapper sets RE2's
+//!     `dot_nl` option. This crossing is over the **rendered** literal
+//!     (`metrics::anchored_re2_literal_for_test`), so it pins the fix
+//!     — the `(?-s)` prefix — rather than a hand-copy of it, and it covers
+//!     screened patterns too: those are precisely the ones that reach SQL.
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 \
@@ -49,6 +58,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings};
+use pulsus_read::metrics::anchored_re2_literal_for_test as rendered_sql_pattern;
 use pulsus_read::metrics::pattern_requires_re2_authority_for_test as screened;
 
 /// Fragments the two engines have opinions about — ordinary regex syntax,
@@ -131,6 +141,14 @@ const TOKENS: &[&str] = &[
     "\\E",
     "\\1",
     "\\C",
+    // Issue #324's subject: `.`, the `s` flag that turns it into
+    // "everything", and a literal newline escape. `(?s)` must keep working
+    // (it is the user's own opt-in) even though the rendered pattern now
+    // carries a leading `(?-s)`.
+    "(?s)",
+    "(?s:",
+    "\\n",
+    "[^\\n]",
 ];
 
 /// Frozen with the fixture: changing either invalidates the committed
@@ -290,9 +308,10 @@ fn generated_corpus_fixture_is_exactly_what_the_seed_produces() {
     }
 }
 
-/// The curated half must keep naming the two classes the live differential
+/// The curated half must keep naming the classes the live differential
 /// discovered (they were not predicted by inspection), so a future edit
-/// cannot quietly drop the cases that motivated the screen's shape.
+/// cannot quietly drop the cases that motivated the screen's shape or
+/// issue #324's SQL-side flag.
 #[test]
 fn curated_corpus_still_carries_the_discovered_divergence_classes() {
     live_gate_or_panic();
@@ -308,6 +327,15 @@ fn curated_corpus_still_carries_the_discovered_divergence_classes() {
         "a{bbb}c",
         "a*?",
         "[*+]",
+        // Issue #324: the measured case, the `s`-flag opt-in that must keep
+        // working over it, and the negated class whose newline behaviour
+        // was always correct and must not be "fixed".
+        ".",
+        "a.b",
+        "(?s).",
+        "(?s:a.b)",
+        r"[^\n]",
+        "[^a]",
     ] {
         assert!(
             curated.iter().any(|p| p == probe),
@@ -400,7 +428,7 @@ fn double_placeholders(sql: &str) -> String {
 async fn re2_accepts(client: &ChClient, pattern: &str) -> bool {
     let sql = double_placeholders(&format!(
         "SELECT match('x', {})",
-        sql_literal(&format!("^(?:{pattern})$"))
+        rendered_sql_pattern(pattern)
     ));
     match client
         .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
@@ -502,9 +530,14 @@ fn parser_admits(pattern: &str) -> bool {
 /// Arabic-Indic one (`\d`), an ASCII letter against `é` (`\w`), space and
 /// tab against NBSP and vertical tab (`\s`), and the punctuation the Rust
 /// crate reads as character-class syntax (`&`, `~`, `-`, `[`, `]`).
+/// Issue #324 adds the newline-bearing subjects: a bare `\n` alone cannot
+/// separate "`.` matched the newline" from "`.` matched nothing and the
+/// anchors did the work", and `\r` is the control in the other direction —
+/// RE2 excludes ONLY `\n` from `.`, so a fix that excluded `\r` too would
+/// be over-correcting and must fail here.
 const SUBJECTS: &[&str] = &[
     "", "a", "b", "z", "0", "9", "_", "-", ".", "&", "~", "[", "]", "a]", "ab", "a-b", " ", "\t",
-    "\n", "\u{000b}", "\u{00a0}", "\u{0663}", "é", "a{bbb}c",
+    "\n", "a\nb", "\r", "a\rb", "\u{000b}", "\u{00a0}", "\u{0663}", "é", "a{bbb}c",
 ];
 
 /// The in-process engine's compiled form of `pattern` — RE2's reading of
@@ -528,13 +561,41 @@ fn match_bits(re: &regex::Regex) -> String {
 /// pattern matched" is decidable from `replaceRegexpOne`'s output alone.
 const SENTINEL: &str = "'<matched>'";
 
+/// Patterns where ClickHouse's `match()` disagreed with RE2 **before**
+/// issue #324's fix and still does after it, for a different and separate
+/// reason — recorded here rather than deleted from the corpus, so the
+/// defect stays visible and any change in its extent is a test failure.
+///
+/// `OptimizedRegularExpression::analyze` scans a `(?…` group head for an
+/// `i` and stops at the first `-` or `)`; when it finds no `i` it leaks the
+/// head's own characters into the literal it extracts as the pattern's
+/// required substring. Measured on 24.8.14.39: `match('xaby', '(?s:ab)')`
+/// is `0` while `match('xs:aby', '(?s:ab)')` is `1` — the server is
+/// searching for `s:ab`. `replaceRegexpOne`, which reaches RE2 without the
+/// wrapper, matches `xaby`. So a scoped flag group (`(?s:`, `(?m:`, `(?U:`
+/// — but not `(?i:`, and not `(?i-s:`) followed by literal text silently
+/// selects no rows on the SQL path.
+///
+/// **Not** what issue #324 is about, and not introduced by it: the same
+/// input answers `0` with the `(?-s)` prefix removed. It is also why the
+/// prefix goes before the anchor — `^(?-s)(?:abc)$` does not match `abc`
+/// (measured), while `(?-s)^(?:abc)$` does, because `^` resets the
+/// candidate literal.
+const KNOWN_CLICKHOUSE_MATCH_DEFECTS: &[&str] = &["(?s:a.b)"];
+
 /// One `String` column per engine call, so a whole pattern's answer is one
 /// round trip. `replaceRegexpOne` runs RE2 directly; `match` is the
 /// function the read path's SQL predicates use and goes through
 /// ClickHouse's `OptimizedRegularExpression` wrapper first, so both are
 /// read and reported separately.
 fn bits_sql(pattern: &str) -> String {
+    // The reference half is RE2 over the USER's anchored pattern; the
+    // `match` half is the literal the read path actually renders, which
+    // since issue #324 is not the same text (`(?-s)` prefix). Comparing
+    // them is the whole point: the fix has to make ClickHouse's wrapper
+    // agree with RE2's own reading of what the user wrote.
     let anchored = sql_literal(&format!("^(?:{pattern})$"));
+    let rendered = rendered_sql_pattern(pattern);
     let mut parts: Vec<String> = Vec::with_capacity(SUBJECTS.len() * 2);
     for subject in SUBJECTS {
         // `replaceRegexpOne` returns an empty haystack unchanged without
@@ -554,7 +615,7 @@ fn bits_sql(pattern: &str) -> String {
     }
     for subject in SUBJECTS {
         let subject = sql_literal(subject);
-        parts.push(format!("toString(match({subject}, {anchored}))"));
+        parts.push(format!("toString(match({subject}, {rendered}))"));
     }
     double_placeholders(&format!("SELECT concat({}) AS bits", parts.join(", ")))
 }
@@ -579,9 +640,10 @@ fn is_re2_rejection(e: &ChError) -> bool {
     }
 }
 
-/// RE2's verdicts for `pattern` over [`SUBJECTS`]: `(true RE2, ClickHouse
-/// `match`)`. `None` when RE2 refuses to compile the pattern — an
-/// acceptance divergence, which the other live test owns.
+/// RE2's verdicts for `pattern` over [`SUBJECTS`]: `(true RE2 over the
+/// user's anchored pattern, ClickHouse `match` over the RENDERED literal)`.
+/// `None` when RE2 refuses to compile the pattern — an acceptance
+/// divergence, which the other live test owns.
 ///
 /// The stream is drained inside this function so its pooled-connection
 /// lease is released before the caller issues the next query.
@@ -637,23 +699,34 @@ async fn the_rewrite_makes_the_in_process_engine_agree_with_re2() {
     let mut over_rejected_by_316: Vec<String> = Vec::new();
     let mut fixed_by_the_rewrite = 0usize;
     let mut clickhouse_match_deviations: Vec<String> = Vec::new();
+    let mut known_defects_seen: Vec<&str> = Vec::new();
     let mut mismatches: Vec<String> = Vec::new();
 
     for pattern in &corpus {
-        // A screened pattern never gets an in-process verdict at all — the
-        // read path defers it to storage (issue #309), so RE2 answers it
-        // and there is nothing here to agree or disagree with. This is the
-        // same order the read path applies: screen first, compile second.
-        if screened(pattern) {
-            screened_off_the_in_process_path += 1;
-            continue;
-        }
+        // Issue #324's crossing runs FIRST and is not screened: a screened
+        // pattern is precisely one the read path sends to SQL, so it is the
+        // most important input to the SQL-vs-RE2 comparison, not an exempt
+        // one.
         let Some((re2, optimized)) = re2_bits(&client, pattern).await else {
             re2_rejected += 1;
             continue;
         };
-        if optimized != re2 && clickhouse_match_deviations.len() < 8 {
-            clickhouse_match_deviations.push(pattern.clone());
+        if optimized != re2 {
+            if KNOWN_CLICKHOUSE_MATCH_DEFECTS.contains(&pattern.as_str()) {
+                known_defects_seen.push(pattern.as_str());
+            } else {
+                clickhouse_match_deviations.push(format!(
+                    "{pattern:?}: clickhouse_match={optimized} re2={re2}"
+                ));
+            }
+        }
+        // A screened pattern never gets an in-process verdict at all — the
+        // read path defers it to storage (issue #309), so RE2 answers it
+        // and there is nothing below to agree or disagree with. This is the
+        // same order the read path applies: screen first, compile second.
+        if screened(pattern) {
+            screened_off_the_in_process_path += 1;
+            continue;
         }
         let Some(re) = rust_accepts(pattern) else {
             // The rewrite does not compile: on every path with a storage
@@ -687,10 +760,33 @@ async fn the_rewrite_makes_the_in_process_engine_agree_with_re2() {
          screened={screened_off_the_in_process_path} re2_rejected={re2_rejected} \
          rust_rejected_after_rewrite={rust_rejected_after_rewrite} \
          fixed_by_the_rewrite={fixed_by_the_rewrite} \
-         clickhouse_match_deviations={:?} over_rejected_by_316={:?}",
+         clickhouse_match_deviations={} over_rejected_by_316={:?}",
         corpus.len(),
-        clickhouse_match_deviations,
+        clickhouse_match_deviations.len(),
         over_rejected_by_316
+    );
+
+    // Issue #324: ClickHouse's `match()` must select the same subjects as
+    // RE2 itself for the literal the read path renders. Before the `(?-s)`
+    // prefix this listed every `.`-carrying pattern (`.`, `.*`, `.+`,
+    // `.(?i)`, `\s{2}|.` on the pre-#324 corpus) — the SQL path
+    // over-matching any label value containing a line break.
+    assert!(
+        clickhouse_match_deviations.is_empty(),
+        "ClickHouse's match() disagrees with RE2 for {} rendered pattern(s) — the SQL \
+         path would return rows the reference would not: {clickhouse_match_deviations:#?}",
+        clickhouse_match_deviations.len()
+    );
+    // The exemption list is not allowed to rot: every entry must still be a
+    // live deviation, so a ClickHouse fix (or a corpus edit that drops the
+    // pattern) forces the list to be deleted rather than silently masking a
+    // future regression on the same input.
+    known_defects_seen.sort_unstable();
+    known_defects_seen.dedup();
+    assert_eq!(
+        known_defects_seen, KNOWN_CLICKHOUSE_MATCH_DEFECTS,
+        "the known-defect exemption list no longer matches what ClickHouse actually does — \
+         delete the entries that now agree with RE2"
     );
 
     assert!(

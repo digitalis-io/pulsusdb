@@ -125,11 +125,37 @@ pub(crate) fn ch_regex_unanchored_checked(pat: &str) -> Result<String, PipelineE
 /// Rust `regex` crate cannot compile is *sent* (`metrics/labels.rs:496-506`,
 /// `:521-526`; `metrics/sql.rs:264-266`). Rust-validating here would reject
 /// exactly the queries that fallback exists to serve.
+///
+/// **Issue #324 — `.` versus newline.** ClickHouse's `match()` compiles its
+/// pattern with RE2's `dot_nl` option ON, so `.` matches a newline there,
+/// while upstream RE2 — and Go's `regexp`, and therefore Prometheus —
+/// leaves it off unless the `s` flag is set. Measured on 24.8.14.39:
+/// `match('\n', '^(?:.)$')` returns `1` while `replaceRegexpOne`, which
+/// reaches RE2 without ClickHouse's `OptimizedRegularExpression` wrapper in
+/// front of it, reports no match — the server is not self-consistent. A
+/// label value carrying a line break therefore over-matched on this path
+/// (they arrive through structured metadata and OTLP attributes). The
+/// rendered pattern is prefixed with RE2's own `(?-s)` flag group, which
+/// restores the reference's reading; a `(?s)` inside the user's pattern
+/// still overrides it from that point on, exactly as upstream.
+///
+/// The flag goes BEFORE the anchor, not inside the group. ClickHouse's
+/// required-substring analysis mis-reads a flag-negation group that follows
+/// a literal and then answers `0` for every row — measured,
+/// `match('abc', '^(?:(?-s)abc)$')` is `0` while RE2 says it matches — and
+/// the leading position is the one it analyses correctly (corpus evidence:
+/// `pulsus-read/tests/re2_screen_differential.rs`). Composing
+/// [`ch_regex_anchored`]'s own output rather than re-spelling the anchoring
+/// template keeps that template single-sourced, which the issue #240
+/// anchoring guard also requires.
 pub(crate) fn ch_regex_anchored_promql_re2(
     _authority: crate::metrics::PromqlRe2Fallback,
     pat: &str,
 ) -> String {
-    ch_regex_anchored(pat)
+    let anchored = ch_regex_anchored(pat);
+    // `ch_string` always opens the literal with `'`, so byte 0 is that
+    // quote and `[1..]` is the pattern text plus its closing quote.
+    format!("'(?-s){}", &anchored[1..])
 }
 
 #[cfg(test)]

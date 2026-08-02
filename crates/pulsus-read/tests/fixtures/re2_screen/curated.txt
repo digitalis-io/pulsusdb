@@ -254,3 +254,39 @@ a{2}b{x}
 [{}]
 [a{2}]
 x\{2\}
+# Issue #324 — `.` versus newline. ClickHouse's `match()` compiles with
+# RE2's `dot_nl` option set, so `.` matched a line break there and does not
+# in RE2 itself. These are the shapes that separate the two readings, plus
+# the `s` flag the user may still set deliberately and the negated classes
+# that must keep their own (correct) newline behaviour.
+.
+.*
+.+
+a.b
+a.*b
+^.$
+(?s).
+(?s).*
+(?s:.)
+(?s:a.b)
+(?s)a.b
+a(?s).b
+(?i)a.b
+(?s)(?i).
+[^a]
+[^\n]
+[^a\n]
+\n
+a\nb
+.\n.
+(.|\n)
+(?:.|\n)*
+\s
+\S
+[[:space:]]
+[^[:space:]]
+.{2}
+.{1,3}
+(?s).{2}
+\.
+a\.b
