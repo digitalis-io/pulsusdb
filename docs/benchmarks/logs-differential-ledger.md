@@ -775,18 +775,41 @@ clients only display it).
   signature rejects and coercion errors — proved byte-exact in the
   captured corpus and stays in it.
 
-### `template-local-zone-environment` (issue #230, adjudication 3)
+### `template-timezone-configured` (issue #311, supersedes `template-local-zone-environment` from #230 adjudication 3)
 
-- The `Local` zone (`__timestamp__`, `date`, `toDate`) resolves from
-  the process environment exactly like a reference process on the same
-  host (`$TZ` name → that zone; no `$TZ` → `/etc/localtime`, named
-  "Local"; else the degenerate UTC form). The hermetic corpus and its
-  captures pin the degenerate-UTC form (stock container, PROVENANCE
-  precondition). Residuals inside this class: `chrono-tz` 0.10.4's
-  IANA tables vs the reference toolchain's (mainstream post-1970 zones
-  agree), zone-abbreviation lookups for layout PARSING approximate
-  Go's `lookupName` with instant±6-month probes, and zone-offset
-  lookups clamp beyond chrono's ±262k-year range.
+- **Reference behaviour:** the `Local` zone used by the template time
+  functions (`__timestamp__`, `now`, `date`, `toDate`) is resolved from
+  the PROCESS — `$TZ` names the zone, else `/etc/localtime` is read and
+  the result is named "Local", else the degenerate UTC form.
+- **PulsusDB behaviour:** the zone is resolved from SERVER
+  CONFIGURATION — `reader.template_timezone` / `PULSUS_TEMPLATE_TIMEZONE`
+  (docs/configuration.md §6), defaulting to `UTC`. `$TZ` and
+  `/etc/localtime` are never read on any path that can reach a query
+  result. An unknown zone name fails config load; there is no fallback.
+- **Why we diverge:** host-resolved state makes one query return
+  different text depending on which server in a cluster answered it —
+  a defect in a database, and one that already reddened CI once (a
+  fixture generated under `Europe/London` failed under `Etc/UTC`,
+  #272). Configuration is not the same thing as ambient inheritance:
+  it is declared once and uniform across the fleet, rather than
+  discovered per machine.
+- **The same behaviour remains available, it merely has to be stated
+  rather than inherited.** A deployment that deliberately runs in a
+  local zone sets `template_timezone` to it once and gets exactly what
+  the reference gave it: a configured zone keeps its own IANA name,
+  which is precisely the reference's `$TZ=<name>` branch. Only its
+  `/etc/localtime` branch — the one that renames the zone to "Local" —
+  has no counterpart here, because nothing reads that file.
+- **Invisible in the common deployment:** the shipped default, `UTC`,
+  produces Go's degenerate all-nil `Local`, which is also what a stock
+  reference container (no `$TZ`, no host zoneinfo) produces. The
+  hermetic corpus and its captures pin that form (PROVENANCE
+  precondition) and are unchanged.
+- Residuals inside this class, unchanged from #230: `chrono-tz`
+  0.10.4's IANA tables vs the reference toolchain's (mainstream
+  post-1970 zones agree), zone-abbreviation lookups for layout PARSING
+  approximate Go's `lookupName` with instant±6-month probes, and
+  zone-offset lookups clamp beyond chrono's ±262k-year range.
 
 ### `template-output-budget` (issue #230 follow-up, bounded divergence)
 

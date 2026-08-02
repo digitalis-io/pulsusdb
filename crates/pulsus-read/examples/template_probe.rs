@@ -4,7 +4,8 @@
 //! Pair it with an in-checkout oracle built against the pinned
 //! reference (a ~60-line `main.go` that feeds the same JSONL through
 //! `log.NewFormatter`/`NewLabelsFormatter` and prints the same shape),
-//! run both under the same `TZ`, and diff — the workflow that
+//! run both in the same zone (this probe takes it as `argv[1]`, the
+//! oracle takes it from `TZ`), and diff — the workflow that
 //! byte-verified this engine over ~725 cases before the container
 //! capture. Not part of any test suite; the committed contract is the
 //! container-captured corpus (`tests/logqltest/corpus/t*.test`).
@@ -18,9 +19,16 @@ fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    // Mirrors the engine's process-environment resolution so the
-    // oracle and the probe can be driven under the same TZ.
-    let env = TemplateEnv::process();
+    // Mirrors the engine's CONFIGURED zone resolution (issue #311):
+    // `template_probe [IANA zone]`, default UTC. Pass the same zone the
+    // oracle is driven with (its `TZ`) to compare like for like — the
+    // engine itself never reads the host environment.
+    let zone = std::env::args().nth(1).unwrap_or_else(|| "UTC".to_string());
+    let tz: chrono_tz::Tz = zone.parse().unwrap_or_else(|_| {
+        eprintln!("template_probe: {zone:?} is not a known IANA timezone name");
+        std::process::exit(2);
+    });
+    let env = TemplateEnv::for_timezone(tz);
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {

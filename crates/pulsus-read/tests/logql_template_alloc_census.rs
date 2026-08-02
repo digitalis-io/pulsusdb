@@ -1730,6 +1730,13 @@ static PINS: &[Pin] = &[
     // ------------------------------------------------------------ mod.rs
     Pin {
         file: "mod.rs",
+        func: "<module>",
+        callees: &["OnceLock::new"],
+        disposition: CONST,
+        why: "one empty process-wide timezone slot, statically sized (issue #311)",
+    },
+    Pin {
+        file: "mod.rs",
         func: "charge",
         callees: &["format!"],
         disposition: CONST,
@@ -2057,10 +2064,10 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "timefns.rs",
-        func: "process",
+        func: "for_timezone",
         callees: &[".to_string"],
         disposition: CONST,
-        why: "zone names, once per compile",
+        why: "one configured zone name, once per compile (issue #311)",
     },
     Pin {
         file: "timefns.rs",
