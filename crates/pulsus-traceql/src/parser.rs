@@ -36,6 +36,15 @@
 //! `{a} && ({b} > {c})`; `{a} > {b} > {c}` ≡ `({a} > {b}) > {c}`) — the
 //! adjudicated precedence pin, frozen into the corpus goldens.
 //!
+//! `&&` and `||` share ONE precedence level and are left-associative, at
+//! both the spanset and the field level (issue #335 classes D10/D11). The
+//! full table, tightest first: `^`, `* / %`, unary `-`, `+ -`, the
+//! comparison operators, then `&&`/`||`. Every arithmetic level is
+//! left-associative — `^` included (D8) — and unary `-` sits BETWEEN
+//! `* / %` and `+ -` (D9). All four placements are the reference's, read
+//! off its own parenthesised echo rather than assumed; the captures and
+//! the whole accept-surface comparison live in `tests/accept_surface/`.
+//!
 //! Disambiguation of the dual-role `>`/`>=`/`<`/`<=` tokens (comparison
 //! inside a field expression, structural operator between spansets) is
 //! purely positional: field-level comparisons are fully consumed before
@@ -214,9 +223,27 @@ fn describe(kind: &TokenKind) -> String {
     }
 }
 
-/// `SpansetExpr := SpansetAnd ("||" SpansetAnd)*` — left-associative;
-/// `&&` binds tighter than `||` at the spanset level, mirroring the
-/// field level.
+/// The boolean operator a token introduces, if any. `&&` and `||` share
+/// ONE precedence level and are left-associative (issue #335, classes
+/// D10/D11) — `a || b && c` is `(a || b) && c`, not `a || (b && c)`.
+///
+/// That is the reference's grammar, verified black-box rather than
+/// inferred: at the field level the reference echoes its own parse in a
+/// type error (`{ .a = 1 || .b = 2 && "x" }` reports
+/// `((.a = 1) || (.b = 2)) && \`x\``), and at the spanset level, where no
+/// error channel exists, a result differential over pushed spans shows
+/// `{A} || {B} && {C}` returning what `({A} || {B}) && {C}` returns.
+/// Both captures live in `tests/accept_surface/matrix.json`.
+fn bool_op_of(kind: &TokenKind) -> Option<BoolOp> {
+    match kind {
+        TokenKind::AndAnd => Some(BoolOp::And),
+        TokenKind::OrOr => Some(BoolOp::Or),
+        _ => None,
+    }
+}
+
+/// `SpansetExpr := SpansetStructural (("&&" | "||") SpansetStructural)*`
+/// — one precedence level, left-associative (see [`bool_op_of`]).
 fn parse_spanset_expr(
     cursor: &mut Cursor<'_>,
     depth: usize,
@@ -227,32 +254,13 @@ fn parse_spanset_expr(
             span: cursor.peek().span,
         });
     }
-    let mut lhs = parse_spanset_and(cursor, depth, binary_nodes)?;
-    while matches!(cursor.peek().kind, TokenKind::OrOr) {
-        charge_binary_node(binary_nodes, cursor.peek().span)?;
-        cursor.advance();
-        let rhs = parse_spanset_and(cursor, depth, binary_nodes)?;
-        lhs = SpansetExpr::Binary {
-            op: BoolOp::Or,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        };
-    }
-    Ok(lhs)
-}
-
-fn parse_spanset_and(
-    cursor: &mut Cursor<'_>,
-    depth: usize,
-    binary_nodes: &mut usize,
-) -> Result<SpansetExpr, TraceQlError> {
     let mut lhs = parse_spanset_structural(cursor, depth, binary_nodes)?;
-    while matches!(cursor.peek().kind, TokenKind::AndAnd) {
+    while let Some(op) = bool_op_of(&cursor.peek().kind) {
         charge_binary_node(binary_nodes, cursor.peek().span)?;
         cursor.advance();
         let rhs = parse_spanset_structural(cursor, depth, binary_nodes)?;
         lhs = SpansetExpr::Binary {
-            op: BoolOp::And,
+            op,
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
         };
@@ -384,8 +392,8 @@ fn parse_spanset_filter(
     Ok(SpansetFilter { body: Some(body) })
 }
 
-/// `FieldExpr := FieldAnd ("||" FieldAnd)*` — `&&` binds tighter than
-/// `||`, both left-associative.
+/// `FieldExpr := FieldPrimary (("&&" | "||") FieldPrimary)*` — one
+/// precedence level, left-associative (see [`bool_op_of`]).
 fn parse_field_expr(
     cursor: &mut Cursor<'_>,
     depth: usize,
@@ -396,40 +404,18 @@ fn parse_field_expr(
             span: cursor.peek().span,
         });
     }
-    let mut lhs = parse_field_and(cursor, depth, binary_nodes)?;
-    while matches!(cursor.peek().kind, TokenKind::OrOr) {
+    let mut lhs = parse_field_primary(cursor, depth, binary_nodes)?;
+    while let Some(op) = bool_op_of(&cursor.peek().kind) {
         charge_binary_node(binary_nodes, cursor.peek().span)?;
         cursor.advance();
-        let rhs = parse_field_and(cursor, depth, binary_nodes)?;
+        let rhs = parse_field_primary(cursor, depth, binary_nodes)?;
         lhs = FieldExpr::Binary {
-            op: BoolOp::Or,
+            op,
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
         };
     }
     Ok(lhs)
-}
-
-fn parse_field_and(
-    cursor: &mut Cursor<'_>,
-    depth: usize,
-    binary_nodes: &mut usize,
-) -> Result<FieldExpr, TraceQlError> {
-    let mut lhs = parse_field_primary(cursor, depth, binary_nodes)?;
-    loop {
-        if matches!(cursor.peek().kind, TokenKind::AndAnd) {
-            charge_binary_node(binary_nodes, cursor.peek().span)?;
-            cursor.advance();
-            let rhs = parse_field_primary(cursor, depth, binary_nodes)?;
-            lhs = FieldExpr::Binary {
-                op: BoolOp::And,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        } else {
-            return Ok(lhs);
-        }
-    }
 }
 
 /// Whether `kind` starts (or continues) a field-expression arithmetic
@@ -592,9 +578,18 @@ fn parse_field_primary(
 
 /// Whether the token at the value position begins a `Field` right-hand
 /// side (issue #183 `comparison.rhs_attribute`): the unscoped `.attr`
-/// form, a `span.`/`resource.`/`parent.` scoped attribute, or a bare
-/// intrinsic keyword. Boolean/status/kind value keywords (`true`, `ok`,
-/// `server`, …) are NOT intrinsics, so they stay literal values.
+/// form, a `span.`/`resource.`/`parent.` scoped attribute, a bare
+/// intrinsic keyword, or a colon-scoped intrinsic (`span:duration`,
+/// `trace:id`, … — issue #335 class D2; the reference treats every
+/// intrinsic as an ordinary operand, so all eighteen colon forms are
+/// legal on either side of a comparison). Boolean/status/kind value
+/// keywords (`true`, `ok`, `server`, …) are NOT intrinsics, so they stay
+/// literal values.
+///
+/// An *unknown* colon pair (`foo:bar`, `span:nope`) deliberately does not
+/// match: it falls through to `parse_value`'s positioned error rather than
+/// being routed into `parse_field`, keeping the unknown-scope surface
+/// exactly where it was.
 fn rhs_begins_field(cursor: &Cursor<'_>) -> bool {
     match &cursor.peek().kind {
         TokenKind::Dot => true,
@@ -608,6 +603,9 @@ fn rhs_begins_field(cursor: &Cursor<'_>) -> bool {
                 && matches!(cursor.peek2().kind, TokenKind::Dot)
             {
                 true
+            } else if matches!(cursor.peek2().kind, TokenKind::Colon) {
+                matches!(&cursor.peek_at(2).kind,
+                    TokenKind::Ident(field) if Intrinsic::from_scoped(name, field).is_some())
             } else {
                 Intrinsic::from_ident(name).is_some()
                     && !matches!(cursor.peek2().kind, TokenKind::Dot)
@@ -639,7 +637,8 @@ fn rhs_begins_arith(cursor: &Cursor<'_>) -> bool {
 }
 
 /// The binding power of an arithmetic operator (issue #185): `+ -` bind
-/// loosest, then `* / %`, then `^` (which is right-associative).
+/// loosest, then `* / %`, then `^`. All three levels are LEFT-associative
+/// (issue #335 class D8 corrected `^`).
 fn arith_prec(op: ArithOp) -> u8 {
     match op {
         ArithOp::Add | ArithOp::Sub => 1,
@@ -647,6 +646,12 @@ fn arith_prec(op: ArithOp) -> u8 {
         ArithOp::Pow => 3,
     }
 }
+
+/// Unary `-` sits BETWEEN the arithmetic levels (issue #335 class D9): a
+/// negand absorbs every operator binding at least this tightly (`* / %`
+/// and `^`) and stops at `+ -`. Deliberately not the usual
+/// "unary binds tightest" — it is the reference's placement.
+const UNARY_BINDS_ABOVE: u8 = 2;
 
 /// A comparison operator introducing the RHS of an arithmetic comparison
 /// (issue #185). Arithmetic expressions never compare with a regex, so
@@ -725,15 +730,16 @@ fn parse_operand_bin(
         cursor.advance();
         let mut rhs = parse_operand_unary(cursor, depth)?;
         while let Some(next) = arith_op_of(&cursor.peek().kind) {
-            let next_prec = arith_prec(next);
-            // `^` is right-associative (equal precedence recurses); the
-            // left-associative operators only recurse on a tighter level.
-            let recurse = next_prec > prec || (next_prec == prec && next == ArithOp::Pow);
-            if !recurse {
+            // Every arithmetic operator is LEFT-associative, `^` included
+            // (issue #335 class D8): the reference evaluates `2 ^ 3 ^ 2`
+            // to 64, i.e. `(2 ^ 3) ^ 2`, not the 512 a right-associative
+            // `^` gives. Captured from the reference's own constant-folded
+            // echo — `{ .a = 2 ^ 3 ^ 2 && "x" }` reports `(.a = 64)`.
+            // So equal precedence never recurses; only a tighter level does.
+            if arith_prec(next) <= prec {
                 break;
             }
-            let next_min = if next_prec > prec { prec + 1 } else { prec };
-            rhs = parse_operand_bin(cursor, rhs, next_min, depth)?;
+            rhs = parse_operand_bin(cursor, rhs, prec + 1, depth)?;
         }
         lhs = Operand::Arith {
             op,
@@ -765,6 +771,13 @@ fn parse_operand_unary(cursor: &mut Cursor<'_>, depth: usize) -> Result<Operand,
             });
         }
         let inner = parse_operand_unary(cursor, depth + 1)?;
+        // Unary `-` binds LOOSER than `^` and `* / %`, but tighter than
+        // `+ -` (issue #335 class D9). So the negand first absorbs every
+        // operator at or above [`UNARY_BINDS_ABOVE`]: `-2 ^ 2` is
+        // `-(2 ^ 2)` = -4, not the 4 that binding `-` tightest gives, and
+        // `-.a * 2` is `-(.a * 2)`. The reference's constant-folded echo
+        // for `{ .a = -2 ^ 2 && "x" }` reports `(.a = -4)`.
+        let inner = parse_operand_bin(cursor, inner, UNARY_BINDS_ABOVE, depth + 1)?;
         return Ok(Operand::Neg(Box::new(inner)));
     }
     parse_operand_atom(cursor, depth)
@@ -2082,6 +2095,145 @@ mod tests {
                 assert_eq!(filter_key(rhs), "c");
             }
             other => panic!("expected left-assoc structural chain, got {other:?}"),
+        }
+    }
+
+    /// Issue #335 classes D10/D11: `&&` and `||` are ONE precedence level,
+    /// left-associative, at both the field and the spanset level — so the
+    /// bare form must parse identically to the reference's parenthesised
+    /// reading, and NOT to the `&&`-binds-tighter reading we had.
+    #[test]
+    fn and_and_or_share_one_left_associative_precedence_level() {
+        for (bare, reference_reading, old_wrong_reading) in [
+            (
+                "{ .a = 1 || .b = 2 && .c = 3 }",
+                "{ ((.a = 1) || (.b = 2)) && (.c = 3) }",
+                "{ (.a = 1) || ((.b = 2) && (.c = 3)) }",
+            ),
+            (
+                "{ .a = 1 } || { .b = 2 } && { .c = 3 }",
+                "(({ .a = 1 } || { .b = 2 }) && { .c = 3 })",
+                "({ .a = 1 } || ({ .b = 2 } && { .c = 3 }))",
+            ),
+            (
+                "{ .a = 1 && .b = 2 || .c = 3 }",
+                "{ ((.a = 1) && (.b = 2)) || (.c = 3) }",
+                "{ ((.a = 1) && (.b = 2)) || (.c = 3) }",
+            ),
+        ] {
+            let got = parse(bare).unwrap_or_else(|e| panic!("{bare:?}: {e}"));
+            let want = parse(reference_reading).unwrap();
+            assert_eq!(got, want, "{bare:?} must group like {reference_reading:?}");
+            if reference_reading != old_wrong_reading {
+                assert_ne!(
+                    got,
+                    parse(old_wrong_reading).unwrap(),
+                    "{bare:?} must NOT group like {old_wrong_reading:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #335 class D8: `^` is left-associative — `2 ^ 3 ^ 2` is 64,
+    /// not 512. Pinned as a tree, not a number: this crate does not
+    /// evaluate.
+    #[test]
+    fn pow_is_left_associative() {
+        let got = parse("{ .a = 2 ^ 3 ^ 2 }").unwrap();
+        assert_eq!(got, parse("{ .a = ((2 ^ 3) ^ 2) }").unwrap());
+        assert_ne!(got, parse("{ .a = (2 ^ (3 ^ 2)) }").unwrap());
+    }
+
+    /// Issue #335 class D9: unary `-` binds LOOSER than `^` and `* / %`
+    /// but tighter than `+ -`, so `-2 ^ 2` is `-(2 ^ 2)` (= -4), not
+    /// `(-2) ^ 2` (= 4).
+    #[test]
+    fn unary_minus_binds_between_the_arithmetic_levels() {
+        for (bare, tighter_level) in [
+            ("{ .a = -2 ^ 2 }", "{ .a = -(2 ^ 2) }"),
+            ("{ .a = -.b * 2 }", "{ .a = -(.b * 2) }"),
+            ("{ .a = -.b / 2 }", "{ .a = -(.b / 2) }"),
+            ("{ .a = -.b % 2 }", "{ .a = -(.b % 2) }"),
+        ] {
+            assert_eq!(
+                parse(bare).unwrap(),
+                parse(tighter_level).unwrap(),
+                "{bare:?} must absorb the tighter arithmetic level"
+            );
+        }
+        // …but `+`/`-` stay OUTSIDE the negation.
+        for (bare, looser_level) in [
+            ("{ .a = -2 + 3 }", "{ .a = (-2) + 3 }"),
+            ("{ .a = -.b - 3 }", "{ .a = (-.b) - 3 }"),
+        ] {
+            assert_eq!(
+                parse(bare).unwrap(),
+                parse(looser_level).unwrap(),
+                "{bare:?} must not absorb the looser arithmetic level"
+            );
+        }
+    }
+
+    /// Issue #335 class D2: every colon-scoped intrinsic is an ordinary
+    /// operand, so all eighteen are legal as a comparison right-hand side
+    /// (they were already legal on the left).
+    #[test]
+    fn every_colon_scoped_intrinsic_is_accepted_as_a_comparison_rhs() {
+        for scoped in [
+            "span:name",
+            "span:duration",
+            "span:status",
+            "span:kind",
+            "span:statusMessage",
+            "span:childCount",
+            "span:id",
+            "span:parentID",
+            "trace:id",
+            "trace:duration",
+            "trace:rootName",
+            "trace:rootService",
+            "instrumentation:name",
+            "instrumentation:version",
+            "event:name",
+            "event:timeSinceStart",
+            "link:spanID",
+            "link:traceID",
+        ] {
+            let q = format!("{{ .a = {scoped} }}");
+            let parsed = parse(&q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+            assert!(
+                matches!(
+                    &parsed.spanset,
+                    SpansetExpr::Filter(SpansetFilter {
+                        body: Some(FieldExpr::FieldCompare {
+                            rhs: Field::Intrinsic(_),
+                            ..
+                        }),
+                    })
+                ),
+                "{q:?} must compare against an intrinsic RHS, got {parsed:?}"
+            );
+        }
+        // Arithmetic and the other comparison operators reach it too.
+        assert!(parse("{ .a >= span:duration }").is_ok());
+        assert!(parse("{ .a = span:duration + 1 }").is_ok());
+    }
+
+    /// The predicate widened for D2 recognises only KNOWN colon pairs, so
+    /// an unknown scope or field keeps its previous positioned error
+    /// instead of being routed into the field parser.
+    #[test]
+    fn an_unknown_colon_pair_on_the_rhs_keeps_its_value_position_error() {
+        for q in [
+            r#"{ .a = foo:bar }"#,
+            r#"{ .a = span:nope }"#,
+            r#"{ .a = trace:childCount }"#,
+        ] {
+            let err = parse(q).unwrap_err();
+            assert!(
+                matches!(err, TraceQlError::UnexpectedToken { .. }),
+                "{q:?} -> {err}"
+            );
         }
     }
 
