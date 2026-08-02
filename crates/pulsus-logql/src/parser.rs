@@ -71,7 +71,7 @@ fn expect_eof(cursor: &Cursor<'_>) -> Result<(), LogQlError> {
 /// The reference's lexer resolves a keyword by looking its text up
 /// case-insensitively, so `RATE(...)`, `SUM BY (...)`, `| JSON` and
 /// `LABEL_REPLACE(...)` are all accepted there (probed against the pinned
-/// v3.7.3 container: every keyword position returns 200 in upper, lower
+/// v3.7.4 container: every keyword position returns 200 in upper, lower
 /// and mixed case). PulsusDB used to compare each keyword with `==`
 /// against its lowercase spelling, so every one of those was a 400 — a
 /// whole-surface rejection divergence, not a per-construct one.

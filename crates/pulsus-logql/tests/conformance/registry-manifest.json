@@ -1,7 +1,7 @@
 {
   "language": "LogQL",
-  "target": "v3.7.3",
-  "sha256": "817fbf97eaffffbed901ec84026cbfd77a4f97acb0e271fb7ca3f3b1af8a5a8a",
+  "target": "v3.7.4",
+  "sha256": "e92d2061f1162b07b6f8262d8296f59c7dd175ff19eca3f91e8786d9f52ee9b6",
   "construct_count": 103,
   "category_counts": {
     "binary-ops": 16,

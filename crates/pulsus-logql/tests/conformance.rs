@@ -1,7 +1,7 @@
 //! The LogQL conformance foundation (issue #191, M8-LQ0).
 //!
 //! A committed, clean-room enumeration of the entire *documented* LogQL
-//! surface for the pinned language target (LogQL v3.7.3, grounded in the
+//! surface for the pinned language target (LogQL v3.7.4, grounded in the
 //! published grafana.com LogQL documentation) plus a disposition manifest
 //! giving every construct exactly one machine-checked home. No upstream
 //! source, grammar, lexer, AST, error string, or test corpus is copied,
@@ -20,7 +20,7 @@
 //!     committed e2e differential cases and asserts every mapped construct's
 //!     AST node is present.
 //!   * the env-gated black-box differential (`logql_differential.rs`)
-//!     replays each probe against a digest-pinned v3.7.3 reference container
+//!     replays each probe against a digest-pinned v3.7.4 reference container
 //!     and pins the live verdict against the recorded `oracle`.
 //!
 //! Pure check functions back the file tests so the RED paths are proven by
@@ -59,7 +59,7 @@ const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[];
 const DOCS_PREFIX: &str = "https://grafana.com/docs/loki/";
 const REPO_PREFIX: &str = "https://github.com/digitalis-io/pulsusdb/";
 const EXPECTED_LANGUAGE: &str = "LogQL";
-const EXPECTED_TARGET: &str = "v3.7.3";
+const EXPECTED_TARGET: &str = "v3.7.4";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -101,7 +101,7 @@ struct Dispositions {
 struct Disposition {
     construct: String,
     status: Status,
-    // The measured black-box verdict of the v3.7.3 reference container for
+    // The measured black-box verdict of the v3.7.4 reference container for
     // this construct's probe (tests/conformance/PROVENANCE.md). It makes the
     // differential disposition-driven: an interim construct the reference
     // *accepts* is a tracked compat gap; one it *rejects* is a both-reject
@@ -206,7 +206,7 @@ fn read(path: &PathBuf) -> String {
 }
 
 fn registry_bytes() -> Vec<u8> {
-    let path = conf_dir().join("registry-logql-v3.7.3.json");
+    let path = conf_dir().join("registry-logql-v3.7.4.json");
     fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
@@ -932,7 +932,7 @@ fn registry_matches_its_integrity_manifest() {
         .collect();
     assert_eq!(
         sha, manifest.sha256,
-        "registry SHA-256 drift — an edit to registry-logql-v3.7.3.json must be deliberate \
+        "registry SHA-256 drift — an edit to registry-logql-v3.7.4.json must be deliberate \
          and re-pin registry-manifest.json"
     );
 

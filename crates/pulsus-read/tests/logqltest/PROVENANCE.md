@@ -102,8 +102,9 @@ This is done **once** per case, offline; CI runs only the hermetic runner.
    additionally requires `limits_config.enable_multi_variant_queries: true`
    — the bare container returns 400 `multi variant queries are disabled
    for this instance` for EVERY `variants(...) of (...)` query (verified
-   on both the v3.7.4 capture image and the v3.7.3 differential oracle
-   image). One config serves every capture: `ci/logql/config.yaml`
+   on both the v3.7.4 capture image and the then-v3.7.3 differential
+   oracle image; the oracle has since been re-pinned to this same v3.7.4
+   image, so the two are now one). One config serves every capture: `ci/logql/config.yaml`
    carries all three deltas. Transcription: the container attaches
    `detected_level`/`detected_level_extracted` labels to variants results
    that PulsusDB's label model has no analogue for — DROP them from

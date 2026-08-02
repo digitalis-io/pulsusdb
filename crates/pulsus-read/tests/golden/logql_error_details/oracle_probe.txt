@@ -187,9 +187,11 @@ asserts and stay byte-identical.
 M8-LQ1 (issue #200) — logfmt flags + unpack/decolorize/drop/keep
 ========================================================================
 
-Reference target: grafana/loki v3.7.3 (the pinned M8-LQ conformance
-target). CONTAINER-CAPTURED and reconciled: the branch-validation was
-performed against the pinned v3.7.3 container, and the values below were
+Reference target: grafana/loki v3.7.3 (the conformance oracle pinned at
+the time of this capture; the oracle has since been re-pinned to v3.7.4 —
+the values below are unchanged history, not a claim about the current
+pin). CONTAINER-CAPTURED and reconciled: the branch-validation was
+performed against the then-pinned v3.7.3 container, and the values below were
 confirmed against it — lines tagged `[byte-exact, v3.7.3]` are verbatim
 from the container capture; the accept/reject verdicts (`| logfmt` lenient,
 `keep` stream-label dropping, `unpack` _entry promotion / non-string skip,
@@ -267,7 +269,8 @@ faithful-format (same structure, ledgered position) for the others.
     labels) drop.
 
 ------------------------------------------------------------------------
-capture probes (for branch-validation against the pinned v3.7.3 image)
+capture probes (for branch-validation; captured against v3.7.3, which
+was the pinned image then — the oracle is now pinned to v3.7.4)
 ------------------------------------------------------------------------
 
   # push each INPUT under {probe="<name>"}; GET query_range with:

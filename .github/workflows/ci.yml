@@ -290,7 +290,7 @@ jobs:
         run: docker rm -f pulsus-tempo-diff || true
 
       # Issue #191 (M8-LQ0): the black-box LogQL differential oracle. ONE
-      # UNMODIFIED, digest-pinned v3.7.3 reference container serves the syntax
+      # UNMODIFIED, digest-pinned v3.7.4 reference container serves the syntax
       # leg (observes only HTTP status at /loki/api/v1/query_range — or
       # /loki/api/v1/query for the registry's instant-only constructs, issue
       # #221; the mounted config enables approx_topk so its probe is
@@ -298,11 +298,11 @@ jobs:
       # pinned against the recorded `oracle` disposition; a supported∧reject
       # is RED. No upstream source is copied. The hermetic `ci` job runs the
       # same test with its gate off, skipping.
-      - name: Start LogQL v3.7.3 reference (differential oracle)
+      - name: Start LogQL v3.7.4 reference (differential oracle)
         run: |
           docker run -d --name pulsus-logql-diff -p 13100:3100 \
             -v "$GITHUB_WORKSPACE"/ci/logql/config.yaml:/etc/loki/local-config.yaml:ro \
-            grafana/loki@sha256:70b9f699fc9bb868b62f1cfd4f787dfa50242f1fd92e6089787d5d7daea75fe8 \
+            grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc \
             -config.file=/etc/loki/local-config.yaml
           for _ in $(seq 1 60); do
             [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:13100/ready)" = "200" ] && break
@@ -331,10 +331,11 @@ jobs:
       # fresh responses derive the same labels as the committed artifact,
       # so the artifact provably stays a capture, not a hand-written
       # expectation (regenerating it is separately gated on a container
-      # reporting exactly the pinned v3.7.4; this leg deliberately also
-      # cross-checks that capture against the digest-pinned v3.7.3
-      # oracle). Runs after the syntax leg so the pushed streams cannot
-      # precede it.
+      # reporting exactly the pinned v3.7.4; since the oracle bump this
+      # leg runs against that same v3.7.4 image). **This is the only leg
+      # that compares VALUES against the container — every other leg on
+      # this container compares HTTP status alone.**  Runs after the
+      # syntax leg so the pushed streams cannot precede it.
       - name: LogQL json key capture drift leg (issue #287)
         env:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"

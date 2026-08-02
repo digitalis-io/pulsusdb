@@ -7,15 +7,34 @@
 //! an identifier payload would silently change which series a query
 //! selects, which is strictly worse than a rejection.
 //!
-//! **Version note.** The language TARGET is v3.7.4; the differential
-//! container is digest-pinned to v3.7.3 and re-pinning it is scheduled
-//! separately. For keyword folding the two agree — the folding half of
-//! this file holds on both — but they do NOT agree about byte-size
-//! literal spellings, which is why those rows carry an explicit
-//! version-difference label in [`KNOWN_RESIDUAL_DIVERGENCES`] instead of
-//! being read as a gap.
+//! **Version note.** The oracle is digest-pinned to v3.7.4 — verified
+//! from the container's own `/loki/api/v1/status/buildinfo`, not from
+//! the tag. That is the same version as the language target, and the
+//! same image the capture corpus under
+//! `crates/pulsus-read/tests/logqltest/` NAMES.
 //!
-//! **Every verdict below was captured from the pinned v3.7.3 reference
+//! It is deliberately not claimed that the corpus was produced by that
+//! image. `logqltest/corpus/b8_byte_parity.test` records `| size == 1b`,
+//! `>= 1pb` and `>= 1024b` as accepted with values, and the image it
+//! names rejects all three (400, re-measured at this digest), so at
+//! least that file cannot have come from it. **Issue #350 owns that
+//! discrepancy** along with the census rows below. Until it is resolved,
+//! treat "the corpus names v3.7.4" as a declaration rather than as
+//! evidence of what v3.7.4 returns.
+//!
+//! The verdicts below were originally captured against the v3.7.3 oracle
+//! this file was written for; every one was re-verified against v3.7.4
+//! when the oracle moved, and the live leg at the bottom re-checks them
+//! on every run.
+//!
+//! One consequence for the residual census: its 19 rows labelled
+//! "version difference" were labelled from the v3.7.3 oracle and that
+//! label is now known to be wrong — both versions reject those byte-size
+//! spellings and PulsusDB accepts them. **Issue #350 owns that
+//! correction**; the rows are deliberately left as they are here so the
+//! two changes do not tangle.
+//!
+//! **Every verdict below was captured from the pinned reference
 //! container** (`ci/logql/config.yaml`, the digest in
 //! `.github/workflows/ci.yml`), black-box, by HTTP status on
 //! `/loki/api/v1/query_range` — plus, for the case-SENSITIVE classes,
@@ -411,31 +430,39 @@ fn range_duration_units_do_not_fold() {
 // quietly fixed without updating this list.
 // ---------------------------------------------------------------------
 
-/// Queries where PulsusDB and the **v3.7.3 differential oracle** disagree
-/// after issue #339. **None is a case-folding gap in the direction #339
+/// Queries where PulsusDB and the **differential oracle** disagree after
+/// issue #339. **None is a case-folding gap in the direction #339
 /// describes** (we reject what the oracle accepts).
 ///
-/// **Read the middle column as "the v3.7.3 ORACLE's verdict", not "the
-/// target's".** The two are not the same thing, and conflating them sent
-/// one adjudication on this issue the wrong way. The language target is
-/// **v3.7.4** (owner-approved 2026-07-25; `docs/api.md` and
-/// `docs/features.md` cite it, `crates/pulsus-read/tests/logqltest/`
-/// captures against it and #287's capture gate refuses any other
-/// version); the differential container is still digest-pinned to
-/// v3.7.3, and re-pinning it moves accept/reject surfaces across the
-/// whole registry, so it is scheduled separately.
+/// The middle column is the ORACLE's verdict. It was recorded against
+/// v3.7.3 and re-verified unchanged when the oracle was re-pinned to
+/// v3.7.4 — every row's oracle verdict is identical on both versions,
+/// which the live leg re-checks on each run.
+///
+/// **That re-verification is what makes the class labels below stale.**
+/// They were written when the oracle was v3.7.3 and the target v3.7.4,
+/// on the reading that a row the oracle rejected and the target accepted
+/// was a version difference. Both versions in fact reject the byte-size
+/// spellings, so those rows are ordinary over-acceptance and PulsusDB is
+/// the side that is wrong. **Issue #350 owns re-classifying them**; the
+/// labels are deliberately left untouched here so the two changes do not
+/// tangle. Read `VERSION DIFFERENCE` below as "disputed, owned by
+/// #350", not as a finding.
 ///
 /// Three classes live here, and they are not the same kind of thing:
 ///
-/// * **VERSION DIFFERENCE — PulsusDB is right.** The byte-size literal
-///   rows. v3.7.4 accepts the full case-insensitive `humanize.ParseBytes`
-///   set (bare units, peta, exa), which is exactly what issue #226 ported
-///   and what `crates/pulsus-read/tests/logqltest/corpus/b8_byte_parity.
-///   test` captures — that corpus records `| size == 1b`, `>= 1pb`,
-///   `>= 1024b` as ACCEPTED with values. v3.7.3's lexer admits only 21
-///   case-sensitive spellings and 400s the rest. Nothing to fix: matching
-///   the oracle here would regress a construct #226 built deliberately
-///   and would contradict committed capture evidence.
+/// * **`VERSION_DIFFERENCE` — the label is FALSIFIED; the rows are
+///   ordinary over-acceptance.** The byte-size literal rows. The label
+///   was written on the reading that v3.7.4 accepted the full
+///   case-insensitive `humanize.ParseBytes` set while the v3.7.3 oracle
+///   did not, so PulsusDB looked correct for the target. Measured
+///   against the v3.7.4 oracle this file is now pinned to: `| size ==
+///   1b`, `>= 1pb`, `>= 1024b`, `1kb` and `1eib` are all **400**, while
+///   `1KiB`, `1k` and `1B` are 200. Both versions reject the spellings
+///   below; PulsusDB accepts them, and is the side that is wrong.
+///   **Issue #350 owns the correction** — the rows, the class string,
+///   and the `b8_byte_parity.test` capture that recorded two of those
+///   spellings as accepted and is the evidence this label rested on.
 /// * **OVER-ACCEPTANCE — unscheduled by design.** `1S`, `[5ns]`/`[5us]`,
 ///   `{by="x"}`/`{json="x"}`. A user does not notice these: their query
 ///   works here and would fail against the reference. Recorded rather
@@ -454,16 +481,17 @@ const OVER_ACCEPTANCE: &str = "over-acceptance";
 const REAL_GAP: &str = "real-gap";
 
 const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
-    // (query, v3.7.3 oracle verdict, PulsusDB verdict, class)
-    // VERSION DIFFERENCE — PulsusDB matches the TARGET; the oracle is
-    // the stale side. v3.7.3's lexer accepts exactly 21 case-sensitive
-    // byte spellings (`B k kB ki kiB K KB Ki KiB M MB Mi MiB G GB Gi
-    // GiB T TB Ti TiB`, no peta, no exa) and 400s everything below with
-    // `syntax error: unexpected $end` — measured across 61 spellings.
-    // v3.7.4 accepts the full case-insensitive `humanize.ParseBytes`
-    // set, which is what PulsusDB implements (issue #226) and what
-    // `logqltest/corpus/b8_byte_parity.test` captures as accepted.
-    // **Do not "fix" these to match the oracle.**
+    // (query, differential-oracle verdict, PulsusDB verdict, class)
+    // The rows carrying `VERSION_DIFFERENCE` — a label now known to be
+    // wrong, kept only until #350 corrects it together with the rows.
+    // BOTH reference versions reject these spellings: the oracle admits
+    // exactly 21 case-sensitive byte spellings (`B k kB ki kiB K KB Ki
+    // KiB M MB Mi MiB G GB Gi GiB T TB Ti TiB`, no peta, no exa) and
+    // 400s everything below with `syntax error: unexpected $end` —
+    // measured across 61 spellings at v3.7.3 and re-measured at the
+    // v3.7.4 digest this file is pinned to. PulsusDB accepts them, so
+    // these are over-acceptance, not a version difference. **#350 owns
+    // fixing them; do not edit these rows here.**
     (
         r#"{app="x"} | json | size > 1b"#,
         "reject",

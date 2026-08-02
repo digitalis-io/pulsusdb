@@ -200,7 +200,9 @@ pub const SVC_RC_DUPTS: &str = "svc-rcdup";
 /// `sum by (grp) (count_over_time({… | logfmt [30m]}))` yields the counts
 /// `{a:5, b:1, c:5}`; `sort` then orders them ascending by value with the
 /// equal-value (`a`/`c`) tie broken by label set ascending → `b, a, c`
-/// (branch-validated against the pinned reference v3.7.3).
+/// (branch-validated against reference v3.7.3, the oracle pinned at the
+/// time; the oracle is now pinned to v3.7.4 and this ordering is
+/// unaffected — it is a value record, not a claim about the current pin).
 pub const SVC_SORT: &str = "svc-sort";
 
 /// The issue #109 scope witness service: exactly ONE synthetic record
