@@ -315,6 +315,16 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-logql --test logql_differential
 
+      # Issue #339: the keyword case-folding table. Its verdicts were
+      # CAPTURED from this same container (which keywords fold, which
+      # token classes are case-sensitive); this leg replays them so the
+      # capture cannot silently rot. The hermetic half of the file runs
+      # in the `ci` job with the gate off.
+      - name: LogQL differential leg (keyword case folding)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-logql --test case_folding
+
       # Issue #287 (fix round 3): the `| json` key-name capture drift leg.
       # Re-pushes every probe of tests/fixtures/json_key_sanitization/
       # capture.json to this job's reference container and asserts the
