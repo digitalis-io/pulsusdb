@@ -255,6 +255,39 @@ Out of this ledger's scope by design:
   and a hermetic test evaluates every committed range case through the
   shipped sliding evaluator and requires the two to agree.
 
+### grouping-dedup-avg-sharded-frontend (issue #288, oracle-config note — no case downgraded)
+
+- **What diverges:** the reference's **sharded query-frontend path**,
+  not its LogQL engine, and only under our oracle config. With
+  `ci/logql/config.yaml`'s `frontend.encoding: protobuf` +
+  `limits_config.shard_aggregations`, `avg by (fp, fp) (…)` — an `avg`
+  whose `by` clause repeats a label — returns an **EMPTY 200**, while
+  every other aggregation dedupes and serves, and `avg by (fp)` itself
+  serves. The shard mapper rewrites `avg X` to `sum X / count X`
+  carrying the DUPLICATED `Grouping.Groups` verbatim
+  (`pkg/logql/shardmapper.go` `OpTypeAvg`, v3.7.4), and that division
+  leg drops every match on the sharded path.
+- **The behaviour of record:** the DEFAULT-config reference container
+  serves `avg by (fp, fp)` identically to `avg by (fp)` (probed on the
+  same image, same dataset) — consistent with its own engine
+  (`VectorAggEvaluator` builds group labels from the metric's unique
+  label set, so duplicates are inert). PulsusDB matches THAT — gated
+  by the hermetic equivalence test below, never by a captured corpus
+  row (b17 carries none for avg).
+- **Why a note, not a divergence:** the engines agree; one frontend
+  configuration of the reference disagrees with the reference itself.
+- **How avg is gated (fix round 1, U6 — STRUCTURAL, not documentary):**
+  `b17_grouping_dedup.test` carries **no** `avg` duplicate-grouping row
+  at all, so there is no captured constant a future oracle-config
+  recapture could silently rewrite to the artifact's empty 200. `avg`
+  dedup is covered by the hermetic equivalence gate
+  `logql_metric_agg_golden.rs::avg_by_duplicate_grouping_equals_the_deduped_form`
+  (`avg by (fp, fp)` == `avg by (fp)` bit-for-bit through the real
+  plan + client-aggregation path, anchored to hand-derived
+  integer-exact values so it cannot pass vacuously) — a route no
+  container run can touch. The b17 header repeats the do-not-re-add
+  instruction with the condition for lifting it.
+
 ### frontend-step-alignment (issue #301, oracle-config note — no case downgraded)
 
 - **What diverges:** the reference's **query-frontend**, not its LogQL

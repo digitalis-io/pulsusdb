@@ -1,0 +1,161 @@
+# b17 — repeated grouping labels are deduplicated (issue #288).
+#
+# Reference of record: grafana/loki:3.7.4. EVERY expected line captured
+# from the pinned container (capture 2026-08-02, T0 on a 30 s boundary,
+# `detected_level` labels dropped per PROVENANCE.md; the two `variants`
+# cases need `ci/logql/config.yaml`'s `enable_multi_variant_queries`,
+# everything else was cross-checked identical on a default-config
+# container — see the avg note below). Metric leaves carry the
+# corpus-conventional `| logfmt` (forces the raw client-aggregated route
+# the hermetic runner replays; the bodies parse to no pairs).
+#
+# The pinned semantics (v3.7.4 `VectorAggEvaluator`): the parser KEEPS
+# duplicated grouping names in the AST (`labels:` appends verbatim, so
+# `by (fp, fp)` renders back with both), but evaluation builds each `by`
+# group's label set from the METRIC's own unique labels — a name counts
+# at most once — and `without` deletes idempotently. So a duplicate has
+# NO observable effect: `by (fp, fp)` == `by (fp)` for every
+# aggregation, for the pre- and postfix grouping positions, for
+# `on(...)`/`group_left(...)` label lists (set-semantic joins), and for
+# the grouping `variants(...)` injects `__variant__` into. Label names
+# are case-sensitive (`by (FP, fp)` is two DISTINCT names).
+#
+# NO `avg` ROWS — deliberate (fix round 1, U6; ledgered as
+# `grouping-dedup-avg-sharded-frontend`): under the oracle config
+# (`ci/logql/config.yaml`, protobuf frontend + `shard_aggregations`)
+# the reference's sharded rewrite `avg X -> sum X / count X` returns an
+# EMPTY 200 for a DUPLICATED `by` label while the default-config
+# reference serves the deduped result. A captured `avg` row here would
+# be unverifiable by any gate, and a future recapture against the
+# oracle config would silently rewrite it to the artifact. `avg` dedup
+# is instead gated hermetically — no captured constant to rewrite — by
+# `logql_metric_agg_golden.rs::avg_by_duplicate_grouping_equals_the_deduped_form`.
+# DO NOT add an `avg` duplicate-grouping row to this file unless that
+# frontend defect is fixed upstream and the capture procedure records
+# which config produced the value.
+#
+# EXCLUDED sub-cases (`by (FP, fp)`, `by (fp, fp, nosuch)`): after
+# dedup these reduce to an ABSENT `by` name, which the reference OMITS
+# (captured: `{fp="a"} 1`, `{fp="b"} 2` for both) while PulsusDB's
+# `group_key` materialises it as `name=""` — the pre-existing
+# engine-wide divergence **owned by #241** (its `group_key` rewrite is
+# deep in review; the #241 adjudication forbids fixing it from another
+# issue). OBLIGATION: when #241 lands, ADD both shapes here with the
+# captured expectations above — ready-made acceptance tests, exactly
+# like the excluded sub-cases in b13/b16.
+
+load
+  {env="e1", fp="a", service_name="svc-gd"}
+  15s line at 15s
+  {env="e2", fp="b", service_name="svc-gd"}
+  20s line at 20s
+  {env="e3", fp="b", service_name="svc-gd"}
+  25s line at 25s
+
+# d1 — baseline.
+eval instant at 60s sum by (fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 1
+  {fp="b"} 2
+
+# d2/d3 — a doubled and a tripled `by` name are identical to d1: one
+# emitted `fp`, same series identity, same values.
+eval instant at 60s sum by (fp, fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 1
+  {fp="b"} 2
+
+eval instant at 60s sum by (fp, fp, fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 1
+  {fp="b"} 2
+
+# d4 — a repeat combined with a distinct name: the distinct name still
+# groups; the repeat still collapses.
+eval instant at 60s sum by (fp, env, fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {env="e1", fp="a"} 1
+  {env="e2", fp="b"} 1
+  {env="e3", fp="b"} 1
+
+# d5/d6 — `without` repeats are idempotent deletes, alone and combined
+# with a distinct name.
+eval instant at 60s sum without (env, env) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a", service_name="svc-gd"} 1
+  {fp="b", service_name="svc-gd"} 2
+
+eval instant at 60s sum without (env, fp, env) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {service_name="svc-gd"} 3
+
+# d8/d9/d10 — the counting, selecting and spread reducers all dedupe.
+eval instant at 60s count by (fp, fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 1
+  {fp="b"} 2
+
+eval instant at 60s min by (fp, fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 1
+  {fp="b"} 1
+
+eval instant at 60s stddev by (fp, fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 0
+  {fp="b"} 0
+
+# d11 — a selector aggregation (`topk`) with a duplicated grouping: the
+# per-group k applies once per DEDUPED group, full input labels emitted.
+eval instant at 60s topk by (fp, fp) (2, count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {env="e1", fp="a", service_name="svc-gd"} 1
+  {env="e2", fp="b", service_name="svc-gd"} 1
+  {env="e3", fp="b", service_name="svc-gd"} 1
+
+# d12 — the POSTFIX grouping position dedupes identically.
+eval instant at 60s sum (count_over_time({service_name="svc-gd"} | logfmt [5m])) by (fp, fp)
+  {fp="a"} 1
+  {fp="b"} 2
+
+# d13 — a duplicated `on(...)` matching list joins set-semantically.
+eval instant at 60s sum by (fp) (count_over_time({service_name="svc-gd"} | logfmt [5m])) + on(fp, fp) sum by (fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 2
+  {fp="b"} 4
+
+# d15 — a duplicated grouping inside a `variants(...)` variant, with the
+# injected `__variant__` alongside.
+eval instant at 60s variants(sum by (fp, fp) (count_over_time({service_name="svc-gd"}[5m]))) of ({service_name="svc-gd"}[5m])
+  {__variant__="0", fp="a"} 1
+  {__variant__="0", fp="b"} 2
+
+# d16 — a variant that already groups `by (__variant__)`: the injection
+# must not create a duplicate entry (single `__variant__` on the wire,
+# carrying the injected index).
+eval instant at 60s variants(sum by (__variant__) (count_over_time({service_name="svc-gd"}[5m]))) of ({service_name="svc-gd"}[5m])
+  {__variant__="0"} 3
+
+# d17 — a variant grouping `without (__variant__)`: the injection joins
+# the without-list (stripping the index), the guard adds no duplicate,
+# and the index-less series are KEPT at instant (the b13 asymmetry);
+# the doubled form is identical.
+eval instant at 60s variants(sum without (__variant__) (count_over_time({service_name="svc-gd"}[5m]))) of ({service_name="svc-gd"}[5m])
+  {env="e1", fp="a", service_name="svc-gd"} 1
+  {env="e2", fp="b", service_name="svc-gd"} 1
+  {env="e3", fp="b", service_name="svc-gd"} 1
+
+eval instant at 60s variants(sum without (__variant__, __variant__) (count_over_time({service_name="svc-gd"}[5m]))) of ({service_name="svc-gd"}[5m])
+  {env="e1", fp="a", service_name="svc-gd"} 1
+  {env="e2", fp="b", service_name="svc-gd"} 1
+  {env="e3", fp="b", service_name="svc-gd"} 1
+
+# r1 — range mode dedupes identically (labels only; the value stream is
+# untouched).
+eval range from 0s to 60s step 30s sum by (fp, fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 30s 1 60s 1
+  {fp="b"} 30s 2 60s 2
+
+clear
+
+# d14 — a duplicated `group_left(...)` include list copies the label
+# once (captured identical to the single-`env` form; own load section —
+# the one side must be unique per signature, and the hermetic runner
+# replays every loaded line).
+load
+  {env="e1", fp="a", service_name="svc-gd4"}
+  15s line at 15s
+
+eval instant at 60s sum by (fp) (count_over_time({service_name="svc-gd4"} | logfmt [5m])) * on(fp) group_left(env, env) sum by (fp, env) (count_over_time({service_name="svc-gd4"} | logfmt [5m]))
+  {env="e1", fp="a"} 1
+
+clear
