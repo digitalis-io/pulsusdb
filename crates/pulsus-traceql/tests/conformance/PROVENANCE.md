@@ -56,7 +56,11 @@ No Tempo, Grafana, or Loki source, grammar file, lexer, AST, Go enum, error
 string, parser table, or test corpus — and no `pkg/tempopb`, `.proto`, or
 generated wire code — is copied, fetched, adapted, or vendored into this
 repository, regardless of upstream license. There is no build-time fetch or
-cache step for any such material. The `pulsus-traceql` lexer, parser, and
+cache step for any such material. The `pulsus-traceql` lexer, parser,
+semantic validator (`validate.rs`, issue #328 — its check LIST is
+identified from the reference's own validator surface, its accept/reject
+behavior captured from the running pinned container into
+`validate-vectors.json`, and its messages are our own), and
 error messages are independently authored from the published TraceQL
 documentation plus observed query behavior. The construct registry and its
 probes are clean-room authored the same way; the `grafana/` seed corpus is

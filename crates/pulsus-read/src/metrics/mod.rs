@@ -106,7 +106,10 @@ pub use refresh::spawn_refresh_loop;
 pub use rows::SeriesRow;
 pub use sample_rows::SampleRow;
 // Unsealed by design — exists because `tests/re2_screen_differential.rs`
-// is an external binary; issue #328's D1 `pulsus-re2` extraction retires it.
+// is an external binary. Issue #328's D1 extraction moved the SCREEN to
+// `pulsus-re2` but this seam stays: the differential's SQL-meaning leg
+// (#324) crosses the RENDERED literal, which only `series_where` can
+// produce.
 #[doc(hidden)]
 pub use series_where::anchored_re2_literal_for_test;
 pub use stats::{CacheMetrics, CacheMetricsSnapshot};

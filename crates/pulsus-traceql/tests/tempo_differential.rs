@@ -207,3 +207,98 @@ fn registry_probes_match_the_recorded_tempo_verdict() {
         registry.constructs.len()
     );
 }
+
+/// Issue #328: the semantic validator's container capture, re-verified
+/// LIVE. Every `validate-vectors.json` row is re-issued against the
+/// pinned reference as the search shadow `query` parameter (parse +
+/// `traceql.Validate` only — the same route the capture used) and the
+/// live status must equal the recorded `tempo_status`. A fabricated or
+/// stale capture reddens here.
+///
+/// Gate: `PULSUSDB_TEMPO_VECTORS=1`, FAIL-CLOSED through
+/// `pulsus_testkit::require_live_gate` — in a live CI job (anything but
+/// the hermetic `ci` lane) an absent gate PANICS instead of skipping,
+/// so a dropped `env:` block cannot report green with the backend
+/// missing (the #320 class).
+#[test]
+fn validate_vectors_match_the_live_reference() {
+    if !pulsus_testkit::require_live_gate("PULSUSDB_TEMPO_VECTORS").is_running() {
+        eprintln!("PULSUSDB_TEMPO_VECTORS unset; skipping the validate-vectors live leg");
+        return;
+    }
+    let base = std::env::var("PULSUSDB_TEMPO_DIFF_URL")
+        .expect("PULSUSDB_TEMPO_VECTORS=1 requires PULSUSDB_TEMPO_DIFF_URL");
+
+    #[derive(Deserialize)]
+    struct Vectors {
+        vectors: Vec<Vector>,
+    }
+    #[derive(Deserialize)]
+    struct Vector {
+        id: String,
+        query: String,
+        tempo_status: u16,
+    }
+    let doc: Vectors =
+        serde_json::from_str(&read(conf_dir().join("validate-vectors.json"))).unwrap();
+    assert!(!doc.vectors.is_empty(), "an empty capture proves nothing");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let start = now.saturating_sub(3600).to_string();
+    let end = now.to_string();
+    let mut mismatches: Vec<String> = Vec::new();
+    for v in &doc.vectors {
+        // The SHADOW parameter: `query=` with start/end supplied, so the
+        // reference's request parser never folds it into the legacy tag
+        // map and never executes it — only the frontend validator sees
+        // it.
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-G",
+            "--max-time",
+            "20",
+        ]);
+        cmd.args(["--data-urlencode", &format!("query={}", v.query)]);
+        for (k, val) in [
+            ("start", start.as_str()),
+            ("end", end.as_str()),
+            ("limit", "1"),
+        ] {
+            cmd.args(["--data-urlencode", &format!("{k}={val}")]);
+        }
+        cmd.arg(format!("{}/api/search", base.trim_end_matches('/')));
+        let out = cmd.output().expect("curl must be on PATH");
+        let code: u16 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        // 2xx normalizes onto the recorded 200; anything else must match
+        // exactly (400), and connection failures (0) are inconclusive.
+        let normalized = if (200..=299).contains(&code) {
+            200
+        } else {
+            code
+        };
+        if normalized != v.tempo_status {
+            mismatches.push(format!(
+                "{}: recorded {} but live Tempo answered {code} for {:?}",
+                v.id, v.tempo_status, v.query
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} vector(s) disagree with the live pinned reference — the capture is stale or \
+         fabricated; re-capture and re-review:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
