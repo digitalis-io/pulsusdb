@@ -3891,7 +3891,9 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
     // The direct population, exactly as the doc above enumerates it, with
     // the site count each name is pinned to.
     const DIRECT_ROUTES: [(&str, usize); 4] = [
-        ("apply_vector_aggs_ok", 25),
+        // 25 + issue #288's `eval_instant_metric_query` (the avg
+        // dedup-equivalence fixture's Plan::Metric arm) = 26.
+        ("apply_vector_aggs_ok", 26),
         ("materialize_vector_lit", 6),
         ("combine_binary", 44),
         ("run_variants_rows", 1),
@@ -3912,8 +3914,8 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
         .collect();
     let direct: usize = per_route.iter().map(|(_, n, _)| n).sum();
     // The claim and the mechanism, side by side: the caveat must exist
-    // exactly while the direct fixtures do. `direct` is 25 + 6 + 44 + 1 =
-    // 76. The caveat is read out of `run_client`'s OWN doc comment — the
+    // exactly while the direct fixtures do. `direct` is 26 + 6 + 44 + 1 =
+    // 77. The caveat is read out of `run_client`'s OWN doc comment — the
     // sentence that makes the claim — so this cannot be satisfied by the
     // string appearing anywhere else in the file, including here.
     //
@@ -3953,4 +3955,113 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
              source it parses"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #288 (fix round 1, U6): `avg` grouping dedup, covered by a
+// hermetic EQUIVALENCE gate rather than a container capture.
+// ---------------------------------------------------------------------
+
+/// Evaluates one instant metric query over `rows` the engine's way,
+/// whichever plan shape it takes (the `Plan::Metric` leaf route for a
+/// range-bottomed chain, `eval_node` for a binary tree).
+fn eval_instant_metric_query(
+    query: &str,
+    rows: &[MetricScanRow],
+    meta: &HashMap<u64, StreamMetaRow>,
+) -> QueryResult {
+    let expr = parse(query).expect("parse");
+    match plan(&expr, &instant_params(60 * NS), &ctx()).expect("plan") {
+        Plan::Metric(mp) => {
+            let client = mp.client.as_ref().expect("client-aggregated plan");
+            let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
+            let result = run_client_agg_rows(
+                rows,
+                &compiled,
+                meta,
+                client,
+                ClientWindow::Instant {
+                    start_ns: mp.grid_start_ns,
+                    end_ns: mp.end_ns,
+                },
+                mp.rate_window_ns,
+            )
+            .expect("client aggregation");
+            apply_vector_aggs_ok(result, &mp.vector_aggs)
+        }
+        Plan::MetricBinary(node) => eval_node(&node, rows, meta).expect("eval"),
+        Plan::Streams(_) => panic!("expected a metric plan for {query}"),
+    }
+}
+
+/// `avg by (fp, fp)` == `avg by (fp)`, bit-for-bit, through the real
+/// plan + client-aggregation path — and equals the hand-derived
+/// integer-exact values (`avg` of small-int counts, the b9 discipline),
+/// so the equivalence cannot pass vacuously with a broken `avg`.
+///
+/// WHY equivalence and not a corpus capture (the b16/b17 discipline for
+/// every other aggregation): under the oracle config
+/// (`ci/logql/config.yaml`, protobuf frontend + shard_aggregations) the
+/// reference's sharded `avg → sum/count` rewrite returns an EMPTY 200
+/// for exactly this shape while its default-config engine serves it —
+/// the ledgered `grouping-dedup-avg-sharded-frontend` note. A captured
+/// `avg` row would be unverifiable by any gate and a future oracle-
+/// config recapture would silently rewrite it to the artifact; this
+/// gate is hermetic, so no recapture can touch it.
+#[test]
+fn avg_by_duplicate_grouping_equals_the_deduped_form() {
+    let meta: HashMap<u64, StreamMetaRow> = HashMap::from([
+        (
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "gd".to_string(),
+                labels: r#"{"env":"e1","fp":"a","service_name":"gd"}"#.to_string(),
+            },
+        ),
+        (
+            2u64,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "gd".to_string(),
+                labels: r#"{"env":"e2","fp":"b","service_name":"gd"}"#.to_string(),
+            },
+        ),
+        (
+            3u64,
+            StreamMetaRow {
+                fingerprint: 3,
+                service: "gd".to_string(),
+                labels: r#"{"env":"e3","fp":"b","service_name":"gd"}"#.to_string(),
+            },
+        ),
+    ]);
+    // Per-series counts over [5m] at 60s: fp=a -> 1; fp=b -> {1, 3}.
+    let rows = vec![
+        row(1, 15 * NS, "one"),
+        row(2, 20 * NS, "two"),
+        row(3, 25 * NS, "three"),
+        row(3, 26 * NS, "four"),
+        row(3, 27 * NS, "five"),
+    ];
+    let dup = eval_instant_metric_query(
+        r#"avg by (fp, fp) (count_over_time({service_name="gd"} | logfmt [5m]))"#,
+        &rows,
+        &meta,
+    );
+    let single = eval_instant_metric_query(
+        r#"avg by (fp) (count_over_time({service_name="gd"} | logfmt [5m]))"#,
+        &rows,
+        &meta,
+    );
+    assert_eq!(
+        bit_canonical(&dup),
+        bit_canonical(&single),
+        "a duplicated `by` name must be evaluation-inert for avg"
+    );
+    // The anchor: avg by fp -> a = 1, b = (1 + 3) / 2 = 2 (integer-exact).
+    assert_eq!(
+        sorted_vector(dup),
+        vec![(lbl(&[("fp", "a")]), 1.0), (lbl(&[("fp", "b")]), 2.0)]
+    );
 }
