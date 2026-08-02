@@ -1697,6 +1697,7 @@ dependencies = [
 name = "pulsus-config"
 version = "0.0.0"
 dependencies = [
+ "chrono-tz",
  "serde",
  "serde_norway",
  "thiserror 2.0.18",

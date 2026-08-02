@@ -676,7 +676,9 @@ enum CompiledLabelFmt {
 pub struct CompiledPipeline {
     stages: Vec<CompiledStage>,
     /// The template execution environment (issue #230): the `Local`
-    /// zone + wall clock the reference resolves from the process.
+    /// zone + wall clock. The zone is SERVER CONFIGURATION
+    /// (`reader.template_timezone`, default UTC — issue #311), not the
+    /// host's, so two nodes sharing a config render identically.
     /// Tests/the corpus runner override it via
     /// [`CompiledPipeline::with_template_env`] to pin determinism.
     template_env: TemplateEnv,
@@ -930,7 +932,9 @@ impl CompiledPipeline {
         let line_filter_only = stages.is_empty() && st.all_line_filter_source;
         CompiledPipeline {
             stages,
-            template_env: TemplateEnv::process(),
+            // Issue #311: the SERVER-CONFIGURED zone (default UTC), never
+            // the host's `$TZ`/`/etc/localtime`.
+            template_env: template::configured_env(),
             mutates_labels: st.mutates_labels,
             rewrites_line: st.rewrites_line,
             line_filter_only,

@@ -1151,7 +1151,9 @@ impl Func {
 #[test]
 fn every_registry_function_charge_dominates_its_allocations() {
     use pulsus_read::logql::template::MAX_TEMPLATE_RENDER_BYTES;
-    let env = TemplateEnv::process();
+    // Issue #311: a PINNED environment, not the host's — allocation
+    // charges must not depend on which machine runs the gate.
+    let env = TemplateEnv::default();
     let line = vec![b'L'; BIG];
     // Literal patterns are compiled ONCE at query compile in production
     // and every per-line call hits this cache — mirrored here so the

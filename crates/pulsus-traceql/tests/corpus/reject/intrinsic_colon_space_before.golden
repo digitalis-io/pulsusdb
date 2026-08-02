@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "whitespace before ':'",
+    expected: "':' immediately after the intrinsic scope keyword (a space is allowed AFTER the colon, but not before it)",
+    span: Span {
+        start: 7,
+        end: 8,
+    },
+}

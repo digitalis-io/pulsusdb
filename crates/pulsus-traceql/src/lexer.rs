@@ -110,6 +110,7 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, TraceQlError> {
                 push(&mut tokens, TokenKind::Comma, start, sc.current_byte());
             }
             ':' => {
+                reject_split_scoped_intrinsic(&tokens, start)?;
                 sc.advance();
                 push(&mut tokens, TokenKind::Colon, start, sc.current_byte());
             }
@@ -148,6 +149,7 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, TraceQlError> {
                     let kind = scan_number_or_duration(&mut sc, start);
                     push(&mut tokens, kind, start, sc.current_byte());
                 } else {
+                    reject_split_attribute_path(&tokens, &sc, start)?;
                     sc.advance();
                     push(&mut tokens, TokenKind::Dot, start, sc.current_byte());
                 }
@@ -278,6 +280,120 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, TraceQlError> {
         span: Span { start: end, end },
     });
     Ok(tokens)
+}
+
+/// The four characters `tokenize` treats as inter-token whitespace.
+fn is_query_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+/// Rejects an attribute path split by whitespace around one of its `.`
+/// separators.
+///
+/// A `.` is only ever an attribute-path separator in this grammar — the
+/// leading-dot fraction (`.5s`) is already consumed as a `Number`/
+/// `Duration` by the caller — so the whole rule lives here, once, and
+/// covers every scope form (`.attr`, `span.`, `resource.`, `parent.`,
+/// `event.`, `link.`, `instrumentation.`, and each `.`-separated key
+/// segment) rather than being restated per scope in the parser.
+///
+/// Reference behaviour (TraceQL as shipped in Tempo v3.0.2, observed
+/// black-box against an unmodified `grafana/tempo:3.0.2` container over
+/// `/api/search`): an attribute path is one contiguous lexeme, so both
+/// spellings with a gap are HTTP 400 parse errors while the tight
+/// spelling is 200 —
+///   * `{ . hi = 1 }`, `{ span. hi = 1 }`, `{ .a. b = 1 }`,
+///     `{ span.a. b = 1 }`, `{ . "foo bar" = 1 }`, `{ . ["foo bar"] = 1 }`
+///     (whitespace *after* the dot), and
+///   * `{ span .hi = 1 }`, `{ .a .b = 1 }`, `{ span.a .b = 1 }`,
+///     `{ span."a b" .c = 1 }`, `{ span.["a b"] .c = 1 }`
+///     (whitespace *before* a continuation dot).
+///
+/// Whitespace before a *leading* dot is untouched: `{ .hi = 1 }` and
+/// `{ .a } >> { .b }` stay valid, because the guard only fires when the
+/// dot would continue the path token that precedes it.
+fn reject_split_attribute_path(
+    tokens: &[Token],
+    sc: &Scanner<'_>,
+    dot_start: usize,
+) -> Result<(), TraceQlError> {
+    let span = Span {
+        start: dot_start,
+        end: dot_start + '.'.len_utf8(),
+    };
+    if matches!(sc.peek_at(1), Some(c) if is_query_whitespace(c)) {
+        return Err(TraceQlError::UnexpectedToken {
+            found: "whitespace after '.'".to_string(),
+            expected: "an attribute name immediately after '.' (an attribute path is a single \
+                       unbroken token)"
+                .to_string(),
+            span,
+        });
+    }
+    // A path segment immediately left of the dot makes this a
+    // continuation dot (`span` + `.`, `["a b"]` + `.`); a gap there
+    // splits the same one lexeme.
+    if let Some(prev) = tokens.last()
+        && matches!(
+            prev.kind,
+            TokenKind::Ident(_) | TokenKind::String(_) | TokenKind::RBracket
+        )
+        && prev.span.end != dot_start
+    {
+        return Err(TraceQlError::UnexpectedToken {
+            found: "whitespace before '.'".to_string(),
+            expected: "'.' immediately after the preceding attribute path segment (an attribute \
+                       path is a single unbroken token)"
+                .to_string(),
+            span,
+        });
+    }
+    Ok(())
+}
+
+/// Rejects a colon-scoped intrinsic (`span:id`, `trace:duration`,
+/// `event:name`, `link:spanID`, `instrumentation:version`) whose scope
+/// keyword is separated from its `:` by whitespace.
+///
+/// A `:` is only ever the scoped-intrinsic separator in this grammar
+/// (the parser consumes `TokenKind::Colon` in exactly one place), so —
+/// as with `reject_split_attribute_path` — the rule is stated once here
+/// and covers every colon scope in every operand position, rather than
+/// being restated per scope in the parser.
+///
+/// **The asymmetry with `.` is DELIBERATE and must not be "fixed" into
+/// consistency.** It is genuine reference behaviour, observed black-box
+/// against an unmodified `grafana/tempo:3.0.2` container over
+/// `/api/search` for every colon scope and every operand position:
+///   * a gap BEFORE the colon is HTTP 400 — `{ span :id = "x" }`,
+///     `{ span : id = "x" }`, `{ trace :duration > 1s }`,
+///     `{ event :name = "x" }`, `{ link :spanID = "x" }`,
+///     `{ instrumentation :version = "x" }`, `select(span :id)`,
+///     `avg(span :duration)`, `by(span :id)`, and across `&&`/`>>`;
+///   * a gap AFTER the colon is HTTP 200 — `{ span: id = "x" }`,
+///     `{ trace: rootName = "x" }`, `{ instrumentation: name = "x" }`,
+///     `select(span: id)`, `by(span: id)`, spaces/tabs/newlines alike.
+///
+/// So there is no trailing-side check here, unlike the `.` guard. An
+/// attribute path is one lexeme on both sides; a colon-scoped intrinsic
+/// binds the scope to the colon only on the left.
+fn reject_split_scoped_intrinsic(tokens: &[Token], colon_start: usize) -> Result<(), TraceQlError> {
+    if let Some(prev) = tokens.last()
+        && matches!(prev.kind, TokenKind::Ident(_))
+        && prev.span.end != colon_start
+    {
+        return Err(TraceQlError::UnexpectedToken {
+            found: "whitespace before ':'".to_string(),
+            expected: "':' immediately after the intrinsic scope keyword (a space is allowed \
+                       AFTER the colon, but not before it)"
+                .to_string(),
+            span: Span {
+                start: colon_start,
+                end: colon_start + ':'.len_utf8(),
+            },
+        });
+    }
+    Ok(())
 }
 
 /// The escape forms named in every malformed-escape error message.
@@ -702,6 +818,204 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    /// Every scope form the grammar has, in the tight spelling the
+    /// reference accepts (HTTP 200 against `grafana/tempo:3.0.2`).
+    /// `parent.` is a recognized-but-unimplemented scope, so it is
+    /// asserted at the token level here and as a `NotYetSupported`
+    /// parse error in `parser.rs`.
+    #[test]
+    fn every_dotted_scope_lexes_when_the_path_has_no_whitespace() {
+        for input in [
+            "{ .hi = 1 }",
+            "{ .a.b = 1 }",
+            r#"{ ."foo bar" = 1 }"#,
+            r#"{ .["foo bar"] = 1 }"#,
+            "{ span.hi = 1 }",
+            "{ span.http.status_code = 1 }",
+            r#"{ span."a b".c = 1 }"#,
+            r#"{ span.["a b"].c = 1 }"#,
+            "{ resource.service.name = \"x\" }",
+            "{ parent.hi = 1 }",
+            "{ event.hi = 1 }",
+            "{ link.hi = 1 }",
+            "{ instrumentation.hi = 1 }",
+            "{ .a } >> { .b }",
+            "{ true } | select(.hi)",
+            "{ true } | avg(.dur) > 1",
+            "{ true } | rate() by(.hi)",
+        ] {
+            assert!(tokenize(input).is_ok(), "{input:?} must lex");
+        }
+    }
+
+    /// The reference (Tempo v3.0.2) lexes an attribute path as one
+    /// contiguous lexeme and rejects every gap-spelling at parse (HTTP
+    /// 400, observed black-box) — the permissiveness was general, not
+    /// per-scope, so this covers the unscoped `.`, all six scope
+    /// keywords, and the intra-key separators.
+    #[test]
+    fn whitespace_after_an_attribute_path_dot_is_rejected_for_every_scope() {
+        for input in [
+            "{ . hi }",
+            "{ . hi = 1 }",
+            "{ .a. b = 1 }",
+            r#"{ . "foo bar" = 1 }"#,
+            r#"{ . ["foo bar"] = 1 }"#,
+            "{ span. hi = 1 }",
+            "{ span . hi = 1 }",
+            "{ span.http. status_code = 1 }",
+            r#"{ span. "a b" = 1 }"#,
+            r#"{ span. ["a b"] = 1 }"#,
+            "{ resource. hi = 1 }",
+            "{ parent. hi = 1 }",
+            "{ event. hi = 1 }",
+            "{ link. hi = 1 }",
+            "{ instrumentation. hi = 1 }",
+            "{ .a = . b }",
+            "{ .a } >> { . b }",
+            "{ true } | select(. hi)",
+            "{ true } | avg(. dur) > 1",
+            "{ true } | rate() by(. hi)",
+            "{\t.\thi = 1 }",
+            "{ .\nhi = 1 }",
+        ] {
+            match tokenize(input) {
+                Err(TraceQlError::UnexpectedToken { found, span, .. }) => {
+                    assert_eq!(found, "whitespace after '.'", "input {input:?}");
+                    assert_eq!(span.end, span.start + 1, "input {input:?}: spans the dot");
+                    assert_eq!(&input[span.start..span.end], ".", "input {input:?}");
+                }
+                other => panic!("{input:?} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// The mirror direction: a gap before a *continuation* dot splits the
+    /// same lexeme (`{ span .hi }`, `{ .a .b }`), which the reference also
+    /// rejects. A gap before a *leading* dot is untouched.
+    #[test]
+    fn whitespace_before_a_continuation_dot_is_rejected() {
+        for input in [
+            "{ span .hi = 1 }",
+            "{ resource .service.name = \"x\" }",
+            "{ event .hi = 1 }",
+            "{ link .hi = 1 }",
+            "{ instrumentation .hi = 1 }",
+            "{ parent .hi = 1 }",
+            "{ .a .b = 1 }",
+            "{ span.a .b = 1 }",
+            r#"{ span."a b" .c = 1 }"#,
+            r#"{ span.["a b"] .c = 1 }"#,
+            "{ .a\n.b = 1 }",
+        ] {
+            match tokenize(input) {
+                Err(TraceQlError::UnexpectedToken { found, span, .. }) => {
+                    assert_eq!(found, "whitespace before '.'", "input {input:?}");
+                    assert_eq!(&input[span.start..span.end], ".", "input {input:?}");
+                }
+                other => panic!("{input:?} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// A leading dot is *not* a continuation dot: whitespace (or a brace,
+    /// operator, comma or paren) before it is exactly how every valid
+    /// unscoped attribute is written, and the guard must not fire there.
+    #[test]
+    fn whitespace_before_a_leading_dot_stays_valid() {
+        for input in [
+            "{ .hi = 1 }",
+            "{.hi = 1 }",
+            "{ .a = .b }",
+            "{ .a = 1 && .b = 2 }",
+            "{ true } | select(.a, .b)",
+            "{ true } | avg (.dur) > 1",
+            "{ true } | rate() by (.hi)",
+        ] {
+            assert!(tokenize(input).is_ok(), "{input:?} must lex");
+        }
+    }
+
+    /// The guard sits after the fraction branch, so a numeric literal that
+    /// merely starts with `.` is unaffected in either direction.
+    #[test]
+    fn a_leading_dot_fraction_is_never_treated_as_a_split_attribute_path() {
+        assert_eq!(
+            kinds("{ duration > .5s }")[3],
+            TokenKind::Duration(".5s".to_string())
+        );
+        assert!(tokenize("{ true } | quantile_over_time(duration, .5) > 1").is_ok());
+        // `{ . 5s }` is a split path, not a fraction: the digit is not
+        // adjacent to the dot.
+        assert!(tokenize("{ . 5s = 1 }").is_err());
+    }
+
+    /// Colon-scoped intrinsics, gap BEFORE the colon: rejected for every
+    /// colon scope the grammar has, in every operand position — the
+    /// permissiveness here was general too, not per-scope.
+    #[test]
+    fn whitespace_before_an_intrinsic_scope_colon_is_rejected_for_every_scope() {
+        for input in [
+            r#"{ span :id = "x" }"#,
+            r#"{ span : id = "x" }"#,
+            "{ span :duration > 1s }",
+            "{ span :childCount > 1 }",
+            r#"{ span :parentID = "x" }"#,
+            r#"{ trace :id = "x" }"#,
+            "{ trace :duration > 1s }",
+            r#"{ trace :rootName = "x" }"#,
+            r#"{ trace :rootService = "x" }"#,
+            r#"{ event :name = "x" }"#,
+            "{ event :timeSinceStart > 1s }",
+            r#"{ link :spanID = "x" }"#,
+            r#"{ link :traceID = "x" }"#,
+            r#"{ instrumentation :name = "x" }"#,
+            r#"{ instrumentation :version = "x" }"#,
+            r#"{ span:name = "x" && trace :id = "y" }"#,
+            r#"{ span:id = "a" } >> { span :id = "b" }"#,
+            "{ true } | select(span :id)",
+            "{ true } | avg(span :duration) > 1s",
+            "{ true } | rate() by(span :id)",
+            "{ span\n:id = \"x\" }",
+            "{ span\t:id = \"x\" }",
+        ] {
+            match tokenize(input) {
+                Err(TraceQlError::UnexpectedToken { found, span, .. }) => {
+                    assert_eq!(found, "whitespace before ':'", "input {input:?}");
+                    assert_eq!(&input[span.start..span.end], ":", "input {input:?}");
+                }
+                other => panic!("{input:?} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// The other half of the pair, and the asymmetry with `.`: a gap
+    /// AFTER the colon is valid — the reference answers 200 to every one
+    /// of these. This test exists to stop the colon guard being "tidied"
+    /// into symmetry with `reject_split_attribute_path`.
+    #[test]
+    fn whitespace_after_an_intrinsic_scope_colon_stays_valid() {
+        for input in [
+            r#"{ span: id = "x" }"#,
+            "{ span: duration > 1s }",
+            "{ span: childCount > 1 }",
+            r#"{ trace: id = "x" }"#,
+            r#"{ trace: rootName = "x" }"#,
+            r#"{ event: name = "x" }"#,
+            r#"{ link: spanID = "x" }"#,
+            r#"{ instrumentation: version = "x" }"#,
+            "{ true } | select(span: id)",
+            "{ true } | rate() by(span: id)",
+            "{ span:\tid = \"x\" }",
+            "{ span:\nid = \"x\" }",
+            // …and the tight spelling, which must keep working.
+            r#"{ span:id = "x" }"#,
+            r#"{ trace:id = "x" }"#,
+        ] {
+            assert!(tokenize(input).is_ok(), "{input:?} must lex");
+        }
     }
 
     #[test]

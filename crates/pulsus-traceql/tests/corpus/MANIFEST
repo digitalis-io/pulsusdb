@@ -34,6 +34,7 @@ accept/field_or
 accept/field_parens
 accept/field_precedence
 accept/hints_most_recent
+accept/intrinsic_colon_space_after
 accept/intrinsic_event_name
 accept/intrinsic_event_time_since_start
 accept/intrinsic_instrumentation_name
@@ -124,6 +125,9 @@ grafana/explore_root_rate_sample
 reject/aggregate_empty
 reject/aggregate_non_numeric
 reject/attr_bare_keyword_value
+reject/attr_dot_space_after
+reject/attr_dot_space_after_scope
+reject/attr_dot_space_before_scope
 reject/bare_intrinsic_word
 reject/bare_parent_word
 reject/bare_unscoped_word
@@ -144,6 +148,7 @@ reject/duration_unknown_unit
 reject/empty
 reject/eof_after_pipe
 reject/field_chain_over_limit
+reject/intrinsic_colon_space_before
 reject/kind_invalid_keyword
 reject/lone_amp
 reject/missing_rbrace
