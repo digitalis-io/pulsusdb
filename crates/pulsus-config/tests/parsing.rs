@@ -211,6 +211,64 @@ fn zero_logql_pipeline_scan_factor_is_rejected_from_yaml_and_env() {
     support::clear_all();
 }
 
+/// Issue #311: an unknown `reader.template_timezone` — from YAML or from
+/// `PULSUS_TEMPLATE_TIMEZONE` — fails config load naming the offending
+/// value. There is deliberately NO fallback: a server that silently
+/// renders in some other zone is the defect this setting removes. A known
+/// zone loads through, and the default is UTC.
+#[test]
+fn an_unknown_template_timezone_is_rejected_from_yaml_and_env() {
+    let _guard = support::lock_env();
+    support::clear_all();
+
+    assert_eq!(
+        pulsus_config::Config::default().reader.template_timezone,
+        pulsus_config::TemplateTimezone::UTC,
+        "the documented default is UTC"
+    );
+
+    // YAML: the deserializer rejects it, so `Config` can never hold it.
+    let path = support::write_temp_yaml(
+        "unknown-template-timezone",
+        "reader:\n  template_timezone: Europe/Lundon\n",
+    );
+    match pulsus_config::load(Some(&path), None) {
+        Err(err @ pulsus_config::ConfigError::Yaml { .. }) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Europe/Lundon") && msg.contains("IANA"),
+                "message must name the offending zone: {msg}"
+            );
+        }
+        other => panic!("expected a Yaml error for an unknown zone, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&path);
+
+    // Env: the same rejection, naming the variable.
+    support::set("PULSUS_TEMPLATE_TIMEZONE", "Europe/Lundon");
+    match pulsus_config::load(None, None) {
+        Err(pulsus_config::ConfigError::Env { var, msg }) => {
+            assert_eq!(var, "PULSUS_TEMPLATE_TIMEZONE");
+            assert!(
+                msg.contains("Europe/Lundon") && msg.contains("IANA"),
+                "message must name the offending zone: {msg}"
+            );
+        }
+        other => panic!("expected an Env error for an unknown zone, got {other:?}"),
+    }
+    support::clear_all();
+
+    // A known zone loads through and keeps its canonical IANA name.
+    let path = support::write_temp_yaml(
+        "known-template-timezone",
+        "reader:\n  template_timezone: Europe/London\n",
+    );
+    let cfg = pulsus_config::load(Some(&path), None).expect("a known zone must load");
+    assert_eq!(cfg.reader.template_timezone.name(), "Europe/London");
+    let _ = std::fs::remove_file(&path);
+    support::clear_all();
+}
+
 #[test]
 fn clickhouse_auth_env_var_splits_on_first_colon() {
     let _guard = support::lock_env();

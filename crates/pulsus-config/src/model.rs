@@ -21,6 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::ConfigError;
 use crate::secret::Secret;
+use crate::timezone::TemplateTimezone;
 use crate::units::{ByteSize, HumanDuration};
 
 /// The complete effective configuration (docs/configuration.md §9).
@@ -343,6 +344,17 @@ pub struct ReaderConfig {
     /// field-level serde default, which would
     /// resolve a partial YAML object to 0) supplies 10.
     pub logql_pipeline_scan_factor: u32,
+    /// `PULSUS_TEMPLATE_TIMEZONE` (issue #311, default `UTC`): the IANA
+    /// zone LogQL `line_format`/`label_format` template time functions
+    /// render local times in. **Server configuration, not host state** —
+    /// the process `$TZ` and `/etc/localtime` are never consulted, so two
+    /// nodes carrying the same configuration render the same text for the
+    /// same query. Loki resolves this per host; setting it to the zone a
+    /// fleet runs in reproduces that behaviour exactly, it just has to be
+    /// stated rather than inherited (ledger row
+    /// `template-timezone-configured`). An unknown zone name is rejected
+    /// at config load.
+    pub template_timezone: TemplateTimezone,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
     /// Issue #182: the safety cap on the number of distinct output series
@@ -429,6 +441,7 @@ impl Default for ReaderConfig {
             promql_max_info_series: 100_000,
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
             logql_pipeline_scan_factor: 10,
+            template_timezone: TemplateTimezone::UTC,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
             traceql_max_series: 1_000,

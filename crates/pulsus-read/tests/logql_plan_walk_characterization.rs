@@ -166,12 +166,15 @@ const LABEL_FILTER_QUERIES: &[&str] = &[
 
 /// A fully PINNED template environment.
 ///
-/// `CompiledPipeline::compile` installs `TemplateEnv::process()`, which
-/// resolves the host's `$TZ` (or `/etc/localtime`) — **ambient input,
-/// not an observable of the compiled pipeline**. Freezing it into a
-/// golden makes the file pass only on a machine whose zone matches
-/// whoever last regenerated it: this golden froze `Europe/London` and
-/// CI, running `Etc/UTC`, failed on 142 lines.
+/// `CompiledPipeline::compile` installs the SERVER-CONFIGURED zone
+/// (`reader.template_timezone`, default UTC — issue #311). It used to
+/// resolve the host's `$TZ` (or `/etc/localtime`) — **ambient input, not
+/// an observable of the compiled pipeline**. Freezing that into a golden
+/// made the file pass only on a machine whose zone matched whoever last
+/// regenerated it: this golden froze `Europe/London` and CI, running
+/// `Etc/UTC`, failed on 142 lines. The golden still pins its own env
+/// rather than relying on the default, so it is independent of a
+/// deployment's configuration too.
 ///
 /// Every field is populated rather than defaulted, so the golden still
 /// pins `local`, `local_name` and `now_ns` byte-for-byte and a field
