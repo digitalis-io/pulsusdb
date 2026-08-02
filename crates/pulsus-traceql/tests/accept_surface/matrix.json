@@ -745,9 +745,10 @@
     {
       "query": "{ !name + 1 = 2 }",
       "reference": "reject",
-      "pulsus": "accept",
-      "verdict": "diverge",
-      "class": "D1",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D1",
       "reference_parse": "!name"
     },
     {
@@ -898,9 +899,10 @@
     {
       "query": "{ !name * 2 = 3 }",
       "reference": "reject",
-      "pulsus": "accept",
-      "verdict": "diverge",
-      "class": "D1",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D1",
       "reference_parse": "name * 2"
     },
     {
