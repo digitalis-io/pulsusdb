@@ -41,6 +41,12 @@
 //!     (`metrics::anchored_re2_literal_for_test`), so it pins the fix
 //!     — the `(?-s)` prefix — rather than a hand-copy of it, and it covers
 //!     screened patterns too: those are precisely the ones that reach SQL.
+//!     Issue #331 rides the same crossing: the flag-group-head defect's
+//!     workaround renderings must agree with RE2 corpus-wide, the
+//!     underlying SERVER defect is pinned separately by the raw-probe
+//!     registry at the bottom of this file (rot-checked in both
+//!     directions), and two hermetic tests prove the workaround leaves
+//!     unaffected patterns byte-identical and preserves compilability.
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 \
@@ -149,6 +155,16 @@ const TOKENS: &[&str] = &[
     "(?s:",
     "\\n",
     "[^\\n]",
+    // Issue #331's subject: the flag-group heads ClickHouse's
+    // `match()` analyzer leaks into its required substring (every
+    // no-`i` head), plus the rewrite's own output shape so the corpus
+    // also reaches patterns where the user already wrote `-i`.
+    "(?m)",
+    "(?m:",
+    "(?U)",
+    "(?U:",
+    "(?-s)",
+    "(?s-i:",
 ];
 
 /// Frozen with the fixture: changing either invalidates the committed
@@ -557,31 +573,142 @@ fn match_bits(re: &regex::Regex) -> String {
         .collect()
 }
 
-/// A replacement string no probe subject can equal, so "the anchored
-/// pattern matched" is decidable from `replaceRegexpOne`'s output alone.
+/// A replacement string no probe subject contains, so "RE2 found a match"
+/// is decidable from `replaceRegexpOne`'s output alone: any match —
+/// full-subject, partial or empty-width — changes the haystack, and no
+/// match leaves it byte-identical. The comparison is `!= subject`, NOT
+/// `= sentinel`: the corpus contains patterns whose own `)` and `|`
+/// escape the `^(?:…)$` template (`)|(?i:` renders as `^(?:)|(?i:)$`,
+/// an alternation of two half-anchored branches), so a match need not
+/// consume the whole subject — measured, `replaceRegexpOne('a',
+/// '^(?:)|(?i:)$', 'X')` is `'Xa'`, which a sentinel-equality reference
+/// misread as "no match" while `match()` correctly answered 1.
 const SENTINEL: &str = "'<matched>'";
 
-/// Patterns where ClickHouse's `match()` disagreed with RE2 **before**
-/// issue #324's fix and still does after it, for a different and separate
-/// reason — recorded here rather than deleted from the corpus, so the
-/// defect stays visible and any change in its extent is a test failure.
+/// One RAW `match()` probe: the pattern is sent to the server exactly as
+/// written — never through the read path's renderer — so these pin
+/// ClickHouse's OWN behaviour independent of issue #331's workaround.
+struct RawMatchProbe {
+    pattern: &'static str,
+    /// Non-empty (the `replaceRegexpOne` reference cannot see the empty
+    /// subject), and chosen so RE2 finds a match somewhere inside it —
+    /// except for the never-match arm probes, where nothing may match.
+    subject: &'static str,
+}
+
+const fn raw(pattern: &'static str, subject: &'static str) -> RawMatchProbe {
+    RawMatchProbe { pattern, subject }
+}
+
+/// Issue #331 (superseding issue #324's single-entry exemption list):
+/// ClickHouse's `OptimizedRegularExpression::analyze` leaks a `(?…`
+/// flag-group head's own characters into the required substring it
+/// extracts, whenever the head's flags carry no `i`. Measured on
+/// 24.8.14.39: `match('xaby', '(?s:ab)')` is `0` while `match('xs:aby',
+/// '(?s:ab)')` is `1` — the server is requiring the literal `s:ab` —
+/// and `replaceRegexpOne`, which reaches RE2 without the wrapper,
+/// matches. Every entry here is a form measured broken, across the
+/// full enumeration: scoped and flag-only heads, every `{s,m,U}`
+/// combination, positive and negated, two-sided, repeated, mid-pattern,
+/// grouped, and inside the read path's own anchored template.
 ///
-/// `OptimizedRegularExpression::analyze` scans a `(?…` group head for an
-/// `i` and stops at the first `-` or `)`; when it finds no `i` it leaks the
-/// head's own characters into the literal it extracts as the pattern's
-/// required substring. Measured on 24.8.14.39: `match('xaby', '(?s:ab)')`
-/// is `0` while `match('xs:aby', '(?s:ab)')` is `1` — the server is
-/// searching for `s:ab`. `replaceRegexpOne`, which reaches RE2 without the
-/// wrapper, matches `xaby`. So a scoped flag group (`(?s:`, `(?m:`, `(?U:`
-/// — but not `(?i:`, and not `(?i-s:`) followed by literal text silently
-/// selects no rows on the SQL path.
-///
-/// **Not** what issue #324 is about, and not introduced by it: the same
-/// input answers `0` with the `(?-s)` prefix removed. It is also why the
-/// prefix goes before the anchor — `^(?-s)(?:abc)$` does not match `abc`
-/// (measured), while `(?-s)^(?:abc)$` does, because `^` resets the
-/// candidate literal.
-const KNOWN_CLICKHOUSE_MATCH_DEFECTS: &[&str] = &["(?s:a.b)"];
+/// **The rot check:** the registry test asserts every entry is STILL
+/// broken raw. The day a ClickHouse upgrade fixes the analyzer, that
+/// assertion fails and the issue #331 workaround
+/// (`pulsus_re2::clickhouse_match_strategy` and the render shapes in
+/// `logql::escape`) is retired rather than carried dead.
+const CLICKHOUSE_STILL_BROKEN_RAW: &[RawMatchProbe] = &[
+    raw("(?s:a)", "xay"),
+    raw("(?s:ab)", "xaby"),
+    raw("(?s:a.b)", "xa-by"),
+    raw("(?m:a)", "xay"),
+    raw("(?m:ab)", "xaby"),
+    raw("(?U:ab+)", "xabby"),
+    raw("(?sm:ab)", "xaby"),
+    raw("(?smU:ab)", "xaby"),
+    raw("(?mU:ab)", "xaby"),
+    raw("(?sU:ab)", "xaby"),
+    raw("(?-s:ab)", "xaby"),
+    raw("(?-m:ab)", "xaby"),
+    raw("(?-U:ab)", "xaby"),
+    raw("(?s-m:ab)", "xaby"),
+    raw("(?U-s:ab)", "xaby"),
+    raw("(?ss:ab)", "xaby"),
+    raw("(?s)ab", "xaby"),
+    raw("(?m)ab", "xaby"),
+    raw("(?U)ab", "xaby"),
+    raw("(?-s)ab", "xaby"),
+    raw("(?-m)ab", "xaby"),
+    raw("(?-U)ab", "xaby"),
+    raw("x(?s:ab)", "zxaby"),
+    raw("x(?m:ab)", "zxaby"),
+    raw("(?:(?s:ab))", "qaby"),
+    // The read path's own template shapes, as they rendered BEFORE the
+    // workaround — the defect this issue exists to fix.
+    raw("^(?:(?s:ab))$", "ab"),
+    raw("(?-s)^(?:(?s:ab))$", "ab"),
+    raw("(?-s)^(?:(?s)ab)$", "ab"),
+];
+
+/// The workaround's PREMISES, asserted against the same live server: a
+/// head carrying `i` anywhere — including every `-i`-appended rewrite
+/// output — does not leak, named groups and plain groups do not leak,
+/// and the never-match-arm shapes answer exactly as RE2 does. If any of
+/// these ever starts failing, the workaround itself is unsound on that
+/// server and must be revisited, not patched around.
+const CLICKHOUSE_STILL_SOUND_RAW: &[RawMatchProbe] = &[
+    // The rewrite outputs for every broken family above.
+    raw("(?s-i:ab)", "xaby"),
+    raw("(?m-i:ab)", "xaby"),
+    raw("(?U-i:ab)", "xaby"),
+    raw("(?sm-i:ab)", "xaby"),
+    raw("(?smU-i:ab)", "xaby"),
+    raw("(?mU-i:ab)", "xaby"),
+    raw("(?sU-i:ab)", "xaby"),
+    raw("(?-si:ab)", "xaby"),
+    raw("(?-mi:ab)", "xaby"),
+    raw("(?-Ui:ab)", "xaby"),
+    raw("(?s-mi:ab)", "xaby"),
+    raw("(?U-si:ab)", "xaby"),
+    raw("(?ss-i:ab)", "xaby"),
+    raw("(?s-i)ab", "xaby"),
+    raw("(?m-i)ab", "xaby"),
+    raw("(?U-i)ab", "xaby"),
+    raw("(?-si)ab", "xaby"),
+    raw("(?-mi)ab", "xaby"),
+    raw("(?-Ui)ab", "xaby"),
+    // User-written i-heads are untouched by the strategy, so they must
+    // be sound on their own.
+    raw("(?i:ab)", "xaby"),
+    raw("(?i)ab", "xaby"),
+    raw("(?im:ab)", "xaby"),
+    raw("(?si:ab)", "xaby"),
+    raw("(?i-s:ab)", "xaby"),
+    raw("(?-is:ab)", "xaby"),
+    // Head-shaped constructs the strategy classifies safe.
+    raw("(?:ab)", "xaby"),
+    raw("(?)ab", "xaby"),
+    raw("(?P<n>ab)", "xaby"),
+    raw("(?<n>ab)", "xaby"),
+    // The never-match-arm render shapes, matching side — including the
+    // fix round 3 non-literal-leading routing's outputs.
+    raw("^(?:(?s:ab))$|$.", "ab"),
+    raw("(?-s)^(?:(?s:ab))$|$.", "ab"),
+    raw("(?:(?s:ab))|$.", "xaby"),
+    raw("(?:(?s:.*ab.*))|$.", "xaby"),
+    raw("^(?:(?s:.*ab.*))$|$.", "xaby"),
+    // Issue #324's own preserved semantics under the arm: `.` must not
+    // match a newline through the alternation.
+];
+
+/// The never-matching arm really never matches — including on subjects
+/// with newlines, and with a user `(?m)` contained by the wrap.
+const CLICKHOUSE_NEVER_MATCH_RAW: &[RawMatchProbe] = &[
+    raw("$.", "a"),
+    raw("$.", "a\nb"),
+    raw("(?:(?m)x)|$.", "q\n"),
+    raw("(?-s)^(?:a.b)$|$.", "a\nb"),
+];
 
 /// One `String` column per engine call, so a whole pattern's answer is one
 /// round trip. `replaceRegexpOne` runs RE2 directly; `match` is the
@@ -610,7 +737,7 @@ fn bits_sql(pattern: &str) -> String {
         }
         let subject = sql_literal(subject);
         parts.push(format!(
-            "if(replaceRegexpOne({subject}, {anchored}, {SENTINEL}) = {SENTINEL}, '1', '0')"
+            "if(replaceRegexpOne({subject}, {anchored}, {SENTINEL}) != {subject}, '1', '0')"
         ));
     }
     for subject in SUBJECTS {
@@ -699,7 +826,6 @@ async fn the_rewrite_makes_the_in_process_engine_agree_with_re2() {
     let mut over_rejected_by_316: Vec<String> = Vec::new();
     let mut fixed_by_the_rewrite = 0usize;
     let mut clickhouse_match_deviations: Vec<String> = Vec::new();
-    let mut known_defects_seen: Vec<&str> = Vec::new();
     let mut mismatches: Vec<String> = Vec::new();
 
     for pattern in &corpus {
@@ -712,13 +838,9 @@ async fn the_rewrite_makes_the_in_process_engine_agree_with_re2() {
             continue;
         };
         if optimized != re2 {
-            if KNOWN_CLICKHOUSE_MATCH_DEFECTS.contains(&pattern.as_str()) {
-                known_defects_seen.push(pattern.as_str());
-            } else {
-                clickhouse_match_deviations.push(format!(
-                    "{pattern:?}: clickhouse_match={optimized} re2={re2}"
-                ));
-            }
+            clickhouse_match_deviations.push(format!(
+                "{pattern:?}: clickhouse_match={optimized} re2={re2}"
+            ));
         }
         // A screened pattern never gets an in-process verdict at all — the
         // read path defers it to storage (issue #309), so RE2 answers it
@@ -766,27 +888,20 @@ async fn the_rewrite_makes_the_in_process_engine_agree_with_re2() {
         over_rejected_by_316
     );
 
-    // Issue #324: ClickHouse's `match()` must select the same subjects as
-    // RE2 itself for the literal the read path renders. Before the `(?-s)`
-    // prefix this listed every `.`-carrying pattern (`.`, `.*`, `.+`,
-    // `.(?i)`, `\s{2}|.` on the pre-#324 corpus) — the SQL path
-    // over-matching any label value containing a line break.
+    // Issues #324/#331: ClickHouse's `match()` must select the same
+    // subjects as RE2 itself for the literal the read path renders — with
+    // NO exemptions. Before the `(?-s)` prefix this listed every
+    // `.`-carrying pattern (the SQL path over-matching any label value
+    // containing a line break); before issue #331's flag-head workaround
+    // it carried a `(?s:a.b)` exemption (the SQL path silently selecting
+    // no rows). The raw-probe registry above is where the underlying
+    // server defect stays visible; the RENDERED literal must simply be
+    // correct.
     assert!(
         clickhouse_match_deviations.is_empty(),
         "ClickHouse's match() disagrees with RE2 for {} rendered pattern(s) — the SQL \
-         path would return rows the reference would not: {clickhouse_match_deviations:#?}",
+         path would return wrong rows: {clickhouse_match_deviations:#?}",
         clickhouse_match_deviations.len()
-    );
-    // The exemption list is not allowed to rot: every entry must still be a
-    // live deviation, so a ClickHouse fix (or a corpus edit that drops the
-    // pattern) forces the list to be deleted rather than silently masking a
-    // future regression on the same input.
-    known_defects_seen.sort_unstable();
-    known_defects_seen.dedup();
-    assert_eq!(
-        known_defects_seen, KNOWN_CLICKHOUSE_MATCH_DEFECTS,
-        "the known-defect exemption list no longer matches what ClickHouse actually does — \
-         delete the entries that now agree with RE2"
     );
 
     assert!(
@@ -820,4 +935,175 @@ async fn the_rewrite_makes_the_in_process_engine_agree_with_re2() {
          a query would return the wrong rows: {mismatches:#?}",
         mismatches.len()
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #331: the flag-group-head defect registry, probed RAW.
+// ---------------------------------------------------------------------
+
+/// `(clickhouse_match, re2)` verdicts for one raw probe, via one round
+/// trip. The subject is non-empty by [`RawMatchProbe`]'s contract, so
+/// `replaceRegexpOne` is a valid RE2 reference.
+async fn raw_verdicts(client: &ChClient, p: &RawMatchProbe) -> (char, char) {
+    let subject = sql_literal(p.subject);
+    let pattern = sql_literal(p.pattern);
+    let sql = double_placeholders(&format!(
+        "SELECT concat(toString(match({subject}, {pattern})), \
+         if(replaceRegexpOne({subject}, {pattern}, '<m>') != {subject}, '1', '0')) AS bits"
+    ));
+    let mut stream = client
+        .query_stream::<BitsRow>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{:?}: raw probe failed: {e:?}", p.pattern));
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await {
+        rows.push(row.unwrap_or_else(|e| panic!("{:?}: raw probe failed: {e:?}", p.pattern)));
+    }
+    let bits = &rows.first().expect("one row").bits;
+    let mut chars = bits.chars();
+    (
+        chars.next().expect("match bit"),
+        chars.next().expect("re2 bit"),
+    )
+}
+
+/// The issue #331 registry, all three faces (see the consts above):
+/// every recorded defect is STILL broken raw (the rot check — a
+/// ClickHouse fix turns up here, and the workaround is then retired,
+/// never carried dead), every premise the workaround rests on still
+/// holds, and the never-matching arm still never matches. Probed RAW,
+/// never through the renderer, so this test is independent of the fix
+/// it justifies.
+#[tokio::test]
+async fn the_flag_head_defect_registry_holds_raw() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-read/tests/re2_screen_differential.rs for setup)"
+        );
+        return;
+    }
+    let client = ChClient::new(test_config()).await.expect("connect");
+    for p in CLICKHOUSE_STILL_BROKEN_RAW {
+        let (ch, re2) = raw_verdicts(&client, p).await;
+        assert_eq!(
+            re2, '1',
+            "{:?} vs {:?}: the registry premise broke — RE2 no longer matches this subject",
+            p.pattern, p.subject
+        );
+        assert_eq!(
+            ch, '0',
+            "{:?} vs {:?}: ClickHouse's match() now AGREES with RE2 — the analyzer defect \
+             is fixed on this server. Delete this entry, and once the list is empty retire \
+             the issue #331 workaround (pulsus_re2::clickhouse_match_strategy and the \
+             render shapes in logql::escape).",
+            p.pattern, p.subject
+        );
+    }
+    for p in CLICKHOUSE_STILL_SOUND_RAW {
+        let (ch, re2) = raw_verdicts(&client, p).await;
+        assert_eq!(
+            (ch, re2),
+            ('1', '1'),
+            "{:?} vs {:?}: a premise of the issue #331 workaround no longer holds on this \
+             server (got match={ch} re2={re2}) — revisit the strategy, do not patch around it",
+            p.pattern,
+            p.subject
+        );
+    }
+    for p in CLICKHOUSE_NEVER_MATCH_RAW {
+        let (ch, re2) = raw_verdicts(&client, p).await;
+        assert_eq!(
+            (ch, re2),
+            ('0', '0'),
+            "{:?} vs {:?}: the never-matching arm MATCHED (match={ch} re2={re2}) — the \
+             defeat rendering would return wrong rows",
+            p.pattern,
+            p.subject
+        );
+    }
+    println!(
+        "flag-head defect registry: {} broken, {} sound, {} never-match probes all hold",
+        CLICKHOUSE_STILL_BROKEN_RAW.len(),
+        CLICKHOUSE_STILL_SOUND_RAW.len(),
+        CLICKHOUSE_NEVER_MATCH_RAW.len()
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #331: hermetic proofs over the corpus.
+// ---------------------------------------------------------------------
+
+/// Patterns the strategy leaves alone must render **byte-for-byte** what
+/// the pre-#331 renderer produced — replicated here from issue #324's
+/// shape (`'(?-s)` + the anchored literal) — so the workaround cannot
+/// perturb the unaffected majority. Counted on both sides so neither
+/// branch can go vacuous. This test covers the PromQL rendering (the
+/// one seam an external binary can reach); the SAME corpus-wide
+/// crossing for the LogQL anchored and unanchored renderings lives
+/// beside the module-private escapers, in `logql::escape`'s tests
+/// (fix round 1).
+#[test]
+fn unaffected_corpus_patterns_render_byte_identically_to_the_pre_331_form() {
+    live_gate_or_panic();
+    let mut verbatim = 0usize;
+    let mut transformed = 0usize;
+    for pattern in full_corpus() {
+        match pulsus_re2::clickhouse_match_strategy(&pattern) {
+            pulsus_re2::ClickhouseMatchStrategy::Verbatim => {
+                verbatim += 1;
+                let anchored = sql_literal(&format!("^(?:{pattern})$"));
+                let pre_331 = format!("'(?-s){}", &anchored[1..]);
+                assert_eq!(
+                    rendered_sql_pattern(&pattern),
+                    pre_331,
+                    "{pattern:?}: an unaffected pattern's rendering moved"
+                );
+            }
+            _ => transformed += 1,
+        }
+    }
+    assert!(verbatim > 3_000, "verbatim side went vacuous: {verbatim}");
+    assert!(
+        transformed > 100,
+        "transformed side went vacuous: {transformed}"
+    );
+}
+
+/// The transform preserves Rust-crate compilability over the whole
+/// corpus, per render shape — the evidence behind
+/// `escape::ch_regex_anchored_checked`'s doc claim that validating the
+/// user's form still covers the emitted form. Each shape is gated on
+/// its OWN raw form compiling, exactly as the read path validates
+/// before it renders (a raw pattern like `/)(?-s)(?P<n>` is invalid
+/// alone yet valid inside the anchoring template, whose group its stray
+/// `)` closes — so the two shapes genuinely differ here).
+#[test]
+fn the_workaround_transform_preserves_compilability_over_the_corpus() {
+    live_gate_or_panic();
+    let mut checked = 0usize;
+    for pattern in full_corpus() {
+        let (anchored, unanchored) = match pulsus_re2::clickhouse_match_strategy(&pattern) {
+            pulsus_re2::ClickhouseMatchStrategy::Verbatim => continue,
+            pulsus_re2::ClickhouseMatchStrategy::RewriteHeads(p) => (format!("^(?:{p})$"), p),
+            pulsus_re2::ClickhouseMatchStrategy::NeverMatchArm => {
+                (format!("^(?:{pattern})$|$."), format!("(?:{pattern})|$."))
+            }
+        };
+        if regex::Regex::new(&format!("^(?:{pattern})$")).is_ok() {
+            assert!(
+                regex::Regex::new(&anchored).is_ok(),
+                "{pattern:?}: the anchored transform no longer compiles: {anchored:?}"
+            );
+            checked += 1;
+        }
+        if regex::Regex::new(&pattern).is_ok() {
+            assert!(
+                regex::Regex::new(&unanchored).is_ok(),
+                "{pattern:?}: the unanchored transform no longer compiles: {unanchored:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 50, "transform side went vacuous: {checked}");
 }

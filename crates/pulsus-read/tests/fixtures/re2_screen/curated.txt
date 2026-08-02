@@ -290,3 +290,50 @@ a\nb
 (?s).{2}
 \.
 a\.b
+
+# Issue #331: flag-group heads ClickHouse's match() analyzer leaks into
+# its required-substring optimisation — every no-`i` combination over
+# {s,m,U}, scoped and flag-only, positive and negated, two-sided,
+# repeated, mid-pattern, nested, grouped; heads mixed with `i` (rendered
+# with the never-match arm); the rewrite's own output shape; and
+# head-shaped impostors inside classes and \Q…\E quotations.
+(?s:ab)
+(?s:a.b)
+(?m:ab)
+(?U:ab+)
+(?sm:ab)
+(?smU:ab)
+(?mU:ab)
+(?sU:ab)
+(?-s:ab)
+(?-m:ab)
+(?-U:ab)
+(?s-m:ab)
+(?U-s:ab)
+(?ss:ab)
+(?s)ab
+(?m)ab
+(?U)ab
+(?-s)ab
+(?-m)ab
+(?-U)ab
+x(?s:ab)
+x(?m)ab
+(?:(?s:ab))
+(?s:a(?m:b))
+(?s:a)|(?m:b)
+(?s:ab)|x
+(?i)(?s:ab)
+(?s:ab)(?i)cd
+(?i:(?s:ab))
+(?s:(?i:ab))
+(?s-i:ab)
+(?-si)ab
+[(?s:]ab
+\Q(?s:ab\E
+
+# Issue #331 fix round 3: affected patterns that are NOT literal-leading
+# (the everyday .*foo.* spellings) — routed to the never-match arm.
+(?s:.*ab.*)
+.*(?s:ab)
+(?s:.+ab)

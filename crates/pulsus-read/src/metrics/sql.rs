@@ -509,6 +509,49 @@ mod tests {
         assert_eq!(anchored_re2_literal_for_test("5.."), "'(?-s)^(?:5..)$'");
     }
 
+    /// Issue #331: a matcher whose pattern carries a no-`i` flag-group
+    /// head would silently select no rows (ClickHouse's analyzer leaks
+    /// the head into its required substring), so the escaper appends
+    /// `-i` to the head — a no-op the analyzer handles — and the
+    /// `(?-s)` prefix composes in front unchanged. A head coexisting
+    /// with an `i`-carrying one instead gets the never-matching `|$.`
+    /// arm. Everything else must render exactly as issue #324 left it
+    /// (previous test).
+    #[test]
+    fn issue_331_affected_matchers_render_the_analyzer_workaround() {
+        assert_eq!(
+            anchored_re2_literal_for_test("(?s:a.b)"),
+            "'(?-s)^(?:(?s-i:a.b))$'"
+        );
+        assert_eq!(
+            anchored_re2_literal_for_test("(?m)up$"),
+            "'(?-s)^(?:(?m-i)up$)$'"
+        );
+        assert_eq!(
+            anchored_re2_literal_for_test("(?i)(?s:ab)"),
+            "'(?-s)^(?:(?i)(?s:ab))$|$.'"
+        );
+        // Fix round 3: not literal-leading -> the arm, by measurement.
+        assert_eq!(
+            anchored_re2_literal_for_test("(?s:.*5..)"),
+            "'(?-s)^(?:(?s:.*5..))$|$.'"
+        );
+        // The workaround changes the row predicate and the issue #315
+        // compile probe identically — they share the renderer.
+        let sql = historical_series_subquery(
+            "metric_series",
+            "up",
+            window(),
+            3_600_000,
+            &[re("status", "(?s:5..)")],
+        );
+        assert_eq!(
+            sql.matches("'(?-s)^(?:(?s-i:5..))$'").count(),
+            2,
+            "got: {sql}"
+        );
+    }
+
     /// Issue #315: the compile probe is a **constant** `match()` folded at
     /// analysis time, spliced into the floored lower bound so it adds no
     /// conjunct (which would cost a duplicated PREWHERE filter — see

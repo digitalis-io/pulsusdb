@@ -3309,6 +3309,7 @@ dependencies = [
  "pulsus-clickhouse",
  "pulsus-logql",
  "pulsus-model",
+ "pulsus-re2",
  "pulsus-read",
  "pulsus-schema",
  "pulsus-traceql",
