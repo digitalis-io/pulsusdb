@@ -998,6 +998,114 @@ clients only display it).
   output length overflow` per line (that surface is bounded and
   correct).
 
+### `json-flatten-key-budget` (issue #287, bounded divergence)
+
+- **Reference behaviour — the FLATTEN itself is parity, only the
+  ceiling diverges.** grafana/loki v3.7.4, `pkg/logql/log/parser.go`:
+  `JSONParser.parseLabelValue` names every leaf label with
+  `buildSanitizedPrefixFromBuffer()`'s `_`-joined ancestor path, so a
+  nested object's whole prefix is repeated into each of its leaves.
+  PulsusDB emits the identical names — the label semantics must NOT
+  change. What the reference does not have is any ceiling on the
+  result: no cap in `JSONParser`, none in `LabelsBuilder.Set`
+  (`pkg/logql/log/labels.go:344`).
+- **Name parity was NOT free, and is now held by capture** (review
+  round 2). PulsusDB used to join RAW keys and sanitize the joined
+  result, which agrees with `appendSanitized`
+  (`pkg/logql/log/util.go:42`) only for keys needing no trimming. The
+  reference trims each part, drops a part that trims empty WITHOUT its
+  separator, applies the leading-digit `_` only when nothing has been
+  emitted yet, maps each rejected RUNE to one `_`, and DROPS a
+  top-level field whose key sanitizes to nothing. Container-captured
+  divergences, all fixed: `{" a ":1}` gave `_a_` (reference `a`),
+  `{"x":{" b ":1}}` gave `x__b_` (`x_b`), `{"  ":{"b":1}}` gave `___b`
+  (`b`), `{"x":{"":1}}` gave `x_` (`x`), `{"a":{"b":{" ":{"c":1}}}}`
+  gave `a_b___c` (`a_b_c`), and `{"":1}` emitted a label with an EMPTY
+  NAME. 51 probes captured from `grafana/loki:3.7.4` — 28 construction
+  rows, a 19-cell collision matrix covering the depth × label-category ×
+  dropped-or-live product, and 4 recorded divergences — with the RAW
+  container responses committed as
+  `tests/fixtures/json_key_sanitization/capture.json`;
+  `tests/logql_json_key_sanitization.rs` derives every assertion about
+  what a probe yields from that artifact (the four recorded divergences
+  are asserted as relations between the artifact-derived reference side
+  and our computed output, values included; the literals left in the
+  suite fall into five machine-inventoried classes — probe inputs, the
+  extractor's response-schema names and constants, pins and plumbing
+  such as the artifact path and image pin, the `_extracted` rule
+  constant, and pre-fix `was` records asserted only as differing —
+  plus assertion-message prose). The artifact's PROVENANCE is attested by
+  the CI drift leg's live re-capture of all 51 probes against the
+  digest-pinned oracle on every run; the extractor's nanosecond
+  timestamp and execution-stats checks are local schema-plausibility
+  sanity, not a provenance proof. Regeneration is
+  gated on a live container reporting exactly v3.7.4. **Still
+  divergent, out of scope and recorded there (artifact-evidenced, filed
+  on #334) rather than claimed:** parsed-vs-parsed key COLLISIONS —
+  `{"a-b":1,"a.b":2}` is `a_b="1"` for the reference
+  (`ParserHints.Extracted`, first wins) and `a_b="1"` plus
+  `a_b_extracted="2"` for PulsusDB (`add_extracted`'s suffix) — and
+  `drop <base-label>` before `| json` on a recolliding key at EITHER
+  depth (the reference's `BaseHas` reads the original stream labels and
+  still renames; our collision check reads the evolving set and does
+  not). Both rules predate this issue and are shared by every parser.
+- **Why that matters:** the emitted key bytes are `Θ(L²)` in the line
+  length. For `{"<p bytes>":{"k00000":0,… ×m}}` the input is
+  `p + 11m + 6` bytes and the keys are `m·(p + 7)` bytes, maximised at
+  `≈ L²/44`. Measured end to end: **65 536 input bytes → 97 615 872 key
+  bytes (1 489.5×)**; 1 MiB extrapolates to ~23.3 GiB by the same
+  closed form. `/query_range` pays this whenever the query carries
+  `| json`; `/detected_fields` pays it on every sampled line
+  unconditionally, through its auto-parse probe.
+- **PulsusDB behaviour:** every key string the full-flatten allocates —
+  the emitted leaf label names AND the intermediate object prefixes
+  they are built from — is CHARGED before it is allocated against a
+  per-ROW ledger shared by all of the row's `| json` stages (the #260
+  lifetime lesson: a per-STAGE ledger would bound one stage while the
+  number of stages is bounded only by the query-text cap, and each
+  extra `| json` re-flattens the line into another simultaneously-live
+  `_extracted` label set). A breach aborts the query with the bounded
+  `422 query_too_broad` (`TooBroadReason::JsonFlattenKeyBytes`) —
+  never a per-line `__error__`, never a truncated label set, never an
+  OOM. It bounds key bytes and nothing else: extracted VALUES are
+  linear in the line (each scalar's text appears once in the input),
+  `null`/array fields build no key and are charged nothing, and the
+  targeted form `| json v="a.b"` takes its label names from the
+  compiled stage and is charged nothing — it still serves the very
+  line the full-flatten refuses.
+- **Threshold:** `MAX_JSON_FLATTEN_KEY_BYTES` = 64 MiB, the template
+  budget's value for the template budget's reason, asserted at compile
+  time to stay `<= MAX_CLIENT_AGG_GROUP_BYTES`. What is spent against
+  it is `alloc_block_bytes(key_len)` — the crate's pinned bound on the
+  block a real allocator RETAINS for one exactly-reserved allocation,
+  not the request size, because `String::with_capacity(n)` guarantees
+  only `capacity >= n` — so the ceiling admits 32 MiB of key CONTENT
+  per row and the worst-SHAPED line it refuses is ~38 KiB. It is a TERM
+  of the published per-query retained-byte figure
+  (`MAX_QUERY_RETAINED_BYTES` = 2,087,477,248 B): #260's row term was a
+  free-standing addend that lost this ledger entirely, and is now a
+  destructured `RowBudgets` table. That table is a convention with a
+  compiler-checked back half, NOT a proof — a new variant answered with
+  an existing field still compiles (verified by mutant); a lexical
+  tripwire (`tests/logql_row_budget_enumeration.rs`) catches that shape
+  and cannot catch a ledger that never declares a variant. A key COUNT cap
+  would not be a bound at all here — the 64 KiB construction emits only
+  2 979 keys — while a normally-shaped line, whose key bytes are a small
+  multiple of `L`, passes at tens of MiB against the ~38 KiB
+  worst-SHAPED refusal above. `tests/logql_json_flatten_budget.rs` pins the
+  closed forms by measurement, the exact ±1 byte boundary, the
+  intermediate-prefix charge (with the leaf-only counterfactual
+  asserted, so a ledger that charged only what it emits fails it), the
+  per-row shared lifetime and its reset, and the streams, metric and
+  `/detected_fields` surfaces.
+- **Why deliberate:** the reference is unbounded, so no finite cap can
+  match it (the #236 O1 shape); "never copy the reference where it is
+  wrong" and the standing charge-before-allocate rule both require the
+  bound. Consequence inside the same class: a line whose flattened keys
+  cross 64 MiB is refused where the reference would serve it (or die
+  trying) — reachable in practice only from adversarially-shaped JSON,
+  since it needs a multi-KiB parent key over thousands of leaves.
+
 ### `logql-error-envelope` (issue #240)
 
 - **What changed:** `ReadError::PipelineInvalid`'s `Display` is now the

@@ -345,6 +345,22 @@ pub enum TooBroadReason {
     /// shape as the #236 O1 residual. Ledgered as
     /// `template-output-budget`.
     TemplateOutputBytes { budget_bytes: u64 },
+    /// Issue #287: one row's `| json` full-flatten would build more
+    /// flattened label-KEY bytes than
+    /// [`crate::logql::pipeline::MAX_JSON_FLATTEN_KEY_BYTES`] — charged
+    /// before every key allocation and shared by all of the row's
+    /// `| json` stages, so a breach means the key was never allocated.
+    ///
+    /// The reference joins the whole ancestor path into every leaf label
+    /// name (grafana/loki v3.7.4, `pkg/logql/log/parser.go`
+    /// `JSONParser.parseLabelValue`), and PulsusDB emits the identical
+    /// names — so the `Θ(L²)` expansion is PARITY and only its CEILING
+    /// diverges. The reference is unbounded (it OOMs); a bounded 422 is
+    /// the ruled behaviour, the same shape as
+    /// [`Self::TemplateOutputBytes`]. Bounds key bytes only: extracted
+    /// VALUES and the targeted `| json a="b.c"` form are linear in the
+    /// line and are charged nothing.
+    JsonFlattenKeyBytes { budget_bytes: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -354,6 +370,12 @@ impl fmt::Display for TooBroadReason {
                 f,
                 "a line_format/label_format template render exceeded the {budget_bytes}-byte \
                  output budget — shrink the template's repeat/indent/padding factors"
+            ),
+            TooBroadReason::JsonFlattenKeyBytes { budget_bytes } => write!(
+                f,
+                "a `| json` full-flatten of one line exceeded the {budget_bytes}-byte \
+                 flattened-key budget — extract the fields you need \
+                 (`| json field=\"a.b\"`) instead of flattening the whole line"
             ),
             TooBroadReason::ScanBudgetBytes {
                 budget_bytes,

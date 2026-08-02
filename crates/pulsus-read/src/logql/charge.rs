@@ -883,18 +883,147 @@ const _: () = assert!(
 /// bound.
 pub const MAX_LEAF_RETAINED_BYTES: u64 = leaf_retained_bytes();
 
-/// [`MAX_LEAF_RETAINED_BYTES`] plus ONE row's template render budget —
+/// [`MAX_LEAF_RETAINED_BYTES`] plus ONE row's per-row output budgets —
 /// the whole per-query retained-byte figure (issue #260).
 ///
-/// The template term is a per-ROW budget since #260 moved its lifetime
-/// off the individual render (whose output the caller RETAINS, so a
-/// per-render budget bounded one buffer while the number of live buffers
-/// was bounded only by the query-text cap). One row is live at a time on
-/// the metric path; the per-row OUTPUTS still accumulate into a streams
-/// result across up to the entries limit (#312), which this figure does
-/// not cover and #260 deliberately did not close.
-pub const MAX_QUERY_RETAINED_BYTES: u64 =
-    MAX_LEAF_RETAINED_BYTES + super::template::MAX_TEMPLATE_RENDER_BYTES;
+/// Those budgets are per-ROW since #260 moved the template budget's
+/// lifetime off the individual render (whose output the caller RETAINS,
+/// so a per-render budget bounded one buffer while the number of live
+/// buffers was bounded only by the query-text cap). One row is live at a
+/// time on the metric path; the per-row OUTPUTS still accumulate into a
+/// streams result across up to the entries limit (#312), which this
+/// figure does not cover and #260 deliberately did not close.
+///
+/// **The row term is a TABLE, and the enumeration behind it is a
+/// convention** (issue #287 review rounds 1 and 2, finding 2). #260
+/// wrote this as `+ MAX_TEMPLATE_RENDER_BYTES` — a free-standing addend
+/// with nothing enumerating it — so #287's second per-row ledger was
+/// written, reviewed and committed without appearing here. That was a
+/// weakness in #260's mechanism and not merely an omission in #287:
+/// #260's derivation was complete over the `AggCaps` axes and over
+/// NOTHING ELSE, while its published claim covered the whole per-query
+/// figure.
+///
+/// [`RowBudgets`] replaces the addend with a destructured table, which
+/// is a real improvement and is NOT a proof. Round 2 was explicit that
+/// a third chain of exhaustive matches would not become one, and the
+/// honest sentence is preferred to a fourth: see [`RowBudgets`] for the
+/// three routes around it that still compile, and for what closing them
+/// would actually take.
+pub const MAX_QUERY_RETAINED_BYTES: u64 = MAX_LEAF_RETAINED_BYTES + row_retained_bytes();
+
+/// Every PER-ROW output budget, one field each, in
+/// [`super::pipeline::RowBudget`] order.
+///
+/// A struct rather than a sum expression so the total can DESTRUCTURE
+/// it: adding a FIELD here without adding its term to
+/// [`row_retained_bytes`] is a build failure.
+///
+/// **What the compiler holds — exactly this and no more:** every field
+/// of this struct is a term of [`row_retained_bytes`], and every
+/// [`super::pipeline::RowBudget`] variant resolves to one of these
+/// fields ([`row_budget_ceiling`] is an exhaustive `match`, so a new
+/// variant will not compile until it is given an answer).
+///
+/// **What it does NOT hold.** Three routes reach a shipped per-row
+/// ledger that is absent from the total, and all three compile:
+///
+/// 1. a new `RowBudget` variant answered with `0` here;
+/// 2. a new `RowBudget` variant answered with an EXISTING field;
+/// 3. a new ledger that reuses an existing variant, or that reports its
+///    breach through some type other than
+///    [`super::pipeline::RowBudgetExceeded`] altogether.
+///
+/// Route 2 is the one a careless author actually takes — reaching for
+/// the nearest plausible ceiling rather than inventing a field — and it
+/// COMPILES, verified by mutant rather than assumed. So the enumeration
+/// of per-row ledgers is a CONVENTION with a compiler-checked back half,
+/// exactly as `AggCaps` is a convention ("every per-query retention cap
+/// in one place") with a compiler-checked back half. The published
+/// figure is sound for the ledgers listed and says nothing about a
+/// ledger nobody listed.
+///
+/// Routes 1 and 2 do leave a LEXICAL trace — a variant with no field of
+/// its own — and `tests/logql_row_budget_enumeration.rs` trips on it by
+/// counting variants against fields and requiring the `match` arms to
+/// answer with distinct fields. That is a tripwire of exactly the kind
+/// #260 already uses beside the `AggCaps` censuses, not a proof: it
+/// reads source text, and route 3 leaves no text to read.
+///
+/// **What would make it complete**, recorded so the next attempt does
+/// not start from another chain: the enumeration has to come from where
+/// a ledger is CONSTRUCTED, not from where its error is named. A
+/// per-row ledger would have to be unconstructable except as one
+/// generic type whose sole constructor reads its ceiling out of this
+/// table — the sealed-leaf shape `template::retained` already uses for
+/// render output, applied to the ledgers themselves. That closes routes
+/// 1 and 3 by making the alternatives unrepresentable; route 2 is a
+/// semantic choice no mechanism can see. It is a cross-cutting refactor
+/// of both existing ledgers, including the sealed template module, and
+/// is deliberately not attempted inside this issue.
+#[derive(Debug)]
+pub struct RowBudgets {
+    /// `line_format`/`label_format` render output (issues #230/#260).
+    pub template_render: u64,
+    /// `| json` full-flatten label keys (issue #287).
+    pub json_flatten_keys: u64,
+}
+
+/// The shipped ceilings, read from the constants the ledgers are
+/// actually constructed with.
+pub const ROW_BUDGETS: RowBudgets = RowBudgets {
+    template_render: super::template::MAX_TEMPLATE_RENDER_BYTES,
+    json_flatten_keys: super::pipeline::MAX_JSON_FLATTEN_KEY_BYTES,
+};
+
+/// The ceiling a [`super::pipeline::RowBudget`] variant reports, read
+/// out of a DESTRUCTURED [`RowBudgets`] through an exhaustive `match`.
+///
+/// This forces a new variant to be given an ANSWER. It does not force
+/// that answer to be a new field — see [`RowBudgets`] for the routes
+/// that leaves open.
+pub(in crate::logql) const fn row_budget_ceiling(budget: super::pipeline::RowBudget) -> u64 {
+    let RowBudgets {
+        template_render,
+        json_flatten_keys,
+    } = ROW_BUDGETS;
+    match budget {
+        super::pipeline::RowBudget::TemplateRender => template_render,
+        super::pipeline::RowBudget::JsonFlattenKeys => json_flatten_keys,
+    }
+}
+
+/// ONE row's per-row output budgets, summed over a DESTRUCTURED
+/// [`RowBudgets`] so a listed field cannot be left out of the total.
+///
+/// The terms ADD rather than share: a single row can hold a full
+/// template-render output and a full `| json` key expansion at the same
+/// time (`{…} | json | line_format …` does exactly that), and the two
+/// ledgers refuse independently.
+///
+/// ```text
+/// template render   64 MiB =  67,108,864
+/// json flatten keys 64 MiB =  67,108,864
+///                            -----------
+///                             134,217,728
+/// ```
+const fn row_retained_bytes() -> u64 {
+    let RowBudgets {
+        template_render,
+        json_flatten_keys,
+    } = ROW_BUDGETS;
+    template_render + json_flatten_keys
+}
+
+/// Each listed [`RowBudgets`] field is the ceiling its
+/// [`super::pipeline::RowBudget`] variant reports, so the summed table
+/// and the enum cannot drift apart for the variants that exist.
+const _: () = assert!(
+    row_budget_ceiling(super::pipeline::RowBudget::TemplateRender)
+        + row_budget_ceiling(super::pipeline::RowBudget::JsonFlattenKeys)
+        == row_retained_bytes(),
+    "every RowBudget variant's ceiling must be a term of the per-row total"
+);
 
 /// [`MAX_LEAF_RETAINED_BYTES`]'s terms — one per [`AggCaps`] axis, in
 /// `AggCaps` order. A `const fn` so the total moves with any cap, any
@@ -1547,12 +1676,16 @@ mod tests {
         );
         assert_eq!(MAX_LEAF_RETAINED_BYTES, 1_953_259_520);
 
-        // The query bound adds exactly ONE row's render budget.
+        // The query bound adds exactly ONE row's per-row output budgets
+        // — BOTH of them (issue #287 review round 1, finding 2: #260's
+        // free-standing `+ template` addend lost the json key ledger).
         assert_eq!(
             MAX_QUERY_RETAINED_BYTES,
-            MAX_LEAF_RETAINED_BYTES + crate::logql::template::MAX_TEMPLATE_RENDER_BYTES
+            MAX_LEAF_RETAINED_BYTES
+                + crate::logql::template::MAX_TEMPLATE_RENDER_BYTES
+                + crate::logql::pipeline::MAX_JSON_FLATTEN_KEY_BYTES
         );
-        assert_eq!(MAX_QUERY_RETAINED_BYTES, 2_020_368_384);
+        assert_eq!(MAX_QUERY_RETAINED_BYTES, 2_087_477_248);
 
         // The variants leaf is strictly smaller, so the sum above really
         // is an upper bound for it too: its fan-out counter shares the
@@ -1624,6 +1757,45 @@ mod tests {
                 "{axis}: every AggCaps axis needs at least one enumerated counter"
             );
         }
+    }
+
+    /// Issue #287 review round 1, finding 2 — the same structural claim
+    /// one layer up, on the axis #260 left as a free-standing addend.
+    ///
+    /// [`RowBudgets`] is destructured here, in [`row_budget_ceiling`]
+    /// (whose `match` over [`super::super::pipeline::RowBudget`] is
+    /// exhaustive) and in [`row_retained_bytes`], so a per-row ledger
+    /// cannot reach the 422 surface without also reaching the total.
+    /// This test adds what the compiler cannot say: that every field is
+    /// a REAL ceiling and that the total is their sum, so a field
+    /// silently zeroed — the arithmetic way to drop a term while keeping
+    /// the destructure — still fails.
+    #[test]
+    fn every_per_row_budget_is_a_term_of_the_query_bound() {
+        let RowBudgets {
+            template_render,
+            json_flatten_keys,
+        } = ROW_BUDGETS;
+        for (name, ceiling) in [
+            ("template_render", template_render),
+            ("json_flatten_keys", json_flatten_keys),
+        ] {
+            assert!(ceiling > 0, "{name}: a zero ceiling is not a ceiling");
+        }
+        assert_eq!(
+            template_render,
+            crate::logql::template::MAX_TEMPLATE_RENDER_BYTES
+        );
+        assert_eq!(
+            json_flatten_keys,
+            crate::logql::pipeline::MAX_JSON_FLATTEN_KEY_BYTES
+        );
+        assert_eq!(
+            MAX_QUERY_RETAINED_BYTES - MAX_LEAF_RETAINED_BYTES,
+            template_render + json_flatten_keys,
+            "the query bound's row term must be the sum of every per-row budget"
+        );
+        assert_eq!(template_render + json_flatten_keys, 134_217_728);
     }
 
     /// AC 8 — the published bound is the SHIPPED one. `docs/features.md`
