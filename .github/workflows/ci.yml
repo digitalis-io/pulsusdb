@@ -245,6 +245,19 @@ jobs:
           PULSUSDB_TEMPO_VECTORS: "1"
         run: cargo test -p pulsus-traceql --test tempo_differential
 
+      # Issue #335: the parser accept-surface audit. Replays the whole
+      # precedence / operand-position probe matrix against the SAME
+      # digest-pinned oracle and asserts every recorded reference verdict
+      # still holds, so a divergence can only be added or closed
+      # deliberately. Runs before the legs that push spans into the
+      # container: the recorded verdicts were captured against both an
+      # empty and a populated store and are stable either way, but keeping
+      # the syntax legs first keeps that independence obvious.
+      - name: TraceQL parser accept-surface audit (oracle leg)
+        env:
+          PULSUSDB_TEMPO_DIFF_URL: "http://localhost:13200"
+        run: cargo test -p pulsus-traceql --test accept_surface
+
       # Issue #185/#189 (M7-TQ6): the compare() VALUE differential, ENFORCED
       # (non-skipped). Pushes fixture OTLP spans to the reference's :4318
       # receiver, waits for them to become metrics-queryable, then asserts

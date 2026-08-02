@@ -1,0 +1,1606 @@
+{
+  "language_target": "TraceQL as shipped in Tempo v3.0.2",
+  "captured": "2026-08-02",
+  "owning_issue": 335,
+  "method": "black-box: every probe replayed against an unmodified grafana/tempo:3.0.2 container; 2xx=accept, 400=reject. Where the reference answered 400 with a type error it echoed its own fully parenthesised parse, which is recorded verbatim in reference_parse and is what fixes the precedence table. No Tempo source was read.",
+  "divergence_classes": [
+    {
+      "id": "D1",
+      "title": "unary '!' binds looser than comparison",
+      "reference": "'!' is an operand-level unary: it binds tighter than every comparison operator and tighter than '+'/'-', but looser than '^' and '*'/'/'/'%'.",
+      "pulsus": "'!' negates a whole field primary, i.e. the entire comparison.",
+      "impact": "accept-surface AND quiet meaning",
+      "status": "open",
+      "deferred_to": "the field-expression regrammar tracked on #335"
+    },
+    {
+      "id": "D2",
+      "title": "colon-scoped intrinsic rejected as a comparison right-hand side",
+      "reference": "Every colon-scoped intrinsic is an ordinary operand and is legal on either side.",
+      "pulsus": "The right-hand-side field predicate recognises dotted attributes and bare intrinsics only.",
+      "impact": "accept-surface",
+      "status": "closed",
+      "closed_by": 335
+    },
+    {
+      "id": "D3",
+      "title": "unary '-' rejected outside the right-hand side",
+      "reference": "Unary '-' is an operand-level unary, legal anywhere an operand is.",
+      "pulsus": "Accepted only when the right-hand side already begins an arithmetic operand.",
+      "impact": "accept-surface",
+      "status": "open",
+      "deferred_to": "the field-expression regrammar tracked on #335"
+    },
+    {
+      "id": "D4",
+      "title": "a literal is rejected at the comparison left-hand side",
+      "reference": "Both sides of a comparison are full field expressions, so a literal (or a literal-only comparison) is legal.",
+      "pulsus": "The left-hand side must begin with a field.",
+      "impact": "accept-surface",
+      "status": "open",
+      "deferred_to": "the field-expression regrammar tracked on #335"
+    },
+    {
+      "id": "D5",
+      "title": "a parenthesised expression is rejected at the comparison left-hand side",
+      "reference": "Parentheses are an operand, so '(.a) = 1' and '(.a + 1) = 2' are legal.",
+      "pulsus": "A parenthesised field expression may only be a whole boolean primary.",
+      "impact": "accept-surface",
+      "status": "open",
+      "deferred_to": "the field-expression regrammar tracked on #335"
+    },
+    {
+      "id": "D6",
+      "title": "chained comparison rejected",
+      "reference": "Comparison operators are left-associative binary operators and chain: 'a = b = c' parses as '(a = b) = c'.",
+      "pulsus": "A second comparison operator is a positioned grammar error.",
+      "impact": "accept-surface",
+      "status": "open",
+      "deferred_to": "the field-expression regrammar tracked on #335"
+    },
+    {
+      "id": "D7",
+      "title": "aggregate argument must be a bare field",
+      "reference": "An aggregate argument is a full field expression (arithmetic, unary, parentheses, any intrinsic).",
+      "pulsus": "Restricted to 'duration' or an attribute.",
+      "impact": "accept-surface",
+      "status": "open",
+      "deferred_to": "the field-expression regrammar tracked on #335"
+    },
+    {
+      "id": "D8",
+      "title": "'^' associativity",
+      "reference": "left-associative: 2 ^ 3 ^ 2 = 64.",
+      "pulsus": "right-associative: 2 ^ (3 ^ 2) = 512.",
+      "impact": "quiet meaning",
+      "status": "closed",
+      "closed_by": 335
+    },
+    {
+      "id": "D9",
+      "title": "unary '-' versus '^'",
+      "reference": "'^' binds tighter than unary '-': -2 ^ 2 = -4.",
+      "pulsus": "unary '-' binds tighter: (-2) ^ 2 = 4.",
+      "impact": "quiet meaning",
+      "status": "closed",
+      "closed_by": 335
+    },
+    {
+      "id": "D10",
+      "title": "'&&' versus '||' inside a spanset filter",
+      "reference": "one precedence level, left-associative: 'a || b && c' parses as '(a || b) && c'.",
+      "pulsus": "'&&' binds tighter than '||'.",
+      "impact": "quiet meaning",
+      "status": "closed",
+      "closed_by": 335
+    },
+    {
+      "id": "D11",
+      "title": "'&&' versus '||' between spansets",
+      "reference": "one precedence level, left-associative (established by result differential, not status).",
+      "pulsus": "'&&' binds tighter than '||'.",
+      "impact": "quiet meaning",
+      "status": "closed",
+      "closed_by": 335
+    }
+  ],
+  "accept_surface_probes": [
+    {
+      "query": "{ !name = \"foo\" }",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D1",
+      "reference_parse": "!name"
+    },
+    {
+      "query": "{ !name }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "!name"
+    },
+    {
+      "query": "{ !.a = 1 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ !.a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ !(.a = 1) }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ !(name = \"foo\") }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ !duration = 1s }",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D1",
+      "reference_parse": "!duration"
+    },
+    {
+      "query": "{ !status = error }",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D1",
+      "reference_parse": "!status"
+    },
+    {
+      "query": "{ !span.a = 1 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ !span:id = \"x\" }",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D1",
+      "reference_parse": "!span:id"
+    },
+    {
+      "query": "{ !1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "!1"
+    },
+    {
+      "query": "{ !\"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "!`x`"
+    },
+    {
+      "query": "{ !true }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ !.a = !.b }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D1"
+    },
+    {
+      "query": "{ -.a = 1 }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D3"
+    },
+    {
+      "query": "{ -1 = .a }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D3"
+    },
+    {
+      "query": "{ .a = -1 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = - 1 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ -duration = 1s }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D3"
+    },
+    {
+      "query": "{ .a = -.b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ - .a = 1 }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D3"
+    },
+    {
+      "query": "{ !!.a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ !-.a }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D3"
+    },
+    {
+      "query": "{ -!.a }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D3"
+    },
+    {
+      "query": "{ !.a && .b = 1 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ !.a = 1 && .b = 2 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 && !.b = 2 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = .b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = span.b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = resource.b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = event.b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = link.b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = instrumentation.b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = name }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = duration }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = status }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = kind }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = statusMessage }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = nestedSetParent }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = rootName }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = rootServiceName }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = traceDuration }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = span:id }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = span:duration }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = span:name }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = span:kind }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = span:status }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = span:statusMessage }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = span:parentID }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = span:childCount }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = trace:id }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = trace:duration }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = trace:rootName }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = trace:rootService }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = event:name }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = event:timeSinceStart }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = link:spanID }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = link:traceID }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = instrumentation:name }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = instrumentation:version }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ span:id = .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ trace:duration = .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ event:name = .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ link:spanID = .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ instrumentation:name = .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ span.a = .b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ name = .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ duration = .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a + 1 = 2 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ 2 = .a + 1 }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D4"
+    },
+    {
+      "query": "{ .a = .b + 1 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a * 2 = .b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ (.a) = 1 }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D5"
+    },
+    {
+      "query": "{ (.a + 1) = 2 }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D5"
+    },
+    {
+      "query": "{ .a = (.b) }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = (1 + 2) }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ 1 = 2 }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D4"
+    },
+    {
+      "query": "{ \"x\" = \"y\" }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D4"
+    },
+    {
+      "query": "{ 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ span.a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ name }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ duration }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ span:id }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ trace:id }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = span:duration + 1 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ span:duration + 1 = .a }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a =~ .b }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a =~ \"x\" }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a > .b }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a >= span:duration }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = 1 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = 1) && `x`"
+    },
+    {
+      "query": "{ \"x\" && .a = 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "`x` && (.a = 1)"
+    },
+    {
+      "query": "{ .a = 1 || \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = 1) || `x`"
+    },
+    {
+      "query": "{ .a = 1 && 2 = 3 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "((.a = 1) && false) && `x`"
+    },
+    {
+      "query": "{ .a = 1 || .b = 2 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "((.a = 1) || (.b = 2)) && `x`"
+    },
+    {
+      "query": "{ \"x\" && .a = 1 || .b = 2 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "`x` && (.a = 1)"
+    },
+    {
+      "query": "{ !name + 1 = 2 }",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D1",
+      "reference_parse": "!name"
+    },
+    {
+      "query": "{ !name * 2 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "name * 2"
+    },
+    {
+      "query": "{ - name }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "-name"
+    },
+    {
+      "query": "{ -name = 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "-name"
+    },
+    {
+      "query": "{ .a = name + \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "name + `x`"
+    },
+    {
+      "query": "{ 1 + \"x\" = .a }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "1 + `x`"
+    },
+    {
+      "query": "{ 2 ^ 3 ^ 2 = .a }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D4"
+    },
+    {
+      "query": "{ -2 ^ 2 = .a }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D3"
+    },
+    {
+      "query": "{ .a = .b = .c }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D6"
+    },
+    {
+      "query": "{ .a = .b && .c }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 = 2 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = 1) = 2"
+    },
+    {
+      "query": "{ 1 < 2 < 3 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "true < 3"
+    },
+    {
+      "query": "{ .a = 1 + \"x\" * 2 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "`x` * 2"
+    },
+    {
+      "query": "{ .a = (\"x\" + 1) }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "`x` + 1"
+    },
+    {
+      "query": "{ .a > 1 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a > 1) && `x`"
+    },
+    {
+      "query": "{ name = \"x\" && duration }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(name = `x`) && duration"
+    },
+    {
+      "query": "{ name = \"x\" && duration = 1s }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ duration && name = \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "duration && (name = `x`)"
+    },
+    {
+      "query": "{ .a =~ \"x\" && 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a =~ `x`) && 1"
+    },
+    {
+      "query": "{ !.a && 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(!.a) && 1"
+    },
+    {
+      "query": "{ !(.a && 1) }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": ".a && 1"
+    },
+    {
+      "query": "{ !.a = \"x\" && 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "((!.a) = `x`) && 1"
+    },
+    {
+      "query": "{ !name * 2 = 3 }",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D1",
+      "reference_parse": "name * 2"
+    },
+    {
+      "query": "{ !.a * 2 = \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "!(.a * 2)"
+    },
+    {
+      "query": "{ !.a ^ 2 = \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "!(.a ^ 2)"
+    },
+    {
+      "query": "{ !.a + 2 = \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "((!.a) + 2) = `x`"
+    },
+    {
+      "query": "{ !.a - 2 = \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "((!.a) - 2) = `x`"
+    },
+    {
+      "query": "{ -.a * 2 = \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(-(.a * 2)) = `x`"
+    },
+    {
+      "query": "{ -.a ^ 2 = \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(-(.a ^ 2)) = `x`"
+    },
+    {
+      "query": "{ .a = 2 ^ 3 ^ 2 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = 64) && `x`"
+    },
+    {
+      "query": "{ .a = 2 + 3 * 4 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = 14) && `x`"
+    },
+    {
+      "query": "{ .a = 2 * 3 + 4 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = 10) && `x`"
+    },
+    {
+      "query": "{ .a = 2 - 3 - 4 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = -5) && `x`"
+    },
+    {
+      "query": "{ .a = 2 / 3 / 4 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = 0) && `x`"
+    },
+    {
+      "query": "{ .a = -2 ^ 2 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = -4) && `x`"
+    },
+    {
+      "query": "{ .a = .b = .c && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "((.a = .b) = .c) && `x`"
+    },
+    {
+      "query": "{ .a < .b < .c && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a < .b) < .c"
+    },
+    {
+      "query": "{ .a = 1 && .b = 2 || .c = 3 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(((.a = 1) && (.b = 2)) || (.c = 3)) && `x`"
+    },
+    {
+      "query": "{ .a = 1 || .b = 2 || .c = 3 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(((.a = 1) || (.b = 2)) || (.c = 3)) && `x`"
+    },
+    {
+      "query": "{ .a = 1 && .b = 2 && .c = 3 || \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(((.a = 1) && (.b = 2)) && (.c = 3)) || `x`"
+    },
+    {
+      "query": "{ !!.a && 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(!(!.a)) && 1"
+    },
+    {
+      "query": "{ !-.a && 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(!(-.a)) && 1"
+    },
+    {
+      "query": "{ -!.a && 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(-(!.a)) && 1"
+    },
+    {
+      "query": "{ .a = 1 } && { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } > { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } && { .b = 1 } > { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } > { .b = 1 } && { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } > { .b = 1 } > { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } || { .b = 1 } && { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } && { .b = 1 } || { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } ~ { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } !> { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } &> { \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = -2 + 3 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = 1) && `x`"
+    },
+    {
+      "query": "{ .a = -2 * 3 && \"x\" }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "reference_parse": "(.a = -6) && `x`"
+    },
+    {
+      "query": "{ true } | count() > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(.a) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(span.a) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(duration) > 1s",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(span:duration) > 1s",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(span:childCount) > 1",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D7"
+    },
+    {
+      "query": "{ true } | avg(trace:duration) > 1s",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D7"
+    },
+    {
+      "query": "{ true } | avg(.a + 1) > 1",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D7"
+    },
+    {
+      "query": "{ true } | avg(1) > 1",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(\"x\") > 1",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg((.a)) > 1",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D7"
+    },
+    {
+      "query": "{ true } | avg() > 1",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(.a, .b) > 1",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | max(.a) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | min(.a) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | sum(.a) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | count(.a) > 1",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(.a) > .b",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | avg(.a) > avg(.b)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(.a)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(span.a)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(name)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(duration)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(span:id)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(trace:id)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(.a, span.b, name)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(.a + 1)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(1)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(\"x\")",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(-.a)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(!.a)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select((.a))",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select()",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | select(.a = 1)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(.a)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(span.a)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(name)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(span:id)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(resource.service.name)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(.a, .b)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(.a + 1)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(1)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(\"x\")",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by()",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(-.a)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by(!.a)",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | rate() by((.a))",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | quantile_over_time(duration, .5) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | quantile_over_time(span:duration, .5) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | quantile_over_time(.a, .5) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | max_over_time(.a) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ true } | max_over_time(span:duration) > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 || .b = 2 && .c = 3 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 && .b = 2 || .c = 3 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 && .b = 2 && .c = 3 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 || .b = 2 || .c = 3 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 2 ^ 3 ^ 2 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 2 - 3 - 4 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 2 / 3 / 4 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 2 + 3 * 4 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = -2 ^ 2 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = -2 + 3 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = -.b * 2 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a } && { .b } > { .c }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a } > { .b } && { .c }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a } > { .b } > { .c }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a } || { .b } && { .c }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a } && { .b } || { .c }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    }
+  ],
+  "meaning_probes": [
+    {
+      "query": "{ !.a = 1 }",
+      "class": "D1",
+      "reference_parse": "(!.a) = 1",
+      "pulsus_parse": "{ !(.a = 1) }",
+      "evidence": "{ !.a = \"x\" && 1 }"
+    },
+    {
+      "query": "{ !span.a = 1 }",
+      "class": "D1",
+      "reference_parse": "(!span.a) = 1",
+      "pulsus_parse": "{ !(span.a = 1) }",
+      "evidence": "{ !.a = \"x\" && 1 }"
+    },
+    {
+      "query": "{ !.a = 1 && .b = 2 }",
+      "class": "D1",
+      "reference_parse": "((!.a) = 1) && (.b = 2)",
+      "pulsus_parse": "{ (!(.a = 1) && .b = 2) }",
+      "evidence": "{ !.a = \"x\" && 1 }"
+    }
+  ],
+  "excluded_inconclusive": [
+    {
+      "query": "{ true } | avg(!.a) > 1",
+      "observed": "HTTP 500",
+      "reason": "the reference parses it (a parse failure is 400) but fails at execution, so it yields no conclusive accept/reject verdict; excluded from the pinned counts rather than scored as a rejection"
+    },
+    {
+      "query": "{ true } | avg(-.a) > 1",
+      "observed": "HTTP 500",
+      "reason": "the reference parses it (a parse failure is 400) but fails at execution, so it yields no conclusive accept/reject verdict; excluded from the pinned counts rather than scored as a rejection"
+    }
+  ],
+  "closed_meaning_probes": [
+    {
+      "query": "{ .a = 2 ^ 3 ^ 2 }",
+      "class": "D8",
+      "reference_parse": "(.a = 64)",
+      "reference_grouping": "{ .a = ((2 ^ 3) ^ 2) }",
+      "pulsus_parse": "{ .a = (2 ^ 3) ^ 2 }",
+      "evidence": "{ .a = 2 ^ 3 ^ 2 && \"x\" }",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = -2 ^ 2 }",
+      "class": "D9",
+      "reference_parse": "(.a = -4)",
+      "reference_grouping": "{ .a = -(2 ^ 2) }",
+      "pulsus_parse": "{ .a = -(2 ^ 2) }",
+      "evidence": "{ .a = -2 ^ 2 && \"x\" }",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a = 1 || .b = 2 && .c = 3 }",
+      "class": "D10",
+      "reference_parse": "((.a = 1) || (.b = 2)) && (.c = 3)",
+      "reference_grouping": "{ ((.a = 1) || (.b = 2)) && (.c = 3) }",
+      "pulsus_parse": "{ ((.a = 1 || .b = 2) && .c = 3) }",
+      "evidence": "{ .a = 1 || .b = 2 && \"x\" }",
+      "closed_by": 335
+    },
+    {
+      "query": "{ .a } || { .b } && { .c }",
+      "class": "D11",
+      "reference_parse": "({ .a } || { .b }) && { .c }",
+      "reference_grouping": "(({ .a } || { .b }) && { .c })",
+      "pulsus_parse": "(({ .a } || { .b }) && { .c })",
+      "evidence": "result differential: '{ .x=\"a\" } || { .x=\"b\" } && { .x=\"zzz\" }' returns no trace, matching the parenthesised '(A || B) && C' and not 'A || (B && C)'",
+      "closed_by": 335
+    }
+  ]
+}
