@@ -61,6 +61,11 @@ fn now_unix_seconds() -> i64 {
 async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<Response, ApiError> {
     let params = params::parse_metrics_params(raw, now_unix_seconds())?;
     let query = pulsus_traceql::parse(params.q.as_str()).map_err(ApiError::Query)?;
+    // Issue #328: the reference's route-independent semantic validation
+    // (`traceql.Validate`), after parse and before planning — the
+    // metrics pipelines carry the same query-frontend middleware as
+    // search (`frontend.go:215,229`).
+    super::querytext::validate_semantics(&query)?;
 
     // Plan BEFORE acquiring the pool: planning needs only config-derived
     // table names/budgets, so parse/param/plan failures (including the
@@ -183,6 +188,30 @@ mod tests {
             run_range("q=%7B%7D%20%7C%20count()%20%3E%202&start=1700000000&end=1700003600").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data", "body {json}");
+    }
+
+    /// Issue #328 (AC 7): `topk(0)` parses and the metrics PLANNER used
+    /// to accept it — the semantic validator now rejects it before
+    /// planning, with the reference's `invalid TraceQL query: ` wrapping
+    /// and no position, on both metrics forms.
+    #[tokio::test]
+    async fn a_non_positive_topk_limit_is_400_with_the_validate_wrapping() {
+        let q = "q=%7B%7D%20%7C%20rate()%20%7C%20topk(0)&start=1700000000&end=1700003600";
+        for (form, (status, json)) in [
+            ("range", run_range(q).await),
+            ("instant", run_instant(q).await),
+        ] {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{form}: body {json}");
+            assert_eq!(json["errorType"], "bad_data", "{form}: body {json}");
+            assert!(
+                json["error"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("invalid TraceQL query: ")
+                        && m.contains("limit must be greater than 0")),
+                "{form}: body {json}"
+            );
+            assert!(json.get("position").is_none(), "{form}: body {json}");
+        }
     }
 
     #[tokio::test]

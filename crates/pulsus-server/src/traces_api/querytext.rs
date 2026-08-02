@@ -76,33 +76,25 @@
 //! parameters, PulsusDB parses both (`q` in `search::search_impl`,
 //! `query` here), so no shape that the reference rejects is accepted.
 //!
-//! # What is NOT reproduced: `traceql.Validate`
+//! # The `traceql.Validate` half (issue #328)
 //!
 //! The middleware's second half (`:51`) is Tempo's own post-parse
 //! semantic validation, `pkg/traceql/validate.go` → `RootExpr.validate`
-//! in `pkg/traceql/ast_validate.go`: operand-type agreement, aggregate
-//! and grouping expressions having to reference the span, regex literals
-//! having to compile, `compare()` not combining with a second stage, and
-//! the constructs it reports as "not yet supported".
-//!
-//! PulsusDB's equivalent rejections live in the PLANNER
-//! (`pulsus_read::plan_search` / `plan_trace_metrics`), which is why every
-//! EXECUTED expression is covered: search's `q` and the metrics
-//! parameter are both planned. Search's `query` is not executed and so
-//! is not planned — and it must not be, because the planner is
-//! route-specific where the reference's validator is not: `{} | rate()`
-//! passes `traceql.Validate` but `plan_search` rejects it as a metrics
-//! expression on the search route, so planning the parameter would
-//! manufacture a rejection the reference does not have.
-//!
-//! The residual is therefore exactly: a search `query` parameter that
-//! PARSES but would fail `traceql.Validate` — e.g. a non-compiling regex
-//! literal — is accepted here and rejected by the reference. Pinned by
-//! `search::tests::a_query_parameter_failing_only_the_reference_semantic_validation_is_accepted`,
-//! which asserts the same expression as `q` (planned, so `400`) and as
-//! `query` (validated only, so accepted). Closing it needs a
-//! route-independent semantic validator, which is a separate piece of
-//! work from this one.
+//! in `pkg/traceql/ast_validate.go`. It is reproduced by
+//! [`pulsus_traceql::validate`] — a ROUTE-INDEPENDENT pass, deliberately
+//! separate from the planner: `pulsus_read::plan_search` is stricter in
+//! places the reference's validator is not (`{} | rate()` plans only on
+//! the metrics routes but VALIDATES everywhere), so planning the shadow
+//! parameter would manufacture a 400 the reference does not have. The
+//! pass runs here for search's `query` (the parameter no handler
+//! parses), and in `search.rs`/`metrics.rs` after their own parse for
+//! the executed parameters — after parse and before planning, exactly
+//! where the reference's middleware sits. Its accept/reject decisions
+//! are container-captured (`pulsus-traceql/tests/conformance/
+//! validate-vectors.json`, re-verified live in CI); the two measured
+//! divergences are ledgered (`traceql-validate-re2-unknown-residual`,
+//! `traceql-validate-nil-spelling-conflation` —
+//! docs/benchmarks/traces-differential-ledger.md).
 //!
 //! # Why the cap is here and not in `pulsus-traceql`
 //!
@@ -189,19 +181,39 @@ pub(crate) enum QueryTextError {
     /// `error::ApiError::Query` puts in the envelope's `position`.
     #[error("invalid TraceQL query: {message}")]
     Invalid { message: String, position: usize },
+
+    /// The expression parsed but failed the reference's semantic
+    /// validation (issue #328, `pulsus_traceql::validate` — the
+    /// middleware's `traceql.Validate` at
+    /// `async_query_validator_middleware.go:51`). Same `invalid TraceQL
+    /// query: ` wrapping as the parse half (`:54` wraps both); no
+    /// position — the reference's Validate errors carry no line/col.
+    #[error("invalid TraceQL query: {0}")]
+    Semantic(pulsus_traceql::ValidateError),
 }
 
 impl QueryTextError {
     /// The byte offset into the rejected expression, for the `400`
-    /// envelope's `position` field. `None` for the length cap: the
-    /// reference's message names no offset there either, and there is no
-    /// meaningful one — the whole value is the problem.
+    /// envelope's `position` field. `None` for the length cap (the
+    /// reference's message names no offset there either — the whole
+    /// value is the problem) and for a semantic rejection (the
+    /// reference's Validate errors carry no line/col).
     pub(crate) fn position(&self) -> Option<usize> {
         match self {
             QueryTextError::TooLong { .. } => None,
             QueryTextError::Invalid { position, .. } => Some(*position),
+            QueryTextError::Semantic(_) => None,
         }
     }
+}
+
+/// The reference's `traceql.Validate` step
+/// (`async_query_validator_middleware.go:51`), wrapped exactly as the
+/// parse step is (`:54`). Shared by [`validate_traceql_query`] (search's
+/// shadow `query`) and the executed-parameter handlers
+/// (`search.rs`/`metrics.rs`), so the three routes cannot drift.
+pub(crate) fn validate_semantics(query: &pulsus_traceql::Query) -> Result<(), QueryTextError> {
+    pulsus_traceql::validate(query).map_err(QueryTextError::Semantic)
 }
 
 /// The reference's `validateTraceQLQuery`
@@ -219,14 +231,13 @@ pub(crate) fn validate_traceql_query(raw: &str) -> Result<(), QueryTextError> {
         return Ok(());
     }
     check_length(raw)?;
-    // The reference's `traceql.Validate(expr)` at `:51` has no
-    // route-independent equivalent here — see the module doc's
-    // "What is NOT reproduced" section.
-    pulsus_traceql::parse(raw).map_err(|e| QueryTextError::Invalid {
+    let query = pulsus_traceql::parse(raw).map_err(|e| QueryTextError::Invalid {
         message: e.to_string(),
         position: e.span().start,
     })?;
-    Ok(())
+    // The reference's `traceql.Validate(expr)` at `:51` (issue #328) —
+    // after the parse succeeds, exactly as the middleware sequences it.
+    validate_semantics(&query)
 }
 
 /// The reference's length comparison alone

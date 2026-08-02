@@ -25,6 +25,9 @@ pulsus-model = { path = "../pulsus-model" }
 # `MatchOp::Re`/`Nre` with Prometheus's full anchoring when selecting
 # loaded series).
 regex.workspace = true
+# Issue #328 D1: the RE2->Rust meaning rewrite (#317) moved to the shared
+# pulsus-re2 crate; `re2_syntax` re-exports it for zero call-site churn.
+pulsus-re2 = { path = "../pulsus-re2" }
 thiserror.workspace = true
 # Issue #69 (M6-06): `limit_ratio`'s deterministic per-series inclusion
 # offset hashes the full label identity with xxh64 (seed 0) — the same

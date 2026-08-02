@@ -9,7 +9,14 @@ pub mod eval;
 pub mod math;
 pub mod parser;
 pub mod plan;
-pub mod re2_syntax;
+/// The #317 RE2→Rust meaning rewrite, moved verbatim to `pulsus-re2`
+/// (issue #328 D1 — a third surface needed it and the direct dependency
+/// edge would be a cargo cycle). Re-exported here so no call site
+/// churned; the module path is kept because `eval::labels`/`eval::info`
+/// and external consumers name `re2_syntax::re2_pattern_to_rust`.
+pub mod re2_syntax {
+    pub use pulsus_re2::re2_pattern_to_rust;
+}
 pub mod value;
 
 pub use annotations::{Annotation, AnnotationKind, Annotations, ForcedMonotonicityDetail};

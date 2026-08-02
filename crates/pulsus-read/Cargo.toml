@@ -19,6 +19,10 @@ pulsus-model = { path = "../pulsus-model" }
 # and `pulsus-model` at once (`pulsus-model -> pulsus-promql ->
 # pulsus-read`, acyclic — issue #31 plan amendment §1).
 pulsus-promql = { path = "../pulsus-promql" }
+# Issue #328 D1: the RE2 acceptance screen (#309) moved to the shared
+# pulsus-re2 crate; `metrics::re2_authority` keeps the matcher-facing
+# wrappers and delegates the pattern scan.
+pulsus-re2 = { path = "../pulsus-re2" }
 # The TraceQL AST (issue #57): `traces::search_plan`/`traces::filter` lower
 # `pulsus_traceql::Query` into the two-phase search plan — mirrors
 # `pulsus-logql`'s role on the logs read path (parsing itself stays

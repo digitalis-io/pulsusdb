@@ -1,0 +1,877 @@
+{
+ "captured": {
+  "image": "grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7",
+  "date": "2026-08-02",
+  "route_note": "every vector is issued as the search shadow `query` parameter (parse + Validate only, no execution) \u2014 the purest observation of the route-independent validator; start/end/limit are supplied so the parameter is never folded into the legacy tag map"
+ },
+ "vectors": [
+  {
+   "id": "tm-r1",
+   "check": "type-mismatch",
+   "query": "{ name = duration }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "type-mismatch"
+  },
+  {
+   "id": "tm-r2",
+   "check": "type-mismatch",
+   "query": "{ status = kind }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "type-mismatch"
+  },
+  {
+   "id": "tm-r3",
+   "check": "type-mismatch",
+   "query": "{ span:childCount = name }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "type-mismatch"
+  },
+  {
+   "id": "tm-r4",
+   "check": "type-mismatch",
+   "query": "{ duration + 1s > name }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "type-mismatch"
+  },
+  {
+   "id": "tm-r5",
+   "check": "type-mismatch",
+   "query": "{ status > kind }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "type-mismatch"
+  },
+  {
+   "id": "tm-r6",
+   "check": "type-mismatch",
+   "query": "{ event:name = duration }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "type-mismatch"
+  },
+  {
+   "id": "tm-a1",
+   "check": "type-mismatch",
+   "query": "{ name = .a }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "tm-a2",
+   "check": "type-mismatch",
+   "query": "{ statusMessage = name }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "tm-a3",
+   "check": "type-mismatch",
+   "query": "{ duration = traceDuration }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "tm-a4",
+   "check": "type-mismatch",
+   "query": "{ duration = 1 + 2 }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "tm-a5",
+   "check": "type-mismatch",
+   "query": "{ instrumentation:name = duration }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "io-r1",
+   "check": "illegal-operator",
+   "query": "{ status > ok }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "illegal-operator"
+  },
+  {
+   "id": "io-r2",
+   "check": "illegal-operator",
+   "query": "{ kind < consumer }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "illegal-operator"
+  },
+  {
+   "id": "io-r3",
+   "check": "illegal-operator",
+   "query": "{ .a > true }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "illegal-operator"
+  },
+  {
+   "id": "io-r4",
+   "check": "illegal-operator",
+   "query": "{ .a =~ 1 }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "illegal-operator"
+  },
+  {
+   "id": "io-r5",
+   "check": "illegal-operator",
+   "query": "{} | count() =~ 2",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "illegal-operator"
+  },
+  {
+   "id": "io-a1",
+   "check": "illegal-operator",
+   "query": "{ name > \"x\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "io-a2",
+   "check": "illegal-operator",
+   "query": "{ status != ok }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "io-a3",
+   "check": "illegal-operator",
+   "query": "{ kind = internal }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "rx-r1",
+   "check": "invalid-regex",
+   "query": "{ span.a =~ \"[\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
+  },
+  {
+   "id": "rx-r2",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"x)(y\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
+  },
+  {
+   "id": "rx-r3",
+   "check": "invalid-regex",
+   "query": "{ .a !~ \"[a--b]\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
+  },
+  {
+   "id": "rx-r4",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"a{2,1}\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
+  },
+  {
+   "id": "rx-a1",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"che.*\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "rx-a2",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"a{bbb}c\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "rx-a3",
+   "check": "invalid-regex",
+   "query": "{ .a !~ \"[]a]\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "rx-u1",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"\\\\Qa*\\\\E\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept",
+   "unknown_class": "literal-quoting"
+  },
+  {
+   "id": "rx-u2",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"\\\\12\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept",
+   "unknown_class": "octal-escape"
+  },
+  {
+   "id": "rx-u3",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?P<n>x)\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept",
+   "unknown_class": "named-group"
+  },
+  {
+   "id": "rx-u4",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"\\\\p{Alphabetic}\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "unicode-property",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u5",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"a{1001}\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "over-max-repeat",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u6",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"a**\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "repetition-of-repetition",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "nil-r1",
+   "check": "intrinsic-not-nil",
+   "query": "{ name = nil }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "intrinsic-not-nil"
+  },
+  {
+   "id": "nil-r2",
+   "check": "intrinsic-not-nil",
+   "query": "{ duration = nil }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "intrinsic-not-nil"
+  },
+  {
+   "id": "nil-r3",
+   "check": "intrinsic-not-nil",
+   "query": "{ span:status = nil }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "intrinsic-not-nil"
+  },
+  {
+   "id": "nil-r4",
+   "check": "intrinsic-not-nil",
+   "query": "{ span:childCount = nil }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "intrinsic-not-nil"
+  },
+  {
+   "id": "nil-r5",
+   "check": "intrinsic-not-nil",
+   "query": "{ resource.service.name = nil }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "intrinsic-not-nil"
+  },
+  {
+   "id": "nil-a1",
+   "check": "intrinsic-not-nil",
+   "query": "{ .a = nil }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "nil-a2",
+   "check": "intrinsic-not-nil",
+   "query": "{ .service.name = nil }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "nil-a3",
+   "check": "intrinsic-not-nil",
+   "query": "{ span.service.name = nil }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "nil-a4",
+   "check": "intrinsic-not-nil",
+   "query": "{ .a != nil }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "nil-a5",
+   "check": "intrinsic-not-nil",
+   "query": "{ name != nil }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "nil-a6",
+   "check": "intrinsic-not-nil",
+   "query": "{ resource.service.name != nil }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "nil-d1",
+   "check": "intrinsic-not-nil",
+   "query": "{ !(name != nil) }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "reject",
+   "error_variant": "intrinsic-not-nil",
+   "divergence": "traceql-validate-nil-spelling-conflation"
+  },
+  {
+   "id": "nil-d2",
+   "check": "intrinsic-not-nil",
+   "query": "{ !(resource.service.name != nil) }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "reject",
+   "error_variant": "intrinsic-not-nil",
+   "divergence": "traceql-validate-nil-spelling-conflation"
+  },
+  {
+   "id": "q-r1",
+   "check": "quantile-out-of-range",
+   "query": "{} | quantile_over_time(duration, 1.5)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "quantile-out-of-range"
+  },
+  {
+   "id": "q-a1",
+   "check": "quantile-out-of-range",
+   "query": "{} | quantile_over_time(duration, .5)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "q-a2",
+   "check": "quantile-out-of-range",
+   "query": "{} | quantile_over_time(duration, 0)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "q-a3",
+   "check": "quantile-out-of-range",
+   "query": "{} | quantile_over_time(duration, 1)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "by-r1",
+   "check": "too-many-group-bys",
+   "query": "{} | rate() by(.a1, .a2, .a3, .a4, .a5, .a6)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "too-many-group-bys"
+  },
+  {
+   "id": "by-r2",
+   "check": "too-many-group-bys",
+   "query": "{} | histogram_over_time(duration) by(.a1, .a2, .a3, .a4, .a5)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "too-many-group-bys"
+  },
+  {
+   "id": "by-r3",
+   "check": "too-many-group-bys",
+   "query": "{} | quantile_over_time(duration, .5) by(.a1, .a2, .a3, .a4, .a5)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "too-many-group-bys"
+  },
+  {
+   "id": "by-a1",
+   "check": "too-many-group-bys",
+   "query": "{} | rate() by(.a1, .a2, .a3, .a4, .a5)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "by-a2",
+   "check": "too-many-group-bys",
+   "query": "{} | histogram_over_time(duration) by(.a1, .a2, .a3, .a4)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "k-r1",
+   "check": "non-positive-limit",
+   "query": "{} | rate() | topk(0)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "non-positive-limit"
+  },
+  {
+   "id": "k-r2",
+   "check": "non-positive-limit",
+   "query": "{} | rate() | bottomk(0)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "non-positive-limit"
+  },
+  {
+   "id": "k-a1",
+   "check": "non-positive-limit",
+   "query": "{} | rate() | topk(3)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "k-a2",
+   "check": "non-positive-limit",
+   "query": "{} | rate() | topk(3) | bottomk(2)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "c-r1",
+   "check": "compare-second-stage",
+   "query": "{} | compare({ .a = 1 }) | topk(3)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "compare-second-stage"
+  },
+  {
+   "id": "c-r2",
+   "check": "compare-second-stage",
+   "query": "{} | rate() | compare({ .a = 1 })",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "compare-second-stage"
+  },
+  {
+   "id": "c-r3",
+   "check": "compare-second-stage",
+   "query": "{} | compare({ .a = 1 }) | rate()",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "compare-second-stage"
+  },
+  {
+   "id": "c-a1",
+   "check": "compare-second-stage",
+   "query": "{} | compare({ .a = 1 })",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "rec-r1",
+   "check": "type-mismatch",
+   "query": "{ name = duration } && { .b = 1 }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "type-mismatch"
+  },
+  {
+   "id": "rec-r2",
+   "check": "illegal-operator",
+   "query": "{} >> { status > ok }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "illegal-operator"
+  },
+  {
+   "id": "rec-r3",
+   "check": "illegal-operator",
+   "query": "{} | compare({ status > ok })",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "illegal-operator"
+  },
+  {
+   "id": "misc-a1",
+   "check": "route-independence",
+   "query": "{} | rate()",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "misc-a2",
+   "check": "route-independence",
+   "query": "{} | sum_over_time(name)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "misc-a3",
+   "check": "route-independence",
+   "query": "{} | sum(nestedSetLeft) = 1",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "misc-a4",
+   "check": "route-independence",
+   "query": "{} | rate() > 5",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "misc-a5",
+   "check": "route-independence",
+   "query": "{ duration + 1s > 2s }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "misc-a6",
+   "check": "route-independence",
+   "query": "{} | by(event:name)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "rx-u7",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?=x)\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "lookaround",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u8",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?!x)\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "lookaround",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u9",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?<=x)\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "lookaround",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u10",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?<!x)\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "lookaround",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u11",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"a\\\\\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "trailing-backslash",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u12",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"\\\\u{263A}\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "rust-only-escape",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u13",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"\\\\U0001F600\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "rust-only-escape",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u14",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"\\\\<word\\\\>\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept",
+   "unknown_class": "boundary-escape"
+  },
+  {
+   "id": "rx-u15",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"\\\\b{start}x\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept",
+   "unknown_class": "boundary-escape"
+  },
+  {
+   "id": "rx-u16",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"[\\\\p{Alphabetic}]\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "unicode-property",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u17",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"\\\\p{L}\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept",
+   "unknown_class": "unicode-property"
+  },
+  {
+   "id": "rx-u18",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?x)a b\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "nonportable-group-head",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u19",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?u:a)\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "nonportable-group-head",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u20",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?#c)a\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "nonportable-group-head",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u21",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"a*??\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "repetition-of-repetition",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u22",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"a{2}{3}\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "repetition-of-repetition",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "rx-u23",
+   "check": "invalid-regex",
+   "query": "{ .a =~ \"(?:(?:(?:(?:[0-9a-f]{32}){32}){32}){32})\" }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "accept",
+   "unknown_class": "compiled-too-big",
+   "divergence": "traceql-validate-re2-unknown-residual"
+  }
+ ]
+}

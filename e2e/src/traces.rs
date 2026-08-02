@@ -118,6 +118,20 @@ struct InformationalRaw {
     metrics_queries: Vec<String>,
 }
 
+/// Issue #328: a pre-committed semantic-rejection case — an expression
+/// that parses but fails `traceql.Validate`, which BOTH stores must
+/// answer with a 400 on their search endpoints. Kept OUT of `cases`
+/// (whose ids are pinned to `traces_corpus::CASE_IDS` exactly), in its
+/// own top-level list.
+#[derive(Debug, Deserialize)]
+struct RejectionCaseRaw {
+    case_id: String,
+    q: String,
+    /// Which validator check the case exercises — documentation,
+    /// validated non-empty by a unit test.
+    check: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct TracesFixture {
     seed: u64,
@@ -126,6 +140,9 @@ struct TracesFixture {
     full: TierCounts,
     limit: u32,
     cases: Vec<CaseRaw>,
+    /// Issue #328: semantic-rejection parity cases (NOT in `cases` — a
+    /// required key, so a fixture without it fails to load loudly).
+    rejection_cases: Vec<RejectionCaseRaw>,
     informational: InformationalRaw,
 }
 
@@ -601,19 +618,24 @@ async fn fetch_tempo_trace(
     }
 }
 
-async fn search_pulsus(
+/// The shared status-returning search core (issue #328 D3′): one GET
+/// against `url`, returning the status AND the body so a caller can
+/// assert a REJECTION — the JSON-returning wrappers below `bail!` on
+/// every non-2xx and structurally cannot.
+async fn search_status(
     ctx: &Ctx,
+    url: &str,
     q: &str,
     window: SearchWindow,
     limit: u32,
     query_timeout: Duration,
-) -> Result<serde_json::Value> {
+) -> Result<(reqwest::StatusCode, String)> {
     let start = window.start_s.to_string();
     let end = window.end_s.to_string();
     let limit_s = limit.to_string();
     let res = ctx
         .http
-        .get(ctx.url("/api/traces/v1/search"))
+        .get(url)
         .query(&[
             ("q", q),
             ("start", start.as_str()),
@@ -623,13 +645,46 @@ async fn search_pulsus(
         .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
-        .context("GET /api/traces/v1/search failed")?;
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
+        .with_context(|| format!("GET {url} failed"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    Ok((status, body))
+}
+
+async fn search_status_pulsus(
+    ctx: &Ctx,
+    q: &str,
+    window: SearchWindow,
+    limit: u32,
+    query_timeout: Duration,
+) -> Result<(reqwest::StatusCode, String)> {
+    let url = ctx.url("/api/traces/v1/search");
+    search_status(ctx, &url, q, window, limit, query_timeout).await
+}
+
+async fn search_status_tempo(
+    ctx: &Ctx,
+    q: &str,
+    window: SearchWindow,
+    limit: u32,
+    query_timeout: Duration,
+) -> Result<(reqwest::StatusCode, String)> {
+    let url = format!("{}/api/search", ctx.tempo_url);
+    search_status(ctx, &url, q, window, limit, query_timeout).await
+}
+
+async fn search_pulsus(
+    ctx: &Ctx,
+    q: &str,
+    window: SearchWindow,
+    limit: u32,
+    query_timeout: Duration,
+) -> Result<serde_json::Value> {
+    let (status, body) = search_status_pulsus(ctx, q, window, limit, query_timeout).await?;
+    if !status.is_success() {
         bail!("pulsus search for {q:?} returned {status}: {body}");
     }
-    res.json().await.context("pulsus search body was not JSON")
+    serde_json::from_str(&body).context("pulsus search body was not JSON")
 }
 
 async fn search_tempo(
@@ -639,28 +694,11 @@ async fn search_tempo(
     limit: u32,
     query_timeout: Duration,
 ) -> Result<serde_json::Value> {
-    let start = window.start_s.to_string();
-    let end = window.end_s.to_string();
-    let limit_s = limit.to_string();
-    let res = ctx
-        .http
-        .get(format!("{}/api/search", ctx.tempo_url))
-        .query(&[
-            ("q", q),
-            ("start", start.as_str()),
-            ("end", end.as_str()),
-            ("limit", limit_s.as_str()),
-        ])
-        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
-        .send()
-        .await
-        .context("GET tempo /api/search failed")?;
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
+    let (status, body) = search_status_tempo(ctx, q, window, limit, query_timeout).await?;
+    if !status.is_success() {
         bail!("tempo search for {q:?} returned {status}: {body}");
     }
-    res.json().await.context("tempo search body was not JSON")
+    serde_json::from_str(&body).context("tempo search body was not JSON")
 }
 
 // ---------------------------------------------------------------------
@@ -1408,6 +1446,8 @@ pub async fn traces_differential(ctx: &Ctx) -> Result<()> {
             .with_context(|| format!("search case {:?}", case.case_id))?;
     }
 
+    assert_rejection_parity(ctx, &fixture, window).await?;
+
     run_informational_comparisons(ctx, &corpus, &fixture, window).await
 }
 
@@ -1806,6 +1846,51 @@ fn metrics_points_delta(
 /// (e.g. its metrics endpoint needs the metrics-generator, deliberately
 /// not enabled in `deploy/e2e/tempo.yaml`) — is dumped as an
 /// informational artifact; the section always returns `Ok`.
+/// Issue #328 (AC 16): both stores must REJECT every pre-committed
+/// semantic-rejection case with a 400 on their search endpoints — the
+/// end-to-end proof that the `traceql.Validate` port answers exactly
+/// where the reference answers. Hard-gated on BOTH sides: a PulsusDB
+/// 200 here is the validator not running end to end, a Tempo non-400 is
+/// a stale fixture premise.
+async fn assert_rejection_parity(
+    ctx: &Ctx,
+    fixture: &TracesFixture,
+    window: SearchWindow,
+) -> Result<()> {
+    let query_timeout = Duration::from_secs(30);
+    for case in &fixture.rejection_cases {
+        let (pulsus_status, pulsus_body) =
+            search_status_pulsus(ctx, &case.q, window, fixture.limit, query_timeout)
+                .await
+                .with_context(|| format!("rejection case {:?} (pulsus)", case.case_id))?;
+        if pulsus_status != reqwest::StatusCode::BAD_REQUEST {
+            bail!(
+                "rejection case {:?} ({}, q={:?}): PulsusDB answered {pulsus_status} instead of                  400: {pulsus_body}",
+                case.case_id,
+                case.check,
+                case.q
+            );
+        }
+        let (tempo_status, tempo_body) =
+            search_status_tempo(ctx, &case.q, window, fixture.limit, query_timeout)
+                .await
+                .with_context(|| format!("rejection case {:?} (tempo)", case.case_id))?;
+        if tempo_status != reqwest::StatusCode::BAD_REQUEST {
+            bail!(
+                "rejection case {:?} ({}, q={:?}): Tempo answered {tempo_status} instead of 400                  — the fixture premise is stale: {tempo_body}",
+                case.case_id,
+                case.check,
+                case.q
+            );
+        }
+        println!(
+            "pulsus-e2e:   traces rejection parity {:?} ({}): both stores 400",
+            case.case_id, case.check
+        );
+    }
+    Ok(())
+}
+
 async fn run_informational_comparisons(
     ctx: &Ctx,
     corpus: &TraceCorpus,
@@ -2041,6 +2126,34 @@ mod tests {
     /// Every informational case must reference a ledger entry, and the
     /// committed ledger must actually contain both the entry id and the
     /// case id — the mechanical fixture↔ledger link.
+    /// Issue #328: the rejection cases are their own top-level list —
+    /// non-empty, unique ids, every field populated — and `cases` stays
+    /// pinned to `CASE_IDS` exactly (asserted above, untouched), which
+    /// is why they could not simply join it.
+    #[test]
+    fn shipped_rejection_cases_are_nonempty_unique_and_out_of_cases() {
+        let fixture = shipped_fixture();
+        assert!(
+            !fixture.rejection_cases.is_empty(),
+            "the semantic-rejection parity step must have cases to run"
+        );
+        let mut ids = std::collections::BTreeSet::new();
+        for case in &fixture.rejection_cases {
+            assert!(
+                ids.insert(case.case_id.as_str()),
+                "duplicate rejection case id {:?}",
+                case.case_id
+            );
+            assert!(!case.q.is_empty(), "{:?}: empty q", case.case_id);
+            assert!(!case.check.is_empty(), "{:?}: empty check", case.case_id);
+            assert!(
+                !CASE_IDS.contains(&case.case_id.as_str()),
+                "{:?} collides with a corpus case id",
+                case.case_id
+            );
+        }
+    }
+
     #[test]
     fn informational_cases_are_recorded_in_the_committed_ledger() {
         let fixture = shipped_fixture();
