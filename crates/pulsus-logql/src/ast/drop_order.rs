@@ -69,6 +69,7 @@ pub(super) fn kind_of(n: &MetricExpr) -> &'static str {
         MetricExpr::VectorFn(_) => "VectorFn",
         MetricExpr::Binary { .. } => "Binary",
         MetricExpr::Variants(_) => "Variants",
+        MetricExpr::LabelReplace { .. } => "LabelReplace",
     }
 }
 

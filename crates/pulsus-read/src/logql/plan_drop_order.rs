@@ -51,6 +51,7 @@ fn kind_of(n: &MetricNode) -> &'static str {
         MetricNode::Binary { .. } => "Binary",
         MetricNode::VectorAgg { .. } => "VectorAgg",
         MetricNode::Variants { .. } => "Variants",
+        MetricNode::LabelReplace { .. } => "LabelReplace",
     }
 }
 

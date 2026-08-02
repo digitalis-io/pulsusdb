@@ -1,0 +1,250 @@
+# b16 — `label_replace(<metricExpr>, "dst", "replacement", "src", "regex")`
+# (issue #276).
+#
+# Reference of record: grafana/loki:3.7.4 (`pkg/logql/syntax/ast.go`
+# `mustNewLabelReplaceExpr`, `pkg/logql/evaluator.go`
+# `LabelReplaceEvaluator`). EVERY expected line below was captured from
+# the pinned container (ci/logql/config.yaml, capture 2026-08-02,
+# every metric leaf carries the corpus-conventional `| logfmt` (forces
+# the raw client-aggregated route the hermetic runner replays; verified
+# label-identical on the container — the bodies parse to no pairs),
+# T0 anchored on a 30 s boundary; the container's `detected_level`
+# labels dropped per PROVENANCE.md). The semantics the captures pin:
+#
+#   * the regex is anchored `^(?:…)$` (NO dot-all — Loki, unlike
+#     Prometheus's `^(?s:…)$`), compiled once at parse/plan time;
+#   * src value = the series' `src` label, "" when the label is absent;
+#   * no match → the series passes through UNTOUCHED (c1's `other`/
+#     absent-src rows; c20's substring non-match pins full anchoring);
+#   * match → `dst` is deleted, then re-set to the Go `ExpandString`
+#     expansion (`$1`, `${name}`, out-of-range/unmatched group → empty,
+#     `$$` → literal `$`, trailing lone `$` → literal `$`); an EMPTY
+#     expansion leaves `dst` deleted (c2);
+#   * `dst` is NOT validated — `0bad` (c7) and even `__name__` (c19)
+#     are set and emitted verbatim (Loki has no counterpart of
+#     Prometheus's destination-name check);
+#   * colliding output label sets: at instant the duplicate samples are
+#     all returned (c14); at range the engine's per-step accumulation
+#     merges them into ONE series whose points repeat per timestamp
+#     (r2). The same-timestamp intra-order is a Go map walk upstream
+#     (irreproducible); PulsusDB pins input-series order — ledgered
+#     `label-replace-collision-tie-order`.
+#
+# Reference-observed rejections for the eval_fail cases:
+#   bad regex        400 parse error : invalid regex in label_replace:
+#                        error parsing regexp: missing closing ): `^(?:()$`
+#                        (the WRAPPED form — the issue #240 asymmetry,
+#                        deliberate; PulsusDB keeps the same structure
+#                        with rust-regex wording after the prefix)
+#   scalar operand   500 unexpected expr type (*syntax.LiteralExpr) for
+#                        Evaluator type (*logql.DefaultEvaluator)
+#                        (PulsusDB: plan-time 400 — ledgered
+#                        `label-replace-scalar-operand-status`)
+
+load
+  {env="prod", service_name="svc-lr", src="source-value-10"}
+  15s line at 15s
+  {env="dev", service_name="svc-lr", src="other"}
+  20s line at 20s
+  {env="stage", service_name="svc-lr"}
+  25s line at 25s
+  {dst="old", env="x", service_name="svc-lr", src="source-value-7"}
+  30s line at 30s
+
+# c1 — basic capture-group replacement; non-matching (`other`) and
+# absent-src rows pass through untouched.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "v-$1", "src", "source-value-(.*)")
+  {dst="v-10", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="v-7", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# c2 — an EMPTY replacement deletes dst on matching series (the
+# pre-existing dst="old" row loses it); non-matching rows keep theirs.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "", "src", "source-value-(.*)")
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {env="stage", service_name="svc-lr"} 1
+  {env="x", service_name="svc-lr", src="source-value-7"} 1
+
+# c3 — dst == src rewrites the source label itself.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "src", "x-$1", "src", "source-value-(.*)")
+  {dst="old", env="x", service_name="svc-lr", src="x-7"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="prod", service_name="svc-lr", src="x-10"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# c4 — an entirely-absent source label reads as "" and `(.*)` MATCHES it:
+# every series gains newdst, with $1 expanding empty.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "newdst", "got[$1]", "missing", "(.*)")
+  {dst="old", env="x", newdst="got[]", service_name="svc-lr", src="source-value-7"} 1
+  {env="dev", newdst="got[]", service_name="svc-lr", src="other"} 1
+  {env="prod", newdst="got[]", service_name="svc-lr", src="source-value-10"} 1
+  {env="stage", newdst="got[]", service_name="svc-lr"} 1
+
+# c5 — a group reference beyond the capture count expands EMPTY (never an
+# error).
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "a-$3", "src", "source-value-(.*)")
+  {dst="a-", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="a-", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# c6 — an UNMATCHED alternation group expands empty while the matched one
+# expands its text.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "[$1][$2]", "src", "(source.*)|(oth.*)")
+  {dst="[][other]", env="dev", service_name="svc-lr", src="other"} 1
+  {dst="[source-value-10][]", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="[source-value-7][]", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# c7 — the destination name is NOT validated: `0bad` is set verbatim.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "0bad", "x", "src", "(.*)")
+  {0bad="x", dst="old", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {0bad="x", env="dev", service_name="svc-lr", src="other"} 1
+  {0bad="x", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {0bad="x", env="stage", service_name="svc-lr"} 1
+
+# c8 — composes under a vector aggregation; the by-label is rewritten
+# first, so grouping sees the replaced values.
+#
+# EXCLUDED sub-case (`sum by (dst) (label_replace(…))`, where two series
+# lack dst): the container groups them into `{}` (captured: `{} 2`,
+# `{dst="v-10"} 1`, `{dst="v-7"} 1`) while PulsusDB's `group_key`
+# materialises the MISSING by-label as `dst=""` — the pre-existing
+# engine-wide `by`-over-a-missing-label divergence **owned by #241**
+# (its `group_key` rewrite is deep in review; the #241 adjudication
+# forbids fixing it from another issue). OBLIGATION: when #241 lands,
+# ADD that sub-case here with the captured expectation above — it is a
+# ready-made acceptance test, exactly like the excluded
+# `sum(absent_over_time(...))` sub-cases in b13.
+eval instant at 60s sum by (env) (label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "env", "e-$1", "src", "source-value-(.*)"))
+  {env="dev"} 1
+  {env="e-10"} 1
+  {env="e-7"} 1
+  {env="stage"} 1
+
+# c9 — nests inside itself; the outer sees the inner's output labels.
+eval instant at 60s label_replace(label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "v-$1", "src", "source-value-(.*)"), "dst2", "w-$1", "dst", "v-(.*)")
+  {dst="v-10", dst2="w-10", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="v-7", dst2="w-7", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# c10 — parenthesizes (a metricExpr alternative, unlike variants).
+eval instant at 60s (label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "v", "src", ".*"))
+  {dst="v", env="dev", service_name="svc-lr", src="other"} 1
+  {dst="v", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="v", env="stage", service_name="svc-lr"} 1
+  {dst="v", env="x", service_name="svc-lr", src="source-value-7"} 1
+
+# c11 — legal as a parameterized vector-aggregation operand. `k` covers
+# every series: at k=2 the reference's equal-value tie choice is a Go
+# heap/map order it cannot reproduce itself (probed: it kept a different
+# pair than PulsusDB's pinned deterministic selection), the same
+# irreproducible-tie class the instant `first/last_over_time` and
+# `approx_topk` pins already document — not a label_replace behaviour,
+# so this case does not pin it.
+eval instant at 60s topk(4, label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "v", "src", ".*"))
+  {dst="v", env="dev", service_name="svc-lr", src="other"} 1
+  {dst="v", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="v", env="stage", service_name="svc-lr"} 1
+  {dst="v", env="x", service_name="svc-lr", src="source-value-7"} 1
+
+# c12 — legal as a binary operand.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "v", "src", ".*") + 1
+  {dst="v", env="dev", service_name="svc-lr", src="other"} 2
+  {dst="v", env="prod", service_name="svc-lr", src="source-value-10"} 2
+  {dst="v", env="stage", service_name="svc-lr"} 2
+  {dst="v", env="x", service_name="svc-lr", src="source-value-7"} 2
+
+# c13 — over `vector(1)`: the empty label set's absent src matches `(.*)`
+# as "", so dst gets the bare prefix.
+eval instant at 60s label_replace(vector(1), "dst", "v-$1", "src", "(.*)")
+  {dst="v-"} 1
+
+# c14 — INSTANT collisions are returned as duplicate samples, never
+# merged (four identical elements on the reference's wire).
+eval instant at 60s label_replace(sum by (src) (count_over_time({service_name="svc-lr"} | logfmt [5m])), "src", "same", "src", "(.*)")
+  {src="same"} 1
+  {src="same"} 1
+  {src="same"} 1
+  {src="same"} 1
+
+# c15 — `$$` is a literal dollar; the following `1-` is literal text, then
+# `$1` expands.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "$$1-$1", "src", "source-value-(.*)")
+  {dst="$1-10", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="$1-7", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# c16 — `${name}` expands a named capture group.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "${x}", "src", "source-value-(?P<x>.*)")
+  {dst="10", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="7", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# c17 — a trailing lone `$` is a literal dollar.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "end$", "src", "source-value-(.*)")
+  {dst="end$", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {dst="end$", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# c18 — the EMPTY regex anchors to `^(?:)$`, matching only an empty (i.e.
+# absent) source: only the src-less row gains dst; the dst="old" row does
+# not match and keeps its old value.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "set", "src", "")
+  {dst="old", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {dst="set", env="stage", service_name="svc-lr"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="prod", service_name="svc-lr", src="source-value-10"} 1
+
+# c19 — `__name__` is an ordinary destination (no Prometheus-style
+# metric-name special case).
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "__name__", "nm", "src", ".*")
+  {__name__="nm", dst="old", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {__name__="nm", env="dev", service_name="svc-lr", src="other"} 1
+  {__name__="nm", env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {__name__="nm", env="stage", service_name="svc-lr"} 1
+
+# c20 — FULL anchoring: the substring `value` does not match any
+# `source-value-*` whole value, so nothing changes.
+eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "hit", "src", "value")
+  {dst="old", env="x", service_name="svc-lr", src="source-value-7"} 1
+  {env="dev", service_name="svc-lr", src="other"} 1
+  {env="prod", service_name="svc-lr", src="source-value-10"} 1
+  {env="stage", service_name="svc-lr"} 1
+
+# r1 — range: the transform applies per series across the matrix.
+eval range from 0s to 60s step 30s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "v-$1", "src", "source-value-(.*)")
+  {dst="v-10", env="prod", service_name="svc-lr", src="source-value-10"} 30s 1 60s 1
+  {dst="v-7", env="x", service_name="svc-lr", src="source-value-7"} 30s 1 60s 1
+  {env="dev", service_name="svc-lr", src="other"} 30s 1 60s 1
+  {env="stage", service_name="svc-lr"} 30s 1 60s 1
+
+# r2 — RANGE collisions merge into one series whose points repeat per
+# grid timestamp (captured verbatim: four samples at each step).
+eval range from 0s to 60s step 30s label_replace(sum by (src) (count_over_time({service_name="svc-lr"} | logfmt [5m])), "src", "same", "src", "(.*)")
+  {src="same"} 30s 1 30s 1 30s 1 30s 1 60s 1 60s 1 60s 1 60s 1
+
+# f1 — an uncompilable regex is a 400 whose message reports the WRAPPED
+# `^(?:…)$` form (the issue #240 asymmetry — deliberate; every other
+# LogQL site reports the user's raw pattern). Wording after the prefix is
+# rust-regex's (ledgered class); the reference's is
+# `error parsing regexp: missing closing ): `^(?:()$``.
+eval_fail instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "x", "src", "(")
+  msg: invalid regex in label_replace:
+
+# f2 — a scalar-typed operand: the reference 500s (`unexpected expr type
+# (*syntax.LiteralExpr) …`); PulsusDB rejects at plan time with its own
+# consistent 400 (ledgered `label-replace-scalar-operand-status`).
+eval_fail instant at 60s label_replace(2, "dst", "v", "src", ".*")
+  msg: label_replace requires a vector operand
+
+eval_fail instant at 60s label_replace(1 + 1, "dst", "v", "src", ".*")
+  msg: label_replace requires a vector operand
+
+clear

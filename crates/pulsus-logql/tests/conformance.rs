@@ -477,6 +477,11 @@ fn walk_metric(me: &MetricExpr, out: &mut BTreeSet<String>) {
         MeNode::Expr(MetricExpr::Variants(_)) => {
             out.insert("func.variants".to_string());
         }
+        MeNode::Expr(MetricExpr::LabelReplace { .. }) => {
+            out.insert("func.label_replace".to_string());
+            // The four arguments are string literals.
+            out.insert("statics.string".to_string());
+        }
         MeNode::Expr(MetricExpr::Binary { op, modifier, .. }) => {
             out.insert(binop_id(*op).to_string());
             if let Some(m) = modifier {
@@ -1084,9 +1089,10 @@ fn differential_categories_are_pinned() {
     // (`stage.distinct`/`stage.ip`) into the new reject-parity bucket
     // (both_reject 2 → 0, reject_parity = 2), driving tracked interim to 0.
     // #221 added `func.vector` (supported) → 98, then `agg.approx_topk`
-    // (supported) → 99, then `func.variants` (supported) → 100.
+    // (supported) → 99, then `func.variants` (supported) → 100; #276
+    // added `func.label_replace` (supported) → 101.
     assert_eq!(
-        supported, 100,
+        supported, 101,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(

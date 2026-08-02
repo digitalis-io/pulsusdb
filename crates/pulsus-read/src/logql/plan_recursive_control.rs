@@ -386,6 +386,38 @@ mod tests {
                     window: window_from(p)?,
                 }),
                 MetricExpr::Variants(_) => build_variants_node(scc2_variants(metric_expr), p, ctx),
+                // NOT part of the frozen `ae66648` body: `label_replace`
+                // (issue #276) postdates it, and the arm exists only so
+                // the exhaustive match compiles. It recurses like every
+                // other arm, keeping the control a faithful "recursive
+                // planner" should a future corpus include the construct;
+                // today's stress corpora never produce it.
+                MetricExpr::LabelReplace {
+                    dst,
+                    replacement,
+                    src,
+                    regex,
+                    ..
+                } => {
+                    let spec = crate::logql::plan::LabelReplaceSpec::compile(
+                        dst,
+                        replacement,
+                        src,
+                        regex,
+                    )?;
+                    let inner = build_metric_node(scc2_child(metric_expr, 0), p, ctx)?;
+                    if !inner.produces_series() {
+                        return Err(ReadError::PipelineInvalid {
+                            reason: "label_replace requires a vector operand, got a scalar \
+                                     expression"
+                                .to_string(),
+                        });
+                    }
+                    Ok(MetricNode::LabelReplace {
+                        spec,
+                        inner: walk::Child::new(inner),
+                    })
+                }
                 MetricExpr::Binary { op, modifier, .. } => Ok(MetricNode::Binary {
                     op: *op,
                     return_bool: matches!(

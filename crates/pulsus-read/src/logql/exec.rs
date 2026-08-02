@@ -36,8 +36,8 @@ use super::labels::{
     StructuredMetadataCtx, merge_labels_with_structured_metadata, parse_flat_labels, series_labels,
 };
 use super::post_agg::{
-    MAX_POST_AGG_BYTES, apply_vector_aggs, charged_instant_chain, charged_range_chain,
-    combine_binary,
+    MAX_POST_AGG_BYTES, apply_label_replace, apply_vector_aggs, charged_instant_chain,
+    charged_range_chain, combine_binary,
 };
 use super::variants::{MAX_VARIANT_FANOUT_STATE_BYTES, VariantArena, VariantsAggState};
 use super::window::{ClientWindow, materialize_vector_lit};
@@ -1319,6 +1319,10 @@ impl LogQlEngine {
                 MetricNode::VectorAgg { aggs, .. } => {
                     let inner = pop_value(&mut vals);
                     apply_vector_aggs(inner, aggs)?
+                }
+                MetricNode::LabelReplace { spec, .. } => {
+                    let inner = pop_value(&mut vals);
+                    apply_label_replace(inner, spec)?
                 }
                 MetricNode::Variants {
                     scan,

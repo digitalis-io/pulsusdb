@@ -1,13 +1,13 @@
 {
   "language": "LogQL",
   "target": "v3.7.3",
-  "sha256": "888495c270dae2ffc4de652ef94d763ca56c9508b66758847008e089516b76d0",
-  "construct_count": 102,
+  "sha256": "817fbf97eaffffbed901ec84026cbfd77a4f97acb0e271fb7ca3f3b1af8a5a8a",
+  "construct_count": 103,
   "category_counts": {
     "binary-ops": 16,
     "extraction": 4,
     "formatters": 3,
-    "functions": 2,
+    "functions": 3,
     "grouping": 2,
     "label-filters": 17,
     "line-filters": 6,

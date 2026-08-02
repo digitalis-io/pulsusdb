@@ -513,6 +513,80 @@ not "fix" us toward the panic.
   field that exists nowhere in the tree: owned by **#277**, a real
   parity bug deferred for sequencing, not an accepted shape.
 
+### `label-replace-scalar-operand-status` (issue #276)
+
+- **Reference behaviour (probed, `grafana/loki:3.7.4`):**
+  `label_replace(2, "d", "r", "s", ".*")` — and any other scalar-typed
+  operand, including a folded `1 + 1` — returns **500 `unexpected expr
+  type (*syntax.LiteralExpr) for Evaluator type
+  (*logql.DefaultEvaluator)`**: the evaluator factory has no arm for a
+  literal where a sample expression is required.
+- **PulsusDB behaviour:** a plan-time **400** `label_replace requires a
+  vector operand, got a scalar expression`, decided in `fold_plan_ops`
+  from the operand's series typing — before any DB read. The regex
+  compile error keeps priority over it (the reference's own ordering:
+  its parse-time regex error surfaces first).
+- **Why deliberate:** both sides reject; the reference's body is an
+  internal Go type-assertion message, the head-of-group rule
+  (`variants-nonconforming-shape-status`) applies — we match the
+  REJECTION, never the crash-shaped surface. Gated by
+  `b16_label_replace.test`'s `eval_fail` cases and
+  `label_replace_over_a_scalar_typed_operand_is_rejected_at_plan_time`.
+
+### `label-replace-collision-tie-order` (issue #276)
+
+- **Reference behaviour (probed):** when `label_replace` maps several
+  range-query series onto ONE label set, the engine's per-step
+  accumulation merges them into a single series whose points repeat per
+  timestamp (`{src="same"} [[t,1],[t,1],[t,1],[t,1]] …` on the wire).
+  The SAME-timestamp intra-order is the evaluator's per-step vector
+  order — for an aggregated operand, a Go map walk the reference cannot
+  reproduce even against itself.
+- **PulsusDB behaviour:** the identical merged shape (timestamp-
+  ascending, duplicates kept), with the same-timestamp tie pinned to
+  the DETERMINISTIC input-series order — the ratified treatment of every
+  irreproducible reference tie (instant `first/last_over_time`,
+  `approx_topk` beyond the retention cap). Values and multiset of
+  points are reference-exact; only the intra-timestamp ordering is
+  pinned rather than mirrored. Instant queries return the duplicate
+  samples unmerged, exactly as the reference does (no divergence
+  there). Gated by `b16_label_replace.test` (r2, c14) and
+  `label_replace_range_collisions_merge_with_input_order_ties`.
+
+### `label-replace-template-amplification` (issue #276 fix round 2 — the O8 threshold, WIRED)
+
+- **Reference behaviour:** no cap exists on this path. The evaluator
+  rewrites and retains every series' label set with no budget, so a
+  large replacement template times a large series count materialises
+  gigabytes of labels and exhausts process memory.
+- **PulsusDB behaviour:** `apply_label_replace` charges
+  `2 × W_LABEL_BYTE × L` bytes per series *before* allocating, `L =
+  dst.len() + replacement.len() + #'$' × max_value_bytes` (each `$` can
+  expand to the input's widest label value), against
+  `MAX_POST_AGG_BYTES` (8 GiB); a breach is a clean **422**
+  `query_too_broad`, never an OOM. **Where refusal begins, concretely:**
+  impossible below `L = 2 413` template bytes at any series count
+  (`L_MIN`, at `N = 435 645`); guaranteed from the amplifying term alone
+  once `L × series > 1 431 655 765` byte·series
+  (`MAX_POST_AGG_BYTES / (2 × W_LABEL_BYTE)`) — e.g. a `$`-free
+  replacement of 3 286 bytes at the region's `N_max = 435 771` series;
+  between the two, the input's own envelope terms decide and only lower
+  the point of refusal.
+- **Why deliberate:** folding `replacement.len()` into the ceiling was
+  considered and rejected (fix round 2 ruling): the replacement is
+  bounded only by the 131 072-byte query-text cap, so an absorbing
+  ceiling would sit in the tens of gigabytes and stop protecting
+  anything. Refusing where the reference OOMs is PulsusDB being correct
+  — the reference being unbounded is not copied (the
+  `template-output-budget` precedent). Unlike O6/O7 this funnel is
+  wired today, which is why the row exists now. Gated by
+  `o8_the_label_replace_template_threshold_bounds_where_refusal_is_possible`
+  (below `L_MIN` admitted over the whole feasible region, refusable at
+  `L_MIN`, `$` gearing exact) and
+  `label_replace_charges_the_collision_merge_clone_before_it_allocates`
+  (charge lands before the allocation it prices); numbers regenerated
+  by `zz_witness_report`.
+
 ## Issue #236 — high-cardinality aggregations: the result-size cap
 
 - **(a) Result-series cap semantics.** *Reference:* `querier.max-query-series`

@@ -982,6 +982,22 @@ pub enum MetricExpr {
     /// nested position the reference grammar rejects (`sum(variants(…))`,
     /// `(variants(…))`, another `variants` argument list).
     Variants(Child<VariantsExpr>),
+    /// `label_replace(<metricExpr>, "<dst>", "<replacement>", "<src>",
+    /// "<regex>")` (issue #276) — mirrors Loki v3.7.4's `labelReplaceExpr`
+    /// grammar rule (`pkg/logql/syntax/syntax.y`), a `metricExpr`
+    /// alternative, so it composes in every metric position (inside
+    /// vector aggregations, parentheses, binary operands, another
+    /// `label_replace`). All four string arguments are raw text here —
+    /// the regex is compiled (and its `^(?:…)$` anchoring applied) by
+    /// `pulsus-read` at plan time, per this crate's "regex not validated"
+    /// contract.
+    LabelReplace {
+        inner: Child<MetricExpr>,
+        dst: String,
+        replacement: String,
+        src: String,
+        regex: String,
+    },
 }
 
 /// `variants(<metricExpr>, …) of (<logRangeExpr>)` (issue #221). Mirrors
@@ -1159,6 +1175,10 @@ impl Scc for MetricScc {
                 0 => Some(MeRef::Var(v.peek())),
                 _ => None,
             },
+            MeNode::Expr(MetricExpr::LabelReplace { inner, .. }) => match i {
+                0 => Some(MeRef::Expr(inner.peek())),
+                _ => None,
+            },
             MeNode::Var(v) => v.variants.peek().get(i).map(MeRef::Expr),
         }
     }
@@ -1207,12 +1227,29 @@ impl Scc for MetricScc {
                     },
                 ) => ao == bo && am == bm,
                 (MetricExpr::Variants(_), MetricExpr::Variants(_)) => true,
+                (
+                    MetricExpr::LabelReplace {
+                        dst: ad,
+                        replacement: ap,
+                        src: as_,
+                        regex: ar,
+                        ..
+                    },
+                    MetricExpr::LabelReplace {
+                        dst: bd,
+                        replacement: bp,
+                        src: bs,
+                        regex: br,
+                        ..
+                    },
+                ) => ad == bd && ap == bp && as_ == bs && ar == br,
                 (MetricExpr::Range { .. }, _)
                 | (MetricExpr::Vector { .. }, _)
                 | (MetricExpr::Literal(_), _)
                 | (MetricExpr::VectorFn(_), _)
                 | (MetricExpr::Binary { .. }, _)
-                | (MetricExpr::Variants(_), _) => false,
+                | (MetricExpr::Variants(_), _)
+                | (MetricExpr::LabelReplace { .. }, _) => false,
             },
             (MeNode::Var(a), MeNode::Var(b)) => {
                 a.variants.len() == b.variants.len() && a.range == b.range
@@ -1266,6 +1303,19 @@ impl Scc for MetricScc {
                 };
                 MeVal::Expr(MetricExpr::Variants(Child::new(v)))
             }
+            MeNode::Expr(MetricExpr::LabelReplace {
+                dst,
+                replacement,
+                src,
+                regex,
+                ..
+            }) => MeVal::Expr(MetricExpr::LabelReplace {
+                inner: Child::new(drain_expr(kids)),
+                dst: dst.clone(),
+                replacement: replacement.clone(),
+                src: src.clone(),
+                regex: regex.clone(),
+            }),
             MeNode::Var(v) => {
                 let n = v.variants.len();
                 let at = kids.len() - n;
@@ -1304,6 +1354,18 @@ impl Scc for MetricScc {
                 MetricExpr::Binary { modifier, .. } => {
                     *modifier = None;
                 }
+                MetricExpr::LabelReplace {
+                    dst,
+                    replacement,
+                    src,
+                    regex,
+                    ..
+                } => {
+                    *dst = String::new();
+                    *replacement = String::new();
+                    *src = String::new();
+                    *regex = String::new();
+                }
             },
             MeSlotNode::Var(v) => {
                 v.range = empty_log_range();
@@ -1325,6 +1387,9 @@ impl Scc for MetricScc {
                 }
                 MetricExpr::Variants(v) => {
                     out.push(MeVal::Var(v.replace(ve_placeholder())));
+                }
+                MetricExpr::LabelReplace { inner, .. } => {
+                    out.push(MeVal::Expr(inner.replace(me_placeholder())));
                 }
             },
             MeSlotNode::Var(v) => {
@@ -1524,6 +1589,33 @@ fn hash_scc<H: Hasher>(root: MeNode<'_>, state: &mut H) {
                         Ok(Emit::Done)
                     }
                 }
+                MetricExpr::LabelReplace {
+                    inner,
+                    dst,
+                    replacement,
+                    src,
+                    regex,
+                } => {
+                    // Declaration order: `inner` precedes the own string
+                    // fields, so the child's hash is emitted between the
+                    // discriminant and the strings — exactly the derive's
+                    // field order.
+                    if step == hash_step::ENTER {
+                        mem::discriminant(e).hash(state);
+                        Ok(Emit::Descend {
+                            next_step: hash_step::AFTER_FIRST,
+                            child: MeRef::Expr(inner.peek()),
+                            child_step: hash_step::ENTER,
+                            child_level: 0,
+                        })
+                    } else {
+                        dst.hash(state);
+                        replacement.hash(state);
+                        src.hash(state);
+                        regex.hash(state);
+                        Ok(Emit::Done)
+                    }
+                }
             },
             MeNode::Var(v) => {
                 let kids = v.variants.peek();
@@ -1695,6 +1787,39 @@ fn debug_scc(root: MeNode<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                     })
                 } else {
                     walk::dbg_close_tuple(f, alt, depth)?;
+                    Ok(Emit::Done)
+                }
+            }
+            MetricExpr::LabelReplace {
+                inner,
+                dst,
+                replacement,
+                src,
+                regex,
+            } => {
+                if step == dbg_step::ENTER {
+                    walk::dbg_open_struct(f, "LabelReplace", alt, depth)?;
+                    f.write_str("inner: ")?;
+                    Ok(Emit::Descend {
+                        next_step: dbg_step::AFTER_FIRST,
+                        child: MeRef::Expr(inner.peek()),
+                        child_step: dbg_step::ENTER,
+                        child_level: depth + 1,
+                    })
+                } else {
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("dst: ")?;
+                    walk::dbg_own(f, dst, alt, depth + 1)?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("replacement: ")?;
+                    walk::dbg_own(f, replacement, alt, depth + 1)?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("src: ")?;
+                    walk::dbg_own(f, src, alt, depth + 1)?;
+                    walk::dbg_sep(f, alt, depth)?;
+                    f.write_str("regex: ")?;
+                    walk::dbg_own(f, regex, alt, depth + 1)?;
+                    walk::dbg_close_struct(f, alt, depth)?;
                     Ok(Emit::Done)
                 }
             }
@@ -1902,6 +2027,36 @@ fn display_scc(root: MeNode<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                             child_level: 0,
                         })
                     } else {
+                        Ok(Emit::Done)
+                    }
+                }
+                MetricExpr::LabelReplace {
+                    inner,
+                    dst,
+                    replacement,
+                    src,
+                    regex,
+                } => {
+                    if step == disp_step::ENTER {
+                        f.write_str("label_replace(")?;
+                        // `ENTER`, not `OPERAND`: a binary inner needs no
+                        // parentheses inside the call's own parens, and
+                        // the round-trip oracle re-parses it identically.
+                        Ok(Emit::Descend {
+                            next_step: disp_step::AFTER_FIRST,
+                            child: MeRef::Expr(inner.peek()),
+                            child_step: disp_step::ENTER,
+                            child_level: 0,
+                        })
+                    } else {
+                        write!(
+                            f,
+                            ", {}, {}, {}, {})",
+                            quote(dst),
+                            quote(replacement),
+                            quote(src),
+                            quote(regex)
+                        )?;
                         Ok(Emit::Done)
                     }
                 }
