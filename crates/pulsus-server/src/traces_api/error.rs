@@ -33,6 +33,7 @@ use super::params::{
 /// |---|---|---|
 /// | `Param` / `SearchParam` / `MetricsParam` / `GraphParam` / `TagsParam` / `TagPath` | 400 | `bad_data` |
 /// | `SearchParam(QueryText(Invalid))` (search `query` parse, carries `position`) | 400 | `bad_data` |
+/// | `QueryText(Semantic)` / `SearchParam(QueryText(Semantic))` (issue #328 `traceql.Validate` port, no `position`) | 400 | `bad_data` |
 /// | `Plan` (except the point cap) | 400 | `bad_data` |
 /// | `Query` (TraceQL parse, carries `position`) | 400 | `bad_data` |
 /// | `Legacy` (strict logfmt, carries `position` into `tags`) | 400 | `bad_data` |
@@ -61,6 +62,13 @@ pub(crate) enum ApiError {
     /// TraceQL parse failure — `400 bad_data` with a `position` byte
     /// offset, matching the LogQL parse-error envelope.
     Query(TraceQlError),
+    /// Query-text admission failure raised by a HANDLER rather than
+    /// parameter parsing (issue #328): the executed expression parsed
+    /// but failed the reference's semantic validation
+    /// (`querytext::validate_semantics`). `400 bad_data`, the
+    /// `invalid TraceQL query: ` wrapping, no `position` for the
+    /// semantic variant.
+    QueryText(super::querytext::QueryTextError),
     /// Search planning failure (unsupported field / type mismatch).
     Plan(pulsus_read::TracePlanError),
     /// The trace has no stored spans (an empty §4.2 fetch).
@@ -85,6 +93,12 @@ impl From<TraceIdError> for ApiError {
 impl From<SearchParamError> for ApiError {
     fn from(e: SearchParamError) -> Self {
         ApiError::SearchParam(e)
+    }
+}
+
+impl From<super::querytext::QueryTextError> for ApiError {
+    fn from(e: super::querytext::QueryTextError) -> Self {
+        ApiError::QueryText(e)
     }
 }
 
@@ -173,6 +187,16 @@ impl IntoResponse for ApiError {
                 "bad_data",
                 e.to_string(),
                 Some(e.span().start),
+            ),
+            // Issue #328: the semantic-validation rejection carries the
+            // same envelope whichever parameter carried the expression
+            // (`position` is `None` for the semantic variant — the
+            // reference's Validate errors name no offset).
+            ApiError::QueryText(e) => (
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                e.to_string(),
+                e.position(),
             ),
             // The metrics point cap is the one plan-time 422 (issue #59
             // adjudication: a static pre-execution rejection in the

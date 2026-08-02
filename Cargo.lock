@@ -1865,6 +1865,8 @@ version = "0.0.0"
 name = "pulsus-traceql"
 version = "0.0.0"
 dependencies = [
+ "pulsus-re2",
+ "pulsus-testkit",
  "serde",
  "serde_json",
  "sha2",
