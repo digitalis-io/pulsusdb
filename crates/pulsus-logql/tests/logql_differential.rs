@@ -1,7 +1,7 @@
 //! Env-gated black-box differential leg (issue #191, M8-LQ0).
 //!
 //! Replays every registry construct's probe against an **unmodified**,
-//! digest-pinned v3.7.3 LogQL reference container and observes only the HTTP
+//! digest-pinned v3.7.4 LogQL reference container and observes only the HTTP
 //! status. No upstream source is read — this is pure runtime use of the
 //! reference image as a language oracle.
 //!
@@ -200,7 +200,7 @@ fn registry_probes_match_the_recorded_oracle_verdict() {
     };
 
     let registry: Registry =
-        serde_json::from_str(&read(conf_dir().join("registry-logql-v3.7.3.json"))).unwrap();
+        serde_json::from_str(&read(conf_dir().join("registry-logql-v3.7.4.json"))).unwrap();
     let disp: Dispositions =
         serde_json::from_str(&read(conf_dir().join("dispositions.json"))).unwrap();
 
@@ -260,7 +260,7 @@ fn registry_probes_match_the_recorded_oracle_verdict() {
 #[test]
 fn probe_endpoint_metadata_is_validated_and_instant_only_constructs_carry_it() {
     let registry: Registry =
-        serde_json::from_str(&read(conf_dir().join("registry-logql-v3.7.3.json"))).unwrap();
+        serde_json::from_str(&read(conf_dir().join("registry-logql-v3.7.4.json"))).unwrap();
     for c in &registry.constructs {
         // Loud on typos — the resolver panics on any unknown value.
         let endpoint = probe_endpoint(c);
@@ -287,7 +287,7 @@ fn an_unknown_probe_endpoint_fails_loudly() {
     });
 }
 
-// Hermetic RED-path proof (#203 plan-review TEST-GAP): the pinned v3.7.3
+// Hermetic RED-path proof (#203 plan-review TEST-GAP): the pinned v3.7.4
 // reference only exercises the reject-parity ∧ Reject agreement arm, so a
 // reference flip to Accept is never covered live. This proves the
 // `("reject-parity", Verdict::Accept)` arm records a loud mismatch rather than

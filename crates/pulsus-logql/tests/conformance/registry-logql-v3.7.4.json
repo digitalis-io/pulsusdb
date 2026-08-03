@@ -1,6 +1,6 @@
 {
   "language": "LogQL",
-  "target": "v3.7.3",
+  "target": "v3.7.4",
   "constructs": [
     {
       "id": "matcher.eq",

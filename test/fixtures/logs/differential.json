@@ -110,7 +110,7 @@
     },
     {
       "case_id": "ip_label_invalid",
-      "construct": "issue #201: `| logfmt | addr != ip(\"10.0.0.0/8\")` — a present-but-non-IP `addr` value is a plain non-match (the IP label filter NEVER errors), so `!=` RETURNS the svc-ipbad witness carrying only its raw `addr=not-an-ip` label and NO __error__/__error_details__, compared set-equal against the pinned reference v3.7.3",
+      "construct": "issue #201: `| logfmt | addr != ip(\"10.0.0.0/8\")` — a present-but-non-IP `addr` value is a plain non-match (the IP label filter NEVER errors), so `!=` RETURNS the svc-ipbad witness carrying only its raw `addr=not-an-ip` label and NO __error__/__error_details__, compared set-equal against reference v3.7.3, the oracle pinned at the time (now v3.7.4; this is a value record, not a claim about the current pin)",
       "mode": "gated",
       "query": "{run_id=\"{R}\", service_name=\"svc-ipbad\"} | logfmt | addr != ip(\"10.0.0.0/8\")"
     },
