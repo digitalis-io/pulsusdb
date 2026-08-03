@@ -1,0 +1,890 @@
+{
+  "WIRE_AGREE_BASELINE": 161,
+  "WIRE_DIVERGE_BASELINE": 60,
+  "wire_baseline": [
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !name = \"foo\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !name }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !.a = 1 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !.a }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !(.a = 1) }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !(name = \"foo\") }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !duration = 1s }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !status = error }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !span.a = 1 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !span:id = \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !\"x\" }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !true }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !.a = !.b }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -.a = 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -1 = .a }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = -1 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = - 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -duration = 1s }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = -.b }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ - .a = 1 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !!.a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !-.a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -!.a }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !.a && .b = 1 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ !.a = 1 && .b = 2 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 && !.b = 2 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = .b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = span.b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = resource.b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = event.b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = link.b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = instrumentation.b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = name }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = duration }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = status }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = kind }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = statusMessage }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = nestedSetParent }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = rootName }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = rootServiceName }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = traceDuration }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = span:id }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = span:duration }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = span:name }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = span:kind }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = span:status }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = span:statusMessage }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = span:parentID }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = span:childCount }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = trace:id }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = trace:duration }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = trace:rootName }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = trace:rootService }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = event:name }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = event:timeSinceStart }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = link:spanID }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = link:traceID }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = instrumentation:name }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = instrumentation:version }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ span:id = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ trace:duration = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ event:name = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ link:spanID = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ instrumentation:name = .a }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ span.a = .b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ name = .a }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ duration = .a }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a + 1 = 2 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ 2 = .a + 1 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = .b + 1 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a * 2 = .b }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ (.a) = 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ (.a + 1) = 2 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = (.b) }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = (1 + 2) }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ 1 = 2 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ \"x\" = \"y\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ \"x\" }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ span.a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ name }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ duration }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ span:id }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ trace:id }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = span:duration + 1 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ span:duration + 1 = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a =~ .b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a =~ \"x\" }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a > .b }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a >= span:duration }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ \"x\" && .a = 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 || \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 && 2 = 3 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 || .b = 2 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ \"x\" && .a = 1 || .b = 2 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !name + 1 = 2 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !name * 2 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ - name }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -name = 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = name + \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ 1 + \"x\" = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ 2 ^ 3 ^ 2 = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -2 ^ 2 = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = .b = .c }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = .b && .c }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 = 2 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ 1 < 2 < 3 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 + \"x\" * 2 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = (\"x\" + 1) }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a > 1 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ name = \"x\" && duration }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ name = \"x\" && duration = 1s }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ duration && name = \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a =~ \"x\" && 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !.a && 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !(.a && 1) }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !.a = \"x\" && 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !name * 2 = 3 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !.a * 2 = \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !.a ^ 2 = \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !.a + 2 = \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !.a - 2 = \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -.a * 2 = \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -.a ^ 2 = \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 2 ^ 3 ^ 2 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 2 + 3 * 4 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 2 * 3 + 4 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 2 - 3 - 4 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 2 / 3 / 4 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = -2 ^ 2 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = .b = .c && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a < .b < .c && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 && .b = 2 || .c = 3 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 || .b = 2 || .c = 3 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 && .b = 2 && .c = 3 || \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !!.a && 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !-.a && 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ -!.a && 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } && { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } > { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } && { .b = 1 } > { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } > { .b = 1 } && { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } > { .b = 1 } > { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } || { .b = 1 } && { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } && { .b = 1 } || { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } ~ { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } !> { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } &> { \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = -2 + 3 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = -2 * 3 && \"x\" }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | count() > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | avg(.a) > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | avg(span.a) > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | avg(duration) > 1s"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | avg(span:duration) > 1s"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg(span:childCount) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg(trace:duration) > 1s"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg(.a + 1) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg(1) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg(\"x\") > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg((.a)) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg() > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg(.a, .b) > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | max(.a) > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | min(.a) > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | sum(.a) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | count(.a) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg(.a) > .b"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | avg(.a) > avg(.b)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | select(.a)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | select(span.a)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | select(name)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | select(duration)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select(span:id)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select(trace:id)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ true } | select(.a, span.b, name)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select(.a + 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select(1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select(\"x\")"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select(-.a)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select(!.a)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select((.a))"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select()"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | select(.a = 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(.a)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(span.a)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(name)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(span:id)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(resource.service.name)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(.a, .b)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(.a + 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(\"x\")"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by()"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(-.a)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by(!.a)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | rate() by((.a))"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | quantile_over_time(duration, .5) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | quantile_over_time(span:duration, .5) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | quantile_over_time(.a, .5) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | max_over_time(.a) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ true } | max_over_time(span:duration) > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 || .b = 2 && .c = 3 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 && .b = 2 || .c = 3 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 && .b = 2 && .c = 3 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 || .b = 2 || .c = 3 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 2 ^ 3 ^ 2 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 2 - 3 - 4 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 2 / 3 / 4 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 2 + 3 * 4 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = -2 ^ 2 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = -2 + 3 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = -.b * 2 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a } && { .b } > { .c }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a } > { .b } && { .c }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a } > { .b } > { .c }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a } || { .b } && { .c }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a } && { .b } || { .c }"
+    }
+  ]
+}
