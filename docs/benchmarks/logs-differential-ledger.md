@@ -620,6 +620,37 @@ not "fix" us toward the panic.
   (charge lands before the allocation it prices); numbers regenerated
   by `zz_witness_report`.
 
+### `byte-literal-render-quantization` (issue #350)
+
+- **Reference behaviour (measured, grafana/loki:3.7.3 AND :3.7.4, both
+  the default config and ci/logql/config.yaml):** a QUERY-side byte
+  threshold is silently QUANTIZED to display precision. Measured: a
+  size=1000 line passes `size >= 1KiB`; `1024B` and `1025B` behave as
+  1000; `1536B` behaves as 1500; decimal-round values like `3kB`/`1TB`
+  compare exactly. Zero-valued literals are unserveable (`0KB` → 400
+  `binary literal has no digits` on the default config, an internal
+  retry-storm 500 under the comparison config; the error names `0B`, a
+  spelling the query never contained). The CONSISTENT explanation — not
+  traced end to end, stated as such — is the threshold's render
+  round-trip: `BytesLabelFilter::String` renders the parsed value
+  through `humanize.Bytes` with spaces stripped
+  (`pkg/logql/log/label_filter.go`), whose 1-decimal SI output ("1.0kB",
+  "0B") matches every measured quantization step and every observed
+  error spelling exactly. The measurements are the pinned facts; the
+  mechanism is the reading they support.
+- **PulsusDB behaviour:** the ENGINE-exact threshold — `1KiB` is 1024,
+  every accepted literal compares at its parsed value. Zero-valued
+  literals are REJECTED (both engines reject; parity, not divergence).
+- **Why deliberate:** the reference disagrees with itself — it documents
+  and parses `1KiB` as 1024, and the value it then compares against is
+  measurably 1000. That is
+  display-precision corruption of a comparison value, the
+  head-of-group class (`variants-nonconforming-shape-status`): we match
+  the reference's consistent branch (its own engine), never the
+  corruption. Gated by `b8_byte_parity.test`'s 1KiB boundary row, which
+  is header-marked as this PINNED divergence and NOT a container
+  capture (issue #350's provenance discipline).
+
 ## Issue #236 — high-cardinality aggregations: the result-size cap
 
 - **(a) Result-series cap semantics.** *Reference:* `querier.max-query-series`

@@ -69,6 +69,11 @@ struct Probe {
     /// naming the issue that did it.
     #[serde(default)]
     closed_by: Option<u32>,
+    /// The divergence class the probe belonged to before it was closed —
+    /// an agreement may not carry `class`, so the closure records it here
+    /// (added with Stage A; the wave-1 D2 closures predate the field).
+    #[serde(default)]
+    closed_class: Option<String>,
 }
 
 /// A probe both implementations accept and parse *differently*. `pulsus_parse`
@@ -107,12 +112,21 @@ struct ClosedMeaningProbe {
 /// twenty probes flipped reject→accept, so `AGREE` 176 + 20 = 196 and
 /// `DIVERGE` 45 − 20 = 25; no agreement became a divergence. D8/D9/D10/D11
 /// are meaning-only and carry no accept-surface probe, so they move
-/// `MEANING` 7 − 4 = 3 and leave the probe counts alone. The remaining 25
-/// are D1 (7), D3 (7), D4 (4), D5 (2), D6 (1), D7 (4) — the
-/// field-expression regrammar.
+/// `MEANING` 7 − 4 = 3 and leave the probe counts alone.
+///
+/// Stage A (#335): [`accepts`] became `parse ∘ validate` to match what the
+/// reference verdict measures, flipping exactly two D1 probes
+/// (`{ !name + 1 = 2 }`, `{ !name * 2 = 3 }`) diverge→agree — our
+/// validator already rejects them; only the scoreboard scored parse alone
+/// — so `AGREE` 196 + 2 = 198 and `DIVERGE` 25 − 2 = 23, with no probe
+/// moving agree→diverge
+/// ([`stage_a_flipped_exactly_the_two_recorded_d1_probes`] shows the flip
+/// rather than inferring it from these counts). The remaining 23 are
+/// D1 (5), D3 (7), D4 (4), D5 (2), D6 (1), D7 (4) — the field-expression
+/// regrammar.
 const TOTAL: usize = 221;
-const AGREE: usize = 196;
-const DIVERGE: usize = 25;
+const AGREE: usize = 198;
+const DIVERGE: usize = 23;
 const MEANING: usize = 3;
 const CLOSED_MEANING: usize = 4;
 
@@ -125,8 +139,16 @@ fn matrix() -> Matrix {
     serde_json::from_str(&raw).expect("matrix.json must parse")
 }
 
+/// Our side of the scoreboard: `parse ∘ validate` (Stage A of #335). The
+/// `reference` verdict this is scored against is an HTTP status from a
+/// route that runs the reference's parse AND its semantic validation, so
+/// scoring our side as `parse` alone compared two different measurements
+/// — a query our validator already rejects was counted as an accept.
 fn accepts(query: &str) -> bool {
-    pulsus_traceql::parse(query).is_ok()
+    match pulsus_traceql::parse(query) {
+        Ok(ast) => pulsus_traceql::validate(&ast).is_ok(),
+        Err(_) => false,
+    }
 }
 
 #[test]
@@ -184,6 +206,18 @@ fn every_divergence_carries_a_class_and_every_class_is_used() {
             ),
             ("agree", Some(c)) => panic!("{:?}: an agreement must not carry class {c}", p.query),
             _ => {}
+        }
+        if let Some(cc) = &p.closed_class {
+            assert!(
+                declared.contains(&cc.as_str()),
+                "{:?}: undeclared closed_class {cc}",
+                p.query
+            );
+            assert!(
+                p.closed_by.is_some() && p.verdict == "agree",
+                "{:?}: closed_class requires a closure on an agreeing probe",
+                p.query
+            );
         }
     }
     for mp in &m.meaning_probes {
@@ -289,6 +323,61 @@ fn agreement_and_divergence_counts_are_pinned() {
         45,
         "closed + still-diverging must equal the audit capture's 45 divergences"
     );
+}
+
+/// Stage A of #335, SHOWN rather than inferred from the counts: the old
+/// verdict (parse alone accepts) and the new one (parse ∘ validate
+/// rejects) are both asserted for the two flipped probes, and the flip
+/// set is pinned exactly — over the whole matrix, `parse` and
+/// `parse ∘ validate` disagree on precisely these two class-D1 probes,
+/// so nothing else moved in either direction, per probe rather than in
+/// aggregate.
+#[test]
+fn stage_a_flipped_exactly_the_two_recorded_d1_probes() {
+    const FLIPPED: [&str; 2] = ["{ !name + 1 = 2 }", "{ !name * 2 = 3 }"];
+    for q in FLIPPED {
+        // The OLD verdict: parse alone accepts — this is what the
+        // scoreboard used to score, and why these diverged.
+        let ast = pulsus_traceql::parse(q).unwrap_or_else(|e| {
+            panic!("{q:?}: the pre-Stage-A verdict (parse accepts) broke: {e}")
+        });
+        // The NEW verdict: validation rejects, agreeing with the
+        // reference's recorded reject.
+        assert!(
+            pulsus_traceql::validate(&ast).is_err(),
+            "{q:?}: the post-Stage-A verdict (validate rejects) broke"
+        );
+    }
+    let m = matrix();
+    let flipped_now: Vec<&str> = m
+        .accept_surface_probes
+        .iter()
+        .filter(|p| pulsus_traceql::parse(&p.query).is_ok() != accepts(&p.query))
+        .map(|p| p.query.as_str())
+        .collect();
+    assert_eq!(
+        flipped_now, FLIPPED,
+        "the parse-vs-validate flip set moved — Stage A's claim was exactly these two"
+    );
+    for q in FLIPPED {
+        let p = m
+            .accept_surface_probes
+            .iter()
+            .find(|p| p.query == q)
+            .expect("flipped probe present");
+        assert_eq!(p.reference, "reject", "{q:?}");
+        assert_eq!(
+            p.pulsus, "reject",
+            "{q:?}: recorded verdict must be the new one"
+        );
+        assert_eq!(p.verdict, "agree", "{q:?}: must not still diverge");
+        assert_eq!(p.closed_by, Some(335), "{q:?}: closure must name the issue");
+        assert_eq!(
+            p.closed_class.as_deref(),
+            Some("D1"),
+            "{q:?}: closure must name the class it closed"
+        );
+    }
 }
 
 /// Closure is proved, not asserted: our parse of the bare query must equal

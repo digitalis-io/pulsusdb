@@ -2199,7 +2199,7 @@ fn classify_numeric_literal(lit: &NumericLiteral) -> Result<(UnitKind, f64), Pip
         NumericLiteral::DurationOrBytes(raw) => {
             if let Some(secs) = parse_duration_seconds(raw) {
                 Ok((UnitKind::Duration, secs))
-            } else if let Some(bytes) = parse_bytes_value(raw) {
+            } else if let Some(bytes) = parse_query_bytes_literal(raw) {
                 Ok((UnitKind::Bytes, bytes))
             } else {
                 Err(PipelineError::BadParserExpr(format!(
@@ -2312,6 +2312,68 @@ pub(crate) fn parse_duration_seconds(raw: &str) -> Option<f64> {
 /// `lastDigit` counts RUNES, so any non-ASCII digit yields a mangled prefix
 /// that Go's ASCII `strconv.ParseFloat` rejects — behaviorally identical to
 /// rejecting it here (both engines reject; #226 v5 Finding B).
+/// The byte-unit suffixes the reference accepts in QUERY TEXT — exactly
+/// the 21 observable spellings, case-sensitive (issue #350, probed
+/// exhaustively on BOTH grafana/loki:3.7.3 and :3.7.4 — every case
+/// variant of every humanize-table suffix; the two versions agree).
+/// This is a strict subset of the humanize table [`parse_bytes_value`]
+/// accepts for LABEL VALUES, because the reference's LEXER gates the
+/// suffix runes to `B i k K M G T P` (`isBytesSizeRune`,
+/// `pkg/logql/syntax/lex.go`) BEFORE `humanize.ParseBytes` runs:
+/// * lowercase `b`, `m`, `g`, `t`, `p`, `e` are not size runes, so
+///   `1b`/`1kb`/`1mb`/`1gb`/`1tb`/`1pb`/`1eb` all reject (`1m` etc. are
+///   DURATIONS — [`classify_numeric_literal`] tries duration first);
+/// * the `P` and `E` tiers are dead in practice even where the rune
+///   table admits them: Go's number scanner consumes `1P…`/`1E…` as
+///   hex-float/scientific exponent forms and errors first (probed:
+///   `'P' exponent requires hexadecimal mantissa` / `exponent has no
+///   digits` on both versions) — no peta, no exa.
+const QUERY_BYTES_SUFFIXES: &[&str] = &[
+    "B", "K", "KB", "Ki", "KiB", "k", "kB", "ki", "kiB", "M", "MB", "Mi", "MiB", "G", "GB", "Gi",
+    "GiB", "T", "TB", "Ti", "TiB",
+];
+
+/// Parses a QUERY-side byte literal (a label-filter RHS such as
+/// `| size >= 1KiB`) to f64 bytes, matching the reference's accepted
+/// set exactly (issue #350):
+/// * the suffix must be one of the 21 [`QUERY_BYTES_SUFFIXES`]
+///   spellings, case-sensitive — everything else (`1b`, `1kb`, `1pb`,
+///   `1024b`, `KIB`, …) is the reference's parse-time 400, surfaced
+///   here as the `neither a duration nor a bytes quantity` rejection;
+/// * fractional mantissas are legal (`1.5KiB`, `1.KiB`, `.5KiB` —
+///   probed 200), commas/spaces are not (the lexer never admits them
+///   into one token, matching the reference);
+/// * a value at or past `math.MaxUint64` rejects
+///   (`999999999TiB` — probed 400), via [`parse_bytes_value`]'s
+///   overflow guard;
+/// * a ZERO-valued literal rejects (`0B`, `0KB`, `0.5B` → truncated 0 —
+///   probed on both versions/both configs: the reference's frontend
+///   re-renders the threshold via `humanize.Bytes(0)` = `0B`, whose
+///   re-parse fails `binary literal has no digits`, a clean 400 on the
+///   default config and a retry-storm 500 under the comparison config —
+///   both-reject either way).
+///
+/// LABEL-VALUE conversion deliberately keeps the FULL case-insensitive
+/// humanize table ([`parse_bytes_value`], unchanged): the reference
+/// converts values with `humanize.ParseBytes` directly, so `size=1eb`
+/// as DATA still reads as 1e18 while `>= 1eb` as QUERY TEXT rejects.
+pub(crate) fn parse_query_bytes_literal(raw: &str) -> Option<f64> {
+    let num_end = raw
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(raw.len());
+    let suffix = &raw[num_end..];
+    if !QUERY_BYTES_SUFFIXES.contains(&suffix) {
+        return None;
+    }
+    let bytes = parse_bytes_value(raw)?;
+    // The zero-valued rejection (see above). `parse_bytes_value`
+    // truncates toward zero, so `0.5B` is 0 here, as upstream.
+    if bytes == 0.0 {
+        return None;
+    }
+    Some(bytes)
+}
+
 pub(crate) fn parse_bytes_value(raw: &str) -> Option<f64> {
     let num_end = raw
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))
@@ -3817,6 +3879,119 @@ mod tests {
             parse_bytes_value("15eib"),
             Some(15.0 * 1_152_921_504_606_846_976.0)
         );
+    }
+
+    /// Issue #350 — the QUERY-side literal parser accepts EXACTLY the
+    /// reference's 21 spellings (probed exhaustively on both v3.7.3 and
+    /// v3.7.4), case-sensitive, at their humanize values.
+    #[test]
+    fn query_bytes_literal_accepts_exactly_the_reference_21_spellings() {
+        let expected: &[(&str, f64)] = &[
+            ("B", 1.0),
+            ("k", 1e3),
+            ("kB", 1e3),
+            ("ki", 1024.0),
+            ("kiB", 1024.0),
+            ("K", 1e3),
+            ("KB", 1e3),
+            ("Ki", 1024.0),
+            ("KiB", 1024.0),
+            ("M", 1e6),
+            ("MB", 1e6),
+            ("Mi", 1024.0 * 1024.0),
+            ("MiB", 1024.0 * 1024.0),
+            ("G", 1e9),
+            ("GB", 1e9),
+            ("Gi", 1024.0 * 1024.0 * 1024.0),
+            ("GiB", 1024.0 * 1024.0 * 1024.0),
+            ("T", 1e12),
+            ("TB", 1e12),
+            ("Ti", 1024.0f64.powi(4)),
+            ("TiB", 1024.0f64.powi(4)),
+        ];
+        assert_eq!(expected.len(), 21);
+        for (suf, factor) in expected {
+            assert_eq!(
+                parse_query_bytes_literal(&format!("2{suf}")),
+                Some(2.0 * factor),
+                "2{suf}"
+            );
+        }
+        // Every OTHER case variant of every humanize suffix rejects
+        // (the probed complement): representative members of each
+        // rejected class.
+        // Includes every spelling the pre-#350 case_folding census
+        // carried as a false "version difference" — their end-to-end
+        // rejection is decided HERE, the layer that census cannot see.
+        for raw in [
+            "1b", "1kb", "1Kb", "1kib", "1Kib", "1KIB", "1KIb", "1kI", "1m", "1mb", "1mB", "1Mb",
+            "1mi", "1mib", "1g", "1gb", "1gi", "1gib", "1t", "1tb", "1ti", "1tib", "1p", "1pb",
+            "1pi", "1pib", "1P", "1PB", "1Pi", "1PiB", "1e", "1eb", "1ei", "1eib", "1E", "1EB",
+            "1Ei", "1EiB", "1xb", "1BB", "1iB",
+        ] {
+            assert_eq!(parse_query_bytes_literal(raw), None, "{raw}");
+        }
+    }
+
+    /// Issue #350 — the probed query-literal edges: fractional mantissas
+    /// accept; zero-valued literals (including fractions truncating to
+    /// zero) reject; overflow rejects; comma/space shapes reject.
+    #[test]
+    fn query_bytes_literal_edges_match_the_probed_reference() {
+        // Fractional forms — probed 200.
+        assert_eq!(parse_query_bytes_literal("1.5KiB"), Some(1_536.0));
+        assert_eq!(parse_query_bytes_literal("1.KiB"), Some(1_024.0));
+        assert_eq!(parse_query_bytes_literal(".5KiB"), Some(512.0));
+        assert_eq!(parse_query_bytes_literal("01B"), Some(1.0));
+        assert_eq!(
+            parse_query_bytes_literal("17TiB"),
+            Some(17.0 * 1024.0f64.powi(4))
+        );
+        // Zero-valued — probed 400 on both versions (the reference's
+        // frontend re-renders the threshold as `0B` and cannot re-parse
+        // its own rendering).
+        for raw in ["0B", "0KB", "0KiB", "0k", "0Ti", "0.5B", ".5B"] {
+            assert_eq!(parse_query_bytes_literal(raw), None, "{raw}");
+        }
+        // Overflow — probed 400 (`unexpected $end` after the lexer
+        // refuses the token).
+        assert_eq!(parse_query_bytes_literal("999999999TiB"), None);
+        // Comma/space shapes — probed 400 (never one token upstream;
+        // never one token in our lexer either — belt and braces here).
+        for raw in ["1,024B", "1 KiB", "3 kB", "1KiB2", "1B1B"] {
+            assert_eq!(parse_query_bytes_literal(raw), None, "{raw}");
+        }
+        // The VALUE-side parser deliberately still takes the full
+        // humanize table — the split IS the reference's behaviour.
+        assert_eq!(parse_bytes_value("1kb"), Some(1_000.0));
+        assert_eq!(parse_bytes_value("1eb"), Some(1e18));
+        assert_eq!(parse_bytes_value("0KB"), Some(0.0));
+    }
+
+    /// Issue #350 — the classify seam: a rejected query spelling is the
+    /// named literal rejection (never a silent 0 and never the old
+    /// humanize acceptance), a duration keeps winning the ambiguous
+    /// spellings (`1m` is a minute, never a megabyte), and accepted
+    /// byte spellings classify as bytes.
+    #[test]
+    fn classify_routes_query_byte_literals_through_the_strict_set() {
+        match classify_numeric_literal(&NumericLiteral::DurationOrBytes("1KiB".to_string())) {
+            Ok((UnitKind::Bytes, v)) => assert_eq!(v, 1024.0),
+            other => panic!("expected bytes 1024, got {other:?}"),
+        }
+        match classify_numeric_literal(&NumericLiteral::DurationOrBytes("1m".to_string())) {
+            Ok((UnitKind::Duration, v)) => assert_eq!(v, 60.0),
+            other => panic!("expected duration 60s, got {other:?}"),
+        }
+        for raw in ["1b", "1kb", "1pb", "1024b", "0B"] {
+            match classify_numeric_literal(&NumericLiteral::DurationOrBytes(raw.to_string())) {
+                Err(PipelineError::BadParserExpr(msg)) => assert!(
+                    msg.contains("is neither a duration nor a bytes quantity"),
+                    "{raw}: {msg}"
+                ),
+                other => panic!("{raw}: expected the literal rejection, got {other:?}"),
+            }
+        }
     }
 
     #[test]
