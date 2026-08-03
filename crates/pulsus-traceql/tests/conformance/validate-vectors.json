@@ -422,15 +422,70 @@
    "pulsus": "accept"
   },
   {
+   "id": "reop-a1",
+   "check": "invalid-regex-operand",
+   "query": "{ .a =~ \"x\" }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "reop-r1",
+   "check": "invalid-regex-operand",
+   "query": "{ .a =~ .b }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "invalid-regex-operand"
+  },
+  {
+   "id": "bool-a1",
+   "check": "spanset-filter-not-boolean",
+   "query": "{ .a }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "bool-r1",
+   "check": "spanset-filter-not-boolean",
+   "query": "{ name }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "spanset-filter-not-boolean"
+  },
+  {
+   "id": "unop-a1",
+   "check": "illegal-unary-operator",
+   "query": "{ !.a }",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "unop-r1",
+   "check": "illegal-unary-operator",
+   "query": "{ !name }",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "illegal-unary-operator"
+  },
+  {
    "id": "nil-d1",
    "check": "intrinsic-not-nil",
    "query": "{ !(name != nil) }",
    "route": "search-query",
    "tempo_status": 200,
    "tempo": "accept",
-   "pulsus": "reject",
-   "error_variant": "intrinsic-not-nil",
-   "divergence": "traceql-validate-nil-spelling-conflation"
+   "pulsus": "accept"
   },
   {
    "id": "nil-d2",
@@ -439,9 +494,7 @@
    "route": "search-query",
    "tempo_status": 200,
    "tempo": "accept",
-   "pulsus": "reject",
-   "error_variant": "intrinsic-not-nil",
-   "divergence": "traceql-validate-nil-spelling-conflation"
+   "pulsus": "accept"
   },
   {
    "id": "q-r1",

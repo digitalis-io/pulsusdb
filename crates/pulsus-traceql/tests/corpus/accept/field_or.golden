@@ -3,25 +3,39 @@ Query {
         SpansetFilter {
             body: Some(
                 Binary {
-                    op: Or,
-                    lhs: Comparison {
-                        field: Attribute {
-                            scope: Unscoped,
-                            key: "a",
-                        },
-                        op: Eq,
-                        value: Number(
-                            "1",
+                    op: Bool(
+                        Or,
+                    ),
+                    lhs: Binary {
+                        op: Cmp(
+                            Eq,
+                        ),
+                        lhs: Field(
+                            Attribute {
+                                scope: Unscoped,
+                                key: "a",
+                            },
+                        ),
+                        rhs: Literal(
+                            Number(
+                                "1",
+                            ),
                         ),
                     },
-                    rhs: Comparison {
-                        field: Attribute {
-                            scope: Unscoped,
-                            key: "b",
-                        },
-                        op: Eq,
-                        value: Number(
-                            "2",
+                    rhs: Binary {
+                        op: Cmp(
+                            Eq,
+                        ),
+                        lhs: Field(
+                            Attribute {
+                                scope: Unscoped,
+                                key: "b",
+                            },
+                        ),
+                        rhs: Literal(
+                            Number(
+                                "2",
+                            ),
                         ),
                     },
                 },

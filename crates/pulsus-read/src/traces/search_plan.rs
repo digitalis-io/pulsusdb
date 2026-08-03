@@ -17,8 +17,8 @@ use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{
-    self, ArithNode, AttrProbe, CompareOperand, LeafEval, NestedSetField, PhysicalPredicate,
-    PlanError, SpanFilterCtx, TraceCtxPred,
+    self, ArithNode, AttrProbe, BoolMatch, CompareOperand, LeafEval, NestedSetField,
+    PhysicalPredicate, PlanError, SpanFilterCtx, TraceCtxPred,
 };
 use super::search_sql;
 
@@ -162,6 +162,24 @@ pub(crate) enum PlannedOperand {
     Attr { str_idx: usize, num_idx: usize },
 }
 
+/// Renders a [`CompareOperand`] as the user wrote it, for the `!`
+/// type-failure message. The reference names the operand too
+/// (`expression (!.a) expected a boolean`), and "the attribute" is no use
+/// to anyone whose query mentions several.
+fn compare_operand_display(operand: &CompareOperand) -> String {
+    match operand {
+        CompareOperand::Name => "name".to_string(),
+        CompareOperand::Service => "resource.service.name".to_string(),
+        CompareOperand::Duration => "duration".to_string(),
+        CompareOperand::Status => "status".to_string(),
+        CompareOperand::Kind => "kind".to_string(),
+        CompareOperand::Attr { key, scope } => match scope {
+            Some(scope) => format!("{scope}.{key}"),
+            None => format!(".{key}"),
+        },
+    }
+}
+
 /// One planned leaf — pre-order within its spanset filter, exactly the
 /// traversal `search_eval` replays.
 #[derive(Debug, Clone)]
@@ -179,6 +197,21 @@ pub(crate) enum PlannedLeafEval {
         field: NestedSetField,
         op: ComparisonOp,
         value: f64,
+    },
+    /// The operand of a `!` (issue #335 Stage B) — `{ !.a }`,
+    /// `{ !.a = true }`, `{ !.a = 1 }` — evaluated from the operand's
+    /// resolved VALUE so absent (no match) and present-non-boolean (whole
+    /// query fails) stay distinguishable. `{ .a }` is NOT here: it is the
+    /// plain comparison `.a = true`.
+    BoolTruth {
+        operand: PlannedOperand,
+        want: BoolMatch,
+        /// The operand as the user wrote it (`.a`, `span.a`, `name`), for
+        /// the type-failure message. Rendered HERE because
+        /// `PlannedOperand::Attr` keeps only batch indices — the key is
+        /// still in scope at plan time and gone by evaluation. Built once
+        /// per leaf per query, never per span.
+        display: String,
     },
     /// A field-vs-field comparison (issue #183 `comparison.rhs_attribute`),
     /// evaluated per candidate span from both operands' resolved values.
@@ -1228,6 +1261,11 @@ pub fn plan_search(
                         value: *value,
                     }
                 }
+                LeafEval::BoolTruth { operand, want } => PlannedLeafEval::BoolTruth {
+                    display: compare_operand_display(operand),
+                    operand: plan_operand(operand, &mut agg_fields, &mut select_attrs),
+                    want: *want,
+                },
                 LeafEval::FieldCompare { lhs, rhs, op } => PlannedLeafEval::FieldCompare {
                     lhs: plan_operand(lhs, &mut agg_fields, &mut select_attrs),
                     rhs: plan_operand(rhs, &mut agg_fields, &mut select_attrs),

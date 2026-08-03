@@ -3,28 +3,41 @@ Query {
         SpansetFilter {
             body: Some(
                 Binary {
-                    op: And,
+                    op: Bool(
+                        And,
+                    ),
                     lhs: Binary {
-                        op: And,
-                        lhs: Comparison {
-                            field: Intrinsic(
-                                NestedSetParent,
+                        op: Bool(
+                            And,
+                        ),
+                        lhs: Binary {
+                            op: Cmp(
+                                Lt,
                             ),
-                            op: Lt,
-                            value: Number(
-                                "0",
+                            lhs: Field(
+                                Intrinsic(
+                                    NestedSetParent,
+                                ),
+                            ),
+                            rhs: Literal(
+                                Number(
+                                    "0",
+                                ),
                             ),
                         },
-                        rhs: BoolStatic(
-                            true,
+                        rhs: Literal(
+                            Bool(
+                                true,
+                            ),
                         ),
                     },
-                    rhs: Exists(
-                        Attribute {
+                    rhs: Exists {
+                        field: Attribute {
                             scope: Resource,
                             key: "service.name",
                         },
-                    ),
+                        negated: false,
+                    },
                 },
             ),
         },

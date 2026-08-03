@@ -4,14 +4,20 @@ Query {
         lhs: Filter(
             SpansetFilter {
                 body: Some(
-                    Comparison {
-                        field: Attribute {
-                            scope: Unscoped,
-                            key: "a",
-                        },
-                        op: Eq,
-                        value: Number(
-                            "1",
+                    Binary {
+                        op: Cmp(
+                            Eq,
+                        ),
+                        lhs: Field(
+                            Attribute {
+                                scope: Unscoped,
+                                key: "a",
+                            },
+                        ),
+                        rhs: Literal(
+                            Number(
+                                "1",
+                            ),
                         ),
                     },
                 ),
@@ -20,14 +26,20 @@ Query {
         rhs: Filter(
             SpansetFilter {
                 body: Some(
-                    Comparison {
-                        field: Attribute {
-                            scope: Unscoped,
-                            key: "b",
-                        },
-                        op: Eq,
-                        value: Number(
-                            "2",
+                    Binary {
+                        op: Cmp(
+                            Eq,
+                        ),
+                        lhs: Field(
+                            Attribute {
+                                scope: Unscoped,
+                                key: "b",
+                            },
+                        ),
+                        rhs: Literal(
+                            Number(
+                                "2",
+                            ),
                         ),
                     },
                 ),

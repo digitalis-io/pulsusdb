@@ -1,9 +1,9 @@
 {
-  "WIRE_AGREE_BASELINE": 161,
-  "WIRE_DIVERGE_BASELINE": 60,
+  "WIRE_AGREE_BASELINE": 177,
+  "WIRE_DIVERGE_BASELINE": 44,
   "wire_baseline": [
     {
-      "pulsus_wire": "accept",
+      "pulsus_wire": "reject",
       "query": "{ !name = \"foo\" }"
     },
     {
@@ -27,11 +27,11 @@
       "query": "{ !(name = \"foo\") }"
     },
     {
-      "pulsus_wire": "accept",
+      "pulsus_wire": "reject",
       "query": "{ !duration = 1s }"
     },
     {
-      "pulsus_wire": "accept",
+      "pulsus_wire": "reject",
       "query": "{ !status = error }"
     },
     {
@@ -39,7 +39,7 @@
       "query": "{ !span.a = 1 }"
     },
     {
-      "pulsus_wire": "accept",
+      "pulsus_wire": "reject",
       "query": "{ !span:id = \"x\" }"
     },
     {
@@ -59,11 +59,11 @@
       "query": "{ !.a = !.b }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ -.a = 1 }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ -1 = .a }"
     },
     {
@@ -75,7 +75,7 @@
       "query": "{ .a = - 1 }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ -duration = 1s }"
     },
     {
@@ -83,7 +83,7 @@
       "query": "{ .a = -.b }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ - .a = 1 }"
     },
     {
@@ -91,11 +91,11 @@
       "query": "{ !!.a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ !-.a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ -!.a }"
     },
     {
@@ -279,7 +279,7 @@
       "query": "{ .a + 1 = 2 }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ 2 = .a + 1 }"
     },
     {
@@ -291,11 +291,11 @@
       "query": "{ .a * 2 = .b }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ (.a) = 1 }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ (.a + 1) = 2 }"
     },
     {
@@ -307,7 +307,7 @@
       "query": "{ .a = (1 + 2) }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ 1 = 2 }"
     },
     {
@@ -419,11 +419,11 @@
       "query": "{ 1 + \"x\" = .a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ 2 ^ 3 ^ 2 = .a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ -2 ^ 2 = .a }"
     },
     {

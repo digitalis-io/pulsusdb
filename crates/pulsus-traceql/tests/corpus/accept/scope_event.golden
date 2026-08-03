@@ -2,14 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Attribute {
-                        scope: Event,
-                        key: "exception.type",
-                    },
-                    op: Eq,
-                    value: String(
-                        "IOError",
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Event,
+                            key: "exception.type",
+                        },
+                    ),
+                    rhs: Literal(
+                        String(
+                            "IOError",
+                        ),
                     ),
                 },
             ),

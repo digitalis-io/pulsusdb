@@ -175,70 +175,193 @@ impl fmt::Display for SpansetFilter {
 /// as at the spanset level.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FieldExpr {
-    Comparison {
-        field: Field,
-        op: ComparisonOp,
-        value: Value,
-    },
-    /// `{lhs} op {rhs}` — a field-vs-field comparison (issue #183,
-    /// `comparison.rhs_attribute`): either side an attribute or an
-    /// intrinsic, compared per-span. Regex operators are rejected at parse
-    /// time (a field RHS never carries a regex).
-    FieldCompare {
-        lhs: Field,
-        op: ComparisonOp,
-        rhs: Field,
-    },
-    /// A bare boolean static (`{ true }` / `{ false }` — issue #183,
-    /// `static.bare_boolean`): matches every span or no span.
-    BoolStatic(bool),
-    /// Attribute existence (issue #185, `existence.*`): the span possesses
-    /// the field. The bare-attribute form (`{ .foo }`) and the `!= nil`
-    /// spelling (`{ .a != nil }`) both parse to `Exists`; `{ .a = nil }`
-    /// parses to `Not(Exists)`. Canonical `Display` is the bare form, so
-    /// the round-trip oracle holds.
-    Exists(Field),
-    /// A comparison with an arithmetic operand on either side (issue #185,
-    /// `arith.*`): `{ .a = 1 + 2 }`, `{ .a = -1 }`, `{ duration * 2 > 1s }`.
-    /// The parser only routes here when an arithmetic operator (`+ - * / %
-    /// ^`) or a unary minus is present, so the frozen literal/field
-    /// comparison goldens do not churn. `Display` fully parenthesizes.
-    ArithCompare {
-        lhs: Operand,
-        op: ComparisonOp,
-        rhs: Operand,
-    },
-    /// Unary field negation (`!(.a = 1)`, `!.a` — issue #183,
-    /// `logic.not`): the per-span boolean inverse of the inner expression.
-    /// `Display` fully parenthesizes the inner so the round-trip oracle
-    /// holds.
-    Not(Box<FieldExpr>),
+    /// A bare field in expression position (`{ .a }`, `{ name }`).
+    ///
+    /// **Truthiness, not presence** (issue #335 Stage B, D12 capture):
+    /// the reference matches a span only when the value *is* `true`.
+    /// PulsusDB used to parse this to `Exists`, which is a different
+    /// question — `{ .a }` and `{ .a != nil }` are not the same query.
+    Field(Field),
+    /// A literal in expression position (`{ true }`, and every
+    /// comparison operand).
+    Literal(Value),
+    /// `{ .a != nil }` (`negated: false` — presence) and `{ .a = nil }`
+    /// (`negated: true` — absence).
+    ///
+    /// A distinct node with the negation ON it, so both spellings render
+    /// as themselves. They must: their meanings split (D12), so a shared
+    /// canonical rendering would break the round-trip by construction.
+    /// `negated: true` keeps PulsusDB's coherent absence semantics — the
+    /// reference's `= nil` was only half characterisable (ledger row
+    /// `traceql-eq-nil-uncharacterised`).
+    Exists { field: Field, negated: bool },
+    /// `!expr` (boolean NOT) and `-expr` (arithmetic negation).
+    Unary { op: UnaryOp, expr: Box<FieldExpr> },
+    /// Every infix operator — logical, comparison and arithmetic — in one
+    /// node. The collapse (issue #335 Stage B): one precedence climb
+    /// replaces the former `Comparison`/`FieldCompare`/`ArithCompare`
+    /// split, which encoded operand *shape* in the node kind and so
+    /// needed lookahead to choose between them.
     Binary {
-        op: BoolOp,
+        op: FieldOp,
         lhs: Box<FieldExpr>,
         rhs: Box<FieldExpr>,
     },
 }
 
+/// A prefix operator (issue #335 Stage B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    /// `!` — boolean NOT. Matches only where the operand is `false`;
+    /// absent never matches, and a non-boolean operand fails the whole
+    /// query (D12 capture: `expression (!.a) expected a boolean`).
+    Not,
+    /// `-` — arithmetic negation.
+    Neg,
+}
+
+impl fmt::Display for UnaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            UnaryOp::Not => "!",
+            UnaryOp::Neg => "-",
+        })
+    }
+}
+
+/// Every infix field operator, in one enum so one climb parses them all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldOp {
+    Bool(BoolOp),
+    Cmp(ComparisonOp),
+    Arith(ArithOp),
+}
+
+impl FieldOp {
+    /// Binding power, loosest first — the reference's precedence:
+    /// `&&`/`||` (one level) < comparison < `+ -` < unary < `* / %` < `^`.
+    /// Unary sits between `+ -` and `* / %`, which is unusual and is the
+    /// reference's own ordering, not a simplification.
+    pub fn binding_power(self) -> u8 {
+        match self {
+            FieldOp::Bool(_) => 1,
+            FieldOp::Cmp(_) => 2,
+            FieldOp::Arith(ArithOp::Add | ArithOp::Sub) => 3,
+            FieldOp::Arith(ArithOp::Mul | ArithOp::Div | ArithOp::Mod) => 5,
+            FieldOp::Arith(ArithOp::Pow) => 6,
+        }
+    }
+
+    /// `^` is RIGHT-associative; every other level is left-associative.
+    ///
+    /// Established STRUCTURALLY against the pinned reference, without any
+    /// model of what `^` computes (issue #335 Stage B). The inner folds
+    /// are `2^3` -> 9 and `3^2` -> 8, so the two candidate groupings
+    /// reduce to different single operations:
+    ///
+    /// | query | reference |
+    /// |---|---|
+    /// | `2 ^ 3 ^ 2` | **64** |
+    /// | `9 ^ 2` (the LEFT grouping's second step) | 512 |
+    /// | `2 ^ 8` (the RIGHT grouping's second step) | **64** |
+    ///
+    /// `2 ^ 3 ^ 2` equals `2 ^ 8`, so the reference groups right.
+    ///
+    /// **Do not "correct" this from the value 64 alone.** The matrix's
+    /// D9 row recorded `2 ^ 3 ^ 2 = 64` and derived "left-associative"
+    /// from it; that derivation is wrong, because the reference reaches
+    /// 64 via right grouping AND an operand-swapping integer `^`
+    /// (ledger `traceql-pow-integer-operand-swap`). Two errors cancelled.
+    /// The value is evidence of nothing about grouping on its own.
+    pub fn is_right_assoc(self) -> bool {
+        matches!(self, FieldOp::Arith(ArithOp::Pow))
+    }
+
+    /// Whether this operator yields a boolean (logical and comparison
+    /// operators do; arithmetic operators do not).
+    pub fn is_boolean_valued(self) -> bool {
+        !matches!(self, FieldOp::Arith(_))
+    }
+}
+
+/// The prefix binding power of `!`/`-` — between `+ -` and `* / %`.
+pub const UNARY_BINDING_POWER: u8 = 4;
+
+impl fmt::Display for FieldOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FieldOp::Bool(op) => write!(f, "{op}"),
+            FieldOp::Cmp(op) => write!(f, "{op}"),
+            FieldOp::Arith(op) => write!(f, "{op}"),
+        }
+    }
+}
+
+/// Renders a comparison operand, dropping the parens an ARITHMETIC node
+/// would otherwise write at its outermost position.
+///
+/// Comparison binds looser than every arithmetic operator, so the top
+/// level of an operand needs no wrapping parens to reparse — `{ .a = 2 - 1 }`
+/// renders as itself rather than `{ .a = (2 - 1) }`. Exactly one level is
+/// stripped; nested arithmetic keeps its parens (`1 + (2 * 3)`), which is
+/// how the pre-collapse `fmt_operand_bare` behaved and what the frozen
+/// goldens hold.
+///
+/// This is rendering fidelity, not cosmetics: a gratuitous paren makes
+/// every future golden diff noisier for no gain, and the reference's own
+/// echo parenthesizes sub-expressions only.
+fn fmt_comparison_operand(f: &mut fmt::Formatter<'_>, operand: &FieldExpr) -> fmt::Result {
+    match operand {
+        FieldExpr::Binary {
+            op: FieldOp::Arith(op),
+            lhs,
+            rhs,
+        } => write!(f, "{lhs} {op} {rhs}"),
+        other => write!(f, "{other}"),
+    }
+}
+
 impl fmt::Display for FieldExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FieldExpr::Comparison { field, op, value } => write!(f, "{field} {op} {value}"),
-            FieldExpr::FieldCompare { lhs, op, rhs } => write!(f, "{lhs} {op} {rhs}"),
-            FieldExpr::BoolStatic(b) => write!(f, "{b}"),
-            FieldExpr::Exists(field) => write!(f, "{field}"),
-            FieldExpr::ArithCompare { lhs, op, rhs } => {
-                // The comparison operator binds looser than every arithmetic
-                // operator, so the outermost operand needs no wrapping parens
-                // (which would otherwise reparse as a grouped field
-                // expression). Inner operands keep their parens via
-                // `Operand`'s own `Display`.
-                fmt_operand_bare(f, lhs)?;
-                write!(f, " {op} ")?;
-                fmt_operand_bare(f, rhs)
+            FieldExpr::Field(field) => write!(f, "{field}"),
+            FieldExpr::Literal(value) => write!(f, "{value}"),
+            // The nil spellings render as themselves. Not cosmetic: their
+            // meanings differ, so a shared rendering could not round-trip.
+            FieldExpr::Exists { field, negated } => {
+                let op = if *negated { "=" } else { "!=" };
+                write!(f, "{field} {op} nil")
             }
-            FieldExpr::Not(inner) => write!(f, "!({inner})"),
-            FieldExpr::Binary { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
+            // `!` parenthesizes its operand (as `Not` did); `-` does not
+            // (as `Operand::Neg` did).
+            FieldExpr::Unary { op, expr } => match op {
+                UnaryOp::Not => write!(f, "!({expr})"),
+                UnaryOp::Neg => write!(f, "-{expr}"),
+            },
+            // **Rendering is keyed on operator CLASS, so every query whose
+            // grouping did not change renders byte-identically** and the
+            // 63 SQL goldens take zero edits:
+            //   comparison  -> bare, as `Comparison`/`ArithCompare` did
+            //   `&&`/`||`   -> parenthesized, as `Binary` did
+            //   arithmetic  -> parenthesized, as `Operand::Arith` did
+            FieldExpr::Binary { op, lhs, rhs } => match op {
+                FieldOp::Bool(BoolOp::And) | FieldOp::Bool(BoolOp::Or) => {
+                    write!(f, "({lhs} {op} {rhs})")
+                }
+                FieldOp::Cmp(ComparisonOp::Eq)
+                | FieldOp::Cmp(ComparisonOp::Neq)
+                | FieldOp::Cmp(ComparisonOp::Gt)
+                | FieldOp::Cmp(ComparisonOp::Gte)
+                | FieldOp::Cmp(ComparisonOp::Lt)
+                | FieldOp::Cmp(ComparisonOp::Lte)
+                | FieldOp::Cmp(ComparisonOp::Re)
+                | FieldOp::Cmp(ComparisonOp::Nre) => {
+                    fmt_comparison_operand(f, lhs)?;
+                    write!(f, " {op} ")?;
+                    fmt_comparison_operand(f, rhs)
+                }
+                _ => write!(f, "({lhs} {op} {rhs})"),
+            },
         }
     }
 }
@@ -282,44 +405,6 @@ impl fmt::Display for ArithOp {
             ArithOp::Pow => "^",
         };
         write!(f, "{s}")
-    }
-}
-
-/// One operand of an [`FieldExpr::ArithCompare`] (issue #185): a field, a
-/// numeric literal (number or duration), a unary negation, or a binary
-/// arithmetic composition. `Display` fully parenthesizes binary nodes and
-/// prefixes negation so the round-trip oracle holds.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Operand {
-    Field(Field),
-    Literal(Value),
-    Neg(Box<Operand>),
-    Arith {
-        op: ArithOp,
-        lhs: Box<Operand>,
-        rhs: Box<Operand>,
-    },
-}
-
-impl fmt::Display for Operand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Operand::Field(field) => write!(f, "{field}"),
-            Operand::Literal(value) => write!(f, "{value}"),
-            Operand::Neg(inner) => write!(f, "-{inner}"),
-            Operand::Arith { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
-        }
-    }
-}
-
-/// Renders an operand at the outermost position of an
-/// [`FieldExpr::ArithCompare`], where a top-level arithmetic node needs no
-/// wrapping parens (the comparison operator binds looser). Nested operands
-/// still parenthesize via [`Operand`]'s `Display`.
-fn fmt_operand_bare(f: &mut fmt::Formatter<'_>, operand: &Operand) -> fmt::Result {
-    match operand {
-        Operand::Arith { op, lhs, rhs } => write!(f, "{lhs} {op} {rhs}"),
-        other => write!(f, "{other}"),
     }
 }
 
@@ -1297,13 +1382,13 @@ mod tests {
             spanset: SpansetExpr::Filter(SpansetFilter { body: None }),
             pipeline: vec![PipelineStage::Compare {
                 selection: Box::new(SpansetFilter {
-                    body: Some(FieldExpr::Comparison {
-                        field: Field::Attribute {
+                    body: Some(FieldExpr::Binary {
+                        op: FieldOp::Cmp(ComparisonOp::Eq),
+                        lhs: Box::new(FieldExpr::Field(Field::Attribute {
                             scope: AttrScope::Span,
                             key: "http.status_code".to_string(),
-                        },
-                        op: ComparisonOp::Eq,
-                        value: Value::Number("500".to_string()),
+                        })),
+                        rhs: Box::new(FieldExpr::Literal(Value::Number("500".to_string()))),
                     }),
                 }),
                 hints: vec![],
@@ -1334,19 +1419,19 @@ mod tests {
 
     #[test]
     fn spanset_and_field_display_fully_parenthesize_binaries() {
-        let cmp = |key: &str| FieldExpr::Comparison {
-            field: Field::Attribute {
+        let cmp = |key: &str| FieldExpr::Binary {
+            op: FieldOp::Cmp(ComparisonOp::Eq),
+            lhs: Box::new(FieldExpr::Field(Field::Attribute {
                 scope: AttrScope::Unscoped,
                 key: key.to_string(),
-            },
-            op: ComparisonOp::Eq,
-            value: Value::Number("1".to_string()),
+            })),
+            rhs: Box::new(FieldExpr::Literal(Value::Number("1".to_string()))),
         };
         let body = FieldExpr::Binary {
-            op: BoolOp::And,
+            op: FieldOp::Bool(BoolOp::And),
             lhs: Box::new(cmp("a")),
             rhs: Box::new(FieldExpr::Binary {
-                op: BoolOp::Or,
+                op: FieldOp::Bool(BoolOp::Or),
                 lhs: Box::new(cmp("b")),
                 rhs: Box::new(cmp("c")),
             }),

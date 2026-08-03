@@ -37,71 +37,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Issue #335 B0 (plan v7-v10): the wire baseline's freeze gates.
-      # Three checks, one enumeration — who may create the file (no-source
-      # gate, v8), whether it can move afterwards (untouched gate, v7,
-      # three-dot: `A...B` diffs against the merge base and is indifferent
-      # to squash history — do NOT "simplify" this into a `git log` walk),
-      # and that no grammar work lands before the baseline exists
-      # (ordering gate, v9; deliberately the main-TIP form `cat-file -e
-      # origin/main:<file>`, not the merge base — v10). "Against which
-      # tree" is the fourth question, answered by the re-derivation test
-      # `accept_surface_wire.rs`, not by this step. The one PR permitted
-      # to fail the untouched gate is a deliberate re-pin attributed to
-      # #351, which merges with this step red and is reviewed as such.
-      #
-      # The source path set: any file under a `src/` tree in `crates/`
-      # (any depth), any `build.rs` (Cargo auto-detects one in a package
-      # root with NO manifest edit — measured, and pulsus-server already
-      # ships one, so this is an established pattern here, not a
-      # hypothetical), every Cargo.toml, the lockfile, and the toolchain
-      # pin. Why that covers compiled code: a new compilation unit
-      # enters the build through a src tree, a build script, or a
-      # manifest edit — all matched — and dependency/toolchain drift
-      # moves the baseline and every later measurement together, so it
-      # cannot produce a post-change baseline. One clause is EMPIRICAL,
-      # checked at B0 rather than invariant: no ON-ROUTE src file pulls
-      # in anything outside its own src tree by any include mechanism —
-      # `#[path]`, `include!`, `include_str!` and `include_bytes!` were
-      # all swept, and every on-route occurrence targets the file itself
-      # or a sibling under the same src/, which the src clause already
-      # covers. Only an EDIT to an out-of-tree included file could evade
-      # the set, and today's only such includes are OFF-route, named so
-      # a later sweep does not mistake them for missed:
-      # pulsus-server/src/prom_api/encode.rs (fixture pulls via
-      # include_str!) and traces_api/metrics_response.rs (a test-region
-      # include of a sibling test target). Adding the first on-route one
-      # cannot evade it — the include site itself lives under src/.
-      # Deliberately outside the set: `vendor/` sources (its
-      # build scripts ARE matched; today's two vendored crates carry
-      # PromQL parsing and OTLP protos, off the TraceQL route), and
-      # tests/ + fixtures — the measurement apparatus itself, guarded by
-      # the accept-surface suite and its live oracle leg, not this step.
-      - name: Wire-baseline freeze gates (issue 335 B0)
-        run: |
-          set -u
-          BASELINE=crates/pulsus-traceql/tests/accept_surface/wire_baseline.json
-          CHANGED=$(git diff --name-only origin/main...HEAD)
-          SRC=$(printf '%s\n' "$CHANGED" \
-            | grep -E '^crates/.+/src/|(^|/)build\.rs$|^Cargo\.lock$|(^|/)Cargo\.toml$|^rust-toolchain\.toml$' || true)
-          if git cat-file -e origin/main:"$BASELINE" 2>/dev/null; then
-            if [ -n "$(git diff --name-only origin/main...HEAD -- "$BASELINE")" ]; then
-              echo "::error::the frozen wire baseline moved — only a deliberate #351 re-pin may do this, and it merges with this step red"
-              exit 1
-            fi
-          else
-            if printf '%s\n' "$CHANGED" | grep -qx "$BASELINE"; then
-              if [ -n "$SRC" ]; then
-                echo "::error::the wire baseline may only be created by a PR with no source, build-script, manifest or toolchain change (crates/**/src/** at any depth, any build.rs, Cargo.lock, any Cargo.toml, rust-toolchain.toml) — issue 335 B0 no-source gate"
-                exit 1
-              fi
-            fi
-            if [ -n "$SRC" ]; then
-              echo "::error::source change before the wire baseline exists on origin/main — Stage B work may not merge before B0 (issue 335 ordering gate)"
-              exit 1
-            fi
-          fi
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.93.0"
@@ -184,12 +119,62 @@ jobs:
           path: target/test-summary/
           if-no-files-found: ignore
 
+
   # Issue #5: every DDL block in docs/schemas.md must be rendered and
   # executed against a fresh ClickHouse in CI. Single-node 24.8 leg (live
   # migration/MV tests, the `--mode init` create-then-no-op acceptance
   # criterion) plus a negative leg proving the < 24.8 version refusal.
   # Uses the runner's own docker (task-manager resolution #3 on issue #5);
   # local development uses podman against the same runtime-neutral fixtures.
+
+  # Issue #335 B0: the wire baseline's freeze gates, in their OWN job.
+  #
+  # It began as step 3 of `ci`, which was wrong twice over. Its failure
+  # skipped every later step, so a re-pin PR got no fmt, no clippy and no
+  # tests; and because every other job declares `needs: ci`, a red `ci`
+  # also skipped the four e2e/schema jobs. A PR touching the baseline
+  # therefore lost its ENTIRE signal — and the downstream
+  # `no such command: nextest` errors read as infrastructure noise rather
+  # than as this gate firing on exactly the change it was built to catch.
+  #
+  # As its own job it blocks nothing else: `ci` and the e2e legs run and
+  # report normally, and this reports red on its own. A deliberate re-pin
+  # is expected to merge with this job red, by human override. There is
+  # deliberately no opt-out marker — a marker is a box that anyone
+  # editing the baseline quietly would also tick, which is the behaviour
+  # the gate exists to prevent.
+  wire-baseline-freeze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Wire-baseline freeze gates (issue 335 B0)
+        run: |
+          set -u
+          BASELINE=crates/pulsus-traceql/tests/accept_surface/wire_baseline.json
+          CHANGED=$(git diff --name-only origin/main...HEAD)
+          SRC=$(printf '%s\n' "$CHANGED" \
+            | grep -E '^crates/.+/src/|(^|/)build\.rs$|^Cargo\.lock$|(^|/)Cargo\.toml$|^rust-toolchain\.toml$' || true)
+          if git cat-file -e origin/main:"$BASELINE" 2>/dev/null; then
+            if [ -n "$(git diff --name-only origin/main...HEAD -- "$BASELINE")" ]; then
+              echo "::error::the frozen wire baseline moved — only a deliberate #351 re-pin may do this, and it merges with this step red"
+              exit 1
+            fi
+          else
+            if printf '%s\n' "$CHANGED" | grep -qx "$BASELINE"; then
+              if [ -n "$SRC" ]; then
+                echo "::error::the wire baseline may only be created by a PR with no source, build-script, manifest or toolchain change (crates/**/src/** at any depth, any build.rs, Cargo.lock, any Cargo.toml, rust-toolchain.toml) — issue 335 B0 no-source gate"
+                exit 1
+              fi
+            fi
+            if [ -n "$SRC" ]; then
+              echo "::error::source change before the wire baseline exists on origin/main — Stage B work may not merge before B0 (issue 335 ordering gate)"
+              exit 1
+            fi
+          fi
+
   schema-it:
     needs: ci
     runs-on: ubuntu-latest

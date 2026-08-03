@@ -2,14 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Attribute {
-                        scope: Unscoped,
-                        key: "http.status_code",
-                    },
-                    op: Eq,
-                    value: Number(
-                        "200",
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Unscoped,
+                            key: "http.status_code",
+                        },
+                    ),
+                    rhs: Literal(
+                        Number(
+                            "200",
+                        ),
                     ),
                 },
             ),

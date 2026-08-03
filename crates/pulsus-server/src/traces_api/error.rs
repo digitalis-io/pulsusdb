@@ -238,11 +238,25 @@ impl IntoResponse for ApiError {
                 // read_error_parts` and `prom_api::error::read_error_parts`
                 // both map it to 400 `bad_data`, matched exhaustively so
                 // this stays correct rather than merely "impossible
-                // today". Unreachable from `traces_api` (111 `ReadError`
-                // mentions, zero LogQL-class constructions), matched here
-                // so a future call path cannot silently downgrade a 400
-                // into the 500 `internal` catch-all below. `Display` is
+                // today". It WAS unreachable from `traces_api` when this
+                // arm was written, and matching it anyway is why the
+                // #335 Stage B change below landed correctly instead of
+                // falling into the 500 catch-all: TraceQL now constructs
+                // it too, for a present NON-boolean operand under `!`
+                // (`expression (!.a) expected a boolean` — the eval-time
+                // failure the reference reports as well). `Display` is
                 // transparent, so `e.to_string()` is the body, unmodified.
+                //
+                // STATUS DIVERGENCE, deliberate: the reference answers
+                // that query 500, because the failure happens mid-scan
+                // inside its querier. A malformed query is the client's
+                // error, not a server fault, so we keep 400 `bad_data` —
+                // consistent with every other surface carrying this
+                // variant. The accept-surface matrix scores a reference
+                // 500 as INCONCLUSIVE rather than as a rejection, so the
+                // scoreboard is unaffected either way. Pinned end to end
+                // by `traces_search_live::
+                // negation_demands_a_boolean_where_truthiness_tolerates_a_string`.
                 // The other LogQL-only variants stay on the catch-all —
                 // #266 owns that.
                 ReadError::PipelineInvalid { .. } => {

@@ -1,8 +1,0 @@
-UnexpectedToken {
-    found: "'='",
-    expected: "'}'",
-    span: Span {
-        start: 9,
-        end: 10,
-    },
-}

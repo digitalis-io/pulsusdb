@@ -1,0 +1,15 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Field(
+                    Intrinsic(
+                        Name,
+                    ),
+                ),
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}

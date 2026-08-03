@@ -1,6 +1,6 @@
 UnexpectedToken {
     found: "identifier \"bogus\"",
-    expected: "a status ('ok', 'error', or 'unset')",
+    expected: "an intrinsic (name, duration, status, kind) or a scoped attribute (span., resource., or the unscoped . form)",
     span: Span {
         start: 11,
         end: 16,

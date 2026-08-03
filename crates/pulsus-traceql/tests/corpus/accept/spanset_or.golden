@@ -4,13 +4,19 @@ Query {
         lhs: Filter(
             SpansetFilter {
                 body: Some(
-                    Comparison {
-                        field: Intrinsic(
-                            Status,
+                    Binary {
+                        op: Cmp(
+                            Eq,
                         ),
-                        op: Eq,
-                        value: Status(
-                            Error,
+                        lhs: Field(
+                            Intrinsic(
+                                Status,
+                            ),
+                        ),
+                        rhs: Literal(
+                            Status(
+                                Error,
+                            ),
                         ),
                     },
                 ),
@@ -19,14 +25,20 @@ Query {
         rhs: Filter(
             SpansetFilter {
                 body: Some(
-                    Comparison {
-                        field: Intrinsic(
-                            Duration,
+                    Binary {
+                        op: Cmp(
+                            Gt,
                         ),
-                        op: Gt,
-                        value: Duration(
+                        lhs: Field(
+                            Intrinsic(
+                                Duration,
+                            ),
+                        ),
+                        rhs: Literal(
                             Duration(
-                                1000000000,
+                                Duration(
+                                    1000000000,
+                                ),
                             ),
                         ),
                     },

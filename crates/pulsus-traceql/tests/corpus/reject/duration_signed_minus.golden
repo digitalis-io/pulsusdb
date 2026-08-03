@@ -1,8 +1,0 @@
-UnexpectedToken {
-    found: "'-'",
-    expected: "a duration literal (durations carry no sign)",
-    span: Span {
-        start: 13,
-        end: 14,
-    },
-}

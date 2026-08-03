@@ -15,6 +15,14 @@ subset). Three case classes:
   These cases map one-to-one onto the frozen registry
   `pulsus_traceql::BOUNDARY_CONSTRUCTS` — both directions are asserted
   mechanically by `tests/corpus.rs`, so scope drift either way fails CI.
+- `validate_reject/<case>.traceql` — a query the grammar PARSES and the
+  semantic pass then rejects (issue #335 Stage B). Its `.golden` pins the
+  parsed AST, because the parse shape is the fact worth freezing; the
+  rejection itself is pinned by `tests/corpus.rs`, which asserts
+  `validate` returns an error. This class exists so `accept/` can keep
+  meaning "a query PulsusDB SERVES" — `tests/validate_corpus.rs` asserts
+  every `accept/` case validates `Ok`, and widening that to "merely
+  parses" would have retired a real gate to make room for three cases.
 - `grafana/<case>.traceql` — a real, observed Grafana-emitted TraceQL
   query (issue #180), captured like an observed HTTP request. Its `.golden`
   pins today's outcome, whatever it is — `Ok`, a named `NotYetSupported`
@@ -41,6 +49,73 @@ provenance in this file when adding one:
 Both hit `nestedSetParent` (a nested-set intrinsic, #181) before any named
 boundary, so today they can only surface a generic parser error; both are
 ledgered in `replay-ledger.json` with `owning_issues` {181, 182}.
+
+## Issue #335 Stage B regeneration (2026-08-03)
+
+The grammar collapse changed `FieldExpr`'s shape, so every `.golden` is a
+new byte string. A single count would hide what matters, so each changed
+case is classified by CAUSE. Method: dump `parse(q)`'s `Display` (or its
+error message) for all 170 cases before and after the collapse and diff —
+a case whose rendering is byte-identical had no behavioural change, only a
+`Debug` shape change. **157 of 170 renderings are identical.** The
+remaining 13, in full:
+
+**A. Nil spellings now render faithfully (3).** `accept/existence_eq_nil`,
+`accept/existence_neq_nil`, `grafana/explore_root_rate_by_service`. The
+old AST folded `= nil`/`!= nil` into the truthiness node, so `{ .a = nil }`
+rendered as `{ !(.a) }`, `{ .a != nil }` as `{ .a }`, and the Grafana query
+lost its `!= nil` entirely on the way out. `Exists { field, negated }`
+keeps the polarity, so all three now render what was written. This is the
+same defect the retired ledger row `traceql-validate-nil-spelling-conflation`
+described, seen from the rendering side.
+
+**B. (was: arithmetic gained parens — FIXED, no longer a class.)** The
+collapse briefly rendered `{ .a = 2 - 1 }` as `{ .a = (2 - 1) }`, changing
+six goldens for nothing. `fmt_comparison_operand` restores the
+pre-collapse behaviour: comparison binds looser than every arithmetic
+operator, so an operand's outermost level needs no wrapping parens to
+reparse. Exactly one level is stripped, as `fmt_operand_bare` did. Kept as
+a numbered entry because the six goldens are unchanged and a future reader
+comparing case counts should see why.
+
+**C. Rejection moved parse → validate; case reclassified `accept/` (5).**
+`bare_intrinsic_word` (`{ name }`), `chained_comparison` (`{ .a = 1 = 2 }`),
+`duration_signed_minus` (`{ duration > -2s }`), `duration_unitless`
+(`{ duration > 100 }`), `nested_set_regex_string`
+(`{ nestedSetLeft =~ "x" }`). All five now parse, which is what `accept/`
+asserts. Their wire verdicts, re-measured against the pinned digest:
+`{ duration > -2s }` and `{ duration > 100 }` are reference **200s** —
+those two were divergences of ours that the collapse CLOSED. The other
+three are reference 400s and our validator rejects them, covered by
+`conformance/validate-vectors.json` (`bool-r1` and the `type-mismatch`
+rows) rather than here.
+
+**D. Parse error MESSAGE changed, still a parse error (5).**
+`reject/attr_bare_keyword_value`, `reject/kind_invalid_keyword`,
+`reject/status_invalid_keyword`, `reject/missing_value`,
+`reject/duration_signed_plus`. Each said "expected a status" / "expected a
+duration literal" and now says "expected a field, a literal, or `(`". This
+is the **stated price of the context-free atom grammar**: the old
+`parse_value(cursor, &field)` typed its operand from the LHS, so it could
+name the expected type; an atom parser has no left context by
+construction. The reference is no more specific here — it answers
+`unknown identifier: bogus` — and every one of the five remains a 400 on
+both sides.
+
+Class C's five cases split by their WIRE verdict, which is why they did
+not all land in the same place: `duration_signed_minus` and
+`duration_unitless` are reference 200s and validate `Ok`, so they are
+`accept/`; `bare_intrinsic_word`, `chained_comparison` and
+`nested_set_regex_string` are reference 400s that our validator also
+rejects, so they are `validate_reject/`. Sorting all five into `accept/`
+on the strength of "they parse now" is the mistake this split corrects —
+it broke `validate_corpus.rs`'s accept-case invariant, which is how it
+was caught.
+
+`MANIFEST` was also re-sorted. It documents `LC_ALL=C sort` order and was
+not in it (the `accept/arith_*` block sat after `accept/attr_*`); the
+regeneration wrote byte order, which is that rule. No entry was added or
+lost — 170 before, 170 after, no duplicates either side.
 
 `MANIFEST` is the declared newline list of every `<class>/<stem>`;
 `tests/corpus.rs` compares it against `read_dir` output before any case

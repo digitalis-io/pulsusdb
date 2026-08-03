@@ -2,16 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                ArithCompare {
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
                     lhs: Field(
                         Attribute {
                             scope: Unscoped,
                             key: "a",
                         },
                     ),
-                    op: Eq,
-                    rhs: Arith {
-                        op: Sub,
+                    rhs: Binary {
+                        op: Arith(
+                            Sub,
+                        ),
                         lhs: Literal(
                             Number(
                                 "2",

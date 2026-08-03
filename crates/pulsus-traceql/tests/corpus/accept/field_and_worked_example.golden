@@ -3,38 +3,60 @@ Query {
         SpansetFilter {
             body: Some(
                 Binary {
-                    op: And,
+                    op: Bool(
+                        And,
+                    ),
                     lhs: Binary {
-                        op: And,
-                        lhs: Comparison {
-                            field: Attribute {
-                                scope: Resource,
-                                key: "service.name",
-                            },
-                            op: Eq,
-                            value: String(
-                                "checkout",
+                        op: Bool(
+                            And,
+                        ),
+                        lhs: Binary {
+                            op: Cmp(
+                                Eq,
+                            ),
+                            lhs: Field(
+                                Attribute {
+                                    scope: Resource,
+                                    key: "service.name",
+                                },
+                            ),
+                            rhs: Literal(
+                                String(
+                                    "checkout",
+                                ),
                             ),
                         },
-                        rhs: Comparison {
-                            field: Attribute {
-                                scope: Span,
-                                key: "http.status_code",
-                            },
-                            op: Gte,
-                            value: Number(
-                                "500",
+                        rhs: Binary {
+                            op: Cmp(
+                                Gte,
+                            ),
+                            lhs: Field(
+                                Attribute {
+                                    scope: Span,
+                                    key: "http.status_code",
+                                },
+                            ),
+                            rhs: Literal(
+                                Number(
+                                    "500",
+                                ),
                             ),
                         },
                     },
-                    rhs: Comparison {
-                        field: Intrinsic(
-                            Duration,
+                    rhs: Binary {
+                        op: Cmp(
+                            Gt,
                         ),
-                        op: Gt,
-                        value: Duration(
+                        lhs: Field(
+                            Intrinsic(
+                                Duration,
+                            ),
+                        ),
+                        rhs: Literal(
                             Duration(
-                                2000000000,
+                                Duration(
+                                    2000000000,
+                                ),
                             ),
                         ),
                     },

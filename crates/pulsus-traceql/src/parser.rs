@@ -9,10 +9,28 @@
 //!   paren-free 100k-operand chain errors cleanly instead of building a
 //!   boxed spine that would overflow the stack in `Display`/`Drop`).
 //!
-//! Together they cap any root-to-leaf AST path at under `2 × MAX_DEPTH`
-//! (128) nested nodes, so the derived recursive `Debug`/`Display`/`Drop`
-//! implementations are stack-safe by construction — no iterative `Drop`
-//! is needed.
+//! Together they cap any root-to-leaf AST path at under
+//! `MAX_DEPTH × (1 + LEVELS)` nested nodes — one nesting level admits at
+//! most one node per precedence level on a right spine — so the derived
+//! recursive `Debug`/`Display`/`Drop` implementations are stack-safe by
+//! construction and no iterative `Drop` is needed.
+//!
+//! `depth` is charged where recursion is genuinely unbounded: parentheses,
+//! unary prefix chains, and the RIGHT-associative `^` (whose RHS re-enters
+//! at its own binding power, so `2^2^2^…` would otherwise recurse without
+//! limit). A LEFT-associative RHS re-enters at a strictly higher binding
+//! power and can therefore descend at most `LEVELS` frames, so charging it
+//! would spend the budget on the shape of the precedence ladder rather
+//! than on user nesting.
+//!
+//! Known gap, PRE-EXISTING and unchanged here (it predates the Stage B
+//! collapse — `61dea2f` looped the arithmetic level uncharged in exactly
+//! the same way): a paren-free left-associative ARITHMETIC chain
+//! (`{ .a = 1+1+1+… }`) is bounded by neither counter, because the budget
+//! counts `&&`/`||` only. Its left spine is as long as the input, and
+//! `Display`/`Drop` walk it recursively. Widening the budget to cover it
+//! would narrow the accept surface, so it is recorded rather than
+//! quietly changed.
 //!
 //! Grammar (plan v2 F1 / v3 F5):
 //!
@@ -40,10 +58,13 @@
 //! both the spanset and the field level (issue #335 classes D10/D11). The
 //! full table, tightest first: `^`, `* / %`, unary `-`, `+ -`, the
 //! comparison operators, then `&&`/`||`. Every arithmetic level is
-//! left-associative — `^` included (D8) — and unary `-` sits BETWEEN
-//! `* / %` and `+ -` (D9). All four placements are the reference's, read
-//! off its own parenthesised echo rather than assumed; the captures and
-//! the whole accept-surface comparison live in `tests/accept_surface/`.
+//! left-associative EXCEPT `^`, which is RIGHT-associative (D8), and
+//! unary `-` sits BETWEEN `* / %` and `+ -` (D9). All four placements are
+//! the reference's, read off its own parenthesised echo rather than
+//! assumed; the captures and the whole accept-surface comparison live in
+//! `tests/accept_surface/`. `^` additionally carries a deliberate VALUE
+//! divergence (grouping agrees, the operator does not) — ledger row
+//! `traceql-pow-integer-operand-swap`.
 //!
 //! Disambiguation of the dual-role `>`/`>=`/`<`/`<=` tokens (comparison
 //! inside a field expression, structural operator between spansets) is
@@ -53,9 +74,10 @@
 //! precedent.
 
 use crate::ast::{
-    AggregateOp, ArithOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, HintValue, Intrinsic,
-    MetricFn, MetricHint, MetricStage, Operand, PipelineStage, Query, SecondStage, SpanKindValue,
-    SpansetExpr, SpansetFilter, StatusValue, StructuralModifier, StructuralOp, Value,
+    AggregateOp, ArithOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, HintValue,
+    Intrinsic, MetricFn, MetricHint, MetricStage, PipelineStage, Query, SecondStage, SpanKindValue,
+    SpansetExpr, SpansetFilter, StatusValue, StructuralModifier, StructuralOp, UNARY_BINDING_POWER,
+    UnaryOp, Value,
 };
 use crate::duration;
 use crate::error::{MAX_DEPTH, TraceQlError};
@@ -394,21 +416,83 @@ fn parse_spanset_filter(
 
 /// `FieldExpr := FieldPrimary (("&&" | "||") FieldPrimary)*` — one
 /// precedence level, left-associative (see [`bool_op_of`]).
+/// **The one climb** (issue #335 Stage B). Replaces the former
+/// `parse_field_expr` / `parse_field_primary` / `parse_operand{,_bin,
+/// _unary,_atom}` layering, which encoded operand SHAPE in the node kind
+/// (`Comparison` vs `FieldCompare` vs `ArithCompare`) and therefore had
+/// to look ahead — `rhs_begins_field`, `rhs_begins_arith` and the LHS
+/// arithmetic peek — to decide which layer to enter. One node kind and
+/// one precedence table need no lookahead at all.
+///
+/// Precedence, loosest first, matching the reference:
+/// `&&`/`||` (one level) < comparison < `+ -` < unary `! -` < `* / %` < `^`.
 fn parse_field_expr(
     cursor: &mut Cursor<'_>,
     depth: usize,
     binary_nodes: &mut usize,
+) -> Result<FieldExpr, TraceQlError> {
+    parse_field_bp(cursor, depth, binary_nodes, 0)
+}
+
+/// Precedence climbing: parse a prefix/atom, then absorb every infix
+/// operator whose binding power is at least `min_bp`.
+fn parse_field_bp(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+    binary_nodes: &mut usize,
+    min_bp: u8,
 ) -> Result<FieldExpr, TraceQlError> {
     if depth >= MAX_DEPTH {
         return Err(TraceQlError::RecursionLimitExceeded {
             span: cursor.peek().span,
         });
     }
-    let mut lhs = parse_field_primary(cursor, depth, binary_nodes)?;
-    while let Some(op) = bool_op_of(&cursor.peek().kind) {
-        charge_binary_node(binary_nodes, cursor.peek().span)?;
+    let mut lhs = parse_field_prefix(cursor, depth, binary_nodes)?;
+    while let Some(op) = field_op_of(&cursor.peek().kind) {
+        let bp = op.binding_power();
+        if bp < min_bp {
+            break;
+        }
+        // The budget counts `&&`/`||` ONLY, at both the field and spanset
+        // levels — the pre-collapse meaning, preserved deliberately. The
+        // climb sees comparison and arithmetic operators through the same
+        // `field_op_of` table, so charging "every infix operator here"
+        // reads natural and is wrong: it would spend the budget on the
+        // `=` in each conjunct and reject a chain of ~32 comparisons that
+        // parsed before. Widening a self-protection guard narrows the
+        // accept surface.
+        if matches!(op, FieldOp::Bool(_)) {
+            charge_binary_node(binary_nodes, cursor.peek().span)?;
+        }
         cursor.advance();
-        let rhs = parse_field_primary(cursor, depth, binary_nodes)?;
+        // `= nil` / `!= nil` fold to `Exists` — ONLY after `=`/`!=` on a
+        // field LHS, which is a decision about the operator and the LHS
+        // already parsed, not a lookahead into the operand.
+        if matches!(
+            op,
+            FieldOp::Cmp(ComparisonOp::Eq) | FieldOp::Cmp(ComparisonOp::Neq)
+        ) && is_nil(cursor.peek())
+            && let FieldExpr::Field(field) = &lhs
+        {
+            let field = field.clone();
+            cursor.advance();
+            lhs = FieldExpr::Exists {
+                field,
+                negated: matches!(op, FieldOp::Cmp(ComparisonOp::Eq)),
+            };
+            continue;
+        }
+        // Left-associative operators bind the RHS one level tighter;
+        // right-associative (`^`) at the same level — which is also why
+        // only the right-associative RHS charges `depth` (see the module
+        // note): re-entering at the SAME binding power can recurse without
+        // limit, re-entering higher cannot.
+        let (next_bp, rhs_depth) = if op.is_right_assoc() {
+            (bp, depth + 1)
+        } else {
+            (bp + 1, depth)
+        };
+        let rhs = parse_field_bp(cursor, rhs_depth, binary_nodes, next_bp)?;
         lhs = FieldExpr::Binary {
             op,
             lhs: Box::new(lhs),
@@ -418,404 +502,151 @@ fn parse_field_expr(
     Ok(lhs)
 }
 
-/// Whether `kind` starts (or continues) a field-expression arithmetic
-/// expression (issue #185, `arith.*`): `+ - * / % ^`.
-fn arith_op_of(kind: &TokenKind) -> Option<ArithOp> {
-    match kind {
-        TokenKind::Plus => Some(ArithOp::Add),
-        TokenKind::Minus => Some(ArithOp::Sub),
-        TokenKind::Star => Some(ArithOp::Mul),
-        TokenKind::Slash => Some(ArithOp::Div),
-        TokenKind::Percent => Some(ArithOp::Mod),
-        TokenKind::Caret => Some(ArithOp::Pow),
-        _ => None,
-    }
-}
-
-/// `FieldPrimary := "(" FieldExpr ")" | Field CmpOp Value | Exists |
-/// ArithCompare`. An *attribute* with no comparison (`{ .foo }`) is
-/// attribute existence (`FieldExpr::Exists`, issue #185); a bare
-/// *intrinsic* (`{ name }`) is malformed grammar in every milestone, so
-/// it gets a plain positioned missing-comparison error (same rationale as
-/// bare `parent`). A comparison with an arithmetic operand on either side
-/// routes to `ArithCompare`.
-const COMPARISON_EXPECTED: &str =
-    "a comparison operator ('=', '!=', '>', '>=', '<', '<=', '=~', '!~')";
-
-fn parse_field_primary(
+/// A prefix operator (`!`, `-`) or an atom.
+fn parse_field_prefix(
     cursor: &mut Cursor<'_>,
     depth: usize,
     binary_nodes: &mut usize,
 ) -> Result<FieldExpr, TraceQlError> {
     let tok = cursor.peek().clone();
-    match tok.kind {
+    let op = match tok.kind {
+        TokenKind::Bang => UnaryOp::Not,
+        TokenKind::Minus => UnaryOp::Neg,
+        _ => return parse_field_atom(cursor, depth, binary_nodes),
+    };
+    if depth >= MAX_DEPTH {
+        return Err(TraceQlError::RecursionLimitExceeded { span: tok.span });
+    }
+    cursor.advance();
+    let expr = parse_field_bp(cursor, depth + 1, binary_nodes, UNARY_BINDING_POWER)?;
+    Ok(FieldExpr::Unary {
+        op,
+        expr: Box::new(expr),
+    })
+}
+
+/// An atom: a parenthesized expression, a literal, or a field.
+///
+/// **Context-free by construction** (issue #335 Stage B). The old
+/// `parse_value(cursor, &field)` needed the LHS to type its operand; that
+/// was doing two jobs. Typing bare idents is grammar and is done here
+/// from the token alone — the ten reserved words (`ok`/`error`/`unset`,
+/// the five span kinds, `true`/`false`) resolve to values without any
+/// left context, which is how the reference's own grammar treats them
+/// (measured: `{ .a = ok }`, `{ .a = server }` are reference 200s).
+/// Rejecting a MISMATCHED pair is a constraint on the pair, not on the
+/// atom, and lives in `validate.rs`.
+fn parse_field_atom(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+    binary_nodes: &mut usize,
+) -> Result<FieldExpr, TraceQlError> {
+    let tok = cursor.peek().clone();
+    match &tok.kind {
         TokenKind::LParen => {
             cursor.advance();
             let expr = parse_field_expr(cursor, depth + 1, binary_nodes)?;
             cursor.expect(&TokenKind::RParen, "')'")?;
             Ok(expr)
         }
-        // `logic.not` (issue #183): unary field negation binds tighter
-        // than `&&`/`||` — a primary. `depth` bounds `!`-chain nesting
-        // (`{ !!!…!.a }`) so the recursive walk never overflows the stack.
-        TokenKind::Bang => {
-            if depth >= MAX_DEPTH {
-                return Err(TraceQlError::RecursionLimitExceeded { span: tok.span });
-            }
+        TokenKind::String(v) => {
+            let v = v.clone();
             cursor.advance();
-            let inner = parse_field_primary(cursor, depth + 1, binary_nodes)?;
-            Ok(FieldExpr::Not(Box::new(inner)))
-        }
-        // A bare boolean static (`static.bare_boolean`, issue #183): a
-        // lone `true`/`false` at field-primary position, not the scope of
-        // a dotted attribute.
-        TokenKind::Ident(ref name)
-            if (name == "true" || name == "false")
-                && !matches!(cursor.peek2().kind, TokenKind::Dot) =>
-        {
-            let b = name == "true";
-            cursor.advance();
-            Ok(FieldExpr::BoolStatic(b))
-        }
-        _ => {
-            let (field, _) = parse_field(cursor)?;
-            // LHS arithmetic (issue #185, `arith.*`): a field immediately
-            // followed by an arithmetic operator makes the whole comparison
-            // an `ArithCompare`, not a `Comparison`.
-            if arith_op_of(&cursor.peek().kind).is_some() {
-                let lhs = parse_operand_from(cursor, Operand::Field(field), depth)?;
-                let op = parse_arith_comparison_op(cursor)?;
-                let rhs = parse_operand(cursor, depth)?;
-                return Ok(FieldExpr::ArithCompare { lhs, op, rhs });
-            }
-            let op = match &cursor.peek().kind {
-                TokenKind::Eq => ComparisonOp::Eq,
-                TokenKind::Neq => ComparisonOp::Neq,
-                TokenKind::Gt => ComparisonOp::Gt,
-                TokenKind::Gte => ComparisonOp::Gte,
-                TokenKind::Lt => ComparisonOp::Lt,
-                TokenKind::Lte => ComparisonOp::Lte,
-                TokenKind::Re => ComparisonOp::Re,
-                TokenKind::Nre => ComparisonOp::Nre,
-                TokenKind::RBrace
-                | TokenKind::AndAnd
-                | TokenKind::OrOr
-                | TokenKind::RParen
-                | TokenKind::Eof
-                    if matches!(field, Field::Attribute { .. }) =>
-                {
-                    // `existence.bare_attr` (issue #185): a bare attribute
-                    // with no comparison is an existence check.
-                    return Ok(FieldExpr::Exists(field));
-                }
-                TokenKind::Eof => {
-                    return Err(TraceQlError::UnexpectedEof {
-                        expected: COMPARISON_EXPECTED.to_string(),
-                        span: cursor.peek().span,
-                    });
-                }
-                other => {
-                    let span = cursor.peek().span;
-                    return Err(TraceQlError::UnexpectedToken {
-                        found: describe(other),
-                        expected: COMPARISON_EXPECTED.to_string(),
-                        span,
-                    });
-                }
-            };
-            cursor.advance();
-            // `= nil` / `!= nil` existence (issue #185): recognized only in
-            // value position (a bare `Ident("nil")`), never a `Value`
-            // variant. `= nil` ⇒ absence (`Not(Exists)`), `!= nil` ⇒
-            // presence (`Exists`).
-            if matches!(op, ComparisonOp::Eq | ComparisonOp::Neq) && is_nil(cursor.peek()) {
-                cursor.advance();
-                return Ok(match op {
-                    ComparisonOp::Eq => FieldExpr::Not(Box::new(FieldExpr::Exists(field))),
-                    _ => FieldExpr::Exists(field),
-                });
-            }
-            // `comparison.rhs_attribute` (issue #183): when the value
-            // position begins a field (attribute or intrinsic) the RHS is
-            // a `Field`, not a literal. Regex operators (`=~`/`!~`) never
-            // accept a field RHS — they fall through to `parse_value`,
-            // which rejects the field-start (Tempo rejects `{ .a =~ .b }`).
-            if !matches!(op, ComparisonOp::Re | ComparisonOp::Nre) && rhs_begins_field(cursor) {
-                let (rhs, _) = parse_field(cursor)?;
-                // RHS arithmetic (issue #185): a field operand followed by
-                // an arithmetic operator makes this an `ArithCompare`.
-                if arith_op_of(&cursor.peek().kind).is_some() {
-                    let rhs = parse_operand_from(cursor, Operand::Field(rhs), depth)?;
-                    return Ok(FieldExpr::ArithCompare {
-                        lhs: Operand::Field(field),
-                        op,
-                        rhs,
-                    });
-                }
-                return Ok(FieldExpr::FieldCompare {
-                    lhs: field,
-                    op,
-                    rhs,
-                });
-            }
-            // RHS arithmetic value (issue #185): a unary `-`, a
-            // parenthesized operand, or a numeric literal followed by an
-            // arithmetic operator (a lone number/duration stays a plain
-            // typed `Value` so the frozen goldens do not churn).
-            if !matches!(op, ComparisonOp::Re | ComparisonOp::Nre) && rhs_begins_arith(cursor) {
-                let rhs = parse_operand(cursor, depth)?;
-                return Ok(FieldExpr::ArithCompare {
-                    lhs: Operand::Field(field),
-                    op,
-                    rhs,
-                });
-            }
-            let value = parse_value(cursor, &field)?;
-            Ok(FieldExpr::Comparison { field, op, value })
-        }
-    }
-}
-
-/// Whether the token at the value position begins a `Field` right-hand
-/// side (issue #183 `comparison.rhs_attribute`): the unscoped `.attr`
-/// form, a `span.`/`resource.`/`parent.` scoped attribute, a bare
-/// intrinsic keyword, or a colon-scoped intrinsic (`span:duration`,
-/// `trace:id`, … — issue #335 class D2; the reference treats every
-/// intrinsic as an ordinary operand, so all eighteen colon forms are
-/// legal on either side of a comparison). Boolean/status/kind value
-/// keywords (`true`, `ok`, `server`, …) are NOT intrinsics, so they stay
-/// literal values.
-///
-/// An *unknown* colon pair (`foo:bar`, `span:nope`) deliberately does not
-/// match: it falls through to `parse_value`'s positioned error rather than
-/// being routed into `parse_field`, keeping the unknown-scope surface
-/// exactly where it was.
-fn rhs_begins_field(cursor: &Cursor<'_>) -> bool {
-    match &cursor.peek().kind {
-        TokenKind::Dot => true,
-        TokenKind::Ident(name) => {
-            if (name == "span"
-                || name == "resource"
-                || name == "parent"
-                || name == "instrumentation"
-                || name == "event"
-                || name == "link")
-                && matches!(cursor.peek2().kind, TokenKind::Dot)
-            {
-                true
-            } else if matches!(cursor.peek2().kind, TokenKind::Colon) {
-                matches!(&cursor.peek_at(2).kind,
-                    TokenKind::Ident(field) if Intrinsic::from_scoped(name, field).is_some())
-            } else {
-                Intrinsic::from_ident(name).is_some()
-                    && !matches!(cursor.peek2().kind, TokenKind::Dot)
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Whether the token is the value-position `nil` keyword (issue #185
-/// existence): a bare `Ident("nil")`, recognized only here — never a
-/// `Value` variant.
-fn is_nil(tok: &Token) -> bool {
-    matches!(&tok.kind, TokenKind::Ident(n) if n == "nil")
-}
-
-/// Whether the token at the value position begins an arithmetic operand
-/// (issue #185): a unary `-`, a parenthesized operand, or a numeric
-/// literal immediately followed by an arithmetic operator. A lone
-/// number/duration is NOT arithmetic (it stays a plain typed `Value`).
-fn rhs_begins_arith(cursor: &Cursor<'_>) -> bool {
-    match &cursor.peek().kind {
-        TokenKind::Minus | TokenKind::LParen => true,
-        TokenKind::Number(_) | TokenKind::Duration(_) => {
-            arith_op_of(&cursor.peek2().kind).is_some()
-        }
-        _ => false,
-    }
-}
-
-/// The binding power of an arithmetic operator (issue #185): `+ -` bind
-/// loosest, then `* / %`, then `^`. All three levels are LEFT-associative
-/// (issue #335 class D8 corrected `^`).
-fn arith_prec(op: ArithOp) -> u8 {
-    match op {
-        ArithOp::Add | ArithOp::Sub => 1,
-        ArithOp::Mul | ArithOp::Div | ArithOp::Mod => 2,
-        ArithOp::Pow => 3,
-    }
-}
-
-/// Unary `-` sits BETWEEN the arithmetic levels (issue #335 class D9): a
-/// negand absorbs every operator binding at least this tightly (`* / %`
-/// and `^`) and stops at `+ -`. Deliberately not the usual
-/// "unary binds tightest" — it is the reference's placement.
-const UNARY_BINDS_ABOVE: u8 = 2;
-
-/// A comparison operator introducing the RHS of an arithmetic comparison
-/// (issue #185). Arithmetic expressions never compare with a regex, so
-/// `=~`/`!~` are positioned errors here.
-fn parse_arith_comparison_op(cursor: &mut Cursor<'_>) -> Result<ComparisonOp, TraceQlError> {
-    let tok = cursor.peek().clone();
-    let op = match tok.kind {
-        TokenKind::Eq => ComparisonOp::Eq,
-        TokenKind::Neq => ComparisonOp::Neq,
-        TokenKind::Gt => ComparisonOp::Gt,
-        TokenKind::Gte => ComparisonOp::Gte,
-        TokenKind::Lt => ComparisonOp::Lt,
-        TokenKind::Lte => ComparisonOp::Lte,
-        TokenKind::Eof => {
-            return Err(TraceQlError::UnexpectedEof {
-                expected: "a comparison operator".to_string(),
-                span: tok.span,
-            });
-        }
-        _ => {
-            return Err(TraceQlError::UnexpectedToken {
-                found: describe(&tok.kind),
-                expected: "a comparison operator (arithmetic expressions do not support regex)"
-                    .to_string(),
-                span: tok.span,
-            });
-        }
-    };
-    cursor.advance();
-    Ok(op)
-}
-
-/// `Operand := Add`, a precedence-climbing arithmetic expression (issue
-/// #185, `arith.*`). Operands are fields, numeric literals, unary
-/// negations, and parenthesized sub-expressions. `depth` bounds paren /
-/// unary nesting to [`MAX_DEPTH`].
-fn parse_operand(cursor: &mut Cursor<'_>, depth: usize) -> Result<Operand, TraceQlError> {
-    if depth >= MAX_DEPTH {
-        return Err(TraceQlError::RecursionLimitExceeded {
-            span: cursor.peek().span,
-        });
-    }
-    let first = parse_operand_unary(cursor, depth)?;
-    parse_operand_bin(cursor, first, 0, depth)
-}
-
-/// Continues precedence-climbing from an already-parsed leading operand
-/// (used when the parser has consumed a field before discovering the
-/// arithmetic operator).
-fn parse_operand_from(
-    cursor: &mut Cursor<'_>,
-    first: Operand,
-    depth: usize,
-) -> Result<Operand, TraceQlError> {
-    if depth >= MAX_DEPTH {
-        return Err(TraceQlError::RecursionLimitExceeded {
-            span: cursor.peek().span,
-        });
-    }
-    parse_operand_bin(cursor, first, 0, depth)
-}
-
-/// The precedence-climbing loop: folds `lhs (op rhs)*` while the operator
-/// binds at least as tightly as `min_prec`.
-fn parse_operand_bin(
-    cursor: &mut Cursor<'_>,
-    mut lhs: Operand,
-    min_prec: u8,
-    depth: usize,
-) -> Result<Operand, TraceQlError> {
-    while let Some(op) = arith_op_of(&cursor.peek().kind) {
-        let prec = arith_prec(op);
-        if prec < min_prec {
-            break;
-        }
-        cursor.advance();
-        let mut rhs = parse_operand_unary(cursor, depth)?;
-        while let Some(next) = arith_op_of(&cursor.peek().kind) {
-            // Every arithmetic operator is LEFT-associative, `^` included
-            // (issue #335 class D8): the reference evaluates `2 ^ 3 ^ 2`
-            // to 64, i.e. `(2 ^ 3) ^ 2`, not the 512 a right-associative
-            // `^` gives. Captured from the reference's own constant-folded
-            // echo — `{ .a = 2 ^ 3 ^ 2 && "x" }` reports `(.a = 64)`.
-            // So equal precedence never recurses; only a tighter level does.
-            if arith_prec(next) <= prec {
-                break;
-            }
-            rhs = parse_operand_bin(cursor, rhs, prec + 1, depth)?;
-        }
-        lhs = Operand::Arith {
-            op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        };
-    }
-    Ok(lhs)
-}
-
-/// A unary-negation-prefixed operand (`-x`) or an atom.
-fn parse_operand_unary(cursor: &mut Cursor<'_>, depth: usize) -> Result<Operand, TraceQlError> {
-    if matches!(cursor.peek().kind, TokenKind::Minus) {
-        if depth >= MAX_DEPTH {
-            return Err(TraceQlError::RecursionLimitExceeded {
-                span: cursor.peek().span,
-            });
-        }
-        let minus = cursor.advance();
-        // A bare signed duration literal (`-2s`) stays a positioned parse
-        // error: the normative duration grammar admits no sign (docs/api.md
-        // §4.2). Arithmetic negation applies to numbers, fields, and
-        // parenthesized operands only.
-        if matches!(cursor.peek().kind, TokenKind::Duration(_)) {
-            return Err(TraceQlError::UnexpectedToken {
-                found: "'-'".to_string(),
-                expected: "a duration literal (durations carry no sign)".to_string(),
-                span: minus.span,
-            });
-        }
-        let inner = parse_operand_unary(cursor, depth + 1)?;
-        // Unary `-` binds LOOSER than `^` and `* / %`, but tighter than
-        // `+ -` (issue #335 class D9). So the negand first absorbs every
-        // operator at or above [`UNARY_BINDS_ABOVE`]: `-2 ^ 2` is
-        // `-(2 ^ 2)` = -4, not the 4 that binding `-` tightest gives, and
-        // `-.a * 2` is `-(.a * 2)`. The reference's constant-folded echo
-        // for `{ .a = -2 ^ 2 && "x" }` reports `(.a = -4)`.
-        let inner = parse_operand_bin(cursor, inner, UNARY_BINDS_ABOVE, depth + 1)?;
-        return Ok(Operand::Neg(Box::new(inner)));
-    }
-    parse_operand_atom(cursor, depth)
-}
-
-/// `Atom := "(" Operand ")" | Number | Duration | Field`.
-fn parse_operand_atom(cursor: &mut Cursor<'_>, depth: usize) -> Result<Operand, TraceQlError> {
-    let tok = cursor.peek().clone();
-    match &tok.kind {
-        TokenKind::LParen => {
-            cursor.advance();
-            let inner = parse_operand(cursor, depth + 1)?;
-            cursor.expect(&TokenKind::RParen, "')'")?;
-            Ok(inner)
+            Ok(FieldExpr::Literal(Value::String(v)))
         }
         TokenKind::Number(raw) => {
             let raw = raw.clone();
             cursor.advance();
-            Ok(Operand::Literal(Value::Number(raw)))
+            Ok(FieldExpr::Literal(Value::Number(raw)))
         }
         TokenKind::Duration(raw) => {
             let parsed = duration::parse_duration(raw, tok.span)?;
             cursor.advance();
-            Ok(Operand::Literal(Value::Duration(parsed)))
+            Ok(FieldExpr::Literal(Value::Duration(parsed)))
         }
-        _ => {
+        TokenKind::Ident(name) => {
+            if let Some(value) = static_value_of(name) {
+                cursor.advance();
+                return Ok(FieldExpr::Literal(value));
+            }
             let (field, _) = parse_field(cursor)?;
-            Ok(Operand::Field(field))
+            Ok(FieldExpr::Field(field))
+        }
+        TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
+            expected: FIELD_ATOM_EXPECTED.to_string(),
+            span: tok.span,
+        }),
+        other => {
+            // A field can also start with `.` or a scope token; defer to
+            // `parse_field`, which owns those spellings and their errors.
+            if field_start(other) {
+                let (field, _) = parse_field(cursor)?;
+                return Ok(FieldExpr::Field(field));
+            }
+            Err(TraceQlError::UnexpectedToken {
+                found: describe(other),
+                expected: FIELD_ATOM_EXPECTED.to_string(),
+                span: tok.span,
+            })
         }
     }
 }
 
-/// `Field := Intrinsic | ("span"|"resource") "." DottedKey | "." DottedKey`.
-/// A bare intrinsic keyword not followed by `.` resolves to the
-/// intrinsic; `parent.` and bracketed attributes are recognized-but-M7;
-/// a bare non-intrinsic word is an error (attributes must be scoped or
-/// use the leading-`.` unscoped form). Returns the field plus its full
-/// byte span.
+const FIELD_ATOM_EXPECTED: &str = "a field, a literal, or '('";
+
+/// The ten reserved words that are VALUES wherever they appear — the
+/// reference's static terminals. Resolved here, from the token alone.
+fn static_value_of(name: &str) -> Option<Value> {
+    if let Some(status) = StatusValue::from_ident(name) {
+        return Some(Value::Status(status));
+    }
+    if let Some(kind) = SpanKindValue::from_ident(name) {
+        return Some(Value::Kind(kind));
+    }
+    match name {
+        "true" => Some(Value::Bool(true)),
+        "false" => Some(Value::Bool(false)),
+        _ => None,
+    }
+}
+
+/// A bare `Ident("nil")` in operand position — never a `Value` variant.
+fn is_nil(tok: &Token) -> bool {
+    matches!(&tok.kind, TokenKind::Ident(n) if n == "nil")
+}
+
+/// Whether `kind` can begin a field. `parse_field` owns these spellings
+/// and their errors; this only decides whether to defer to it.
+fn field_start(kind: &TokenKind) -> bool {
+    matches!(kind, TokenKind::Dot | TokenKind::Ident(_))
+}
+
+/// Maps a token to an infix field operator.
+fn field_op_of(kind: &TokenKind) -> Option<FieldOp> {
+    Some(match kind {
+        TokenKind::AndAnd => FieldOp::Bool(BoolOp::And),
+        TokenKind::OrOr => FieldOp::Bool(BoolOp::Or),
+        TokenKind::Eq => FieldOp::Cmp(ComparisonOp::Eq),
+        TokenKind::Neq => FieldOp::Cmp(ComparisonOp::Neq),
+        TokenKind::Gt => FieldOp::Cmp(ComparisonOp::Gt),
+        TokenKind::Gte => FieldOp::Cmp(ComparisonOp::Gte),
+        TokenKind::Lt => FieldOp::Cmp(ComparisonOp::Lt),
+        TokenKind::Lte => FieldOp::Cmp(ComparisonOp::Lte),
+        // `Re`/`Nre` are `=~`/`!~`. `Tilde` is the STRUCTURAL SIBLING
+        // operator and is deliberately absent here — it is a spanset
+        // operator, never a field one.
+        TokenKind::Re => FieldOp::Cmp(ComparisonOp::Re),
+        TokenKind::Nre => FieldOp::Cmp(ComparisonOp::Nre),
+        TokenKind::Plus => FieldOp::Arith(ArithOp::Add),
+        TokenKind::Minus => FieldOp::Arith(ArithOp::Sub),
+        TokenKind::Star => FieldOp::Arith(ArithOp::Mul),
+        TokenKind::Slash => FieldOp::Arith(ArithOp::Div),
+        TokenKind::Percent => FieldOp::Arith(ArithOp::Mod),
+        TokenKind::Caret => FieldOp::Arith(ArithOp::Pow),
+        _ => return None,
+    })
+}
+
 fn parse_field(cursor: &mut Cursor<'_>) -> Result<(Field, Span), TraceQlError> {
     let tok = cursor.peek().clone();
     match &tok.kind {
@@ -974,208 +805,6 @@ fn parse_dotted_key(cursor: &mut Cursor<'_>) -> Result<(String, usize), TraceQlE
         end = span.end;
     }
     Ok((key, end))
-}
-
-/// Field-typed value parsing (plan v2 F4): the closed `status`/`kind`
-/// keyword sets are enforced here with a position, `duration` requires a
-/// duration literal (a bare number has no unit), `name` requires a
-/// string, and attributes accept string/number/boolean/duration.
-fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlError> {
-    match field {
-        Field::Intrinsic(Intrinsic::Status) => {
-            const EXPECTED: &str = "a status ('ok', 'error', or 'unset')";
-            let tok = cursor.peek().clone();
-            match &tok.kind {
-                TokenKind::Ident(name) => match StatusValue::from_ident(name) {
-                    Some(status) => {
-                        cursor.advance();
-                        Ok(Value::Status(status))
-                    }
-                    None => Err(TraceQlError::UnexpectedToken {
-                        found: describe(&tok.kind),
-                        expected: EXPECTED.to_string(),
-                        span: tok.span,
-                    }),
-                },
-                TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
-                    expected: EXPECTED.to_string(),
-                    span: tok.span,
-                }),
-                _ => Err(TraceQlError::UnexpectedToken {
-                    found: describe(&tok.kind),
-                    expected: EXPECTED.to_string(),
-                    span: tok.span,
-                }),
-            }
-        }
-        Field::Intrinsic(Intrinsic::Kind) => {
-            const EXPECTED: &str =
-                "a span kind ('internal', 'server', 'client', 'producer', or 'consumer')";
-            let tok = cursor.peek().clone();
-            match &tok.kind {
-                TokenKind::Ident(name) => match SpanKindValue::from_ident(name) {
-                    Some(kind) => {
-                        cursor.advance();
-                        Ok(Value::Kind(kind))
-                    }
-                    None => Err(TraceQlError::UnexpectedToken {
-                        found: describe(&tok.kind),
-                        expected: EXPECTED.to_string(),
-                        span: tok.span,
-                    }),
-                },
-                TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
-                    expected: EXPECTED.to_string(),
-                    span: tok.span,
-                }),
-                _ => Err(TraceQlError::UnexpectedToken {
-                    found: describe(&tok.kind),
-                    expected: EXPECTED.to_string(),
-                    span: tok.span,
-                }),
-            }
-        }
-        // `duration` and `traceDuration`/`trace:duration` require a
-        // duration literal (issue #184: the trace-wide duration is the
-        // same value type as the span duration).
-        Field::Intrinsic(
-            Intrinsic::Duration | Intrinsic::TraceDuration | Intrinsic::EventTimeSinceStart,
-        ) => {
-            let tok = cursor.peek().clone();
-            match &tok.kind {
-                TokenKind::Duration(raw) => {
-                    cursor.advance();
-                    Ok(Value::Duration(duration::parse_duration(raw, tok.span)?))
-                }
-                TokenKind::Number(_) => Err(TraceQlError::UnexpectedToken {
-                    found: describe(&tok.kind),
-                    expected: "a duration with a unit (e.g. 2s, 100ms)".to_string(),
-                    span: tok.span,
-                }),
-                TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
-                    expected: "a duration literal (e.g. 2s, 100ms)".to_string(),
-                    span: tok.span,
-                }),
-                _ => Err(TraceQlError::UnexpectedToken {
-                    found: describe(&tok.kind),
-                    expected: "a duration literal (e.g. 2s, 100ms)".to_string(),
-                    span: tok.span,
-                }),
-            }
-        }
-        // String-valued intrinsics: `name` plus the issue #184 additions
-        // `statusMessage`, `span:id`, `span:parentID`, `trace:id`,
-        // `rootName`, `rootServiceName`, and the issue #192 scoped intrinsics
-        // `instrumentation:name`/`instrumentation:version`/`event:name`/
-        // `link:spanID`/`link:traceID` (the last two lowercase-hex ids). The
-        // operator (`=`/`!=`/`=~`/`!~`)
-        // is validated downstream at leaf compilation; here the value must
-        // be a string literal.
-        Field::Intrinsic(
-            Intrinsic::Name
-            | Intrinsic::StatusMessage
-            | Intrinsic::SpanId
-            | Intrinsic::ParentId
-            | Intrinsic::TraceId
-            | Intrinsic::RootName
-            | Intrinsic::RootServiceName
-            | Intrinsic::InstrumentationName
-            | Intrinsic::InstrumentationVersion
-            | Intrinsic::EventName
-            | Intrinsic::LinkSpanId
-            | Intrinsic::LinkTraceId,
-        ) => {
-            let tok = cursor.peek().clone();
-            match tok.kind {
-                TokenKind::String(value) => {
-                    cursor.advance();
-                    Ok(Value::String(value))
-                }
-                TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
-                    expected: "a string".to_string(),
-                    span: tok.span,
-                }),
-                _ => Err(TraceQlError::UnexpectedToken {
-                    found: describe(&tok.kind),
-                    expected: "a string".to_string(),
-                    span: tok.span,
-                }),
-            }
-        }
-        // Numeric span/trace properties: the nested-set intrinsics (issue
-        // #181) and `span:childCount` (issue #184) compare against a bare
-        // number (`< 0`, `> 2`). A regex string (`=~ "x"`) is a positioned
-        // `UnexpectedToken` here — the value must be a number.
-        Field::Intrinsic(
-            Intrinsic::NestedSetParent
-            | Intrinsic::NestedSetLeft
-            | Intrinsic::NestedSetRight
-            | Intrinsic::ChildCount,
-        ) => {
-            let tok = cursor.peek().clone();
-            match &tok.kind {
-                TokenKind::Number(raw) => {
-                    let raw = raw.clone();
-                    cursor.advance();
-                    Ok(Value::Number(raw))
-                }
-                TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
-                    expected: "a number".to_string(),
-                    span: tok.span,
-                }),
-                _ => Err(TraceQlError::UnexpectedToken {
-                    found: describe(&tok.kind),
-                    expected: "a number".to_string(),
-                    span: tok.span,
-                }),
-            }
-        }
-        Field::Attribute { .. } => {
-            const EXPECTED: &str = "a value (string, number, boolean, or duration)";
-            let tok = cursor.peek().clone();
-            match &tok.kind {
-                TokenKind::String(value) => {
-                    let value = value.clone();
-                    cursor.advance();
-                    Ok(Value::String(value))
-                }
-                TokenKind::Number(raw) => {
-                    let raw = raw.clone();
-                    cursor.advance();
-                    Ok(Value::Number(raw))
-                }
-                TokenKind::Duration(raw) => {
-                    let parsed = duration::parse_duration(raw, tok.span)?;
-                    cursor.advance();
-                    Ok(Value::Duration(parsed))
-                }
-                TokenKind::Ident(name) => match name.as_str() {
-                    "true" => {
-                        cursor.advance();
-                        Ok(Value::Bool(true))
-                    }
-                    "false" => {
-                        cursor.advance();
-                        Ok(Value::Bool(false))
-                    }
-                    _ => Err(TraceQlError::UnexpectedToken {
-                        found: describe(&tok.kind),
-                        expected: EXPECTED.to_string(),
-                        span: tok.span,
-                    }),
-                },
-                TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
-                    expected: EXPECTED.to_string(),
-                    span: tok.span,
-                }),
-                _ => Err(TraceQlError::UnexpectedToken {
-                    found: describe(&tok.kind),
-                    expected: EXPECTED.to_string(),
-                    span: tok.span,
-                }),
-            }
-        }
-    }
 }
 
 /// `PipelineStage := Aggregate | Select | Metric` (plan v2 F5 / v3 F5;
@@ -1764,8 +1393,16 @@ mod tests {
     fn only_field(q: &str) -> Field {
         match parse(q).expect("parse").spanset {
             SpansetExpr::Filter(SpansetFilter {
-                body: Some(FieldExpr::Comparison { field, .. }),
-            }) => field,
+                body:
+                    Some(FieldExpr::Binary {
+                        op: FieldOp::Cmp(_),
+                        lhs,
+                        ..
+                    }),
+            }) => match *lhs {
+                FieldExpr::Field(field) => field,
+                other => panic!("{q}: expected a field LHS, got {other:?}"),
+            },
             other => panic!("{q}: expected a single comparison, got {other:?}"),
         }
     }
@@ -1924,6 +1561,51 @@ mod tests {
         q
     }
 
+    /// Only the RIGHT-associative RHS charges `depth`, and the asymmetry
+    /// is load-bearing in BOTH directions. This test fails if the
+    /// condition is dropped either way, so it cannot be satisfied by
+    /// "charge always" or "charge never".
+    ///
+    /// - `^` re-enters the climb at its OWN binding power, so a paren-free
+    ///   `2^2^2^…` recurses once per operator. Uncharged it would build a
+    ///   right spine as long as the input and overflow the stack in
+    ///   `Display`/`Drop`; it must error cleanly instead.
+    /// - A left-associative RHS re-enters one level tighter, so it returns
+    ///   after an atom: charging it costs a CONSTANT (one per operator on
+    ///   the path, not one per chain element), which nonetheless eats the
+    ///   nesting headroom. Measured against the pre-collapse parser at
+    ///   `61dea2f`, the paren boundary is 63 accepted / 64 rejected;
+    ///   charging the left RHS moves it to 61 / 62 and silently rejects
+    ///   two nesting levels that used to parse.
+    ///
+    /// A flat left-associative chain is a POOR witness for the second leg
+    /// and was tried first: `2 * 2 * … * 2` is iterative, so it parses
+    /// under both variants. The boundary below is the discriminating one.
+    #[test]
+    fn only_the_right_associative_rhs_charges_the_depth_guard() {
+        let pow_chain = format!("{{ .a = 2{} }}", " ^ 2".repeat(MAX_DEPTH + 2));
+        assert!(
+            matches!(
+                parse(&pow_chain),
+                Err(TraceQlError::RecursionLimitExceeded { .. })
+            ),
+            "a paren-free `^` chain recurses per operator and must be bounded"
+        );
+
+        let nested = |n: usize| format!("{{ {}.a = 1 && .b = 2{} }}", "(".repeat(n), ")".repeat(n));
+        assert!(
+            parse(&nested(MAX_DEPTH - 1)).is_ok(),
+            "MAX_DEPTH - 1 paren levels parsed before the collapse and must still parse"
+        );
+        assert!(
+            matches!(
+                parse(&nested(MAX_DEPTH)),
+                Err(TraceQlError::RecursionLimitExceeded { .. })
+            ),
+            "the boundary must not move outward either"
+        );
+    }
+
     #[test]
     fn a_just_under_limit_flat_field_chain_parses() {
         // The budget admits MAX_DEPTH - 1 binary nodes.
@@ -2006,11 +1688,15 @@ mod tests {
         match expr {
             SpansetExpr::Filter(SpansetFilter {
                 body:
-                    Some(FieldExpr::Comparison {
-                        field: Field::Attribute { key, .. },
+                    Some(FieldExpr::Binary {
+                        op: FieldOp::Cmp(_),
+                        lhs,
                         ..
                     }),
-            }) => key,
+            }) => match lhs.as_ref() {
+                FieldExpr::Field(Field::Attribute { key, .. }) => key.as_str(),
+                other => panic!("expected an attribute LHS, got {other:?}"),
+            },
             other => panic!("expected a single-attr filter, got {other:?}"),
         }
     }
@@ -2134,14 +1820,27 @@ mod tests {
         }
     }
 
-    /// Issue #335 class D8: `^` is left-associative — `2 ^ 3 ^ 2` is 64,
-    /// not 512. Pinned as a tree, not a number: this crate does not
-    /// evaluate.
+    /// Issue #335 class D8: `^` is **RIGHT**-associative — `2 ^ 3 ^ 2`
+    /// groups as `2 ^ (3 ^ 2)`. Pinned as a tree, not a number: this
+    /// crate does not evaluate.
+    ///
+    /// **Established structurally, not from the value.** The reference
+    /// folds `2^3` to 9 and `3^2` to 8, so the candidate groupings reduce
+    /// to different single operations: `2 ^ 3 ^ 2` measures 64, `9 ^ 2`
+    /// (left's second step) measures 512, `2 ^ 8` (right's second step)
+    /// measures 64. The three-term form equals `2 ^ 8`, so it groups
+    /// right — a conclusion that needs no model of what `^` computes.
+    ///
+    /// This test previously asserted LEFT associativity, derived from the
+    /// reference value 64 alone. That derivation was wrong: the reference
+    /// reaches 64 by right grouping combined with an operand-swapping
+    /// integer `^` (ledger `traceql-pow-integer-operand-swap`), i.e. two
+    /// errors cancelling. **A value can only ever pin a value.**
     #[test]
-    fn pow_is_left_associative() {
+    fn pow_is_right_associative() {
         let got = parse("{ .a = 2 ^ 3 ^ 2 }").unwrap();
-        assert_eq!(got, parse("{ .a = ((2 ^ 3) ^ 2) }").unwrap());
-        assert_ne!(got, parse("{ .a = (2 ^ (3 ^ 2)) }").unwrap());
+        assert_eq!(got, parse("{ .a = (2 ^ (3 ^ 2)) }").unwrap());
+        assert_ne!(got, parse("{ .a = ((2 ^ 3) ^ 2) }").unwrap());
     }
 
     /// Issue #335 class D9: unary `-` binds LOOSER than `^` and `* / %`
@@ -2205,8 +1904,8 @@ mod tests {
                 matches!(
                     &parsed.spanset,
                     SpansetExpr::Filter(SpansetFilter {
-                        body: Some(FieldExpr::FieldCompare {
-                            rhs: Field::Intrinsic(_),
+                        body: Some(FieldExpr::Binary {
+                            op: FieldOp::Cmp(_),
                             ..
                         }),
                     })
@@ -2337,7 +2036,11 @@ mod tests {
         let field = parse(r#"{ .a !~ "x" }"#).unwrap();
         match &field.spanset {
             SpansetExpr::Filter(SpansetFilter {
-                body: Some(FieldExpr::Comparison { op, .. }),
+                body:
+                    Some(FieldExpr::Binary {
+                        op: FieldOp::Cmp(op),
+                        ..
+                    }),
             }) => assert_eq!(*op, ComparisonOp::Nre),
             other => panic!("expected a field !~ comparison, got {other:?}"),
         }
@@ -2359,7 +2062,10 @@ mod tests {
             assert!(matches!(
                 &parsed.spanset,
                 SpansetExpr::Filter(SpansetFilter {
-                    body: Some(FieldExpr::Not(_))
+                    body: Some(FieldExpr::Unary {
+                        op: UnaryOp::Not,
+                        ..
+                    })
                 })
             ));
             assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
@@ -2369,7 +2075,7 @@ mod tests {
             assert_eq!(
                 parsed.spanset,
                 SpansetExpr::Filter(SpansetFilter {
-                    body: Some(FieldExpr::BoolStatic(want))
+                    body: Some(FieldExpr::Literal(Value::Bool(want)))
                 })
             );
         }
@@ -2387,14 +2093,27 @@ mod tests {
             let parsed = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
             match &parsed.spanset {
                 SpansetExpr::Filter(SpansetFilter {
-                    body: Some(FieldExpr::FieldCompare { .. }),
-                }) => {}
-                other => panic!("{query} -> expected FieldCompare, got {other:?}"),
+                    body:
+                        Some(FieldExpr::Binary {
+                            op: FieldOp::Cmp(_),
+                            rhs,
+                            ..
+                        }),
+                }) if matches!(rhs.as_ref(), FieldExpr::Field(_)) => {}
+                other => panic!("{query} -> expected a field-vs-field compare, got {other:?}"),
             }
             assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
         }
-        // A regex against a field RHS is rejected (Tempo rejects it too).
-        assert!(parse(r#"{ .a =~ .b }"#).is_err());
+        // A regex against a field RHS is still rejected, by the
+        // VALIDATOR since the Stage B collapse — one operand grammar
+        // cannot know which operator it is feeding, so the rule moved to
+        // where the operator and the operand are both in scope. Measured
+        // reference: 400 `invalid type for =~ or !~: .b`.
+        let ast = parse(r#"{ .a =~ .b }"#).expect("parses after the collapse");
+        assert_eq!(
+            crate::validate(&ast).unwrap_err().rule_id(),
+            "invalid-regex-operand"
+        );
         // A spanset-level `!{…}` is a plain parse error (not a construct).
         assert!(matches!(
             parse(r#"!{ .a = 1 }"#),
@@ -2433,7 +2152,7 @@ mod tests {
         assert_eq!(
             parsed.spanset,
             SpansetExpr::Filter(SpansetFilter {
-                body: Some(FieldExpr::Exists(Field::Attribute {
+                body: Some(FieldExpr::Field(Field::Attribute {
                     scope: AttrScope::Unscoped,
                     key: "foo".to_string(),
                 })),
@@ -2449,10 +2168,13 @@ mod tests {
         assert_eq!(
             present.spanset,
             SpansetExpr::Filter(SpansetFilter {
-                body: Some(FieldExpr::Exists(Field::Attribute {
-                    scope: AttrScope::Unscoped,
-                    key: "a".to_string(),
-                })),
+                body: Some(FieldExpr::Exists {
+                    field: Field::Attribute {
+                        scope: AttrScope::Unscoped,
+                        key: "a".to_string(),
+                    },
+                    negated: false,
+                }),
             })
         );
         assert_eq!(parse(&present.to_string()).unwrap(), present);
@@ -2460,7 +2182,7 @@ mod tests {
         assert!(matches!(
             absent.spanset,
             SpansetExpr::Filter(SpansetFilter {
-                body: Some(FieldExpr::Not(_)),
+                body: Some(FieldExpr::Exists { negated: true, .. }),
             })
         ));
         assert_eq!(parse(&absent.to_string()).unwrap(), absent);
@@ -2481,9 +2203,32 @@ mod tests {
             let parsed = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
             match &parsed.spanset {
                 SpansetExpr::Filter(SpansetFilter {
-                    body: Some(FieldExpr::ArithCompare { .. }),
-                }) => {}
-                other => panic!("{query}: expected ArithCompare, got {other:?}"),
+                    body:
+                        Some(FieldExpr::Binary {
+                            op: FieldOp::Cmp(_),
+                            lhs,
+                            rhs,
+                        }),
+                }) if matches!(
+                    lhs.as_ref(),
+                    FieldExpr::Binary {
+                        op: FieldOp::Arith(_),
+                        ..
+                    } | FieldExpr::Unary {
+                        op: UnaryOp::Neg,
+                        ..
+                    }
+                ) || matches!(
+                    rhs.as_ref(),
+                    FieldExpr::Binary {
+                        op: FieldOp::Arith(_),
+                        ..
+                    } | FieldExpr::Unary {
+                        op: UnaryOp::Neg,
+                        ..
+                    }
+                ) => {}
+                other => panic!("{query}: expected an arithmetic compare, got {other:?}"),
             }
             assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
         }
@@ -2535,21 +2280,30 @@ mod tests {
         assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
     }
 
+    /// A bare non-boolean body is REJECTED, and after the issue #335
+    /// Stage B collapse the rejection is the validator's.
+    ///
+    /// It used to be a parse error ("expected a comparison operator"),
+    /// which was our grammar's accident, not the reference's: the
+    /// reference PARSES `{ name }` and then rejects it with `span filter
+    /// field expressions must resolve to a boolean`. Same 400 on the wire,
+    /// correct layer, and the message now says what is actually wrong.
+    ///
+    /// This lives in the parser's test module deliberately, next to the
+    /// grammar it stopped being a rule of, so nobody re-adds the guard.
     #[test]
-    fn a_bare_intrinsic_is_a_plain_missing_comparison_error() {
-        // `{ name }` is malformed grammar in every milestone, not a
-        // future construct (round-2 adjudication 1).
+    fn a_bare_non_boolean_body_parses_and_the_validator_rejects_it() {
         for query in ["{ name }", "{ duration }", "{ status && .a = 1 }"] {
-            let err = parse(query).unwrap_err();
-            match err {
-                TraceQlError::UnexpectedToken { expected, .. } => {
-                    assert!(
-                        expected.contains("comparison operator"),
-                        "{query}: {expected}"
-                    );
-                }
-                other => panic!("{query} -> unexpected {other}"),
-            }
+            let ast = parse(query).unwrap_or_else(|e| panic!("{query} must now parse: {e}"));
+            let err = crate::validate(&ast).expect_err("must be rejected by the validator");
+            assert!(
+                matches!(
+                    err.rule_id(),
+                    "spanset-filter-not-boolean" | "type-mismatch"
+                ),
+                "{query} -> unexpected rule {}",
+                err.rule_id()
+            );
         }
     }
 
@@ -2571,10 +2325,22 @@ mod tests {
             let parsed = parse(query).unwrap();
             match &parsed.spanset {
                 SpansetExpr::Filter(SpansetFilter {
-                    body: Some(FieldExpr::Comparison { field, value, .. }),
+                    body:
+                        Some(FieldExpr::Binary {
+                            op: FieldOp::Cmp(_),
+                            lhs,
+                            rhs,
+                        }),
                 }) => {
-                    assert_eq!(*field, Field::Intrinsic(intrinsic), "{query}");
-                    assert!(matches!(value, Value::Number(_)), "{query}");
+                    assert_eq!(
+                        **lhs,
+                        FieldExpr::Field(Field::Intrinsic(intrinsic)),
+                        "{query}"
+                    );
+                    assert!(
+                        matches!(rhs.as_ref(), FieldExpr::Literal(Value::Number(_))),
+                        "{query}"
+                    );
                 }
                 other => panic!("{query} -> unexpected {other:?}"),
             }
@@ -2584,20 +2350,20 @@ mod tests {
         }
     }
 
+    /// `{ nestedSetLeft =~ "x" }` — a regex against an int-typed intrinsic.
+    ///
+    /// Was a POSITIONED parse error (the old operand grammar knew the
+    /// LHS's type and refused the string); is now the validator's
+    /// positionless type rule, which is the reference's own signature for
+    /// it: measured 400 `binary operations must operate on the same type:
+    /// nestedSetLeft =~ `x``.
     #[test]
-    fn nested_set_regex_string_is_a_positioned_unexpected_token() {
-        let err = parse(r#"{ nestedSetLeft =~ "x" }"#).unwrap_err();
-        match err {
-            TraceQlError::UnexpectedToken { expected, span, .. } => {
-                assert!(expected.contains("number"), "{expected}");
-                // The string value sits after `nestedSetLeft =~ `.
-                assert_eq!(
-                    &r#"{ nestedSetLeft =~ "x" }"#[span.start..span.end],
-                    r#""x""#
-                );
-            }
-            other => panic!("unexpected {other}"),
-        }
+    fn nested_set_regex_string_is_a_validate_type_mismatch() {
+        let ast = parse(r#"{ nestedSetLeft =~ "x" }"#).expect("parses after the collapse");
+        assert_eq!(
+            crate::validate(&ast).unwrap_err().rule_id(),
+            "type-mismatch"
+        );
     }
 
     #[test]

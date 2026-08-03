@@ -1,0 +1,30 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Binary {
+                    op: Cmp(
+                        Gt,
+                    ),
+                    lhs: Field(
+                        Intrinsic(
+                            Duration,
+                        ),
+                    ),
+                    rhs: Unary {
+                        op: Neg,
+                        expr: Literal(
+                            Duration(
+                                Duration(
+                                    2000000000,
+                                ),
+                            ),
+                        ),
+                    },
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}

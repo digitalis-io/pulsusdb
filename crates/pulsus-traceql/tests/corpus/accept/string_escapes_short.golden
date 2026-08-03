@@ -2,13 +2,19 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Intrinsic(
-                        Name,
+                Binary {
+                    op: Cmp(
+                        Eq,
                     ),
-                    op: Eq,
-                    value: String(
-                        "col1\tcol2\n\"quoted\" \\ bell\u{7} vt\u{b} bs\u{8} ff\u{c} cr\r",
+                    lhs: Field(
+                        Intrinsic(
+                            Name,
+                        ),
+                    ),
+                    rhs: Literal(
+                        String(
+                            "col1\tcol2\n\"quoted\" \\ bell\u{7} vt\u{b} bs\u{8} ff\u{c} cr\r",
+                        ),
                     ),
                 },
             ),
