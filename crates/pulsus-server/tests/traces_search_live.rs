@@ -236,6 +236,16 @@ fn kv_str(key: &str, value: &str) -> KeyValue {
     }
 }
 
+fn kv_bool(key: &str, value: bool) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::BoolValue(value)),
+        }),
+        key_strindex: 0,
+    }
+}
+
 fn kv_int(key: &str, value: i64) -> KeyValue {
     KeyValue {
         key: key.to_string(),
@@ -1273,4 +1283,139 @@ async fn scan_budget_breach_is_422_query_too_broad() {
     let json = res.json(ctx);
     assert_eq!(json["status"], "error", "{ctx}");
     assert_eq!(json["errorType"], "query_too_broad", "{ctx}: body {json}");
+}
+
+// ---------------------------------------------------------------------
+// Spawn D: the `!`/truthiness asymmetry against a store that HOLDS a
+// string-valued attribute (issue #335 Stage B).
+// ---------------------------------------------------------------------
+
+/// The two deliberate behaviour changes of the Stage B grammar collapse,
+/// end to end through the real route.
+///
+/// **Why this needs a live store, and why an empty one will not do.** The
+/// whole claim is about what happens when a span carries a NON-boolean
+/// value under `!`. Evaluation never touches a span in an empty store, so
+/// the error cannot fire and every one of these queries answers a cheerful
+/// 200 — which is exactly how the `{ .a }` defect below hid during Stage
+/// B's own development, where every probe ran against an empty container.
+/// The seed therefore includes a STRING-valued `a` on purpose; it is the
+/// load-bearing fixture, not corpus decoration.
+///
+/// What is pinned:
+///
+/// 1. `{ .a }` is truthiness and TOLERATES the string: 200, matching only
+///    the span whose `a` is `true`. Not a 500, and not the `false` or
+///    string spans either. `{ .a }` plans as the plain comparison
+///    `.a = true`, so a string simply is not equal to a boolean.
+/// 2. `{ !.a = 1 }` FAILS the query, because `!` demands a boolean and the
+///    string span reaches the evaluator. No boolean could have satisfied
+///    `= 1` anyway (`BoolMatch::Never`), and that is the point: the
+///    operand is still resolved, so the failure survives. Answering an
+///    empty 200 here would be a silent wrong answer.
+/// 3. `{ !.a = .b }` — a field on both sides — takes the generic
+///    comparison path rather than the `!`-operand fold, which only covers
+///    a literal operand. Pinned so the fold's BOUNDARY is visible.
+///
+/// STATUS NOTE, deliberate divergence: the reference answers case 2 with a
+/// **500** (`expression (!.a) expected a boolean, but got TypeString`)
+/// because the failure happens mid-scan inside its querier. We answer
+/// **400 bad_data**: it is a client's malformed query, not a server fault,
+/// and `traces_api::error` has always classified `PipelineInvalid` that
+/// way. The matrix scores a reference 500 as INCONCLUSIVE rather than as a
+/// rejection (`excluded_inconclusive`), so this does not move the
+/// scoreboard either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn negation_demands_a_boolean_where_truthiness_tolerates_a_string() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_134;
+    let db = "pulsus_traces_search_it_d";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    // The string-valued `a` is the fixture that makes this test able to
+    // fail at all.
+    for (n, name, attrs) in [
+        (1u8, "a-string", vec![kv_str("a", "hello"), kv_int("b", 1)]),
+        (2u8, "a-true", vec![kv_bool("a", true), kv_int("b", 1)]),
+        (3u8, "a-false", vec![kv_bool("a", false), kv_int("b", 1)]),
+    ] {
+        ingest(
+            port,
+            vec![span(
+                tid(n),
+                sid(1),
+                None,
+                name,
+                ts(base, n as i64),
+                MS,
+                attrs,
+            )],
+            checkout_resource(),
+            name,
+        );
+    }
+
+    // 1. Truthiness tolerates the string: 200, only the `true` span.
+    let ctx = "truthiness-tolerates-string";
+    let res = search(port, "{ .a }", w0, w1, "", ctx);
+    assert_eq!(
+        trace_set(&res.json(ctx)),
+        BTreeSet::from([hex(&tid(2))]),
+        "{ctx}: only a == true matches; the string and false spans do not, \
+         and the string must not fail the query"
+    );
+
+    // 2. `!` demands a boolean: the string span fails the whole query.
+    let ctx = "negation-demands-boolean";
+    let path = format!(
+        "/api/traces/v1/search?q={}&start={w0}&end={w1}",
+        enc("{ !.a = 1 }")
+    );
+    let res = get(port, &path, ctx);
+    assert_eq!(
+        res.status,
+        400,
+        "{ctx}: a present non-boolean under `!` must fail the query, not \
+         answer an empty 200, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(ctx);
+    assert_eq!(json["status"], "error", "{ctx}");
+    let msg = json["error"].as_str().unwrap_or_default();
+    // The reference names the operand too (`expression (!.a) expected a
+    // boolean, but got TypeString`). Pinned by EQUALITY, not `contains`:
+    // this message read `expression (!the attribute) expected a boolean`
+    // until this test was written, which is no use to anyone whose query
+    // mentions several attributes.
+    assert_eq!(msg, "expression (!.a) expected a boolean", "{ctx}");
+
+    // 3. The fold's boundary: a field on both sides is the generic path.
+    let ctx = "negated-operand-vs-field-rhs";
+    let res = get(
+        port,
+        &format!(
+            "/api/traces/v1/search?q={}&start={w0}&end={w1}",
+            enc("{ !.a = .b }")
+        ),
+        ctx,
+    );
+    assert_eq!(
+        res.status,
+        400,
+        "{ctx}: body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(ctx);
+    assert_eq!(json["errorType"], "bad_data", "{ctx}");
+    assert_eq!(
+        json["error"], "type mismatch: a boolean negation is not an arithmetic operand",
+        "{ctx}: the generic path must name why it refused, not merely refuse"
+    );
 }

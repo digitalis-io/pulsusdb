@@ -650,23 +650,6 @@ fn eval_field_compare(
     }
 }
 
-/// Evaluates one filter's boolean tree for one span. Deliberately never
-/// short-circuits: `leaf_idx` must advance through every comparison so
-/// the pre-order leaf registry stays aligned with the AST walk.
-/// Renders a planned operand for the reference's non-boolean error
-/// message. Only reached on the error path, so the allocation is not in
-/// the per-span hot loop.
-fn operand_display(operand: &PlannedOperand) -> String {
-    match operand {
-        PlannedOperand::Name => "name".to_string(),
-        PlannedOperand::Service => "resource.service.name".to_string(),
-        PlannedOperand::Duration => "duration".to_string(),
-        PlannedOperand::Status => "status".to_string(),
-        PlannedOperand::Kind => "kind".to_string(),
-        PlannedOperand::Attr { .. } => "the attribute".to_string(),
-    }
-}
-
 /// Consumes the next planned leaf, in pre-order, and evaluates it.
 fn eval_planned_leaf(
     filter: &PlannedFilter,
@@ -687,7 +670,11 @@ fn eval_planned_leaf(
         //                             the reference does
         // Returning no-match for the third case would be a quiet wrong
         // answer where the reference is a loud failure.
-        PlannedLeafEval::BoolTruth { operand, want } => {
+        PlannedLeafEval::BoolTruth {
+            operand,
+            want,
+            display,
+        } => {
             match resolve_operand(operand, env.ctx.trace_id, span, env.attrs) {
                 None => false,
                 Some(v) => match (v.text, want) {
@@ -701,10 +688,7 @@ fn eval_planned_leaf(
                     (Some("true" | "false"), BoolMatch::Never) => false,
                     _ => {
                         return Err(ReadError::PipelineInvalid {
-                            reason: format!(
-                                "expression (!{}) expected a boolean",
-                                operand_display(operand)
-                            ),
+                            reason: format!("expression (!{display}) expected a boolean"),
                         });
                     }
                 },
