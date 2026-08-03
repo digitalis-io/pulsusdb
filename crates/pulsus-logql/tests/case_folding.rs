@@ -9,30 +9,13 @@
 //!
 //! **Version note.** The oracle is digest-pinned to v3.7.4 — verified
 //! from the container's own `/loki/api/v1/status/buildinfo`, not from
-//! the tag. That is the same version as the language target, and the
-//! same image the capture corpus under
-//! `crates/pulsus-read/tests/logqltest/` NAMES.
-//!
-//! It is deliberately not claimed that the corpus was produced by that
-//! image. `logqltest/corpus/b8_byte_parity.test` records `| size == 1b`,
-//! `>= 1pb` and `>= 1024b` as accepted with values, and the image it
-//! names rejects all three (400, re-measured at this digest), so at
-//! least that file cannot have come from it. **Issue #350 owns that
-//! discrepancy** along with the census rows below. Until it is resolved,
-//! treat "the corpus names v3.7.4" as a declaration rather than as
-//! evidence of what v3.7.4 returns.
+//! the tag — which is the same version as the language target and as the
+//! capture corpus under `crates/pulsus-read/tests/logqltest/`.
 //!
 //! The verdicts below were originally captured against the v3.7.3 oracle
 //! this file was written for; every one was re-verified against v3.7.4
 //! when the oracle moved, and the live leg at the bottom re-checks them
 //! on every run.
-//!
-//! One consequence for the residual census: its 19 rows labelled
-//! "version difference" were labelled from the v3.7.3 oracle and that
-//! label is now known to be wrong — both versions reject those byte-size
-//! spellings and PulsusDB accepts them. **Issue #350 owns that
-//! correction**; the rows are deliberately left as they are here so the
-//! two changes do not tangle.
 //!
 //! **Every verdict below was captured from the pinned reference
 //! container** (`ci/logql/config.yaml`, the digest in
@@ -435,34 +418,23 @@ fn range_duration_units_do_not_fold() {
 /// describes** (we reject what the oracle accepts).
 ///
 /// The middle column is the ORACLE's verdict. It was recorded against
-/// v3.7.3 and re-verified unchanged when the oracle was re-pinned to
-/// v3.7.4 — every row's oracle verdict is identical on both versions,
-/// which the live leg re-checks on each run.
-///
-/// **That re-verification is what makes the class labels below stale.**
-/// They were written when the oracle was v3.7.3 and the target v3.7.4,
-/// on the reading that a row the oracle rejected and the target accepted
-/// was a version difference. Both versions in fact reject the byte-size
-/// spellings, so those rows are ordinary over-acceptance and PulsusDB is
-/// the side that is wrong. **Issue #350 owns re-classifying them**; the
-/// labels are deliberately left untouched here so the two changes do not
-/// tangle. Read `VERSION DIFFERENCE` below as "disputed, owned by
-/// #350", not as a finding.
+/// v3.7.3, re-verified unchanged when the oracle was re-pinned to
+/// v3.7.4, and the live leg re-checks it on every run. Oracle and target
+/// are now one version, so that distinction no longer needs policing —
+/// but it did once, and reading a probe as the target's behaviour sent
+/// one adjudication on this issue the wrong way.
 ///
 /// Three classes live here, and they are not the same kind of thing:
 ///
-/// * **`VERSION_DIFFERENCE` — the label is FALSIFIED; the rows are
-///   ordinary over-acceptance.** The byte-size literal rows. The label
-///   was written on the reading that v3.7.4 accepted the full
-///   case-insensitive `humanize.ParseBytes` set while the v3.7.3 oracle
-///   did not, so PulsusDB looked correct for the target. Measured
-///   against the v3.7.4 oracle this file is now pinned to: `| size ==
-///   1b`, `>= 1pb`, `>= 1024b`, `1kb` and `1eib` are all **400**, while
-///   `1KiB`, `1k` and `1B` are 200. Both versions reject the spellings
-///   below; PulsusDB accepts them, and is the side that is wrong.
-///   **Issue #350 owns the correction** — the rows, the class string,
-///   and the `b8_byte_parity.test` capture that recorded two of those
-///   spellings as accepted and is the evidence this label rested on.
+/// * **`VERSION_DIFFERENCE` — EMPTY, and pinned at zero.** It once held
+///   19 byte-size literal rows, on the reading that v3.7.4 accepted the
+///   full case-insensitive `humanize.ParseBytes` set while the v3.7.3
+///   oracle did not. Measurement disproved it: BOTH versions accept only
+///   the 21 case-sensitive spellings, so PulsusDB was the side that was
+///   wrong. Issue #350 fixed the parser and deleted the rows — they are
+///   agreement now, and the census forbids agreement rows. The class
+///   name survives only so the zero can be pinned; a row appearing here
+///   again would mean the two reference versions had genuinely diverged.
 /// * **OVER-ACCEPTANCE — unscheduled by design.** `1S`, `[5ns]`/`[5us]`,
 ///   `{by="x"}`/`{json="x"}`. A user does not notice these: their query
 ///   works here and would fail against the reference. Recorded rather
@@ -470,8 +442,19 @@ fn range_duration_units_do_not_fold() {
 /// * **A REAL GAP, filed elsewhere.** `offset`, unimplemented in every
 ///   spelling — a query that runs against the reference fails here.
 ///
-/// The census fails if any row's PulsusDB verdict moves, so none can be
-/// quietly forgotten or quietly fixed.
+/// **What this census can and cannot observe (issue #350):** its
+/// PulsusDB verdict is [`accepts`] — `pulsus_logql::parse` — so it fails
+/// when a row's PARSE-layer verdict moves, and it CANNOT see a verdict
+/// decided below the parser (plan/pipeline compile in `pulsus-read`).
+/// Issue #350 proved that blindness concretely: the byte-literal
+/// spellings' end-to-end verdict flipped to reject while this census
+/// stayed green, because they still PARSE here. A row whose verdict is
+/// decided below the parser therefore does NOT belong in this table —
+/// its end-to-end home is `pulsus-read` (`b8_byte_parity.test`'s
+/// `eval_fail` block through the full parse→plan→compile route, plus
+/// `pipeline.rs`'s exhaustive literal tests); this file keeps only the
+/// REFERENCE half of those rows ([`BYTE_LITERAL_QUERY_REJECTS`], live
+/// leg) and a hermetic pin that the layer split itself still holds.
 /// The three classes a residual row can belong to. Machine-readable
 /// rather than only a comment heading, so [`the_residual_divergence_census_is_exact`]
 /// can pin a total PER CLASS — a row that is re-classified without the
@@ -482,130 +465,6 @@ const REAL_GAP: &str = "real-gap";
 
 const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
     // (query, differential-oracle verdict, PulsusDB verdict, class)
-    // The rows carrying `VERSION_DIFFERENCE` — a label now known to be
-    // wrong, kept only until #350 corrects it together with the rows.
-    // BOTH reference versions reject these spellings: the oracle admits
-    // exactly 21 case-sensitive byte spellings (`B k kB ki kiB K KB Ki
-    // KiB M MB Mi MiB G GB Gi GiB T TB Ti TiB`, no peta, no exa) and
-    // 400s everything below with `syntax error: unexpected $end` —
-    // measured across 61 spellings at v3.7.3 and re-measured at the
-    // v3.7.4 digest this file is pinned to. PulsusDB accepts them, so
-    // these are over-acceptance, not a version difference. **#350 owns
-    // fixing them; do not edit these rows here.**
-    (
-        r#"{app="x"} | json | size > 1b"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1kb"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1Kb"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1kib"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1Kib"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1KIB"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1mb"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1mB"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1Mb"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1mi"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1mib"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1g"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1gb"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1gi"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1gib"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1tb"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1tib"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1pb"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
-    (
-        r#"{app="x"} | json | size > 1PB"#,
-        "reject",
-        "accept",
-        VERSION_DIFFERENCE,
-    ),
     // OVER-ACCEPTANCE. A label-filter duration with an uppercase unit:
     // the oracle lexes no literal at all (`400 syntax error: unexpected
     // $end`).
@@ -666,12 +525,18 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
 fn the_residual_census_totals_are_pinned() {
     assert_eq!(
         KNOWN_RESIDUAL_DIVERGENCES.len(),
-        28,
+        9,
         "the residual census changed size — update this total and every count quoted \
-         about it (issue #339)"
+         about it (issues #339, #350)"
     );
     for (class, expected) in [
-        (VERSION_DIFFERENCE, 19),
+        // Issue #350 emptied this class: the 19 byte-literal rows were
+        // never a version difference — BOTH v3.7.3 and v3.7.4 reject
+        // those spellings (probed exhaustively) — and PulsusDB now
+        // rejects them too, so they are agreements, not residual
+        // divergences. Their spellings live on in
+        // [`BYTE_LITERAL_QUERY_REJECTS`] below.
+        (VERSION_DIFFERENCE, 0),
         (OVER_ACCEPTANCE, 7),
         (REAL_GAP, 2),
     ] {
@@ -740,6 +605,11 @@ fn live_expectations() -> Vec<(String, &'static str)> {
     for q in NON_FOLDING_REJECTS {
         out.push(((*q).to_string(), "reject"));
     }
+    // The byte-literal spellings both engines reject (#350): only the
+    // REFERENCE half is checkable from this crate — see the const's doc.
+    for q in BYTE_LITERAL_QUERY_REJECTS {
+        out.push(((*q).to_string(), "reject"));
+    }
     // The residual census carries the reference verdict per row.
     for (q, reference, _, _) in KNOWN_RESIDUAL_DIVERGENCES {
         out.push(((*q).to_string(), reference));
@@ -782,6 +652,58 @@ const FOLDING_PROBES: &[&str] = &[
     r#"{App="X", Env="Prod"}"#,
     r#"{app="x"} | json | RATE="R""#,
 ];
+
+/// Byte-literal query spellings the reference rejects — on BOTH v3.7.3
+/// and v3.7.4, probed exhaustively (issue #350; the versions agree, so
+/// these were never the version difference this file once recorded).
+/// PulsusDB ALSO rejects every one of them since #350 — but that verdict
+/// is decided in `pulsus-read`'s pipeline (`classify_numeric_literal` →
+/// `parse_query_bytes_literal`), BELOW this crate's parser, so this file
+/// can only pin two things honestly: the REFERENCE verdict (replayed by
+/// the live leg) and the LAYER SPLIT itself
+/// ([`byte_literal_rejects_still_parse_here_the_verdict_lives_below`]).
+/// The end-to-end PulsusDB verdict is pinned in `pulsus-read`:
+/// `logqltest/corpus/b8_byte_parity.test`'s `eval_fail` block (full
+/// parse→plan→compile→eval route) and `pipeline.rs`'s exhaustive
+/// 21-spelling accept/reject tests.
+const BYTE_LITERAL_QUERY_REJECTS: &[&str] = &[
+    r#"{app="x"} | json | size > 1b"#,
+    r#"{app="x"} | json | size > 1kb"#,
+    r#"{app="x"} | json | size > 1Kb"#,
+    r#"{app="x"} | json | size > 1kib"#,
+    r#"{app="x"} | json | size > 1Kib"#,
+    r#"{app="x"} | json | size > 1KIB"#,
+    r#"{app="x"} | json | size > 1mb"#,
+    r#"{app="x"} | json | size > 1mB"#,
+    r#"{app="x"} | json | size > 1Mb"#,
+    r#"{app="x"} | json | size > 1mi"#,
+    r#"{app="x"} | json | size > 1mib"#,
+    r#"{app="x"} | json | size > 1g"#,
+    r#"{app="x"} | json | size > 1gb"#,
+    r#"{app="x"} | json | size > 1gi"#,
+    r#"{app="x"} | json | size > 1gib"#,
+    r#"{app="x"} | json | size > 1tb"#,
+    r#"{app="x"} | json | size > 1tib"#,
+    r#"{app="x"} | json | size > 1pb"#,
+    r#"{app="x"} | json | size > 1PB"#,
+];
+
+/// The layer split, pinned hermetically: every rejected byte spelling
+/// still PARSES in this crate — the rejection is a plan/compile-time
+/// verdict in `pulsus-read`. If any of these ever stops parsing, the
+/// verdict has MOVED LAYERS and both this file's claims and the
+/// `pulsus-read` pins must be re-derived (that movement was invisible to
+/// the pre-#350 census, which is exactly why this pin exists).
+#[test]
+fn byte_literal_rejects_still_parse_here_the_verdict_lives_below() {
+    for q in BYTE_LITERAL_QUERY_REJECTS {
+        assert!(
+            accepts(q),
+            "{q}: parses no more — the byte-literal verdict moved into the parser; \
+             re-derive the layer-split claims here and in pulsus-read"
+        );
+    }
+}
 
 /// Spellings the reference REJECTS — the non-folding half. A live accept
 /// here would mean we are now under-folding relative to the reference.

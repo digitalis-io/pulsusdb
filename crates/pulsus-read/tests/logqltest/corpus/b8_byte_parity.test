@@ -1,21 +1,45 @@
-# Batch B8 (issue #226): byte-unit + empty-label parity with Loki. Every
-# expected outcome is a byte-exact capture from grafana/loki:3.7.4 (the #218
-# exact-fixture discipline — see PROVENANCE.md). Instant-eval only. Each
-# `load`…`clear` section is scoped to exactly the streams its query selects.
+# Batch B8 (issue #226, corrected by issue #350): byte-unit + empty-label
+# parity with Loki. Instant-eval only. Each `load`…`clear` section is scoped
+# to exactly the streams its query selects.
 #
-# Two divergences from Loki are closed here:
-#   1. `label_format` rename from an ABSENT source is a no-op (dst NOT created),
-#      matching Loki (fmt.go:414-419) — see the rename section.
-#   2. The byte value/RHS parser is now a faithful `humanize.ParseBytes` port:
-#      bare units, uint64 truncation, exa tier, comma separators, space-trim,
-#      the `f >= math.MaxUint64` overflow rejection, and the two humanize error
-#      details (`too large: …`, `unhandled size name: …`).
-# The 1KiB=1024/1000-excluded case is a regression-lock: both engines agree
-# (the field report compared decimal `1KB` in-container vs binary `1KiB`).
+# PROVENANCE, per row class (issue #350 — the original header claimed every
+# expectation was a byte-exact capture; SIX query spellings the reference
+# rejects and ONE threshold the reference silently corrupts were recorded
+# under that claim, and nothing hermetic could catch it — independently
+# confirmed by the oracle re-pin's review, which ran `| size == 1b` and
+# `>= 1pb` against the v3.7.4 container at the very digest this file
+# names and got 400s for the rows recorded here as accepted-with-values):
+#   * every row EXCEPT the 1KiB boundary row was re-captured verbatim from
+#     grafana/loki:3.7.4 on 2026-08-02 (query_range over the exact
+#     load-section dataset, ci/logql/config.yaml, v3.7.3 cross-checked
+#     identical) — with the query spellings corrected to the reference's
+#     accepted set;
+#   * the 1KiB boundary row is a PINNED DIVERGENCE, not a capture — see its
+#     own header and the `byte-literal-render-quantization` ledger row.
+#
+# QUERY-side byte literals accept exactly the reference's 21 spellings
+# (probed exhaustively on BOTH v3.7.3 and v3.7.4 — the versions agree):
+#   B  k kB ki kiB  K KB Ki KiB  M MB Mi MiB  G GB Gi GiB  T TB Ti TiB
+# Case-sensitive; no lowercase `b`; no peta or exa tier (the reference's
+# own number scanner eats `1P…`/`1E…` as exponent forms first); a
+# zero-valued literal rejects (its frontend re-renders the threshold as
+# `0B`, which its own lexer cannot re-parse — both versions). The
+# rejections are pinned in the eval_fail block at the end.
+# LABEL VALUES keep the full case-insensitive humanize table — the
+# reference converts values with `humanize.ParseBytes` directly, so
+# `size=1eb` as DATA still reads as 1e18 while `>= 1eb` as QUERY rejects.
 
 # =====================================================================
-# 1KiB boundary regression-lock: both engines parse 1KiB=1024, so a
-# `size` of 1000 is excluded and 1024 is included.
+# 1KiB boundary — PINNED DIVERGENCE (issue #350; ledger row
+# `byte-literal-render-quantization`), NOT a container capture. PulsusDB
+# holds the ENGINE-exact threshold: 1KiB = 1024, so 1000 is excluded.
+# The live reference INCLUDES the 1000 line (measured, both versions,
+# both the default and comparison configs; 1025B → 1000, 1536B → 1500,
+# exact again at decimal round values) — display-precision corruption
+# of the comparison value, consistent with its threshold re-rendering
+# through `humanize.Bytes` (see the ledger row for the evidence bounds).
+# Loki documents and parses 1KiB = 1024; the corrupted comparison is its
+# own inconsistency, so PulsusDB keeps the exact value.
 # =====================================================================
 load
   {env="prod", service_name="b8-kib"}
@@ -28,7 +52,7 @@ eval instant at 60s {service_name="b8-kib"} | logfmt | size >= 1KiB
 clear
 
 # =====================================================================
-# bare unit on the RHS literal: `1k` = 1000 (no `b` suffix required).
+# bare unit on the RHS literal: `1k` = 1000 (no `B` suffix required).
 # =====================================================================
 load
   {env="prod", service_name="b8-bare"}
@@ -41,50 +65,55 @@ clear
 
 # =====================================================================
 # uint64 truncation: the value `1.5` truncates toward zero to 1, so it
-# equals the RHS `1b`.
+# equals the RHS `1B` (was `1b` — a spelling the reference rejects).
 # =====================================================================
 load
   {env="prod", service_name="b8-trunc"}
   0s   size=1.5
 
-eval instant at 60s {service_name="b8-trunc"} | logfmt | size == 1b
+eval instant at 60s {service_name="b8-trunc"} | logfmt | size == 1B
   {env="prod", service_name="b8-trunc", size="1.5"}  0s  size=1.5
 
 clear
 
 # =====================================================================
-# exa tier, value-side: `1eb` = 1e18 >= `1pb` = 1e15. Well-separated
-# magnitudes keep the f64-vs-uint64 exa residual immaterial (v3 note).
+# exa tier, VALUE-side only: `1eb` = 1e18 >= `1TB` = 1e12 (was `1pb` —
+# the whole query-side p/e tier is rejected by the reference). 1e12
+# round-trips the reference's humanize re-render exactly, so the row is
+# a clean capture.
 # =====================================================================
 load
   {env="prod", service_name="b8-exa"}
   0s   size=1eb
 
-eval instant at 60s {service_name="b8-exa"} | logfmt | size >= 1pb
+eval instant at 60s {service_name="b8-exa"} | logfmt | size >= 1TB
   {env="prod", service_name="b8-exa", size="1eb"}  0s  size=1eb
 
 clear
 
 # =====================================================================
-# comma separator: `1,024` = 1024 (commas stripped before ParseFloat).
+# comma separator, VALUE-side: `1,024` = 1024 >= `1kB` = 1000 (was
+# `1024b` — rejected spelling; a comma never lexes into a query literal
+# on either engine).
 # =====================================================================
 load
   {env="prod", service_name="b8-comma"}
   0s   size=1,024
 
-eval instant at 60s {service_name="b8-comma"} | logfmt | size >= 1024b
+eval instant at 60s {service_name="b8-comma"} | logfmt | size >= 1kB
   {env="prod", service_name="b8-comma", size="1,024"}  0s  size=1,024
 
 clear
 
 # =====================================================================
-# space-trim: `3 kB` = 3000 (whitespace between number and unit trimmed).
+# space-trim, VALUE-side: `3 kB` = 3000 >= `3kB` = 3000 (was `3000b` —
+# rejected spelling; whitespace never lexes into a query literal).
 # =====================================================================
 load
   {env="prod", service_name="b8-space"}
   0s   size="3 kB"
 
-eval instant at 60s {service_name="b8-space"} | logfmt | size >= 3000b
+eval instant at 60s {service_name="b8-space"} | logfmt | size >= 3kB
   {env="prod", service_name="b8-space", size="3 kB"}  0s  size="3 kB"
 
 clear
@@ -103,28 +132,74 @@ eval instant at 60s {service_name="b8-rename"} | logfmt | label_format newk=miss
 clear
 
 # =====================================================================
-# overflow: `16eib` = 16 * 2^60 == 2^64 hits `f >= math.MaxUint64`, so the
-# value fails to convert. Loki keeps the line and tags the per-line error
-# `LabelFilterErr` + `too large: 16eib` (label_filter.go:181-188).
+# overflow, VALUE-side: `16eib` = 16 * 2^60 == 2^64 hits
+# `f >= math.MaxUint64`, so the value fails to convert. Loki keeps the
+# line and tags the per-line error `LabelFilterErr` + `too large: 16eib`
+# (label_filter.go:181-188). RHS was `1b` — rejected spelling.
 # =====================================================================
 load
   {env="prod", service_name="b8-ovf"}
   0s   size=16eib
 
-eval instant at 60s {service_name="b8-ovf"} | logfmt | size > 1b
+eval instant at 60s {service_name="b8-ovf"} | logfmt | size > 1B
   {__error__="LabelFilterErr", __error_details__="too large: 16eib", env="prod", service_name="b8-ovf", size="16eib"}  0s  size=16eib
 
 clear
 
 # =====================================================================
-# unknown suffix: `5xb` fails to convert; Loki keeps the line and tags
-# `unhandled size name: xb` (the trimmed+lowercased suffix).
+# unknown suffix, VALUE-side: `5xb` fails to convert; Loki keeps the
+# line and tags `unhandled size name: xb` (the trimmed+lowercased
+# suffix). RHS was `1b` — rejected spelling.
 # =====================================================================
 load
   {env="prod", service_name="b8-bad"}
   0s   size=5xb
 
-eval instant at 60s {service_name="b8-bad"} | logfmt | size > 1b
+eval instant at 60s {service_name="b8-bad"} | logfmt | size > 1B
   {__error__="LabelFilterErr", __error_details__="unhandled size name: xb", env="prod", service_name="b8-bad", size="5xb"}  0s  size=5xb
+
+clear
+
+# =====================================================================
+# QUERY-side rejections (issue #350): spellings outside the 21-set, the
+# dead p/e tiers, wrong case, overflow, and the zero value — every one
+# probed 400 on BOTH v3.7.3 and v3.7.4. The reference's message is its
+# parse-error class (`syntax error: unexpected $end` and friends);
+# PulsusDB's is its own named literal rejection (the pre-existing
+# inner-text divergence class).
+# =====================================================================
+load
+  {env="prod", service_name="b8-rej"}
+  0s   size=1000
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size == 1b
+  msg: literal "1b" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 1kb
+  msg: literal "1kb" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 1024b
+  msg: literal "1024b" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 1pb
+  msg: literal "1pb" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 1PB
+  msg: literal "1PB" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 1EB
+  msg: literal "1EB" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 1KIB
+  msg: literal "1KIB" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 999999999TiB
+  msg: literal "999999999TiB" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 0B
+  msg: literal "0B" is neither a duration nor a bytes quantity
+
+eval_fail instant at 60s {service_name="b8-rej"} | logfmt | size >= 0KB
+  msg: literal "0KB" is neither a duration nor a bytes quantity
 
 clear
