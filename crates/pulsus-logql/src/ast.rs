@@ -944,6 +944,14 @@ pub enum MetricExpr {
         /// so the AST keeps its `Eq`/`Hash` derive (amendment 2 §1). Only
         /// `quantile_over_time` populates this.
         param: Option<String>,
+        /// `by (…)` / `without (…)` on the range aggregation itself
+        /// (issue #344) — `max_over_time({app="x"} | unwrap v [5m]) by (fp)`.
+        /// POSTFIX ONLY, and only for the eight ops
+        /// [`RangeAggOp::allows_grouping`] admits; the reference rejects the
+        /// prefix placement its vector aggregations accept, and rejects the
+        /// other seven ops by name. `None` for every op that forbids it,
+        /// so an illegal combination is unrepresentable after parsing.
+        grouping: Option<Grouping>,
     },
     Vector {
         op: VectorAggOp,
@@ -1191,13 +1199,15 @@ impl Scc for MetricScc {
                         op: ao,
                         range: ar,
                         param: ap,
+                        grouping: ag,
                     },
                     MetricExpr::Range {
                         op: bo,
                         range: br,
                         param: bp,
+                        grouping: bg,
                     },
-                ) => ao == bo && ar == br && ap == bp,
+                ) => ao == bo && ar == br && ap == bp && ag == bg,
                 (
                     MetricExpr::Vector {
                         op: ao,
@@ -1260,13 +1270,17 @@ impl Scc for MetricScc {
 
     fn rebuild(n: MeNode<'_>, kids: &mut Vec<MeVal>) -> MeVal {
         match n {
-            MeNode::Expr(MetricExpr::Range { op, range, param }) => {
-                MeVal::Expr(MetricExpr::Range {
-                    op: *op,
-                    range: range.clone(),
-                    param: param.clone(),
-                })
-            }
+            MeNode::Expr(MetricExpr::Range {
+                op,
+                range,
+                param,
+                grouping,
+            }) => MeVal::Expr(MetricExpr::Range {
+                op: *op,
+                range: range.clone(),
+                param: param.clone(),
+                grouping: grouping.clone(),
+            }),
             MeNode::Expr(MetricExpr::Literal(raw)) => MeVal::Expr(MetricExpr::Literal(raw.clone())),
             MeNode::Expr(MetricExpr::VectorFn(raw)) => {
                 MeVal::Expr(MetricExpr::VectorFn(raw.clone()))
@@ -1513,11 +1527,17 @@ fn hash_scc<H: Hasher>(root: MeNode<'_>, state: &mut H) {
     let done: Result<(), ()> = walk::emit::<MetricScc, ()>(root, |n, step, _depth| {
         match n {
             MeNode::Expr(e) => match e {
-                MetricExpr::Range { op, range, param } => {
+                MetricExpr::Range {
+                    op,
+                    range,
+                    param,
+                    grouping,
+                } => {
                     mem::discriminant(e).hash(state);
                     op.hash(state);
                     range.hash(state);
                     param.hash(state);
+                    grouping.hash(state);
                     Ok(Emit::Done)
                 }
                 MetricExpr::Literal(raw) => {
@@ -1685,7 +1705,12 @@ fn debug_scc(root: MeNode<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let alt = f.alternate();
     walk::emit::<MetricScc, fmt::Error>(root, |n, step, depth| match n {
         MeNode::Expr(e) => match e {
-            MetricExpr::Range { op, range, param } => {
+            MetricExpr::Range {
+                op,
+                range,
+                param,
+                grouping,
+            } => {
                 walk::dbg_open_struct(f, "Range", alt, depth)?;
                 f.write_str("op: ")?;
                 walk::dbg_own(f, op, alt, depth + 1)?;
@@ -1695,6 +1720,9 @@ fn debug_scc(root: MeNode<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 walk::dbg_sep(f, alt, depth)?;
                 f.write_str("param: ")?;
                 walk::dbg_own(f, param, alt, depth + 1)?;
+                walk::dbg_sep(f, alt, depth)?;
+                f.write_str("grouping: ")?;
+                walk::dbg_own(f, grouping, alt, depth + 1)?;
                 walk::dbg_close_struct(f, alt, depth)?;
                 Ok(Emit::Done)
             }
@@ -1947,10 +1975,21 @@ fn display_scc(root: MeNode<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         }
         match n {
             MeNode::Expr(e) => match e {
-                MetricExpr::Range { op, range, param } => {
+                MetricExpr::Range {
+                    op,
+                    range,
+                    param,
+                    grouping,
+                } => {
                     match param {
                         Some(p) => write!(f, "{op}({p}, {range})")?,
                         None => write!(f, "{op}({range})")?,
+                    }
+                    // POSTFIX only — the reference rejects the prefix
+                    // placement here (issue #344), so rendering it that way
+                    // would produce a string that does not reparse there.
+                    if let Some(g) = grouping {
+                        write!(f, " {g}")?;
                     }
                     Ok(Emit::Done)
                 }
@@ -2326,6 +2365,35 @@ impl RangeAggOp {
             "absent_over_time" => Some(Self::AbsentOverTime),
             "rate_counter" => Some(Self::RateCounter),
             _ => None,
+        }
+    }
+
+    /// Whether the reference admits a `by`/`without` clause on this range
+    /// aggregation (issue #344). Captured by probing grafana/loki v3.7.4
+    /// directly — every one of the fifteen ops, in both directions — NOT
+    /// by reasoning about which ones look like they should: `sum_over_time`
+    /// and `rate` over an unwrapped range are the trap, since both take a
+    /// numeric sample stream and both are rejected. The eight that admit
+    /// it are exactly the sample-selecting/summarising ops; the seven that
+    /// do not answer
+    /// `parse error : grouping not allowed for <op> aggregation`.
+    pub fn allows_grouping(self) -> bool {
+        match self {
+            RangeAggOp::AvgOverTime
+            | RangeAggOp::MinOverTime
+            | RangeAggOp::MaxOverTime
+            | RangeAggOp::StddevOverTime
+            | RangeAggOp::StdvarOverTime
+            | RangeAggOp::QuantileOverTime
+            | RangeAggOp::FirstOverTime
+            | RangeAggOp::LastOverTime => true,
+            RangeAggOp::Rate
+            | RangeAggOp::RateCounter
+            | RangeAggOp::CountOverTime
+            | RangeAggOp::BytesRate
+            | RangeAggOp::BytesOverTime
+            | RangeAggOp::SumOverTime
+            | RangeAggOp::AbsentOverTime => false,
         }
     }
 

@@ -682,3 +682,111 @@ fn label_replace_trailing_syntax_error_wins_over_argument_content() {
         other => panic!("expected a positional parse error, got {other:?}"),
     }
 }
+
+/// Issue #344: a range aggregation takes a `by`/`without` clause on exactly
+/// eight of the fifteen ops. The split is captured from grafana/loki
+/// v3.7.4 by probing every op in both directions — NOT from reasoning about
+/// which ones look like they should, which gets `sum_over_time` and an
+/// unwrapped `rate` wrong (both consume the same numeric sample stream the
+/// accepted eight do, and both are rejected).
+#[test]
+fn exactly_eight_range_aggregations_accept_a_grouping_clause() {
+    // Every op paired with a body that satisfies its own unwrap arity, so
+    // the only thing under test is the grouping clause.
+    const UNWRAPPED: &str = r#"{app="x"} | unwrap v [5m]"#;
+    const LOGS: &str = r#"{app="x"} [5m]"#;
+    let accepts: &[(&str, &str)] = &[
+        ("avg_over_time", UNWRAPPED),
+        ("min_over_time", UNWRAPPED),
+        ("max_over_time", UNWRAPPED),
+        ("stddev_over_time", UNWRAPPED),
+        ("stdvar_over_time", UNWRAPPED),
+        ("first_over_time", UNWRAPPED),
+        ("last_over_time", UNWRAPPED),
+    ];
+    let rejects: &[(&str, &str)] = &[
+        ("rate", LOGS),
+        ("rate", UNWRAPPED),
+        ("rate_counter", UNWRAPPED),
+        ("count_over_time", LOGS),
+        ("bytes_rate", LOGS),
+        ("bytes_over_time", LOGS),
+        ("sum_over_time", UNWRAPPED),
+        ("absent_over_time", UNWRAPPED),
+    ];
+    for (op, body) in accepts {
+        for clause in ["by (fp)", "without (fp)", "by ()", "by (a, b)", "BY (fp)"] {
+            let q = format!("{op}({body}) {clause}");
+            assert!(parse(&q).is_ok(), "{q:?} must parse");
+        }
+    }
+    // `quantile_over_time` carries a leading parameter.
+    for clause in ["by (fp)", "without (fp)"] {
+        let q = format!("quantile_over_time(0.99, {UNWRAPPED}) {clause}");
+        assert!(parse(&q).is_ok(), "{q:?} must parse");
+    }
+    for (op, body) in rejects {
+        for clause in ["by (fp)", "without (fp)"] {
+            let q = format!("{op}({body}) {clause}");
+            match parse(&q) {
+                Err(LogQlError::GroupingNotAllowed { op: got, .. }) => {
+                    assert_eq!(&got, op, "{q:?}")
+                }
+                other => panic!("{q:?} must be a grouping rejection, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// The rejection carries the reference's verbatim sentence (our house
+/// `at byte N` suffix appended, as every other reference-verbatim error in
+/// this crate does).
+#[test]
+fn the_range_grouping_rejection_carries_the_reference_wording() {
+    let err = parse(r#"count_over_time({app="x"}[5m]) by (fp)"#).unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("grouping not allowed for count_over_time aggregation"),
+        "{err}"
+    );
+}
+
+/// POSTFIX ONLY. The reference has no prefix production for a range
+/// aggregation's grouping — unlike its vector aggregations, which take
+/// both — so `max_over_time by (fp) (...)` is a plain syntax error there
+/// and must not be quietly accepted here.
+#[test]
+fn a_range_aggregation_grouping_is_rejected_before_the_call() {
+    for q in [
+        r#"max_over_time by (fp) ({app="x"} | unwrap v [5m])"#,
+        r#"count_over_time by (fp) ({app="x"}[5m])"#,
+        r#"quantile_over_time by (fp) (0.99, {app="x"} | unwrap v [5m])"#,
+    ] {
+        let err = parse(q).unwrap_err();
+        assert!(
+            matches!(err, LogQlError::UnexpectedToken { .. }),
+            "{q:?} -> {err}"
+        );
+    }
+}
+
+/// The clause round-trips through `Display` in the postfix position it was
+/// written in — rendering it as a prefix would produce a string the
+/// reference cannot reparse.
+#[test]
+fn a_range_aggregation_grouping_round_trips_postfix() {
+    for q in [
+        r#"max_over_time({app="x"} | unwrap v [5m]) by (fp)"#,
+        r#"avg_over_time({app="x"} | unwrap v [5m]) without (fp, region)"#,
+        r#"quantile_over_time(0.99, {app="x"} | unwrap v [5m]) by (fp)"#,
+    ] {
+        let expr = parse(q).unwrap();
+        let rendered = expr.to_string();
+        // `Grouping`'s own Display is the crate-wide `by(a, b)` spelling.
+        assert!(
+            rendered.contains(") by(") || rendered.contains(") without("),
+            "{q:?} rendered as {rendered:?}"
+        );
+        assert_eq!(parse(&rendered).unwrap(), expr, "{q:?} -> {rendered:?}");
+    }
+}
