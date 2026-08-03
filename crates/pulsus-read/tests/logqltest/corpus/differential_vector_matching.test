@@ -3,6 +3,10 @@
 # and the two explicit-matching rejections. All counts divide/multiply
 # exactly. Semantics pinned in logql_metric_agg_golden.rs against the
 # reference.
+#
+# provenance: ported(test/fixtures/logs/differential.json)
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # --- on(method) one-to-one: output is the reduced {method} signature ---
 load

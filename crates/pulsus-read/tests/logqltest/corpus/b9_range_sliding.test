@@ -13,6 +13,10 @@
 # class-C folds and cross-stream StableHash same-ns tie cases are covered by
 # the env-gated live schema-it differential (they need the container oracle
 # to capture, per PROVENANCE.md), not this hermetic file.
+#
+# provenance: derived
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="prod", service_name="checkout"} service=checkout

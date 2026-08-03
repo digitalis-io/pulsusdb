@@ -11,6 +11,10 @@
 # Loki drops empty-valued labels; PulsusDB keeps them — cases are authored to
 # never emit an empty label (except keep-with-matcher, where BOTH agree the
 # stream survives with an empty label set).
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # === line_format: {{.label}} substitution over a json pipeline ===
 # json parser promotes status/method/path/region; line_format rewrites only the line body

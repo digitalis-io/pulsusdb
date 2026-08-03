@@ -31,6 +31,10 @@
 # `pkg/logql/sketch` package at v3.7.4 before capture. They are valid
 # only for the pinned reference's hash functions and width; if either
 # ever changes the tokens must be re-derived the same way.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # ===================================================================
 # DATASET A — five `lvl` values with distinct integer counts

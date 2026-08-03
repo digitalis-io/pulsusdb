@@ -2,6 +2,10 @@
 # (issue #201). A missing addr DROPS under `=` (no error); a present-but-
 # non-IP value is a plain non-match, so `!=` RETURNS it carrying only its
 # raw label and NO __error__/__error_details__.
+#
+# provenance: ported(test/fixtures/logs/differential.json)
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # --- missing addr drops under `=` -------------------------------------
 load

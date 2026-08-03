@@ -8,6 +8,10 @@
 #
 # A dataset backs the one data+vector combination case; the pure vector(n)
 # cases ignore it.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="prod", service_name="vec-a"}
