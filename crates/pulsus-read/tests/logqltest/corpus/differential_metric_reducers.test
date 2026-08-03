@@ -4,6 +4,10 @@
 # divisions are hand-derived; the rate_counter values are the bit-exact
 # reference captures pinned in logql_metric_agg_golden.rs (grafana/loki:3.7.4,
 # the #218 ns/ms extrapolation-factor semantics). See PROVENANCE.md.
+#
+# provenance: ported(test/fixtures/logs/differential.json)
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # --- count_over_time over a json+filter pipeline; * scalar ------------
 load

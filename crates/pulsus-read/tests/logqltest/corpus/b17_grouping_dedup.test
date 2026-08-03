@@ -43,6 +43,10 @@
 # issue). OBLIGATION: when #241 lands, ADD both shapes here with the
 # captured expectations above — ready-made acceptance tests, exactly
 # like the excluded sub-cases in b13/b16.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="e1", fp="a", service_name="svc-gd"}

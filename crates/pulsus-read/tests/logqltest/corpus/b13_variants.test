@@ -61,6 +61,10 @@
 #                                           but got "approx_topk"
 #   variants(sum_over_time({…}[5m])) of 500 runtime error: invalid memory
 #                                           address or nil pointer dereference
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="dev", service_name="svcv"} service=svcv
@@ -231,46 +235,59 @@ load
 
 # positional: `variantsExpr` is an `expr` alternative, not a
 # `metricExpr` — every nested position rejects.
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s sum(variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m]))
   msg: an aggregation function
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s (variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m]))
   msg: an aggregation function
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s topk(1, variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m]))
   msg: an aggregation function
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s label_replace(variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m]), "a", "b", "c", "d")
   msg: an aggregation function
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(variants(count_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m])) of ({service_name="rj"}[5m])
   msg: an aggregation function
 
 # grammar shapes.
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants() of ({service_name="rj"}[5m])
   msg: an aggregation function
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(count_over_time({service_name="rj"}[5m]),) of ({service_name="rj"}[5m])
   msg: an aggregation function
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(count_over_time({service_name="rj"}[5m]))
   msg: 'of'
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(count_over_time({service_name="rj"}[5m])) of {service_name="rj"}[5m]
   msg: '('
 
 # non-conforming variant shapes — the reference 500s (three texts plus a
 # nil-pointer panic, header table); PulsusDB rejects each at plan time
 # with one named 400. Both sides reject (ledgered divergence).
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(1) of ({service_name="rj"}[5m])
   msg: must be a range aggregation
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(count_over_time({service_name="rj"}[5m]) + 1) of ({service_name="rj"}[5m])
   msg: must be a range aggregation
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(sum(sum(count_over_time({service_name="rj"}[5m])))) of ({service_name="rj"}[5m])
   msg: must be a range aggregation
 
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(approx_topk(1, count_over_time({service_name="rj"}[5m]))) of ({service_name="rj"}[5m])
   msg: must be a range aggregation
 
@@ -282,6 +299,7 @@ eval_fail instant at 60s variants(approx_topk(1, count_over_time({service_name="
 # `logqltest/PROVENANCE.md` §#240). This row gates a substring of
 # PulsusDB's own wording, which borrows the reference's non-variants
 # arity phrasing without claiming reference provenance for it.
+# provenance: divergence(variants-nonconforming-shape-status)
 eval_fail instant at 60s variants(sum_over_time({service_name="rj"}[5m])) of ({service_name="rj"}[5m])
   msg: invalid aggregation sum_over_time without unwrap
 

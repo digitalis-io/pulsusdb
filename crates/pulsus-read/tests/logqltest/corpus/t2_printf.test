@@ -4,6 +4,10 @@
 # forms — plan AC-6.
 # Captured from grafana/loki:3.7.4 per PROVENANCE.md (stock container,
 # no TZ, no host zoneinfo — the degenerate-UTC Local precondition).
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {a="Hello", arr="[5,6,7]", b="x", b64="aGVsbG8=", big="hello world of words", dur="250ms", epoch="1673798889", js="{\"a\":1,\"b\":[1,2,null],\"s\":\"x\",\"neg\":-2.5,\"t\":true}", n="5", nested="{\"o\":{\"p\":{\"q\":\"deep\"}},\"l\":[[1,2],[3]]}", path="/api/v1/users?q=a b&x=1", service_name="t2s0r1785119441", sz="1KB", u="héllo"} service=t2s0r1785119441

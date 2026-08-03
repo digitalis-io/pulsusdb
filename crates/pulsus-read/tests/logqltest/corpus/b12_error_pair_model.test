@@ -33,6 +33,10 @@
 # in PulsusDB (U5) until #230 lands.
 #
 # DET abbreviates: Value looks like object, but can't find closing '}' symbol
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # ======================================================================
 # §1 (b12a) — pipeline-set errors on a plain line.

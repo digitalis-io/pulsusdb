@@ -2,6 +2,10 @@
 # __error_details__ propagation (issue #99) and the surviving-error metric
 # reject (issue M6-10 D1). __error_details__ strings are byte-exact vs the
 # reference (pinned by logql_pipeline_golden.rs + logql_metric_agg_golden.rs).
+#
+# provenance: ported(test/fixtures/logs/differential.json)
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # --- json over a non-object line: __error__ + byte-exact detail --------
 load

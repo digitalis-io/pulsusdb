@@ -28,6 +28,10 @@
 # LABEL VALUES keep the full case-insensitive humanize table — the
 # reference converts values with `humanize.ParseBytes` directly, so
 # `size=1eb` as DATA still reads as 1e18 while `>= 1eb` as QUERY rejects.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # =====================================================================
 # 1KiB boundary — PINNED DIVERGENCE (issue #350; ledger row
@@ -46,6 +50,7 @@ load
   0s   size=1000
   5s   size=1024
 
+# provenance: divergence(byte-literal-render-quantization)
 eval instant at 60s {service_name="b8-kib"} | logfmt | size >= 1KiB
   {env="prod", service_name="b8-kib", size="1024"}  5s  size=1024
 

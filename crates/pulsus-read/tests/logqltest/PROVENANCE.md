@@ -525,3 +525,59 @@ verified byte-clean afterwards (`git status --porcelain` empty). Per
 
 All five pre-committed additional points disagree, so all are kept
 (the keep-iff-disagrees rule); the `5328` row is mandatory.
+
+## Provenance markers (issue #352)
+
+Every `eval`/`eval_fail` directive in `corpus/` carries a provenance
+marker: a `# provenance:` line at the top of the file (the file default)
+or immediately above a directive (a row override). `check_e_*` in
+`crates/pulsus-read/tests/logqltest_provenance.rs` enforces it.
+
+| marker | meaning |
+|---|---|
+| `captured` | the expectation was taken from the pinned reference container |
+| `derived` | hand-derived from documented semantics, not captured |
+| `divergence(<ledger-id>)` | a PINNED divergence; the row records what PulsusDB does *instead of* the reference, and must never be re-captured. The id must name a `### \`id\`` heading in `docs/benchmarks/logs-differential-ledger.md` |
+| `ported(<source>)` | carried over from another fixture that has its own live comparison |
+
+### What a marker is, and what no mechanism can check
+
+**A replay validates the VALUE, not the provenance.** This is the point
+to hold on to, because it is easy to read a green replay leg as "the
+capture claims have been checked". It cannot be:
+
+- a **hand-authored value that happens to be correct passes** any replay;
+- a **genuine capture that has gone stale fails** one.
+
+"This was captured from the reference rather than hand-authored" is a
+fact about what happened at capture time. Nothing we can build
+re-establishes it. Issue #352's two known instances sit on opposite sides
+of that line: the *never true* one was a PROVENANCE failure caught only
+incidentally, because its value was also wrong — had the false capture
+been accidentally right, nothing would have flagged it — while the *went
+stale* one is a pure value failure, which is the class a replay owns.
+
+So the marker does the one checkable thing: it makes each row's claim
+explicit and counted, so an unmarked row cannot enter the corpus
+unnoticed. **`unmarked` is asserted at zero, not reported** — a census of
+what we have cannot detect what nobody marked, so it has to be a gate. A
+new corpus file lands unmarked and the check fails. That default exists
+because the defect reproduced itself while being described: the issue was
+filed at "26 of 31 files" and was "27 of 32" by the time it was picked
+up, a new file having arrived carrying an unchecked claim.
+
+### Counts
+
+Pinned in `logqltest_provenance.rs`; change them deliberately.
+
+| class | directives |
+|---|---|
+| `captured` | 1135 |
+| `derived` | 16 |
+| `divergence(...)` | 17 |
+| `ported(...)` | 32 |
+| **unmarked** | **0** (asserted) |
+| total | 1200 |
+
+A future live replay leg (issue #352 step 2) reads these markers to
+decide what it may compare — `captured` only. It does not verify them.

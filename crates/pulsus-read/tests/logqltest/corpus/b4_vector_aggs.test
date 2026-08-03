@@ -12,6 +12,10 @@
 # Datasets are multi-series (several logfmt-extracted label values) so the
 # grouping actually partitions; every loaded sample falls inside the query
 # window (t-range, t].
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # ===================================================================
 # DATASET A — region x host, per-series counts {us/a=2, us/b=4,

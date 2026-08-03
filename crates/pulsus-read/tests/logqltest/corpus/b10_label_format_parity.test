@@ -17,6 +17,10 @@
 # The container adds its own `detected_level` ingest label, which PulsusDB does
 # not model; it is elided from the expectations here (and explicitly dropped in
 # the empty-label-set case so the query text stays byte-identical to the probe).
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="prod", service_name="lfp"} service=lfp

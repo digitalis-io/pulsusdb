@@ -4,6 +4,10 @@
 # see PROVENANCE.md). Instant-eval only. Each `load`…`clear` section is scoped
 # to exactly the streams its query selects (a streams eval replays every loaded
 # line through the pipeline). service_name supplies the stream's service.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # =====================================================================
 # json parser

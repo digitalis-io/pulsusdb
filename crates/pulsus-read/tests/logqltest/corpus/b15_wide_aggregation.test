@@ -47,6 +47,10 @@
 #    (`pin_reduction_order`). The captured `avg` here is
 #    1.0119760479041917, but capturing it would pin OUR order as if it
 #    were the reference's. See ledger entry #236 (b).
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="prod", service_name="wide"}

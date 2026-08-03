@@ -67,6 +67,10 @@
 # semantics above are that work's acceptance criteria, captured while the
 # container was in hand; when execution lands, the eight `eval_fail` rows
 # become `eval` rows with those values and this note goes.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="prod", service_name="rg", fp="1", region="eu"}
