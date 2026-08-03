@@ -1510,6 +1510,13 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
 /// per-variant `[range]` windows, or the common pipeline). Both
 /// pre-existing call sites pass `false`, so every existing plan/SQL
 /// snapshot is byte-identical.
+/// The single wording for "the grammar accepts this, the engine does not
+/// execute it yet" on a range-aggregation grouping (issue #344). One
+/// constant so the top-level planner and the `variants(...)` arm cannot
+/// drift apart, and so a grep finds every mention when execution lands.
+const RANGE_GROUPING_UNSUPPORTED: &str =
+    "range aggregation grouping is parsed but not yet executed (issue #344)";
+
 fn metric_plan(
     metric_expr: &MetricExpr,
     p: &QueryParams,
@@ -1529,7 +1536,13 @@ fn metric_plan(
     }
 
     let (base, raw_vector_aggs) = unwrap_vector_aggs(metric_expr);
-    let MetricExpr::Range { op, range, param } = base else {
+    let MetricExpr::Range {
+        op,
+        range,
+        param,
+        grouping: range_grouping,
+    } = base
+    else {
         // `plan_metric_expr`/`build_metric_node` route every
         // `Literal`/`Binary`-bottomed expression to the node tree, so the
         // base reaching `metric_plan` is structurally always `Range`.
@@ -1579,6 +1592,27 @@ fn metric_plan(
     if forbids_unwrap && has_unwrap {
         return Err(ReadError::PipelineInvalid {
             reason: format!("invalid aggregation {op} with unwrap"),
+        });
+    }
+    // Issue #344: the grammar now accepts a range-aggregation grouping on
+    // the eight ops the reference admits it on (the other seven are a
+    // parse-time rejection carrying the reference's wording). EXECUTION is
+    // a separate, larger piece of work: the grouping aggregates the group's
+    // RAW SAMPLES — `stddev_over_time(...) by (fp)` over {1,5,7} is
+    // 2.4944…, the population stddev of the merged samples, not a stddev of
+    // per-series stddevs — so it re-keys the client aggregator's groups and
+    // needs a total sample order across merged streams for
+    // `first_over_time`/`last_over_time`. Until that lands the planner
+    // refuses it by name rather than executing the ungrouped query and
+    // silently returning the wrong series.
+    //
+    // Placed AFTER the unwrap-arity checks on purpose: those carry the
+    // reference's own verbatim messages, and our not-yet-executed refusal
+    // must never displace one. `max_over_time({a="b"}[5m]) by (fp)` answers
+    // `invalid aggregation max_over_time without unwrap` on both systems.
+    if range_grouping.is_some() {
+        return Err(ReadError::PipelineInvalid {
+            reason: RANGE_GROUPING_UNSUPPORTED.to_string(),
         });
     }
     let quantile = match (op, param) {
@@ -2225,6 +2259,9 @@ fn build_variants_node(
             unwrap: None,
         },
         param: None,
+        // The synthesised common-range scan carries no grouping: the
+        // emitted SQL is op- and grouping-independent (issue #344).
+        grouping: None,
     };
     let scan = metric_plan(&scan_expr, p, ctx, /*force_client=*/ true)?;
 
@@ -2256,9 +2293,23 @@ fn build_variants_node(
         {
             return Err(reject(index));
         }
-        let MetricExpr::Range { op, range, param } = base else {
+        let MetricExpr::Range {
+            op,
+            range,
+            param,
+            grouping,
+        } = base
+        else {
             return Err(reject(index));
         };
+        // Issue #344: a range-aggregation grouping is parsed but not yet
+        // executed; inside `variants(...)` it is rejected by the same
+        // named error the top-level planner uses, never silently dropped.
+        if grouping.is_some() {
+            return Err(ReadError::PipelineInvalid {
+                reason: RANGE_GROUPING_UNSUPPORTED.to_string(),
+            });
+        }
 
         // Arity is decided by the VARIANT's own expression, not the
         // common range (Δ1) — the reference messages verbatim.
