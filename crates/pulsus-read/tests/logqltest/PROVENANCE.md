@@ -568,16 +568,52 @@ up, a new file having arrived carrying an unchecked claim.
 
 ### Counts
 
-Pinned in `logqltest_provenance.rs`; change them deliberately.
+**Deliberately not restated here.** The per-class directive counts —
+`captured`, `derived`, `divergence(...)`, `ported(...)`, `unmarked`, and
+the total — are pinned as constants in
+`crates/pulsus-read/tests/logqltest_provenance.rs` (`check_e_*`), which
+derives them from this corpus and asserts them. A second copy in this
+document could only ever drift from that one, and a mechanism to detect
+the drift would be apparatus guarding apparatus. Read the constants.
 
-| class | directives |
-|---|---|
-| `captured` | 1135 |
-| `derived` | 16 |
-| `divergence(...)` | 17 |
-| `ported(...)` | 32 |
-| **unmarked** | **0** (asserted) |
-| total | 1200 |
+The figure that carries meaning rather than scale is **`unmarked`, which
+is asserted at zero** — a new corpus file lands unmarked and the check
+fails.
 
-A future live replay leg (issue #352 step 2) reads these markers to
-decide what it may compare — `captured` only. It does not verify them.
+### Replayable is NOT the same number as captured
+
+A live replay leg (issue #352 step 2) reads these markers to decide what
+it may compare. It does not verify them.
+
+**`captured` and `replayable` are different figures and must never be
+read as one** — the marker says where a value came from, not whether a
+replay can check it. Both are pinned in
+`crates/pulsus-read/tests/logqltest_replay.rs` (`REPLAYABLE`,
+`UNREPLAYED_BY_REASON`), asserted against the classification, with an
+example row per reason.
+
+The gap between them is not a shortfall. Every excluded row falls into
+one of five classes, each a decision:
+
+- **config-delta file** — the capture needed a container config the CI
+  oracle does not run (`b12`/`b14` need `discover_log_levels: false`,
+  which `ci/logql/config.yaml` does not carry), so a replay there is
+  inconclusive.
+- **our-error-text (`eval_fail`)** — the expectation is PulsusDB's error
+  text, not a reference value; the reference's rejection is pinned by the
+  registry disposition and the status-only differential.
+- **`ported(...)`** — not a capture claim; covered by the source
+  fixture's own live comparison.
+- **`divergence(...)`** — records what PulsusDB does INSTEAD of the
+  reference, so replay and comparator would be one source and a "fix"
+  would erase the divergence.
+- **`derived`** — not a capture claim.
+
+**`REPLAYABLE` is an upper bound, not a measurement.** A known class sits
+inside it: rows the reference cannot reproduce against itself (Go
+map-order in its own output, same-timestamp tie order, `approx_topk`
+above its retention cap), where the corpus pins a deterministic choice
+the reference does not make. Nothing marks them and no list exists —
+fabricating one would be worse than saying there is none, since a wrong
+exclusion list reads exactly like a right one. The replay should surface
+them as flapping failures and they should be marked from that evidence.
