@@ -156,3 +156,34 @@ Re-record only with a deliberate grammar change, in the same commit:
    `PULSUSDB_TEMPO_DIFF_URL=http://localhost:13201 cargo test -p pulsus-traceql --test accept_surface`.
 
 Adding a probe: append it with both sides recorded and bump the counts.
+
+## The `!` / absence capture (Stage B, AC 4)
+
+Captured 2026-08-03 against the pinned digest, **before** the Stage B
+de-conflation commit (its own commit, so the ordering is a fact in the
+history rather than a claim). Channel: result differential — spans pushed
+over OTLP with attribute batteries `a = {true, false, absent, "x",
+resource-only true}` and boolean-only `c = {true, false, absent}`, each
+spelling queried over `/api/search` and scored by matched span set,
+stable across three rounds.
+
+Findings, wider than the four spellings the ruling named (the sweep was
+built claim-first: every spelling our tree maps onto `Exists` /
+`Not(Exists)`):
+
+| spelling | reference (measured) | this tree today |
+|---|---|---|
+| `{ .a }` | truthiness — only `a == true` | presence |
+| `{ .a != nil }` | presence | presence (agrees) |
+| `{ !.a }` | boolean NOT — only `a == false`; absent never matches; non-boolean is an evaluation error | absence |
+| `{ .a = nil }` | stable but inscrutable sets matching no simple predicate | absence |
+
+Scoped (`span.`) variants behave identically at span scope. Two
+operational notes: the reference's `!` over a non-boolean value fails the
+whole query on the live-store path (`expression (!.a) expected a
+boolean`), so the oracle acceptance leg for these probes needs a
+container without such data; and the `= nil` sets, while deterministic,
+correspond to no absence/presence reading — a decision (follow, or keep
+our coherent absence semantics as a ledgered divergence) is required at
+the de-conflation design point and is deliberately NOT taken by this
+capture.

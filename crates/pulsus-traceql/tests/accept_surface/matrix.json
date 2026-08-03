@@ -102,6 +102,14 @@
       "impact": "quiet meaning",
       "status": "closed",
       "closed_by": 335
+    },
+    {
+      "id": "D12",
+      "title": "bare / '!' / '= nil' attribute spellings conflated onto existence",
+      "reference": "distinct semantics per spelling, established by result differential: bare attribute = truthiness (matches only a == true, at every scope); '!' = boolean NOT (matches only a == false; an absent attribute never matches; a non-boolean value is an evaluation error); '!= nil' = presence; '= nil' = stable but inscrutable result sets matching no simple predicate (neither absence nor negated presence).",
+      "pulsus": "one node pair: bare and '!= nil' both parse to Exists and evaluate as presence; '!' and '= nil' both parse to Not(Exists) and evaluate as absence, with identical canonical text.",
+      "impact": "quiet meaning",
+      "status": "open"
     }
   ],
   "accept_surface_probes": [
@@ -1553,6 +1561,48 @@
       "reference_parse": "((!.a) = 1) && (.b = 2)",
       "pulsus_parse": "{ (!(.a = 1) && .b = 2) }",
       "evidence": "{ !.a = \"x\" && 1 }"
+    },
+    {
+      "query": "{ !.a }",
+      "class": "D12",
+      "reference_parse": "boolean NOT: matches only spans where a == false; absent a never matches; non-boolean a is an evaluation error",
+      "pulsus_parse": "{ !(.a) }",
+      "evidence": "result differential, pinned tempo digest, 2026-08-03: boolean battery c={true,false,absent} -> ['c-false']; '{ !.b7z }' with b7z absent everywhere -> []; with a string-typed a in a live-store block the whole query errors ('expression (!.a) expected a boolean'), so the oracle acceptance leg needs a container without such data"
+    },
+    {
+      "query": "{ !span.a }",
+      "class": "D12",
+      "reference_parse": "boolean NOT at span scope: matches only spans whose span-scoped a == false; absent never matches; non-boolean errors",
+      "pulsus_parse": "{ !(span.a) }",
+      "evidence": "result differential, pinned tempo digest, 2026-08-03: boolean battery -> '{ !span.c }' = ['c-false']; resource-only a (r-true) not matched"
+    },
+    {
+      "query": "{ .a = nil }",
+      "class": "D12",
+      "reference_parse": "no coherent predicate: stable but inscrutable result sets - matches neither absent-a spans nor any simple function of a (measured identically across 3 rounds, 10s apart)",
+      "pulsus_parse": "{ !(.a) }",
+      "evidence": "result differential, pinned tempo digest, 2026-08-03: over spans a={true,false,absent,'x',resource-true} plus c={true,false,absent}: '{ .a = nil }' -> ['c-false']; '{ .c = nil }' -> ['s-str','s-true']; '{ .b7z = nil }' (b7z nowhere) -> ['c-false','s-str','s-true']; none of these is the absence set"
+    },
+    {
+      "query": "{ span.a = nil }",
+      "class": "D12",
+      "reference_parse": "no coherent predicate at span scope: stable but inscrutable result sets (see the unscoped probe)",
+      "pulsus_parse": "{ !(span.a) }",
+      "evidence": "result differential, pinned tempo digest, 2026-08-03: '{ span.c = nil }' -> ['s-false','s-str','s-true'] - not the absent-span.c set, which would include c-absent"
+    },
+    {
+      "query": "{ .a }",
+      "class": "D12",
+      "reference_parse": "truthiness: matches only spans where a == true (span or resource scope); presence of a false/string a does not match",
+      "pulsus_parse": "{ .a }",
+      "evidence": "result differential, pinned tempo digest, 2026-08-03: a-battery -> ['r-true','s-true'] (s-false, s-str present-but-not-true, excluded); '{ .a != nil }' (presence) -> ['r-true','s-false','s-str','s-true'] - the two spellings differ there and are one AST here"
+    },
+    {
+      "query": "{ span.a }",
+      "class": "D12",
+      "reference_parse": "truthiness at span scope: matches only spans whose span-scoped a == true",
+      "pulsus_parse": "{ span.a }",
+      "evidence": "result differential, pinned tempo digest, 2026-08-03: '{ span.a }' -> ['s-true']; '{ span.c }' -> ['c-true']; resource-only a (r-true) excluded"
     }
   ],
   "excluded_inconclusive": [

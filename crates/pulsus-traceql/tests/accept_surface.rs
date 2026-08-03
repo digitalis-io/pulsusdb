@@ -124,10 +124,19 @@ struct ClosedMeaningProbe {
 /// rather than inferring it from these counts). The remaining 23 are
 /// D1 (5), D3 (7), D4 (4), D5 (2), D6 (1), D7 (4) — the field-expression
 /// regrammar.
+/// Stage B capture (#335 AC 4, binding ruling): the `!`/absence
+/// de-conflation may not begin until the reference behaviour of every
+/// spelling our tree conflates onto existence is measured. The
+/// mechanism class is "spellings that parse to `Exists`/`Not(Exists)`
+/// here" — bare, `!`, `= nil`, `!= nil`, at both scopes — and the
+/// result differential found the conflation WIDER than the `!`/nil
+/// pair the plan named: the reference reads a bare attribute as
+/// truthiness while `!= nil` is presence, two spellings that are one
+/// AST here. Class D12 records all of it; `MEANING` 3 + 6 = 9.
 const TOTAL: usize = 221;
 const AGREE: usize = 198;
 const DIVERGE: usize = 23;
-const MEANING: usize = 3;
+const MEANING: usize = 9;
 const CLOSED_MEANING: usize = 4;
 
 fn matrix() -> Matrix {
@@ -323,6 +332,40 @@ fn agreement_and_divergence_counts_are_pinned() {
         45,
         "closed + still-diverging must equal the audit capture's 45 divergences"
     );
+}
+
+/// Stage B of #335, AC 4 (binding): the `!`/absence collapse cannot
+/// begin until these spellings' reference behaviour is captured — this
+/// test is what makes that an ordering fact rather than an intention,
+/// together with the capture landing in its own commit before any
+/// grammar change. The four ruled queries plus the two bare spellings
+/// the capture found conflated the same way must be present by exact
+/// string, as D12 meaning probes.
+#[test]
+fn stage_b_not_absence_meaning_probes_are_captured() {
+    let m = matrix();
+    for q in [
+        // The four the ruling names:
+        "{ !.a }",
+        "{ !span.a }",
+        "{ .a = nil }",
+        "{ span.a = nil }",
+        // The two the capture's own sweep added (bare = truthiness in
+        // the reference, presence here):
+        "{ .a }",
+        "{ span.a }",
+    ] {
+        let p = m
+            .meaning_probes
+            .iter()
+            .find(|p| p.query == q)
+            .unwrap_or_else(|| panic!("AC4: {q:?} must be captured before the collapse"));
+        assert_eq!(p.class, "D12", "{q:?}");
+        assert!(
+            p.evidence.contains("result differential"),
+            "{q:?}: the capture must be container-measured, not asserted"
+        );
+    }
 }
 
 /// Stage A of #335, SHOWN rather than inferred from the counts: the old
