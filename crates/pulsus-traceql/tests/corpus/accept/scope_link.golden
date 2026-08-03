@@ -2,14 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Attribute {
-                        scope: Link,
-                        key: "relation",
-                    },
-                    op: Eq,
-                    value: String(
-                        "child_of",
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Link,
+                            key: "relation",
+                        },
+                    ),
+                    rhs: Literal(
+                        String(
+                            "child_of",
+                        ),
                     ),
                 },
             ),

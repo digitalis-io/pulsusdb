@@ -2,15 +2,21 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Attribute {
-                        scope: Span,
-                        key: "client.timeout",
-                    },
-                    op: Eq,
-                    value: Duration(
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Span,
+                            key: "client.timeout",
+                        },
+                    ),
+                    rhs: Literal(
                         Duration(
-                            5000000000,
+                            Duration(
+                                5000000000,
+                            ),
                         ),
                     ),
                 },

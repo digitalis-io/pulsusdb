@@ -2,13 +2,19 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Intrinsic(
-                        LinkTraceId,
+                Binary {
+                    op: Cmp(
+                        Eq,
                     ),
-                    op: Eq,
-                    value: String(
-                        "000102030405060708090a0b0c0d0e0f",
+                    lhs: Field(
+                        Intrinsic(
+                            LinkTraceId,
+                        ),
+                    ),
+                    rhs: Literal(
+                        String(
+                            "000102030405060708090a0b0c0d0e0f",
+                        ),
                     ),
                 },
             ),

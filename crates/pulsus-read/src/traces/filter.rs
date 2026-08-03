@@ -47,8 +47,8 @@
 //! anywhere in `traces/` without validation does not compile.
 
 use pulsus_traceql::{
-    ArithOp, AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, Operand, SpanKindValue,
-    SpansetFilter, StatusValue, Value,
+    ArithOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, SpanKindValue,
+    SpansetFilter, StatusValue, UnaryOp, Value,
 };
 
 use crate::logql::escape;
@@ -317,6 +317,29 @@ pub enum LeafEval {
         rhs: CompareOperand,
         op: ComparisonOp,
     },
+    /// The operand of a `!` (issue #335 Stage B) — `{ !.a }`,
+    /// `{ !.a = true }`, `{ !.a = 1 }`.
+    ///
+    /// **Only `!` produces this leaf, and the asymmetry is measured.**
+    /// `{ .a }` is plain `.a = true` and is compiled as such: against a
+    /// store holding a string `a`, the reference answers `{ .a }` 200 with
+    /// no match and `{ !.a }` **500** `expression (!.a) expected a
+    /// boolean, but got TypeString`. Equality against a boolean literal
+    /// simply does not match a string; the `!` OPERATOR demands a boolean.
+    ///
+    /// So this is a value CO-LOAD, not a membership probe: membership
+    /// cannot tell an ABSENT field from one present with a non-boolean
+    /// value, and those two outcomes differ (no-match vs whole-query
+    /// failure). Booleans are stored as the strings `"true"`/`"false"`, so
+    /// the resolved text carries the discriminator.
+    ///
+    /// `want` is the value the OPERAND must hold, not the value of the
+    /// negation — `{ !.a }` matches where `!a` is true, i.e. where `a` is
+    /// `false`, and carries `Is(false)`.
+    BoolTruth {
+        operand: CompareOperand,
+        want: BoolMatch,
+    },
     /// An arithmetic comparison (issue #185 `arith.*`): both operand trees
     /// resolve to a numeric value per candidate span and are compared
     /// engine-side.
@@ -325,6 +348,40 @@ pub enum LeafEval {
         op: ComparisonOp,
         rhs: ArithNode,
     },
+}
+
+/// Which boolean value a `!` operand must hold for its leaf to match
+/// (issue #335 Stage B).
+///
+/// `Never` is not "no constraint" — it is "no boolean satisfies this
+/// comparison", which the reference reaches by comparing a boolean
+/// against a non-boolean literal (`{ !.a = 1 }`). It still RESOLVES the
+/// operand, because the whole-query type failure on a present non-boolean
+/// fires either way: measured, `{ !.a = 1 }` is a 500 against a store
+/// holding a string `a`, and a 200 with no matches against one holding
+/// only booleans. Collapsing `Never` to "plan nothing" would turn that
+/// 500 into a silent empty result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolMatch {
+    /// The operand must resolve to this boolean.
+    Is(bool),
+    /// No boolean matches; the operand is still resolved and type-checked.
+    Never,
+}
+
+impl BoolMatch {
+    /// `(!operand) op literal` → the value `operand` must hold.
+    ///
+    /// `!a == v` ⟺ `a == !v`; `!a != v` ⟺ `a == v`. Any other operator
+    /// against a boolean is rejected by the validator (`{ !.c >= true }`
+    /// is a reference 400), and against a non-boolean nothing matches.
+    fn of_comparison(op: ComparisonOp, literal: &Value) -> BoolMatch {
+        match (op, literal) {
+            (ComparisonOp::Eq, Value::Bool(v)) => BoolMatch::Is(!v),
+            (ComparisonOp::Neq, Value::Bool(v)) => BoolMatch::Is(*v),
+            _ => BoolMatch::Never,
+        }
+    }
 }
 
 /// One fully classified leaf comparison.
@@ -1234,6 +1291,19 @@ fn compile_field_compare(
 /// resource attribute (the writer indexes it). Intrinsic existence
 /// (`name`, `duration`, …) is always trivially true and out of scope — a
 /// clean `400`.
+/// Compiles `{ .a }` / `{ !.a }` — boolean truthiness (issue #335 Stage
+/// B). The generator is the same key-existence scan `= true` would use
+/// (only spans carrying the key can match either way); the VALUE is
+/// resolved per span so the non-boolean case is distinguishable.
+fn compile_bool_truth(field: &Field, want: BoolMatch) -> Result<CompiledLeaf, PlanError> {
+    let operand = compare_operand(field)?;
+    let existence = compile_exists(field)?;
+    Ok(CompiledLeaf {
+        eval: LeafEval::BoolTruth { operand, want },
+        generator: existence.generator,
+    })
+}
+
 fn compile_exists(field: &Field) -> Result<CompiledLeaf, PlanError> {
     let (scope, key) = match field {
         Field::Attribute { scope, key } => (*scope, key.clone()),
@@ -1266,18 +1336,37 @@ fn compile_exists(field: &Field) -> Result<CompiledLeaf, PlanError> {
 /// Compiles an arithmetic operand tree (issue #185 `arith.*`): numeric
 /// literals fold, field operands resolve engine-side. A `Value` literal
 /// that is not numeric (string/bool/status/kind) is a type mismatch.
-fn compile_arith_node(operand: &Operand) -> Result<ArithNode, PlanError> {
+fn compile_arith_node(operand: &FieldExpr) -> Result<ArithNode, PlanError> {
     match operand {
-        Operand::Literal(Value::Number(raw)) => Ok(ArithNode::Value(parse_num(raw)?)),
-        Operand::Literal(Value::Duration(d)) => Ok(ArithNode::Value(d.as_nanos() as f64)),
-        Operand::Literal(_) => Err(PlanError::TypeMismatch(
+        FieldExpr::Literal(Value::Number(raw)) => Ok(ArithNode::Value(parse_num(raw)?)),
+        FieldExpr::Literal(Value::Duration(d)) => Ok(ArithNode::Value(d.as_nanos() as f64)),
+        FieldExpr::Literal(_) => Err(PlanError::TypeMismatch(
             "arithmetic operands must be numeric (a number, duration, or numeric field)"
                 .to_string(),
         )),
-        Operand::Field(field) => Ok(ArithNode::Operand(compare_operand(field)?)),
-        Operand::Neg(inner) => Ok(ArithNode::Neg(Box::new(compile_arith_node(inner)?))),
-        Operand::Arith { op, lhs, rhs } => Ok(ArithNode::Bin {
-            op: *op,
+        FieldExpr::Field(field) => Ok(ArithNode::Operand(compare_operand(field)?)),
+        // `= nil` / `!= nil` is a boolean, never an arithmetic operand.
+        FieldExpr::Exists { .. } => Err(PlanError::TypeMismatch(
+            "an existence check is not an arithmetic operand".to_string(),
+        )),
+        FieldExpr::Unary {
+            op: UnaryOp::Not, ..
+        } => Err(PlanError::TypeMismatch(
+            "a boolean negation is not an arithmetic operand".to_string(),
+        )),
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => Ok(ArithNode::Neg(Box::new(compile_arith_node(expr)?))),
+        FieldExpr::Binary { op, lhs, rhs } => Ok(ArithNode::Bin {
+            op: match op {
+                FieldOp::Arith(a) => *a,
+                _ => {
+                    return Err(PlanError::TypeMismatch(
+                        "a non-arithmetic operator in an arithmetic operand".to_string(),
+                    ));
+                }
+            },
             lhs: Box::new(compile_arith_node(lhs)?),
             rhs: Box::new(compile_arith_node(rhs)?),
         }),
@@ -1288,17 +1377,25 @@ fn compile_arith_node(operand: &Operand) -> Result<ArithNode, PlanError> {
 /// (all-literal subexpressions fold at plan time — no column work).
 /// Returns `None` when a field operand is present, or when a division /
 /// modulo by zero makes the fold undefined.
-fn fold_operand(operand: &Operand) -> Option<f64> {
+fn fold_operand(operand: &FieldExpr) -> Option<f64> {
     match operand {
-        Operand::Literal(Value::Number(raw)) => raw.parse::<f64>().ok().filter(|n| n.is_finite()),
-        Operand::Literal(Value::Duration(d)) => Some(d.as_nanos() as f64),
-        Operand::Literal(_) => None,
-        Operand::Field(_) => None,
-        Operand::Neg(inner) => fold_operand(inner).map(|v| -v),
-        Operand::Arith { op, lhs, rhs } => {
+        FieldExpr::Literal(Value::Number(raw)) => raw.parse::<f64>().ok().filter(|n| n.is_finite()),
+        FieldExpr::Literal(Value::Duration(d)) => Some(d.as_nanos() as f64),
+        FieldExpr::Literal(_) => None,
+        FieldExpr::Field(_) => None,
+        FieldExpr::Exists { .. } => None,
+        FieldExpr::Unary {
+            op: UnaryOp::Not, ..
+        } => None,
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => fold_operand(expr).map(|v| -v),
+        FieldExpr::Binary { op, lhs, rhs } => {
             let l = fold_operand(lhs)?;
             let r = fold_operand(rhs)?;
-            apply_arith(*op, l, r)
+            let FieldOp::Arith(a) = op else { return None };
+            apply_arith(*a, l, r)
         }
     }
 }
@@ -1336,9 +1433,9 @@ pub(crate) fn apply_arith(op: ArithOp, l: f64, r: f64) -> Option<f64> {
 /// operand trees and evaluates engine-side, pruning on a referenced
 /// attribute key when one exists.
 fn compile_field_arith(
-    lhs: &Operand,
+    lhs: &FieldExpr,
     op: ComparisonOp,
-    rhs: &Operand,
+    rhs: &FieldExpr,
 ) -> Result<CompiledLeaf, PlanError> {
     if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
         return Err(PlanError::TypeMismatch(
@@ -1348,12 +1445,12 @@ fn compile_field_arith(
     // Fold `attr <op> <all-literal>` (and the mirror) to a numeric attr
     // leaf so the common probe forms get the `val_num` pushdown + goldens
     // of a plain numeric comparison.
-    if let Operand::Field(field @ Field::Attribute { .. }) = lhs
+    if let FieldExpr::Field(field @ Field::Attribute { .. }) = lhs
         && let Some(n) = fold_operand(rhs)
     {
         return compile_leaf(field, op, &Value::Number(render_num(n)));
     }
-    if let Operand::Field(field @ Field::Attribute { .. }) = rhs
+    if let FieldExpr::Field(field @ Field::Attribute { .. }) = rhs
         && let Some(n) = fold_operand(lhs)
     {
         return compile_leaf(field, flip_comparison(op), &Value::Number(render_num(n)));
@@ -1625,64 +1722,136 @@ fn collect(
     leaves: &mut Vec<CompiledLeaf>,
 ) -> Result<Vec<LeafGenerator>, PlanError> {
     match expr {
-        FieldExpr::Comparison { field, op, value } => {
-            let leaf = compile_leaf(field, *op, value)?;
+        // **A bare field is TRUTHINESS** (issue #335 Stage B, D12
+        // capture): `{ .a }` matches only where the value IS `true`, so it
+        // plans EXACTLY as the comparison `.a = true` — not the
+        // key-existence leaf the old `Exists` parse produced, and not a
+        // value co-load either.
+        //
+        // The plain comparison is the measured semantics, not a
+        // shortcut: against a store holding a string `a`, the reference
+        // answers `{ .a }` 200 with no match, where `{ !.a }` is a 500.
+        // Equality against a boolean literal does not match a string;
+        // only the `!` OPERATOR demands a boolean. Routing this through
+        // `BoolTruth` would fail the query where the reference serves it —
+        // and it costs an index-served membership probe, since `= true`
+        // is exactly what the attribute index answers.
+        FieldExpr::Field(field) => {
+            let leaf = compile_leaf(field, ComparisonOp::Eq, &Value::Bool(true))?;
             let generator = leaf.generator.clone();
             leaves.push(leaf);
             Ok(vec![generator])
         }
-        // Field-vs-field comparison (issue #183): one leaf, one generator
-        // (the key-existence scan of an attribute operand — or the
-        // time-range superset when both are physical intrinsics).
-        FieldExpr::FieldCompare { lhs, op, rhs } => {
-            let leaf = compile_field_compare(lhs, *op, rhs)?;
-            let generator = leaf.generator.clone();
-            leaves.push(leaf);
-            Ok(vec![generator])
-        }
-        // Attribute existence (issue #185): one leaf, one index-served
-        // key-only generator.
-        FieldExpr::Exists(field) => {
+        // A bare literal (`{ true }`/`{ false }`): as broad as `{}` in
+        // Phase 1; exactness is Phase 2's job.
+        FieldExpr::Literal(_) => Ok(vec![LeafGenerator::time_range()]),
+        // `!= nil` is presence — one index-served key-only generator.
+        // `= nil` is absence, which no positive index can serve.
+        //
+        // BOTH forms push a leaf. `collect` and `eval_expr` walk the same
+        // AST and pair by pre-order POSITION, so an arm that plans no leaf
+        // must have an eval arm that consumes none — and `= nil` consumes
+        // one (it negates the existence probe). Planning it as a bare
+        // generator desynchronises every leaf after it in the same filter,
+        // which reads as an unrelated predicate rather than as a crash.
+        // Pre-collapse this was structural: `= nil` parsed as
+        // `Not(Exists(..))`, and the generic `Not` arm compiled its child.
+        // The fold to one node removed that, so it is explicit here.
+        FieldExpr::Exists { field, negated } => {
             let leaf = compile_exists(field)?;
+            if *negated {
+                // Absence: the probe stays POSITIVE and `eval_expr`
+                // negates it. No positive index serves "key absent", so
+                // the generator is the time-range superset.
+                leaves.push(leaf);
+                return Ok(vec![LeafGenerator::time_range()]);
+            }
             let generator = leaf.generator.clone();
             leaves.push(leaf);
             Ok(vec![generator])
         }
-        // An arithmetic comparison (issue #185): one leaf, one generator
-        // (a numeric attr scan for the folded probe form, else the
-        // key-existence / time-range superset).
-        FieldExpr::ArithCompare { lhs, op, rhs } => {
-            let leaf = compile_field_arith(lhs, *op, rhs)?;
+        // **`!` is boolean NOT** (issue #335 Stage B, D12 capture):
+        // `{ !.a }` matches only where the value IS `false`, so a bare
+        // field operand plans as `.a = false`. It is NOT absence, which
+        // is what the pre-collapse grammar produced.
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(expr.as_ref(), FieldExpr::Field(_)) => {
+            let FieldExpr::Field(field) = expr.as_ref() else {
+                unreachable!("guarded by the match arm above");
+            };
+            let leaf = compile_bool_truth(field, BoolMatch::Is(false))?;
             let generator = leaf.generator.clone();
             leaves.push(leaf);
             Ok(vec![generator])
         }
-        // A bare boolean static (issue #183): no leaf and no positive
-        // index — `{ true }`/`{ false }` are as broad as `{}` in Phase 1
-        // (exactness is Phase-2's job), so the time-range superset covers
-        // both. `{ false }` returns no spans in Phase 2 (never a match).
-        FieldExpr::BoolStatic(_) => Ok(vec![LeafGenerator::time_range()]),
-        // Unary field negation (issue #183 `logic.not`): the inner leaves
-        // are compiled (Phase-2 alignment) but negation is not positively
-        // indexable — the ratified `!=` rule generalizes — so the leaf
-        // pairs with the time-range superset.
-        FieldExpr::Not(inner) => {
-            collect(inner, leaves)?;
+        // Any other negation: the inner leaves are compiled (Phase-2
+        // alignment) but negation is not positively indexable — the
+        // ratified `!=` rule generalizes — so it pairs with the
+        // time-range superset.
+        FieldExpr::Unary { expr, .. } => {
+            collect(expr, leaves)?;
             Ok(vec![LeafGenerator::time_range()])
         }
         FieldExpr::Binary { op, lhs, rhs } => {
+            // **The shape dispatch moved here from the parser** (issue
+            // #335 Stage B). The AST is uniform; a consumer that needs
+            // operand shape asks for it, which is not lookahead — both
+            // sides are already parsed.
+            if let FieldOp::Cmp(cmp) = op {
+                let cmp = *cmp;
+                let leaf = match (lhs.as_ref(), rhs.as_ref()) {
+                    (FieldExpr::Field(f), FieldExpr::Literal(v)) => compile_leaf(f, cmp, v)?,
+                    (FieldExpr::Field(l), FieldExpr::Field(r)) => compile_field_compare(l, cmp, r)?,
+                    // `(!field) op literal`, either way round (issue #335
+                    // Stage B). `!` binding tighter than `=` is the D1
+                    // closure, so this shape only reaches the planner
+                    // after the collapse — before it, `!` sat at
+                    // spanset-filter level and the planner never saw it.
+                    // Measured: `{ !.c = true }` returns the `c = false`
+                    // span and `{ true = !.c }` the same, so the two
+                    // orders are one case.
+                    (
+                        FieldExpr::Unary {
+                            op: UnaryOp::Not,
+                            expr,
+                        },
+                        FieldExpr::Literal(v),
+                    )
+                    | (
+                        FieldExpr::Literal(v),
+                        FieldExpr::Unary {
+                            op: UnaryOp::Not,
+                            expr,
+                        },
+                    ) if matches!(expr.as_ref(), FieldExpr::Field(_)) => {
+                        let FieldExpr::Field(field) = expr.as_ref() else {
+                            unreachable!("guarded by the match arm above");
+                        };
+                        compile_bool_truth(field, BoolMatch::of_comparison(cmp, v))?
+                    }
+                    _ => compile_field_arith(lhs, cmp, rhs)?,
+                };
+                let generator = leaf.generator.clone();
+                leaves.push(leaf);
+                return Ok(vec![generator]);
+            }
             // Both sides are always compiled (leaf order is the pre-order
             // traversal Phase 2 replays), regardless of which side's
             // generators win an `&&` choice.
             let left = collect(lhs, leaves)?;
             let right = collect(rhs, leaves)?;
             match op {
-                pulsus_traceql::BoolOp::Or => {
+                // A non-boolean operator at predicate position
+                // (`{ .a + 1 }`): no positive index — Phase 2 decides.
+                FieldOp::Cmp(_) | FieldOp::Arith(_) => Ok(vec![LeafGenerator::time_range()]),
+                FieldOp::Bool(BoolOp::Or) => {
                     let mut all = left;
                     all.extend(right);
                     Ok(all)
                 }
-                pulsus_traceql::BoolOp::And => {
+                FieldOp::Bool(BoolOp::And) => {
                     if gen_set_score(&right) < gen_set_score(&left) {
                         Ok(right)
                     } else {
@@ -1885,8 +2054,11 @@ mod tests {
         // but `compile_leaf` is a public API taking any AST — extract a
         // parsed `Duration` value and hand it back with a regex operator.
         let f = first_filter("{ duration > 1s }");
-        let Some(FieldExpr::Comparison { value, .. }) = f.body else {
+        let Some(FieldExpr::Binary { rhs, .. }) = f.body else {
             panic!("expected a duration comparison");
+        };
+        let FieldExpr::Literal(value) = *rhs else {
+            panic!("expected a literal duration operand");
         };
         let err = compile_leaf(
             &Field::Intrinsic(Intrinsic::Duration),
@@ -2274,19 +2446,105 @@ mod tests {
     // -- issue #185: existence + arithmetic --------------------------------
 
     #[test]
-    fn attribute_existence_compiles_to_a_key_only_index_scan() {
-        // `.a != nil` / bare `.a` — present ⇒ key-only AttrKeyScan.
-        for q in [r#"{ .a != nil }"#, r#"{ .a }"#] {
-            let compiled = compile_span_filter(&first_filter(q)).unwrap();
-            assert_eq!(compiled.generators[0].class, GenClass::AttrKeyScan);
-            assert_eq!(compiled.generators[0].predicate, "key = 'a' AND 1");
-            match &compiled.leaves[0].eval {
-                LeafEval::Attr { probe, negated } => {
-                    assert_eq!(probe.pred, ValuePred::KeyExists);
-                    assert!(!negated, "{q}");
-                }
-                other => panic!("{q}: expected an attr existence eval, got {other:?}"),
+    fn presence_compiles_to_a_key_only_index_scan() {
+        // `.a != nil` — present ⇒ key-only AttrKeyScan.
+        let compiled = compile_span_filter(&first_filter(r#"{ .a != nil }"#)).unwrap();
+        assert_eq!(compiled.generators[0].class, GenClass::AttrKeyScan);
+        assert_eq!(compiled.generators[0].predicate, "key = 'a' AND 1");
+        match &compiled.leaves[0].eval {
+            LeafEval::Attr { probe, negated } => {
+                assert_eq!(probe.pred, ValuePred::KeyExists);
+                assert!(!negated);
             }
+            other => panic!("expected an attr existence eval, got {other:?}"),
+        }
+    }
+
+    /// `{ .a }` is TRUTHINESS, not presence (issue #335 Stage B, D12).
+    ///
+    /// These two queries were one test asserting one plan, because the
+    /// pre-collapse grammar gave them one AST. That conflation IS the D12
+    /// divergence: measured at the pinned digest, the reference's `{ .a }`
+    /// matches only `a == true`, while `{ .a != nil }` matches a present
+    /// `false` or string `a` too.
+    ///
+    /// `{ .a }` plans as the plain comparison `.a = true`, NOT as the
+    /// `BoolTruth` co-load. Measured against a store holding a string `a`,
+    /// `{ .a }` is a reference 200 with no match while `{ !.a }` is a 500 —
+    /// equality against a boolean literal simply does not match a string,
+    /// and only `!` demands a boolean. Planning it as a co-load would fail
+    /// the query where the reference serves it.
+    #[test]
+    fn a_bare_attribute_is_truthiness_not_presence() {
+        let compiled = compile_span_filter(&first_filter(r#"{ .a }"#)).unwrap();
+        let explicit = compile_span_filter(&first_filter(r#"{ .a = true }"#)).unwrap();
+        assert_eq!(
+            compiled.leaves[0].eval, explicit.leaves[0].eval,
+            "`{{ .a }}` must plan exactly as `.a = true`"
+        );
+        assert!(
+            !matches!(compiled.leaves[0].eval, LeafEval::BoolTruth { .. }),
+            "truthiness must not route through the `!` co-load"
+        );
+        // The distinction is the point: presence plans a different leaf.
+        let presence = compile_span_filter(&first_filter(r#"{ .a != nil }"#)).unwrap();
+        assert_ne!(
+            compiled.leaves[0].eval, presence.leaves[0].eval,
+            "truthiness and presence must not plan the same leaf"
+        );
+    }
+
+    /// A `!` operand in a COMPARISON (issue #335 Stage B).
+    ///
+    /// `!` binding tighter than `=` is the D1 closure, so
+    /// `Binary{Cmp, Unary{Not, Field}, Literal}` only reaches the planner
+    /// after the collapse — before it, `!` sat at spanset-filter level.
+    /// Four such shapes were reference 200s the planner rejected.
+    ///
+    /// Every `want` below is derived from a measurement against the
+    /// pinned digest over a store with `c` true / `c` false:
+    /// `{ !.c }` → the `false` span, `{ !.c = true }` → `false`,
+    /// `{ !.c = false }` → `true`, `{ !.c != true }` → `true`,
+    /// `{ !.c = 1 }` → no match (and a 500 when some span's `c` is a
+    /// string, which is what `Never` still resolving the operand
+    /// preserves).
+    #[test]
+    fn a_negated_operand_in_a_comparison_folds_into_the_operands_value() {
+        for (q, want) in [
+            (r#"{ !.c }"#, BoolMatch::Is(false)),
+            (r#"{ !.c = true }"#, BoolMatch::Is(false)),
+            (r#"{ !.c = false }"#, BoolMatch::Is(true)),
+            (r#"{ !.c != true }"#, BoolMatch::Is(true)),
+            (r#"{ !.c != false }"#, BoolMatch::Is(false)),
+            // Non-boolean literal: no boolean satisfies it.
+            (r#"{ !.c = 1 }"#, BoolMatch::Never),
+            (r#"{ !.c = "x" }"#, BoolMatch::Never),
+            (r#"{ !.c > 1 }"#, BoolMatch::Never),
+            // The literal may sit on either side.
+            (r#"{ true = !.c }"#, BoolMatch::Is(false)),
+            (r#"{ false = !.c }"#, BoolMatch::Is(true)),
+            (r#"{ 1 = !.c }"#, BoolMatch::Never),
+        ] {
+            let compiled = compile_span_filter(&first_filter(q)).unwrap();
+            match &compiled.leaves[0].eval {
+                LeafEval::BoolTruth { want: got, .. } => assert_eq!(*got, want, "{q}"),
+                other => panic!("{q}: expected a `!`-operand leaf, got {other:?}"),
+            }
+        }
+    }
+
+    /// The four shapes whose wire verdict Stage B regressed: reference
+    /// 200s that the planner rejected until the arm above existed.
+    #[test]
+    fn the_negated_comparison_shapes_plan_at_all() {
+        for q in [
+            r#"{ !.a = 1 }"#,
+            r#"{ !span.a = 1 }"#,
+            r#"{ !.a = 1 && .b = 2 }"#,
+            r#"{ .a = 1 && !.b = 2 }"#,
+        ] {
+            compile_span_filter(&first_filter(q))
+                .unwrap_or_else(|e| panic!("{q} is a reference 200 and must plan: {e:?}"));
         }
     }
 
@@ -2303,6 +2561,32 @@ mod tests {
                 assert!(!negated, "the inner existence probe stays positive");
             }
             other => panic!("expected an attr existence eval, got {other:?}"),
+        }
+    }
+
+    /// `collect` and `search_eval::eval_expr` pair leaves by pre-order
+    /// POSITION, so every leaf-consuming eval arm needs a leaf-planning
+    /// arm. `{ .a = nil }` planned none while eval consumed one, which
+    /// silently shifted every later leaf in the same filter — the query
+    /// then answers with a different predicate rather than failing.
+    ///
+    /// This counts the leaves a shape plans. The other half of the pairing
+    /// (that eval consumes exactly that many) is asserted in `eval_filter`
+    /// itself, so it holds for every shape any test evaluates.
+    #[test]
+    fn every_leaf_consuming_shape_plans_a_leaf() {
+        for (q, want) in [
+            (r#"{ .a = nil }"#, 1),
+            (r#"{ .a != nil }"#, 1),
+            (r#"{ .a }"#, 1),
+            (r#"{ !.a }"#, 1),
+            (r#"{ .a = 1 }"#, 1),
+            (r#"{ .a = nil && .b = 1 }"#, 2),
+            (r#"{ .b = 1 && .a = nil }"#, 2),
+            (r#"{ .a = nil || .b != nil }"#, 2),
+        ] {
+            let compiled = compile_span_filter(&first_filter(q)).unwrap();
+            assert_eq!(compiled.leaves.len(), want, "{q}");
         }
     }
 

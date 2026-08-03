@@ -2,7 +2,7 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Exists(
+                Field(
                     Attribute {
                         scope: Unscoped,
                         key: "foo",

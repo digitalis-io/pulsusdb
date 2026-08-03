@@ -2,14 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Attribute {
-                        scope: Span,
-                        key: "http.route",
-                    },
-                    op: Re,
-                    value: String(
-                        "/api/v\\d+/.*",
+                Binary {
+                    op: Cmp(
+                        Re,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Span,
+                            key: "http.route",
+                        },
+                    ),
+                    rhs: Literal(
+                        String(
+                            "/api/v\\d+/.*",
+                        ),
                     ),
                 },
             ),

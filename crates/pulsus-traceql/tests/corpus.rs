@@ -24,11 +24,17 @@ use std::fs;
 use std::path::PathBuf;
 
 use pulsus_traceql::{
-    BOUNDARY_CONSTRUCTS, ComparisonOp, Field, FieldExpr, Intrinsic, Query, SpansetExpr,
+    BOUNDARY_CONSTRUCTS, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, Query, SpansetExpr,
     StructuralOp, TokenKind, TraceQlError, parse,
 };
 
-const SUBDIRS: [&str; 4] = ["accept", "reject", "unsupported", "grafana"];
+const SUBDIRS: [&str; 5] = [
+    "accept",
+    "reject",
+    "unsupported",
+    "grafana",
+    "validate_reject",
+];
 
 fn corpus_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -143,6 +149,19 @@ fn every_case_reproduces_its_pinned_golden() {
         let outcome = parse(&input);
         if case.starts_with("accept/") {
             assert!(outcome.is_ok(), "{case} must parse, got {outcome:?}");
+        } else if case.starts_with("validate_reject/") {
+            // Parses, and the SEMANTIC pass rejects it (issue #335 Stage B).
+            // Its own class because `accept/` means "a query PulsusDB
+            // serves" — `validate_corpus.rs` asserts every accept case
+            // validates `Ok`, and widening that to "merely parses" would
+            // have retired a real gate to make room for three cases.
+            let ast = outcome
+                .as_ref()
+                .unwrap_or_else(|e| panic!("{case} must parse, got {e}"));
+            assert!(
+                pulsus_traceql::validate(ast).is_err(),
+                "{case} must be rejected by validate"
+            );
         } else if case.starts_with("unsupported/") {
             assert!(
                 matches!(outcome, Err(TraceQlError::NotYetSupported { .. })),
@@ -374,14 +393,25 @@ fn contains_structural(expr: &SpansetExpr, want: StructuralOp) -> bool {
 
 fn collect_field_comparisons<'q>(expr: &'q FieldExpr, out: &mut Vec<(&'q Field, ComparisonOp)>) {
     match expr {
-        FieldExpr::Comparison { field, op, .. } => out.push((field, *op)),
-        FieldExpr::FieldCompare { lhs, op, .. } => out.push((lhs, *op)),
-        FieldExpr::BoolStatic(_) => {}
-        // Existence (`{ .foo }`) and arithmetic comparisons (issue #185)
-        // are not the field-vs-literal/field pairs the dual-role token
-        // gates reason about, so they contribute nothing here.
-        FieldExpr::Exists(_) | FieldExpr::ArithCompare { .. } => {}
-        FieldExpr::Not(inner) => collect_field_comparisons(inner, out),
+        // A comparison whose LHS is a field — the field-vs-literal and
+        // field-vs-field pairs the dual-role token gates reason about.
+        // After the issue #335 Stage B collapse the operand shape is read
+        // off the node rather than encoded in the variant.
+        FieldExpr::Binary {
+            op: FieldOp::Cmp(op),
+            lhs,
+            rhs,
+        } => {
+            if let FieldExpr::Field(field) = lhs.as_ref() {
+                out.push((field, *op));
+            }
+            collect_field_comparisons(lhs, out);
+            collect_field_comparisons(rhs, out);
+        }
+        // Bare fields/literals, existence and arithmetic are not those
+        // pairs, so they contribute nothing.
+        FieldExpr::Field(_) | FieldExpr::Literal(_) | FieldExpr::Exists { .. } => {}
+        FieldExpr::Unary { expr: inner, .. } => collect_field_comparisons(inner, out),
         FieldExpr::Binary { lhs, rhs, .. } => {
             collect_field_comparisons(lhs, out);
             collect_field_comparisons(rhs, out);

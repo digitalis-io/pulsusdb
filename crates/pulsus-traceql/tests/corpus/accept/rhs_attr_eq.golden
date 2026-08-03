@@ -2,16 +2,22 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                FieldCompare {
-                    lhs: Attribute {
-                        scope: Unscoped,
-                        key: "a",
-                    },
-                    op: Eq,
-                    rhs: Attribute {
-                        scope: Unscoped,
-                        key: "b",
-                    },
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Unscoped,
+                            key: "a",
+                        },
+                    ),
+                    rhs: Field(
+                        Attribute {
+                            scope: Unscoped,
+                            key: "b",
+                        },
+                    ),
                 },
             ),
         },

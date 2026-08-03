@@ -37,9 +37,12 @@
 //!
 //! 1. Binary operand types must match (`{ name = duration }` →
 //!    [`ValidateError::TypeMismatch`]); an `Attribute`-typed operand
-//!    matches anything.
+//!    matches anything. Applies to EVERY binary class — comparison,
+//!    `&&`/`||` and arithmetic (`{ .a = 1 && "x" }`, `{ name * 2 }`).
 //! 2. The operator must be legal for BOTH operand types
-//!    (`{ status > ok }` → [`ValidateError::IllegalOperator`]).
+//!    (`{ status > ok }` → [`ValidateError::IllegalOperator`]), per
+//!    class: comparison has a per-type operator set, `&&`/`||` want
+//!    booleans, arithmetic wants numbers.
 //! 3. A `=~`/`!~` RHS must be a string static whose pattern an
 //!    RE2-family engine accepts — decided by
 //!    [`pulsus_re2::re2_verdict`], with `Unknown` ACCEPTED (an
@@ -61,6 +64,22 @@
 //!    `… | compare(…) | rate()` are parse errors THERE and parse HERE,
 //!    so this check carries their rejection too — same 400 surface,
 //!    different layer).
+//! 9. A unary operator must be legal for its operand's type — `!` takes
+//!    a boolean, `-` a number ([`ValidateError::IllegalUnaryOperator`];
+//!    the reference words the unary failure in the SINGULAR, "the given
+//!    type", against rule 2's plural).
+//! 10. A spanset filter's body must RESOLVE to a boolean (`{ name }`,
+//!     `{ 1 }`, `{ .a + 1 }` →
+//!     [`ValidateError::SpansetFilterNotBoolean`]); an attribute-typed
+//!     body is accepted, since its type is unknown until the span is read
+//!     (`{ .a }` is truthiness).
+//!
+//! Rules 9 and 10, and the widening of rules 1 and 2 past comparison,
+//! arrived with the issue #335 Stage B grammar collapse. They were not
+//! missed before: they were UNREACHABLE while the layered parser could
+//! not build the offending shapes, and the collapsed grammar builds them
+//! exactly as the reference's grammar does. Every one is measured against
+//! the pinned digest — see each variant's doc for the queries.
 //!
 //! Every OTHER check on the reference's list is unreachable here
 //! because our parser is stricter — each has a parse-guard in the test
@@ -69,8 +88,8 @@
 //! sampled families are named as sampled).
 
 use crate::ast::{
-    AggregateOp, AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, MetricFn, MetricStage,
-    Operand, PipelineStage, Query, SecondStage, SpansetExpr, SpansetFilter, Value,
+    AggregateOp, AttrScope, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, MetricFn,
+    MetricStage, PipelineStage, Query, SecondStage, SpansetExpr, SpansetFilter, UnaryOp, Value,
 };
 use pulsus_re2::{Re2Verdict, re2_verdict};
 use thiserror::Error;
@@ -101,6 +120,56 @@ pub enum ValidateError {
     /// literal in this message is load-bearing (issue #328 D6).
     #[error("invalid regex {value:?}: {reason}")]
     InvalidRegex { value: String, reason: String },
+    /// A `=~`/`!~` right-hand side must be a string literal.
+    ///
+    /// Before the issue #335 Stage B collapse this was unreachable: the
+    /// layered parser refused a field RHS for a regex operator, so the
+    /// validator needed no rule. The collapse removed that guard — one
+    /// operand grammar cannot know the operator — which silently widened
+    /// the accept surface until this rule landed. **Found by the
+    /// dual-position token enumeration, not by a probe.**
+    ///
+    /// Measured against the pinned reference: `{ .a =~ .b }`,
+    /// `{ .a !~ .b }` and `{ name =~ .b }` are 400 `invalid type for =~
+    /// or !~: .b` — a SEMANTIC error (no position, names the
+    /// subexpression), which is why the rule belongs here and not in the
+    /// parser.
+    #[error("invalid type for =~ or !~: {operand}")]
+    InvalidRegexOperand { operand: String },
+    /// A spanset filter's body must RESOLVE to a boolean.
+    ///
+    /// Before the Stage B collapse the layered parser could only build a
+    /// boolean-shaped body, so no rule was needed. The collapsed grammar
+    /// parses any field expression between the braces — `{ name }`,
+    /// `{ 1 }`, `{ .a + 1 }` — which is the reference's grammar too; the
+    /// reference rejects them in its validator, and so must we.
+    ///
+    /// An ATTRIBUTE-typed body is accepted: `{ .a }` and `{ -.a }` are
+    /// reference 200s because the type is unknown until the span is read
+    /// (`{ .a }` is truthiness). Only a body whose type is statically
+    /// known and non-boolean is rejected.
+    ///
+    /// Measured, pinned reference: `{ name }`, `{ duration }`, `{ kind }`,
+    /// `{ 1 }`, `{ "x" }`, `{ 1s }`, `{ ok }`, `{ server }`,
+    /// `{ nestedSetLeft }`, `{ .a + 1 }`, `{ .a ^ 1 }`, `{ (1) }` and
+    /// `{ !.a + 1 }` are 400 `span filter field expressions must resolve
+    /// to a boolean: …`; `{ .a }`, `{ -.a }`, `{ !.a }`, `{ true }`,
+    /// `{ (.a) }`, `{ .a - .b }` and `{ !(.a = 1) }` are 200s.
+    #[error("span filter field expressions must resolve to a boolean: {expr}")]
+    SpansetFilterNotBoolean { expr: String },
+    /// A unary operator must be legal for its operand's type: `!` takes a
+    /// boolean, `-` takes a number; an attribute takes either.
+    ///
+    /// The reference words the UNARY failure in the singular — "the given
+    /// type" — against the plural of its binary sibling, which is why this
+    /// is its own variant rather than a reuse of
+    /// [`ValidateError::IllegalOperator`].
+    ///
+    /// Measured: `{ !1 }` → `illegal operation for the given type: !1`,
+    /// and likewise `{ !name }`, `{ !"x" }`, `{ -name }`, `{ -true }`.
+    /// `{ !.a }`, `{ -.a }` and `{ !true }` are 200s.
+    #[error("illegal operation for the given type: {expr}")]
+    IllegalUnaryOperator { expr: String },
     /// `ast_validate.go:272-287` — `= nil` is illegal on any intrinsic
     /// and on scoped `resource.service.name`.
     #[error("{field} = nil is not valid: intrinsics cannot be nil")]
@@ -129,6 +198,9 @@ impl ValidateError {
             ValidateError::TypeMismatch { .. } => "type-mismatch",
             ValidateError::IllegalOperator { .. } => "illegal-operator",
             ValidateError::InvalidRegex { .. } => "invalid-regex",
+            ValidateError::InvalidRegexOperand { .. } => "invalid-regex-operand",
+            ValidateError::SpansetFilterNotBoolean { .. } => "spanset-filter-not-boolean",
+            ValidateError::IllegalUnaryOperator { .. } => "illegal-unary-operator",
             ValidateError::IntrinsicNotNil { .. } => "intrinsic-not-nil",
             ValidateError::QuantileOutOfRange { .. } => "quantile-out-of-range",
             ValidateError::TooManyGroupBys { .. } => "too-many-group-bys",
@@ -149,6 +221,22 @@ pub const VALIDATE_RULES: &[(&str, &str)] = &[
         "ast_validate.go:198-219 via enum_operators.go:77-121",
     ),
     ("invalid-regex", "ast_validate.go:221-245"),
+    (
+        "invalid-regex-operand",
+        "ast_validate.go:221-245 (the same rule's operand half)",
+    ),
+    // Cited by SYMBOL, not by line: these two rules were established from
+    // the pinned container's responses (see each variant's doc for the
+    // measured queries), and inventing line numbers to match the rows
+    // above would dress a measurement up as a source reading.
+    (
+        "spanset-filter-not-boolean",
+        "ast_validate.go SpansetFilter.validate (impliedType must be boolean or attribute)",
+    ),
+    (
+        "illegal-unary-operator",
+        "ast_validate.go UnaryOperation.validate via enum_operators.go binaryTypeValid/unary set",
+    ),
     ("intrinsic-not-nil", "ast_validate.go:272-287"),
     ("quantile-out-of-range", "ast_metrics.go:328-332"),
     (
@@ -195,104 +283,149 @@ fn validate_spanset(expr: &SpansetExpr) -> Result<(), ValidateError> {
 }
 
 fn validate_filter(filter: &SpansetFilter) -> Result<(), ValidateError> {
-    match &filter.body {
-        None => Ok(()),
-        Some(body) => validate_field_expr(body),
+    let Some(body) = &filter.body else {
+        return Ok(());
+    };
+    validate_field_expr(body)?;
+    // The body must RESOLVE to a boolean. Order matters and is the
+    // reference's: `{ !1 }` reports the illegal unary operator (from the
+    // recursive walk above), not the non-boolean body, even though both
+    // hold.
+    match expr_type(body) {
+        // Unknown until the span is read — `{ .a }` is truthiness.
+        OperandType::Attribute | OperandType::Boolean => Ok(()),
+        OperandType::String | OperandType::Numeric | OperandType::Status | OperandType::Kind => {
+            Err(ValidateError::SpansetFilterNotBoolean {
+                expr: format!("{{ {body} }}"),
+            })
+        }
     }
 }
 
+/// **Rejections that moved from the parser to here (issue #335 Stage B).**
+///
+/// The collapse deleted the layered parser, and with it every guard that
+/// lived in a layer rather than in a rule. Each one below was a parse
+/// error before Stage B and is a validate error after it. All were
+/// measured against the pinned reference and all match its POSITIONLESS
+/// semantic signature, which is what says the rejection belongs here.
+///
+/// | moved | before | after | reference |
+/// |---|---|---|---|
+/// | operand type mismatch (`{ status = "ok" }`, `{ name = 5 }`) | field-typed `parse_value` refused the literal | `check_comparison` | 400 `binary operations must operate on the same type` |
+/// | regex operand (`{ .a =~ .b }`) | parser refused a field RHS for `=~`/`!~` | [`ValidateError::InvalidRegexOperand`] | 400 `invalid type for =~ or !~: .b` |
+/// | non-boolean filter body (`{ name }`, `{ 1 }`, `{ .a + 1 }`) | no layer could build a non-boolean body | [`ValidateError::SpansetFilterNotBoolean`] | 400 `span filter field expressions must resolve to a boolean` |
+/// | unary operand type (`{ !name }`, `{ -true }`, `{ !1 }`) | `!` was a spanset-filter form, `-` an operand-only form | [`ValidateError::IllegalUnaryOperator`] | 400 `illegal operation for the given type` (singular) |
+/// | non-comparison operand types (`{ .a = 1 && "x" }`, `{ name * 2 }`) | logical operands were boolean-shaped layers; arithmetic operands a separate grammar | rules 1-2, now over every binary class | 400 `binary operations must operate on the same type` / `illegal operation for the given types` |
+///
+/// One further rejection appeared in Stage B that is NOT in this class,
+/// and the difference matters at the re-pin: a non-boolean `!` operand
+/// (`{ !.a }` where `.a` is a string) now fails the whole query, but it
+/// is a per-span EVALUATION error in `pulsus-read`, not a validate rule —
+/// the query parses and validates, and fails when a span disagrees with
+/// it. It cannot move the parse axis, so it belongs in the ledger as a
+/// deliberate behaviour change rather than on this list.
+///
+/// **Why this is a list and not a note.** On the WIRE axis these are
+/// verdict-neutral: parse ∘ validate composes, and a rejection stays a
+/// rejection wherever it happens. On the PARSE axis every one of them is
+/// `reject → accept`. So at the accept-surface re-pin, each parse-axis
+/// move must be matched against this list *in advance* — an unexplained
+/// move stops the work, and "it is probably one of these" is not an
+/// explanation. Add a row here the moment a guard moves, not afterwards.
 fn validate_field_expr(expr: &FieldExpr) -> Result<(), ValidateError> {
     match expr {
-        FieldExpr::Comparison { field, op, value } => {
-            check_comparison(
-                field_type(field),
-                *op,
-                value_type(value),
-                &format!("{field} {op} {value}"),
-            )?;
-            // Rule 3: the regex pattern itself. The RHS is a string
-            // static by construction here (a non-string RHS already
-            // failed the operator check: `=~` is illegal for every
-            // non-string, non-attribute type, and an attribute RHS
-            // cannot appear in `Comparison`).
-            if let (ComparisonOp::Re | ComparisonOp::Nre, Value::String(pattern)) = (op, value) {
-                check_regex(pattern)?;
+        FieldExpr::Field(_) | FieldExpr::Literal(_) => Ok(()),
+        // `!= nil` (presence) and `= nil` (absence). Rule 4 keys off the
+        // NEGATED form, which is now the node's own flag rather than a
+        // `Not(Exists(..))` shape — so the `{ !(name != nil) }`
+        // over-rejection the old shape forced is gone by construction
+        // (ledger `traceql-validate-nil-spelling-conflation` retires).
+        FieldExpr::Exists { field, negated } => {
+            if !*negated {
+                return Ok(());
             }
-            Ok(())
-        }
-        FieldExpr::FieldCompare { lhs, op, rhs } => {
-            // A field RHS never carries a regex (parse-guarded), so no
-            // pattern check is reachable here.
-            check_comparison(
-                field_type(lhs),
-                *op,
-                field_type(rhs),
-                &format!("{lhs} {op} {rhs}"),
-            )
-        }
-        FieldExpr::ArithCompare { lhs, op, rhs } => {
-            check_comparison(
-                operand_type(lhs),
-                *op,
-                operand_type(rhs),
-                &format!("{expr}"),
-            )?;
-            if let (ComparisonOp::Re | ComparisonOp::Nre, Operand::Literal(Value::String(p))) =
-                (op, rhs)
-            {
-                check_regex(p)?;
-            }
-            Ok(())
-        }
-        FieldExpr::BoolStatic(_) => Ok(()),
-        // `!= nil` (and the bare-attribute existence spelling) — accepted
-        // everywhere, measured: `{ name != nil }` and
-        // `{ resource.service.name != nil }` are both reference 200s.
-        FieldExpr::Exists(_) => Ok(()),
-        FieldExpr::Not(inner) => {
-            // Rule 4. The parser normalizes `x = nil` to `Not(Exists(x))`,
-            // so the nil rule keys off that shape. MEASURED CONFLATION,
-            // ledgered (`traceql-validate-nil-spelling-conflation`): the
-            // double-negation spelling `{ !(name != nil) }` produces the
-            // same AST and is a reference 200 — rejecting here matches
-            // the canonical `= nil` 400 and over-rejects only that
-            // spelling; distinguishing them needs a parser/AST change
-            // this issue does not make.
-            if let FieldExpr::Exists(field) = inner.as_ref() {
-                match field {
-                    Field::Intrinsic(_) => {
-                        return Err(ValidateError::IntrinsicNotNil {
-                            field: field.to_string(),
-                        });
-                    }
-                    Field::Attribute { scope, key } => {
-                        // Exhaustive over `AttrScope` ON PURPOSE (issue
-                        // #328 D4 tier 1): the reference's nil rule also
-                        // names `parent.`-scoped fields, which our AST
-                        // cannot represent — adding an `AttrScope`
-                        // variant stops this compiling and forces the
-                        // decision here.
-                        match scope {
-                            AttrScope::Resource if key == "service.name" => {
-                                return Err(ValidateError::IntrinsicNotNil {
-                                    field: field.to_string(),
-                                });
-                            }
-                            AttrScope::Span
-                            | AttrScope::Resource
-                            | AttrScope::Unscoped
-                            | AttrScope::Instrumentation
-                            | AttrScope::Event
-                            | AttrScope::Link => {}
+            match field {
+                Field::Intrinsic(_) => Err(ValidateError::IntrinsicNotNil {
+                    field: field.to_string(),
+                }),
+                Field::Attribute { scope, key } => {
+                    // Exhaustive over `AttrScope` ON PURPOSE (issue #328
+                    // D4 tier 1): the reference's nil rule also names
+                    // `parent.`-scoped fields, which our AST cannot
+                    // represent — adding a variant stops this compiling
+                    // and forces the decision here.
+                    match scope {
+                        AttrScope::Resource if key == "service.name" => {
+                            Err(ValidateError::IntrinsicNotNil {
+                                field: field.to_string(),
+                            })
                         }
+                        AttrScope::Span
+                        | AttrScope::Resource
+                        | AttrScope::Unscoped
+                        | AttrScope::Instrumentation
+                        | AttrScope::Event
+                        | AttrScope::Link => Ok(()),
                     }
                 }
             }
-            validate_field_expr(inner)
         }
-        FieldExpr::Binary { lhs, rhs, .. } => {
+        FieldExpr::Unary { op, expr: inner } => {
+            validate_field_expr(inner)?;
+            check_unary(*op, expr_type(inner), &expr.to_string())
+        }
+        FieldExpr::Binary { op, lhs, rhs } => {
             validate_field_expr(lhs)?;
-            validate_field_expr(rhs)
+            validate_field_expr(rhs)?;
+            let rendered = format!("{lhs} {op} {rhs}");
+            // Rule 1 (matching operand types) applies to EVERY binary
+            // class, not just comparison: measured, `{ .a = 1 && "x" }` is
+            // 400 `binary operations must operate on the same type` and
+            // `{ name * 2 }` likewise.
+            if !types_match(expr_type(lhs), expr_type(rhs)) {
+                return Err(ValidateError::TypeMismatch { expr: rendered });
+            }
+            // Rule 2 (operator legality) is per class. Destructuring
+            // rather than asking the operator what class it is: the
+            // comparison arm hands us a `ComparisonOp` directly, so no
+            // other operator can reach `op_valid` even by mistake.
+            let cmp = match op {
+                // `&&`/`||` take booleans; `+ - * / % ^` take numbers; an
+                // attribute takes either. Measured: `{ !.a && 1 }` and
+                // `{ .a - true }` are 400 `illegal operation for the given
+                // types`, while `{ .a = 1s + 1 }` and `{ true && true }`
+                // are 200s.
+                FieldOp::Bool(_) => {
+                    return check_class_operands(
+                        expr_type(lhs),
+                        expr_type(rhs),
+                        OperandType::Boolean,
+                        rendered,
+                    );
+                }
+                FieldOp::Arith(_) => {
+                    return check_class_operands(
+                        expr_type(lhs),
+                        expr_type(rhs),
+                        OperandType::Numeric,
+                        rendered,
+                    );
+                }
+                FieldOp::Cmp(cmp) => *cmp,
+            };
+            check_comparison(expr_type(lhs), cmp, expr_type(rhs), &rendered)?;
+            if matches!(cmp, ComparisonOp::Re | ComparisonOp::Nre) {
+                // The RHS of a regex operator must be a string literal.
+                let FieldExpr::Literal(Value::String(pattern)) = rhs.as_ref() else {
+                    return Err(ValidateError::InvalidRegexOperand {
+                        operand: rhs.to_string(),
+                    });
+                };
+                // Rule 3: the pattern itself.
+                check_regex(pattern)?;
+            }
+            Ok(())
         }
     }
 }
@@ -408,6 +541,44 @@ fn op_valid(op: ComparisonOp, t: OperandType) -> bool {
     }
 }
 
+/// Rule 2 for the non-comparison classes, whose legal operand set is a
+/// single type (plus `Attribute`, which is every type): `&&`/`||` want
+/// `Boolean`, the arithmetic operators want `Numeric`.
+///
+/// Reached only after [`types_match`], so the two operands are already
+/// either equal or attribute-wild; both are still checked because an
+/// attribute pairs with anything and must not launder its partner.
+fn check_class_operands(
+    lhs: OperandType,
+    rhs: OperandType,
+    want: OperandType,
+    expr: String,
+) -> Result<(), ValidateError> {
+    let ok = |t: OperandType| t == OperandType::Attribute || t == want;
+    if ok(lhs) && ok(rhs) {
+        Ok(())
+    } else {
+        Err(ValidateError::IllegalOperator { expr })
+    }
+}
+
+/// Rule 2 for the unary operators. `!` wants a boolean, `-` a number, and
+/// an attribute satisfies either — its type is unknown until the span is
+/// read, so `{ !.a }` and `{ -.a }` are both reference 200s.
+fn check_unary(op: UnaryOp, operand: OperandType, expr: &str) -> Result<(), ValidateError> {
+    let want = match op {
+        UnaryOp::Not => OperandType::Boolean,
+        UnaryOp::Neg => OperandType::Numeric,
+    };
+    if operand == OperandType::Attribute || operand == want {
+        Ok(())
+    } else {
+        Err(ValidateError::IllegalUnaryOperator {
+            expr: expr.to_string(),
+        })
+    }
+}
+
 /// Rules 1 and 2, in the reference's order (measured: `{ status > kind }`
 /// reports the type mismatch, not the illegal operator).
 fn check_comparison(
@@ -496,20 +667,24 @@ fn value_type(value: &Value) -> OperandType {
     }
 }
 
-/// [`Operand`] typing — `Unary`/`BinaryOperation.impliedType`: negation
-/// keeps its operand's type; arithmetic takes the first non-attribute
-/// operand's type.
-fn operand_type(operand: &Operand) -> OperandType {
-    match operand {
-        Operand::Field(field) => field_type(field),
-        Operand::Literal(value) => value_type(value),
-        Operand::Neg(inner) => operand_type(inner),
-        Operand::Arith { lhs, rhs, .. } => {
-            let l = operand_type(lhs);
+/// Field-expression typing — the reference's `impliedType`: negation
+/// keeps its operand's type; a binary node takes the first non-attribute
+/// operand's type; a comparison or logical node is boolean.
+fn expr_type(expr: &FieldExpr) -> OperandType {
+    match expr {
+        FieldExpr::Field(field) => field_type(field),
+        FieldExpr::Literal(value) => value_type(value),
+        FieldExpr::Exists { .. } => OperandType::Boolean,
+        FieldExpr::Unary { expr, .. } => expr_type(expr),
+        FieldExpr::Binary { op, lhs, rhs } => {
+            if op.is_boolean_valued() {
+                return OperandType::Boolean;
+            }
+            let l = expr_type(lhs);
             if l != OperandType::Attribute {
                 l
             } else {
-                operand_type(rhs)
+                expr_type(rhs)
             }
         }
     }
@@ -731,25 +906,61 @@ mod tests {
         }
     }
 
-    /// The nil-spelling conflation, pinned as the ledgered divergence it
-    /// is (`traceql-validate-nil-spelling-conflation`): the parser
-    /// normalizes `{ !(name != nil) }` onto the same AST as
-    /// `{ name = nil }`, so the exotic double-negation spelling is
-    /// over-rejected (reference 200) as the price of rejecting the
-    /// canonical spelling (reference 400).
+    /// The nil-spelling conflation is RETIRED (issue #335 Stage B): this
+    /// pins the DISTINCTION, where its predecessor pinned the conflation.
+    ///
+    /// `= nil` / `!= nil` fold to one `Exists { field, negated }` node
+    /// carrying the polarity as a flag, so the canonical and the
+    /// double-negation spellings are different ASTs and the validator can
+    /// tell them apart. Ledger row
+    /// `traceql-validate-nil-spelling-conflation` closed with this.
+    ///
+    /// Both halves are asserted. AST inequality alone would pass if the
+    /// nodes differed and the validator still rejected both; the verdicts
+    /// alone would pass if the parser reintroduced the conflation and some
+    /// other rule happened to accept.
     #[test]
-    fn the_nil_double_negation_spelling_is_conflated_and_rejected() {
+    fn the_nil_spellings_are_no_longer_conflated() {
         let canonical = parse("{ name = nil }").expect("parses");
-        let exotic = parse("{ !(name != nil) }").expect("parses");
-        assert_eq!(canonical, exotic, "the conflation this pin documents");
+        let double_negation = parse("{ !(name != nil) }").expect("parses");
+        assert_ne!(
+            canonical, double_negation,
+            "the spellings must be distinguishable, which is what retired the divergence"
+        );
         assert!(matches!(
-            v("{ !(name != nil) }"),
+            v("{ name = nil }"),
             Err(ValidateError::IntrinsicNotNil { .. })
         ));
+        // Measured 200s at the pinned digest, all previously over-rejected.
+        for q in [
+            "{ !(name != nil) }",
+            "{ !(resource.service.name != nil) }",
+            "{ name != nil }",
+            "{ .a = nil }",
+            "{ !(.a != nil) }",
+        ] {
+            assert!(
+                v(q).is_ok(),
+                "{q:?} is a reference 200 and must be accepted"
+            );
+        }
     }
 
-    /// D5′: the rule table and the variant set are the same set, both
-    /// directions, and every id is unique.
+    /// D5′: the rule table and the listed variants are the same set,
+    /// both directions, and every id is unique.
+    ///
+    /// **Residual, stated because it bit once.** `instances` is a hand
+    /// list, and a hand list cannot see a variant nobody added to it: the
+    /// `invalid-regex-operand` rule shipped earlier in issue #335 Stage B
+    /// with a `rule_id` arm and NO citation row, and this test stayed
+    /// green because the variant was missing from both sides at once. The
+    /// count assertion only catches a variant added to one side. Rust has
+    /// no stable variant enumeration, so what stands behind this is the
+    /// reverse direction below (every row must be produced by a listed
+    /// instance) plus `tests/validate_corpus.rs`, which drives real
+    /// queries through `validate` and maps the resulting `rule_id` to a
+    /// vector — a rule with no citation row fails THERE the moment any
+    /// query reaches it.
     #[test]
     fn every_rule_variant_has_exactly_one_citation_row() {
         let instances = [
@@ -762,6 +973,15 @@ mod tests {
             ValidateError::InvalidRegex {
                 value: String::new(),
                 reason: String::new(),
+            },
+            ValidateError::InvalidRegexOperand {
+                operand: String::new(),
+            },
+            ValidateError::SpansetFilterNotBoolean {
+                expr: String::new(),
+            },
+            ValidateError::IllegalUnaryOperator {
+                expr: String::new(),
             },
             ValidateError::IntrinsicNotNil {
                 field: String::new(),
@@ -785,6 +1005,14 @@ mod tests {
                 1,
                 "{} must have exactly one citation row",
                 e.rule_id()
+            );
+        }
+        // The reverse direction: no citation row may name an id that no
+        // listed variant produces.
+        for (id, _) in VALIDATE_RULES {
+            assert!(
+                instances.iter().any(|e| e.rule_id() == *id),
+                "citation row {id} names no variant"
             );
         }
     }
@@ -964,22 +1192,18 @@ mod tests {
     /// sample.
     #[test]
     fn sampled_parse_guards_for_the_remaining_reference_checks() {
+        // (a) STILL unreachable: the parser rejects these, so the
+        // reference's corresponding check has nothing to run on here. A
+        // loosening of the grammar turns one of these into an accept and
+        // this test goes red — which is the whole point of the list.
         for (q, family) in [
-            // Spanset filters must resolve to a boolean
-            // (ast_validate.go:111-137).
-            ("{ name }", "non-boolean spanset filter"),
-            ("{ 1 = 1 }", "literal-vs-literal comparison"),
             // Scalar expressions and filters (ast_validate.go:151-162).
             (r#"{} | avg(duration) = "x""#, "non-numeric scalar operand"),
             (r#"{} | count() =~ "x""#, "regex scalar filter on a string"),
-            // Unary operators (ast_validate.go:164-196).
-            ("{ -.a > 1 }", "unary minus in field position"),
-            ("{ -duration > 1s }", "unary minus on an intrinsic"),
-            // Regex with a non-static RHS (ast_validate.go:221-245).
-            (r#"{ name =~ .a }"#, "regex against a field RHS"),
-            (r#"{ .a + 1 =~ "x" }"#, "regex against an arithmetic LHS"),
             // compare() extra arguments (engine_metrics_compare.go:
-            // 319-341: topN/start/end).
+            // 319-341: topN/start/end). NOTE the reference ACCEPTS
+            // `compare({…}, 10)` — we are stricter here, which is a
+            // pre-existing divergence, not a check we mirror.
             ("{} | compare({ .a = 1 }, 10)", "compare() topN argument"),
             // parent. scope (ast_validate.go:250-267) — also tier 1: the
             // AttrScope match in validate_field_expr has no variant for
@@ -987,6 +1211,33 @@ mod tests {
             ("{ parent.a = 1 }", "parent scope"),
         ] {
             assert!(parse(q).is_err(), "{family}: {q:?} must stay a parse error");
+        }
+
+        // (b) MOVED to this pass by the issue #335 Stage B collapse. Each
+        // was a parse error before and is a validate rule now; the
+        // rejection is unchanged on the wire, so the entry moves rather
+        // than disappearing. Asserting the RULE ID, not merely `is_err`:
+        // "some error" would still pass if the collapse left a stray
+        // parse error behind and the rule were never wired up.
+        for (q, rule) in [
+            ("{ name }", "spanset-filter-not-boolean"),
+            (r#"{ name =~ .a }"#, "invalid-regex-operand"),
+            (r#"{ .a + 1 =~ "x" }"#, "type-mismatch"),
+        ] {
+            let err = v(q).unwrap_err();
+            assert_eq!(err.rule_id(), rule, "{q:?} must be caught by {rule}");
+        }
+
+        // (c) NOT a check on either side. These sat in the guard list
+        // because our parser rejected them, and the list read that as
+        // "the reference's check is unreachable" — but the reference
+        // ACCEPTS all three (measured 200s), so what the guard actually
+        // pinned was a divergence of ours. The collapse closed it.
+        for q in ["{ 1 = 1 }", "{ -.a > 1 }", "{ -duration > 1s }"] {
+            assert!(
+                v(q).is_ok(),
+                "{q:?} is a reference 200 and must be accepted"
+            );
         }
     }
 }

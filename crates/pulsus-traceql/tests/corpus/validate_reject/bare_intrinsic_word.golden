@@ -2,9 +2,9 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Literal(
-                    Bool(
-                        true,
+                Field(
+                    Intrinsic(
+                        Name,
                     ),
                 ),
             ),

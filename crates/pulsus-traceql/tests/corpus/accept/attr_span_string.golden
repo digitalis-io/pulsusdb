@@ -2,14 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Attribute {
-                        scope: Span,
-                        key: "http.method",
-                    },
-                    op: Eq,
-                    value: String(
-                        "POST",
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Span,
+                            key: "http.method",
+                        },
+                    ),
+                    rhs: Literal(
+                        String(
+                            "POST",
+                        ),
                     ),
                 },
             ),

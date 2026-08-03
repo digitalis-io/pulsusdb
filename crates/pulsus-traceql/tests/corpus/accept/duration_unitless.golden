@@ -8,14 +8,12 @@ Query {
                     ),
                     lhs: Field(
                         Intrinsic(
-                            EventTimeSinceStart,
+                            Duration,
                         ),
                     ),
                     rhs: Literal(
-                        Duration(
-                            Duration(
-                                1000000,
-                            ),
+                        Number(
+                            "100",
                         ),
                     ),
                 },

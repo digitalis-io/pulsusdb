@@ -4,18 +4,16 @@ Query {
             body: Some(
                 Binary {
                     op: Cmp(
-                        Gt,
+                        Re,
                     ),
                     lhs: Field(
                         Intrinsic(
-                            EventTimeSinceStart,
+                            NestedSetLeft,
                         ),
                     ),
                     rhs: Literal(
-                        Duration(
-                            Duration(
-                                1000000,
-                            ),
+                        String(
+                            "x",
                         ),
                     ),
                 },

@@ -29,7 +29,7 @@
 //! `service_time` projection (plan v2 delta 4: `Or` nodes are opaque,
 //! rendered wholesale in `WHERE`, no hoist).
 
-use pulsus_traceql::{AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, Value};
+use pulsus_traceql::{AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, Value};
 
 use crate::logql::escape;
 
@@ -114,15 +114,31 @@ pub fn compile_filter_predicate(
 /// (`None` when the whole body was the hoisted leaf).
 fn extract_root_service_eq(expr: &FieldExpr) -> (Option<String>, Option<FieldExpr>) {
     match expr {
-        FieldExpr::Comparison {
-            field: Field::Attribute { scope, key },
-            op: ComparisonOp::Eq,
-            value: Value::String(s),
-        } if *scope == AttrScope::Resource && key == "service.name" => {
+        // The hoistable leaf, now expressed over the collapsed node:
+        // `resource.service.name = "…"` is a `Cmp(Eq)` whose sides are a
+        // resource-scoped attribute and a string literal.
+        FieldExpr::Binary {
+            op: FieldOp::Cmp(ComparisonOp::Eq),
+            lhs,
+            rhs,
+        } if matches!(
+            (lhs.as_ref(), rhs.as_ref()),
+            (
+                FieldExpr::Field(Field::Attribute {
+                    scope: AttrScope::Resource,
+                    key,
+                }),
+                FieldExpr::Literal(Value::String(_)),
+            ) if key == "service.name"
+        ) =>
+        {
+            let FieldExpr::Literal(Value::String(s)) = rhs.as_ref() else {
+                unreachable!("guarded by the match arm above");
+            };
             (Some(format!("service = {}", escape::ch_string(s))), None)
         }
         FieldExpr::Binary {
-            op: BoolOp::And,
+            op: FieldOp::Bool(BoolOp::And),
             lhs,
             rhs,
         } => {
@@ -144,7 +160,7 @@ fn extract_root_service_eq(expr: &FieldExpr) -> (Option<String>, Option<FieldExp
 fn recombine(lhs: Option<FieldExpr>, rhs: Option<FieldExpr>) -> Option<FieldExpr> {
     match (lhs, rhs) {
         (Some(l), Some(r)) => Some(FieldExpr::Binary {
-            op: BoolOp::And,
+            op: FieldOp::Bool(BoolOp::And),
             lhs: Box::new(l),
             rhs: Box::new(r),
         }),
@@ -179,7 +195,23 @@ fn render_expr(
     window: SnappedWindow,
 ) -> Result<String, PlanError> {
     match expr {
-        FieldExpr::Comparison { field, op, value } => {
+        // The comparison arms, now dispatched on operand SHAPE (the
+        // collapse moved this out of the parser). Only the
+        // field-vs-literal shape has metrics SQL; the others are the same
+        // clean 400s they were before.
+        FieldExpr::Binary {
+            op: FieldOp::Cmp(op),
+            lhs,
+            rhs,
+        } => {
+            let (FieldExpr::Field(field), FieldExpr::Literal(value)) = (lhs.as_ref(), rhs.as_ref())
+            else {
+                return Err(PlanError::TypeMismatch(
+                    "field-vs-field and arithmetic comparisons are not supported in metrics \
+                     filters"
+                        .to_string(),
+                ));
+            };
             let leaf = filter::compile_leaf(field, *op, value)?;
             match &leaf.eval {
                 // Issue #282: the renderers below validate every regex as
@@ -207,6 +239,9 @@ fn render_expr(
                 // `compile_leaf` never yields a field-vs-field or arithmetic
                 // leaf (those come via the `FieldCompare`/`ArithCompare` AST
                 // arms) — keep the match exhaustive.
+                LeafEval::BoolTruth { .. } => Err(PlanError::TypeMismatch(
+                    "bare field truthiness is not supported in metrics filters".to_string(),
+                )),
                 LeafEval::FieldCompare { .. } => Err(PlanError::TypeMismatch(
                     "field-vs-field comparisons are not supported in metrics filters".to_string(),
                 )),
@@ -220,7 +255,10 @@ fn render_expr(
         // like are answerable on the metrics surface (the grafana
         // `rate() by(service)` case). The absent form (`= nil`) parses to
         // `Not(Exists)` and is rejected below with the other negations.
-        FieldExpr::Exists(field) => {
+        FieldExpr::Exists {
+            field,
+            negated: false,
+        } => {
             let probe = match field {
                 Field::Attribute { scope, key } => AttrProbe {
                     key: key.clone(),
@@ -242,26 +280,35 @@ fn render_expr(
             };
             semi_join_sql(&probe, false, attrs_table, window)
         }
-        // Arithmetic comparisons (issue #185) are a search-surface
-        // construct; the metrics filter path does not support them yet
-        // (a clean 400, mirroring the field-vs-field rejection).
-        FieldExpr::ArithCompare { .. } => Err(PlanError::TypeMismatch(
-            "arithmetic comparisons are not supported in metrics filters".to_string(),
+        // `= nil` (absence) has no positive membership semi-join — the
+        // same rejection the `Not(Exists)` shape used to take.
+        FieldExpr::Exists { negated: true, .. } => Err(PlanError::TypeMismatch(
+            "absence checks are not supported in metrics filters".to_string(),
         )),
-        // Field-vs-field comparison, bare boolean statics and unary field
-        // negation (issue #183) are search-surface constructs; the metrics
-        // filter path does not support them yet (a clean 400, tracked as a
-        // follow-up — mirrors the nested-set metrics rejection above).
-        FieldExpr::FieldCompare { .. } => Err(PlanError::TypeMismatch(
-            "field-vs-field comparisons are not supported in metrics filters".to_string(),
+        // Bare fields (truthiness), bare literals and unary negation are
+        // search-surface constructs; the metrics filter path does not
+        // support them (clean 400s, mirroring the nested-set rejection).
+        FieldExpr::Field(_) => Err(PlanError::TypeMismatch(
+            "bare field truthiness is not supported in metrics filters".to_string(),
         )),
-        FieldExpr::BoolStatic(_) => Err(PlanError::TypeMismatch(
+        FieldExpr::Literal(_) => Err(PlanError::TypeMismatch(
             "bare boolean statics are not supported in metrics filters".to_string(),
         )),
-        FieldExpr::Not(_) => Err(PlanError::TypeMismatch(
+        FieldExpr::Unary { .. } => Err(PlanError::TypeMismatch(
             "field negation is not supported in metrics filters".to_string(),
         )),
-        FieldExpr::Binary { op, lhs, rhs } => {
+        // Arithmetic at predicate position is likewise unsupported here.
+        FieldExpr::Binary {
+            op: FieldOp::Arith(_),
+            ..
+        } => Err(PlanError::TypeMismatch(
+            "arithmetic comparisons are not supported in metrics filters".to_string(),
+        )),
+        FieldExpr::Binary {
+            op: FieldOp::Bool(op),
+            lhs,
+            rhs,
+        } => {
             let l = render_expr(lhs, attrs_table, window)?;
             let r = render_expr(rhs, attrs_table, window)?;
             let sym = match op {

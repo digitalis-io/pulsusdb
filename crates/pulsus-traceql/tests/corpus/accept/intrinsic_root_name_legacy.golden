@@ -2,13 +2,19 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Intrinsic(
-                        RootName,
+                Binary {
+                    op: Cmp(
+                        Eq,
                     ),
-                    op: Eq,
-                    value: String(
-                        "GET /",
+                    lhs: Field(
+                        Intrinsic(
+                            RootName,
+                        ),
+                    ),
+                    rhs: Literal(
+                        String(
+                            "GET /",
+                        ),
                     ),
                 },
             ),

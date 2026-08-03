@@ -2,14 +2,13 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Not(
-                    Exists(
-                        Attribute {
-                            scope: Unscoped,
-                            key: "a",
-                        },
-                    ),
-                ),
+                Exists {
+                    field: Attribute {
+                        scope: Unscoped,
+                        key: "a",
+                    },
+                    negated: true,
+                },
             ),
         },
     ),

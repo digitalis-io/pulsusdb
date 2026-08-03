@@ -2,14 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Attribute {
-                        scope: Span,
-                        key: "http.status_code",
-                    },
-                    op: Gte,
-                    value: Number(
-                        "500",
+                Binary {
+                    op: Cmp(
+                        Gte,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Span,
+                            key: "http.status_code",
+                        },
+                    ),
+                    rhs: Literal(
+                        Number(
+                            "500",
+                        ),
                     ),
                 },
             ),

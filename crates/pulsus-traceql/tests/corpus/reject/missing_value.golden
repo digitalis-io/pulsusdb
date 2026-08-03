@@ -1,6 +1,6 @@
 UnexpectedToken {
     found: "'}'",
-    expected: "a value (string, number, boolean, or duration)",
+    expected: "a field, a literal, or '('",
     span: Span {
         start: 7,
         end: 8,

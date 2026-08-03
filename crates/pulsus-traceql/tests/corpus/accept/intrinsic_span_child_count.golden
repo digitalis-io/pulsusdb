@@ -2,13 +2,19 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Intrinsic(
-                        ChildCount,
+                Binary {
+                    op: Cmp(
+                        Gt,
                     ),
-                    op: Gt,
-                    value: Number(
-                        "2",
+                    lhs: Field(
+                        Intrinsic(
+                            ChildCount,
+                        ),
+                    ),
+                    rhs: Literal(
+                        Number(
+                            "2",
+                        ),
                     ),
                 },
             ),

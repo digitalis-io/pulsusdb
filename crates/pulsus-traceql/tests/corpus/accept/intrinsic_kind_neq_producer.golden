@@ -2,13 +2,19 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Intrinsic(
-                        Kind,
+                Binary {
+                    op: Cmp(
+                        Neq,
                     ),
-                    op: Neq,
-                    value: Kind(
-                        Producer,
+                    lhs: Field(
+                        Intrinsic(
+                            Kind,
+                        ),
+                    ),
+                    rhs: Literal(
+                        Kind(
+                            Producer,
+                        ),
                     ),
                 },
             ),

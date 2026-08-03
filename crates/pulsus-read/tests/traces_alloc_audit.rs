@@ -118,6 +118,9 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "the fractional-digit scratch buffer (<= 9 ASCII bytes) for a by(duration) group value's Go-duration render - a bounded scalar render whose result .len() is charged by charged_str at the group-value site before retention (the same residual class as build_summary's duration/status/kind scalar renders)"),
     ("search_eval.rs", "go_duration_string", "format!", 5,
      "bounded duration-string assembly (<= ~32 bytes, e.g. '2540400h10m10.000000000s') for a by(duration)/by(traceDuration) group value; charged_str charges its .len() before it is cloned into the retained tuple/attributes - a scalar-render residual"),
+    // ---- issue #335 Stage B: the non-boolean `!` operand error --------
+    ("search_eval.rs", "eval_planned_leaf", "format!", 1,
+     "the PipelineInvalid message for a present NON-boolean operand under `!` (`expression (!.a) expected a boolean`), matching the reference's whole-query failure. On the ERROR path only: the BoolTruth arm compares the co-loaded value against the strings \"true\"/\"false\" and allocates nothing when it matches either, so the per-span hot loop is unaffected and the allocation happens once, immediately before the query is abandoned"),
     // ---- issue #172 + #183: structural relation intermediates -----------
     ("search_eval.rs", "rel_descendants", "HashMap::", 1,
      "parent->children adjacency map (incl. its per-entry child Vecs via or_default): spans x DESCENDANT_TRANSIENT_BYTES envelope (key + Vec header + child slot with doubling slack) charged before allocation, released after the walk"),

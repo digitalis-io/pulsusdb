@@ -1,6 +1,6 @@
 UnexpectedToken {
     found: "identifier \"frobnicate\"",
-    expected: "a span kind ('internal', 'server', 'client', 'producer', or 'consumer')",
+    expected: "an intrinsic (name, duration, status, kind) or a scoped attribute (span., resource., or the unscoped . form)",
     span: Span {
         start: 9,
         end: 19,

@@ -195,15 +195,30 @@ fn every_divergence_is_ledgered_and_every_ledger_row_is_witnessed() {
             ),
         }
     }
-    // The reverse direction: every `traceql-validate-*` ledger row id is
-    // witnessed by at least one vector, so neither side can be retired
+    // The reverse direction: every LIVE `traceql-validate-*` ledger row id
+    // is witnessed by at least one vector, so neither side can be retired
     // alone.
+    //
+    // A row whose heading is marked `RETIRED` is held to the OPPOSITE
+    // requirement: it must be witnessed by NO vector. A retired row
+    // describes a divergence that no longer exists, so a surviving witness
+    // means the retirement is false. That inversion is what stops
+    // "RETIRED" being a way to silence this gate — the word does not
+    // exempt the row, it swaps which assertion it must satisfy.
     for line in ledger.lines() {
-        if let Some(rest) = line.strip_prefix("### `traceql-validate-") {
-            let id = format!(
-                "traceql-validate-{}",
-                rest.split('`').next().unwrap_or_default()
+        let Some(rest) = line.strip_prefix("### `traceql-validate-") else {
+            continue;
+        };
+        let id = format!(
+            "traceql-validate-{}",
+            rest.split('`').next().unwrap_or_default()
+        );
+        if line.contains("RETIRED") {
+            assert!(
+                !named.contains(id.as_str()),
+                "ledger row {id:?} is marked RETIRED but a vector still names it as a divergence"
             );
+        } else {
             assert!(
                 named.contains(id.as_str()),
                 "ledger row {id:?} is witnessed by no vector"
@@ -402,6 +417,18 @@ fn vector_error_variants_are_real_rule_ids() {
         ValidateError::InvalidRegex {
             value: String::new(),
             reason: String::new(),
+        }
+        .rule_id(),
+        ValidateError::InvalidRegexOperand {
+            operand: String::new(),
+        }
+        .rule_id(),
+        ValidateError::SpansetFilterNotBoolean {
+            expr: String::new(),
+        }
+        .rule_id(),
+        ValidateError::IllegalUnaryOperator {
+            expr: String::new(),
         }
         .rule_id(),
         ValidateError::IntrinsicNotNil {

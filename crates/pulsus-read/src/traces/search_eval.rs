@@ -59,11 +59,12 @@
 use std::collections::{HashMap, HashSet};
 
 use pulsus_traceql::{
-    AggregateOp, ComparisonOp, FieldExpr, SpansetExpr, StructuralModifier, StructuralOp,
+    AggregateOp, BoolOp, ComparisonOp, FieldExpr, FieldOp, SpansetExpr, StructuralModifier,
+    StructuralOp, UnaryOp, Value,
 };
 
 use super::exec::ByteBudget;
-use super::filter::NestedSetField;
+use super::filter::{BoolMatch, NestedSetField};
 use super::search_plan::{
     AggSource, GroupKeyResolver, PhysicalEval, PhysicalSelect, PlannedArith, PlannedFilter,
     PlannedGroupKey, PlannedLeafEval, PlannedOperand, SearchPlan, SelectField, SpansetStage,
@@ -652,69 +653,165 @@ fn eval_field_compare(
 /// Evaluates one filter's boolean tree for one span. Deliberately never
 /// short-circuits: `leaf_idx` must advance through every comparison so
 /// the pre-order leaf registry stays aligned with the AST walk.
+/// Renders a planned operand for the reference's non-boolean error
+/// message. Only reached on the error path, so the allocation is not in
+/// the per-span hot loop.
+fn operand_display(operand: &PlannedOperand) -> String {
+    match operand {
+        PlannedOperand::Name => "name".to_string(),
+        PlannedOperand::Service => "resource.service.name".to_string(),
+        PlannedOperand::Duration => "duration".to_string(),
+        PlannedOperand::Status => "status".to_string(),
+        PlannedOperand::Kind => "kind".to_string(),
+        PlannedOperand::Attr { .. } => "the attribute".to_string(),
+    }
+}
+
+/// Consumes the next planned leaf, in pre-order, and evaluates it.
+fn eval_planned_leaf(
+    filter: &PlannedFilter,
+    leaf_idx: &mut usize,
+    span: &HydratedSpan,
+    env: &EvalEnv<'_>,
+) -> Result<bool, ReadError> {
+    let leaf = &filter.leaves[*leaf_idx];
+    *leaf_idx += 1;
+    Ok(match leaf {
+        // **Boolean truthiness** (issue #335 Stage B, D12 capture).
+        // Booleans are stored as the strings `"true"`/`"false"`, so the
+        // resolved text separates the three cases the reference
+        // distinguishes:
+        //   absent               -> no match, never an error
+        //   present "true"/"false" -> match iff it equals `want`
+        //   present, anything else -> the WHOLE QUERY fails, exactly as
+        //                             the reference does
+        // Returning no-match for the third case would be a quiet wrong
+        // answer where the reference is a loud failure.
+        PlannedLeafEval::BoolTruth { operand, want } => {
+            match resolve_operand(operand, env.ctx.trace_id, span, env.attrs) {
+                None => false,
+                Some(v) => match (v.text, want) {
+                    // `want` is the value the OPERAND must hold, so the
+                    // negation is already folded in at plan time.
+                    (Some("true"), BoolMatch::Is(w)) => *w,
+                    (Some("false"), BoolMatch::Is(w)) => !*w,
+                    // A boolean operand compared against a NON-boolean
+                    // (`{ !.a = 1 }`): resolved and type-checked, matches
+                    // nothing.
+                    (Some("true" | "false"), BoolMatch::Never) => false,
+                    _ => {
+                        return Err(ReadError::PipelineInvalid {
+                            reason: format!(
+                                "expression (!{}) expected a boolean",
+                                operand_display(operand)
+                            ),
+                        });
+                    }
+                },
+            }
+        }
+        PlannedLeafEval::Physical(p) => eval_physical(p, span),
+        PlannedLeafEval::Attr { probe_idx, negated } => {
+            let member =
+                env.attrs.membership[*probe_idx].contains(&(env.ctx.trace_id, span.span_id));
+            member != *negated
+        }
+        PlannedLeafEval::NestedSet { field, op, value } => env
+            .nested_set
+            .and_then(|idx| idx.get(&span.span_id))
+            .map(|v| cmp_f64(*op, v.value(*field) as f64, *value))
+            .unwrap_or(false),
+        PlannedLeafEval::FieldCompare { lhs, rhs, op } => {
+            eval_field_compare(lhs, rhs, *op, env.ctx.trace_id, span, env.attrs)
+        }
+        PlannedLeafEval::TraceCtx(tc) => eval_trace_ctx(tc, &env.ctx, span),
+        PlannedLeafEval::Arith { lhs, op, rhs } => {
+            match (
+                resolve_arith(lhs, env.ctx.trace_id, span, env.attrs),
+                resolve_arith(rhs, env.ctx.trace_id, span, env.attrs),
+            ) {
+                (Some(l), Some(r)) => cmp_f64(*op, l, r),
+                _ => false,
+            }
+        }
+    })
+}
+
+/// Evaluates one field expression against one span.
 fn eval_expr(
     expr: &FieldExpr,
     filter: &PlannedFilter,
     leaf_idx: &mut usize,
     span: &HydratedSpan,
     env: &EvalEnv<'_>,
-) -> bool {
+) -> Result<bool, ReadError> {
     match expr {
-        // Every leaf-bearing field expression consumes exactly one planned
-        // leaf, in pre-order (issue #185 adds `Exists` and `ArithCompare`).
-        FieldExpr::Comparison { .. }
-        | FieldExpr::FieldCompare { .. }
-        | FieldExpr::Exists(_)
-        | FieldExpr::ArithCompare { .. } => {
-            let leaf = &filter.leaves[*leaf_idx];
-            *leaf_idx += 1;
-            match leaf {
-                PlannedLeafEval::Physical(p) => eval_physical(p, span),
-                PlannedLeafEval::Attr { probe_idx, negated } => {
-                    let member = env.attrs.membership[*probe_idx]
-                        .contains(&(env.ctx.trace_id, span.span_id));
-                    member != *negated
-                }
-                // The numbering covers every hydrated span, so the lookup
-                // succeeds whenever the plan flagged nested-set (index is
-                // `Some`); an absent index/entry is a non-match.
-                PlannedLeafEval::NestedSet { field, op, value } => env
-                    .nested_set
-                    .and_then(|idx| idx.get(&span.span_id))
-                    .map(|v| cmp_f64(*op, v.value(*field) as f64, *value))
-                    .unwrap_or(false),
-                PlannedLeafEval::FieldCompare { lhs, rhs, op } => {
-                    eval_field_compare(lhs, rhs, *op, env.ctx.trace_id, span, env.attrs)
-                }
-                // Trace-level intrinsics (issue #184): evaluated against
-                // the trace-wide co-load context.
-                PlannedLeafEval::TraceCtx(tc) => eval_trace_ctx(tc, &env.ctx, span),
-                // Arithmetic comparison (issue #185): resolve both operand
-                // trees to numbers per span, then compare. An absent /
-                // non-numeric operand or a division-by-zero is no match.
-                PlannedLeafEval::Arith { lhs, op, rhs } => {
-                    match (
-                        resolve_arith(lhs, env.ctx.trace_id, span, env.attrs),
-                        resolve_arith(rhs, env.ctx.trace_id, span, env.attrs),
-                    ) {
-                        (Some(l), Some(r)) => cmp_f64(*op, l, r),
-                        _ => false,
-                    }
-                }
-            }
+        // **A bare field is TRUTHINESS** (issue #335 Stage B, D12
+        // capture) — planned as `.a = true`, so it is leaf-bearing like a
+        // written comparison. NOT presence, which is what the
+        // pre-collapse grammar produced.
+        FieldExpr::Field(_) => eval_planned_leaf(filter, leaf_idx, span, env),
+        FieldExpr::Exists { negated: false, .. }
+        | FieldExpr::Binary {
+            op: FieldOp::Cmp(_),
+            ..
+        } => eval_planned_leaf(filter, leaf_idx, span, env),
+        // `{ .a = nil }` — ABSENCE, PulsusDB's kept semantics (ledger
+        // `traceql-eq-nil-uncharacterised`): the key-existence leaf,
+        // negated.
+        FieldExpr::Exists { negated: true, .. } => {
+            Ok(!eval_planned_leaf(filter, leaf_idx, span, env)?)
         }
-        // A bare boolean static (issue #183) consumes no leaf.
-        FieldExpr::BoolStatic(b) => *b,
-        // Unary field negation (issue #183): the inner walk advances
-        // `leaf_idx` through the inner subtree, then the result is negated.
-        FieldExpr::Not(inner) => !eval_expr(inner, filter, leaf_idx, span, env),
-        FieldExpr::Binary { op, lhs, rhs } => {
-            let l = eval_expr(lhs, filter, leaf_idx, span, env);
-            let r = eval_expr(rhs, filter, leaf_idx, span, env);
-            match op {
-                pulsus_traceql::BoolOp::And => l && r,
-                pulsus_traceql::BoolOp::Or => l || r,
-            }
+        FieldExpr::Literal(Value::Bool(b)) => Ok(*b),
+        FieldExpr::Literal(_) => Ok(false),
+        // **`!` on a bare field is BOOLEAN NOT** (Stage B, D12) — planned
+        // as `.a = false`, matching only where the value IS `false`.
+        // Absent never matches, which falls out of the leaf.
+        //
+        // A present NON-boolean operand fails the whole query, as the
+        // reference does (`expression (!.a) expected a boolean`): the
+        // `PlannedLeafEval::BoolTruth` arm returns that error. An earlier
+        // comment here claimed this needed a value-TYPE channel
+        // `ResolvedVal` does not carry; that was wrong — booleans are
+        // stored as the strings "true"/"false", so the co-loaded value
+        // discriminates them from anything else without a new channel.
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr: inner,
+        } if matches!(inner.as_ref(), FieldExpr::Field(_)) => {
+            eval_planned_leaf(filter, leaf_idx, span, env)
+        }
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr: inner,
+        } => Ok(!eval_expr(inner, filter, leaf_idx, span, env)?),
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => {
+            eval_expr(inner, filter, leaf_idx, span, env)?;
+            Ok(false)
+        }
+        FieldExpr::Binary {
+            op: FieldOp::Bool(op),
+            lhs,
+            rhs,
+        } => {
+            let l = eval_expr(lhs, filter, leaf_idx, span, env)?;
+            let r = eval_expr(rhs, filter, leaf_idx, span, env)?;
+            Ok(match op {
+                BoolOp::And => l && r,
+                BoolOp::Or => l || r,
+            })
+        }
+        FieldExpr::Binary {
+            op: FieldOp::Arith(_),
+            lhs,
+            rhs,
+        } => {
+            eval_expr(lhs, filter, leaf_idx, span, env)?;
+            eval_expr(rhs, filter, leaf_idx, span, env)?;
+            Ok(false)
         }
     }
 }
@@ -769,7 +866,23 @@ fn eval_filter(
             None => true,
             Some(expr) => {
                 let mut leaf_idx = 0;
-                eval_expr(expr, filter, &mut leaf_idx, span, env)
+                let matched = eval_expr(expr, filter, &mut leaf_idx, span, env)?;
+                // `collect` (filter.rs) and `eval_expr` walk the same AST
+                // and pair leaves by pre-order POSITION. Nothing in the
+                // types enforces that, and a mismatch is SILENT: every
+                // leaf after the offending node is read as a different
+                // predicate, so the query returns confidently wrong spans
+                // rather than failing. Issue #335 Stage B produced exactly
+                // that — `{ .a = nil }` planned no leaf while eval
+                // consumed one. Checking it here makes any future
+                // divergence fail across the whole existing suite instead
+                // of waiting for a test that happens to use the shape.
+                debug_assert_eq!(
+                    leaf_idx,
+                    filter.leaves.len(),
+                    "leaf/eval walk desynchronised for {expr}"
+                );
+                matched
             }
         };
         if is_match {
@@ -2229,6 +2342,42 @@ mod tests {
         assert_eq!(ids, vec![sid(1), sid(2)]);
     }
 
+    /// `{ .a = nil && .b = 1 }` — absence beside a second leaf.
+    ///
+    /// This shape is the one a leaf/eval pairing bug misreads: `= nil`
+    /// consumes a leaf in `eval_expr`, so if `collect` plans none, the
+    /// `.b = 1` leaf is read as the absence probe and the whole filter
+    /// answers with the wrong predicate rather than failing. The
+    /// `debug_assert_eq!` in `eval_filter` cannot fire on a shape no test
+    /// EVALUATES, and before this test none did — the assertion was
+    /// guarding an empty channel.
+    #[test]
+    fn absence_beside_a_second_leaf_reads_its_own_probe() {
+        let p = plan(r#"{ .a = nil && .b = 1 }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "svc", "no-a-yes-b", 10, 1),
+                span(2, "svc", "yes-a-yes-b", 20, 1),
+                span(3, "svc", "no-a-no-b", 30, 1),
+            ],
+        };
+        // Probe 0 is the `.a` key-existence probe (negated by `= nil`),
+        // probe 1 is `.b = 1`. Span 1: no `a`, has `b=1` -> matches.
+        // Span 2: has `a` -> excluded. Span 3: no `b=1` -> excluded.
+        let attrs = membership(
+            &p,
+            &[
+                (0, tid(1), sid(2)),
+                (1, tid(1), sid(1)),
+                (1, tid(1), sid(2)),
+            ],
+        );
+        let matches = eval(&p, &[trace], &attrs);
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(1)]);
+    }
+
     #[test]
     fn negation_matches_absent_and_different_but_not_equal() {
         // Ratified rule: `!=` matches spans lacking the key and spans
@@ -2983,6 +3132,105 @@ mod tests {
             let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
             assert_eq!(budget.used(), retained, "{q}: intermediates all released");
         }
+    }
+
+    /// The `!`/truthiness ASYMMETRY, measured at the pinned digest over a
+    /// store holding a string `a`: `{ .a }` is a 200 matching nothing,
+    /// `{ !.a }` is a 500 `expression (!.a) expected a boolean, but got
+    /// TypeString`. Equality against a boolean literal does not match a
+    /// string; the `!` OPERATOR demands a boolean.
+    ///
+    /// Before this test the error path had NO eval coverage at all — the
+    /// message existed, the allowlist described it, and nothing ran it.
+    #[test]
+    fn truthiness_tolerates_a_non_boolean_where_negation_fails_the_query() {
+        // `{ .a }` plans as `.a = true`: a membership probe, so a span
+        // whose `a` is a string is simply not a member.
+        let p = plan(r#"{ .a }"#);
+        let trace = || TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a-true", 10, 1), span(2, "s", "a-str", 20, 1)],
+        };
+        let matches = eval(&p, &[trace()], &membership(&p, &[(0, tid(1), sid(1))]));
+        assert_eq!(
+            matched_ids(&matches),
+            vec![1],
+            "no error, no match for the string"
+        );
+
+        // `{ !.a }` co-loads the value and fails the WHOLE query on a
+        // present non-boolean.
+        let p = plan(r#"{ !.a }"#);
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(2)), "hello".to_string());
+        let err = evaluate_batch(
+            &p,
+            &[trace()],
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect_err("a present non-boolean under `!` must fail the query");
+        match err {
+            ReadError::PipelineInvalid { reason } => {
+                assert!(reason.contains("expected a boolean"), "{reason}");
+                assert!(
+                    reason.contains("!"),
+                    "the message names the negation: {reason}"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `{ !.c }` and `{ !.c = 1 }` over BOOLEAN values: the first matches
+    /// the `false` span, the second matches nothing and does NOT error —
+    /// `Never` still resolves the operand, so the type check survives
+    /// while no boolean satisfies the comparison. Both measured.
+    #[test]
+    fn a_negated_operand_matches_by_value_and_never_matches_a_non_boolean_literal() {
+        let trace = || TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "s", "c-true", 10, 1),
+                span(2, "s", "c-false", 20, 1),
+            ],
+        };
+        let p = plan(r#"{ !.c }"#);
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(1)), "true".to_string());
+        attrs.select_values[0].insert((tid(1), sid(2)), "false".to_string());
+        assert_eq!(matched_ids(&eval(&p, &[trace()], &attrs)), vec![2]);
+
+        let p = plan(r#"{ !.c = 1 }"#);
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(1)), "true".to_string());
+        attrs.select_values[0].insert((tid(1), sid(2)), "false".to_string());
+        assert!(
+            eval(&p, &[trace()], &attrs).is_empty(),
+            "no boolean satisfies `!c = 1`, and it must not error either"
+        );
+
+        // ...but `Never` must still RESOLVE the operand: a present
+        // NON-boolean under `!` fails the whole query even though no
+        // boolean could have matched. Measured: `{ !.a = 1 }` is a 500
+        // against a store holding a string `a`. Skipping the resolve
+        // because "nothing can match anyway" would turn that into a
+        // silent empty result.
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(1)), "hello".to_string());
+        let err = evaluate_batch(
+            &p,
+            &[trace()],
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect_err("`Never` must still type-check the operand");
+        assert!(
+            matches!(&err, ReadError::PipelineInvalid { reason } if reason.contains("expected a boolean")),
+            "got {err:?}"
+        );
     }
 
     #[test]

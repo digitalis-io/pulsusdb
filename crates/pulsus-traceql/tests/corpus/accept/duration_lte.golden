@@ -2,14 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Intrinsic(
-                        Duration,
+                Binary {
+                    op: Cmp(
+                        Lte,
                     ),
-                    op: Lte,
-                    value: Duration(
+                    lhs: Field(
+                        Intrinsic(
+                            Duration,
+                        ),
+                    ),
+                    rhs: Literal(
                         Duration(
-                            1500000000,
+                            Duration(
+                                1500000000,
+                            ),
                         ),
                     ),
                 },

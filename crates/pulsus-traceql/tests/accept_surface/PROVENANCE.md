@@ -33,8 +33,16 @@ vendored; our error text stays our own. Three observation channels:
    below is **read off the reference rather than inferred** from accept /
    reject statuses — those cannot separate two groupings that both parse.
    `{ .a = 1 || .b = 2 && "x" }` answers `((.a = 1) || (.b = 2)) && \`x\``;
-   `{ .a = 2 ^ 3 ^ 2 && "x" }` answers `(.a = 64)`, constant-folded, which
-   settles `^` associativity by value. Every capture is recorded verbatim
+   `{ .a = 2 ^ 3 ^ 2 && "x" }` answers `(.a = 64)`, constant-folded — but
+   **that value does NOT settle `^` associativity**, and reading it that
+   way produced a wrong entry that misled two people (issue #335 Stage B).
+   A folded value settles grouping only if the operator's own semantics
+   are known, and this one's are not what they appear: the reference's
+   INTEGER `^` swaps its operands. Grouping was settled structurally
+   instead — `2 ^ 3 ^ 2` equals `2 ^ 8` and not `9 ^ 2`, using the
+   reference's own folds of the subexpressions — which needs no model of
+   the operator. **A folded value pins a value; use two of them against
+   each candidate grouping to pin a grouping.** Every capture is recorded verbatim
    in `reference_parse`. Treat a precedence claim here as unverified
    unless it carries one.
 3. **Result differential**, for the one level with no error channel
@@ -76,7 +84,7 @@ divergence this commit closed, `≠` one still open.
 
 | level | reference | this parser | |
 |---|---|---|---|
-| 1 | `^`, left-associative (`2^3^2` = 64) | same since D8 was fixed | ✔ |
+| 1 | `^`, **right**-associative (`2^3^2` ≡ `2^8`; the folded value 64 alone does not establish this — see the method note) | same since D8 was fixed; the grouping agrees and the OPERATOR diverges deliberately (`traceql-pow-integer-operand-swap`) | ✔ |
 | 2 | `* / %`, left-associative | same | = |
 | 3 | unary `!`, unary `-` (so `-2^2` = -4, `-.a*2` = `-(.a*2)`) | unary `-` matches since D9 was fixed; unary `!` is still not at this level | ✔ / ≠ D1 |
 | 4 | `+ -`, left-associative | same | = |

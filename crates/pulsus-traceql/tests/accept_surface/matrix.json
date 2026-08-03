@@ -70,8 +70,8 @@
     {
       "id": "D8",
       "title": "'^' associativity",
-      "reference": "left-associative: 2 ^ 3 ^ 2 = 64.",
-      "pulsus": "right-associative: 2 ^ (3 ^ 2) = 512.",
+      "reference": "MEASURED: 2 ^ 3 ^ 2 = 64. GROUPING (separately established, issue #335 Stage B): RIGHT-associative — 2 ^ 3 ^ 2 equals 2 ^ 8 (64) and not 9 ^ 2 (512), where 9 and 8 are the reference folds of 2^3 and 3^2. The value 64 alone does NOT establish grouping: the reference reaches it by right grouping combined with an operand-swapping integer ^ (ledger traceql-pow-integer-operand-swap), two errors cancelling. An earlier reading of this row derived left-associativity from the value and was wrong.",
+      "pulsus": "right-associative: 2 ^ (3 ^ 2). GROUPING AGREES with the reference; the VALUE differs (512 vs 64) because PulsusDB computes lhs^rhs where the reference's integer path swaps operands — a ledgered deliberate divergence, not a grammar difference.",
       "impact": "quiet meaning",
       "status": "closed",
       "closed_by": 335
@@ -1622,9 +1622,9 @@
       "query": "{ .a = 2 ^ 3 ^ 2 }",
       "class": "D8",
       "reference_parse": "(.a = 64)",
-      "reference_grouping": "{ .a = ((2 ^ 3) ^ 2) }",
-      "pulsus_parse": "{ .a = (2 ^ 3) ^ 2 }",
-      "evidence": "{ .a = 2 ^ 3 ^ 2 && \"x\" }",
+      "reference_grouping": "{ .a = (2 ^ (3 ^ 2)) }",
+      "pulsus_parse": "{ .a = 2 ^ (3 ^ 2) }",
+      "evidence": "{ .a = 2 ^ 3 ^ 2 && \"x\" }: reference folds to (.a = 64). GROUPING is established from three folds, not from that one value: 2 ^ 3 ^ 2 -> 64, 9 ^ 2 -> 512, 2 ^ 8 -> 64, where 9 and 8 are the reference folds of 2 ^ 3 and 3 ^ 2 -- so the three-term form is the RIGHT grouping. This row previously recorded ((2 ^ 3) ^ 2), derived from the value 64 alone, and was wrong: the reference reaches 64 by right grouping combined with an operand-swapping integer ^ (ledger traceql-pow-integer-operand-swap), two errors cancelling. Grouping agrees; the operator diverges deliberately, so the folded VALUE here is 512 for PulsusDB. This probe scores grouping only.",
       "closed_by": 335
     },
     {

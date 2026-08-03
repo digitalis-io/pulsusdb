@@ -1,6 +1,6 @@
 UnexpectedToken {
     found: "'+'",
-    expected: "a duration literal (e.g. 2s, 100ms)",
+    expected: "a field, a literal, or '('",
     span: Span {
         start: 13,
         end: 14,

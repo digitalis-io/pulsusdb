@@ -2,14 +2,20 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Attribute {
-                        scope: Span,
-                        key: "attr with spaces",
-                    },
-                    op: Eq,
-                    value: Number(
-                        "1",
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Span,
+                            key: "attr with spaces",
+                        },
+                    ),
+                    rhs: Literal(
+                        Number(
+                            "1",
+                        ),
                     ),
                 },
             ),

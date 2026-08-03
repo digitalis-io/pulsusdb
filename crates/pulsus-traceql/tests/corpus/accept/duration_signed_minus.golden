@@ -8,16 +8,19 @@ Query {
                     ),
                     lhs: Field(
                         Intrinsic(
-                            EventTimeSinceStart,
+                            Duration,
                         ),
                     ),
-                    rhs: Literal(
-                        Duration(
+                    rhs: Unary {
+                        op: Neg,
+                        expr: Literal(
                             Duration(
-                                1000000,
+                                Duration(
+                                    2000000000,
+                                ),
                             ),
                         ),
-                    ),
+                    },
                 },
             ),
         },

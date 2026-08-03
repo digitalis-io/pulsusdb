@@ -111,7 +111,26 @@ but keeps the entry for history.
   `tempo_differential.rs::validate_vectors_match_the_live_reference`
   re-measures every vector against the pinned digest, fail-closed.
 
-### `traceql-validate-nil-spelling-conflation` (issue #328)
+### `traceql-validate-nil-spelling-conflation` (issue #328) — **RETIRED by #335 Stage B**
+
+- **Retired 2026-08-03.** The row's own exit condition was "the fix rides
+  whenever the AST next changes shape", and the Stage B grammar collapse
+  is that change: `= nil` / `!= nil` now fold to a single `Exists { field,
+  negated }` node carrying the polarity as a flag, so `{ name = nil }` and
+  `{ !(name != nil) }` are DIFFERENT ASTs and the validator can tell them
+  apart. Re-measured against the same pinned digest after the collapse:
+  `{ name = nil }` 400 / reject, `{ !(name != nil) }` 200 / accept,
+  `{ name != nil }` 200 / accept, `{ .a = nil }` 200 / accept,
+  `{ !(.a != nil) }` 200 / accept,
+  `{ !(resource.service.name != nil) }` 200 / accept — six for six.
+  The over-rejection is gone; no divergence remains to record.
+- **Gate:** `validate::tests::the_nil_spellings_are_no_longer_conflated`
+  now pins the DISTINCTION (both the AST inequality and both verdicts), so
+  a regression to the conflated shape fails rather than quietly restoring
+  the divergence this row described. The `nil-d1`/`nil-d2` vectors were
+  re-recorded with the matching verdicts in the same change.
+
+The original entry, kept for the trail:
 
 - **What:** the parser normalizes `x = nil` to `Not(Exists(x))` — and
   the double-negation spelling `!(x != nil)` produces the SAME node, so
@@ -131,3 +150,60 @@ but keeps the entry for history.
   `validate::tests::the_nil_double_negation_spelling_is_conflated_and_rejected`
   pins the conflation itself, so the row cannot outlive the AST that
   causes it.
+
+### `traceql-pow-integer-operand-swap` (issue #335 Stage B)
+
+- **Reference behaviour (measured, `grafana/tempo@sha256:aa8df8d0…`,
+  v3.0.2):** the `^` operator **swaps its operands on the INTEGER path**.
+  Measured, with the folded constant read from the reference's own
+  type-error message:
+
+  | query | reference | `lhs^rhs` would be |
+  |---|---|---|
+  | `2 ^ 10` | 100 | 1024 |
+  | `10 ^ 2` | 1024 | 100 |
+  | `2 ^ 3` | 9 | 8 |
+  | `5 ^ 0` | 0 | 1 |
+  | `0 ^ 5` | 1 | 0 |
+  | `2 ^ -1` | 1 | 0.5 |
+
+- **The condition is load-bearing — this is NOT a blanket swap.** One
+  float operand takes a correct path:
+
+  | query | reference |
+  |---|---|
+  | `3 ^ 4` | **64** (swapped) |
+  | `3.0 ^ 4` | **81.0** (correct) |
+  | `2 ^ 10` | 100 (swapped) |
+  | `2.0 ^ 10`, `2 ^ 10.0`, `2.0 ^ 10.0` | 1024.0 (correct) |
+  | `4 ^ 0.5` | 2.0 (correct) |
+
+  The same mathematical operands give opposite results, decided by the
+  literal's spelling. Anyone writing "the reference's `^` swaps its
+  operands" without the condition states something false for
+  `2.0 ^ 10`, so the row would read as wrong and take the ledger's
+  credibility with it.
+
+- **PulsusDB behaviour:** `lhs ^ rhs` on every path. `2 ^ 10` is 1024.
+
+- **Why deliberate:** this is a defect, not a convention. A result that
+  depends on whether the user typed `3` or `3.0` cannot be relied on, and
+  a user writing `2 ^ 10` means 1024. Under the standing mandate we match
+  the reference except where it is wrong.
+
+- **Consequence, stated plainly because it looks like a regression:**
+  `{ .a = 2 ^ 3 ^ 2 }` is **512** for PulsusDB and **64** for the
+  reference. Grouping AGREES — both are right-associative (established
+  structurally; see `FieldOp::is_right_assoc`). Only the operator
+  diverges.
+
+  The merged #335 audit previously made PulsusDB answer 64 by making `^`
+  **left**-associative with a correct operator: `(2^3)^2` = 8² = 64. The
+  reference reaches 64 by right grouping with a swapped operator:
+  `2^(3^2)` = `2^8` → 8² = 64. **Two independent errors cancelled for
+  that one input.** Fixing the grammar without copying the defect
+  necessarily breaks the agreement, and the agreement was never evidence
+  of a shared model — a single value can only ever pin a value. That
+  finding is not a criticism of the audit: seeing it took a three-term
+  structural probe plus a characterisation of the operator, neither of
+  which a single-value comparison can motivate.

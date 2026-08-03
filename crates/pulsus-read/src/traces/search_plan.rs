@@ -17,8 +17,8 @@ use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{
-    self, ArithNode, AttrProbe, CompareOperand, LeafEval, NestedSetField, PhysicalPredicate,
-    PlanError, SpanFilterCtx, TraceCtxPred,
+    self, ArithNode, AttrProbe, BoolMatch, CompareOperand, LeafEval, NestedSetField,
+    PhysicalPredicate, PlanError, SpanFilterCtx, TraceCtxPred,
 };
 use super::search_sql;
 
@@ -179,6 +179,15 @@ pub(crate) enum PlannedLeafEval {
         field: NestedSetField,
         op: ComparisonOp,
         value: f64,
+    },
+    /// The operand of a `!` (issue #335 Stage B) — `{ !.a }`,
+    /// `{ !.a = true }`, `{ !.a = 1 }` — evaluated from the operand's
+    /// resolved VALUE so absent (no match) and present-non-boolean (whole
+    /// query fails) stay distinguishable. `{ .a }` is NOT here: it is the
+    /// plain comparison `.a = true`.
+    BoolTruth {
+        operand: PlannedOperand,
+        want: BoolMatch,
     },
     /// A field-vs-field comparison (issue #183 `comparison.rhs_attribute`),
     /// evaluated per candidate span from both operands' resolved values.
@@ -1228,6 +1237,10 @@ pub fn plan_search(
                         value: *value,
                     }
                 }
+                LeafEval::BoolTruth { operand, want } => PlannedLeafEval::BoolTruth {
+                    operand: plan_operand(operand, &mut agg_fields, &mut select_attrs),
+                    want: *want,
+                },
                 LeafEval::FieldCompare { lhs, rhs, op } => PlannedLeafEval::FieldCompare {
                     lhs: plan_operand(lhs, &mut agg_fields, &mut select_attrs),
                     rhs: plan_operand(rhs, &mut agg_fields, &mut select_attrs),

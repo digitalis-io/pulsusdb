@@ -2,13 +2,19 @@ Query {
     spanset: Filter(
         SpansetFilter {
             body: Some(
-                Comparison {
-                    field: Intrinsic(
-                        StatusMessage,
+                Binary {
+                    op: Cmp(
+                        Eq,
                     ),
-                    op: Eq,
-                    value: String(
-                        "boom",
+                    lhs: Field(
+                        Intrinsic(
+                            StatusMessage,
+                        ),
+                    ),
+                    rhs: Literal(
+                        String(
+                            "boom",
+                        ),
                     ),
                 },
             ),
