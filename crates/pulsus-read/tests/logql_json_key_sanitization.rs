@@ -28,7 +28,9 @@
 //! the fresh responses derive the same labels as the committed artifact
 //! (CI runs it against the digest-pinned differential oracle, so the
 //! artifact is re-validated against a real reference on every push —
-//! that leg also cross-checks v3.7.3 against the v3.7.4 capture).
+//! that leg now runs the SAME v3.7.4 image this artifact was captured
+//! from, so the status oracle and this value capture no longer speak for
+//! different versions).
 //! [`artifact_probe_set_is_exactly_the_source_probe_set`] pins the
 //! artifact's probes (id, pipeline, stream, structured metadata, line,
 //! query shape) to the tables below. PROVENANCE — that the committed
@@ -940,9 +942,20 @@ fn capture_probe(base_url: &str, nonce: u64, sp: &SourceProbe) -> ArtifactProbe 
 /// rewrites the artifact instead — and refuses any container that does
 /// not report the pinned version, so the artifact can only ever be
 /// produced by the reference it names. Drift deliberately does NOT pin
-/// the version: CI points it at the digest-pinned v3.7.3 differential
-/// oracle, cross-checking the v3.7.4 capture against a second reference
-/// build.
+/// the version: it runs against whatever `PULSUSDB_LOGQL_DIFF_URL`
+/// serves, and in CI that is the differential oracle.
+///
+/// **That used to be a SECOND reference build.** Before the oracle was
+/// re-pinned, CI ran drift against a v3.7.3 container while this artifact
+/// was captured at v3.7.4, so the check incidentally spanned two
+/// versions; both sides are v3.7.4 now and it is same-version. The
+/// cross-version property is gone, and it is not being reconstructed: it
+/// was incidental rather than designed, this leg's job is drift against
+/// the pinned oracle, and it would not have caught anything we have
+/// actually hit — issue #350's byte-size spellings are rejected by both
+/// versions, so a cross-version check was blind to them too. Standing up
+/// a second container to preserve it would be apparatus for a property
+/// nobody chose.
 #[test]
 fn the_committed_capture_matches_the_live_reference() {
     let Ok(base_url) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {

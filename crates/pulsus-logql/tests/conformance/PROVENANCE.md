@@ -10,7 +10,7 @@ than silent skips.
 
 Files:
 
-- `registry-logql-v3.7.3.json` — the construct registry. One entry per
+- `registry-logql-v3.7.4.json` — the construct registry. One entry per
   documented construct: `id`, `category`, `syntax`, `doc` (public-docs
   URL with a real page path + anchor), `probe` (a canonical clean-room
   example query), and — for constructs that are instant-only in the
@@ -44,37 +44,63 @@ Files:
 
 ## Oracle & language pin
 
-The language target is **LogQL v3.7.4**; the differential container in this
-directory is still digest-pinned to **v3.7.3**. "Pinning a version" here
-means a documented *version reference for the language*, **not** pinning,
-fetching, adapting, or vendoring any reference-implementation source.
+The language target is **LogQL v3.7.4**, and the differential container in
+this directory is digest-pinned to the same version. "Pinning a version"
+here means a documented *version reference for the language*, **not**
+pinning, fetching, adapting, or vendoring any reference-implementation
+source.
 
-> **The target and the oracle digest are not the same version — read this
-> before treating an oracle probe as the target's behaviour** (issue #339).
-> The target moved to v3.7.4 (owner-approved 2026-07-25 with the corpus
-> epic): `docs/api.md` and `docs/features.md` cite v3.7.4,
-> `crates/pulsus-read/tests/logqltest/` captures against v3.7.4, and
-> issue #287's capture gate refuses any other version. This directory's
-> oracle digest still resolves to v3.7.3, because re-pinning it moves
-> accept/reject surfaces across the whole registry and is scheduled as its
-> own work with its own sweep. The lagging side is this directory as a
-> whole — the container digest, `registry-logql-v3.7.3.json`'s `target`
-> field, and the `EXPECTED_TARGET` constant that checks it all still say
-> v3.7.3, deliberately and together, so they stay self-consistent until
-> that re-pin happens.
+> **Four things carry the version and they move together.** The container
+> digest in `.github/workflows/ci.yml`, `registry-logql-v3.7.4.json`'s
+> `target` field, `registry-manifest.json`'s `target`, and
+> `conformance.rs`'s `EXPECTED_TARGET` — the harness cross-checks them, so
+> correcting one alone reddens rather than drifts. They were briefly out
+> of step with the language target while the bump was scheduled; that gap
+> is closed.
 >
-> The two versions do not always agree. The measured case: **byte-size
-> literal spellings**. v3.7.3's lexer admits exactly 21 case-sensitive
-> spellings (`B k kB ki kiB K KB Ki KiB M MB Mi MiB G GB Gi GiB T TB Ti
-> TiB`) and 400s `1b`/`1kb`/`1pb`/`1024b`; v3.7.4 accepts the full
-> case-insensitive `humanize.ParseBytes` set, which is what PulsusDB
-> implements (issue #226) and what
-> `crates/pulsus-read/tests/logqltest/corpus/b8_byte_parity.test` captures
-> as accepted. An adjudication on #339 was made from an oracle probe alone
-> and concluded PulsusDB was over-accepting; it was not. Where the oracle
-> and a v3.7.4 capture disagree, **the capture wins** — see
-> `crates/pulsus-logql/tests/case_folding.rs`, whose residual census
-> labels that class explicitly.
+> **Why the digest is the capture image's.** It is the same image
+> `crates/pulsus-read/tests/logqltest/` captures against
+> (`sha256:87f0a067…`, recorded in that directory's PROVENANCE), so the
+> status oracle and the value corpus now speak for one version. Issue #339
+> is the reason this matters: an adjudication was made there from a probe
+> against the older oracle and concluded PulsusDB was over-accepting on
+> byte-size literals, which it was not. A version disagreement is visible
+> only from a probe **and** a capture together, so a probe against an
+> oracle that lags the capture corpus can look authoritative and be wrong.
+> Where an oracle probe and a capture disagree, **the capture wins**.
+
+### What the oracle actually compares — status vs values
+
+A construct probe checks **acceptance only**. Two reference versions can
+agree on every accept/reject verdict and still return different *values*,
+and no registry probe would see it. Stated plainly, because it bounds what
+an oracle bump can be said to have verified:
+
+| leg | container | compares | breadth |
+|---|---|---|---|
+| `logql_differential.rs` | live | **HTTP status only** (2xx/400) | all 103 registry constructs |
+| `case_folding.rs` live leg | live | **HTTP status only** | the keyword-folding table |
+| `logql_json_key_sanitization.rs` | live | **values** (derived label names) | 51 probes, `\| json` key derivation only |
+| `logqltest` corpus (`logqltest_corpus.rs`) | none — replays a committed capture | **values and error strings** | 911 `eval`/`eval_fail` directives across 31 batch files |
+| `conformance.rs` | none | registry integrity, no reference at all | 103 constructs |
+
+So **live value comparison is thin**: one leg, one construct family. Broad
+value coverage exists, but hermetically, against a frozen capture rather
+than against the running container — it proves we still match what the
+reference returned *when the corpus was captured*, not what it returns now.
+There is also no mechanical construct→captured-value map: the corpus is
+organised by feature batch, not by registry id, so "which constructs have
+value coverage" cannot be answered by a query today.
+
+**Consequence for a version bump.** Moving the oracle re-verifies the
+status surface completely and the value surface barely. That is acceptable
+for the v3.7.3→v3.7.4 move specifically, because the corpus was already
+captured at v3.7.4 — the bump removed a version mismatch rather than
+introducing one, and the one live value leg (whose regeneration gate
+already demanded v3.7.4) now runs against the image it was captured from.
+It would **not** be acceptable for a bump to a version the corpus has not
+been captured against: that needs a corpus regeneration, not just a digest
+change.
 
 The oracle is:
 
@@ -94,19 +120,22 @@ The oracle is:
 
 The digest-pinned reference container image used by the differential leg
 and the CI `schema-it` job is the functional coordinate
-`docker.io/grafana/loki@sha256:70b9f699fc9bb868b62f1cfd4f787dfa50242f1fd92e6089787d5d7daea75fe8`
-(tag `3.7.3`). It is used purely at runtime as a black-box syntax oracle;
-no source from it is read, copied, or vendored.
+`docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+(tag `3.7.4`; it reports `"version":"3.7.4"` from
+`/loki/api/v1/status/buildinfo`, and is the same image
+`crates/pulsus-read/tests/logqltest/` captures its values against). It is
+used purely at runtime as a black-box syntax oracle; no source from it is
+read, copied, or vendored.
 
 Every conformance case and every expected result is authored by us from the
 published documentation and observed behaviour.
 
 **Docs-vs-binary conflict policy:** where the published docs disagree with
-observed v3.7.3 behaviour, observed behaviour wins; the divergence is
+observed v3.7.4 behaviour, observed behaviour wins; the divergence is
 recorded here and escalated to the owner if material. Two such observed
 verdicts are recorded as `oracle: reject` and dispositioned `reject-parity`
 (#203 closeout): `stage.ip` (no standalone `ip` pipeline stage exists) and
-`stage.distinct` (no `distinct` pipeline stage exists in v3.7.3, in any
+`stage.distinct` (no `distinct` pipeline stage exists in v3.7.4, in any
 argument form). We reject both with a construct-named `NotYetSupported` and so
 does the reference — a terminal parity, not a tracked gap.
 
@@ -151,7 +180,7 @@ Every construct has exactly one `status`:
   rejects it (`oracle: reject`): parity, not a compatibility gap. It is a
   terminal state — **no `owning_issue`** and not counted by
   `interim_count_pin`. The residual `stage.distinct`/`stage.ip` constructs
-  (no such pipeline stage exists in v3.7.3) are the two members. The live
+  (no such pipeline stage exists in v3.7.4) are the two members. The live
   differential separately confirms the reference still rejects; a flip to
   Accept (either side) is RED.
 - `divergence` — an owner-escalated, intentional deviation. Requires a
@@ -167,7 +196,7 @@ to 0 and flips the pin into a strict gate.
 ## The `oracle` field and the differential (no ad-hoc exemptions)
 
 Every disposition records `oracle` ∈ {`accept`, `reject`}: the measured
-black-box verdict of the v3.7.3 reference for the construct's probe (2xx =
+black-box verdict of the v3.7.4 reference for the construct's probe (2xx =
 accept, HTTP 400 = reject; any other status is inconclusive and fails the
 leg). It makes the differential **disposition-driven** —
 `tests/logql_differential.rs` replays each registry probe and asserts the
@@ -205,18 +234,22 @@ refuses a range-aggregation grouping with a named error, so an end-to-end
 query still fails. Recorded here rather than left to be inferred from the
 word "supported".
 
-Both rows were captured against **grafana/loki v3.7.4**, not the `v3.7.3`
-in this directory's registry filename (a concurrent branch is re-pinning
-that; renaming the file here would have collided with it). The container's
-identity was read from the running process — `/loki/api/v1/status/buildinfo`
-answered `{"version":"3.7.4","revision":"b318f282"}` — rather than trusted
-from any committed header. The captured semantics and the full
+Both rows were captured against **grafana/loki v3.7.4**. When they landed,
+this directory's registry filename still said `v3.7.3` and the note here
+recorded the mismatch as pending on a concurrent re-pin branch; that branch
+has since merged, so the registry, the manifest, `EXPECTED_TARGET` and the
+container digest all name v3.7.4 and there is no mismatch left to flag. The
+container's identity was read from the running process —
+`/loki/api/v1/status/buildinfo` answered
+`{"version":"3.7.4","revision":"b318f282"}` — rather than trusted from any
+committed header; that is the same `b318f282` the pinned digest resolves
+to, so these rows and the differential oracle are one image. The captured semantics and the full
 accept/reject split live in
 `crates/pulsus-read/tests/logqltest/corpus/b18_range_agg_grouping.test`.
 
 ## Revision workflow
 
-1. **Add / change a construct:** edit `registry-logql-v3.7.3.json`, then
+1. **Add / change a construct:** edit `registry-logql-v3.7.4.json`, then
    re-pin `registry-manifest.json` (SHA-256 over the exact registry bytes +
    the new counts). Add the matching `dispositions.json` entry (the bijection
    test fails otherwise).
