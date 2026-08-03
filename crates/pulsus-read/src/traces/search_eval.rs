@@ -518,7 +518,9 @@ fn eval_trace_ctx(tc: &TraceCtxEval, ctx: &TraceEvalCtx<'_>, span: &HydratedSpan
 /// happens in the compare (keeping it out of the per-span hot loop).
 struct ResolvedVal<'a> {
     num: Option<f64>,
-    text: Option<&'a str>,
+    /// `Cow` because issue #351's id intrinsics RENDER their value
+    /// (lowercase hex of a byte array) rather than borrowing a column.
+    text: Option<std::borrow::Cow<'a, str>>,
 }
 
 /// Resolves one comparison operand to its typed value for a span, or
@@ -526,62 +528,106 @@ struct ResolvedVal<'a> {
 /// match). Physical intrinsics are always present.
 fn resolve_operand<'a>(
     operand: &PlannedOperand,
-    trace_id: [u8; 16],
     span: &'a HydratedSpan,
-    attrs: &'a BatchAttrs,
+    env: &'a EvalEnv<'a>,
 ) -> Option<ResolvedVal<'a>> {
+    use std::borrow::Cow;
+    let trace_id = env.ctx.trace_id;
+    let attrs = env.attrs;
+    let text = |t: &'a str| {
+        Some(ResolvedVal {
+            num: None,
+            text: Some(Cow::Borrowed(t)),
+        })
+    };
+    let owned = |t: String| {
+        Some(ResolvedVal {
+            num: None,
+            text: Some(Cow::Owned(t)),
+        })
+    };
+    let number = |n: f64| {
+        Some(ResolvedVal {
+            num: Some(n),
+            text: None,
+        })
+    };
     match operand {
-        PlannedOperand::Name => Some(ResolvedVal {
-            num: None,
-            text: Some(&span.name),
-        }),
-        PlannedOperand::Service => Some(ResolvedVal {
-            num: None,
-            text: Some(&span.service),
-        }),
-        PlannedOperand::Duration => Some(ResolvedVal {
-            num: Some(span.duration_ns as f64),
-            text: None,
-        }),
-        PlannedOperand::Status => Some(ResolvedVal {
-            num: Some(span.status_code as f64),
-            text: None,
-        }),
-        PlannedOperand::Kind => Some(ResolvedVal {
-            num: Some(span.kind as f64),
-            text: None,
-        }),
+        PlannedOperand::Name => text(&span.name),
+        PlannedOperand::Service => text(&span.service),
+        // -- issue #351: intrinsics as a field-vs-field operand. Each
+        // resolves to ONE scalar per span, from the hydrated span or a
+        // co-load `plan_operand` requested. A `None` here means "no
+        // value for this span", which the comparison treats as no match —
+        // the same rule an absent attribute key follows.
+        PlannedOperand::StatusMessage => text(&span.status_message),
+        PlannedOperand::ScopeName => text(&span.scope_name),
+        PlannedOperand::ScopeVersion => text(&span.scope_version),
+        // Ids render as LOWERCASE HEX, matching the id literal path
+        // (`lowercase_hex_literal`) so `{ .a = span:id }` compares against
+        // the same spelling `{ span:id = "…" }` accepts.
+        PlannedOperand::SpanId => owned(hex_lower(&span.span_id)),
+        PlannedOperand::ParentId => owned(hex_lower(&span.parent_id)),
+        PlannedOperand::TraceId => owned(hex_lower(&trace_id)),
+        PlannedOperand::TraceDurationNs => env
+            .ctx
+            .info
+            .and_then(|i| number((i.trace_end_ns - i.trace_start_ns) as f64)),
+        PlannedOperand::RootName => env.ctx.info.and_then(|i| text(i.root_name.as_str())),
+        PlannedOperand::RootServiceName => env.ctx.info.and_then(|i| text(i.root_service.as_str())),
+        // An absent entry is zero children, exactly as the TraceCtx leaf
+        // reads it.
+        PlannedOperand::ChildCount => number(
+            env.ctx
+                .child_counts
+                .get(&(trace_id, span.span_id))
+                .copied()
+                .unwrap_or(0) as f64,
+        ),
+        PlannedOperand::NestedSet(field) => env
+            .nested_set
+            .and_then(|ix| ix.get(&span.span_id))
+            .and_then(|v| number(v.value(*field) as f64)),
+        PlannedOperand::Duration => number(span.duration_ns as f64),
+        PlannedOperand::Status => number(span.status_code as f64),
+        PlannedOperand::Kind => number(span.kind as f64),
         PlannedOperand::Attr { str_idx, num_idx } => {
             let key = (trace_id, span.span_id);
-            let text = attrs.select_values[*str_idx].get(&key).map(String::as_str);
+            let t = attrs.select_values[*str_idx].get(&key).map(String::as_str);
             let num = attrs.agg_values[*num_idx].get(&key).copied();
-            if text.is_none() && num.is_none() {
+            if t.is_none() && num.is_none() {
                 None
             } else {
-                Some(ResolvedVal { num, text })
+                Some(ResolvedVal {
+                    num,
+                    text: t.map(Cow::Borrowed),
+                })
             }
         }
     }
 }
 
+/// Lowercase hex, the rendering every id intrinsic uses.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Resolves an arithmetic operand tree to a number for a span (issue
 /// #185). A field operand that is absent or string-typed, or a
 /// division/modulo by zero, yields `None` (no match).
-fn resolve_arith(
-    node: &PlannedArith,
-    trace_id: [u8; 16],
-    span: &HydratedSpan,
-    attrs: &BatchAttrs,
-) -> Option<f64> {
+fn resolve_arith(node: &PlannedArith, span: &HydratedSpan, env: &EvalEnv<'_>) -> Option<f64> {
     match node {
         PlannedArith::Value(v) => Some(*v),
-        PlannedArith::Operand(operand) => {
-            resolve_operand(operand, trace_id, span, attrs).and_then(|r| r.num)
-        }
-        PlannedArith::Neg(inner) => resolve_arith(inner, trace_id, span, attrs).map(|v| -v),
+        PlannedArith::Operand(operand) => resolve_operand(operand, span, env).and_then(|r| r.num),
+        PlannedArith::Neg(inner) => resolve_arith(inner, span, env).map(|v| -v),
         PlannedArith::Bin { op, lhs, rhs } => {
-            let l = resolve_arith(lhs, trace_id, span, attrs)?;
-            let r = resolve_arith(rhs, trace_id, span, attrs)?;
+            let l = resolve_arith(lhs, span, env)?;
+            let r = resolve_arith(rhs, span, env)?;
             super::filter::apply_arith(*op, l, r)
         }
     }
@@ -627,13 +673,12 @@ fn eval_field_compare(
     lhs: &PlannedOperand,
     rhs: &PlannedOperand,
     op: ComparisonOp,
-    trace_id: [u8; 16],
     span: &HydratedSpan,
-    attrs: &BatchAttrs,
+    env: &EvalEnv<'_>,
 ) -> bool {
     let (Some(l), Some(r)) = (
-        resolve_operand(lhs, trace_id, span, attrs),
-        resolve_operand(rhs, trace_id, span, attrs),
+        resolve_operand(lhs, span, env),
+        resolve_operand(rhs, span, env),
     ) else {
         return false; // absent key on either side ⇒ no match
     };
@@ -642,7 +687,7 @@ fn eval_field_compare(
         (Some(ln), Some(rn)) => cmp_f64(op, ln, rn),
         // Both string-typed ⇒ lexicographic string compare.
         (None, None) => match (l.text, r.text) {
-            (Some(lt), Some(rt)) => cmp_str(op, lt, rt),
+            (Some(lt), Some(rt)) => cmp_str(op, lt.as_ref(), rt.as_ref()),
             _ => false,
         },
         // Cross-type (numeric vs string) ⇒ no match for every operator.
@@ -675,9 +720,9 @@ fn eval_planned_leaf(
             want,
             display,
         } => {
-            match resolve_operand(operand, env.ctx.trace_id, span, env.attrs) {
+            match resolve_operand(operand, span, env) {
                 None => false,
-                Some(v) => match (v.text, want) {
+                Some(v) => match (v.text.as_deref(), want) {
                     // `want` is the value the OPERAND must hold, so the
                     // negation is already folded in at plan time.
                     (Some("true"), BoolMatch::Is(w)) => *w,
@@ -706,14 +751,11 @@ fn eval_planned_leaf(
             .map(|v| cmp_f64(*op, v.value(*field) as f64, *value))
             .unwrap_or(false),
         PlannedLeafEval::FieldCompare { lhs, rhs, op } => {
-            eval_field_compare(lhs, rhs, *op, env.ctx.trace_id, span, env.attrs)
+            eval_field_compare(lhs, rhs, *op, span, env)
         }
         PlannedLeafEval::TraceCtx(tc) => eval_trace_ctx(tc, &env.ctx, span),
         PlannedLeafEval::Arith { lhs, op, rhs } => {
-            match (
-                resolve_arith(lhs, env.ctx.trace_id, span, env.attrs),
-                resolve_arith(rhs, env.ctx.trace_id, span, env.attrs),
-            ) {
+            match (resolve_arith(lhs, span, env), resolve_arith(rhs, span, env)) {
                 (Some(l), Some(r)) => cmp_f64(*op, l, r),
                 _ => false,
             }
