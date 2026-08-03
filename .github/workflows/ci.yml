@@ -391,6 +391,24 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_json_key_sanitization
 
+      # Issue #352 step 3: the LogQL corpus replay. Takes each reachable
+      # corpus case's `load` to this same reference and compares its
+      # answer against the committed expectation, so a capture that goes
+      # STALE is caught rather than trusted forever. NIGHTLY/dispatch
+      # only: drift is a property of time passing, not of the commit
+      # under test, and the leg needs ~80 sequential pushes.
+      #
+      # It verifies VALUES; it does not verify provenance markers — it
+      # reads them to decide which rows it may compare. 77 of the 948
+      # rows the markers permit are physically reachable; the gap is
+      # enumerated by reason in the test, dominated by 678 template rows
+      # pinned to an absolute date the reference will not serve.
+      - name: LogQL corpus replay leg (issue #352, nightly)
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logqltest_replay
+
       - name: Stop LogQL differential oracle
         if: always()
         run: docker rm -f pulsus-logql-diff || true

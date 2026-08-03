@@ -7,6 +7,66 @@ time. Every expected value is **bit-exact** (`f64::to_bits`, no tolerance —
 the #218 lesson): a one-ULP perturbation reddens the runner
 (`a_perturbed_expected_value_reddens_the_runner`).
 
+## Replay coverage: three numbers, never one (issue #352 step 3)
+
+The live replay leg (`logqltest_replay.rs`) is built. It takes each
+reachable case's `load` to the digest-pinned reference and compares the
+answer against the committed expectation, so a capture that goes STALE is
+caught rather than trusted forever.
+
+**A replay validates the VALUE, not the provenance** — it reads the
+marker only to decide which rows it may compare. That statement above the
+marker table still holds and is now load-bearing in code.
+
+| figure | means | today |
+|---|---|---|
+| `captured` | directives claiming container capture | 1135 |
+| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | 948 |
+| `REACHABLE` | rows a live replay can PHYSICALLY compare | 77 |
+
+`PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg existed,
+and that name was wrong: most of those rows can never be reached. The
+same conflation this issue opened with, one level further in. The gap is
+enumerated by reason, not absorbed:
+
+- **absolute-timestamp (template corpus) — 678.** `t1`-`t6` samples carry
+  a fixed 2026-07-27 timestamp. They cannot be time-shifted (the expected
+  value is a function of the timestamp — `t5_time.test` is 258 rows of
+  exactly that) and cannot be pushed as-is (outside the reference's ~3h
+  ingestion window). **This is the single largest lever on reachability,
+  and it is blocked by the CORPUS, not the harness:** unblocking it means
+  re-capturing those files against RELATIVE time, which is corpus work
+  with its own capture procedure and review.
+- **metric query — 191.** The first slice replays log (streams) queries
+  only.
+- **range/matrix — 2.** Needs the step grid replayed too.
+
+### Two properties of the reference that shaped the leg, both measured
+
+**It serves only the last ~3 hours.** A push older than that returns
+`204` and is then invisible — a success that answers nothing, which reads
+exactly like a replay finding a mismatch. The measured table is in
+`INGESTION_WINDOW`, and `slots_fit_inside_the_measured_ingestion_window`
+asserts the slice's slots stay inside it arithmetically.
+
+**It injects `detected_level`** when `discover_log_levels` is on, which it
+is in `ci/logql/config.yaml`. The corpus was captured with it off, so the
+label is stripped before comparison — the leg's ONE normalisation, named
+at the constant. The better fix is `discover_log_levels: false` in that
+config, which would also unblock the 121 config-delta rows in
+`b12_error_pair_model` and `b14_detected_fields`; it is deliberately not
+done from inside this leg, because that config is shared with the syntax
+and json-key legs. **Follow-up, with both legs re-verified.**
+
+### The container must be fresh
+
+Two runs push the same corpus labels at overlapping absolute times, so
+the reference sees one stream and merges the entries; no query window can
+separate them. The leg checks for a prior run and fails with instructions
+rather than reporting the stale lines as corpus mismatches. CI always
+starts a fresh container, which is why an unchecked assumption here would
+have held in CI and misled every local run.
+
 ## Pinned reference
 
 - **Container (capture only):** `grafana/loki:3.7.4`.

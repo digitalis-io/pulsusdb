@@ -51,9 +51,9 @@ use pulsus_read::logql::{
 };
 
 /// A sorted label set.
-type Labels = Vec<(String, String)>;
+pub type Labels = Vec<(String, String)>;
 /// One resolved streams entry: `(sorted labels, timestamp_ns, line)`.
-type StreamEntry = (Labels, i64, String);
+pub type StreamEntry = (Labels, i64, String);
 /// One resolved instant-vector sample: `(sorted labels, value)`.
 type VectorEntry = (Labels, f64);
 
@@ -1196,7 +1196,11 @@ fn compare_streams(expected: &[String], actual: Vec<StreamEntry>) -> (bool, Stri
     }
 }
 
-fn parse_expected_stream(line: &str) -> Result<StreamEntry, String> {
+/// Parses one corpus `{labels} <ts> <line>` expectation. Public so the
+/// live replay (issue #352 step 3) reads expectations through the SAME
+/// parser the hermetic corpus uses — a second reader would be a second
+/// source of truth for what the corpus says.
+pub fn parse_expected_stream(line: &str) -> Result<StreamEntry, String> {
     let (mut labels, consumed) = parse_labelset(line)?;
     labels.sort();
     let rest = line[consumed..].trim_start();
