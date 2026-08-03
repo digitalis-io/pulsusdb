@@ -17,6 +17,10 @@
 # half of the claim: whole-second widths (`nsec == 0`), exactly-representable
 # widths and sub-second widths (`sec == 0`) are IDENTICAL under both forms,
 # so the fix is inert for them.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 
 # ===================================================================

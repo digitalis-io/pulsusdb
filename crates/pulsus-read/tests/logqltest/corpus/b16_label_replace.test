@@ -40,6 +40,10 @@
 #                        Evaluator type (*logql.DefaultEvaluator)
 #                        (PulsusDB: plan-time 400 — ledgered
 #                        `label-replace-scalar-operand-status`)
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="prod", service_name="svc-lr", src="source-value-10"}
@@ -165,6 +169,7 @@ eval instant at 60s label_replace(vector(1), "dst", "v-$1", "src", "(.*)")
 
 # c14 — INSTANT collisions are returned as duplicate samples, never
 # merged (four identical elements on the reference's wire).
+# provenance: divergence(label-replace-collision-tie-order)
 eval instant at 60s label_replace(sum by (src) (count_over_time({service_name="svc-lr"} | logfmt [5m])), "src", "same", "src", "(.*)")
   {src="same"} 1
   {src="same"} 1
@@ -227,6 +232,7 @@ eval range from 0s to 60s step 30s label_replace(count_over_time({service_name="
 
 # r2 — RANGE collisions merge into one series whose points repeat per
 # grid timestamp (captured verbatim: four samples at each step).
+# provenance: divergence(label-replace-collision-tie-order)
 eval range from 0s to 60s step 30s label_replace(sum by (src) (count_over_time({service_name="svc-lr"} | logfmt [5m])), "src", "same", "src", "(.*)")
   {src="same"} 30s 1 30s 1 30s 1 30s 1 60s 1 60s 1 60s 1 60s 1
 

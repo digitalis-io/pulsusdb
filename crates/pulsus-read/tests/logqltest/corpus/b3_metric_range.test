@@ -12,6 +12,10 @@
 # raw-scan client-aggregation path. Covers rate/count_over_time/bytes_rate/
 # bytes_over_time over a log range; sum/avg/min/max/stddev/stdvar/quantile/
 # first/last/absent_over_time and rate/rate_counter over unwrapped values.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 
 # ===================================================================

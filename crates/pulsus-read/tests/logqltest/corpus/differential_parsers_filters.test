@@ -6,6 +6,10 @@
 # Each service scope is isolated with `clear` — a streams eval replays every
 # loaded line through the query's pipeline, so the loaded set must equal the
 # scope the query selects.
+#
+# provenance: ported(test/fixtures/logs/differential.json)
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # --- json: string filter, anchored regex filter, numeric filter ------
 load

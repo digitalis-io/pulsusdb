@@ -9,6 +9,10 @@
 # These are COMBINATIONS, not single-construct cases (those live in B1–B5).
 # Every metric query carries a parser stage (the raw-scan client-aggregation
 # path) and every loaded sample falls inside the query window (t-range, t].
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # =====================================================================
 # parser × label/line filter × count/rate × aggregation-by

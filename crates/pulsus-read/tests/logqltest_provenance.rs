@@ -657,3 +657,231 @@ fn check_d7_exemption_call_sites_match_the_committed_table() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Check E (issue #352): every corpus directive carries a provenance
+// marker, and the counts are PINNED.
+// ---------------------------------------------------------------------
+
+/// **A replay validates the VALUE, not the provenance.** That distinction
+/// is the reason this check exists and the reason it is not a replay.
+///
+/// "This expectation was captured from the reference, not hand-authored"
+/// is a fact about what happened at capture time. No mechanism we can
+/// build re-establishes it: a hand-authored value that happens to be
+/// correct passes any replay, and a genuine capture that has gone stale
+/// fails one. Issue #352's two known instances sit on opposite sides of
+/// that line — the never-true one was a PROVENANCE failure caught only
+/// incidentally, because its value was also wrong, and had the false
+/// capture been accidentally right nothing would have flagged it.
+///
+/// So this check does the one thing that is actually checkable: it makes
+/// every row's claim EXPLICIT and COUNTED, so an unmarked row cannot
+/// enter the corpus unnoticed. A future live replay leg (issue #352 step
+/// 2) rests on these markers to decide what it may compare; it does not
+/// and cannot verify them.
+///
+/// **`unmarked` is asserted at zero, not printed.** A census of what we
+/// have cannot detect what nobody marked, so the count has to be a gate:
+/// a new corpus file lands unmarked and this fails. That is deliberate —
+/// the issue's own count went stale between filing and pickup (26 of 31
+/// became 27 of 32) because a new file arrived carrying an unchecked
+/// claim, which is the defect reproducing itself while being described.
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum Provenance {
+    Captured,
+    Derived,
+    Divergence(String),
+    Ported(String),
+}
+
+fn parse_provenance(value: &str) -> Result<Provenance, String> {
+    let v = value.trim();
+    if v == "captured" {
+        return Ok(Provenance::Captured);
+    }
+    if v == "derived" {
+        return Ok(Provenance::Derived);
+    }
+    for (prefix, ctor) in [
+        (
+            "divergence(",
+            Provenance::Divergence as fn(String) -> Provenance,
+        ),
+        ("ported(", Provenance::Ported as fn(String) -> Provenance),
+    ] {
+        if let Some(rest) = v.strip_prefix(prefix)
+            && let Some(inner) = rest.strip_suffix(')')
+            && !inner.is_empty()
+        {
+            return Ok(ctor(inner.to_string()));
+        }
+    }
+    Err(format!(
+        "unknown provenance {v:?} (expected captured | derived | \
+         divergence(<ledger-id>) | ported(<source>))"
+    ))
+}
+
+/// Every `eval`/`eval_fail` directive in the corpus, with the provenance
+/// in force for it: its own preceding `# provenance:` line when present,
+/// else the file-level default, else `None` (unmarked).
+fn corpus_directive_provenance() -> Vec<(String, usize, String, Option<Provenance>)> {
+    let dir = manifest_path("tests/logqltest/corpus");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("corpus dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "test"))
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for path in files {
+        let name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        let text = std::fs::read_to_string(&path).expect("corpus file");
+        let lines: Vec<&str> = text.lines().collect();
+        // File-level default: the first `# provenance:` line that is not
+        // immediately followed by a directive it would be overriding.
+        let mut file_default: Option<Provenance> = None;
+        let mut pending: Option<Provenance> = None;
+        for (i, raw) in lines.iter().enumerate() {
+            if let Some(rest) = raw.trim().strip_prefix("# provenance:") {
+                let p = parse_provenance(rest).unwrap_or_else(|e| panic!("{name}:{}: {e}", i + 1));
+                let next_is_directive = lines.get(i + 1).is_some_and(|l| l.starts_with("eval"));
+                if next_is_directive {
+                    pending = Some(p);
+                } else if file_default.is_none() {
+                    file_default = Some(p);
+                } else {
+                    panic!("{name}:{}: a second file-level provenance marker", i + 1);
+                }
+                continue;
+            }
+            if raw.starts_with("eval") {
+                let p = pending.take().or_else(|| file_default.clone());
+                out.push((name.clone(), i + 1, raw.trim().to_string(), p));
+            }
+        }
+    }
+    out
+}
+
+/// The ledger ids a `divergence(...)` marker may name — the `### \`id\``
+/// headings of the logs differential ledger.
+fn ledger_ids() -> Vec<String> {
+    let text = read("../../docs/benchmarks/logs-differential-ledger.md");
+    text.lines()
+        .filter_map(|l| l.strip_prefix("### `"))
+        .filter_map(|l| l.split('`').next())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+#[test]
+fn check_e_every_corpus_directive_carries_a_counted_provenance_marker() {
+    let rows = corpus_directive_provenance();
+
+    // The scan must be finding the corpus: an empty or tiny result would
+    // make every assertion below vacuous.
+    assert!(
+        rows.len() > 900,
+        "expected the whole corpus, found {} directives",
+        rows.len()
+    );
+
+    // (1) UNMARKED IS A GATE, NOT A REPORT. A new corpus file — or a new
+    // row in a file whose default does not apply — fails here rather
+    // than joining the corpus with an unchecked claim.
+    let unmarked: Vec<String> = rows
+        .iter()
+        .filter(|(_, _, _, p)| p.is_none())
+        .map(|(f, n, d, _)| format!("{f}:{n}: {}", &d[..d.len().min(70)]))
+        .collect();
+    assert!(
+        unmarked.is_empty(),
+        "{} corpus directives carry no provenance marker — add a file-level \
+         `# provenance:` line or a per-row override (issue #352):\n{}",
+        unmarked.len(),
+        unmarked.join("\n")
+    );
+
+    // (2) Pinned totals, so a class silently changing size fails.
+    let count = |f: &dyn Fn(&Provenance) -> bool| {
+        rows.iter()
+            .filter(|(_, _, _, p)| p.as_ref().is_some_and(f))
+            .count()
+    };
+    let captured = count(&|p| matches!(p, Provenance::Captured));
+    let derived = count(&|p| matches!(p, Provenance::Derived));
+    let divergence = count(&|p| matches!(p, Provenance::Divergence(_)));
+    let ported = count(&|p| matches!(p, Provenance::Ported(_)));
+    assert_eq!(
+        (captured, derived, divergence, ported, rows.len()),
+        (CAPTURED, DERIVED, DIVERGENCE, PORTED, TOTAL),
+        "corpus provenance counts moved (captured, derived, divergence, ported, total) \
+         — update these pins and the figure quoted on issue #352"
+    );
+
+    // (3) Every `divergence(<id>)` names a REAL ledger row. A marker
+    // pointing at nothing is the drift this check exists to stop.
+    let ids = ledger_ids();
+    for (f, n, _, p) in &rows {
+        if let Some(Provenance::Divergence(id)) = p {
+            assert!(
+                ids.contains(id),
+                "{f}:{n}: provenance names ledger row {id:?}, which does not exist \
+                 in docs/benchmarks/logs-differential-ledger.md (have: {ids:?})"
+            );
+        }
+    }
+}
+
+/// The reverse direction of check E(3): a ledger row that says a corpus
+/// file gates it must be named by a marker in that file. Without this,
+/// a ledger row could claim corpus coverage that no row provides.
+#[test]
+fn check_e_ledger_rows_claiming_corpus_gating_are_named_by_a_marker() {
+    let ledger = read("../../docs/benchmarks/logs-differential-ledger.md");
+    let rows = corpus_directive_provenance();
+    let marked: Vec<(&String, &String)> = rows
+        .iter()
+        .filter_map(|(f, _, _, p)| match p {
+            Some(Provenance::Divergence(id)) => Some((f, id)),
+            _ => None,
+        })
+        .collect();
+
+    // A ledger section that says "Gated by `<file>.test`" must have a
+    // divergence marker in that file naming this section's id.
+    let mut current: Option<String> = None;
+    let mut missing = Vec::new();
+    for line in ledger.lines() {
+        if let Some(rest) = line.strip_prefix("### `") {
+            current = rest.split('`').next().map(|s| s.to_string());
+        }
+        if let (Some(id), Some(at)) = (current.as_ref(), line.find("Gated by `")) {
+            let tail = &line[at + "Gated by `".len()..];
+            if let Some(file) = tail.split('`').next()
+                && file.ends_with(".test")
+                && !marked.iter().any(|(f, mid)| *f == file && *mid == id)
+            {
+                missing.push(format!(
+                    "ledger `{id}` says it is gated by {file}, but no \
+                                      `# provenance: divergence({id})` marker exists there"
+                ));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+/// Pinned corpus provenance counts (issue #352 step 1).
+const CAPTURED: usize = 1_135;
+const DERIVED: usize = 16;
+const DIVERGENCE: usize = 17;
+const PORTED: usize = 32;
+const TOTAL: usize = 1_200;

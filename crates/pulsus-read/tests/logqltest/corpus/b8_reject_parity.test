@@ -7,6 +7,10 @@
 # fragment of PulsusDB's parse-error Display). The reference-rejects side is
 # additionally pinned by the reject-parity registry disposition + the live
 # differential leg (see the conformance harness).
+#
+# provenance: derived
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 load
   {env="prod", service_name="rp"}

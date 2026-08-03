@@ -1,6 +1,10 @@
 # Ported instant-eval subset of differential.json — formatting stages.
 # line_format rewrites the line body; label_format renames a label. Neither
 # touches values, so these are streams cases (deterministic pipeline output).
+#
+# provenance: ported(test/fixtures/logs/differential.json)
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # --- line_format {{.label}} substitution -----------------------------
 load

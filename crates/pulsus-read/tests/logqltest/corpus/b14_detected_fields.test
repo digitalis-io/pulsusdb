@@ -14,6 +14,10 @@
 # same-entry case invalid); A4 label-sorted expected blocks, fields
 # transcribed as a set, `jsonPath` dropped (#254); A5 a disagreeing case is
 # dropped and filed, never worked around.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
 
 # C1 — line_limit >= loaded lines and field_limit >= field count: full
 # exact cardinality over every sampled entry.
