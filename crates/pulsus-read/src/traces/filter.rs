@@ -236,6 +236,27 @@ pub enum CompareOperand {
     Duration,
     Status,
     Kind,
+    /// Issue #351: intrinsics that resolve to ONE scalar per span, from
+    /// the hydrated span or a per-trace co-load the planner already
+    /// requests for the literal-comparison path. Adding them here is what
+    /// closes the field-vs-field gap — the values were always available,
+    /// only this operand type could not name them.
+    ///
+    /// `event:`/`link:` intrinsics are deliberately NOT here: they are
+    /// index-probe membership leaves over a span's MANY events/links, so
+    /// they have no single per-span value to compare against. That is a
+    /// different mechanism, not an omission.
+    StatusMessage,
+    SpanId,
+    ParentId,
+    TraceId,
+    TraceDurationNs,
+    RootName,
+    RootServiceName,
+    ChildCount,
+    ScopeName,
+    ScopeVersion,
+    NestedSet(NestedSetField),
     Attr {
         key: String,
         scope: Option<&'static str>,
@@ -1195,32 +1216,63 @@ fn compare_operand(field: &Field) -> Result<CompareOperand, PlanError> {
         Field::Intrinsic(Intrinsic::Duration) => Ok(CompareOperand::Duration),
         Field::Intrinsic(Intrinsic::Status) => Ok(CompareOperand::Status),
         Field::Intrinsic(Intrinsic::Kind) => Ok(CompareOperand::Kind),
-        Field::Intrinsic(
-            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight,
-        ) => Err(PlanError::TypeMismatch(
-            "nested-set intrinsics are not supported in a field-vs-field comparison".to_string(),
-        )),
+        Field::Intrinsic(Intrinsic::NestedSetParent) => {
+            Ok(CompareOperand::NestedSet(NestedSetField::Parent))
+        }
+        Field::Intrinsic(Intrinsic::NestedSetLeft) => {
+            Ok(CompareOperand::NestedSet(NestedSetField::Left))
+        }
+        Field::Intrinsic(Intrinsic::NestedSetRight) => {
+            Ok(CompareOperand::NestedSet(NestedSetField::Right))
+        }
         // Issue #184: the trace-level/scoped intrinsics resolve from the
         // per-trace co-load (or an id rendering), not a per-span column
         // value — out of scope on the field-vs-field path (a clean 400,
         // mirroring nested-set).
+        Field::Intrinsic(Intrinsic::StatusMessage) => Ok(CompareOperand::StatusMessage),
+        Field::Intrinsic(Intrinsic::ChildCount) => Ok(CompareOperand::ChildCount),
+        Field::Intrinsic(Intrinsic::SpanId) => Ok(CompareOperand::SpanId),
+        Field::Intrinsic(Intrinsic::ParentId) => Ok(CompareOperand::ParentId),
+        Field::Intrinsic(Intrinsic::TraceId) => Ok(CompareOperand::TraceId),
+        Field::Intrinsic(Intrinsic::TraceDuration) => Ok(CompareOperand::TraceDurationNs),
+        Field::Intrinsic(Intrinsic::RootName) => Ok(CompareOperand::RootName),
+        Field::Intrinsic(Intrinsic::RootServiceName) => Ok(CompareOperand::RootServiceName),
+        Field::Intrinsic(Intrinsic::InstrumentationName) => Ok(CompareOperand::ScopeName),
+        Field::Intrinsic(Intrinsic::InstrumentationVersion) => Ok(CompareOperand::ScopeVersion),
+        // Issue #351: the span-event and span-link intrinsics stay
+        // rejected, and the reason is structural rather than pending
+        // work. They are index-probe MEMBERSHIP leaves over a span's many
+        // events/links (`compile_attr_probe_leaf` on the dedicated
+        // `event:intrinsic` / `link:intrinsic` scopes), so there is no
+        // single per-span value for the other operand to be compared
+        // against.
+        //
+        // The reference DOES answer them, and its semantics are
+        // FIRST-EVENT-ONLY — measured with a discriminating fixture, not
+        // inferred from one example. Four spans, each with an attribute
+        // `a` and several events:
+        //
+        //   events [evX, evY, evZ], a = "evZ" (last)   -> NO match
+        //   events [evP, evQ, evR], a = "evP" (first)  -> MATCH
+        //   events [ev1, evM, ev2], a = "evM" (middle) -> NO match
+        //   events [ev7, ev8],      a = "evNope"       -> NO match
+        //
+        // Every one of those event names IS individually queryable
+        // (`{ event:name = "evZ" }` returns its span), so the data is
+        // fully indexed and the field-vs-field form simply consults the
+        // FIRST event. Stable across three runs.
+        //
+        // This matters for whoever implements it: an "any event matches"
+        // reading — which one positive example would support — is WRONG
+        // and would produce a different result set. Closing these needs
+        // an event/link value co-load this planner does not have.
         Field::Intrinsic(
-            Intrinsic::StatusMessage
-            | Intrinsic::ChildCount
-            | Intrinsic::SpanId
-            | Intrinsic::ParentId
-            | Intrinsic::TraceId
-            | Intrinsic::TraceDuration
-            | Intrinsic::RootName
-            | Intrinsic::RootServiceName
-            | Intrinsic::InstrumentationName
-            | Intrinsic::InstrumentationVersion
-            | Intrinsic::EventName
+            Intrinsic::EventName
             | Intrinsic::EventTimeSinceStart
             | Intrinsic::LinkSpanId
             | Intrinsic::LinkTraceId,
         ) => Err(PlanError::TypeMismatch(
-            "this intrinsic is not supported in a field-vs-field comparison".to_string(),
+            "event/link intrinsics are not supported in a field-vs-field comparison".to_string(),
         )),
         Field::Attribute { scope, key }
             if *scope == AttrScope::Resource && key == "service.name" =>
@@ -1571,7 +1623,27 @@ fn physical_col(operand: &CompareOperand) -> Option<&'static str> {
         CompareOperand::Duration => Some("duration_ns"),
         CompareOperand::Status => Some("status_code"),
         CompareOperand::Kind => Some("kind"),
-        CompareOperand::Name | CompareOperand::Service | CompareOperand::Attr { .. } => None,
+        // Issue #351: the intrinsics added for field-vs-field comparison
+        // resolve per span in Phase 2, not from a spans-table column the
+        // arithmetic pushdown can name. `status_message`, `scope_name`
+        // and the ids ARE columns, but they are strings; the trace-level
+        // and nested-set ones come from co-loads. Listing them here
+        // rather than a wildcard keeps a future numeric column an
+        // explicit decision.
+        CompareOperand::Name
+        | CompareOperand::Service
+        | CompareOperand::StatusMessage
+        | CompareOperand::SpanId
+        | CompareOperand::ParentId
+        | CompareOperand::TraceId
+        | CompareOperand::TraceDurationNs
+        | CompareOperand::RootName
+        | CompareOperand::RootServiceName
+        | CompareOperand::ChildCount
+        | CompareOperand::ScopeName
+        | CompareOperand::ScopeVersion
+        | CompareOperand::NestedSet(_)
+        | CompareOperand::Attr { .. } => None,
     }
 }
 
@@ -1623,7 +1695,23 @@ fn analyze_arith(
             CompareOperand::Duration | CompareOperand::Status | CompareOperand::Kind => {
                 *has_physical = true
             }
-            CompareOperand::Name | CompareOperand::Service => *has_string = true,
+            // Issue #351: string-typed operands mark the tree as
+            // non-numeric; the trace/nested-set ones are numeric but not
+            // spans-table columns, so they also block the pushdown and
+            // resolve per span in Phase 2.
+            CompareOperand::Name
+            | CompareOperand::Service
+            | CompareOperand::StatusMessage
+            | CompareOperand::SpanId
+            | CompareOperand::ParentId
+            | CompareOperand::TraceId
+            | CompareOperand::RootName
+            | CompareOperand::RootServiceName
+            | CompareOperand::ScopeName
+            | CompareOperand::ScopeVersion
+            | CompareOperand::TraceDurationNs
+            | CompareOperand::ChildCount
+            | CompareOperand::NestedSet(_) => *has_string = true,
         },
         ArithNode::Neg(inner) => analyze_arith(inner, attrs, has_physical, has_string),
         ArithNode::Bin { lhs, rhs, .. } => {
@@ -2421,8 +2509,29 @@ mod tests {
         }
     }
 
+    /// Issue #351: an intrinsic is a legal field-vs-field operand whenever
+    /// it resolves to ONE scalar per span. Measured against the pinned
+    /// reference over a seeded store — `{ .a = span:id }` matches the span
+    /// whose `a` holds its own id hex, `{ .a = trace:duration }` the one
+    /// whose `a` holds the trace duration in nanoseconds, and the reverse
+    /// operand order behaves identically.
+    ///
+    /// This test previously asserted the OPPOSITE for eight of them. That
+    /// was the planner's limit, not the language's: they already worked
+    /// against a LITERAL, so the values were always available and only
+    /// this operand type could not name them.
+    ///
+    /// **What the measurement did NOT establish.** `span:childCount` and
+    /// `nestedSetParent` returned no rows from the reference, which its
+    /// own probes suggest is because that container populates neither
+    /// (`{ span:childCount > 0 }` is empty; `{ nestedSetParent != 0 }`
+    /// matches everything, the absent-key rule). So their ACCEPTANCE is
+    /// measured — a 200, which is what the accept-surface scores — but
+    /// the rendering of those two VALUES is not. Other intrinsics on the
+    /// same resolver do return matching rows, so the path resolves rather
+    /// than short-circuiting; that is the extent of it.
     #[test]
-    fn new_intrinsics_are_rejected_in_field_vs_field_comparisons() {
+    fn per_span_intrinsics_are_legal_field_vs_field_operands() {
         for intrinsic in [
             Intrinsic::StatusMessage,
             Intrinsic::ChildCount,
@@ -2432,6 +2541,51 @@ mod tests {
             Intrinsic::TraceDuration,
             Intrinsic::RootName,
             Intrinsic::RootServiceName,
+            Intrinsic::InstrumentationName,
+            Intrinsic::InstrumentationVersion,
+            Intrinsic::NestedSetParent,
+            Intrinsic::NestedSetLeft,
+            Intrinsic::NestedSetRight,
+        ] {
+            for (lhs, rhs) in [
+                (
+                    Field::Intrinsic(intrinsic),
+                    Field::Attribute {
+                        scope: AttrScope::Unscoped,
+                        key: "a".to_string(),
+                    },
+                ),
+                (
+                    Field::Attribute {
+                        scope: AttrScope::Unscoped,
+                        key: "a".to_string(),
+                    },
+                    Field::Intrinsic(intrinsic),
+                ),
+            ] {
+                compile_field_compare(&lhs, ComparisonOp::Eq, &rhs)
+                    .unwrap_or_else(|e| panic!("{intrinsic:?} (either order): {e:?}"));
+            }
+        }
+    }
+
+    /// The event/link intrinsics stay rejected, and the reason is
+    /// STRUCTURAL rather than pending work: they are index-probe
+    /// membership leaves over a span's many events/links, so there is no
+    /// single per-span value for the other operand to compare against.
+    /// The reference does answer these, with FIRST-EVENT-ONLY semantics —
+    /// established with a discriminating fixture (a span whose LAST event
+    /// matches does not match; one whose FIRST event matches does), not
+    /// from a single positive example, which cannot tell "any" from
+    /// "first" or "all". Closing them needs an event/link value co-load
+    /// this planner does not have.
+    #[test]
+    fn event_and_link_intrinsics_stay_rejected_as_field_vs_field_operands() {
+        for intrinsic in [
+            Intrinsic::EventName,
+            Intrinsic::EventTimeSinceStart,
+            Intrinsic::LinkSpanId,
+            Intrinsic::LinkTraceId,
         ] {
             let err = compile_field_compare(
                 &Field::Intrinsic(intrinsic),
@@ -2439,7 +2593,10 @@ mod tests {
                 &Field::Intrinsic(Intrinsic::Name),
             )
             .unwrap_err();
-            assert!(matches!(err, PlanError::TypeMismatch(_)), "{intrinsic:?}");
+            let PlanError::TypeMismatch(msg) = err else {
+                panic!("{intrinsic:?}: unexpected error kind")
+            };
+            assert!(msg.contains("event/link"), "{intrinsic:?}: {msg}");
         }
     }
 

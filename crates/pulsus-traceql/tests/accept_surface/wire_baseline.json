@@ -1,6 +1,6 @@
 {
-  "WIRE_AGREE_BASELINE": 177,
-  "WIRE_DIVERGE_BASELINE": 44,
+  "WIRE_AGREE_BASELINE": 195,
+  "WIRE_DIVERGE_BASELINE": 26,
   "wire_baseline": [
     {
       "pulsus_wire": "reject",
@@ -151,27 +151,27 @@
       "query": "{ .a = kind }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = statusMessage }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = nestedSetParent }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = rootName }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = rootServiceName }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = traceDuration }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = span:id }"
     },
     {
@@ -191,31 +191,31 @@
       "query": "{ .a = span:status }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = span:statusMessage }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = span:parentID }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = span:childCount }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = trace:id }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = trace:duration }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = trace:rootName }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = trace:rootService }"
     },
     {
@@ -235,19 +235,19 @@
       "query": "{ .a = link:traceID }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = instrumentation:name }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = instrumentation:version }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ span:id = .a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ trace:duration = .a }"
     },
     {
@@ -259,7 +259,7 @@
       "query": "{ link:spanID = .a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ instrumentation:name = .a }"
     },
     {

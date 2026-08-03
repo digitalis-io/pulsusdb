@@ -159,7 +159,25 @@ pub(crate) enum PlannedOperand {
     Duration,
     Status,
     Kind,
-    Attr { str_idx: usize, num_idx: usize },
+    /// Issue #351 — per-span scalars from the hydrated span or a
+    /// per-trace co-load. No batch indices: unlike `Attr`, nothing needs
+    /// interning, but several of them REQUIRE a co-load, which
+    /// `plan_operand` requests as it maps them.
+    StatusMessage,
+    SpanId,
+    ParentId,
+    TraceId,
+    TraceDurationNs,
+    RootName,
+    RootServiceName,
+    ChildCount,
+    ScopeName,
+    ScopeVersion,
+    NestedSet(NestedSetField),
+    Attr {
+        str_idx: usize,
+        num_idx: usize,
+    },
 }
 
 /// Renders a [`CompareOperand`] as the user wrote it, for the `!`
@@ -173,6 +191,21 @@ fn compare_operand_display(operand: &CompareOperand) -> String {
         CompareOperand::Duration => "duration".to_string(),
         CompareOperand::Status => "status".to_string(),
         CompareOperand::Kind => "kind".to_string(),
+        CompareOperand::StatusMessage => "statusMessage".to_string(),
+        CompareOperand::SpanId => "span:id".to_string(),
+        CompareOperand::ParentId => "span:parentID".to_string(),
+        CompareOperand::TraceId => "trace:id".to_string(),
+        CompareOperand::TraceDurationNs => "trace:duration".to_string(),
+        CompareOperand::RootName => "trace:rootName".to_string(),
+        CompareOperand::RootServiceName => "trace:rootService".to_string(),
+        CompareOperand::ChildCount => "span:childCount".to_string(),
+        CompareOperand::ScopeName => "instrumentation:name".to_string(),
+        CompareOperand::ScopeVersion => "instrumentation:version".to_string(),
+        CompareOperand::NestedSet(f) => match f {
+            NestedSetField::Parent => "nestedSetParent".to_string(),
+            NestedSetField::Left => "nestedSetLeft".to_string(),
+            NestedSetField::Right => "nestedSetRight".to_string(),
+        },
         CompareOperand::Attr { key, scope } => match scope {
             Some(scope) => format!("{scope}.{key}"),
             None => format!(".{key}"),
@@ -816,10 +849,22 @@ fn attr_field_ref(field: &Field) -> Option<AttrFieldRef> {
 /// intrinsic resolves from the hydrated columns (no read registered); an
 /// attribute is interned into BOTH the `val` (`select_attrs`) and the
 /// `val_num` (`agg_fields`) reads so Phase 2 has a typed value.
+/// Maps a compiled operand to its planned form, REQUESTING any per-batch
+/// co-load it needs on the way (issue #351).
+///
+/// The co-load flags are the same ones `plan_trace_ctx` sets for the
+/// literal-comparison path, so a field-vs-field operand pays for exactly
+/// what a literal comparison against the same intrinsic already pays for.
+/// Forgetting one would not fail to compile — it would resolve to `None`
+/// per span and silently match nothing, so each arm sets its flag beside
+/// the mapping rather than in a separate pass.
 fn plan_operand(
     operand: &CompareOperand,
     agg_fields: &mut Vec<AttrFieldRef>,
     select_attrs: &mut Vec<AttrFieldRef>,
+    nested_set: &mut bool,
+    trace_ctx: &mut bool,
+    child_count: &mut bool,
 ) -> PlannedOperand {
     match operand {
         CompareOperand::Name => PlannedOperand::Name,
@@ -827,6 +872,32 @@ fn plan_operand(
         CompareOperand::Duration => PlannedOperand::Duration,
         CompareOperand::Status => PlannedOperand::Status,
         CompareOperand::Kind => PlannedOperand::Kind,
+        CompareOperand::StatusMessage => PlannedOperand::StatusMessage,
+        CompareOperand::SpanId => PlannedOperand::SpanId,
+        CompareOperand::ParentId => PlannedOperand::ParentId,
+        CompareOperand::TraceId => PlannedOperand::TraceId,
+        CompareOperand::ScopeName => PlannedOperand::ScopeName,
+        CompareOperand::ScopeVersion => PlannedOperand::ScopeVersion,
+        CompareOperand::TraceDurationNs => {
+            *trace_ctx = true;
+            PlannedOperand::TraceDurationNs
+        }
+        CompareOperand::RootName => {
+            *trace_ctx = true;
+            PlannedOperand::RootName
+        }
+        CompareOperand::RootServiceName => {
+            *trace_ctx = true;
+            PlannedOperand::RootServiceName
+        }
+        CompareOperand::ChildCount => {
+            *child_count = true;
+            PlannedOperand::ChildCount
+        }
+        CompareOperand::NestedSet(f) => {
+            *nested_set = true;
+            PlannedOperand::NestedSet(*f)
+        }
         CompareOperand::Attr { key, scope } => {
             let field_ref = AttrFieldRef {
                 key: key.clone(),
@@ -848,19 +919,46 @@ fn plan_arith(
     node: &ArithNode,
     agg_fields: &mut Vec<AttrFieldRef>,
     select_attrs: &mut Vec<AttrFieldRef>,
+    nested_set: &mut bool,
+    trace_ctx: &mut bool,
+    child_count: &mut bool,
 ) -> PlannedArith {
     match node {
         ArithNode::Value(v) => PlannedArith::Value(*v),
-        ArithNode::Operand(operand) => {
-            PlannedArith::Operand(plan_operand(operand, agg_fields, select_attrs))
-        }
-        ArithNode::Neg(inner) => {
-            PlannedArith::Neg(Box::new(plan_arith(inner, agg_fields, select_attrs)))
-        }
+        ArithNode::Operand(operand) => PlannedArith::Operand(plan_operand(
+            operand,
+            agg_fields,
+            select_attrs,
+            nested_set,
+            trace_ctx,
+            child_count,
+        )),
+        ArithNode::Neg(inner) => PlannedArith::Neg(Box::new(plan_arith(
+            inner,
+            agg_fields,
+            select_attrs,
+            nested_set,
+            trace_ctx,
+            child_count,
+        ))),
         ArithNode::Bin { op, lhs, rhs } => PlannedArith::Bin {
             op: *op,
-            lhs: Box::new(plan_arith(lhs, agg_fields, select_attrs)),
-            rhs: Box::new(plan_arith(rhs, agg_fields, select_attrs)),
+            lhs: Box::new(plan_arith(
+                lhs,
+                agg_fields,
+                select_attrs,
+                nested_set,
+                trace_ctx,
+                child_count,
+            )),
+            rhs: Box::new(plan_arith(
+                rhs,
+                agg_fields,
+                select_attrs,
+                nested_set,
+                trace_ctx,
+                child_count,
+            )),
         },
     }
 }
@@ -1263,12 +1361,33 @@ pub fn plan_search(
                 }
                 LeafEval::BoolTruth { operand, want } => PlannedLeafEval::BoolTruth {
                     display: compare_operand_display(operand),
-                    operand: plan_operand(operand, &mut agg_fields, &mut select_attrs),
+                    operand: plan_operand(
+                        operand,
+                        &mut agg_fields,
+                        &mut select_attrs,
+                        &mut nested_set,
+                        &mut trace_ctx,
+                        &mut child_count,
+                    ),
                     want: *want,
                 },
                 LeafEval::FieldCompare { lhs, rhs, op } => PlannedLeafEval::FieldCompare {
-                    lhs: plan_operand(lhs, &mut agg_fields, &mut select_attrs),
-                    rhs: plan_operand(rhs, &mut agg_fields, &mut select_attrs),
+                    lhs: plan_operand(
+                        lhs,
+                        &mut agg_fields,
+                        &mut select_attrs,
+                        &mut nested_set,
+                        &mut trace_ctx,
+                        &mut child_count,
+                    ),
+                    rhs: plan_operand(
+                        rhs,
+                        &mut agg_fields,
+                        &mut select_attrs,
+                        &mut nested_set,
+                        &mut trace_ctx,
+                        &mut child_count,
+                    ),
                     op: *op,
                 },
                 LeafEval::TraceCtx(pred) => PlannedLeafEval::TraceCtx(plan_trace_ctx(
@@ -1277,9 +1396,23 @@ pub fn plan_search(
                     &mut child_count,
                 )?),
                 LeafEval::Arith { lhs, op, rhs } => PlannedLeafEval::Arith {
-                    lhs: plan_arith(lhs, &mut agg_fields, &mut select_attrs),
+                    lhs: plan_arith(
+                        lhs,
+                        &mut agg_fields,
+                        &mut select_attrs,
+                        &mut nested_set,
+                        &mut trace_ctx,
+                        &mut child_count,
+                    ),
                     op: *op,
-                    rhs: plan_arith(rhs, &mut agg_fields, &mut select_attrs),
+                    rhs: plan_arith(
+                        rhs,
+                        &mut agg_fields,
+                        &mut select_attrs,
+                        &mut nested_set,
+                        &mut trace_ctx,
+                        &mut child_count,
+                    ),
                 },
             };
             leaves.push(planned);
