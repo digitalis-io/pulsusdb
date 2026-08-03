@@ -73,6 +73,7 @@ fn leaf() -> MetricExpr {
             op: pulsus_logql::RangeAggOp::Rate,
             range: range.clone(),
             param: param.clone(),
+            grouping: None,
         },
         other => panic!("unexpected fixture shape: {other:?}"),
     }

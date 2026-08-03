@@ -3482,6 +3482,7 @@ mod tests {
                 op: pulsus_logql::RangeAggOp::CountOverTime,
                 range: range_of(service),
                 param: None,
+                grouping: None,
             }
         }
 

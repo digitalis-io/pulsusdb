@@ -189,6 +189,9 @@ pub(super) fn build_expr(s: &Shape) -> MetricExpr {
             op: RangeAggOp::Rate,
             range: leaf_range(),
             param: None,
+            // Drop order is about CHILD slots; a grouping is an owned leaf
+            // like `param`, dropped in field order with the rest.
+            grouping: None,
         },
         // Never empty: an empty `Literal` is the placeholder shape and
         // would be filtered out of the trace.

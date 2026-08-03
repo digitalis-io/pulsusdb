@@ -457,9 +457,22 @@ fn walk_label_filter(lfe: &LabelFilterExpr, out: &mut BTreeSet<String>) {
 /// is a `BTreeSet`, so visit order was never observable).
 fn walk_metric(me: &MetricExpr, out: &mut BTreeSet<String>) {
     pulsus_logql::for_each_metric_expr(me, |n| match n {
-        MeNode::Expr(MetricExpr::Range { op, range, .. }) => {
+        MeNode::Expr(MetricExpr::Range {
+            op,
+            range,
+            grouping,
+            ..
+        }) => {
             out.insert(range_id(*op).to_string());
             out.insert("range.duration_literal".to_string());
+            // Issue #344: a grouping on the range aggregation itself is its
+            // OWN construct, distinct from `grouping.by`/`grouping.without`
+            // on a vector aggregation — the reference admits it on only
+            // eight of the fifteen range ops, and postfix only.
+            if let Some(g) = grouping {
+                out.insert("grouping.range_agg".to_string());
+                out.insert(grouping_id(g.kind).to_string());
+            }
             walk_log(&range.selector, out);
         }
         MeNode::Expr(MetricExpr::Vector { op, grouping, .. }) => {
@@ -1091,8 +1104,10 @@ fn differential_categories_are_pinned() {
     // #221 added `func.vector` (supported) → 98, then `agg.approx_topk`
     // (supported) → 99, then `func.variants` (supported) → 100; #276
     // added `func.label_replace` (supported) → 101.
+    // #344 added `grouping.range_agg` (supported) -> 102, and
+    // `grouping.range_agg_disallowed` as the reject-parity twin -> 3.
     assert_eq!(
-        supported, 101,
+        supported, 102,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(
@@ -1104,8 +1119,9 @@ fn differential_categories_are_pinned() {
         "both-reject agreement count pin (interim ∧ oracle rejects)"
     );
     assert_eq!(
-        reject_parity, 2,
-        "reject-parity count pin (reject-parity ∧ oracle rejects: stage.ip, stage.distinct)"
+        reject_parity, 3,
+        "reject-parity count pin (reject-parity ∧ oracle rejects: stage.ip, stage.distinct, \
+         grouping.range_agg_disallowed)"
     );
 
     // Every tracked interim gap must name an owning issue.

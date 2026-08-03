@@ -362,6 +362,16 @@
       "oracle": "accept"
     },
     {
+      "construct": "grouping.range_agg",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "grouping.range_agg_disallowed",
+      "status": "reject-parity",
+      "oracle": "reject"
+    },
+    {
       "construct": "binop.add",
       "status": "supported",
       "oracle": "accept"

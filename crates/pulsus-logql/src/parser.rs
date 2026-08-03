@@ -1200,8 +1200,32 @@ fn parse_range_agg_call(cursor: &mut Cursor<'_>, op: RangeAggOp) -> Result<Metri
         None
     };
     let range = parse_log_range(cursor)?;
-    cursor.expect(&TokenKind::RParen, "')'")?;
-    Ok(MetricExpr::Range { op, range, param })
+    let close = cursor.expect(&TokenKind::RParen, "')'")?;
+    // Issue #344: a range aggregation takes its grouping POSTFIX ONLY.
+    // Unlike a vector aggregation, the reference has no prefix production
+    // here — `max_over_time by (fp) (…)` is `syntax error: unexpected by,
+    // expecting (`, which is what `maybe_grouping` NOT being called before
+    // the '(' above already produces.
+    let grouping = maybe_grouping(cursor)?;
+    // …and it admits one on only eight of the fifteen ops. This fires
+    // before the planner's unwrap-compatibility check, matching the
+    // reference's own ordering: `sum_over_time({a="b"}[5m]) by (fp)`
+    // answers the grouping rejection, not `invalid aggregation
+    // sum_over_time without unwrap`, and `bytes_over_time({a="b"} | unwrap
+    // v [5m]) by (fp)` likewise answers the grouping rejection rather than
+    // `… with unwrap` (both probed on v3.7.4).
+    if grouping.is_some() && !op.allows_grouping() {
+        return Err(LogQlError::GroupingNotAllowed {
+            op: op.to_string(),
+            span: close.span,
+        });
+    }
+    Ok(MetricExpr::Range {
+        op,
+        range,
+        param,
+        grouping,
+    })
 }
 
 /// `LogRange := LogExpr "[" Duration "]"`.

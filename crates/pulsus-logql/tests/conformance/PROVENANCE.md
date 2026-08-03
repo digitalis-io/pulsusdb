@@ -222,6 +222,31 @@ of:
 `supported ∧ reject` and zero `reject-parity ∧ accept`, so a status or oracle
 flip must be re-pinned deliberately.
 
+## `grouping.range_agg` — what `supported` does and does not claim (issue #344)
+
+`status: supported` in this file means exactly what `check_status` checks:
+**the probe parses**. For `grouping.range_agg` — a `by`/`without` clause on
+a range aggregation — that is the whole truth of the language surface and
+nothing more: the grammar accepts it on the eight ops the reference admits
+it on, and `grouping.range_agg_disallowed` pins the reject-parity twin for
+the seven it refuses by name. **Execution is not implemented**: the planner
+refuses a range-aggregation grouping with a named error, so an end-to-end
+query still fails. Recorded here rather than left to be inferred from the
+word "supported".
+
+Both rows were captured against **grafana/loki v3.7.4**. When they landed,
+this directory's registry filename still said `v3.7.3` and the note here
+recorded the mismatch as pending on a concurrent re-pin branch; that branch
+has since merged, so the registry, the manifest, `EXPECTED_TARGET` and the
+container digest all name v3.7.4 and there is no mismatch left to flag. The
+container's identity was read from the running process —
+`/loki/api/v1/status/buildinfo` answered
+`{"version":"3.7.4","revision":"b318f282"}` — rather than trusted from any
+committed header; that is the same `b318f282` the pinned digest resolves
+to, so these rows and the differential oracle are one image. The captured semantics and the full
+accept/reject split live in
+`crates/pulsus-read/tests/logqltest/corpus/b18_range_agg_grouping.test`.
+
 ## Revision workflow
 
 1. **Add / change a construct:** edit `registry-logql-v3.7.4.json`, then
