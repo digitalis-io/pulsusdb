@@ -10,8 +10,9 @@
       "reference": "'!' is an operand-level unary: it binds tighter than every comparison operator and tighter than '+'/'-', but looser than '^' and '*'/'/'/'%'.",
       "pulsus": "'!' negates a whole field primary, i.e. the entire comparison.",
       "impact": "accept-surface AND quiet meaning",
-      "status": "open",
-      "deferred_to": "the field-expression regrammar tracked on #335"
+      "status": "closed",
+      "deferred_to": "the field-expression regrammar tracked on #335",
+      "closed_by": 335
     },
     {
       "id": "D2",
@@ -28,8 +29,9 @@
       "reference": "Unary '-' is an operand-level unary, legal anywhere an operand is.",
       "pulsus": "Accepted only when the right-hand side already begins an arithmetic operand.",
       "impact": "accept-surface",
-      "status": "open",
-      "deferred_to": "the field-expression regrammar tracked on #335"
+      "status": "closed",
+      "deferred_to": "the field-expression regrammar tracked on #335",
+      "closed_by": 335
     },
     {
       "id": "D4",
@@ -37,8 +39,9 @@
       "reference": "Both sides of a comparison are full field expressions, so a literal (or a literal-only comparison) is legal.",
       "pulsus": "The left-hand side must begin with a field.",
       "impact": "accept-surface",
-      "status": "open",
-      "deferred_to": "the field-expression regrammar tracked on #335"
+      "status": "closed",
+      "deferred_to": "the field-expression regrammar tracked on #335",
+      "closed_by": 335
     },
     {
       "id": "D5",
@@ -46,8 +49,9 @@
       "reference": "Parentheses are an operand, so '(.a) = 1' and '(.a + 1) = 2' are legal.",
       "pulsus": "A parenthesised field expression may only be a whole boolean primary.",
       "impact": "accept-surface",
-      "status": "open",
-      "deferred_to": "the field-expression regrammar tracked on #335"
+      "status": "closed",
+      "deferred_to": "the field-expression regrammar tracked on #335",
+      "closed_by": 335
     },
     {
       "id": "D6",
@@ -55,8 +59,9 @@
       "reference": "Comparison operators are left-associative binary operators and chain: 'a = b = c' parses as '(a = b) = c'.",
       "pulsus": "A second comparison operator is a positioned grammar error.",
       "impact": "accept-surface",
-      "status": "open",
-      "deferred_to": "the field-expression regrammar tracked on #335"
+      "status": "closed",
+      "deferred_to": "the field-expression regrammar tracked on #335",
+      "closed_by": 335
     },
     {
       "id": "D7",
@@ -116,9 +121,10 @@
     {
       "query": "{ !name = \"foo\" }",
       "reference": "reject",
-      "pulsus": "accept",
-      "verdict": "diverge",
-      "class": "D1",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D1",
       "reference_parse": "!name"
     },
     {
@@ -155,17 +161,19 @@
     {
       "query": "{ !duration = 1s }",
       "reference": "reject",
-      "pulsus": "accept",
-      "verdict": "diverge",
-      "class": "D1",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D1",
       "reference_parse": "!duration"
     },
     {
       "query": "{ !status = error }",
       "reference": "reject",
-      "pulsus": "accept",
-      "verdict": "diverge",
-      "class": "D1",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D1",
       "reference_parse": "!status"
     },
     {
@@ -177,9 +185,10 @@
     {
       "query": "{ !span:id = \"x\" }",
       "reference": "reject",
-      "pulsus": "accept",
-      "verdict": "diverge",
-      "class": "D1",
+      "pulsus": "reject",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D1",
       "reference_parse": "!span:id"
     },
     {
@@ -205,23 +214,26 @@
     {
       "query": "{ !.a = !.b }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D1"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D1"
     },
     {
       "query": "{ -.a = 1 }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D3"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D3"
     },
     {
       "query": "{ -1 = .a }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D3"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D3"
     },
     {
       "query": "{ .a = -1 }",
@@ -238,9 +250,10 @@
     {
       "query": "{ -duration = 1s }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D3"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D3"
     },
     {
       "query": "{ .a = -.b }",
@@ -251,9 +264,10 @@
     {
       "query": "{ - .a = 1 }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D3"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D3"
     },
     {
       "query": "{ !!.a }",
@@ -264,16 +278,18 @@
     {
       "query": "{ !-.a }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D3"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D3"
     },
     {
       "query": "{ -!.a }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D3"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D3"
     },
     {
       "query": "{ !.a && .b = 1 }",
@@ -566,9 +582,10 @@
     {
       "query": "{ 2 = .a + 1 }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D4"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D4"
     },
     {
       "query": "{ .a = .b + 1 }",
@@ -585,16 +602,18 @@
     {
       "query": "{ (.a) = 1 }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D5"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D5"
     },
     {
       "query": "{ (.a + 1) = 2 }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D5"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D5"
     },
     {
       "query": "{ .a = (.b) }",
@@ -611,16 +630,18 @@
     {
       "query": "{ 1 = 2 }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D4"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D4"
     },
     {
       "query": "{ \"x\" = \"y\" }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D4"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D4"
     },
     {
       "query": "{ 1 }",
@@ -797,23 +818,26 @@
     {
       "query": "{ 2 ^ 3 ^ 2 = .a }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D4"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D4"
     },
     {
       "query": "{ -2 ^ 2 = .a }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D3"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D3"
     },
     {
       "query": "{ .a = .b = .c }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D6"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D6"
     },
     {
       "query": "{ .a = .b && .c }",
@@ -1542,27 +1566,6 @@
   ],
   "meaning_probes": [
     {
-      "query": "{ !.a = 1 }",
-      "class": "D1",
-      "reference_parse": "(!.a) = 1",
-      "pulsus_parse": "{ !(.a = 1) }",
-      "evidence": "{ !.a = \"x\" && 1 }"
-    },
-    {
-      "query": "{ !span.a = 1 }",
-      "class": "D1",
-      "reference_parse": "(!span.a) = 1",
-      "pulsus_parse": "{ !(span.a = 1) }",
-      "evidence": "{ !.a = \"x\" && 1 }"
-    },
-    {
-      "query": "{ !.a = 1 && .b = 2 }",
-      "class": "D1",
-      "reference_parse": "((!.a) = 1) && (.b = 2)",
-      "pulsus_parse": "{ (!(.a = 1) && .b = 2) }",
-      "evidence": "{ !.a = \"x\" && 1 }"
-    },
-    {
       "query": "{ !.a }",
       "class": "D12",
       "reference_parse": "boolean NOT: matches only spans where a == false; absent a never matches; non-boolean a is an evaluation error",
@@ -1580,14 +1583,14 @@
       "query": "{ .a = nil }",
       "class": "D12",
       "reference_parse": "no coherent predicate: stable but inscrutable result sets - matches neither absent-a spans nor any simple function of a (measured identically across 3 rounds, 10s apart)",
-      "pulsus_parse": "{ !(.a) }",
+      "pulsus_parse": "{ .a = nil }",
       "evidence": "result differential, pinned tempo digest, 2026-08-03: over spans a={true,false,absent,'x',resource-true} plus c={true,false,absent}: '{ .a = nil }' -> ['c-false']; '{ .c = nil }' -> ['s-str','s-true']; '{ .b7z = nil }' (b7z nowhere) -> ['c-false','s-str','s-true']; none of these is the absence set"
     },
     {
       "query": "{ span.a = nil }",
       "class": "D12",
       "reference_parse": "no coherent predicate at span scope: stable but inscrutable result sets (see the unscoped probe)",
-      "pulsus_parse": "{ !(span.a) }",
+      "pulsus_parse": "{ span.a = nil }",
       "evidence": "result differential, pinned tempo digest, 2026-08-03: '{ span.c = nil }' -> ['s-false','s-str','s-true'] - not the absent-span.c set, which would include c-absent"
     },
     {
@@ -1652,6 +1655,33 @@
       "reference_grouping": "(({ .a } || { .b }) && { .c })",
       "pulsus_parse": "(({ .a } || { .b }) && { .c })",
       "evidence": "result differential: '{ .x=\"a\" } || { .x=\"b\" } && { .x=\"zzz\" }' returns no trace, matching the parenthesised '(A || B) && C' and not 'A || (B && C)'",
+      "closed_by": 335
+    },
+    {
+      "query": "{ !.a = 1 }",
+      "class": "D1",
+      "reference_parse": "(!.a) = 1",
+      "reference_grouping": "{ (!.a) = 1 }",
+      "pulsus_parse": "{ !(.a) = 1 }",
+      "evidence": "{ !.a = \"x\" && 1 }",
+      "closed_by": 335
+    },
+    {
+      "query": "{ !span.a = 1 }",
+      "class": "D1",
+      "reference_parse": "(!span.a) = 1",
+      "reference_grouping": "{ (!span.a) = 1 }",
+      "pulsus_parse": "{ !(span.a) = 1 }",
+      "evidence": "{ !.a = \"x\" && 1 }",
+      "closed_by": 335
+    },
+    {
+      "query": "{ !.a = 1 && .b = 2 }",
+      "class": "D1",
+      "reference_parse": "((!.a) = 1) && (.b = 2)",
+      "reference_grouping": "{ ((!.a) = 1) && (.b = 2) }",
+      "pulsus_parse": "{ (!(.a) = 1 && .b = 2) }",
+      "evidence": "{ !.a = \"x\" && 1 }",
       "closed_by": 335
     }
   ]

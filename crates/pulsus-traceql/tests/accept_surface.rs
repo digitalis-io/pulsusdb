@@ -133,11 +133,30 @@ struct ClosedMeaningProbe {
 /// pair the plan named: the reference reads a bare attribute as
 /// truthiness while `!= nil` is presence, two spellings that are one
 /// AST here. Class D12 records all of it; `MEANING` 3 + 6 = 9.
+///
+/// Stage B (#335), the grammar collapse: one precedence-climbing routine
+/// replaces the layered field-expression parser, so every operand
+/// position takes the same grammar and `!` becomes a field-level prefix
+/// operator. That closes five classes outright — **D1** (5 probes),
+/// **D3** (7), **D4** (4), **D5** (2), **D6** (1) — moving 19 probes
+/// diverge→agree and none the other way, so `AGREE` 198 + 19 = 217 and
+/// `DIVERGE` 23 − 19 = 4. Fifteen were reject→accept (the uniform operand
+/// grammar now accepts what the reference accepts) and four were
+/// accept→reject (`{ !name = "foo" }` and friends: `!` binds tighter than
+/// `=`, so its operand is the intrinsic, and the reference rejects `!` on
+/// a non-boolean with the same message we now produce).
+///
+/// The 4 residuals are all **D7** — `avg(<field expr>)` still takes a
+/// restricted argument grammar. That is Stage C, not a surprise.
+///
+/// The direction claim is checked in the DIFF, not inferred here: the
+/// re-pin commit changes 19 `"verdict"` lines, every one `diverge` →
+/// `agree`.
 const TOTAL: usize = 221;
-const AGREE: usize = 198;
-const DIVERGE: usize = 23;
-const MEANING: usize = 9;
-const CLOSED_MEANING: usize = 4;
+const AGREE: usize = 217;
+const DIVERGE: usize = 4;
+const MEANING: usize = 6;
+const CLOSED_MEANING: usize = 7;
 
 fn matrix() -> Matrix {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -296,6 +315,47 @@ fn every_divergence_carries_a_class_and_every_class_is_used() {
     }
 }
 
+/// **The oracle column is frozen independently of the file that holds
+/// it.** Every other gate here compares our verdicts against
+/// `matrix.json`'s `reference` column, so all of them pass if that column
+/// is edited to match us — a re-pin marking its own homework, and nothing
+/// else in the apparatus would notice.
+///
+/// The digest covers `(query, reference)` for all 221 probes, in order.
+/// It lives in this SOURCE file rather than beside the data, so a
+/// data-only edit fails; moving it is a deliberate, reviewable act that
+/// means one thing: **the reference container was re-measured.** Never
+/// update it to make a run go green.
+///
+/// FNV-1a rather than a hash crate: no new dependency for a
+/// change-detector, and the value is regenerated from the assertion
+/// message.
+#[test]
+fn the_reference_column_is_frozen_against_silent_re_pinning() {
+    const REFERENCE_DIGEST: u64 = 0x95bd_d72a_11e5_6743;
+    let m = matrix();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |b: &[u8]| {
+        for byte in b {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    for p in &m.accept_surface_probes {
+        feed(p.query.as_bytes());
+        feed(&[0x01]);
+        feed(p.reference.as_bytes());
+        feed(&[0x00]);
+    }
+    assert_eq!(
+        h, REFERENCE_DIGEST,
+        "the reference (ORACLE) column changed. This is not a count to \
+         refresh: it means the probe set or the reference container's \
+         answers moved. Re-measure against the pinned digest, record what \
+         changed and why, and only then update REFERENCE_DIGEST to {h:#x}"
+    );
+}
+
 #[test]
 fn agreement_and_divergence_counts_are_pinned() {
     let m = matrix();
@@ -368,59 +428,66 @@ fn stage_b_not_absence_meaning_probes_are_captured() {
     }
 }
 
-/// Stage A of #335, SHOWN rather than inferred from the counts: the old
-/// verdict (parse alone accepts) and the new one (parse ∘ validate
-/// rejects) are both asserted for the two flipped probes, and the flip
-/// set is pinned exactly — over the whole matrix, `parse` and
-/// `parse ∘ validate` disagree on precisely these two class-D1 probes,
-/// so nothing else moved in either direction, per probe rather than in
-/// aggregate.
+/// Every probe on which `parse` alone and `parse ∘ validate` disagree —
+/// i.e. every rejection that the grammar collapse moved OUT of the parser
+/// — must be attributable to a rule on the parse→validate class list kept
+/// in `validate_field_expr`'s doc comment.
+///
+/// This replaces Stage A's `stage_a_flipped_exactly_the_two_recorded_d1_probes`,
+/// which pinned the flip set as exactly two queries by name. That was the
+/// right gate while the layered parser made two rejections movable; the
+/// Stage B collapse legitimately moves 70, so naming them individually
+/// would be a list nobody could check. The class list is the checkable
+/// form of the same claim: a flip whose rule is NOT on the list is an
+/// unexplained parse-axis move and fails here.
+///
+/// The list, and what each row catches (counts at the Stage B re-pin):
+///
+/// | rule | flips |
+/// |---|---|
+/// | `type-mismatch` (operand types must match, every binary class) | 34 |
+/// | `spanset-filter-not-boolean` (a filter body must resolve to a boolean) | 16 |
+/// | `illegal-unary-operator` (`!` takes a boolean, `-` a number) | 12 |
+/// | `illegal-operator` (operator legal for both operand types) | 7 |
+/// | `invalid-regex-operand` (`=~`/`!~` needs a string literal) | 1 |
+///
+/// Counts are asserted as a TOTAL, not per rule: which rule catches a
+/// given query is an implementation detail that may legitimately shift
+/// (two rules can both hold and the reference reports one), but the flip
+/// set as a whole may not grow a member no rule on the list explains.
 #[test]
-fn stage_a_flipped_exactly_the_two_recorded_d1_probes() {
-    const FLIPPED: [&str; 2] = ["{ !name + 1 = 2 }", "{ !name * 2 = 3 }"];
-    for q in FLIPPED {
-        // The OLD verdict: parse alone accepts — this is what the
-        // scoreboard used to score, and why these diverged.
-        let ast = pulsus_traceql::parse(q).unwrap_or_else(|e| {
-            panic!("{q:?}: the pre-Stage-A verdict (parse accepts) broke: {e}")
-        });
-        // The NEW verdict: validation rejects, agreeing with the
-        // reference's recorded reject.
-        assert!(
-            pulsus_traceql::validate(&ast).is_err(),
-            "{q:?}: the post-Stage-A verdict (validate rejects) broke"
-        );
-    }
+fn every_parse_axis_flip_is_explained_by_the_class_list() {
+    /// The parse→validate class list, by `ValidateError::rule_id`.
+    const MOVED_TO_VALIDATE: [&str; 5] = [
+        "type-mismatch",
+        "illegal-operator",
+        "invalid-regex-operand",
+        "spanset-filter-not-boolean",
+        "illegal-unary-operator",
+    ];
     let m = matrix();
-    let flipped_now: Vec<&str> = m
-        .accept_surface_probes
-        .iter()
-        .filter(|p| pulsus_traceql::parse(&p.query).is_ok() != accepts(&p.query))
-        .map(|p| p.query.as_str())
-        .collect();
-    assert_eq!(
-        flipped_now, FLIPPED,
-        "the parse-vs-validate flip set moved — Stage A's claim was exactly these two"
-    );
-    for q in FLIPPED {
-        let p = m
-            .accept_surface_probes
-            .iter()
-            .find(|p| p.query == q)
-            .expect("flipped probe present");
-        assert_eq!(p.reference, "reject", "{q:?}");
-        assert_eq!(
-            p.pulsus, "reject",
-            "{q:?}: recorded verdict must be the new one"
-        );
-        assert_eq!(p.verdict, "agree", "{q:?}: must not still diverge");
-        assert_eq!(p.closed_by, Some(335), "{q:?}: closure must name the issue");
-        assert_eq!(
-            p.closed_class.as_deref(),
-            Some("D1"),
-            "{q:?}: closure must name the class it closed"
-        );
+    let mut flips = 0usize;
+    let mut unexplained = Vec::new();
+    for p in &m.accept_surface_probes {
+        let Ok(ast) = pulsus_traceql::parse(&p.query) else {
+            continue; // the parser still rejects it: nothing moved
+        };
+        let Err(err) = pulsus_traceql::validate(&ast) else {
+            continue; // accepted by both: nothing moved
+        };
+        flips += 1;
+        if !MOVED_TO_VALIDATE.contains(&err.rule_id()) {
+            unexplained.push(format!("{:?} -> {}", p.query, err.rule_id()));
+        }
     }
+    assert!(
+        unexplained.is_empty(),
+        "{} parse-axis flip(s) are on no class-list row — a rejection that moved out \
+         of the parser without a rule to land on is unexplained, not a count to update:\n{}",
+        unexplained.len(),
+        unexplained.join("\n")
+    );
+    assert_eq!(flips, 70, "the parse-axis flip set moved");
 }
 
 /// Closure is proved, not asserted: our parse of the bare query must equal

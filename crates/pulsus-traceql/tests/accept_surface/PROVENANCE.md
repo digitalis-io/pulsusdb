@@ -77,6 +77,64 @@ rendering.
 **Still open — the field-expression regrammar (D1, D3–D7).** Not a
 collection of patches: see the root cause below.
 
+## Stage B re-pin (issue #335, 2026-08-03)
+
+The grammar collapse: one precedence-climbing routine replaces the layered
+field-expression parser, so every operand position takes the same grammar
+and `!` becomes a field-level prefix operator.
+
+**Parse axis (`parse ∘ validate`): 19 probes moved, every one
+`diverge → agree`, none the other way.** `AGREE` 198 → 217,
+`DIVERGE` 23 → 4. The direction is checked in the re-pin commit's diff —
+19 changed `"verdict"` lines, all `diverge` → `agree` — not inferred from
+the totals, because two errors that cancel leave the totals right.
+
+| class | probes | direction | why it is an improvement |
+|---|---|---|---|
+| D1 | 5 | 4 accept→reject, 1 reject→accept | `!` binds tighter than `=`, so its operand is the intrinsic. `{ !name = "foo" }` is a reference **400** (`illegal operation for the given type: !name`) and is now ours too, with the same message; `{ !.a = !.b }` is a reference 200 we refused. |
+| D3 | 7 | reject→accept | unary `-` is legal in every operand position, not just the RHS. |
+| D4 | 4 | reject→accept | a literal is legal at the comparison LHS. |
+| D5 | 2 | reject→accept | a parenthesised expression is legal at the LHS. |
+| D6 | 1 | reject→accept | comparison is an ordinary left-associative binary level, so it chains. |
+
+The 4 residual divergences are all **D7** — `avg(<field expr>)` still
+takes a restricted argument grammar. Stage C.
+
+**Wire axis (`parse → validate → plan`): 16 probes moved, every one
+`diverge → agree`.** `WIRE_AGREE_BASELINE` 161 → 177,
+`WIRE_DIVERGE_BASELINE` 60 → 44.
+
+The two axes disagree on purpose and the gap is the point: parse-axis 4
+vs wire-axis 44. A query can parse and validate and still be a planner
+400, and the wire is where users live. Stage B itself produced four such
+regressions — `{ !.a = 1 }` and friends validate but had no planner arm —
+and they were caught by this baseline, not by the parse-axis count, which
+read a clean 4 throughout. See `traces/filter.rs`'s `BoolMatch`.
+
+**Every parse-axis flip is accounted for.** 70 probes now parse and are
+rejected by `validate`; each is attributable to a rule on the
+parse→validate class list in `validate_field_expr`'s doc comment, asserted
+by `every_parse_axis_flip_is_explained_by_the_class_list`. That test
+replaces Stage A's `stage_a_flipped_exactly_the_two_recorded_d1_probes`,
+which named the flip set as two exact queries — right while two rejections
+were movable, unusable at 70.
+
+**Issue #359 closed by this change, not deferred by it.** It recorded five
+value forms we 400'd and the reference answers (`{ duration = 5 }`,
+`{ duration > 5 }`, `{ .a = ok }`, `{ .a = server }`, `{ .a = unset }`)
+and expected Stage B to preserve those rejections behind a pointer. The
+context-free atom grammar accepts all five instead: value typing stopped
+being the parser's job, which was exactly #359's predicted mechanism, so
+the fix arrived with the collapse rather than after it. Re-measured
+against the pinned digest — all five plus `{ .a = error }`,
+`{ .a = client }`, `{ duration = 5.5 }`, `{ span:duration = 5 }`,
+`{ duration > -2s }` are reference 200s and ours accept, ten for ten.
+
+**They are NOT probes in this matrix**, which stays at 221 through Stage B
+by ruling. Adding the class as probes is follow-up work, and until then
+this class remains unmeasured by the scoreboard — which is what let it go
+unnoticed in the first place.
+
 ## Operator precedence and associativity
 
 Tightest first. `=` marks agreement from the audit capture, `✔` a
