@@ -388,9 +388,14 @@ Out of this ledger's scope by design:
   true heavy hitters were stable). **No one can match that regime,
   including the reference itself.** PulsusDB pins a deterministic
   canonical insertion order (label-ascending) instead — the same
-  treatment as the ratified instant `first_over_time`/`last_over_time`
-  tie pin — and the corpus pre-commits to staying below the cap and off
-  k-boundary ties (rule recorded in the `.test` header).
+  treatment as the ratified same-nanosecond SAME-STREAM `tie_rank` order
+  — and the corpus pre-commits to staying below the cap and off
+  k-boundary ties (rule recorded in the `.test` header). (This bullet
+  used to cite the instant `first_over_time`/`last_over_time` tie pin as
+  its precedent. Issue #344 deleted that pin: the reference's instant tie
+  order is specified after all, so ours was a wrong value rather than a
+  choice among irreproducible orders, and it is no longer an example of
+  anything.)
 - **Range-rejection status delta (the matching-error-status-divergence
   precedent, third instance):** any `approx_topk` in a range query is
   refused with the reference's body, byte-for-byte:
@@ -578,8 +583,11 @@ not "fix" us toward the panic.
 - **PulsusDB behaviour:** the identical merged shape (timestamp-
   ascending, duplicates kept), with the same-timestamp tie pinned to
   the DETERMINISTIC input-series order — the ratified treatment of every
-  irreproducible reference tie (instant `first/last_over_time`,
-  `approx_topk` beyond the retention cap). Values and multiset of
+  irreproducible reference tie (`approx_topk` beyond the retention cap,
+  same-nanosecond same-stream `tie_rank`; the instant
+  `first/last_over_time` pin this used to name was DELETED by issue #344,
+  which found the reference's order there specified and ours wrong).
+  Values and multiset of
   points are reference-exact; only the intra-timestamp ordering is
   pinned rather than mirrored. Instant queries return the duplicate
   samples unmerged, exactly as the reference does (no divergence

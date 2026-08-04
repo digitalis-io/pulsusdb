@@ -348,7 +348,13 @@ fn the_detected_fields_auto_parse_pass_surfaces_the_breach() {
 fn the_metric_path_charges_the_same_key_budget() {
     let compiled = compiled(r#"{app="a"} | json"#);
     let err = compiled
-        .run_metric_into(&quadratic_line(32_761, 2_979), &[], 0, &mut Vec::new())
+        .run_metric_into(
+            &quadratic_line(32_761, 2_979),
+            &[],
+            0,
+            None,
+            &mut Vec::new(),
+        )
         .expect_err("the metric entrypoint shares the ledger");
     assert_eq!(err.budget, RowBudget::JsonFlattenKeys);
 }

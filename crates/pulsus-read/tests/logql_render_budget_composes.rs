@@ -134,7 +134,7 @@ fn a_label_format_stages_destinations_share_one_row_budget() {
     let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
     let base = base();
     if pipeline
-        .run_metric_into("line", &base, 0, &mut labels)
+        .run_metric_into("line", &base, 0, None, &mut labels)
         .is_ok()
     {
         panic!("the metric path must compose identically");
@@ -399,7 +399,7 @@ fn the_metric_path_charges_the_fast_paths_too() {
     let pipeline = compiled(&fast_path_label_format(count, "{{.big}}"));
     let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
     if pipeline
-        .run_metric_into("line", &base, 0, &mut labels)
+        .run_metric_into("line", &base, 0, None, &mut labels)
         .is_ok()
     {
         panic!("the metric path must charge the Simple fast path too");

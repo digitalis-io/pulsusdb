@@ -10,7 +10,7 @@
 //! no hot-path call crosses a codegen-unit boundary.
 
 use super::error::{ReadError, TooBroadReason};
-use super::pipeline::{ERROR_LABEL, MetricRun};
+use super::pipeline::{ERROR_LABEL, MetricRun, RangeGrouping};
 use super::plan::{self, ClientAgg, ClientValue};
 use super::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_logql::RangeAggOp;
@@ -37,8 +37,8 @@ pub(in crate::logql) const CLIENT_AGG_CHUNK_ROWS: usize = 8_192;
 
 /// Streaming per-bucket accumulator for every over-time reducer except
 /// `quantile_over_time` (which needs the full value set). Welford's
-/// algorithm for mean/M2 (population stddev/stdvar); first/last are
-/// timestamp-anchored, order-independent.
+/// algorithm for mean/M2 (population stddev/stdvar); first/last are the
+/// endpoints of the canonical `(timestamp, stream_hash, tie_rank)` order.
 #[derive(Debug, Clone)]
 pub(in crate::logql) struct SimpleAcc {
     count: u64,
@@ -47,14 +47,17 @@ pub(in crate::logql) struct SimpleAcc {
     max: f64,
     mean: f64,
     m2: f64,
-    first_ts: i64,
+    /// The `(timestamp, stream_hash)` key of the current `first`/`last`
+    /// candidate — see [`SimpleAcc::add`] for why `tie_rank` needs no
+    /// field.
+    first_key: (i64, u64),
     first_v: f64,
-    last_ts: i64,
+    last_key: (i64, u64),
     last_v: f64,
 }
 
 impl SimpleAcc {
-    fn new(ts_ns: i64, v: f64) -> Self {
+    fn new(ts_ns: i64, stream_hash: u64, v: f64) -> Self {
         SimpleAcc {
             count: 1,
             sum: v,
@@ -62,14 +65,44 @@ impl SimpleAcc {
             max: v,
             mean: v,
             m2: 0.0,
-            first_ts: ts_ns,
+            first_key: (ts_ns, stream_hash),
             first_v: v,
-            last_ts: ts_ns,
+            last_key: (ts_ns, stream_hash),
             last_v: v,
         }
     }
 
-    fn add(&mut self, ts_ns: i64, v: f64) {
+    /// **`first`/`last` are positions in Loki's delivery order, not
+    /// extrema** (issue #344; this replaced a value-tiebreak whose stated
+    /// premise the source refuted).
+    ///
+    /// The reference reads them straight off its merged sample iterator —
+    /// `first(samples) = samples[0]`, `last(samples) = samples[len-1]`
+    /// (`pkg/logql/range_vector.go:489-501 @ v3.7.4`), and the streaming
+    /// evaluator an instant query uses does the same incrementally
+    /// (`FirstOverTime.agg` keeps the first sample it sees,
+    /// `LastOverTime.agg` overwrites with every sample, `:818-844`). That
+    /// delivery order is `(Timestamp, StreamHash)`
+    /// (`SampleIteratorHeap.Less`, `pkg/iter/sample_iterator.go:139-148`),
+    /// where `StreamHash()` is `labels.StableHash` over the ORIGINAL
+    /// stream labels (`pkg/chunkenc/memchunk.go:1922`) — the same
+    /// [`win_order`] the sliding path has folded in since issue #227.
+    ///
+    /// **`tie_rank` needs no field here.** It only separates samples of
+    /// the SAME stream at the SAME nanosecond, and `metric_raw_samples`
+    /// delivers those in `ORDER BY timestamp_ns, fingerprint, body` —
+    /// ascending body, which is exactly the group-local `tie_rank` the
+    /// sliding path assigns. So `<` for `first` (keep the earliest
+    /// arrival on an exact key tie) and `>=` for `last` (take the latest)
+    /// reproduce the full three-key order from the scan's own sequence.
+    ///
+    /// The predecessor rule — smallest value at the minimum timestamp,
+    /// largest at the maximum — was adopted because the reference's
+    /// instant tie order was believed unspecified. It is specified, and
+    /// on a group merging two streams at one nanosecond the two rules
+    /// disagree: measured against the pinned v3.7.4 container,
+    /// `last_over_time(…) by (fp)` answers 5 where the value rule gives 7.
+    fn add(&mut self, ts_ns: i64, stream_hash: u64, v: f64) {
         self.count += 1;
         self.sum += v;
         self.min = self.min.min(v);
@@ -77,20 +110,13 @@ impl SimpleAcc {
         let delta = v - self.mean;
         self.mean += delta / self.count as f64;
         self.m2 += delta * (v - self.mean);
-        // Equal-timestamp tie-break (review round 2, finding 2): the
-        // pinned PulsusDB rule — `first` takes the SMALLEST value among
-        // samples tied at the minimum timestamp, `last` the LARGEST at
-        // the maximum (`total_cmp` so NaN ties cannot flap). Fully
-        // input-order-independent, so the reducer is deterministic even
-        // if the scan's stable ordering ever changed. The reference's
-        // own tie order for identical timestamps is unspecified; ours is
-        // pinned here and documented (features.md §2).
-        if ts_ns < self.first_ts || (ts_ns == self.first_ts && v.total_cmp(&self.first_v).is_lt()) {
-            self.first_ts = ts_ns;
+        let key = (ts_ns, stream_hash);
+        if key < self.first_key {
+            self.first_key = key;
             self.first_v = v;
         }
-        if ts_ns > self.last_ts || (ts_ns == self.last_ts && v.total_cmp(&self.last_v).is_gt()) {
-            self.last_ts = ts_ns;
+        if key >= self.last_key {
+            self.last_key = key;
             self.last_v = v;
         }
     }
@@ -108,17 +134,17 @@ pub(in crate::logql) enum BucketAcc {
 }
 
 impl BucketAcc {
-    fn new(op: RangeAggOp, ts_ns: i64, v: f64) -> Self {
+    fn new(op: RangeAggOp, ts_ns: i64, stream_hash: u64, v: f64) -> Self {
         match op {
             RangeAggOp::QuantileOverTime => BucketAcc::Values(vec![v]),
             RangeAggOp::RateCounter => BucketAcc::Counter(vec![(ts_ns, v)]),
-            _ => BucketAcc::Simple(SimpleAcc::new(ts_ns, v)),
+            _ => BucketAcc::Simple(SimpleAcc::new(ts_ns, stream_hash, v)),
         }
     }
 
-    fn add(&mut self, ts_ns: i64, v: f64) {
+    fn add(&mut self, ts_ns: i64, stream_hash: u64, v: f64) {
         match self {
-            BucketAcc::Simple(acc) => acc.add(ts_ns, v),
+            BucketAcc::Simple(acc) => acc.add(ts_ns, stream_hash, v),
             BucketAcc::Values(vals) => vals.push(v),
             BucketAcc::Counter(pts) => pts.push((ts_ns, v)),
         }
@@ -319,6 +345,13 @@ pub(in crate::logql) struct ClientAggState<'q> {
     /// the physical `service` column re-injected as `service_name`,
     /// sorted).
     pub(in crate::logql) base_labels: HashMap<u64, Vec<(String, String)>>,
+    /// Per-fingerprint `StableHash` of the stream labels — the SECOND key
+    /// of Loki's sample delivery order, which is what
+    /// `first_over_time`/`last_over_time` read their endpoints off
+    /// ([`SimpleAcc::add`]). The sliding path has kept this map since
+    /// issue #227; the instant path needed it once a grouping let two
+    /// streams share one accumulator (issue #344).
+    hashes: HashMap<u64, u64>,
     fan_out: bool,
     /// `absent_over_time`'s selector-wide presence (plan v2 D2). A FLAG,
     /// not a bucket set, since issue #236 Part D: an instant window has
@@ -370,15 +403,22 @@ impl<'q> ClientAggState<'q> {
         caps: AggCaps,
     ) -> Result<Self, ReadError> {
         let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        let mut hashes: HashMap<u64, u64> = HashMap::new();
         for (fp, m) in meta {
-            base_labels.insert(*fp, series_labels(m));
+            let labels = series_labels(m);
+            hashes.insert(*fp, stream_hash(&labels));
+            base_labels.insert(*fp, labels);
         }
         Ok(ClientAggState {
             compiled,
             client,
             rate_window_ns,
             base_labels,
-            fan_out: compiled.metric_mutates_labels(),
+            hashes,
+            // Issue #344 — the instant twin of `RangeSlideState`'s gate:
+            // a grouping merges streams, so the state must group by final
+            // label set (`label_groups`), never by fingerprint.
+            fan_out: compiled.metric_mutates_labels() || client.grouping.is_some(),
             present: false,
             fp_groups: HashMap::new(),
             label_groups: HashMap::new(),
@@ -407,6 +447,7 @@ impl<'q> ClientAggState<'q> {
                 &row.body,
                 base,
                 row.timestamp_ns,
+                self.client.grouping.as_deref(),
                 &mut scratch,
             )? {
                 MetricRun::Dropped => continue,
@@ -433,6 +474,13 @@ impl<'q> ClientAggState<'q> {
                 },
             };
             let op = self.client.range_op;
+            // Issue #344: the sample's stream identity, the second key of
+            // Loki's delivery order ([`SimpleAcc::add`]). A fingerprint
+            // with no hydrated meta cannot reach here — `base_labels` was
+            // resolved above and both maps are filled from the same
+            // iteration — so the `unwrap_or(0)` is defence in depth, and
+            // the same default `RangeSlideState::flush_collision` uses.
+            let stream_hash = self.hashes.get(&row.fingerprint).copied().unwrap_or(0);
             if matches!(op, RangeAggOp::QuantileOverTime) {
                 self.quantile_values += 1;
                 if self.quantile_values > self.caps.quantile_values {
@@ -468,7 +516,7 @@ impl<'q> ClientAggState<'q> {
                 let key = render_labels_json_sorted(&scratch);
                 match self.label_groups.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
-                        e.into_mut().1.add(row.timestamp_ns, v);
+                        e.into_mut().1.add(row.timestamp_ns, stream_hash, v);
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
                         let labels: LabelSet = scratch
@@ -490,7 +538,7 @@ impl<'q> ClientAggState<'q> {
                             group_entry_bytes(e.key(), &labels, INSTANT_GROUP_SLOT),
                             self.caps.group_bytes,
                         )?;
-                        e.insert((labels, BucketAcc::new(op, row.timestamp_ns, v)));
+                        e.insert((labels, BucketAcc::new(op, row.timestamp_ns, stream_hash, v)));
                     }
                 }
             } else {
@@ -511,10 +559,10 @@ impl<'q> ClientAggState<'q> {
                 }
                 match self.fp_groups.entry(row.fingerprint) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
-                        e.get_mut().add(row.timestamp_ns, v);
+                        e.get_mut().add(row.timestamp_ns, stream_hash, v);
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(BucketAcc::new(op, row.timestamp_ns, v));
+                        e.insert(BucketAcc::new(op, row.timestamp_ns, stream_hash, v));
                     }
                 }
             }
@@ -751,9 +799,9 @@ fn reduce_window(
         // sum/avg/min/max/stddev/stdvar reuse the instant path's exact
         // arithmetic (`SimpleAcc`) folded in canonical order.
         _ => {
-            let mut acc = SimpleAcc::new(ordered[0].ts, ordered[0].value);
+            let mut acc = SimpleAcc::new(ordered[0].ts, ordered[0].stream_hash, ordered[0].value);
             for s in &ordered[1..] {
-                acc.add(s.ts, s.value);
+                acc.add(s.ts, s.stream_hash, s.value);
             }
             Some(match op {
                 RangeAggOp::SumOverTime => acc.sum,
@@ -1068,6 +1116,13 @@ pub(in crate::logql) struct RangeSlideState<'q> {
     offset_ns: i64,
     fan_out: bool,
     is_absent: bool,
+    /// The range aggregation's own `by`/`without` (issue #344), borrowed
+    /// from the plan for the state's lifetime and handed to
+    /// [`super::pipeline::CompiledPipeline::run_metric_into`] per row —
+    /// the reference applies it inside the sample extractor too, which is
+    /// what makes the merge run over the group's RAW SAMPLES rather than
+    /// over per-series results.
+    grouping: Option<&'q RangeGrouping>,
     /// Whether the reducer is order-DEPENDENT (class C, or first/last) and so
     /// needs the full-body `tie_rank` order within a collision group. When
     /// false (count/bytes/rate-no-unwrap, min/max/quantile) the body is never
@@ -1198,6 +1253,15 @@ impl<'q> RangeSlideState<'q> {
         let needs_body_order = matches!(class, ReducerClass::CanonicalFold)
             || matches!(op, RangeAggOp::FirstOverTime | RangeAggOp::LastOverTime);
         let is_absent = matches!(op, RangeAggOp::AbsentOverTime);
+        // Issue #344: a grouping MERGES streams, so it must take the
+        // fan-out path — which groups by the final (already-projected)
+        // label set — never the per-fingerprint sliders, which cannot
+        // merge across fingerprints at all. Today the disjunct is
+        // subsumed (every op that admits a grouping requires `unwrap`, so
+        // `metric_mutates_labels()` is already true), and it is spelled
+        // out anyway: without it, a grouping-allowed op that stopped
+        // requiring unwrap would silently return the per-stream answer.
+        let fan_out = compiled.metric_mutates_labels() || client.grouping.is_some();
         Ok(RangeSlideState {
             compiled,
             op,
@@ -1212,8 +1276,9 @@ impl<'q> RangeSlideState<'q> {
             range: range_ns.get(),
             kmax,
             offset_ns,
-            fan_out: compiled.metric_mutates_labels(),
+            fan_out,
             is_absent,
+            grouping: client.grouping.as_deref(),
             needs_body_order,
             absent_labels: client.absent_labels.clone(),
             base_labels,
@@ -1294,6 +1359,7 @@ impl<'q> RangeSlideState<'q> {
     /// scratch across the whole batch.
     pub(in crate::logql) fn push_rows(&mut self, rows: &[MetricScanRow]) -> Result<(), ReadError> {
         let base_labels = std::mem::take(&mut self.base_labels);
+        let grouping = self.grouping;
         let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
         let mut result = Ok(());
         for row in rows {
@@ -1311,18 +1377,20 @@ impl<'q> RangeSlideState<'q> {
             let Some(base) = base_labels.get(&row.fingerprint) else {
                 continue;
             };
-            let (line, value) =
-                match self
-                    .compiled
-                    .run_metric_into(&row.body, base, row.timestamp_ns, &mut scratch)
-                {
-                    Ok(MetricRun::Dropped) => continue,
-                    Ok(MetricRun::Kept { line, value }) => (line, value),
-                    Err(e) => {
-                        result = Err(e.into());
-                        break;
-                    }
-                };
+            let (line, value) = match self.compiled.run_metric_into(
+                &row.body,
+                base,
+                row.timestamp_ns,
+                grouping,
+                &mut scratch,
+            ) {
+                Ok(MetricRun::Dropped) => continue,
+                Ok(MetricRun::Kept { line, value }) => (line, value),
+                Err(e) => {
+                    result = Err(e.into());
+                    break;
+                }
+            };
             if let Err(e) = check_surviving_error(&scratch) {
                 result = Err(e);
                 break;
@@ -2415,6 +2483,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2444,6 +2513,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2471,6 +2541,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2496,6 +2567,7 @@ mod tests {
             range_op,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let client = client_for(RangeAggOp::Rate);
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
@@ -2537,6 +2609,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2577,6 +2650,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2609,6 +2683,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2644,6 +2719,7 @@ mod tests {
             range_op: RangeAggOp::QuantileOverTime,
             param: Some(0.5),
             absent_labels: vec![],
+            grouping: None,
         };
         let per_sample = retention_points_per_sample(client.range_op);
         assert_eq!(
@@ -2789,6 +2865,7 @@ mod tests {
                 range_op: op,
                 param: None,
                 absent_labels: vec![],
+                grouping: None,
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
             let rows: Vec<MetricScanRow> = order
@@ -2845,6 +2922,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(!compiled.metric_mutates_labels());
@@ -2877,6 +2955,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(compiled.metric_mutates_labels());
@@ -2916,6 +2995,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let mut state =
@@ -2982,6 +3062,7 @@ mod tests {
                     range_op: op,
                     param: None,
                     absent_labels: vec![("app".to_string(), "a".to_string())],
+                    grouping: None,
                 };
                 let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
                 let mut state = ClientAggState::new(
@@ -3060,6 +3141,7 @@ mod tests {
                     range_op: op,
                     param: None,
                     absent_labels: vec![],
+                    grouping: None,
                 };
                 let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
                 assert_eq!(
@@ -3106,6 +3188,7 @@ mod tests {
             range_op: RangeAggOp::AbsentOverTime,
             param: None,
             absent_labels: vec![("app".to_string(), "a".to_string())],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let run = |rows: &[MetricScanRow]| -> usize {
@@ -3221,6 +3304,7 @@ mod tests {
                         range_op: op,
                         param: None,
                         absent_labels: vec![],
+                        grouping: None,
                     };
                     let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
                     let res =
@@ -3337,6 +3421,7 @@ mod tests {
                     range_op: op,
                     param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
                     absent_labels: vec![],
+                    grouping: None,
                 };
                 let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
                 let mut state = RangeSlideState::new(
@@ -3451,6 +3536,7 @@ mod tests {
                 range_op: op,
                 param: None,
                 absent_labels: vec![],
+                grouping: None,
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
             assert!(compiled.metric_mutates_labels());
@@ -3531,6 +3617,7 @@ mod tests {
                 range_op: op,
                 param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
                 absent_labels: vec![],
+                grouping: None,
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
             assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
@@ -3731,6 +3818,7 @@ mod tests {
                 range_op: op,
                 param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
                 absent_labels: vec![],
+                grouping: None,
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
             let mut state =
@@ -3821,6 +3909,7 @@ mod tests {
             range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -3873,6 +3962,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
@@ -3935,6 +4025,7 @@ mod tests {
             range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4016,6 +4107,7 @@ mod tests {
             range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4125,6 +4217,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4182,6 +4275,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4242,6 +4336,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4334,6 +4429,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4396,6 +4492,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4507,6 +4604,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(
@@ -4609,6 +4707,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
@@ -4688,6 +4787,7 @@ mod tests {
             range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4738,6 +4838,7 @@ mod tests {
             range_op: RangeAggOp::AbsentOverTime,
             param: None,
             absent_labels: vec![("app".to_string(), "a".to_string())],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4804,6 +4905,7 @@ mod tests {
             param: None,
             pipeline: vec![],
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4861,6 +4963,7 @@ mod tests {
             param: None,
             pipeline: vec![],
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4895,6 +4998,7 @@ mod tests {
             range_op: RangeAggOp::QuantileOverTime,
             param: Some(0.5),
             absent_labels: Vec::new(),
+            grouping: None,
         };
         let meta = HashMap::from([(
             1u64,
@@ -4966,6 +5070,7 @@ mod tests {
             range_op: RangeAggOp::RateCounter,
             param: None,
             absent_labels: Vec::new(),
+            grouping: None,
         };
         let meta = HashMap::from([(
             1u64,
@@ -5173,7 +5278,7 @@ mod tests {
             CompiledPipeline::compile(&parse_pipeline(r#"{x="y"} | json"#)).expect("compile");
         let mut labels = Vec::new();
         let MetricRun::Kept { .. } = compiled
-            .run_metric_into("a=Hello b=World", &base, 0, &mut labels)
+            .run_metric_into("a=Hello b=World", &base, 0, None, &mut labels)
             .expect("no budget breach")
         else {
             panic!("an errored line is kept for the surviving-error check");
@@ -5191,7 +5296,7 @@ mod tests {
                 .expect("compile");
         let mut labels = Vec::new();
         let MetricRun::Kept { .. } = compiled
-            .run_metric_into("a=Hello b=World", &base, 0, &mut labels)
+            .run_metric_into("a=Hello b=World", &base, 0, None, &mut labels)
             .expect("no budget breach")
         else {
             panic!("kept");
@@ -5252,6 +5357,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(
@@ -5320,6 +5426,7 @@ mod tests {
             range_op: op,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&[]).unwrap();
         let count_client = mk(RangeAggOp::CountOverTime);

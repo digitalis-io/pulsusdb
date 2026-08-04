@@ -10,8 +10,8 @@ use super::pipeline::CompiledPipeline;
 use super::plan::{self};
 use super::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_logql::{
-    LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, Matcher, MetricExpr, NumericLiteral,
-    ParserStage, RangeAggOp, Stage, StreamSelector,
+    Grouping, LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, Matcher, MetricExpr,
+    NumericLiteral, ParserStage, RangeAggOp, Stage, StreamSelector,
 };
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -250,25 +250,31 @@ pub(crate) fn variant_pipeline_entry_bytes(common: &[Stage], tail: &[Stage]) -> 
 ///
 /// - `base_labels`: `entries × map_entry_bytes(size_of::<(u64, LabelSet)>())`
 ///   (C) + `Σ label_set_bytes(labels)` (H);
-/// - `hashes` (the sliding kind only): `entries ×
-///   map_entry_bytes(size_of::<(u64, u64)>())` (C; the payload is `Copy`).
+/// - `hashes`: `entries × map_entry_bytes(size_of::<(u64, u64)>())`
+///   (C; the payload is `Copy`).
+///
+/// **The `hashes` term is unconditional since issue #344.** It used to be
+/// charged for the sliding kind only, because only that kind held the
+/// map; the instant kind now holds one too — `first_over_time`/
+/// `last_over_time` take the endpoints of Loki's
+/// `(timestamp, stream_hash, tie_rank)` order on BOTH paths, so both
+/// need the per-fingerprint `StableHash`. The `with_hashes` parameter is
+/// gone rather than passed `true` twice: a flag with one reachable value
+/// is a place for the two kinds to silently drift apart again.
 ///
 /// Walked over the FIRST sub-state's ALREADY-BUILT maps, so the sizing
 /// pass is one O(streams) traversal with no re-parse and no allocation,
 /// and runs only when a query declares ≥ 2 variants.
-fn variant_meta_snapshot_bytes(base_labels: &HashMap<u64, LabelSet>, with_hashes: bool) -> u64 {
+fn variant_meta_snapshot_bytes(base_labels: &HashMap<u64, LabelSet>) -> u64 {
     let mut bytes: u64 = 0;
     for labels in base_labels.values() {
         bytes = bytes
             .saturating_add(map_entry_bytes(size_of::<(u64, LabelSet)>()))
             .saturating_add(label_set_bytes(labels));
     }
-    if with_hashes {
-        bytes = bytes.saturating_add(
-            (base_labels.len() as u64).saturating_mul(map_entry_bytes(size_of::<(u64, u64)>())),
-        );
-    }
-    bytes
+    bytes.saturating_add(
+        (base_labels.len() as u64).saturating_mul(map_entry_bytes(size_of::<(u64, u64)>())),
+    )
 }
 
 /// The per-sub-state charge, for sub-state index ≥ 1 (index 0 costs
@@ -339,13 +345,31 @@ pub(in crate::logql) fn variant_state_bytes(
 ///   the `Grouping::labels` buffer ([`grown_alloc_bytes`] over `len + 1` —
 ///   `__variant__` is PUSHED into it, the one N-scaled buffer that
 ///   reallocs) + each cloned label + the injected `__variant__` string.
+/// - the variant's own RANGE grouping (issue #344): the `Box` holding the
+///   normalized clause, plus `RangeGrouping::from_ast`'s clone of the
+///   AST's label list — an exactly-reserved buffer and one owned `String`
+///   per name (the sort and dedup that follow are in place and allocate
+///   nothing). Charged whether or not the dedup shrinks the list, because
+///   the clone happens first.
 pub(crate) fn variant_spec_bytes(
     tail: &[Stage],
     selector: &StreamSelector,
     is_absent: bool,
+    range_grouping: Option<&Grouping>,
     agg_chain: &MetricExpr,
 ) -> u64 {
     let mut bytes: u64 = 0;
+    if let Some(g) = range_grouping {
+        bytes = bytes.saturating_add(alloc_block_bytes(
+            size_of::<super::pipeline::RangeGrouping>() as u64,
+        ));
+        if !g.labels.is_empty() {
+            bytes = bytes.saturating_add(vec_buffer_bytes::<String>(g.labels.len() as u64));
+            for l in &g.labels {
+                bytes = bytes.saturating_add(alloc_block_bytes(l.len() as u64));
+            }
+        }
+    }
     if !tail.is_empty() {
         bytes = bytes
             .saturating_add(vec_buffer_bytes::<Stage>(tail.len() as u64))
@@ -634,13 +658,13 @@ impl<'q> VariantsAggState<'q> {
             };
             if i == 0 {
                 // Sized from the FIRST sub-state's already-built maps —
-                // one O(streams) walk, no re-parse, no allocation; the
-                // hashes half exists only on the sliding kind.
+                // one O(streams) walk, no re-parse, no allocation. Both
+                // kinds carry `base_labels` AND `hashes` since issue
+                // #344, so the two arms differ only in which state they
+                // borrow from.
                 meta_bytes = match &state {
-                    MetricAggState::Range(s) => variant_meta_snapshot_bytes(&s.base_labels, true),
-                    MetricAggState::Instant(s) => {
-                        variant_meta_snapshot_bytes(&s.base_labels, false)
-                    }
+                    MetricAggState::Range(s) => variant_meta_snapshot_bytes(&s.base_labels),
+                    MetricAggState::Instant(s) => variant_meta_snapshot_bytes(&s.base_labels),
                 };
             }
             subs.push(state);
@@ -1022,15 +1046,14 @@ mod tests {
     /// The I4/I5 expected meta term, built INDEPENDENTLY of
     /// `variant_meta_snapshot_bytes` (same inputs, formula spelled out) so
     /// deleting the runtime charge fails the equality.
-    fn expected_meta_term(meta: &HashMap<u64, StreamMetaRow>, with_hashes: bool) -> u64 {
+    fn expected_meta_term(meta: &HashMap<u64, StreamMetaRow>) -> u64 {
         let mut bytes = 0u64;
         for m in meta.values() {
             let labels = series_labels(m);
             bytes += map_entry_bytes(size_of::<(u64, LabelSet)>()) + label_set_bytes(&labels);
         }
-        if with_hashes {
-            bytes += meta.len() as u64 * map_entry_bytes(size_of::<(u64, u64)>());
-        }
+        // Issue #344: unconditional — both sub-state kinds hold `hashes`.
+        bytes += meta.len() as u64 * map_entry_bytes(size_of::<(u64, u64)>());
         bytes
     }
 
@@ -1089,6 +1112,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
         let mut plain = RangeSlideState::new(
@@ -1131,21 +1155,38 @@ mod tests {
             st.charged_bytes() - arena.charged_bytes()
         };
         let meta = k_stream_meta(4);
-        let expected = expected_meta_term(&meta, false);
+        let expected = expected_meta_term(&meta);
         assert!(expected > 0);
         assert_eq!(sub_charges(&meta) - sub_charges(&HashMap::new()), expected);
     }
 
-    /// I5 — CHARGE: the `hashes` TABLE share, isolated from I4: the RANGE
-    /// kind over the same meta pair adds exactly the `(u64, u64)` table
-    /// term on top of I4's expression — so I5 fails alone when only the
-    /// hashes half is deleted (I4 still passing).
+    /// I5 — CHARGE: the `hashes` TABLE share, for **both** sub-state
+    /// kinds.
+    ///
+    /// **Re-aimed by issue #344, and the re-aim is the point.** It used
+    /// to isolate the term by DIFFERENCE: only the sliding kind held a
+    /// `hashes` map, so charging the range fixture and not the instant
+    /// one made the term visible and let I5 fail alone. The instant kind
+    /// now holds the map too (`first_over_time`/`last_over_time` take the
+    /// endpoints of Loki's `(timestamp, stream_hash, tie_rank)` order on
+    /// both paths), so that difference is structurally zero and the old
+    /// assertion had degenerated into `expected > expected`, which is
+    /// false for every input — it could only ever have passed while the
+    /// two kinds disagreed.
+    ///
+    /// What replaces it guards the failure that actually happened here:
+    /// ONE kind gaining state the charge still prices for the other. Both
+    /// fixtures are charged, both must equal the same independently
+    /// spelled expression, and the `hashes` half is asserted to be a
+    /// nonzero component of it — so deleting the term from
+    /// `variant_meta_snapshot_bytes`, or reintroducing a per-kind
+    /// condition on it, fails here.
     #[test]
-    fn i5_meta_hashes_table_share_is_charged() {
-        let sub_charges = |meta: &HashMap<u64, StreamMetaRow>| {
+    fn i5_meta_hashes_table_share_is_charged_for_both_sub_state_kinds() {
+        let sub_charges = |spec: QuerySpec, meta: &HashMap<u64, StreamMetaRow>| {
             let (scan, variants, _) = variants_fixture(
                 &n_variant_query(2, r#"count_over_time({app="x"}[5m])"#, r#"{app="x"}[5m]"#),
-                variants_range_spec(),
+                spec,
             );
             let cp = scan.client.expect("client scan");
             let arena = VariantArena::build(&cp.pipeline, &variants, u64::MAX, 0).expect("build");
@@ -1153,9 +1194,22 @@ mod tests {
             st.charged_bytes() - arena.charged_bytes()
         };
         let meta = k_stream_meta(4);
-        let expected = expected_meta_term(&meta, true);
-        assert!(expected > expected_meta_term(&meta, false));
-        assert_eq!(sub_charges(&meta) - sub_charges(&HashMap::new()), expected);
+        let expected = expected_meta_term(&meta);
+        // The `hashes` half, spelled on its own: a real, nonzero part of
+        // the expression above, so the equalities below cannot be
+        // satisfied by a charge that omits it.
+        let hashes_half = meta.len() as u64 * map_entry_bytes(size_of::<(u64, u64)>());
+        assert!(hashes_half > 0 && expected > hashes_half);
+        for spec in [
+            QuerySpec::Instant { at_ns: 60 * VSEC },
+            variants_range_spec(),
+        ] {
+            assert_eq!(
+                sub_charges(spec, &meta) - sub_charges(spec, &HashMap::new()),
+                expected,
+                "both sub-state kinds hold `base_labels` AND `hashes`, so both must be                  charged for both: {spec:?}"
+            );
+        }
     }
 
     /// I6 — CHARGE: the range kind's construction-time `absent_labels`

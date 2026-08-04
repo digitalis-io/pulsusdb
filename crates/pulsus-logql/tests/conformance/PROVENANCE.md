@@ -225,14 +225,30 @@ flip must be re-pinned deliberately.
 ## `grouping.range_agg` — what `supported` does and does not claim (issue #344)
 
 `status: supported` in this file means exactly what `check_status` checks:
-**the probe parses**. For `grouping.range_agg` — a `by`/`without` clause on
-a range aggregation — that is the whole truth of the language surface and
-nothing more: the grammar accepts it on the eight ops the reference admits
-it on, and `grouping.range_agg_disallowed` pins the reject-parity twin for
-the seven it refuses by name. **Execution is not implemented**: the planner
-refuses a range-aggregation grouping with a named error, so an end-to-end
-query still fails. Recorded here rather than left to be inferred from the
-word "supported".
+**the probe parses**. That is a statement about the language surface only,
+and it is worth reading twice for any construct whose execution lands
+separately from its grammar — which is exactly what happened here.
+
+For `grouping.range_agg` — a `by`/`without` clause on a range aggregation —
+the grammar accepts it on the eight ops the reference admits it on, and
+`grouping.range_agg_disallowed` pins the reject-parity twin for the seven it
+refuses by name. When those two rows first landed the planner still refused
+the clause with a named error, so `supported` meant the probe parsed and
+nothing else, and this section said so.
+
+**That is no longer the gap: the eight EXECUTE.** The clause is normalised
+at plan time and applied per row by the compiled pipeline, exactly where the
+reference applies it (inside the sample extractor,
+`pkg/logql/log/metrics_extraction.go:229 @ v3.7.4`), so the aggregation runs
+over the group's merged RAW SAMPLES. The row's `supported` is now backed
+end to end. **The status did not change and neither did the count pins** —
+the row already said `supported`, because that word only ever spoke about
+parsing; what changed is that the caveat under it is gone. The 40
+container-captured expectations that establish it (values, output label
+sets, and the cross-stream `StableHash` tie on BOTH the instant and the
+sliding path) live in
+`crates/pulsus-read/tests/logqltest/corpus/b18_range_agg_grouping.test`,
+which also records the one excluded case and why.
 
 Both rows were captured against **grafana/loki v3.7.4**. When they landed,
 this directory's registry filename still said `v3.7.3` and the note here

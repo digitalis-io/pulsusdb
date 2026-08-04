@@ -245,12 +245,14 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // rejection — into `plan_legacy_descent.rs`. Issue #293 converted
         // that walk and deleted the module, moving the construction back:
         // 13 + 1 -> 14, total unchanged both times.
-        // Issue #344 added TWO: the range-aggregation grouping refusal in
-        // `metric_plan` and its `variants(...)`-arm twin, both built from
-        // the single `RANGE_GROUPING_UNSUPPORTED` constant so the two
-        // cannot drift. 16 -> 18; #240's sweep numbers stand, since both
-        // are ordinary `PipelineInvalid` reasons carrying no regex and no
-        // reference-verbatim text.
+        // Issue #344's grammar half added TWO: the range-aggregation
+        // grouping refusal in `metric_plan` and its `variants(...)`-arm
+        // twin, both built from one constant so they could not drift.
+        // 16 -> 18. Its EXECUTION half takes both back out — grouped
+        // range aggregations now run — and adds none: 18 -> 16, the
+        // pre-#344 figure, with the constant deleted. #240's sweep
+        // numbers stand across both moves, since neither refusal carried
+        // a regex or reference-verbatim text.
         // Issue #343 is net ZERO here, and the zero is the finding. The
         // two interim `offset is parsed but not yet evaluated` refusals
         // were replaced by the planner's window shift, and an earlier
@@ -261,7 +263,7 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // empty where it does not), so refusing it was a divergence
         // dressed as safety. Both out, none in: 18 stands, and so do
         // #240's sweep numbers.
-        ("plan.rs", 18),
+        ("plan.rs", 16),
         ("exec.rs", 12),
         ("client_agg.rs", 1),
         ("fold.rs", 1),
@@ -890,7 +892,20 @@ fn check_e_ledger_rows_claiming_corpus_gating_are_named_by_a_marker() {
 }
 
 /// Pinned corpus provenance counts (issue #352 step 1).
-const CAPTURED: usize = 1_135;
+///
+/// Issue #344 (execution half): 1_135 -> 1_163. `b18_range_agg_grouping
+/// .test` gained 28 `eval` rows — the eight accepted operations executed,
+/// the `by`/`without`/empty-list/duplicate/absent-name shapes, `by` on the
+/// unwrapped label, and eight `eval range` rows for the sliding path
+/// (which include the cross-stream `StableHash` tie). Every value came
+/// from one fresh capture against the pinned v3.7.4 container, so they
+/// carry the file's `captured` default; none of the 22 pre-existing
+/// `eval_fail` rows was removed, but the eight "not yet executed"
+/// refusals among them became `eval` rows. Two more landed with the
+/// instant `first`/`last` delivery-order fix in the same issue — the
+/// cross-stream tie rows that were briefly excluded while our instant
+/// reducer still used a value tiebreak. 1_161 -> 1_163 -> 1_165.
+const CAPTURED: usize = 1_165;
 /// Issue #343 added `b19_offset.test`'s 9 rows: hand-derived from the
 /// semantics measured on that issue, over a fixture authored here rather
 /// than taken from the container, so they are `derived` and not
@@ -900,4 +915,4 @@ const CAPTURED: usize = 1_135;
 const DERIVED: usize = 31;
 const DIVERGENCE: usize = 17;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_215;
+const TOTAL: usize = 1_245;

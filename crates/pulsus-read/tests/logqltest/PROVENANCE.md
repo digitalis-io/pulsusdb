@@ -20,8 +20,8 @@ marker table still holds and is now load-bearing in code.
 
 | figure | means | today |
 |---|---|---|
-| `captured` | directives claiming container capture | 1135 |
-| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | 948 |
+| `captured` | directives claiming container capture | 1165 |
+| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | 988 |
 | `REACHABLE` | rows a live replay can PHYSICALLY compare | 77 |
 
 `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg existed,
@@ -37,9 +37,13 @@ enumerated by reason, not absorbed:
   and it is blocked by the CORPUS, not the harness:** unblocking it means
   re-capturing those files against RELATIVE time, which is corpus work
   with its own capture procedure and review.
-- **metric query — 191.** The first slice replays log (streams) queries
-  only.
-- **range/matrix — 2.** Needs the step grid replayed too.
+- **metric query — 223.** The first slice replays log (streams) queries
+  only. Issue #344 added 32 (`b18_range_agg_grouping.test`'s executed
+  grouped range aggregations, including the two cross-stream tie rows its
+  instant `first`/`last` delivery-order fix unblocked).
+- **range/matrix — 10.** Needs the step grid replayed too. Issue #344
+  added 8 (the same file's sliding-path rows, which include the
+  cross-stream `StableHash` tie).
 
 ### Two properties of the reference that shaped the leg, both measured
 

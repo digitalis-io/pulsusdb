@@ -1134,7 +1134,7 @@ fn metric_path_sets_both_error_and_the_detail_label() {
     let base = base();
     let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
     let out = pipeline
-        .run_metric_into("not json", &base, 0, &mut labels)
+        .run_metric_into("not json", &base, 0, None, &mut labels)
         .expect("no budget breach");
     assert!(matches!(out, MetricRun::Kept { .. }));
     assert!(

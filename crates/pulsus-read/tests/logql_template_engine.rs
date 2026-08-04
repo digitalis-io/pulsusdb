@@ -734,7 +734,7 @@ fn a_repeat_render_at_the_budget_succeeds_and_one_past_it_is_a_clean_query_error
     // The metric path aborts identically.
     let mut labels = Vec::new();
     pipeline
-        .run_metric_into("line", &base, 0, &mut labels)
+        .run_metric_into("line", &base, 0, None, &mut labels)
         .expect_err("metric path must abort too");
     // And label_format renders share the same budget.
     let pipeline = compiled(&format!(

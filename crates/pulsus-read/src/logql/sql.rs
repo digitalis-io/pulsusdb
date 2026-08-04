@@ -540,8 +540,20 @@ pub fn metric_instant(
 /// carries `fingerprint, body` as secondary keys — the projection's only
 /// other columns — so equal-timestamp rows arrive in one reproducible
 /// order across runs/merges/replicas (float accumulation order, and
-/// therefore bit-level sums, stay stable; the first/last reducers are
-/// additionally order-independent via their own value tie-break).
+/// therefore bit-level sums, stay stable).
+///
+/// **This ordering is now load-bearing for `first`/`last`, not merely
+/// stabilising** (issue #344). Those reducers take the endpoints of
+/// Loki's `(timestamp, stream_hash, tie_rank)` delivery order; the
+/// instant accumulator compares `(timestamp, stream_hash)` explicitly
+/// and reads `tie_rank` — which separates only SAME-stream samples at
+/// one nanosecond — off the arrival sequence this `ORDER BY` produces,
+/// `body` ascending being exactly the sliding path's group-local
+/// `tie_rank`. Dropping or reordering the `body` key would therefore
+/// change answers, not just bit-level sums. (The doc line replaced here
+/// claimed the first/last reducers were "additionally order-independent
+/// via their own value tie-break"; that tie-break was deleted as a wrong
+/// value — see `SimpleAcc::add`.)
 pub fn metric_raw_samples(
     samples_table: &str,
     services: &[String],

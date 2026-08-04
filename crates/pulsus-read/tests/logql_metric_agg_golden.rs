@@ -352,45 +352,131 @@ fn first_and_last_are_timestamp_anchored_regardless_of_input_order() {
     }
 }
 
-/// Equal timestamps (review round 2, finding 2): the pinned,
-/// INPUT-ORDER-INDEPENDENT tie rule — `first` takes the SMALLEST value
-/// among samples tied at the minimum timestamp, `last` the LARGEST at
-/// the maximum. Both the natural and the fully reversed input ordering
-/// must give the one same answer (the SQL scan additionally carries a
-/// stable `fingerprint, body` secondary sort, but the reducer does not
-/// depend on it).
+/// Equal timestamps — `first`/`last` are POSITIONS IN LOKI'S DELIVERY
+/// ORDER, not extrema (issue #344).
+///
+/// **What this test used to pin, and why it changed.** It asserted a
+/// PulsusDB-specific rule: `first` takes the smallest value among samples
+/// tied at the minimum timestamp, `last` the largest at the maximum. That
+/// rule was adopted on the premise that the reference's instant tie order
+/// was unspecified, so pinning our own deterministic one cost nothing.
+/// **The premise was false.** The reference's instant evaluator reads the
+/// endpoints of its merged sample iterator — `FirstOverTime.agg` keeps the
+/// first sample it sees and `LastOverTime.agg` overwrites with every
+/// sample (`pkg/logql/range_vector.go:818-844 @ v3.7.4`), the batched form
+/// being `samples[0]` / `samples[len-1]` (`:489-501`) — over a delivery
+/// order that is explicitly `(Timestamp, StreamHash)`
+/// (`SampleIteratorHeap.Less`, `pkg/iter/sample_iterator.go:139-148`).
+/// So the order IS specified, our value rule disagreed with it whenever a
+/// group held same-nanosecond samples from two streams, and the
+/// difference was measurable: `last_over_time(…) by (fp)` answers 5 on
+/// the pinned v3.7.4 container where the value rule gives 7.
+///
+/// The test is kept and re-aimed rather than deleted, because both halves
+/// still need pinning — they are just different properties now:
+///
+/// 1. **Cross-stream ties are `stream_hash`-ordered, and that IS
+///    input-order-independent** — `stream_hash` is an explicit key, so
+///    reversing the input cannot move the answer. This is the half the
+///    old rule got wrong, and the invariance it claimed survives here.
+/// 2. **Same-stream ties fall back to arrival order**, which is the SQL
+///    scan's `ORDER BY timestamp_ns, fingerprint, body` — ascending body,
+///    the same group-local `tie_rank` the sliding path assigns. That is
+///    the ratified same-nanosecond same-stream divergence (the reference
+///    orders by an unstored chunk-insertion ordinal), and it is order
+///    DEPENDENT by construction, so it is asserted against the scan order
+///    the engine actually delivers rather than against a reversal the
+///    scan cannot produce.
 #[test]
-fn first_and_last_tie_break_identically_for_reordered_equal_timestamp_inputs() {
-    let natural = vec![
+fn first_and_last_take_the_endpoints_of_lokis_delivery_order() {
+    let params = instant_params(60 * NS);
+    // `group` is empty for the single-stream half and `by (env)` for the
+    // two-stream half — both streams carry `env="prod"`, so the grouping
+    // merges them into ONE accumulator, which is the shape a cross-stream
+    // tie needs (issue #344).
+    let value = |op: &str,
+                 group: &str,
+                 rows: &[MetricScanRow],
+                 meta: &HashMap<u64, StreamMetaRow>|
+     -> f64 {
+        single_vector_value(
+            run_client(
+                &format!(r#"{op}({{env="prod"}} | logfmt | unwrap v [1m]){group}"#),
+                &params,
+                rows,
+                meta,
+            )
+            .unwrap(),
+        )
+    };
+
+    // (2) SAME stream, same nanosecond: the scan delivers ascending body,
+    // so `first` is the lowest body at the minimum ts and `last` the
+    // highest at the maximum.
+    let same_stream = vec![
         row(1, 10 * NS, "v=1"),
         row(1, 10 * NS, "v=2"), // ties the min timestamp
         row(1, 30 * NS, "v=3"),
         row(1, 30 * NS, "v=4"), // ties the max timestamp
     ];
+    assert_eq!(
+        value("first_over_time", "", &same_stream, &meta_one()),
+        1.0,
+        "first = the earliest-delivered sample at the minimum timestamp"
+    );
+    assert_eq!(
+        value("last_over_time", "", &same_stream, &meta_one()),
+        4.0,
+        "last = the latest-delivered sample at the maximum timestamp"
+    );
+
+    // (1) TWO streams tied at one nanosecond. `stream_hash` decides, so
+    // the answer must be identical under the natural and the fully
+    // reversed input — the property the old value rule claimed and this
+    // one keeps, now for the reference's reason rather than ours.
+    let meta = meta_two();
+    let natural = vec![
+        row(1, 10 * NS, "v=10"),
+        row(2, 10 * NS, "v=20"), // a DIFFERENT stream at the same ts
+        row(1, 30 * NS, "v=30"),
+        row(2, 30 * NS, "v=40"),
+    ];
     let reversed: Vec<MetricScanRow> = natural.iter().rev().cloned().collect();
-    let params = instant_params(60 * NS);
-    for rows in [&natural, &reversed] {
-        let first = single_vector_value(
-            run_client(
-                r#"first_over_time({env="prod"} | logfmt | unwrap v [1m])"#,
-                &params,
-                rows,
-                &meta_one(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(first, 1.0, "first = smallest value among min-ts ties");
-        let last = single_vector_value(
-            run_client(
-                r#"last_over_time({env="prod"} | logfmt | unwrap v [1m])"#,
-                &params,
-                rows,
-                &meta_one(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(last, 4.0, "last = largest value among max-ts ties");
-    }
+    let first_natural = value("first_over_time", " by (env)", &natural, &meta);
+    let last_natural = value("last_over_time", " by (env)", &natural, &meta);
+    assert_eq!(
+        value("first_over_time", " by (env)", &reversed, &meta),
+        first_natural,
+        "a cross-stream tie is decided by stream_hash, so input order cannot move it"
+    );
+    assert_eq!(
+        value("last_over_time", " by (env)", &reversed, &meta),
+        last_natural,
+        "a cross-stream tie is decided by stream_hash, so input order cannot move it"
+    );
+    // …and the pair the hash picks is a real pair, one per boundary
+    // timestamp — not the min/max of the values, which would be 10 and 40
+    // under the old rule regardless of hash.
+    assert!(
+        first_natural == 10.0 || first_natural == 20.0,
+        "first came from the ts=10 tie: {first_natural}"
+    );
+    assert!(
+        last_natural == 30.0 || last_natural == 40.0,
+        "last came from the ts=30 tie: {last_natural}"
+    );
+    // The discriminator against the deleted rule: `stream_hash` order is
+    // a property of the LABELS, so `first`/`last` select the SAME stream
+    // at both boundary timestamps. The value rule picked the smallest at
+    // one end and the largest at the other, which on this fixture is
+    // stream 1 then stream 2 — it cannot produce a consistent stream.
+    let first_stream_is_one = first_natural == 10.0;
+    let last_stream_is_one = last_natural == 30.0;
+    assert_eq!(
+        first_stream_is_one, !last_stream_is_one,
+        "first takes the lowest-hash stream and last the highest, so exactly one of \
+         them is stream 1: first={first_natural}, last={last_natural}"
+    );
 }
 
 /// Issue #227 sliding half-open `(t-range, t]` boundary: a row exactly at
@@ -3915,9 +4001,14 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
     // residual fixtures): 38 + 14 = 52. The 5-year caps then took three
     // back: R1d's real-data witness and R2's `[1369008h]`/`[1369007h]`
     // pair no longer parse, and R2 is now proved unreachable by arithmetic
-    // plus one parse refusal instead of by evaluation. 52 - 3 = 49. The
+    // plus one parse refusal instead of by evaluation. 52 - 3 = 49. Issue
+    // #344 took one more: the equal-timestamp tie fixture had two
+    // `run_client` sites inside a loop over two input orderings, and its
+    // rewrite drives every case through ONE site in a closure (the
+    // orderings are no longer symmetric — a same-stream tie is arrival-
+    // ordered by construction — so the loop had to go). 49 - 1 = 48. The
     // scope caveat is unaffected — every routed fixture has a folded twin.
-    const ROUTED_SITES: usize = 49;
+    const ROUTED_SITES: usize = 48;
     let src = include_str!("logql_metric_agg_golden.rs");
     // Nothing inside `run_client` is a fixture — neither a call site
     // (there are none) nor the `apply_vector_aggs_ok` that builds the

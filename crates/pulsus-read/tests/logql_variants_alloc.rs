@@ -1480,16 +1480,24 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "plan.rs",
         ty: None,
         anchor: "build_variants_node",
-        // Issue #344: 26 -> 27. The range-aggregation grouping is parsed
-        // but not executed, so the per-variant arm refuses it by name
-        // (`if grouping.is_some()`), which is one new branch. W-MEM
-        // disposition: **NIL on the taken path, BAND on the untaken one** —
-        // the guard itself allocates nothing (`Option::is_some` on a field
-        // already owned by the AST), and the refusal it guards allocates
-        // exactly one `String` from an existing `&'static str` constant on
-        // a path that returns `Err` immediately and plans nothing, so it
-        // adds no term to any per-variant band. No callee joins the set:
-        // `.is_some`, `Err` and `.to_string` are all already pinned.
+        // Issue #344 (grammar half): 26 -> 27. The range-aggregation
+        // grouping was parsed but not executed, so the per-variant arm
+        // refused it by name (`if grouping.is_some()`) — one new branch,
+        // NIL taken / BAND untaken, no new callee.
+        //
+        // Issue #344 (execution half): 29 -> 28, and `.as_ref` joins the
+        // callee set. The refusal is DELETED — grouped variants now
+        // execute — and nothing conditional replaces it: the clause is
+        // handed to `VariantSpec::try_new` as `grouping.as_ref()`, an
+        // unconditional borrow of a field the AST already owns. W-MEM
+        // disposition of the new callee: **NIL** — `Option::as_ref` is a
+        // reference reshuffle that allocates on neither path, so it adds
+        // no term to any per-variant band. The normalization it feeds
+        // (`RangeGrouping::from_ast`, one `Vec<String>` clone) happens
+        // inside `try_new`, AFTER that frame's `charge_fanout_bytes`
+        // gate, and is charged by `variant_spec_bytes`' new
+        // range-grouping term — so the allocation is inside an existing
+        // band, not a new one. Inventory row P-l.
         //
         // Issue #343: 27 branches — UNCHANGED — and two new callees, from
         // the `offset` window shift. The interim `if range.offset_ns
@@ -1515,10 +1523,12 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         // both new arms — the substitution writes two `i64` literals into
         // the `Copy` `ClientWindow` that was being built anyway; no
         // allocation on either path, so no per-variant band term.
-        branches: 29,
+        branches: 28,
         callees: &[
             ".any",
             ".as_nanos",
+            // Issue #344: the per-variant grouping borrow, NIL.
+            ".as_ref",
             ".as_u64",
             ".clone",
             ".enumerate",
@@ -1771,25 +1781,67 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         // (3 -> 1 branches). Regenerated with `zz_print_frame_censuses`.
         // W-MEM disposition: **unchanged** — row C-e still prices the
         // `base_labels` snapshot, which is the only allocation here.
+        //
+        // Issue #344: 1 branch — UNCHANGED — and two new callees.
+        // `.is_some` is the fan-out gate's new disjunct
+        // (`metric_mutates_labels() || client.grouping.is_some()`, which
+        // makes a grouped instant query group by final label set instead
+        // of by fingerprint); `||` short-circuits, so the census counts it
+        // as part of the same expression rather than a new branch. W-MEM
+        // disposition: **NIL** — `Option::is_some` on a borrowed plan
+        // field allocates on neither path.
+        //
+        // `stream_hash` is the SECOND new callee and the one with a real
+        // charge: the instant state now builds a per-fingerprint `hashes`
+        // map beside `base_labels`, because `first_over_time`/
+        // `last_over_time` take the endpoints of Loki's `(timestamp,
+        // stream_hash, tie_rank)` order on the instant path too (it
+        // previously used a value tiebreak, which returned a wrong value
+        // on a group merging two streams at one nanosecond). W-MEM
+        // disposition: **BAND, row C-e** — the same row that prices the
+        // `base_labels` snapshot, whose `variant_meta_snapshot_bytes`
+        // hashes term is now charged for BOTH sub-state kinds rather than
+        // the sliding one alone. `stream_hash` itself hashes into a
+        // stack buffer and allocates nothing; the map entries it fills
+        // are what C-e prices.
         branches: 1,
         callees: &[
             ".insert",
+            // Issue #344: the fan-out gate's grouping disjunct, NIL.
+            ".is_some",
             ".metric_mutates_labels",
             "Ok",
             "new",
             "series_labels",
+            // Issue #344: the instant path's `hashes` map, BAND (C-e).
+            "stream_hash",
         ],
     },
     Frame {
         file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "new",
+        // Issue #344: 6 branches — UNCHANGED — and two new callees.
+        // `.is_some` is the fan-out gate's grouping disjunct (a grouping
+        // MERGES streams, so the state must group by final label set, not
+        // by fingerprint) and `.as_deref` borrows the boxed clause into
+        // the state's `grouping` field for the per-row projection. Both
+        // are in the existing `let`/struct-literal expressions, so
+        // neither is a new branch. W-MEM disposition: **NIL** for both —
+        // `Option::is_some`/`Option::as_deref` over a borrowed plan field
+        // allocate on neither path and add no per-variant band term (the
+        // clause itself was cloned and charged at plan time, inside
+        // `variant_spec_bytes`' range-grouping term). Inventory row C-e.
         branches: 6,
         callees: &[
+            // Issue #344: the borrowed grouping, NIL.
+            ".as_deref",
             ".as_u64",
             ".clone",
             ".get",
             ".insert",
+            // Issue #344: the fan-out gate's grouping disjunct, NIL.
+            ".is_some",
             ".metric_mutates_labels",
             "Ok",
             "ensure_grid_resolution",
@@ -1919,10 +1971,23 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         // disposition: **NIL**, unchanged (row F-b) — the fold's
         // per-row work is the same minus one map lookup.
         branches: 21,
+        // Issue #344: 21 branches — UNCHANGED — and three new callees.
+        // `.as_deref` passes the range grouping into `run_metric_into` so
+        // the per-row label projection can apply it; `.copied` and
+        // `.unwrap_or` read the row's `stream_hash` out of the `hashes`
+        // map for the `first`/`last` delivery-order keys. All three are
+        // W-MEM **NIL**: `Option` reshuffles and a `u64` copy, evaluated
+        // as arguments inside existing calls, allocating on neither path
+        // and adding no per-variant band term. (The map they read is
+        // charged at construction — row C-e, see `ClientAggState::new`.)
         callees: &[
             ".add",
+            // Issue #344: the per-row grouping borrow, NIL.
+            ".as_deref",
             ".collect",
             ".contains_key",
+            // Issue #344: the per-row `stream_hash` lookup, NIL.
+            ".copied",
             ".entry",
             ".get",
             ".get_mut",
@@ -1935,6 +2000,7 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             ".run_metric_into",
             ".sort_unstable",
             ".to_string",
+            ".unwrap_or",
             "Err",
             "Ok",
             "QueryTooBroad",
