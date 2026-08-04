@@ -118,15 +118,15 @@
 //!
 //! | id | what | frames | site | disp | covered by |
 //! | F-a | MetricAggState::push_rows kind dispatch | MetricAggState::push_rows | exec.rs MetricAggState::push_rows | NIL | Phi1/Phi4 |
-//! | F-b | ClientAggState::push_rows prologue (Vec::new scratch) | ClientAggState::push_rows | exec.rs ClientAggState::push_rows | NIL | Phi4-Phi7 |
+//! | F-b | ClientAggState::push_rows prologue (Vec::new scratch) | ClientAggState::push_rows, ClientAggState::push_rows_inner | exec.rs ClientAggState::push_rows | NIL | Phi4-Phi7 |
 //! | F-c | RangeSlideState::push_rows prologue/epilogue (mem::take) | RangeSlideState::push_rows | exec.rs RangeSlideState::push_rows | NIL | Phi1-Phi3 |
-//! | F-d | the row loops and everything reachable only from them | ClientAggState::push_rows, RangeSlideState::push_rows, RangeSlideState::flush_collision, FpSlide::finish | exec.rs row paths | NOT-EXEC | rows.is_empty(); the existing CLIENT_AGG_FLAT_BUDGET per-row gate |
+//! | F-d | the row loops and everything reachable only from them | ClientAggState::push_rows, ClientAggState::push_rows_inner, ClientAggState::stage, ClientAggState::flush_pending, RangeSlideState::push_rows, RangeSlideState::flush_collision, FpSlide::finish | exec.rs row paths | NOT-EXEC | rows.is_empty(); the existing CLIENT_AGG_FLAT_BUDGET per-row gate |
 //! | F-e | MetricAggState::finish kind dispatch (Box move) | MetricAggState::finish | exec.rs MetricAggState::finish | NIL | Phi1/Phi4 |
-//! | F-f | ClientAggState::finish absent vs non-absent | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 vs Phi4/Phi5 |
-//! | F-g | absent: the finish-time absent_labels clone (1 + 2k) | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (k = 2 gives 5) |
-//! | F-h | absent instant: present empty vec![sample] vs empty Vector | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (empty-present arm; no rows) |
-//! | F-j | non-absent fan_out label_groups vs fp_groups collects | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi5 / Phi4 (0 each: empty maps reserve nothing) |
-//! | F-k | non-absent instant emit | ClientAggState::finish | exec.rs ClientAggState::finish | BAND | Phi4/Phi5 (0) |
+//! | F-f | ClientAggState::finish absent vs non-absent | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 vs Phi4/Phi5 |
+//! | F-g | absent: the finish-time absent_labels clone (1 + 2k) | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (k = 2 gives 5) |
+//! | F-h | absent instant: present empty vec![sample] vs empty Vector | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (empty-present arm; no rows) |
+//! | F-j | non-absent fan_out label_groups vs fp_groups collects | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi5 / Phi4 (0 each: empty maps reserve nothing) |
+//! | F-k | non-absent instant emit | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi4/Phi5 (0) |
 //! | F-l | RangeSlideState finish prologue (flush early-return, cur None) | RangeSlideState::finish, RangeSlideState::finish_in_place, RangeSlideState::flush_collision | exec.rs RangeSlideState::finish_in_place | NIL | Phi1-Phi3 |
 //! | F-m | is_absent routes to finish_absent (points + vec![series]) | RangeSlideState::finish_in_place, RangeSlideState::finish_absent | exec.rs RangeSlideState::finish_absent | BAND | Phi3 |
 //! | F-n | fan_out group loop vs series_out take | RangeSlideState::finish_in_place | exec.rs RangeSlideState::finish_in_place | BAND | Phi2 / Phi1 (0 each) |
@@ -1474,7 +1474,7 @@ fn zz_print_frame_censuses() {
 /// (M1's `.clone` → `.cloned` plus `format_args!`) and
 /// `RangeSlideState::new` (the `vec![0; …]` macro body does not parse as
 /// an expression list, so the token fallback records `max?`).
-static PER_VARIANT_FRAMES: [Frame; 27] = [
+static PER_VARIANT_FRAMES: [Frame; 31] = [
     // --- W_plan (4) ---
     Frame {
         file: "plan.rs",
@@ -1804,14 +1804,29 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         // the sliding one alone. `stream_hash` itself hashes into a
         // stack buffer and allocates nothing; the map entries it fills
         // are what C-e prices.
-        branches: 1,
+        //
+        // Issue #344 review round 1: 1 -> 2 branches, and `matches!` +
+        // `reducer_class` join the callee set. The new branch is the
+        // `needs_ts_order` gate — `matches!(reducer_class(op, value),
+        // CanonicalFold)` — decided ONCE here rather than per row, so the
+        // equal-timestamp staging buffer exists only for the reducers
+        // whose fold order matters. W-MEM disposition: **NIL** —
+        // `reducer_class` is an exhaustive `match` over two `Copy` enums
+        // returning a third, and `matches!` compiles to a discriminant
+        // test; neither allocates on either path, and the staging buffer
+        // the flag governs starts EMPTY (`Vec::new()` allocates nothing)
+        // and is charged against the collision caps when it fills.
+        branches: 2,
         callees: &[
             ".insert",
             // Issue #344: the fan-out gate's grouping disjunct, NIL.
             ".is_some",
             ".metric_mutates_labels",
             "Ok",
+            // Issue #344 review round 1: the `needs_ts_order` gate, NIL.
+            "matches!",
             "new",
+            "reducer_class",
             "series_labels",
             // Issue #344: the instant path's `hashes` map, BAND (C-e).
             "stream_hash",
@@ -1957,65 +1972,37 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         ty: Some("MetricAggState"),
         anchor: "finish",
         branches: 1,
-        callees: &[".finish", "Ok"],
+        // Issue #344 review round 1: `Ok` LEAVES the callee set.
+        // `ClientAggState::finish` became fallible (it flushes the last
+        // staged equal-timestamp run, which charges group bytes like any
+        // other group creation), so the instant arm forwards its
+        // `Result` instead of wrapping a `QueryResult` in `Ok`. One
+        // callee fewer, branches unchanged, and no new allocation: the
+        // flush's charge is `ClientAggState::group_bytes`, already
+        // enumerated.
+        callees: &[".finish"],
     },
     Frame {
         file: "client_agg.rs",
         ty: Some("ClientAggState"),
         anchor: "push_rows",
-        // Issue #236 Part D: the per-group `BTreeMap` collapses to one
-        // `BucketAcc`, so the bucket-entry match moves inside each
-        // grouping arm and `bucket_of`/`INSTANT_BUCKET` leave the frame;
-        // `present` becomes a flag, so `.insert` on the bucket set goes
-        // too. Regenerated with `zz_print_frame_censuses`. W-MEM
-        // disposition: **NIL**, unchanged (row F-b) — the fold's
-        // per-row work is the same minus one map lookup.
-        branches: 21,
-        // Issue #344: 21 branches — UNCHANGED — and three new callees.
-        // `.as_deref` passes the range grouping into `run_metric_into` so
-        // the per-row label projection can apply it; `.copied` and
-        // `.unwrap_or` read the row's `stream_hash` out of the `hashes`
-        // map for the `first`/`last` delivery-order keys. All three are
-        // W-MEM **NIL**: `Option` reshuffles and a `u64` copy, evaluated
-        // as arguments inside existing calls, allocating on neither path
-        // and adding no per-variant band term. (The map they read is
-        // charged at construction — row C-e, see `ClientAggState::new`.)
-        callees: &[
-            ".add",
-            // Issue #344: the per-row grouping borrow, NIL.
-            ".as_deref",
-            ".collect",
-            ".contains_key",
-            // Issue #344: the per-row `stream_hash` lookup, NIL.
-            ".copied",
-            ".entry",
-            ".get",
-            ".get_mut",
-            ".insert",
-            ".into_mut",
-            ".iter",
-            ".key",
-            ".len",
-            ".map",
-            ".run_metric_into",
-            ".sort_unstable",
-            ".to_string",
-            ".unwrap_or",
-            "Err",
-            "Ok",
-            "QueryTooBroad",
-            "charge_group_bytes",
-            "check_surviving_error",
-            "group_entry_bytes",
-            "matches!",
-            "new",
-            "render_labels_json_sorted",
-        ],
+        // Issue #344 review round 1: this frame is now a THIN WRAPPER.
+        // The batch-reused `scratch` borrows from `base_labels` through
+        // its `Cow`s, so the row loop cannot also hold a `&mut self` for
+        // the mid-loop staging flush; `base_labels` therefore moves to a
+        // local for the batch (the move `RangeSlideState::push_rows`
+        // already makes, for the same reason) and the body moved to
+        // `push_rows_inner`, censused separately below. W-MEM
+        // disposition: **NIL** — `mem::take` swaps a `HashMap` header,
+        // allocating nothing, and the map is restored on every exit
+        // including the error one. Inventory row F-b.
+        branches: 0,
+        callees: &[".push_rows_inner", "take"],
     },
     Frame {
         file: "client_agg.rs",
         ty: Some("ClientAggState"),
-        anchor: "finish",
+        anchor: "finish_folded",
         // Issue #236 Part D: the state is instant-only by construction,
         // so the two stepped arms — the `bucket_grid` absence walk and
         // the per-bucket `Matrix` emit — are DELETED, not merely unused
@@ -2042,6 +2029,126 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             "new",
             "vec!",
         ],
+    },
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("ClientAggState"),
+        anchor: "push_rows_inner",
+        // Issue #344 review round 1: the former `push_rows` body, plus
+        // the equal-timestamp staging route. 21 -> 22 branches (the
+        // `needs_ts_order` arm) and three new callees: `.flush_pending`
+        // closes the previous run, `.stage` opens the new one, and
+        // `.then` builds the group's `LabelSet` only when the group does
+        // not exist yet — the SAME condition the direct arm builds it
+        // under, so no per-row allocation is added. W-MEM disposition:
+        // **BAND on the staging arm, NIL on the gate** — the staged
+        // key/labels are charged against the collision caps before they
+        // are held (see `ClientAggState::stage`), and the gate itself is
+        // a `bool` field read. Inventory rows F-b/F-d.
+        branches: 25,
+        callees: &[
+            ".add",
+            ".as_deref",
+            ".collect",
+            ".contains_key",
+            ".copied",
+            ".entry",
+            ".flush_pending",
+            ".get",
+            ".get_mut",
+            ".insert",
+            ".into_mut",
+            ".iter",
+            ".key",
+            ".len",
+            ".map",
+            ".run_metric_into",
+            ".sort_unstable",
+            ".stage",
+            ".then",
+            ".to_string",
+            ".unwrap_or",
+            "Err",
+            "Ok",
+            "QueryTooBroad",
+            "charge_group_bytes",
+            "check_surviving_error",
+            "group_entry_bytes",
+            "matches!",
+            "new",
+            "render_labels_json_sorted",
+        ],
+    },
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("ClientAggState"),
+        anchor: "stage",
+        // Issue #344 review round 1. Size -> check BOTH collision caps ->
+        // only then retain, the same three-step order
+        // `RangeSlideState::stage_member` uses, so the staged run is
+        // bounded by `MAX_TS_COLLISION_GROUP`/`_BYTES` and a breach is
+        // the existing named `TsCollisionGroup` 422 rather than unbounded
+        // read-path growth. W-MEM disposition: **BAND** — one `Vec` slot
+        // per staged sample, capacity reused across runs; the `key`
+        // String is MOVED in, not cloned. Inventory row F-d.
+        branches: 2,
+        callees: &[
+            ".len",
+            ".push",
+            ".saturating_add",
+            "Err",
+            "Ok",
+            "QueryTooBroad",
+            "alloc_block_bytes",
+            "label_set_bytes",
+            "size_of",
+        ],
+    },
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("ClientAggState"),
+        anchor: "flush_pending",
+        // Issue #344 review round 1: folds the staged run in
+        // `(stream_hash, tie_rank)` order and releases it. The sort is
+        // STABLE, so equal hashes keep arrival order — which within one
+        // stream is the scan's `body`-ascending sequence, i.e. exactly
+        // `tie_rank`. W-MEM disposition: **BAND** — the group creations
+        // it performs charge `group_bytes` in the same units the direct
+        // arm does, and the buffer's capacity returns to the state so the
+        // next run reuses it. Inventory row F-d.
+        branches: 5,
+        callees: &[
+            ".add",
+            ".clear",
+            ".drain",
+            ".entry",
+            ".insert",
+            ".into_mut",
+            ".is_empty",
+            ".is_err",
+            ".is_ok",
+            ".key",
+            ".sort_by_key",
+            ".unwrap_or_default",
+            "Ok",
+            "charge_group_bytes",
+            "group_entry_bytes",
+            "new",
+            "take",
+        ],
+    },
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("ClientAggState"),
+        anchor: "finish",
+        // Issue #344 review round 1: `finish` became a two-step —
+        // close the last staged equal-timestamp run, then read the
+        // accumulators — so the emit body moved to `finish_folded`,
+        // censused above. W-MEM disposition: **NIL** — the flush's own
+        // allocations are `flush_pending`'s (BAND there); this frame adds
+        // a `Result` wrap. Inventory row F-f.
+        branches: 1,
+        callees: &[".finish_folded", ".flush_pending", "Ok"],
     },
     Frame {
         file: "client_agg.rs",
@@ -2488,7 +2595,10 @@ static INVENTORY: [Row; 49] = [
         id: "F-b",
         window: Win::Fin,
         what: "ClientAggState::push_rows prologue (Vec::new scratch)",
-        frames: &["ClientAggState::push_rows"],
+        frames: &[
+            "ClientAggState::push_rows",
+            "ClientAggState::push_rows_inner",
+        ],
         site: "exec.rs ClientAggState::push_rows",
         disp: Disp::Nil,
         covered_by: "Phi4-Phi7",
@@ -2508,6 +2618,9 @@ static INVENTORY: [Row; 49] = [
         what: "the row loops and everything reachable only from them",
         frames: &[
             "ClientAggState::push_rows",
+            "ClientAggState::push_rows_inner",
+            "ClientAggState::stage",
+            "ClientAggState::flush_pending",
             "RangeSlideState::push_rows",
             "RangeSlideState::flush_collision",
             "FpSlide::finish",
@@ -2529,7 +2642,7 @@ static INVENTORY: [Row; 49] = [
         id: "F-f",
         window: Win::Fin,
         what: "ClientAggState::finish absent vs non-absent",
-        frames: &["ClientAggState::finish"],
+        frames: &["ClientAggState::finish", "ClientAggState::finish_folded"],
         site: "exec.rs ClientAggState::finish",
         disp: Disp::Band,
         covered_by: "Phi6/Phi7 vs Phi4/Phi5",
@@ -2538,7 +2651,7 @@ static INVENTORY: [Row; 49] = [
         id: "F-g",
         window: Win::Fin,
         what: "absent: the finish-time absent_labels clone (1 + 2k)",
-        frames: &["ClientAggState::finish"],
+        frames: &["ClientAggState::finish", "ClientAggState::finish_folded"],
         site: "exec.rs ClientAggState::finish",
         disp: Disp::Band,
         covered_by: "Phi6/Phi7 (k = 2 gives 5)",
@@ -2547,7 +2660,7 @@ static INVENTORY: [Row; 49] = [
         id: "F-h",
         window: Win::Fin,
         what: "absent instant: present empty vec![sample] vs empty Vector",
-        frames: &["ClientAggState::finish"],
+        frames: &["ClientAggState::finish", "ClientAggState::finish_folded"],
         site: "exec.rs ClientAggState::finish",
         disp: Disp::Band,
         covered_by: "Phi6/Phi7 (empty-present arm; no rows)",
@@ -2556,7 +2669,7 @@ static INVENTORY: [Row; 49] = [
         id: "F-j",
         window: Win::Fin,
         what: "non-absent fan_out label_groups vs fp_groups collects",
-        frames: &["ClientAggState::finish"],
+        frames: &["ClientAggState::finish", "ClientAggState::finish_folded"],
         site: "exec.rs ClientAggState::finish",
         disp: Disp::Band,
         covered_by: "Phi5 / Phi4 (0 each: empty maps reserve nothing)",
@@ -2565,7 +2678,7 @@ static INVENTORY: [Row; 49] = [
         id: "F-k",
         window: Win::Fin,
         what: "non-absent instant emit",
-        frames: &["ClientAggState::finish"],
+        frames: &["ClientAggState::finish", "ClientAggState::finish_folded"],
         site: "exec.rs ClientAggState::finish",
         disp: Disp::Band,
         covered_by: "Phi4/Phi5 (0)",
@@ -2829,7 +2942,7 @@ fn module_doc() -> String {
 fn g4_frame_census_and_inventory_closure() {
     let _serial = serialize();
     // (1) 26 unique frames, each resolving to exactly one item.
-    assert_eq!(PER_VARIANT_FRAMES.len(), 27);
+    assert_eq!(PER_VARIANT_FRAMES.len(), 31);
     let mut keys = BTreeSet::new();
     for f in &PER_VARIANT_FRAMES {
         assert!(

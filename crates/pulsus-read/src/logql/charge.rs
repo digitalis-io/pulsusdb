@@ -1874,15 +1874,18 @@ mod tests {
         /// [`LEAF_COUNTERS`]; see its table for which are simultaneously
         /// live.
         const EXPECTED: &[(&str, &str, &str, usize)] = &[
-            // `ClientAggState::group_bytes` (instant, ×2: the
-            // label-group and fingerprint-group arms) and
-            // `RangeSlideState::group_bytes` (range, ×2: the
-            // non-mutating `series_out` and mutating `groups` arms).
+            // `ClientAggState::group_bytes` (instant, ×3: the
+            // label-group and fingerprint-group arms plus issue #344's
+            // equal-timestamp staging flush, which creates label groups
+            // out of the SAME arm's staged rows and so charges the same
+            // counter in the same units) and `RangeSlideState::
+            // group_bytes` (range, ×2: the non-mutating `series_out` and
+            // mutating `groups` arms).
             (
                 "client_agg.rs",
                 "charge_group_bytes",
                 "&mut self.group_bytes",
-                4,
+                5,
             ),
             // `ReduceFold::group_bytes` XOR `SelectFold::group_bytes`,
             // reached through `charged_group_key`'s `&mut u64` parameter.
@@ -2026,7 +2029,7 @@ mod tests {
             (
                 "client_agg.rs",
                 "group_bytes",
-                5,
+                6,
                 "ClientAggState::group_bytes | RangeSlideState::group_bytes | the fold's cap",
             ),
             (
@@ -2047,17 +2050,24 @@ mod tests {
                 2,
                 "ClientAggState::counter_values (INLINE — no gate function)",
             ),
+            // Issue #344: `ClientAggState::pending` joins
+            // `RangeSlideState::coll` on BOTH collision axes. The two
+            // buffers hold the same kind of thing — one equal-timestamp
+            // run staged so it can be ordered before it is folded — and
+            // are deliberately bounded by the same cap and the same named
+            // 422; the instant one's run is the wider `(timestamp)` group
+            // because cross-stream order is what it exists for.
             (
                 "client_agg.rs",
                 "collision_members",
-                2,
-                "RangeSlideState::coll member count",
+                4,
+                "RangeSlideState::coll member count | ClientAggState::pending",
             ),
             (
                 "client_agg.rs",
                 "collision_bytes",
-                2,
-                "RangeSlideState::coll_bytes",
+                4,
+                "RangeSlideState::coll_bytes | ClientAggState::pending_bytes",
             ),
             (
                 "client_agg.rs",

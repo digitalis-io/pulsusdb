@@ -904,8 +904,14 @@ fn check_e_ledger_rows_claiming_corpus_gating_are_named_by_a_marker() {
 /// refusals among them became `eval` rows. Two more landed with the
 /// instant `first`/`last` delivery-order fix in the same issue — the
 /// cross-stream tie rows that were briefly excluded while our instant
-/// reducer still used a value tiebreak. 1_161 -> 1_163 -> 1_165.
-const CAPTURED: usize = 1_165;
+/// reducer still used a value tiebreak. 1_161 -> 1_163 -> 1_165. Review
+/// round 1 added seven more and removed one: the fingerprint-vs-
+/// StableHash inversion section (5), `avg_over_time`'s ungrouped
+/// recurrence pin (1), the post-unwrap-filter error pair (2), minus the
+/// grouped `avg_over_time` row whose captured value was a
+/// frontend-dependent `sum/count` rather than the reducer's.
+/// 1_165 + 7 = 1_172.
+const CAPTURED: usize = 1_172;
 /// Issue #343 added `b19_offset.test`'s 9 rows: hand-derived from the
 /// semantics measured on that issue, over a fixture authored here rather
 /// than taken from the container, so they are `derived` and not
@@ -915,4 +921,4 @@ const CAPTURED: usize = 1_165;
 const DERIVED: usize = 31;
 const DIVERGENCE: usize = 17;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_245;
+const TOTAL: usize = 1_252;

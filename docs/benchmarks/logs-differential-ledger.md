@@ -1530,3 +1530,69 @@ a divergence at a public surface, found while implementing the cap.
     http://127.0.0.1:3199/loki/api/v1/query` with files holding
     `count_over_time({app="a…"}[5m])` at exactly 100,000 / 131,071 /
     131,072 bytes.
+
+### `grouped-avg-over-time-unexplained` (issue #344 review round 1, MEASURED, MECHANISM UNIDENTIFIED)
+
+**This entry is not a deliberate divergence.** Every other entry in this
+file records a difference we chose, with a reason. This one records a
+difference we **measured and cannot yet explain**, and it is here so that
+the measurement is not lost and so that no future reader mistakes the
+absence of a corpus row for an oversight.
+
+- **What was measured.** On the pinned `grafana/loki:3.7.4`, default
+  single-binary config, the reference answers a GROUPED `avg_over_time`
+  differently from an UNGROUPED one over the same samples in the same
+  order. One stream, four samples at distinct ascending timestamps
+  `{83.2, 42.2, 79.0, 12.6}`:
+
+  | query | answer |
+  |---|---|
+  | `avg_over_time({…} \| logfmt \| unwrap v [5m])` | `54.24999999999999` |
+  | `… by (env)` / `by ()` / `by (service_name)` / `without (v)` | `54.25` |
+  | `… without ()` (the no-op grouping) | `54.24999999999999` |
+
+  `54.24999999999999` is the range reducer's own recurrence
+  (`mean += F/count - mean/count`, `pkg/logql/range_vector.go:379-401`
+  batched / `:716-744` streaming @ v3.7.4) folded in timestamp order.
+  `54.25` is `sum/count` — the reference also answers `sum_over_time`
+  = `217` over those four samples. Reproduced on a second fixture:
+  `{1, 5, 7}` grouped answers `4.333333333333333`, which is `13/3`.
+
+- **Stable, so not a Go-map walk.** 25 consecutive runs of each form
+  returned the same value every time.
+
+- **NOT a fold-order effect**, which is the explanation to rule out first
+  and the one this issue's other work was about. `stdvar_over_time` over
+  the SAME stream answers `832.6475000000002` both grouped and ungrouped,
+  and that fixture's 24 permutations span five distinct values — so the
+  fold order is unchanged by the grouping and only `avg` moves.
+
+- **Not located in the query mappers.** `pkg/logql/rangemapper.go`'s
+  `splittableRangeVectorOp` does not list `OpRangeTypeAvg`, and
+  `pkg/logql/shardmapper.go`'s `avg -> sum(x)/count(x)` rewrite
+  (`:259-275`) is for the VECTOR aggregation, not the range one. **The
+  mechanism is unidentified.** No mechanism is asserted here.
+
+- **What PulsusDB does.** It computes the reducer's recurrence for both
+  the grouped and the ungrouped form, so it answers `54.24999999999999`
+  either way. **We do not reproduce the grouped value**, because doing so
+  would mean making our reducer return a different result depending on
+  whether the query carries a `by (…)` clause — copying an inconsistency
+  we cannot explain, at a cost of one ULP.
+
+- **What IS proven, and where.** `avg_over_time`'s recurrence is pinned
+  by the UNGROUPED row in
+  `crates/pulsus-read/tests/logqltest/corpus/b18_range_agg_grouping.test`
+  (the `service_name="avgr"` section), captured from the same container:
+  `54.24999999999999` over those four values, chosen so the range
+  recurrence, the vector aggregation's `(F - mean)/count` recurrence and
+  `sum/count` give three different answers. That row is the parity claim;
+  there is deliberately no grouped `avg` row beside it, and the file's
+  header says why.
+
+- **Re-derivation.** `podman run --rm -d -p 3100:3100 grafana/loki:3.7.4`
+  (no config file — the deltas in `ci/logql/config.yaml` are not needed
+  and were not used), push the four values one second apart on one
+  stream, then query `avg_over_time`, `avg_over_time … by (env)`,
+  `avg_over_time … without ()`, `stdvar_over_time` and
+  `stdvar_over_time … by (env)` at an instant covering them.

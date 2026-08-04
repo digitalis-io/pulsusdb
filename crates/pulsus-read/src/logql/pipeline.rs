@@ -2021,21 +2021,38 @@ impl CompiledPipeline {
         // it into the extractor's `without` list
         // (`metrics_extraction.go:154-158 @ v3.7.4`): the ungrouped and
         // `without` forms delete it, `by (L)` does not.
-        match grouping {
-            None => {
-                if let Some(label) = unwrapped {
-                    remove_label(labels, label);
+        if has_err {
+            // `labels.go:665-668` — on an errored line `GroupedLabels`
+            // returns `b.LabelsResult()`, the builder's labels UNTOUCHED.
+            // Nothing else in the reference ever deletes the unwrapped
+            // label (`streamLabelSampleExtractor::Process` only READS it,
+            // `metrics_extraction.go:202-230`); it goes only via the
+            // `without` list the extractor folds it into, and that list is
+            // part of the grouping this branch skips. So an errored line
+            // keeps it — including the shape this branch exists for: a
+            // SUCCESSFUL unwrap followed by a failing post-unwrap filter,
+            // where `unwrapped` is `Some` and the label is still present.
+            //
+            // Both the grouped and the ungrouped forms take this arm,
+            // because the reference has ONE `GroupedLabels` and a nil
+            // grouping reaches its `HasErr` check the same way.
+        } else {
+            // The deferred successful-unwrap deletion (issue #221): the
+            // label leaves the result series only now, AFTER every
+            // post-`unwrap` filter processed it — the reference's
+            // ordering. Issue #344 folds it into the grouping projection,
+            // exactly as the reference folds it into the extractor's
+            // `without` list (`metrics_extraction.go:154-158 @ v3.7.4`):
+            // the ungrouped and `without` forms delete it, `by (L)` does
+            // not.
+            match grouping {
+                None => {
+                    if let Some(label) = unwrapped {
+                        remove_label(labels, label);
+                    }
                 }
+                Some(g) => g.project(labels, unwrapped),
             }
-            Some(_) if has_err => {
-                // `labels.go:665-668` — grouping is skipped entirely on an
-                // errored line. The unwrapped label is deleted as before,
-                // so this arm is byte-identical to the ungrouped one.
-                if let Some(label) = unwrapped {
-                    remove_label(labels, label);
-                }
-            }
-            Some(g) => g.project(labels, unwrapped),
         }
         errs.merge_into(labels);
         Ok((MetricRun::Kept { line, value }, has_err))
