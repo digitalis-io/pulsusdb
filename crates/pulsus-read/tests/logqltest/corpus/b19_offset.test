@@ -125,7 +125,9 @@ clear
 #
 # The shift is `T - d` in i64 nanoseconds. When that leaves
 # [i64::MIN, i64::MAX] the window the user asked for does not exist and
-# the query answers EMPTY. The shipped code SATURATED instead, which
+# the query answers EMPTY. The 5-year caps (43800h on `offset`, on
+# `[range]` and on the query span) bound every DURATION but NOT where the
+# request sits, so these rows put the extreme there instead. The shipped code SATURATED instead, which
 # relocates the evaluation to a rail — a query about 2026 answered from
 # a window starting 1977-01-08. The reference's own plain int64
 # subtraction (v3.7.4 pkg/logql/range_vector.go:50-52) WRAPS there,
@@ -141,20 +143,24 @@ clear
 
 load
   {env="prod", service_name="offx"}
-  1000000000000000000ns  old
-  1779999999000000000ns  recent
   9223372036854775807ns  at the high rail
+  9065691916854775806ns  just under five years below the grid start
 
-# --- AC 1. `T + 9e18` is past i64::MAX for an ordinary 2026 grid, so
-# the whole evaluation domain is off the axis: empty. Against the
-# saturating predecessor this answered one point
-# (223372036854775807, 2) — both rows, reported on 1977-01-08.
-eval range from 1780000000000000000ns to 1780000120000000000ns step 60s count_over_time({service_name="offx"}[2500000h] offset -2500000h)
+# --- AC 1. Nothing in a query may span more than 5 years (43800h), so
+# the only unbounded quantity left is where the REQUEST sits. A grid
+# ending at i64::MAX shifted 5 years FORWARD leaves the axis entirely:
+# empty. Against the saturating predecessor both bounds landed on the
+# rail and the single grid point answered 2, reported at an instant the
+# request never named.
+eval range from 9223371916854775807ns to 9223372036854775807ns step 60s count_over_time({service_name="offx"}[43800h] offset -43800h)
 
-# --- AC 1's CONTROL: `T + 5.4e18` IS representable, so the same rows
-# are read, two per grid point, on the caller's own grid.
-eval range from 1780000000000000000ns to 1780000120000000000ns step 60s count_over_time({service_name="offx"}[2500000h] offset -1500000h)
-  {env="prod", service_name="offx"} 1780000000000000000ns 2 1780000060000000000ns 2 1780000120000000000ns 2
+# --- AC 1's CONTROL: the same magnitude shifted BACKWARDS is
+# representable, so the row just under five years below the grid IS read,
+# at every grid point, on the caller's own grid. (The forward and
+# backward windows are disjoint by construction, so each direction sees
+# its own row — that is the point of the pair.)
+eval range from 9223371916854775807ns to 9223372036854775807ns step 60s count_over_time({service_name="offx"}[43800h] offset 43800h)
+  {env="prod", service_name="offx"} 9223371916854775807ns 1 9223371976854775807ns 1 9223372036854775807ns 1
 
 # --- AC 2, low rail. `(i64::MIN + 1) - 1h` underflows: absence is
 # reported for a window that exists, and this one does not. Against the

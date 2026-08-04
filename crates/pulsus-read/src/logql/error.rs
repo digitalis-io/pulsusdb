@@ -709,6 +709,21 @@ pub enum ReadError {
     /// like [`Self::InvalidStep`]; nothing the reference serves is in the
     /// rejected region — values past `i64::MAX` are unrepresentable in a Go
     /// `time.Duration` and a parse-level 400 there.
+    /// The 5-year rule, place 3 of 3 (issue #343, owner mandate): the
+    /// query's own `start`-to-`end` span exceeded
+    /// [`pulsus_logql::MAX_QUERY_SPAN_NS`]. The two duration LITERALS
+    /// (`offset`, `[range]`) are capped against the same constant in the
+    /// parser; this is the one the parser cannot see.
+    ///
+    /// Same class and shape as [`Self::DurationOutOfRange`] — a client
+    /// input error, a clean 400 `bad_data`, never a clamped window. It is
+    /// what closes the remaining absurd-input hole: a `start` in 1677 with
+    /// an ordinary `offset 1h` still walks off the representable
+    /// timestamp domain. A deliberate divergence (the reference bounds no
+    /// query span at all), ledgered as `five-year-span-cap`.
+    #[error("query time range of {value} ns is outside the supported range (0 to {max} ns)")]
+    QuerySpanTooLong { value: i128, max: i64 },
+
     #[error("{what} of {value} ns is outside the supported range (1 to {max} ns)")]
     DurationOutOfRange {
         what: &'static str,

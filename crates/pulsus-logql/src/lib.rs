@@ -35,7 +35,7 @@ pub use ast::{
     VariantsExpr, VectorAggOp, VectorMatching, for_each_label_filter, for_each_metric_expr,
 };
 pub use error::LogQlError;
-pub use limits::MAX_QUERY_BYTES;
+pub use limits::{MAX_QUERY_BYTES, MAX_QUERY_SPAN_HOURS, MAX_QUERY_SPAN_NS};
 pub use parser::{parse, parse_selector};
 pub use token::Span;
 

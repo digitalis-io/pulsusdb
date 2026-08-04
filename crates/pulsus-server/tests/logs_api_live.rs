@@ -1726,33 +1726,24 @@ async fn offset_shifts_the_data_window_and_not_the_reported_timestamps() {
 /// rendered-SQL snapshot in `pulsus-read/tests/sql_snapshots.rs`, both sit
 /// above the place the user stands. What shipped was a plan that
 /// SATURATED onto the `i64` rail, and its observable was a `metric_read`
-/// stage carrying `timestamp_ns > 223372036854775807` — a full
-/// `log_samples` scan from 1977-01-08 for a query about 2026. So this
+/// stage carrying a scan over a span the request never named. So this
 /// asserts on the explain payload the server actually returns: **no
-/// `metric_read` stage exists**, and the result is empty.
+/// `metric_read` stage exists**, the stage that IS reported carries the
+/// degenerate window's signature month, and the result is empty.
 ///
-/// **The control is required, not decorative.** Deleting the explain
-/// plumbing, or making every plan degenerate, would make the first
-/// assertion pass vacuously. The second query differs only in the offset
-/// magnitude — `T + 5.4e18` is representable — and must still produce a
-/// `metric_read` stage. The two together say "this query issues no scan
-/// AND that is not because scans stopped being reported".
+/// **Under the 5-year caps the extreme lives in the request's POSITION.**
+/// Every duration below is an ordinary hour: `offset`, `[range]` and the
+/// query span are each capped at 43,800 h, and nothing bounds where on the
+/// axis `time` sits, so a request one hour below `i64::MAX` shifted one
+/// hour forward is how the domain is left now.
 ///
-/// **WHAT THIS GATE CANNOT SEE, said where the claim is made:
-/// `MetricPlan::empty_domain`.** The flag saves a ClickHouse round trip
-/// and is NOT wire-observable. Measured (issue #343, AC 8): with the flag
-/// forced `false` this test stays GREEN — the degenerate window still
-/// renders `'1970-01-01'`, stage 1 resolves zero fingerprints, the
-/// engine's pre-existing empty-fingerprint return fires, and the explain
-/// payload is byte-identical either way. What this test gates is the
-/// DEGENERATE WINDOW (against the saturating predecessor it reddens with
-/// `got stages ["stage1_stream_resolution", "stage2_hydration",
-/// "metric_read"]`). The flag is asserted DIRECTLY, in
-/// `pulsus-read/tests/sql_snapshots.rs`,
-/// `pulsus-read/src/logql/plan.rs`'s unit tests and
-/// `pulsus-read/tests/logql_metric_agg_golden.rs::r2_instant_…`. Reading
-/// a green run here as coverage of the flag would be reading it for more
-/// than it measures.
+/// **The control varies the position, not the offset, and that is forced.**
+/// An off-axis request is by construction within 5 years of a rail, so its
+/// partition months can never overlap a month that holds data — stage 1
+/// resolves nothing and no `metric_read` follows for that reason alone.
+/// The control is therefore an ordinary request with an ordinary offset,
+/// which still does what a control must: it fails if the explain plumbing
+/// is deleted or every plan is made degenerate.
 #[tokio::test]
 async fn an_offset_past_the_timestamp_axis_issues_no_scan_at_all() {
     if !should_run() {
@@ -1761,19 +1752,18 @@ async fn an_offset_past_the_timestamp_axis_issues_no_scan_at_all() {
     }
     let db = "pulsus_logs_api_it_offset_domain_edge";
     let port = 31_122;
-    let (_guard, _client, _base_ns) = setup(db, port).await;
+    let (_guard, _client, base_ns) = setup(db, port).await;
 
-    // An ORDINARY 2026 instant — nothing here depends on an exotic
-    // request time; only the offset is extreme.
-    const AT_NS: i64 = 1_780_000_000_000_000_000;
+    // One hour below `i64::MAX`: `T - (-1h)` leaves the axis by 1 ns.
+    const AT_RAIL_NS: i64 = i64::MAX - 3_600_000_000_000 + 1;
 
-    let explain = |query: &str| -> serde_json::Value {
+    let explain = |query: &str, at_ns: i64| -> serde_json::Value {
         let res = http_request(
             port,
             "GET",
             &q(
                 "/api/logs/v1/query",
-                &[("query", query), ("time", &AT_NS.to_string())],
+                &[("query", query), ("time", &at_ns.to_string())],
             ),
             &[("X-Pulsus-Explain", "1")],
             None,
@@ -1782,22 +1772,43 @@ async fn an_offset_past_the_timestamp_axis_issues_no_scan_at_all() {
         assert_eq!(res.status, 200, "{query}: {}", res.body);
         json(&res)
     };
-    let stage_names = |body: &serde_json::Value| -> Vec<String> {
+    let stages = |body: &serde_json::Value| -> Vec<(String, String)> {
         body["data"]["explain"]["stages"]
             .as_array()
             .unwrap_or_else(|| panic!("no explain stages in {body}"))
             .iter()
-            .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+            .map(|s| {
+                (
+                    s["name"].as_str().unwrap_or_default().to_string(),
+                    s["sql"].as_str().unwrap_or_default().to_string(),
+                )
+            })
             .collect()
     };
 
-    // Off the axis: `T + 9e18 > i64::MAX`.
-    let off_axis = explain(r#"count_over_time({env="prod"}[2500000h] offset -2500000h)"#);
-    let off_stages = stage_names(&off_axis);
+    // Off the axis.
+    let off_axis = explain(
+        r#"count_over_time({env="prod"}[5m] offset -1h)"#,
+        AT_RAIL_NS,
+    );
+    let off_stages = stages(&off_axis);
     assert!(
-        !off_stages.iter().any(|n| n == "metric_read"),
+        !off_stages.iter().any(|(n, _)| n == "metric_read"),
         "a query whose window left the timestamp axis must issue no scan, \
-         got stages {off_stages:?}"
+         got stages {:?}",
+        off_stages.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    // The degenerate window's signature at the wire: `months_overlapping(0,
+    // -1)` yields the single literal `'1970-01-01'`. The saturating
+    // predecessor named months at the far end of the axis instead.
+    let stage1 = off_stages
+        .iter()
+        .find(|(n, _)| n == "stage1_stream_resolution")
+        .map(|(_, sql)| sql.clone())
+        .unwrap_or_default();
+    assert!(
+        stage1.contains("month = '1970-01-01'"),
+        "expected the degenerate window's partition list, got:\n{stage1}"
     );
     assert_eq!(
         off_axis["data"]["result"].as_array().map(Vec::len),
@@ -1805,14 +1816,91 @@ async fn an_offset_past_the_timestamp_axis_issues_no_scan_at_all() {
         "and it answers empty: {off_axis}"
     );
 
-    // The control: `T + 5.4e18 = 7180000000000000000 <= i64::MAX`, so the
-    // very same shape DOES plan a scan and DOES report it.
-    let on_axis = explain(r#"count_over_time({env="prod"}[2500000h] offset -1500000h)"#);
-    let on_stages = stage_names(&on_axis);
+    // The control: an ordinary request with an ordinary offset DOES plan a
+    // scan and DOES report it.
+    let on_axis = explain(r#"count_over_time({env="prod"}[10m] offset 1h)"#, base_ns);
+    let on_stages = stages(&on_axis);
     assert!(
-        on_stages.iter().any(|n| n == "metric_read"),
-        "a representable shift must still be scanned and reported, \
-         got stages {on_stages:?}"
+        on_stages.iter().any(|(n, _)| n == "metric_read"),
+        "a representable shift must still be scanned and reported, got {:?}",
+        on_stages.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+}
+
+/// Issue #343 — the 5-year caps over the wire (owner mandate): each of the
+/// three places is a `400 bad_data` echoing what the user sent, and the
+/// query one nanosecond under each cap is served. Hermetic tests own the
+/// arithmetic; this owns the STATUS, which is the thing a client sees.
+#[tokio::test]
+async fn nothing_in_a_query_may_span_more_than_five_years() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_span_cap";
+    let port = 31_123;
+    let (_guard, _client, base_ns) = setup(db, port).await;
+    const CAP_NS: i64 = 157_680_000_000_000_000;
+
+    let instant = |query: &str| -> (u16, String) {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query",
+                &[("query", query), ("time", &base_ns.to_string())],
+            ),
+        )
+        .expect("query reachable");
+        (res.status, res.body)
+    };
+    // 1. `offset`, both directions.
+    for (query, want) in [
+        (r#"count_over_time({env="prod"}[5m] offset 43800h)"#, 200),
+        (r#"count_over_time({env="prod"}[5m] offset -43800h)"#, 200),
+        (r#"count_over_time({env="prod"}[5m] offset 43801h)"#, 400),
+        (r#"count_over_time({env="prod"}[5m] offset -43801h)"#, 400),
+        // 2. the `[range]` selector.
+        (r#"count_over_time({env="prod"}[43800h])"#, 200),
+        (r#"count_over_time({env="prod"}[43801h])"#, 400),
+    ] {
+        let (status, body) = instant(query);
+        assert_eq!(status, want, "{query}: {body}");
+        if want == 400 {
+            assert!(
+                body.contains("\"errorType\":\"bad_data\"") && body.contains("too long"),
+                "{query}: {body}"
+            );
+        }
+    }
+
+    // 3. the query's own start-to-end span.
+    let range = |start_ns: i64, end_ns: i64| -> (u16, String) {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query_range",
+                &[
+                    ("query", r#"count_over_time({env="prod"}[5m])"#),
+                    ("start", &start_ns.to_string()),
+                    ("end", &end_ns.to_string()),
+                    // 5 years / 43800s = 3,600 grid points, under the
+                    // reference's own 11,000-point resolution fence — which
+                    // would otherwise refuse a 5-year span first and hide
+                    // the cap this test is for.
+                    ("step", "43800s"),
+                ],
+            ),
+        )
+        .expect("query_range reachable");
+        (res.status, res.body)
+    };
+    let (status, body) = range(base_ns - CAP_NS, base_ns);
+    assert_eq!(status, 200, "exactly 5 years is served: {body}");
+    let (status, body) = range(base_ns - CAP_NS - 1, base_ns);
+    assert_eq!(status, 400, "one nanosecond more is refused: {body}");
+    assert!(
+        body.contains("\"errorType\":\"bad_data\"") && body.contains("query time range of"),
+        "{body}"
     );
 }
 

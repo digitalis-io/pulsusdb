@@ -25,6 +25,42 @@ use crate::token::Span;
 /// different layer.
 pub const MAX_QUERY_BYTES: usize = 131_072;
 
+/// **NOTHING IN A LogQL QUERY MAY SPAN MORE THAN 5 YEARS** (43,800 h =
+/// 5 × 365 d), in nanoseconds. ONE rule, three places:
+///
+/// 1. `offset <duration>` — magnitude, in EITHER direction
+///    ([`crate::parse`]).
+/// 2. The `[range]` selector ([`crate::parse`]).
+/// 3. The query's own `start`-to-`end` span
+///    (`pulsus_read::logql::plan`, which reads this constant rather than
+///    restating it).
+///
+/// One nanosecond more is a `400 bad_data` echoing the value the user
+/// sent, never a clamped value: someone asking for a stupid number gets
+/// told plainly rather than silently handed a different answer.
+///
+/// **A DELIBERATE DIVERGENCE — the only limit here that is ours rather
+/// than the reference's.** grafana/loki v3.7.4 accepts an offset and a
+/// range anywhere in the `i64` nanosecond domain, and bounds no query
+/// span at all — measured on the digest-pinned oracle:
+/// `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) is a 200 there, as
+/// is `offset -9223372036854775808ns` (`i64::MIN`), and `[2562047h]` (a
+/// 292-year window) is a 200. Retention is days to months and nobody
+/// queries five years of logs, so this refuses nothing a real deployment
+/// does while removing the whole class of absurd-input arithmetic that
+/// issue #343 chased down four successive layers. Ledgered as
+/// `five-year-span-cap` in docs/benchmarks/logs-differential-ledger.md.
+///
+/// Same status as [`MAX_QUERY_BYTES`] — `400 bad_data` — and the two
+/// literal forms are enforced at the same layer it is, the parser, so no
+/// entry point can skip them.
+pub const MAX_QUERY_SPAN_NS: i64 = 157_680_000_000_000_000;
+
+/// [`MAX_QUERY_SPAN_NS`] in whole hours (43,800) — the figure the
+/// rejection messages quote. Derived, so the constant and every message
+/// that names it cannot drift apart.
+pub const MAX_QUERY_SPAN_HOURS: i64 = MAX_QUERY_SPAN_NS / 3_600_000_000_000;
+
 /// A query string that has passed the [`MAX_QUERY_BYTES`] admission check.
 ///
 /// The field is private to this module and [`CheckedQuery::new`] is the

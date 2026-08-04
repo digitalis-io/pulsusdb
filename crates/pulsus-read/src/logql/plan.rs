@@ -930,10 +930,44 @@ pub struct ProbePlan {
 /// Plans `expr` into a [`Plan`]. See the module docs for the two-phase
 /// split with stage 2/3 SQL generation.
 pub fn plan(expr: &Expr, p: &QueryParams, ctx: &PlanCtx<'_>) -> Result<Plan, ReadError> {
+    check_query_span(p)?;
     match expr {
         Expr::Log(log_expr) => Ok(Plan::Streams(streams_plan(log_expr, p, ctx)?)),
         Expr::Metric(metric_expr) => plan_metric_expr(metric_expr, p, ctx),
     }
+}
+
+/// **The 5-year rule, place 3 of 3** (issue #343, owner mandate): the
+/// query's own `start`-to-`end` span may not exceed
+/// [`pulsus_logql::MAX_QUERY_SPAN_NS`] — the SAME constant the parser
+/// bounds `offset` and `[range]` against, read rather than restated.
+///
+/// This is the place the parser cannot reach, and the one that closes the
+/// remaining hole: a `start` in 1677 with an ordinary `offset 1h` is
+/// otherwise accepted and still walks off the representable timestamp
+/// domain.
+///
+/// Run once in [`plan`], so it covers streams and metric queries alike.
+/// An [`QuerySpec::Instant`] has no span to bound — its window is
+/// `[at - range, at]`, and `range` is capped in the parser. `start > end`
+/// is left alone here (an empty grid, handled downstream); only the
+/// MAGNITUDE is bounded, computed in `i128` so the subtraction cannot
+/// overflow before it is judged.
+fn check_query_span(p: &QueryParams) -> Result<(), ReadError> {
+    let QuerySpec::Range {
+        start_ns, end_ns, ..
+    } = p.spec
+    else {
+        return Ok(());
+    };
+    let span = i128::from(end_ns) - i128::from(start_ns);
+    if span > i128::from(pulsus_logql::MAX_QUERY_SPAN_NS) {
+        return Err(ReadError::QuerySpanTooLong {
+            value: span,
+            max: pulsus_logql::MAX_QUERY_SPAN_NS,
+        });
+    }
+    Ok(())
 }
 
 /// Dispatches a metric expression: a (vector-agg-wrapped) range
@@ -3786,45 +3820,55 @@ mod tests {
         assert_eq!(mp.end_ns - mp.start_ns, plain.end_ns - plain.start_ns);
     }
 
-    /// A colossal offset the reference accepts (`offset 100000h`) shifts
-    /// both bounds by its exact amount and answers empty against 1970
-    /// data — no error, no wrap, and no rejection surface the reference
-    /// does not have.
+    /// The LARGEST offset that exists — `offset 43800h`, the 5-year cap —
+    /// shifts both bounds by its exact amount and answers empty against
+    /// 1970 data. No error, no wrap, no clamp.
     ///
-    /// **This one is REPRESENTABLE** (`0 - 3.6e17` is far inside `i64`),
-    /// which is why it never exercised the rail: the shipped
+    /// **This one is REPRESENTABLE** (`0 - 1.5768e17` is far inside
+    /// `i64`), which is why it exercises no rail: the shipped
     /// `saturating_sub` and today's `checked_sub` agree here exactly. The
-    /// rail behaviour it was once named for is owned by
+    /// rail behaviour is owned by
     /// [`offset_off_the_timestamp_axis_plans_the_degenerate_empty_window`]
-    /// below.
+    /// below, which needs a near-rail REQUEST rather than a large offset —
+    /// the cap makes that the only way to reach it.
     #[test]
-    fn a_colossal_offset_shifts_exactly_rather_than_erroring() {
+    fn the_largest_accepted_offset_shifts_exactly_rather_than_erroring() {
         let mp = metric_mp(
-            r#"count_over_time({env="prod"}[5m] offset 100000h)"#,
+            r#"count_over_time({env="prod"}[5m] offset 43800h)"#,
             QuerySpec::Instant { at_ns: 0 },
         )
         .unwrap();
-        assert!(!mp.empty_domain, "100000h back from 1970 is representable");
-        assert_eq!(mp.end_ns, -(100_000 * HOUR_NS), "T - d, exactly");
+        assert!(!mp.empty_domain, "5 years back from 1970 is representable");
+        assert_eq!(
+            mp.end_ns,
+            -pulsus_logql::MAX_QUERY_SPAN_NS,
+            "T - d, exactly"
+        );
         assert_eq!(mp.start_ns, mp.end_ns - FIVE_MIN_NS);
     }
 
     /// Issue #343 boundary fix: when the shift leaves the representable
     /// timestamp axis the planner substitutes the DEGENERATE empty
     /// evaluation domain and raises `empty_domain` — it does NOT clamp
-    /// onto the `i64` rail (which relocated the window: a 2026 query
-    /// scanned `timestamp_ns > 223372036854775807`, a 1977-01-08 floor)
-    /// and it does NOT refuse (the reference serves every one of these).
+    /// onto the `i64` rail (which relocated the window) and it does NOT
+    /// refuse (an ordinary offset over a near-rail request is a legitimate
+    /// query).
     ///
-    /// Both spec shapes and both rails, plus a representable control so
-    /// the substitution cannot be reached by every plan.
+    /// **THE 5-YEAR CAPS DO NOT MAKE THIS UNREACHABLE, and that is the
+    /// point of the cases chosen.** The caps bound `offset`, `[range]` and
+    /// the query SPAN — none of them bounds where on the axis the request
+    /// SITS. `start`/`end`/`time` are plain `i64` nanoseconds at the API
+    /// (`logs_api::params::parse_ts` accepts the whole domain), so a
+    /// request within 5 years of a rail plus an ORDINARY offset still
+    /// leaves it. Both cases below use a 1-hour offset and a 60-second
+    /// span; only the request's position is extreme.
     #[test]
     fn offset_off_the_timestamp_axis_plans_the_degenerate_empty_window() {
-        // Instant, high rail: `T - (-9e18)` overflows.
+        // Instant, high rail: `at` one hour below MAX, shifted forward.
         let instant = metric_mp(
-            r#"count_over_time({env="prod"}[2500000h] offset -2500000h)"#,
+            r#"count_over_time({env="prod"}[5m] offset -1h)"#,
             QuerySpec::Instant {
-                at_ns: 1_780_000_000_000_000_000,
+                at_ns: i64::MAX - HOUR_NS + 1,
             },
         )
         .unwrap();
@@ -3839,12 +3883,12 @@ mod tests {
         assert_eq!(instant.step_ns, None, "still an instant plan");
 
         // Range, low rail: `i64::MIN - 1h` underflows on the START bound
-        // alone — one failing bound is enough.
+        // alone — one failing bound is enough. The span is 60s.
         let range = metric_mp(
             r#"count_over_time({env="prod"}[5m] offset 1h)"#,
             QuerySpec::Range {
                 start_ns: i64::MIN,
-                end_ns: 0,
+                end_ns: i64::MIN + 60_000_000_000,
                 step_ns: FIVE_MIN_NS as u64,
             },
         )
@@ -3870,6 +3914,56 @@ mod tests {
         .unwrap();
         assert!(!ok.empty_domain);
         assert_eq!(ok.end_ns, 100 * HOUR_NS - HOUR_NS);
+    }
+
+    /// **The 5-year rule, place 3 of 3** (issue #343, owner mandate): the
+    /// query's own `start`-to-`end` span. Checked once in [`plan`], so it
+    /// covers streams and metric queries alike, against the SAME
+    /// `pulsus_logql::MAX_QUERY_SPAN_NS` the parser bounds `offset` and
+    /// `[range]` against.
+    ///
+    /// This is the place the parser cannot see and the one that closes the
+    /// remaining hole: a 1677 `start` with an ordinary `offset 1h` was
+    /// accepted and still walked off the representable domain. It bounds
+    /// the SPAN only — a near-rail request of ordinary width stays legal,
+    /// which is why the degenerate-window path above is still reachable.
+    #[test]
+    fn a_query_span_over_five_years_is_refused() {
+        const CAP: i64 = pulsus_logql::MAX_QUERY_SPAN_NS;
+        let spec = |start_ns: i64, end_ns: i64| QuerySpec::Range {
+            start_ns,
+            end_ns,
+            step_ns: FIVE_MIN_NS as u64,
+        };
+        // At the cap: accepted.
+        metric_mp(r#"count_over_time({env="prod"}[5m])"#, spec(0, CAP)).expect("exactly 5 years");
+        // One nanosecond over: refused, for a metric query...
+        assert!(matches!(
+            metric_mp(r#"count_over_time({env="prod"}[5m])"#, spec(0, CAP + 1)),
+            Err(ReadError::QuerySpanTooLong { .. })
+        ));
+        // ...and for a plain streams query, which never reaches
+        // `metric_plan` at all.
+        assert!(matches!(
+            plan_at(r#"{env="prod"}"#, spec(0, CAP + 1)),
+            Err(ReadError::QuerySpanTooLong { .. })
+        ));
+        // The 1677 hole, closed: the span is what refuses it, not the
+        // offset (which is an ordinary hour).
+        assert!(matches!(
+            metric_mp(
+                r#"count_over_time({env="prod"}[5m] offset 1h)"#,
+                spec(i64::MIN, 0)
+            ),
+            Err(ReadError::QuerySpanTooLong { .. })
+        ));
+        // An INSTANT query has no span to bound, so a near-rail `at` is
+        // still planned — the degenerate-window path stays live.
+        metric_mp(
+            r#"count_over_time({env="prod"}[5m])"#,
+            QuerySpec::Instant { at_ns: i64::MAX },
+        )
+        .expect("an instant query carries no span");
     }
 
     /// The shared scan and the variant windows of one `variants(...)`
