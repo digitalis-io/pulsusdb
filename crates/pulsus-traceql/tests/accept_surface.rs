@@ -54,7 +54,24 @@ struct DivergenceClass {
     /// `open` — still diverging, with probes to prove it. `closed` — fixed,
     /// and required to have NO diverging probe left, which is what turns
     /// "we closed it" into an assertion rather than a claim.
+    ///
+    /// **This is the PARSE axis** (`parse ∘ validate`, what
+    /// [`accepts`] measures). A class closed here may still be open on
+    /// the wire — see [`DivergenceClass::wire_status`].
     status: String,
+    /// The WIRE axis (`parse → validate → plan`), present only on a
+    /// class whose two axes disagree (issue #335 Stage C: D7). Held to
+    /// the same teeth as `status`, one axis over:
+    /// [`a_class_open_on_the_wire_has_a_probe_still_diverging_there`]
+    /// joins this against the committed `wire_baseline.json` column, so
+    /// the field cannot become a comfortable sentence.
+    #[serde(default)]
+    wire_status: Option<String>,
+    /// Why the two axes disagree, in the class row rather than only in
+    /// PROVENANCE.md — a reader meeting `status: "closed"` must not have
+    /// to go looking. Required (and non-empty) whenever `wire_status` is.
+    #[serde(default)]
+    wire_note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,9 +169,25 @@ struct ClosedMeaningProbe {
 /// The direction claim is checked in the DIFF, not inferred here: the
 /// re-pin commit changes 19 `"verdict"` lines, every one `diverge` →
 /// `agree`.
+///
+/// Stage C (#335), the aggregate argument: `parse_aggregate` takes a
+/// full field expression and `validate` gained rule 11 (numeric-or-
+/// attribute AND references the span), so **D7**'s 4 probes flip
+/// diverge→agree — `AGREE` 217 + 4 = 221 and `DIVERGE` 4 − 0 = 0 — and
+/// two both-reject probes (`avg(1)`, `avg("x")`) move their rejection
+/// from the parser to the validator without changing verdict.
+///
+/// **`DIVERGE == 0` is a statement about the PARSE axis and nothing
+/// more.** D7 is not closed for a user: on the wire
+/// (`parse → validate → plan`, `pulsus-read/tests/accept_surface_wire.rs`)
+/// three of its four probes are still planner 400s against a reference
+/// 2xx — `avg(span:childCount)` and `avg(trace:duration)` have no
+/// numeric aggregation path and `avg(.a + 1)` is a composite source. The
+/// class row carries `wire_status: "open"` saying so. Read this constant
+/// as "the grammar agrees", never as "these queries work".
 const TOTAL: usize = 221;
-const AGREE: usize = 217;
-const DIVERGE: usize = 4;
+const AGREE: usize = 221;
+const DIVERGE: usize = 0;
 const MEANING: usize = 6;
 const CLOSED_MEANING: usize = 7;
 
@@ -315,6 +348,101 @@ fn every_divergence_carries_a_class_and_every_class_is_used() {
     }
 }
 
+/// The wire axis's half of the class-status teeth (issue #335 Stage C,
+/// plan v3 AC 2: *no class may be `wire_status: "closed"` while any
+/// probe diverges on that axis*).
+///
+/// **Why it is needed at all.** Stage C closes D7 on the parse axis and
+/// leaves it open on the wire, so `matrix.json` gained a `wire_status`
+/// field — and a status field with no assertion behind it is the exact
+/// shape this issue has paid for repeatedly. This is the assertion.
+///
+/// **What it can and cannot see.** It joins against the COMMITTED
+/// `pulsus_wire` column in `wire_baseline.json`, because
+/// `parse → validate → plan` is unreachable from this crate (the cargo
+/// edge runs the other way). That column is itself re-derived from the
+/// tree under test, per probe, by
+/// `pulsus-read/tests/accept_surface_wire.rs` — so the two together
+/// bind the status to the planner's real behaviour, and neither alone
+/// does. Stated rather than assumed: if that suite is deleted, this one
+/// degrades to checking a file against a file.
+#[test]
+fn a_class_open_on_the_wire_has_a_probe_still_diverging_there() {
+    #[derive(Deserialize)]
+    struct WireBaseline {
+        wire_baseline: Vec<WireProbe>,
+    }
+    #[derive(Deserialize)]
+    struct WireProbe {
+        query: String,
+        pulsus_wire: String,
+    }
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("accept_surface")
+        .join("wire_baseline.json");
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let wire: WireBaseline = serde_json::from_str(&raw).expect("wire_baseline.json must parse");
+    let m = matrix();
+
+    let diverges_on_wire = |query: &str| -> bool {
+        let probe = m
+            .accept_surface_probes
+            .iter()
+            .find(|p| p.query == query)
+            .unwrap_or_else(|| panic!("{query:?} is in the wire baseline but not the matrix"));
+        wire.wire_baseline
+            .iter()
+            .find(|w| w.query == query)
+            .map(|w| w.pulsus_wire != probe.reference)
+            .unwrap_or_else(|| panic!("{query:?} has no wire baseline entry"))
+    };
+
+    for c in &m.divergence_classes {
+        let Some(wire_status) = &c.wire_status else {
+            continue;
+        };
+        assert!(
+            c.wire_note.as_ref().is_some_and(|n| !n.trim().is_empty()),
+            "class {}: wire_status needs its wire_note",
+            c.id
+        );
+        // A probe belongs to the class through `class` (still diverging
+        // on the parse axis) or `closed_class` (closed there) — the
+        // wire question is asked of both.
+        let members: Vec<&str> = m
+            .accept_surface_probes
+            .iter()
+            .filter(|p| {
+                p.class.as_deref() == Some(c.id.as_str())
+                    || p.closed_class.as_deref() == Some(c.id.as_str())
+            })
+            .map(|p| p.query.as_str())
+            .collect();
+        let diverging = members
+            .iter()
+            .filter(|q| diverges_on_wire(q))
+            .collect::<Vec<_>>();
+        match wire_status.as_str() {
+            "open" => assert!(
+                !diverging.is_empty(),
+                "class {} is recorded wire-open but every one of its {} probes now agrees on \
+                 the wire — close it, and say so in the re-pin",
+                c.id,
+                members.len()
+            ),
+            "closed" => assert!(
+                diverging.is_empty(),
+                "class {} is recorded wire-closed but {} probe(s) still diverge there: {:?}",
+                c.id,
+                diverging.len(),
+                diverging
+            ),
+            other => panic!("class {}: bad wire_status {other:?}", c.id),
+        }
+    }
+}
+
 /// **The oracle column is frozen independently of the file that holds
 /// it.** Every other gate here compares our verdicts against
 /// `matrix.json`'s `reference` column, so all of them pass if that column
@@ -450,6 +578,8 @@ fn stage_b_not_absence_meaning_probes_are_captured() {
 /// | `illegal-unary-operator` (`!` takes a boolean, `-` a number) | 12 |
 /// | `illegal-operator` (operator legal for both operand types) | 7 |
 /// | `invalid-regex-operand` (`=~`/`!~` needs a string literal) | 1 |
+/// | `aggregate-not-numeric` (rule 11's type half — Stage C) | 1 |
+/// | `aggregate-not-span-referencing` (rule 11's span half — Stage C) | 1 |
 ///
 /// Counts are asserted as a TOTAL, not per rule: which rule catches a
 /// given query is an implementation detail that may legitimately shift
@@ -458,12 +588,17 @@ fn stage_b_not_absence_meaning_probes_are_captured() {
 #[test]
 fn every_parse_axis_flip_is_explained_by_the_class_list() {
     /// The parse→validate class list, by `ValidateError::rule_id`.
-    const MOVED_TO_VALIDATE: [&str; 5] = [
+    const MOVED_TO_VALIDATE: [&str; 7] = [
         "type-mismatch",
         "illegal-operator",
         "invalid-regex-operand",
         "spanset-filter-not-boolean",
         "illegal-unary-operator",
+        // Stage C: `parse_aggregate` no longer screens its argument
+        // against an aggregatable-intrinsic allowlist, so `avg(1)` and
+        // `avg("x")` are rule-11 rejections instead of parse errors.
+        "aggregate-not-numeric",
+        "aggregate-not-span-referencing",
     ];
     let m = matrix();
     let mut flips = 0usize;
@@ -487,7 +622,7 @@ fn every_parse_axis_flip_is_explained_by_the_class_list() {
         unexplained.len(),
         unexplained.join("\n")
     );
-    assert_eq!(flips, 70, "the parse-axis flip set moved");
+    assert_eq!(flips, 72, "the parse-axis flip set moved");
 }
 
 /// Closure is proved, not asserted: our parse of the bare query must equal

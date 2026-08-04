@@ -138,11 +138,84 @@ jobs:
   # than as this gate firing on exactly the change it was built to catch.
   #
   # As its own job it blocks nothing else: `ci` and the e2e legs run and
-  # report normally, and this reports red on its own. A deliberate re-pin
-  # is expected to merge with this job red, by human override. There is
+  # report normally, and this reports red on its own. There is
   # deliberately no opt-out marker — a marker is a box that anyone
   # editing the baseline quietly would also tick, which is the behaviour
   # the gate exists to prevent.
+  #
+  # ISSUE #335 STAGE C — the baseline is DIRECTIONAL, not immutable.
+  #
+  # Gate 3 used to fail on any movement, so a legitimate improvement
+  # merged with this job red "by human override". That taught the next
+  # reader that the freeze is negotiable, which is the failure mode plan
+  # v10 named. It is now a rule with a direction, which is not a
+  # loosening:
+  #
+  #   the baseline may move only toward FEWER divergences — never toward
+  #   more, and never by a probe that agreed on `origin/main` diverging
+  #   here.
+  #
+  # Why a decrease is safe to allow. The freeze exists to stop a POISONED
+  # baseline: numbers measured after a change, so broken code agrees with
+  # itself. A decrease cannot express that — it is strictly more
+  # agreement with the reference, and the reference column is
+  # `matrix.json`'s, which this job reads from `origin/main` and which
+  # the hermetic
+  # `accept_surface.rs::the_reference_column_is_frozen_against_silent_re_pinning`
+  # digest independently forbids a PR to move. Only OUR side can move
+  # here, and only toward the oracle. An increase stays forbidden and is
+  # exactly what the freeze catches.
+  #
+  # The clauses are complementary, per plan v5: the per-probe clause
+  # blocks the compensating swap (two probes trading places leaves every
+  # total right), and the totals clause bounds what the per-probe one
+  # cannot see — a probe ADDED to the baseline already diverging has no
+  # prior state to move from.
+  #
+  # THE PROBE KEY, and why the first version of this rule was bypassable
+  # (Stage C review). A probe's identity is its `query` string, and the
+  # first cut both trusted that field to be stable and used list LENGTH
+  # as set cardinality. That let a PR substitute probes: delete an
+  # agreeing probe A, add a duplicate of a diverging probe B, then
+  # improve B and regress A. Nothing "moved" — A was simply not there to
+  # be looked at — and the length was unchanged, so both clauses passed
+  # while the baseline quietly lost A's coverage. The key is therefore
+  # treated as a SET, not a list:
+  #
+  #   * every key on `origin/main` must still be present at HEAD, so a
+  #     rename, a replacement or a deletion is a failure, not a silence;
+  #   * keys must be unique at HEAD, so a duplicate cannot pad the count
+  #     back up;
+  #   * both divergence totals are computed BY THE JOIN, from the probe
+  #     data and the oracle, never from `length` and never from the
+  #     committed constants (which are separately checked to move in the
+  #     same direction);
+  #   * the oracle is `origin/main`'s `matrix.json`, WITH NO FALLBACK to
+  #     this branch's. A probe with no reference row on main is
+  #     unscoreable and fails. The first cut fell back to HEAD's matrix
+  #     for unknown keys, which let a PR add a diverging probe together
+  #     with the reference row that scores it — a PR picking its own
+  #     oracle, which is exactly what this rule denies. The deliberate
+  #     consequence: adding a probe and moving the baseline cannot be the
+  #     same PR. Land the probe with its oracle row, then move the
+  #     baseline.
+  #   * duplicate probe keys fail in EVERY file a join is built from —
+  #     this branch's baseline, origin/main's baseline, and both
+  #     matrices. `jq`'s `from_entries` keeps the LAST value for a
+  #     repeated key without complaining, so a duplicate does not break
+  #     the join, it silently decides it; a check that covers three of
+  #     the four inputs leaves the fourth deciding.
+  #
+  # STATED EDGE: the totals are scored with origin/main's oracle column
+  # for every key main knows. A deliberate ORACLE re-pin (the reference
+  # container re-measured, `REFERENCE_DIGEST` moved) can therefore make
+  # this job red even though our side did not regress. That is the
+  # intended behaviour — an oracle move is exactly when a human should
+  # look — and it is written down here rather than discovered.
+  #
+  # Gates 2 (no source alongside creation), 4 (ordering — no source
+  # before the baseline exists) and the hermetic re-derivation are
+  # untouched by this and still stand exactly as B0 left them.
   wire-baseline-freeze:
     runs-on: ubuntu-latest
     steps:
@@ -150,17 +223,148 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Wire-baseline freeze gates (issue 335 B0)
+      - name: Wire-baseline freeze gates (issue 335 B0, direction rule Stage C)
         run: |
           set -u
           BASELINE=crates/pulsus-traceql/tests/accept_surface/wire_baseline.json
+          MATRIX=crates/pulsus-traceql/tests/accept_surface/matrix.json
           CHANGED=$(git diff --name-only origin/main...HEAD)
           SRC=$(printf '%s\n' "$CHANGED" \
             | grep -E '^crates/.+/src/|(^|/)build\.rs$|^Cargo\.lock$|(^|/)Cargo\.toml$|^rust-toolchain\.toml$' || true)
           if git cat-file -e origin/main:"$BASELINE" 2>/dev/null; then
             if [ -n "$(git diff --name-only origin/main...HEAD -- "$BASELINE")" ]; then
-              echo "::error::the frozen wire baseline moved — only a deliberate #351 re-pin may do this, and it merges with this step red"
-              exit 1
+              # The baseline moved. It may only have moved toward fewer
+              # divergences. Both "before" sides come from origin/main —
+              # the baseline it is measured against AND the oracle column
+              # it is scored with — so nothing this PR contains can
+              # decide its own verdict here.
+              TMP=$(mktemp -d)
+              git show origin/main:"$BASELINE" > "$TMP/old_baseline.json"
+              git show origin/main:"$MATRIX" > "$TMP/old_matrix.json"
+
+              # Clause 0, the KEY SET. Everything below joins on the probe
+              # query, so the join has to be total and one-to-one before
+              # any verdict computed through it means anything. `jq`'s
+              # from_entries silently keeps the LAST value for a repeated
+              # key, so a duplicate does not error — it quietly decides
+              # which row wins. Both sides of the join are checked.
+              DUPLICATED=$(jq -r '
+                [ .wire_baseline[].query ] | group_by(.)
+                | map(select(length > 1) | .[0]) | .[]' "$BASELINE")
+              if [ -n "$DUPLICATED" ]; then
+                echo "::error::the wire baseline has duplicate probe keys — a probe's query IS its identity here, and a duplicate can pad the probe count back up after a deletion (issue 335 Stage C direction rule):"
+                printf '%s\n' "$DUPLICATED"
+                exit 1
+              fi
+              DUP_OLD_BASELINE=$(jq -r '
+                [ .wire_baseline[].query ] | group_by(.)
+                | map(select(length > 1) | .[0]) | .[]' "$TMP/old_baseline.json")
+              if [ -n "$DUP_OLD_BASELINE" ]; then
+                echo "::error::origin/main's wire_baseline.json has duplicate probe keys — the \$before map the MISSING and REGRESSED clauses join on would silently keep one row per key (issue 335 Stage C direction rule):"
+                printf '%s\n' "$DUP_OLD_BASELINE"
+                exit 1
+              fi
+              DUP_ORACLE=$(jq -r '
+                [ .accept_surface_probes[].query ] | group_by(.)
+                | map(select(length > 1) | .[0]) | .[]' "$TMP/old_matrix.json")
+              if [ -n "$DUP_ORACLE" ]; then
+                echo "::error::origin/main's matrix.json has duplicate probe keys — the oracle map this gate joins on would silently keep one row per key (issue 335 Stage C direction rule):"
+                printf '%s\n' "$DUP_ORACLE"
+                exit 1
+              fi
+              DUP_HEAD_ORACLE=$(jq -r '
+                [ .accept_surface_probes[].query ] | group_by(.)
+                | map(select(length > 1) | .[0]) | .[]' "$MATRIX")
+              if [ -n "$DUP_HEAD_ORACLE" ]; then
+                echo "::error::this branch's matrix.json has duplicate probe keys — the same silent last-wins join feeds the hermetic wire suite (issue 335 Stage C direction rule):"
+                printf '%s\n' "$DUP_HEAD_ORACLE"
+                exit 1
+              fi
+              MISSING=$(jq -r --slurpfile new "$BASELINE" '
+                ([ $new[0].wire_baseline[].query ]
+                   | map({key: ., value: true}) | from_entries) as $have
+                | [ .wire_baseline[].query | select(($have[.] // false) | not) ]
+                | .[]' "$TMP/old_baseline.json")
+              if [ -n "$MISSING" ]; then
+                echo "::error::the wire baseline dropped probes present on origin/main — renaming, replacing or deleting a probe retires whatever it was showing; every origin/main key must still be present (issue 335 Stage C direction rule):"
+                printf '%s\n' "$MISSING"
+                exit 1
+              fi
+              # THE ORACLE IS origin/main's, WITH NO FALLBACK. Every probe
+              # in the baseline must have a reference verdict THERE; a
+              # probe whose only oracle row is on this branch is
+              # unscoreable and fails. An earlier cut fell back to HEAD's
+              # matrix for keys main did not know, which handed a PR the
+              # ability to add a diverging probe together with the
+              # reference row that scores it — the very thing the
+              # "both before-sides come from origin/main" rule exists to
+              # deny (Stage C review, [medium]).
+              #
+              # The consequence is deliberate: ADDING a probe and MOVING
+              # the baseline cannot happen in one PR. Land the probe with
+              # its oracle row first, then move the baseline.
+              UNJOINABLE=$(jq -r \
+                --slurpfile omtx "$TMP/old_matrix.json" '
+                  ($omtx[0].accept_surface_probes
+                     | map({key: .query, value: .reference}) | from_entries) as $oref
+                  | [ .wire_baseline[].query | select($oref[.] == null) ]
+                  | .[]' "$BASELINE")
+              if [ -n "$UNJOINABLE" ]; then
+                echo "::error::wire baseline probes with no reference verdict on origin/main — the oracle comes from origin/main with no fallback, so a probe added in this PR cannot be scored by a reference row this PR also supplies; land the probe first, move the baseline after (issue 335 Stage C direction rule):"
+                printf '%s\n' "$UNJOINABLE"
+                exit 1
+              fi
+
+              # Clause 1, per probe: nothing that AGREED on origin/main
+              # may diverge here. Scored against origin/main's reference
+              # column, never this PR's.
+              REGRESSED=$(jq -r \
+                --slurpfile old "$TMP/old_baseline.json" \
+                --slurpfile mtx "$TMP/old_matrix.json" '
+                  ($mtx[0].accept_surface_probes
+                     | map({key: .query, value: .reference}) | from_entries) as $ref
+                  | ($old[0].wire_baseline
+                     | map({key: .query, value: .pulsus_wire}) | from_entries) as $before
+                  | [ .wire_baseline[]
+                      | select(($ref[.query] != null) and ($before[.query] != null))
+                      | select($before[.query] == $ref[.query] and .pulsus_wire != $ref[.query])
+                      | .query ]
+                  | .[]' "$BASELINE")
+              if [ -n "$REGRESSED" ]; then
+                echo "::error::the wire baseline moved the WRONG WAY — these probes agreed with the reference on origin/main and diverge here; the baseline may only move toward fewer divergences (issue 335 Stage C direction rule):"
+                printf '%s\n' "$REGRESSED"
+                exit 1
+              fi
+
+              # Clause 2, the totals — DERIVED BY THE JOIN, from the probe
+              # data and the oracle, never from `length` and never from the
+              # committed constants. Bounds what clause 1 cannot see: a
+              # probe added here has no prior state to move from.
+              OLD_DERIVED=$(jq -r --slurpfile mtx "$TMP/old_matrix.json" '
+                ($mtx[0].accept_surface_probes
+                   | map({key: .query, value: .reference}) | from_entries) as $ref
+                | [ .wire_baseline[]
+                    | select($ref[.query] != null)
+                    | select(.pulsus_wire != $ref[.query]) ] | length' "$TMP/old_baseline.json")
+              NEW_DERIVED=$(jq -r --slurpfile omtx "$TMP/old_matrix.json" '
+                ($omtx[0].accept_surface_probes
+                   | map({key: .query, value: .reference}) | from_entries) as $ref
+                | [ .wire_baseline[] | select(.pulsus_wire != $ref[.query]) ]
+                | length' "$BASELINE")
+              if [ "$NEW_DERIVED" -gt "$OLD_DERIVED" ]; then
+                echo "::error::the wire baseline's derived divergence count rose ($OLD_DERIVED -> $NEW_DERIVED) — the baseline may only move toward fewer divergences (issue 335 Stage C direction rule)"
+                exit 1
+              fi
+              # The committed constants must move the same way as the data
+              # they claim to summarise.
+              OLD_DIVERGE=$(jq -r '.WIRE_DIVERGE_BASELINE' "$TMP/old_baseline.json")
+              NEW_DIVERGE=$(jq -r '.WIRE_DIVERGE_BASELINE' "$BASELINE")
+              if [ "$NEW_DIVERGE" -gt "$OLD_DIVERGE" ]; then
+                echo "::error::the wire baseline's committed WIRE_DIVERGE_BASELINE rose ($OLD_DIVERGE -> $NEW_DIVERGE) — the baseline may only move toward fewer divergences (issue 335 Stage C direction rule)"
+                exit 1
+              fi
+              KEYS=$(jq -r '[ .wire_baseline[].query ] | unique | length' "$BASELINE")
+              echo "wire baseline moved toward agreement: derived diverge $OLD_DERIVED -> $NEW_DERIVED (committed $OLD_DIVERGE -> $NEW_DIVERGE) over $KEYS unique probe keys, every origin/main key still present, none regressed"
             fi
           else
             if printf '%s\n' "$CHANGED" | grep -qx "$BASELINE"; then

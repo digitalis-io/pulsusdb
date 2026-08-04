@@ -8,8 +8,10 @@ Query {
         Aggregate {
             op: Max,
             field: Some(
-                Intrinsic(
-                    Duration,
+                Field(
+                    Intrinsic(
+                        Duration,
+                    ),
                 ),
             ),
             cmp: Lte,

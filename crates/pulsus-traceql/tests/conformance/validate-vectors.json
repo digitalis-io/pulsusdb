@@ -479,6 +479,112 @@
    "error_variant": "illegal-unary-operator"
   },
   {
+   "id": "agg-a1",
+   "check": "aggregate-not-numeric",
+   "query": "{} | avg(span:childCount) > 1",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "agg-a2",
+   "check": "aggregate-not-numeric",
+   "query": "{} | avg(instrumentation:name) > 1",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "agg-r1",
+   "check": "aggregate-not-numeric",
+   "query": "{} | avg(\"x\") > 1",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "aggregate-not-numeric"
+  },
+  {
+   "id": "agg-r2",
+   "check": "aggregate-not-numeric",
+   "query": "{} | avg(name) > 1",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "aggregate-not-numeric"
+  },
+  {
+   "id": "agg-r3",
+   "check": "aggregate-not-numeric",
+   "query": "{} | min(status) > 1",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "aggregate-not-numeric"
+  },
+  {
+   "id": "agg-r4",
+   "check": "aggregate-not-numeric",
+   "query": "{} | avg(.a = 1) > 1",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "aggregate-not-numeric"
+  },
+  {
+   "id": "aggspan-a1",
+   "check": "aggregate-not-span-referencing",
+   "query": "{} | avg(.a + 1) > 1",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "aggspan-a2",
+   "check": "aggregate-not-span-referencing",
+   "query": "{} | avg(trace:duration) > 1s",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "aggspan-r1",
+   "check": "aggregate-not-span-referencing",
+   "query": "{} | avg(1) > 1",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "aggregate-not-span-referencing"
+  },
+  {
+   "id": "aggspan-r2",
+   "check": "aggregate-not-span-referencing",
+   "query": "{} | avg(1s) > 1s",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "aggregate-not-span-referencing"
+  },
+  {
+   "id": "aggspan-r3",
+   "check": "aggregate-not-span-referencing",
+   "query": "{} | sum(-1) > 1",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "aggregate-not-span-referencing"
+  },
+  {
    "id": "nil-d1",
    "check": "intrinsic-not-nil",
    "query": "{ !(name != nil) }",

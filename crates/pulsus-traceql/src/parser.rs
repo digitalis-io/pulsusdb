@@ -951,9 +951,23 @@ fn is_metric_fn_name(name: &str) -> bool {
     )
 }
 
-/// `count() Cmp Value` (zero-arity) or `avg|sum|min|max(AggField) Cmp
-/// Value` (one-arity, numeric-aggregatable fields only) — every
-/// malformed arity is a positioned error (plan v2 F5).
+/// `count() Cmp Value` (zero-arity) or `avg|sum|min|max(FieldExpr) Cmp
+/// Value` (one-arity) — every malformed arity is a positioned error
+/// (plan v2 F5).
+///
+/// **The argument is a full field expression** (issue #335 Stage C, D7).
+/// The reference parses an ordinary operand there and decides legality
+/// in its validator: `avg(span:childCount)`, `avg(trace:duration)`,
+/// `avg(.a + 1)` and `avg((.a))` are all measured 200s against the
+/// pinned digest, while `avg(1)` and `avg("x")` are 400s whose messages
+/// name the parsed subexpression and carry no position — the semantic
+/// signature. So the intrinsic blocklist that used to live here is gone;
+/// `validate.rs` rule 11 holds the same rejections, and the search
+/// planner holds the shapes it cannot execute.
+///
+/// The argument gets a FRESH recursion/`&&`-budget, like `compare()`'s
+/// inner filter: it is a self-contained expression, not a continuation
+/// of the spanset filter's.
 fn parse_aggregate(
     cursor: &mut Cursor<'_>,
     op: AggregateOp,
@@ -973,42 +987,10 @@ fn parse_aggregate(
                     span,
                 });
             }
-            let (field, field_span) = parse_field(cursor)?;
-            // Non-numerically-aggregatable intrinsics: the string/enum
-            // fields plus every issue #184 trace-level/scoped intrinsic
-            // (`avg(rootName)`, `sum(statusMessage)`, `max(span:childCount)`
-            // — numeric aggregation of childCount/traceDuration is out of
-            // scope). `duration`/`nestedSet*` stay aggregatable.
-            if matches!(
-                field,
-                Field::Intrinsic(
-                    Intrinsic::Name
-                        | Intrinsic::Status
-                        | Intrinsic::Kind
-                        | Intrinsic::StatusMessage
-                        | Intrinsic::ChildCount
-                        | Intrinsic::SpanId
-                        | Intrinsic::ParentId
-                        | Intrinsic::TraceId
-                        | Intrinsic::TraceDuration
-                        | Intrinsic::RootName
-                        | Intrinsic::RootServiceName
-                        | Intrinsic::InstrumentationName
-                        | Intrinsic::InstrumentationVersion
-                        | Intrinsic::EventName
-                        | Intrinsic::EventTimeSinceStart
-                        | Intrinsic::LinkSpanId
-                        | Intrinsic::LinkTraceId
-                )
-            ) {
-                return Err(TraceQlError::UnexpectedToken {
-                    found: format!("identifier {:?}", field.to_string()),
-                    expected: "an aggregatable field (duration or an attribute)".to_string(),
-                    span: field_span,
-                });
-            }
+            let mut inner_nodes = 0usize;
+            let expr = parse_field_expr(cursor, 0, &mut inner_nodes)?;
             cursor.expect(&TokenKind::RParen, "')'")?;
-            Some(field)
+            Some(expr)
         }
     };
     let cmp = parse_comparison_op(cursor)?;
@@ -1524,21 +1506,57 @@ mod tests {
         );
     }
 
+    /// Issue #184 AC9 asserted that aggregating any trace-level or
+    /// scoped intrinsic is a PARSE error. Issue #335 Stage C (D7) moves
+    /// that decision to the validator, because the reference makes it
+    /// there — and the reference's answer is not uniform across the
+    /// group: `max(span:childCount)` and `min(traceDuration)` are 200s
+    /// (numeric), `avg(rootName)` and friends are 400s (string). A parse
+    /// rejection could not tell them apart, which is why the rule had to
+    /// move rather than be re-tuned.
+    ///
+    /// The parse side keeps a claim of its own: the argument PARSES,
+    /// carrying the field expression the validator then judges.
     #[test]
-    fn aggregating_a_trace_level_or_scoped_intrinsic_is_a_positioned_error() {
-        // AC9: numeric aggregation of these intrinsics is rejected at parse.
-        for q in [
-            r#"{} | avg(rootName)"#,
-            r#"{} | sum(statusMessage)"#,
-            r#"{} | max(span:childCount)"#,
-            r#"{} | min(traceDuration)"#,
-            r#"{} | avg(rootServiceName)"#,
+    fn every_intrinsic_aggregate_argument_now_parses_for_the_validator_to_judge() {
+        for (q, want) in [
+            (
+                r#"{} | avg(rootName) > 1"#,
+                Field::Intrinsic(Intrinsic::RootName),
+            ),
+            (
+                r#"{} | sum(statusMessage) > 1"#,
+                Field::Intrinsic(Intrinsic::StatusMessage),
+            ),
+            (
+                r#"{} | max(span:childCount) > 1"#,
+                Field::Intrinsic(Intrinsic::ChildCount),
+            ),
+            (
+                r#"{} | min(traceDuration) > 1s"#,
+                Field::Intrinsic(Intrinsic::TraceDuration),
+            ),
+            (
+                r#"{} | avg(rootServiceName) > 1"#,
+                Field::Intrinsic(Intrinsic::RootServiceName),
+            ),
         ] {
-            assert!(
-                matches!(parse(q), Err(TraceQlError::UnexpectedToken { .. })),
-                "{q}: must be a positioned aggregation error"
+            let ast = parse(q).unwrap_or_else(|e| panic!("{q}: must parse now, got {e}"));
+            let [PipelineStage::Aggregate { field, .. }] = ast.pipeline.as_slice() else {
+                panic!("{q}: expected one aggregate stage, got {:?}", ast.pipeline);
+            };
+            assert_eq!(
+                field.as_ref(),
+                Some(&FieldExpr::Field(want.clone())),
+                "{q}: the argument must reach the validator intact"
             );
         }
+        // A missing comparison is still a positioned parse error — the
+        // aggregate's trailing `cmp value` is untouched by Stage C.
+        assert!(matches!(
+            parse("{} | avg(rootName)"),
+            Err(TraceQlError::UnexpectedEof { .. })
+        ));
     }
 
     /// `{ .a = 1 && .a = 1 && ... }` with `ops` field-level `&&`
