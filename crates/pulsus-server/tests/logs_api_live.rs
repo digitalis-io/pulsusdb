@@ -1902,6 +1902,59 @@ async fn nothing_in_a_query_may_span_more_than_five_years() {
         body.contains("\"errorType\":\"bad_data\"") && body.contains("query time range of"),
         "{body}"
     );
+
+    // 3b. EVERY route that carries `start`/`end`, not just `query_range`.
+    // The SELECTOR-ONLY ones are the reason this loop exists: `/series`,
+    // `/labels` and `/label/{name}/values` never reach the planner, so the
+    // first cut of the span cap — which lived there — let a 20-year range
+    // straight through. The cap now sits in the one function all nine
+    // share (`handlers::parse_bounds`), and this is what says so.
+    let over = (base_ns - CAP_NS - 1).to_string();
+    let now = base_ns.to_string();
+    let at_cap = (base_ns - CAP_NS).to_string();
+    let mut uncapped: Vec<String> = Vec::new();
+    for (path, extra) in [
+        ("/api/logs/v1/series", vec![("match[]", r#"{env="prod"}"#)]),
+        ("/api/logs/v1/labels", vec![]),
+        ("/api/logs/v1/label/env/values", vec![]),
+        (
+            "/api/logs/v1/detected_labels",
+            vec![("query", r#"{env="prod"}"#)],
+        ),
+        (
+            "/api/logs/v1/detected_fields",
+            vec![("query", r#"{env="prod"}"#)],
+        ),
+        ("/api/logs/v1/patterns", vec![("query", r#"{env="prod"}"#)]),
+        ("/api/logs/v1/stats", vec![("query", r#"{env="prod"}"#)]),
+        ("/api/logs/v1/volume", vec![("query", r#"{env="prod"}"#)]),
+    ] {
+        let call = |start: &str| {
+            let mut params: Vec<(&str, &str)> = extra.clone();
+            params.push(("start", start));
+            params.push(("end", now.as_str()));
+            http_get(port, &q(path, &params)).expect("route reachable")
+        };
+        let res = call(&over);
+        if res.status != 400 || !res.body.contains("query time range of") {
+            uncapped.push(format!("{path} -> {} {}", res.status, res.body));
+        }
+        let res = call(&at_cap);
+        assert_eq!(
+            res.status, 200,
+            "{path} must still serve exactly 5 years: {}",
+            res.body
+        );
+    }
+    // Collected, not short-circuited: the first cut of this cap covered
+    // some of these routes by accident (through the planner) and missed
+    // others, so a loop that stopped at the first failure would have
+    // reported one name and hidden the rest.
+    assert!(
+        uncapped.is_empty(),
+        "these routes carry start/end and do NOT cap the span:\n{}",
+        uncapped.join("\n")
+    );
 }
 
 /// Issue #343 — `variants(...)` reads each variant's OWN offset window,

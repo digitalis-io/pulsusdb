@@ -725,10 +725,22 @@ not "fix" us toward the panic.
   | **R2 / R2-instant** | a beyond-rail grid instant whose window reaches stored data | **UNREACHABLE** — see below |
 
   **The `five-year-span-cap` row above narrowed this residual to
-  `absent_over_time` alone.** Before the caps, R1b and R1d each carried a
+  `absent_over_time` alone — FOR DATA ADMITTED THROUGH THE ENFORCED
+  INGESTION PATHS.** Before the caps, R1b and R1d each carried a
   demonstrated witness that lost a STORED SAMPLE; both are now impossible,
   and R2 — the only route by which a beyond-rail window could reach stored
-  data at all — cannot be expressed:
+  data at all — cannot be expressed. **Every "impossible" below is
+  conditional on `min_stored_ts = 0` and
+  `max_stored_ts = 4_294_943_999_999_999_999`, which are the ingest gate's
+  bounds (`crates/pulsus-write/src/protocols/loki_push.rs`), not a
+  storage-enforced invariant** — stopping point (ii) below says the same
+  thing about the branch conditions, and it applies here verbatim. A row
+  written by another door (a direct ClickHouse `INSERT`, a restored
+  backup) can hold a timestamp outside those bounds, and then the
+  proofs' premises no longer hold and the branch it lands in loses real
+  data again. Enforcing the timestamp domain at storage would make the
+  unconditional claim true; that is a larger change than this issue and is
+  not taken here. The three arguments, each under that condition:
 
   * **R1b**: `B = E - d <= (S + cap) - d < (d - 2^63 + cap) - d = MIN + cap`,
     far below `min_stored_ts = 0`, so the necessary condition
@@ -742,9 +754,11 @@ not "fix" us toward the panic.
     43,800 h — 31 times too small. `[1369008h]`, the shortest range that
     would have reached, does not parse.
 
-  **So no value-producing operation can lose real data any more.** What
-  remains is `absent_over_time`'s synthetic `1`s on branches that need a
-  request sitting within 5 years of an `i64` rail. The rows are kept
+  **So no value-producing operation can lose real data any more, for any
+  row the ingest gate admitted.** What remains is `absent_over_time`'s
+  synthetic `1`s on branches that need a request sitting within 5 years of
+  an `i64` rail. For a row loaded outside those paths the older, wider
+  analysis above it still applies unchanged. The rows are kept
   rather than deleted so that raising a cap re-opens them visibly; the
   three witnesses below are recorded as they were MEASURED, and two of
   them are no longer expressible.

@@ -4336,9 +4336,9 @@ fn r1a_low_rail_total_absent_over_time_loses_its_whole_grid() {
 /// underflows while `B` stays in domain, so the exact grid has an
 /// in-domain suffix that PulsusDB drops.
 ///
-/// **ABSENCE-ONLY UNDER THE 5-YEAR CAPS — real-data loss is no longer
-/// possible here, and the ledger row says so.** Before the caps this
-/// branch had a demonstrated witness losing a stored sample. Now
+/// **ABSENCE-ONLY UNDER THE 5-YEAR CAPS, for any row the ingest gate
+/// admitted — and the ledger row says so.** Before the caps this branch
+/// had a demonstrated witness losing a stored sample. Now
 /// `B = E - d <= (S + cap) - d < (d - 2^63 + cap) - d = MIN + cap`, which
 /// is far below `min_stored_ts = 0`, so no stored sample can lie at or
 /// below `B`. The necessary condition `E - d >= min_stored_ts` is
@@ -4408,13 +4408,15 @@ fn r1c_high_rail_total_needs_no_pre_1970_start() {
 /// domain while `B` overflows, so the exact grid has an in-domain PREFIX
 /// that PulsusDB drops.
 ///
-/// **ABSENCE-ONLY UNDER THE 5-YEAR CAPS — real-data loss is no longer
-/// possible here either.** `B > MAX` forces `E > MAX - cap`, and the span
+/// **ABSENCE-ONLY UNDER THE 5-YEAR CAPS, for any row the ingest gate
+/// admitted.** `B > MAX` forces `E > MAX - cap`, and the span
 /// cap then forces `S >= E - cap > MAX - 2*cap = 8908012036854775807`, so
 /// every in-domain grid point sits above `8.9e18` and every window's lower
 /// bound is `>= A - r >= 8.9e18 - cap`, far above
 /// `max_stored_ts = 4294943999999999999`. The necessary condition
-/// `S - d - range < max_stored_ts` is unsatisfiable.
+/// `S - d - range < max_stored_ts` is unsatisfiable. `max_stored_ts` is
+/// the ingest gate's ceiling, not a storage-enforced invariant — same
+/// condition as R1b's.
 ///
 /// The entry boundary with `-d = MAX - S` EXACTLY: `A = MAX` is in domain
 /// and `B = MAX + 120s` is not.
@@ -4457,7 +4459,8 @@ fn r1d_high_rail_partial_straddles_at_the_entry_boundary() {
 /// so.** It is kept rather than deleted: if the cap is ever raised, this
 /// test is where the branch comes back.
 ///
-/// R2 was the only way a value-producing operation could lose real data:
+/// R2 was the only way a value-producing operation could lose real data
+/// for a row the ingest gate admitted:
 /// a grid instant beyond the rail whose `(g - r, g]` window still reaches
 /// stored data. The first such instant is `MAX + 1`, and the window is
 /// strict on the left, so it reaches `max_stored_ts` only when

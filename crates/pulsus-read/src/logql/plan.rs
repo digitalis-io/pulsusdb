@@ -960,6 +960,25 @@ fn check_query_span(p: &QueryParams) -> Result<(), ReadError> {
     else {
         return Ok(());
     };
+    check_query_span_ns(start_ns, end_ns)
+}
+
+/// The 5-year span rule over a bare `start`/`end` pair — the form the HTTP
+/// layer has, and the ONE implementation both callers share.
+///
+/// `logs_api::handlers::parse_bounds` calls this: it is the single
+/// function every LogQL endpoint carrying `start`/`end` goes through
+/// (`query_range`, `series`, `labels`, `label/{name}/values`,
+/// `detected_labels`, `detected_fields`, `patterns`, `stats`, `volume`),
+/// including the selector-only ones that never reach [`plan`] at all —
+/// which is exactly how `/series` slipped past the first cut of this
+/// check. [`plan`] keeps its own call for the LIBRARY API, whose callers
+/// (tests, e2e, any embedder) never pass through `parse_bounds`.
+///
+/// `start > end` is left alone — an empty grid, handled downstream. Only
+/// the positive magnitude is bounded, computed in `i128` so the
+/// subtraction cannot overflow before it is judged.
+pub fn check_query_span_ns(start_ns: i64, end_ns: i64) -> Result<(), ReadError> {
     let span = i128::from(end_ns) - i128::from(start_ns);
     if span > i128::from(pulsus_logql::MAX_QUERY_SPAN_NS) {
         return Err(ReadError::QuerySpanTooLong {

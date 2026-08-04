@@ -153,7 +153,8 @@ pub use walkbound::{
 
 pub use plan::{
     ClientAgg, ClientValue, LabelReplaceSpec, MAX_VARIANT_SUB_STATES, MetricNode, MetricNodeScc,
-    MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision, StreamsPlan, VariantSpec, plan,
+    MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision, StreamsPlan, VariantSpec,
+    check_query_span_ns, plan,
 };
 pub use post_agg::{
     B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
