@@ -1078,8 +1078,21 @@ fn plan_pipeline(
                 // decided HERE. A bare `duration` or attribute is
                 // planned; every other shape — a composite expression,
                 // or an intrinsic with no numeric aggregation path — is
-                // a clean 400, exactly as before Stage C, so no query
-                // gained or lost an answer at this arm.
+                // a clean 400.
+                //
+                // **This arm changed and moved no wire verdict**, which
+                // is not the same claim and was measured rather than
+                // assumed (Stage C review). For the shapes that could
+                // reach a planner before Stage C the decision is
+                // identical: `{ true } | avg(.a) > 1` renders a
+                // `SearchPlan` byte-identical to the one `49cff9a`
+                // rendered. The shapes this arm newly REJECTS could not
+                // be constructed before — the parser refused them — so
+                // no query that used to be answered stops being
+                // answered. `{ true } | avg((.a)) > 1` becoming a wire
+                // accept is the parser's doing, not this arm's: parens
+                // do not survive into the AST, so it arrives here as the
+                // already-served `avg(.a)`.
                 let source = match (op, field) {
                     (AggregateOp::Count, None) => AggSource::Count,
                     (AggregateOp::Count, Some(_)) => {

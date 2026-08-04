@@ -183,8 +183,30 @@ class row carries `wire_status: "open"` and its note, asserted by
 **One probe moved on the wire, and the freeze gate gained a direction
 rather than a waiver.** `{ true } | avg((.a)) > 1` is now a wire accept:
 parentheses group without surviving into the AST, so it IS `avg(.a)` —
-the same plan the planner has always served, reached without touching
-planner code. `wire_baseline.json` is re-pinned accordingly:
+the same plan the planner has always served.
+
+*Correction, and it matters because the re-pin was allowed on this
+ground:* an earlier version of this section — and the review round that
+accepted it — said the flip was reached "without touching planner code".
+**That is false.** `search_plan.rs` DOES change here: the aggregate
+source match and `aggregate_threshold` destructure a `FieldExpr` instead
+of a `Field`, and a rejection arm is added for composite sources. What
+is true is narrower and was measured rather than argued, on both trees:
+
+```
+49cff9a (pre-Stage-C)   { true } | avg(.a) > 1     -> plans OK
+                        { true } | avg((.a)) > 1   -> PARSE ERROR (never reaches the planner)
+this tree               { true } | avg(.a) > 1     -> plans OK, SearchPlan byte-identical to 49cff9a's
+                        { true } | avg((.a)) > 1   -> the SAME plan, byte for byte
+```
+
+So the flip is **parser-caused**: the query previously died at parse, and
+the plan it now reaches is one the planner already produced, unchanged by
+this change. The planner edits are type-mechanical for the shapes that
+could already exist, plus a rejection for shapes that could not; they do
+not move any probe's wire disposition.
+
+`wire_baseline.json` is re-pinned accordingly:
 `WIRE_AGREE_BASELINE` 195 → **196**, `WIRE_DIVERGE_BASELINE` 26 → **25**,
 one `pulsus_wire` field `reject` → `accept`.
 
