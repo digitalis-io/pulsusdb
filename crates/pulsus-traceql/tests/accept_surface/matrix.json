@@ -69,8 +69,10 @@
       "reference": "An aggregate argument is a full field expression (arithmetic, unary, parentheses, any intrinsic).",
       "pulsus": "Restricted to 'duration' or an attribute.",
       "impact": "accept-surface",
-      "status": "open",
-      "deferred_to": "the field-expression regrammar tracked on #335"
+      "status": "closed",
+      "closed_by": 335,
+      "wire_status": "open",
+      "wire_note": "PARSE axis only. Stage C widened the argument to a field expression and ported the reference's rule 11, so all four probes agree here. On the WIRE (parse -> validate -> plan) three of them are still planner 400s where the reference answers 2xx: avg(span:childCount) and avg(trace:duration) have no numeric aggregation path, and avg(.a + 1) is a composite source. Only avg((.a)) reaches a 2xx, because parentheses group without surviving into the AST, so it IS avg(.a). See wire_baseline.json and PROVENANCE.md."
     },
     {
       "id": "D8",
@@ -1184,23 +1186,26 @@
     {
       "query": "{ true } | avg(span:childCount) > 1",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D7"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D7"
     },
     {
       "query": "{ true } | avg(trace:duration) > 1s",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D7"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D7"
     },
     {
       "query": "{ true } | avg(.a + 1) > 1",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D7"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D7"
     },
     {
       "query": "{ true } | avg(1) > 1",
@@ -1217,9 +1222,10 @@
     {
       "query": "{ true } | avg((.a)) > 1",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D7"
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D7"
     },
     {
       "query": "{ true } | avg() > 1",

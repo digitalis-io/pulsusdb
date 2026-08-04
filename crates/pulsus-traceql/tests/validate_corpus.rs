@@ -431,6 +431,14 @@ fn vector_error_variants_are_real_rule_ids() {
             expr: String::new(),
         }
         .rule_id(),
+        ValidateError::AggregateNotNumeric {
+            expr: String::new(),
+        }
+        .rule_id(),
+        ValidateError::AggregateNotSpanReferencing {
+            expr: String::new(),
+        }
+        .rule_id(),
         ValidateError::IntrinsicNotNil {
             field: String::new(),
         }

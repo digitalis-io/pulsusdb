@@ -30,8 +30,19 @@
 //! against any other tree fail here in B0's own PR. The remaining
 //! ordering questions (who may create the file, whether it can move
 //! later, and that no grammar work lands first) are the CI freeze gates
-//! beside the `ci` job's checkout — the four checks are one enumeration,
-//! not four precautions.
+//! in the `wire-baseline-freeze` job — the four checks are one
+//! enumeration, not four precautions.
+//!
+//! **The baseline is directional, not immutable** (issue #335 Stage C).
+//! It may move only toward FEWER divergences: per probe, nothing that
+//! agreed on `origin/main` may diverge here, and neither the divergence
+//! count nor the probe set may grow. That is what a legitimate
+//! improvement looks like — Stage C's own re-pin is one, `avg((.a))`
+//! reject→accept — and a decrease cannot express the thing the freeze
+//! exists to stop, which is numbers measured against already-changed
+//! code so broken code agrees with itself. This test is the half that
+//! makes the committed values the TREE's values; the CI job is the half
+//! that judges the direction they moved.
 //!
 //! **Why it lives in `pulsus-read`:** `parse → validate → plan` is only
 //! reachable here (`pulsus-traceql` cannot depend on the planners), so
@@ -216,8 +227,9 @@ fn every_committed_wire_verdict_is_reproduced_by_the_planner() {
     assert!(
         drift.is_empty(),
         "{} probe(s) do not reproduce from this tree — the committed baseline was measured \
-         against a different tree, or the route changed under it (a deliberate re-pin is \
-         #351's, and merges with the CI freeze gate red):\n{}",
+         against a different tree, or the route changed under it. A deliberate re-pin \
+         re-records these values in the same change, and the CI freeze gate then decides \
+         whether the move was toward FEWER divergences (allowed) or more (never):\n{}",
         drift.len(),
         drift.join("\n")
     );

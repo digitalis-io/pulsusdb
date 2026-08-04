@@ -774,11 +774,20 @@ impl fmt::Display for SpanKindValue {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PipelineStage {
     /// `count() cmp value` (zero-arity — `field: None`) or
-    /// `avg|sum|min|max(field) cmp value` (one-arity, numeric-aggregatable
-    /// fields only: `duration` or an attribute).
+    /// `avg|sum|min|max(expr) cmp value` (one-arity).
+    ///
+    /// The argument is a full [`FieldExpr`], not a bare [`Field`] (issue
+    /// #335 Stage C, D7): the reference's aggregate argument is an
+    /// ordinary field expression, so `avg(span:childCount)`,
+    /// `avg(trace:duration)`, `avg(.a + 1)` and `avg((.a))` all parse
+    /// there. Which arguments are LEGAL is a semantic question the
+    /// parser must not answer — the reference validates that the
+    /// argument's implied type is numeric-or-attribute and that it
+    /// references the span (`validate.rs` rule 11), and the search
+    /// planner separately rejects the shapes it cannot execute.
     Aggregate {
         op: AggregateOp,
-        field: Option<Field>,
+        field: Option<FieldExpr>,
         cmp: ComparisonOp,
         value: Value,
     },

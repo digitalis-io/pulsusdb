@@ -73,9 +73,18 @@
 //!     [`ValidateError::SpansetFilterNotBoolean`]); an attribute-typed
 //!     body is accepted, since its type is unknown until the span is read
 //!     (`{ .a }` is truthiness).
+//! 11. An aggregate's argument must resolve to a NUMBER type (or an
+//!     attribute, whose type is unknown until the span is read —
+//!     [`ValidateError::AggregateNotNumeric`]) **and** must reference
+//!     the span ([`ValidateError::AggregateNotSpanReferencing`]). Two
+//!     variants because the reference words them differently and the
+//!     order between them is observable; one reference check, split the
+//!     way `invalid-regex`/`invalid-regex-operand` already are.
 //!
 //! Rules 9 and 10, and the widening of rules 1 and 2 past comparison,
-//! arrived with the issue #335 Stage B grammar collapse. They were not
+//! arrived with the issue #335 Stage B grammar collapse. Rule 11
+//! arrived with Stage C, which made the aggregate argument a full field
+//! expression (D7). They were not
 //! missed before: they were UNREACHABLE while the layered parser could
 //! not build the offending shapes, and the collapsed grammar builds them
 //! exactly as the reference's grammar does. Every one is measured against
@@ -170,6 +179,49 @@ pub enum ValidateError {
     /// `{ !.a }`, `{ -.a }` and `{ !true }` are 200s.
     #[error("illegal operation for the given type: {expr}")]
     IllegalUnaryOperator { expr: String },
+    /// An aggregate argument must resolve to a NUMBER type; an
+    /// attribute is accepted, its type being unknown until the span is
+    /// read (issue #335 Stage C, rule 11).
+    ///
+    /// Before Stage C this was unreachable: the parser took a bare
+    /// `Field` from a hand-maintained aggregatable-intrinsic allowlist,
+    /// so no non-numeric argument could be built. The reference parses
+    /// an ordinary field expression there and rejects the surplus in its
+    /// validator — a POSITIONLESS error naming the whole aggregate,
+    /// which is the semantic signature.
+    ///
+    /// Measured against the pinned digest (`{} | avg(…) > 1` unless a
+    /// duration threshold is required), 400 `aggregate field expressions
+    /// must resolve to a number type`: `avg("x")`, `avg(name)`,
+    /// `avg(status)`, `avg(kind)`, `avg(statusMessage)`, `avg(span:id)`,
+    /// `avg(span:parentID)`, `avg(trace:id)`, `avg(rootName)`,
+    /// `avg(rootServiceName)`, `avg(event:name)`, `avg(link:spanID)`,
+    /// `avg(link:traceID)`, `avg(true)`, `avg(.a = 1)`,
+    /// `avg(.a && .b)`, `avg(.a =~ "x")`, `avg(.a = nil)`,
+    /// `avg(.a != nil)`, `avg(status = ok)`, `min(status)`, `max(name)`,
+    /// `min("x")`. 200s: `avg(.a)`, `avg((.a))`, `avg(!.a)`, `avg(-.a)`,
+    /// `avg(.a + 1)`, `avg(.a * 2 + 1)`, `avg(duration)`,
+    /// `avg(span:duration)`, `avg(span:childCount)`,
+    /// `avg(trace:duration)`, `avg(traceDuration)`,
+    /// `avg(event:timeSinceStart)`, `avg(nestedSetParent|Left|Right)`,
+    /// `avg(instrumentation:name|version)` (the mirrored
+    /// attribute-typing quirk, see [`field_type`]).
+    #[error("aggregate field expressions must resolve to a number type: {expr}")]
+    AggregateNotNumeric { expr: String },
+    /// An aggregate argument must REFERENCE THE SPAN — a numeric
+    /// expression built only from literals aggregates nothing (issue
+    /// #335 Stage C, rule 11's second half).
+    ///
+    /// Checked AFTER the number-type half, and the order is observable:
+    /// `avg("x")` reports the type, `avg(1)` the span reference.
+    ///
+    /// Measured, 400 `aggregate field expressions must reference the
+    /// span`: `avg(1)`, `avg((1))`, `avg(-1)`, `avg(1s)`, `avg(-1s)`,
+    /// `avg(1 + 2)`, `sum(1)`, `sum(-1)`. 200s: every argument
+    /// containing a field, at any depth — `avg(.a + 1)`, `avg(1 + .a)`,
+    /// `avg(-(-.a))`, `avg(nestedSetParent + nestedSetLeft)`.
+    #[error("aggregate field expressions must reference the span: {expr}")]
+    AggregateNotSpanReferencing { expr: String },
     /// `ast_validate.go:272-287` — `= nil` is illegal on any intrinsic
     /// and on scoped `resource.service.name`.
     #[error("{field} = nil is not valid: intrinsics cannot be nil")]
@@ -201,6 +253,8 @@ impl ValidateError {
             ValidateError::InvalidRegexOperand { .. } => "invalid-regex-operand",
             ValidateError::SpansetFilterNotBoolean { .. } => "spanset-filter-not-boolean",
             ValidateError::IllegalUnaryOperator { .. } => "illegal-unary-operator",
+            ValidateError::AggregateNotNumeric { .. } => "aggregate-not-numeric",
+            ValidateError::AggregateNotSpanReferencing { .. } => "aggregate-not-span-referencing",
             ValidateError::IntrinsicNotNil { .. } => "intrinsic-not-nil",
             ValidateError::QuantileOutOfRange { .. } => "quantile-out-of-range",
             ValidateError::TooManyGroupBys { .. } => "too-many-group-bys",
@@ -236,6 +290,18 @@ pub const VALIDATE_RULES: &[(&str, &str)] = &[
     (
         "illegal-unary-operator",
         "ast_validate.go UnaryOperation.validate via enum_operators.go binaryTypeValid/unary set",
+    ),
+    // Rule 11's two halves — one reference check, two messages, the same
+    // symbol-level citation posture as the two rows above (the verdicts
+    // and the ORDER between the halves are container-measured; see each
+    // variant's doc for the queries).
+    (
+        "aggregate-not-numeric",
+        "ast_validate.go Aggregate.validate (the impliedType must be numeric or attribute half)",
+    ),
+    (
+        "aggregate-not-span-referencing",
+        "ast_validate.go Aggregate.validate via ast.go referencesSpan (the span-reference half)",
     ),
     ("intrinsic-not-nil", "ast_validate.go:272-287"),
     ("quantile-out-of-range", "ast_metrics.go:328-332"),
@@ -317,6 +383,7 @@ fn validate_filter(filter: &SpansetFilter) -> Result<(), ValidateError> {
 /// | non-boolean filter body (`{ name }`, `{ 1 }`, `{ .a + 1 }`) | no layer could build a non-boolean body | [`ValidateError::SpansetFilterNotBoolean`] | 400 `span filter field expressions must resolve to a boolean` |
 /// | unary operand type (`{ !name }`, `{ -true }`, `{ !1 }`) | `!` was a spanset-filter form, `-` an operand-only form | [`ValidateError::IllegalUnaryOperator`] | 400 `illegal operation for the given type` (singular) |
 /// | non-comparison operand types (`{ .a = 1 && "x" }`, `{ name * 2 }`) | logical operands were boolean-shaped layers; arithmetic operands a separate grammar | rules 1-2, now over every binary class | 400 `binary operations must operate on the same type` / `illegal operation for the given types` |
+/// | aggregate argument (`{} \| avg(name) > 1`, `{} \| avg(1) > 1`) — issue #335 Stage C | `parse_aggregate` took a bare field off an aggregatable-intrinsic allowlist | [`ValidateError::AggregateNotNumeric`] / [`ValidateError::AggregateNotSpanReferencing`] (rule 11) | 400 `aggregate field expressions must resolve to a number type` / `… must reference the span` |
 ///
 /// One further rejection appeared in Stage B that is NOT in this class,
 /// and the difference matters at the re-pin: a non-boolean `!` operand
@@ -434,7 +501,7 @@ fn validate_stage(stage: &PipelineStage) -> Result<(), ValidateError> {
     match stage {
         PipelineStage::Aggregate {
             op,
-            field: _,
+            field,
             cmp,
             value,
         } => {
@@ -449,6 +516,28 @@ fn validate_stage(stage: &PipelineStage) -> Result<(), ValidateError> {
                 | AggregateOp::Avg
                 | AggregateOp::Min
                 | AggregateOp::Max => {}
+            }
+            // Rule 11 (issue #335 Stage C): the ARGUMENT, in the
+            // reference's own order — the ordinary field-expression
+            // rules first (`avg(!1)` is `illegal operation for the given
+            // type: !1`, not an aggregate error), then the number type,
+            // then the span reference (`avg("x")` reports the type,
+            // `avg(1)` the reference). All three orderings measured.
+            if let Some(arg) = field {
+                validate_field_expr(arg)?;
+                let rendered = format!("{op}({arg})");
+                match expr_type(arg) {
+                    OperandType::Numeric | OperandType::Attribute => {}
+                    OperandType::String
+                    | OperandType::Boolean
+                    | OperandType::Status
+                    | OperandType::Kind => {
+                        return Err(ValidateError::AggregateNotNumeric { expr: rendered });
+                    }
+                }
+                if !references_span(arg) {
+                    return Err(ValidateError::AggregateNotSpanReferencing { expr: rendered });
+                }
             }
             check_comparison(
                 OperandType::Numeric,
@@ -667,6 +756,28 @@ fn value_type(value: &Value) -> OperandType {
     }
 }
 
+/// Rule 11's second half (`ast.go referencesSpan`): does the expression
+/// name anything read off a span?
+///
+/// A FIELD does, at every scope and for every intrinsic — including the
+/// trace-scoped ones. That is not an inference from the phrase but the
+/// measured behaviour: `avg(trace:duration)` and `avg(traceDuration)`
+/// are reference 200s under an error message that says "must reference
+/// the span". A LITERAL does not, however it is spelled or nested
+/// (`avg(1)`, `avg((1))`, `avg(-1)`, `avg(1s)`, `avg(1 + 2)` are 400s).
+///
+/// `Exists` is unreachable here in practice — it is boolean-typed, so
+/// the number-type half rejects it first — but it names a field, so it
+/// answers `true` rather than pretending the question has no answer.
+fn references_span(expr: &FieldExpr) -> bool {
+    match expr {
+        FieldExpr::Field(_) | FieldExpr::Exists { .. } => true,
+        FieldExpr::Literal(_) => false,
+        FieldExpr::Unary { expr, .. } => references_span(expr),
+        FieldExpr::Binary { lhs, rhs, .. } => references_span(lhs) || references_span(rhs),
+    }
+}
+
 /// Field-expression typing — the reference's `impliedType`: negation
 /// keeps its operand's type; a binary node takes the first non-attribute
 /// operand's type; a comparison or logical node is boolean.
@@ -742,6 +853,43 @@ mod tests {
             }),
             (r#"{ .a =~ "a{2,1}" }"#, |e| {
                 matches!(e, E::InvalidRegex { .. })
+            }),
+            // Rule 11 (issue #335 Stage C), both halves and their order.
+            (r#"{} | avg("x") > 1"#, |e| {
+                matches!(e, E::AggregateNotNumeric { .. })
+            }),
+            ("{} | avg(name) > 1", |e| {
+                matches!(e, E::AggregateNotNumeric { .. })
+            }),
+            ("{} | min(status) > 1", |e| {
+                matches!(e, E::AggregateNotNumeric { .. })
+            }),
+            ("{} | avg(.a = 1) > 1", |e| {
+                matches!(e, E::AggregateNotNumeric { .. })
+            }),
+            ("{} | avg(1) > 1", |e| {
+                matches!(e, E::AggregateNotSpanReferencing { .. })
+            }),
+            ("{} | avg(1s) > 1s", |e| {
+                matches!(e, E::AggregateNotSpanReferencing { .. })
+            }),
+            ("{} | sum(-1) > 1", |e| {
+                matches!(e, E::AggregateNotSpanReferencing { .. })
+            }),
+            ("{} | avg(1 + 2) > 1", |e| {
+                matches!(e, E::AggregateNotSpanReferencing { .. })
+            }),
+            // The inner field-expression rules run FIRST: measured
+            // `illegal operation for the given type: !1`, not an
+            // aggregate error.
+            ("{} | avg(!1) > 1", |e| {
+                matches!(e, E::IllegalUnaryOperator { .. })
+            }),
+            ("{} | avg(-name) > 1", |e| {
+                matches!(e, E::IllegalUnaryOperator { .. })
+            }),
+            (r#"{} | avg(1 + "x") > 1"#, |e| {
+                matches!(e, E::TypeMismatch { .. })
             }),
             ("{ name = nil }", |e| matches!(e, E::IntrinsicNotNil { .. })),
             ("{ duration = nil }", |e| {
@@ -853,6 +1001,20 @@ mod tests {
             "{} | count() > 2 | select(name)",
             "{ duration > 1s } | rate()",
             "{ true }",
+            // Rule 11's accept side (issue #335 Stage C, D7): the four
+            // probes that closed, plus the shapes that establish the
+            // rule's boundary — every one a measured reference 200.
+            "{} | avg(span:childCount) > 1",
+            "{} | avg(trace:duration) > 1s",
+            "{} | avg(.a + 1) > 1",
+            "{} | avg((.a)) > 1",
+            "{} | avg(!.a) > 1",
+            "{} | avg(-.a) > 1",
+            "{} | avg(1 + .a) > 1",
+            "{} | max(.a * 2) > 1",
+            "{} | avg(nestedSetParent + nestedSetLeft) > 1",
+            "{} | avg(event:timeSinceStart) > 1",
+            "{} | avg(instrumentation:name) > 1",
         ] {
             assert_eq!(v(q), Ok(()), "{q:?} must validate Ok");
         }
@@ -983,6 +1145,12 @@ mod tests {
             ValidateError::IllegalUnaryOperator {
                 expr: String::new(),
             },
+            ValidateError::AggregateNotNumeric {
+                expr: String::new(),
+            },
+            ValidateError::AggregateNotSpanReferencing {
+                expr: String::new(),
+            },
             ValidateError::IntrinsicNotNil {
                 field: String::new(),
             },
@@ -1032,14 +1200,24 @@ mod tests {
     // silently missing.
     // -----------------------------------------------------------------
 
-    /// D4 tier 2 — the `AggregateOp` × `Intrinsic` product, exhaustively
-    /// (both matches break the build on a new variant): the reference
-    /// validates that aggregates reference the span
-    /// (`ast_validate.go:63-70,86-109`); here every non-`duration`
-    /// intrinsic aggregate target is a parse error, over the WHOLE
-    /// product.
+    /// The `AggregateOp` × `Intrinsic` product, exhaustively (both
+    /// matches break the build on a new variant).
+    ///
+    /// **Was a D4 tier-2 PARSE guard; is now rule 11's product table**
+    /// (issue #335 Stage C). The guard asserted that every non-`duration`
+    /// intrinsic aggregate target stays a parse error, standing in for
+    /// the reference check we had not ported. Rule 11 ports it, so the
+    /// guard has done its job and is replaced — by the same exhaustive
+    /// product, now asserting the reference's own disposition per cell
+    /// rather than a blanket parse rejection.
+    ///
+    /// Every cell is container-measured (`{} | <op>(<intrinsic>) > 1`,
+    /// the shadow `query=` route, pinned digest): the numeric intrinsics
+    /// and the two `instrumentation:` ones are 200s, the string/status/
+    /// kind ones are 400 `must resolve to a number type`, and
+    /// `count(<anything>)` is a parse error on both sides.
     #[test]
-    fn aggregate_over_every_non_duration_intrinsic_stays_a_parse_error() {
+    fn aggregate_over_every_intrinsic_matches_the_reference_type_rule() {
         let agg_token = |op: AggregateOp| match op {
             AggregateOp::Count => "count",
             AggregateOp::Sum => "sum",
@@ -1102,28 +1280,43 @@ mod tests {
         ];
         for op in aggs {
             for i in intrinsics {
-                // The grammar's legal intrinsic aggregates: `duration`
-                // and the numeric nested-set intrinsics under the
-                // one-arity ops (`sum(nestedSetLeft) = 1` is measured a
-                // reference 200 — span-referencing AND numeric, so no
-                // guard applies); `count(anything)` is not.
-                let numeric_target = matches!(
-                    i,
-                    Intrinsic::Duration
-                        | Intrinsic::NestedSetParent
-                        | Intrinsic::NestedSetLeft
-                        | Intrinsic::NestedSetRight
-                );
-                if numeric_target && op != AggregateOp::Count {
+                let q = format!("{{}} | {}({}) = 1", agg_token(op), intrinsic_token(i));
+                // `count()` is strictly zero-arity in BOTH grammars
+                // (measured: `count(1)` is a reference parse error), so
+                // the whole `count` row stays a parse error here.
+                if op == AggregateOp::Count {
+                    assert!(parse(&q).is_err(), "{q:?} must stay a parse error");
                     continue;
                 }
-                let q = format!("{{}} | {}({}) = 1", agg_token(op), intrinsic_token(i));
-                assert!(
-                    parse(&q).is_err(),
-                    "{q:?} now PARSES — the parser loosened; the reference's span-referencing \
-                     aggregate validation (ast_validate.go:63-70,86-109) must be ported before \
-                     this guard is relaxed"
-                );
+                // Rule 11's type half, per the measured product: an
+                // argument whose implied type is numeric or attribute
+                // validates; every other intrinsic is
+                // `aggregate-not-numeric`. The exhaustive match is what
+                // forces a new `Intrinsic` variant to be classified.
+                let accepted = match field_type(&Field::Intrinsic(i)) {
+                    OperandType::Numeric | OperandType::Attribute => true,
+                    OperandType::String
+                    | OperandType::Boolean
+                    | OperandType::Status
+                    | OperandType::Kind => false,
+                };
+                let ast = parse(&q).unwrap_or_else(|e| {
+                    panic!("{q:?} must PARSE after Stage C's widening, got {e}")
+                });
+                match validate(&ast) {
+                    Ok(()) => assert!(accepted, "{q:?} validates but is a reference 400"),
+                    Err(err) => {
+                        assert!(
+                            !accepted,
+                            "{q:?} is a reference 200 but was rejected: {err}"
+                        );
+                        assert_eq!(
+                            err.rule_id(),
+                            "aggregate-not-numeric",
+                            "{q:?} rejected under the wrong rule ({err})"
+                        );
+                    }
+                }
             }
         }
     }

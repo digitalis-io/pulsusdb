@@ -135,6 +135,73 @@ by ruling. Adding the class as probes is follow-up work, and until then
 this class remains unmeasured by the scoreboard — which is what let it go
 unnoticed in the first place.
 
+## Stage C re-pin (issue #335, 2026-08-04) — the aggregate argument
+
+D7's mechanism: `parse_aggregate` took a bare `Field` and screened it
+against a hand-maintained aggregatable-intrinsic allowlist. The reference
+parses an ORDINARY FIELD EXPRESSION there and decides legality in its
+validator. Stage C makes the argument a `FieldExpr` and ports that check
+as `validate.rs` rule 11 — the argument's implied type must be numeric
+or attribute, and it must reference the span.
+
+**Parse axis: 4 probes moved, every one `diverge → agree`.**
+`AGREE` 217 → 221, `DIVERGE` 4 → **0**. Two both-reject probes
+(`{ true } | avg(1) > 1`, `{ true } | avg("x") > 1`) keep their verdict
+and move their rejection from the parser to the validator, so the
+parse-axis flip set goes 70 → 72.
+
+Rule 11 is two `rule_id`s because the reference words its two halves
+differently and the ORDER between them is observable (measured, pinned
+digest, shadow `query=` route):
+
+```
+{} | avg("x") > 1  ->  400 aggregate field expressions must resolve to a number type: avg(`x`)
+{} | avg(1) > 1    ->  400 aggregate field expressions must reference the span: avg(1)
+{} | avg(!1) > 1   ->  400 illegal operation for the given type: !1   (the inner rules run first)
+```
+
+The whole `AggregateOp × Intrinsic` product was re-measured for the
+type half: the numeric intrinsics (`duration`, `span:duration`,
+`span:childCount`, `traceDuration`/`trace:duration`,
+`event:timeSinceStart`, `nestedSetParent|Left|Right`) and the two
+`instrumentation:` ones (the mirrored attribute-typing quirk) are
+reference 200s; every string/status/kind intrinsic is a 400. `count(x)`
+is a parse error on both sides. `validate.rs`'s
+`aggregate_over_every_intrinsic_matches_the_reference_type_rule` asserts
+that product cell by cell and replaces the D4 tier-2 parse guard the
+rule retires — a blanket parse rejection could not have told
+`max(span:childCount)` (a 200) from `avg(rootName)` (a 400), which is
+why the decision had to move rather than be re-tuned.
+
+**Wire axis: D7 stays OPEN, and the parse-axis zero does not say
+otherwise.** `avg(span:childCount)` and `avg(trace:duration)` have no
+numeric aggregation path in the planner and `avg(.a + 1)` is a composite
+source; all three are still planner 400s against a reference 2xx. The
+class row carries `wire_status: "open"` and its note, asserted by
+`accept_surface.rs::a_class_open_on_the_wire_has_a_probe_still_diverging_there`.
+
+**One probe moved on the wire, and the freeze gate gained a direction
+rather than a waiver.** `{ true } | avg((.a)) > 1` is now a wire accept:
+parentheses group without surviving into the AST, so it IS `avg(.a)` —
+the same plan the planner has always served, reached without touching
+planner code. `wire_baseline.json` is re-pinned accordingly:
+`WIRE_AGREE_BASELINE` 195 → **196**, `WIRE_DIVERGE_BASELINE` 26 → **25**,
+one `pulsus_wire` field `reject` → `accept`.
+
+Rather than merge that "by human override", the `wire-baseline-freeze`
+job now states the rule it was always enforcing badly: **the baseline
+may move only toward fewer divergences.** Per probe, nothing that agreed
+on `origin/main` may diverge here; and neither the divergence count nor
+the probe set may grow. Both "before" sides — the baseline and the
+reference column it is scored against — are read from `origin/main`, so
+nothing in a PR decides its own verdict. A decrease cannot express a
+poisoned baseline (it is strictly more agreement with an oracle the PR
+cannot move); an increase stays forbidden, which is the freeze. Verified
+against real git states: the honest decrease passes, while a regressing
+probe, a compensating swap that leaves the count unchanged, an added
+already-diverging probe, a divergence retired by deleting its probe, and
+a PR that rewrites its own `reference` column to match all fail.
+
 ## Operator precedence and associativity
 
 Tightest first. `=` marks agreement from the audit capture, `✔` a
@@ -171,7 +238,7 @@ behaviour, not a transcription slip: `!.a * 2` groups as `!(.a * 2)` while
 | comparison LHS — parenthesised expression | yes | **≠ D5** |
 | comparison LHS — unary `-` / `!` | yes | **≠ D1, D3** |
 | aggregate argument (`avg/min/max/sum`) — attribute, `duration` | yes | = |
-| aggregate argument — colon intrinsic, arithmetic, parentheses | yes | **≠ D7** |
+| aggregate argument — colon intrinsic, arithmetic, parentheses | yes | ✔ since D7 was fixed (parse axis; three of the four are still planner 400s — see the Stage C section) |
 | aggregate argument — literal, empty, two arguments; `count(x)` | no | = |
 | aggregate comparison RHS — attribute or another aggregate | no | = |
 | `select(...)` — attribute, bare intrinsic, colon intrinsic, list | yes | = |
@@ -209,6 +276,18 @@ dispatches on what follows through three ad-hoc predicates
 reference has a single operand grammar with comparison as an ordinary
 binary level, which is why every operand position is uniform there and
 patchy here. `D8`–`D11` are precedence-table entries placed differently.
+
+**State after Stage C (2026-08-04).** The two paragraphs above are the
+first fix wave's record and are kept as written; they are not the
+current state. Every accept-surface class D1–D11 now carries
+`"status": "closed"` on the PARSE axis — the collapse (Stage B) closed
+D1 and D3–D6, Stage C closed D7, and `DIVERGE` is 0 over all 221
+probes. That is a statement about the grammar; `D12` (the meaning class
+the Stage B capture opened) stays open on its six meaning probes. On
+the WIRE axis `wire_baseline.json` is where the
+answer lives, and D7 is recorded `wire_status: "open"` there and in its
+class row: three of its four probes are still planner 400s the reference
+answers.
 
 ## Regenerating
 

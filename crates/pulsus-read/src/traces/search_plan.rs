@@ -8,8 +8,8 @@
 //! rejection here is a caller error ([`PlanError`] → `400 bad_data`).
 
 use pulsus_traceql::{
-    AggregateOp, ComparisonOp, Field, HintValue, Intrinsic, PipelineStage, Query, SpansetExpr,
-    SpansetFilter, Value,
+    AggregateOp, ComparisonOp, Field, FieldExpr, HintValue, Intrinsic, PipelineStage, Query,
+    SpansetExpr, SpansetFilter, Value,
 };
 use regex::Regex;
 
@@ -965,7 +965,7 @@ fn plan_arith(
 
 fn aggregate_threshold(
     op: AggregateOp,
-    field: &Option<Field>,
+    field: &Option<FieldExpr>,
     value: &Value,
 ) -> Result<f64, PlanError> {
     match value {
@@ -977,8 +977,10 @@ fn aggregate_threshold(
         // A duration threshold is meaningful only against a duration
         // aggregate (nanosecond scale).
         Value::Duration(d)
-            if matches!(field, Some(Field::Intrinsic(Intrinsic::Duration)))
-                && op != AggregateOp::Count =>
+            if matches!(
+                field,
+                Some(FieldExpr::Field(Field::Intrinsic(Intrinsic::Duration)))
+            ) && op != AggregateOp::Count =>
         {
             Ok(d.as_nanos() as f64)
         }
@@ -1070,6 +1072,14 @@ fn plan_pipeline(
                         "aggregate filters do not support regex operators".to_string(),
                     ));
                 }
+                // The argument is a full `FieldExpr` since issue #335
+                // Stage C (D7): the grammar no longer decides which
+                // arguments are legal, so the executable subset is
+                // decided HERE. A bare `duration` or attribute is
+                // planned; every other shape — a composite expression,
+                // or an intrinsic with no numeric aggregation path — is
+                // a clean 400, exactly as before Stage C, so no query
+                // gained or lost an answer at this arm.
                 let source = match (op, field) {
                     (AggregateOp::Count, None) => AggSource::Count,
                     (AggregateOp::Count, Some(_)) => {
@@ -1080,18 +1090,26 @@ fn plan_pipeline(
                     (_, None) => {
                         return Err(PlanError::TypeMismatch(format!("{op}() requires a field")));
                     }
-                    (_, Some(Field::Intrinsic(Intrinsic::Duration))) => AggSource::DurationNs,
-                    (_, Some(Field::Intrinsic(other))) => {
+                    (_, Some(FieldExpr::Field(Field::Intrinsic(Intrinsic::Duration)))) => {
+                        AggSource::DurationNs
+                    }
+                    (_, Some(FieldExpr::Field(Field::Intrinsic(other)))) => {
                         return Err(PlanError::TypeMismatch(format!(
                             "{other} is not numerically aggregatable"
                         )));
                     }
-                    (_, Some(attr @ Field::Attribute { .. })) => {
+                    (_, Some(FieldExpr::Field(attr @ Field::Attribute { .. }))) => {
                         let field_ref = attr_field_ref(attr)
                             .expect("Field::Attribute always yields a field ref");
                         AggSource::Attr {
                             field_idx: intern(agg_fields, &field_ref),
                         }
+                    }
+                    (_, Some(expr)) => {
+                        return Err(PlanError::TypeMismatch(format!(
+                            "{op}({expr}) is not an executable aggregation source: only a bare \
+                             duration or attribute can be aggregated"
+                        )));
                     }
                 };
                 aggregates.push(PlannedAggregate {
@@ -1624,20 +1642,67 @@ mod tests {
 
     #[test]
     fn aggregate_on_a_non_numeric_intrinsic_is_rejected() {
-        // The parser already rejects `avg(name)`; the planner's own guard
-        // covers direct-AST callers, so build the stage by hand.
+        // `avg(name)` parses since issue #335 Stage C and is rejected by
+        // `validate`; the planner's own guard covers direct-AST callers,
+        // so build the stage by hand.
         let mut query = parse(r#"{ .k = "v" }"#).expect("parse");
         query
             .pipeline
             .push(pulsus_traceql::PipelineStage::Aggregate {
                 op: pulsus_traceql::AggregateOp::Avg,
-                field: Some(pulsus_traceql::Field::Intrinsic(Intrinsic::Name)),
+                field: Some(FieldExpr::Field(pulsus_traceql::Field::Intrinsic(
+                    Intrinsic::Name,
+                ))),
                 cmp: ComparisonOp::Gt,
                 value: Value::Number("1".to_string()),
             });
         assert!(matches!(
             plan_search(&query, &PARAMS, &ctx()),
             Err(PlanError::TypeMismatch(_))
+        ));
+    }
+
+    /// Issue #335 Stage C (D7): the argument is a full field expression
+    /// now, so the planner — not the grammar — is what refuses a shape
+    /// it cannot execute. `avg(span:childCount)` and `avg(trace:duration)`
+    /// are reference 200s that parse and validate here and still have no
+    /// aggregation path, and `avg(.a + 1)` is a composite source; all
+    /// three are clean `400`s, which is what keeps D7 open on the wire
+    /// axis while its parse axis closes.
+    #[test]
+    fn an_aggregate_argument_the_planner_cannot_execute_is_a_clean_400() {
+        for q in [
+            r#"{ .k = "v" } | avg(span:childCount) > 1"#,
+            r#"{ .k = "v" } | avg(trace:duration) > 1s"#,
+            r#"{ .k = "v" } | avg(.a + 1) > 1"#,
+            r#"{ .k = "v" } | avg(-.a) > 1"#,
+        ] {
+            let query = parse(q).unwrap_or_else(|e| panic!("{q} must parse: {e}"));
+            assert_eq!(pulsus_traceql::validate(&query), Ok(()), "{q}");
+            assert!(
+                matches!(
+                    plan_search(&query, &PARAMS, &ctx()),
+                    Err(PlanError::TypeMismatch(_))
+                ),
+                "{q} must be a planner 400"
+            );
+        }
+    }
+
+    /// The other side of the same arm: a parenthesised attribute is the
+    /// SAME AST as the bare one (parentheses group, they do not survive
+    /// into the tree), so `avg((.a))` plans exactly like `avg(.a)`.
+    /// Recorded as an assertion because it is the one D7 probe whose
+    /// wire disposition Stage C moves.
+    #[test]
+    fn a_parenthesised_aggregate_argument_plans_like_the_bare_one() {
+        let bare = parse(r#"{ .k = "v" } | avg(.a) > 1"#).expect("parse");
+        let parens = parse(r#"{ .k = "v" } | avg((.a)) > 1"#).expect("parse");
+        assert_eq!(bare, parens, "parentheses must not survive into the AST");
+        let p = plan_search(&parens, &PARAMS, &ctx()).expect("plans");
+        assert!(matches!(
+            p.aggregates[0].source,
+            AggSource::Attr { field_idx: 0 }
         ));
     }
 

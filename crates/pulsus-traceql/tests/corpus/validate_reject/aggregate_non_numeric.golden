@@ -6,18 +6,17 @@ Query {
     ),
     pipeline: [
         Aggregate {
-            op: Min,
+            op: Avg,
             field: Some(
                 Field(
-                    Attribute {
-                        scope: Unscoped,
-                        key: "retries",
-                    },
+                    Intrinsic(
+                        Name,
+                    ),
                 ),
             ),
-            cmp: Lt,
+            cmp: Gt,
             value: Number(
-                "2",
+                "1",
             ),
         },
     ],

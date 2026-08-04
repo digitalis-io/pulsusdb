@@ -125,7 +125,6 @@ accept/structural_union_sibling
 grafana/explore_root_rate_by_service
 grafana/explore_root_rate_sample
 reject/aggregate_empty
-reject/aggregate_non_numeric
 reject/attr_bare_keyword_value
 reject/attr_dot_space_after
 reject/attr_dot_space_after_scope
@@ -165,6 +164,7 @@ reject/unterminated_string
 unsupported/parent_scope
 unsupported/structural_gte
 unsupported/structural_lte
+validate_reject/aggregate_non_numeric
 validate_reject/bare_intrinsic_word
 validate_reject/chained_comparison
 validate_reject/nested_set_regex_string

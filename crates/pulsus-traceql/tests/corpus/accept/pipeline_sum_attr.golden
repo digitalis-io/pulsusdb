@@ -8,10 +8,12 @@ Query {
         Aggregate {
             op: Sum,
             field: Some(
-                Attribute {
-                    scope: Span,
-                    key: "bytes",
-                },
+                Field(
+                    Attribute {
+                        scope: Span,
+                        key: "bytes",
+                    },
+                ),
             ),
             cmp: Gte,
             value: Number(
