@@ -1266,6 +1266,41 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 /// Both fall out of requiring a duration token, so neither needs a
 /// special case; they are stated because the next reader will wonder.
 ///
+/// - **AN OVER-RANGE MAGNITUDE IS REJECTED, NEVER CLAMPED, AND THE BOUND
+///   IS ASYMMETRIC.** Accepted exactly when the signed value fits `i64`
+///   nanoseconds: `+9223372036854775807ns` (`i64::MAX`) and
+///   `-9223372036854775808ns` (`i64::MIN`) are both fine, one ns beyond
+///   either is a 400. Clamping here would hand the planner an offset the
+///   user never wrote — the same defect class issue #343 fixed one layer
+///   down, where a saturating shift relocated the evaluation window, and
+///   nothing downstream can detect an already-altered offset.
+///
+///   MEASURED on the digest-pinned v3.7.4 oracle
+///   (`grafana/loki@sha256:87f0a067…`, `/status/buildinfo` reporting
+///   `3.7.4` / `b318f282`), positive and negative separately:
+///   `offset 2562047h47m16s854ms775us807ns` → 200, one ns more → 400
+///   `syntax error: unexpected NUMBER, expecting DURATION`;
+///   `offset -9223372036854775808ns` → 200, one ns more negative → 400
+///   `syntax error: unexpected -, expecting DURATION`.
+///
+///   The asymmetry is not an accident of ours: the reference lexes the
+///   magnitude with `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`),
+///   which tries `model.ParseDuration` first — vendored
+///   `prometheus/common/model/time.go:249-255`, rejecting `dur > 1<<63-1`
+///   as `duration out of range` — and falls back to Go's
+///   `time.ParseDuration`, whose floor is `-1<<63`. A leading `-` fails
+///   the Prometheus parser outright (it demands a leading digit), so the
+///   negative form always lands on the stdlib fallback and reaches
+///   `i64::MIN`. Either way the failure returns `(0, false)` from
+///   `tryScanDuration` (`lex.go:293`), so the text never becomes a
+///   DURATION token and the grammar rejects it — which is why the two
+///   messages name different unexpected tokens.
+///
+///   Our wording is our own, as it is for every LogQL parse error (the
+///   corpus's `our-error-text` provenance class); what must match, and
+///   what is asserted, is the accept/reject verdict and the exact
+///   boundary.
+///
 /// The keyword goes through [`is_kw`] like every other keyword in this
 /// file (issue #339's rule): the reference's lexer folds keywords, so
 /// `OFFSET 1m` is a 200 there. A byte compare here made `offset` the one
@@ -1284,8 +1319,20 @@ fn parse_offset(cursor: &mut Cursor<'_>) -> Result<Option<i64>, LogQlError> {
     }
     let (raw, span) = cursor.expect_duration()?;
     let nanos = duration::parse_duration(&raw, span)?.as_nanos();
-    let signed = i64::try_from(nanos).unwrap_or(i64::MAX);
-    Ok(Some(if negative { -signed } else { signed }))
+    // `i128::from(u64)` is lossless and infallible, so the sign is applied
+    // to the EXACT magnitude and only then bounded — a `u64 -> i64`
+    // conversion before negation could not represent `i64::MIN`, which the
+    // reference accepts.
+    let magnitude = i128::from(nanos);
+    let signed = if negative { -magnitude } else { magnitude };
+    let offset_ns = i64::try_from(signed).map_err(|_| LogQlError::InvalidDuration {
+        raw: raw.clone(),
+        reason: "offset is outside the representable range \
+                 (-9223372036854775808 .. 9223372036854775807 nanoseconds)"
+            .to_string(),
+        span,
+    })?;
+    Ok(Some(offset_ns))
 }
 
 /// `variants "(" metricExpr ("," metricExpr)* ")" "of" "(" logRange ")"`
@@ -1517,5 +1564,82 @@ mod tests {
             "keyword literals must be lowercase (is_kw folds the INPUT, not the expectation):\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Issue #343 review finding: an over-range `offset` magnitude is
+    /// REJECTED, never clamped. The predecessor did
+    /// `i64::try_from(nanos).unwrap_or(i64::MAX)`, which handed the
+    /// planner an offset the user never wrote — the identical
+    /// clamp-instead-of-handle defect this issue exists to fix, one layer
+    /// above the code it fixed, and undetectable from below.
+    ///
+    /// Both bounds and both signs, each pinned to a MEASURED verdict from
+    /// the digest-pinned v3.7.4 oracle (`grafana/loki@sha256:87f0a067…`,
+    /// buildinfo `3.7.4` / `b318f282`), listed beside its case. The
+    /// asymmetry — `i64::MIN` accepted, `i64::MAX` the positive ceiling —
+    /// is the reference's, not ours: see [`parse_offset`]'s doc for the
+    /// `model.ParseDuration` / `time.ParseDuration` split that produces it.
+    #[test]
+    fn an_over_range_offset_is_rejected_and_the_bound_is_asymmetric() {
+        // Accepted, exactly at the rails.
+        for (query, want) in [
+            // oracle: 200
+            (
+                r#"count_over_time({app="x"}[5m] offset 9223372036854775807ns)"#,
+                i64::MAX,
+            ),
+            // oracle: 200 — the same instant spelled compound
+            (
+                r#"count_over_time({app="x"}[5m] offset 2562047h47m16s854ms775us807ns)"#,
+                i64::MAX,
+            ),
+            // oracle: 200 — `i64::MIN`, which a `u64 -> i64` conversion
+            // before negation cannot represent (the predecessor answered
+            // -9223372036854775807 here: accepted, wrong value)
+            (
+                r#"count_over_time({app="x"}[5m] offset -9223372036854775808ns)"#,
+                i64::MIN,
+            ),
+            // oracle: 200
+            (
+                r#"count_over_time({app="x"}[5m] offset 2562047h)"#,
+                2_562_047 * 3_600_000_000_000,
+            ),
+        ] {
+            let expr = crate::parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert_eq!(offset_of(&expr), Some(want), "{query}");
+        }
+
+        // Rejected, one nanosecond past each rail.
+        for query in [
+            // oracle: 400 `syntax error: unexpected NUMBER, expecting DURATION`
+            r#"count_over_time({app="x"}[5m] offset 9223372036854775808ns)"#,
+            r#"count_over_time({app="x"}[5m] offset 2562047h47m16s854ms775us808ns)"#,
+            r#"count_over_time({app="x"}[5m] offset 2562048h)"#,
+            r#"count_over_time({app="x"}[5m] offset 18446744073709551615ns)"#,
+            // oracle: 400 `syntax error: unexpected -, expecting DURATION`
+            r#"count_over_time({app="x"}[5m] offset -9223372036854775809ns)"#,
+            r#"count_over_time({app="x"}[5m] offset -2562048h)"#,
+        ] {
+            let err =
+                crate::parse(query).expect_err(&format!("{query} must be rejected, never clamped"));
+            let text = err.to_string();
+            assert!(
+                text.contains("outside the representable range"),
+                "{query}: expected the out-of-range refusal, got {text:?}"
+            );
+        }
+    }
+
+    /// The `offset_ns` of a single-range metric query, for the boundary
+    /// test above. Kept local: it walks exactly the one shape that test
+    /// builds and has no other caller.
+    fn offset_of(expr: &crate::ast::Expr) -> Option<i64> {
+        match expr {
+            crate::ast::Expr::Metric(crate::ast::MetricExpr::Range { range, .. }) => {
+                range.offset_ns
+            }
+            other => panic!("expected a range aggregation, got {other:?}"),
+        }
     }
 }
