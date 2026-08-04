@@ -1058,6 +1058,14 @@ pub(in crate::logql) struct RangeSlideState<'q> {
     step: u64,
     range: i64,
     kmax: i64,
+    /// The `offset` shift this state's grid was ALREADY moved back by
+    /// (issue #343). Every internal comparison — `covering_k`, the
+    /// eviction bound, `emit_until`'s boundary — runs in the shifted
+    /// domain against the raw sample timestamps, which is exactly what
+    /// makes the window `(t-offset-range, t-offset]`; the shift is added
+    /// back ONCE, to the emitted point timestamps, in
+    /// [`RangeSlideState::finish_in_place`].
+    offset_ns: i64,
     fan_out: bool,
     is_absent: bool,
     /// Whether the reducer is order-DEPENDENT (class C, or first/last) and so
@@ -1165,6 +1173,7 @@ impl<'q> RangeSlideState<'q> {
             end_ns,
             step_ns,
             range_ns,
+            offset_ns,
         } = window
         else {
             unreachable!("RangeSlideState is constructed only for a Range window")
@@ -1202,6 +1211,7 @@ impl<'q> RangeSlideState<'q> {
             // in-domain `i64` (issue #227 review round 2, finding 2).
             range: range_ns.get(),
             kmax,
+            offset_ns,
             fan_out: compiled.metric_mutates_labels(),
             is_absent,
             needs_body_order,
@@ -1751,6 +1761,17 @@ impl<'q> RangeSlideState<'q> {
 
     /// Finalizes into the query result, asserting the concurrent-retention
     /// invariant closed out (every charge discharged).
+    ///
+    /// **The single point where `offset` is added back** (issue #343).
+    /// [`Self::finish_in_place`] has four exits — absent, fan-out folded,
+    /// fan-out materialised, and the ordinary per-fingerprint path — and
+    /// every one of them takes its timestamps from `grid_point`, i.e. in
+    /// the SHIFTED domain. Shifting here rather than in `grid_point` is
+    /// deliberate: that value doubles as the sliding window's own
+    /// boundary (`emit_until`, the eviction bound), so moving it would
+    /// move the WINDOW as well as the label on it. This is the type's
+    /// completion point — `finish_in_place` exists only so the
+    /// post-condition below stays observable to a test.
     fn finish(mut self) -> Result<QueryResult, ReadError> {
         let out = self.finish_in_place()?;
         debug_assert_eq!(
@@ -1761,12 +1782,16 @@ impl<'q> RangeSlideState<'q> {
             self.group_bytes, 0,
             "every group-label byte charge must be discharged at finish"
         );
-        Ok(out)
+        Ok(shift_emitted_points(out, self.offset_ns))
     }
 
     /// The finish body, in place so the post-condition (`retained == 0`) is
     /// OBSERVABLE — `finish` consumes `self`, which made the release leg of
     /// the AC8 test unfalsifiable (issue #227 review round 3, finding 3).
+    ///
+    /// Emits on the SHIFTED grid: [`Self::finish`] is what puts the
+    /// `offset` back (issue #343). The in-module tests that call this
+    /// directly all drive offset-free windows, where the two agree.
     fn finish_in_place(&mut self) -> Result<QueryResult, ReadError> {
         // `base_labels` moved to a local (as in `push_rows`) so the final
         // `&mut self` flush does not clash with a `self.base_labels` borrow.
@@ -2064,6 +2089,40 @@ impl<'q> RangeSlideState<'q> {
                 points,
             }]
         })
+    }
+}
+
+/// Puts a leaf's emitted matrix back on the CALLER's grid after the
+/// evaluation ran `offset` earlier (issue #343).
+///
+/// The shift is `+offset_ns` — the inverse of the planner's
+/// `shift_by_offset`, and SIGNED, so a negative offset (which the
+/// reference accepts, shifting the window forward) comes back correctly
+/// too. `offset_ns == 0` is the overwhelmingly common case and returns
+/// the result untouched, so no offset-free query pays for this.
+///
+/// A uniform translation of every point on every series: it commutes with
+/// everything downstream (`apply_vector_aggs` groups points BY timestamp,
+/// and `combine_binary` joins on it), which is why each leaf can shift
+/// independently and a query mixing offsets — `rate(a[5m]) /
+/// rate(a[5m] offset 1h)` — still joins on the caller's grid.
+///
+/// Vector (instant) results carry no timestamp of their own, so they pass
+/// through: the API stamps them with the request's `time`, offset or not.
+fn shift_emitted_points(result: QueryResult, offset_ns: i64) -> QueryResult {
+    if offset_ns == 0 {
+        return result;
+    }
+    match result {
+        QueryResult::Matrix(mut series) => {
+            for s in &mut series {
+                for (ts, _) in &mut s.points {
+                    *ts = ts.saturating_add(offset_ns);
+                }
+            }
+            QueryResult::Matrix(series)
+        }
+        other => other,
     }
 }
 

@@ -389,8 +389,18 @@ mod tests {
         // the ceiling assert still holds at compile time, and
         // `the_four_times_probe_clears_the_threshold_with_stated_headroom`
         // re-checks `B*(C-1) > S` and `B*(2C-1) > S` against the new S.
+        //
+        // 168 -> 184 (issue #343): `LogRange` gained
+        // `offset_ns: Option<i64>` — 16 bytes at 8-byte alignment, no niche
+        // in `i64` to pack the discriminant into — widening `MetricExpr::
+        // Range` and so `MeVal` again. Re-derived the same way: the figure
+        // below is the one `size_of` produces (the assertion immediately
+        // after re-checks that identity, so a stale pin here cannot pass),
+        // the compile-time `MAX_WALK_ENTRY_BYTES <= WALK_ENTRY_CEILING_BYTES`
+        // (192) still holds with 8 bytes to spare, and the 4x-probe test
+        // re-checks both headroom inequalities against the new S.
         assert_eq!(
-            MAX_WALK_ENTRY_BYTES, 168,
+            MAX_WALK_ENTRY_BYTES, 184,
             "the largest `ChunkStack` entry moved; re-derive \
              `WALK_FIXED_SLACK_BYTES`'s consequences before re-pinning"
         );

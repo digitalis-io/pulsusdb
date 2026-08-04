@@ -43,6 +43,23 @@ pub enum ClientWindow {
         step_ns: ValidatedDuration,
         /// The `[range]` selector width — the sliding span `(t-range, t]`.
         range_ns: ValidatedDuration,
+        /// `offset <duration>` in SIGNED nanoseconds, `0` when absent
+        /// (issue #343).
+        ///
+        /// **`grid_start_ns`/`end_ns` above are ALREADY shifted by it.**
+        /// This field is the shift the evaluator adds back to every
+        /// EMITTED point timestamp, so a matrix comes out on the caller's
+        /// grid while the data window sits `offset` earlier — Loki v3.7.4
+        /// `pkg/logql/range_vector.go` runs the iterator from
+        /// `start-offset` and reports `current + offset`.
+        ///
+        /// It lives on the window rather than beside it so no caller can
+        /// build a range window and forget to decide: the compiler asks.
+        /// [`ClientWindow::Instant`] deliberately has no counterpart —
+        /// an instant result carries no timestamp of its own (the API
+        /// stamps it with the request's `time`), so there is nothing to
+        /// shift back.
+        offset_ns: i64,
     },
 }
 
@@ -416,6 +433,7 @@ mod tests {
             end_ns: 100,
             step_ns: step,
             range_ns: range,
+            offset_ns: 0,
         };
         assert_eq!(w.step_ns(), Some(step));
         assert!(range.get() > 0, "a validated range is never zero");

@@ -1,0 +1,122 @@
+# b19_offset.test — issue #343: the `offset` range-selector modifier.
+#
+# `offset d` evaluates the range selector over `(T - d - range, T - d]`.
+# The semantics, the accept surface and both boundaries were MEASURED
+# against the pinned grafana/loki:3.7.4 container and are recorded on
+# issue #343; the load below reproduces that probe's shape — 3 lines an
+# hour back, 7 recent ones — so the counts here are that probe's
+# 3 / 7 / 10 arithmetic over a fixture authored to match it.
+#
+# EVERY CASE HERE IS A `range` EVAL, AND THAT IS NOT A STYLE CHOICE.
+# The hermetic runner hands the evaluator every loaded row: on an INSTANT
+# query the window `(at-range, at]` is a SQL predicate, so this file
+# cannot observe an instant shift at all and an instant row here would
+# pass for the wrong reason. The sliding range evaluator owns its window
+# in Rust, so a range row does exercise the arithmetic. The instant half
+# of the shift is pinned where it actually lives — the scan bounds the
+# planner emits (`plan.rs`'s `offset_shifts_*` tests) and the SQL those
+# bounds render into.
+#
+# AND NO `variants(...)` ROW BELONGS HERE EITHER — the same limit, one
+# layer along. `variants(...)` reads each variant's window INTERSECTED
+# with the common range's single shared scan (measured, v3.7.4, seeded
+# store: a `[5m] offset 1h` variant answers 2 under a `[63m30s]` common
+# range and EMPTY under a `[5m]` one). That intersection is the SQL scan
+# predicate, which this runner does not apply — both queries answer 3
+# here. Written, measured, moved: the discriminating variants rows live
+# in `pulsus-server/tests/logs_api_live.rs`, against real ClickHouse.
+#
+# THE `[70m]` CONTROL IS WHAT MAKES THIS EVIDENCE. `[5m]` answering 7 and
+# `[5m] offset 1h` answering 3 is equally consistent with "the window
+# moved" and with "the old data was never loaded". The control window
+# spans both batches and answers 10, so the split is the window moving.
+#
+# THE SIGN IS THE TRAP. A negative offset is legal (a reference 200) and
+# shifts the window FORWARD. Written as an absolute-value subtraction the
+# planner reads correctly and silently evaluates the wrong window, so the
+# negative case below is chosen to answer a DIFFERENT NON-EMPTY value
+# under the signed rule than under `|d|` (7 vs 3), not merely "empty" —
+# an empty-vs-something pair would also pass if the shift saturated.
+#
+# AND THE OFFSET MOVES THE DATA WINDOW, NEVER THE EMITTED TIMESTAMPS.
+# The first three cases share one grid and differ only in value; the
+# negative case reports at 10m while reading the data at 70m.
+#
+# provenance: derived
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  Hand-derived from the semantics measured on issue #343 — the fixture
+#  is authored here rather than being the container's, and the `| logfmt`
+#  these rows need is not in the probe, so they are not verbatim captures
+#  and must not claim to be.)
+
+# 3 lines an hour back (6m, 7m, 8m) and 7 recent ones (66m..69m), one
+# stream: every body is identical so `| logfmt` yields ONE series.
+load
+  {env="prod", service_name="off"}
+  6m      lvl=info
+  7m      lvl=info
+  8m      lvl=info
+  66m     lvl=info
+  66m30s  lvl=info
+  67m     lvl=info
+  67m30s  lvl=info
+  68m     lvl=info
+  68m30s  lvl=info
+  69m     lvl=info
+
+# --- the control: no offset. Grid {65m, 70m}, window (t-5m, t]:
+# 65m sees (60m, 65m] -> gap; 70m sees (65m, 70m] -> the recent 7.
+eval range from 65m to 70m step 5m count_over_time({service_name="off"} | logfmt [5m])
+  {env="prod", lvl="info", service_name="off"} 70m 7
+
+# --- THE SHIFT, on the SAME grid. Evaluation moves to {5m, 10m}:
+# 5m sees (0, 5m] -> gap; 10m sees (5m, 10m] -> the old 3. The point is
+# reported at 70m, NOT at 10m — only the value moved.
+eval range from 65m to 70m step 5m count_over_time({service_name="off"} | logfmt [5m] offset 1h)
+  {env="prod", lvl="info", service_name="off"} 70m 3
+
+# --- `offset 0s` is the IDENTITY, and is its own spelling: bare
+# `offset 0` is a reference 400 while `offset 0s` is a 200.
+eval range from 65m to 70m step 5m count_over_time({service_name="off"} | logfmt [5m] offset 0s)
+  {env="prod", lvl="info", service_name="off"} 70m 7
+
+# --- THE CONTROL. (0, 70m] spans both batches: all 10 lines are loaded
+# and visible, so 3-vs-7 above is the window moving, not data missing.
+eval range from 70m to 70m step 5m count_over_time({service_name="off"} | logfmt [70m])
+  {env="prod", lvl="info", service_name="off"} 70m 10
+
+# --- NEGATIVE: the window moves FORWARD. Grid {5m, 10m}, evaluation at
+# {65m, 70m}: 65m sees (60m, 65m] -> gap; 70m sees (65m, 70m] -> 7, and
+# it is reported at 10m, the caller's grid point. Under an absolute-value
+# shift the evaluation would move BACK to {-55m, -50m} and answer
+# nothing, and under `|d|`-as-a-back-shift-of-the-data it would answer 3
+# — two non-empty values tell the rules apart.
+eval range from 5m to 10m step 5m count_over_time({service_name="off"} | logfmt [5m] offset -1h)
+  {env="prod", lvl="info", service_name="off"} 10m 7
+
+# --- NEGATIVE, past the loaded data: evaluation at {125m, 130m} holds
+# nothing, so no series at all.
+eval range from 65m to 70m step 5m count_over_time({service_name="off"} | logfmt [5m] offset -1h)
+
+# --- a compound duration shifts by its TOTAL: 1h30m back from 70m is
+# -20m, and (-25m, -20m] is empty.
+eval range from 70m to 70m step 5m count_over_time({service_name="off"} | logfmt [5m] offset 1h30m)
+
+clear
+
+# --- an unwrapped range aggregation carries the offset too -----------
+load
+  {env="prod", service_name="offu"}
+  6m   v=4
+  7m   v=1
+  66m  v=7
+  67m  v=2
+
+eval range from 70m to 70m step 5m sum_over_time({service_name="offu"} | logfmt | unwrap v [5m])
+  {env="prod", service_name="offu"} 70m 9
+
+eval range from 70m to 70m step 5m sum_over_time({service_name="offu"} | logfmt | unwrap v [5m] offset 1h)
+  {env="prod", service_name="offu"} 70m 5
+
+clear
+

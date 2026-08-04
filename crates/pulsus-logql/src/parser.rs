@@ -1265,8 +1265,15 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///
 /// Both fall out of requiring a duration token, so neither needs a
 /// special case; they are stated because the next reader will wonder.
+///
+/// The keyword goes through [`is_kw`] like every other keyword in this
+/// file (issue #339's rule): the reference's lexer folds keywords, so
+/// `OFFSET 1m` is a 200 there. A byte compare here made `offset` the one
+/// keyword that did not fold — recorded as a reference-accept /
+/// ours-reject row in the #339 census until this landed. Identifier
+/// PAYLOADS still never fold; that asymmetry is unchanged.
 fn parse_offset(cursor: &mut Cursor<'_>) -> Result<Option<i64>, LogQlError> {
-    let is_offset_kw = matches!(&cursor.peek().kind, TokenKind::Ident(k) if k == "offset");
+    let is_offset_kw = matches!(&cursor.peek().kind, TokenKind::Ident(k) if is_kw(k, "offset"));
     if !is_offset_kw {
         return Ok(None);
     }

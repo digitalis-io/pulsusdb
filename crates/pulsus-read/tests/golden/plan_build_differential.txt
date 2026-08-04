@@ -102,6 +102,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -152,6 +153,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -476,6 +478,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -518,6 +521,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -565,6 +569,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -595,6 +600,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -642,6 +648,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -684,6 +691,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -727,6 +735,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -778,6 +787,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -808,6 +818,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -839,6 +850,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -882,6 +894,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -924,6 +937,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -971,6 +985,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1001,6 +1016,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1044,6 +1060,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1086,6 +1103,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1133,6 +1151,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1163,6 +1182,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1214,6 +1234,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1256,6 +1277,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1311,6 +1333,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1341,6 +1364,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1390,6 +1414,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1432,6 +1457,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1485,6 +1511,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1515,6 +1542,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1567,6 +1595,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1609,6 +1638,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1665,6 +1695,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1695,6 +1726,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1752,6 +1784,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1794,6 +1827,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1855,6 +1889,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1885,6 +1920,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1942,6 +1978,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -1984,6 +2021,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2045,6 +2083,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2075,6 +2114,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2130,6 +2170,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2172,6 +2213,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2231,6 +2273,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2261,6 +2304,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2316,6 +2360,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2358,6 +2403,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2417,6 +2463,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2447,6 +2494,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2498,6 +2546,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2540,6 +2589,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2595,6 +2645,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2625,6 +2676,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2668,6 +2720,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2724,6 +2777,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2776,6 +2830,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2837,6 +2892,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2894,6 +2950,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -2964,6 +3021,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -3038,6 +3096,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3080,6 +3139,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3136,6 +3196,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3166,6 +3227,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3223,6 +3285,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3265,6 +3328,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3326,6 +3390,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3356,6 +3421,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3434,6 +3500,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3519,6 +3586,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -3578,6 +3646,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -3620,6 +3689,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -3676,6 +3746,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -3740,6 +3811,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -3770,6 +3842,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -3814,6 +3887,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -3960,6 +4034,7 @@ MetricBinary(
             range_ns: ValidatedDuration(
                 300000000000,
             ),
+            offset_ns: 0,
             rate_window_ns: Some(
                 300000000000,
             ),
@@ -3995,13 +4070,14 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                 },
                 instant_lower_inclusive: false,
                 rate_window_ns: None,
                 vector_aggs: [],
             },
         ],
-        spec_bytes: 336,
+        spec_bytes: 352,
     },
 )
 
@@ -4028,6 +4104,7 @@ MetricBinary(
             range_ns: ValidatedDuration(
                 300000000000,
             ),
+            offset_ns: 0,
             rate_window_ns: Some(
                 300000000000,
             ),
@@ -4063,7 +4140,7 @@ MetricBinary(
                 vector_aggs: [],
             },
         ],
-        spec_bytes: 336,
+        spec_bytes: 352,
     },
 )
 
@@ -4094,6 +4171,7 @@ MetricBinary(
             range_ns: ValidatedDuration(
                 300000000000,
             ),
+            offset_ns: 0,
             rate_window_ns: Some(
                 300000000000,
             ),
@@ -4129,6 +4207,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                 },
                 instant_lower_inclusive: false,
                 rate_window_ns: None,
@@ -4152,6 +4231,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                 },
                 instant_lower_inclusive: false,
                 rate_window_ns: Some(
@@ -4174,7 +4254,7 @@ MetricBinary(
                 ],
             },
         ],
-        spec_bytes: 1360,
+        spec_bytes: 1392,
     },
 )
 
@@ -4201,6 +4281,7 @@ MetricBinary(
             range_ns: ValidatedDuration(
                 300000000000,
             ),
+            offset_ns: 0,
             rate_window_ns: Some(
                 300000000000,
             ),
@@ -4269,7 +4350,7 @@ MetricBinary(
                 ],
             },
         ],
-        spec_bytes: 1360,
+        spec_bytes: 1392,
     },
 )
 
@@ -4304,6 +4385,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -4339,13 +4421,14 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                     },
                     instant_lower_inclusive: false,
                     rate_window_ns: None,
                     vector_aggs: [],
                 },
             ],
-            spec_bytes: 336,
+            spec_bytes: 352,
         },
         rhs: Scalar(
             1.0,
@@ -4380,6 +4463,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -4415,7 +4499,7 @@ MetricBinary(
                     vector_aggs: [],
                 },
             ],
-            spec_bytes: 336,
+            spec_bytes: 352,
         },
         rhs: Scalar(
             1.0,
@@ -4457,6 +4541,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -4492,13 +4577,14 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                     },
                     instant_lower_inclusive: false,
                     rate_window_ns: None,
                     vector_aggs: [],
                 },
             ],
-            spec_bytes: 336,
+            spec_bytes: 352,
         },
     },
 )
@@ -4533,6 +4619,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -4568,7 +4655,7 @@ MetricBinary(
                     vector_aggs: [],
                 },
             ],
-            spec_bytes: 336,
+            spec_bytes: 352,
         },
     },
 )
@@ -4616,6 +4703,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -4675,6 +4763,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -4739,6 +4828,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -4786,6 +4876,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -4846,6 +4937,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -4893,6 +4985,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -4958,6 +5051,7 @@ MetricBinary(
                         range_ns: ValidatedDuration(
                             300000000000,
                         ),
+                        offset_ns: 0,
                         rate_window_ns: Some(
                             300000000000,
                         ),
@@ -4993,6 +5087,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5081,6 +5176,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -5142,6 +5238,7 @@ MetricBinary(
                     range_ns: ValidatedDuration(
                         300000000000,
                     ),
+                    offset_ns: 0,
                     rate_window_ns: Some(
                         300000000000,
                     ),
@@ -5225,6 +5322,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: None,
                 op: QuantileOverTime,
                 vector_aggs: [],
@@ -5282,6 +5380,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: None,
                 op: QuantileOverTime,
                 vector_aggs: [],
@@ -5349,6 +5448,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5391,6 +5491,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5438,6 +5539,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5468,6 +5570,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5511,6 +5614,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5553,6 +5657,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5600,6 +5705,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5630,6 +5736,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5673,6 +5780,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5715,6 +5823,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5762,6 +5871,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5792,6 +5902,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5835,6 +5946,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5877,6 +5989,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5924,6 +6037,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5954,6 +6068,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -5997,6 +6112,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6039,6 +6155,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6086,6 +6203,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6116,6 +6234,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6159,6 +6278,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6201,6 +6321,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6248,6 +6369,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6278,6 +6400,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6321,6 +6444,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6363,6 +6487,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6410,6 +6535,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6440,6 +6566,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6483,6 +6610,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6525,6 +6653,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6572,6 +6701,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6602,6 +6732,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6645,6 +6776,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6687,6 +6819,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6734,6 +6867,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6764,6 +6898,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6807,6 +6942,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6849,6 +6985,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6896,6 +7033,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6926,6 +7064,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -6969,6 +7108,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7011,6 +7151,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7058,6 +7199,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7088,6 +7230,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7131,6 +7274,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7173,6 +7317,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7220,6 +7365,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7250,6 +7396,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7293,6 +7440,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7335,6 +7483,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7382,6 +7531,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7412,6 +7562,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7455,6 +7606,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7497,6 +7649,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7544,6 +7697,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7574,6 +7728,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7617,6 +7772,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7659,6 +7815,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7706,6 +7863,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7736,6 +7894,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7779,6 +7938,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7821,6 +7981,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7868,6 +8029,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7898,6 +8060,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7941,6 +8104,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -7983,6 +8147,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8030,6 +8195,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8060,6 +8226,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8103,6 +8270,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8145,6 +8313,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8192,6 +8361,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8222,6 +8392,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8265,6 +8436,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8307,6 +8479,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8354,6 +8527,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8384,6 +8558,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8427,6 +8602,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8469,6 +8645,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8516,6 +8693,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8546,6 +8724,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8589,6 +8768,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8631,6 +8811,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8678,6 +8859,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),
@@ -8708,6 +8890,7 @@ MetricBinary(
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
+                offset_ns: 0,
                 rate_window_ns: Some(
                     300000000000,
                 ),

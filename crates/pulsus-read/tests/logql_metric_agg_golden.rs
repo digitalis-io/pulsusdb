@@ -175,6 +175,8 @@ fn run_client(
             end_ns: mp.end_ns,
             step_ns,
             range_ns: mp.range_ns,
+            // Issue #343: the plan's bounds are already offset-shifted.
+            offset_ns: mp.offset_ns,
         },
         None => ClientWindow::Instant {
             start_ns: mp.grid_start_ns,
@@ -1206,6 +1208,8 @@ fn zero_k_over_501_groups_is_empty_not_a_rejection() {
                     end_ns: mp.end_ns,
                     step_ns,
                     range_ns: mp.range_ns,
+                    // Issue #343: the plan's bounds are already offset-shifted.
+                    offset_ns: mp.offset_ns,
                 },
                 None => ClientWindow::Instant {
                     start_ns: mp.grid_start_ns,
@@ -2948,6 +2952,8 @@ fn eval_node(
                             end_ns: mp.end_ns,
                             step_ns,
                             range_ns: mp.range_ns,
+                            // Issue #343: the plan's bounds are already offset-shifted.
+                            offset_ns: mp.offset_ns,
                         },
                         None => ClientWindow::Instant {
                             start_ns: mp.grid_start_ns,

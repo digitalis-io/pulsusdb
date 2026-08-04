@@ -473,6 +473,15 @@ fn walk_metric(me: &MetricExpr, out: &mut BTreeSet<String>) {
                 out.insert("grouping.range_agg".to_string());
                 out.insert(grouping_id(g.kind).to_string());
             }
+            // Issue #343: `offset` is a modifier ON the range selector,
+            // not a range function, so it is a presence-flag id like
+            // `range.duration_literal` beside it — driven by a struct
+            // field rather than an enum variant, and therefore
+            // exercise-proven by test #12's probe, not by the variant
+            // catalog.
+            if range.offset_ns.is_some() {
+                out.insert("range.offset".to_string());
+            }
             walk_log(&range.selector, out);
         }
         MeNode::Expr(MetricExpr::Vector { op, grouping, .. }) => {
@@ -637,7 +646,8 @@ fn matchgroup_id(g: &MatchGroup) -> &'static str {
 // walker; (2) non-variant leaf ids driven by struct fields / string tables /
 // presence flags (e.g. `statics.string`, `parser.*.expressions`,
 // `labelfilter.error`, `fmt.line_format`, `template.builtin.representative`,
-// `unwrap.*`, `range.duration_literal`, `binop.bool`, `match.on/ignoring`,
+// `unwrap.*`, `range.duration_literal`, `range.offset`, `binop.bool`,
+// `match.on/ignoring`,
 // `labelfilter.and/or`) are exercise-proven per-construct by test #12 and by
 // the reverse gate #10b, not by this catalog.
 
@@ -1106,8 +1116,13 @@ fn differential_categories_are_pinned() {
     // added `func.label_replace` (supported) → 101.
     // #344 added `grouping.range_agg` (supported) -> 102, and
     // `grouping.range_agg_disallowed` as the reject-parity twin -> 3.
+    // #343 added `range.offset` (supported) -> 103: the reference accepts
+    // `offset` on every range selector, and PulsusDB now parses it, folds
+    // the keyword, and shifts the planner window — so `supported` is the
+    // end-to-end disposition, not a parse-only claim. An `interim` one
+    // would go red against the hard `interim == 0` pin above.
     assert_eq!(
-        supported, 102,
+        supported, 103,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(

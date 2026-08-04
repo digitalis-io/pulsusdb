@@ -252,6 +252,17 @@ pub struct MetricPlan {
     /// [`ValidatedDuration`] (issue #227 review round 3), so the evaluator
     /// can neither narrow nor be handed unvalidated client input.
     pub range_ns: ValidatedDuration,
+    /// `offset <duration>` in SIGNED nanoseconds, `0` when absent (issue
+    /// #343). Every time bound above is ALREADY shifted by it — this
+    /// field is what the emitted point timestamps add back so a matrix
+    /// comes out on the CALLER's grid, exactly as Loki v3.7.4's
+    /// `batchRangeVectorIterator` reports `current + offset` after
+    /// starting at `start - offset`.
+    ///
+    /// Signed because the reference accepts a negative offset and shifts
+    /// the window forward; an instant result carries no timestamp, so
+    /// only the range/matrix shape ever reads it back.
+    pub offset_ns: i64,
     pub rate_window_ns: Option<u64>,
     pub op: RangeAggOp,
     /// Outer-to-inner vector-aggregation chain (`sum by (...) (avg(...))`
@@ -1668,17 +1679,15 @@ fn metric_plan(
             None
         };
 
-    // Issue #343: `offset` PARSES but the planner does not shift the
-    // window yet. Rejecting it here is deliberate and is the whole point:
-    // ignoring `offset_ns` would evaluate the UNSHIFTED window and return
-    // confidently wrong data — a fix at the grammar layer relocating the
-    // failure to this one, which is the defect #351 was filed for. A
-    // clean rejection is honest; a silent wrong answer is not.
-    if range.offset_ns.is_some() {
-        return Err(super::error::ReadError::PipelineInvalid {
-            reason: "offset is parsed but not yet evaluated (issue #343)".to_string(),
-        });
-    }
+    // Issue #343: `offset d` evaluates the range selector over
+    // `(T - d - range, T - d]` — the WHOLE time domain moves back by `d`,
+    // measured against the pinned v3.7.4 container (3 old lines vs 7 recent
+    // ones, with a `[70m]` control proving the window moved rather than the
+    // data being absent).
+    //
+    // `offset 0s` is the identity, so an absent offset and a zero one are
+    // the same window — `unwrap_or(0)` rather than a branch.
+    let offset_ns = range.offset_ns.unwrap_or(0);
     // Issue #227 review round 2: VALIDATE the client-controlled `[range]`
     // duration at this boundary. Everything downstream carries the validated
     // `i64` — no `as i64` narrowing of client input exists past this line.
@@ -1690,8 +1699,16 @@ fn metric_plan(
     // `t ∈ {grid_start + k·step ≤ end}`, so the scan must reach back a full
     // `range` before `grid_start`. `rate_window_ns = range` (never `step`)
     // is the `rate([1m]) ≠ rate([10m])` fix.
+    //
+    // Issue #343: every bound below is the OFFSET-SHIFTED evaluation
+    // domain (`shift_by_offset`), so the scan, the partition months and
+    // the emit grid all move together. The emitted point TIMESTAMPS are
+    // put back on the caller's grid by `MetricPlan::offset_ns` (Loki
+    // v3.7.4 `pkg/logql/range_vector.go` does exactly this: it starts the
+    // iterator at `start-offset` and reports `current + offset`).
     let (start_ns, scan_lower, end_ns, step_ns, grid_start_ns, rate_window_ns) = match p.spec {
         QuerySpec::Instant { at_ns } => {
+            let at_ns = shift_by_offset(at_ns, offset_ns);
             let (start, lower) = widen_scan_start(at_ns, range_ns);
             (start, lower, at_ns, None, start, Some(range_ns))
         }
@@ -1705,6 +1722,8 @@ fn metric_plan(
             // in-domain durations only: every later `step as i128` /
             // `step_ns > i64::MAX` guard is then provably never taken.
             let step = validate_duration_ns(step_ns, "step")?;
+            let start_ns = shift_by_offset(start_ns, offset_ns);
+            let end_ns = shift_by_offset(end_ns, offset_ns);
             let (scan_start, lower) = widen_scan_start(start_ns, range_ns);
             (
                 scan_start,
@@ -1847,6 +1866,7 @@ fn metric_plan(
         step_ns,
         grid_start_ns,
         range_ns,
+        offset_ns,
         // Widening a boundary-validated positive `i64` to `u64` for
         // `apply_rate`'s divisor — provably lossless (issue #227 round 2).
         rate_window_ns: if is_rate {
@@ -1881,6 +1901,26 @@ fn widen_scan_start(start_ns: i64, range_ns: ValidatedDuration) -> (i64, ScanLow
         Some(lo) => (lo, ScanLowerBound::Exclusive),
         None => (i64::MIN, ScanLowerBound::Inclusive),
     }
+}
+
+/// Moves one evaluation-domain instant back by `offset ns` (issue #343).
+///
+/// **SIGNED, and that is the whole point.** The reference accepts a
+/// NEGATIVE offset and shifts the window FORWARD, into the future
+/// (`rate({app="x"}[5m] offset -1h)` is a v3.7.4 **200**, returning empty
+/// against a fixture with no future data). Written as an absolute-value
+/// subtraction this reads correctly and silently evaluates the wrong
+/// window for every negative offset — a quietly wrong time window, which
+/// is the worst outcome this construct can produce. One subtraction, sign
+/// included, is the reason this is a named function rather than an inline
+/// `-`.
+///
+/// Saturating rather than erroring: a colossal offset (the reference
+/// accepts `offset 100000h`) pushes BOTH bounds to the same i64 rail, so
+/// the span is preserved and the query answers empty — which is what the
+/// reference answers. There is no new rejection surface to invent here.
+fn shift_by_offset(instant_ns: i64, offset_ns: i64) -> i64 {
+    instant_ns.saturating_sub(offset_ns)
 }
 
 /// Unwraps every outer `MetricExpr::Vector` layer, returning the
@@ -2377,17 +2417,40 @@ fn build_variants_node(
         } else {
             ClientValue::Count
         };
+        // Issue #343: **the VARIANT's own offset**, not the common range's.
+        //
+        // `variants(...)` fetches ONCE, from the common range's window (that
+        // range's own offset included), and evaluates each variant's whole
+        // expression over exactly those rows — so a variant reads its
+        // shifted window INTERSECTED with the common one. Measured against
+        // the pinned v3.7.4 container with a seeded store: a variant
+        // `[5m] offset 1h` under a common `[63m30s]` that reaches only two
+        // of the three old lines answers **2** — not 3 (which a per-variant
+        // scan would give) and not empty. Under a common `[70m]` the same
+        // variant answers 3; under a common `[5m]` it answers 200-EMPTY.
+        //
+        // Two corrections are pinned by that measurement, both of which read
+        // as improvements and are not:
+        //
+        // * The reference does NOT reject a variant whose offset differs
+        //   from the common range's — every such shape is a 200. An earlier
+        //   draft of this refused them by name, which 400s the query the
+        //   reference answers 3.
+        // * Widening the shared scan to COVER the union of the variants'
+        //   shifted windows would answer 3 where the reference answers
+        //   empty. It is not a fix; it is a divergence.
+        //
+        // Reading the variant's own offset here is the whole of it: the
+        // intersection then falls out of the single shared scan, exactly as
+        // it does there.
+        let offset_ns = range.offset_ns.unwrap_or(0);
         // The variant's OWN `[range]`, validated at the boundary, on the
         // SHARED grid (`grid_start_ns`/`end_ns`/`step_ns` equal the scan
         // plan's; only `range_ns` differs).
-        if range.offset_ns.is_some() {
-            return Err(super::error::ReadError::PipelineInvalid {
-                reason: "offset is parsed but not yet evaluated (issue #343)".to_string(),
-            });
-        }
         let range_ns = validate_duration_ns(range.range.as_nanos(), "range selector")?;
         let (window, instant_lower_inclusive) = match p.spec {
             QuerySpec::Instant { at_ns } => {
+                let at_ns = shift_by_offset(at_ns, offset_ns);
                 let (lo, bound) = widen_scan_start(at_ns, range_ns);
                 (
                     ClientWindow::Instant {
@@ -2405,10 +2468,11 @@ fn build_variants_node(
                 let step = validate_duration_ns(step_ns, "step")?;
                 (
                     ClientWindow::Range {
-                        grid_start_ns: start_ns,
-                        end_ns,
+                        grid_start_ns: shift_by_offset(start_ns, offset_ns),
+                        end_ns: shift_by_offset(end_ns, offset_ns),
                         step_ns: step,
                         range_ns,
+                        offset_ns,
                     },
                     false,
                 )
@@ -3486,6 +3550,243 @@ mod tests {
         .unwrap();
         assert_eq!(mp.start_ns, i64::MIN);
         assert_eq!(mp.scan_lower, ScanLowerBound::Exclusive);
+    }
+
+    // --- Issue #343: the `offset` window shift ------------------------
+    //
+    // These own the INSTANT half of the shift, which the hermetic corpus
+    // cannot see: an instant window is a SQL predicate, so `b19_offset.
+    // test` — which drives the pure evaluator over every loaded row —
+    // reaches only the range/sliding half. What a user experiences on an
+    // instant query IS `start_ns`/`end_ns`, the bounds asserted here.
+
+    const HOUR_NS: i64 = 3_600_000_000_000;
+    const FIVE_MIN_NS: i64 = 300_000_000_000;
+
+    /// A positive offset moves the whole instant window BACK by `d`, and
+    /// the emitted-grid shift is recorded so a matrix can be put back.
+    #[test]
+    fn offset_shifts_the_instant_scan_window_back() {
+        let at = 100 * HOUR_NS;
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[5m] offset 1h)"#,
+            QuerySpec::Instant { at_ns: at },
+        )
+        .unwrap();
+        assert_eq!(mp.end_ns, at - HOUR_NS, "the window's upper bound is T - d");
+        assert_eq!(
+            mp.start_ns,
+            at - HOUR_NS - FIVE_MIN_NS,
+            "and its lower bound is T - d - range"
+        );
+        assert_eq!(mp.grid_start_ns, mp.start_ns);
+        assert_eq!(mp.scan_lower, ScanLowerBound::Exclusive);
+        assert_eq!(mp.offset_ns, HOUR_NS);
+    }
+
+    /// `offset 0s` is the IDENTITY — byte-identical to the same query
+    /// without an offset. It is a distinct SPELLING (bare `offset 0` is a
+    /// reference 400), never a distinct plan.
+    #[test]
+    fn a_zero_offset_plans_identically_to_no_offset() {
+        let spec = QuerySpec::Instant {
+            at_ns: 100 * HOUR_NS,
+        };
+        let with = metric_mp(r#"count_over_time({env="prod"}[5m] offset 0s)"#, spec).unwrap();
+        let without = metric_mp(r#"count_over_time({env="prod"}[5m])"#, spec).unwrap();
+        assert_eq!(with, without);
+        assert_eq!(with.offset_ns, 0);
+    }
+
+    /// **The sign, which is the whole trap.** A NEGATIVE offset is a
+    /// reference 200 and shifts the window FORWARD. Written as an
+    /// absolute-value subtraction the planner reads correctly and
+    /// silently evaluates `(T-d-range, T-d]` instead — so this asserts
+    /// the bounds are ABOVE `at`, and asserts they differ from the
+    /// positive-offset plan, which an `|d|` implementation could not do.
+    #[test]
+    fn a_negative_offset_shifts_the_window_forward_not_back() {
+        let at = 100 * HOUR_NS;
+        let ahead = metric_mp(
+            r#"count_over_time({env="prod"}[5m] offset -1h)"#,
+            QuerySpec::Instant { at_ns: at },
+        )
+        .unwrap();
+        assert_eq!(ahead.end_ns, at + HOUR_NS, "T - (-d) is T + d");
+        assert_eq!(ahead.start_ns, at + HOUR_NS - FIVE_MIN_NS);
+        assert_eq!(ahead.offset_ns, -HOUR_NS);
+
+        let behind = metric_mp(
+            r#"count_over_time({env="prod"}[5m] offset 1h)"#,
+            QuerySpec::Instant { at_ns: at },
+        )
+        .unwrap();
+        assert_ne!(
+            ahead.end_ns, behind.end_ns,
+            "an absolute-value shift would make these equal"
+        );
+        assert_eq!(
+            ahead.end_ns - behind.end_ns,
+            2 * HOUR_NS,
+            "the two windows sit a full 2d apart, one either side of T"
+        );
+    }
+
+    /// The range shape: the SCAN and the EMIT GRID both move, and
+    /// `offset_ns` carries the shift the evaluator adds back so the
+    /// matrix comes out on the caller's grid.
+    #[test]
+    fn offset_shifts_the_range_scan_and_grid_together() {
+        let start = 100 * HOUR_NS;
+        let end = start + HOUR_NS;
+        let spec = QuerySpec::Range {
+            start_ns: start,
+            end_ns: end,
+            step_ns: FIVE_MIN_NS as u64,
+        };
+        let mp = metric_mp(r#"count_over_time({env="prod"}[5m] offset 1h)"#, spec).unwrap();
+        assert_eq!(mp.grid_start_ns, start - HOUR_NS);
+        assert_eq!(mp.end_ns, end - HOUR_NS);
+        assert_eq!(
+            mp.start_ns,
+            start - HOUR_NS - FIVE_MIN_NS,
+            "the scan still reaches a full [range] below the grid"
+        );
+        assert_eq!(mp.offset_ns, HOUR_NS);
+
+        // The SPAN is preserved: an offset translates the domain, it does
+        // not widen it, so the byte budget of an offset query matches the
+        // same query without one.
+        let plain = metric_mp(r#"count_over_time({env="prod"}[5m])"#, spec).unwrap();
+        assert_eq!(mp.end_ns - mp.start_ns, plain.end_ns - plain.start_ns);
+    }
+
+    /// A colossal offset saturates BOTH bounds onto the same rail rather
+    /// than erroring or wrapping: the reference accepts `offset 100000h`
+    /// and answers empty, and so does this — no rejection surface the
+    /// reference does not have.
+    #[test]
+    fn a_colossal_offset_saturates_rather_than_wrapping() {
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"}[5m] offset 100000h)"#,
+            QuerySpec::Instant { at_ns: 0 },
+        )
+        .unwrap();
+        assert!(mp.end_ns < 0, "the window sits far in the past");
+        assert!(
+            mp.start_ns <= mp.end_ns,
+            "the bounds stay ordered: {} .. {}",
+            mp.start_ns,
+            mp.end_ns
+        );
+    }
+
+    /// The shared scan and the variant windows of one `variants(...)`
+    /// plan: `(scan.start_ns, scan.end_ns, [variant window bounds])`.
+    fn variants_windows(query: &str, spec: QuerySpec) -> (i64, i64, Vec<(i64, i64)>) {
+        match &plan_at(query, spec).expect("plans") {
+            Plan::MetricBinary(MetricNode::Variants { scan, variants, .. }) => (
+                scan.start_ns,
+                scan.end_ns,
+                variants
+                    .iter()
+                    .map(|v| match v.window() {
+                        ClientWindow::Instant { start_ns, end_ns } => (start_ns, end_ns),
+                        ClientWindow::Range {
+                            grid_start_ns,
+                            end_ns,
+                            ..
+                        } => (grid_start_ns, end_ns),
+                    })
+                    .collect(),
+            ),
+            other => panic!("expected a variants plan, got {other:?}"),
+        }
+    }
+
+    /// **A variant's window comes from its OWN offset, over the single
+    /// shared scan of the COMMON range's window** — the reference's model,
+    /// measured against the pinned v3.7.4 container with a seeded store
+    /// (issue #343): a variant reads its shifted window INTERSECTED with
+    /// the common one.
+    ///
+    /// So a variant offset the common range does not share is planned, not
+    /// refused: the reference answers such a query 200 in every shape
+    /// probed, `3` where the common window covers the shifted data and
+    /// empty where it does not. This asserts the plan that produces that —
+    /// the variant window moves, the scan does not.
+    #[test]
+    fn a_variant_carries_its_own_offset_over_the_common_ranges_scan() {
+        let at = 100 * HOUR_NS;
+        let (scan_start, scan_end, windows) = variants_windows(
+            r#"variants(count_over_time({env="prod"}[5m] offset 1h)) of ({env="prod"}[5m])"#,
+            QuerySpec::Instant { at_ns: at },
+        );
+        // The scan is the COMMON range's, unshifted and NOT widened to
+        // cover the variant: union-widening would answer 3 where the
+        // reference answers empty, which is a divergence, not a fix.
+        assert_eq!((scan_start, scan_end), (at - FIVE_MIN_NS, at));
+        // The variant's window IS shifted, by its own offset.
+        assert_eq!(windows, vec![(at - HOUR_NS - FIVE_MIN_NS, at - HOUR_NS)]);
+        assert!(
+            windows[0].1 < scan_start,
+            "this pair does not overlap at all, which is what makes the \
+             reference's answer for it empty rather than partial"
+        );
+    }
+
+    /// The other three arrangements, each pinned by the same probe.
+    #[test]
+    fn every_variant_offset_arrangement_plans_with_its_own_window() {
+        let at = 100 * HOUR_NS;
+        let spec = QuerySpec::Instant { at_ns: at };
+
+        // UNIFORM: scan and variant move together, and the variant's
+        // window sits inside the scan — the case that answers 3.
+        let (s0, s1, w) = variants_windows(
+            r#"variants(count_over_time({env="prod"}[5m] offset 1h)) of ({env="prod"}[5m] offset 1h)"#,
+            spec,
+        );
+        assert_eq!((s0, s1), (at - HOUR_NS - FIVE_MIN_NS, at - HOUR_NS));
+        assert_eq!(w, vec![(at - HOUR_NS - FIVE_MIN_NS, at - HOUR_NS)]);
+
+        // The COMMON range carries the offset and the variant does not:
+        // the scan moves, the variant window does not.
+        let (s0, s1, w) = variants_windows(
+            r#"variants(count_over_time({env="prod"}[5m])) of ({env="prod"}[5m] offset 1h)"#,
+            spec,
+        );
+        assert_eq!((s0, s1), (at - HOUR_NS - FIVE_MIN_NS, at - HOUR_NS));
+        assert_eq!(w, vec![(at - FIVE_MIN_NS, at)]);
+
+        // TWO variants, only the first offset: each gets its own window
+        // off ONE scan. The reference returns only the second one's
+        // series for exactly this shape.
+        let (s0, s1, w) = variants_windows(
+            r#"variants(count_over_time({env="prod"}[5m] offset 1h), count_over_time({env="prod"}[5m])) of ({env="prod"}[5m])"#,
+            spec,
+        );
+        assert_eq!((s0, s1), (at - FIVE_MIN_NS, at));
+        assert_eq!(
+            w,
+            vec![
+                (at - HOUR_NS - FIVE_MIN_NS, at - HOUR_NS),
+                (at - FIVE_MIN_NS, at),
+            ]
+        );
+
+        // `offset 0s` on the variant against no offset on the common
+        // range is the identity — the same window, not merely the same
+        // `Option` shape.
+        let (_, _, zero) = variants_windows(
+            r#"variants(count_over_time({env="prod"}[5m] offset 0s)) of ({env="prod"}[5m])"#,
+            spec,
+        );
+        let (_, _, absent) = variants_windows(
+            r#"variants(count_over_time({env="prod"}[5m])) of ({env="prod"}[5m])"#,
+            spec,
+        );
+        assert_eq!(zero, absent);
     }
 
     /// Issue #227: a range query NO LONGER routes to the 5s rollup on a

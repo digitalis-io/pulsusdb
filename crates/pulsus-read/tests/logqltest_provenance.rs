@@ -251,6 +251,16 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // cannot drift. 16 -> 18; #240's sweep numbers stand, since both
         // are ordinary `PipelineInvalid` reasons carrying no regex and no
         // reference-verbatim text.
+        // Issue #343 is net ZERO here, and the zero is the finding. The
+        // two interim `offset is parsed but not yet evaluated` refusals
+        // were replaced by the planner's window shift, and an earlier
+        // draft added one back — a `variants(...)` refusal for a variant
+        // whose offset differed from the common range's. Probing the
+        // pinned v3.7.4 container refuted it: the reference PLANS that
+        // shape (200, the shifted data where the common window covers it,
+        // empty where it does not), so refusing it was a divergence
+        // dressed as safety. Both out, none in: 18 stands, and so do
+        // #240's sweep numbers.
         ("plan.rs", 18),
         ("exec.rs", 12),
         ("client_agg.rs", 1),
@@ -881,7 +891,11 @@ fn check_e_ledger_rows_claiming_corpus_gating_are_named_by_a_marker() {
 
 /// Pinned corpus provenance counts (issue #352 step 1).
 const CAPTURED: usize = 1_135;
-const DERIVED: usize = 16;
+/// Issue #343 added `b19_offset.test`'s 9 rows: hand-derived from the
+/// semantics measured on that issue, over a fixture authored here rather
+/// than taken from the container, so they are `derived` and not
+/// `captured`. 16 -> 25.
+const DERIVED: usize = 25;
 const DIVERGENCE: usize = 17;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_200;
+const TOTAL: usize = 1_209;
