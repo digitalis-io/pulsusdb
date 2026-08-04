@@ -238,12 +238,13 @@ Out of this ledger's scope by design:
 - **Gating:** the live `schema-it` differential now asserts the raw
   sliding path is bit-exact to `grafana/loki:3.7.4` on an off-5s-boundary
   grid (env-gated), plus the hermetic `logqltest` `eval range` corpus.
-  INSTANT metric queries were already identical (`(t - range, t]` at one
-  evaluation instant) and were unchanged BY THIS ISSUE. Issue #344 later
-  corrected their `first_over_time`/`last_over_time` tie order to the same
-  `(timestamp, StableHash)` delivery order this entry's sliding path uses
-  (`pkg/iter/sample_iterator.go:139-148` @ v3.7.4); the same-nanosecond
-  same-stream residual above now applies to both paths alike.
+  This issue's own change is to the RANGE path: the sliding window
+  replaces the tumbling one there, and the instant path already evaluated
+  `(t - range, t]` at one evaluation instant. Issue #344 later corrected
+  the instant path's `first_over_time`/`last_over_time` tie order to the
+  same `(timestamp, StableHash)` delivery order this entry's sliding path
+  uses (`pkg/iter/sample_iterator.go:139-148` @ v3.7.4), so the
+  same-nanosecond same-stream residual above applies to both paths alike.
 - **e2e cases re-gated (issue #227).** The five cases this entry covered
   are no longer informational — the divergence they recorded is gone, so
   `test/fixtures/logs/differential.json` carries them at `mode: "gated"`
