@@ -1668,6 +1668,17 @@ fn metric_plan(
             None
         };
 
+    // Issue #343: `offset` PARSES but the planner does not shift the
+    // window yet. Rejecting it here is deliberate and is the whole point:
+    // ignoring `offset_ns` would evaluate the UNSHIFTED window and return
+    // confidently wrong data — a fix at the grammar layer relocating the
+    // failure to this one, which is the defect #351 was filed for. A
+    // clean rejection is honest; a silent wrong answer is not.
+    if range.offset_ns.is_some() {
+        return Err(super::error::ReadError::PipelineInvalid {
+            reason: "offset is parsed but not yet evaluated (issue #343)".to_string(),
+        });
+    }
     // Issue #227 review round 2: VALIDATE the client-controlled `[range]`
     // duration at this boundary. Everything downstream carries the validated
     // `i64` — no `as i64` narrowing of client input exists past this line.
@@ -2257,6 +2268,10 @@ fn build_variants_node(
             },
             range: v.range.range,
             unwrap: None,
+            // Issue #343: the variants scan expression inherits the
+            // source range selector's offset, so the guard above sees it
+            // rather than this synthesised node silently dropping it.
+            offset_ns: v.range.offset_ns,
         },
         param: None,
         // The synthesised common-range scan carries no grouping: the
@@ -2365,6 +2380,11 @@ fn build_variants_node(
         // The variant's OWN `[range]`, validated at the boundary, on the
         // SHARED grid (`grid_start_ns`/`end_ns`/`step_ns` equal the scan
         // plan's; only `range_ns` differs).
+        if range.offset_ns.is_some() {
+            return Err(super::error::ReadError::PipelineInvalid {
+                reason: "offset is parsed but not yet evaluated (issue #343)".to_string(),
+            });
+        }
         let range_ns = validate_duration_ns(range.range.as_nanos(), "range selector")?;
         let (window, instant_lower_inclusive) = match p.spec {
             QuerySpec::Instant { at_ns } => {

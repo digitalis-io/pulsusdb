@@ -463,8 +463,30 @@ const VERSION_DIFFERENCE: &str = "version-difference";
 const OVER_ACCEPTANCE: &str = "over-acceptance";
 const REAL_GAP: &str = "real-gap";
 
-const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
-    // (query, differential-oracle verdict, PulsusDB verdict, class)
+/// The wire column's "adds nothing" marker.
+const SAME: &str = "same-as-parse";
+
+/// `(query, reference, PulsusDB PARSE, PulsusDB WIRE, class)`.
+///
+/// **Two axes, because they are different facts** (issue #343, following
+/// the TraceQL matrix). Collapsing them is what let #335's D2 ship as
+/// "closed" on a parse score while every such query still 400'd at the
+/// planner; switching that matrix to the wire exposed 37 divergences
+/// nobody could see.
+///
+/// The WIRE column is `SAME` when the planner adds nothing to the parse
+/// verdict, or an explicit verdict when it differs. `offset` is the
+/// worked example: **parse accept, wire reject** — the grammar landed
+/// (issue #343) and the planner window shift has not, so a query using it
+/// is still refused end to end. When the shift lands, one field moves and
+/// this census says so.
+///
+/// The parse column is DERIVED (`accepts()` runs the parser). The wire
+/// column is RECORDED, not derived, because this crate cannot see the
+/// planner — `pulsus-read` owns it. That is a real weakness of this
+/// table and is stated rather than hidden.
+const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str, &str)] = &[
+    // (query, differential-oracle verdict, parse, wire, class)
     // OVER-ACCEPTANCE. A label-filter duration with an uppercase unit:
     // the oracle lexes no literal at all (`400 syntax error: unexpected
     // $end`).
@@ -472,6 +494,7 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
         r#"{app="x"} | json | d > 1S"#,
         "reject",
         "accept",
+        SAME,
         OVER_ACCEPTANCE,
     ),
     // OVER-ACCEPTANCE. Range-selector units the oracle does not know at
@@ -480,19 +503,30 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
         r#"count_over_time({app="x"}[5ns])"#,
         "reject",
         "accept",
+        SAME,
         OVER_ACCEPTANCE,
     ),
     (
         r#"count_over_time({app="x"}[5us])"#,
         "reject",
         "accept",
+        SAME,
         OVER_ACCEPTANCE,
     ),
-    // A REAL GAP (filed separately). `offset` is unimplemented here in
-    // EVERY spelling, so it is not part of the folding gap; the
-    // reference accepts both.
+    // A REAL GAP (issue #343), and the worked example of why this table
+    // carries TWO axes. The grammar landed: `offset` now PARSES, on every
+    // range selector, matching the reference. The planner window shift did
+    // not, and it rejects rather than silently evaluating the UNSHIFTED
+    // window — so end to end the query is still refused.
+    //
+    // parse: accept · wire: reject. Recording only one of those would be
+    // false in one direction or the other: "reject" hides that the grammar
+    // shipped, "accept" claims a fix a user cannot observe. When the
+    // planner shift lands, the wire field moves to `accept` and this row
+    // leaves the census.
     (
         r#"count_over_time({app="x"}[5m] offset 1m)"#,
+        "accept",
         "accept",
         "reject",
         REAL_GAP,
@@ -501,6 +535,7 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
         r#"count_over_time({app="x"}[5m] OFFSET 1m)"#,
         "accept",
         "reject",
+        SAME,
         REAL_GAP,
     ),
     // OVER-ACCEPTANCE. A keyword used as a selector label name: the
@@ -508,10 +543,10 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
     // (`unexpected by,
     // expecting IDENTIFIER or }` — note it prints the FOLDED spelling
     // for `{BY="x"}` too, which is how the fold was established).
-    (r#"{by="x"}"#, "reject", "accept", OVER_ACCEPTANCE),
-    (r#"{BY="x"}"#, "reject", "accept", OVER_ACCEPTANCE),
-    (r#"{json="x"}"#, "reject", "accept", OVER_ACCEPTANCE),
-    (r#"{JSON="x"}"#, "reject", "accept", OVER_ACCEPTANCE),
+    (r#"{by="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
+    (r#"{BY="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
+    (r#"{json="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
+    (r#"{JSON="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
 ];
 
 /// **Counts are pinned, not just rows.** The census used to assert every
@@ -542,7 +577,7 @@ fn the_residual_census_totals_are_pinned() {
     ] {
         let n = KNOWN_RESIDUAL_DIVERGENCES
             .iter()
-            .filter(|(_, _, _, c)| *c == class)
+            .filter(|(_, _, _, _, c)| *c == class)
             .count();
         assert_eq!(n, expected, "{class} row count changed");
     }
@@ -553,7 +588,7 @@ fn the_residual_census_totals_are_pinned() {
         .map(|class| {
             KNOWN_RESIDUAL_DIVERGENCES
                 .iter()
-                .filter(|(_, _, _, c)| c == class)
+                .filter(|(_, _, _, _, c)| c == class)
                 .count()
         })
         .sum();
@@ -567,16 +602,22 @@ fn the_residual_census_totals_are_pinned() {
 #[test]
 fn the_residual_divergence_census_is_exact() {
     let mut drifted = Vec::new();
-    for (query, reference, recorded, _class) in KNOWN_RESIDUAL_DIVERGENCES {
+    for (query, reference, parse, wire, _class) in KNOWN_RESIDUAL_DIVERGENCES {
         let ours = if accepts(query) { "accept" } else { "reject" };
-        if ours != *recorded {
+        if ours != *parse {
             drifted.push(format!(
-                "{query:?}: recorded PulsusDB={recorded}, actual={ours} (reference={reference})"
+                "{query:?}: recorded parse={parse}, actual={ours} (reference={reference})"
             ));
         }
+        // The row must still record a DIVERGENCE on the axis the user
+        // experiences. A row whose wire verdict equals the reference has
+        // been fixed end to end and belongs out of this list; a row whose
+        // PARSE now agrees while the wire does not is still a divergence,
+        // which is exactly what the two columns exist to express.
+        let effective: &str = if *wire == SAME { parse } else { wire };
         assert_ne!(
-            reference, recorded,
-            "{query:?} is in the residual list but records agreement — remove it"
+            *reference, effective,
+            "{query:?} agrees with the reference on the WIRE — it is fixed, remove it"
         );
     }
     assert!(
@@ -611,7 +652,7 @@ fn live_expectations() -> Vec<(String, &'static str)> {
         out.push(((*q).to_string(), "reject"));
     }
     // The residual census carries the reference verdict per row.
-    for (q, reference, _, _) in KNOWN_RESIDUAL_DIVERGENCES {
+    for (q, reference, _, _, _) in KNOWN_RESIDUAL_DIVERGENCES {
         out.push(((*q).to_string(), reference));
     }
     out

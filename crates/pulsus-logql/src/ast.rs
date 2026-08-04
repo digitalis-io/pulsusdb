@@ -1107,6 +1107,7 @@ fn empty_log_range() -> LogRange {
         },
         range: Duration::from_nanos(0),
         unwrap: None,
+        offset_ns: None,
     }
 }
 
@@ -2296,11 +2297,29 @@ pub struct LogRange {
     pub selector: LogExpr,
     pub range: Duration,
     pub unwrap: Option<Unwrap>,
+    /// `offset <duration>` (issue #343) — shifts the evaluated window
+    /// BACK by this much: the selector is evaluated over
+    /// `(T - offset - range, T - offset]`.
+    ///
+    /// Signed NANOSECONDS rather than [`Duration`], which is `u64`,
+    /// because **the reference accepts a NEGATIVE offset** and shifts the
+    /// window forward. Measured against the pinned v3.7.4 container:
+    /// `rate({app="x"}[5m] offset -1h)` is a 200. It looks like a bug and
+    /// is not — do not "tidy" it into a rejection.
+    pub offset_ns: Option<i64>,
 }
 
 impl fmt::Display for LogRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}[{}]", self.selector, self.range)
+        write!(f, "{}[{}]", self.selector, self.range)?;
+        if let Some(ns) = self.offset_ns {
+            // Rendered from the ABSOLUTE value with an explicit sign, so a
+            // negative offset round-trips (`Duration` is unsigned).
+            let mag = Duration::from_nanos(ns.unsigned_abs());
+            let sign = if ns < 0 { "-" } else { "" };
+            write!(f, " offset {sign}{mag}")?;
+        }
+        Ok(())
     }
 }
 
@@ -2616,8 +2635,26 @@ fn quote(value: &str) -> String {
 // Static keyword tables used by the parser to recognize M6 constructs it
 // does not implement and name them in `LogQlError::NotYetSupported`
 // (docs/features.md §2 "LogQL — parity (M6)"; architect plan amendment 1
-// §3). `offset` is deliberately absent — it is a PromQL-ism with no LogQL
-// grammar (amendment 1 §3 note).
+// §3).
+//
+// This comment used to read: "`offset` is deliberately absent — it is a
+// PromQL-ism with no LogQL grammar". **That was false, and it is the
+// mechanism that hid the gap** (issue #343). The reference accepts
+// `offset` on every range selector — measured against the pinned v3.7.4
+// container — so the construct was not merely missing a registry row: we
+// had written down that it does not exist, which excluded it from THIS
+// table too, so it never even became a `NotYetSupported` error. A missing
+// entry is an absence; a false one removes the construct from the place
+// you would look for it.
+//
+// The detector, worth carrying: that claim was justified by where the
+// construct CAME FROM ("a PromQL-ism"), not by what the reference's
+// grammar accepts. A claim resting on a construct's origin is a claim
+// nobody measured, and it reads exactly as confidently as one that was.
+// Its neighbours here were audited against the container when this was
+// found (`ip`, the unwrap conversions, the identifier-shaped binary
+// operators) and all three hold — so the list was written from
+// measurement and this single entry was not.
 //
 // These three tables are `pub` (re-exported from `lib.rs`) SOLELY so the
 // LogQL conformance harness (issue #191, `tests/conformance.rs`) can couple

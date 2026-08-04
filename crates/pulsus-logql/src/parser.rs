@@ -1228,18 +1228,57 @@ fn parse_range_agg_call(cursor: &mut Cursor<'_>, op: RangeAggOp) -> Result<Metri
     })
 }
 
-/// `LogRange := LogExpr "[" Duration "]"`.
+/// `LogRange := LogExpr "[" Duration "]" ("offset" ["-"] Duration)?`.
+///
+/// **`offset` binds to the RANGE SELECTOR, never to the expression**
+/// (issue #343). Measured against the pinned v3.7.4 container:
+/// `rate({app="x"}[5m] offset 1h)` is a 200, while `rate({app="x"}[5m])
+/// offset 1h` and `{app="x"} offset 1h` are both 400
+/// `syntax error: unexpected offset`. Parsing it here — inside the range
+/// selector — is what makes those two spellings errors for us too.
 fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
     let selector = parse_log_expr(cursor)?;
     cursor.expect(&TokenKind::LBracket, "'['")?;
     let (raw, span) = cursor.expect_duration()?;
     let range = duration::parse_duration(&raw, span)?;
     cursor.expect(&TokenKind::RBracket, "']'")?;
+    let offset_ns = parse_offset(cursor)?;
     Ok(LogRange {
         selector,
         range,
         unwrap: None, // M1 never populates the M6 `unwrap` stage
+        offset_ns,
     })
+}
+
+/// The optional `offset ["-"] <duration>` suffix (issue #343).
+///
+/// Two boundaries, both MEASURED and both easy to "tidy" into a bug:
+///
+/// - **A NEGATIVE offset is ACCEPTED** and shifts the window FORWARD:
+///   `rate({app="x"}[5m] offset -1h)` is a reference **200**. Rejecting
+///   it as nonsense would be a divergence on the accept surface.
+/// - **A bare `0` is REJECTED** while `0s` is fine: `offset 0` is a
+///   reference **400** `syntax error: unexpected NUMBER, expecting
+///   DURATION`. Accepting bare `0` "for symmetry" would over-accept —
+///   the operand is a DURATION token, and `0` is a number.
+///
+/// Both fall out of requiring a duration token, so neither needs a
+/// special case; they are stated because the next reader will wonder.
+fn parse_offset(cursor: &mut Cursor<'_>) -> Result<Option<i64>, LogQlError> {
+    let is_offset_kw = matches!(&cursor.peek().kind, TokenKind::Ident(k) if k == "offset");
+    if !is_offset_kw {
+        return Ok(None);
+    }
+    cursor.advance();
+    let negative = matches!(cursor.peek().kind, TokenKind::Minus);
+    if negative {
+        cursor.advance();
+    }
+    let (raw, span) = cursor.expect_duration()?;
+    let nanos = duration::parse_duration(&raw, span)?.as_nanos();
+    let signed = i64::try_from(nanos).unwrap_or(i64::MAX);
+    Ok(Some(if negative { -signed } else { signed }))
 }
 
 /// `variants "(" metricExpr ("," metricExpr)* ")" "of" "(" logRange ")"`

@@ -180,6 +180,7 @@ fn leaf_range() -> LogRange {
         },
         range: Duration::from_nanos(1),
         unwrap: None,
+        offset_ns: None,
     }
 }
 
