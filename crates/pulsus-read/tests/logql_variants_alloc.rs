@@ -120,7 +120,7 @@
 //! | F-a | MetricAggState::push_rows kind dispatch | MetricAggState::push_rows | exec.rs MetricAggState::push_rows | NIL | Phi1/Phi4 |
 //! | F-b | ClientAggState::push_rows prologue (Vec::new scratch) | ClientAggState::push_rows, ClientAggState::push_rows_inner | exec.rs ClientAggState::push_rows | NIL | Phi4-Phi7 |
 //! | F-c | RangeSlideState::push_rows prologue/epilogue (mem::take) | RangeSlideState::push_rows | exec.rs RangeSlideState::push_rows | NIL | Phi1-Phi3 |
-//! | F-d | the row loops and everything reachable only from them | ClientAggState::push_rows, ClientAggState::push_rows_inner, ClientAggState::stage, ClientAggState::flush_pending, RangeSlideState::push_rows, RangeSlideState::flush_collision, FpSlide::finish | exec.rs row paths | NOT-EXEC | rows.is_empty(); the existing CLIENT_AGG_FLAT_BUDGET per-row gate |
+//! | F-d | the row loops and everything reachable only from them | ClientAggState::push_rows, ClientAggState::push_rows_inner, ClientAggState::stage, ClientAggState::stage_bytes, ClientAggState::flush_pending, RangeSlideState::push_rows, RangeSlideState::flush_collision, FpSlide::finish | exec.rs row paths | NOT-EXEC | rows.is_empty(); the existing CLIENT_AGG_FLAT_BUDGET per-row gate |
 //! | F-e | MetricAggState::finish kind dispatch (Box move) | MetricAggState::finish | exec.rs MetricAggState::finish | NIL | Phi1/Phi4 |
 //! | F-f | ClientAggState::finish absent vs non-absent | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 vs Phi4/Phi5 |
 //! | F-g | absent: the finish-time absent_labels clone (1 + 2k) | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (k = 2 gives 5) |
@@ -1474,7 +1474,7 @@ fn zz_print_frame_censuses() {
 /// (M1's `.clone` → `.cloned` plus `format_args!`) and
 /// `RangeSlideState::new` (the `vec![0; …]` macro body does not parse as
 /// an expression list, so the token fallback records `max?`).
-static PER_VARIANT_FRAMES: [Frame; 31] = [
+static PER_VARIANT_FRAMES: [Frame; 32] = [
     // --- W_plan (4) ---
     Frame {
         file: "plan.rs",
@@ -2036,15 +2036,16 @@ static PER_VARIANT_FRAMES: [Frame; 31] = [
         anchor: "push_rows_inner",
         // Issue #344 review round 1: the former `push_rows` body, plus
         // the equal-timestamp staging route. 21 -> 22 branches (the
-        // `needs_ts_order` arm) and three new callees: `.flush_pending`
-        // closes the previous run, `.stage` opens the new one, and
-        // `.then` builds the group's `LabelSet` only when the group does
-        // not exist yet — the SAME condition the direct arm builds it
-        // under, so no per-row allocation is added. W-MEM disposition:
-        // **BAND on the staging arm, NIL on the gate** — the staged
-        // key/labels are charged against the collision caps before they
-        // are held (see `ClientAggState::stage`), and the gate itself is
-        // a `bool` field read. Inventory rows F-b/F-d.
+        // `needs_ts_order` arm) and two new callees: `.flush_pending`
+        // closes the previous run and `.stage` opens the new one. W-MEM
+        // disposition: **NIL in this frame** — the staging arm allocates
+        // NOTHING here. Review round 2 moved the key render and the
+        // `LabelSet` collect inside `ClientAggState::stage`, behind its
+        // cap check, so this frame hands over the borrowed label scratch
+        // and the `.then`/`.collect` that used to sit in the row loop are
+        // gone from it. The allocations are censused where they now
+        // happen (BAND, `ClientAggState::stage`). Inventory rows
+        // F-b/F-d.
         branches: 25,
         callees: &[
             ".add",
@@ -2065,7 +2066,6 @@ static PER_VARIANT_FRAMES: [Frame; 31] = [
             ".run_metric_into",
             ".sort_unstable",
             ".stage",
-            ".then",
             ".to_string",
             ".unwrap_or",
             "Err",
@@ -2083,24 +2083,65 @@ static PER_VARIANT_FRAMES: [Frame; 31] = [
         file: "client_agg.rs",
         ty: Some("ClientAggState"),
         anchor: "stage",
-        // Issue #344 review round 1. Size -> check BOTH collision caps ->
-        // only then retain, the same three-step order
-        // `RangeSlideState::stage_member` uses, so the staged run is
-        // bounded by `MAX_TS_COLLISION_GROUP`/`_BYTES` and a breach is
-        // the existing named `TsCollisionGroup` 422 rather than unbounded
-        // read-path growth. W-MEM disposition: **BAND** — one `Vec` slot
-        // per staged sample, capacity reused across runs; the `key`
-        // String is MOVED in, not cloned. Inventory row F-d.
+        // Issue #344, re-shaped by review round 2. Size -> check BOTH
+        // collision caps -> only then allocate, the same three-step order
+        // `RangeSlideState::stage_member` uses. The previous revision
+        // rendered the key and collected the `LabelSet` in the CALLER and
+        // passed them in, so the cap was checked after the two
+        // allocations it exists to bound; both now happen here, after the
+        // check, which is why `.collect`/`.to_string`/
+        // `render_labels_json_sorted` moved into this frame's callee set
+        // and `.then` left `push_rows_inner`'s.
+        //
+        // W-MEM disposition: **BAND** — the rendered key, the cloned
+        // `LabelSet` and one `Vec` slot per staged sample, all sized by
+        // `stage_bytes` BEFORE they exist and charged against
+        // `MAX_TS_COLLISION_GROUP`/`_BYTES`; a breach is the existing
+        // named `TsCollisionGroup` 422 and leaves the buffer untouched.
+        // The `Vec`'s capacity is returned to the state at flush, so the
+        // steady state is one allocation per query. Inventory row F-d.
         branches: 2,
         callees: &[
+            ".collect",
+            ".contains_key",
+            ".iter",
             ".len",
+            ".map",
             ".push",
             ".saturating_add",
+            ".stage_bytes",
+            ".to_string",
             "Err",
             "Ok",
             "QueryTooBroad",
+            "Some",
+            "render_labels_json_sorted",
+        ],
+    },
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("ClientAggState"),
+        anchor: "stage_bytes",
+        // Issue #344 review round 2: the SIZING half of the staging
+        // funnel, split out so the caller can charge before it allocates.
+        // A provable upper bound on what `stage` is about to allocate —
+        // the rendered JSON sized exactly by `rendered_labels_json_len`
+        // and grown through `grown_alloc_bytes`, each label string and
+        // the element buffer through `alloc_block_bytes`, and the
+        // `PendingSample` slot at 8x to dominate a doubling `Vec`'s
+        // realloc peak rather than charging one logical slot.
+        //
+        // W-MEM disposition: **NIL** — it walks the borrowed scratch and
+        // returns a `u64`; it allocates on no path, which is the property
+        // that lets it run before the cap check. Inventory row F-d.
+        branches: 1,
+        callees: &[
+            ".len",
+            ".saturating_add",
+            ".saturating_mul",
             "alloc_block_bytes",
-            "label_set_bytes",
+            "grown_alloc_bytes",
+            "rendered_labels_json_len",
             "size_of",
         ],
     },
@@ -2620,6 +2661,7 @@ static INVENTORY: [Row; 49] = [
             "ClientAggState::push_rows",
             "ClientAggState::push_rows_inner",
             "ClientAggState::stage",
+            "ClientAggState::stage_bytes",
             "ClientAggState::flush_pending",
             "RangeSlideState::push_rows",
             "RangeSlideState::flush_collision",
@@ -2942,7 +2984,7 @@ fn module_doc() -> String {
 fn g4_frame_census_and_inventory_closure() {
     let _serial = serialize();
     // (1) 26 unique frames, each resolving to exactly one item.
-    assert_eq!(PER_VARIANT_FRAMES.len(), 31);
+    assert_eq!(PER_VARIANT_FRAMES.len(), 32);
     let mut keys = BTreeSet::new();
     for f in &PER_VARIANT_FRAMES {
         assert!(

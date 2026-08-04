@@ -21,8 +21,8 @@ use super::agg::{EMPTY_LABEL_SET, LabelSet, pin_reduction_order, range_payload_c
 use super::charge::{
     AggCaps, FP_GROUP_SLOT, INSTANT_GROUP_SLOT, MUT_GROUP_SLOT, SERIES_OUT_SLOT, alloc_block_bytes,
     charge_group_bytes, charge_result_points, charge_retention, discharge_group_bytes,
-    discharge_retention, group_entry_bytes, grown_alloc_bytes, label_set_bytes,
-    rendered_labels_json_len, retention_points_per_sample,
+    discharge_retention, group_entry_bytes, grown_alloc_bytes, rendered_labels_json_len,
+    retention_points_per_sample,
 };
 use super::exec::{MatrixSeries, QueryResult, VectorSample, apply_rate, range_seconds};
 use super::fold::{FoldGrid, VectorAggFold, covering_k_of, grid_slot_count};
@@ -618,26 +618,26 @@ impl<'q> ClientAggState<'q> {
             // group's accumulator or folds into it — there is no bucket
             // map to index.
             if self.fan_out {
+                // In-place sort, no allocation — safe before the caps.
                 scratch.sort_unstable();
-                let key = render_labels_json_sorted(&scratch);
                 if self.needs_ts_order {
                     // Order-DEPENDENT reducer: the scan hands equal
                     // timestamps in `fingerprint` order and the reference
                     // folds them in `StableHash` order, so the run is
                     // staged and re-ordered before any of it is folded.
+                    //
+                    // NOTHING is rendered or collected here: `stage` is
+                    // the single staging funnel and it sizes, checks both
+                    // caps, and only then allocates. The key and the
+                    // label set are built INSIDE it, after the check.
                     if row.timestamp_ns != self.pending_ts {
                         self.flush_pending(op)?;
                         self.pending_ts = row.timestamp_ns;
                     }
-                    let labels = (!self.label_groups.contains_key(&key)).then(|| {
-                        scratch
-                            .iter()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect::<LabelSet>()
-                    });
-                    self.stage(stream_hash, key, labels, v)?;
+                    self.stage(stream_hash, &scratch, v)?;
                     continue;
                 }
+                let key = render_labels_json_sorted(&scratch);
                 match self.label_groups.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
                         e.into_mut().1.add(row.timestamp_ns, stream_hash, v);
@@ -694,61 +694,52 @@ impl<'q> ClientAggState<'q> {
         Ok(())
     }
 
-    /// Stages one sample of the open equal-timestamp run.
+    /// **The single staging funnel** for the instant path — the ONLY
+    /// place a per-sample allocation enters `pending`, and the direct
+    /// counterpart of [`RangeSlideState::stage_member`].
     ///
-    /// **Why this exists** (issue #344 review round 1). The order-
-    /// dependent reducers — `sum`/`avg`/`stddev`/`stdvar`/`rate_counter`
-    /// and unwrapped `rate`, i.e. exactly [`ReducerClass::CanonicalFold`]
-    /// — must fold in Loki's delivery order `(timestamp, stream_hash,
-    /// tie_rank)`. `first`/`last` can read that order off an explicit key
-    /// comparison ([`SimpleAcc::add`]) because they only ever SELECT one
-    /// sample; a sum cannot, because every sample's position matters. And
-    /// the scan cannot supply the order directly: `metric_raw_samples`
-    /// orders equal timestamps by `fingerprint`, not by `stream_hash`,
-    /// and those two disagree whenever `StableHash` ranks the streams
-    /// differently from their fingerprints — which is the common case,
-    /// the two being unrelated hashes.
+    /// Order is load-bearing and is the same three steps that funnel
+    /// uses: **(i) size every allocation this sample will make, (ii)
+    /// check BOTH caps, (iii) only then allocate.** Because the sizing
+    /// happens first, the allocation that would breach a cap is never
+    /// performed — which is the whole point of the buffer existing. An
+    /// earlier revision rendered the key and collected the label set in
+    /// the row loop and passed them in, so the cap was checked AFTER the
+    /// two allocations it was meant to bound; the caller now hands over
+    /// the borrowed label scratch and nothing is built until the check
+    /// passes (issue #344 review round 2).
     ///
-    /// **Bounded, and by the SAME cap as the sliding path's collision
+    /// **Why this exists at all.** The order-dependent reducers —
+    /// `sum`/`avg`/`stddev`/`stdvar`/`rate_counter` and unwrapped `rate`,
+    /// i.e. exactly [`ReducerClass::CanonicalFold`] — must fold in Loki's
+    /// delivery order `(timestamp, stream_hash, tie_rank)`.
+    /// `first`/`last` can read that order off an explicit key comparison
+    /// ([`SimpleAcc::add`]) because they only ever SELECT one sample; a
+    /// sum cannot, because every sample's position matters. And the scan
+    /// cannot supply the order: `metric_raw_samples` orders equal
+    /// timestamps by `fingerprint`, not by `stream_hash`, and those two
+    /// are unrelated hashes.
+    ///
+    /// **Bounded, by the SAME caps as the sliding path's collision
     /// group.** Nothing structurally bounds how many rows share one
-    /// nanosecond, so this buffer is charged against
-    /// [`AggCaps::collision_members`]/[`AggCaps::collision_bytes`] before
-    /// each staged allocation and a breach is the existing named
-    /// [`TooBroadReason::TsCollisionGroup`] 422 — never unbounded growth
-    /// on the read path. The run is the wider `(timestamp)` group rather
-    /// than the sliding path's `(fingerprint, timestamp)` one, because
-    /// cross-stream order is the whole point here.
-    ///
-    /// **It costs nothing when there is no tie**, which is the normal
-    /// case: a one-sample run stages one `Vec` slot (capacity reused
-    /// across runs) and the `key` String is MOVED, not cloned — it is the
-    /// same String the direct path would hand to `entry()`. The
-    /// `LabelSet` is built only when the group does not exist yet, the
-    /// same condition the direct path builds it under.
+    /// nanosecond, so the buffer is charged against
+    /// [`AggCaps::collision_members`]/[`AggCaps::collision_bytes`] and a
+    /// breach is the existing named [`TooBroadReason::TsCollisionGroup`]
+    /// 422 — never unbounded growth on the read path. The run is the
+    /// wider `(timestamp)` group rather than the sliding path's
+    /// `(fingerprint, timestamp)` one, because cross-stream order is what
+    /// it exists for.
     fn stage(
         &mut self,
         stream_hash: u64,
-        key: String,
-        labels: Option<LabelSet>,
+        scratch: &[(Cow<'_, str>, Cow<'_, str>)],
         value: f64,
     ) -> Result<(), ReadError> {
-        // **DO NOT "tidy" this into `map_or(0, label_set_bytes)`.**
-        // The per-variant allocation census
-        // (`tests/logql_variants_alloc.rs`) parses CALL expressions, so a
-        // sizing helper passed as a function VALUE silently DISAPPEARS
-        // from this frame's pinned callee set — the tripwire stops seeing
-        // it, and stops seeing whatever replaces it later. That is a real
-        // weakness in the tripwire, recorded here because the site is
-        // where it bites: the shorter spelling is what `clippy::
-        // redundant_closure` asks for, and it is the one that blinds the
-        // census. The `match` satisfies both.
-        let labels_bytes = match &labels {
-            Some(l) => label_set_bytes(l),
-            None => 0,
-        };
-        let bytes = alloc_block_bytes(key.len() as u64)
-            .saturating_add(labels_bytes)
-            .saturating_add(size_of::<PendingSample>() as u64);
+        // (i) size EVERY allocation this sample will make.
+        let bytes = self.stage_bytes(scratch);
+        // (ii) both caps, BEFORE any allocation. `saturating_add` cannot
+        // mask a breach (saturation only grows the sum) but does keep a
+        // pathological charge from overflowing the comparison itself.
         let next_count = self.pending.len() as u64 + 1;
         let next_bytes = self.pending_bytes.saturating_add(bytes);
         if next_count > self.caps.collision_members || next_bytes > self.caps.collision_bytes {
@@ -759,6 +750,18 @@ impl<'q> ClientAggState<'q> {
                 bytes_cap: self.caps.collision_bytes,
             }));
         }
+        // (iii) now — and only now — allocate.
+        let key = render_labels_json_sorted(scratch);
+        let labels = if self.label_groups.contains_key(&key) {
+            None
+        } else {
+            Some(
+                scratch
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<LabelSet>(),
+            )
+        };
         self.pending_bytes = next_bytes;
         self.pending.push(PendingSample {
             stream_hash,
@@ -767,6 +770,60 @@ impl<'q> ClientAggState<'q> {
             value,
         });
         Ok(())
+    }
+
+    /// A provable UPPER BOUND on the heap bytes [`Self::stage`] is about
+    /// to allocate for one sample — the instant twin of
+    /// [`RangeSlideState::member_stage_bytes`], sized the same way and
+    /// for the same reason: charging an over-estimate is what makes the
+    /// cap sound, because `pending_bytes >= actual staged heap bytes`
+    /// then holds and bounding `pending_bytes` bounds the real footprint.
+    ///
+    /// Per allocation:
+    /// - **rendered label JSON** ([`render_labels_json_sorted`]) — sized
+    ///   by [`rendered_labels_json_len`], which walks the SAME escape
+    ///   arms as the renderer and so yields the rendered length exactly,
+    ///   including the `\u00xx` six-bytes-for-one expansion of a C0
+    ///   control byte. The `String` is pre-sized assuming no escaping, so
+    ///   escaping-heavy input forces geometric growth — charged through
+    ///   [`grown_alloc_bytes`].
+    /// - **the cloned `LabelSet`** — one exactly-reserved `String` per
+    ///   key and per value plus one exactly-reserved element buffer, each
+    ///   through [`alloc_block_bytes`] so allocator size-class rounding
+    ///   is covered. Charged UNCONDITIONALLY, even though `stage` builds
+    ///   it only for a group that does not exist yet: the existence probe
+    ///   needs the rendered key, which cannot be built before the check
+    ///   without reintroducing the very ordering this funnel fixes. An
+    ///   over-charge is the safe direction; an early allocation is not.
+    /// - **the `PendingSample` slot in `pending`** — a `Vec` push can
+    ///   DOUBLE capacity with the old buffer still live during the
+    ///   realloc, so charging one slot understates the peak. For `n`
+    ///   samples the live request is `<= 2n` slots plus an old buffer of
+    ///   `<= n`; with each block retained at `<= 2x` its request (the
+    ///   [`alloc_block_bytes`] model) the peak is `<= 6n x
+    ///   size_of::<PendingSample>()`, and the initial
+    ///   `min_non_zero_cap = 4` block is `<= 8x`. Charging `8x` per
+    ///   sample dominates BOTH for every `n >= 1`. The `String`/`Vec`
+    ///   headers of the pieces above live INSIDE that slot, so they are
+    ///   already covered.
+    ///
+    /// Saturating throughout, so a hostile label value cannot wrap the
+    /// charge round to a small number — saturation only makes it larger.
+    fn stage_bytes(&self, scratch: &[(Cow<'_, str>, Cow<'_, str>)]) -> u64 {
+        /// See the slot bullet above: 8x per element dominates the
+        /// `<= 6n`-slot realloc peak and the first sample's
+        /// `min_non_zero_cap = 4` block.
+        const VEC_GROWTH_FACTOR: u64 = 8;
+
+        let mut bytes = (size_of::<PendingSample>() as u64).saturating_mul(VEC_GROWTH_FACTOR);
+        bytes = bytes.saturating_add(grown_alloc_bytes(rendered_labels_json_len(scratch)));
+        for (k, v) in scratch {
+            bytes = bytes
+                .saturating_add(alloc_block_bytes(k.len() as u64))
+                .saturating_add(alloc_block_bytes(v.len() as u64));
+        }
+        let elems = (scratch.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
+        bytes.saturating_add(alloc_block_bytes(elems))
     }
 
     /// Folds the staged run in canonical order, then releases it.
@@ -4203,6 +4260,173 @@ mod tests {
             state.coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
             "staged {} bytes exceeds the {MAX_TS_COLLISION_GROUP_BYTES}-byte cap",
             state.coll_bytes
+        );
+    }
+
+    /// **The ordering gate for the instant staging funnel** (issue #344
+    /// review round 2), mirroring
+    /// `fold.rs::the_fold_charges_before_it_builds_a_group_key`.
+    ///
+    /// A behavioural test CANNOT see this defect, and that is the whole
+    /// reason this one parses source instead. The reviewed bug was that
+    /// `stage`'s two allocations happened before its cap check; but the
+    /// transient is built either way, so every observable — the refusal,
+    /// the retained buffer, `pending_bytes` — is identical with the
+    /// allocations before or after. Restoring the inversion under
+    /// `instant_staging_charges_before_it_allocates_and_stays_inside_the_cap`
+    /// leaves it GREEN, which is exactly the "gate weaker than the claim"
+    /// shape. So the order is asserted where it is written.
+    ///
+    /// Three anchors, in the one order that makes the cap sound: the
+    /// SIZE (`stage_bytes`, which allocates nothing), then the CHECK
+    /// (the `TsCollisionGroup` refusal), then the two allocations
+    /// (`render_labels_json_sorted` and the `LabelSet` collect). Nothing
+    /// that allocates may precede the refusal.
+    #[test]
+    fn the_instant_staging_funnel_sizes_and_checks_before_it_allocates() {
+        let src = include_str!("client_agg.rs");
+        let start = src
+            .find("    fn stage(\n        &mut self,")
+            .expect("the instant staging funnel");
+        let end = src[start..]
+            .find("    fn stage_bytes(")
+            .expect("the end of stage")
+            + start;
+        let body = &src[start..end];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("stage must contain `{needle}`"))
+        };
+        let size = at("self.stage_bytes(scratch)");
+        let check = at("TooBroadReason::TsCollisionGroup");
+        let render = at("render_labels_json_sorted(scratch)");
+        let collect = at(".collect::<LabelSet>()");
+        assert!(
+            size < check,
+            "stage must SIZE before it checks — a check over a charge that does not yet \
+             cover this sample bounds nothing"
+        );
+        assert!(
+            check < render && check < collect,
+            "stage allocates before its cap check (render at {render}, collect at {collect}, \
+             check at {check}) — the cap must refuse BEFORE the allocation it bounds, not \
+             observe it afterwards"
+        );
+        // And the caller hands over the borrowed scratch rather than
+        // pre-built pieces: an allocation moved back into the row loop
+        // would reintroduce the reviewed defect at a site this gate does
+        // not read.
+        let loop_start = src
+            .find("    fn push_rows_inner(")
+            .expect("the instant row loop");
+        let loop_end = src[loop_start..]
+            .find("\n    /// **The single staging funnel** for the instant path")
+            .expect("the end of push_rows_inner")
+            + loop_start;
+        let row_loop = &src[loop_start..loop_end];
+        let stage_call = row_loop
+            .find("self.stage(stream_hash, &scratch, v)")
+            .expect("push_rows_inner must stage from the borrowed scratch");
+        let direct_render = row_loop
+            .find("let key = render_labels_json_sorted(&scratch);")
+            .expect("the direct (non-staging) arm still renders its own key");
+        assert!(
+            stage_call < direct_render,
+            "the staging arm must `continue` BEFORE the direct arm's render — a render \
+             above the staging call would allocate for every staged sample outside the funnel"
+        );
+    }
+
+    /// Issue #344 review round 2: the INSTANT staging funnel charges
+    /// BEFORE it allocates, and its buffer stays inside the cap.
+    ///
+    /// The earlier revision rendered the group key and collected the
+    /// `LabelSet` in the row loop and only then called `stage`, so the
+    /// cap was checked after the two allocations it exists to bound —
+    /// a buffer that could overshoot by a whole sample's heap before
+    /// refusing. This drives the byte cap on an equal-timestamp run of
+    /// huge label values and asserts three things a post-check funnel
+    /// cannot satisfy: the named refusal, that the BYTE dimension bit
+    /// (not the member count), and that `pending`/`pending_bytes` are
+    /// left holding NOTHING from the refused sample.
+    #[test]
+    fn instant_staging_charges_before_it_allocates_and_stays_inside_the_cap() {
+        // `sum_over_time` is `CanonicalFold`, so the equal-timestamp run
+        // is staged for the delivery-order fold.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+            grouping: None,
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(ClientWindow::Instant {
+                start_ns: 0,
+                end_ns: 10,
+            }),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
+
+        // A 64 KiB label VALUE per row, all at the SAME timestamp and
+        // each with a distinct group key, so every row stages a fresh
+        // rendered key + `LabelSet`. Sized so DOZENS fit before the 8 MiB
+        // byte cap bites — the refusal must happen mid-run, not on the
+        // first sample, or the "staged what fit" assertion below would be
+        // vacuous. Still far below the 10 000-member cap, so the byte
+        // dimension is what bites.
+        let big = "x".repeat(64 * 1024);
+        let rows: Vec<MetricScanRow> = (0..512)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("a=1 pad{i}={big}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count, cap, ..
+            })) => {
+                assert_eq!(cap, MAX_TS_COLLISION_GROUP);
+                assert!(
+                    count < MAX_TS_COLLISION_GROUP,
+                    "the BYTE cap must trip well before the member cap, tripped at {count}"
+                );
+            }
+            other => panic!("expected TsCollisionGroup from the byte cap, got {other:?}"),
+        }
+        // Bound proof, observed rather than argued: the staged buffer
+        // never exceeded the cap…
+        assert!(
+            state.pending_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
+            "staged {} bytes exceeds the {MAX_TS_COLLISION_GROUP_BYTES}-byte cap",
+            state.pending_bytes
+        );
+        // …and the REFUSED sample left nothing behind: `pending_bytes` is
+        // the charge for exactly the samples `pending` still holds, so a
+        // funnel that allocated first and charged after would show a
+        // count one higher than the charge accounts for.
+        let charged_for: u64 = state
+            .pending
+            .iter()
+            .map(|p| p.key.len() as u64)
+            .sum::<u64>();
+        assert!(
+            charged_for <= state.pending_bytes,
+            "the retained keys ({charged_for} B) must be covered by the charge ({} B)",
+            state.pending_bytes
+        );
+        assert!(
+            !state.pending.is_empty(),
+            "the run must have staged the samples that DID fit, or this proves nothing"
         );
     }
 
