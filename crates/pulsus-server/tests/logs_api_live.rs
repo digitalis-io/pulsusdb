@@ -1904,11 +1904,17 @@ async fn nothing_in_a_query_may_span_more_than_five_years() {
     );
 
     // 3b. EVERY route that carries `start`/`end`, not just `query_range`.
-    // The SELECTOR-ONLY ones are the reason this loop exists: `/series`,
-    // `/labels` and `/label/{name}/values` never reach the planner, so the
-    // first cut of the span cap — which lived there — let a 20-year range
-    // straight through. The cap now sits in the one function all nine
-    // share (`handlers::parse_bounds`), and this is what says so.
+    // `/labels` and `/label/{name}/values` are the reason this loop
+    // exists: they resolve label names and values without building a plan,
+    // so the first cut of the span cap — which lived in the planner — let
+    // a 20-year range straight through. Those two and only those two:
+    // measured by deleting the `parse_bounds` call and running this loop,
+    // which is also why it collects rather than short-circuits. `/series`
+    // is NOT one of them despite taking only a selector — the engine
+    // builds a synthetic Range spec and calls `plan()` per selector — and
+    // neither are `detected_*`, `patterns`, `stats`, `volume`. The cap now
+    // sits in the one function all nine share
+    // (`handlers::parse_bounds`), and this is what says so.
     let over = (base_ns - CAP_NS - 1).to_string();
     let now = base_ns.to_string();
     let at_cap = (base_ns - CAP_NS).to_string();

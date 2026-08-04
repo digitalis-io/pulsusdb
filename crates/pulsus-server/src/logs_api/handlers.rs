@@ -49,9 +49,15 @@ pub(super) async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError
 ///
 /// **THE CAP LIVES HERE BECAUSE THIS IS THE ONLY PLACE EVERY ENDPOINT
 /// CARRYING `start`/`end` PASSES THROUGH.** Its first cut sat in
-/// `pulsus_read::logql::plan`, which the SELECTOR-ONLY routes never reach:
-/// `/series`, `/labels` and `/label/{name}/values` go through
-/// `parse_selector` instead, so a 20-year range walked straight past it.
+/// `pulsus_read::logql::plan`, and the two LABEL-DISCOVERY routes never
+/// reach it: `/labels` and `/label/{name}/values` resolve names and values
+/// without building a plan at all, so a 20-year range walked straight past
+/// it. Those two, and only those two — established by deleting the call
+/// below and enumerating what still served a 5-year-plus range, not by
+/// reading route shapes. `/series` looks like it should be a third and is
+/// not: `LogQlEngine::series` builds a synthetic `QuerySpec::Range` and
+/// calls `plan()` per selector, so the planner-level check already caught
+/// it, as it did for `detected_*`, `patterns`, `stats` and `volume`.
 /// Nine routes share this function — `query_range`, `series`, `labels`,
 /// `label/{name}/values`, `detected_labels`, `detected_fields`,
 /// `patterns`, `stats`, `volume` — and each is covered by the one call

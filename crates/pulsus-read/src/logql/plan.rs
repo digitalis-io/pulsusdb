@@ -970,10 +970,16 @@ fn check_query_span(p: &QueryParams) -> Result<(), ReadError> {
 /// function every LogQL endpoint carrying `start`/`end` goes through
 /// (`query_range`, `series`, `labels`, `label/{name}/values`,
 /// `detected_labels`, `detected_fields`, `patterns`, `stats`, `volume`),
-/// including the selector-only ones that never reach [`plan`] at all —
-/// which is exactly how `/series` slipped past the first cut of this
-/// check. [`plan`] keeps its own call for the LIBRARY API, whose callers
-/// (tests, e2e, any embedder) never pass through `parse_bounds`.
+/// including the LABEL-DISCOVERY ones that never reach [`plan`] at all.
+/// `/labels` and `/label/{name}/values` are exactly those, and are what
+/// slipped past the first cut of this check, which lived in [`plan`]
+/// alone — MEASURED by deleting the `parse_bounds` call and enumerating
+/// what then served a 5-year-plus range, not inferred from route shape.
+/// `/series` is NOT one of them despite taking only a selector:
+/// `super::exec::LogQlEngine::series` builds a synthetic
+/// [`QuerySpec::Range`] and calls [`plan`] per selector, so it was covered
+/// all along. [`plan`] keeps its own call for the LIBRARY API, whose
+/// callers (tests, e2e, any embedder) never pass through `parse_bounds`.
 ///
 /// `start > end` is left alone — an empty grid, handled downstream. Only
 /// the positive magnitude is bounded, computed in `i128` so the
