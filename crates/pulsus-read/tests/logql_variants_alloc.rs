@@ -96,6 +96,7 @@
 //! | P-i | absent vs non-absent absent_labels | ::build_variants_node | plan.rs VariantSpec::try_new absent arm | BAND | G1e vs every other plan fixture |
 //! | P-j | parse_plan_number success path (format! only on Err) | ::parse_plan_number | plan.rs parse_plan_number | NIL | executes under G1a/G1h |
 //! | P-k | the reused raw-handle buffer (one growth, intercept) | ::unwrap_vector_aggs_into | plan.rs unwrap_vector_aggs_into | BAND | G1a upper band; G1d pins the 0-layer shape at 0 |
+//! | P-l | the variant offset shift (integer arithmetic only) | ::build_variants_node | plan.rs build_variants_node offset arm | NIL | executes under every G1 fixture |
 //!
 //! ## W_ctor
 //!
@@ -140,6 +141,7 @@
 //! | F-z | instant sub-state narrowing refusal (issue #236 Part D) | VariantsAggState::new | exec.rs VariantsAggState::new as_instant/ok_or_else | UNREACH | a stepped window routes to the Range arm above, and the witness cannot be minted from one |
 //! | F-y | one mutating group's cell drain (expanded / delta / sample sweep) | RangeSlideState::drain_group | exec.rs RangeSlideState::drain_group | NOT-EXEC | rows.is_empty() => no mutating group exists => never called (F-d's premise) |
 //! | F-x | issue #236 Part B fold containers (dense slots, live map) | RangeSlideState::finish_in_place | exec.rs RangeSlideState::emit + VectorAggFold | NOT-EXEC | run_variants never calls attach_fold; fold is None here |
+//! | F-y2 | offset put back on the emitted grid (in-place, both arms) | RangeSlideState::finish | client_agg.rs shift_emitted_points | NIL | offset-free variants take the early return; the shift mutates points in place |
 //!
 //! # G4 — what this gate does NOT catch (eight gaps)
 //!
@@ -1488,7 +1490,32 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         // a path that returns `Err` immediately and plans nothing, so it
         // adds no term to any per-variant band. No callee joins the set:
         // `.is_some`, `Err` and `.to_string` are all already pinned.
-        branches: 27,
+        //
+        // Issue #343: 27 branches — UNCHANGED — and two new callees, from
+        // the `offset` window shift. The interim `if range.offset_ns
+        // .is_some()` refusal came out and nothing replaced it: a variant
+        // carrying a different offset from the common range's is PLANNED,
+        // reading its own shifted window intersected with the one shared
+        // scan, which is what the reference does (measured, v3.7.4, seeded
+        // store). An earlier draft refused that shape by name and the
+        // branch count stood at 28; the probe refuted the refusal, so the
+        // net effect on this frame is a guard removed and no guard added.
+        // W-MEM disposition of what remains: **NIL** — `.unwrap_or` on an
+        // `Option<i64>` and `shift_by_offset` (one `i64::checked_sub`)
+        // are integer arithmetic over `Copy` scalars, allocating on
+        // neither path, so they add no term to any per-variant band.
+        // Inventory row P-l.
+        //
+        // Issue #343 boundary fix: 27 -> 29, no callee change.
+        // `shift_by_offset` became fallible (`checked_sub`), so each spec
+        // arm now matches on its result and substitutes the degenerate
+        // empty window when the shifted domain leaves the representable
+        // timestamp axis — one new arm per spec shape, PER VARIANT (a
+        // sibling variant is unaffected). W-MEM disposition: **NIL** on
+        // both new arms — the substitution writes two `i64` literals into
+        // the `Copy` `ClientWindow` that was being built anyway; no
+        // allocation on either path, so no per-variant band term.
+        branches: 29,
         callees: &[
             ".any",
             ".as_nanos",
@@ -1499,6 +1526,9 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
             ".iter",
             ".len",
             ".map_err",
+            // Issue #343: the offset shift, both NIL (see above).
+            ".unwrap_or",
+            "shift_by_offset",
             // Issue #272: `v.variants` is a `ChildVec`, so the variant
             // list is read as an inert handle opened by the driver
             // (`walk::slice_of(v.variants.peek())`) rather than by
@@ -1973,8 +2003,22 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "finish",
+        // Issue #343: one new callee, `shift_emitted_points` — the ONE
+        // place a leaf's emitted matrix is put back on the caller's grid
+        // after the whole evaluation ran `offset` earlier. Branch count
+        // unchanged: it is a straight-line call, and the `offset_ns == 0`
+        // early return inside it belongs to that function's own frame, not
+        // this one. W-MEM disposition: **NIL** — it mutates the
+        // already-allocated `points` vectors in place (`&mut` over
+        // `(i64, f64)` tuples) and allocates nothing on either arm, so it
+        // adds no per-variant term. Inventory row F-y2.
         branches: 1,
-        callees: &[".finish_in_place", "Ok", "debug_assert_eq!"],
+        callees: &[
+            ".finish_in_place",
+            "Ok",
+            "debug_assert_eq!",
+            "shift_emitted_points",
+        ],
     },
     Frame {
         file: "client_agg.rs",
@@ -2136,8 +2180,8 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
 /// W_ctor + 23 W_fin = 46 rows, each with exactly ONE disposition. The
 /// module-doc tables are a RENDERING of this const (assertion 7), never
 /// the source.
-static INVENTORY: [Row; 47] = [
-    // --- W_plan (11) ---
+static INVENTORY: [Row; 49] = [
+    // --- W_plan (12) ---
     Row {
         id: "P-a",
         window: Win::Plan,
@@ -2236,6 +2280,15 @@ static INVENTORY: [Row; 47] = [
         site: "plan.rs unwrap_vector_aggs_into",
         disp: Disp::Band,
         covered_by: "G1a upper band; G1d pins the 0-layer shape at 0",
+    },
+    Row {
+        id: "P-l",
+        window: Win::Plan,
+        what: "the variant offset shift (integer arithmetic only)",
+        frames: &["::build_variants_node"],
+        site: "plan.rs build_variants_node offset arm",
+        disp: Disp::Nil,
+        covered_by: "executes under every G1 fixture",
     },
     // --- W_ctor (12) ---
     Row {
@@ -2587,6 +2640,15 @@ static INVENTORY: [Row; 47] = [
         disp: Disp::NotExec,
         covered_by: "run_variants never calls attach_fold; fold is None here",
     },
+    Row {
+        id: "F-y2",
+        window: Win::Fin,
+        what: "offset put back on the emitted grid (in-place, both arms)",
+        frames: &["RangeSlideState::finish"],
+        site: "client_agg.rs shift_emitted_points",
+        disp: Disp::Nil,
+        covered_by: "offset-free variants take the early return; the shift mutates points in place",
+    },
 ];
 
 /// The 15 delegating boundary callees (see [`Boundary`]).
@@ -2730,11 +2792,11 @@ fn g4_frame_census_and_inventory_closure() {
         );
     }
     // (3) inventory size and per-window counts; unique ids.
-    assert_eq!(INVENTORY.len(), 47);
+    assert_eq!(INVENTORY.len(), 49);
     let count = |w: Win| INVENTORY.iter().filter(|r| r.window == w).count();
     assert_eq!(
         (count(Win::Plan), count(Win::Ctor), count(Win::Fin)),
-        (11, 12, 24)
+        (12, 12, 25)
     );
     let mut ids = BTreeSet::new();
     for r in &INVENTORY {

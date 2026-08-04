@@ -114,6 +114,7 @@ fn log_range(spec: LogRangeSpec) -> LogRange {
         },
         range: five_minutes(),
         unwrap: None,
+        offset_ns: None,
     }
 }
 

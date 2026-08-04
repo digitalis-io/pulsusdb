@@ -43,6 +43,10 @@ pub(in crate::logql) fn slide_window(
         step_ns: super::params::validate_duration_ns(step_ns, "step").expect("valid step"),
         range_ns: super::params::validate_duration_ns(range_ns, "range selector")
             .expect("valid range"),
+        // Issue #343: the offset-free window. Fixtures that need a
+        // shifted one build it explicitly, so no test silently inherits
+        // an offset it did not ask for.
+        offset_ns: 0,
     }
 }
 

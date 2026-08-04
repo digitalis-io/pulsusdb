@@ -539,7 +539,13 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 }
 
 /// Pinned coverage (issue #352 steps 2-3). THREE figures, never one.
-const TOTAL_DIRECTIVES: usize = 1_200;
+///
+/// Issue #343 added `b19_offset.test`'s 9 rows, and its boundary fix 6
+/// more (the domain-edge rows). They move the TOTAL and the `derived`
+/// exclusion only: `derived` is not a capture claim, so
+/// [`PROVENANCE_PERMITS`] does not move, and they are metric queries,
+/// which this slice cannot reach in any case.
+const TOTAL_DIRECTIVES: usize = 1_215;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
@@ -552,7 +558,7 @@ const PROVENANCE_PERMITS: usize = 948;
 /// absorbed into one number.
 const REACHABLE: usize = 77;
 
-const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=14, \
+const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \
 not a capture claim (ported)=29, our-error-text (eval_fail)=71, pinned-divergence=17";
 
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \

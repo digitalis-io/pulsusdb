@@ -226,6 +226,41 @@ fn grouping_matching_and_set_operator_keywords_fold() {
     }
 }
 
+/// The `offset` range-selector modifier (issue #343). Reference probe:
+/// `count_over_time({app="x"}[5m] OFFSET 1m)` is a 200, the same as the
+/// lowercase spelling.
+///
+/// This keyword arrived after #339 and was the ONE compared by bytes
+/// (`k == "offset"`) instead of through `is_kw`, so it alone did not
+/// fold — a reference-accept / ours-reject row the #339 census carried
+/// until #343 routed it through `is_kw` like every other keyword. It
+/// sits in its own test so that history is legible; the sign and the
+/// compound-duration forms come along because the fold is decided on the
+/// keyword, never on its operand.
+#[test]
+fn the_offset_modifier_keyword_folds() {
+    for (upper, lower) in [
+        (
+            r#"count_over_time({app="x"}[5m] OFFSET 1m)"#,
+            r#"count_over_time({app="x"}[5m] offset 1m)"#,
+        ),
+        (
+            r#"rate({app="x"}[5m] Offset 1h30m)"#,
+            r#"rate({app="x"}[5m] offset 1h30m)"#,
+        ),
+        (
+            r#"rate({app="x"}[5m] OFFSET -1h)"#,
+            r#"rate({app="x"}[5m] offset -1h)"#,
+        ),
+        (
+            r#"sum_over_time({app="x"} | unwrap v [5m] OFFSET 0s)"#,
+            r#"sum_over_time({app="x"} | unwrap v [5m] offset 0s)"#,
+        ),
+    ] {
+        assert_eq!(round_trip(upper), round_trip(lower), "{upper}");
+    }
+}
+
 /// Pipeline-stage names, `unwrap`, the unwrap conversions and `ip`.
 /// Reference probe: `| JSON`, `| LINE_FORMAT`, `| DROP a`, `| UNWRAP v`,
 /// `unwrap DURATION(v)`, `|= IP("1.2.3.4")` all 200.
@@ -439,8 +474,17 @@ fn range_duration_units_do_not_fold() {
 ///   `{by="x"}`/`{json="x"}`. A user does not notice these: their query
 ///   works here and would fail against the reference. Recorded rather
 ///   than filed, which is only safe because this census exists.
-/// * **A REAL GAP, filed elsewhere.** `offset`, unimplemented in every
-///   spelling — a query that runs against the reference fails here.
+/// * **`REAL_GAP` — EMPTY, and pinned at zero.** It held the two
+///   `offset` rows until issue #343 implemented the construct: the
+///   grammar, the case fold (`offset` was the one keyword compared by
+///   bytes rather than through `is_kw`), and the planner's window shift
+///   `(T - d - range, T - d]`. Both spellings agree with the reference on
+///   BOTH axes now, and the census forbids agreement rows, so both left
+///   together — one leaving alone would have meant the fold or the shift
+///   was still missing. The class name survives so the zero can be
+///   pinned. `count_over_time({app="x"}[5m] OFFSET 1m)` moved to
+///   [`FOLDING_PROBES`], which is where an agreeing fold belongs and
+///   keeps the live leg checking it.
 ///
 /// **What this census can and cannot observe (issue #350):** its
 /// PulsusDB verdict is [`accepts`] — `pulsus_logql::parse` — so it fails
@@ -463,8 +507,34 @@ const VERSION_DIFFERENCE: &str = "version-difference";
 const OVER_ACCEPTANCE: &str = "over-acceptance";
 const REAL_GAP: &str = "real-gap";
 
-const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
-    // (query, differential-oracle verdict, PulsusDB verdict, class)
+/// The wire column's "adds nothing" marker.
+const SAME: &str = "same-as-parse";
+
+/// `(query, reference, PulsusDB PARSE, PulsusDB WIRE, class)`.
+///
+/// **Two axes, because they are different facts** (issue #343, following
+/// the TraceQL matrix). Collapsing them is what let #335's D2 ship as
+/// "closed" on a parse score while every such query still 400'd at the
+/// planner; switching that matrix to the wire exposed 37 divergences
+/// nobody could see.
+///
+/// The WIRE column is `SAME` when the planner adds nothing to the parse
+/// verdict, or an explicit verdict when it differs. `offset` was the
+/// worked example, and the census watched it move: it read **parse
+/// accept, wire reject** while the grammar had landed and the planner
+/// window shift had not, then left the table entirely once the shift
+/// landed and the two axes agreed with the reference. Recording either
+/// axis alone would have been false in one direction at each step —
+/// `reject` hides a shipped grammar, `accept` claims a fix no user can
+/// observe. Every row happens to read `SAME` today; the column is kept
+/// because that fact is a measurement, not a property.
+///
+/// The parse column is DERIVED (`accepts()` runs the parser). The wire
+/// column is RECORDED, not derived, because this crate cannot see the
+/// planner — `pulsus-read` owns it. That is a real weakness of this
+/// table and is stated rather than hidden.
+const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str, &str)] = &[
+    // (query, differential-oracle verdict, parse, wire, class)
     // OVER-ACCEPTANCE. A label-filter duration with an uppercase unit:
     // the oracle lexes no literal at all (`400 syntax error: unexpected
     // $end`).
@@ -472,6 +542,7 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
         r#"{app="x"} | json | d > 1S"#,
         "reject",
         "accept",
+        SAME,
         OVER_ACCEPTANCE,
     ),
     // OVER-ACCEPTANCE. Range-selector units the oracle does not know at
@@ -480,38 +551,25 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
         r#"count_over_time({app="x"}[5ns])"#,
         "reject",
         "accept",
+        SAME,
         OVER_ACCEPTANCE,
     ),
     (
         r#"count_over_time({app="x"}[5us])"#,
         "reject",
         "accept",
+        SAME,
         OVER_ACCEPTANCE,
-    ),
-    // A REAL GAP (filed separately). `offset` is unimplemented here in
-    // EVERY spelling, so it is not part of the folding gap; the
-    // reference accepts both.
-    (
-        r#"count_over_time({app="x"}[5m] offset 1m)"#,
-        "accept",
-        "reject",
-        REAL_GAP,
-    ),
-    (
-        r#"count_over_time({app="x"}[5m] OFFSET 1m)"#,
-        "accept",
-        "reject",
-        REAL_GAP,
     ),
     // OVER-ACCEPTANCE. A keyword used as a selector label name: the
     // oracle's lexer emits a keyword token there and rejects it
     // (`unexpected by,
     // expecting IDENTIFIER or }` — note it prints the FOLDED spelling
     // for `{BY="x"}` too, which is how the fold was established).
-    (r#"{by="x"}"#, "reject", "accept", OVER_ACCEPTANCE),
-    (r#"{BY="x"}"#, "reject", "accept", OVER_ACCEPTANCE),
-    (r#"{json="x"}"#, "reject", "accept", OVER_ACCEPTANCE),
-    (r#"{JSON="x"}"#, "reject", "accept", OVER_ACCEPTANCE),
+    (r#"{by="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
+    (r#"{BY="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
+    (r#"{json="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
+    (r#"{JSON="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
 ];
 
 /// **Counts are pinned, not just rows.** The census used to assert every
@@ -525,7 +583,7 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str)] = &[
 fn the_residual_census_totals_are_pinned() {
     assert_eq!(
         KNOWN_RESIDUAL_DIVERGENCES.len(),
-        9,
+        7,
         "the residual census changed size — update this total and every count quoted \
          about it (issues #339, #350)"
     );
@@ -538,11 +596,16 @@ fn the_residual_census_totals_are_pinned() {
         // [`BYTE_LITERAL_QUERY_REJECTS`] below.
         (VERSION_DIFFERENCE, 0),
         (OVER_ACCEPTANCE, 7),
-        (REAL_GAP, 2),
+        // Issue #343 emptied this class: `offset` is implemented — the
+        // grammar, the `is_kw` fold, and the planner's window shift — so
+        // both spellings agree with the reference on both axes and are
+        // agreements, not residual divergences. The accepted spelling
+        // lives on in [`FOLDING_PROBES`].
+        (REAL_GAP, 0),
     ] {
         let n = KNOWN_RESIDUAL_DIVERGENCES
             .iter()
-            .filter(|(_, _, _, c)| *c == class)
+            .filter(|(_, _, _, _, c)| *c == class)
             .count();
         assert_eq!(n, expected, "{class} row count changed");
     }
@@ -553,7 +616,7 @@ fn the_residual_census_totals_are_pinned() {
         .map(|class| {
             KNOWN_RESIDUAL_DIVERGENCES
                 .iter()
-                .filter(|(_, _, _, c)| c == class)
+                .filter(|(_, _, _, _, c)| c == class)
                 .count()
         })
         .sum();
@@ -567,16 +630,22 @@ fn the_residual_census_totals_are_pinned() {
 #[test]
 fn the_residual_divergence_census_is_exact() {
     let mut drifted = Vec::new();
-    for (query, reference, recorded, _class) in KNOWN_RESIDUAL_DIVERGENCES {
+    for (query, reference, parse, wire, _class) in KNOWN_RESIDUAL_DIVERGENCES {
         let ours = if accepts(query) { "accept" } else { "reject" };
-        if ours != *recorded {
+        if ours != *parse {
             drifted.push(format!(
-                "{query:?}: recorded PulsusDB={recorded}, actual={ours} (reference={reference})"
+                "{query:?}: recorded parse={parse}, actual={ours} (reference={reference})"
             ));
         }
+        // The row must still record a DIVERGENCE on the axis the user
+        // experiences. A row whose wire verdict equals the reference has
+        // been fixed end to end and belongs out of this list; a row whose
+        // PARSE now agrees while the wire does not is still a divergence,
+        // which is exactly what the two columns exist to express.
+        let effective: &str = if *wire == SAME { parse } else { wire };
         assert_ne!(
-            reference, recorded,
-            "{query:?} is in the residual list but records agreement — remove it"
+            *reference, effective,
+            "{query:?} agrees with the reference on the WIRE — it is fixed, remove it"
         );
     }
     assert!(
@@ -611,7 +680,7 @@ fn live_expectations() -> Vec<(String, &'static str)> {
         out.push(((*q).to_string(), "reject"));
     }
     // The residual census carries the reference verdict per row.
-    for (q, reference, _, _) in KNOWN_RESIDUAL_DIVERGENCES {
+    for (q, reference, _, _, _) in KNOWN_RESIDUAL_DIVERGENCES {
         out.push(((*q).to_string(), reference));
     }
     out
@@ -643,6 +712,11 @@ const FOLDING_PROBES: &[&str] = &[
     r#"{app="x"} | LINE_FORMAT "{{.a}}""#,
     r#"{app="x"} | json | DROP a"#,
     r#"sum_over_time({app="x"} | UNWRAP DURATION(v) [5m])"#,
+    // Issue #343: the accepted `offset` spelling, moved here out of the
+    // residual census when the construct was implemented — an agreeing
+    // fold belongs with the other folds, and the live leg keeps checking
+    // the reference still accepts it.
+    r#"count_over_time({app="x"}[5m] OFFSET 1m)"#,
     r#"{app="x"} |= IP("1.2.3.4")"#,
     // Identifier payloads are accepted in either case — the SEMANTIC
     // claim about them (which series they select) is established by the

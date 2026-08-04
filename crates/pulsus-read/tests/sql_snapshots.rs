@@ -1210,3 +1210,102 @@ fn a_five_variant_tree_has_exactly_one_scan_leaf() {
     };
     assert_eq!(node.leaves().len(), 1, "one scan, N-independent");
 }
+
+// ---------------------------------------------------------------------
+// Issue #343 (boundary fix) — AC 5a/5c: the RENDERED scan predicate when
+// the offset shift leaves the representable timestamp axis.
+//
+// The layer is the point. A planner-field assertion would pass while the
+// user still got a domain-wide scan; what a user experiences is the SQL
+// text, so that is what these pin. The wire half (no `metric_read` stage
+// at all) lives in `pulsus-server/tests/logs_api_live.rs`.
+// ---------------------------------------------------------------------
+
+/// One hour below `i64::MAX`. The 5-year caps bound every DURATION in a
+/// query, so the only unbounded quantity left is where the request sits on
+/// the axis — which is what these two cases vary. Both offsets below are
+/// an ordinary one hour.
+const OFFSET_AT_NS: i64 = i64::MAX - 3_600_000_000_000 + 1;
+
+/// Renders `sql::metric_instant` from a plan exactly as `LogQlEngine`
+/// would for an instant metric query, so the asserted text is the text
+/// that would reach ClickHouse.
+fn instant_sql(mp: &pulsus_read::logql::MetricPlan, fingerprints: &[u64]) -> String {
+    sql::metric_instant(
+        sql::MetricSource {
+            table: &mp.table,
+            bucket_col: mp.bucket_col,
+            agg_expr: mp.agg_expr,
+        },
+        &["'checkout'".to_string()],
+        fingerprints,
+        TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        mp.scan_lower,
+        &mp.extra_predicates,
+    )
+}
+
+/// **AC 5a.** `offset -1h` at an instant one hour below `i64::MAX` shifts
+/// the evaluation domain past the rail. The scan predicate must be the
+/// DEGENERATE empty window.
+///
+/// Against `17e2802` this rendered a saturated window instead — the shift
+/// clamped both bounds onto the `i64::MAX` rail, producing a scan over a
+/// span the request never named. (The case then read
+/// `[2500000h] offset -2500000h` at a 2026 instant, rendering
+/// `timestamp_ns > 223372036854775807`, a 1977-01-08 floor; both those
+/// durations are now refused at parse by the 5-year cap, so the extreme
+/// has moved to the request's position, which nothing bounds.)
+///
+/// The phrases are asserted whole and delimited: `> 0 AND` must not be
+/// able to match as a prefix of a longer number.
+#[test]
+fn an_offset_past_the_timestamp_axis_renders_the_degenerate_empty_window() {
+    let params = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: OFFSET_AT_NS,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mp = metric_plan(r#"count_over_time({env="prod"}[5m] offset -1h)"#, &params);
+    assert!(mp.empty_domain, "the shifted domain left the axis");
+    assert_eq!((mp.start_ns, mp.grid_start_ns, mp.end_ns), (0, 0, -1));
+    let sql = instant_sql(&mp, &[101, 205]);
+    assert!(
+        sql.contains("timestamp_ns > 0 AND timestamp_ns <= -1"),
+        "expected the degenerate empty window, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("timestamp_ns <= 9223372036854775807"),
+        "the saturated rail must be gone:\n{sql}"
+    );
+}
+
+/// **AC 5c — the non-vacuity control, and it is required.** The SAME query
+/// with the sign flipped stays inside the axis and must render its real
+/// window. Deleting the shift, or making every plan degenerate, reddens
+/// this while leaving the case above green.
+#[test]
+fn an_offset_inside_the_timestamp_axis_still_renders_its_real_window() {
+    let params = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: OFFSET_AT_NS,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mp = metric_plan(r#"count_over_time({env="prod"}[5m] offset 1h)"#, &params);
+    assert!(!mp.empty_domain, "T - 1h is representable");
+    // T - 1h = i64::MAX - 2h + 1, and the scan reaches a further 5m back.
+    let end = OFFSET_AT_NS - 3_600_000_000_000;
+    let start = end - 300_000_000_000;
+    let sql = instant_sql(&mp, &[101, 205]);
+    assert!(
+        sql.contains(&format!("timestamp_ns > {start} AND timestamp_ns <= {end}")),
+        "expected the shifted-but-representable window, got:\n{sql}"
+    );
+}

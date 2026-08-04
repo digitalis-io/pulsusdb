@@ -175,6 +175,8 @@ fn run_client(
             end_ns: mp.end_ns,
             step_ns,
             range_ns: mp.range_ns,
+            // Issue #343: the plan's bounds are already offset-shifted.
+            offset_ns: mp.offset_ns,
         },
         None => ClientWindow::Instant {
             start_ns: mp.grid_start_ns,
@@ -469,12 +471,15 @@ fn an_oversized_bucket_grid_is_a_named_too_broad_error_before_any_allocation() {
 /// that slips past the cap.
 #[test]
 fn extreme_window_bounds_hit_the_bucket_cap_without_overflow() {
-    // The full i64 nanosecond range at step 1 ns (~2^64 buckets — would
-    // wrap a plain i64 count).
+    // Issue #343's 5-year span cap now refuses the full i64 range BEFORE
+    // the bucket cap can fire, so these use the widest span that exists
+    // (exactly 5 years) at step 1 ns — 1.5768e17 buckets, still far past
+    // the cap and still enough to wrap a plain i64 count. The premise is
+    // unchanged; only the width the request is allowed to ask for is.
     let params = QueryParams {
         spec: pulsus_read::logql::QuerySpec::Range {
-            start_ns: i64::MIN,
-            end_ns: i64::MAX,
+            start_ns: 0,
+            end_ns: pulsus_logql::MAX_QUERY_SPAN_NS,
             step_ns: 1,
         },
         limit: 100,
@@ -499,7 +504,7 @@ fn extreme_window_bounds_hit_the_bucket_cap_without_overflow() {
     let params = QueryParams {
         spec: pulsus_read::logql::QuerySpec::Range {
             start_ns: i64::MIN,
-            end_ns: i64::MIN / 2,
+            end_ns: i64::MIN + pulsus_logql::MAX_QUERY_SPAN_NS,
             step_ns: 1,
         },
         limit: 100,
@@ -535,18 +540,19 @@ fn extreme_window_bounds_hit_the_bucket_cap_without_overflow() {
     )
     .unwrap();
     assert_eq!(result, QueryResult::Matrix(Vec::new()));
-    // A large-but-IN-DOMAIN step over the extreme window is a handful of
+    // A large-but-IN-DOMAIN step over the widest window is a handful of
     // buckets: accepted (no false positive from the widened arithmetic).
     // `MAX_DURATION_NS` is the validated ceiling — since round 10 the
     // reference's full positive int64 (`i64::MAX`), so this is the largest
-    // step the reference can represent, over the full timestamp domain
-    // (one saturated fence interval); a step ABOVE it is rejected at the
+    // step the reference can represent; a step ABOVE it is rejected at the
     // planner boundary instead — see
-    // `a_hostile_step_is_rejected_end_to_end_by_the_planner`.
+    // `a_hostile_step_is_rejected_end_to_end_by_the_planner`. The window is
+    // now the widest the 5-year span cap admits rather than the whole
+    // timestamp domain; the step is unchanged and still dwarfs it.
     let params = QueryParams {
         spec: pulsus_read::logql::QuerySpec::Range {
             start_ns: i64::MIN,
-            end_ns: i64::MAX,
+            end_ns: i64::MIN + pulsus_logql::MAX_QUERY_SPAN_NS,
             step_ns: pulsus_read::logql::MAX_DURATION_NS as u64,
         },
         limit: 100,
@@ -1206,6 +1212,8 @@ fn zero_k_over_501_groups_is_empty_not_a_rejection() {
                     end_ns: mp.end_ns,
                     step_ns,
                     range_ns: mp.range_ns,
+                    // Issue #343: the plan's bounds are already offset-shifted.
+                    offset_ns: mp.offset_ns,
                 },
                 None => ClientWindow::Instant {
                     start_ns: mp.grid_start_ns,
@@ -2948,6 +2956,8 @@ fn eval_node(
                             end_ns: mp.end_ns,
                             step_ns,
                             range_ns: mp.range_ns,
+                            // Issue #343: the plan's bounds are already offset-shifted.
+                            offset_ns: mp.offset_ns,
                         },
                         None => ClientWindow::Instant {
                             start_ns: mp.grid_start_ns,
@@ -3900,7 +3910,14 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
     ];
     // 38 real call sites. The floor of 40 the first cut used was met only
     // because a substring census counted its own `run_client(` literals.
-    const ROUTED_SITES: usize = 38;
+    // Issue #343's boundary fix routed 14 more (AC 1's pair, AC 2's four
+    // rail-and-control cases, AC 4's round-trip loop, and the seven R1/R2
+    // residual fixtures): 38 + 14 = 52. The 5-year caps then took three
+    // back: R1d's real-data witness and R2's `[1369008h]`/`[1369007h]`
+    // pair no longer parse, and R2 is now proved unreachable by arithmetic
+    // plus one parse refusal instead of by evaluation. 52 - 3 = 49. The
+    // scope caveat is unaffected — every routed fixture has a folded twin.
+    const ROUTED_SITES: usize = 49;
     let src = include_str!("logql_metric_agg_golden.rs");
     // Nothing inside `run_client` is a fixture — neither a call site
     // (there are none) nor the `apply_vector_aggs_ok` that builds the
@@ -4063,5 +4080,423 @@ fn avg_by_duplicate_grouping_equals_the_deduped_form() {
     assert_eq!(
         sorted_vector(dup),
         vec![(lbl(&[("fp", "a")]), 1.0), (lbl(&[("fp", "b")]), 2.0)]
+    );
+}
+
+// =====================================================================
+// Issue #343 (boundary fix) — the offset shift at the edge of the
+// representable timestamp domain.
+//
+// The shipped code SATURATED (`i64::saturating_sub`) when `T - d` left
+// `[i64::MIN, i64::MAX]`, which relocates the evaluation window to a rail
+// instead of recognising it has left the axis. It now `checked_sub`s and
+// substitutes a DEGENERATE empty window (`end_ns < grid_start_ns`), so
+// the query answers empty. The reference's plain int64 subtraction
+// (v3.7.4 `pkg/logql/range_vector.go:50-52`, tag `v3.7.4` /
+// `b318f2829f0ae2094ab3a1e90780450e9e4b03be`) WRAPS there, relocating the
+// window to an unrelated instant; we evaluate exactly instead. The
+// residual — the shapes where empty is not the exact answer either — is
+// ledgered as `offset-domain-edge-exact-arithmetic`.
+// =====================================================================
+
+/// An ordinary 2026 instant. Nothing in this section depends on an exotic
+/// request time; only the offset is extreme.
+const OFFSET_T: i64 = 1_780_000_000_000_000_000;
+
+/// `range_params` with a caller-chosen step (the section's witnesses use
+/// steps the file-wide 60s constant cannot express).
+fn range_params_step(start_ns: i64, end_ns: i64, step_ns: u64) -> QueryParams {
+    QueryParams {
+        spec: pulsus_read::logql::QuerySpec::Range {
+            start_ns,
+            end_ns,
+            step_ns,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    }
+}
+
+fn matrix_points(result: QueryResult) -> Vec<(i64, f64)> {
+    match result {
+        QueryResult::Matrix(series) => series.into_iter().flat_map(|s| s.points).collect(),
+        other => panic!("expected a matrix, got {other:?}"),
+    }
+}
+
+/// **AC 1 — the reachable range case.** A request sitting one grid-width
+/// below `i64::MAX`, shifted forward by an ordinary offset, puts the
+/// evaluation domain past the rail. The correct answer is EMPTY: the
+/// window the user asked for does not exist.
+///
+/// *Against `17e2802` this returned one point at the relocated instant* —
+/// both bounds saturated onto `i64::MAX`, the single grid point's window
+/// swallowed the rows, and putting the offset back landed the point
+/// somewhere the request never named.
+///
+/// **The shape changed with the 5-year caps and the substance did not.**
+/// This case used to be an ordinary 2026 request with a 285-year offset
+/// over a 285-year range; both are now refused at parse. The extreme has
+/// moved from the DURATIONS to the request's POSITION on the axis, which
+/// is the only unbounded quantity left — every duration here is inside the
+/// cap.
+///
+/// The control is the same shape with a shift that stays on the axis, so
+/// this cannot pass by the fixture simply being unreadable.
+#[test]
+fn a_range_offset_past_the_timestamp_axis_answers_empty() {
+    const CAP: i64 = pulsus_logql::MAX_QUERY_SPAN_NS;
+    // start = MAX - 120s, end = MAX: a 120-second request at the rail.
+    let start = i64::MAX - 120 * NS;
+    let params = range_params_step(start, i64::MAX, 60 * NS as u64);
+
+    // `offset -43800h` moves the domain 5 years FORWARD, past MAX.
+    // Under the saturating predecessor both bounds landed on MAX and the
+    // single grid point's `(MAX - 5y, MAX]` window held both rows.
+    let at_rail = vec![
+        row(1, i64::MAX - 1000, "recent"),
+        row(1, i64::MAX - 2000, "older"),
+    ];
+    let off_axis = run_client(
+        r#"count_over_time({env="prod"}[43800h] offset -43800h)"#,
+        &params,
+        &at_rail,
+        &meta_one(),
+    )
+    .expect("a domain-crossing offset is a 200, never a refusal");
+    assert_eq!(
+        matrix_points(off_axis),
+        Vec::new(),
+        "the shifted window is off the axis, so there is nothing to report"
+    );
+
+    // Control: the SAME magnitude shifted BACKWARDS is representable, so
+    // the data in that window is read and reported on the CALLER's grid.
+    // Its own rows, because the two windows are disjoint by construction.
+    let below = vec![
+        row(1, start - CAP - 1000, "recent"),
+        row(1, start - CAP - 2000, "older"),
+    ];
+    let on_axis = run_client(
+        r#"count_over_time({env="prod"}[43800h] offset 43800h)"#,
+        &params,
+        &below,
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(
+        matrix_points(on_axis),
+        vec![(start, 2.0), (start + 60 * NS, 2.0), (i64::MAX, 2.0)],
+        "a representable shift still reads the data, on the CALLER's grid"
+    );
+}
+
+/// **AC 2 — the domain edge, both rails, each with its own control.**
+///
+/// *Against `17e2802`*: the low-rail case reported a point at
+/// `i64::MIN + 1h` (`-9223368436854775808`) and the high-rail case a point
+/// at `9223372036854775806`. Both are instants the request never named.
+#[test]
+fn an_offset_off_either_rail_answers_empty_while_the_rails_themselves_work() {
+    // --- low rail: `i64::MIN - 1h` underflows.
+    let at_min = range_params_step(i64::MIN, i64::MIN, 60 * NS as u64);
+    let absent_off = run_client(
+        r#"absent_over_time({env="prod"}[5m] offset 1h)"#,
+        &at_min,
+        &[],
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(
+        matrix_points(absent_off),
+        Vec::new(),
+        "absence is reported for a window that exists; this one does not"
+    );
+    // Control: the SAME grid point with no shift does report absence, so
+    // the emptiness above is the shift and not the fixture.
+    let absent_on = run_client(
+        r#"absent_over_time({env="prod"}[5m] offset 0s)"#,
+        &at_min,
+        &[],
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(matrix_points(absent_on), vec![(i64::MIN, 1.0)]);
+
+    // --- high rail: `i64::MAX - (-1ns)` overflows by exactly one ns.
+    let at_max = range_params_step(i64::MAX, i64::MAX, 60 * NS as u64);
+    let rows = vec![row(1, i64::MAX, "at the rail")];
+    let count_off = run_client(
+        r#"count_over_time({env="prod"}[5m] offset -1ns)"#,
+        &at_max,
+        &rows,
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(
+        matrix_points(count_off),
+        Vec::new(),
+        "one nanosecond past the rail is still past the rail"
+    );
+    let count_on = run_client(
+        r#"count_over_time({env="prod"}[5m] offset 0s)"#,
+        &at_max,
+        &rows,
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(matrix_points(count_on), vec![(i64::MAX, 1.0)]);
+}
+
+/// **AC 4 — the round trip is exact where it applies.** The planner
+/// subtracts the offset once at the boundary and `shift_emitted_points`
+/// adds it back once on emit; over an ORDINARY range spec that pair must
+/// be the identity on the timestamp axis, for either sign and for a
+/// colossal-but-representable magnitude.
+///
+/// **This is not the rail gate.** It bites only where the shift is
+/// representable — every case here is, and `43800h` is the largest offset
+/// that exists at all (the 5-year cap); the rail behaviour is pinned by
+/// the two tests above and by the R1/R2 residual pins below. *Against
+/// `17e2802` this passes*, and it is stated as an anti-regression gate.
+///
+/// `absent_over_time` over an empty store emits at EVERY grid point,
+/// which is what makes "every request grid point, and only those" an
+/// assertion rather than a sample.
+#[test]
+fn the_offset_round_trip_is_exact_for_every_representable_shift() {
+    let start = OFFSET_T;
+    let end = start + 300 * NS;
+    let params = range_params_step(start, end, 60 * NS as u64);
+    let expected: Vec<(i64, f64)> = (0..=5).map(|k| (start + k * 60 * NS, 1.0)).collect();
+    for offset in ["0s", "1h", "-1h", "43800h", "-43800h"] {
+        let query = format!(r#"absent_over_time({{env="prod"}}[5m] offset {offset})"#);
+        let points = matrix_points(
+            run_client(&query, &params, &[], &meta_one()).expect("a representable shift plans"),
+        );
+        assert_eq!(
+            points, expected,
+            "offset {offset}: every emitted point must land back on the \
+             request's own grid {start}..={end}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// AC 6 — the residual, one test per branch, each pinned by its own entry
+// inequality. Ledger id `offset-domain-edge-exact-arithmetic`
+// (docs/benchmarks/logs-differential-ledger.md).
+//
+// Notation: request range spec `S <= E`, step `p`, offset `d`, range `r`;
+// `A = S - d`, `B = E - d` EXACT; `MIN = -2^63`, `MAX = 2^63 - 1`.
+// `shift_by_offset` fails iff `A` or `B` leaves `[MIN, MAX]`.
+// `min_stored_ts = 0` / `max_stored_ts = 4_294_943_999_999_999_999` are
+// the ingest gate's floor and ceiling
+// (`pulsus-write/src/protocols/loki_push.rs`).
+//
+// Every one of these says PulsusDB answers empty and records what exact
+// arithmetic would answer. If a branch is ever made exact, its test here
+// is what has to change.
+// ---------------------------------------------------------------------
+
+/// **R1a — low rail, TOTAL** (`d > E + 2^63`). The whole shifted grid is
+/// below `MIN`.
+///
+/// Loses `absent_over_time`'s entire grid of `1`s. **No value-producing
+/// operation can be affected**: every grid point is `< MIN`, so its window
+/// `(g - r, g]` lies wholly below `MIN` and no representable sample can
+/// occupy it.
+///
+/// **Still reachable under the 5-year caps**, and with an ORDINARY offset:
+/// `E = i64::MIN + 30m` and `d = 1h` give `E + 2^63 = 30m < 1h = d`. The
+/// caps bound the durations, never where the request sits.
+#[test]
+fn r1a_low_rail_total_absent_over_time_loses_its_whole_grid() {
+    const D: i128 = 3_600_000_000_000; // 1h
+    const E: i64 = i64::MIN + 1_800_000_000_000; // MIN + 30m
+    const S: i64 = i64::MIN;
+    const { assert!(D > E as i128 + (1i128 << 63), "R1a entry inequality") };
+    let points = matrix_points(
+        run_client(
+            r#"absent_over_time({env="prod"}[5m] offset 1h)"#,
+            &range_params_step(S, E, 60 * NS as u64),
+            &[],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        points.is_empty(),
+        "PulsusDB answers empty; exact arithmetic would answer a `1` at \
+         every request grid point, all of whose windows are below MIN"
+    );
+}
+
+/// **R1b — low rail, PARTIAL** (`E + 2^63 >= d > S + 2^63`). `A`
+/// underflows while `B` stays in domain, so the exact grid has an
+/// in-domain suffix that PulsusDB drops.
+///
+/// **ABSENCE-ONLY UNDER THE 5-YEAR CAPS, for any row the ingest gate
+/// admitted — and the ledger row says so.** Before the caps this branch
+/// had a demonstrated witness losing a stored sample. Now
+/// `B = E - d <= (S + cap) - d < (d - 2^63 + cap) - d = MIN + cap`, which
+/// is far below `min_stored_ts = 0`, so no stored sample can lie at or
+/// below `B`. The necessary condition `E - d >= min_stored_ts` is
+/// unsatisfiable.
+///
+/// Reachable only at the extreme corner: `d` must be the full 5-year cap
+/// and `S` within it of `MIN`. That is the case below.
+#[test]
+fn r1b_low_rail_partial_loses_only_absence_under_the_cap() {
+    const D: i128 = pulsus_logql::MAX_QUERY_SPAN_NS as i128;
+    const S: i64 = i64::MIN;
+    const E: i64 = i64::MIN + pulsus_logql::MAX_QUERY_SPAN_NS;
+    const {
+        assert!(
+            (E as i128 + (1i128 << 63)) >= D && D > S as i128 + (1i128 << 63),
+            "R1b entry inequality"
+        )
+    };
+    // `B = E - d = MIN`: in domain, and below every storable timestamp.
+    const { assert!(E as i128 - D == i64::MIN as i128, "B is exactly MIN") };
+    let points = matrix_points(
+        run_client(
+            r#"absent_over_time({env="prod"}[5m] offset 43800h)"#,
+            &range_params_step(S, E, pulsus_logql::MAX_QUERY_SPAN_NS as u64 / 8),
+            &[],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        points.is_empty(),
+        "PulsusDB answers empty; exact arithmetic keeps the in-domain \
+         suffix of `1`s, and only those — no stored sample can be lost"
+    );
+}
+
+/// **R1c — high rail, TOTAL** (`-d > MAX - S`, with **no sign constraint
+/// on `S`**). The whole shifted grid is above `MAX`.
+///
+/// Loses `absent_over_time`'s whole grid. **Value-producing operations are
+/// now unaffected**: reaching stored data from beyond the rail is the R2
+/// case, which the 5-year range cap has made unreachable (see
+/// [`r2_is_unreachable_under_the_five_year_range_cap`]).
+///
+/// Under the caps this requires `S` within 5 years of `MAX` — an ordinary
+/// positive start still, which is what the name records, but no longer any
+/// positive start.
+#[test]
+fn r1c_high_rail_total_needs_no_pre_1970_start() {
+    const NEG_D: i64 = pulsus_logql::MAX_QUERY_SPAN_NS;
+    const S: i64 = i64::MAX - NEG_D + 1; // -d > MAX - S by exactly 1 ns
+    const { assert!(NEG_D > i64::MAX - S, "R1c entry inequality") };
+    const { assert!(S > 0, "an ordinary positive start qualifies") };
+    let points = matrix_points(
+        run_client(
+            r#"absent_over_time({env="prod"}[5m] offset -43800h)"#,
+            &range_params_step(S, S + 120 * NS, 60 * NS as u64),
+            &[],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(points.is_empty(), "the whole grid is above MAX");
+}
+
+/// **R1d — high rail, PARTIAL** (`MAX - E < -d <= MAX - S`). `A` stays in
+/// domain while `B` overflows, so the exact grid has an in-domain PREFIX
+/// that PulsusDB drops.
+///
+/// **ABSENCE-ONLY UNDER THE 5-YEAR CAPS, for any row the ingest gate
+/// admitted.** `B > MAX` forces `E > MAX - cap`, and the span
+/// cap then forces `S >= E - cap > MAX - 2*cap = 8908012036854775807`, so
+/// every in-domain grid point sits above `8.9e18` and every window's lower
+/// bound is `>= A - r >= 8.9e18 - cap`, far above
+/// `max_stored_ts = 4294943999999999999`. The necessary condition
+/// `S - d - range < max_stored_ts` is unsatisfiable. `max_stored_ts` is
+/// the ingest gate's ceiling, not a storage-enforced invariant — same
+/// condition as R1b's.
+///
+/// The entry boundary with `-d = MAX - S` EXACTLY: `A = MAX` is in domain
+/// and `B = MAX + 120s` is not.
+#[test]
+fn r1d_high_rail_partial_straddles_at_the_entry_boundary() {
+    const NEG_D: i64 = pulsus_logql::MAX_QUERY_SPAN_NS;
+    const S: i64 = i64::MAX - NEG_D;
+    const E: i64 = S + 120 * NS;
+    const {
+        assert!(
+            S > 0 && i64::MAX - E < NEG_D && NEG_D <= i64::MAX - S,
+            "R1d entry inequality"
+        )
+    };
+    const MAX_STORED_TS: i64 = 4_294_943_999_999_999_999;
+    const {
+        assert!(
+            (S as i128 + NEG_D as i128) - pulsus_logql::MAX_QUERY_SPAN_NS as i128
+                > MAX_STORED_TS as i128,
+            "even the widest window from the in-domain prefix cannot reach stored data"
+        )
+    };
+    let points = matrix_points(
+        run_client(
+            r#"absent_over_time({env="prod"}[5m] offset -43800h)"#,
+            &range_params_step(S, E, 60 * NS as u64),
+            &[],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        points.is_empty(),
+        "PulsusDB answers empty; exact arithmetic keeps the in-domain \
+         prefix of `1`s, and only those"
+    );
+}
+
+/// **R2 — UNREACHABLE under the 5-year range cap, and this is what says
+/// so.** It is kept rather than deleted: if the cap is ever raised, this
+/// test is where the branch comes back.
+///
+/// R2 was the only way a value-producing operation could lose real data
+/// for a row the ingest gate admitted:
+/// a grid instant beyond the rail whose `(g - r, g]` window still reaches
+/// stored data. The first such instant is `MAX + 1`, and the window is
+/// strict on the left, so it reaches `max_stored_ts` only when
+///
+/// ```text
+/// range > (i64::MAX + 1) - max_stored_ts
+///       = 9223372036854775808 - 4294943999999999999
+///       = 4928428036854775809 ns   (~1369007.79 h ~ 156.28 years)
+/// ```
+///
+/// The range cap is **43800 h**, five years — 31 times too small. Both the
+/// range and the instant form of R2 are therefore dead: no `[range]` that
+/// parses can span the gap. The arithmetic is asserted, and the refusal of
+/// the smallest range that WOULD have reached is measured.
+#[test]
+fn r2_is_unreachable_under_the_five_year_range_cap() {
+    const MAX_STORED_TS: i64 = 4_294_943_999_999_999_999;
+    const REACH_THRESHOLD: i128 = (1i128 << 63) - MAX_STORED_TS as i128;
+    const {
+        assert!(
+            REACH_THRESHOLD == 4_928_428_036_854_775_809,
+            "the reach threshold"
+        )
+    };
+    const {
+        assert!(
+            REACH_THRESHOLD > pulsus_logql::MAX_QUERY_SPAN_NS as i128,
+            "no admissible [range] can reach stored data from beyond the rail"
+        )
+    };
+    // `[1369008h]` is the shortest range that would have reached. It does
+    // not parse.
+    let err = pulsus_logql::parse(r#"count_over_time({env="prod"}[1369008h])"#)
+        .expect_err("the range cap refuses it");
+    assert!(
+        err.to_string().starts_with("range too long ("),
+        "expected the range cap, got {err}"
     );
 }

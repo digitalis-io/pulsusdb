@@ -44,8 +44,54 @@ pub(super) async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError
 }
 
 /// Parses `start`/`end` (defaults: `end = now`, `start = end - 1h`,
-/// docs/api.md §2.1).
-pub(super) fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), ParamError> {
+/// docs/api.md §2.1) and applies the **5-year query-span cap** (issue
+/// #343).
+///
+/// **THE CAP LIVES HERE BECAUSE THIS IS THE ONLY PLACE EVERY ENDPOINT
+/// CARRYING `start`/`end` PASSES THROUGH.** Its first cut sat in
+/// `pulsus_read::logql::plan`, which three of these code paths never
+/// reach, so a 20-year range walked straight past it.
+///
+/// **Whether a route reaches `plan()` is a property of the ENGINE METHOD
+/// it calls, not of whether it takes a selector.** The nine routes sharing
+/// this function, each verified against the engine code and then measured
+/// (see below):
+///
+/// | route | reaches `plan()`? |
+/// |---|---|
+/// | `query_range` | yes — it IS a plan |
+/// | `series` | yes — `series_inner` builds a synthetic `QuerySpec::Range` and plans per selector |
+/// | `stats`, `patterns`, `volume`, `detected_fields` | yes — same idiom; each requires a `query` |
+/// | `detected_labels` **with** `query` | yes — the `Some(expr)` arm plans |
+/// | `detected_labels` **without** `query` | **NO** — the `None` arm derives months and aggregates directly |
+/// | `labels`, `label/{name}/values` | **NO** — label discovery resolves names/values without a plan |
+///
+/// So the last three rows are capped by THIS call and nothing else, and
+/// the rest are capped twice. `/series` looks like it should be among them
+/// and is not; `/detected_labels` is in both groups depending on one
+/// optional parameter.
+///
+/// **How that table was established, because guessing it from route shape
+/// is what produced two wrong versions of this comment:** the call below
+/// was deleted and `logs_api_live::nothing_in_a_query_may_span_more_than_five_years`
+/// re-run, which sends an over-cap range to every row (both
+/// `detected_labels` forms) and COLLECTS the ones still served. It named
+/// exactly `labels`, `label/{name}/values` and the unscoped
+/// `detected_labels` — the scoped `detected_labels` row, same path, stayed
+/// capped, which is what makes the `query`-dependent split a measurement
+/// rather than a reading.
+///
+/// The two endpoints deliberately NOT covered, because neither takes a
+/// time RANGE:
+/// * `/query` (instant) — a single `time`, no span to bound. Its window is
+///   `[time - range, time]`, and `[range]` is capped in the parser.
+/// * `/tail` — a live stream with a `start` and no `end`, whose `start` is
+///   already raised to the retention floor (`tail.rs`), so its span is
+///   bounded by retention rather than by the client.
+///
+/// `pulsus_read::logql::check_query_span_ns` is the single implementation;
+/// `plan` keeps its own call for the library API.
+pub(super) fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), ApiError> {
     let now = params::now_ns();
     let end_ns = match params::get(pairs, "end") {
         Some(v) => params::parse_ts(v)?,
@@ -55,6 +101,7 @@ pub(super) fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), Par
         Some(v) => params::parse_ts(v)?,
         None => params::default_start_ns(end_ns),
     };
+    pulsus_read::logql::check_query_span_ns(start_ns, end_ns)?;
     Ok((start_ns, end_ns))
 }
 
@@ -653,28 +700,41 @@ mod tests {
         );
     }
 
-    /// Issue #227 review round 8 (end-to-end): a full-i64-domain request at
-    /// a 1_000_000s step must pass the resolution guard — the reference's
-    /// span subtraction saturates at the int64-ns duration bound (Go
-    /// `time.Time.Sub`), so it counts 9_223 intervals, not the true span's
-    /// 18_446 — and proceed past parameter parsing (hermetically the
-    /// engine-pool 503, never the resolution 400 the pre-round-8 exact
-    /// fence returned).
+    /// Issue #227 review round 8 (end-to-end): the WIDEST admissible
+    /// request at a 1_000_000s step must pass the resolution guard and
+    /// proceed past parameter parsing (hermetically the engine-pool 503,
+    /// never a resolution 400).
+    ///
+    /// **Round 8's actual subject — the reference's SATURATING span
+    /// subtraction (Go `time.Time.Sub`), which counts 9_223 intervals for
+    /// a full-i64 span instead of the true 18_446 — is no longer reachable
+    /// from the wire.** This case used to send `start=i64::MIN,
+    /// end=i64::MAX`; issue #343's 5-year query-span cap now refuses that
+    /// with a 400 before the resolution guard sees it, and no admissible
+    /// span can exceed an int64 duration any more, so nothing can
+    /// saturate. Said rather than deleted: the saturation behaviour itself
+    /// is still pinned where it lives, by
+    /// `pulsus_read::logql::window`'s
+    /// `grid_resolution_fence_saturates_the_span_like_the_reference`,
+    /// which calls `fence_intervals(i64::MIN, i64::MAX, …)` directly and
+    /// is untouched by an HTTP-layer cap. What remains here is the
+    /// end-to-end half: the widest request a client can send clears
+    /// parameter parsing and the resolution guard.
     #[tokio::test]
-    async fn query_range_across_the_full_timestamp_domain_passes_the_request_guard() {
+    async fn query_range_across_the_widest_admissible_span_passes_the_request_guard() {
         let q = format!(
             "query=count_over_time(%7Bapp%3D%22a%22%7D%5B5m%5D)\
              &start={}&end={}&step=1000000s",
-            i64::MIN,
-            i64::MAX
+            0,
+            pulsus_logql::MAX_QUERY_SPAN_NS
         );
         let res = query_range(State(test_state()), HeaderMap::new(), RawQuery(Some(q))).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
-            "a saturated-span request the reference serves must pass the \
-             resolution guard (got {json:?})"
+            "the widest admissible request must pass the resolution \
+             guard (got {json:?})"
         );
     }
 

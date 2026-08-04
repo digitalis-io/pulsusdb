@@ -136,6 +136,23 @@ pub enum LogQlError {
     /// stays well-formed.
     #[error("input size too long ({len} > {cap})")]
     QueryTooLong { len: usize, cap: usize, span: Span },
+
+    /// An `offset` or `[range]` duration literal longer than
+    /// [`crate::MAX_QUERY_SPAN_NS`] (issue #343, owner mandate). `what` is
+    /// `"offset"` or `"range"`; `raw` is the literal AS WRITTEN — sign
+    /// included, in the units the user sent — so the message shows what
+    /// tripped it.
+    ///
+    /// Same shape as [`LogQlError::QueryTooLong`] (`X too long (got >
+    /// cap)`), the same `400 bad_data`, and the cap is DERIVED from the
+    /// constant rather than spelled again so the two cannot drift.
+    #[error("{what} too long ({raw} > {cap_hours}h)")]
+    SpanTooLong {
+        what: &'static str,
+        raw: String,
+        cap_hours: i64,
+        span: Span,
+    },
 }
 
 impl LogQlError {
@@ -156,7 +173,8 @@ impl LogQlError {
             | LogQlError::InvalidAggregationParam { span, .. }
             | LogQlError::AggregationParamNotPositive { span, .. }
             | LogQlError::GroupingNotAllowed { span, .. }
-            | LogQlError::QueryTooLong { span, .. } => *span,
+            | LogQlError::QueryTooLong { span, .. }
+            | LogQlError::SpanTooLong { span, .. } => *span,
         }
     }
 }

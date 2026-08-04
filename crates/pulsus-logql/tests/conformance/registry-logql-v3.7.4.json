@@ -409,6 +409,13 @@
       "probe": "count_over_time({app=\"x\"}[10m])"
     },
     {
+      "id": "range.offset",
+      "category": "metric-range-functions",
+      "syntax": "[<duration>] offset <duration>",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#offset-modifier",
+      "probe": "count_over_time({app=\"x\"}[5m] offset 1h)"
+    },
+    {
       "id": "agg.sum",
       "category": "vector-aggregations",
       "syntax": "sum(...)",

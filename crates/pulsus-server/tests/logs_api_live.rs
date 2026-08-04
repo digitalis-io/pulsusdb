@@ -15,7 +15,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -1570,6 +1570,626 @@ async fn query_range_surfaces_error_details_label_end_to_end() {
     );
 
     drop(guard);
+}
+
+/// Issue #343 — `offset` END TO END, over the wire, against real
+/// ClickHouse.
+///
+/// **The layer matters here more than usual.** This construct's whole
+/// history is a verdict that was true one layer up and false where the
+/// user stands: it parsed while the planner refused it, and the #339
+/// census had to carry a parse column and a wire column separately to say
+/// so. A hermetic test cannot close that gap — an INSTANT window is a SQL
+/// predicate, so the pure evaluator never sees it — which is exactly why
+/// the instant leg below is here and not in `b19_offset.test`.
+///
+/// Two claims, each with its own control:
+///
+/// 1. **The data window moves.** One batch 30s back and one at `now`; the
+///    same `[10s]` selector answers 3 without an offset and 5 with
+///    `offset 30s`. A `[10m]` control window spans both and answers 8, so
+///    the 3/5 split is the window moving rather than rows missing.
+/// 2. **The emitted timestamps do NOT move.** The two range queries share
+///    one grid and must report the same instant, differing only in value.
+///
+/// **What it does NOT cover, established by mutation rather than
+/// asserted:** the SIGN. Every offset here is positive, so replacing the
+/// planner's `t - d` with `t - |d|` leaves this test green — it was tried.
+/// The sign is owned by `plan.rs`'s
+/// `a_negative_offset_shifts_the_window_forward_not_back` and by
+/// `b19_offset.test`'s negative rows, both of which that mutant reddens.
+/// Reading this test as end-to-end coverage of `offset` would be reading
+/// it for more than it measures.
+#[tokio::test]
+async fn offset_shifts_the_data_window_and_not_the_reported_timestamps() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_offset";
+    let port = 31_120;
+    // Dropped first: every count below is EXACT, so a previous run's rows
+    // surviving in the window would inflate them (the sibling tests here
+    // assert `>= 1` and do not care).
+    drop_database(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+
+    // `setup` seeds 3 samples on the prod stream at base-3s/-2s/-1s. Add 5
+    // more at base-35s .. base-39s — STRICTLY inside `(base-40s,
+    // base-30s]`, the window `[10s] offset 30s` evaluates. Not on the
+    // -40s edge: that bound is exclusive (Loki's `(t-range, t]`), so a
+    // sample placed there would be excluded and this would read as an
+    // off-by-one in the shift rather than in the fixture.
+    let mut values = Vec::new();
+    for i in 1..=5i64 {
+        let ts = base_ns - 34_000_000_000 - i * 1_000_000_000;
+        values.push(format!("('checkout', {FP_A}, {ts}, 0, 'prod old {i}')"));
+    }
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                 VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed the older batch");
+
+    let instant = |query: &str| -> String {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query",
+                &[("query", query), ("time", &base_ns.to_string())],
+            ),
+        )
+        .expect("query reachable");
+        assert_eq!(res.status, 200, "{query}: {}", res.body);
+        let body = json(&res);
+        assert_eq!(body["data"]["resultType"], "vector", "{query}");
+        body["data"]["result"][0]["value"][1]
+            .as_str()
+            .unwrap_or_else(|| panic!("{query}: no vector value in {}", res.body))
+            .to_string()
+    };
+
+    // The instant leg — the half no hermetic test can reach.
+    assert_eq!(
+        instant(r#"count_over_time({env="prod", service_name="checkout"}[10s])"#),
+        "3",
+        "the recent batch"
+    );
+    assert_eq!(
+        instant(r#"count_over_time({env="prod", service_name="checkout"}[10s] offset 30s)"#),
+        "5",
+        "the window moved back 30s onto the older batch"
+    );
+    assert_eq!(
+        instant(r#"count_over_time({env="prod", service_name="checkout"}[10s] offset 0s)"#),
+        "3",
+        "`offset 0s` is the identity"
+    );
+    // THE CONTROL: both batches are present and visible, so 3-vs-5 above
+    // is the window moving, not rows missing.
+    assert_eq!(
+        instant(r#"count_over_time({env="prod", service_name="checkout"}[10m])"#),
+        "8",
+        "the control window spans both batches"
+    );
+
+    // The range leg: same grid, so the timestamps must be identical.
+    let range = |query: &str| -> (serde_json::Value, String) {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query_range",
+                &[
+                    ("query", query),
+                    ("start", &base_ns.to_string()),
+                    ("end", &base_ns.to_string()),
+                    ("step", "10s"),
+                ],
+            ),
+        )
+        .expect("query_range reachable");
+        assert_eq!(res.status, 200, "{query}: {}", res.body);
+        let body = json(&res);
+        assert_eq!(body["data"]["resultType"], "matrix", "{query}");
+        let point = &body["data"]["result"][0]["values"][0];
+        (
+            point[0].clone(),
+            point[1]
+                .as_str()
+                .unwrap_or_else(|| panic!("{query}: no matrix point in {}", res.body))
+                .to_string(),
+        )
+    };
+    let (plain_ts, plain_v) =
+        range(r#"count_over_time({env="prod", service_name="checkout"}[10s])"#);
+    let (shifted_ts, shifted_v) =
+        range(r#"count_over_time({env="prod", service_name="checkout"}[10s] offset 30s)"#);
+    assert_eq!(plain_v, "3");
+    assert_eq!(shifted_v, "5", "the value moved with the window");
+    assert_eq!(
+        plain_ts, shifted_ts,
+        "the offset must move the DATA window, never the reported grid"
+    );
+}
+
+/// Issue #343 (boundary fix), **AC 5b/5c — the WIRE**: an offset that
+/// shifts the evaluation domain past `i64::MAX` must issue NO scan at all.
+///
+/// **The layer is the whole finding.** A planner-field assertion, or the
+/// rendered-SQL snapshot in `pulsus-read/tests/sql_snapshots.rs`, both sit
+/// above the place the user stands. What shipped was a plan that
+/// SATURATED onto the `i64` rail, and its observable was a `metric_read`
+/// stage carrying a scan over a span the request never named. So this
+/// asserts on the explain payload the server actually returns: **no
+/// `metric_read` stage exists**, the stage that IS reported carries the
+/// degenerate window's signature month, and the result is empty.
+///
+/// **Under the 5-year caps the extreme lives in the request's POSITION.**
+/// Every duration below is an ordinary hour: `offset`, `[range]` and the
+/// query span are each capped at 43,800 h, and nothing bounds where on the
+/// axis `time` sits, so a request one hour below `i64::MAX` shifted one
+/// hour forward is how the domain is left now.
+///
+/// **The control varies the position, not the offset, and that is forced.**
+/// An off-axis request is by construction within 5 years of a rail, so its
+/// partition months can never overlap a month that holds data — stage 1
+/// resolves nothing and no `metric_read` follows for that reason alone.
+/// The control is therefore an ordinary request with an ordinary offset,
+/// which still does what a control must: it fails if the explain plumbing
+/// is deleted or every plan is made degenerate.
+#[tokio::test]
+async fn an_offset_past_the_timestamp_axis_issues_no_scan_at_all() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_offset_domain_edge";
+    let port = 31_122;
+    let (_guard, _client, base_ns) = setup(db, port).await;
+
+    // One hour below `i64::MAX`: `T - (-1h)` leaves the axis by 1 ns.
+    const AT_RAIL_NS: i64 = i64::MAX - 3_600_000_000_000 + 1;
+
+    let explain = |query: &str, at_ns: i64| -> serde_json::Value {
+        let res = http_request(
+            port,
+            "GET",
+            &q(
+                "/api/logs/v1/query",
+                &[("query", query), ("time", &at_ns.to_string())],
+            ),
+            &[("X-Pulsus-Explain", "1")],
+            None,
+        )
+        .expect("query reachable");
+        assert_eq!(res.status, 200, "{query}: {}", res.body);
+        json(&res)
+    };
+    let stages = |body: &serde_json::Value| -> Vec<(String, String)> {
+        body["data"]["explain"]["stages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no explain stages in {body}"))
+            .iter()
+            .map(|s| {
+                (
+                    s["name"].as_str().unwrap_or_default().to_string(),
+                    s["sql"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+
+    // Off the axis.
+    let off_axis = explain(
+        r#"count_over_time({env="prod"}[5m] offset -1h)"#,
+        AT_RAIL_NS,
+    );
+    let off_stages = stages(&off_axis);
+    assert!(
+        !off_stages.iter().any(|(n, _)| n == "metric_read"),
+        "a query whose window left the timestamp axis must issue no scan, \
+         got stages {:?}",
+        off_stages.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    // The degenerate window's signature at the wire: `months_overlapping(0,
+    // -1)` yields the single literal `'1970-01-01'`. The saturating
+    // predecessor named months at the far end of the axis instead.
+    let stage1 = off_stages
+        .iter()
+        .find(|(n, _)| n == "stage1_stream_resolution")
+        .map(|(_, sql)| sql.clone())
+        .unwrap_or_default();
+    assert!(
+        stage1.contains("month = '1970-01-01'"),
+        "expected the degenerate window's partition list, got:\n{stage1}"
+    );
+    assert_eq!(
+        off_axis["data"]["result"].as_array().map(Vec::len),
+        Some(0),
+        "and it answers empty: {off_axis}"
+    );
+
+    // The control: an ordinary request with an ordinary offset DOES plan a
+    // scan and DOES report it.
+    let on_axis = explain(r#"count_over_time({env="prod"}[10m] offset 1h)"#, base_ns);
+    let on_stages = stages(&on_axis);
+    assert!(
+        on_stages.iter().any(|(n, _)| n == "metric_read"),
+        "a representable shift must still be scanned and reported, got {:?}",
+        on_stages.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+}
+
+/// Issue #343 — the 5-year caps over the wire (owner mandate): each of the
+/// three places is a `400 bad_data` echoing what the user sent, and the
+/// query one nanosecond under each cap is served. Hermetic tests own the
+/// arithmetic; this owns the STATUS, which is the thing a client sees.
+#[tokio::test]
+async fn nothing_in_a_query_may_span_more_than_five_years() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_span_cap";
+    let port = 31_123;
+    let (_guard, _client, base_ns) = setup(db, port).await;
+    const CAP_NS: i64 = 157_680_000_000_000_000;
+
+    let instant = |query: &str| -> (u16, String) {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query",
+                &[("query", query), ("time", &base_ns.to_string())],
+            ),
+        )
+        .expect("query reachable");
+        (res.status, res.body)
+    };
+    // 1. `offset`, both directions.
+    for (query, want) in [
+        (r#"count_over_time({env="prod"}[5m] offset 43800h)"#, 200),
+        (r#"count_over_time({env="prod"}[5m] offset -43800h)"#, 200),
+        (r#"count_over_time({env="prod"}[5m] offset 43801h)"#, 400),
+        (r#"count_over_time({env="prod"}[5m] offset -43801h)"#, 400),
+        // 2. the `[range]` selector.
+        (r#"count_over_time({env="prod"}[43800h])"#, 200),
+        (r#"count_over_time({env="prod"}[43801h])"#, 400),
+    ] {
+        let (status, body) = instant(query);
+        assert_eq!(status, want, "{query}: {body}");
+        if want == 400 {
+            assert!(
+                body.contains("\"errorType\":\"bad_data\"") && body.contains("too long"),
+                "{query}: {body}"
+            );
+        }
+    }
+
+    // 3. the query's own start-to-end span.
+    let range = |start_ns: i64, end_ns: i64| -> (u16, String) {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query_range",
+                &[
+                    ("query", r#"count_over_time({env="prod"}[5m])"#),
+                    ("start", &start_ns.to_string()),
+                    ("end", &end_ns.to_string()),
+                    // 5 years / 43800s = 3,600 grid points, under the
+                    // reference's own 11,000-point resolution fence — which
+                    // would otherwise refuse a 5-year span first and hide
+                    // the cap this test is for.
+                    ("step", "43800s"),
+                ],
+            ),
+        )
+        .expect("query_range reachable");
+        (res.status, res.body)
+    };
+    let (status, body) = range(base_ns - CAP_NS, base_ns);
+    assert_eq!(status, 200, "exactly 5 years is served: {body}");
+    let (status, body) = range(base_ns - CAP_NS - 1, base_ns);
+    assert_eq!(status, 400, "one nanosecond more is refused: {body}");
+    assert!(
+        body.contains("\"errorType\":\"bad_data\"") && body.contains("query time range of"),
+        "{body}"
+    );
+
+    // 3b. EVERY route that carries `start`/`end`, not just `query_range`.
+    // THREE code paths never reach the planner and are capped by
+    // `handlers::parse_bounds` alone: `/labels`, `/label/{name}/values`
+    // and `/detected_labels` WITHOUT a `query` (its `selector == None` arm
+    // derives months and aggregates directly). The first cut of the cap
+    // lived in the planner and let all three serve a 20-year range.
+    //
+    // That set is measured, not read off route shapes: delete the
+    // `parse_bounds` call and run this loop, which sends an over-cap range
+    // to every row and COLLECTS the survivors rather than short-circuiting
+    // — the reason it collects. `/series` is NOT among them despite taking
+    // only a selector (the engine builds a synthetic Range spec and plans
+    // per selector), and `/detected_labels` appears twice below precisely
+    // so the scoped form staying capped while the unscoped one does not is
+    // visible rather than assumed. The full table is at `parse_bounds`.
+    let over = (base_ns - CAP_NS - 1).to_string();
+    let now = base_ns.to_string();
+    let at_cap = (base_ns - CAP_NS).to_string();
+    let mut uncapped: Vec<String> = Vec::new();
+    for (path, extra) in [
+        ("/api/logs/v1/series", vec![("match[]", r#"{env="prod"}"#)]),
+        ("/api/logs/v1/labels", vec![]),
+        ("/api/logs/v1/label/env/values", vec![]),
+        (
+            "/api/logs/v1/detected_labels",
+            vec![("query", r#"{env="prod"}"#)],
+        ),
+        // The UNSCOPED form is a DIFFERENT code path: with no `query`,
+        // `detected_labels_inner` takes its `selector == None` arm, derives
+        // months directly and never plans, so `parse_bounds` is the only
+        // thing capping it. Covered explicitly because the scoped row above
+        // cannot speak for it.
+        ("/api/logs/v1/detected_labels", vec![]),
+        (
+            "/api/logs/v1/detected_fields",
+            vec![("query", r#"{env="prod"}"#)],
+        ),
+        ("/api/logs/v1/patterns", vec![("query", r#"{env="prod"}"#)]),
+        ("/api/logs/v1/stats", vec![("query", r#"{env="prod"}"#)]),
+        ("/api/logs/v1/volume", vec![("query", r#"{env="prod"}"#)]),
+    ] {
+        let call = |start: &str| {
+            let mut params: Vec<(&str, &str)> = extra.clone();
+            params.push(("start", start));
+            params.push(("end", now.as_str()));
+            http_get(port, &q(path, &params)).expect("route reachable")
+        };
+        let res = call(&over);
+        if res.status != 400 || !res.body.contains("query time range of") {
+            uncapped.push(format!("{path} -> {} {}", res.status, res.body));
+        }
+        let res = call(&at_cap);
+        assert_eq!(
+            res.status, 200,
+            "{path} must still serve exactly 5 years: {}",
+            res.body
+        );
+    }
+    // Collected, not short-circuited: the first cut of this cap covered
+    // some of these routes by accident (through the planner) and missed
+    // others, so a loop that stopped at the first failure would have
+    // reported one name and hidden the rest.
+    assert!(
+        uncapped.is_empty(),
+        "these routes carry start/end and do NOT cap the span:\n{}",
+        uncapped.join("\n")
+    );
+}
+
+/// Issue #343 — `variants(...)` reads each variant's OWN offset window,
+/// INTERSECTED with the common range's single shared scan.
+///
+/// **The `[63500ms]` case is the reason this test exists.** Every other
+/// arrangement is satisfied by more than one model of what
+/// `variants(...)` does; this one is not. The common range reaches two of
+/// the three older lines and the variant's shifted window wants all
+/// three, so:
+///
+/// | model | predicts |
+/// |---|---|
+/// | shared scan, then per-variant filter | **2** |
+/// | a scan per variant | 3 |
+/// | no coverage of a divergent offset | 0 |
+/// | refusing a divergent offset | 400 |
+///
+/// The pinned v3.7.4 reference answers **2** (seeded store; the common
+/// range alone answers 5 and the variant window unconstrained answers 3,
+/// so 2 is neither). PulsusDB must answer 2 for the same reason it does:
+/// one scan, each variant filtering its own window inside it.
+///
+/// It is here and not in `b19_offset.test` because that intersection IS
+/// the SQL scan predicate. The hermetic runner hands the evaluator every
+/// loaded row, so it answers 3 for this query and empty for none of them
+/// — measured before moving it, not assumed.
+///
+/// The empty rows are kept deliberately: they are the ones that would go
+/// green if the shared scan were ever widened to COVER the union of the
+/// variants' shifted windows. That widening reads like a fix and is a
+/// divergence — the reference answers empty there, not 3.
+///
+/// **Which rows actually discriminate, measured not assumed.** Reading a
+/// variant's window off the COMMON range's offset instead of its own —
+/// the one-token slip this whole test exists to catch — changes:
+///
+/// | row | correct | that slip |
+/// |---|---|---|
+/// | `[63500ms]` discriminator | 2 | 7 |
+/// | wide-cover `[70s]` | 3 | 7 |
+/// | empty, disjoint | no series | 7 |
+/// | empty, mirror | no series | 3 |
+/// | two variants, one offset | variant 1 only | both |
+///
+/// and leaves the rest identical. **`EMPTY#3` (`offset 60s` variant under
+/// an `offset 30s` common range) does NOT catch it** — the slip moves that
+/// variant's window to the common range's, which is also empty, so both
+/// answer nothing. It is kept because it still separates this model from a
+/// union-widened scan, which would answer 3 there; it is simply not
+/// evidence about the offset the variant reads. Said plainly rather than
+/// left to be assumed from the row's presence.
+///
+/// The two batches are deliberately different sizes (3 old, 7 recent). At
+/// 3-and-3, which is where this fixture started, the wide-cover row reads
+/// 3 under both the correct code and the slip and catches nothing.
+#[tokio::test]
+async fn variants_reads_each_variants_offset_window_intersected_with_the_shared_scan() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_variants_offset";
+    let port = 31_121;
+    // Exact counts throughout, so a previous run's rows must not survive.
+    drop_database(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+
+    // THE REFERENCE PROBE'S FIXTURE, on a compressed timescale (seconds
+    // for its minutes, so the whole thing stays inside one partition
+    // month): **3 old lines** at base-64s/-63s/-62s and **7 recent** at
+    // base-5s..base-1s. `setup` already seeded 3 of the recent ones
+    // (base-3s/-2s/-1s), so 4 more join them.
+    //
+    // The two batches are DIFFERENT SIZES on purpose. With 3 and 3 — the
+    // shape this started as — several rows below are satisfied by reading
+    // the wrong batch, and the mutant that reads the wrong window still
+    // passes them. Every number asserted here is the number the pinned
+    // v3.7.4 container answered for the same shape.
+    let mut values = Vec::new();
+    for i in 62..=64i64 {
+        let ts = base_ns - i * 1_000_000_000;
+        values.push(format!("('checkout', {FP_A}, {ts}, 0, 'prod old {i}')"));
+    }
+    for i in 1..=4i64 {
+        let ts = base_ns - 4_000_000_000 - i * 100_000_000;
+        values.push(format!("('checkout', {FP_A}, {ts}, 0, 'prod new {i}')"));
+    }
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                 VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed the older batch");
+
+    // Variant values by `__variant__` index; an absent index means the
+    // variant produced no series at all, which is a real answer here.
+    let variants = |query: &str| -> BTreeMap<String, String> {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query",
+                &[("query", query), ("time", &base_ns.to_string())],
+            ),
+        )
+        .expect("query reachable");
+        assert_eq!(res.status, 200, "{query}: {}", res.body);
+        let body = json(&res);
+        let mut out = BTreeMap::new();
+        for s in body["data"]["result"].as_array().expect("result array") {
+            let idx = s["metric"]["__variant__"]
+                .as_str()
+                .expect("__variant__ label")
+                .to_string();
+            out.insert(idx, s["value"][1].as_str().expect("value").to_string());
+        }
+        out
+    };
+    let one = |query: &str| -> Option<String> { variants(query).get("0").cloned() };
+
+    let sel = r#"{env="prod", service_name="checkout"}"#;
+
+    // Baselines, so the fixture is established before anything is read
+    // from a variants query.
+    assert_eq!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[5s])) of ({sel}[5s])"#
+        )),
+        Some("7".to_string()),
+        "the recent batch"
+    );
+    assert_eq!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[70s])) of ({sel}[70s])"#
+        )),
+        Some("10".to_string()),
+        "the wide control spans both batches"
+    );
+
+    // THE DISCRIMINATOR. Common `[63500ms]` reaches base-63s and base-62s
+    // but NOT base-64s; the variant's `(base-65s, base-60s]` wants all
+    // three. The intersection is 2.
+    assert_eq!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[5s] offset 60s)) of ({sel}[63500ms])"#
+        )),
+        Some("2".to_string()),
+        "the variant reads its shifted window INTERSECTED with the shared scan"
+    );
+
+    // The two controls that make that 2 mean something: the common range
+    // alone, and the variant's window unconstrained.
+    assert_eq!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[63500ms])) of ({sel}[63500ms])"#
+        )),
+        Some("9".to_string()),
+        "the common range alone"
+    );
+    assert_eq!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[5s] offset 60s)) of ({sel}[70s])"#
+        )),
+        Some("3".to_string()),
+        "a common range wide enough to cover the shifted window serves it whole \
+         — 3, the OLD batch, which the recent batch's 7 cannot be mistaken for"
+    );
+
+    // EMPTY where the shared scan does not reach the shifted window. A
+    // union-widened scan would answer 3 here, which the reference does not.
+    assert!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[5s] offset 60s)) of ({sel}[5s])"#
+        ))
+        .is_none(),
+        "a variant window disjoint from the shared scan yields no series"
+    );
+    // The mirror image: the COMMON range carries the offset, the variant
+    // does not.
+    assert!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[5s])) of ({sel}[5s] offset 60s)"#
+        ))
+        .is_none(),
+        "the scan moved and the variant window did not"
+    );
+    // Both offset, differently.
+    assert!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[5s] offset 60s)) of ({sel}[5s] offset 30s)"#
+        ))
+        .is_none(),
+        "two different offsets, neither covering the other"
+    );
+
+    // Two variants, only the first offset: one scan, one series out — the
+    // shape the reference answers with variant 1 alone.
+    let mixed = variants(&format!(
+        r#"variants(count_over_time({sel}[5s] offset 60s), count_over_time({sel}[5s])) of ({sel}[5s])"#
+    ));
+    assert_eq!(mixed.get("0"), None, "the offset variant reads nothing");
+    assert_eq!(
+        mixed.get("1"),
+        Some(&"7".to_string()),
+        "its neighbour is unaffected"
+    );
+
+    // `offset 0s` on a variant is the identity against no offset at all.
+    assert_eq!(
+        one(&format!(
+            r#"variants(count_over_time({sel}[5s] offset 0s)) of ({sel}[5s])"#
+        )),
+        Some("7".to_string()),
+    );
 }
 
 fn read_rss_kb(pid: u32) -> Option<u64> {

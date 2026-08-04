@@ -33,7 +33,7 @@ use crate::ast::{
 use crate::duration;
 use crate::error::{LABEL_FILTER_MAX_DEPTH, LogQlError, MAX_DEPTH};
 use crate::lexer;
-use crate::limits::CheckedQuery;
+use crate::limits::{CheckedQuery, MAX_QUERY_SPAN_HOURS, MAX_QUERY_SPAN_NS};
 use crate::token::{Span, Token, TokenKind};
 use crate::walk;
 
@@ -1228,18 +1228,142 @@ fn parse_range_agg_call(cursor: &mut Cursor<'_>, op: RangeAggOp) -> Result<Metri
     })
 }
 
-/// `LogRange := LogExpr "[" Duration "]"`.
+/// `LogRange := LogExpr "[" Duration "]" ("offset" ["-"] Duration)?`.
+///
+/// **`offset` binds to the RANGE SELECTOR, never to the expression**
+/// (issue #343). Measured against the pinned v3.7.4 container:
+/// `rate({app="x"}[5m] offset 1h)` is a 200, while `rate({app="x"}[5m])
+/// offset 1h` and `{app="x"} offset 1h` are both 400
+/// `syntax error: unexpected offset`. Parsing it here — inside the range
+/// selector — is what makes those two spellings errors for us too.
 fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
     let selector = parse_log_expr(cursor)?;
     cursor.expect(&TokenKind::LBracket, "'['")?;
     let (raw, span) = cursor.expect_duration()?;
     let range = duration::parse_duration(&raw, span)?;
+    // The 5-year rule, place 2 of 3 (issue #343, owner mandate):
+    // `[2500000h]` is a 285-year window and is nonsense. See
+    // [`check_span`].
+    check_span("range", range.as_nanos(), &raw, span)?;
     cursor.expect(&TokenKind::RBracket, "']'")?;
+    let offset_ns = parse_offset(cursor)?;
     Ok(LogRange {
         selector,
         range,
         unwrap: None, // M1 never populates the M6 `unwrap` stage
+        offset_ns,
     })
+}
+
+/// The optional `offset ["-"] <duration>` suffix (issue #343).
+///
+/// Two boundaries, both MEASURED and both easy to "tidy" into a bug:
+///
+/// - **A NEGATIVE offset is ACCEPTED** and shifts the window FORWARD:
+///   `rate({app="x"}[5m] offset -1h)` is a reference **200**. Rejecting
+///   it as nonsense would be a divergence on the accept surface.
+/// - **A bare `0` is REJECTED** while `0s` is fine: `offset 0` is a
+///   reference **400** `syntax error: unexpected NUMBER, expecting
+///   DURATION`. Accepting bare `0` "for symmetry" would over-accept —
+///   the operand is a DURATION token, and `0` is a number.
+///
+/// Both fall out of requiring a duration token, so neither needs a
+/// special case; they are stated because the next reader will wonder.
+///
+/// - **AN OVER-CAP MAGNITUDE IS REJECTED, NEVER CLAMPED**, in either
+///   direction: `offset 43800h` and `offset -43800h` are the largest
+///   accepted, one nanosecond more is a `400` ([`check_span`], the 5-year
+///   rule, place 1 of 3). Clamping here would hand the planner an offset
+///   the user never wrote — the same defect class issue #343 fixed one
+///   layer down, where a saturating shift relocated the evaluation
+///   window, and nothing downstream can detect an already-altered offset.
+///
+///   **The cap is OURS; the reference has none here.** MEASURED on the
+///   digest-pinned v3.7.4 oracle (`grafana/loki@sha256:87f0a067…`,
+///   `/status/buildinfo` reporting `3.7.4` / `b318f282`), the reference
+///   accepts the whole `i64` nanosecond domain, asymmetrically:
+///   `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) → 200, one ns
+///   more → 400 `syntax error: unexpected NUMBER, expecting DURATION`;
+///   `offset -9223372036854775808ns` (`i64::MIN`) → 200, one ns more
+///   negative → 400 `syntax error: unexpected -, expecting DURATION`.
+///
+///   That asymmetry is not an accident of its own: the magnitude is lexed
+///   by `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`), which
+///   tries `model.ParseDuration` first — vendored
+///   `prometheus/common/model/time.go:249-255`, rejecting `dur > 1<<63-1`
+///   as `duration out of range` — and falls back to Go's
+///   `time.ParseDuration`, whose floor is `-1<<63`. A leading `-` fails
+///   the Prometheus parser outright (it demands a leading digit), so the
+///   negative form always lands on the stdlib fallback and reaches
+///   `i64::MIN`. Recorded because our cap sits far inside it: the whole
+///   `i64` band is reference-accepted and PulsusDB-refused, ledgered as
+///   `five-year-span-cap`.
+///
+/// The keyword goes through [`is_kw`] like every other keyword in this
+/// file (issue #339's rule): the reference's lexer folds keywords, so
+/// `OFFSET 1m` is a 200 there. A byte compare here made `offset` the one
+/// keyword that did not fold — recorded as a reference-accept /
+/// ours-reject row in the #339 census until this landed. Identifier
+/// PAYLOADS still never fold; that asymmetry is unchanged.
+fn parse_offset(cursor: &mut Cursor<'_>) -> Result<Option<i64>, LogQlError> {
+    let is_offset_kw = matches!(&cursor.peek().kind, TokenKind::Ident(k) if is_kw(k, "offset"));
+    if !is_offset_kw {
+        return Ok(None);
+    }
+    cursor.advance();
+    let negative = matches!(cursor.peek().kind, TokenKind::Minus);
+    if negative {
+        cursor.advance();
+    }
+    let (raw, span) = cursor.expect_duration()?;
+    let nanos = duration::parse_duration(&raw, span)?.as_nanos();
+    // The magnitude is checked BEFORE any conversion, so nothing can be
+    // narrowed or clamped on the way in. The signed literal is echoed as
+    // the user wrote it, sign included.
+    let written = if negative {
+        format!("-{raw}")
+    } else {
+        raw.clone()
+    };
+    let magnitude = check_span("offset", nanos, &written, span)?;
+    // `magnitude <= MAX_QUERY_SPAN_NS` was just established, so negating
+    // it cannot overflow.
+    Ok(Some(if negative { -magnitude } else { magnitude }))
+}
+
+/// **The 5-year rule** (issue #343, owner mandate): nothing in a LogQL
+/// query may span more than [`MAX_QUERY_SPAN_NS`] — 43,800 h = 5 × 365 d.
+/// One check, used by both duration literals; the query's own
+/// `start`-to-`end` span is the third place, enforced at the planner
+/// against this same constant.
+///
+/// Returns the value as a validated `i64` on success, so a caller cannot
+/// pass the check and then convert unsafely. Over the cap it is a `400`
+/// echoing `written` — the literal AS SENT, in the user's own units —
+/// never a clamped value: someone asking for a stupid number is told
+/// plainly rather than silently handed a different answer.
+///
+/// **A deliberate divergence.** The reference bounds neither literal
+/// below the `i64` domain and bounds no query span at all; retention is
+/// days to months, so this refuses nothing a real deployment does.
+/// Ledgered as `five-year-span-cap`.
+fn check_span(
+    what: &'static str,
+    nanos: u64,
+    written: &str,
+    span: Span,
+) -> Result<i64, LogQlError> {
+    let too_long = || LogQlError::SpanTooLong {
+        what,
+        raw: written.to_string(),
+        cap_hours: MAX_QUERY_SPAN_HOURS,
+        span,
+    };
+    let ns = i64::try_from(nanos).map_err(|_| too_long())?;
+    if ns > MAX_QUERY_SPAN_NS {
+        return Err(too_long());
+    }
+    Ok(ns)
 }
 
 /// `variants "(" metricExpr ("," metricExpr)* ")" "of" "(" logRange ")"`
@@ -1426,6 +1550,9 @@ fn parse_grouping(cursor: &mut Cursor<'_>) -> Result<Grouping, LogQlError> {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_QUERY_SPAN_HOURS, MAX_QUERY_SPAN_NS};
+    use crate::error::LogQlError;
+
     /// [`is_kw`] compares `name` case-insensitively against a `want` that
     /// must already be lowercase — a mixed-case `want` would silently
     /// never match, and `debug_assert` only catches it if that call site
@@ -1471,5 +1598,99 @@ mod tests {
             "keyword literals must be lowercase (is_kw folds the INPUT, not the expectation):\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// **The 5-year rule on both duration literals** (issue #343, owner
+    /// mandate): `offset` and `[range]` each cap at
+    /// [`MAX_QUERY_SPAN_NS`] — 43,800 h — and are REFUSED past it, never
+    /// clamped. The third place, the query's own `start`-to-`end` span, is
+    /// enforced at the planner against the same constant.
+    ///
+    /// The predecessor did `i64::try_from(nanos).unwrap_or(i64::MAX)`,
+    /// which handed the planner an offset the user never wrote — the
+    /// identical clamp-instead-of-handle defect this issue exists to fix,
+    /// one layer above the code it fixed, and undetectable from below. The
+    /// cap subsumes it: nothing past 43,800 h reaches a conversion at all.
+    ///
+    /// Every rejected case here is a reference **200** (measured on the
+    /// digest-pinned v3.7.4 oracle `grafana/loki@sha256:87f0a067…`,
+    /// buildinfo `3.7.4` / `b318f282`: it accepts the whole `i64`
+    /// nanosecond domain for both literals, e.g. `offset 2562047h` and
+    /// `[2562047h]`). That is the ledgered `five-year-span-cap`
+    /// divergence, and this test is what pins it.
+    #[test]
+    fn both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp() {
+        const CAP: i64 = MAX_QUERY_SPAN_NS;
+
+        // --- `offset`: accepted up to the cap, either direction.
+        for (query, want) in [
+            (r#"count_over_time({app="x"}[5m] offset 43800h)"#, CAP),
+            (r#"count_over_time({app="x"}[5m] offset -43800h)"#, -CAP),
+            (
+                r#"count_over_time({app="x"}[5m] offset 1h)"#,
+                3_600_000_000_000,
+            ),
+            (r#"count_over_time({app="x"}[5m] offset 0s)"#, 0),
+        ] {
+            let expr = crate::parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert_eq!(range_of(&expr).offset_ns, Some(want), "{query}");
+        }
+
+        // --- `offset`: refused past it, both signs, and refused rather
+        // than narrowed for magnitudes that do not even fit `i64`.
+        for query in [
+            r#"count_over_time({app="x"}[5m] offset 43801h)"#,
+            r#"count_over_time({app="x"}[5m] offset -43801h)"#,
+            r#"count_over_time({app="x"}[5m] offset 2562047h)"#,
+            r#"count_over_time({app="x"}[5m] offset 9223372036854775808ns)"#,
+            r#"count_over_time({app="x"}[5m] offset 18446744073709551615ns)"#,
+            r#"count_over_time({app="x"}[5m] offset -9223372036854775809ns)"#,
+        ] {
+            let err = crate::parse(query).expect_err("must be refused, never clamped");
+            assert!(
+                matches!(&err, LogQlError::SpanTooLong { what: "offset", .. }),
+                "{query}: {err}"
+            );
+        }
+
+        // --- `[range]`: the same cap, the same refusal.
+        let expr = crate::parse(r#"count_over_time({app="x"}[43800h])"#).expect("at the cap");
+        assert_eq!(range_of(&expr).range.as_nanos(), CAP as u64);
+        for query in [
+            r#"count_over_time({app="x"}[43801h])"#,
+            r#"count_over_time({app="x"}[2500000h])"#,
+            r#"count_over_time({app="x"}[9223372036854775808ns])"#,
+        ] {
+            let err = crate::parse(query).expect_err("must be refused");
+            assert!(
+                matches!(&err, LogQlError::SpanTooLong { what: "range", .. }),
+                "{query}: {err}"
+            );
+        }
+
+        // The message echoes the literal AS SENT, sign included, and
+        // quotes the cap in hours derived from the constant.
+        let err = crate::parse(r#"count_over_time({app="x"}[5m] offset -43801h)"#).unwrap_err();
+        assert_eq!(err.to_string(), "offset too long (-43801h > 43800h)");
+        let err = crate::parse(r#"count_over_time({app="x"}[43801h])"#).unwrap_err();
+        assert_eq!(err.to_string(), "range too long (43801h > 43800h)");
+    }
+
+    /// `MAX_QUERY_SPAN_NS` IS five years, so the "(5 years)" every doc and
+    /// ledger line says cannot quietly become false.
+    #[test]
+    fn the_span_cap_is_exactly_five_365_day_years() {
+        assert_eq!(MAX_QUERY_SPAN_NS, 5 * 365 * 24 * 3_600_000_000_000);
+        assert_eq!(MAX_QUERY_SPAN_HOURS, 43_800);
+    }
+
+    /// The `LogRange` of a single-range metric query, for the boundary
+    /// test above. Kept local: it walks exactly the one shape that test
+    /// builds and has no other caller.
+    fn range_of(expr: &crate::ast::Expr) -> &crate::ast::LogRange {
+        match expr {
+            crate::ast::Expr::Metric(crate::ast::MetricExpr::Range { range, .. }) => range,
+            other => panic!("expected a range aggregation, got {other:?}"),
+        }
     }
 }

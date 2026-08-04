@@ -2893,6 +2893,8 @@ mod tests {
                 end_ns: mp.end_ns,
                 step_ns,
                 range_ns: mp.range_ns,
+                // Issue #343: the plan's bounds are already offset-shifted.
+                offset_ns: mp.offset_ns,
             },
             None => pulsus_read::logql::ClientWindow::Instant {
                 start_ns: mp.grid_start_ns,

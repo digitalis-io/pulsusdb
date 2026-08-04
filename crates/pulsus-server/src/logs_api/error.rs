@@ -126,6 +126,8 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
         // Issue #227: an out-of-domain `[range]`/`step` duration is a client
         // input error, same class as `InvalidStep`.
         | ReadError::DurationOutOfRange { .. }
+        // Issue #343: the 5-year query-span cap, the same client-input class.
+        | ReadError::QuerySpanTooLong { .. }
         | ReadError::PipelineInvalid { .. }
         | ReadError::MetricPipelineError { .. }
         | ReadError::PipelineUnsupportedInMetric { .. } => {

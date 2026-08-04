@@ -292,6 +292,11 @@
       "oracle": "accept"
     },
     {
+      "construct": "range.offset",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
       "construct": "agg.sum",
       "status": "supported",
       "oracle": "accept"

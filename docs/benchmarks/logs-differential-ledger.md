@@ -651,6 +651,188 @@ not "fix" us toward the panic.
   is header-marked as this PINNED divergence and NOT a container
   capture (issue #350's provenance discipline).
 
+### `five-year-span-cap` (issue #343, owner mandate — a deliberate limit, not a defect)
+
+- **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
+  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`): both
+  LogQL duration literals are accepted across the whole `i64` nanosecond
+  domain — `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) and
+  `offset -9223372036854775808ns` (`i64::MIN`) are 200s, as is
+  `[2562047h]`, a 292-year window — and the query's own `start`-to-`end`
+  span is not bounded at all.
+- **PulsusDB behaviour (the delta): NOTHING IN A LogQL QUERY MAY SPAN MORE
+  THAN 5 YEARS** — `MAX_QUERY_SPAN_NS` = 157,680,000,000,000,000 ns =
+  43,800 h = 5 × 365 d. One rule, three places, all against that one
+  constant:
+  1. `offset` magnitude, either direction (parser).
+  2. The `[range]` selector (parser).
+  3. The query's `start`-to-`end` span (planner, `plan()` — so it covers
+     streams and metric queries alike). An instant query has no span; its
+     window is bounded by the capped `[range]`.
+- **Status and shape:** `400 bad_data`, the same class as the query-text
+  cap and `DurationOutOfRange`. The value the user sent is echoed —
+  `offset too long (-43801h > 43800h)`, `range too long (43801h > 43800h)`,
+  `query time range of N ns is outside the supported range (0 to
+  157680000000000000 ns)` — never a clamped value: someone asking for a
+  stupid number is told plainly rather than silently handed a different
+  answer.
+- **Why:** retention is days to months and nobody queries five years of
+  logs, so this refuses nothing a real deployment does. What it does
+  remove is the whole class of absurd-input arithmetic issue #343 chased
+  down four successive layers — including the last hole, a `start` in 1677
+  with an ordinary `offset 1h`, which the two literal caps alone would not
+  have closed.
+- **Pinned by** `crates/pulsus-logql/src/parser.rs`'s
+  `both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`
+  and `the_span_cap_is_exactly_five_365_day_years`, and
+  `crates/pulsus-read/src/logql/plan.rs`'s
+  `a_query_span_over_five_years_is_refused`.
+
+### `offset-domain-edge-exact-arithmetic` (issue #343, informational note — not a gate downgrade)
+
+- **Reference behaviour, cited:** v3.7.4
+  (`b318f2829f0ae2094ab3a1e90780450e9e4b03be`)
+  `pkg/logql/range_vector.go:50-52` shifts the evaluation domain once at
+  the boundary — `start = start - offset` / `end = end - offset` — in
+  plain `int64` nanoseconds, and `:195` / `:589`
+  (`ts := r.current/1e+6 + r.offset/1e+6`) invert that shift on emit.
+  Plain `int64` subtraction **WRAPS** when the shifted instant leaves the
+  domain, relocating the window to an unrelated instant.
+- **PulsusDB behaviour (the delta):** the same one-shift-at-the-boundary
+  structure, evaluated EXACTLY (`i64::checked_sub`). When the shift leaves
+  `[i64::MIN, i64::MAX]` the query answers **empty** — it neither wraps
+  (the reference) nor clamps onto the rail (what PulsusDB shipped before
+  this fix, which scanned `timestamp_ns > 223372036854775807`, a
+  1977-01-08 floor, for a query about 2026). No new rejection surface: a
+  large, negative or domain-crossing offset is a 200 answering empty,
+  never a 400.
+- **The residual.** Notation: request range spec `S <= E`, step `p`,
+  offset `d`, range `r`; `A = S - d`, `B = E - d` EXACT;
+  `MIN = -2^63`, `MAX = 2^63 - 1`; `min_stored_ts = 0` and
+  `max_stored_ts = 4_294_943_999_999_999_999` are the ingest gate's floor
+  and ceiling (1970-01-01 .. 2106-02-06,
+  `crates/pulsus-write/src/protocols/loki_push.rs`). The shift fails iff
+  `A` or `B` leaves `[MIN, MAX]`; `A < MIN AND B > MAX` is impossible (it
+  needs `E - S > 2^64 - 1`), so four entry branches partition the failing
+  space:
+
+  | branch | entry inequality | what is lost, UNDER THE 5-YEAR CAPS |
+  |---|---|---|
+  | **R1a** low, total | `B < MIN` ⟺ `d > E + 2^63` (forces `E <= -2`) | **absence-only** — every grid point is `< MIN`, so its window `(g-r, g]` lies wholly below `MIN` and no representable sample can occupy it. **Still reachable**, with an ordinary `offset 1h` and `E` near `MIN` |
+  | **R1b** low, partial | `E + 2^63 >= d > S + 2^63` (forces `S <= -2`) | **absence-only now.** Reachable only at the corner where `d` is the full 5-year cap and `S` within it of `MIN` |
+  | **R1c** high, total | `-d > MAX - S` (**no sign constraint on `S`**) | **absence-only now** (its value-op clause pointed at R2, which is dead). Reachable with `S` within 5 years of `MAX` |
+  | **R1d** high, partial | `MAX - E < -d <= MAX - S` | **absence-only now.** Reachable with `S, E` within 5 years of `MAX` |
+  | **R2 / R2-instant** | a beyond-rail grid instant whose window reaches stored data | **UNREACHABLE** — see below |
+
+  **The `five-year-span-cap` row above narrowed this residual to
+  `absent_over_time` alone — FOR DATA ADMITTED THROUGH THE ENFORCED
+  INGESTION PATHS.** Before the caps, R1b and R1d each carried a
+  demonstrated witness that lost a STORED SAMPLE; both are now impossible,
+  and R2 — the only route by which a beyond-rail window could reach stored
+  data at all — cannot be expressed. **Every "impossible" below is
+  conditional on `min_stored_ts = 0` and
+  `max_stored_ts = 4_294_943_999_999_999_999`, which are the ingest gate's
+  bounds (`crates/pulsus-write/src/protocols/loki_push.rs`), not a
+  storage-enforced invariant** — stopping point (ii) below says the same
+  thing about the branch conditions, and it applies here verbatim. A row
+  written by another door (a direct ClickHouse `INSERT`, a restored
+  backup) can hold a timestamp outside those bounds, and then the
+  proofs' premises no longer hold and the branch it lands in loses real
+  data again. Enforcing the timestamp domain at storage would make the
+  unconditional claim true; that is a larger change than this issue and is
+  not taken here. The three arguments, each under that condition:
+
+  * **R1b**: `B = E - d <= (S + cap) - d < (d - 2^63 + cap) - d = MIN + cap`,
+    far below `min_stored_ts = 0`, so the necessary condition
+    `E - d >= min_stored_ts` is unsatisfiable.
+  * **R1d**: `B > MAX` forces `E > MAX - cap`, and the span cap then forces
+    `S >= E - cap > MAX - 2*cap = 8908012036854775807`; every in-domain
+    window's lower bound is `>= A - r >= 8.9e18 - cap`, far above
+    `max_stored_ts`, so `S - d - range < max_stored_ts` is unsatisfiable.
+  * **R2**: reaching `max_stored_ts` from `MAX + 1` needs
+    `range > 4928428036854775809 ns` (~156.28 years). The range cap is
+    43,800 h — 31 times too small. `[1369008h]`, the shortest range that
+    would have reached, does not parse.
+
+  **So no value-producing operation can lose real data any more, for any
+  row the ingest gate admitted.** What remains is `absent_over_time`'s
+  synthetic `1`s on branches that need a request sitting within 5 years of
+  an `i64` rail. For a row loaded outside those paths the older, wider
+  analysis above it still applies unchanged. The rows are kept
+  rather than deleted so that raising a cap re-opens them visibly; the
+  three witnesses below are recorded as they were MEASURED, and two of
+  them are no longer expressible.
+
+  Elsewhere below, the word is **possible**, never *does*.
+- **The two corrected necessary conditions**, each certainly true:
+  - **R1b**: real-data loss requires `E - d >= min_stored_ts` (a lost
+    sample satisfies `s <= g <= B`). `E - S >= 2^63 + 1` follows from it
+    and is kept only as a consequence.
+  - **R1d**: real-data loss requires `S - d - range < max_stored_ts` —
+    every in-domain window's lower bound is `>= A - r`, so if
+    `A - r >= max_stored_ts` no stored sample can be inside one.
+
+  **Sufficiency depends on grid phase, step, range and the storage bounds
+  together and is deliberately NOT enumerated.** A span-only formulation
+  was tried and is **not even necessary**: the R1d witness below has span
+  `4_928_428_036_854_775_808`, one nanosecond under that bound, and loses
+  real data anyway.
+- **The three witnesses** as originally measured — **two of them (R1b, R2-instant) can no longer be expressed under the 5-year caps**, and the R1d one is likewise dead; they are kept as the record of what the branches did before the caps, and as the shape to re-derive if a cap is ever raised:
+  - **R1b** — `S = -9223372036854775808`, `E = 1779627963145224192`,
+    `step = 1000000000000000`,
+    `count_over_time({app="x"}[5m] offset 1h)`, one row at
+    `1779624363145224192`. Admitted end to end (the HTTP fence saturates
+    the span to `i64::MAX`, `MAX / 1e15 = 9223 <= 11000`);
+    `A = -9223375636854775808` underflows, `B = 1779624363145224192` does
+    not; the exact grid holds 11 004 points and its last one is exactly
+    `B`, whose `(B-5m, B]` window holds that row. Exact answers `1` at
+    caller grid point `1779627963145224192`; PulsusDB answers empty.
+  - **R1d** — `S = -1105056000000000000`, `E = 3823372036854775808`,
+    `step = 500000000000000`,
+    `count_over_time({app="x"}[5m] offset -1500000h)`, one row at
+    `4294943999999999999` (`max_stored_ts`).
+    `A = 4294944000000000000 <= MAX`, `B = 9223372036854775808 = MAX + 1`;
+    `A - 5m = 4294943700000000000 < max_stored_ts <= A`, so grid point
+    `k = 0` covers the row. Exact answers `1`; PulsusDB answers empty.
+  - **R2-instant** — instant `at_ns = 3823372036854775808`,
+    `count_over_time({app="x"}[1369008h] offset -1500000h)`, one row at
+    `4294943999999999999`. `A = MAX + 1`; the window
+    `(4294943236854775808, MAX+1]` holds the row. Exact answers `1`;
+    PulsusDB answers empty.
+- **R2 and R2-instant — a beyond-rail grid instant whose window still
+  reaches stored data.** The first such instant is `MAX + 1`, and
+  `(g-r, g]` is strict on the left, so it reaches `max_stored_ts` only
+  when
+
+  ```text
+  range > (i64::MAX + 1) - max_stored_ts
+        = 9_223_372_036_854_775_808 - 4_294_943_999_999_999_999
+        = 4_928_428_036_854_775_809 ns   (~1_369_007.79 h ~ 156.28 years)
+  ```
+
+  so `[1369008h]` can reach and `[1369007h]` cannot — that pair is the
+  test boundary.
+- **R1-instant:** the instant spec is the degenerate `A = B = at - d`. Not
+  representable ⇒ empty, which is exact for value ops when `at - d < MIN`;
+  for `absent_over_time` the exact answer is a single `1`.
+- **Where the enumeration stops**, stated rather than implied: (i) it
+  assumes `S <= E` — for `S > E` the grid is empty on both sides and every
+  branch is vacuous; (ii) `min/max_stored_ts` are the *ingest gate's*
+  bounds, so data loaded by another door widens the value-op branches,
+  which is why the inequalities are written in terms of those symbols and
+  not baked constants; (iii) sufficiency, as above.
+- **Why the residual is accepted:** every branch needs an absurd input — a
+  292-year request span, a 236-year offset, or a 156-year `[range]` — and
+  the sub-grid trim that would close them puts extra arithmetic on the one
+  site the whole correctness argument rests on. Adjudicated on issue #343.
+- **Pinned by** `crates/pulsus-read/tests/logql_metric_agg_golden.rs`, one
+  test per live branch (`r1a_…`, `r1b_…`, `r1c_…`, `r1d_…`) plus
+  `r2_is_unreachable_under_the_five_year_range_cap`, which asserts the
+  156-year arithmetic and measures the parse refusal rather than
+  evaluating a branch that can no longer occur. Each names this entry. If
+  a branch is ever made exact, or a cap raised, its test is what has to
+  change.
+
 ## Issue #236 — high-cardinality aggregations: the result-size cap
 
 - **(a) Result-series cap semantics.** *Reference:* `querier.max-query-series`

@@ -178,6 +178,9 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         | ReadError::InvalidStep
         // Issue #227: LogQL-only (the LogQL planner's duration boundary).
         | ReadError::DurationOutOfRange { .. }
+        // Issue #343: LogQL-only (the 5-year query-span cap, applied in the
+        // LogQL planner); matched here for exhaustiveness, same 400 class.
+        | ReadError::QuerySpanTooLong { .. }
         | ReadError::PipelineInvalid { .. }
         | ReadError::MetricPipelineError { .. }
         | ReadError::PipelineUnsupportedInMetric { .. } => {
