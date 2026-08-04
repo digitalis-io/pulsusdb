@@ -189,7 +189,20 @@ jobs:
   #   * both divergence totals are computed BY THE JOIN, from the probe
   #     data and the oracle, never from `length` and never from the
   #     committed constants (which are separately checked to move in the
-  #     same direction).
+  #     same direction);
+  #   * the oracle is `origin/main`'s `matrix.json`, WITH NO FALLBACK to
+  #     this branch's. A probe with no reference row on main is
+  #     unscoreable and fails. The first cut fell back to HEAD's matrix
+  #     for unknown keys, which let a PR add a diverging probe together
+  #     with the reference row that scores it — a PR picking its own
+  #     oracle, which is exactly what this rule denies. The deliberate
+  #     consequence: adding a probe and moving the baseline cannot be the
+  #     same PR. Land the probe with its oracle row, then move the
+  #     baseline.
+  #   * duplicate probe keys fail — in the baseline AND in both matrices.
+  #     `jq`'s `from_entries` keeps the LAST value for a repeated key
+  #     without complaining, so a duplicate does not break the join, it
+  #     silently decides it.
   #
   # STATED EDGE: the totals are scored with origin/main's oracle column
   # for every key main knows. A deliberate ORACLE re-pin (the reference
@@ -229,13 +242,32 @@ jobs:
 
               # Clause 0, the KEY SET. Everything below joins on the probe
               # query, so the join has to be total and one-to-one before
-              # any verdict computed through it means anything.
+              # any verdict computed through it means anything. `jq`'s
+              # from_entries silently keeps the LAST value for a repeated
+              # key, so a duplicate does not error — it quietly decides
+              # which row wins. Both sides of the join are checked.
               DUPLICATED=$(jq -r '
                 [ .wire_baseline[].query ] | group_by(.)
                 | map(select(length > 1) | .[0]) | .[]' "$BASELINE")
               if [ -n "$DUPLICATED" ]; then
                 echo "::error::the wire baseline has duplicate probe keys — a probe's query IS its identity here, and a duplicate can pad the probe count back up after a deletion (issue 335 Stage C direction rule):"
                 printf '%s\n' "$DUPLICATED"
+                exit 1
+              fi
+              DUP_ORACLE=$(jq -r '
+                [ .accept_surface_probes[].query ] | group_by(.)
+                | map(select(length > 1) | .[0]) | .[]' "$TMP/old_matrix.json")
+              if [ -n "$DUP_ORACLE" ]; then
+                echo "::error::origin/main's matrix.json has duplicate probe keys — the oracle map this gate joins on would silently keep one row per key (issue 335 Stage C direction rule):"
+                printf '%s\n' "$DUP_ORACLE"
+                exit 1
+              fi
+              DUP_HEAD_ORACLE=$(jq -r '
+                [ .accept_surface_probes[].query ] | group_by(.)
+                | map(select(length > 1) | .[0]) | .[]' "$MATRIX")
+              if [ -n "$DUP_HEAD_ORACLE" ]; then
+                echo "::error::this branch's matrix.json has duplicate probe keys — the same silent last-wins join feeds the hermetic wire suite (issue 335 Stage C direction rule):"
+                printf '%s\n' "$DUP_HEAD_ORACLE"
                 exit 1
               fi
               MISSING=$(jq -r --slurpfile new "$BASELINE" '
@@ -248,20 +280,27 @@ jobs:
                 printf '%s\n' "$MISSING"
                 exit 1
               fi
-              # A probe added here must carry an oracle row, or its
-              # disposition cannot be scored at all.
+              # THE ORACLE IS origin/main's, WITH NO FALLBACK. Every probe
+              # in the baseline must have a reference verdict THERE; a
+              # probe whose only oracle row is on this branch is
+              # unscoreable and fails. An earlier cut fell back to HEAD's
+              # matrix for keys main did not know, which handed a PR the
+              # ability to add a diverging probe together with the
+              # reference row that scores it — the very thing the
+              # "both before-sides come from origin/main" rule exists to
+              # deny (Stage C review, [medium]).
+              #
+              # The consequence is deliberate: ADDING a probe and MOVING
+              # the baseline cannot happen in one PR. Land the probe with
+              # its oracle row first, then move the baseline.
               UNJOINABLE=$(jq -r \
-                --slurpfile omtx "$TMP/old_matrix.json" \
-                --slurpfile nmtx "$MATRIX" '
+                --slurpfile omtx "$TMP/old_matrix.json" '
                   ($omtx[0].accept_surface_probes
                      | map({key: .query, value: .reference}) | from_entries) as $oref
-                  | ($nmtx[0].accept_surface_probes
-                     | map({key: .query, value: .reference}) | from_entries) as $nref
-                  | [ .wire_baseline[].query
-                      | select(($oref[.] // $nref[.]) == null) ]
+                  | [ .wire_baseline[].query | select($oref[.] == null) ]
                   | .[]' "$BASELINE")
               if [ -n "$UNJOINABLE" ]; then
-                echo "::error::wire baseline probes with no reference verdict in either matrix — an unscoreable probe cannot be counted as agreement (issue 335 Stage C direction rule):"
+                echo "::error::wire baseline probes with no reference verdict on origin/main — the oracle comes from origin/main with no fallback, so a probe added in this PR cannot be scored by a reference row this PR also supplies; land the probe first, move the baseline after (issue 335 Stage C direction rule):"
                 printf '%s\n' "$UNJOINABLE"
                 exit 1
               fi
@@ -297,17 +336,11 @@ jobs:
                 | [ .wire_baseline[]
                     | select($ref[.query] != null)
                     | select(.pulsus_wire != $ref[.query]) ] | length' "$TMP/old_baseline.json")
-              NEW_DERIVED=$(jq -r \
-                --slurpfile omtx "$TMP/old_matrix.json" \
-                --slurpfile nmtx "$MATRIX" '
-                  ($omtx[0].accept_surface_probes
-                     | map({key: .query, value: .reference}) | from_entries) as $oref
-                  | ($nmtx[0].accept_surface_probes
-                     | map({key: .query, value: .reference}) | from_entries) as $nref
-                  | [ .wire_baseline[]
-                      | . as $w
-                      | ($oref[$w.query] // $nref[$w.query]) as $r
-                      | select($w.pulsus_wire != $r) ] | length' "$BASELINE")
+              NEW_DERIVED=$(jq -r --slurpfile omtx "$TMP/old_matrix.json" '
+                ($omtx[0].accept_surface_probes
+                   | map({key: .query, value: .reference}) | from_entries) as $ref
+                | [ .wire_baseline[] | select(.pulsus_wire != $ref[.query]) ]
+                | length' "$BASELINE")
               if [ "$NEW_DERIVED" -gt "$OLD_DERIVED" ]; then
                 echo "::error::the wire baseline's derived divergence count rose ($OLD_DERIVED -> $NEW_DERIVED) — the baseline may only move toward fewer divergences (issue 335 Stage C direction rule)"
                 exit 1

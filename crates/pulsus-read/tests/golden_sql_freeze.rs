@@ -25,6 +25,19 @@
 //! which happened: a file added or removed reads differently from a file
 //! edited, and lumping them into one hash tells a reviewer neither.
 //!
+//! **The unit is the DIRECTORY, not the `.sql` files in it** (Stage C
+//! review, [low]). The first cut walked one level and filtered on the
+//! `.sql` extension, so a `README` dropped in, or a golden tucked into a
+//! subdirectory, moved neither the count nor the digest — the claim
+//! "these directories are frozen" was true only of part of them. The
+//! walk is now recursive and digests EVERY file it finds, whatever its
+//! extension, keyed by its path RELATIVE to `tests/golden/`. Two
+//! consequences worth stating because they are the properties being
+//! bought: a file nested one level down has a different relative path
+//! and so moves the digest, and a rename — including a move between the
+//! two golden directories — moves it too, because the path is fed
+//! before the bytes.
+//!
 //! **This is not an immutability claim.** These goldens are regenerated
 //! deliberately when the SQL builders change (issue #57's
 //! `regenerate_goldens`); such a change updates this constant in the same
@@ -35,7 +48,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// `traces_search` (issue #57) and `traces_metrics` (issue #59/#182):
-/// the two byte-frozen SQL corpora, with their committed sizes.
+/// the two byte-frozen SQL corpora, with their committed sizes. The
+/// count is of EVERY file in the directory tree, not of `.sql` files —
+/// today the two coincide, and a file of any other kind appearing is
+/// precisely the thing the count should report.
 const CORPORA: [(&str, usize); 2] = [("traces_search", 46), ("traces_metrics", 17)];
 
 /// A 64-bit rolling digest over `(relative path, 0x01, bytes, 0x00)` for
@@ -65,16 +81,36 @@ fn golden_dir(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Every `.sql` file in `dir`, sorted by file name (the path bytes are
-/// part of the digest, so the order must be deterministic and is).
-fn sql_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
-        .map(|entry| entry.expect("dir entry").path())
-        .filter(|p| p.extension().is_some_and(|e| e == "sql"))
-        .collect();
-    files.sort();
-    files
+/// Every file under `dir`, RECURSIVELY and regardless of extension,
+/// returned as `(path relative to the corpus root, absolute path)` and
+/// sorted by the relative path — which is what the digest feeds, so the
+/// order is deterministic and a nested file is distinguishable from a
+/// top-level one of the same name.
+fn corpus_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+        let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+            .map(|entry| entry.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or_else(|| panic!("non-UTF-8 golden name: {}", path.display()))
+                .to_string();
+            let rel = format!("{prefix}{name}");
+            if path.is_dir() {
+                walk(&path, &format!("{rel}/"), out);
+            } else {
+                out.push((rel, path));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, "", &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 #[test]
@@ -82,13 +118,15 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
     let mut total = 0usize;
     for (name, want) in CORPORA {
         let dir = golden_dir(name);
-        let files = sql_files(&dir);
+        let files = corpus_files(&dir);
         assert_eq!(
             files.len(),
             want,
-            "golden/{name}/ holds {} .sql files, not the committed {want} — a golden was added \
-             or removed; that is a deliberate act and moves this count with it",
-            files.len()
+            "golden/{name}/ holds {} files, not the committed {want} — something was added or \
+             removed under that directory (the walk is recursive and counts EVERY file, not \
+             only `.sql`); that is a deliberate act and moves this count with it: {:?}",
+            files.len(),
+            files.iter().map(|(rel, _)| rel).collect::<Vec<_>>()
         );
         total += files.len();
     }
@@ -106,12 +144,11 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     };
     for (name, _) in CORPORA {
         let dir = golden_dir(name);
-        for path in sql_files(&dir) {
-            let file = path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or_else(|| panic!("non-UTF-8 golden name: {}", path.display()));
-            feed(format!("{name}/{file}").as_bytes());
+        for (rel, path) in corpus_files(&dir) {
+            // The path is fed BEFORE the bytes, so a rename — including a
+            // move between the two corpora, or into a subdirectory —
+            // moves the digest even though no byte of content changed.
+            feed(format!("{name}/{rel}").as_bytes());
             feed(&[0x01]);
             feed(&fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())));
             feed(&[0x00]);
