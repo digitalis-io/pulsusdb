@@ -78,6 +78,10 @@ have held in CI and misled every local run.
   (`pkg/logql/`).
 - Instant metric queries are **semantically identical** to the reference
   (`docs/features.md`), so their goldens are bit-exact against the container.
+  One exception: the ratified same-nanosecond **same-stream** `tie_rank`
+  residual applies to instant queries too (issue #344) and no committed
+  instant capture contains such a tie, so the captures hold — a NEW one
+  with two samples of a single stream at one nanosecond would not.
 - **Range queries (issue #227)** now evaluate Loki's **sliding** windows
   bit-exactly, so `eval range from <T0> to <T1> step <S>` is in scope. Two
   capture disciplines:
