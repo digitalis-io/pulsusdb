@@ -894,8 +894,10 @@ const CAPTURED: usize = 1_135;
 /// Issue #343 added `b19_offset.test`'s 9 rows: hand-derived from the
 /// semantics measured on that issue, over a fixture authored here rather
 /// than taken from the container, so they are `derived` and not
-/// `captured`. 16 -> 25.
-const DERIVED: usize = 25;
+/// `captured`. 16 -> 25. Its boundary fix added the 6 domain-edge rows
+/// (three off-axis, each with its on-axis control), same file default:
+/// 25 -> 31.
+const DERIVED: usize = 31;
 const DIVERGENCE: usize = 17;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_209;
+const TOTAL: usize = 1_215;

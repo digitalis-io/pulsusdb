@@ -917,8 +917,25 @@ impl LogQlEngine {
                 );
             }
         }
-        let fingerprints = self.resolve_fingerprints(&mp.stage1_sql).await?;
         let is_instant = mp.step_ns.is_none();
+        // Issue #343: the offset shift left the representable timestamp
+        // axis, so the query answers empty. Returned BEFORE
+        // `resolve_fingerprints` — zero ClickHouse round trips, where the
+        // saturating predecessor issued a domain-wide scan from 1977 — and
+        // BEFORE the `absent_over_time` zero-fingerprint arm below, whose
+        // synthetic `1` would otherwise be reported for a window that does
+        // not exist. The pipeline is compiled above this, so a bad regex
+        // stays a 400 either way. The plan's bounds are ALSO degenerate
+        // (`end_ns < grid_start_ns`), so this is the round-trip saving,
+        // not the correctness mechanism.
+        if mp.empty_domain {
+            return Ok(if is_instant {
+                QueryResult::Vector(Vec::new())
+            } else {
+                QueryResult::Matrix(Vec::new())
+            });
+        }
+        let fingerprints = self.resolve_fingerprints(&mp.stage1_sql).await?;
         if fingerprints.is_empty() {
             // `absent_over_time` must still report absence when the
             // selector resolves NO streams at all.

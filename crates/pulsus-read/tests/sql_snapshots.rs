@@ -1210,3 +1210,101 @@ fn a_five_variant_tree_has_exactly_one_scan_leaf() {
     };
     assert_eq!(node.leaves().len(), 1, "one scan, N-independent");
 }
+
+// ---------------------------------------------------------------------
+// Issue #343 (boundary fix) — AC 5a/5c: the RENDERED scan predicate when
+// the offset shift leaves the representable timestamp axis.
+//
+// The layer is the point. A planner-field assertion would pass while the
+// user still got a domain-wide scan; what a user experiences is the SQL
+// text, so that is what these pin. The wire half (no `metric_read` stage
+// at all) lives in `pulsus-server/tests/logs_api_live.rs`.
+// ---------------------------------------------------------------------
+
+/// 2026-05-28T…Z — an ORDINARY instant, chosen so nothing about these
+/// cases depends on an exotic request time; only the offset is extreme.
+const OFFSET_AT_NS: i64 = 1_780_000_000_000_000_000;
+
+/// Renders `sql::metric_instant` from a plan exactly as `LogQlEngine`
+/// would for an instant metric query, so the asserted text is the text
+/// that would reach ClickHouse.
+fn instant_sql(mp: &pulsus_read::logql::MetricPlan, fingerprints: &[u64]) -> String {
+    sql::metric_instant(
+        sql::MetricSource {
+            table: &mp.table,
+            bucket_col: mp.bucket_col,
+            agg_expr: mp.agg_expr,
+        },
+        &["'checkout'".to_string()],
+        fingerprints,
+        TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        mp.scan_lower,
+        &mp.extra_predicates,
+    )
+}
+
+/// **AC 5a.** `[2500000h] offset -2500000h` at an ordinary 2026 instant
+/// shifts the evaluation domain to `T + 9e18`, which is past `i64::MAX`.
+/// The scan predicate must be the DEGENERATE empty window.
+///
+/// Against `17e2802` this rendered
+/// `timestamp_ns > 223372036854775807 AND timestamp_ns <= 9223372036854775807`
+/// — a full scan from 1977-01-08 for a query about 2026 — because
+/// `shift_by_offset` saturated both bounds onto the `i64::MAX` rail.
+///
+/// The phrases are asserted whole and delimited: `> 0 AND` must not be
+/// able to match as a prefix of `> 223372036854775807 AND`.
+#[test]
+fn an_offset_past_the_timestamp_axis_renders_the_degenerate_empty_window() {
+    let params = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: OFFSET_AT_NS,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mp = metric_plan(
+        r#"count_over_time({env="prod"}[2500000h] offset -2500000h)"#,
+        &params,
+    );
+    assert!(mp.empty_domain, "the shifted domain left the axis");
+    assert_eq!((mp.start_ns, mp.grid_start_ns, mp.end_ns), (0, 0, -1));
+    let sql = instant_sql(&mp, &[101, 205]);
+    assert!(
+        sql.contains("timestamp_ns > 0 AND timestamp_ns <= -1"),
+        "expected the degenerate empty window, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("timestamp_ns > 223372036854775807 AND"),
+        "the 1977 scan floor must be gone:\n{sql}"
+    );
+}
+
+/// **AC 5c — the non-vacuity control, and it is required.** The SAME
+/// query shape with an offset that stays inside the axis
+/// (`T + 5.4e18 = 7180000000000000000 <= i64::MAX`) must render its real
+/// window. Deleting the shift, or making every plan degenerate, reddens
+/// this while leaving the case above green.
+#[test]
+fn an_offset_inside_the_timestamp_axis_still_renders_its_real_window() {
+    let params = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: OFFSET_AT_NS,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mp = metric_plan(
+        r#"count_over_time({env="prod"}[2500000h] offset -1500000h)"#,
+        &params,
+    );
+    assert!(!mp.empty_domain, "T + 5.4e18 is representable");
+    let sql = instant_sql(&mp, &[101, 205]);
+    assert!(
+        sql.contains("timestamp_ns > -1820000000000000000 AND timestamp_ns <= 7180000000000000000"),
+        "expected the shifted-but-representable window, got:\n{sql}"
+    );
+}

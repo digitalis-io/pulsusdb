@@ -1501,11 +1501,21 @@ static PER_VARIANT_FRAMES: [Frame; 27] = [
         // branch count stood at 28; the probe refuted the refusal, so the
         // net effect on this frame is a guard removed and no guard added.
         // W-MEM disposition of what remains: **NIL** — `.unwrap_or` on an
-        // `Option<i64>` and `shift_by_offset` (one `i64::saturating_sub`)
+        // `Option<i64>` and `shift_by_offset` (one `i64::checked_sub`)
         // are integer arithmetic over `Copy` scalars, allocating on
         // neither path, so they add no term to any per-variant band.
         // Inventory row P-l.
-        branches: 27,
+        //
+        // Issue #343 boundary fix: 27 -> 29, no callee change.
+        // `shift_by_offset` became fallible (`checked_sub`), so each spec
+        // arm now matches on its result and substitutes the degenerate
+        // empty window when the shifted domain leaves the representable
+        // timestamp axis — one new arm per spec shape, PER VARIANT (a
+        // sibling variant is unaffected). W-MEM disposition: **NIL** on
+        // both new arms — the substitution writes two `i64` literals into
+        // the `Copy` `ClientWindow` that was being built anyway; no
+        // allocation on either path, so no per-variant band term.
+        branches: 29,
         callees: &[
             ".any",
             ".as_nanos",

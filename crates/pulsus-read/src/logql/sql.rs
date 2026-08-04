@@ -458,6 +458,14 @@ pub fn log_patterns_read(
 /// &[]` for the rollup path (`log_metrics_<res>` has no `service` column,
 /// `ORDER BY (fingerprint, bucket_ns)`); a non-empty `services` renders the
 /// same singleton/`IN` split [`stage3`] uses.
+///
+/// **Structurally unreachable today** (recorded while auditing the offset
+/// shift, issue #343 — a note, not a change): `plan.rs`'s `metric_plan`
+/// sets `client = Some(..)` for EVERY `is_range` query (issue #227 retired
+/// the range rollup fast path), so routing can never take the
+/// `RouteChoice::Rollup` range arm and no caller reaches this builder
+/// outside its own snapshot tests. Kept because the rollup range shape is
+/// the one this file documents against docs/schemas.md §3.2.
 pub fn metric_range(
     source: MetricSource<'_>,
     services: &[String],

@@ -2109,6 +2109,19 @@ impl<'q> RangeSlideState<'q> {
 ///
 /// Vector (instant) results carry no timestamp of their own, so they pass
 /// through: the API stamps them with the request's `time`, offset or not.
+///
+/// **The round trip is EXACT, so `saturating_add` never saturates** (issue
+/// #343, after `shift_by_offset` became `checked_sub`). Every emitted point
+/// is `grid_point(k)` with `k <= kmax`, hence lies in
+/// `[grid_start, end] = [S−d, E−d]`; both of those are representable
+/// precisely because `checked_sub` returned `Some` for them, so
+/// `point + d ∈ [S, E] ⊆ i64`. When it returned `None` the planner
+/// substituted the degenerate window and no point is emitted at all. The
+/// `debug_assert!` below is that invariant, checked where it would break.
+/// This mirrors v3.7.4 `pkg/logql/range_vector.go:195` / `:589`
+/// (`ts := r.current/1e+6 + r.offset/1e+6`, tag `v3.7.4` /
+/// `b318f2829f0ae2094ab3a1e90780450e9e4b03be`) — the one place the offset
+/// is added back.
 fn shift_emitted_points(result: QueryResult, offset_ns: i64) -> QueryResult {
     if offset_ns == 0 {
         return result;
@@ -2117,6 +2130,11 @@ fn shift_emitted_points(result: QueryResult, offset_ns: i64) -> QueryResult {
         QueryResult::Matrix(mut series) => {
             for s in &mut series {
                 for (ts, _) in &mut s.points {
+                    debug_assert!(
+                        ts.checked_add(offset_ns).is_some(),
+                        "issue #343: an emitted point must round-trip exactly \
+                         ({ts} + {offset_ns} left i64)"
+                    );
                     *ts = ts.saturating_add(offset_ns);
                 }
             }

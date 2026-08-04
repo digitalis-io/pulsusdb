@@ -120,3 +120,58 @@ eval range from 70m to 70m step 5m sum_over_time({service_name="offu"} | logfmt 
 
 clear
 
+
+# --- THE DOMAIN EDGE (issue #343 boundary fix) ----------------------
+#
+# The shift is `T - d` in i64 nanoseconds. When that leaves
+# [i64::MIN, i64::MAX] the window the user asked for does not exist and
+# the query answers EMPTY. The shipped code SATURATED instead, which
+# relocates the evaluation to a rail — a query about 2026 answered from
+# a window starting 1977-01-08. The reference's own plain int64
+# subtraction (v3.7.4 pkg/logql/range_vector.go:50-52) WRAPS there,
+# relocating it to an unrelated instant; we evaluate exactly. Ledgered
+# as `offset-domain-edge-exact-arithmetic`.
+#
+# EVERY OFF-AXIS ROW HERE IS PAIRED WITH AN ON-AXIS CONTROL, because
+# "empty" is the answer a broken fixture also gives.
+#
+# These rows take the FILE default `provenance: derived` declared in the
+# header — hand-derived from the boundary semantics, over a fixture
+# authored here rather than taken from the container.
+
+load
+  {env="prod", service_name="offx"}
+  1000000000000000000ns  old
+  1779999999000000000ns  recent
+  9223372036854775807ns  at the high rail
+
+# --- AC 1. `T + 9e18` is past i64::MAX for an ordinary 2026 grid, so
+# the whole evaluation domain is off the axis: empty. Against the
+# saturating predecessor this answered one point
+# (223372036854775807, 2) — both rows, reported on 1977-01-08.
+eval range from 1780000000000000000ns to 1780000120000000000ns step 60s count_over_time({service_name="offx"}[2500000h] offset -2500000h)
+
+# --- AC 1's CONTROL: `T + 5.4e18` IS representable, so the same rows
+# are read, two per grid point, on the caller's own grid.
+eval range from 1780000000000000000ns to 1780000120000000000ns step 60s count_over_time({service_name="offx"}[2500000h] offset -1500000h)
+  {env="prod", service_name="offx"} 1780000000000000000ns 2 1780000060000000000ns 2 1780000120000000000ns 2
+
+# --- AC 2, low rail. `(i64::MIN + 1) - 1h` underflows: absence is
+# reported for a window that exists, and this one does not. Against the
+# predecessor this answered a `1` at i64::MIN + 1h.
+eval range from -9223372036854775807ns to -9223372036854775807ns step 60s absent_over_time({service_name="offx"}[5m] offset 1h)
+
+# --- its CONTROL: the same grid point unshifted DOES report absence.
+eval range from -9223372036854775807ns to -9223372036854775807ns step 60s absent_over_time({service_name="offx"}[5m] offset 0s)
+  {service_name="offx"} -9223372036854775807ns 1
+
+# --- AC 2, high rail. `i64::MAX - (-1ns)` overflows by exactly one
+# nanosecond: empty. Against the predecessor this answered a `1` at
+# 9223372036854775806.
+eval range from 9223372036854775807ns to 9223372036854775807ns step 60s count_over_time({service_name="offx"}[5m] offset -1ns)
+
+# --- its CONTROL: unshifted, the rail row is counted at the rail.
+eval range from 9223372036854775807ns to 9223372036854775807ns step 60s count_over_time({service_name="offx"}[5m] offset 0s)
+  {env="prod", service_name="offx"} 9223372036854775807ns 1
+
+clear

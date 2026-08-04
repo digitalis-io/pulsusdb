@@ -1719,6 +1719,103 @@ async fn offset_shifts_the_data_window_and_not_the_reported_timestamps() {
     );
 }
 
+/// Issue #343 (boundary fix), **AC 5b/5c — the WIRE**: an offset that
+/// shifts the evaluation domain past `i64::MAX` must issue NO scan at all.
+///
+/// **The layer is the whole finding.** A planner-field assertion, or the
+/// rendered-SQL snapshot in `pulsus-read/tests/sql_snapshots.rs`, both sit
+/// above the place the user stands. What shipped was a plan that
+/// SATURATED onto the `i64` rail, and its observable was a `metric_read`
+/// stage carrying `timestamp_ns > 223372036854775807` — a full
+/// `log_samples` scan from 1977-01-08 for a query about 2026. So this
+/// asserts on the explain payload the server actually returns: **no
+/// `metric_read` stage exists**, and the result is empty.
+///
+/// **The control is required, not decorative.** Deleting the explain
+/// plumbing, or making every plan degenerate, would make the first
+/// assertion pass vacuously. The second query differs only in the offset
+/// magnitude — `T + 5.4e18` is representable — and must still produce a
+/// `metric_read` stage. The two together say "this query issues no scan
+/// AND that is not because scans stopped being reported".
+///
+/// **WHAT THIS GATE CANNOT SEE, said where the claim is made:
+/// `MetricPlan::empty_domain`.** The flag saves a ClickHouse round trip
+/// and is NOT wire-observable. Measured (issue #343, AC 8): with the flag
+/// forced `false` this test stays GREEN — the degenerate window still
+/// renders `'1970-01-01'`, stage 1 resolves zero fingerprints, the
+/// engine's pre-existing empty-fingerprint return fires, and the explain
+/// payload is byte-identical either way. What this test gates is the
+/// DEGENERATE WINDOW (against the saturating predecessor it reddens with
+/// `got stages ["stage1_stream_resolution", "stage2_hydration",
+/// "metric_read"]`). The flag is asserted DIRECTLY, in
+/// `pulsus-read/tests/sql_snapshots.rs`,
+/// `pulsus-read/src/logql/plan.rs`'s unit tests and
+/// `pulsus-read/tests/logql_metric_agg_golden.rs::r2_instant_…`. Reading
+/// a green run here as coverage of the flag would be reading it for more
+/// than it measures.
+#[tokio::test]
+async fn an_offset_past_the_timestamp_axis_issues_no_scan_at_all() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_offset_domain_edge";
+    let port = 31_122;
+    let (_guard, _client, _base_ns) = setup(db, port).await;
+
+    // An ORDINARY 2026 instant — nothing here depends on an exotic
+    // request time; only the offset is extreme.
+    const AT_NS: i64 = 1_780_000_000_000_000_000;
+
+    let explain = |query: &str| -> serde_json::Value {
+        let res = http_request(
+            port,
+            "GET",
+            &q(
+                "/api/logs/v1/query",
+                &[("query", query), ("time", &AT_NS.to_string())],
+            ),
+            &[("X-Pulsus-Explain", "1")],
+            None,
+        )
+        .expect("query reachable");
+        assert_eq!(res.status, 200, "{query}: {}", res.body);
+        json(&res)
+    };
+    let stage_names = |body: &serde_json::Value| -> Vec<String> {
+        body["data"]["explain"]["stages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no explain stages in {body}"))
+            .iter()
+            .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    // Off the axis: `T + 9e18 > i64::MAX`.
+    let off_axis = explain(r#"count_over_time({env="prod"}[2500000h] offset -2500000h)"#);
+    let off_stages = stage_names(&off_axis);
+    assert!(
+        !off_stages.iter().any(|n| n == "metric_read"),
+        "a query whose window left the timestamp axis must issue no scan, \
+         got stages {off_stages:?}"
+    );
+    assert_eq!(
+        off_axis["data"]["result"].as_array().map(Vec::len),
+        Some(0),
+        "and it answers empty: {off_axis}"
+    );
+
+    // The control: `T + 5.4e18 = 7180000000000000000 <= i64::MAX`, so the
+    // very same shape DOES plan a scan and DOES report it.
+    let on_axis = explain(r#"count_over_time({env="prod"}[2500000h] offset -1500000h)"#);
+    let on_stages = stage_names(&on_axis);
+    assert!(
+        on_stages.iter().any(|n| n == "metric_read"),
+        "a representable shift must still be scanned and reported, \
+         got stages {on_stages:?}"
+    );
+}
+
 /// Issue #343 — `variants(...)` reads each variant's OWN offset window,
 /// INTERSECTED with the common range's single shared scan.
 ///

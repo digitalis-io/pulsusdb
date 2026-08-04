@@ -263,6 +263,48 @@ pub struct MetricPlan {
     /// the window forward; an instant result carries no timestamp, so
     /// only the range/matrix shape ever reads it back.
     pub offset_ns: i64,
+    /// The shifted evaluation domain left the representable timestamp axis
+    /// (issue #343), so the query answers empty.
+    ///
+    /// # NEITHER MECHANISM MAY BE DELETED ON THE GROUNDS THAT THE OTHER COVERS IT
+    ///
+    /// Two mechanisms carry this, and each looks redundant given the other.
+    /// Deleting either reintroduces the bug while reading as tidying, so the
+    /// division of labour is written down here once:
+    ///
+    /// * **The DEGENERATE WINDOW is what makes the answer correct.** When
+    ///   [`shift_by_offset`] returns `None` the planner substitutes
+    ///   `grid_start_ns = 0`, `end_ns = -1` ([`EMPTY_DOMAIN_GRID_START_NS`] /
+    ///   [`EMPTY_DOMAIN_END_NS`]), and `end < grid_start` makes every path
+    ///   downstream produce nothing — the SQL predicate, the emit grid, the
+    ///   fence, the partition list. It holds on EVERY path, which is why the
+    ///   same substitution is repeated per variant in [`build_variants_node`]:
+    ///   a variant's shift is its own, so a whole-plan flag could not express
+    ///   one variant leaving the axis while its siblings stay on it.
+    /// * **This FLAG is defence in depth plus one saved round trip, and is
+    ///   deliberately NOT the correctness mechanism.** [`super::exec`] returns
+    ///   empty on it before `resolve_fingerprints`, so an off-axis query costs
+    ///   zero ClickHouse round trips instead of one.
+    /// * **Why the defence in depth stays rather than being trimmed:** the
+    ///   instant path re-filters nothing. [`super::window::ClientWindow::Instant`]
+    ///   carries no residual `[range]` because the scan already bounded the
+    ///   rows, so a row that reached the engine WOULD be returned regardless of
+    ///   the window. MEASURED, not reasoned: an in-engine instant fixture over
+    ///   the degenerate window returned `1` (issue #343, AC 6's
+    ///   `r2_instant_…`, which is pinned at the plan for exactly this reason).
+    /// * **The evidence they are not interchangeable** is issue #343's AC 8
+    ///   finding: forcing this flag `false` leaves the WIRE unchanged — the
+    ///   degenerate window still renders `'1970-01-01'`, stage 1 resolves zero
+    ///   fingerprints, the pre-existing empty-fingerprint return fires, and the
+    ///   explain payload is byte-identical. The flag therefore has no
+    ///   distinguishing wire observable; it is asserted DIRECTLY by
+    ///   `sql_snapshots.rs::an_offset_past_the_timestamp_axis_renders_the_degenerate_empty_window`,
+    ///   this module's own
+    ///   `tests::offset_off_the_timestamp_axis_plans_the_degenerate_empty_window`
+    ///   and `logql_metric_agg_golden.rs::r2_instant_a_beyond_rail_instant_window_reaches_stored_data`.
+    ///   Conversely the saturating mutant reddens the wire test and those three
+    ///   alike. Two mechanisms, two different jobs, two different gates.
+    pub empty_domain: bool,
     pub rate_window_ns: Option<u64>,
     pub op: RangeAggOp,
     /// Outer-to-inner vector-aggregation chain (`sum by (...) (avg(...))`
@@ -1706,35 +1748,69 @@ fn metric_plan(
     // put back on the caller's grid by `MetricPlan::offset_ns` (Loki
     // v3.7.4 `pkg/logql/range_vector.go` does exactly this: it starts the
     // iterator at `start-offset` and reports `current + offset`).
-    let (start_ns, scan_lower, end_ns, step_ns, grid_start_ns, rate_window_ns) = match p.spec {
-        QuerySpec::Instant { at_ns } => {
-            let at_ns = shift_by_offset(at_ns, offset_ns);
-            let (start, lower) = widen_scan_start(at_ns, range_ns);
-            (start, lower, at_ns, None, start, Some(range_ns))
-        }
-        QuerySpec::Range {
-            start_ns,
-            end_ns,
-            step_ns,
-        } => {
-            // Validate the client `step` at the same boundary as `[range]`
-            // (issue #227 review round 2), so the whole evaluator works over
-            // in-domain durations only: every later `step as i128` /
-            // `step_ns > i64::MAX` guard is then provably never taken.
-            let step = validate_duration_ns(step_ns, "step")?;
-            let start_ns = shift_by_offset(start_ns, offset_ns);
-            let end_ns = shift_by_offset(end_ns, offset_ns);
-            let (scan_start, lower) = widen_scan_start(start_ns, range_ns);
-            (
-                scan_start,
-                lower,
-                end_ns,
-                Some(step),
+    // The SINGLE decision point for a shift that leaves the representable
+    // timestamp axis (issue #343): on `None` from either bound, substitute
+    // the degenerate empty evaluation domain and raise `empty_domain`.
+    // Everything after this — SQL, routing, client window, probes — is
+    // built from the substituted bounds unchanged, so a consumer that
+    // never reads the flag still produces nothing.
+    let (start_ns, scan_lower, end_ns, step_ns, grid_start_ns, rate_window_ns, empty_domain) =
+        match p.spec {
+            QuerySpec::Instant { at_ns } => match shift_by_offset(at_ns, offset_ns) {
+                Some(at_ns) => {
+                    let (start, lower) = widen_scan_start(at_ns, range_ns);
+                    (start, lower, at_ns, None, start, Some(range_ns), false)
+                }
+                None => (
+                    EMPTY_DOMAIN_GRID_START_NS,
+                    ScanLowerBound::Exclusive,
+                    EMPTY_DOMAIN_END_NS,
+                    None,
+                    EMPTY_DOMAIN_GRID_START_NS,
+                    Some(range_ns),
+                    true,
+                ),
+            },
+            QuerySpec::Range {
                 start_ns,
-                Some(range_ns),
-            )
-        }
-    };
+                end_ns,
+                step_ns,
+            } => {
+                // Validate the client `step` at the same boundary as `[range]`
+                // (issue #227 review round 2), so the whole evaluator works over
+                // in-domain durations only: every later `step as i128` /
+                // `step_ns > i64::MAX` guard is then provably never taken.
+                // Ahead of the shift on purpose: a bad step is a 400 whether or
+                // not the offset moves the window off the axis.
+                let step = validate_duration_ns(step_ns, "step")?;
+                match (
+                    shift_by_offset(start_ns, offset_ns),
+                    shift_by_offset(end_ns, offset_ns),
+                ) {
+                    (Some(start_ns), Some(end_ns)) => {
+                        let (scan_start, lower) = widen_scan_start(start_ns, range_ns);
+                        (
+                            scan_start,
+                            lower,
+                            end_ns,
+                            Some(step),
+                            start_ns,
+                            Some(range_ns),
+                            false,
+                        )
+                    }
+                    _ => (
+                        EMPTY_DOMAIN_GRID_START_NS,
+                        ScanLowerBound::Exclusive,
+                        EMPTY_DOMAIN_END_NS,
+                        Some(step),
+                        EMPTY_DOMAIN_GRID_START_NS,
+                        Some(range_ns),
+                        true,
+                    ),
+                }
+            }
+        };
 
     let normalized = normalize_matchers(&range.selector.selector)?;
     let months = months_overlapping(start_ns, end_ns);
@@ -1867,6 +1943,7 @@ fn metric_plan(
         grid_start_ns,
         range_ns,
         offset_ns,
+        empty_domain,
         // Widening a boundary-validated positive `i64` to `u64` for
         // `apply_rate`'s divisor — provably lossless (issue #227 round 2).
         rate_window_ns: if is_rate {
@@ -1903,7 +1980,12 @@ fn widen_scan_start(start_ns: i64, range_ns: ValidatedDuration) -> (i64, ScanLow
     }
 }
 
-/// Moves one evaluation-domain instant back by `offset ns` (issue #343).
+/// Moves one evaluation-domain instant back by `offset` ns (issue #343) —
+/// ONCE, at the boundary, exactly as v3.7.4
+/// `pkg/logql/range_vector.go:50-52` does (`start = start - offset;
+/// end = end - offset`, tag `v3.7.4` /
+/// `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), so every comparison
+/// downstream runs offset-free in the shifted domain and cannot forget it.
 ///
 /// **SIGNED, and that is the whole point.** The reference accepts a
 /// NEGATIVE offset and shifts the window FORWARD, into the future
@@ -1915,13 +1997,35 @@ fn widen_scan_start(start_ns: i64, range_ns: ValidatedDuration) -> (i64, ScanLow
 /// included, is the reason this is a named function rather than an inline
 /// `-`.
 ///
-/// Saturating rather than erroring: a colossal offset (the reference
-/// accepts `offset 100000h`) pushes BOTH bounds to the same i64 rail, so
-/// the span is preserved and the query answers empty — which is what the
-/// reference answers. There is no new rejection surface to invent here.
-fn shift_by_offset(instant_ns: i64, offset_ns: i64) -> i64 {
-    instant_ns.saturating_sub(offset_ns)
+/// `checked_sub`, not `saturating_sub`. `None` means the shifted
+/// evaluation domain has left the representable timestamp axis and the
+/// query answers EMPTY. The reference's plain int64 subtraction WRAPS
+/// there, relocating the window to an unrelated instant; saturating
+/// CLAMPS, which is what shipped and what scanned from 1977-01-08 for a
+/// 2026 query (`count_over_time({env="prod"}[2500000h] offset -2500000h)`
+/// rendered `timestamp_ns > 223372036854775807`). The residual — the
+/// handful of shapes where answering empty is not the exact answer either
+/// — is ledgered as `offset-domain-edge-exact-arithmetic`.
+///
+/// There is still no new rejection surface: a domain-crossing offset is a
+/// 200 answering empty, never a 400.
+fn shift_by_offset(instant_ns: i64, offset_ns: i64) -> Option<i64> {
+    instant_ns.checked_sub(offset_ns)
 }
+
+/// The grid lower bound of the DEGENERATE empty evaluation domain
+/// substituted when [`shift_by_offset`] leaves the representable
+/// timestamp axis (issue #343). Paired with [`EMPTY_DOMAIN_END_NS`],
+/// `0 / -1` is the minimal pair with `end < grid_start`, which is what
+/// makes [`super::window::grid_point_count`] return 0 and
+/// `fence_intervals` return 0 (so `kmax = -1` and no grid point exists),
+/// and what makes [`months_overlapping`] — which takes
+/// `end_ns.max(start_ns)` — yield the single literal `'1970-01-01'`.
+const EMPTY_DOMAIN_GRID_START_NS: i64 = 0;
+
+/// The upper bound of the degenerate empty evaluation domain; see
+/// [`EMPTY_DOMAIN_GRID_START_NS`].
+const EMPTY_DOMAIN_END_NS: i64 = -1;
 
 /// Unwraps every outer `MetricExpr::Vector` layer, returning the
 /// innermost non-`Vector` expression and the aggregation chain (with raw
@@ -2448,28 +2552,49 @@ fn build_variants_node(
         // SHARED grid (`grid_start_ns`/`end_ns`/`step_ns` equal the scan
         // plan's; only `range_ns` differs).
         let range_ns = validate_duration_ns(range.range.as_nanos(), "range selector")?;
+        // Issue #343: the degenerate-window substitution is PER VARIANT,
+        // never whole-plan. A variant whose own shift leaves the axis gets
+        // the empty window and its siblings are untouched — a whole-plan
+        // refusal here would 400 a query the reference serves 200.
         let (window, instant_lower_inclusive) = match p.spec {
-            QuerySpec::Instant { at_ns } => {
-                let at_ns = shift_by_offset(at_ns, offset_ns);
-                let (lo, bound) = widen_scan_start(at_ns, range_ns);
-                (
+            QuerySpec::Instant { at_ns } => match shift_by_offset(at_ns, offset_ns) {
+                Some(at_ns) => {
+                    let (lo, bound) = widen_scan_start(at_ns, range_ns);
+                    (
+                        ClientWindow::Instant {
+                            start_ns: lo,
+                            end_ns: at_ns,
+                        },
+                        matches!(bound, ScanLowerBound::Inclusive),
+                    )
+                }
+                // `instant_lower_inclusive = false` makes `admits_instant`
+                // demand `ts > 0 && ts <= -1`, which admits no timestamp.
+                None => (
                     ClientWindow::Instant {
-                        start_ns: lo,
-                        end_ns: at_ns,
+                        start_ns: EMPTY_DOMAIN_GRID_START_NS,
+                        end_ns: EMPTY_DOMAIN_END_NS,
                     },
-                    matches!(bound, ScanLowerBound::Inclusive),
-                )
-            }
+                    false,
+                ),
+            },
             QuerySpec::Range {
                 start_ns,
                 end_ns,
                 step_ns,
             } => {
                 let step = validate_duration_ns(step_ns, "step")?;
+                let (grid_start_ns, end_ns) = match (
+                    shift_by_offset(start_ns, offset_ns),
+                    shift_by_offset(end_ns, offset_ns),
+                ) {
+                    (Some(start_ns), Some(end_ns)) => (start_ns, end_ns),
+                    _ => (EMPTY_DOMAIN_GRID_START_NS, EMPTY_DOMAIN_END_NS),
+                };
                 (
                     ClientWindow::Range {
-                        grid_start_ns: shift_by_offset(start_ns, offset_ns),
-                        end_ns: shift_by_offset(end_ns, offset_ns),
+                        grid_start_ns,
+                        end_ns,
                         step_ns: step,
                         range_ns,
                         offset_ns,
@@ -3661,24 +3786,90 @@ mod tests {
         assert_eq!(mp.end_ns - mp.start_ns, plain.end_ns - plain.start_ns);
     }
 
-    /// A colossal offset saturates BOTH bounds onto the same rail rather
-    /// than erroring or wrapping: the reference accepts `offset 100000h`
-    /// and answers empty, and so does this — no rejection surface the
-    /// reference does not have.
+    /// A colossal offset the reference accepts (`offset 100000h`) shifts
+    /// both bounds by its exact amount and answers empty against 1970
+    /// data — no error, no wrap, and no rejection surface the reference
+    /// does not have.
+    ///
+    /// **This one is REPRESENTABLE** (`0 - 3.6e17` is far inside `i64`),
+    /// which is why it never exercised the rail: the shipped
+    /// `saturating_sub` and today's `checked_sub` agree here exactly. The
+    /// rail behaviour it was once named for is owned by
+    /// [`offset_off_the_timestamp_axis_plans_the_degenerate_empty_window`]
+    /// below.
     #[test]
-    fn a_colossal_offset_saturates_rather_than_wrapping() {
+    fn a_colossal_offset_shifts_exactly_rather_than_erroring() {
         let mp = metric_mp(
             r#"count_over_time({env="prod"}[5m] offset 100000h)"#,
             QuerySpec::Instant { at_ns: 0 },
         )
         .unwrap();
-        assert!(mp.end_ns < 0, "the window sits far in the past");
-        assert!(
-            mp.start_ns <= mp.end_ns,
-            "the bounds stay ordered: {} .. {}",
-            mp.start_ns,
-            mp.end_ns
+        assert!(!mp.empty_domain, "100000h back from 1970 is representable");
+        assert_eq!(mp.end_ns, -(100_000 * HOUR_NS), "T - d, exactly");
+        assert_eq!(mp.start_ns, mp.end_ns - FIVE_MIN_NS);
+    }
+
+    /// Issue #343 boundary fix: when the shift leaves the representable
+    /// timestamp axis the planner substitutes the DEGENERATE empty
+    /// evaluation domain and raises `empty_domain` — it does NOT clamp
+    /// onto the `i64` rail (which relocated the window: a 2026 query
+    /// scanned `timestamp_ns > 223372036854775807`, a 1977-01-08 floor)
+    /// and it does NOT refuse (the reference serves every one of these).
+    ///
+    /// Both spec shapes and both rails, plus a representable control so
+    /// the substitution cannot be reached by every plan.
+    #[test]
+    fn offset_off_the_timestamp_axis_plans_the_degenerate_empty_window() {
+        // Instant, high rail: `T - (-9e18)` overflows.
+        let instant = metric_mp(
+            r#"count_over_time({env="prod"}[2500000h] offset -2500000h)"#,
+            QuerySpec::Instant {
+                at_ns: 1_780_000_000_000_000_000,
+            },
+        )
+        .unwrap();
+        assert!(instant.empty_domain);
+        assert_eq!(
+            (instant.start_ns, instant.grid_start_ns, instant.end_ns),
+            (0, 0, -1),
+            "grid_start = 0 and end = -1: `end < grid_start`, so no grid \
+             point exists and no timestamp is admitted"
         );
+        assert_eq!(instant.scan_lower, ScanLowerBound::Exclusive);
+        assert_eq!(instant.step_ns, None, "still an instant plan");
+
+        // Range, low rail: `i64::MIN - 1h` underflows on the START bound
+        // alone — one failing bound is enough.
+        let range = metric_mp(
+            r#"count_over_time({env="prod"}[5m] offset 1h)"#,
+            QuerySpec::Range {
+                start_ns: i64::MIN,
+                end_ns: 0,
+                step_ns: FIVE_MIN_NS as u64,
+            },
+        )
+        .unwrap();
+        assert!(range.empty_domain);
+        assert_eq!(
+            (range.start_ns, range.grid_start_ns, range.end_ns),
+            (0, 0, -1)
+        );
+        assert_eq!(
+            range.step_ns.map(|d| d.get()),
+            Some(FIVE_MIN_NS),
+            "the validated step survives: the shape stays a matrix"
+        );
+
+        // The control: an ordinary shift is untouched by any of this.
+        let ok = metric_mp(
+            r#"count_over_time({env="prod"}[5m] offset 1h)"#,
+            QuerySpec::Instant {
+                at_ns: 100 * HOUR_NS,
+            },
+        )
+        .unwrap();
+        assert!(!ok.empty_domain);
+        assert_eq!(ok.end_ns, 100 * HOUR_NS - HOUR_NS);
     }
 
     /// The shared scan and the variant windows of one `variants(...)`

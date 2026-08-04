@@ -3906,7 +3906,11 @@ fn every_client_routed_fixture_is_an_equivalence_case() {
     ];
     // 38 real call sites. The floor of 40 the first cut used was met only
     // because a substring census counted its own `run_client(` literals.
-    const ROUTED_SITES: usize = 38;
+    // Issue #343's boundary fix routed 14 more (AC 1's pair, AC 2's four
+    // rail-and-control cases, AC 4's round-trip loop, and the seven R1/R2
+    // residual fixtures): 38 + 14 = 52. The scope caveat is unaffected —
+    // every one of them has a folded twin.
+    const ROUTED_SITES: usize = 52;
     let src = include_str!("logql_metric_agg_golden.rs");
     // Nothing inside `run_client` is a fixture — neither a call site
     // (there are none) nor the `apply_vector_aggs_ok` that builds the
@@ -4069,5 +4073,469 @@ fn avg_by_duplicate_grouping_equals_the_deduped_form() {
     assert_eq!(
         sorted_vector(dup),
         vec![(lbl(&[("fp", "a")]), 1.0), (lbl(&[("fp", "b")]), 2.0)]
+    );
+}
+
+// =====================================================================
+// Issue #343 (boundary fix) — the offset shift at the edge of the
+// representable timestamp domain.
+//
+// The shipped code SATURATED (`i64::saturating_sub`) when `T - d` left
+// `[i64::MIN, i64::MAX]`, which relocates the evaluation window to a rail
+// instead of recognising it has left the axis. It now `checked_sub`s and
+// substitutes a DEGENERATE empty window (`end_ns < grid_start_ns`), so
+// the query answers empty. The reference's plain int64 subtraction
+// (v3.7.4 `pkg/logql/range_vector.go:50-52`, tag `v3.7.4` /
+// `b318f2829f0ae2094ab3a1e90780450e9e4b03be`) WRAPS there, relocating the
+// window to an unrelated instant; we evaluate exactly instead. The
+// residual — the shapes where empty is not the exact answer either — is
+// ledgered as `offset-domain-edge-exact-arithmetic`.
+// =====================================================================
+
+/// An ordinary 2026 instant. Nothing in this section depends on an exotic
+/// request time; only the offset is extreme.
+const OFFSET_T: i64 = 1_780_000_000_000_000_000;
+
+/// `range_params` with a caller-chosen step (the section's witnesses use
+/// steps the file-wide 60s constant cannot express).
+fn range_params_step(start_ns: i64, end_ns: i64, step_ns: u64) -> QueryParams {
+    QueryParams {
+        spec: pulsus_read::logql::QuerySpec::Range {
+            start_ns,
+            end_ns,
+            step_ns,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    }
+}
+
+fn matrix_points(result: QueryResult) -> Vec<(i64, f64)> {
+    match result {
+        QueryResult::Matrix(series) => series.into_iter().flat_map(|s| s.points).collect(),
+        other => panic!("expected a matrix, got {other:?}"),
+    }
+}
+
+/// **AC 1 — the reachable range case.** `[2500000h] offset -2500000h` at
+/// an ordinary 2026 instant puts the evaluation domain at `T + 9e18`,
+/// past `i64::MAX`. Both rows sit in the request's own era, and the
+/// correct answer is EMPTY: the window the user asked for does not exist.
+///
+/// *Against `17e2802` this returned one point
+/// `(223372036854775807, 2.0)`* — both bounds saturated onto `i64::MAX`,
+/// the single grid point's `(MAX - 9e18, MAX]` window swallowed both rows,
+/// and putting the offset back landed the point on 1977-01-08.
+///
+/// The control is the same shape with an offset that STAYS on the axis,
+/// so this cannot pass by the fixture simply being unreadable.
+#[test]
+fn a_range_offset_past_the_timestamp_axis_answers_empty() {
+    let rows = vec![
+        row(1, 1_000_000_000_000_000_000, "old"),
+        row(1, OFFSET_T - NS, "recent"),
+    ];
+    let params = range_params_step(OFFSET_T, OFFSET_T + 120 * NS, 60 * NS as u64);
+    let off_axis = run_client(
+        r#"count_over_time({env="prod"}[2500000h] offset -2500000h)"#,
+        &params,
+        &rows,
+        &meta_one(),
+    )
+    .expect("a domain-crossing offset is a 200, never a refusal");
+    assert_eq!(
+        matrix_points(off_axis),
+        Vec::new(),
+        "the shifted window is off the axis, so there is nothing to report"
+    );
+
+    // Control: `T + 5.4e18` is representable, so the same rows ARE read —
+    // three grid points, both rows inside each `(g - 2500000h, g]`.
+    let on_axis = run_client(
+        r#"count_over_time({env="prod"}[2500000h] offset -1500000h)"#,
+        &params,
+        &rows,
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(
+        matrix_points(on_axis),
+        vec![
+            (OFFSET_T, 2.0),
+            (OFFSET_T + 60 * NS, 2.0),
+            (OFFSET_T + 120 * NS, 2.0),
+        ],
+        "a representable shift still reads the data, on the CALLER's grid"
+    );
+}
+
+/// **AC 2 — the domain edge, both rails, each with its own control.**
+///
+/// *Against `17e2802`*: the low-rail case reported a point at
+/// `i64::MIN + 1h` (`-9223368436854775808`) and the high-rail case a point
+/// at `9223372036854775806`. Both are instants the request never named.
+#[test]
+fn an_offset_off_either_rail_answers_empty_while_the_rails_themselves_work() {
+    // --- low rail: `i64::MIN - 1h` underflows.
+    let at_min = range_params_step(i64::MIN, i64::MIN, 60 * NS as u64);
+    let absent_off = run_client(
+        r#"absent_over_time({env="prod"}[5m] offset 1h)"#,
+        &at_min,
+        &[],
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(
+        matrix_points(absent_off),
+        Vec::new(),
+        "absence is reported for a window that exists; this one does not"
+    );
+    // Control: the SAME grid point with no shift does report absence, so
+    // the emptiness above is the shift and not the fixture.
+    let absent_on = run_client(
+        r#"absent_over_time({env="prod"}[5m] offset 0s)"#,
+        &at_min,
+        &[],
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(matrix_points(absent_on), vec![(i64::MIN, 1.0)]);
+
+    // --- high rail: `i64::MAX - (-1ns)` overflows by exactly one ns.
+    let at_max = range_params_step(i64::MAX, i64::MAX, 60 * NS as u64);
+    let rows = vec![row(1, i64::MAX, "at the rail")];
+    let count_off = run_client(
+        r#"count_over_time({env="prod"}[5m] offset -1ns)"#,
+        &at_max,
+        &rows,
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(
+        matrix_points(count_off),
+        Vec::new(),
+        "one nanosecond past the rail is still past the rail"
+    );
+    let count_on = run_client(
+        r#"count_over_time({env="prod"}[5m] offset 0s)"#,
+        &at_max,
+        &rows,
+        &meta_one(),
+    )
+    .expect("plans");
+    assert_eq!(matrix_points(count_on), vec![(i64::MAX, 1.0)]);
+}
+
+/// **AC 4 — the round trip is exact where it applies.** The planner
+/// subtracts the offset once at the boundary and `shift_emitted_points`
+/// adds it back once on emit; over an ORDINARY range spec that pair must
+/// be the identity on the timestamp axis, for either sign and for a
+/// colossal-but-representable magnitude.
+///
+/// **This is not the rail gate.** It bites only where the shift is
+/// representable — every case here is; the rail behaviour is pinned by
+/// the two tests above and by the R1/R2 residual pins below. *Against
+/// `17e2802` this passes*, and it is stated as an anti-regression gate.
+///
+/// `absent_over_time` over an empty store emits at EVERY grid point,
+/// which is what makes "every request grid point, and only those" an
+/// assertion rather than a sample.
+#[test]
+fn the_offset_round_trip_is_exact_for_every_representable_shift() {
+    let start = OFFSET_T;
+    let end = start + 300 * NS;
+    let params = range_params_step(start, end, 60 * NS as u64);
+    let expected: Vec<(i64, f64)> = (0..=5).map(|k| (start + k * 60 * NS, 1.0)).collect();
+    for offset in ["0s", "1h", "-1h", "100000h", "-100000h"] {
+        let query = format!(r#"absent_over_time({{env="prod"}}[5m] offset {offset})"#);
+        let points = matrix_points(
+            run_client(&query, &params, &[], &meta_one()).expect("a representable shift plans"),
+        );
+        assert_eq!(
+            points, expected,
+            "offset {offset}: every emitted point must land back on the \
+             request's own grid {start}..={end}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// AC 6 — the residual, one test per branch, each pinned by its own entry
+// inequality. Ledger id `offset-domain-edge-exact-arithmetic`
+// (docs/benchmarks/logs-differential-ledger.md).
+//
+// Notation: request range spec `S <= E`, step `p`, offset `d`, range `r`;
+// `A = S - d`, `B = E - d` EXACT; `MIN = -2^63`, `MAX = 2^63 - 1`.
+// `shift_by_offset` fails iff `A` or `B` leaves `[MIN, MAX]`.
+// `min_stored_ts = 0` / `max_stored_ts = 4_294_943_999_999_999_999` are
+// the ingest gate's floor and ceiling
+// (`pulsus-write/src/protocols/loki_push.rs`).
+//
+// Every one of these says PulsusDB answers empty and records what exact
+// arithmetic would answer. If a branch is ever made exact, its test here
+// is what has to change.
+// ---------------------------------------------------------------------
+
+/// **R1a — low rail, TOTAL** (`d > E + 2^63`, which forces `E <= -2`).
+/// The whole shifted grid is below `MIN`.
+///
+/// Loses `absent_over_time`'s entire grid of `1`s. **No value-producing
+/// operation can be affected**: every grid point is `< MIN`, so its
+/// window `(g - r, g]` lies wholly below `MIN` and no representable
+/// sample can occupy it.
+///
+/// Entry, exactly: `E = -3000000000000`, `d = 2562047h =
+/// 9223369200000000000`, and `E + 2^63 = 9223369036854775808 < d`.
+#[test]
+fn r1a_low_rail_total_absent_over_time_loses_its_whole_grid() {
+    const E: i64 = -3_000_000_000_000;
+    const D: i64 = 2_562_047 * 3_600_000_000_000;
+    assert!(
+        D as i128 > E as i128 + (1i128 << 63),
+        "R1a entry inequality"
+    );
+    let params = range_params_step(E - 600 * NS, E, 60 * NS as u64);
+    let points = matrix_points(
+        run_client(
+            r#"absent_over_time({env="prod"}[5m] offset 2562047h)"#,
+            &params,
+            &[],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        points.is_empty(),
+        "PulsusDB answers empty; exact arithmetic would answer a `1` at \
+         every request grid point, all of whose windows are below MIN"
+    );
+}
+
+/// **R1b — low rail, PARTIAL** (`E + 2^63 >= d > S + 2^63`, forcing
+/// `S <= -2`). `A` underflows while `B` stays in domain, so the exact
+/// grid has an in-domain suffix that PulsusDB drops.
+///
+/// Loses absence, and **real-data loss is POSSIBLE** — not "does", and
+/// not characterised by a span inequality alone. The NECESSARY condition
+/// is `E - d >= min_stored_ts` (a lost sample satisfies `s <= g <= B`);
+/// sufficiency depends on grid phase, step, range and the storage bounds
+/// together and is deliberately not enumerated. This witness is what
+/// makes "possible" a fact:
+///
+/// `S = i64::MIN`, `E = 1779627963145224192`, `p = 1000000000000000`,
+/// `count_over_time([5m] offset 1h)`, one row at `1779624363145224192`.
+/// The EXACT grid is anchored at `A = -9223372040454775808` and its span
+/// `B - A = 11003000000000000000` is exactly `11003 * p`, so it holds
+/// 11004 points and its last is exactly `B` — whose `(B - 5m, B]` window
+/// holds that row. Exact answers `1` at caller grid point `E`.
+#[test]
+fn r1b_low_rail_partial_may_lose_real_data() {
+    const S: i64 = i64::MIN;
+    const E: i64 = 1_779_627_963_145_224_192;
+    const D: i64 = 3_600_000_000_000; // 1h
+    const P: u64 = 1_000_000_000_000_000;
+    assert!(
+        (E as i128 + (1i128 << 63)) >= D as i128 && D as i128 > S as i128 + (1i128 << 63),
+        "R1b entry inequality"
+    );
+    let row_ts = E - D; // = B, the exact grid's last point
+    let points = matrix_points(
+        run_client(
+            r#"count_over_time({env="prod"}[5m] offset 1h)"#,
+            &range_params_step(S, E, P),
+            &[row(1, row_ts, "inside B's window")],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        points.is_empty(),
+        "PulsusDB answers empty; exact arithmetic answers 1 at {E}"
+    );
+}
+
+/// **R1c — high rail, TOTAL** (`-d > MAX - S`, with **no sign constraint
+/// on `S`**: this needs neither a pre-1970 start nor a 156-year range).
+/// The whole shifted grid is above `MAX`.
+///
+/// Loses `absent_over_time`'s whole grid; for value-producing operations
+/// the loss is the R2 case below (a beyond-rail window can still reach
+/// stored data, but only past a 156-year `[range]`).
+///
+/// Entry, exactly: `S = 1780000000000000000` is an ordinary 2026 instant,
+/// `MAX - S = 7443372036854775807`, and `-d = 9000000000000000000`.
+#[test]
+fn r1c_high_rail_total_needs_no_pre_1970_start() {
+    const S: i64 = OFFSET_T;
+    const NEG_D: i64 = 2_500_000 * 3_600_000_000_000;
+    const { assert!(NEG_D > i64::MAX - S, "R1c entry inequality") };
+    const { assert!(S > 0, "an ordinary positive start qualifies") };
+    let points = matrix_points(
+        run_client(
+            r#"absent_over_time({env="prod"}[5m] offset -2500000h)"#,
+            &range_params_step(S, S + 120 * NS, 60 * NS as u64),
+            &[],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(points.is_empty(), "the whole grid is above MAX");
+}
+
+/// **R1d — high rail, PARTIAL** (`MAX - E < -d <= MAX - S`, which
+/// **ordinary positive `S, E` satisfy**). `A` stays in domain while `B`
+/// overflows, so the exact grid has an in-domain PREFIX that PulsusDB
+/// drops.
+///
+/// Loses absence, and **real-data loss is POSSIBLE**. The NECESSARY
+/// condition is `S - d - range < max_stored_ts`: every in-domain window's
+/// lower bound is `>= A - r`, so if `A - r >= max_stored_ts` no stored
+/// sample can be inside one. Sufficiency is deliberately not enumerated.
+/// A span-only formulation was tried and is **not even necessary** — the
+/// second case below has span `4928428036854775808`, one nanosecond under
+/// that bound, and loses real data anyway.
+///
+/// Two cases: the entry boundary with ordinary bounds, and the real-data
+/// witness.
+#[test]
+fn r1d_high_rail_partial_straddles_with_ordinary_bounds() {
+    // (i) `-d = MAX - S` EXACTLY, so `A = MAX` is in domain and
+    //     `B = MAX + 120s` is not. `S`/`E` are ordinary positive ns.
+    const NEG_D: i64 = 2_000_000 * 3_600_000_000_000; // 7.2e18
+    const S: i64 = i64::MAX - NEG_D;
+    const E: i64 = S + 120 * NS;
+    const {
+        assert!(
+            S > 0 && i64::MAX - E < NEG_D && NEG_D <= i64::MAX - S,
+            "R1d entry inequality"
+        )
+    };
+    let boundary = matrix_points(
+        run_client(
+            r#"absent_over_time({env="prod"}[5m] offset -2000000h)"#,
+            &range_params_step(S, E, 60 * NS as u64),
+            &[],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        boundary.is_empty(),
+        "PulsusDB answers empty; exact arithmetic keeps the in-domain prefix"
+    );
+
+    // (ii) the real-data witness: `A = 4294944000000000000 <= MAX`,
+    //      `B = MAX + 1`. Grid point `k = 0` sits at `A`, and
+    //      `A - 5m = 4294943700000000000 < max_stored_ts <= A`, so its
+    //      window covers a row stored at the ingest ceiling.
+    const WS: i64 = -1_105_056_000_000_000_000;
+    const WE: i64 = 3_823_372_036_854_775_808;
+    const WP: u64 = 500_000_000_000_000;
+    const MAX_STORED_TS: i64 = 4_294_943_999_999_999_999;
+    let witness = matrix_points(
+        run_client(
+            r#"count_over_time({env="prod"}[5m] offset -1500000h)"#,
+            &range_params_step(WS, WE, WP),
+            &[row(1, MAX_STORED_TS, "at the ingest ceiling")],
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        witness.is_empty(),
+        "PulsusDB answers empty; exact arithmetic answers 1 at {WS}"
+    );
+}
+
+/// **R2 — a beyond-rail grid instant whose window still reaches stored
+/// data.** The first such instant is `MAX + 1`, and `(g - r, g]` is
+/// strict on the left, so it reaches `max_stored_ts` only when
+///
+/// ```text
+/// range > (i64::MAX + 1) - max_stored_ts
+///       = 9223372036854775808 - 4294943999999999999
+///       = 4928428036854775809 ns   (~1369007.79 h ~ 156.28 years)
+/// ```
+///
+/// so `[1369008h]` can reach and `[1369007h]` cannot. **Both answer empty
+/// under PulsusDB**; the pair is here to record WHICH of the two is the
+/// residual: the `[1369008h]` arm is (exact answer `1`), the
+/// `[1369007h]` arm is not (exact answer is empty too).
+#[test]
+fn r2_range_a_beyond_rail_window_reaches_stored_data_only_past_1369008h() {
+    const NEG_D: i64 = 1_500_000 * 3_600_000_000_000; // 5.4e18
+    // `S - d = MAX + 1` exactly — the first beyond-rail grid instant.
+    const S: i64 = 3_823_372_036_854_775_808;
+    const MAX_STORED_TS: i64 = 4_294_943_999_999_999_999;
+    assert_eq!(S as i128 + NEG_D as i128, (1i128 << 63), "A = MAX + 1");
+    assert_eq!(
+        (1i128 << 63) - MAX_STORED_TS as i128,
+        4_928_428_036_854_775_809,
+        "the reach threshold"
+    );
+    let params = range_params_step(S, S + 120 * NS, 60 * NS as u64);
+    let rows = [row(1, MAX_STORED_TS, "at the ingest ceiling")];
+    let reaching = matrix_points(
+        run_client(
+            r#"count_over_time({env="prod"}[1369008h] offset -1500000h)"#,
+            &params,
+            &rows,
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        reaching.is_empty(),
+        "THE RESIDUAL: exact arithmetic answers 1 at {S}"
+    );
+    let not_reaching = matrix_points(
+        run_client(
+            r#"count_over_time({env="prod"}[1369007h] offset -1500000h)"#,
+            &params,
+            &rows,
+            &meta_one(),
+        )
+        .expect("plans"),
+    );
+    assert!(
+        not_reaching.is_empty(),
+        "EXACT: one hour shorter and the window cannot reach the row either"
+    );
+}
+
+/// **R2-instant** — the same reach, on an instant query, whose whole
+/// answer is the single window `(A - r, A]` with `A = MAX + 1`.
+/// `(4294943236854775808, MAX + 1]` holds a row at `max_stored_ts`, so
+/// exact arithmetic answers `1`; PulsusDB answers empty.
+///
+/// **Pinned at the PLAN, and that is the only layer that can hold it.**
+/// An instant window is a SQL PREDICATE — `ClientWindow::Instant` carries
+/// no residual `[range]` and re-filters nothing, because the scan already
+/// bounded the rows — so no in-engine fixture can observe an instant
+/// shift at all, the same limit `b19_offset.test` records for the corpus.
+/// What a user experiences here IS `start_ns`/`end_ns`, so those are what
+/// this asserts; the text they render into is pinned by
+/// `sql_snapshots.rs::an_offset_past_the_timestamp_axis_renders_the_degenerate_empty_window`.
+#[test]
+fn r2_instant_a_beyond_rail_instant_window_reaches_stored_data() {
+    const AT: i64 = 3_823_372_036_854_775_808;
+    const NEG_D: i64 = 1_500_000 * 3_600_000_000_000;
+    const MAX_STORED_TS: i64 = 4_294_943_999_999_999_999;
+    const RANGE: i64 = 1_369_008 * 3_600_000_000_000;
+    assert_eq!(AT as i128 + NEG_D as i128, (1i128 << 63), "A = MAX + 1");
+    assert!(
+        (1i128 << 63) - RANGE as i128 <= MAX_STORED_TS as i128,
+        "the exact window (A - r, A] reaches the ingest ceiling"
+    );
+    let mp = metric_plan_of(
+        r#"count_over_time({env="prod"}[1369008h] offset -1500000h)"#,
+        &instant_params(AT),
+    );
+    assert!(mp.empty_domain);
+    assert_eq!(
+        (mp.start_ns, mp.end_ns),
+        (0, -1),
+        "THE RESIDUAL: the scan is the degenerate empty window, so PulsusDB \
+         answers empty where exact arithmetic answers 1"
     );
 }
