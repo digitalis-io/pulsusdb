@@ -30,13 +30,17 @@
 //! `.sql` extension, so a `README` dropped in, or a golden tucked into a
 //! subdirectory, moved neither the count nor the digest — the claim
 //! "these directories are frozen" was true only of part of them. The
-//! walk is now recursive and digests EVERY file it finds, whatever its
-//! extension, keyed by its path RELATIVE to `tests/golden/`. Two
-//! consequences worth stating because they are the properties being
-//! bought: a file nested one level down has a different relative path
-//! and so moves the digest, and a rename — including a move between the
-//! two golden directories — moves it too, because the path is fed
-//! before the bytes.
+//! walk is now recursive and digests EVERY entry it finds, whatever its
+//! extension, keyed by its path RELATIVE to `tests/golden/`. Consequences
+//! worth stating because they are the properties being bought: a file
+//! nested one level down has a different relative path and so moves the
+//! digest; a rename — including a move between the two golden
+//! directories — moves it too, because the path is fed before the bytes;
+//! an EMPTY directory moves it, because directories are entries in their
+//! own right (round 3 — a file-only walk digests nothing for one); and a
+//! symlink FAILS rather than being followed, so the digest cannot depend
+//! on bytes outside the corpus and a directory cycle cannot hang the
+//! walk.
 //!
 //! **This is not an immutability claim.** These goldens are regenerated
 //! deliberately when the SQL builders change (issue #57's
@@ -81,35 +85,75 @@ fn golden_dir(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Every file under `dir`, RECURSIVELY and regardless of extension,
-/// returned as `(path relative to the corpus root, absolute path)` and
-/// sorted by the relative path — which is what the digest feeds, so the
-/// order is deterministic and a nested file is distinguishable from a
-/// top-level one of the same name.
-fn corpus_files(dir: &Path) -> Vec<(String, PathBuf)> {
-    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
-        let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+/// One entry in the frozen tree: a file whose bytes are digested, or a
+/// directory, which is digested as a NAME ONLY.
+///
+/// Directories are represented (Stage C review round 3) so that an EMPTY
+/// one is not invisible: a walk that only yields files digests nothing
+/// for `traces_search/scratch/`, and a directory appearing inside a
+/// frozen corpus is a change like any other. The two kinds carry
+/// different separator bytes, so a directory `foo` and a file `foo`
+/// cannot collide.
+enum Entry {
+    File { rel: String, path: PathBuf },
+    Dir { rel: String },
+}
+
+impl Entry {
+    fn rel(&self) -> &str {
+        match self {
+            Entry::File { rel, .. } | Entry::Dir { rel } => rel,
+        }
+    }
+}
+
+/// Everything under `dir`, RECURSIVELY, sorted by the path relative to
+/// the corpus root — which is what the digest feeds, so the order is
+/// deterministic and a nested entry is distinguishable from a top-level
+/// one of the same name.
+///
+/// **Symlinks are rejected outright, not followed.** `is_dir()` resolves
+/// through a symlink, so the previous walk would have recursed forever
+/// on a directory-symlink cycle and would have digested bytes from
+/// outside the repository on an external target — a non-hermetic freeze.
+/// `symlink_metadata` never follows, and a symlink appearing inside a
+/// directory that is supposed to be frozen is itself a change worth
+/// failing on, which is why this rejects rather than resolves.
+fn corpus_entries(dir: &Path) -> Vec<Entry> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<Entry>) {
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
             .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
             .map(|entry| entry.expect("dir entry").path())
             .collect();
-        entries.sort();
-        for path in entries {
+        paths.sort();
+        for path in paths {
             let name = path
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or_else(|| panic!("non-UTF-8 golden name: {}", path.display()))
                 .to_string();
             let rel = format!("{prefix}{name}");
-            if path.is_dir() {
+            let meta = fs::symlink_metadata(&path)
+                .unwrap_or_else(|e| panic!("symlink_metadata {}: {e}", path.display()));
+            let kind = meta.file_type();
+            assert!(
+                !kind.is_symlink(),
+                "{} is a symlink. A frozen corpus holds real files: a symlink makes the digest \
+                 depend on something outside it (and a directory cycle would make this walk \
+                 never terminate). Remove it, or freeze what it points at.",
+                path.display()
+            );
+            if kind.is_dir() {
+                out.push(Entry::Dir { rel: rel.clone() });
                 walk(&path, &format!("{rel}/"), out);
             } else {
-                out.push((rel, path));
+                out.push(Entry::File { rel, path });
             }
         }
     }
     let mut out = Vec::new();
     walk(dir, "", &mut out);
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by(|a, b| a.rel().cmp(b.rel()));
     out
 }
 
@@ -118,19 +162,20 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
     let mut total = 0usize;
     for (name, want) in CORPORA {
         let dir = golden_dir(name);
-        let files = corpus_files(&dir);
+        let entries = corpus_entries(&dir);
         assert_eq!(
-            files.len(),
+            entries.len(),
             want,
-            "golden/{name}/ holds {} files, not the committed {want} — something was added or \
-             removed under that directory (the walk is recursive and counts EVERY file, not \
-             only `.sql`); that is a deliberate act and moves this count with it: {:?}",
-            files.len(),
-            files.iter().map(|(rel, _)| rel).collect::<Vec<_>>()
+            "golden/{name}/ holds {} entries, not the committed {want} — something was added or \
+             removed under that directory (the walk is recursive and counts EVERY entry: files \
+             of any extension AND directories); that is a deliberate act and moves this count \
+             with it: {:?}",
+            entries.len(),
+            entries.iter().map(Entry::rel).collect::<Vec<_>>()
         );
-        total += files.len();
+        total += entries.len();
     }
-    assert_eq!(total, 63, "the frozen SQL corpus is 46 + 17 = 63 files");
+    assert_eq!(total, 63, "the frozen SQL corpus is 46 + 17 = 63 entries");
 }
 
 #[test]
@@ -144,14 +189,28 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     };
     for (name, _) in CORPORA {
         let dir = golden_dir(name);
-        for (rel, path) in corpus_files(&dir) {
+        for entry in corpus_entries(&dir) {
             // The path is fed BEFORE the bytes, so a rename — including a
             // move between the two corpora, or into a subdirectory —
             // moves the digest even though no byte of content changed.
-            feed(format!("{name}/{rel}").as_bytes());
-            feed(&[0x01]);
-            feed(&fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())));
-            feed(&[0x00]);
+            // A directory feeds its name and a DIFFERENT separator, so an
+            // empty directory is visible and cannot be confused with a
+            // file of the same name.
+            match entry {
+                Entry::File { rel, path } => {
+                    feed(format!("{name}/{rel}").as_bytes());
+                    feed(&[0x01]);
+                    feed(
+                        &fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+                    );
+                    feed(&[0x00]);
+                }
+                Entry::Dir { rel } => {
+                    feed(format!("{name}/{rel}").as_bytes());
+                    feed(&[0x02]);
+                    feed(&[0x00]);
+                }
+            }
         }
     }
     assert_eq!(

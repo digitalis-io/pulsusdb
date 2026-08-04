@@ -199,10 +199,12 @@ jobs:
   #     consequence: adding a probe and moving the baseline cannot be the
   #     same PR. Land the probe with its oracle row, then move the
   #     baseline.
-  #   * duplicate probe keys fail — in the baseline AND in both matrices.
-  #     `jq`'s `from_entries` keeps the LAST value for a repeated key
-  #     without complaining, so a duplicate does not break the join, it
-  #     silently decides it.
+  #   * duplicate probe keys fail in EVERY file a join is built from —
+  #     this branch's baseline, origin/main's baseline, and both
+  #     matrices. `jq`'s `from_entries` keeps the LAST value for a
+  #     repeated key without complaining, so a duplicate does not break
+  #     the join, it silently decides it; a check that covers three of
+  #     the four inputs leaves the fourth deciding.
   #
   # STATED EDGE: the totals are scored with origin/main's oracle column
   # for every key main knows. A deliberate ORACLE re-pin (the reference
@@ -252,6 +254,14 @@ jobs:
               if [ -n "$DUPLICATED" ]; then
                 echo "::error::the wire baseline has duplicate probe keys — a probe's query IS its identity here, and a duplicate can pad the probe count back up after a deletion (issue 335 Stage C direction rule):"
                 printf '%s\n' "$DUPLICATED"
+                exit 1
+              fi
+              DUP_OLD_BASELINE=$(jq -r '
+                [ .wire_baseline[].query ] | group_by(.)
+                | map(select(length > 1) | .[0]) | .[]' "$TMP/old_baseline.json")
+              if [ -n "$DUP_OLD_BASELINE" ]; then
+                echo "::error::origin/main's wire_baseline.json has duplicate probe keys — the \$before map the MISSING and REGRESSED clauses join on would silently keep one row per key (issue 335 Stage C direction rule):"
+                printf '%s\n' "$DUP_OLD_BASELINE"
                 exit 1
               fi
               DUP_ORACLE=$(jq -r '
