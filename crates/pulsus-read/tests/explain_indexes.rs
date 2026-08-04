@@ -1615,6 +1615,76 @@ async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key(
     assert_eq!(usage, expected_metric_instant_raw_usage());
 }
 
+/// Issue #344 — a range-aggregation grouping costs the SCAN nothing.
+///
+/// The clause is a per-row label projection inside the client
+/// aggregator; it never reaches SQL. So a grouped query must plan the
+/// **byte-identical** statement to its ungrouped twin, engage the same
+/// primary key, and issue the same ONE scan — never one scan per group,
+/// and never an extra round trip to enumerate the groups. Asserted as
+/// SQL equality plus the shared `EXPLAIN indexes=1` usage, so a future
+/// change that pushed grouping into SQL would have to justify itself
+/// here rather than land unnoticed.
+#[tokio::test]
+async fn a_grouped_range_aggregation_plans_the_same_single_raw_scan_as_its_ungrouped_twin() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_344_grouped_scan";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let table = format!("{db}.log_samples");
+    let build = |query: &str| {
+        let mp = metric_plan(query, &range_params(ts_ns), db);
+        assert!(!mp.rollup, "{query}");
+        assert!(mp.client.is_some(), "{query}: unwrap forces client-agg");
+        assert_eq!(mp.table, "log_samples", "{query}");
+        assert_eq!(
+            mp.routing.reason, "raw: client-side pipeline/unwrap aggregation",
+            "{query}: grouping must not change the routing decision"
+        );
+        let sql = sql::metric_raw_samples(
+            &table,
+            &["'checkout'".to_string()],
+            &[FP_PROD],
+            TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            mp.scan_lower,
+            &mp.extra_predicates,
+        );
+        assert!(!sql.contains("LIMIT"), "{query}: {sql}");
+        (mp, sql)
+    };
+
+    let (plain, plain_sql) =
+        build(r#"max_over_time({env="prod"} | logfmt | unwrap duration(took) [5m])"#);
+    for grouped in [
+        r#"max_over_time({env="prod"} | logfmt | unwrap duration(took) [5m]) by (env)"#,
+        r#"max_over_time({env="prod"} | logfmt | unwrap duration(took) [5m]) without (env)"#,
+        r#"max_over_time({env="prod"} | logfmt | unwrap duration(took) [5m]) by ()"#,
+    ] {
+        let (mp, sql) = build(grouped);
+        assert_eq!(sql, plain_sql, "{grouped}: the emitted SQL must not move");
+        assert_eq!(
+            (mp.start_ns, mp.end_ns, mp.step_ns),
+            (plain.start_ns, plain.end_ns, plain.step_ns),
+            "{grouped}: the scan window must not move"
+        );
+        assert_eq!(
+            mp.probes.len(),
+            plain.probes.len(),
+            "{grouped}: no extra round trip"
+        );
+        assert!(
+            mp.client.as_ref().expect("client").grouping.is_some(),
+            "{grouped}: the clause must be planned, not dropped"
+        );
+        let usage = explain(&client, &sql).await;
+        assert_eq!(usage, expected_metric_instant_raw_usage(), "{grouped}");
+    }
+}
+
 #[tokio::test]
 async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key() {
     skip_unless_live!();

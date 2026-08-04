@@ -2685,6 +2685,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);

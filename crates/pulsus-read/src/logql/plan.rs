@@ -28,7 +28,7 @@ use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_s
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
-use super::pipeline::PipelineError;
+use super::pipeline::{PipelineError, RangeGrouping};
 use super::sql::ScanLowerBound;
 use super::window::{ClientWindow, GridWindow};
 
@@ -341,6 +341,21 @@ pub struct ClientAgg {
     /// `absent_over_time` only: the selector's `Eq`-matcher labels — the
     /// synthetic-absence series labels (oracle-probed; plan v2 D2).
     pub absent_labels: Vec<(String, String)>,
+    /// The range aggregation's OWN `by`/`without` clause (issue #344),
+    /// normalized at plan time. Applied per row by the compiled pipeline
+    /// ([`super::pipeline::RangeGrouping`]), which is where the reference
+    /// applies it too — so the merge is over the group's RAW SAMPLES and
+    /// the existing fan-out machinery (which already merges streams by
+    /// final label set) needs no second grouping layer.
+    ///
+    /// **Boxed**, so the clause costs one pointer in `ClientAgg` rather
+    /// than 32 bytes. Almost every plan carries `None` here, and
+    /// `MetricPlan` is the largest `Plan` variant — inlining the clause
+    /// widened `Plan` past `clippy::large_enum_variant`'s threshold,
+    /// making every `Plan`-sized move pay for a field that is absent in
+    /// the common case. The `Box` is allocated once per query at plan
+    /// time and read as `Option<&RangeGrouping>` on the row path.
+    pub grouping: Option<Box<RangeGrouping>>,
 }
 
 /// Where a client-aggregated sample's value comes from. `Unwrap` carries
@@ -1619,13 +1634,6 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
 /// per-variant `[range]` windows, or the common pipeline). Both
 /// pre-existing call sites pass `false`, so every existing plan/SQL
 /// snapshot is byte-identical.
-/// The single wording for "the grammar accepts this, the engine does not
-/// execute it yet" on a range-aggregation grouping (issue #344). One
-/// constant so the top-level planner and the `variants(...)` arm cannot
-/// drift apart, and so a grep finds every mention when execution lands.
-const RANGE_GROUPING_UNSUPPORTED: &str =
-    "range aggregation grouping is parsed but not yet executed (issue #344)";
-
 fn metric_plan(
     metric_expr: &MetricExpr,
     p: &QueryParams,
@@ -1703,27 +1711,13 @@ fn metric_plan(
             reason: format!("invalid aggregation {op} with unwrap"),
         });
     }
-    // Issue #344: the grammar now accepts a range-aggregation grouping on
-    // the eight ops the reference admits it on (the other seven are a
-    // parse-time rejection carrying the reference's wording). EXECUTION is
-    // a separate, larger piece of work: the grouping aggregates the group's
-    // RAW SAMPLES — `stddev_over_time(...) by (fp)` over {1,5,7} is
-    // 2.4944…, the population stddev of the merged samples, not a stddev of
-    // per-series stddevs — so it re-keys the client aggregator's groups and
-    // needs a total sample order across merged streams for
-    // `first_over_time`/`last_over_time`. Until that lands the planner
-    // refuses it by name rather than executing the ungrouped query and
-    // silently returning the wrong series.
-    //
-    // Placed AFTER the unwrap-arity checks on purpose: those carry the
-    // reference's own verbatim messages, and our not-yet-executed refusal
-    // must never displace one. `max_over_time({a="b"}[5m]) by (fp)` answers
-    // `invalid aggregation max_over_time without unwrap` on both systems.
-    if range_grouping.is_some() {
-        return Err(ReadError::PipelineInvalid {
-            reason: RANGE_GROUPING_UNSUPPORTED.to_string(),
-        });
-    }
+    // Issue #344: the range aggregation's own `by`/`without`, normalized
+    // once here so the per-row projection is not re-deriving it. The
+    // parser has already refused it on the seven ops the reference
+    // refuses it on, so `Some` implies one of the eight.
+    let grouping = range_grouping
+        .as_ref()
+        .map(|g| Box::new(RangeGrouping::from_ast(g)));
     let quantile = match (op, param) {
         (RangeAggOp::QuantileOverTime, Some(raw)) => {
             Some(parse_plan_number(raw, format_args!("quantile parameter"))?)
@@ -1745,37 +1739,50 @@ fn metric_plan(
     // per-event `(t-range, t]` boundary; only raw `log_samples` can).
     // Instant queries keep their existing routing (rollup/SQL-raw).
     let is_range = matches!(p.spec, QuerySpec::Range { .. });
-    let client =
-        if force_client || has_beyond_line_filter || has_unwrap || client_only_op || is_range {
-            let value = if has_unwrap {
-                ClientValue::Unwrap
-            } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {
-                ClientValue::Bytes
-            } else {
-                ClientValue::Count
-            };
-            let absent_labels = if matches!(op, RangeAggOp::AbsentOverTime) {
-                range
-                    .selector
-                    .selector
-                    .matchers
-                    .iter()
-                    .filter(|m| m.op == MatchOp::Eq)
-                    .map(|m| (m.name.clone(), m.value.clone()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            Some(ClientAgg {
-                pipeline: pipeline.clone(),
-                value,
-                range_op: *op,
-                param: quantile,
-                absent_labels,
-            })
+    // Issue #344: a grouping is a client-path trigger in its own right.
+    // Today it is subsumed — all eight ops that admit a grouping also
+    // REQUIRE unwrap, so `client_only_op` is already true — but the
+    // grouping is carried ON `ClientAgg`, so if that ever stopped holding
+    // the SQL-aggregated path would silently drop the clause and return
+    // the ungrouped answer. Naming it here makes that unrepresentable
+    // instead of incidental.
+    let client = if force_client
+        || has_beyond_line_filter
+        || has_unwrap
+        || client_only_op
+        || is_range
+        || grouping.is_some()
+    {
+        let value = if has_unwrap {
+            ClientValue::Unwrap
+        } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {
+            ClientValue::Bytes
         } else {
-            None
+            ClientValue::Count
         };
+        let absent_labels = if matches!(op, RangeAggOp::AbsentOverTime) {
+            range
+                .selector
+                .selector
+                .matchers
+                .iter()
+                .filter(|m| m.op == MatchOp::Eq)
+                .map(|m| (m.name.clone(), m.value.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(ClientAgg {
+            pipeline: pipeline.clone(),
+            value,
+            range_op: *op,
+            param: quantile,
+            absent_labels,
+            grouping,
+        })
+    } else {
+        None
+    };
 
     // Issue #343: `offset d` evaluates the range selector over
     // `(T - d - range, T - d]` — the WHOLE time domain moves back by `d`,
@@ -2251,10 +2258,16 @@ mod variant_spec {
             window: ClientWindow,
             instant_lower_inclusive: bool,
             rate_window_ns: Option<u64>,
+            range_grouping: Option<&Grouping>,
         ) -> Result<Self, ReadError> {
             let is_absent = matches!(range_op, RangeAggOp::AbsentOverTime);
-            let bytes =
-                super::super::variants::variant_spec_bytes(tail, selector, is_absent, agg_chain);
+            let bytes = super::super::variants::variant_spec_bytes(
+                tail,
+                selector,
+                is_absent,
+                range_grouping,
+                agg_chain,
+            );
             crate::logql::variants::charge_fanout_bytes(charged, bytes, cap).map_err(
                 |(bytes, cap)| {
                     ReadError::QueryTooBroad(TooBroadReason::VariantSpecBytes { bytes, cap })
@@ -2308,6 +2321,10 @@ mod variant_spec {
                     range_op,
                     param,
                     absent_labels,
+                    // Issue #344: charged above through
+                    // `variant_spec_bytes`' range-grouping term, so the
+                    // clone here is one the charge already paid for.
+                    grouping: range_grouping.map(|g| Box::new(RangeGrouping::from_ast(g))),
                 },
                 window,
                 instant_lower_inclusive,
@@ -2396,6 +2413,7 @@ mod variant_spec {
                     end_ns: 60,
                 },
                 false,
+                None,
                 None,
             )
             .expect("try_new");
@@ -2517,14 +2535,30 @@ fn build_variants_node(
         else {
             return Err(reject(index));
         };
-        // Issue #344: a range-aggregation grouping is parsed but not yet
-        // executed; inside `variants(...)` it is rejected by the same
-        // named error the top-level planner uses, never silently dropped.
-        if grouping.is_some() {
-            return Err(ReadError::PipelineInvalid {
-                reason: RANGE_GROUPING_UNSUPPORTED.to_string(),
-            });
-        }
+        // Issue #344: each variant carries its OWN grouping, normalized
+        // here and applied per row by the sub-state's projection — which
+        // is what the reference does too
+        // (`variantRangeAggExprExtractor`, `pkg/logql/syntax/extractor.go
+        // :148-181 @ v3.7.4`, reads `rangeAgg.Grouping` per variant and
+        // builds a per-variant `LabelExtractorWithStages`). The compiled
+        // pipeline is SHARED across variants with equal tails
+        // ([`super::super::variants::VariantArena`]), so the grouping
+        // cannot live on it; it rides `ClientAgg` and is passed per call.
+        //
+        // ORDER — the asymmetry the grammar half carried forward is
+        // CLOSED, by DELETING the refusals rather than by reordering
+        // them. The grammar half placed the `variants(...)` grouping
+        // refusal BEFORE this arm's unwrap-arity checks and the top-level
+        // one AFTER, so an allowed grouped shape could in principle have
+        // displaced a reference-verbatim arity message. Neither arm has a
+        // grouping rejection any more: the clause is normalized (by
+        // `RangeGrouping::from_ast`, inside `VariantSpec::try_new`, which
+        // is total and cannot fail) and executed. With no fallible step
+        // there is nothing left to order, in either arm, so the defect
+        // this would have become is structurally gone rather than merely
+        // unreachable. `grouping` therefore stays the AST clause here and
+        // is normalized once at the single `VariantSpec` construction
+        // site, where its bytes are charged before the clone.
 
         // Arity is decided by the VARIANT's own expression, not the
         // common range (Δ1) — the reference messages verbatim.
@@ -2682,6 +2716,7 @@ fn build_variants_node(
             window,
             instant_lower_inclusive,
             rate_window_ns,
+            grouping.as_ref(),
         )?;
         variants.push(spec);
     }
@@ -4850,6 +4885,77 @@ mod tests {
         }
     }
 
+    /// Issue #344 execution half — the range-aggregation grouping is
+    /// PLANNED, in both arms, and lands on the `ClientAgg` that carries
+    /// it to the per-row projection. Both refusals are gone, and the
+    /// ordering asymmetry between the arms goes with them: neither arm
+    /// has a fallible grouping step left, so no arity message can be
+    /// displaced by one.
+    #[test]
+    fn a_range_aggregation_grouping_is_planned_in_both_arms() {
+        let spec = QuerySpec::Instant {
+            at_ns: 60_000_000_000,
+        };
+        let params = QueryParams {
+            spec,
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        // Top level.
+        let expr =
+            parse(r#"max_over_time({a="b"} | logfmt | unwrap v [5m]) by (fp, fp)"#).expect("parse");
+        let Plan::Metric(mp) = plan(&expr, &params, &test_ctx()).expect("plans") else {
+            panic!("expected a metric plan")
+        };
+        let client = mp.client.as_ref().expect("grouped ⇒ client-aggregated");
+        assert_eq!(
+            client.grouping,
+            Some(Box::new(RangeGrouping::By(vec!["fp".to_string()]))),
+            "the clause must reach `ClientAgg`, deduplicated"
+        );
+
+        // `variants(...)`: per variant, each carrying its OWN clause.
+        const V: &str = concat!(
+            r#"variants(max_over_time({a="b"} | logfmt | unwrap v [5m]) by (fp), "#,
+            r#"min_over_time({a="b"} | logfmt | unwrap v [5m]) without (region), "#,
+            r#"count_over_time({a="b"}[5m])) of ({a="b"}[5m])"#,
+        );
+        let (_, variants, _) = variants_parts(V, spec);
+        assert_eq!(variants.len(), 3);
+        assert_eq!(
+            variants[0].client().grouping,
+            Some(Box::new(RangeGrouping::By(vec!["fp".to_string()])))
+        );
+        assert_eq!(
+            variants[1].client().grouping,
+            Some(Box::new(RangeGrouping::Without(vec!["region".to_string()])))
+        );
+        assert_eq!(
+            variants[2].client().grouping,
+            None,
+            "an ungrouped sibling is untouched"
+        );
+
+        // The arity messages both arms carry are still reached and still
+        // verbatim — the property the deleted refusals could have broken.
+        let arity = parse(r#"max_over_time({a="b"}[5m]) by (fp)"#).expect("parse");
+        match plan(&arity, &params, &test_ctx()) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert_eq!(reason, "invalid aggregation max_over_time without unwrap");
+            }
+            other => panic!("expected the arity rejection, got {other:?}"),
+        }
+        match variants_plan_of(
+            r#"variants(max_over_time({a="b"}[5m]) by (fp)) of ({a="b"}[5m])"#,
+            spec,
+        ) {
+            Err(ReadError::PipelineInvalid { reason }) => {
+                assert_eq!(reason, "invalid aggregation max_over_time without unwrap");
+            }
+            other => panic!("expected the arity rejection, got {other:?}"),
+        }
+    }
+
     /// B2 / AC 4 — unwrap arity is decided by the VARIANT's own pipeline
     /// (the reference messages verbatim); a common-range unwrap alone
     /// trips NEITHER (it is dead syntax — Δ1).
@@ -5126,8 +5232,13 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
         };
-        let sized =
-            crate::logql::variants::variant_spec_bytes(tail, &range.selector.selector, false, me);
+        let sized = crate::logql::variants::variant_spec_bytes(
+            tail,
+            &range.selector.selector,
+            false,
+            None,
+            me,
+        );
         assert!(sized > 0);
         let mut charged = 0u64;
         VariantSpec::try_new(
@@ -5144,6 +5255,7 @@ mod tests {
             false,
             window,
             false,
+            None,
             None,
         )
         .expect("exactly the sized charge admits");
@@ -5163,6 +5275,7 @@ mod tests {
             false,
             window,
             false,
+            None,
             None,
         ) {
             Err(ReadError::QueryTooBroad(TooBroadReason::VariantSpecBytes { bytes, cap })) => {

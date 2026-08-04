@@ -1,12 +1,11 @@
 # b18 — grouping on a RANGE aggregation (issue #344).
 #
-# Reference of record: grafana/loki:3.7.4. Captured 2026-08-02 against a
+# Reference of record: grafana/loki:3.7.4. The grammar half was captured
+# 2026-08-02; the EXECUTION values below were captured 2026-08-04 against a
 # container whose identity was READ FROM THE RUNNING PROCESS, not from any
 # committed header: `/loki/api/v1/status/buildinfo` answered
-# {"version":"3.7.4","revision":"b318f282","branch":"release-3.7.x"}.
-# (Issue #350 is fixing a header that claimed a capture never taken, and a
-# concurrent branch is re-pinning the comparison container 3.7.3 -> 3.7.4;
-# neither was trusted here.)
+# {"version":"3.7.4","revision":"b318f282","branch":"release-3.7.x"} — the
+# same `b318f282` the pinned digest resolves to.
 #
 # WHICH OPS TAKE IT — probed, not reasoned about. All fifteen range
 # aggregations were sent in both directions (`by (fp)` and `without (fp)`,
@@ -37,36 +36,113 @@
 # unwrap check is reached normally: `max_over_time({app="x"} [5m]) by (fp)`
 # answers `invalid aggregation max_over_time without unwrap`.)
 #
-# SEMANTICS — captured against the same container over three streams,
-# {app=x,fp=1,region=eu} with samples 1 and 5, {app=x,fp=2,region=eu} with
-# 10, {app=x,fp=1,region=us} with 7:
+# WHERE THE GROUPING IS APPLIED, and why that is the whole semantics. In
+# the reference it is applied inside the SAMPLE EXTRACTOR, before a sample
+# reaches any window: `streamLabelSampleExtractor.Process` ends in
+# `l.builder.GroupedLabels()` (`pkg/logql/log/metrics_extraction.go:229 @
+# v3.7.4`), and `batchRangeVectorIterator.load` then appends the sample
+# into `window[lbs]` keyed by that already-projected label string
+# (`pkg/logql/range_vector.go:149-188 @ v3.7.4`). So samples from
+# DIFFERENT streams that project to the same group land in ONE sample
+# slice, and the reducer sees the merged raw samples — not a per-series
+# result. That is what makes this construct more than sugar for an outer
+# vector aggregation, and every value below is a direct consequence.
 #
-#   * `by (L)` reduces the output labels to L alone and merges every series
-#     sharing L: `max_over_time(...) by (fp)` is {fp="1"}=7, {fp="2"}=10.
-#   * The merge is over the group's RAW SAMPLES, not over per-series
-#     results. `stddev_over_time(...) by (fp)` is 2.494438257849294 for
-#     fp=1 — the population stddev of {1,5,7} — where a stddev of the
-#     per-series stddevs would be 1. This is what makes the construct more
-#     than sugar for an outer vector aggregation.
+# THE UNWRAPPED LABEL IS PART OF THE GROUPING, not deleted beside it.
+# `LabelExtractorWithStages` (`metrics_extraction.go:154-158 @ v3.7.4`)
+# folds it into the group list —
+#     if len(groups) == 0 || without { without = true;
+#                                      groups = append(groups, labelName) }
+# — so "no grouping" and `without (…)` are one code path (both delete it)
+# while `by (L)` is another (which does not). Nothing else in the
+# reference ever deletes it. Hence the `by (v)` row below, where `v` IS
+# the unwrapped label and survives into the output series.
+#
+# SEMANTICS, captured over the three streams loaded below:
+#
+#   * `by (L)` reduces the output labels to L alone and merges every
+#     series sharing L.
+#   * The merge is over the group's RAW SAMPLES. `stddev_over_time(...)
+#     by (fp)` for fp=1 is the population stddev of the MERGED {1,5,7};
+#     a stddev of the per-series stddevs would be 1. The second section
+#     below is the sharper form of the same test.
 #   * `without (L)` keeps every label except L, including parser-derived
-#     ones (`msg`, `detected_level`, `service_name`).
-#   * `by ()` collapses everything into one series with an EMPTY label set;
-#     `without ()` is the identity.
+#     ones.
+#   * `by ()` collapses everything into one series with an EMPTY label
+#     set; `without ()` is the identity.
 #   * `by (absent_label)` collapses into `{}` — the absent name is not
 #     materialised as an empty-string label.
 #   * Duplicates dedupe, the same as issue #288 established for vector
-#     aggregations — `by (fp, fp)` == `by (fp)`, `without (region, region)`
-#     == `without (region)` — but that was CONFIRMED here rather than
-#     carried over.
+#     aggregations — CONFIRMED here rather than carried over.
 #
-# STATE OF THIS FILE. The grammar half has landed: the seven rejections
-# carry the reference's wording, and the eight accepted forms now parse.
-# EXECUTION has not — re-keying the client aggregator's groups needs a
-# total sample order across merged streams for first/last_over_time — so
-# the eight currently stop at a named planner refusal, pinned below. The
-# semantics above are that work's acceptance criteria, captured while the
-# container was in hand; when execution lands, the eight `eval_fail` rows
-# become `eval` rows with those values and this note goes.
+# `detected_level` is stripped from every expected label set below, per
+# PROVENANCE.md: the reference injects it and PulsusDB's label model has
+# no analogue. Values are unaffected.
+#
+# THE SAME-TIMESTAMP CROSS-STREAM TIE, on both paths. `by (fp)` on the
+# first fixture creates a genuine tie: two DIFFERENT streams both hold a
+# sample at 30s inside the fp="1" group ({region="eu"} v=5 and
+# {region="us"} v=7). The reference resolves it by DELIVERY ORDER, and
+# delivery order is `(timestamp, StableHash(stream labels))`
+# (`SampleIteratorHeap.Less`, `pkg/iter/sample_iterator.go:139-148 @
+# v3.7.4`; `StreamHash()` is the base-labels hash,
+# `pkg/chunkenc/memchunk.go:1922 @ v3.7.4`), with `first`/`last` the ends
+# of that order — `samples[0]`/`samples[len-1]` batched
+# (`range_vector.go:489-501`) and `FirstOverTime.agg`/`LastOverTime.agg`
+# streaming (`:818-844`). On THIS label set the `us` stream sorts first,
+# so the reference answers `first` = 7 and `last` = 5.
+#
+# Both are asserted below, on BOTH paths. That is new with the execution
+# half: the instant reducer previously used a PulsusDB-specific value
+# tiebreak (smallest at the first timestamp, largest at the last), adopted
+# on the premise that the reference's instant tie order was unspecified.
+# The source above refutes that premise — the streaming evaluator an
+# instant query uses reads the same delivery order — so the value rule was
+# simply a wrong answer (7 where the reference says 5), not a ratified
+# divergence, and it is gone. The one residual is unchanged and unrelated:
+# same-nanosecond SAME-STREAM samples are ordered by full body bytes,
+# because the reference orders them by an ingestion ordinal it does not
+# store.
+#
+# included.
+#
+# NO GROUPED `avg_over_time` ROW — deliberate, and measured (issue #344
+# review round 1). The reference answers a grouped `avg_over_time`
+# DIFFERENTLY from an ungrouped one over the same samples in the same
+# order, in the last bits. Measured on the pinned v3.7.4, default config,
+# one stream, four samples at distinct ascending timestamps
+# {83.2, 42.2, 79.0, 12.6}:
+#
+#   avg_over_time(…)              -> 54.24999999999999
+#   avg_over_time(…) by (env)     -> 54.25
+#   avg_over_time(…) without ()   -> 54.24999999999999   (the no-op grouping)
+#
+# 54.24999999999999 is the reducer's own recurrence
+# (`mean += F/count - mean/count`, `range_vector.go:379-401`/`:716-744 @
+# v3.7.4`) folded in timestamp order; 54.25 is `sum/count` (the reference
+# also answers `sum_over_time` = 217 and there are 4 samples). Stable over
+# 25 runs each, so it is not a Go-map walk. It is NOT a fold-order effect
+# either: `stdvar_over_time` over the SAME stream answers
+# 832.6475000000002 both grouped and ungrouped, and that fixture's
+# permutations span five distinct values — so the order is unchanged and
+# only `avg` moves. The mechanism is not in `rangemapper.go`/
+# `shardmapper.go` (neither lists `OpRangeTypeAvg`), so it is recorded as
+# a measurement rather than explained away.
+#
+# A captured grouped-`avg` row would therefore pin a value the reducer
+# never computes — the same trap `b17_grouping_dedup.test` documents for
+# vector `avg` under a sharded frontend. The row that WAS here
+# (`avg_over_time(…) by (fp)` = 4.333333333333333, which is 13/3, i.e.
+# sum/count again) is deleted, and the reducer's recurrence is pinned by
+# the UNGROUPED row in the third section below instead — where the
+# reference and PulsusDB agree exactly.
+#
+# The measurement is recorded in full, including what was ruled out and
+# the fact that the mechanism is UNIDENTIFIED, as
+# `grouped-avg-over-time-unexplained` in
+# docs/benchmarks/logs-differential-ledger.md. It is not a deliberate
+# divergence and is not marked as one; the absence of a grouped `avg` row
+# here is the point, not an oversight.
 #
 # provenance: captured
 # (file default; see logqltest/PROVENANCE.md §provenance markers.
@@ -112,7 +188,7 @@ eval_fail instant at 60s sum_over_time({service_name="rg"}[1m]) by (fp)
 eval_fail instant at 60s bytes_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
   msg: grouping not allowed for bytes_over_time aggregation
 
-# …and for an op that DOES allow grouping, the unwrap check is still reached.
+# …and for an op that DOES allow grouping the unwrap check is still reached.
 eval_fail instant at 60s max_over_time({service_name="rg"}[1m]) by (fp)
   msg: invalid aggregation max_over_time without unwrap
 
@@ -121,35 +197,348 @@ eval_fail instant at 60s max_over_time({service_name="rg"}[1m]) by (fp)
 eval_fail instant at 60s max_over_time by (fp) ({service_name="rg"} | logfmt | unwrap v [1m])
   msg: unexpected
 
-# --- the eight that parse; execution pending (issue #344) ---
+# --- the eight that accept it, executed ---
+#
+# `by (fp)` merges {region="eu"} and {region="us"} for fp="1", so its
+# group holds the merged samples {1,5,7} and fp="2" holds {10}.
 
-eval_fail instant at 60s avg_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
-  msg: not yet executed
+eval instant at 60s min_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 1
+  {fp="2"} 10
 
-eval_fail instant at 60s min_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
-  msg: not yet executed
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 7
+  {fp="2"} 10
 
-eval_fail instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
-  msg: not yet executed
+# THE DISCRIMINATING ROW on this fixture: 2.494438257849294 is the
+# population stddev of the MERGED {1,5,7}. A per-series implementation
+# (stddev of {2, 0}) gives 1.
+eval instant at 60s stddev_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 2.494438257849294
+  {fp="2"} 0
 
-eval_fail instant at 60s stddev_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
-  msg: not yet executed
+eval instant at 60s stdvar_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 6.222222222222222
+  {fp="2"} 0
 
-eval_fail instant at 60s stdvar_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
-  msg: not yet executed
+eval instant at 60s quantile_over_time(0.99, {service_name="rg"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 6.959999999999999
+  {fp="2"} 10
 
-eval_fail instant at 60s quantile_over_time(0.99, {service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
-  msg: not yet executed
+eval instant at 60s quantile_over_time(0.5, {service_name="rg"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 5
+  {fp="2"} 10
 
-eval_fail instant at 60s first_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
-  msg: not yet executed
+# The fp="1" group's earliest sample is the unique one at 0s, so `first`
+# carries no tie here…
+eval instant at 60s first_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 1
+  {fp="2"} 10
 
-eval_fail instant at 60s last_over_time({service_name="rg"} | logfmt | unwrap v [1m]) without (region)
-  msg: not yet executed
+# …but `last` lands squarely on the cross-stream tie at 30s (see the
+# header): 5, the `eu` stream, because `us` sorts FIRST under StableHash
+# and `last` takes the final delivered sample. Neither value is the
+# larger of the two, which is what the deleted value tiebreak returned.
+eval instant at 60s last_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 5
+  {fp="2"} 10
 
-# `BY`/`WITHOUT` fold, and the postfix clause is still recognised.
-eval_fail instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [1m]) BY (fp)
-  msg: not yet executed
+# The same tie under `without`, so the rule is pinned for both grouping
+# directions rather than only the one that reduces to a single label.
+eval instant at 60s last_over_time({service_name="rg"} | logfmt | unwrap v [5m]) without (region)
+  {env="prod", fp="1", service_name="rg"} 5
+  {env="prod", fp="2", service_name="rg"} 10
 
-eval_fail instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [1m]) WITHOUT (region)
-  msg: not yet executed
+# --- `without`: keeps every other label, drops the unwrapped one ---
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) without (region)
+  {env="prod", fp="1", service_name="rg"} 7
+  {env="prod", fp="2", service_name="rg"} 10
+
+eval instant at 60s first_over_time({service_name="rg"} | logfmt | unwrap v [5m]) without (region)
+  {env="prod", fp="1", service_name="rg"} 1
+  {env="prod", fp="2", service_name="rg"} 10
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) without (fp, region, env)
+  {service_name="rg"} 10
+
+# --- the empty-list forms, and the ungrouped control they bracket ---
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by ()
+  {} 10
+
+# `without ()` is the identity — byte-identical to the ungrouped row below.
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) without ()
+  {env="prod", fp="1", region="eu", service_name="rg"} 5
+  {env="prod", fp="1", region="us", service_name="rg"} 7
+  {env="prod", fp="2", region="eu", service_name="rg"} 10
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m])
+  {env="prod", fp="1", region="eu", service_name="rg"} 5
+  {env="prod", fp="1", region="us", service_name="rg"} 7
+  {env="prod", fp="2", region="eu", service_name="rg"} 10
+
+# An absent name collapses to `{}` WITHOUT being materialised as `nosuch=""`.
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (nosuch)
+  {} 10
+
+# --- multi-name and duplicate grouping lists ---
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp, region)
+  {fp="1", region="eu"} 5
+  {fp="1", region="us"} 7
+  {fp="2", region="eu"} 10
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp, fp)
+  {fp="1"} 7
+  {fp="2"} 10
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) without (region, region)
+  {env="prod", fp="1", service_name="rg"} 7
+  {env="prod", fp="2", service_name="rg"} 10
+
+# --- `by` on the UNWRAPPED label keeps it (see the header note) ---
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (v)
+  {v="1"} 1
+  {v="5"} 5
+  {v="7"} 7
+  {v="10"} 10
+
+# --- case folding, and composition with an outer aggregation ---
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) BY (fp)
+  {fp="1"} 7
+  {fp="2"} 10
+
+eval instant at 60s max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) WITHOUT (region)
+  {env="prod", fp="1", service_name="rg"} 7
+  {env="prod", fp="2", service_name="rg"} 10
+
+eval instant at 60s sum by (fp) (max_over_time({service_name="rg"} | logfmt | unwrap v [5m]) by (fp))
+  {fp="1"} 7
+  {fp="2"} 10
+
+# --- the RANGE (sliding) path takes the grouping too ------------------
+#
+# Grid {0,30s,60s}, window `(t-range, t]`. The fp="1" group merges the
+# {region="eu"} and {region="us"} streams, so each window holds the union
+# of their samples and the reducer runs over that union.
+#
+# `[30s]`: t=0 → fp1 {1}, fp2 {10}; t=30s → fp1 {5,7} (both streams),
+# fp2 empty (a gap, the 0s sample is `≤ t-range`); t=60s → both empty.
+
+eval range from 0s to 60s step 30s max_over_time({service_name="rg"} | logfmt | unwrap v [30s]) by (fp)
+  {fp="1"} 0s 1 30s 7
+  {fp="2"} 0s 10
+
+eval range from 0s to 60s step 30s min_over_time({service_name="rg"} | logfmt | unwrap v [30s]) by (fp)
+  {fp="1"} 0s 1 30s 5
+  {fp="2"} 0s 10
+
+# `[1m]`: t=30s → fp1 {1,5,7}; t=60s → fp1 {5,7} (0s excluded).
+eval range from 0s to 60s step 30s max_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  {fp="1"} 0s 1 30s 7 60s 7
+  {fp="2"} 0s 10 30s 10
+
+eval range from 0s to 60s step 30s max_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by ()
+  {} 0s 10 30s 10 60s 7
+
+# THE CROSS-STREAM TIE on the sliding path — the same rule the instant
+# rows above pin, reached through a different evaluator. At t=30s the
+# fp="1" window holds two samples at the SAME nanosecond from two
+# DIFFERENT streams ({region="eu"} v=5 and {region="us"} v=7); the `us`
+# stream sorts first under StableHash, so `first` is 7 and `last` is 5 —
+# the OPPOSITE of what a value-ordered tiebreak gives for either. These
+# rows are simultaneously the grouping test and the evidence that our
+# `stream_hash` IS Loki's `StableHash`: nothing else would land on 7/5
+# rather than 5/7.
+eval range from 0s to 60s step 30s first_over_time({service_name="rg"} | logfmt | unwrap v [30s]) by (fp)
+  {fp="1"} 0s 1 30s 7
+  {fp="2"} 0s 10
+
+eval range from 0s to 60s step 30s last_over_time({service_name="rg"} | logfmt | unwrap v [30s]) by (fp)
+  {fp="1"} 0s 1 30s 5
+  {fp="2"} 0s 10
+
+eval range from 0s to 60s step 30s first_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  {fp="1"} 0s 1 30s 1 60s 7
+  {fp="2"} 0s 10 30s 10
+
+eval range from 0s to 60s step 30s last_over_time({service_name="rg"} | logfmt | unwrap v [1m]) by (fp)
+  {fp="1"} 0s 1 30s 5 60s 5
+  {fp="2"} 0s 10 30s 10
+
+clear
+
+# =====================================================================
+# The sharper raw-sample discriminator: TWO streams sharing fp="g", with
+# well-separated per-stream value ranges, so a per-series implementation
+# and a merged-samples one cannot be confused for one another.
+#
+#   merged {1,2,10,20}: population stddev 7.628073151196178
+#   per-series stddevs {0.5, 5}: their stddev would be 2.25
+#
+# Every sample sits at its own timestamp, so `first`/`last` carry no tie.
+# =====================================================================
+
+load
+  {env="prod", service_name="rg2", fp="g", s="one"}
+  0s  v=1
+  15s v=2
+  {env="prod", service_name="rg2", fp="g", s="two"}
+  30s v=10
+  45s v=20
+
+eval instant at 60s stddev_over_time({service_name="rg2"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="g"} 7.628073151196178
+
+# The ungrouped control: the per-series stddevs the grouped row is NOT.
+eval instant at 60s stddev_over_time({service_name="rg2"} | logfmt | unwrap v [5m])
+  {env="prod", fp="g", s="one", service_name="rg2"} 0.5
+  {env="prod", fp="g", s="two", service_name="rg2"} 5
+
+eval instant at 60s stdvar_over_time({service_name="rg2"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="g"} 58.18749999999999
+
+eval instant at 60s avg_over_time({service_name="rg2"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="g"} 8.25
+
+eval instant at 60s quantile_over_time(0.5, {service_name="rg2"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="g"} 6
+
+# first/last across the merged streams, tie-free: the group's endpoints
+# are the 0s sample of one stream and the 45s sample of the other.
+eval instant at 60s first_over_time({service_name="rg2"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="g"} 1
+
+eval instant at 60s last_over_time({service_name="rg2"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="g"} 20
+
+eval instant at 60s sum(stddev_over_time({service_name="rg2"} | logfmt | unwrap v [5m]) by (fp))
+  {} 7.628073151196178
+
+clear
+
+clear
+
+# =====================================================================
+# THE FINGERPRINT-vs-StableHash INVERSION (issue #344 review round 1).
+#
+# The order-DEPENDENT reducers (`sum`/`avg`/`stddev`/`stdvar`/
+# `rate_counter` and unwrapped `rate`) must fold in Loki's delivery order
+# `(timestamp, StableHash, tie_rank)`. `first`/`last` can be SELECTED by
+# comparing that key, but a Welford fold cannot — every sample's POSITION
+# matters — and the scan cannot supply the order: `metric_raw_samples`
+# orders equal timestamps by `fingerprint` while the reference orders
+# them by `StableHash`, and those two are unrelated hashes.
+#
+# This section makes them DISAGREE on purpose. The streams are declared
+# so the FIRST (lower fingerprint) carries the HIGHER StableHash:
+#
+#   {env=prod, fp=1, region=a, service_name=inv}  StableHash 4756057037604826754
+#   {env=prod, fp=1, region=d, service_name=inv}  StableHash 2731236545490999475
+#
+# so fingerprint order is (a, d) and delivery order is (d, a). Both hold
+# a sample at exactly 30s inside one `by (fp)` group, and the values are
+# chosen so Welford separates the two orders in the last bits:
+#
+#   fold [1.1, 3.1, 0.1]  (delivery order)     stdvar 1.5555555555555556
+#   fold [1.1, 0.1, 3.1]  (fingerprint order)  stdvar 1.5555555555555554
+#
+# The captured values below are the delivery-order ones. `last_over_time`
+# = 0.1 — the `a` stream, which sorts LAST — is the independent witness
+# that the inversion is real on this fixture rather than assumed: under
+# fingerprint order `a` comes first and `last` would be 3.1.
+# =====================================================================
+
+load
+  {env="prod", service_name="inv", fp="1", region="a"}
+  0s  v=1.1
+  30s v=0.1
+  {env="prod", service_name="inv", fp="1", region="d"}
+  30s v=3.1
+
+# THE ORDER DISCRIMINATOR — fingerprint order gives ...554.
+eval instant at 60s stdvar_over_time({service_name="inv"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 1.5555555555555556
+
+eval instant at 60s stddev_over_time({service_name="inv"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 1.247219128924647
+
+# The witness: `a` sorts LAST under StableHash on this fixture.
+eval instant at 60s last_over_time({service_name="inv"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 0.1
+
+# Order-INDEPENDENT reducers are unaffected, and are here so a change
+# that reordered everything could not hide behind the rows above.
+eval instant at 60s max_over_time({service_name="inv"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 3.1
+
+eval instant at 60s first_over_time({service_name="inv"} | logfmt | unwrap v [5m]) by (fp)
+  {fp="1"} 1.1
+
+clear
+
+# =====================================================================
+# `avg_over_time`'s OWN RECURRENCE, ungrouped — where the reference and
+# PulsusDB agree exactly, and the row the deleted grouped `avg` row is
+# replaced by (see the header).
+#
+# The reference's range reducer is `mean += F/count - mean/count`
+# (`range_vector.go:379-401` batched, `:716-744` streaming), NOT the
+# `mean += (F - mean)/count` its VECTOR aggregation uses
+# (`evaluator.go:525-526`). The two are algebraically equal and differ in
+# floating point on about a quarter of random inputs; these four values
+# are one such case:
+#
+#   mean += F/n - mean/n    -> 54.24999999999999   (the reference, captured)
+#   mean += (F - mean)/n    -> 54.25000000000001
+#   sum/count               -> 54.25
+# =====================================================================
+
+load
+  {env="prod", service_name="avgr"}
+  0s  v=83.2
+  5s  v=42.2
+  10s v=79.0
+  15s v=12.6
+
+eval instant at 60s avg_over_time({service_name="avgr"} | logfmt | unwrap v [5m])
+  {env="prod", service_name="avgr"} 54.24999999999999
+
+clear
+
+# =====================================================================
+# THE ERROR PATH KEEPS THE UNWRAPPED LABEL (issue #344 review round 1).
+#
+# `GroupedLabels` returns `b.LabelsResult()` — the builder's labels
+# UNTOUCHED — as soon as `HasErr()` (`pkg/logql/log/labels.go:665-668 @
+# v3.7.4`), and nothing else in the reference ever deletes the unwrapped
+# label: it goes only via the `without` list the extractor folds it into,
+# which is part of the grouping that branch skips. So on an errored line
+# it survives, grouped and ungrouped alike.
+#
+# The shape that reaches it is a SUCCESSFUL unwrap followed by a FAILING
+# post-unwrap numeric filter — `v` is converted and pending deletion, and
+# then `| lat > 1` errors on a non-numeric `lat`. Captured verbatim from
+# the pinned container, which answers 400 for both forms with the same
+# series, `v="5"` included:
+#
+#   pipeline error: 'LabelFilterErr' for series: '{__error__="LabelFilterErr",
+#   __error_details__="strconv.ParseFloat: parsing \"abc\": invalid syntax",
+#   detected_level="unknown", env="prod", fp="9", lat="abc",
+#   service_name="perr", v="5"}'
+# =====================================================================
+
+load
+  {env="prod", service_name="perr", fp="9"}
+  10s v=5 lat=abc
+
+eval_fail instant at 60s max_over_time({service_name="perr"} | logfmt | unwrap v | lat > 1 [5m]) by (fp)
+  msg: v="5"
+
+eval_fail instant at 60s max_over_time({service_name="perr"} | logfmt | unwrap v | lat > 1 [5m])
+  msg: v="5"
+
+clear

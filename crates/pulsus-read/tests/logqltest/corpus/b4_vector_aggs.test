@@ -5,8 +5,11 @@
 # and with by/without grouping) over an INNER metric range expression
 # (count_over_time / rate through a `| logfmt` parser, the raw-scan
 # client-aggregation path). Instant metric queries are semantically
-# identical to the reference (docs/features.md:55), so every expected value
-# below is a BIT-EXACT capture from grafana/loki:3.7.4 (see PROVENANCE.md
+# identical to the reference (docs/features.md:55) — except for the
+# ratified same-nanosecond same-stream `tie_rank` residual, which applies
+# to them too (issue #344) and which no case here contains — so every
+# expected value below is a BIT-EXACT capture from grafana/loki:3.7.4
+# (see PROVENANCE.md
 # for the capture procedure — the #218 discipline, never hand-computed).
 #
 # Datasets are multi-series (several logfmt-extracted label values) so the

@@ -1,8 +1,11 @@
 # B3 — metric range-aggregation value corpus (issue #220, Lean plan).
 #
 # Every case is an instant metric eval. Instant metric queries are
-# semantically identical to the reference (docs/features.md:55), so each
-# expected value below is a BIT-EXACT capture from grafana/loki:3.7.4 (the
+# semantically identical to the reference (docs/features.md:55) — except
+# for the ratified same-nanosecond same-stream `tie_rank` residual, which
+# applies to them too (issue #344) and which no case here contains — so
+# each expected value below is a BIT-EXACT capture from
+# grafana/loki:3.7.4 (the
 # #218 discipline: rate/rate_counter extrapolation factors are captured
 # verbatim, never hand-computed as increase/60). See PROVENANCE.md for the
 # capture procedure.

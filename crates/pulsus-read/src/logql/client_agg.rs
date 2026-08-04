@@ -10,7 +10,7 @@
 //! no hot-path call crosses a codegen-unit boundary.
 
 use super::error::{ReadError, TooBroadReason};
-use super::pipeline::{ERROR_LABEL, MetricRun};
+use super::pipeline::{ERROR_LABEL, MetricRun, RangeGrouping};
 use super::plan::{self, ClientAgg, ClientValue};
 use super::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_logql::RangeAggOp;
@@ -37,63 +37,150 @@ pub(in crate::logql) const CLIENT_AGG_CHUNK_ROWS: usize = 8_192;
 
 /// Streaming per-bucket accumulator for every over-time reducer except
 /// `quantile_over_time` (which needs the full value set). Welford's
-/// algorithm for mean/M2 (population stddev/stdvar); first/last are
-/// timestamp-anchored, order-independent.
+/// algorithm for mean/M2 (population stddev/stdvar); first/last are the
+/// endpoints of the canonical `(timestamp, stream_hash, tie_rank)` order.
 #[derive(Debug, Clone)]
 pub(in crate::logql) struct SimpleAcc {
     count: u64,
     sum: f64,
     min: f64,
     max: f64,
-    mean: f64,
+    /// `avg_over_time`'s mean, under the RANGE aggregation's own
+    /// recurrence — NOT the vector aggregation's. See [`SimpleAcc::fold`].
+    avg_mean: f64,
+    /// Welford's mean, feeding `m2` for `stddev`/`stdvar` only.
+    w_mean: f64,
     m2: f64,
-    first_ts: i64,
+    /// The `(timestamp, stream_hash)` key of the current `first`/`last`
+    /// candidate — see [`SimpleAcc::add`] for why `tie_rank` needs no
+    /// field.
+    first_key: (i64, u64),
     first_v: f64,
-    last_ts: i64,
+    last_key: (i64, u64),
     last_v: f64,
 }
 
 impl SimpleAcc {
-    fn new(ts_ns: i64, v: f64) -> Self {
-        SimpleAcc {
-            count: 1,
-            sum: v,
+    /// Seeds from the first sample by folding it through [`Self::fold`],
+    /// so the seed and every later sample take the SAME arithmetic path.
+    /// The reference's accumulators all start from a zero state and fold
+    /// sample one like any other (`range_vector.go:704-802 @ v3.7.4`), so
+    /// a hand-written seed is a second implementation of the recurrence
+    /// that can — and did — disagree with it (`aux += v*(v-mean)` is
+    /// `NaN`, not `0.0`, when the first sample is infinite).
+    fn new(ts_ns: i64, stream_hash: u64, v: f64) -> Self {
+        let mut acc = SimpleAcc {
+            count: 0,
+            sum: 0.0,
             min: v,
             max: v,
-            mean: v,
+            avg_mean: 0.0,
+            w_mean: 0.0,
             m2: 0.0,
-            first_ts: ts_ns,
+            first_key: (ts_ns, stream_hash),
             first_v: v,
-            last_ts: ts_ns,
+            last_key: (ts_ns, stream_hash),
             last_v: v,
-        }
+        };
+        acc.fold(v);
+        acc
     }
 
-    fn add(&mut self, ts_ns: i64, v: f64) {
+    /// The value-only half: every per-sample recurrence, transcribed from
+    /// the reference's own reducers.
+    ///
+    /// **`avg_over_time` and the vector `avg` use DIFFERENT recurrences in
+    /// the reference, and PulsusDB had transcribed the wrong one here.**
+    /// The vector aggregation is `mean += (F - mean)/count`
+    /// (`pkg/logql/evaluator.go:525-526 @ v3.7.4`, which
+    /// [`super::agg::VectorAccum`] correctly reproduces); the RANGE
+    /// aggregation is `mean += F/count - mean/count`
+    /// (`pkg/logql/range_vector.go:400` batched, `:739` streaming). Those
+    /// are algebraically equal and NOT equal in floating point: over
+    /// 200 000 random 2-to-6-sample groups they disagree in the last bits
+    /// on **25%** of inputs. So `avg_mean` carries the range recurrence
+    /// and `w_mean` Welford's — two means, because the reference keeps
+    /// two accumulators.
+    ///
+    /// The infinity guards (`range_vector.go:383-399`) come with it: once
+    /// the mean is infinite, a same-signed infinite sample and any finite
+    /// non-NaN sample both leave it alone, where the plain recurrence
+    /// would produce `Inf - Inf = NaN`. `count` is still incremented,
+    /// exactly as the reference does before its `continue`.
+    fn fold(&mut self, v: f64) {
         self.count += 1;
         self.sum += v;
         self.min = self.min.min(v);
         self.max = self.max.max(v);
-        let delta = v - self.mean;
-        self.mean += delta / self.count as f64;
-        self.m2 += delta * (v - self.mean);
-        // Equal-timestamp tie-break (review round 2, finding 2): the
-        // pinned PulsusDB rule — `first` takes the SMALLEST value among
-        // samples tied at the minimum timestamp, `last` the LARGEST at
-        // the maximum (`total_cmp` so NaN ties cannot flap). Fully
-        // input-order-independent, so the reducer is deterministic even
-        // if the scan's stable ordering ever changed. The reference's
-        // own tie order for identical timestamps is unspecified; ours is
-        // pinned here and documented (features.md §2).
-        if ts_ns < self.first_ts || (ts_ns == self.first_ts && v.total_cmp(&self.first_v).is_lt()) {
-            self.first_ts = ts_ns;
+        let n = self.count as f64;
+        // `avg_over_time` — `range_vector.go:379-401`, arm for arm.
+        let skip_avg = self.avg_mean.is_infinite()
+            && ((v.is_infinite() && (self.avg_mean > 0.0) == (v > 0.0))
+                || (!v.is_infinite() && !v.is_nan()));
+        if !skip_avg {
+            self.avg_mean += v / n - self.avg_mean / n;
+        }
+        // `stddev_over_time`/`stdvar_over_time` — Welford, `:427-447`.
+        let delta = v - self.w_mean;
+        self.w_mean += delta / n;
+        self.m2 += delta * (v - self.w_mean);
+    }
+
+    /// **`first`/`last` are positions in Loki's delivery order, not
+    /// extrema** (issue #344; this replaced a value-tiebreak whose stated
+    /// premise the source refuted).
+    ///
+    /// The reference reads them straight off its merged sample iterator —
+    /// `first(samples) = samples[0]`, `last(samples) = samples[len-1]`
+    /// (`pkg/logql/range_vector.go:489-501 @ v3.7.4`), and the streaming
+    /// evaluator an instant query uses does the same incrementally
+    /// (`FirstOverTime.agg` keeps the first sample it sees,
+    /// `LastOverTime.agg` overwrites with every sample, `:818-844`). That
+    /// delivery order is `(Timestamp, StreamHash)`
+    /// (`SampleIteratorHeap.Less`, `pkg/iter/sample_iterator.go:139-148`),
+    /// where `StreamHash()` is `labels.StableHash` over the ORIGINAL
+    /// stream labels (`pkg/chunkenc/memchunk.go:1922`) — the same
+    /// [`win_order`] the sliding path has folded in since issue #227.
+    ///
+    /// **`tie_rank` needs no field here.** It only separates samples of
+    /// the SAME stream at the SAME nanosecond, and `metric_raw_samples`
+    /// delivers those in `ORDER BY timestamp_ns, fingerprint, body` —
+    /// ascending body, which is exactly the group-local `tie_rank` the
+    /// sliding path assigns. So `<` for `first` (keep the earliest
+    /// arrival on an exact key tie) and `>=` for `last` (take the latest)
+    /// reproduce the full three-key order from the scan's own sequence.
+    ///
+    /// The predecessor rule — smallest value at the minimum timestamp,
+    /// largest at the maximum — was adopted because the reference's
+    /// instant tie order was believed unspecified. It is specified, and
+    /// on a group merging two streams at one nanosecond the two rules
+    /// disagree: measured against the pinned v3.7.4 container,
+    /// `last_over_time(…) by (fp)` answers 5 where the value rule gives 7.
+    fn add(&mut self, ts_ns: i64, stream_hash: u64, v: f64) {
+        self.fold(v);
+        let key = (ts_ns, stream_hash);
+        if key < self.first_key {
+            self.first_key = key;
             self.first_v = v;
         }
-        if ts_ns > self.last_ts || (ts_ns == self.last_ts && v.total_cmp(&self.last_v).is_gt()) {
-            self.last_ts = ts_ns;
+        if key >= self.last_key {
+            self.last_key = key;
             self.last_v = v;
         }
     }
+}
+
+/// One sample of an open equal-timestamp run, held until the run closes
+/// so it can be folded in `(stream_hash, tie_rank)` order — see
+/// [`ClientAggState::stage`]. Carries the rendered group key (MOVED from
+/// the row loop, never cloned) and, only for a group that does not exist
+/// yet, that group's label set.
+#[derive(Debug)]
+struct PendingSample {
+    stream_hash: u64,
+    key: String,
+    labels: Option<LabelSet>,
+    value: f64,
 }
 
 /// One bucket's state: streaming stats, the full value set for
@@ -108,17 +195,17 @@ pub(in crate::logql) enum BucketAcc {
 }
 
 impl BucketAcc {
-    fn new(op: RangeAggOp, ts_ns: i64, v: f64) -> Self {
+    fn new(op: RangeAggOp, ts_ns: i64, stream_hash: u64, v: f64) -> Self {
         match op {
             RangeAggOp::QuantileOverTime => BucketAcc::Values(vec![v]),
             RangeAggOp::RateCounter => BucketAcc::Counter(vec![(ts_ns, v)]),
-            _ => BucketAcc::Simple(SimpleAcc::new(ts_ns, v)),
+            _ => BucketAcc::Simple(SimpleAcc::new(ts_ns, stream_hash, v)),
         }
     }
 
-    fn add(&mut self, ts_ns: i64, v: f64) {
+    fn add(&mut self, ts_ns: i64, stream_hash: u64, v: f64) {
         match self {
-            BucketAcc::Simple(acc) => acc.add(ts_ns, v),
+            BucketAcc::Simple(acc) => acc.add(ts_ns, stream_hash, v),
             BucketAcc::Values(vals) => vals.push(v),
             BucketAcc::Counter(pts) => pts.push((ts_ns, v)),
         }
@@ -137,7 +224,7 @@ impl BucketAcc {
                 RangeAggOp::Rate | RangeAggOp::BytesRate => apply_rate(acc.sum, rate_window_ns),
                 RangeAggOp::CountOverTime => acc.count as f64,
                 RangeAggOp::BytesOverTime | RangeAggOp::SumOverTime => acc.sum,
-                RangeAggOp::AvgOverTime => acc.mean,
+                RangeAggOp::AvgOverTime => acc.avg_mean,
                 RangeAggOp::MinOverTime => acc.min,
                 RangeAggOp::MaxOverTime => acc.max,
                 RangeAggOp::StddevOverTime => (acc.m2 / acc.count as f64).sqrt(),
@@ -319,6 +406,13 @@ pub(in crate::logql) struct ClientAggState<'q> {
     /// the physical `service` column re-injected as `service_name`,
     /// sorted).
     pub(in crate::logql) base_labels: HashMap<u64, Vec<(String, String)>>,
+    /// Per-fingerprint `StableHash` of the stream labels — the SECOND key
+    /// of Loki's sample delivery order, which is what
+    /// `first_over_time`/`last_over_time` read their endpoints off
+    /// ([`SimpleAcc::add`]). The sliding path has kept this map since
+    /// issue #227; the instant path needed it once a grouping let two
+    /// streams share one accumulator (issue #344).
+    hashes: HashMap<u64, u64>,
     fan_out: bool,
     /// `absent_over_time`'s selector-wide presence (plan v2 D2). A FLAG,
     /// not a bucket set, since issue #236 Part D: an instant window has
@@ -333,6 +427,22 @@ pub(in crate::logql) struct ClientAggState<'q> {
     /// Label-mutating/unwrapping pipelines group by the rendered final
     /// label set.
     label_groups: HashMap<String, (LabelSet, BucketAcc)>,
+    /// **The equal-timestamp staging buffer** (issue #344 review round 1).
+    /// Non-empty only for the order-DEPENDENT reducers
+    /// ([`ReducerClass::CanonicalFold`]), and only while an
+    /// equal-`timestamp_ns` run is open. See [`ClientAggState::stage`].
+    pending: Vec<PendingSample>,
+    /// The timestamp the open run is at; meaningless when `pending` is
+    /// empty.
+    pending_ts: i64,
+    /// Transient bytes `pending` holds, charged BEFORE each staged
+    /// allocation against [`AggCaps::collision_bytes`] and reset when the
+    /// run flushes — the same counter and the same named 422 the sliding
+    /// path's per-`(fingerprint, timestamp)` collision group uses.
+    pending_bytes: u64,
+    /// Whether this reducer needs the canonical order at all
+    /// ([`ReducerClass::CanonicalFold`]) — decided once, at construction.
+    needs_ts_order: bool,
     /// Total values retained across every quantile accumulator, charged
     /// against [`MAX_QUANTILE_VALUES`].
     quantile_values: u64,
@@ -370,18 +480,37 @@ impl<'q> ClientAggState<'q> {
         caps: AggCaps,
     ) -> Result<Self, ReadError> {
         let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        let mut hashes: HashMap<u64, u64> = HashMap::new();
         for (fp, m) in meta {
-            base_labels.insert(*fp, series_labels(m));
+            let labels = series_labels(m);
+            hashes.insert(*fp, stream_hash(&labels));
+            base_labels.insert(*fp, labels);
         }
         Ok(ClientAggState {
             compiled,
             client,
             rate_window_ns,
             base_labels,
-            fan_out: compiled.metric_mutates_labels(),
+            hashes,
+            // Issue #344 — the instant twin of `RangeSlideState`'s gate:
+            // a grouping merges streams, so the state must group by final
+            // label set (`label_groups`), never by fingerprint.
+            fan_out: compiled.metric_mutates_labels() || client.grouping.is_some(),
             present: false,
             fp_groups: HashMap::new(),
             label_groups: HashMap::new(),
+            pending: Vec::new(),
+            pending_ts: 0,
+            pending_bytes: 0,
+            // Issue #344 review round 1: the order-dependent reducers are
+            // exactly `ReducerClass::CanonicalFold` — the classification
+            // that already exists for the sliding path, reused rather than
+            // re-derived so the two paths cannot disagree about which
+            // reducers care.
+            needs_ts_order: matches!(
+                reducer_class(client.range_op, client.value),
+                ReducerClass::CanonicalFold
+            ),
             quantile_values: 0,
             counter_values: 0,
             group_bytes: 0,
@@ -397,16 +526,34 @@ impl<'q> ClientAggState<'q> {
     /// label scratch is reused across the whole batch (the #72
     /// allocation discipline).
     pub(in crate::logql) fn push_rows(&mut self, rows: &[MetricScanRow]) -> Result<(), ReadError> {
+        // `base_labels` is moved to a LOCAL for the duration (the same
+        // move `RangeSlideState::push_rows` makes, and for the same
+        // reason): the batch-reused `scratch` borrows from it through its
+        // `Cow`s, so leaving it on `self` would tie a `self` borrow across
+        // the mid-loop `&mut self` staging flush (issue #344 review round
+        // 1). Restored on every exit, including the error one.
+        let base_labels = std::mem::take(&mut self.base_labels);
+        let result = self.push_rows_inner(rows, &base_labels);
+        self.base_labels = base_labels;
+        result
+    }
+
+    fn push_rows_inner(
+        &mut self,
+        rows: &[MetricScanRow],
+        base_labels: &HashMap<u64, Vec<(String, String)>>,
+    ) -> Result<(), ReadError> {
         let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
         let is_absent = matches!(self.client.range_op, RangeAggOp::AbsentOverTime);
         for row in rows {
-            let Some(base) = self.base_labels.get(&row.fingerprint) else {
+            let Some(base) = base_labels.get(&row.fingerprint) else {
                 continue;
             };
             let (line, value) = match self.compiled.run_metric_into(
                 &row.body,
                 base,
                 row.timestamp_ns,
+                self.client.grouping.as_deref(),
                 &mut scratch,
             )? {
                 MetricRun::Dropped => continue,
@@ -433,6 +580,13 @@ impl<'q> ClientAggState<'q> {
                 },
             };
             let op = self.client.range_op;
+            // Issue #344: the sample's stream identity, the second key of
+            // Loki's delivery order ([`SimpleAcc::add`]). A fingerprint
+            // with no hydrated meta cannot reach here — `base_labels` was
+            // resolved above and both maps are filled from the same
+            // iteration — so the `unwrap_or(0)` is defence in depth, and
+            // the same default `RangeSlideState::flush_collision` uses.
+            let stream_hash = self.hashes.get(&row.fingerprint).copied().unwrap_or(0);
             if matches!(op, RangeAggOp::QuantileOverTime) {
                 self.quantile_values += 1;
                 if self.quantile_values > self.caps.quantile_values {
@@ -464,11 +618,29 @@ impl<'q> ClientAggState<'q> {
             // group's accumulator or folds into it — there is no bucket
             // map to index.
             if self.fan_out {
+                // In-place sort, no allocation — safe before the caps.
                 scratch.sort_unstable();
+                if self.needs_ts_order {
+                    // Order-DEPENDENT reducer: the scan hands equal
+                    // timestamps in `fingerprint` order and the reference
+                    // folds them in `StableHash` order, so the run is
+                    // staged and re-ordered before any of it is folded.
+                    //
+                    // NOTHING is rendered or collected here: `stage` is
+                    // the single staging funnel and it sizes, checks both
+                    // caps, and only then allocates. The key and the
+                    // label set are built INSIDE it, after the check.
+                    if row.timestamp_ns != self.pending_ts {
+                        self.flush_pending(op)?;
+                        self.pending_ts = row.timestamp_ns;
+                    }
+                    self.stage(stream_hash, &scratch, v)?;
+                    continue;
+                }
                 let key = render_labels_json_sorted(&scratch);
                 match self.label_groups.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
-                        e.into_mut().1.add(row.timestamp_ns, v);
+                        e.into_mut().1.add(row.timestamp_ns, stream_hash, v);
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
                         let labels: LabelSet = scratch
@@ -490,7 +662,7 @@ impl<'q> ClientAggState<'q> {
                             group_entry_bytes(e.key(), &labels, INSTANT_GROUP_SLOT),
                             self.caps.group_bytes,
                         )?;
-                        e.insert((labels, BucketAcc::new(op, row.timestamp_ns, v)));
+                        e.insert((labels, BucketAcc::new(op, row.timestamp_ns, stream_hash, v)));
                     }
                 }
             } else {
@@ -511,15 +683,197 @@ impl<'q> ClientAggState<'q> {
                 }
                 match self.fp_groups.entry(row.fingerprint) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
-                        e.get_mut().add(row.timestamp_ns, v);
+                        e.get_mut().add(row.timestamp_ns, stream_hash, v);
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(BucketAcc::new(op, row.timestamp_ns, v));
+                        e.insert(BucketAcc::new(op, row.timestamp_ns, stream_hash, v));
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// **The single staging funnel** for the instant path — the ONLY
+    /// place a per-sample allocation enters `pending`, and the direct
+    /// counterpart of [`RangeSlideState::stage_member`].
+    ///
+    /// Order is load-bearing and is the same three steps that funnel
+    /// uses: **(i) size every allocation this sample will make, (ii)
+    /// check BOTH caps, (iii) only then allocate.** Because the sizing
+    /// happens first, the allocation that would breach a cap is never
+    /// performed — which is the whole point of the buffer existing. An
+    /// earlier revision rendered the key and collected the label set in
+    /// the row loop and passed them in, so the cap was checked AFTER the
+    /// two allocations it was meant to bound; the caller now hands over
+    /// the borrowed label scratch and nothing is built until the check
+    /// passes (issue #344 review round 2).
+    ///
+    /// **Why this exists at all.** The order-dependent reducers —
+    /// `sum`/`avg`/`stddev`/`stdvar`/`rate_counter` and unwrapped `rate`,
+    /// i.e. exactly [`ReducerClass::CanonicalFold`] — must fold in Loki's
+    /// delivery order `(timestamp, stream_hash, tie_rank)`.
+    /// `first`/`last` can read that order off an explicit key comparison
+    /// ([`SimpleAcc::add`]) because they only ever SELECT one sample; a
+    /// sum cannot, because every sample's position matters. And the scan
+    /// cannot supply the order: `metric_raw_samples` orders equal
+    /// timestamps by `fingerprint`, not by `stream_hash`, and those two
+    /// are unrelated hashes.
+    ///
+    /// **Bounded, by the SAME caps as the sliding path's collision
+    /// group.** Nothing structurally bounds how many rows share one
+    /// nanosecond, so the buffer is charged against
+    /// [`AggCaps::collision_members`]/[`AggCaps::collision_bytes`] and a
+    /// breach is the existing named [`TooBroadReason::TsCollisionGroup`]
+    /// 422 — never unbounded growth on the read path. The run is the
+    /// wider `(timestamp)` group rather than the sliding path's
+    /// `(fingerprint, timestamp)` one, because cross-stream order is what
+    /// it exists for.
+    fn stage(
+        &mut self,
+        stream_hash: u64,
+        scratch: &[(Cow<'_, str>, Cow<'_, str>)],
+        value: f64,
+    ) -> Result<(), ReadError> {
+        // (i) size EVERY allocation this sample will make.
+        let bytes = self.stage_bytes(scratch);
+        // (ii) both caps, BEFORE any allocation. `saturating_add` cannot
+        // mask a breach (saturation only grows the sum) but does keep a
+        // pathological charge from overflowing the comparison itself.
+        let next_count = self.pending.len() as u64 + 1;
+        let next_bytes = self.pending_bytes.saturating_add(bytes);
+        if next_count > self.caps.collision_members || next_bytes > self.caps.collision_bytes {
+            return Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count: next_count,
+                cap: self.caps.collision_members,
+                bytes: next_bytes,
+                bytes_cap: self.caps.collision_bytes,
+            }));
+        }
+        // (iii) now — and only now — allocate.
+        let key = render_labels_json_sorted(scratch);
+        let labels = if self.label_groups.contains_key(&key) {
+            None
+        } else {
+            Some(
+                scratch
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<LabelSet>(),
+            )
+        };
+        self.pending_bytes = next_bytes;
+        self.pending.push(PendingSample {
+            stream_hash,
+            key,
+            labels,
+            value,
+        });
+        Ok(())
+    }
+
+    /// A provable UPPER BOUND on the heap bytes [`Self::stage`] is about
+    /// to allocate for one sample — the instant twin of
+    /// [`RangeSlideState::member_stage_bytes`], sized the same way and
+    /// for the same reason: charging an over-estimate is what makes the
+    /// cap sound, because `pending_bytes >= actual staged heap bytes`
+    /// then holds and bounding `pending_bytes` bounds the real footprint.
+    ///
+    /// Per allocation:
+    /// - **rendered label JSON** ([`render_labels_json_sorted`]) — sized
+    ///   by [`rendered_labels_json_len`], which walks the SAME escape
+    ///   arms as the renderer and so yields the rendered length exactly,
+    ///   including the `\u00xx` six-bytes-for-one expansion of a C0
+    ///   control byte. The `String` is pre-sized assuming no escaping, so
+    ///   escaping-heavy input forces geometric growth — charged through
+    ///   [`grown_alloc_bytes`].
+    /// - **the cloned `LabelSet`** — one exactly-reserved `String` per
+    ///   key and per value plus one exactly-reserved element buffer, each
+    ///   through [`alloc_block_bytes`] so allocator size-class rounding
+    ///   is covered. Charged UNCONDITIONALLY, even though `stage` builds
+    ///   it only for a group that does not exist yet: the existence probe
+    ///   needs the rendered key, which cannot be built before the check
+    ///   without reintroducing the very ordering this funnel fixes. An
+    ///   over-charge is the safe direction; an early allocation is not.
+    /// - **the `PendingSample` slot in `pending`** — a `Vec` push can
+    ///   DOUBLE capacity with the old buffer still live during the
+    ///   realloc, so charging one slot understates the peak. For `n`
+    ///   samples the live request is `<= 2n` slots plus an old buffer of
+    ///   `<= n`; with each block retained at `<= 2x` its request (the
+    ///   [`alloc_block_bytes`] model) the peak is `<= 6n x
+    ///   size_of::<PendingSample>()`, and the initial
+    ///   `min_non_zero_cap = 4` block is `<= 8x`. Charging `8x` per
+    ///   sample dominates BOTH for every `n >= 1`. The `String`/`Vec`
+    ///   headers of the pieces above live INSIDE that slot, so they are
+    ///   already covered.
+    ///
+    /// Saturating throughout, so a hostile label value cannot wrap the
+    /// charge round to a small number — saturation only makes it larger.
+    fn stage_bytes(&self, scratch: &[(Cow<'_, str>, Cow<'_, str>)]) -> u64 {
+        /// See the slot bullet above: 8x per element dominates the
+        /// `<= 6n`-slot realloc peak and the first sample's
+        /// `min_non_zero_cap = 4` block.
+        const VEC_GROWTH_FACTOR: u64 = 8;
+
+        let mut bytes = (size_of::<PendingSample>() as u64).saturating_mul(VEC_GROWTH_FACTOR);
+        bytes = bytes.saturating_add(grown_alloc_bytes(rendered_labels_json_len(scratch)));
+        for (k, v) in scratch {
+            bytes = bytes
+                .saturating_add(alloc_block_bytes(k.len() as u64))
+                .saturating_add(alloc_block_bytes(v.len() as u64));
+        }
+        let elems = (scratch.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
+        bytes.saturating_add(alloc_block_bytes(elems))
+    }
+
+    /// Folds the staged run in canonical order, then releases it.
+    ///
+    /// `sort_by_key` is STABLE, so equal `stream_hash` keeps arrival
+    /// order — and arrival order within one stream is the scan's
+    /// `body`-ascending sequence, which is exactly the group-local
+    /// `tie_rank` the sliding path assigns. Sorting on `stream_hash`
+    /// alone therefore yields the full `(stream_hash, tie_rank)` order
+    /// without storing a rank.
+    fn flush_pending(&mut self, op: RangeAggOp) -> Result<(), ReadError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let ts = self.pending_ts;
+        let mut staged = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
+        staged.sort_by_key(|p| p.stream_hash);
+        let mut result = Ok(());
+        for p in staged.drain(..) {
+            if result.is_err() {
+                continue;
+            }
+            match self.label_groups.entry(p.key) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    e.into_mut().1.add(ts, p.stream_hash, p.value);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    // `labels` is `Some` whenever the group was absent at
+                    // staging time, and a Vacant entry here means it was
+                    // absent for EVERY stager of this key, so the `Some`
+                    // is guaranteed. `unwrap_or_default` is the
+                    // never-taken defensive arm, not a silent empty set.
+                    let labels = p.labels.unwrap_or_default();
+                    result = charge_group_bytes(
+                        &mut self.group_bytes,
+                        group_entry_bytes(e.key(), &labels, INSTANT_GROUP_SLOT),
+                        self.caps.group_bytes,
+                    );
+                    if result.is_ok() {
+                        e.insert((labels, BucketAcc::new(op, ts, p.stream_hash, p.value)));
+                    }
+                }
+            }
+        }
+        // The buffer's capacity is returned to the state so the next run
+        // reuses it — one allocation for the whole query, not one per run.
+        staged.clear();
+        self.pending = staged;
+        result
     }
 
     /// Finishes every accumulator into the metric result.
@@ -531,7 +885,15 @@ impl<'q> ClientAggState<'q> {
     /// for absence and the per-bucket `Matrix` emit — were dead, and are
     /// deleted rather than left as a second reading of a contract the type
     /// already states.
-    fn finish(self) -> QueryResult {
+    /// Fallible since issue #344 review round 1: the last equal-timestamp
+    /// run has to be folded before the accumulators are read, and that
+    /// fold charges group bytes exactly as the in-scan one does.
+    fn finish(mut self) -> Result<QueryResult, ReadError> {
+        self.flush_pending(self.client.range_op)?;
+        Ok(self.finish_folded())
+    }
+
+    fn finish_folded(self) -> QueryResult {
         if matches!(self.client.range_op, RangeAggOp::AbsentOverTime) {
             let labels: LabelSet = self.client.absent_labels.clone();
             return if self.present {
@@ -751,13 +1113,13 @@ fn reduce_window(
         // sum/avg/min/max/stddev/stdvar reuse the instant path's exact
         // arithmetic (`SimpleAcc`) folded in canonical order.
         _ => {
-            let mut acc = SimpleAcc::new(ordered[0].ts, ordered[0].value);
+            let mut acc = SimpleAcc::new(ordered[0].ts, ordered[0].stream_hash, ordered[0].value);
             for s in &ordered[1..] {
-                acc.add(s.ts, s.value);
+                acc.add(s.ts, s.stream_hash, s.value);
             }
             Some(match op {
                 RangeAggOp::SumOverTime => acc.sum,
-                RangeAggOp::AvgOverTime => acc.mean,
+                RangeAggOp::AvgOverTime => acc.avg_mean,
                 RangeAggOp::MinOverTime => acc.min,
                 RangeAggOp::MaxOverTime => acc.max,
                 RangeAggOp::StddevOverTime => (acc.m2 / acc.count as f64).sqrt(),
@@ -1068,6 +1430,13 @@ pub(in crate::logql) struct RangeSlideState<'q> {
     offset_ns: i64,
     fan_out: bool,
     is_absent: bool,
+    /// The range aggregation's own `by`/`without` (issue #344), borrowed
+    /// from the plan for the state's lifetime and handed to
+    /// [`super::pipeline::CompiledPipeline::run_metric_into`] per row —
+    /// the reference applies it inside the sample extractor too, which is
+    /// what makes the merge run over the group's RAW SAMPLES rather than
+    /// over per-series results.
+    grouping: Option<&'q RangeGrouping>,
     /// Whether the reducer is order-DEPENDENT (class C, or first/last) and so
     /// needs the full-body `tie_rank` order within a collision group. When
     /// false (count/bytes/rate-no-unwrap, min/max/quantile) the body is never
@@ -1198,6 +1567,15 @@ impl<'q> RangeSlideState<'q> {
         let needs_body_order = matches!(class, ReducerClass::CanonicalFold)
             || matches!(op, RangeAggOp::FirstOverTime | RangeAggOp::LastOverTime);
         let is_absent = matches!(op, RangeAggOp::AbsentOverTime);
+        // Issue #344: a grouping MERGES streams, so it must take the
+        // fan-out path — which groups by the final (already-projected)
+        // label set — never the per-fingerprint sliders, which cannot
+        // merge across fingerprints at all. Today the disjunct is
+        // subsumed (every op that admits a grouping requires `unwrap`, so
+        // `metric_mutates_labels()` is already true), and it is spelled
+        // out anyway: without it, a grouping-allowed op that stopped
+        // requiring unwrap would silently return the per-stream answer.
+        let fan_out = compiled.metric_mutates_labels() || client.grouping.is_some();
         Ok(RangeSlideState {
             compiled,
             op,
@@ -1212,8 +1590,9 @@ impl<'q> RangeSlideState<'q> {
             range: range_ns.get(),
             kmax,
             offset_ns,
-            fan_out: compiled.metric_mutates_labels(),
+            fan_out,
             is_absent,
+            grouping: client.grouping.as_deref(),
             needs_body_order,
             absent_labels: client.absent_labels.clone(),
             base_labels,
@@ -1294,6 +1673,7 @@ impl<'q> RangeSlideState<'q> {
     /// scratch across the whole batch.
     pub(in crate::logql) fn push_rows(&mut self, rows: &[MetricScanRow]) -> Result<(), ReadError> {
         let base_labels = std::mem::take(&mut self.base_labels);
+        let grouping = self.grouping;
         let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
         let mut result = Ok(());
         for row in rows {
@@ -1311,18 +1691,20 @@ impl<'q> RangeSlideState<'q> {
             let Some(base) = base_labels.get(&row.fingerprint) else {
                 continue;
             };
-            let (line, value) =
-                match self
-                    .compiled
-                    .run_metric_into(&row.body, base, row.timestamp_ns, &mut scratch)
-                {
-                    Ok(MetricRun::Dropped) => continue,
-                    Ok(MetricRun::Kept { line, value }) => (line, value),
-                    Err(e) => {
-                        result = Err(e.into());
-                        break;
-                    }
-                };
+            let (line, value) = match self.compiled.run_metric_into(
+                &row.body,
+                base,
+                row.timestamp_ns,
+                grouping,
+                &mut scratch,
+            ) {
+                Ok(MetricRun::Dropped) => continue,
+                Ok(MetricRun::Kept { line, value }) => (line, value),
+                Err(e) => {
+                    result = Err(e.into());
+                    break;
+                }
+            };
             if let Err(e) = check_surviving_error(&scratch) {
                 result = Err(e);
                 break;
@@ -2238,7 +2620,7 @@ pub fn run_client_agg_rows_folded(
         AggCaps::DEFAULT,
     )?;
     state.push_rows(rows)?;
-    apply_vector_aggs(state.finish(), aggs)
+    apply_vector_aggs(state.finish()?, aggs)
 }
 
 /// The live engine's per-fold metric-aggregation state: the instant
@@ -2260,7 +2642,7 @@ impl MetricAggState<'_> {
 
     pub(in crate::logql) fn finish(self) -> Result<QueryResult, ReadError> {
         match self {
-            MetricAggState::Instant(s) => Ok(s.finish()),
+            MetricAggState::Instant(s) => s.finish(),
             MetricAggState::Range(s) => s.finish(),
         }
     }
@@ -2415,6 +2797,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2444,6 +2827,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2471,6 +2855,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2496,6 +2881,7 @@ mod tests {
             range_op,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let client = client_for(RangeAggOp::Rate);
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
@@ -2537,6 +2923,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2577,6 +2964,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2609,6 +2997,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -2644,6 +3033,7 @@ mod tests {
             range_op: RangeAggOp::QuantileOverTime,
             param: Some(0.5),
             absent_labels: vec![],
+            grouping: None,
         };
         let per_sample = retention_points_per_sample(client.range_op);
         assert_eq!(
@@ -2789,6 +3179,7 @@ mod tests {
                 range_op: op,
                 param: None,
                 absent_labels: vec![],
+                grouping: None,
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
             let rows: Vec<MetricScanRow> = order
@@ -2845,6 +3236,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(!compiled.metric_mutates_labels());
@@ -2877,6 +3269,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(compiled.metric_mutates_labels());
@@ -2916,6 +3309,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let mut state =
@@ -2982,6 +3376,7 @@ mod tests {
                     range_op: op,
                     param: None,
                     absent_labels: vec![("app".to_string(), "a".to_string())],
+                    grouping: None,
                 };
                 let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
                 let mut state = ClientAggState::new(
@@ -2996,7 +3391,7 @@ mod tests {
                 state.push_rows(rows).expect("fold");
                 let out = state.finish();
                 assert!(
-                    matches!(out, QueryResult::Vector(_)),
+                    matches!(out, Ok(QueryResult::Vector(_))),
                     "{op:?} over {} row(s) must emit a vector, got {out:?}",
                     rows.len()
                 );
@@ -3060,6 +3455,7 @@ mod tests {
                     range_op: op,
                     param: None,
                     absent_labels: vec![],
+                    grouping: None,
                 };
                 let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
                 assert_eq!(
@@ -3077,7 +3473,7 @@ mod tests {
                 )
                 .unwrap();
                 state.push_rows(&rows).expect("fold");
-                let QueryResult::Vector(items) = state.finish() else {
+                let Ok(QueryResult::Vector(items)) = state.finish() else {
                     panic!("instant results are vectors");
                 };
                 assert_eq!(items.len(), 1, "{op:?} {arm}: one group");
@@ -3106,6 +3502,7 @@ mod tests {
             range_op: RangeAggOp::AbsentOverTime,
             param: None,
             absent_labels: vec![("app".to_string(), "a".to_string())],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let run = |rows: &[MetricScanRow]| -> usize {
@@ -3119,7 +3516,7 @@ mod tests {
             )
             .unwrap();
             state.push_rows(rows).expect("fold");
-            let QueryResult::Vector(items) = state.finish() else {
+            let Ok(QueryResult::Vector(items)) = state.finish() else {
                 panic!("instant absence is a vector");
             };
             items.len()
@@ -3221,6 +3618,7 @@ mod tests {
                         range_op: op,
                         param: None,
                         absent_labels: vec![],
+                        grouping: None,
                     };
                     let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
                     let res =
@@ -3337,6 +3735,7 @@ mod tests {
                     range_op: op,
                     param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
                     absent_labels: vec![],
+                    grouping: None,
                 };
                 let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
                 let mut state = RangeSlideState::new(
@@ -3451,6 +3850,7 @@ mod tests {
                 range_op: op,
                 param: None,
                 absent_labels: vec![],
+                grouping: None,
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
             assert!(compiled.metric_mutates_labels());
@@ -3531,6 +3931,7 @@ mod tests {
                 range_op: op,
                 param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
                 absent_labels: vec![],
+                grouping: None,
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
             assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
@@ -3731,6 +4132,7 @@ mod tests {
                 range_op: op,
                 param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
                 absent_labels: vec![],
+                grouping: None,
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
             let mut state =
@@ -3821,6 +4223,7 @@ mod tests {
             range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -3860,6 +4263,173 @@ mod tests {
         );
     }
 
+    /// **The ordering gate for the instant staging funnel** (issue #344
+    /// review round 2), mirroring
+    /// `fold.rs::the_fold_charges_before_it_builds_a_group_key`.
+    ///
+    /// A behavioural test CANNOT see this defect, and that is the whole
+    /// reason this one parses source instead. The reviewed bug was that
+    /// `stage`'s two allocations happened before its cap check; but the
+    /// transient is built either way, so every observable — the refusal,
+    /// the retained buffer, `pending_bytes` — is identical with the
+    /// allocations before or after. Restoring the inversion under
+    /// `instant_staging_charges_before_it_allocates_and_stays_inside_the_cap`
+    /// leaves it GREEN, which is exactly the "gate weaker than the claim"
+    /// shape. So the order is asserted where it is written.
+    ///
+    /// Three anchors, in the one order that makes the cap sound: the
+    /// SIZE (`stage_bytes`, which allocates nothing), then the CHECK
+    /// (the `TsCollisionGroup` refusal), then the two allocations
+    /// (`render_labels_json_sorted` and the `LabelSet` collect). Nothing
+    /// that allocates may precede the refusal.
+    #[test]
+    fn the_instant_staging_funnel_sizes_and_checks_before_it_allocates() {
+        let src = include_str!("client_agg.rs");
+        let start = src
+            .find("    fn stage(\n        &mut self,")
+            .expect("the instant staging funnel");
+        let end = src[start..]
+            .find("    fn stage_bytes(")
+            .expect("the end of stage")
+            + start;
+        let body = &src[start..end];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("stage must contain `{needle}`"))
+        };
+        let size = at("self.stage_bytes(scratch)");
+        let check = at("TooBroadReason::TsCollisionGroup");
+        let render = at("render_labels_json_sorted(scratch)");
+        let collect = at(".collect::<LabelSet>()");
+        assert!(
+            size < check,
+            "stage must SIZE before it checks — a check over a charge that does not yet \
+             cover this sample bounds nothing"
+        );
+        assert!(
+            check < render && check < collect,
+            "stage allocates before its cap check (render at {render}, collect at {collect}, \
+             check at {check}) — the cap must refuse BEFORE the allocation it bounds, not \
+             observe it afterwards"
+        );
+        // And the caller hands over the borrowed scratch rather than
+        // pre-built pieces: an allocation moved back into the row loop
+        // would reintroduce the reviewed defect at a site this gate does
+        // not read.
+        let loop_start = src
+            .find("    fn push_rows_inner(")
+            .expect("the instant row loop");
+        let loop_end = src[loop_start..]
+            .find("\n    /// **The single staging funnel** for the instant path")
+            .expect("the end of push_rows_inner")
+            + loop_start;
+        let row_loop = &src[loop_start..loop_end];
+        let stage_call = row_loop
+            .find("self.stage(stream_hash, &scratch, v)")
+            .expect("push_rows_inner must stage from the borrowed scratch");
+        let direct_render = row_loop
+            .find("let key = render_labels_json_sorted(&scratch);")
+            .expect("the direct (non-staging) arm still renders its own key");
+        assert!(
+            stage_call < direct_render,
+            "the staging arm must `continue` BEFORE the direct arm's render — a render \
+             above the staging call would allocate for every staged sample outside the funnel"
+        );
+    }
+
+    /// Issue #344 review round 2: the INSTANT staging funnel charges
+    /// BEFORE it allocates, and its buffer stays inside the cap.
+    ///
+    /// The earlier revision rendered the group key and collected the
+    /// `LabelSet` in the row loop and only then called `stage`, so the
+    /// cap was checked after the two allocations it exists to bound —
+    /// a buffer that could overshoot by a whole sample's heap before
+    /// refusing. This drives the byte cap on an equal-timestamp run of
+    /// huge label values and asserts three things a post-check funnel
+    /// cannot satisfy: the named refusal, that the BYTE dimension bit
+    /// (not the member count), and that `pending`/`pending_bytes` are
+    /// left holding NOTHING from the refused sample.
+    #[test]
+    fn instant_staging_charges_before_it_allocates_and_stays_inside_the_cap() {
+        // `sum_over_time` is `CanonicalFold`, so the equal-timestamp run
+        // is staged for the delivery-order fold.
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+            grouping: None,
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let mut state = ClientAggState::new(
+            &compiled,
+            &meta,
+            &client,
+            instant_of(ClientWindow::Instant {
+                start_ns: 0,
+                end_ns: 10,
+            }),
+            None,
+            AggCaps::DEFAULT,
+        )
+        .unwrap();
+
+        // A 64 KiB label VALUE per row, all at the SAME timestamp and
+        // each with a distinct group key, so every row stages a fresh
+        // rendered key + `LabelSet`. Sized so DOZENS fit before the 8 MiB
+        // byte cap bites — the refusal must happen mid-run, not on the
+        // first sample, or the "staged what fit" assertion below would be
+        // vacuous. Still far below the 10 000-member cap, so the byte
+        // dimension is what bites.
+        let big = "x".repeat(64 * 1024);
+        let rows: Vec<MetricScanRow> = (0..512)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("a=1 pad{i}={big}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count, cap, ..
+            })) => {
+                assert_eq!(cap, MAX_TS_COLLISION_GROUP);
+                assert!(
+                    count < MAX_TS_COLLISION_GROUP,
+                    "the BYTE cap must trip well before the member cap, tripped at {count}"
+                );
+            }
+            other => panic!("expected TsCollisionGroup from the byte cap, got {other:?}"),
+        }
+        // Bound proof, observed rather than argued: the staged buffer
+        // never exceeded the cap…
+        assert!(
+            state.pending_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
+            "staged {} bytes exceeds the {MAX_TS_COLLISION_GROUP_BYTES}-byte cap",
+            state.pending_bytes
+        );
+        // …and the REFUSED sample left nothing behind: `pending_bytes` is
+        // the charge for exactly the samples `pending` still holds, so a
+        // funnel that allocated first and charged after would show a
+        // count one higher than the charge accounts for.
+        let charged_for: u64 = state
+            .pending
+            .iter()
+            .map(|p| p.key.len() as u64)
+            .sum::<u64>();
+        assert!(
+            charged_for <= state.pending_bytes,
+            "the retained keys ({charged_for} B) must be covered by the charge ({} B)",
+            state.pending_bytes
+        );
+        assert!(
+            !state.pending.is_empty(),
+            "the run must have staged the samples that DID fit, or this proves nothing"
+        );
+    }
+
     /// Review round 4, finding 1: the byte cap covers the FAN-OUT staging
     /// (rendered label JSON + cloned `LabelSet`) for a reducer that stages NO
     /// body — the exact hole in the round-3 accounting. Class A
@@ -3873,6 +4443,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
@@ -3935,6 +4506,7 @@ mod tests {
             range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4016,6 +4588,7 @@ mod tests {
             range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4125,6 +4698,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4182,6 +4756,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4242,6 +4817,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4334,6 +4910,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4396,6 +4973,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4507,6 +5085,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(
@@ -4589,7 +5168,7 @@ mod tests {
             state.group_bytes, live,
             "every fingerprint charged; the repeated one charged once"
         );
-        match state.finish() {
+        match state.finish().expect("finish") {
             QueryResult::Vector(samples) => assert_eq!(samples.len(), 2),
             other => panic!("expected a vector, got {other:?}"),
         }
@@ -4609,6 +5188,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
@@ -4672,7 +5252,7 @@ mod tests {
             state.group_bytes, live,
             "every insertion charged; the repeated group charged once"
         );
-        match state.finish() {
+        match state.finish().expect("finish") {
             QueryResult::Vector(samples) => assert_eq!(samples.len(), 2),
             other => panic!("expected a vector, got {other:?}"),
         }
@@ -4688,6 +5268,7 @@ mod tests {
             range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4738,6 +5319,7 @@ mod tests {
             range_op: RangeAggOp::AbsentOverTime,
             param: None,
             absent_labels: vec![("app".to_string(), "a".to_string())],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4804,6 +5386,7 @@ mod tests {
             param: None,
             pipeline: vec![],
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4861,6 +5444,7 @@ mod tests {
             param: None,
             pipeline: vec![],
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4895,6 +5479,7 @@ mod tests {
             range_op: RangeAggOp::QuantileOverTime,
             param: Some(0.5),
             absent_labels: Vec::new(),
+            grouping: None,
         };
         let meta = HashMap::from([(
             1u64,
@@ -4966,6 +5551,7 @@ mod tests {
             range_op: RangeAggOp::RateCounter,
             param: None,
             absent_labels: Vec::new(),
+            grouping: None,
         };
         let meta = HashMap::from([(
             1u64,
@@ -5107,6 +5693,18 @@ mod tests {
         )
         .unwrap();
         state.push_rows(&rows).unwrap();
+        // Issue #344 review round 1: `rate_counter` is a
+        // `CanonicalFold` reducer, so the LAST equal-timestamp run stays
+        // staged until something closes it — a later timestamp during the
+        // scan, or `finish`. This test introspects before `finish` (which
+        // consumes the state), so it closes the run explicitly; the
+        // emptiness assertion below is the invariant that the staging
+        // buffer never outlives the flush.
+        state.flush_pending(client.range_op).unwrap();
+        assert!(
+            state.pending.is_empty(),
+            "the staged run must be released by its flush"
+        );
 
         // `unwrap` sets the metric fan-out gate, so grouping is by final
         // label set — one group here (the unwrapped `c` is removed, base
@@ -5132,7 +5730,7 @@ mod tests {
         );
 
         // Values below the cap are unaffected by the retention guard.
-        let QueryResult::Vector(items) = state.finish() else {
+        let Ok(QueryResult::Vector(items)) = state.finish() else {
             panic!("an instant rate_counter query yields a vector");
         };
         assert_eq!(items.len(), 1, "one series: {items:?}");
@@ -5173,7 +5771,7 @@ mod tests {
             CompiledPipeline::compile(&parse_pipeline(r#"{x="y"} | json"#)).expect("compile");
         let mut labels = Vec::new();
         let MetricRun::Kept { .. } = compiled
-            .run_metric_into("a=Hello b=World", &base, 0, &mut labels)
+            .run_metric_into("a=Hello b=World", &base, 0, None, &mut labels)
             .expect("no budget breach")
         else {
             panic!("an errored line is kept for the surviving-error check");
@@ -5191,7 +5789,7 @@ mod tests {
                 .expect("compile");
         let mut labels = Vec::new();
         let MetricRun::Kept { .. } = compiled
-            .run_metric_into("a=Hello b=World", &base, 0, &mut labels)
+            .run_metric_into("a=Hello b=World", &base, 0, None, &mut labels)
             .expect("no budget breach")
         else {
             panic!("kept");
@@ -5252,6 +5850,7 @@ mod tests {
             range_op: RangeAggOp::CountOverTime,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         assert!(
@@ -5320,6 +5919,7 @@ mod tests {
             range_op: op,
             param: None,
             absent_labels: vec![],
+            grouping: None,
         };
         let compiled = CompiledPipeline::compile(&[]).unwrap();
         let count_client = mk(RangeAggOp::CountOverTime);

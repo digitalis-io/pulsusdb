@@ -703,6 +703,105 @@ enum CompiledLabelFmt {
     },
 }
 
+/// A range aggregation's own `by`/`without` clause, normalized once at
+/// plan time into the shape the per-row label projection needs (issue
+/// #344).
+///
+/// **This is the reference's `(groups, without, noLabels)` triple**, and
+/// it is normalized here for exactly the reason it is normalized there:
+/// `pkg/logql/log/metrics_extraction.go:154-158 @ v3.7.4` folds the
+/// UNWRAPPED LABEL into the group list before any sample is extracted —
+///
+/// ```text
+/// if len(groups) == 0 || without {
+///     without = true
+///     groups = append(groups, labelName)
+///     sort.Strings(groups)
+/// }
+/// ```
+///
+/// — so "no grouping at all" and `without (…)` are the SAME code path
+/// there, both of which delete the unwrapped label, while `by (L)` with a
+/// non-empty `L` takes a different one that does not. The reference never
+/// deletes the unwrapped label anywhere else (`streamLabelSampleExtractor
+/// ::Process`, `metrics_extraction.go:202-230 @ v3.7.4`, only READS it),
+/// which is why `max_over_time({…} | unwrap v [5m]) by (v)` keeps `v` in
+/// the output series — captured from the pinned container as
+/// `{v="1"} 1, {v="5"} 5, {v="7"} 7, {v="10"} 10`. PulsusDB's own
+/// unwrapped-label deletion therefore has to live INSIDE this projection
+/// rather than beside it, or that shape would silently lose the label.
+///
+/// The projection itself is `LabelsBuilder::GroupedLabels`
+/// (`pkg/logql/log/labels.go:664-688 @ v3.7.4`) with its `withResult`
+/// (`:690-721`) / `withoutResult` (`:723-769`) arms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeGrouping {
+    /// `by ()` — the reference's `Grouping.Singleton()`
+    /// (`pkg/logql/syntax/ast.go:1550-1553 @ v3.7.4`), which sets
+    /// `noLabels` and makes `GroupedLabels` return
+    /// `EmptyLabelsResult` unconditionally (`labels.go:669-671`): every
+    /// sample in the selector collapses into ONE `{}` series.
+    Singleton,
+    /// `by (L)`, `L` non-empty — keep exactly the names in `L` (sorted
+    /// and deduplicated here; the retain is idempotent in the names, so
+    /// `by (fp, fp) == by (fp)` as issue #288 established and this
+    /// construct's own capture re-confirmed). The unwrapped label is NOT
+    /// deleted — see the type doc.
+    By(Vec<String>),
+    /// `without (L)` (`L` possibly empty) — drop the names in `L` AND the
+    /// unwrapped label, keeping everything else including parser-derived
+    /// labels. `without ()` is therefore the identity with respect to the
+    /// ungrouped form, which is the reference's `Grouping.Noop()`
+    /// (`ast.go:1544-1547 @ v3.7.4`).
+    Without(Vec<String>),
+}
+
+impl RangeGrouping {
+    /// Normalizes a parsed `by`/`without` clause. `sort` + `dedup` is a
+    /// plan-time cost paid once, so the per-row projection is a
+    /// `binary_search` rather than a linear scan of a client-supplied
+    /// list.
+    pub fn from_ast(g: &pulsus_logql::Grouping) -> Self {
+        if matches!(g.kind, pulsus_logql::GroupingKind::By) && g.labels.is_empty() {
+            return RangeGrouping::Singleton;
+        }
+        let mut names = g.labels.clone();
+        names.sort_unstable();
+        names.dedup();
+        match g.kind {
+            pulsus_logql::GroupingKind::By => RangeGrouping::By(names),
+            pulsus_logql::GroupingKind::Without => RangeGrouping::Without(names),
+        }
+    }
+
+    fn contains(names: &[String], name: &str) -> bool {
+        names.binary_search_by(|n| n.as_str().cmp(name)).is_ok()
+    }
+
+    /// Applies the projection in place over the pipeline's final label
+    /// set. `unwrapped` is the successfully-unwrapped label pending
+    /// deletion — the reference folds it into the `without` list, so it
+    /// is deleted by the `Without` arm and by the ungrouped default, and
+    /// retained by `By`.
+    fn project(&self, labels: &mut Vec<(Cow<'_, str>, Cow<'_, str>)>, unwrapped: Option<&str>) {
+        match self {
+            // `labels.go:669-671` — `noLabels` short-circuits every other
+            // arm, so nothing (not even a parser-derived label) survives.
+            RangeGrouping::Singleton => labels.clear(),
+            // `withResult`, `labels.go:690-721`: the output is built FROM
+            // the group list, so a name the label set does not carry is
+            // simply absent — never materialized as `name=""`. A retain
+            // over the label set has exactly that property.
+            RangeGrouping::By(names) => labels.retain(|(k, _)| Self::contains(names, k)),
+            // `withoutResult`, `labels.go:723-769`: every base and added
+            // label except the group names survives.
+            RangeGrouping::Without(names) => labels.retain(|(k, _)| {
+                !Self::contains(names, k) && unwrapped.is_none_or(|u| k.as_ref() != u)
+            }),
+        }
+    }
+}
+
 /// The compiled, reusable per-line evaluator (consumed by the streams
 /// read path here and by the M6-10 metric-pipeline seam later).
 #[derive(Debug, Clone)]
@@ -1162,7 +1261,7 @@ impl CompiledPipeline {
         sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Result<Option<Cow<'a, str>>, RowBudgetExceeded> {
-        match self.run_mode_into(body, base, ts_ns, sm, labels, false)? {
+        match self.run_mode_into(body, base, ts_ns, sm, None, labels, false)? {
             (MetricRun::Dropped, _) => Ok(None),
             (MetricRun::Kept { line, .. }, _) => Ok(Some(line)),
         }
@@ -1188,7 +1287,15 @@ impl CompiledPipeline {
         ts_ns: i64,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Result<(Option<Cow<'a, str>>, bool), RowBudgetExceeded> {
-        match self.run_mode_into(body, base, ts_ns, &EMPTY_STRUCTURED_METADATA, labels, false)? {
+        match self.run_mode_into(
+            body,
+            base,
+            ts_ns,
+            &EMPTY_STRUCTURED_METADATA,
+            None,
+            labels,
+            false,
+        )? {
             (MetricRun::Dropped, has_err) => Ok((None, has_err)),
             (MetricRun::Kept { line, .. }, has_err) => Ok((Some(line), has_err)),
         }
@@ -1204,29 +1311,52 @@ impl CompiledPipeline {
     /// post-unwrap `__error__` filters process it in pipeline order; a
     /// MISSING unwrap label drops the line (the oracle silently skips
     /// those, never erroring — probed live).
+    ///
+    /// `grouping` (issue #344) is the range aggregation's own
+    /// `by`/`without` clause, applied to the final label set exactly
+    /// where the reference applies it — inside the sample extractor,
+    /// before the sample reaches any window
+    /// (`streamLabelSampleExtractor::Process` ends in
+    /// `l.builder.GroupedLabels()`, `metrics_extraction.go:229 @
+    /// v3.7.4`). It is passed per CALL rather than compiled into the
+    /// pipeline because `variants(...)` SHARES one compiled pipeline
+    /// across variants with identical tails
+    /// ([`super::variants::VariantArena`]) while each variant carries its
+    /// own grouping.
     pub fn run_metric_into<'a>(
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
         ts_ns: i64,
+        grouping: Option<&RangeGrouping>,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Result<MetricRun<'a>, RowBudgetExceeded> {
         // `MetricScanRow` carries no structured metadata (issue #249), so the
         // metric path always seeds empty slots.
         Ok(self
-            .run_mode_into(body, base, ts_ns, &EMPTY_STRUCTURED_METADATA, labels, true)?
+            .run_mode_into(
+                body,
+                base,
+                ts_ns,
+                &EMPTY_STRUCTURED_METADATA,
+                grouping,
+                labels,
+                true,
+            )?
             .0)
     }
 
     /// The second element of the return is the reference's `HasErr()` at the
     /// end of the pipeline — the pre-materialization slot state
     /// [`CompiledPipeline::run_into_reporting_err`] surfaces.
+    #[allow(clippy::too_many_arguments)]
     fn run_mode_into<'a>(
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
         ts_ns: i64,
         sm: &'a StructuredMetadataCtx,
+        grouping: Option<&RangeGrouping>,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
         metric: bool,
     ) -> Result<(MetricRun<'a>, bool), RowBudgetExceeded> {
@@ -1870,16 +2000,60 @@ impl CompiledPipeline {
             }
         }
 
-        // The deferred successful-unwrap deletion (issue #221): the label
-        // leaves the result series only now, AFTER every post-`unwrap`
-        // filter processed it — the reference's ordering.
-        if let Some(label) = unwrapped {
-            remove_label(labels, label);
-        }
         // The ONE merge point (`appendErrors` over the `visible()` gate):
         // kept lines only — a dropped line never merges (issue #238). The
         // slot state is captured BEFORE the merge consumes the slots.
+        //
+        // Read BEFORE the grouping projection below, not just before the
+        // merge: `GroupedLabels` (`labels.go:665-668 @ v3.7.4`) returns
+        // the UNGROUPED label set whenever `HasErr()`, "before applying
+        // grouping otherwise the error might get lost". PulsusDB fails the
+        // whole metric query on a surviving nonempty `__error__`
+        // (`check_surviving_error`), so keeping the ungrouped set here is
+        // what guarantees the error label is still present for that check
+        // to find — a `by (fp)` projection would otherwise drop
+        // `__error__` and turn a named 400 into a silent wrong answer.
         let has_err = errs.has_err();
+        // The deferred successful-unwrap deletion (issue #221): the label
+        // leaves the result series only now, AFTER every post-`unwrap`
+        // filter processed it — the reference's ordering. Issue #344 folds
+        // it into the grouping projection, exactly as the reference folds
+        // it into the extractor's `without` list
+        // (`metrics_extraction.go:154-158 @ v3.7.4`): the ungrouped and
+        // `without` forms delete it, `by (L)` does not.
+        if has_err {
+            // `labels.go:665-668` — on an errored line `GroupedLabels`
+            // returns `b.LabelsResult()`, the builder's labels UNTOUCHED.
+            // Nothing else in the reference ever deletes the unwrapped
+            // label (`streamLabelSampleExtractor::Process` only READS it,
+            // `metrics_extraction.go:202-230`); it goes only via the
+            // `without` list the extractor folds it into, and that list is
+            // part of the grouping this branch skips. So an errored line
+            // keeps it — including the shape this branch exists for: a
+            // SUCCESSFUL unwrap followed by a failing post-unwrap filter,
+            // where `unwrapped` is `Some` and the label is still present.
+            //
+            // Both the grouped and the ungrouped forms take this arm,
+            // because the reference has ONE `GroupedLabels` and a nil
+            // grouping reaches its `HasErr` check the same way.
+        } else {
+            // The deferred successful-unwrap deletion (issue #221): the
+            // label leaves the result series only now, AFTER every
+            // post-`unwrap` filter processed it — the reference's
+            // ordering. Issue #344 folds it into the grouping projection,
+            // exactly as the reference folds it into the extractor's
+            // `without` list (`metrics_extraction.go:154-158 @ v3.7.4`):
+            // the ungrouped and `without` forms delete it, `by (L)` does
+            // not.
+            match grouping {
+                None => {
+                    if let Some(label) = unwrapped {
+                        remove_label(labels, label);
+                    }
+                }
+                Some(g) => g.project(labels, unwrapped),
+            }
+        }
         errs.merge_into(labels);
         Ok((MetricRun::Kept { line, value }, has_err))
     }
@@ -4086,7 +4260,7 @@ mod tests {
         let base = vec![("app".to_string(), "x".to_string())];
         // Metric extraction still works end-to-end.
         let mut labels = Vec::new();
-        let _ = compiled.run_metric_into("d=250ms latency=2s", &base, 0, &mut labels);
+        let _ = compiled.run_metric_into("d=250ms latency=2s", &base, 0, None, &mut labels);
     }
 
     #[test]
@@ -4220,7 +4394,7 @@ mod tests {
         let base = vec![("app".to_string(), "x".to_string())];
         let mut labels = Vec::new();
         let MetricRun::Kept { value, .. } = compiled
-            .run_metric_into("took=250ms level=info", &base, 0, &mut labels)
+            .run_metric_into("took=250ms level=info", &base, 0, None, &mut labels)
             .expect("no budget breach")
         else {
             panic!("expected the line to be kept");
@@ -4233,6 +4407,166 @@ mod tests {
         assert!(labels.iter().any(|(k, v)| k == "level" && v == "info"));
     }
 
+    // -----------------------------------------------------------------
+    // Issue #344 — the range-aggregation grouping projection.
+    // -----------------------------------------------------------------
+
+    /// Runs one line through an unwrapping pipeline under `grouping` and
+    /// returns the sorted final label set. `logfmt` puts `v` and `region`
+    /// in the label set; `app` comes from the base (stream) labels.
+    fn grouped_labels(grouping: Option<&RangeGrouping>, body: &str) -> Vec<(String, String)> {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"max_over_time({a="b"} | logfmt | unwrap v [5m])"#,
+        ))
+        .unwrap();
+        let base = vec![("app".to_string(), "x".to_string())];
+        let mut labels = Vec::new();
+        let MetricRun::Kept { .. } = compiled
+            .run_metric_into(body, &base, 0, grouping, &mut labels)
+            .expect("no budget breach")
+        else {
+            panic!("expected the line to be kept");
+        };
+        let mut out: Vec<(String, String)> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn pairs(kv: &[(&str, &str)]) -> Vec<(String, String)> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn by(names: &[&str]) -> RangeGrouping {
+        RangeGrouping::from_ast(&pulsus_logql::Grouping {
+            kind: pulsus_logql::GroupingKind::By,
+            labels: names.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    fn without(names: &[&str]) -> RangeGrouping {
+        RangeGrouping::from_ast(&pulsus_logql::Grouping {
+            kind: pulsus_logql::GroupingKind::Without,
+            labels: names.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    /// Every arm of the projection, against the reference's rules —
+    /// `GroupedLabels` (`pkg/logql/log/labels.go:664-688 @ v3.7.4`) over
+    /// the group list `LabelExtractorWithStages` normalises
+    /// (`pkg/logql/log/metrics_extraction.go:154-158 @ v3.7.4`). The
+    /// container-captured end-to-end evidence for the same rules is
+    /// `b18_range_agg_grouping.test`; this pins them at the one place
+    /// they are implemented.
+    #[test]
+    fn the_range_grouping_projection_matches_every_reference_arm() {
+        const BODY: &str = "v=1 region=eu";
+
+        // No grouping: today's behaviour, and the reference's
+        // `without (v)` default — the unwrapped label is deleted, nothing
+        // else is.
+        assert_eq!(
+            grouped_labels(None, BODY),
+            pairs(&[("app", "x"), ("region", "eu")])
+        );
+
+        // `without ()` is the identity: `Grouping.Noop()` (ast.go:1544)
+        // normalises to the same `without (v)` the ungrouped form takes.
+        assert_eq!(
+            grouped_labels(Some(&without(&[])), BODY),
+            grouped_labels(None, BODY)
+        );
+
+        // `without (L)` drops L AND the unwrapped label.
+        assert_eq!(
+            grouped_labels(Some(&without(&["region"])), BODY),
+            pairs(&[("app", "x")])
+        );
+
+        // `by (L)` keeps exactly L…
+        assert_eq!(
+            grouped_labels(Some(&by(&["region"])), BODY),
+            pairs(&[("region", "eu")])
+        );
+
+        // …including the UNWRAPPED label, which `by` does not delete —
+        // the case that would silently vanish if the projection sat
+        // beside the unwrap deletion instead of subsuming it. Captured:
+        // `max_over_time(… | unwrap v [5m]) by (v)` answers `{v="1"} 1`.
+        assert_eq!(
+            grouped_labels(Some(&by(&["v"])), BODY),
+            pairs(&[("v", "1")])
+        );
+
+        // An absent name is NOT materialised as `name=""`.
+        assert_eq!(grouped_labels(Some(&by(&["nosuch"])), BODY), pairs(&[]));
+
+        // `by ()` is `Singleton()` ⇒ `noLabels` ⇒ the empty set, which
+        // short-circuits ahead of every other arm (labels.go:669-671).
+        assert_eq!(grouped_labels(Some(&by(&[])), BODY), pairs(&[]));
+
+        // Duplicates dedupe in both directions (issue #288's rule,
+        // re-confirmed for this construct against the container).
+        assert_eq!(
+            grouped_labels(Some(&by(&["region", "region"])), BODY),
+            grouped_labels(Some(&by(&["region"])), BODY)
+        );
+        assert_eq!(
+            grouped_labels(Some(&without(&["region", "region"])), BODY),
+            grouped_labels(Some(&without(&["region"])), BODY)
+        );
+
+        // The normalisation itself: `by ()` is the Singleton arm, not an
+        // empty `By` list (which would keep nothing for a different and
+        // accidental reason).
+        assert_eq!(by(&[]), RangeGrouping::Singleton);
+        assert_eq!(without(&[]), RangeGrouping::Without(Vec::new()));
+        assert_eq!(
+            by(&["b", "a", "b"]),
+            RangeGrouping::By(vec!["a".to_string(), "b".to_string()]),
+            "the names are sorted and deduplicated once, at plan time"
+        );
+    }
+
+    /// `GroupedLabels` returns the UNGROUPED set when `HasErr()`
+    /// (`labels.go:665-668 @ v3.7.4`: "before applying grouping otherwise
+    /// the error might get lost"). For PulsusDB that is load-bearing
+    /// rather than cosmetic: `check_surviving_error` fails the query on a
+    /// nonempty `__error__`, and a `by (region)` projection would
+    /// otherwise DROP `__error__` and turn a named 400 into a silently
+    /// wrong answer.
+    #[test]
+    fn an_errored_line_keeps_its_ungrouped_labels_so_the_error_survives_grouping() {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"max_over_time({a="b"} | logfmt | unwrap duration(took) [5m])"#,
+        ))
+        .unwrap();
+        let base = vec![("app".to_string(), "x".to_string())];
+        for grouping in [None, Some(&by(&["region"])), Some(&without(&["region"]))] {
+            let mut labels = Vec::new();
+            let MetricRun::Kept { .. } = compiled
+                .run_metric_into("took=abc region=eu", &base, 0, grouping, &mut labels)
+                .expect("no budget breach")
+            else {
+                panic!("a failed conversion keeps the line");
+            };
+            assert!(
+                labels
+                    .iter()
+                    .any(|(k, v)| k == ERROR_LABEL && v == SAMPLE_EXTRACTION_ERROR),
+                "the error must survive the projection for {grouping:?}: {labels:?}"
+            );
+            assert!(
+                labels.iter().any(|(k, _)| k == "app"),
+                "the errored line's labels stay UNGROUPED for {grouping:?}: {labels:?}"
+            );
+        }
+    }
+
     #[test]
     fn metric_run_tags_sample_extraction_err_on_a_failed_conversion_and_keeps_the_line() {
         let compiled = CompiledPipeline::compile(&stages_of(
@@ -4242,7 +4576,7 @@ mod tests {
         let base = vec![("app".to_string(), "x".to_string())];
         let mut labels = Vec::new();
         let MetricRun::Kept { value, .. } = compiled
-            .run_metric_into("took=abc level=warn", &base, 0, &mut labels)
+            .run_metric_into("took=abc level=warn", &base, 0, None, &mut labels)
             .expect("no budget breach")
         else {
             panic!("a failed conversion keeps the line (a later __error__ filter may drop it)");
@@ -4270,7 +4604,7 @@ mod tests {
         let mut labels = Vec::new();
         assert!(matches!(
             compiled
-                .run_metric_into("level=error", &base, 0, &mut labels)
+                .run_metric_into("level=error", &base, 0, None, &mut labels)
                 .expect("no budget breach"),
             MetricRun::Dropped
         ));
@@ -4288,13 +4622,13 @@ mod tests {
         let mut labels = Vec::new();
         assert!(matches!(
             compiled
-                .run_metric_into("took=abc", &base, 0, &mut labels)
+                .run_metric_into("took=abc", &base, 0, None, &mut labels)
                 .expect("no budget breach"),
             MetricRun::Dropped
         ));
         assert!(matches!(
             compiled
-                .run_metric_into("took=100ms", &base, 0, &mut labels)
+                .run_metric_into("took=100ms", &base, 0, None, &mut labels)
                 .expect("no budget breach"),
             MetricRun::Kept {
                 value: Some(v),
@@ -4328,7 +4662,7 @@ mod tests {
             let compiled = CompiledPipeline::compile(&stages_of(query)).unwrap();
             let mut labels = Vec::new();
             let MetricRun::Kept { value, .. } = compiled
-                .run_metric_into(body, &base, 0, &mut labels)
+                .run_metric_into(body, &base, 0, None, &mut labels)
                 .expect("no budget breach")
             else {
                 panic!("expected {query} over {body:?} to keep the line");
@@ -4465,7 +4799,7 @@ mod tests {
         let base = vec![("a".to_string(), "b".to_string())];
         let mut labels = Vec::new();
         let MetricRun::Kept { .. } = compiled
-            .run_metric_into("level=info took=bad", &base, 0, &mut labels)
+            .run_metric_into("level=info took=bad", &base, 0, None, &mut labels)
             .expect("no budget breach")
         else {
             panic!("or-true absorbs the failure and keeps the line");

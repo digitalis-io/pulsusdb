@@ -399,7 +399,7 @@ jobs:
       # under test, and the leg needs ~80 sequential pushes.
       #
       # It verifies VALUES; it does not verify provenance markers — it
-      # reads them to decide which rows it may compare. 77 of the 948
+      # reads them to decide which rows it may compare. 77 of the 993
       # rows the markers permit are physically reachable; the gap is
       # enumerated by reason in the test, dominated by 678 template rows
       # pinned to an absolute date the reference will not serve.

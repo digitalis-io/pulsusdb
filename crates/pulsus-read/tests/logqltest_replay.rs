@@ -545,12 +545,28 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// exclusion only: `derived` is not a capture claim, so
 /// [`PROVENANCE_PERMITS`] does not move, and they are metric queries,
 /// which this slice cannot reach in any case.
-const TOTAL_DIRECTIVES: usize = 1_215;
+///
+/// Issue #344's execution half moves all three provenance figures.
+/// `b18_range_agg_grouping.test` gained 28 captured `eval` rows and
+/// converted 10 `eval_fail` rows (the interim "not yet executed"
+/// refusals) into `eval`s, and its instant `first`/`last`
+/// delivery-order fix added the two cross-stream tie rows: TOTAL
+/// 1_215 -> 1_245, `our-error-text (eval_fail)` 71 -> 61, and so
+/// `PROVENANCE_PERMITS` 948 -> 993 (the rows added across both rounds
+/// plus the 10 that stopped being our own error text; review round 1 net
+/// +5 permitted — seven captured rows added, one grouped-`avg` row
+/// removed, and two of the new ones are `eval_fail`s carrying our own
+/// error text, which the markers do not permit a replay to compare).
+/// [`REACHABLE`] does NOT move: every newly-permitted row is a metric
+/// queries (30 instant, 8 on a step grid) and this slice replays log
+/// (streams) queries at a single instant — so they land in the
+/// enumerated gap, not in the coverage.
+const TOTAL_DIRECTIVES: usize = 1_252;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 948;
+const PROVENANCE_PERMITS: usize = 993;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -559,10 +575,16 @@ const PROVENANCE_PERMITS: usize = 948;
 const REACHABLE: usize = 77;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \
-not a capture claim (ported)=29, our-error-text (eval_fail)=71, pinned-divergence=17";
+not a capture claim (ported)=29, our-error-text (eval_fail)=63, pinned-divergence=17";
 
+/// Issue #344: `metric query` 191 -> 221 and `range/matrix eval`
+/// 2 -> 10. All 38 of `b18_range_agg_grouping.test`'s newly-permitted
+/// rows are metric queries, 8 of them on a step grid, and this slice
+/// replays log (streams) queries at a single instant — so they enlarge
+/// the ENUMERATED gap rather than the coverage. Both are levers the
+/// module docs already name.
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \
-metric query (slice: streams only)=191, range/matrix eval (slice: instant only)=2";
+metric query (slice: streams only)=228, range/matrix eval (slice: instant only)=10";
 
 /// How far back the first slot sits. Bounded above by
 /// [`INGESTION_WINDOW`] and below by the total slot span; both are

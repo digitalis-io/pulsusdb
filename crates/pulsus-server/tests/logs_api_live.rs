@@ -2192,6 +2192,188 @@ async fn variants_reads_each_variants_offset_window_intersected_with_the_shared_
     );
 }
 
+/// Issue #344 — a grouped range aggregation, end to end over the real
+/// ClickHouse scan.
+///
+/// The hermetic corpus already pins the VALUES; what only a live run can
+/// establish is that the clause survives the whole route — HTTP → planner
+/// → the one raw `log_samples` scan → the client aggregator's row loop —
+/// and that the merge really happens over samples arriving from two
+/// DIFFERENT fingerprints rather than over two per-stream results.
+///
+/// The fixture is chosen so those two readings cannot be confused: the
+/// `prod` stream carries `{1, 2}` and the `staging` stream `{10, 20}`,
+/// both relabelled into one group by `by (svc)`. The merged population
+/// stddev is 7.628073151196178 (captured from the pinned v3.7.4
+/// reference for exactly this sample set); a stddev of the per-series
+/// stddevs would be 2.25, and the per-series values 0.5 and 5 are
+/// asserted alongside as the control. `min`/`max` bracket it: 1 and 20
+/// can only come from a group holding both streams' samples.
+#[tokio::test]
+async fn a_grouped_range_aggregation_merges_two_streams_raw_samples_end_to_end() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_range_grouping";
+    let port = 31_124;
+    // Exact values throughout, so a previous run's rows must not survive.
+    drop_database(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+
+    // `setup` seeds 3 unwrappable-free lines per stream; they are dropped
+    // by `| logfmt | unwrap v` (no `v` key — a missing unwrap label skips
+    // the line, never errors), so only these four samples reach the
+    // reducer.
+    //
+    // The four samples get DISTINCT, ascending timestamps —
+    // `prod` at base-4s/-3s, `staging` at base-2s/-1s — so the merged
+    // group folds them in value order 1, 2, 10, 20. That matters to the
+    // LAST BIT: Welford's recurrence is not associative, and interleaving
+    // the streams (which is what equal timestamps would do, ordered by
+    // `stream_hash`) gives 7.628073151196179 instead — a legitimate
+    // ordering difference, not a defect, but not the sample order the
+    // captured constant below was taken over. Same-timestamp cross-stream
+    // order is pinned separately, on the sliding path, by
+    // `b18_range_agg_grouping.test`.
+    let mut values = Vec::new();
+    for (fp, vs) in [(FP_A, [1, 2]), (FP_B, [10, 20])] {
+        for (i, v) in vs.iter().enumerate() {
+            let ago = if fp == FP_A {
+                4 - i as i64
+            } else {
+                2 - i as i64
+            };
+            let ts = base_ns - ago * 1_000_000_000;
+            values.push(format!("('checkout', {fp}, {ts}, 0, 'v={v}')"));
+        }
+    }
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                 VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed the unwrappable samples");
+
+    // Both seeded streams share `service_name="checkout"` and differ in
+    // `env`, so `| label_format svc=service_name` gives them a common
+    // grouping label without disturbing the selector.
+    const SEL: &str =
+        r#"{service_name="checkout"} | logfmt | label_format svc=service_name | unwrap v [30s]"#;
+
+    let vector = |query: &str| -> Vec<(String, String)> {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query",
+                &[("query", query), ("time", &base_ns.to_string())],
+            ),
+        )
+        .expect("query reachable");
+        assert_eq!(res.status, 200, "{query}: {}", res.body);
+        let body = json(&res);
+        assert_eq!(body["data"]["resultType"], "vector", "{query}");
+        let mut out: Vec<(String, String)> = body["data"]["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{query}: no result array in {}", res.body))
+            .iter()
+            .map(|r| {
+                (
+                    serde_json::to_string(&r["metric"]).expect("metric renders"),
+                    r["value"][1].as_str().expect("string value").to_string(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+
+    // THE DISCRIMINATOR: one series, and its value is the stddev of the
+    // MERGED {1,2,10,20}, not of the per-series stddevs.
+    assert_eq!(
+        vector(&format!("stddev_over_time({SEL}) by (svc)")),
+        vec![(
+            r#"{"svc":"checkout"}"#.to_string(),
+            "7.628073151196178".to_string()
+        )],
+    );
+    // The control: ungrouped, the same scan yields the two per-stream
+    // stddevs — 0.5 and 5, whose own stddev would be 2.25.
+    assert_eq!(
+        vector(&format!("stddev_over_time({SEL})"))
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect::<Vec<_>>(),
+        vec!["0.5".to_string(), "5".to_string()],
+    );
+    // The endpoints can only come from a group holding both streams.
+    assert_eq!(
+        vector(&format!("min_over_time({SEL}) by (svc)")),
+        vec![(r#"{"svc":"checkout"}"#.to_string(), "1".to_string())],
+    );
+    assert_eq!(
+        vector(&format!("max_over_time({SEL}) by (svc)")),
+        vec![(r#"{"svc":"checkout"}"#.to_string(), "20".to_string())],
+    );
+    // `by ()` collapses to one `{}` series over every sample.
+    assert_eq!(
+        vector(&format!("max_over_time({SEL}) by ()")),
+        vec![("{}".to_string(), "20".to_string())],
+    );
+    // `without` drops ONLY the named label and keeps every other,
+    // including the parser-derived `svc` — so whether it merges depends
+    // on which label it removes, and both directions are asserted.
+    // `without (svc)` leaves `env` behind and the streams stay apart;
+    // `without (env)` removes the only distinguishing label and they
+    // merge, over the raw samples again (max 20). `service_name` is
+    // absent from both: `label_format svc=service_name` is the
+    // reference's `Set`-then-`Del`, so it MOVES the label rather than
+    // copying it (docs/features.md).
+    let without_svc = vector(&format!("max_over_time({SEL}) without (svc)"));
+    assert_eq!(
+        without_svc.len(),
+        2,
+        "`without (svc)` keeps `env`, so the streams stay apart: {without_svc:?}"
+    );
+    assert!(
+        without_svc
+            .iter()
+            .all(|(m, _)| m.contains(r#""env""#) && !m.contains(r#""svc""#)),
+        "{without_svc:?}"
+    );
+    assert_eq!(
+        vector(&format!("max_over_time({SEL}) without (env)")),
+        vec![(r#"{"svc":"checkout"}"#.to_string(), "20".to_string())],
+    );
+    // …and the seven operations the reference refuses are still a 400
+    // through the real route, not a silently ungrouped 200.
+    let refused = http_get(
+        port,
+        &q(
+            "/api/logs/v1/query",
+            &[
+                ("query", &format!("sum_over_time({SEL}) by (svc)")),
+                ("time", &base_ns.to_string()),
+            ],
+        ),
+    )
+    .expect("query reachable");
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(
+        refused
+            .body
+            .contains("grouping not allowed for sum_over_time aggregation"),
+        "{}",
+        refused.body
+    );
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {
