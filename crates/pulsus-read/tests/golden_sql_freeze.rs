@@ -58,25 +58,33 @@ use std::path::{Path, PathBuf};
 /// precisely the thing the count should report.
 const CORPORA: [(&str, usize); 2] = [("traces_search", 46), ("traces_metrics", 17)];
 
-/// A 64-bit rolling digest over `(relative path, 0x01, bytes, 0x00)` for
-/// every `.sql` file, in sorted path order — FNV-1a's shape with the
-/// same mixing constants `accept_surface.rs` uses, deliberately, so the
-/// two change-detectors in this repo are the same function (its
-/// multiplier is not the textbook FNV prime; for a change-detector that
-/// is immaterial, and matching the existing one is worth more than the
-/// name). No new dependency, and the value is regenerated from the
-/// assertion message.
+/// A 64-bit rolling digest over every entry, in sorted path order —
+/// FNV-1a's shape with the same mixing constants `accept_surface.rs`
+/// uses, deliberately, so the two change-detectors in this repo are the
+/// same function (its multiplier is not the textbook FNV prime; for a
+/// change-detector that is immaterial, and matching the existing one is
+/// worth more than the name). No new dependency, and the value is
+/// regenerated from the assertion message.
+///
+/// **The record is LENGTH-PREFIXED, not separator-delimited** (Stage C
+/// review round 4). Framing each entry as `kind · len(path) · path ·
+/// len(bytes) · bytes` makes the encoding injective by construction. The
+/// separator form it replaces was ambiguous: with `0x01` between path and
+/// content and `0x00` after, a file named `a\x01b` holding `X` fed
+/// exactly the same bytes as a file named `a` holding `b\x01X` — two
+/// different corpus states, one digest. Escaping `0x01` would have moved
+/// that question to the next byte; a length prefix removes it.
 ///
 /// Verified to certify the PRE-change corpus: recomputed independently
-/// over `49cff9a`'s 63 golden blobs, it is this value — so the constant
-/// pins the goldens as they stood before issue #335 Stage C, which is
-/// what makes "Stage C edits zero SQL goldens" a checkable statement
-/// rather than a claim.
+/// over `49cff9a`'s 63 golden blobs — under this encoding — it is this
+/// value, so the constant pins the goldens as they stood before issue
+/// #335 Stage C, which is what makes "Stage C edits zero SQL goldens" a
+/// checkable statement rather than a claim.
 ///
 /// **Never update this to make a run go green.** Moving it means one
 /// thing: the frozen SQL corpus was deliberately regenerated, and the
 /// change says which query's output moved and why.
-const PINNED_SQL_CORPUS: u64 = 0x04ac_b7f2_1762_cfb7;
+const PINNED_SQL_CORPUS: u64 = 0xfd4a_e0c5_99df_bc38;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -92,8 +100,8 @@ fn golden_dir(name: &str) -> PathBuf {
 /// one is not invisible: a walk that only yields files digests nothing
 /// for `traces_search/scratch/`, and a directory appearing inside a
 /// frozen corpus is a change like any other. The two kinds carry
-/// different separator bytes, so a directory `foo` and a file `foo`
-/// cannot collide.
+/// different KIND bytes, so a directory `foo` and a file `foo` cannot
+/// collide.
 enum Entry {
     File { rel: String, path: PathBuf },
     Dir { rel: String },
@@ -119,6 +127,25 @@ impl Entry {
 /// `symlink_metadata` never follows, and a symlink appearing inside a
 /// directory that is supposed to be frozen is itself a change worth
 /// failing on, which is why this rejects rather than resolves.
+///
+/// **The ROOT is held to the same rule as its children** (Stage C review
+/// round 4). Checking every entry `read_dir` yields while never checking
+/// the directory `read_dir` was called on left the whole corpus
+/// substitutable: replace `traces_search/` itself with a symlink and the
+/// walk followed it, digesting a tree from anywhere. The root is checked
+/// before it is read.
+///
+/// **Stated edge, deliberately not closed** (the review classified it a
+/// stated edge, not a demonstrated bypass; the cap on this apparatus is
+/// deliberate): a FIFO or a device node is neither a symlink nor a
+/// directory, so it is walked as a file and `fs::read` is called on it —
+/// a FIFO would block the suite until something writes, and a character
+/// device would feed bytes that are not corpus content. Reaching it
+/// requires `mknod`/`mkfifo` inside `tests/golden/`, which is not
+/// something a patch can do and not something git can carry: git stores
+/// only regular files, symlinks and gitlinks, so neither can arrive
+/// through a PR. Closing it would be one `kind.is_file()` assertion if
+/// that ever changes.
 fn corpus_entries(dir: &Path) -> Vec<Entry> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<Entry>) {
         let mut paths: Vec<PathBuf> = fs::read_dir(dir)
@@ -151,6 +178,20 @@ fn corpus_entries(dir: &Path) -> Vec<Entry> {
             }
         }
     }
+    let root = fs::symlink_metadata(dir)
+        .unwrap_or_else(|e| panic!("symlink_metadata {}: {e}", dir.display()));
+    assert!(
+        !root.file_type().is_symlink(),
+        "the corpus root {} is a symlink. The whole frozen directory would be substitutable: \
+         the walk would digest whatever tree it points at. Remove it, or freeze what it points \
+         at.",
+        dir.display()
+    );
+    assert!(
+        root.file_type().is_dir(),
+        "the corpus root {} is not a directory",
+        dir.display()
+    );
     let mut out = Vec::new();
     walk(dir, "", &mut out);
     out.sort_by(|a, b| a.rel().cmp(b.rel()));
@@ -187,30 +228,35 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
     };
+    // One record per entry: KIND · len(path) · path · len(bytes) · bytes,
+    // every length an 8-byte big-endian count. Length-prefixed rather
+    // than separator-delimited, so the encoding is injective: no two
+    // corpus states can produce the same byte stream, whatever bytes
+    // appear inside a name or a file. The path is still fed before the
+    // content, so a rename — including a move between the two corpora or
+    // into a subdirectory — moves the digest with no byte of content
+    // changed; a directory carries its own KIND and an empty content
+    // field, so an empty directory is visible and cannot be confused
+    // with a file of the same name.
+    const KIND_FILE: u8 = 0x01;
+    const KIND_DIR: u8 = 0x02;
     for (name, _) in CORPORA {
         let dir = golden_dir(name);
         for entry in corpus_entries(&dir) {
-            // The path is fed BEFORE the bytes, so a rename — including a
-            // move between the two corpora, or into a subdirectory —
-            // moves the digest even though no byte of content changed.
-            // A directory feeds its name and a DIFFERENT separator, so an
-            // empty directory is visible and cannot be confused with a
-            // file of the same name.
-            match entry {
-                Entry::File { rel, path } => {
-                    feed(format!("{name}/{rel}").as_bytes());
-                    feed(&[0x01]);
-                    feed(
-                        &fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
-                    );
-                    feed(&[0x00]);
-                }
-                Entry::Dir { rel } => {
-                    feed(format!("{name}/{rel}").as_bytes());
-                    feed(&[0x02]);
-                    feed(&[0x00]);
-                }
-            }
+            let (kind, rel, content) = match entry {
+                Entry::File { rel, path } => (
+                    KIND_FILE,
+                    rel,
+                    fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+                ),
+                Entry::Dir { rel } => (KIND_DIR, rel, Vec::new()),
+            };
+            let key = format!("{name}/{rel}");
+            feed(&[kind]);
+            feed(&(key.len() as u64).to_be_bytes());
+            feed(key.as_bytes());
+            feed(&(content.len() as u64).to_be_bytes());
+            feed(&content);
         }
     }
     assert_eq!(
