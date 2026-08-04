@@ -1904,17 +1904,20 @@ async fn nothing_in_a_query_may_span_more_than_five_years() {
     );
 
     // 3b. EVERY route that carries `start`/`end`, not just `query_range`.
-    // `/labels` and `/label/{name}/values` are the reason this loop
-    // exists: they resolve label names and values without building a plan,
-    // so the first cut of the span cap — which lived in the planner — let
-    // a 20-year range straight through. Those two and only those two:
-    // measured by deleting the `parse_bounds` call and running this loop,
-    // which is also why it collects rather than short-circuits. `/series`
-    // is NOT one of them despite taking only a selector — the engine
-    // builds a synthetic Range spec and calls `plan()` per selector — and
-    // neither are `detected_*`, `patterns`, `stats`, `volume`. The cap now
-    // sits in the one function all nine share
-    // (`handlers::parse_bounds`), and this is what says so.
+    // THREE code paths never reach the planner and are capped by
+    // `handlers::parse_bounds` alone: `/labels`, `/label/{name}/values`
+    // and `/detected_labels` WITHOUT a `query` (its `selector == None` arm
+    // derives months and aggregates directly). The first cut of the cap
+    // lived in the planner and let all three serve a 20-year range.
+    //
+    // That set is measured, not read off route shapes: delete the
+    // `parse_bounds` call and run this loop, which sends an over-cap range
+    // to every row and COLLECTS the survivors rather than short-circuiting
+    // — the reason it collects. `/series` is NOT among them despite taking
+    // only a selector (the engine builds a synthetic Range spec and plans
+    // per selector), and `/detected_labels` appears twice below precisely
+    // so the scoped form staying capped while the unscoped one does not is
+    // visible rather than assumed. The full table is at `parse_bounds`.
     let over = (base_ns - CAP_NS - 1).to_string();
     let now = base_ns.to_string();
     let at_cap = (base_ns - CAP_NS).to_string();
@@ -1927,6 +1930,12 @@ async fn nothing_in_a_query_may_span_more_than_five_years() {
             "/api/logs/v1/detected_labels",
             vec![("query", r#"{env="prod"}"#)],
         ),
+        // The UNSCOPED form is a DIFFERENT code path: with no `query`,
+        // `detected_labels_inner` takes its `selector == None` arm, derives
+        // months directly and never plans, so `parse_bounds` is the only
+        // thing capping it. Covered explicitly because the scoped row above
+        // cannot speak for it.
+        ("/api/logs/v1/detected_labels", vec![]),
         (
             "/api/logs/v1/detected_fields",
             vec![("query", r#"{env="prod"}"#)],

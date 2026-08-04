@@ -49,19 +49,37 @@ pub(super) async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError
 ///
 /// **THE CAP LIVES HERE BECAUSE THIS IS THE ONLY PLACE EVERY ENDPOINT
 /// CARRYING `start`/`end` PASSES THROUGH.** Its first cut sat in
-/// `pulsus_read::logql::plan`, and the two LABEL-DISCOVERY routes never
-/// reach it: `/labels` and `/label/{name}/values` resolve names and values
-/// without building a plan at all, so a 20-year range walked straight past
-/// it. Those two, and only those two — established by deleting the call
-/// below and enumerating what still served a 5-year-plus range, not by
-/// reading route shapes. `/series` looks like it should be a third and is
-/// not: `LogQlEngine::series` builds a synthetic `QuerySpec::Range` and
-/// calls `plan()` per selector, so the planner-level check already caught
-/// it, as it did for `detected_*`, `patterns`, `stats` and `volume`.
-/// Nine routes share this function — `query_range`, `series`, `labels`,
-/// `label/{name}/values`, `detected_labels`, `detected_fields`,
-/// `patterns`, `stats`, `volume` — and each is covered by the one call
-/// below rather than by a copy of its own.
+/// `pulsus_read::logql::plan`, which three of these code paths never
+/// reach, so a 20-year range walked straight past it.
+///
+/// **Whether a route reaches `plan()` is a property of the ENGINE METHOD
+/// it calls, not of whether it takes a selector.** The nine routes sharing
+/// this function, each verified against the engine code and then measured
+/// (see below):
+///
+/// | route | reaches `plan()`? |
+/// |---|---|
+/// | `query_range` | yes — it IS a plan |
+/// | `series` | yes — `series_inner` builds a synthetic `QuerySpec::Range` and plans per selector |
+/// | `stats`, `patterns`, `volume`, `detected_fields` | yes — same idiom; each requires a `query` |
+/// | `detected_labels` **with** `query` | yes — the `Some(expr)` arm plans |
+/// | `detected_labels` **without** `query` | **NO** — the `None` arm derives months and aggregates directly |
+/// | `labels`, `label/{name}/values` | **NO** — label discovery resolves names/values without a plan |
+///
+/// So the last three rows are capped by THIS call and nothing else, and
+/// the rest are capped twice. `/series` looks like it should be among them
+/// and is not; `/detected_labels` is in both groups depending on one
+/// optional parameter.
+///
+/// **How that table was established, because guessing it from route shape
+/// is what produced two wrong versions of this comment:** the call below
+/// was deleted and `logs_api_live::nothing_in_a_query_may_span_more_than_five_years`
+/// re-run, which sends an over-cap range to every row (both
+/// `detected_labels` forms) and COLLECTS the ones still served. It named
+/// exactly `labels`, `label/{name}/values` and the unscoped
+/// `detected_labels` — the scoped `detected_labels` row, same path, stayed
+/// capped, which is what makes the `query`-dependent split a measurement
+/// rather than a reading.
 ///
 /// The two endpoints deliberately NOT covered, because neither takes a
 /// time RANGE:

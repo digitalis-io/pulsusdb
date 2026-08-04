@@ -967,19 +967,16 @@ fn check_query_span(p: &QueryParams) -> Result<(), ReadError> {
 /// layer has, and the ONE implementation both callers share.
 ///
 /// `logs_api::handlers::parse_bounds` calls this: it is the single
-/// function every LogQL endpoint carrying `start`/`end` goes through
-/// (`query_range`, `series`, `labels`, `label/{name}/values`,
-/// `detected_labels`, `detected_fields`, `patterns`, `stats`, `volume`),
-/// including the LABEL-DISCOVERY ones that never reach [`plan`] at all.
-/// `/labels` and `/label/{name}/values` are exactly those, and are what
-/// slipped past the first cut of this check, which lived in [`plan`]
-/// alone — MEASURED by deleting the `parse_bounds` call and enumerating
-/// what then served a 5-year-plus range, not inferred from route shape.
-/// `/series` is NOT one of them despite taking only a selector:
-/// `super::exec::LogQlEngine::series` builds a synthetic
-/// [`QuerySpec::Range`] and calls [`plan`] per selector, so it was covered
-/// all along. [`plan`] keeps its own call for the LIBRARY API, whose
-/// callers (tests, e2e, any embedder) never pass through `parse_bounds`.
+/// function every LogQL endpoint carrying `start`/`end` goes through, and
+/// for three of those code paths it is the ONLY thing that caps the span.
+/// The full division of labour is written out once, at `parse_bounds`
+/// itself; the short version is that reaching [`plan`] is a property of
+/// the ENGINE METHOD a route calls, not of whether the route takes a
+/// selector — `/series` reaches it, `/labels` does not, and
+/// `/detected_labels` reaches it only when `query` is present.
+///
+/// [`plan`] keeps its own call for the LIBRARY API, whose callers (tests,
+/// e2e, any embedder) never pass through `parse_bounds`.
 ///
 /// `start > end` is left alone — an empty grid, handled downstream. Only
 /// the positive magnitude is bounded, computed in `i128` so the
