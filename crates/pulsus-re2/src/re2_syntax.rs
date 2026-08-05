@@ -8,42 +8,38 @@
 //! in-process paths that ROUTE THROUGH THIS MODULE — the warm label
 //! cache, `concrete_name_matches`, `info()`'s ignore-set matchers,
 //! `label_replace` on both signals — compile with the Rust
-//! `regex` crate instead, whose grammar **overlaps** RE2's without
-//! containing it (issue #336: neither contains the other — the Rust crate
-//! rejects `\Q…\E` and octal escapes, which RE2 accepts, and the
-//! acceptance screen below has an arm for exactly that,
-//! `rust_rejects_beyond_its_remit`). What this module handles is the
-//! overlap: several constructs are accepted by both engines and mean
+//! `regex` crate instead. The two grammars overlap without either
+//! containing the other, and several constructs they both accept mean
 //! different things.
-//! Those are value divergences, not status ones — the query succeeds and
-//! returns the wrong rows, with nothing to indicate it.
 //!
-//! NOT every in-process regex site routes through here, and the list above
-//! is the ones that do — `pulsus-read`'s LogQL pipeline compiles the
-//! user's pattern with the Rust crate and does NOT call
-//! [`re2_pattern_to_rust`], so the table below is live there (issue #336,
-//! open; docs/api.md §9.1's "as written" rows). Adding a caller means
-//! adding it to that list, not assuming it:
+//! **`docs/api.md` §9.2 is the authoritative table of which constructs
+//! those are, and this module exists to close exactly that list.** It is
+//! deliberately not restated here. The copy that used to live in this
+//! comment drifted twice before issue #336 caught it — it claimed `[]a]`
+//! reads differently in the two engines (it does not; the rewrite escapes
+//! it anyway, a harmless no-op) and listed `(?P<n>…)` as an acceptance
+//! divergence (both engines accept named groups). Change a rewrite rule
+//! and update §9.2, never a second table.
 //!
-//! | construct | RE2 / Go `regexp` | Rust `regex` |
-//! |---|---|---|
-//! | `\d` `\w` `\s` (+ negations) | ASCII (`[0-9]`, `[0-9A-Za-z_]`, `[\t\n\f\r ]`) | Unicode (`\p{Nd}`, …) |
-//! | `\b` `\B` | ASCII word boundary | Unicode word boundary |
-//! | `[a&&b]` | class of `a`, `&`, `b` | intersection — matches nothing |
-//! | `[a~~b]` | class of `a`, `~`, `b` | symmetric difference |
-//! | `[a--b]` | range `a`–`-`, i.e. **rejected** | difference — matches `a` |
-//! | `[a[b]]` | class of `a`, `[`, `b`, then a literal `]` | nested class (union) |
-//! | `a{bbb}c`, `a{,5}` | literal braces | malformed repetition — rejected |
+//! The RULES this module applies, which is a statement about the code
+//! rather than about either engine: the Perl classes `\d`/`\w`/`\s` and
+//! their negations, the boundaries `\b`/`\B`, the class-set operators
+//! (`&&`, `~~`, `--`), a nested `[`, a leading `]`, and a brace run that
+//! is not a well-formed repetition. Everything else passes through
+//! byte-for-byte.
 //!
-//! `[]a]` sat on that table until issue #336, marked "*(differs)*" on the
-//! Rust side. It does not differ: **both** engines read a leading `]` as a
-//! literal, so `[]a]` is the class `{']', 'a'}` in each — measured against
-//! Go's `regexp`, ClickHouse 24.8's RE2 and `regex` 1.13.0. The class
-//! rewrite still escapes it, which is a harmless no-op rather than a
-//! correction, and the row was removed because it was never a divergence.
+//! These are value divergences, not status ones — an unrewritten pattern
+//! makes the query SUCCEED and return the wrong rows, with nothing to
+//! indicate it.
 //!
-//! [`re2_pattern_to_rust`] rewrites those constructs into Rust syntax with
-//! RE2's meaning, and leaves everything else byte-identical. The rewrite is
+//! NOT every in-process regex site routes through here. The callers that
+//! do are the four named above; `pulsus-read`'s LogQL pipeline compiles
+//! the user's pattern with the Rust crate and does NOT call
+//! [`re2_pattern_to_rust`], which is the open defect behind docs/api.md
+//! §9.1's "as written" rows (issue #336). Adding a caller means adding it
+//! to that list, not assuming it.
+//!
+//! The rewrite is
 //! applied **only to the Rust side**: the pattern that reaches ClickHouse
 //! is still the user's, because RE2 already reads it correctly and
 //! rewriting the SQL predicate could only add risk. The one exception is
@@ -58,18 +54,11 @@
 //! rendered literal agree on every probe subject.
 //!
 //! **Not** in scope here — acceptance divergences, where one engine
-//! rejects what the other compiles: `\p{Alphabetic}` and `a{1001}` (Rust
-//! accepts, RE2 rejects) and `\Q…\E` (RE2 accepts, Rust rejects). Those
-//! are `metrics::re2_authority`'s job: it screens them off the in-process
-//! path so RE2 returns the verdict. A rewrite whose output the Rust crate
-//! rejects therefore costs a storage round-trip and never a wrong answer.
-//!
-//! `(?P<n>…)` was listed here as an acceptance divergence and is not one
-//! — **both** engines accept named groups, which are RE2's own syntax
-//! (measured against Go's `regexp`, ClickHouse RE2 and the pinned Loki
-//! v3.7.4 container, issue #336). It is still screened, for the different
-//! reason that the screen defers every non-`(?:`/flag group head wholesale
-//! rather than modelling each one.
+//! rejects what the other compiles, in either direction (docs/api.md
+//! §9.3 and §9.4 tabulate both). Those are `metrics::re2_authority`'s
+//! job: it screens them off the in-process path so RE2 returns the
+//! verdict. A rewrite whose output the Rust crate rejects therefore costs
+//! a storage round-trip and never a wrong answer.
 
 use std::borrow::Cow;
 
@@ -884,8 +873,10 @@ mod tests {
         assert_eq!(re2_pattern_to_rust("[0-9--4]"), r"[0-9\--4]");
     }
 
-    /// RE2 lets a class start with a literal `]`; the Rust crate does not
-    /// read it that way.
+    /// Pins the rewrite's OUTPUT for a leading `]` — the class walker's
+    /// indexing depends on the escape being emitted. Deliberately says
+    /// nothing about what either engine reads there; docs/api.md §9.2
+    /// covers that, and the claim that used to sit here was wrong.
     #[test]
     fn a_leading_close_bracket_is_a_literal() {
         assert_eq!(re2_pattern_to_rust("[]a]"), r"[\]a]");
@@ -1204,8 +1195,12 @@ mod tests {
         assert!(regex::Regex::new(&format!("^(?:{out})$")).is_err());
     }
 
-    /// Everything the two engines already agree on must survive
-    /// byte-for-byte.
+    /// The rewrite is the IDENTITY on any pattern none of its rules
+    /// touch: it must never perturb bytes it has no reason to change.
+    /// That is a property of THIS function and not a claim about the
+    /// engines — `\Qa*\E` below passes through because no rule applies to
+    /// it, and docs/api.md §9.4 records that the two engines disagree
+    /// about it.
     #[test]
     fn agreed_syntax_passes_through_verbatim() {
         for pattern in [

@@ -78,9 +78,9 @@ pub use re2_syntax::{
 };
 
 /// RE2's repetition ceiling — `kMaxRepeat` in `re2/parse.cc`, `maxRepeat`
-/// in Go's `regexp/syntax/parse.go`. The Rust crate has no equivalent
-/// count limit (only a compiled-size budget), so `a{1001}` compiles there
-/// and is rejected by both reference engines.
+/// in Go's `regexp/syntax/parse.go`, which is where this 1000 comes from
+/// and the only reason it is not a round number of our choosing. The
+/// consequence for a user is docs/api.md §9.3's repetition-cap row.
 const RE2_MAX_REPEAT: u64 = 1000;
 
 /// The three-valued RE2 acceptance verdict (issue #328 D1).
@@ -92,10 +92,12 @@ pub enum Re2Verdict {
     /// joint rejection, or the Rust crate rejected it inside the region
     /// where its rejections are trusted to be RE2's too.
     Rejects,
-    /// Undecidable in-process, in EITHER direction: the Rust crate
+    /// Undecidable in-process, in EITHER direction — the Rust crate
     /// accepts beyond RE2 (the [`pattern_requires_re2_authority`]
-    /// classes), or rejects within RE2 (`\Q…\E`, octal escapes, a
-    /// compiled-size overflow). A consumer must treat this as accept.
+    /// classes) or rejects within it. A consumer must treat this as
+    /// accept, which is why docs/api.md §9.3 can list rows reachable on
+    /// no route but trace validation. Membership of either direction is
+    /// §9.3 and §9.4; do not re-enumerate it here.
     Unknown,
 }
 
@@ -133,12 +135,13 @@ pub fn re2_verdict(pattern: &str) -> Re2Verdict {
     }
 }
 
-/// `true` when the pattern carries a construct the Rust crate REJECTS
-/// and RE2 accepts, so a compile failure proves nothing about RE2:
-/// `\Q…\E` literal quoting and octal escapes (`\0`–`\7`). Substring
-/// containment on purpose — an escaped `\\Q` also matches, which only
-/// widens `Unknown` (the safe direction; a narrower escape-aware scan
-/// could misclassify and over-reject).
+/// `true` when the pattern carries a construct from docs/api.md §9.4's
+/// first two rows — the ones the Rust crate rejects and RE2 accepts — so
+/// a compile failure here proves nothing about RE2's verdict.
+///
+/// Substring containment on purpose: an escaped `\\Q` also matches, which
+/// only widens `Unknown` (the safe direction; a narrower escape-aware
+/// scan could misclassify and over-reject).
 fn rust_rejects_beyond_its_remit(pattern: &str) -> bool {
     let b = pattern.as_bytes();
     b.windows(2)
@@ -154,10 +157,11 @@ pub fn pattern_requires_re2_authority_for_test(pattern: &str) -> bool {
     pattern_requires_re2_authority(pattern)
 }
 
-/// What the byte just consumed was, for the "a repetition operator needs a
-/// repeatable operand" rule. The Rust crate accepts a repetition applied to
-/// a repetition (`a**` compiles as `(a*)*`); RE2 and Go reject it with
-/// `bad repetition operator`.
+/// What the byte just consumed was, for the "a repetition operator needs
+/// a repeatable operand" rule. This state exists only because the two
+/// engines disagree about a repetition applied to a repetition —
+/// docs/api.md §9.3's repetition-of-repetition row — so the scan has to
+/// track enough structure to spot one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Prev {
     /// Nothing repeatable yet — pattern start, or just after `(` or `|`.
@@ -322,9 +326,13 @@ fn re2_portable_group_head_len(bytes: &[u8]) -> Option<usize> {
 }
 
 /// `b[i]` is a backslash: `true` when the escape it introduces is one only
-/// the storage engine's RE2 can adjudicate. A trailing backslash is
-/// malformed in both engines and can only reach here if the Rust crate
-/// accepted it, so it defers too.
+/// the storage engine's RE2 can adjudicate.
+///
+/// The part no docs table covers, because it is about the ORDER this code
+/// runs in: the scan happens BEFORE any compilation, so a trailing
+/// backslash (`b.get(i + 1) == None`) reaches this arm whatever either
+/// engine would go on to say about the pattern. It defers rather than
+/// deciding. Which engines accept which escapes is docs/api.md §9.3.
 fn escape_requires_re2_authority(b: &[u8], i: usize) -> bool {
     match b.get(i + 1) {
         None => true,
@@ -446,18 +454,17 @@ mod tests {
     use super::*;
 
     /// Patterns the screen defers because the Rust crate's ACCEPTANCE of
-    /// them cannot be trusted to be RE2's. The list is MIXED, and issue
-    /// #336 measured it member by member against Go's `regexp`,
-    /// ClickHouse 24.8's RE2 and the pinned Loki v3.7.4 container: RE2
-    /// REJECTS `\p{Alphabetic}`, `\u{263A}`, `\U0001F600`, `(?x) a b `,
-    /// `(?i-u:foo)`, `a{1001}` and `a{2,1001}` — and ACCEPTS `\p{Greek}`,
-    /// `\pL`, `\P{L}`, `[\p{L}0-9]`, `(?P<name>a)` and `(?<name>a)`. This
-    /// test was named `…_the_rust_crate_accepts_beyond_re2_…`, which was
-    /// false for those last six. Deferring them costs a storage
-    /// round-trip and nothing else: the screen models `\p` and the
-    /// non-`(?:`/flag group heads WHOLESALE rather than enumerating RE2's
-    /// property table and head vocabulary, which is the conservative
-    /// direction on purpose.
+    /// them cannot be trusted to be RE2's. The list is MIXED, which is
+    /// the point and was why this test used to be called
+    /// `…_the_rust_crate_accepts_beyond_re2_…`: false for six of its
+    /// thirteen rows. Some are docs/api.md §9.3 rows; the rest —
+    /// `\p{Greek}`, `\pL`, `\P{L}`, `[\p{L}0-9]`, `(?P<name>a)` and
+    /// `(?<name>a)` — appear in no §9 table because BOTH engines accept
+    /// them (measured, issue #336), so deferring them costs a storage
+    /// round-trip and nothing a user can see. That is deliberate: the
+    /// screen models `\p` and the non-`(?:`/flag group heads WHOLESALE
+    /// rather than enumerating RE2's property table and head vocabulary,
+    /// which is the conservative direction.
     ///
     /// Each premise is pinned: the Rust crate must ACCEPT the anchored
     /// form, otherwise the vendored parser rejects at plan time and the
