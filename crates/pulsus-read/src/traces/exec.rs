@@ -84,11 +84,11 @@ use super::rows::{
     MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
     MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
     MetricGroupCountRow, MetricHistogramInstantRow, MetricHistogramRow, MetricQuantileInstantRow,
-    MetricQuantileRow, NumSetRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrSetRow,
-    StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
+    MetricQuantileRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
+    TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
-    self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, SpanSetGroup,
+    self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, SpanKey, SpanSetGroup,
     SpanSummary, TraceCtxInfo, TraceMatch, TraceSpans,
 };
 use super::search_plan::{SearchCtx, SearchPlan};
@@ -216,11 +216,6 @@ const MEMBERSHIP_ENTRY_BYTES: usize =
 /// Retention charge for one numeric attribute value entry.
 const NUM_VALUE_ENTRY_BYTES: usize =
     std::mem::size_of::<(([u8; 16], [u8; 8]), f64)>() + RETAINED_ENTRY_OVERHEAD;
-/// Per-ELEMENT container overhead for a co-loaded event/link text set
-/// (issue #351): the `String` header beside the bytes it points at, so
-/// the charge covers the whole retained value rather than only its
-/// payload.
-const STR_SET_ELEM_OVERHEAD: usize = std::mem::size_of::<String>();
 /// Retention charge for one direct-child-count co-load entry (issue
 /// #184): the `(trace_id, parent span_id) → count` map entry.
 const CHILD_COUNT_ENTRY_BYTES: usize =
@@ -1805,16 +1800,30 @@ impl TraceEngine {
             }
             attrs.select_values.push(map);
         }
-        // Issue #351: the MULTI-VALUED event/link value sets — one
-        // `groupUniqArray` read per distinct intrinsic, on the same
-        // `(key, scope)` index prefix the literal form probes. Issued
-        // only when a leaf compares one against another field
-        // (`needs_event_sets()`), so every other query pays nothing.
+        // Issue #351: the MULTI-VALUED event/link values — ONE ROW PER
+        // VALUE, on the same `(key, scope)` index prefix the literal form
+        // probes. Issued only when a leaf compares one against another
+        // field (`needs_event_sets()`), so every other query pays
+        // nothing.
         //
-        // Every element is CHARGED, not capped: the set's cardinality is
-        // data-driven (a span may carry many events), and a cap would
-        // silently change the answer instead of refusing. The charge
-        // makes a pathological span a clean `422 query_too_broad`.
+        // **Row-per-value is the memory contract.** The first cut read
+        // `groupUniqArray(...) GROUP BY trace_id, span_id`, which broke
+        // this module's own Layer-1 residual bound — "never a-priori
+        // row-unbounded", above — because an array column is an
+        // unbounded number of capped strings in ONE row: the server-side
+        // aggregate state AND the client's decoded row both grew with a
+        // span's distinct event count before any charge could run, and
+        // phase-2 reads carry no `max_memory_usage`, so a server-side
+        // blow-up would have been a 500 rather than the required 422.
+        //
+        // Now every row is fixed-width columns plus one byte-capped
+        // string — the documented block shape — and the charge PRECEDES
+        // retention of each value (`collect_rows_charged` charges per row
+        // as it streams; the value is moved into the set afterwards).
+        // Duplicate rows from at-least-once replays need no `DISTINCT`:
+        // ANY-match is unaffected by a repeat and ALL-match compares
+        // `matchCount == elemCount`, which a repeat increments on both
+        // sides.
         for set_idx in 0..plan.event_sets.len() {
             let sql = plan.event_set_sql_for(set_idx, batch_ids);
             charge_explain(
@@ -1824,45 +1833,51 @@ impl TraceEngine {
                 &sql,
                 Some(("event/link set = ", plan.event_sets[set_idx].display())),
             )?;
-            let mut map = HashMap::new();
+            let mut map: HashMap<SpanKey, EventValues> = HashMap::new();
             if plan.event_sets[set_idx].is_numeric() {
-                let rows: Vec<NumSetRow> = self
+                let rows: Vec<NumValueRow> = self
                     .collect_rows_charged(
                         &sql,
                         settings,
                         budget,
                         batch_charged,
                         map_trace_read_error,
-                        |row: &NumSetRow| {
-                            MEMBERSHIP_ENTRY_BYTES + row.v.len() * std::mem::size_of::<f64>()
-                        },
+                        |_| NUM_VALUE_ENTRY_BYTES,
                     )
                     .await?;
-                map.reserve(rows.len());
                 for row in rows {
-                    map.insert((row.trace_id, row.span_id), EventValues::Num(row.v));
+                    let Some(v) = row.v else { continue };
+                    match map
+                        .entry((row.trace_id, row.span_id))
+                        .or_insert_with(|| EventValues::Num(Vec::new()))
+                    {
+                        EventValues::Num(values) => values.push(v),
+                        EventValues::Text(_) => {
+                            unreachable!("a numeric set never decodes text values")
+                        }
+                    }
                 }
             } else {
-                let rows: Vec<StrSetRow> = self
+                let rows: Vec<StrValueRow> = self
                     .collect_rows_charged(
                         &sql,
                         settings,
                         budget,
                         batch_charged,
                         map_trace_read_error,
-                        |row: &StrSetRow| {
-                            MEMBERSHIP_ENTRY_BYTES
-                                + row
-                                    .v
-                                    .iter()
-                                    .map(|s| s.len() + STR_SET_ELEM_OVERHEAD)
-                                    .sum::<usize>()
-                        },
+                        |row: &StrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
                     )
                     .await?;
-                map.reserve(rows.len());
                 for row in rows {
-                    map.insert((row.trace_id, row.span_id), EventValues::Text(row.v));
+                    match map
+                        .entry((row.trace_id, row.span_id))
+                        .or_insert_with(|| EventValues::Text(Vec::new()))
+                    {
+                        EventValues::Text(values) => values.push(row.v),
+                        EventValues::Num(_) => {
+                            unreachable!("a text set never decodes numeric values")
+                        }
+                    }
                 }
             }
             attrs.event_sets.push(map);

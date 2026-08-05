@@ -39,14 +39,13 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
 GROUP BY trace_id, span_id
 
 == phase2 event set[0] ==
-SELECT trace_id, span_id, groupUniqArray(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v
+SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND key = 'name'
   AND scope = 'event:intrinsic'
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
   AND trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
-GROUP BY trace_id, span_id
 
 == root hydration (sample winners) ==
 SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns

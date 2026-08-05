@@ -290,10 +290,11 @@ const CASES: &[Case] = &[
     },
     Case {
         // Issue #351: an event intrinsic compared against a FIELD is
-        // multi-valued — the plan carries a `groupUniqArray` SET co-load
-        // and the leaf prunes on the attribute operand's key-existence
-        // scan (valid for every operator, since an absent scalar never
-        // matches).
+        // multi-valued — the plan carries a per-value co-load (one row
+        // per value, NO aggregate: an array column would make one row
+        // grow with the span's event count) and the leaf prunes on the
+        // attribute operand's key-existence scan, valid for every
+        // operator since an absent scalar never matches.
         name: "event_name_vs_attr",
         q: r#"{ .a = event:name }"#,
         distributed: false,

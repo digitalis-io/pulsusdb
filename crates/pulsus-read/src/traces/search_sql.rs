@@ -272,33 +272,45 @@ pub fn attr_values_sql(
     )
 }
 
-/// Phase 2 — one MULTI-VALUED event/link intrinsic's per-span VALUE SET
-/// over one batch (issue #351): the set `{ .a = event:name }` compares
-/// against.
+/// Phase 2 — one MULTI-VALUED event/link intrinsic's per-span values over
+/// one batch (issue #351): the values `{ .a = event:name }` compares
+/// against, **one row per value**.
 ///
 /// Index-served on the same `(key, scope)` prefix the literal form
 /// probes, plus the window's date/time pruning and the batch's
-/// `trace_id IN` restriction — the [`attr_values_sql`] shape with
-/// `groupUniqArray` in place of `any`.
+/// `trace_id IN` restriction. Same rows read as the scalar
+/// [`attr_values_sql`] would read; only the projection differs.
 ///
-/// **`groupUniqArray`, not `groupArray`, and the choice is load-bearing
-/// twice.** It dedups the `ReplacingMergeTree`/at-least-once row
-/// duplicates that `SELECT DISTINCT` handles on the membership path — a
-/// replayed event row must not become a second set element — and
-/// duplicate elements cannot change ANY-match or ALL-match, so deduping
-/// has no semantic consequence. It also bounds the set at the number of
-/// DISTINCT values rather than the number of events.
+/// **NO aggregate — deliberately, and this is the memory contract, not a
+/// style choice.** The first cut of this read used
+/// `groupUniqArray(...) GROUP BY trace_id, span_id`, and it broke the
+/// Layer-1 residual bound this module's own contract states: "at most
+/// `TRACE_SEARCH_MAX_BLOCK_ROWS` rows × (fixed-width columns + string
+/// columns each capped at [`TRACE_STR_COL_CAP`] bytes at the source) —
+/// never a-priori row-unbounded" (`traces::exec` module doc,
+/// docs/schemas.md §7). An ARRAY column is an unbounded number of capped
+/// strings in ONE row, so a single span with enough distinct event names
+/// made both the server-side aggregate state and the client's decoded row
+/// grow without any of that bound applying — and phase-2 reads carry no
+/// `max_memory_usage` (only phase-1 generators do), so a server-side
+/// blow-up would have surfaced as a 500 rather than the required 422.
 ///
-/// **The cardinality is not capped, it is CHARGED.** A cap would silently
-/// change the answer (a span whose 501st distinct event name is the
-/// matching one would stop matching); the executor charges every element
-/// against the request's retention budget instead, so a pathological span
-/// is a clean `422 query_too_broad` — the architecture's "a breach of
-/// either layer is a 422, never an OOM" (docs/schemas.md §7).
+/// Row-per-value restores the stated shape exactly: every row is
+/// fixed-width columns plus ONE byte-capped string, the read is bounded
+/// by `max_rows_to_read`/`max_bytes_to_read` (both `throw`, both already
+/// mapped to `422 query_too_broad`), and the executor charges each value
+/// against the retention budget BEFORE retaining it.
 ///
-/// String values are byte-capped per element with the shared cap helper,
-/// exactly as the scalar `val` read caps its one value, so both sides of
-/// a comparison are capped consistently.
+/// **Duplicate rows need no server-side `DISTINCT`.** At-least-once
+/// replays can repeat a value, and repetition is inert under both
+/// matching rules: ANY-match is unaffected by a repeat, and ALL-match
+/// compares `matchCount == elemCount`, which a duplicated element
+/// increments on both sides. Dropping the `DISTINCT` removes the last
+/// server-side hash state from this read.
+///
+/// String values are byte-capped with the shared cap helper, exactly as
+/// the scalar `val` read caps its one value, so both sides of a
+/// comparison are capped consistently.
 pub fn event_set_sql(
     attrs_table: &str,
     set: super::filter::EventSetField,
@@ -306,18 +318,14 @@ pub fn event_set_sql(
     window: TimeWindow,
 ) -> String {
     let (value_col, extra) = if set.is_numeric() {
-        (
-            "groupUniqArray(val_num) AS v".to_string(),
-            "\n  AND isNotNull(val_num)",
-        )
+        ("val_num AS v".to_string(), "\n  AND isNotNull(val_num)")
     } else {
-        (format!("groupUniqArray({}) AS v", byte_cap_expr("val")), "")
+        (format!("{} AS v", byte_cap_expr("val")), "")
     };
     format!(
         "SELECT trace_id, span_id, {value_col}\n\
          FROM {attrs_table}\n\
-         WHERE {}\n  AND key = {}\n  AND scope = {}{extra}\n  AND {}\n  AND {}\n\
-         GROUP BY trace_id, span_id",
+         WHERE {}\n  AND key = {}\n  AND scope = {}{extra}\n  AND {}\n  AND {}",
         date_clause(window),
         escape::ch_string(set.key()),
         escape::ch_string(set.scope()),
@@ -416,6 +424,64 @@ mod tests {
         start_ns: 1_700_000_000_000_000_000,
         end_ns: 1_700_010_800_000_000_000,
     };
+
+    /// Issue #351, after review: the event/link value read must carry NO
+    /// server-side aggregate. The first cut used
+    /// `groupUniqArray(...) GROUP BY trace_id, span_id`, whose ARRAY
+    /// column is an unbounded number of capped strings in ONE row —
+    /// breaking the Layer-1 residual bound `traces::exec`'s module doc
+    /// states ("never a-priori row-unbounded") and growing both the
+    /// server-side aggregate state and the client's decoded row before
+    /// any charge could run.
+    ///
+    /// This asserts the SHAPE, not the text: no aggregate of any kind, no
+    /// `GROUP BY`, one byte-capped value column, and the `(key, scope)`
+    /// index prefix plus date/time/batch pruning intact. A reviewer can
+    /// check the invariant from this test instead of re-deriving it from
+    /// the memory contract.
+    #[test]
+    fn the_event_value_read_carries_no_aggregate_so_a_row_stays_bounded() {
+        use super::super::filter::EventSetField;
+        for set in [
+            EventSetField::EventName,
+            EventSetField::LinkSpanId,
+            EventSetField::LinkTraceId,
+        ] {
+            let sql = event_set_sql("trace_attrs_idx", set, &[[7u8; 16]], W);
+            for banned in [
+                "groupUniqArray",
+                "groupArray",
+                "GROUP BY",
+                "DISTINCT",
+                "any(",
+            ] {
+                assert!(
+                    !sql.contains(banned),
+                    "{set:?}: {banned} would make one ROW grow without bound: {sql}"
+                );
+            }
+            assert!(
+                sql.contains(&format!("{} AS v", byte_cap_expr("val"))),
+                "{set:?}: the value column must be byte-capped at the source: {sql}"
+            );
+            assert!(sql.contains(&format!("key = '{}'", set.key())), "{sql}");
+            assert!(sql.contains(&format!("scope = '{}'", set.scope())), "{sql}");
+            assert!(sql.contains("date >= toDate("), "{sql}");
+            assert!(sql.contains("timestamp_ns >"), "{sql}");
+            assert!(sql.contains("trace_id IN ("), "{sql}");
+        }
+        // The numeric member reads `val_num` and filters its nulls, and
+        // is likewise aggregate-free.
+        let sql = event_set_sql(
+            "trace_attrs_idx",
+            EventSetField::EventTimeSinceStart,
+            &[[7u8; 16]],
+            W,
+        );
+        assert!(sql.contains("val_num AS v"), "{sql}");
+        assert!(sql.contains("isNotNull(val_num)"), "{sql}");
+        assert!(!sql.contains("GROUP BY"), "{sql}");
+    }
 
     #[test]
     fn date_literal_renders_the_unix_epoch_and_a_modern_date() {

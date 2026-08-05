@@ -100,25 +100,6 @@ pub struct StrValueRow {
     pub v: String,
 }
 
-/// One span's TEXT event/link value set row (`search_sql::event_set_sql`
-/// on a `val`-backed intrinsic, issue #351) — `groupUniqArray` yields the
-/// span's distinct values.
-#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
-pub struct StrSetRow {
-    pub trace_id: [u8; 16],
-    pub span_id: [u8; 8],
-    pub v: Vec<String>,
-}
-
-/// One span's NUMERIC event/link value set row (`event:timeSinceStart`,
-/// the one `val_num`-backed member; issue #351).
-#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
-pub struct NumSetRow {
-    pub trace_id: [u8; 16],
-    pub span_id: [u8; 8],
-    pub v: Vec<f64>,
-}
-
 /// One winners' root-hydration row (`search_sql::root_sql`).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct RootRow {

@@ -87,16 +87,23 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 1
 ///
 /// **Moved on issue #351** (owner ruling, 2026-08-05), for ADDITIONS
 /// only: three new `traces_search` cases pin the multi-valued event/link
-/// SET co-load's SQL — `event_name_vs_attr`, `event_name_vs_name_neq`
+/// value read's SQL — `event_name_vs_attr`, `event_name_vs_name_neq`
 /// (the negated form, whose generator must fall back to the time-range
 /// superset because a span with NO events matches `!=`), and
 /// `event_time_since_start_vs_attr` (the numeric member, read from
-/// `val_num`). The corpus went 63 → 66 entries; **no existing golden's
-/// bytes changed**, which the separate membership assertion above makes
-/// visible — a count that moves by exactly the number of new files,
-/// beside a digest that moves, reads differently from a digest that
-/// moves alone.
-const PINNED_SQL_CORPUS: u64 = 0x9c78_70c8_8ca1_ee92;
+/// `val_num`). The corpus went 63 → 66 entries; **no PRE-EXISTING
+/// golden's bytes changed**, which the separate membership assertion
+/// above makes visible — a count that moves by exactly the number of new
+/// files, beside a digest that moves, reads differently from a digest
+/// that moves alone.
+///
+/// Moved a second time in the same issue, after review: the three NEW
+/// goldens were regenerated when the read dropped its
+/// `groupUniqArray(...) GROUP BY` aggregate for a row-per-value
+/// projection (the Layer-1 residual bound in the `traces::exec` module
+/// doc — an array column is row-unbounded by construction). Still only
+/// those three files; the other 63 are byte-identical to `49cff9a`.
+const PINNED_SQL_CORPUS: u64 = 0xb718_14b9_674a_32fe;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

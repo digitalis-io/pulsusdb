@@ -131,10 +131,18 @@ pub struct BatchAttrs {
     pub child_counts: HashMap<SpanKey, u64>,
 }
 
-/// One span's co-loaded event/link value set (issue #351). Two
-/// variants because the four intrinsics split exactly as their literal
-/// leaves do: `event:timeSinceStart` is read from `val_num`, the other
-/// three from `val`.
+/// One span's co-loaded event/link values (issue #351). Two variants
+/// because the four intrinsics split exactly as their literal leaves do:
+/// `event:timeSinceStart` is read from `val_num`, the other three from
+/// `val`.
+///
+/// **Values, not a deduplicated set** (review of the first cut): the read
+/// is one row per value with no server-side aggregate, so a repeated
+/// value from an at-least-once replay arrives twice. That is inert under
+/// both matching rules — ANY-match is unaffected by a repeat, and
+/// ALL-match compares `matchCount == elemCount`, which a repeat
+/// increments on both sides — so nothing pays for a `DISTINCT` that
+/// could not change an answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventValues {
     Text(Vec<String>),
@@ -906,7 +914,7 @@ fn eval_leaf(
 }
 
 /// Evaluates a multi-valued event/link comparison for one span (issue
-/// #351), against the batch's `groupUniqArray` co-load.
+/// #351), against the batch's per-span value co-load.
 ///
 /// **ANY-match, `!=` ALL-match** (owner ruling, 2026-08-05) — the
 /// reference's own designed rule for a multi-valued operand:

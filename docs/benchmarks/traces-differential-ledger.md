@@ -317,7 +317,7 @@ re-decide from the evidence rather than re-derive it.
   (the fixture table above, span for span), and the live
   `event_and_link_comparisons_match_any_event_over_real_clickhouse`,
   which runs the co-load against a real ClickHouse — the hermetic tests
-  cannot execute the `groupUniqArray` read the semantics depend on.
+  cannot execute the per-batch value read the semantics depend on.
 
 - **Accept-surface effect:** the six probes move `reject → accept` on
   the wire axis. The reference's own verdict is unchanged (it always

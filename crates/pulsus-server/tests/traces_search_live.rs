@@ -1606,3 +1606,90 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
         "{ctx}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Spawn F: a wide event set is REFUSED, not materialized (issue #351,
+// review of the first cut).
+// ---------------------------------------------------------------------
+
+/// Issue #351 review: one span carrying many distinct event values must
+/// hit the read budget and come back `422 query_too_broad` — never a
+/// silently materialized unbounded per-span array.
+///
+/// **Why this cannot be a hermetic test.** The growth happens in the
+/// database: the first cut read `groupUniqArray(...) GROUP BY` and the
+/// array was built server-side, so no in-process test could observe
+/// either the aggregate state or the size of the row that came back. The
+/// only place the shape is real is against a live ClickHouse.
+///
+/// **Scale-invariant, per the standing rule:** the budget is lowered
+/// rather than the fixture inflated (the `scan_budget_breach_is_422…`
+/// precedent above), so this never becomes a wall-time or memory race.
+///
+/// The pair is what makes it evidence:
+///
+/// * `{ name != event:name }` — the scalar side is a PHYSICAL intrinsic,
+///   so the event value read is the ONLY `trace_attrs_idx` read in the
+///   whole query; blowing the row budget can therefore only be that read.
+/// * `{ name = "ev-bulk" }` over the same store and the same budget
+///   answers `200`. Without this control, a 422 would equally well be
+///   explained by an unrelated read, and the test would prove nothing
+///   about the event path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_136;
+    let db = "pulsus_traces_search_it_f";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", "50")]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    // ONE span carrying 400 distinct event names — the shape the review
+    // was about: a single span whose event cardinality, not the trace
+    // count, drives the read.
+    let start = ts(base, 1);
+    let mut s = span(tid(1), sid(1), None, "ev-bulk", start, MS, vec![]);
+    s.events = (0..400u32)
+        .map(|i| opentelemetry_proto::tonic::trace::v1::span::Event {
+            time_unix_nano: start + u64::from(i) + 1,
+            name: format!("evt-{i:04}"),
+            attributes: vec![],
+            dropped_attributes_count: 0,
+        })
+        .collect();
+    ingest(port, vec![s], checkout_resource(), "wide event span");
+
+    // The control FIRST: the same store and budget answer 200 when the
+    // query does not read the event values.
+    let ctx = "control-no-event-read-is-200";
+    let res = search(port, r#"{ name = "ev-bulk" }"#, w0, w1, "", ctx);
+    assert_eq!(
+        trace_set(&res.json(ctx)),
+        BTreeSet::from([hex(&tid(1))]),
+        "{ctx}: the budget must not already be exhausted without the event read"
+    );
+
+    // The event value read is the only attrs read here, and its rows
+    // exceed the 50-row budget: a clean 422, never an unbounded
+    // materialization.
+    let ctx = "wide-event-set-is-422";
+    let path = format!(
+        "/api/traces/v1/search?q={}&start={w0}&end={w1}",
+        enc("{ name != event:name }")
+    );
+    let res = get(port, &path, ctx);
+    assert_eq!(
+        res.status,
+        422,
+        "{ctx}: a wide event set must be refused, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(ctx);
+    assert_eq!(json["status"], "error", "{ctx}");
+    assert_eq!(json["errorType"], "query_too_broad", "{ctx}: body {json}");
+}

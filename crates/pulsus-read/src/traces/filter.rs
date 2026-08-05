@@ -781,8 +781,10 @@ const LINK_TRACE_ID_KEY: &str = "traceID";
 ///
 /// Each is index-served under its dedicated intrinsic scope, one row per
 /// event/link (`otlp_traces.rs` emits them in the span-event / span-link
-/// fan-out), so the set is read by a `groupUniqArray` co-load over the
-/// same `(key, scope)` prefix the literal form probes.
+/// fan-out), so the values are read ONE ROW PER VALUE over the same
+/// `(key, scope)` prefix the literal form probes — no server-side
+/// aggregate, so no single row can grow with a span's event count
+/// (`search_sql::event_set_sql` carries the memory contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventSetField {
     /// `event:name` — the event's name, one row per event.
