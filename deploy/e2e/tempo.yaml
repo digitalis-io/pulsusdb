@@ -32,3 +32,7 @@ storage:
       path: /tmp/tempo/blocks
     wal:
       path: /tmp/tempo/wal
+
+# TraceQL metrics: do NOT add a `metrics_generator` block. At the pinned
+# Tempo version above it does nothing for these queries. See issue #252
+# for why.

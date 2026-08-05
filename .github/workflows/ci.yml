@@ -1005,8 +1005,12 @@ jobs:
       # on the real TraceQL metrics pushdown — service PREWHERE hoist ->
       # service_time projection, attr semi-join (key, val)-prefix + time
       # granule pruning, the scan-budget 422 trip, and the semi-join
-      # IN-set overflow (code 191 -> the dedicated 422 reason). Reuses
-      # this job's ClickHouse 24.8 container.
+      # IN-set overflow (code 191 -> the dedicated 422 reason). Since
+      # issue #252 it also carries AC13: the log2 histogram's scan-row
+      # identity against a count-only query over the byte-identical inner
+      # subquery, and its exact result-row identity at typical AND
+      # maximum bucket occupancy. Reuses this job's ClickHouse 24.8
+      # container.
       - name: TraceQL metrics EXPLAIN + budget gates (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1017,7 +1021,11 @@ jobs:
       # identities on a seeded deterministic corpus — sum(rate*step) ==
       # sum(count_over_time) == independent deduped count, instant ==
       # whole-snapped-window bucket, replay-duplicate invariance, snap
-      # edge cases, dual-scope negation. Reuses this job's ClickHouse
+      # edge cases, dual-scope negation. Since issue #252 it also
+      # carries the log2-histogram membership/gap/tally-sum gates, the
+      # sub-2ns guard (spans of -1/0/1 ns produce no __bucket series
+      # while count_over_time counts them), and the ledgered
+      # quantile-divergence direction. Reuses this job's ClickHouse
       # 24.8 container.
       - name: Live traces metrics consistency suite
         env:
