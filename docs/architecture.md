@@ -254,6 +254,27 @@ In-house parser → planner → SQL generator over `trace_attrs_idx` + `trace_sp
 
 Query endpoints (`/api/profiles/v1/{merge,select_series,export,render,render-diff}` and the label APIs) resolve profile series via `profile_series_idx`, then merge the precomputed `tree` structures across the selected time range in the engine, emitting flamebearer JSON, pprof, or Graphviz DOT (with `maxNodes`, unit-aware value formatting, and self-percentage-scaled font sizes).
 
+### 5.6 Budgeted seams: two disciplines
+
+Every read-path stage that can hold input-scaled memory is bounded by a byte budget it must charge against before it allocates. Two disciplines govern those seams. They complement each other — the first is about *when you may allocate*, the second about *what you may refuse for*.
+
+> **Charge before you allocate.** No allocation whose size a caller can influence happens before it is charged against a budget that can refuse it.
+>
+> **Rule out meaning before you refuse for resources.** If a request is going to be rejected for a reason the system can determine *without allocating*, that rejection must be evaluated before any reservation that could refuse first. Otherwise the client gets the same status with the wrong reason and the wrong remediation — and where the two refusals map to different HTTP statuses, a parity divergence as well.
+
+**The classifying test, applied to every fallible call a reservation covers:** *can this error be returned before the reserved quantity has begun to be allocated?*
+
+- **(P) — decidable from the inputs.** The refusal is a function of data the caller has already materialised, needing auxiliary scratch whose size is a function of INPUT COUNTS alone and never of the output's shape, and constructing no part of the charged output. It must be decided before the stage's charge, and **its own scratch is charged first**, sized from counts read without allocating (`Vec::len()`). That preflight charge is levied against a **ceiling of its own** and never against the caller's counter — a shared counter would make the preflight's admission a function of an unrelated caller's spending, which is the composition hazard the whole rule exists to remove. Assert the domination as a `const`: the preflight's per-series constant plus its per-allocation floors must not exceed the stage model's per-series coefficient.
+  - **(P0)** — the part that needs no scratch at all runs above even the preflight charge, so it can never be preempted, at any cap, with any counter.
+  - **When the scratch would exceed its ceiling the preflight is SKIPPED, not refused.** A skip is not an `Err`, there is nothing to swallow, and behaviour falls back byte-for-byte to the un-preflighted path. A preflight that could *refuse* would add a rejection surface instead of correcting one.
+- **(A) — reachable only during allocation.** The error and the allocation are genuinely simultaneous, so a breach may honestly preempt it.
+
+**The worked counter-example, because it cost three design rounds.** `grouping_unique_error` — two `group_left(include)` many-side series collapsing onto one output identity — reads as class (A): it seems to need the final, include-copied output labels, which is exactly the allocation the include amplifier prices. It is class (P). Within one step two many-side elements are only ever compared when they share the match signature, and a shared signature means the same one-side element was matched, so the include overlay is *identical* for both; the final label sets are equal iff the operands' own labels are equal outside the include names. That is a comparison of two already-materialised, borrowed label slices. "It looks like it needs the output" is not the test — *is it a deterministic function of the inputs, in `O(input counts)` scratch* is.
+
+**The exemplar in the tree.** `crates/pulsus-read/src/metrics/exec.rs` already does this at the label cache: on an outcome that could report `FanoutExceeded` it calls `first_invalid_regex_detail(...)` first and returns `InvalidRegexMatcher` if there is one, only then mapping the budget verdict — because upstream Prometheus compiles every matcher in its parser, so an uncompilable one is a 400 whatever the cache is doing.
+
+**The worked (P) case.** `post_agg::combine_binary_capped` (issue #290). All five of the LogQL binary funnel's semantic refusals are decided above the stage charge, and the ordering is structural rather than conventional: `decide_binary` MOVES both operands into a value with no accessor, and `Ledger::acquire_binary` is the only way to get them back. An operand therefore cannot reach the join except through a charge the decision preceded; skipping the decision, conditioning it, or deciding one pair and charging another are all compile errors rather than review findings.
+
 ---
 
 ## 6. Ruler

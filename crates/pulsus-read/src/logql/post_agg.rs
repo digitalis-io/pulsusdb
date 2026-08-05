@@ -116,7 +116,15 @@ pub fn combine_binary(
 
 /// The binary cap seam; see [`apply_vector_aggs_capped`]. The charge is
 /// levied on the measured operands BEFORE the join builds its one-side
-/// index, its match signatures or its output.
+/// index, its match signatures or its output — and **after** every
+/// class-(P) semantic refusal has been decided (issue #290).
+///
+/// The order is structural, not a convention. [`decide_binary`] MOVES
+/// both operands into a `BinaryDecided`, and `Ledger::acquire_binary` is
+/// the only way to get them back: an operand cannot reach the join except
+/// through a charge the decision preceded, and the decision cannot be
+/// skipped, conditioned or made over a different pair, because there is
+/// no second pair to name. See docs/architecture.md §5.6.
 #[allow(clippy::too_many_arguments)]
 pub fn combine_binary_capped(
     charged: &mut u64,
@@ -127,9 +135,8 @@ pub fn combine_binary_capped(
     rhs: QueryResult,
     cap: u64,
 ) -> Result<QueryResult, ReadError> {
-    let (lm, rm) = (measure_operand(&lhs), measure_operand(&rhs));
-    let bytes = binary_peak_bytes(op, matching, &lm, &rm);
-    let l = Ledger::acquire_binary(charged, &lm, &rm, bytes, cap)?;
+    let decided = decide_binary(op, matching, lhs, rhs)?;
+    let (l, lhs, rhs) = Ledger::acquire_binary(charged, decided, cap)?;
     match (lhs, rhs) {
         (QueryResult::Scalar(l), QueryResult::Scalar(r)) => {
             if is_set_op(op) {
@@ -182,9 +189,17 @@ pub fn combine_binary_capped(
         // Both operands evaluate under the same QuerySpec, so a
         // vector/matrix mix (or a streams/string operand) is structurally
         // impossible — defensive named error, never a panic.
-        _ => Err(ReadError::PipelineInvalid {
-            reason: "binary operation over incompatible result types".to_string(),
-        }),
+        _ => Err(incompatible_types_error()),
+    }
+}
+
+/// The operand-shape mismatch refusal, in ONE constructor so the arm
+/// [`combine_binary_capped`] keeps as defence in depth and the class-(P)
+/// preflight that now decides it above the charge cannot drift apart
+/// (issue #290).
+fn incompatible_types_error() -> ReadError {
+    ReadError::PipelineInvalid {
+        reason: "binary operation over incompatible result types".to_string(),
     }
 }
 
@@ -328,8 +343,15 @@ fn multiple_matches_error() -> ReadError {
 }
 
 fn grouping_unique_error() -> ReadError {
-    // Prometheus/Loki wording for a duplicate grouped output identity;
-    // unreachable with distinct many-side series, kept for completeness.
+    // Prometheus/Loki wording for a duplicate grouped output identity.
+    //
+    // REACHABLE with distinct many-side series (issue #290 corrects the
+    // former "unreachable" claim here): when the include copy DROPS a
+    // label the many-side series differed on, two distinct many series
+    // collapse onto one output identity. Witness, shipped and green:
+    // `group_left_include_collapsing_distinct_many_labels_is_grouping_unique_error`
+    // (crates/pulsus-read/tests/logql_metric_agg_golden.rs:2549), oracle-
+    // pinned byte-identical against `grafana/loki:3.4.2`.
     ReadError::PipelineInvalid {
         reason: "multiple matches for labels: grouping labels must ensure unique matches"
             .to_string(),
@@ -1310,13 +1332,14 @@ pub const B_INCLUDE: u64 = 27;
 /// and only LOWER the point of refusal. **Reachable**: `L_MIN` fits
 /// inside `MAX_QUERY_BYTES = 131 072` (stated once above, on purpose).
 ///
-/// O6 and O7 are model-level thresholds only: the funnel that turns
-/// them into an actual refusal is issue #236's §4 and is not wired yet,
-/// so the divergence ledger does not carry O6/O7 rows until it is. O8's
-/// funnel IS wired — [`apply_label_replace`] refuses live with a clean
-/// 422 — so its row is ledgered now:
-/// `label-replace-template-amplification` in
-/// docs/benchmarks/logs-differential-ledger.md.
+/// All three funnels ARE wired: [`apply_vector_aggs`] carries O6,
+/// [`combine_binary`] carries O7 and [`apply_label_replace`] carries O8,
+/// each refusing live with a clean 422 at [`MAX_POST_AGG_BYTES`], and
+/// `both_amplifiers_are_refused_end_to_end_from_query_text` drives O6
+/// and O7 from real query text. The divergence ledger carries a row for
+/// each, in docs/benchmarks/logs-differential-ledger.md: rows (d) and
+/// (e) under "Issue #236 — high-cardinality aggregations" for O6/O7, and
+/// `label-replace-template-amplification` for O8.
 pub const MAX_POST_AGG_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// A stage input's measured shape — the raw counted quantities the byte
@@ -1709,6 +1732,697 @@ fn measure_instant(series: &[InstantSeries]) -> StageInput {
     m
 }
 
+/// Bytes charged per operand series for the class-(P) preflight's OWN
+/// scratch (issue #290).
+///
+/// Priced the way every other `Vec::with_capacity` charge in this crate
+/// is priced (`variants::vec_buffer_bytes`,
+/// `detected_probe::scratch_capacity_bytes`):
+/// `alloc_block_bytes(n * size_of::<T>())`. No `grown_alloc_bytes` term —
+/// every one of the six buffers is reserved at a count known up front and
+/// never pushed past capacity, which the runtime capacity gate
+/// (`the_preflight_scratch_stays_inside_its_charge`) is what proves.
+///
+/// **Slope derivation.** `alloc_block_bytes(x) = max(2x, 32) <= 2x + 32`,
+/// and the six buffers hold, per series of `S = lhs.series + rhs.series`:
+/// `sides_l` + `sides_r` (their capacities SUM to `S`) at `2·W` where
+/// `W = size_of::<SideSeries>()`; `order`, `groups` and `cursors` at
+/// `3 · 2 · 4 = 24`; the `heads` heap at `2 · 16 = 32`. Six buffers
+/// contribute six floors, which is [`PREFLIGHT_FLAT_BYTES`].
+pub const PREFLIGHT_BYTES_PER_SERIES: u64 =
+    2 * size_of::<preflight::SideSeries<'static>>() as u64 + 56;
+
+/// The six per-allocation floors of [`PREFLIGHT_BYTES_PER_SERIES`]'
+/// derivation — `alloc_block_bytes`' [`super::charge::MIN_ALLOC_BYTES`] applied
+/// once per buffer, so the charge covers the smallest inputs where the
+/// floor and not the product dominates.
+pub const PREFLIGHT_FLAT_BYTES: u64 = 6 * super::charge::MIN_ALLOC_BYTES;
+
+/// **Domination.** For every `S >= 1`,
+/// `slope·S + flat <= (slope + flat)·S <= B_SERIES·S <= binary_peak_bytes`
+/// — [`binary_peak_bytes_without`] always starts with
+/// `B_SERIES · (lhs.series + rhs.series)` and every other term is
+/// non-negative. A preflight whose scratch is NOT dominated by the stage
+/// charge it precedes could hold memory the stage's own model does not,
+/// so the inequality is asserted at compile time rather than believed.
+const _: () = assert!(PREFLIGHT_BYTES_PER_SERIES + PREFLIGHT_FLAT_BYTES <= B_SERIES);
+
+/// The scratch ceiling above which the class-(P) preflight is SKIPPED.
+///
+/// Derived, not chosen, so that every input the stage charge can admit at
+/// the production cap is preflighted: the stage admits only if
+/// `B_SERIES·S <= MAX_POST_AGG_BYTES`, i.e. `S <= MAX_POST_AGG_BYTES /
+/// B_SERIES`, and the preflight's closed form at that `S` is this figure.
+///
+/// A skip is **not** a refusal — it is not an `Err`, there is nothing to
+/// swallow, and the caller falls through to the unchanged stage path, so
+/// the three join refusals behave exactly as they did before issue #290.
+pub const MAX_BINARY_PREFLIGHT_BYTES: u64 =
+    PREFLIGHT_BYTES_PER_SERIES * (MAX_POST_AGG_BYTES / B_SERIES) + PREFLIGHT_FLAT_BYTES;
+
+/// The class-(P) preflight's charge, as ONE closed form so there is no
+/// per-buffer twin to drift from the derivation above.
+///
+/// `S == 0` charges 0: [`preflight::decide_binary_refusals`] returns
+/// before any buffer exists when either operand carries no series (no
+/// step can then have both sides non-empty), so the six floors are not
+/// owed.
+pub fn preflight_scratch_bytes(lhs: &StageInput, rhs: &StageInput) -> u64 {
+    let s = lhs.series().saturating_add(rhs.series());
+    if s == 0 {
+        return 0;
+    }
+    PREFLIGHT_BYTES_PER_SERIES
+        .saturating_mul(s)
+        .saturating_add(PREFLIGHT_FLAT_BYTES)
+}
+
+/// The ceiling [`ledger::PreflightCharge::acquire`] tests against. Test
+/// builds can force it, because the skip branch is unreachable below
+/// ~6.75 million combined series and would otherwise never be exercised
+/// in CI (issue #290 AC 21).
+fn preflight_ceiling() -> u64 {
+    // ONE definition, with the `cfg` inside the body: a `#[cfg(test)]` /
+    // `#[cfg(not(test))]` pair would be two free functions of the same
+    // name, which `region_census::free_fns` refuses because the
+    // call-graph closure could not resolve which body it walked.
+    #[cfg(test)]
+    if let Some(forced) = PREFLIGHT_CEILING_OVERRIDE.with(|c| c.get()) {
+        return forced;
+    }
+    MAX_BINARY_PREFLIGHT_BYTES
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Forces [`preflight_ceiling`]; `None` = the shipped constant.
+    static PREFLIGHT_CEILING_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    /// Every timestamp the preflight reads, counted at the ONE accessor
+    /// that can read one ([`preflight::points::Points::at`]). A
+    /// `thread_local`, not an atomic: `cargo test` runs these in threads
+    /// of one process and a process-global counter cross-contaminates.
+    static PREFLIGHT_POINTS_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `Σ alloc_block_bytes(buf.capacity() · size_of::<T>())` over the
+    /// six scratch buffers, recorded at
+    /// [`preflight::decide_binary_refusals`]' single exit.
+    static PREFLIGHT_SCRATCH_CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The class-(P) preflight: every semantic refusal the binary funnel can
+/// raise, decided from the operands' already-materialised labels and
+/// timestamps **before** the stage charge exists (issue #290).
+///
+/// The classifying test this module satisfies, stated in
+/// docs/architecture.md §5.6: a refusal is class **(P)** iff it is
+/// decidable reading only the inputs — already materialised, already
+/// owned by the caller — with auxiliary scratch whose size is a function
+/// of INPUT COUNTS alone and never of the output's shape, and without
+/// constructing any part of the charged output. All five of this funnel's
+/// semantic refusals pass that test, so this funnel has no class-(A)
+/// member left; every remaining post-charge refusal is [`Ledger::admit`],
+/// i.e. the budget itself.
+///
+/// **The scratch is charged before it is allocated.** `decide_shape` is
+/// (P0) — a match on operand discriminants that allocates nothing and
+/// therefore runs above every charge. [`decide_binary_refusals`] is (P1):
+/// it takes a `&PreflightCharge`, which is proof that its six buffers
+/// were priced from `Vec::len()` counts and admitted against
+/// [`MAX_BINARY_PREFLIGHT_BYTES`] first.
+///
+/// **This module allocates NOTHING outside those six buffers.** Two
+/// independent mechanisms bound that: a source rule in
+/// `tests/logql_post_agg_witness.rs` (`the_preflight_module_allocates_only_its_six_reserved_buffers`),
+/// which sees direct calls only, and the measured allocator gate in
+/// `tests/logql_preflight_alloc_gate.rs`, which is closed over the callee
+/// closure by construction and is the enforcement of the byte bound.
+mod preflight {
+    use super::ledger::PreflightCharge;
+    use super::{
+        BinOp, MatchGroup, QueryResult, ReadError, VectorMatching, duplicate_one_side_error,
+        grouping_unique_error, incompatible_types_error, is_set_op, multiple_matches_error,
+        set_op_scalar_error,
+    };
+    use std::cmp::{Ordering, Reverse};
+    use std::collections::BinaryHeap;
+
+    /// The only route by which the preflight can read a timestamp.
+    ///
+    /// The field is private to THIS module, so a traversal that bypasses
+    /// [`Points::at`] is one that cannot name the data — which is what
+    /// makes the read counter a COMPLETE record of point reads rather
+    /// than an advisory one, and the numeric bound in
+    /// `the_preflight_reads_no_point_without_a_collision` meaningful.
+    /// In non-test builds the increment compiles out entirely.
+    pub(super) mod points {
+        /// `None` is an INSTANT operand — one virtual step at `t = 0`.
+        /// (An `enum { Instant, Steps(&[..]) }` is the same shape; the
+        /// `Option` spelling keeps the payload behind a private field.)
+        pub(super) struct Points<'a> {
+            steps: Option<&'a [(i64, f64)]>,
+        }
+
+        impl<'a> Points<'a> {
+            pub(super) fn instant() -> Self {
+                Self { steps: None }
+            }
+
+            pub(super) fn steps(pts: &'a [(i64, f64)]) -> Self {
+                Self { steps: Some(pts) }
+            }
+
+            /// `O(1)`, and UNCOUNTED: a length is not a point.
+            pub(super) fn len(&self) -> usize {
+                match self.steps {
+                    None => 1,
+                    Some(p) => p.len(),
+                }
+            }
+
+            /// The ONLY read.
+            pub(super) fn at(&self, i: usize) -> i64 {
+                #[cfg(test)]
+                super::super::PREFLIGHT_POINTS_READ.with(|c| c.set(c.get().saturating_add(1)));
+                match self.steps {
+                    None => 0,
+                    Some(p) => p[i].0,
+                }
+            }
+        }
+    }
+    use points::Points;
+
+    /// One operand series, borrowed: its already-materialised labels and
+    /// the timestamps at which it is present. Never owns anything.
+    pub(super) struct SideSeries<'a> {
+        labels: &'a [(String, String)],
+        points: Points<'a>,
+    }
+
+    /// A many-side element's per-step output identity — the quantity its
+    /// refusal is keyed on. `Grouped` carries no owned data: it is
+    /// compared through a filtered walk of the BORROWED label slice, and
+    /// no output label vector is ever materialised.
+    ///
+    /// The two modes are mutually exclusive (`one_to_one =
+    /// include.is_none()`, `instant_join`'s `:387`), so exactly one
+    /// collision error is possible per step.
+    #[derive(Clone, Copy)]
+    enum Identity<'a> {
+        /// Identity is the match signature; a repeat is
+        /// [`multiple_matches_error`].
+        OneToOne,
+        /// Identity is `(signature, labels minus the include names)`; a
+        /// repeat is [`grouping_unique_error`].
+        ///
+        /// Why the include names alone: within one step two many-side
+        /// elements are only ever compared when they share the match
+        /// signature `key`, and a shared `key` means
+        /// `one_by_key.get(&key)` returned the SAME one-side element `r`
+        /// (`instant_join`'s `:400-403`). The include overlay is
+        /// therefore identical for both — a fixed set of `(name, value)`
+        /// pairs to insert and a fixed set of names to delete
+        /// (`:421-431`) — and the two parts have disjoint key sets, so
+        /// `final_labels(l1) == final_labels(l2)` iff
+        /// `filter(l1, k ∉ include) == filter(l2, k ∉ include)`.
+        Grouped(&'a [String]),
+    }
+
+    /// (P0) — the operand-shape dispatch, reproducing the arm
+    /// [`super::combine_binary_capped`]'s `match` selects over ALL SEVEN
+    /// [`QueryResult`] variants. Allocates nothing, so it runs above even
+    /// the preflight's own charge and can never be preempted.
+    pub(super) fn decide_shape(
+        op: BinOp,
+        lhs: &QueryResult,
+        rhs: &QueryResult,
+    ) -> Result<(), ReadError> {
+        match (lhs, rhs) {
+            (QueryResult::Scalar(_), QueryResult::Scalar(_))
+            | (QueryResult::Scalar(_), QueryResult::Vector(_) | QueryResult::Matrix(_))
+            | (QueryResult::Vector(_) | QueryResult::Matrix(_), QueryResult::Scalar(_)) => {
+                if is_set_op(op) {
+                    return Err(set_op_scalar_error(op));
+                }
+                Ok(())
+            }
+            (QueryResult::Vector(_), QueryResult::Vector(_))
+            | (QueryResult::Matrix(_), QueryResult::Matrix(_)) => Ok(()),
+            _ => Err(incompatible_types_error()),
+        }
+    }
+
+    /// A side's series count — `Vec::len`, `O(1)`, no traversal.
+    fn operand_series(r: &QueryResult) -> usize {
+        match r {
+            QueryResult::Vector(items) => items.len(),
+            QueryResult::Matrix(items) => items.len(),
+            _ => 0,
+        }
+    }
+
+    /// The counts the preflight's own charge was sized from, read back
+    /// off the operands so [`PreflightCharge::admit`] can refuse a body
+    /// that measured one pair and decided over another. `O(series)`, no
+    /// per-point work.
+    pub(super) fn operand_counts(lhs: &QueryResult, rhs: &QueryResult) -> (u64, u64) {
+        let count = |r: &QueryResult| -> (u64, u64) {
+            match r {
+                QueryResult::Vector(items) => (items.len() as u64, items.len() as u64),
+                QueryResult::Matrix(items) => (
+                    items.len() as u64,
+                    items
+                        .iter()
+                        .fold(0u64, |a, s| a.saturating_add(s.points.len() as u64)),
+                ),
+                _ => (0, 0),
+            }
+        };
+        let (ls, lp) = count(lhs);
+        let (rs, rp) = count(rhs);
+        (ls.saturating_add(rs), lp.saturating_add(rp))
+    }
+
+    /// The preflight's admission — the [`super::admit_join`] of its own
+    /// regime.
+    fn admit_operands(series: u64, points: u64, pc: &PreflightCharge) -> Result<(), ReadError> {
+        pc.admit(series, points)
+    }
+
+    /// (P1) — the three join refusals, decided over the WHOLE join.
+    ///
+    /// `duplicate_one_side_error` (`instant_join`'s `:392`),
+    /// `multiple_matches_error` (`:442`) and `grouping_unique_error`
+    /// (`:449`) are all functions of the operands' labels and of which
+    /// series are present at which timestamp. This reproduces
+    /// `combine_matrices`' ascending step order (`:589`) and
+    /// `instant_join`'s within-step order — the one-side index before the
+    /// many loop — so the error it returns is the error the join would
+    /// have returned, at the same step.
+    pub(super) fn decide_binary_refusals<'a>(
+        op: BinOp,
+        matching: Option<&VectorMatching>,
+        lhs: &'a QueryResult,
+        rhs: &'a QueryResult,
+        pc: &PreflightCharge,
+    ) -> Result<(), ReadError> {
+        // `set_op_join` constructs no semantic refusal, and every operand
+        // shape other than V⊗V / M⊗M either errors in `decide_shape` or
+        // goes to `map_samples`, which has no join.
+        if is_set_op(op)
+            || !matches!(
+                (lhs, rhs),
+                (QueryResult::Vector(_), QueryResult::Vector(_))
+                    | (QueryResult::Matrix(_), QueryResult::Matrix(_))
+            )
+        {
+            return Ok(());
+        }
+        let (n_l, n_r) = (operand_series(lhs), operand_series(rhs));
+        // `instant_join`'s `:372` short-circuit: a side with no series is
+        // empty at every step, so no step can reach the one-side index.
+        if n_l == 0 || n_r == 0 {
+            return Ok(());
+        }
+        let (series, points) = operand_counts(lhs, rhs);
+        admit_operands(series, points, pc)?;
+
+        let total = n_l + n_r;
+        let mut sides_l: Vec<SideSeries<'a>> = Vec::with_capacity(n_l);
+        let mut sides_r: Vec<SideSeries<'a>> = Vec::with_capacity(n_r);
+        let mut order: Vec<u32> = Vec::with_capacity(total);
+        let mut groups: Vec<u32> = Vec::with_capacity(total);
+        let mut cursors: Vec<u32> = Vec::with_capacity(total);
+        let mut heads: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::with_capacity(total);
+
+        // ONE exit, so the capacity observation below sees every return
+        // path of the stages (issue #290 AC 19).
+        let out = (|| -> Result<(), ReadError> {
+            project_side(lhs, &mut sides_l, pc);
+            project_side(rhs, &mut sides_r, pc);
+            // `instant_join`'s own role assignment, transcribed
+            // (`:379-383`).
+            let (many, one, ident, swapped) = match matching.and_then(|m| m.group.as_ref()) {
+                None => (&sides_l[..], &sides_r[..], Identity::OneToOne, false),
+                Some(MatchGroup::Left(inc)) => (
+                    &sides_l[..],
+                    &sides_r[..],
+                    Identity::Grouped(inc.as_slice()),
+                    false,
+                ),
+                Some(MatchGroup::Right(inc)) => (
+                    &sides_r[..],
+                    &sides_l[..],
+                    Identity::Grouped(inc.as_slice()),
+                    true,
+                ),
+            };
+            // No two series on the same side share the identity that
+            // side's refusal is keyed on ⇒ no step can refuse, and NO
+            // POINT HAS BEEN READ.
+            if !collision_groups(one, many, matching, ident, &mut order, &mut groups, pc) {
+                return Ok(());
+            }
+            match earliest_offending_step(
+                one,
+                many,
+                ident,
+                &order,
+                &groups,
+                &mut heads,
+                &mut cursors,
+                swapped,
+                pc,
+            ) {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        })();
+
+        #[cfg(test)]
+        record_scratch_capacity(&sides_l, &sides_r, &order, &groups, &cursors, &heads);
+        out
+    }
+
+    /// Borrows one operand's series into the scratch view. Pushes exactly
+    /// `operand_series(operand)` entries into a buffer the caller
+    /// reserved at that count, so the `alloc_block_bytes` model's
+    /// "one exactly-reserved request" precondition holds.
+    fn project_side<'a>(
+        operand: &'a QueryResult,
+        out: &mut Vec<SideSeries<'a>>,
+        _pc: &PreflightCharge,
+    ) {
+        match operand {
+            QueryResult::Vector(items) => {
+                for s in items {
+                    out.push(SideSeries {
+                        labels: s.labels.as_slice(),
+                        points: Points::instant(),
+                    });
+                }
+            }
+            QueryResult::Matrix(items) => {
+                for s in items {
+                    out.push(SideSeries {
+                        labels: s.labels.as_slice(),
+                        points: Points::steps(s.points.as_slice()),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The union index `gi` addresses the one side first, then the many
+    /// side; the bool is "this is a many-side series".
+    fn series_at<'s, 'a>(
+        one: &'s [SideSeries<'a>],
+        many: &'s [SideSeries<'a>],
+        gi: u32,
+    ) -> (&'s SideSeries<'a>, bool) {
+        let i = gi as usize;
+        if i < one.len() {
+            (&one[i], false)
+        } else {
+            (&many[i - one.len()], true)
+        }
+    }
+
+    /// Stage 3 — sorts the union by `(match signature, side, identity)`
+    /// and assigns each sorted position its KEY GROUP (a run of equal
+    /// match signature). Returns whether any two series on the SAME side
+    /// share the identity that side's refusal is keyed on; `false` means
+    /// no step can refuse and the caller returns `Ok` having read no
+    /// point.
+    ///
+    /// `sort_unstable_by` is in-place (pattern-defeating quicksort) —
+    /// `sort_by` would allocate `n/2` and break the six-buffer model.
+    ///
+    /// Cost `O(S log S · L)` comparator work, `O(S)` auxiliary, ZERO
+    /// point reads.
+    #[allow(clippy::too_many_arguments)]
+    fn collision_groups(
+        one: &[SideSeries<'_>],
+        many: &[SideSeries<'_>],
+        matching: Option<&VectorMatching>,
+        ident: Identity<'_>,
+        order: &mut Vec<u32>,
+        groups: &mut Vec<u32>,
+        _pc: &PreflightCharge,
+    ) -> bool {
+        let total = one.len() + many.len();
+        for gi in 0..total {
+            order.push(gi as u32);
+        }
+        order.sort_unstable_by(|&a, &b| {
+            let (sa, ma) = series_at(one, many, a);
+            let (sb, mb) = series_at(one, many, b);
+            sig_cmp(sa.labels, sb.labels, matching)
+                // One-side members sort BEFORE many-side members inside a
+                // key group, which is what lets the per-step scan see a
+                // group's one-side presence before its many-side members.
+                .then_with(|| ma.cmp(&mb))
+                .then_with(|| {
+                    if ma && mb {
+                        grouped_ident_cmp(sa.labels, sb.labels, ident)
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+        });
+
+        let mut kg = 0u32;
+        for pos in 0..total {
+            if pos > 0 {
+                let (sp, _) = series_at(one, many, order[pos - 1]);
+                let (sc, _) = series_at(one, many, order[pos]);
+                if sig_cmp(sp.labels, sc.labels, matching) != Ordering::Equal {
+                    kg += 1;
+                }
+            }
+            groups.push(kg);
+        }
+
+        for pos in 1..total {
+            if groups[pos] != groups[pos - 1] {
+                continue;
+            }
+            let (sp, mp) = series_at(one, many, order[pos - 1]);
+            let (sc, mc) = series_at(one, many, order[pos]);
+            if !mp && !mc {
+                return true; // two one-side series share a match signature
+            }
+            if mp && mc && grouped_ident_cmp(sp.labels, sc.labels, ident) == Ordering::Equal {
+                return true; // two many-side series share an output identity
+            }
+        }
+        false
+    }
+
+    /// Stage 4 — the earliest step at which the join would refuse, and
+    /// with which error.
+    ///
+    /// A `(timestamp, sorted position)` min-heap, so within one step the
+    /// pops arrive in sorted-position order: key groups are contiguous,
+    /// and inside a key group the one-side members arrive before the
+    /// many-side members, which in turn arrive in identity order. Two
+    /// present series that share an identity are therefore ADJACENT among
+    /// the pops, and the whole per-step state is three scalars.
+    ///
+    /// Precedence transcribes `instant_join`: the one-side index is built
+    /// before the many loop, so a duplicate one-side signature wins over
+    /// a many-side repeat at the SAME step; and `combine_matrices`'
+    /// ascending union (`:589`) makes the earliest step win across steps.
+    /// Both are gated by `:372`'s short-circuit — a step where either
+    /// side is empty refuses nothing.
+    ///
+    /// Each point is read exactly once, when it is pushed: `O(P log S)`
+    /// time, `O(S)` auxiliary, never more than `P` reads.
+    #[allow(clippy::too_many_arguments)]
+    fn earliest_offending_step(
+        one: &[SideSeries<'_>],
+        many: &[SideSeries<'_>],
+        ident: Identity<'_>,
+        order: &[u32],
+        groups: &[u32],
+        heads: &mut BinaryHeap<Reverse<(i64, u32)>>,
+        cursors: &mut Vec<u32>,
+        swapped: bool,
+        _pc: &PreflightCharge,
+    ) -> Option<ReadError> {
+        for (pos, &gi) in order.iter().enumerate() {
+            let (s, _) = series_at(one, many, gi);
+            cursors.push(0);
+            if s.points.len() > 0 {
+                heads.push(Reverse((s.points.at(0), pos as u32)));
+            }
+        }
+
+        while let Some(&Reverse((t, _))) = heads.peek() {
+            let mut one_present = false;
+            let mut many_present = false;
+            let mut dup_one = false;
+            let mut ident_repeat = false;
+            let mut cur_kg = u32::MAX;
+            let mut kg_one_seen = false;
+            let mut prev_many: Option<u32> = None;
+
+            while let Some(&Reverse((tt, pos))) = heads.peek() {
+                if tt != t {
+                    break;
+                }
+                heads.pop();
+                let (s, is_many) = series_at(one, many, order[pos as usize]);
+                let kg = groups[pos as usize];
+                if kg != cur_kg {
+                    cur_kg = kg;
+                    kg_one_seen = false;
+                    prev_many = None;
+                }
+                if is_many {
+                    many_present = true;
+                    if let Some(pp) = prev_many
+                        && kg_one_seen
+                    {
+                        let (sp, _) = series_at(one, many, order[pp as usize]);
+                        if grouped_ident_cmp(sp.labels, s.labels, ident) == Ordering::Equal {
+                            ident_repeat = true;
+                        }
+                    }
+                    prev_many = Some(pos);
+                } else {
+                    one_present = true;
+                    if kg_one_seen {
+                        dup_one = true;
+                    }
+                    kg_one_seen = true;
+                }
+
+                let next = cursors[pos as usize] as usize + 1;
+                if next < s.points.len() {
+                    let nt = s.points.at(next);
+                    // The operands are ascending by construction
+                    // (`exec.rs:120-121`). If one is not, the preflight
+                    // DECIDES NOTHING and the join decides as it always
+                    // did — an incomplete preflight is safe, an unsound
+                    // one is not.
+                    if nt <= t {
+                        return None;
+                    }
+                    heads.push(Reverse((nt, pos)));
+                }
+                cursors[pos as usize] = next as u32;
+            }
+
+            if one_present && many_present {
+                if dup_one {
+                    return Some(duplicate_one_side_error(swapped));
+                }
+                if ident_repeat {
+                    return Some(match ident {
+                        Identity::OneToOne => multiple_matches_error(),
+                        Identity::Grouped(_) => grouping_unique_error(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// `match_signature`'s `on`/`ignoring` filter, as a predicate rather
+    /// than a projection — the preflight must not materialise a
+    /// `MatchSig`, which `match_signature` clones (`:270-288`).
+    fn keep_label(k: &str, matching: Option<&VectorMatching>) -> bool {
+        match matching {
+            None => true,
+            Some(vm) if vm.on => vm.labels.iter().any(|l| l == k),
+            Some(vm) => !vm.labels.iter().any(|l| l == k),
+        }
+    }
+
+    /// Orders two series by their match signature, comparing the filtered
+    /// label sequences in place. Equality here is exactly `MatchSig`
+    /// equality, because a `MatchSig` IS that sequence.
+    fn sig_cmp(
+        a: &[(String, String)],
+        b: &[(String, String)],
+        matching: Option<&VectorMatching>,
+    ) -> Ordering {
+        a.iter()
+            .filter(|(k, _)| keep_label(k, matching))
+            .cmp(b.iter().filter(|(k, _)| keep_label(k, matching)))
+    }
+
+    /// Orders two many-side series by their per-step output identity; see
+    /// [`Identity`] for why the include names are all that is filtered.
+    fn grouped_ident_cmp(
+        a: &[(String, String)],
+        b: &[(String, String)],
+        ident: Identity<'_>,
+    ) -> Ordering {
+        match ident {
+            Identity::OneToOne => Ordering::Equal,
+            Identity::Grouped(inc) => a
+                .iter()
+                .filter(|(k, _)| !inc.iter().any(|n| n == k))
+                .cmp(b.iter().filter(|(k, _)| !inc.iter().any(|n| n == k))),
+        }
+    }
+
+    /// Records what the six buffers actually hold, so the charge is
+    /// checked against an OBSERVATION on every differential case rather
+    /// than against its own arithmetic.
+    #[cfg(test)]
+    // `&Vec<T>`, not `&[T]`: a slice cannot report `capacity()`, and
+    // capacity is the whole quantity here — a `push` past the reserved
+    // count is exactly the model violation this observes.
+    #[allow(clippy::ptr_arg)]
+    fn record_scratch_capacity(
+        sides_l: &Vec<SideSeries<'_>>,
+        sides_r: &Vec<SideSeries<'_>>,
+        order: &Vec<u32>,
+        groups: &Vec<u32>,
+        cursors: &Vec<u32>,
+        heads: &BinaryHeap<Reverse<(i64, u32)>>,
+    ) {
+        let blk = crate::logql::charge::alloc_block_bytes;
+        let w = size_of::<SideSeries<'_>>() as u64;
+        let total = blk(sides_l.capacity() as u64 * w)
+            + blk(sides_r.capacity() as u64 * w)
+            + blk(order.capacity() as u64 * 4)
+            + blk(groups.capacity() as u64 * 4)
+            + blk(cursors.capacity() as u64 * 4)
+            + blk(heads.capacity() as u64 * size_of::<Reverse<(i64, u32)>>() as u64);
+        super::PREFLIGHT_SCRATCH_CAP.with(|c| c.set(total));
+    }
+}
+
+/// The seam `tests/logql_preflight_alloc_gate.rs` brackets with its own
+/// counting global allocator (issue #290 §3).
+///
+/// `#[doc(hidden)]`, and it exists for that gate: the preflight's
+/// allocation bound has to be MEASURED, because the source rule that
+/// would otherwise carry it sees direct calls only and a helper defined
+/// outside the scanned module defeats it. An integration-test binary
+/// cannot bracket a private function, and this is the smallest seam that
+/// lets it. The body is `measure_operand` twice and the `PreflightCharge`
+/// block, and nothing else. Precedent:
+/// `tests/logql_json_key_alloc_gate.rs`.
+#[doc(hidden)]
+pub fn preflight_alloc_probe(
+    op: BinOp,
+    matching: Option<&VectorMatching>,
+    lhs: &QueryResult,
+    rhs: &QueryResult,
+) -> Result<(), ReadError> {
+    let (lm, rm) = (measure_operand(lhs), measure_operand(rhs));
+    match PreflightCharge::acquire(&lm, &rm) {
+        Some(pc) => preflight::decide_binary_refusals(op, matching, lhs, rhs, &pc),
+        None => Ok(()),
+    }
+}
+
 /// The funnel's proof token (issue #236 §4.1).
 ///
 /// Everything in this module is private to it: [`Ledger`]'s fields, its
@@ -1716,10 +2430,124 @@ fn measure_instant(series: &[InstantSeries]) -> StageInput {
 /// signature is therefore PROOF that the stage's modelled bytes were
 /// charged against the cap before that function could be reached — an
 /// uncapped call site does not compile, in release exactly as in debug.
+///
+/// Issue #290 adds a SECOND proof token to the same module,
+/// [`PreflightCharge`], for the class-(P) preflight's own scratch, and
+/// [`BinaryDecided`] — which is not a token but its dual: a value that
+/// OWNS the operands whose refusals have been decided, with no accessor,
+/// so [`Ledger::acquire_binary`] is the only way to get them back.
 mod ledger {
     #[cfg(test)]
     use super::MAX_POST_AGG_BYTES;
-    use super::{ReadError, StageInput, TooBroadReason};
+    use super::{
+        BinOp, MAX_BINARY_PREFLIGHT_BYTES, QueryResult, ReadError, StageInput, TooBroadReason,
+        VectorMatching,
+    };
+
+    /// The class-(P) preflight's proof token (issue #290).
+    ///
+    /// It OWNS its charge. There is no `&mut u64` parameter, so a caller
+    /// cannot hand it a precharge it cannot honour, and `charged`/`cap`
+    /// are not in scope for its decision — the preflight's admission is
+    /// never a function of an unrelated caller's spending. A
+    /// `&PreflightCharge` in a signature is proof that the scratch was
+    /// charged, exactly as `&Ledger` is for the stage.
+    #[derive(Debug)]
+    pub(in crate::logql) struct PreflightCharge {
+        bytes: u64,
+        admitted_series: u64,
+        admitted_points: u64,
+    }
+
+    impl PreflightCharge {
+        /// `None` = the scratch would exceed
+        /// [`MAX_BINARY_PREFLIGHT_BYTES`], so the preflight is SKIPPED.
+        /// A skip is not a refusal: it is not an `Err`, there is nothing
+        /// to swallow, and the caller falls through to the unchanged
+        /// stage path.
+        pub(super) fn acquire(lhs: &StageInput, rhs: &StageInput) -> Option<Self> {
+            let bytes = super::preflight_scratch_bytes(lhs, rhs);
+            if bytes > super::preflight_ceiling() {
+                return None;
+            }
+            Some(Self {
+                bytes,
+                admitted_series: lhs.series().saturating_add(rhs.series()),
+                admitted_points: lhs.points().saturating_add(rhs.points()),
+            })
+        }
+
+        /// Unchanged in spirit from [`Ledger::admit`]: the charge was
+        /// sized from these counts, so a body that measured one pair and
+        /// decides over another is refused.
+        pub(super) fn admit(&self, series: u64, points: u64) -> Result<(), ReadError> {
+            if series > self.admitted_series || points > self.admitted_points {
+                return Err(ReadError::QueryTooBroad(
+                    TooBroadReason::MetricPostAggBytes {
+                        bytes: self.bytes,
+                        cap: MAX_BINARY_PREFLIGHT_BYTES,
+                    },
+                ));
+            }
+            Ok(())
+        }
+
+        #[cfg(test)]
+        pub(super) fn bytes(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    /// Operands whose every class-(P) refusal has been decided, together
+    /// with the measurement taken FROM THEM (issue #290).
+    ///
+    /// The fields are private to this module: the only constructor is
+    /// [`decide_binary`], and the only exit is [`Ledger::acquire_binary`],
+    /// which charges. There is no accessor, no `into_operands`, no
+    /// `Deref`. That is what makes "decide before you charge" structural
+    /// rather than conventional — an operand cannot reach the join except
+    /// through a charge the decision preceded, and there is no second
+    /// pair for a caller to decide one of and charge the other.
+    #[derive(Debug)]
+    pub(super) struct BinaryDecided {
+        lhs: QueryResult,
+        rhs: QueryResult,
+        lm: StageInput,
+        rm: StageInput,
+        bytes: u64,
+    }
+
+    /// Decides every class-(P) refusal of the binary funnel, then
+    /// measures and prices the operands it decided over.
+    ///
+    /// Takes NEITHER `charged` NOR `cap`: the preflight's own admission
+    /// reads only the operands' counts and its own ceiling, so a caller's
+    /// spending cannot make a semantic error unreachable. The tiers are
+    /// (P0) `decide_shape`, uncharged because it allocates nothing; then
+    /// the measurement, which is saturating arithmetic over already
+    /// materialised data; then (P1) `decide_binary_refusals`, under its
+    /// own charge, SKIPPED rather than refused when the scratch would
+    /// exceed the ceiling.
+    pub(super) fn decide_binary(
+        op: BinOp,
+        matching: Option<&VectorMatching>,
+        lhs: QueryResult,
+        rhs: QueryResult,
+    ) -> Result<BinaryDecided, ReadError> {
+        super::preflight::decide_shape(op, &lhs, &rhs)?;
+        let (lm, rm) = (super::measure_operand(&lhs), super::measure_operand(&rhs));
+        let bytes = super::binary_peak_bytes(op, matching, &lm, &rm);
+        if let Some(pc) = PreflightCharge::acquire(&lm, &rm) {
+            super::preflight::decide_binary_refusals(op, matching, &lhs, &rhs, &pc)?;
+        }
+        Ok(BinaryDecided {
+            lhs,
+            rhs,
+            lm,
+            rm,
+            bytes,
+        })
+    }
 
     /// Proof that a stage's modelled bytes were charged, AND the budget
     /// that charge covers.
@@ -1752,20 +2580,33 @@ mod ledger {
         /// The binary funnel's charge. Both operands are live at once and
         /// both enter the join, so the admitted envelope is their SUM —
         /// the same quantity `binary_peak_bytes` is evaluated over.
+        ///
+        /// Consumes the decision, levies the charge derived from it, and
+        /// hands back the operands it was decided over. Callers cannot
+        /// name those operands by any other route (issue #290): there is
+        /// no `&StageInput` parameter left to supply a measurement that
+        /// was not taken from them, and no way to obtain a
+        /// [`BinaryDecided`] except from [`decide_binary`].
         pub(super) fn acquire_binary(
             charged: &'a mut u64,
-            lhs: &StageInput,
-            rhs: &StageInput,
-            bytes: u64,
+            decided: BinaryDecided,
             cap: u64,
-        ) -> Result<Self, ReadError> {
-            Self::acquire_for(
+        ) -> Result<(Self, QueryResult, QueryResult), ReadError> {
+            let BinaryDecided {
+                lhs,
+                rhs,
+                lm,
+                rm,
+                bytes,
+            } = decided;
+            let l = Self::acquire_for(
                 charged,
-                lhs.series().saturating_add(rhs.series()),
-                lhs.points().saturating_add(rhs.points()),
+                lm.series().saturating_add(rm.series()),
+                lm.points().saturating_add(rm.points()),
                 bytes,
                 cap,
-            )
+            )?;
+            Ok((l, lhs, rhs))
         }
 
         fn acquire_for(
@@ -1830,6 +2671,12 @@ mod ledger {
 }
 
 use ledger::Ledger;
+// Issue #290's two additions, each on its OWN line and AFTER the line
+// above: `the_enforcement_path_contains_no_debug_assert` delimits its
+// scan region with the literal `"\nuse ledger::Ledger;"`, so folding
+// these into a brace group would silence that gate rather than fail it.
+use ledger::PreflightCharge;
+use ledger::decide_binary;
 
 /// One binary operand's measured shape; a scalar/string/streams operand
 /// carries no series and measures empty.
@@ -3003,5 +3850,898 @@ mod tests {
         apply_label_replace_capped(&mut charged, input(), &spec, MAX_POST_AGG_BYTES)
             .expect("within cap");
         assert_eq!(charged, 0, "the ledger must discharge on success");
+    }
+
+    // =================================================================
+    // Issue #290 — the class-(P) preflight: the differential, the
+    // read counter, the scratch charge and the skip path.
+    // =================================================================
+
+    /// **The oracle: the join with NO preflight and an unrefusable
+    /// budget.** A faithful copy of [`combine_binary_capped`]'s
+    /// post-charge `match`, driven by `Ledger::for_test`. It is what the
+    /// preflight's answers are differentiated against, so the two cannot
+    /// drift silently — 491 520 + 98 cases pin them equal.
+    fn join_only(
+        op: BinOp,
+        return_bool: bool,
+        matching: Option<&VectorMatching>,
+        lhs: QueryResult,
+        rhs: QueryResult,
+    ) -> Result<QueryResult, ReadError> {
+        let mut charged = 0u64;
+        let l = Ledger::for_test(&mut charged);
+        match (lhs, rhs) {
+            (QueryResult::Scalar(a), QueryResult::Scalar(b)) => {
+                if is_set_op(op) {
+                    return Err(set_op_scalar_error(op));
+                }
+                let v = if op.is_comparison() {
+                    if compare(op, a, b) { 1.0 } else { 0.0 }
+                } else {
+                    arith(op, a, b)
+                };
+                Ok(QueryResult::Scalar(v))
+            }
+            (
+                QueryResult::Scalar(s),
+                vector_side @ (QueryResult::Vector(_) | QueryResult::Matrix(_)),
+            ) => {
+                if is_set_op(op) {
+                    return Err(set_op_scalar_error(op));
+                }
+                map_samples(
+                    vector_side,
+                    |v| scalar_apply(op, return_bool, s, v, true),
+                    &l,
+                )
+            }
+            (
+                vector_side @ (QueryResult::Vector(_) | QueryResult::Matrix(_)),
+                QueryResult::Scalar(s),
+            ) => {
+                if is_set_op(op) {
+                    return Err(set_op_scalar_error(op));
+                }
+                map_samples(
+                    vector_side,
+                    |v| scalar_apply(op, return_bool, s, v, false),
+                    &l,
+                )
+            }
+            (QueryResult::Vector(a), QueryResult::Vector(b)) => Ok(QueryResult::Vector(
+                combine_vectors(op, return_bool, matching, a, b, &l)?,
+            )),
+            (QueryResult::Matrix(a), QueryResult::Matrix(b)) => Ok(QueryResult::Matrix(
+                combine_matrices(op, return_bool, matching, a, b, &l)?,
+            )),
+            _ => Err(incompatible_types_error()),
+        }
+    }
+
+    /// The comparable identity of a refusal: the reason text for the
+    /// semantic errors, the debug form for anything else. Comparing the
+    /// TEXT is what makes "the preflight returns the error the join would
+    /// have returned" a claim about what a client sees.
+    fn err_key(e: &ReadError) -> String {
+        match e {
+            ReadError::PipelineInvalid { reason } => reason.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn err_of<T>(r: Result<T, ReadError>) -> Option<String> {
+        r.err().map(|e| err_key(&e))
+    }
+
+    /// The pre-committed 5-series multiset over `{x, y}`, key-sorted.
+    /// It contains one EXACT duplicate (index 2 repeats index 0), one
+    /// signature-colliding pair under `on(x)`/`ignoring(y)`, and one
+    /// series carrying no `y` — which as the ONE side is the include-copy
+    /// collapse that reaches `grouping_unique_error`.
+    const DIFF_SERIES: [&[(&str, &str)]; 5] = [
+        &[("x", "1"), ("y", "p")],
+        &[("x", "1"), ("y", "q")],
+        &[("x", "1"), ("y", "p")],
+        &[("x", "2"), ("y", "p")],
+        &[("x", "1")],
+    ];
+
+    fn diff_labels(i: usize) -> Vec<(String, String)> {
+        DIFF_SERIES[i]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// The three pre-committed timestamp assignments. `T0` puts every
+    /// series on every step; `T1` gives colliding pairs steps they never
+    /// share (the admit-side control, and the source of steps where one
+    /// side is empty and the other is not — `instant_join`'s `:372`
+    /// short-circuit); `T2` overlaps partially, so "earliest step wins"
+    /// is exercised.
+    fn diff_stamps(pattern: usize, i: usize) -> &'static [i64] {
+        match pattern {
+            0 => &[1, 2, 3],
+            1 => match i % 3 {
+                0 => &[1],
+                1 => &[2],
+                _ => &[3],
+            },
+            _ => {
+                if i.is_multiple_of(2) {
+                    &[1, 2]
+                } else {
+                    &[2, 3]
+                }
+            }
+        }
+    }
+
+    /// `shape == 0` is the instant (one-virtual-step) form; `1..=3`
+    /// select `T0`/`T1`/`T2` over matrix operands.
+    fn diff_side(subset: u32, shape: usize) -> QueryResult {
+        let members = (0..5usize).filter(|i| (subset >> i) & 1 == 1);
+        if shape == 0 {
+            QueryResult::Vector(
+                members
+                    .map(|i| VectorSample {
+                        labels: diff_labels(i),
+                        value: (i + 1) as f64,
+                    })
+                    .collect(),
+            )
+        } else {
+            QueryResult::Matrix(
+                members
+                    .map(|i| MatrixSeries {
+                        labels: diff_labels(i),
+                        points: diff_stamps(shape - 1, i)
+                            .iter()
+                            .map(|&t| (t, (i + 1) as f64))
+                            .collect(),
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    /// Axis A — `(op, return_bool)`, six entries.
+    ///
+    /// Six and not ten: `return_bool` is read at exactly one place,
+    /// inside `if op.is_comparison()` (`instant_join`'s `:410-419`), and
+    /// its only effect is on `value`/`keep`; `keep` gates `out.push`
+    /// AFTER every duplicate check (`:438-454`). `set_op_join` never
+    /// reads it. So it cannot change any refusal for any op — `(Gt, true)`
+    /// is kept as a control and pairing it with the four non-comparison
+    /// ops adds no reachable branch.
+    const AXIS_A: [(BinOp, bool); 6] = [
+        (BinOp::Div, false),
+        (BinOp::Gt, false),
+        (BinOp::Gt, true),
+        (BinOp::And, false),
+        (BinOp::Or, false),
+        (BinOp::Unless, false),
+    ];
+
+    /// Axis B — the eight matching clauses.
+    fn axis_b() -> Vec<Option<VectorMatching>> {
+        let x = || vec!["x".to_string()];
+        let y = || vec!["y".to_string()];
+        let inc_y = || vec!["y".to_string()];
+        vec![
+            None,
+            Some(VectorMatching {
+                on: true,
+                labels: x(),
+                group: None,
+            }),
+            Some(VectorMatching {
+                on: false,
+                labels: y(),
+                group: None,
+            }),
+            Some(VectorMatching {
+                on: true,
+                labels: x(),
+                group: Some(MatchGroup::Left(Vec::new())),
+            }),
+            Some(VectorMatching {
+                on: true,
+                labels: x(),
+                group: Some(MatchGroup::Left(inc_y())),
+            }),
+            Some(VectorMatching {
+                on: false,
+                labels: y(),
+                group: Some(MatchGroup::Left(inc_y())),
+            }),
+            Some(VectorMatching {
+                on: true,
+                labels: x(),
+                group: Some(MatchGroup::Right(Vec::new())),
+            }),
+            Some(VectorMatching {
+                on: true,
+                labels: x(),
+                group: Some(MatchGroup::Right(inc_y())),
+            }),
+        ]
+    }
+
+    /// Axis D — one instant shape plus the nine independent
+    /// `(T_lhs, T_rhs)` matrix pairs.
+    fn axis_d() -> Vec<(usize, usize)> {
+        let mut out = vec![(0usize, 0usize)];
+        for l in 1..=3 {
+            for r in 1..=3 {
+                out.push((l, r));
+            }
+        }
+        out
+    }
+
+    /// The three-way relation, for one case. Soundness (the preflight
+    /// invents no rejection), completeness (it misses none of the three
+    /// join refusals) and message identity are ONE assertion now that all
+    /// three are decided; the two byte assertions ride along because the
+    /// scratch model has to hold on every input the differential drives,
+    /// not on the four fixtures someone chose.
+    fn diff_case(
+        op: BinOp,
+        return_bool: bool,
+        matching: Option<&VectorMatching>,
+        sl: u32,
+        sr: u32,
+        dl: usize,
+        dr: usize,
+    ) {
+        let lhs = diff_side(sl, dl);
+        let rhs = diff_side(sr, dr);
+        let (lm, rm) = (measure_operand(&lhs), measure_operand(&rhs));
+        let charge = preflight_scratch_bytes(&lm, &rm);
+        PREFLIGHT_SCRATCH_CAP.with(|c| c.set(0));
+        let decided = err_of(decide_binary(op, matching, lhs.clone(), rhs.clone()));
+        let oracle = err_of(join_only(op, return_bool, matching, lhs, rhs));
+        assert_eq!(
+            decided, oracle,
+            "op = {op:?} bool = {return_bool} matching = {matching:?} subsets = ({sl:#07b}, \
+             {sr:#07b}) shapes = ({dl}, {dr})"
+        );
+        let observed = PREFLIGHT_SCRATCH_CAP.with(|c| c.get());
+        assert!(
+            observed <= charge,
+            "the preflight held {observed} B of scratch against a {charge} B charge"
+        );
+        let modelled = binary_peak_bytes(op, matching, &lm, &rm);
+        assert!(
+            charge <= modelled,
+            "the preflight charge {charge} must be dominated by the stage charge {modelled}"
+        );
+        let s = lm.series() + rm.series();
+        let want = if s == 0 {
+            0
+        } else {
+            PREFLIGHT_BYTES_PER_SERIES * s + PREFLIGHT_FLAT_BYTES
+        };
+        assert_eq!(
+            charge, want,
+            "the charge must be the closed form at S = {s}"
+        );
+    }
+
+    /// One axis-A partition of the differential — 8 × 10 × 1024 cases.
+    fn run_diff_partition(a: usize) -> usize {
+        let (op, return_bool) = AXIS_A[a];
+        let matchings = axis_b();
+        let shapes = axis_d();
+        let mut cases = 0usize;
+        for m in &matchings {
+            for &(dl, dr) in &shapes {
+                for sl in 0..32u32 {
+                    for sr in 0..32u32 {
+                        diff_case(op, return_bool, m.as_ref(), sl, sr, dl, dr);
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 81_920, "partition {a} lost cases");
+        cases
+    }
+
+    macro_rules! diff_partition {
+        ($name:ident, $idx:expr) => {
+            #[test]
+            fn $name() {
+                let started = std::time::Instant::now();
+                let cases = run_diff_partition($idx);
+                println!(
+                    "#290 differential partition {} ({:?}): {cases} cases in {:?}",
+                    $idx,
+                    AXIS_A[$idx],
+                    started.elapsed()
+                );
+            }
+        };
+    }
+
+    diff_partition!(the_preflight_agrees_with_the_join_over_partition_0_div, 0);
+    diff_partition!(the_preflight_agrees_with_the_join_over_partition_1_gt, 1);
+    diff_partition!(
+        the_preflight_agrees_with_the_join_over_partition_2_gt_bool,
+        2
+    );
+    diff_partition!(the_preflight_agrees_with_the_join_over_partition_3_and, 3);
+    diff_partition!(the_preflight_agrees_with_the_join_over_partition_4_or, 4);
+    diff_partition!(
+        the_preflight_agrees_with_the_join_over_partition_5_unless,
+        5
+    );
+
+    /// A dropped partition fails by ARITHMETIC, not by someone noticing:
+    /// the six partitions must cover the whole pre-committed space.
+    #[test]
+    fn the_differential_partitions_cover_the_whole_space() {
+        assert_eq!(AXIS_A.len(), 6);
+        assert_eq!(axis_b().len(), 8);
+        assert_eq!(axis_d().len(), 10);
+        let per_partition = axis_b().len() * axis_d().len() * 32 * 32;
+        assert_eq!(per_partition, 81_920);
+        assert_eq!(AXIS_A.len() * per_partition, 491_520);
+    }
+
+    /// Every [`QueryResult`] variant against every other, at two ops —
+    /// the exhaustive pin of (P0) against the arm the real `match`
+    /// selects.
+    #[test]
+    fn the_shape_dispatch_is_pinned_against_every_result_variant_pair() {
+        let variants = || -> Vec<QueryResult> {
+            vec![
+                QueryResult::Streams {
+                    items: Vec::new(),
+                    partial: false,
+                },
+                QueryResult::Vector(Vec::new()),
+                QueryResult::Matrix(Vec::new()),
+                QueryResult::Scalar(1.0),
+                QueryResult::String(String::new()),
+                QueryResult::VectorHist(Vec::new()),
+                QueryResult::MatrixHist(Vec::new()),
+            ]
+        };
+        let mut cases = 0usize;
+        for op in [BinOp::Div, BinOp::And] {
+            for (li, _) in variants().into_iter().enumerate() {
+                for (ri, _) in variants().into_iter().enumerate() {
+                    let lhs = variants().remove(li);
+                    let rhs = variants().remove(ri);
+                    let decided = err_of(decide_binary(op, None, lhs.clone(), rhs.clone()));
+                    let oracle = err_of(join_only(op, false, None, lhs, rhs));
+                    assert_eq!(decided, oracle, "op = {op:?} variants = ({li}, {ri})");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 98);
+    }
+
+    // ---- the read counter -------------------------------------------
+
+    /// One fixture series: `(labels, first timestamp, stride)`. A stride
+    /// of 2 on two colliding series is what makes them never present at
+    /// the same step.
+    type ReadFixtureSeries<'a> = (&'a [(&'a str, &'a str)], i64, i64);
+
+    fn matrix_side(series: &[ReadFixtureSeries<'_>], points_per_series: usize) -> QueryResult {
+        QueryResult::Matrix(
+            series
+                .iter()
+                .map(|(labels, offset, stride)| MatrixSeries {
+                    labels: labels
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect(),
+                    points: (0..points_per_series)
+                        .map(|t| (offset + t as i64 * stride, 1.0))
+                        .collect(),
+                })
+                .collect(),
+        )
+    }
+
+    fn points_read_for(
+        matching: Option<&VectorMatching>,
+        lhs: QueryResult,
+        rhs: QueryResult,
+    ) -> u64 {
+        PREFLIGHT_POINTS_READ.with(|c| c.set(0));
+        let _ = decide_binary(BinOp::Div, matching, lhs, rhs);
+        PREFLIGHT_POINTS_READ.with(|c| c.get())
+    }
+
+    fn on_x_group_left_empty() -> VectorMatching {
+        VectorMatching {
+            on: true,
+            labels: vec!["x".to_string()],
+            group: Some(MatchGroup::Left(Vec::new())),
+        }
+    }
+
+    /// The five collision shapes the counter is asserted over. Each is
+    /// `(name, matching, lhs, rhs)` built at `n` points per series. Index
+    /// 0 is the no-collision control; 1–3 refuse at their first step; 4
+    /// sweeps every step and admits, which is where a quadratic
+    /// traversal becomes visible.
+    fn read_fixtures(
+        n: usize,
+    ) -> Vec<(
+        &'static str,
+        Option<VectorMatching>,
+        QueryResult,
+        QueryResult,
+    )> {
+        let distinct_l: &[ReadFixtureSeries<'_>] = &[
+            (&[("x", "1")], 0, 1),
+            (&[("x", "2")], 0, 1),
+            (&[("x", "3")], 0, 1),
+            (&[("x", "4")], 0, 1),
+        ];
+        let distinct_r: &[ReadFixtureSeries<'_>] = &[
+            (&[("x", "1")], 0, 1),
+            (&[("x", "2")], 0, 1),
+            (&[("x", "3")], 0, 1),
+            (&[("x", "4")], 0, 1),
+        ];
+        // Two ONE-side series sharing the `on(x)` signature.
+        let dup_one: &[ReadFixtureSeries<'_>] = &[
+            (&[("x", "1"), ("z", "a")], 0, 1),
+            (&[("x", "1"), ("z", "b")], 0, 1),
+            (&[("x", "2")], 0, 1),
+            (&[("x", "3")], 0, 1),
+        ];
+        // The SAME collision on interleaved steps, so the two colliding
+        // series are never present together. Stage 3 cannot rule it out
+        // — they do share a signature — so Stage 4 sweeps every step and
+        // returns `Ok`. This is the fixture that measures the SWEEP: the
+        // three refusing ones below stop at their first step, where a
+        // quadratic traversal never gets the chance to show itself.
+        let dup_one_disjoint: &[ReadFixtureSeries<'_>] = &[
+            (&[("x", "1"), ("z", "a")], 0, 2),
+            (&[("x", "1"), ("z", "b")], 1, 2),
+            (&[("x", "2")], 0, 1),
+            (&[("x", "3")], 0, 1),
+        ];
+        // Two MANY-side series sharing the full signature (one-to-one).
+        let dup_many: &[ReadFixtureSeries<'_>] = &[
+            (&[("x", "1")], 0, 1),
+            (&[("x", "1")], 0, 1),
+            (&[("x", "2")], 0, 1),
+            (&[("x", "3")], 0, 1),
+        ];
+        // The grouped collapse: two many series differing only in `y`,
+        // with `y` copied from a one side that has none.
+        let collapse_many: &[ReadFixtureSeries<'_>] = &[
+            (&[("x", "1"), ("y", "p")], 0, 1),
+            (&[("x", "1"), ("y", "q")], 0, 1),
+        ];
+        let collapse_one: &[ReadFixtureSeries<'_>] = &[(&[("x", "1")], 0, 1)];
+        vec![
+            (
+                "no-collision",
+                Some(on_x_group_left_empty()),
+                matrix_side(distinct_l, n),
+                matrix_side(distinct_r, n),
+            ),
+            (
+                "one-side collision",
+                Some(on_x_group_left_empty()),
+                matrix_side(distinct_l, n),
+                matrix_side(dup_one, n),
+            ),
+            (
+                "many-side collision, one-to-one",
+                None,
+                matrix_side(dup_many, n),
+                matrix_side(distinct_r, n),
+            ),
+            (
+                "many-side collision, grouped",
+                Some(VectorMatching {
+                    on: false,
+                    labels: vec!["y".to_string()],
+                    group: Some(MatchGroup::Left(vec!["y".to_string()])),
+                }),
+                matrix_side(collapse_many, n),
+                matrix_side(collapse_one, n),
+            ),
+            (
+                "one-side collision that never co-occurs — a FULL sweep, admitted",
+                Some(on_x_group_left_empty()),
+                matrix_side(distinct_l, n),
+                matrix_side(dup_one_disjoint, n),
+            ),
+        ]
+    }
+
+    fn total_points(r: &QueryResult) -> u64 {
+        match r {
+            QueryResult::Matrix(items) => items
+                .iter()
+                .fold(0u64, |a, s| a.saturating_add(s.points.len() as u64)),
+            QueryResult::Vector(items) => items.len() as u64,
+            _ => 0,
+        }
+    }
+
+    /// **No point is read unless two series on the SAME side share the
+    /// identity that side's refusal is keyed on.** An identity at ten
+    /// times the points, not a threshold — a threshold would pass for a
+    /// traversal that reads a constant fraction.
+    #[test]
+    fn the_preflight_reads_no_point_without_a_collision() {
+        for n in [4usize, 40] {
+            let mut fx = read_fixtures(n);
+            let (name, m, lhs, rhs) = fx.remove(0);
+            assert_eq!(name, "no-collision");
+            assert_eq!(
+                points_read_for(m.as_ref(), lhs, rhs),
+                0,
+                "the no-collision fixture read a point at {n} points per series"
+            );
+        }
+    }
+
+    /// On a collision the reads stay inside the operands' own point
+    /// totals, and grow LINEARLY with them — a nested sweep fails the
+    /// ratio even though it would pass a ceiling chosen for the small
+    /// fixture.
+    #[test]
+    fn the_preflight_reads_stay_linear_in_the_points_it_must_examine() {
+        for i in 1..5usize {
+            let mut small = read_fixtures(4);
+            let (name, m, lhs, rhs) = small.remove(i);
+            let bound = 2 * (total_points(&lhs) + total_points(&rhs));
+            let reads_small = points_read_for(m.as_ref(), lhs, rhs);
+            assert!(
+                reads_small > 0,
+                "{name}: the collision fixture must reach the step sweep"
+            );
+            assert!(
+                reads_small <= bound,
+                "{name}: read {reads_small} points against a {bound}-point bound"
+            );
+
+            let mut big = read_fixtures(40);
+            let (_, m, lhs, rhs) = big.remove(i);
+            let bound = 2 * (total_points(&lhs) + total_points(&rhs));
+            let reads_big = points_read_for(m.as_ref(), lhs, rhs);
+            assert!(
+                reads_big <= bound,
+                "{name}: read {reads_big} points against a {bound}-point bound at 10x"
+            );
+            assert!(
+                reads_big <= reads_small * 11,
+                "{name}: reads grew {reads_small} -> {reads_big} for a 10x point count — that \
+                 is superlinear"
+            );
+        }
+    }
+
+    // ---- the scratch model ------------------------------------------
+
+    /// The published figures, by EQUALITY. They are derived
+    /// (`2 · size_of::<SideSeries>() + 56`, `6 · MIN_ALLOC_BYTES`), so a
+    /// wider view type moves them and this is what says so.
+    #[test]
+    fn the_preflight_constants_are_the_published_figures() {
+        assert_eq!(PREFLIGHT_BYTES_PER_SERIES, 120);
+        assert_eq!(PREFLIGHT_FLAT_BYTES, 192);
+        assert_eq!(MAX_POST_AGG_BYTES / B_SERIES, 6_753_093);
+        assert_eq!(MAX_BINARY_PREFLIGHT_BYTES, 810_371_352);
+        assert_eq!(
+            MAX_BINARY_PREFLIGHT_BYTES,
+            PREFLIGHT_BYTES_PER_SERIES * (MAX_POST_AGG_BYTES / B_SERIES) + PREFLIGHT_FLAT_BYTES
+        );
+    }
+
+    /// The six buffers at their real reserved counts fit inside the
+    /// charge, and the charge is dominated by the stage model, across a
+    /// series sweep that includes the small inputs where the 32-byte
+    /// allocator floor and not the product dominates.
+    #[test]
+    fn the_scratch_model_covers_the_six_buffers_and_stays_under_the_stage_charge() {
+        let blk = crate::logql::charge::alloc_block_bytes;
+        let w = 2 * size_of::<preflight::SideSeries<'static>>() as u64 / 2;
+        for &nl in &[0u64, 1, 2, 3, 7, 64, 4096] {
+            for &nr in &[0u64, 1, 2, 3, 7, 64, 4096] {
+                let lm = StageInput::for_derivation(nl, 0, 0, 0, 0, 0, nl, 1);
+                let rm = StageInput::for_derivation(nr, 0, 0, 0, 0, 0, nr, 1);
+                let charge = preflight_scratch_bytes(&lm, &rm);
+                let s = nl + nr;
+                if s == 0 {
+                    assert_eq!(charge, 0);
+                    continue;
+                }
+                let buffers =
+                    blk(nl * w) + blk(nr * w) + blk(s * 4) + blk(s * 4) + blk(s * 4) + blk(s * 16);
+                assert!(
+                    buffers <= charge,
+                    "S = {s}: the six buffers price {buffers} B against a {charge} B charge"
+                );
+                assert!(
+                    charge <= B_SERIES * s,
+                    "S = {s}: the preflight charge {charge} must be dominated by B_SERIES · S"
+                );
+            }
+        }
+    }
+
+    /// The preflight's own admission is a real check, not a formality:
+    /// a charge sized from one pair refuses a body handed another.
+    #[test]
+    fn the_preflight_charge_refuses_a_wider_pair_than_it_was_sized_for() {
+        let one = QueryResult::Vector(vec![VectorSample {
+            labels: diff_labels(0),
+            value: 1.0,
+        }]);
+        let narrow = measure_operand(&one);
+        let pc = PreflightCharge::acquire(&narrow, &narrow).expect("well inside the ceiling");
+        assert_eq!(
+            pc.bytes(),
+            PREFLIGHT_BYTES_PER_SERIES * 2 + PREFLIGHT_FLAT_BYTES
+        );
+        let wide = QueryResult::Vector(
+            (0..64)
+                .map(|i| VectorSample {
+                    labels: vec![("x".to_string(), format!("{i:08}"))],
+                    value: 1.0,
+                })
+                .collect(),
+        );
+        match preflight::decide_binary_refusals(BinOp::Div, None, &wide, &wide, &pc) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricPostAggBytes { bytes, cap })) => {
+                assert_eq!(bytes, pc.bytes());
+                assert_eq!(cap, MAX_BINARY_PREFLIGHT_BYTES);
+            }
+            other => panic!("expected the preflight's own admission to refuse, got {other:?}"),
+        }
+    }
+
+    // ---- the skip path ----------------------------------------------
+
+    /// Runs `f` with the preflight ceiling forced, so the skip branch —
+    /// unreachable below ~6.75 million combined series, and therefore
+    /// untested in CI by construction — is exercised.
+    fn with_preflight_ceiling<T>(ceiling: u64, f: impl FnOnce() -> T) -> T {
+        PREFLIGHT_CEILING_OVERRIDE.with(|c| c.set(Some(ceiling)));
+        let out = f();
+        PREFLIGHT_CEILING_OVERRIDE.with(|c| c.set(None));
+        out
+    }
+
+    /// **A skip is behaviour-preserving.** With the ceiling forced to 0
+    /// the (P1) block is never entered, and every case's answer is
+    /// "pre-change behaviour with the (P0) corrections applied": the
+    /// shape refusals still win above the charge, and everything else is
+    /// the join's own answer.
+    ///
+    /// The P0-case count is asserted non-zero, because a run in which no
+    /// case can distinguish the two oracles proves neither.
+    #[test]
+    fn a_skipped_preflight_leaves_behaviour_unchanged() {
+        let (op, return_bool) = AXIS_A[0];
+        let matchings = axis_b();
+        let shapes = axis_d();
+        let mut cases = 0usize;
+        let mut p0_cases = 0usize;
+        with_preflight_ceiling(0, || {
+            for m in &matchings {
+                for &(dl, dr) in &shapes {
+                    for sl in 0..32u32 {
+                        for sr in 0..32u32 {
+                            let lhs = diff_side(sl, dl);
+                            let rhs = diff_side(sr, dr);
+                            let mut charged = 0u64;
+                            let got = err_of(combine_binary_capped(
+                                &mut charged,
+                                op,
+                                return_bool,
+                                m.as_ref(),
+                                lhs.clone(),
+                                rhs.clone(),
+                                MAX_POST_AGG_BYTES,
+                            ));
+                            let shape = err_of(preflight::decide_shape(op, &lhs, &rhs));
+                            if shape.is_some() {
+                                p0_cases += 1;
+                            }
+                            let want = match shape {
+                                Some(e) => Some(e),
+                                None => err_of(join_only(op, return_bool, m.as_ref(), lhs, rhs)),
+                            };
+                            assert_eq!(got, want, "skip mode diverged at ({sl:#07b}, {sr:#07b})");
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+            // The axis-A partition carries no scalar or mixed-shape
+            // operand, so the P0 half would be vacuous on it alone; these
+            // pre-committed pairs are what make the distinction real.
+            for op in [BinOp::Div, BinOp::And] {
+                for (lhs, rhs) in [
+                    (QueryResult::Scalar(1.0), QueryResult::Scalar(2.0)),
+                    (QueryResult::Scalar(1.0), QueryResult::Vector(Vec::new())),
+                    (QueryResult::Vector(Vec::new()), QueryResult::Scalar(2.0)),
+                    (
+                        QueryResult::Vector(Vec::new()),
+                        QueryResult::Matrix(Vec::new()),
+                    ),
+                    (
+                        QueryResult::String(String::new()),
+                        QueryResult::Vector(Vec::new()),
+                    ),
+                ] {
+                    let mut charged = 0u64;
+                    let got = err_of(combine_binary_capped(
+                        &mut charged,
+                        op,
+                        false,
+                        None,
+                        lhs.clone(),
+                        rhs.clone(),
+                        MAX_POST_AGG_BYTES,
+                    ));
+                    let shape = err_of(preflight::decide_shape(op, &lhs, &rhs));
+                    if shape.is_some() {
+                        p0_cases += 1;
+                    }
+                    let want = match shape {
+                        Some(e) => Some(e),
+                        None => err_of(join_only(op, false, None, lhs, rhs)),
+                    };
+                    assert_eq!(got, want, "skip mode diverged on a P0 pair");
+                    cases += 1;
+                }
+            }
+        });
+        assert_eq!(cases, 81_930);
+        assert!(
+            p0_cases > 0,
+            "no case in the skip-mode run could distinguish the two oracles"
+        );
+        println!("#290 skip-mode run: {cases} cases, {p0_cases} of them (P0)");
+    }
+
+    /// **The defect, kept reproducible.** With the preflight skipped —
+    /// which is byte-for-byte the pre-#290 ordering for the three join
+    /// refusals — the same six fixtures that
+    /// `tests/logql_semantics_before_budget.rs` asserts return a 400 at
+    /// `cap = 0` come back as `MetricPostAggBytes`, i.e. a 422
+    /// `query_too_broad` telling the client their query is too large when
+    /// it is ambiguous.
+    ///
+    /// This is the discriminating half. Without it the runtime rows would
+    /// pass on code that never had the bug, and "shown failing on today's
+    /// code" would be a claim about a mutant nobody can re-run.
+    #[test]
+    fn the_join_refusals_are_preempted_by_the_budget_when_the_preflight_is_skipped() {
+        let on_x_gl = VectorMatching {
+            on: true,
+            labels: vec!["x".to_string()],
+            group: Some(MatchGroup::Left(Vec::new())),
+        };
+        let on_x = VectorMatching {
+            on: true,
+            labels: vec!["x".to_string()],
+            group: None,
+        };
+        let ign_y_gl_y = VectorMatching {
+            on: false,
+            labels: vec!["y".to_string()],
+            group: Some(MatchGroup::Left(vec!["y".to_string()])),
+        };
+        let s = |pairs: &[(&str, &str)], v: f64| VectorSample {
+            labels: pairs
+                .iter()
+                .map(|(k, val)| ((*k).to_string(), (*val).to_string()))
+                .collect(),
+            value: v,
+        };
+        let m = |pairs: &[(&str, &str)], ts: &[i64]| MatrixSeries {
+            labels: pairs
+                .iter()
+                .map(|(k, val)| ((*k).to_string(), (*val).to_string()))
+                .collect(),
+            points: ts.iter().map(|&t| (t, 1.0)).collect(),
+        };
+        let rows: Vec<(&str, &VectorMatching, QueryResult, QueryResult)> = vec![
+            (
+                "matrix, duplicate at a later step",
+                &on_x_gl,
+                QueryResult::Matrix(vec![m(&[("m", "a"), ("x", "1")], &[1, 2])]),
+                QueryResult::Matrix(vec![
+                    m(&[("x", "1"), ("z", "p")], &[1, 2]),
+                    m(&[("x", "1"), ("z", "q")], &[2]),
+                ]),
+            ),
+            (
+                "matrix, empty leading steps on one side",
+                &on_x_gl,
+                QueryResult::Matrix(vec![m(&[("m", "a"), ("x", "1")], &[1, 2])]),
+                QueryResult::Matrix(vec![
+                    m(&[("x", "1"), ("z", "p")], &[2]),
+                    m(&[("x", "1"), ("z", "q")], &[2]),
+                ]),
+            ),
+            (
+                "vector, duplicate one side",
+                &on_x_gl,
+                QueryResult::Vector(vec![s(&[("m", "a"), ("x", "1")], 10.0)]),
+                QueryResult::Vector(vec![
+                    s(&[("x", "1"), ("z", "p")], 2.0),
+                    s(&[("x", "1"), ("z", "q")], 3.0),
+                ]),
+            ),
+            (
+                "grouped join with an empty include list",
+                &on_x_gl,
+                QueryResult::Vector(vec![
+                    s(&[("x", "1"), ("y", "p")], 10.0),
+                    s(&[("x", "1"), ("y", "p")], 20.0),
+                ]),
+                QueryResult::Vector(vec![s(&[("x", "1")], 2.0)]),
+            ),
+            (
+                "one-to-one, multiple matches",
+                &on_x,
+                QueryResult::Vector(vec![
+                    s(&[("a", "1"), ("x", "1")], 10.0),
+                    s(&[("a", "2"), ("x", "1")], 20.0),
+                ]),
+                QueryResult::Vector(vec![s(&[("x", "1")], 2.0)]),
+            ),
+            (
+                "grouped join, include copy collapses two distinct many series",
+                &ign_y_gl_y,
+                QueryResult::Vector(vec![
+                    s(&[("x", "1"), ("y", "p")], 10.0),
+                    s(&[("x", "1"), ("y", "q")], 20.0),
+                ]),
+                QueryResult::Vector(vec![s(&[("x", "1")], 2.0)]),
+            ),
+        ];
+        for (name, matching, lhs, rhs) in rows {
+            // With the preflight ON, the semantic error wins at cap = 0.
+            let mut charged = 0u64;
+            let decided = combine_binary_capped(
+                &mut charged,
+                BinOp::Div,
+                false,
+                Some(matching),
+                lhs.clone(),
+                rhs.clone(),
+                0,
+            );
+            assert!(
+                matches!(decided, Err(ReadError::PipelineInvalid { .. })),
+                "{name}: expected the semantic 400, got {decided:?}"
+            );
+
+            // With it SKIPPED — the pre-#290 ordering — the budget
+            // answers first, which is the defect.
+            let mut charged = 0u64;
+            let preempted = with_preflight_ceiling(0, || {
+                combine_binary_capped(&mut charged, BinOp::Div, false, Some(matching), lhs, rhs, 0)
+            });
+            match preempted {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricPostAggBytes { .. })) => {}
+                other => panic!(
+                    "{name}: the un-preflighted path must still be preempted by the budget — \
+                     if it is not, this row no longer discriminates the defect: {other:?}"
+                ),
+            }
+        }
     }
 }
