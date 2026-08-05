@@ -1859,8 +1859,8 @@ fn metrics_points_delta(
 // 3.0.2 TraceQL metrics over recent spans are served by the live-store,
 // not the metrics-generator (`cmd/tempo/app/modules.go:719 @ v3.0.2`,
 // `modules/querier/querier_query_range.go:18,32 @ v3.0.2`; A/B measured
-// on issue #252 — see that file's header). What it needs is TIME, which
-// is why this control polls.
+// on issue #252). What it needs is TIME, which is why this control
+// polls.
 // ---------------------------------------------------------------------
 
 /// A window the REFERENCE has been observed to serve IN FULL for this

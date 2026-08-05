@@ -128,9 +128,7 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 2
 ///      readable.) Its `_provenance.config` sentence was then CORRECTED
 ///      in the same issue — it claimed the reference needs a
 ///      `metrics_generator` block to answer TraceQL metrics at all,
-///      which the A/B recorded in `deploy/e2e/tempo.yaml`'s header
-///      refuted (identical settled answers with and without, on both of
-///      that A/B's corpora, at both of its steps). Its
+///      which an A/B recorded on issue #252 refuted. Its
 ///      `_provenance.note` followed in the next review round — it
 ///      blamed metrics visibility lag on block completion, where the
 ///      same A/B shows the lag is the step's right edge. Digest-only
