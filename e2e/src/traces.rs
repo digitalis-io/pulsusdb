@@ -1448,7 +1448,7 @@ pub async fn traces_differential(ctx: &Ctx) -> Result<()> {
 
     assert_rejection_parity(ctx, &fixture, window).await?;
 
-    run_informational_comparisons(ctx, &corpus, &fixture, window).await
+    run_informational_comparisons(ctx, &corpus, &fixture).await
 }
 
 /// The trace-by-ID hard gate (plan v2 delta 4): span-ID **sets** only —
@@ -1856,6 +1856,28 @@ fn metrics_points_delta(
 // and from neither system's response.
 // ---------------------------------------------------------------------
 
+/// A window the REFERENCE has been observed to answer for this corpus —
+/// the output of [`assert_reference_metrics_positive_control`], and the
+/// only window the informational metrics comparison may use.
+///
+/// It exists because "both stores were asked the same question" is not
+/// automatic here. Measured on `grafana/tempo:3.0.2` (issue #252): a
+/// query at a 60 s step returns NOTHING about a corpus until the whole
+/// 60 s interval containing it has elapsed AND cleared the frontend's
+/// `query_end_cutoff` (30 s, `modules/frontend/config.go:146` @ v3.0.2,
+/// applied by `api.ClampDateRangeReq`) — up to ~90 s after the last
+/// span, because `IntervalMapperQueryRange` is RIGHT-closed and an
+/// interval is only served once `end >= interval_end`. At the control's
+/// 5 s step the same corpus is answerable within ~5-10 s. So the step,
+/// not the window width and not ingest lag, is what decides whether the
+/// reference can answer at all.
+#[derive(Debug, Clone, Copy)]
+struct ServableWindow {
+    start_s: i64,
+    end_s: i64,
+    step_s: i64,
+}
+
 /// The step the control queries at, and the pad it puts either side of
 /// the corpus. Fixed rather than derived so the window can be aligned to
 /// it, and deliberately SMALLER than the corpus's own span so the
@@ -2009,7 +2031,10 @@ fn reference_histogram_from_body(
 /// on grafana/tempo:3.0.2 — the live block has to complete first), so a
 /// single shot would be a flake, and the poll's deadline is what turns
 /// "the reference never answered" into a failure.
-async fn assert_reference_metrics_positive_control(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> {
+async fn assert_reference_metrics_positive_control(
+    ctx: &Ctx,
+    corpus: &TraceCorpus,
+) -> Result<ServableWindow> {
     let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
     // One step of pad either side, not the search window's ±1 h: the
     // step grid stays small and every interval is one the corpus can
@@ -2075,10 +2100,15 @@ async fn assert_reference_metrics_positive_control(ctx: &Ctx, corpus: &TraceCorp
         Ok(()) => {
             println!(
                 "pulsus-e2e:   traces reference-positive control: Tempo reproduced all {} \
-                 (step, bucket) histogram cells for {q:?}",
+                 (step, bucket) histogram cells for {q:?} over [{start_s}, {end_s}) at \
+                 {CONTROL_STEP_S}s",
                 expected.len()
             );
-            Ok(())
+            Ok(ServableWindow {
+                start_s,
+                end_s,
+                step_s: CONTROL_STEP_S,
+            })
         }
         Err(err) => Err(err.context(format!(
             "the reference did not reproduce the corpus's histogram_over_time schedule for \
@@ -2144,11 +2174,14 @@ async fn assert_rejection_parity(
     Ok(())
 }
 
+/// The never-gating comparisons. `window` is deliberately NOT a
+/// parameter: the tags half needs none, and the metrics half must use
+/// the window the reference-positive control validated rather than the
+/// search window (issue #252 — see [`ServableWindow`]).
 async fn run_informational_comparisons(
     ctx: &Ctx,
     corpus: &TraceCorpus,
     fixture: &TracesFixture,
-    window: SearchWindow,
 ) -> Result<()> {
     let mut deltas: Vec<String> = Vec::new();
     let mut sections: Vec<serde_json::Value> = Vec::new();
@@ -2211,15 +2244,25 @@ async fn run_informational_comparisons(
     // recorded here is a delta against whatever the reference happened
     // to return — which, with the pre-#252 `deploy/e2e/tempo.yaml`, was
     // an empty series set for every query.
-    assert_reference_metrics_positive_control(ctx, corpus).await?;
+    let servable = assert_reference_metrics_positive_control(ctx, corpus).await?;
 
+    // Every metrics comparison runs over the window the control just
+    // proved the reference answers, at the same step — not the ±1 h
+    // search window at a 60 s step, which the reference cannot serve for
+    // a freshly-ingested corpus (see [`ServableWindow`]) and which asked
+    // the two stores different questions even when it could: ours
+    // answered over the full window while Tempo answered over its
+    // clamped, step-aligned one.
+    //
+    // No extra polling: the control IS the wait, and a window that ends
+    // in the past stays servable once it is servable.
     for raw_q in &fixture.informational.metrics_queries {
         let q = raw_q.replace("{R}", &corpus.run_id);
         let params = [
             ("q", q.clone()),
-            ("start", window.start_s.to_string()),
-            ("end", window.end_s.to_string()),
-            ("step", "60s".to_string()),
+            ("start", servable.start_s.to_string()),
+            ("end", servable.end_s.to_string()),
+            ("step", format!("{}s", servable.step_s)),
         ];
         let pulsus = get_json_with(
             ctx,
