@@ -673,10 +673,7 @@ fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
 }
 
 /// **The oracle column is frozen independently of the file that holds
-/// it.** Every other gate here compares our verdicts against
-/// `matrix.json`'s `reference` column, so all of them pass if that column
-/// is edited to match us — a re-pin marking its own homework, and nothing
-/// else in the apparatus would notice.
+/// it.**
 ///
 /// The digest covers `(query, reference)` for all 221 probes, in order.
 /// It lives in this SOURCE file rather than beside the data, so a
@@ -716,9 +713,7 @@ fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
 /// git grep -nIE '[Ff][Nn][Vv]|01b3|01B3|0100_0193|cbf2_9ce4|cbf29ce4|811c_9dc5|811c9dc5'
 /// ```
 ///
-/// It matches the name case-insensitively plus both FNV offset bases
-/// and both prime tails in every `_`-separated spelling, so it finds a
-/// site that uses the constants without ever writing "FNV". Read its
+/// Read its
 /// output; do not trust a summary of it, including a past one. Three
 /// hand-written enumerations of that output were attempted on #335 and
 /// each was false in a new way — a count, then a classification, then
