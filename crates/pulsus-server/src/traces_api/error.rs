@@ -9,11 +9,18 @@
 //! below — which is also this file's pin on the table in [`ApiError`]'s
 //! doc (issue #266).
 //!
-//! Errors are always this JSON envelope, never protobuf, regardless of the
-//! request's `Accept` header (docs/api.md §4.1) — pinned by
-//! `api_conformance`'s `assert_traces_fetch_route`, case
-//! `absent-404-stays-json`, which also uses the mounted-but-absent `404`
-//! envelope as its mounting oracle.
+//! Whether an error may switch to protobuf under `Accept` is settled in
+//! docs/api.md §4.1 and exercised on the wire by `api_conformance`'s
+//! `assert_traces_fetch_route`, case `absent-404-stays-json` — the fetch
+//! route's 404 under both protobuf `Accept` spellings, asserting the JSON
+//! content type. That same mounted-but-absent envelope is the suite's
+//! mounting oracle for the fetch surface.
+//!
+//! Which variants a §4.1 fetch can raise is decided by
+//! `handlers::trace_by_id_impl`'s call graph rather than here — read it
+//! there. As read at this commit it reaches `Param`, `NotFound`,
+//! `NotAcceptable`, `Read`, `Assemble` and `PoolUnavailable`, none of
+//! which renders a `position`, so a fetch error carries none.
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -34,6 +41,15 @@ use super::params::{
 /// A `/api/traces/v1` handler's failure, converted to the documented
 /// error envelope by [`IntoResponse`]. The table is asserted case by case
 /// in `the_envelope_table_holds_for_every_api_error_variant`.
+///
+/// It is the whole handler-visible failure surface: read the six route
+/// modules (`handlers.rs`, `search.rs`, `tags.rs`, `metrics.rs`,
+/// `graph.rs`, `compat.rs`) and, at this commit, every route handler
+/// either cannot fail (`compat::echo`, a constant 200) or renders its
+/// error through this enum. Responses made ABOVE the handlers are not
+/// `ApiError`s and are not in the table — the server-wide `TimeoutLayer`'s
+/// 408 (`middleware.rs`) and axum's own 404/405 for an unmounted path or
+/// method.
 ///
 /// | variant | HTTP | `errorType` |
 /// |---|---|---|
@@ -71,7 +87,7 @@ pub(crate) enum ApiError {
     QueryText(super::querytext::QueryTextError),
     /// Search planning failure (unsupported field / type mismatch).
     Plan(pulsus_read::TracePlanError),
-    /// The trace has no stored spans (an empty §4.2 fetch).
+    /// The trace has no stored spans (an empty §4.1 fetch).
     NotFound,
     /// RFC 9110: no served representation is acceptable under the
     /// request's `Accept` header (plan v3 §3).
@@ -240,14 +256,28 @@ impl IntoResponse for ApiError {
 }
 
 /// The `ReadError` half of the table above, matched **exhaustively**
-/// (issue #266): a new or re-routed `ReadError` variant fails the build
-/// here rather than being absorbed onto 500 `internal` by a catch-all.
-/// Do not reintroduce a `_` arm: the compiler cannot object to one.
+/// (issue #266). What that does and does not buy, exactly:
 ///
-/// That absorption is a live hazard, not a tidiness one: Grafana's Tempo
-/// datasource proxies our status and body through verbatim —
-/// `grafana/grafana-tempo-datasource` `pkg/tempo/tempo.go:370,373`
-/// @ `3c7375bb541c3acde1deb068ea7ead9ebfdf56b9` (`v13.1.5-11-g3c7375b`)
+/// - Adding a variant to `ReadError` fails the build here (E0004): no
+///   arm covers it.
+/// - Deleting an arm below, or narrowing one so a variant loses its
+///   cover, fails the build the same way.
+/// - Making an ALREADY-COVERED variant reachable on this surface does
+///   NOT fail the build. A re-route in the call graph compiles silently
+///   and takes whatever arm already covers it. That is the case a
+///   maintainer actually meets, and it is why every variant below gets a
+///   decided mapping: the re-route then lands on a status someone chose,
+///   instead of on 500 by omission.
+///
+/// So do not reintroduce a `_` arm in place of these: a wildcard covers
+/// every future variant, which removes the first case above — the one
+/// that fires when the change is in another crate.
+///
+/// Absorbing a variant onto 500 that way is a live hazard, not a tidiness
+/// one: Grafana's Tempo datasource proxies our status and body through
+/// verbatim — `grafana/grafana-tempo-datasource`
+/// `pkg/tempo/tempo.go:370,373` @
+/// `3c7375bb541c3acde1deb068ea7ead9ebfdf56b9` (`v13.1.5-11-g3c7375b`)
 /// copies the upstream headers, then `rw.WriteHeader(resp.StatusCode)`
 /// and `io.Copy(rw, resp.Body)` with no status rewriting. So a rejection
 /// that should be 400 arriving as 500 stops being "your query is wrong"
@@ -255,18 +285,21 @@ impl IntoResponse for ApiError {
 /// datasource unhealthy and dependent alert rules go to Error state, over
 /// a database that is fine.
 ///
-/// The return tuple carries no offset: the traces `position` names the
-/// TraceQL expression or legacy `tags` value the client sent, while
-/// [`ReadError::Parse`]'s span indexes a LogQL query text this surface
-/// never receives. Pinned by
-/// `a_logql_parse_error_renders_no_traces_position`.
+/// `logs_api::error::read_error_parts` and
+/// `prom_api::error::read_error_parts` match `ReadError` the same way,
+/// without a wildcard — read either. They did so before this issue too,
+/// which is what #266 closed: adding a variant was a build failure on
+/// those two surfaces and a silent 500 on this one.
 ///
-/// Arms record a decision, not a reachability judgement: a variant gets
-/// an explicit mapping whether or not a traces handler can raise it, so a
-/// later re-route cannot turn one into a 500 by omission.
+/// No arm returns an offset, and the signature is why — a 3-tuple, with
+/// the call site supplying `None`. That this is a decision and not an
+/// omission is asserted in
+/// `a_logql_parse_error_renders_no_traces_position`: [`ReadError::Parse`]
+/// carries a LogQL span, an offset into a query text this surface never
+/// receives.
 fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
     match e {
-        // A bounded-response rejection (docs/api.md §4.2/§4.4). Pinned by
+        // A bounded-response rejection (docs/api.md §4.2-§4.4). Pinned by
         // `query_too_broad_maps_to_422_query_too_broad`.
         ReadError::QueryTooBroad(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -275,8 +308,9 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         ),
         // The engine declined a well-formed query: a bounded-response
         // rejection, never a server fault. `query_too_broad` is the name
-        // the traces taxonomy gives that class (docs/api.md §4.1). Pinned
-        // by `a_metrics_engine_decline_maps_to_422_query_too_broad_not_500`.
+        // the traces taxonomy gives that class (docs/api.md
+        // §4.2/§4.3/§4.4). Pinned by
+        // `a_metrics_engine_decline_maps_to_422_query_too_broad_not_500`.
         ReadError::NamelessSelectorUnresolvable { .. } | ReadError::HistogramResultUnsupported => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "query_too_broad",
@@ -300,7 +334,7 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         // server-wide `TimeoutLayer` firing first (`middleware.rs`, itself
         // a 408). 400 `bad_data` would accuse the client of a bad query.
         // `timeout` is this surface's documented `errorType` for the
-        // ClickHouse read timeout (docs/api.md §4.1-§4.4). Pinned by
+        // ClickHouse read timeout (docs/api.md §4.1-§4.3). Pinned by
         // `a_cancelled_promql_evaluation_maps_to_408_timeout_not_400_bad_data`.
         ReadError::Promql(pulsus_promql::PromqlError::Cancelled) => {
             (StatusCode::REQUEST_TIMEOUT, "timeout", e.to_string())
@@ -310,6 +344,15 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         // remaining `Promql` inners included. Pinned by
         // `a_logql_planner_read_error_maps_to_400_bad_data_not_500` and
         // `a_non_cancellation_promql_error_maps_to_400_bad_data`.
+        //
+        // The comparison a reader will want, because the two surfaces
+        // differ here: `prom_api` splits the same ten `PromqlError`
+        // inners three ways — read `prom_api::error::promql_error_parts`;
+        // as read at this commit, two on 400 `bad_data`, seven on 422
+        // `execution`, `Cancelled` on 408. This surface keeps the uniform
+        // 400 on purpose, and spells its own declined-query class
+        // `query_too_broad` (docs/api.md §4.2/§4.3/§4.4) in the arms
+        // above.
         ReadError::Parse(_)
         | ReadError::Promql(_)
         | ReadError::EmptyMatcherSet
@@ -558,8 +601,8 @@ mod tests {
 
     /// Issue #266: the two metrics-path "engine declines a well-formed
     /// query" variants take this surface's bounded-response family — 422
-    /// `query_too_broad`, the `errorType` docs/api.md §4.1 defines for
-    /// traces — not the removed catch-all's 500.
+    /// `query_too_broad`, the `errorType` docs/api.md §4.2/§4.3/§4.4
+    /// defines for traces — not the removed catch-all's 500.
     #[tokio::test]
     async fn a_metrics_engine_decline_maps_to_422_query_too_broad_not_500() {
         for err in [
@@ -646,10 +689,11 @@ mod tests {
     /// cap, and `QueryText`'s inners under both carriers), each checking
     /// status, `errorType` and whether a `position` offset is rendered.
     ///
-    /// It does not fail when a variant is ADDED — nothing can force that.
-    /// Adding a case is the obligation [`IntoResponse`]'s own exhaustive
-    /// `match` creates, the way [`read_error_parts`]'s does for
-    /// `ReadError`.
+    /// It does not fail when a variant is ADDED: a list of cases cannot
+    /// notice a variant nobody listed. What the compiler forces on a new
+    /// variant is a MAPPING — [`IntoResponse`]'s own exhaustive `match`,
+    /// and [`read_error_parts`]'s for `ReadError`; adding the case here is
+    /// on whoever adds the variant.
     #[tokio::test]
     async fn the_envelope_table_holds_for_every_api_error_variant() {
         use super::super::querytext::QueryTextError;
