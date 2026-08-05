@@ -13,6 +13,7 @@ Conventions:
 - Timestamps: log APIs use nanoseconds; metrics APIs use RFC3339 or unix seconds; trace APIs accept unix seconds/nanoseconds/RFC3339.
 - Errors: `{"status":"error","errorType":...,"error":...}` envelopes; `429` on ingest backpressure; `400` for malformed queries with parser position where available.
 - Compression: requests may be `gzip`, `snappy`, or `zstd` (`Content-Encoding`); responses gzip when accepted.
+- Regular expressions: RE2 in every query language — §9 documents the dialect and the measured differences from Loki/Prometheus/Tempo.
 
 ## Request headers (all optional)
 
@@ -627,3 +628,103 @@ Routing note: the alias `GET /api/traces/{traceId}` coexists with native `/api/t
 **Zipkin v2 JSON receiver (M6, `POST /api/v2/spans`, `POST /tempo/spans`).** A foreign-format decoder + model adapter feeding the *native* trace-storage path — each Zipkin v2 JSON span is adapted into one self-contained OTLP `ResourceSpans` and handed to the same parser the native `POST /v1/traces` receiver uses, so a Zipkin-ingested span stores with `payload_type = 1` (OTLP) and is queryable via trace-by-ID (§4.1) and TraceQL search (§4.2) with no read-path difference. Both documented paths bind to the same handler. Mounts iff `PULSUS_COMPAT_ENDPOINTS=true` **and** the Writer subsystem is mounted (`Gate::CompatAndWriter`, the Loki push precedent below); it 404s wherever the writer subsystem does. **Scope is Zipkin v2 JSON only** (v1 JSON, protobuf, and thrift are deferred). The body is always decoded as a Zipkin v2 JSON span array — `Content-Type` is not a fork discriminator (v2 JSON is the sole supported encoding, so there is nothing to content-negotiate, unlike native OTLP which forks JSON vs protobuf on CT) — decompressed per `Content-Encoding` for gzip; the decompressed body is capped at 64 MiB (400). **Documented `Content-Type` divergence:** because the decode is unconditionally JSON, a well-formed JSON span array sent under `Content-Type: application/x-protobuf` is accepted (**202**) where the OpenZipkin oracle would answer 400. This is the sole divergence — no real Zipkin client emits it, and it lets the ratified conformance harness (which sends `application/x-protobuf` generically on ingest success paths) pass; a genuinely non-JSON body under any CT is a clean JSON-parse **400** (never a mis-parse or panic). Field mapping: `traceId` (16-hex 64-bit → left-padded to 16 bytes, 32-hex 128-bit verbatim — byte-identical to the same trace sent as OTLP) / `id` / `parentId` (absent → root); `name`; `kind` CLIENT/SERVER/PRODUCER/CONSUMER → OTLP `SpanKind` (missing → INTERNAL); `timestamp` + `duration` **microseconds** → nanoseconds; `localEndpoint.serviceName` → the `service` dimension (resource `service.name`), its `ipv4`/`ipv6`/`port` → resource `net.host.ip`/`net.host.port`; `remoteEndpoint` → span `net.peer.*`; `tags` → span attributes (verbatim); `annotations` (timestamp + value) → span events; `debug`/`shared` → span attributes `zipkin.debug`/`zipkin.shared`. **Shared spans:** a Zipkin shared span reports the same `(traceId, id)` from both RPC ends with different `kind` (SERVER vs CLIENT); both are stored and **both are returned by trace-by-ID** — the assembler de-duplicates on `(span_id, kind)`, so neither side is dropped (a genuine no-op for native OTLP, whose span ids are unique per trace). Success is an empty **202** Accepted (both sync and async `X-Pulsus-Async: 1` — the OpenZipkin oracle answers 202 regardless), matched against openzipkin/zipkin:3; a malformed span array, or any span with a non-hex/wrong-length id or an unrepresentable timestamp, is a whole-request **400** plain-text error (Zipkin has no partial-success channel — all-or-nothing, unlike the native OTLP receiver's per-span rejection), an unsupported `Content-Encoding` is **400**, and sink backpressure is **429** plain-text.
 
 **Loki push receiver (M6, `POST /loki/api/v1/push`).** A foreign-format decoder feeding the *native* log-storage path — a pushed stream's labels flatten through the same canonical model (`LabelSet::from_normalized` → `stream_fingerprint`) an OTLP log does, so pushed logs are queryable via LogQL (§2) and appear in `/api/logs/v1/tail` with no read-path difference. Mounts iff `PULSUS_COMPAT_ENDPOINTS=true` **and** the Writer subsystem is mounted (the writer-side analog of the §8.1 Reader gating); it 404s wherever the writer subsystem does, and the compat flag alone never mounts it without the writer role. Both request encodings are accepted: `Content-Type: application/json` selects the JSON body (`{"streams":[{"stream":{…},"values":[["<unix_nano>","<line>"],…]}]}`, honoring `Content-Encoding` for gzip); anything else or an absent `Content-Type` selects the snappy-compressed protobuf body (`logproto.PushRequest`, pinned to grafana/loki 3.4.2), which is *always* block-snappy-decompressed regardless of `Content-Encoding` — the agent default, so uncompressed protobuf is unsupported, exactly as upstream Loki. Success is an empty **204** (both encodings; **202** for async `X-Pulsus-Async: 1`); a malformed body, label string, or timestamp is a whole-request **400** plain-text error (Loki has no partial-success channel — all-or-nothing), and sink backpressure is **429** plain-text. Response codes match grafana/loki 3.4.2 where it has an equivalent (204 success, 400 malformed/oversize); 202/async and 429/backpressure are PulsusDB-contract additions. The decompressed body is capped at 64 MiB (mapping to 400, like Loki's own over-limit rejection — the cap *size* differs from Loki's per-line/per-stream limits, a deliberate divergence). **Structured metadata** (per-entry labels — protobuf `EntryAdapter.structuredMetadata`, or a trailing third element in a JSON `values` entry) is **stored per-entry and surfaced in LogQL/tail** (issue #97). It is decoded into the `log_samples.structured_metadata` column (a canonical sorted-key JSON String, the same representation as `log_streams.labels`), bounded by a per-entry cardinality limit charged before the canonical JSON is built (over-limit is a whole-request 400). On the read path it fans into the response stream labels alongside the base labels — matching grafana/loki 3.4.2's default (`categorize_labels` off) — so an entry carrying distinct structured metadata forms its own result stream, and a `| key="value"` pipeline label filter selects on it. Structured metadata is per-entry: it never enters `stream_fingerprint` (a stream pushed with vs. without it fingerprints identically) nor the tail keyset cursor. Server-side structured-metadata filter pushdown is a deferred optimization (client-side filtering is the baseline, consistent with parsed-label filters).
+
+---
+
+## 9. Regular expressions
+
+Every regular expression in a PulsusDB query is **RE2** ([google/re2](https://github.com/google/re2)) — the same dialect Loki, Prometheus and Tempo accept, since Go's `regexp` is an RE2 port. RE2 trades features for a linear-time matching guarantee: **there are no backreferences and no lookaround**, here exactly as in those systems. The full syntax is [RE2's own reference](https://github.com/google/re2/wiki/Syntax).
+
+| Signal | Construct | Anchoring |
+|--------|-----------|-----------|
+| Logs | stream selector `{app=~"…"}`, label filter `\| a=~"…"`, `\| drop`/`\| keep` matcher, `label_replace` | fully anchored — `^(?:…)$` |
+| Logs | line filter `\|~` / `!~`, `\| regexp "…"` | unanchored (substring search) |
+| Metrics | label matcher `=~` / `!~`, `label_replace`, `info()` ignore set | fully anchored |
+| Traces | attribute/intrinsic comparison `=~` / `!~` | fully anchored |
+
+The rest of this section records where PulsusDB's behaviour is *not* identical to those references. Everything in it was measured, not inferred; §9.5 says how, and names the cases still unverified.
+
+### 9.1 Two engines, one dialect
+
+A pattern is evaluated in one of two places:
+
+- **In ClickHouse** (`match()`), whose engine is RE2 itself, whenever the predicate is pushed into the scan: stream and series selectors, trace attribute comparisons, and log line filters that precede any `line_format`.
+- **In process**, with the Rust [`regex`](https://docs.rs/regex) crate, whenever the pattern must run over an already-materialised result: the metrics label cache, PromQL `label_replace` and `info()`, and the LogQL pipeline stages that cannot be pushed down (a line filter after a parser or `line_format`, an `ip(…)` filter, `| regexp`, `| drop`/`| keep`, label filters over parsed labels, `label_replace`).
+
+The Rust crate's grammar is a **superset** of RE2's, and several constructs mean different things in it. On the metrics path, and for `label_replace` on both paths, the pattern is therefore rewritten into the Rust syntax that carries RE2's meaning before it is compiled, so both engines answer the same query the same way.
+
+### 9.2 Constructs that mean different things in the two engines
+
+| Construct | RE2 — and what PulsusDB should mean | Rust `regex`, unrewritten |
+|-----------|------------------------------------|---------------------------|
+| `\d` `\w` `\s` and their negations | ASCII: `[0-9]`, `[0-9A-Za-z_]`, `[\t\n\f\r ]` (note: `\s` excludes the vertical tab) | Unicode: `\d` matches `٥`, `\w` matches `ｗ`, `\s` matches `\v` |
+| `\b` `\B` | ASCII word boundary | Unicode word boundary |
+| `[a&&b]` | a class of `a`, `&`, `b` | set *intersection* — matches nothing |
+| `[a~~b]` | a class of `a`, `~`, `b` | symmetric difference |
+| `[a--b]` | **rejected** (`invalid character class range`) | set *difference* — matches `a` |
+| `[a[b]]` | a class of `a`, `[`, `b`, followed by a literal `]` | a nested class (union) — no literal `[` |
+| `[[:foo:]]` — an unrecognised POSIX class name | **rejected** | a nested class — matches `:`, `f`, `o` |
+| `a{bbb}c`, `a{,5}`, `a{}` | literal braces | **rejected** (`repetition quantifier expects a valid decimal`) |
+
+(`[]a]` is *not* on this list: both engines read a leading `]` as a literal, measured on both.)
+
+**Where the rewrite is applied.** Pushed-down predicates need no rewrite — ClickHouse *is* RE2. The metrics in-process path and `label_replace` on both signals apply it. Two surfaces do not:
+
+- **Known divergence, open and unfixed — LogQL pipeline stages evaluated in process do not apply the rewrite (issue #336).** These five sites compile the pattern exactly as written, so every row of the table above is live in them:
+  - a line filter (`|~` / `!~`) that follows a `line_format`,
+  - a line filter with an `ip(…)` alternative,
+  - `| regexp "…"`,
+  - `| drop` / `| keep` with a `=~` / `!~` matcher,
+  - a label filter (`| a=~"…"`) over a label a parser produced.
+
+  A line filter that precedes every `line_format` and carries no `ip(…)` is pushed into ClickHouse instead and gets RE2's reading — so **the same pattern can mean two things in the same query language depending on whether the planner pushed it down**, and moving a filter from before a `line_format` to after it can silently change what it matches. Measured against Loki 3.7.4, which answers the opposite in each case (double-quoted LogQL strings take Go escapes, hence `"\\d"` for the regex `\d`): `{…} | logfmt | a=~"\\d"` matches the line `a=٥`; `| a=~"\\w"` matches `ｗ`; `` | a=~`[a&&b]` `` does not match `&`; `` | a=~`a{bbb}c` `` is rejected outright. Across the 4,315-pattern differential corpus, 120 of the 1,152 patterns both engines compile read differently at these sites.
+
+  **If a LogQL query gives results you did not expect from a `\d`/`\w`/`\s`/`\b` or a character-class pattern, this is the first thing to check.** The workaround that always works is to spell the class out — `[0-9]` for `\d`, `[0-9A-Za-z_]` for `\w`, `[\t\n\f\r ]` for `\s` — which both engines read the same way. For a *line* filter you can also keep it ahead of every `line_format`, which pushes it down; a label filter over a parsed label, `| regexp` and `| drop`/`| keep` have no pushed-down form, so only the spelled-out class helps there. **Metrics and traces are not affected** — PromQL label matchers, `label_replace` and `info()` all apply the rewrite, and trace attribute comparisons are evaluated by ClickHouse's RE2. This is a defect rather than a design choice; it is not fixed as of this writing, and issue #336 carries the measurement.
+- LogQL `label_format` templates use Go template functions with their own regex arguments, which are compiled by the Rust crate directly.
+
+### 9.3 Patterns PulsusDB accepts that the reference rejects
+
+These are queries that PulsusDB can answer and that Loki, Prometheus and Tempo answer with `400`. In every case the reference's engine has a limit the Rust `regex` crate does not — RE2 caps repetition counts and carries a fixed, small Unicode-property table where the Rust crate carries the full UCD.
+
+The last column says *where* the pattern survives, because a query only reaches the Rust crate on some routes:
+
+- **in process** — the warm metrics label cache, PromQL `label_replace`/`info()`, and LogQL pipeline stages the planner could not push down. A route that reaches storage instead hands the pattern to ClickHouse's RE2, which rejects it (`400`), so the *same* metrics query can be answered or rejected depending on the label cache's state.
+- **LogQL in process only** — accepted only where the pattern is compiled as written (§9.2); the metrics rewrite turns it into something the Rust crate itself rejects.
+- **trace validation only** — trace search's `query=` parameter is checked and never executed, so nothing rejects it there; that route's residual is enumerated per class in `docs/benchmarks/traces-differential-ledger.md` (`traceql-validate-re2-unknown-residual`). Everything in this table is accepted there.
+
+| Pattern class | Example | Where PulsusDB accepts it |
+|---------------|---------|---------------------------|
+| Unicode properties outside RE2's fixed table | `\p{Alphabetic}`, `[\p{Alphabetic}]` — in-table names (`\p{L}`, `\p{Lu}`, `\p{Greek}`, `\p{Han}`) are accepted by both, and `\p{Word}` is rejected by both | in process |
+| Repetition above RE2's `kMaxRepeat` of 1000 | `a{1001}`, `a{2,1001}`, `a{1001,}`, `a{100000}` | in process |
+| Repetition of a repetition | `a**`, `a*+`, `a++`, `a?*`, `a{2}{3}`, `a*??`, `a{2,3}+` | in process |
+| An unrecognised POSIX class name | `[[:foo:]]`, `[a[:zzz:]]`, `[[:^foo:]]` | in process |
+| Non-RE2 group heads | `(?x…)` extended mode, `(?u…)`, `(?i-u:…)`, `(?R)` — which the Rust crate reads as its own CRLF-mode flag, so the pattern silently matches everything | in process |
+| `\U`-form escapes | `\U0001F600` | in process |
+| `\u{…}` escapes | `\u{263A}` | LogQL in process only |
+| Lookaround | `(?=x)`, `(?!x)`, `(?<=x)`, `(?<!x)` | trace validation only — the Rust crate rejects lookaround too, so every other surface agrees with the reference |
+| Comment groups; a trailing backslash | `(?#c)a`, `a\` | trace validation only |
+
+### 9.4 Patterns PulsusDB rejects that the reference accepts
+
+The narrower and more disruptive direction: a query that works against Loki or Prometheus and returns `400` here. Each is a construct RE2 accepts and the Rust `regex` crate does not.
+
+| Pattern class | Example | Rust `regex` error |
+|---------------|---------|--------------------|
+| `\Q…\E` literal quoting | `\Qa*\E`, a bare `\Q` | `unrecognized escape sequence` |
+| Octal escapes | `\0`, `\12`, `\101` | `backreferences are not supported` |
+| A repetition applied to a flag-setting group | `a(?i){2}`, `a(?i)*`, `a(?i)+`, `a(?i)?` | `repetition operator missing expression` |
+| A repeated flag letter in a group head | `(?ss:ab)`, `(?ii)a`, `(?i-ii)a` | `duplicate flag` |
+| An empty flag group | `(?)a` | `repetition operator missing expression` |
+| Literal braces (LogQL only — the metrics rewrite escapes them, §9.2) | `a{bbb}c`, `a{,5}`, `a{}` | `repetition quantifier expects a valid decimal` |
+
+On logs these are rejected at plan time, before the pattern reaches ClickHouse, because every LogQL regex — pushed down or not — is validated by an in-process compile of the pattern as written; measured, `{app="x"} |~ "a{bbb}c"` is a plan-time rejection here and a `200` on Loki 3.7.4. On metrics the outcome is route-dependent: a selector answered in process, or one with no storage fallback to learn a verdict from, returns `400`, while a predicate that reaches ClickHouse is compiled by RE2 and answered. `[a--b]` is rejected by PulsusDB *and* by the reference, so it is agreement, not a divergence.
+
+### 9.5 How this was measured, and what is not covered
+
+The tables above were produced by compiling each pattern against four engines and crossing the verdicts: Go's `regexp` (go1.25.5 — the reference implementation behind LogQL, PromQL and TraceQL), the digest-pinned `grafana/loki:3.7.4` oracle at the wire (`|~` and `{app=~…}`, accept = `2xx`, reject = `400`), ClickHouse 24.8.14.39's RE2, and the Rust `regex` crate 1.13.0 as PulsusDB compiles it. Go and Loki agreed on every probe; Go and ClickHouse's RE2 agreed on everything except `\C`, which C++ RE2 accepts as "any byte" and Go rejects (PulsusDB rejects it, matching the reference).
+
+Stated gaps:
+
+- The lists are **not proved exhaustive.** They come from the 4,315-pattern differential corpus plus targeted probes of every construct where the two grammars are known to differ; a construct in neither is not covered by anything above.
+- ClickHouse's `match()` short-circuits some patterns to a plain substring search before compiling them, so a handful of syntactically invalid patterns (`x)(y`, `a\`) are neither rejected nor matched as regexes there. PulsusDB rejects both in process, matching the reference, so no query is known to reach that behaviour; it is recorded because it means ClickHouse is not, by itself, a complete acceptance oracle.
+- Whether the reference's *error text* matches PulsusDB's is out of scope here: only accept-versus-reject is claimed.

@@ -39,7 +39,10 @@
 //! returns `Undecidable` at exactly SIX sites, each a closed class
 //! family: the bare-escape check (`\p`/`\P` Unicode properties,
 //! `\u`/`\U`, the `\<`/`\>`/`\b{…}`/`\B{…}` boundary escapes, a
-//! trailing backslash), the same escapes inside a character class, the
+//! trailing backslash), the same escapes inside a character class **that
+//! closes** (issue #336: an unterminated one is a decidable joint
+//! rejection whatever it contains, so `[\p{L}` no longer reaches this
+//! site — the site itself remains, for `[\p{Alphabetic}]`), the
 //! non-`(?:`/flag group heads (lookarounds, named groups, `(?x`/`(?u`/
 //! `(?#`/…), a `*`/`+` applied to a repetition, a `?` applied to an
 //! already-lazy repetition, and a `{n,m}` above `kMaxRepeat` or
@@ -101,8 +104,9 @@ pub enum Re2Verdict {
 ///
 /// Decision order (plan v3 D1′):
 /// 1. scan `Undecidable` → `Unknown`;
-/// 2. scan joint-reject (an unterminated class — measured: `[`, `[a`
-///    are rejected by the Rust crate AND by RE2) → `Rejects`;
+/// 2. scan joint-reject (an unterminated class — measured: `[`, `[a`,
+///    and since #336 `[\p{L}`/`[a\` too, are rejected by the Rust crate
+///    AND by RE2) → `Rejects`;
 /// 3. otherwise compile `re2_pattern_to_rust(pattern)`, bare:
 ///    `Ok` → `Accepts`; `CompiledTooBig` → `Unknown` (RE2's budget is
 ///    not ours to guess); any other error → `Unknown` if the pattern
@@ -336,8 +340,10 @@ enum ClassEnd {
     /// The index of the closing `]`.
     Found(usize),
     /// No closing `]` — both engines reject (`[`, `[a`; measured).
+    /// Issue #336: this outcome WINS over `Undecidable`, so `[\p{L}` is a
+    /// decidable joint rejection and not a deferral.
     Unterminated,
-    /// The class carries an escape only RE2 can adjudicate
+    /// The class CLOSES but carries an escape only RE2 can adjudicate
     /// (`[\p{Alphabetic}]`), classified exactly like the bare escape.
     Undecidable,
 }
@@ -345,6 +351,16 @@ enum ClassEnd {
 /// Scans the class opened at `open`, honouring an initial `^` and
 /// backslash escapes. Class contents are scanned, not skipped, so
 /// `[\p{Alphabetic}]` is caught exactly like the bare `\p{Alphabetic}`.
+///
+/// An undecidable escape is REMEMBERED, not returned on sight (issue
+/// #336): whether the class closes is decided first, because an
+/// unterminated class is a joint rejection whatever it contains —
+/// `[\p{L}`, `[\p{Alphabetic}`, `[\u{263A}` and `[a\` are all rejected by
+/// the Rust crate, by Go's `regexp` (`missing closing ]` /
+/// `invalid character class range` / `invalid escape sequence`) and by
+/// ClickHouse 24.8's RE2, measured. Deciding the escape first reported
+/// them `Unknown`, which is the same conflation #328 split for the bare
+/// `[`, one level in.
 ///
 /// A nested `[` is NOT treated as opening a sub-class: RE2 reads it as a
 /// literal, and the class-set-operation reading the Rust crate gives it is
@@ -354,15 +370,23 @@ fn class_end(b: &[u8], open: usize) -> ClassEnd {
     if b.get(i) == Some(&b'^') {
         i += 1;
     }
+    let mut undecidable = false;
     while i < b.len() {
         match b[i] {
             b'\\' => {
-                if escape_requires_re2_authority(b, i) {
-                    return ClassEnd::Undecidable;
-                }
+                undecidable |= escape_requires_re2_authority(b, i);
+                // A trailing backslash steps past the end; the loop
+                // condition then reports the class unterminated, which is
+                // what both engines answer for `[a\`.
                 i += 2;
             }
-            b']' => return ClassEnd::Found(i),
+            b']' => {
+                return if undecidable {
+                    ClassEnd::Undecidable
+                } else {
+                    ClassEnd::Found(i)
+                };
+            }
             _ => i += 1,
         }
     }
@@ -593,6 +617,37 @@ mod tests {
         for pattern in [r"[\p{Alphabetic}]", r"[a\p{L}]"] {
             assert_eq!(scan(pattern), Scan::Undecidable, "{pattern:?}");
             assert!(pattern_requires_re2_authority(pattern));
+        }
+    }
+
+    /// Issue #336: an unterminated class carrying an undecidable escape
+    /// is still a DECIDABLE joint rejection — the missing `]` rejects it
+    /// in every engine, so the escape never gets to matter. Measured
+    /// three ways for each pattern below: the Rust `regex` crate
+    /// (asserted here as the premise), Go's `regexp` at go1.25.5
+    /// (`missing closing ]` for `[\p{L}`/`[a\`, `invalid character class
+    /// range` for `[\p{Alphabetic}`, `invalid escape sequence` for
+    /// `[\u{263A}`), and ClickHouse 24.8.14.39's RE2 (`Code: 427`
+    /// `cannot compile re2` on all four). Before the fix each was
+    /// `Unknown`.
+    #[test]
+    fn an_unterminated_class_is_a_joint_rejection_whatever_escape_it_carries() {
+        for pattern in [r"[\p{L}", r"[\p{Alphabetic}", r"[\u{263A}", r"[a\"] {
+            assert!(
+                regex::Regex::new(pattern).is_err(),
+                "premise: the Rust crate must REJECT {pattern:?} for the joint claim"
+            );
+            assert_eq!(scan(pattern), Scan::JointReject, "{pattern:?}");
+            assert_eq!(re2_verdict(pattern), Re2Verdict::Rejects, "{pattern:?}");
+            // The boolean screen is unmoved: both outcomes are
+            // non-portable, which is why the frozen corpus baseline
+            // cannot shift.
+            assert!(pattern_requires_re2_authority(pattern), "{pattern:?}");
+        }
+        // The escape still decides when the class DOES close.
+        for pattern in [r"[\p{L}]", r"[\p{Alphabetic}]", r"[\u{263A}]"] {
+            assert_eq!(scan(pattern), Scan::Undecidable, "{pattern:?}");
+            assert_eq!(re2_verdict(pattern), Re2Verdict::Unknown, "{pattern:?}");
         }
     }
 
