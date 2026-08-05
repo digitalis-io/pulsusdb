@@ -33,46 +33,53 @@ storage:
     wal:
       path: /tmp/tempo/wal
 
-# TraceQL METRICS (`/api/metrics/query_range`, `/api/metrics/query`).
-# Without this block 3.0.2 boots with
+# TraceQL METRICS (`/api/metrics/query_range`, `/api/metrics/query`) need
+# NO extra configuration on 3.0.2, and in particular no
+# `metrics_generator` block — do not add one. The metrics-generator has
+# no part in serving a TraceQL metrics query on this version:
 #
-#   msg="metrics-generator is not configured."
-#   err="no metrics_generator.storage.path configured, metrics generator
-#        will be disabled"
+#   - the query-frontend splits the range at `query_backend_after` and
+#     sends the recent slice as `QueryModeRecent`
+#     (`modules/frontend/metrics_query_range_sharder.go:334-362 @ v3.0.2`);
+#   - the querier answers that mode off the LIVE-STORE ring
+#     (`modules/querier/querier_query_range.go:18,32 @ v3.0.2`), and the
+#     live-store is what the Metrics gRPC service is registered on
+#     (`cmd/tempo/app/modules.go:719 @ v3.0.2`);
+#   - the generator's processor list no longer contains local-blocks at
+#     all (`modules/generator/validation/fields.go:19-25 @ v3.0.2`:
+#     service-graphs / span-metrics{,-count,-latency,-size} / host-info),
+#     so nothing routes TraceQL metrics through it. Configuring it makes
+#     the binary log `msg="ignoring unknown metrics-generator processor"
+#     processor=local-blocks` every 10 s; the newer `local_blocks` /
+#     `traces_storage` spellings from current Tempo docs hard-fail boot
+#     (`field local_blocks not found in type generator.ProcessorConfig`).
+#     `ci/tempo/tempo-compare.yaml` records the same architecture note
+#     from issue #185 and has never carried a generator block.
 #
-# and then answers EVERY TraceQL metrics query with `{"series":[]}` (or,
-# for `count_over_time`/`rate`, the step grid with every value zero)
-# while `/api/search` still returns the whole ingested corpus. The
-# traces differential's informational metrics comparison
-# (`e2e/src/traces.rs::run_informational_comparisons`) was therefore
-# diffing our output against nothing and summarising a delta computed
-# from an empty series set — a green check that could not fail. Issue
-# #252 adds a reference-positive control that fails the scenario when
-# the reference answers nothing, and this key is what makes that control
-# satisfiable.
+# With no `metrics_generator.storage.path`, 3.0.2 logs
+# `msg="metrics-generator is not configured."` and substitutes an idle
+# service (`cmd/tempo/app/modules.go:294-306 @ v3.0.2`); nothing else
+# changes.
 #
-# A/B measured on grafana/tempo:3.0.2 (standalone, OTLP/HTTP ingest of
-# 20 spans of 300 ms, 2026-08-05):
-#   - committed config (no `metrics_generator` block): `/api/search`
-#     returns the traces, `histogram_over_time(duration)` returns no
-#     series for > 200 s of polling;
-#   - this config: the same query returns
-#     `{"__bucket": 0.536870912} = 20` about 75 s after ingest (the
-#     live block has to complete first — metrics visibility lags search
-#     visibility, which is why the harness polls the reference rather
-#     than querying it once).
+# MEASURED (issue #252, 2026-08-05), because an earlier revision of this
+# file asserted the opposite. Two arms of this exact file — with and
+# without a `metrics_generator.storage.path` block — run in
+# `compose.single.yaml`'s topology (same image digest, same mounted
+# configs, same static IPs, corpus pushed through the otel-collector's
+# `otlp/tempo` exporter), each polled for ~235 s at 5 s intervals, on two
+# corpora (20 spans of 300 ms; the differential's own 24-trace/96-span CI
+# corpus) and at both a 5 s and a 60 s step, over six queries
+# (`histogram_over_time` filtered and unfiltered, `rate`,
+# `count_over_time` under `status = error`, `quantile_over_time`). Once
+# the reference settles, every settled answer is IDENTICAL between the
+# two arms — same series counts, same `__bucket` maps, same rate/count
+# totals, same quantile bits. The no-block arm's Tempo log carries the
+# "not configured" warning above, so the arms really did differ.
 #
-# `metrics_generator.storage.path` is the whole fix, deliberately with
-# NO `overrides.defaults.metrics_generator.processors` list: the
-# `local-blocks` processor no longer exists in 3.0.2
-# (`modules/generator/validation/fields.go:19-25 @ v3.0.2` lists
-# service-graphs / span-metrics{,-count,-latency,-size} / host-info
-# only), and configuring it makes the binary log
-# `msg="ignoring unknown metrics-generator processor" processor=local-blocks`
-# every 10 s while changing no result — measured identical, with and
-# without. The newer `local_blocks` / `traces_storage` spellings from
-# current Tempo docs do not exist here either and hard-fail boot
-# (`field local_blocks not found in type generator.ProcessorConfig`).
-metrics_generator:
-  storage:
-    path: /tmp/tempo/generator/wal
+# What DOES delay a first non-empty answer is the step, not this key: at
+# a 5 s step the histogram appeared 10.1 s after ingest in both arms; at
+# a 60 s step it appeared at 50.4 s (block present) and 40.3 s (block
+# absent), because a 60 s interval only reports once wall-clock passes
+# its right edge. That is why the harness polls the reference
+# (`e2e/src/traces.rs::assert_reference_metrics_positive_control`) rather
+# than querying it once.

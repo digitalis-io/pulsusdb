@@ -125,11 +125,16 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 2
 ///      `expform`. Each time the count stayed at 20, because those
 ///      corpora live INSIDE the existing JSON, and only the digest
 ///      moved: the split this test's two assertions exist to make
-///      readable.)
+///      readable.) Its `_provenance.config` sentence was then CORRECTED
+///      in the same issue — it claimed the reference needs a
+///      `metrics_generator` block to answer TraceQL metrics at all,
+///      which a compose-topology A/B refuted (identical answers with and
+///      without, both corpora, both steps). Digest-only again: no
+///      captured value moved.
 ///
 /// Corpus 66 -> 69 entries; `quantile_over_time_multi.sql` and the other
 /// 65 pre-existing goldens are byte-identical.
-const PINNED_SQL_CORPUS: u64 = 0xf391_5f72_212a_f682;
+const PINNED_SQL_CORPUS: u64 = 0x97ea_d8f0_ba46_0fc0;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

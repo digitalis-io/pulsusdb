@@ -1844,16 +1844,23 @@ fn metrics_points_delta(
 // ---------------------------------------------------------------------
 // Issue #252: the reference-positive control on TraceQL metrics.
 //
-// The traces differential's metrics comparison used to run against a
-// Tempo with no metrics-generator configured, which answers every
-// TraceQL metrics query with an empty series set while `/api/search`
-// returns the whole corpus. The comparison therefore diffed our output
-// against nothing and summarised a delta computed from an empty map —
-// a check that could not fail. `deploy/e2e/tempo.yaml` now configures
-// `metrics_generator.storage.path`, and the control below is what keeps
-// that true: it asserts an INDEPENDENTLY SCHEDULED tally for every
-// `(step, bucket)`, derived from the corpus generator's own arithmetic
-// and from neither system's response.
+// The traces differential's metrics comparison summarised a delta
+// against whatever the reference happened to return, over whatever
+// range it happened to serve — including, when the reference had not
+// yet made the corpus visible to TraceQL metrics, an empty series set.
+// A delta against an empty map is a check that cannot fail. The control
+// below is what fixes that: it asserts an INDEPENDENTLY SCHEDULED tally
+// for every `(step, bucket)`, derived from the corpus generator's own
+// arithmetic and from neither system's response, before any comparison
+// runs.
+//
+// The reference reaches that state on its own with the committed
+// `deploy/e2e/tempo.yaml` and no metrics-specific configuration: on
+// 3.0.2 TraceQL metrics over recent spans are served by the live-store,
+// not the metrics-generator (`cmd/tempo/app/modules.go:719 @ v3.0.2`,
+// `modules/querier/querier_query_range.go:18,32 @ v3.0.2`; A/B measured
+// on issue #252 — see that file's header). What it needs is TIME, which
+// is why this control polls.
 // ---------------------------------------------------------------------
 
 /// A window the REFERENCE has been observed to serve IN FULL for this
@@ -2253,8 +2260,8 @@ async fn assert_reference_metrics_positive_control(
             "the reference did not reproduce the corpus's histogram_over_time schedule for \
              {q:?} over [{start_s}, {end_s}) at {CONTROL_STEP_S}s. This gates the metrics \
              comparison below, which is otherwise a diff against whatever the reference \
-             happened to return (with no metrics-generator configured, that is an empty \
-             series set), over whatever range it happened to serve. Last observed: {}",
+             happened to return — an empty series set included — over whatever range it \
+             happened to serve. Last observed: {}",
             last.borrow()
         ))),
     }
@@ -2263,10 +2270,10 @@ async fn assert_reference_metrics_positive_control(
 /// The never-gating comparisons (ratified on #19/#60): tags-vs-Tempo and
 /// TraceQL-metrics-vs-Tempo. Every delta is dumped as an informational
 /// artifact and the COMPARISON still never gates — but since issue #252
-/// its PRECONDITION does: `deploy/e2e/tempo.yaml` now enables the
-/// metrics-generator, so the reference actually answers TraceQL metrics
-/// queries, and [`assert_reference_metrics_positive_control`] fails the
-/// scenario if it stops.
+/// its PRECONDITION does: [`assert_reference_metrics_positive_control`]
+/// fails the scenario unless the reference has reproduced the corpus's
+/// own `(step, bucket)` schedule over the window this comparison is
+/// about to use.
 ///
 /// Issue #328 (AC 16): both stores must REJECT every pre-committed
 /// semantic-rejection case with a 400 on their search endpoints — the
@@ -2382,8 +2389,9 @@ async fn run_informational_comparisons(
     // Issue #252 AC11b: the reference-positive CONTENT control, run
     // before the comparisons below. Until it passes, every "delta"
     // recorded here is a delta against whatever the reference happened
-    // to return — which, with the pre-#252 `deploy/e2e/tempo.yaml`, was
-    // an empty series set for every query.
+    // to return over whatever range it happened to serve — an empty
+    // series set included, which is what the pre-#252 ±1 h/60 s window
+    // asks for on a freshly-ingested corpus (see [`ServedWindow`]).
     let served = assert_reference_metrics_positive_control(ctx, corpus).await?;
 
     // Every metrics comparison runs over the window the control observed
@@ -3046,20 +3054,21 @@ mod tests {
 
     #[test]
     fn an_empty_reference_body_can_never_satisfy_the_control() {
-        // AC12's hermetic half: the shape the reference returns with no
-        // metrics-generator configured decodes to an EMPTY map, which
-        // cannot equal a non-empty expectation — so the control fails
-        // rather than passing on nothing. (The full mutant — revert
-        // `deploy/e2e/tempo.yaml` and watch the leg fail — is
-        // CI-authoritative; the reference's empty-body behaviour with
-        // that config was measured directly on grafana/tempo:3.0.2.)
+        // The shape the reference returns before it has made a
+        // freshly-ingested corpus visible to TraceQL metrics — measured
+        // on grafana/tempo:3.0.2 with the committed config, at the first
+        // two polls after ingest — decodes to an EMPTY map, which cannot
+        // equal a non-empty expectation. So the control fails rather
+        // than passing on nothing, which is the whole point of holding
+        // the comparison behind it.
         let start_ns = 1_700_000_000 * NS_PER_S_I64;
         let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
         let empty = serde_json::json!({"series": [], "metrics": {}});
         let decoded = reference_histogram_from_body(&empty, start_ns, step_ns).unwrap();
         assert!(decoded.is_empty());
-        // The other shape an unconfigured reference returns — a series
-        // whose every value is elided — also decodes to nothing.
+        // The other shape the reference returns when it has nothing to
+        // report for a query — a series whose every value is elided —
+        // also decodes to nothing.
         let all_zero = serde_json::json!({"series": [{
             "labels": [{"key": "__bucket", "value": {"doubleValue": 0.536870912}}],
             "samples": [{"timestampMs": "1700000005000"}, {"timestampMs": "1700000010000"}]
@@ -3076,8 +3085,7 @@ mod tests {
     /// (issue #252, 2026-08-05): a `rate()` whose selector matches no
     /// span comes back as ONE series carrying the whole step grid with
     /// every value elided — `series=1 samples=8 nonzero=0`. Reproduced
-    /// identically for `count_over_time()`, and identically again
-    /// against a Tempo with no metrics-generator configured;
+    /// identically for `count_over_time()`;
     /// `histogram_over_time` in the same state returns `series=0`
     /// instead, which is the asymmetry that let the earlier form of the
     /// precondition look like it was covering all three queries.
