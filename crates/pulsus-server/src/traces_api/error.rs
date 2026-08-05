@@ -312,9 +312,12 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         ),
         // UNREACHABLE here — `NamelessSelectorUnresolvable` is raised only
         // by the metrics engine (`metrics/exec.rs`), which no traces
-        // handler calls, and `HistogramResultUnsupported` is constructed
-        // nowhere in the workspace today (M7-A5b's histogram encoders
-        // replaced that reject — `metrics/exec.rs:3693`). Mapped to
+        // handler calls, and `HistogramResultUnsupported` has no
+        // production construction site left anywhere in the workspace:
+        // M7-A5b's histogram encoders replaced that reject
+        // (`metrics/exec.rs:3693`), leaving renderer tests as its only
+        // constructors (`prom_api/error.rs`'s and the one below), which
+        // build it precisely because nothing else does. Mapped to
         // this surface's bounded-response family, the same class both
         // other renderers give them: a well-formed query the engine
         // declines, never a server fault. `prom_api` spells that class
@@ -378,24 +381,32 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         // `logql/client_agg.rs`), `Parse` exists only as the
         // `#[from] LogQlError` conversion, `Promql`'s remaining inners are
         // built by the metrics engine (`metrics/dispatch.rs`,
-        // `metrics/exec.rs`), and `PipelineUnsupportedInMetric` is
-        // constructed nowhere in the workspace today (M6-10 replaced that
-        // rejection with client aggregation — `logql/plan.rs:1601`).
-        // TraceQL's own equivalents arrive as `ApiError::Query`/
-        // `ApiError::Plan` instead. All are mapped to the class they have
-        // on BOTH other renderers — a malformed or out-of-domain client
+        // `metrics/exec.rs`), and `PipelineUnsupportedInMetric` has no
+        // production construction site left in the workspace either (M6-10
+        // replaced that rejection with client aggregation —
+        // `logql/plan.rs:1601`); as with `HistogramResultUnsupported`
+        // above, the only code that builds it is renderer tests,
+        // `logs_api/error.rs`'s and the one below. TraceQL's own
+        // equivalents arrive as `ApiError::Query`/`ApiError::Plan`
+        // instead. The eight non-`Promql` patterns take the class BOTH
+        // other renderers give them — a malformed or out-of-domain client
         // query is 400 `bad_data`, and it stays 400 if the call graph ever
         // brings one here, rather than becoming a 500 that blames the
         // database for the client's query.
         //
-        // `Promql` is 400 for every inner variant EXCEPT `Cancelled`
-        // above, rather than `prom_api`'s per-inner 400/422/408 split:
-        // that split is a PromQL-API contract (docs/api.md §3's five-type
-        // taxonomy) whose 422 `execution` type §4.1's traces table does
-        // not carry, so reproducing it here would invent a traces mapping
-        // for a type this endpoint does not document. `logs_api` is
-        // uniform 400 over all of `Promql`; this surface deliberately
-        // differs from it on `Cancelled` alone.
+        // `Promql` is the exception to that sentence, and only against
+        // `prom_api`. `logs_api` is uniform 400 across every inner (its
+        // own `ReadError::Promql(_)` arm), so this surface agrees with it
+        // apart from `Cancelled` above. `prom_api` instead splits per
+        // inner: `Parse`/`InvalidRegexMatcher` 400 `bad_data` (agreeing
+        // with this arm), then `Unsupported`, `BadMatching`,
+        // `HistogramBucket`, `LabelSet`, `InvalidParameter`, `ScalarOp`
+        // and `ExtendedHistogram` — seven of the ten — 422 `execution`,
+        // and `Cancelled` 408. We do not reproduce that split: it is a
+        // PromQL-API contract (docs/api.md §3's five-type taxonomy) whose
+        // 422 `execution` type §4.1's traces table does not carry, so
+        // reproducing it here would invent a traces mapping for a type
+        // this endpoint does not document.
         ReadError::Parse(_)
         | ReadError::Promql(_)
         | ReadError::EmptyMatcherSet
@@ -573,9 +584,10 @@ mod tests {
     /// `bad_data` here as it is on `logs_api`/`prom_api`, not the 500 the
     /// removed catch-all gave it. All are unreachable from a traces
     /// handler today (the LogQL planner is not on this call graph, and
-    /// `PipelineUnsupportedInMetric` is constructed nowhere at all since
-    /// M6-10) — the arms are the record of the decision, so a future
-    /// re-route cannot make one a 500 by omission.
+    /// `PipelineUnsupportedInMetric` has had no production construction
+    /// site anywhere since M6-10 — the loop below is one of its two, both
+    /// renderer tests) — the arms are the record of the decision, so a
+    /// future re-route cannot make one a 500 by omission.
     #[tokio::test]
     async fn a_logql_planner_read_error_maps_to_400_bad_data_not_500() {
         for err in [
@@ -667,8 +679,9 @@ mod tests {
     /// 422 `prom_api` gives them, spelled with the `errorType` docs/api.md
     /// §4.1 defines for traces), not the removed catch-all's 500. Only
     /// `NamelessSelectorUnresolvable` is raised by the metrics engine
-    /// today; `HistogramResultUnsupported` is constructed nowhere since
-    /// M7-A5b's histogram encoders replaced that reject.
+    /// today; `HistogramResultUnsupported` has had no production
+    /// construction site since M7-A5b's histogram encoders replaced that
+    /// reject — the loop below is one of its two, both renderer tests.
     #[tokio::test]
     async fn a_metrics_engine_decline_maps_to_422_query_too_broad_not_500() {
         for err in [
