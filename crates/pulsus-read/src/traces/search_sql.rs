@@ -426,7 +426,7 @@ mod tests {
     };
 
     /// Issue #351, after review: the event/link value read must carry NO
-    /// server-side aggregate. The first cut used
+    /// server-side state. The first cut used
     /// `groupUniqArray(...) GROUP BY trace_id, span_id`, whose ARRAY
     /// column is an unbounded number of capped strings in ONE row —
     /// breaking the Layer-1 residual bound `traces::exec`'s module doc
@@ -434,21 +434,21 @@ mod tests {
     /// server-side aggregate state and the client's decoded row before
     /// any charge could run.
     ///
-    /// This asserts the SHAPE, not the text: no aggregate of any kind, no
-    /// `GROUP BY`, one value column, and the `(key, scope)` index prefix
-    /// plus date/time/batch pruning intact. A reviewer can check the
-    /// invariant from this test instead of re-deriving it from the memory
-    /// contract.
+    /// **A positive SHAPE gate, not a ban list** (review 3, `[medium]`).
+    /// The first version banned seven spellings, and a denylist keeps
+    /// losing this race: `LIMIT 1 BY trace_id, span_id` contains none of
+    /// them and still needs per-group state, and any ban list is
+    /// case-sensitive besides. So this asserts what the statement IS —
+    /// every line must be one of the three clause forms the builder
+    /// emits — which no appended clause, in any spelling or case, can
+    /// satisfy. The clause vocabulary is thereby closed by construction
+    /// rather than by enumeration of what to exclude.
     ///
-    /// **EVERY intrinsic takes the SAME gate** (review 2, [medium]): the
-    /// numeric member used to be checked only for `GROUP BY`, so a
-    /// `DISTINCT`, a `groupArray`/`groupUniqArray` or a window aggregate
-    /// over `val_num` would have reintroduced server-side state without
-    /// failing anything. The banned list and the pruning assertions now
-    /// run over all four, and only the VALUE COLUMN assertion branches —
-    /// which is the one thing that genuinely differs.
+    /// The banned spellings are kept as a SECOND, redundant assertion,
+    /// purely so a failure names the construct a reader recognises; the
+    /// line-shape assertion above is what makes the gate airtight.
     #[test]
-    fn the_event_value_read_carries_no_aggregate_so_a_row_stays_bounded() {
+    fn the_event_value_read_carries_no_server_side_state() {
         use super::super::filter::EventSetField;
         for set in [
             EventSetField::EventName,
@@ -457,6 +457,31 @@ mod tests {
             EventSetField::LinkTraceId,
         ] {
             let sql = event_set_sql("trace_attrs_idx", set, &[[7u8; 16]], W);
+
+            // (1) THE SHAPE. Exactly one projection line, one FROM line,
+            // one WHERE line and any number of `  AND` continuations —
+            // and nothing else, ever. A `GROUP BY` / `LIMIT n BY` /
+            // `ORDER BY` / window clause has to occupy a line, and no
+            // such line is admissible.
+            let lines: Vec<&str> = sql.lines().collect();
+            assert!(
+                lines[0].starts_with("SELECT trace_id, span_id, "),
+                "{set:?}: line 0 must be the fixed projection: {sql}"
+            );
+            assert_eq!(
+                lines[1], "FROM trace_attrs_idx",
+                "{set:?}: line 1 must be the bare FROM: {sql}"
+            );
+            for (i, line) in lines.iter().enumerate().skip(2) {
+                assert!(
+                    line.starts_with("WHERE ") || line.starts_with("  AND "),
+                    "{set:?}: line {i} is neither a WHERE nor an AND continuation, so the \
+                     statement grew a clause that can hold server-side state: {line:?} in {sql}"
+                );
+            }
+
+            // (2) The named constructs, for a failure a reader
+            // recognises. Redundant with (1) by design.
             for banned in [
                 "groupUniqArray",
                 "groupArray",
@@ -465,13 +490,14 @@ mod tests {
                 "any(",
                 "uniq",
                 "OVER (",
+                "LIMIT",
             ] {
                 assert!(
                     !sql.contains(banned),
-                    "{set:?}: {banned} would put server-side state behind this read \
-                     and let one ROW grow without bound: {sql}"
+                    "{set:?}: {banned} would put server-side state behind this read: {sql}"
                 );
             }
+
             // The value column: `val_num` for the one numeric member,
             // the byte-capped `val` for the three string members.
             if set.is_numeric() {

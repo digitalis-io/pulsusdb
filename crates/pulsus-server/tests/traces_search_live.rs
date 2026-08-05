@@ -1482,10 +1482,11 @@ async fn negation_demands_a_boolean_where_truthiness_tolerates_a_string() {
 /// comparison, end to end through the real server and a live ClickHouse.
 ///
 /// **This is the leg that can fail.** The semantics live in a per-batch
-/// `groupUniqArray` co-load that no hermetic test executes: the SQL has
-/// to run, the array has to decode into a per-span set, and the
-/// any/all-match rule has to be applied to it. A plan-level check would
-/// pass with the co-load returning nothing at all.
+/// value co-load that no hermetic test executes: the read has to run,
+/// its rows — ONE PER VALUE — have to accumulate into each span's value
+/// list, and the any/all-match rule has to be applied to that list. A
+/// plan-level check would pass with the co-load returning nothing at
+/// all.
 ///
 /// The fixture is the one the reference was probed with, and the
 /// expectation is OURS — which is where the ratified divergence sits
@@ -1597,7 +1598,7 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
     }
 
     // The literal form is unchanged and still index-served — the control
-    // that says the set co-load did not disturb the membership path.
+    // that says the value co-load did not disturb the membership path.
     let ctx = "literal-event-name-unchanged";
     let res = search(port, r#"{ event:name = "evZ" }"#, w0, w1, "", ctx);
     assert_eq!(
@@ -1605,6 +1606,33 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
         BTreeSet::from([hex(&tid(1))]),
         "{ctx}"
     );
+
+    // The `~`/`!~` half of the owner's ruling (review 3). It lives HERE,
+    // on the literal path, because a regex against a FIELD operand is a
+    // 400 in both systems — `pulsus_traceql::validate` and the reference
+    // both answer `invalid type for =~ or !~: event:name`, measured — so
+    // the field-vs-field path can never see a regex operator.
+    //
+    // `=~` is ANY-match: span 1's events are evX/evY/evZ and the pattern
+    // matches evZ. `!~` is ALL-match: span 1 is EXCLUDED because one of
+    // its events matches, while spans 2-4 (no `ev?` match... spans 2 and
+    // 3 do contain `ev`-prefixed names, so the discriminating pattern is
+    // anchored on evZ alone) are kept.
+    for (q, expected, ctx) in [
+        (
+            r#"{ event:name =~ "evZ" }"#,
+            BTreeSet::from([hex(&tid(1))]),
+            "regex-any-match",
+        ),
+        (
+            r#"{ event:name !~ "evZ" }"#,
+            BTreeSet::from([hex(&tid(2)), hex(&tid(3)), hex(&tid(4)), hex(&tid(5))]),
+            "regex-all-match-excludes-the-span-with-a-matching-event",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(trace_set(&res.json(ctx)), expected, "{ctx}: {q}");
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1616,11 +1644,14 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
 /// hit the read budget and come back `422 query_too_broad` — never a
 /// silently materialized unbounded per-span array.
 ///
-/// **Why this cannot be a hermetic test.** The growth happens in the
-/// database: the first cut read `groupUniqArray(...) GROUP BY` and the
-/// array was built server-side, so no in-process test could observe
-/// either the aggregate state or the size of the row that came back. The
-/// only place the shape is real is against a live ClickHouse.
+/// **Why this cannot be a hermetic test.** The read happens in the
+/// database, and so did the growth this test exists to refuse: the first
+/// cut read `groupUniqArray(...) GROUP BY`, whose array was built
+/// server-side, so no in-process test could observe either the aggregate
+/// state or the size of the row that came back. The read is now one row
+/// per value (`search_sql::event_set_sql`), and it is still only against
+/// a live ClickHouse that the row budget, the streaming charge and the
+/// refusal are real at once.
 ///
 /// **Scale-invariant, per the standing rule:** the budget is lowered
 /// rather than the fixture inflated (the `scan_budget_breach_is_422…`

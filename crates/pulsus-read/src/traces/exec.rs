@@ -253,19 +253,26 @@ impl<R, C: FnMut(&R) -> usize, A: FnMut(R)> ChargedRowSink<R> for FnRowSink<C, A
 /// Retention charge for ONE co-loaded event/link value (issue #351,
 /// review 2), covering every structure that holds it at the peak:
 ///
-/// * its slot in the span's `Vec<String>`/`Vec<f64>`, doubled — a
-///   growing `Vec` can hold up to twice the slots it uses, and the
-///   `String` header (24 bytes) upper-bounds the `f64` slot (8) so one
-///   constant serves both branches;
+/// * its slot in the span's `Vec<String>`/`Vec<f64>`, charged at
+///   [`VEC_INITIAL_RESERVATION_SLOTS`] slots per value. **Not 2×**
+///   (review 3, `[high]`): a fresh `Vec`'s FIRST push reserves 4 slots,
+///   so a 2× charge under-charges the first value of every span by half.
+///   Charging 4 slots per value upper-bounds the capacity at every
+///   length, since a `Vec` holding `n` values has capacity
+///   `max(4, 2^ceil(log2 n)) ≤ max(4, 2n) ≤ 4n` for `n ≥ 1` — the
+///   initial reservation is covered by the first value's own charge, and
+///   the doubling by every value's. `size_of::<String>()` (24 B)
+///   upper-bounds the `f64` slot (8 B), so one constant serves both
+///   branches;
 /// * a WHOLE map entry plus the hash-table envelope. The map holds one
 ///   entry per SPAN, not per value, so charging one per value
 ///   over-charges — the direction a budget must err in.
 ///
 /// The value's own bytes are added by the caller on the text branch. The
 /// string payload is MOVED out of the decoded row into the vec, so it is
-/// charged once and exists once; the row it came from is dropped before
-/// the next is read.
-const EVENT_VALUE_ENTRY_BYTES: usize = 2 * std::mem::size_of::<String>()
+/// charged once and exists once.
+const EVENT_VALUE_ENTRY_BYTES: usize = VEC_INITIAL_RESERVATION_SLOTS
+    * std::mem::size_of::<String>()
     + std::mem::size_of::<(SpanKey, EventValues)>()
     + RETAINED_ENTRY_OVERHEAD;
 /// Retention charge for one direct-child-count co-load entry (issue
@@ -1928,19 +1935,26 @@ impl TraceEngine {
         // through [`Self::stream_rows_charged`] means that at any moment
         // the live structures holding a co-loaded value are exactly:
         //
-        //   1. the per-span `Vec<String>`/`Vec<f64>` inside `map` — one
-        //      slot per value, with a growing `Vec`'s doubling slack;
+        //   1. the per-span `Vec<String>`/`Vec<f64>` inside `map` — its
+        //      capacity, which is the initial 4-slot reservation and then
+        //      the doubling slack;
         //   2. `map`'s own entry for that span — ONE per span, not per
         //      value;
         //   3. the string payload itself, which is MOVED out of the row
         //      into (1) and so exists once, never copied;
-        //   4. the single row the driver has just decoded, which is
-        //      dropped before the next is read.
+        //   4. the driver's transiently buffered BLOCK — up to
+        //      `max_block_size` (`TRACE_SEARCH_MAX_BLOCK_ROWS`, 4096)
+        //      decoded rows, not a single row (review 3's correction).
+        //      It is bounded: each row here is fixed-width columns plus
+        //      ONE `TRACE_STR_COL_CAP`-capped string, which is exactly
+        //      the Layer-1 residual shape this module's contract states,
+        //      and `max_result_bytes` (64 MiB, throw) bounds it besides.
         //
         // [`EVENT_VALUE_ENTRY_BYTES`] + the payload length upper-bounds
-        // (1)+(2)+(3) per value, and (4) is the documented one-block
-        // Layer-1 residual. No second collection exists to hold anything
-        // a second time.
+        // (1)+(2)+(3) per value — see that constant for why the slot is
+        // charged at the 4-slot reservation rather than 2× — and (4) is
+        // the documented Layer-1 block residual. No second collection
+        // exists to hold anything a second time.
         for set_idx in 0..plan.event_sets.len() {
             let sql = plan.event_set_sql_for(set_idx, batch_ids);
             charge_explain(
