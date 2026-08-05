@@ -12,8 +12,9 @@
 # timestamps (grammar-enforced); A3 the field_limit case introduces each
 # field on a different entry (the reference's Go map order makes a
 # same-entry case invalid); A4 label-sorted expected blocks, fields
-# transcribed as a set, `jsonPath` dropped (#254); A5 a disagreeing case is
-# dropped and filed, never worked around.
+# transcribed as a set, `jsonPath` dropped (no column in the four-token
+# field grammar; #254 implemented the key — see PROVENANCE.md A4); A5 a
+# disagreeing case is dropped and filed, never worked around.
 #
 # provenance: captured
 # (file default; see logqltest/PROVENANCE.md §provenance markers.

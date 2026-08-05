@@ -23,6 +23,7 @@ use super::labels::{
     merge_labels_with_structured_metadata, parse_flat_labels, parse_flat_labels_into,
     render_labels_json_sorted,
 };
+use super::pipeline::JsonPaths;
 
 /// One fan-out group's accumulator — deliberately WITHOUT `labels_json`:
 /// the map key is the single owned copy of the rendered label set, moved
@@ -355,14 +356,14 @@ fn observe_detected_row<'a>(
         buf.clear();
         parse_flat_labels_into(sm_json, buf);
         for (k, v) in buf.iter() {
-            acc.observe_pair(k, v, None);
+            acc.observe_pair(k, v, detected::FieldSource::Unattributed);
         }
     }
     for (k, v) in scratch.iter() {
         if run_base.iter().any(|(bk, _)| bk.as_str() == k.as_ref()) {
             continue;
         }
-        acc.observe_pair(k.as_ref(), v.as_ref(), None);
+        acc.observe_pair(k.as_ref(), v.as_ref(), detected::FieldSource::Unattributed);
     }
     // Drop every borrow of `run_base` before the buffer is recycled.
     scratch.clear();
@@ -382,16 +383,31 @@ fn observe_detected_row<'a>(
 /// `'static` (rule R2) — on the breach path it is then dropped, and
 /// `feed_row`'s `trim()` (which runs on every exit) is what accounts
 /// for the capacity.
+///
+/// The issue #254 json-path sink is a ROW-LOCAL (deliberately NOT a
+/// sixth carried feeder buffer, which would move
+/// `MAX_FEEDER_SCRATCH_BYTES`): a row that parses as neither json nor
+/// logfmt leaves it at `Vec::new()`, so it allocates nothing at all, and
+/// a json row pays one spine plus one `Vec<String>` per captured leaf —
+/// the same per-leaf slice the reference allocates at
+/// `pkg/logql/log/parser.go:162,196 @ v3.7.4`. It never reaches the
+/// query path, whose json parser has capture off.
 fn auto_parse_observe<'l>(
     line: &'l str,
     acc: &mut FieldAccumulator,
     scratch: LabelScratch<'l>,
 ) -> Result<LabelScratch<'static>, ReadError> {
     let mut scratch = scratch;
-    let parsed = detected::auto_parse_into(line, &mut scratch);
+    let mut paths = JsonPaths::default();
+    let parsed = detected::auto_parse_into(line, &mut scratch, &mut paths);
     if let Ok(Some(parser)) = parsed {
-        for (k, v) in scratch.iter() {
-            acc.observe_pair(k.as_ref(), v.as_ref(), Some(parser));
+        for (i, (k, v)) in scratch.iter().enumerate() {
+            let source = if parser == "json" {
+                detected::FieldSource::Json { path: paths.get(i) }
+            } else {
+                detected::FieldSource::Logfmt
+            };
+            acc.observe_pair(k.as_ref(), v.as_ref(), source);
         }
     }
     scratch.clear();
@@ -440,9 +456,17 @@ fn observe_detected_row_legacy_shape<'a>(
                 .filter(|(k, _)| !run_base.iter().any(|(bk, _)| bk.as_str() == k.as_ref()))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            acc.observe_parsed(&added, None);
+            acc.observe_parsed(&added, detected::FieldSource::Unattributed);
             if let Some((parser, pairs)) = detected::auto_parse_legacy_shape(line.as_ref()) {
-                acc.observe_parsed(&pairs, Some(parser));
+                // The pre-#244 shape predates #254's path capture, so the
+                // json arm attributes with NO path — this helper measures
+                // allocation shape and never runs in production (AC 13e).
+                let source = if parser == "json" {
+                    detected::FieldSource::Json { path: None }
+                } else {
+                    detected::FieldSource::Logfmt
+                };
+                acc.observe_parsed(&pairs, source);
             }
             true
         }
@@ -672,8 +696,19 @@ impl DetectedFieldsProbe {
         self.base_labels.insert(fingerprint, labels.to_vec());
     }
 
+    /// `parser` is `None` (unattributed), `Some("json")` or
+    /// `Some("logfmt")` — the seam predates issue #254's json paths and
+    /// carries none, so a `Some("json")` observation here attributes the
+    /// parser without a path. The corpus runner and the live suites reach
+    /// paths through the production [`DetectedFieldsProbe::feed_row`].
     pub fn observe_pair(&mut self, key: &str, value: &str, parser: Option<&'static str>) {
-        self.acc.observe_pair(key, value, parser);
+        let source = match parser {
+            None => detected::FieldSource::Unattributed,
+            Some("json") => detected::FieldSource::Json { path: None },
+            Some("logfmt") => detected::FieldSource::Logfmt,
+            Some(other) => panic!("unknown parser name {other:?} (json | logfmt)"),
+        };
+        self.acc.observe_pair(key, value, source);
     }
 
     /// One row through the PRODUCTION feeder; applies the
@@ -1435,6 +1470,13 @@ mod tests {
     /// in the #244 implementation notes; this test pins that the probe
     /// seam still routes production `feed_row` through the NEW shape by
     /// asserting the two paths agree on a smoke row.)
+    ///
+    /// `json_path` is the ONE field the two shapes are allowed to differ
+    /// on (issue #254): the legacy transcription is frozen at the pre-#244
+    /// text, which predates the capture, so it attributes `json` with no
+    /// path. That asymmetry is asserted explicitly below rather than
+    /// silently normalized away — if the production path ever STOPPED
+    /// capturing, this test would fail on that assertion.
     #[test]
     fn probe_feed_row_and_legacy_shape_agree_on_a_smoke_row() {
         let compiled = detected_compiled(r#"{app="x"} | json"#);
@@ -1450,7 +1492,24 @@ mod tests {
                 .feed_row_legacy_shape(&compiled, 1, 5, body, sm)
                 .expect("ok")
         );
-        assert_eq!(new_probe.finish(), legacy_probe.finish());
+        let (mut new_fields, new_capped) = new_probe.finish();
+        let (legacy_fields, legacy_capped) = legacy_probe.finish();
+        assert_eq!(
+            new_fields
+                .iter()
+                .map(|f| (f.label.as_str(), f.json_path.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("code", Some(vec!["code".to_string()])),
+                ("level", Some(vec!["level".to_string()])),
+                ("trace_id", None),
+            ],
+            "the production shape captures a json path per json-flattened field (#254)"
+        );
+        for f in &mut new_fields {
+            f.json_path = None;
+        }
+        assert_eq!((new_fields, new_capped), (legacy_fields, legacy_capped));
     }
 
     /// The no-pipeline fast-path label set: merge + `append_visible` + sort

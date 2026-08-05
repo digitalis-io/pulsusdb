@@ -4,10 +4,12 @@
 //! - detected_labels drops ID-only keys (all-UUID, all-numeric), keeps
 //!   static (`namespace`) + mixed keys with EXACT cardinalities, and
 //!   `query=` scoping narrows to the resolved streams;
-//! - detected_fields returns structured-metadata fields (`parsers:[]`),
-//!   json/logfmt-detected fields with the pinned `type`s and parser
-//!   attribution, respects `limit` (first-seen field cap) and
-//!   `line_limit` (sample size);
+//! - detected_fields returns structured-metadata fields (`parsers:null`
+//!   — issue #258's third shape), json/logfmt-detected fields with the
+//!   pinned `type`s, parser attribution and the raw `jsonPath` (issue
+//!   #254), respects `limit` (first-seen field cap) and `line_limit`
+//!   (sample size), and answers a zero-field sample with the reference's
+//!   bare `{}` (issue #258);
 //! - `X-Pulsus-Explain` shows the single stage-3 scan with skip-index
 //!   line-filter prefilters + `LIMIT <line_limit>` (Tier-1 pushdown
 //!   evidence at the endpoint level), and the paged keyset route when a
@@ -254,22 +256,40 @@ struct SeedSampleRow {
     structured_metadata: String,
 }
 
-fn fields_of(json: &serde_json::Value) -> Vec<(String, String, u64, Vec<String>)> {
+/// `(label, type, cardinality, parsers, jsonPath)` per field. `parsers`
+/// is `null` (issue #258) for an unattributed field, which maps to an
+/// empty vec here; `jsonPath` is ABSENT (issue #254) unless the field was
+/// json-flattened, which maps to `None`.
+type DetectedField = (String, String, u64, Vec<String>, Option<Vec<String>>);
+
+fn fields_of(json: &serde_json::Value) -> Vec<DetectedField> {
     json["fields"]
         .as_array()
         .expect("fields array")
         .iter()
         .map(|f| {
+            let parsers = match &f["parsers"] {
+                serde_json::Value::Null => Vec::new(),
+                v => v
+                    .as_array()
+                    .expect("parsers array or null")
+                    .iter()
+                    .map(|p| p.as_str().expect("parser").to_string())
+                    .collect(),
+            };
+            let json_path = f.get("jsonPath").map(|p| {
+                p.as_array()
+                    .expect("jsonPath array")
+                    .iter()
+                    .map(|c| c.as_str().expect("path component").to_string())
+                    .collect()
+            });
             (
                 f["label"].as_str().expect("label").to_string(),
                 f["type"].as_str().expect("type").to_string(),
                 f["cardinality"].as_u64().expect("cardinality"),
-                f["parsers"]
-                    .as_array()
-                    .expect("parsers array")
-                    .iter()
-                    .map(|p| p.as_str().expect("parser").to_string())
-                    .collect(),
+                parsers,
+                json_path,
             )
         })
         .collect()
@@ -342,7 +362,7 @@ async fn detected_labels_and_fields_end_to_end() {
             &format!(
                 "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
                  body, structured_metadata) VALUES \
-                 ('checkout', 1, {t1}, 0, '{{\"count\":7,\"ratio\":1.5,\"active\":true,\"took\":\"250ms\",\"size\":\"3MiB\",\"msg\":\"hello\"}}', ''), \
+                 ('checkout', 1, {t1}, 0, '{{\"count\":7,\"ratio\":1.5,\"active\":true,\"took\":\"250ms\",\"size\":\"3MiB\",\"msg\":\"hello\",\"user\":{{\"id\":42}}}}', ''), \
                  ('checkout', 1, {t2}, 0, 'method=GET status_text=slow', '{{\"trace_id\":\"abc123\"}}'), \
                  ('checkout', 1, {t3}, 0, 'plain x=\"unterminated', '')",
                 t1 = now - 3_000_000_000,
@@ -458,15 +478,18 @@ async fn detected_labels_and_fields_end_to_end() {
         json.get("pulsus_partial").is_none(),
         "complete responses carry no pulsus_partial key: {json}"
     );
-    let owned = |items: &[(&str, &str, u64, &[&str])]| {
+    /// One expected field row, in `fields_of` order.
+    type ExpectedField<'a> = (&'a str, &'a str, u64, &'a [&'a str], Option<&'a [&'a str]>);
+    let owned = |items: &[ExpectedField<'_>]| {
         items
             .iter()
-            .map(|(l, t, c, p)| {
+            .map(|(l, t, c, p, jp)| {
                 (
                     l.to_string(),
                     t.to_string(),
                     *c,
                     p.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    jp.map(|path| path.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
                 )
             })
             .collect::<Vec<_>>()
@@ -474,17 +497,37 @@ async fn detected_labels_and_fields_end_to_end() {
     assert_eq!(
         fields_of(&json),
         owned(&[
-            ("active", "boolean", 1, &["json"]),
-            ("count", "int", 1, &["json"]),
-            ("method", "string", 1, &["logfmt"]),
-            ("msg", "string", 1, &["json"]),
-            ("ratio", "float", 1, &["json"]),
-            ("size", "bytes", 1, &["json"]),
-            ("status_text", "string", 1, &["logfmt"]),
-            ("took", "duration", 1, &["json"]),
-            ("trace_id", "string", 1, &[]),
+            ("active", "boolean", 1, &["json"], Some(&["active"][..])),
+            ("count", "int", 1, &["json"], Some(&["count"][..])),
+            ("method", "string", 1, &["logfmt"], None),
+            ("msg", "string", 1, &["json"], Some(&["msg"][..])),
+            ("ratio", "float", 1, &["json"], Some(&["ratio"][..])),
+            ("size", "bytes", 1, &["json"], Some(&["size"][..])),
+            ("status_text", "string", 1, &["logfmt"], None),
+            ("took", "duration", 1, &["json"], Some(&["took"][..])),
+            ("trace_id", "string", 1, &[], None),
+            ("user_id", "int", 1, &["json"], Some(&["user", "id"][..])),
         ]),
-        "six-type detection, json/logfmt attribution, SM field with no parser: {json}"
+        "six-type detection, json/logfmt attribution, the raw jsonPath (#254 — nested \
+         `user.id` carries both components, a logfmt/SM field carries none), SM field with \
+         no parser: {json}"
+    );
+    // Issue #258's third shape, on the wire: an unattributed field's
+    // `parsers` is JSON `null`, never `[]`; a logfmt field carries no
+    // `jsonPath` key at all (#254, `omitempty`).
+    let trace_id = json["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .find(|f| f["label"] == "trace_id")
+        .expect("trace_id field");
+    assert!(trace_id["parsers"].is_null(), "{trace_id}");
+    assert!(trace_id.get("jsonPath").is_none(), "{trace_id}");
+    assert!(
+        res.body
+            .contains(r#"{"label":"user_id","type":"int","cardinality":1,"parsers":["json"],"jsonPath":["user","id"]}"#),
+        "byte-exact reference field shape (proto field order): {}",
+        res.body
     );
 
     // -- `limit` (field cap): first-seen field names win ------------------
@@ -519,7 +562,9 @@ async fn detected_labels_and_fields_end_to_end() {
         false,
     );
     assert_eq!(res.status, 200, "body: {}", res.body);
-    assert_eq!(res.body, r#"{"fields":[],"limit":1000}"#);
+    // Issue #258: a zero-field result is the reference's bare `{}` — no
+    // `fields`, no `limit`.
+    assert_eq!(res.body, "{}");
 
     // -- Explain, fast path: the single stage-3 scan carries the
     //    skip-index line-filter prefilters + LIMIT <line_limit> (Tier-1
@@ -600,7 +645,7 @@ async fn detected_labels_and_fields_end_to_end() {
     );
     assert_eq!(
         fields_of(&json),
-        owned(&[("level", "string", 1, &["json"])]),
+        owned(&[("level", "string", 1, &["json"], Some(&["level"][..]))]),
         "late-occurring matches (page 3 of the walk) must be detected: {json}"
     );
 
@@ -704,11 +749,12 @@ async fn detected_fields_budget_truncation_signals_pulsus_partial() {
         json["pulsus_partial"], true,
         "budget exhaustion mid-paging must signal the additive partial key: {json}"
     );
-    assert_eq!(
-        json["fields"],
-        serde_json::json!([]),
-        "no field ever matched — the truncated sample is empty: {json}"
+    assert!(
+        json.get("fields").is_none() && json.get("limit").is_none(),
+        "no field ever matched — the truncated sample is the bare object plus the additive \
+         partial key (issue #258): {json}"
     );
+    assert_eq!(res.body, r#"{"pulsus_partial":true}"#);
 
     drop_db(db).await;
 }

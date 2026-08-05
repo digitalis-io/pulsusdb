@@ -33,8 +33,8 @@ use std::sync::LazyLock;
 use pulsus_logql::{ParserStage, Stage};
 
 use super::pipeline::{
-    CompiledPipeline, ERROR_DETAILS_LABEL, ERROR_LABEL, RowBudgetExceeded, parse_bytes_value,
-    parse_duration_seconds,
+    CompiledPipeline, ERROR_DETAILS_LABEL, ERROR_LABEL, JsonPaths, RowBudgetExceeded,
+    parse_bytes_value, parse_duration_seconds,
 };
 
 /// One `/detected_labels` response entry: a kept stream-index key and its
@@ -57,8 +57,50 @@ pub struct DetectedFieldOut {
     pub cardinality: u64,
     /// `"json"`/`"logfmt"` in encounter order, deduped; empty for fields
     /// observed only without parser attribution (structured metadata /
-    /// query-pipeline extractions).
+    /// query-pipeline extractions). The reference marshals THAT case as
+    /// JSON `null`, not `[]` — see `logs_api::encode`.
     pub parsers: Vec<&'static str>,
+    /// The RAW JSON key path this label was flattened from, as of the
+    /// LAST json-parsed observation (issue #254) — `["user","id"]` for a
+    /// nested `user.id`, `None` for a field never seen through the json
+    /// auto-parse. Mirrors the reference's `parsedFields.jsonPath`
+    /// (`pkg/querier/queryrange/detected_fields.go:230,344 @ v3.7.4`),
+    /// which likewise starts nil and is only ever written by a
+    /// json-attributed entry.
+    pub json_path: Option<Vec<String>>,
+}
+
+/// How one observed `key = value` pair was discovered — the reference's
+/// per-entry `parsers` slice plus, for json, the raw path
+/// (`detected_fields.go:337-346 @ v3.7.4`).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum FieldSource<'p> {
+    /// Structured metadata or a query-pipeline extraction: no parser
+    /// attribution, and never a json path (the reference's
+    /// structured-metadata loop passes an EMPTY parser slice and never
+    /// touches `jsonPath`).
+    Unattributed,
+    /// The `logfmt` auto-detection won this entry. The reference guards
+    /// its `jsonPath` write with `slices.Contains(parsers, "json")`, so a
+    /// logfmt entry leaves any previously-captured path standing.
+    Logfmt,
+    /// The `json` auto-detection won this entry; `path` is what the
+    /// flatten captured for this label ON THIS ENTRY. `None` REPLACES a
+    /// stored path with nothing — the reference assigns
+    /// `GetJSONPath(k)` unconditionally on a json entry, and that lookup
+    /// misses for a label the flatten did not produce.
+    Json { path: Option<&'p [String]> },
+}
+
+impl FieldSource<'_> {
+    /// The parser name to attribute, or `None` when unattributed.
+    fn parser(&self) -> Option<&'static str> {
+        match self {
+            FieldSource::Unattributed => None,
+            FieldSource::Logfmt => Some("logfmt"),
+            FieldSource::Json { .. } => Some("json"),
+        }
+    }
 }
 
 /// A `/detected_fields` engine result (issue #170 plan v2): `truncated`
@@ -185,6 +227,9 @@ struct FieldState {
     field_type: &'static str,
     values: HashSet<String>,
     parsers: Vec<&'static str>,
+    /// The raw json path of the LAST json-attributed observation (issue
+    /// #254). Charged like every other retained allocation.
+    json_path: Option<Vec<String>>,
     /// The budget refused a growth: type still re-detects and parsers still
     /// append (both bounded), the VALUE set stops growing.
     frozen: bool,
@@ -214,6 +259,54 @@ fn value_entry_bytes(value: &str) -> u64 {
         .saturating_add(super::charge::alloc_block_bytes(value.len() as u64))
 }
 
+/// A provable upper bound on the retained heap one json path costs: the
+/// `Vec<String>` spine, exactly reserved
+/// (`Vec::with_capacity(path.len())`), plus each part's exactly-reserved
+/// `String` — [`super::charge::alloc_block_bytes`] per allocation, the
+/// same model every other charge site here uses.
+fn json_path_bytes(path: &[String]) -> u64 {
+    path.iter()
+        .map(|p| super::charge::alloc_block_bytes(p.len() as u64))
+        .fold(
+            super::charge::alloc_block_bytes(size_of_val(path) as u64),
+            |acc, b| acc.saturating_add(b),
+        )
+}
+
+/// Stores a json-attributed observation's raw path on `state`, charging
+/// the retention budget first (issue #244's invariant: nothing is
+/// retained before it is charged).
+///
+/// Two departures from a naive "charge the new path every time", both
+/// forced by [`RetentionBudget`] never discharging:
+///  * an IDENTICAL path (the overwhelming case — the same key at the same
+///    depth on every entry of a stream) is a no-op, so a field's path is
+///    charged ONCE rather than once per sampled entry;
+///  * a differing path charges only the GROWTH, because the slot's
+///    retained bytes are what the budget bounds and the old vector is
+///    freed as the new one lands.
+///
+/// A refused charge CLAMPS — the previously stored path stands and the
+/// response is marked `pulsus_partial` — mirroring the value set's
+/// `frozen` behaviour rather than introducing a new error surface.
+fn store_json_path(budget: &mut RetentionBudget, state: &mut FieldState, path: Option<&[String]>) {
+    if state.json_path.as_deref() == path {
+        return;
+    }
+    let Some(path) = path else {
+        // The reference assigns `GetJSONPath(k)` unconditionally on a
+        // json entry, so a miss CLEARS the stored path.
+        state.json_path = None;
+        return;
+    };
+    let old = state.json_path.as_deref().map_or(0, json_path_bytes);
+    let new = json_path_bytes(path);
+    if new > old && !budget.charge(new - old) {
+        return; // clamp + serve
+    }
+    state.json_path = Some(path.to_vec());
+}
+
 /// The post-admission tail of [`FieldAccumulator::observe_pair`], factored
 /// free so the `&mut` budget and the `&mut` field state (both reached
 /// through `self`) can be borrowed simultaneously. The ORDER is the
@@ -222,7 +315,7 @@ fn observe_admitted(
     budget: &mut RetentionBudget,
     state: &mut FieldState,
     value: &str,
-    parser: Option<&'static str>,
+    source: FieldSource<'_>,
 ) {
     state.field_type = determine_type(value);
     if !state.frozen && !state.values.contains(value) {
@@ -232,10 +325,13 @@ fn observe_admitted(
             state.frozen = true; // clamp + serve
         }
     }
-    if let Some(p) = parser
+    if let Some(p) = source.parser()
         && !state.parsers.contains(&p)
     {
         state.parsers.push(p);
+    }
+    if let FieldSource::Json { path } = source {
+        store_json_path(budget, state, path);
     }
 }
 
@@ -270,26 +366,22 @@ impl FieldAccumulator {
 
     /// Structured-metadata pairs: fields with no parser attribution.
     pub(super) fn observe_structured_metadata(&mut self, pairs: &[(String, String)]) {
-        self.observe_parsed(pairs, None);
+        self.observe_parsed(pairs, FieldSource::Unattributed);
     }
 
     /// Parsed pairs — from the query pipeline's own extractions
-    /// (`parser = None`) or from [`auto_parse_into`]'s json/logfmt
-    /// detection (`parser = Some(...)`).
-    pub(super) fn observe_parsed(
-        &mut self,
-        pairs: &[(String, String)],
-        parser: Option<&'static str>,
-    ) {
+    /// ([`FieldSource::Unattributed`]) or from [`auto_parse_into`]'s
+    /// json/logfmt detection.
+    pub(super) fn observe_parsed(&mut self, pairs: &[(String, String)], source: FieldSource<'_>) {
         for (key, value) in pairs {
-            self.observe_pair(key, value, parser);
+            self.observe_pair(key, value, source);
         }
     }
 
     /// One observed `key = value` pair, borrowed — nothing is cloned until
     /// the retention budget has approved the bytes (issue #244).
     /// `__error__`/`__error_details__` never become fields.
-    pub(super) fn observe_pair(&mut self, key: &str, value: &str, parser: Option<&'static str>) {
+    pub(super) fn observe_pair(&mut self, key: &str, value: &str, source: FieldSource<'_>) {
         if key == ERROR_LABEL || key == ERROR_DETAILS_LABEL {
             return;
         }
@@ -310,6 +402,7 @@ impl FieldAccumulator {
                     field_type: "string",
                     values: HashSet::new(),
                     parsers: Vec::with_capacity(2),
+                    json_path: None,
                     frozen: false,
                 },
             );
@@ -319,7 +412,7 @@ impl FieldAccumulator {
         let Some(state) = self.fields.get_mut(key) else {
             return;
         };
-        observe_admitted(&mut self.budget, state, value, parser);
+        observe_admitted(&mut self.budget, state, value, source);
     }
 
     /// Bytes the retention budget has accepted so far.
@@ -334,9 +427,19 @@ impl FieldAccumulator {
         self.budget.peak_charged()
     }
 
-    /// Final response entries, sorted by label (deterministic wire order —
-    /// a documented divergence from the reference's Go map order), plus
-    /// whether the retention budget ever refused a charge (issue #244).
+    /// Final response entries, sorted by label, plus whether the
+    /// retention budget ever refused a charge (issue #244).
+    ///
+    /// The sort is a deterministic PIN, not parity: the reference ranges
+    /// a Go map at both slice-build sites and never sorts before
+    /// marshaling (`pkg/querier/queryrange/detected_fields.go:57-75`,
+    /// `pkg/storage/detected/fields.go:54-101`,
+    /// `pkg/util/marshal/marshal.go:182-188 @ v3.7.4`), so its order is
+    /// randomised per iteration and irreproducible even against itself —
+    /// there is no order to mirror. Registered as
+    /// `detected-fields-array-order-pinned` in
+    /// docs/benchmarks/logs-differential-ledger.md; the same treatment
+    /// `label-replace-collision-tie-order` and `approx_topk` get.
     ///
     /// Allocates the response `Vec<DetectedFieldOut>` — RESPONSE-scoped, at
     /// most `field_limit` (<= 5000) entries, once per request. Outside every
@@ -353,6 +456,7 @@ impl FieldAccumulator {
                 field_type: state.field_type,
                 cardinality: state.values.len() as u64,
                 parsers: state.parsers,
+                json_path: state.json_path,
             })
             .collect();
         out.sort_by(|a, b| a.label.cmp(&b.label));
@@ -411,20 +515,32 @@ static LOGFMT_PARSER: LazyLock<CompiledPipeline> = LazyLock::new(|| {
 /// logfmt's reading of a JSON line instead of refusing. The template
 /// budget stays unreachable here (the probe pipelines are bare parsers
 /// with no templates) — only the key budget can fire.
+/// `paths` is the issue #254 capture sink, addressed by position in
+/// `out`: after a `json` win, `paths.get(i)` is the raw key path behind
+/// `out[i]`. Both probe runs are handed the SAME sink and every `| json`
+/// stage clears it on entry, so a logfmt win (or a total failure) leaves
+/// it empty rather than showing the abandoned json attempt's paths.
 pub(super) fn auto_parse_into<'l>(
     line: &'l str,
     out: &mut Vec<(Cow<'l, str>, Cow<'l, str>)>,
+    paths: &mut JsonPaths,
 ) -> Result<Option<&'static str>, RowBudgetExceeded> {
     for (name, parser) in [("json", &*JSON_PARSER), ("logfmt", &*LOGFMT_PARSER)] {
+        // An abandoned attempt's captured paths never survive into the
+        // next one: the logfmt pipeline has no `| json` stage, so it
+        // would not clear them itself.
+        paths.clear();
         // Auto-detection probes carry no row timestamp (plan v1 §4:
         // detected.rs passes 0) — the probe pipelines are bare parsers,
         // so `__timestamp__` is unreachable and 0 is inert.
-        let (kept, has_err) = parser.run_into_reporting_err(line, &[], 0, out)?;
+        let (kept, has_err) =
+            parser.run_into_reporting_err_with_json_paths(line, &[], 0, out, Some(&mut *paths))?;
         if kept.is_some() && !has_err {
             return Ok(Some(name));
         }
     }
     out.clear();
+    paths.clear();
     Ok(None)
 }
 
@@ -470,8 +586,9 @@ mod tests {
     /// which the scratch-reuse refactor did not change.
     fn auto_parse(line: &str) -> Option<(&'static str, Vec<(String, String)>)> {
         let mut out = Vec::new();
-        let parser =
-            auto_parse_into(line, &mut out).expect("no budget breach in these fixtures")?;
+        let mut paths = JsonPaths::default();
+        let parser = auto_parse_into(line, &mut out, &mut paths)
+            .expect("no budget breach in these fixtures")?;
         let pairs = out
             .into_iter()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -614,6 +731,197 @@ mod tests {
         assert!(!pairs.iter().any(|(k, _)| k == ERROR_LABEL), "{pairs:?}");
     }
 
+    // -- auto_parse json-path capture (issue #254) ------------------------
+
+    /// `(label, value, captured raw path)` for one auto-parsed pair.
+    type CapturedPair = (String, String, Option<Vec<String>>);
+
+    /// Every pair the auto-parse emitted, in wire order, with its
+    /// captured raw path.
+    fn auto_parse_paths(line: &str) -> (&'static str, Vec<CapturedPair>) {
+        let mut out = Vec::new();
+        let mut paths = JsonPaths::default();
+        let parser = auto_parse_into(line, &mut out, &mut paths)
+            .expect("no budget breach in these fixtures")
+            .expect("the line parses");
+        let pairs = out
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                (
+                    k.to_string(),
+                    v.to_string(),
+                    paths.get(i).map(<[String]>::to_vec),
+                )
+            })
+            .collect();
+        (parser, pairs)
+    }
+
+    fn path_of(pairs: &[CapturedPair], label: &str) -> Option<Vec<String>> {
+        pairs
+            .iter()
+            .find(|(l, ..)| l == label)
+            .unwrap_or_else(|| panic!("no label {label} in {pairs:?}"))
+            .2
+            .clone()
+    }
+
+    /// A top-level field's path is the single RAW key — the reference
+    /// records `[]string{string(key)}` BEFORE sanitizing
+    /// (`pkg/logql/log/parser.go:161-163 @ v3.7.4`), so `a-b` (label
+    /// `a_b`) keeps its hyphen in the path.
+    #[test]
+    fn json_path_of_a_top_level_field_is_the_raw_key() {
+        let (parser, pairs) = auto_parse_paths(r#"{"msg":"hi","a-b":1}"#);
+        assert_eq!(parser, "json");
+        assert_eq!(path_of(&pairs, "msg"), Some(vec!["msg".to_string()]));
+        assert_eq!(path_of(&pairs, "a_b"), Some(vec!["a-b".to_string()]));
+    }
+
+    /// A nested field carries one component per open object, leaf last —
+    /// `buildJSONPathFromPrefixBuffer` (`parser.go:234-248 @ v3.7.4`).
+    #[test]
+    fn json_path_of_a_nested_field_is_every_component_in_order() {
+        let (_, pairs) = auto_parse_paths(r#"{"user":{"id":7,"name":{"first":"a"}}}"#);
+        assert_eq!(
+            path_of(&pairs, "user_id"),
+            Some(vec!["user".to_string(), "id".to_string()])
+        );
+        assert_eq!(
+            path_of(&pairs, "user_name_first"),
+            Some(vec![
+                "user".to_string(),
+                "name".to_string(),
+                "first".to_string()
+            ])
+        );
+    }
+
+    /// A component that trims EMPTY contributes nothing to the label name
+    /// but still occupies a path slot: `buildSanitizedPrefixFromBuffer`
+    /// `continue`s on it (`parser.go:213-228`) while
+    /// `buildJSONPathFromPrefixBuffer` iterates the buffer unfiltered
+    /// (`:234-248 @ v3.7.4`).
+    #[test]
+    fn json_path_keeps_a_component_that_trims_empty() {
+        let (_, pairs) = auto_parse_paths(r#"{"x":{"  ":{"b":1}}}"#);
+        assert_eq!(
+            path_of(&pairs, "x_b"),
+            Some(vec!["x".to_string(), "  ".to_string(), "b".to_string()])
+        );
+    }
+
+    /// The `_extracted` collision rename re-points the path at the RENAMED
+    /// label and records the UNSUFFIXED raw part — the reference trims the
+    /// suffix back off in `buildJSONPathFromPrefixBuffer` (`parser.go:243
+    /// @ v3.7.4`). (Which of the two keys is renamed is the registered
+    /// #334 divergence and is not what this pins.)
+    #[test]
+    fn json_path_follows_the_extracted_collision_rename() {
+        let (_, pairs) = auto_parse_paths(r#"{"a-b":1,"a.b":2}"#);
+        assert_eq!(path_of(&pairs, "a_b"), Some(vec!["a-b".to_string()]));
+        assert_eq!(
+            path_of(&pairs, "a_b_extracted"),
+            Some(vec!["a.b".to_string()])
+        );
+    }
+
+    /// A logfmt-won line captures no path at all — the reference's
+    /// `jsonPath` write is guarded by `slices.Contains(parsers, "json")`
+    /// (`pkg/querier/queryrange/detected_fields.go:342-346 @ v3.7.4`) —
+    /// and the abandoned json attempt's capture never survives.
+    #[test]
+    fn a_logfmt_line_captures_no_json_path() {
+        let (parser, pairs) = auto_parse_paths("method=GET status=200");
+        assert_eq!(parser, "logfmt");
+        assert!(
+            pairs.iter().all(|(.., p)| p.is_none()),
+            "logfmt pairs must carry no path: {pairs:?}"
+        );
+    }
+
+    /// The accumulator stores the path of the LAST json-attributed
+    /// observation and never lets an unattributed or logfmt one clear it
+    /// (`detected_fields.go:337-346 @ v3.7.4`).
+    #[test]
+    fn the_accumulator_keeps_the_last_json_path_and_ignores_other_sources() {
+        let path = vec!["user".to_string(), "id".to_string()];
+        let mut acc = FieldAccumulator::new(10);
+        acc.observe_pair("user_id", "1", FieldSource::Json { path: Some(&path) });
+        acc.observe_pair("user_id", "2", FieldSource::Logfmt);
+        acc.observe_pair("user_id", "3", FieldSource::Unattributed);
+        let (fields, capped) = acc.finish();
+        assert!(!capped);
+        assert_eq!(fields[0].json_path.as_deref(), Some(&path[..]));
+
+        // A json observation whose flatten produced no path CLEARS it.
+        let mut acc = FieldAccumulator::new(10);
+        acc.observe_pair("user_id", "1", FieldSource::Json { path: Some(&path) });
+        acc.observe_pair("user_id", "2", FieldSource::Json { path: None });
+        let (fields, _) = acc.finish();
+        assert_eq!(fields[0].json_path, None);
+    }
+
+    /// A field never seen through the json auto-parse has no path.
+    #[test]
+    fn an_unattributed_field_has_no_json_path() {
+        let mut acc = FieldAccumulator::new(10);
+        acc.observe_pair("trace_id", "abc", FieldSource::Unattributed);
+        let (fields, _) = acc.finish();
+        assert_eq!(fields[0].json_path, None);
+        assert!(fields[0].parsers.is_empty());
+    }
+
+    /// Issue #244's invariant extends to the path: it is charged BEFORE
+    /// it is retained, an identical repeat costs nothing, and a refused
+    /// charge CLAMPS (the stored path stands, `capped` is set) rather than
+    /// erroring.
+    #[test]
+    fn a_json_path_is_charged_once_and_clamps_when_the_budget_refuses() {
+        let short = vec!["a".to_string()];
+        let longer = vec![
+            "averyverylongcomponentname".to_string(),
+            "second".to_string(),
+        ];
+
+        // An identical repeat costs nothing; a GROWING path charges the
+        // delta.
+        let mut acc = FieldAccumulator::new(10);
+        acc.observe_pair("f", "1", FieldSource::Json { path: Some(&short) });
+        let after_first = acc.charged();
+        acc.observe_pair("f", "1", FieldSource::Json { path: Some(&short) });
+        assert_eq!(
+            acc.charged(),
+            after_first,
+            "an identical path must not be charged again"
+        );
+        acc.observe_pair(
+            "f",
+            "1",
+            FieldSource::Json {
+                path: Some(&longer),
+            },
+        );
+        assert!(acc.charged() > after_first, "a longer path charges more");
+
+        // A budget sized EXACTLY for the first observation refuses the
+        // growth: the stored path stands and `capped` is set — a clamp,
+        // never an error.
+        let mut acc = FieldAccumulator::with_byte_budget(10, after_first);
+        acc.observe_pair("f", "1", FieldSource::Json { path: Some(&short) });
+        acc.observe_pair(
+            "f",
+            "1",
+            FieldSource::Json {
+                path: Some(&longer),
+            },
+        );
+        let (fields, capped) = acc.finish();
+        assert!(capped, "the refused path growth must set retention_capped");
+        assert_eq!(fields[0].json_path.as_deref(), Some(&short[..]));
+    }
+
     // -- FieldAccumulator --------------------------------------------------
 
     #[test]
@@ -625,7 +933,7 @@ mod tests {
                 ("__error_details__", "x"),
                 ("ok", "1"),
             ]),
-            None,
+            FieldSource::Unattributed,
         );
         let (fields, _) = acc.finish();
         assert_eq!(fields.len(), 1);
@@ -635,9 +943,12 @@ mod tests {
     #[test]
     fn field_limit_caps_on_first_seen_names_and_skips_later_names_entirely() {
         let mut acc = FieldAccumulator::new(2);
-        acc.observe_parsed(&owned(&[("a", "1"), ("b", "2"), ("c", "3")]), None);
+        acc.observe_parsed(
+            &owned(&[("a", "1"), ("b", "2"), ("c", "3")]),
+            FieldSource::Unattributed,
+        );
         // `a` is already admitted — later observations still count.
-        acc.observe_parsed(&owned(&[("a", "4"), ("c", "5")]), None);
+        acc.observe_parsed(&owned(&[("a", "4"), ("c", "5")]), FieldSource::Unattributed);
         let (fields, _) = acc.finish();
         assert_eq!(
             fields.iter().map(|f| f.label.as_str()).collect::<Vec<_>>(),
@@ -650,9 +961,9 @@ mod tests {
     #[test]
     fn cardinality_is_exact_over_distinct_values() {
         let mut acc = FieldAccumulator::new(100);
-        acc.observe_parsed(&owned(&[("k", "x")]), None);
-        acc.observe_parsed(&owned(&[("k", "y")]), None);
-        acc.observe_parsed(&owned(&[("k", "x")]), None);
+        acc.observe_parsed(&owned(&[("k", "x")]), FieldSource::Unattributed);
+        acc.observe_parsed(&owned(&[("k", "y")]), FieldSource::Unattributed);
+        acc.observe_parsed(&owned(&[("k", "x")]), FieldSource::Unattributed);
         let (fields, _) = acc.finish();
         assert_eq!(fields[0].cardinality, 2);
     }
@@ -660,9 +971,9 @@ mod tests {
     #[test]
     fn type_is_re_detected_per_observation_and_the_last_wins() {
         let mut acc = FieldAccumulator::new(100);
-        acc.observe_parsed(&owned(&[("k", "42")]), None);
+        acc.observe_parsed(&owned(&[("k", "42")]), FieldSource::Unattributed);
         assert_eq!(acc.fields["k"].field_type, "int");
-        acc.observe_parsed(&owned(&[("k", "hello")]), None);
+        acc.observe_parsed(&owned(&[("k", "hello")]), FieldSource::Unattributed);
         let (fields, _) = acc.finish();
         assert_eq!(fields[0].field_type, "string", "last observation wins");
     }
@@ -671,9 +982,15 @@ mod tests {
     fn structured_metadata_fields_carry_no_parser_and_parsed_fields_dedupe_parsers() {
         let mut acc = FieldAccumulator::new(100);
         acc.observe_structured_metadata(&owned(&[("trace_id", "abc")]));
-        acc.observe_parsed(&owned(&[("level", "info")]), Some("json"));
-        acc.observe_parsed(&owned(&[("level", "warn")]), Some("json"));
-        acc.observe_parsed(&owned(&[("level", "err")]), Some("logfmt"));
+        acc.observe_parsed(
+            &owned(&[("level", "info")]),
+            FieldSource::Json { path: None },
+        );
+        acc.observe_parsed(
+            &owned(&[("level", "warn")]),
+            FieldSource::Json { path: None },
+        );
+        acc.observe_parsed(&owned(&[("level", "err")]), FieldSource::Logfmt);
         let (fields, _) = acc.finish();
         let trace = fields
             .iter()
@@ -691,10 +1008,15 @@ mod tests {
         );
     }
 
+    /// The `detected-fields-array-order-pinned` ledger row's gate: the
+    /// wire order is label-ascending regardless of accumulation order.
     #[test]
     fn finish_sorts_fields_by_label() {
         let mut acc = FieldAccumulator::new(100);
-        acc.observe_parsed(&owned(&[("zeta", "1"), ("alpha", "2")]), None);
+        acc.observe_parsed(
+            &owned(&[("zeta", "1"), ("alpha", "2")]),
+            FieldSource::Unattributed,
+        );
         let (fields, _) = acc.finish();
         assert_eq!(
             fields.iter().map(|f| f.label.as_str()).collect::<Vec<_>>(),
@@ -719,7 +1041,11 @@ mod tests {
         let budget = 4 * 1024;
         let mut acc = FieldAccumulator::with_byte_budget(100, budget);
         for i in 0..500u32 {
-            acc.observe_pair(&format!("k{}", i % 7), &format!("value-{i}"), None);
+            acc.observe_pair(
+                &format!("k{}", i % 7),
+                &format!("value-{i}"),
+                FieldSource::Unattributed,
+            );
             assert!(
                 acc.charged() <= budget,
                 "charged {} exceeded budget {budget} at observation {i}",
@@ -745,9 +1071,9 @@ mod tests {
             "budget must refuse the second admission"
         );
         let mut acc = FieldAccumulator::with_byte_budget(100, budget);
-        acc.observe_pair(first, "1", None);
+        acc.observe_pair(first, "1", FieldSource::Unattributed);
         let charged_before = acc.charged();
-        acc.observe_pair(second, "2", None);
+        acc.observe_pair(second, "2", FieldSource::Unattributed);
         assert_eq!(
             acc.charged(),
             charged_before,
@@ -770,9 +1096,9 @@ mod tests {
             "budget must refuse the wide value"
         );
         let mut acc = FieldAccumulator::with_byte_budget(100, budget);
-        acc.observe_pair("k", "small", None);
+        acc.observe_pair("k", "small", FieldSource::Unattributed);
         let charged_before = acc.charged();
-        acc.observe_pair("k", &wide, None);
+        acc.observe_pair("k", &wide, FieldSource::Unattributed);
         assert_eq!(acc.charged(), charged_before);
         assert!(acc.fields["k"].frozen, "the refusal freezes the field");
         let (fields, capped) = acc.finish();
@@ -790,7 +1116,11 @@ mod tests {
     fn a_tiny_budget_clamps_and_serves_never_errors() {
         let mut acc = FieldAccumulator::with_byte_budget(100, 4 * 1024);
         for i in 0..500u32 {
-            acc.observe_pair(&format!("field{}", i % 50), &format!("v{i}"), None);
+            acc.observe_pair(
+                &format!("field{}", i % 50),
+                &format!("v{i}"),
+                FieldSource::Unattributed,
+            );
         }
         let (fields, capped) = acc.finish();
         assert!(capped, "retention_capped must be set");
@@ -809,11 +1139,11 @@ mod tests {
     fn a_frozen_field_still_re_detects_type_and_appends_parsers() {
         let budget = field_entry_bytes("k") + value_entry_bytes("42") + 1;
         let mut acc = FieldAccumulator::with_byte_budget(100, budget);
-        acc.observe_pair("k", "42", Some("json"));
+        acc.observe_pair("k", "42", FieldSource::Json { path: None });
         assert_eq!(acc.fields["k"].field_type, "int");
         // Refused (freezes): a value with a different detected type and
         // the other parser name.
-        acc.observe_pair("k", "hello-world-wide-value", Some("logfmt"));
+        acc.observe_pair("k", "hello-world-wide-value", FieldSource::Logfmt);
         assert!(acc.fields["k"].frozen);
         let (fields, capped) = acc.finish();
         assert!(capped);
@@ -841,7 +1171,7 @@ mod tests {
         let mut acc = FieldAccumulator::with_byte_budget(5000, budget);
         for i in 0..512u32 {
             let name = format!("{i:05}-{}", "n".repeat(65_536));
-            acc.observe_pair(&name, "v", None);
+            acc.observe_pair(&name, "v", FieldSource::Unattributed);
         }
         let (fields, capped) = acc.finish();
         assert!(capped, "512 x 64 KiB names must breach 1 MiB");

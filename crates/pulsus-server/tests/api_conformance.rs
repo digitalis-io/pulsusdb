@@ -749,10 +749,19 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             );
         }
         (Surface::LogsDetectedFields, _) => {
-            // Issue #170, docs/api.md §2.6.3: exact empty-DB equality —
-            // the default field limit (1000) and NO `pulsus_partial` key
-            // (complete responses stay byte-identical to the reference
-            // shape).
+            // Issues #170/#258, docs/api.md §2.6.3: against an empty
+            // database the exact body is the reference's bare `{}` — no
+            // `fields`, no `limit` (only assigned when fields exist), no
+            // `pulsus_partial`.
+            //
+            // This is a SHAPE assertion, NOT the mounting oracle: `{}` is
+            // not handler-identifying. Mounting is proven twice over —
+            // `assert_full_route_matrix` asserts the exact documented
+            // success STATUS before this runs (an unmounted path is an
+            // empty 404), and
+            // `assert_detected_fields_handler_identity` drives the same
+            // route to an `explain` payload only this handler can
+            // produce.
             assert!(
                 res.content_type()
                     .is_some_and(|ct| ct.starts_with("application/json")),
@@ -760,7 +769,7 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             );
             assert_eq!(
                 res.json(ctx),
-                serde_json::json!({ "fields": [], "limit": 1000 }),
+                serde_json::json!({}),
                 "{ctx}: exact empty-DB detected_fields body"
             );
         }
@@ -1175,9 +1184,52 @@ fn assert_full_route_matrix(port: u16, spec: &RouteSpec, spawn: &str) {
     let res = get(port, &sibling, &ctx);
     assert_404_empty(&res, &ctx);
 
+    if spec.surface == Surface::LogsDetectedFields {
+        assert_detected_fields_handler_identity(port, spec, spawn);
+    }
+
     for case in spec.cases {
         run_case(port, spec, case, spawn);
     }
+}
+
+/// The `/detected_fields` MOUNTING ORACLE (issue #258).
+///
+/// Until #258 the oracle was the empty-DB body `{"fields":[],"limit":N}`
+/// — recognisable, but a divergence from the reference, and a test that
+/// depends on the divergent shape blocks fixing it. The reference's
+/// zero-field body is bare `{}`, which identifies nothing, so the oracle
+/// moved to a signal that does not live in the field list at all: with
+/// `X-Pulsus-Explain: 1` the handler answers with the additive `explain`
+/// object, whose `result_type` is the literal `detected_fields` that
+/// `logs_api::detected::detected_fields_impl` alone passes to
+/// `PlanExplain::new`. A route that is unmounted (empty 404), bound to
+/// another handler, or stubbed out to return a bare `{}` all fail here.
+///
+/// The other spawns keep the exact documented success status as their
+/// mounting proof — which is what actually distinguished a mounted route
+/// from an empty 404 all along; the body equality never added mounting
+/// information, only shape.
+fn assert_detected_fields_handler_identity(port: u16, spec: &RouteSpec, spawn: &str) {
+    let ctx = format!(
+        "[{spawn}] GET {} case=mounting-oracle-explain-fingerprint",
+        spec.path
+    );
+    let mut req = manifest::Req::new("GET", resolve_path(spec.path));
+    req.query = spec.base_query.to_string();
+    req.headers.push(("x-pulsus-explain", "1".to_string()));
+    let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_eq!(
+        res.status,
+        spec.success_status,
+        "{ctx}: status (body: {:?})",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(&ctx);
+    assert_eq!(
+        json["explain"]["result_type"], "detected_fields",
+        "{ctx}: only the detected_fields handler stamps this result_type, body {json}"
+    );
 }
 
 /// The dedicated trace-fetch matrix (issue #55; `Surface::TracesFetch` is
