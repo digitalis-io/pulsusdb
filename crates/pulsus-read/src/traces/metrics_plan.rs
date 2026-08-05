@@ -97,8 +97,9 @@ pub enum PlanKind {
     /// power-of-two nanosecond bucket that actually occurred
     /// (`__bucket=<bucket seconds>` label), the reference's
     /// `Log2Bucketize` model (issue #252). There is no ladder and no
-    /// cumulation; membership is data-dependent, bounded at 64 buckets
-    /// per step by the bit width of `Int64`.
+    /// cumulation; membership is data-dependent, bounded by the bit
+    /// width of `Int64` — 63 buckets are reachable, and the gates use 64
+    /// as the static ceiling.
     Histogram,
     /// `compare({selection})` — baseline/selection attribute meta-series
     /// (`__meta_type` + one attribute label). The cross-tab/totals SQL is

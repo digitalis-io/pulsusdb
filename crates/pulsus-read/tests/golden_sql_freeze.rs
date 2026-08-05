@@ -119,11 +119,13 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 2
 ///   3. One non-`.sql` file was ADDED — `log2_reference_capture.json`,
 ///      the byte-committed capture from the pinned Tempo container. The
 ///      walk digests EVERY entry, whatever its extension, so it moves
-///      both numbers by design.
+///      both numbers by design. (Re-captured once during review, when
+///      two corpora were added to hold down the series-ORDER rule: the
+///      count did not move, the digest did.)
 ///
 /// Corpus 66 -> 69 entries; `quantile_over_time_multi.sql` and the other
 /// 65 pre-existing goldens are byte-identical.
-const PINNED_SQL_CORPUS: u64 = 0xfef1_d4ae_c000_15e5;
+const PINNED_SQL_CORPUS: u64 = 0x9914_8221_0273_86ea;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

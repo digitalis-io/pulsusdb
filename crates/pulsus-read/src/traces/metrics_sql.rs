@@ -697,9 +697,11 @@ const LOG2_BUCKET_EXPR: &str = "toUInt64(roundToExp2(val - 1)) * 2";
 /// raw rows, and it keeps the inner subquery byte-identical to
 /// [`metrics_agg_range_sql`]'s, so the PREWHERE hoist, `service_time`
 /// projection selection and `trace_attrs_idx` granule pruning are
-/// unchanged. The guard is also what excludes negatives: `roundToExp2`
-/// of a negative argument feeds `toUInt64` and would yield a large,
-/// plausible-looking bucket rather than an error.
+/// unchanged. The guard is also what excludes negatives, and it fails
+/// SILENTLY without it: measured on 24.8.14.39, `roundToExp2` over
+/// `Int64` returns `0` for every argument `<= 0`, so a `-1`, `0` or
+/// `1` ns duration lands in a spurious `__bucket = 0` series rather than
+/// raising anything.
 ///
 /// `roundToExp2` rounds DOWN and `roundUpToPowerOfTwo` does not exist on
 /// ClickHouse 24.8, hence the `(val - 1) * 2` form. The `toUInt64`
@@ -711,10 +713,12 @@ const LOG2_BUCKET_EXPR: &str = "toUInt64(roundToExp2(val - 1)) * 2";
 /// `Int64` (`crates/pulsus-schema/src/catalog.rs:347`), and nothing is
 /// claimed above it.
 ///
-/// The returned row count per step is bounded by 64 — the bit width of
-/// the duration, not a property of the corpus — so the bucket axis can
-/// never breach `traceql_max_series` (which in any case gates `by(...)`
-/// keys, and grouping stays rejected for this function).
+/// The returned row count per step is bounded by the bit width of the
+/// duration, not by any property of the corpus: an `Int64` nanosecond
+/// duration reaches exactly 63 distinct buckets (`2^1 .. 2^63`), and the
+/// gates use 64 as the static ceiling. So the bucket axis can never
+/// breach `traceql_max_series` (which in any case gates `by(...)` keys,
+/// and grouping stays rejected for this function).
 pub fn metrics_log2_bucket_range_sql(
     spans_table: &str,
     filter: &FilterSql,

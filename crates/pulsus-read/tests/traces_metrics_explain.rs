@@ -816,12 +816,22 @@ async fn metrics_explain_and_budget_gates() {
     // Maximum occupancy: one span per reachable power of two, so every
     // one of the 62 storable buckets is occupied at once and the exact
     // identity is exercised where the row count is largest.
-    // Anchored to a step START and packed 10 s apart, so all 62 land in
+    // Anchored to a step START and packed 10 s apart, so all 63 land in
     // ONE step: the ceiling is only exercised where a single step
     // carries every bucket.
+    //
+    // `1i64 << k` for k in 1..=62 occupies buckets 2^1..2^62, and the
+    // extra `2^62 + 1` span occupies 2^63 — the TOP of the reachable
+    // range, which is the whole reason `bucket_ns` is `UInt64` and the
+    // SQL casts before doubling. Without it this corpus would claim
+    // "every reachable bucket" while leaving the one that motivated the
+    // type untested.
     let maxocc_base = step_start_ns(base + WINDOW_NS / 2) + 60 * NS_PER_S;
     let maxocc: Vec<(i64, i64)> = (1..=62u32)
-        .map(|k| (maxocc_base + i64::from(k) * 10 * NS_PER_S, 1i64 << k))
+        .map(|k| 1i64 << k)
+        .chain(std::iter::once((1i64 << 62) + 1))
+        .enumerate()
+        .map(|(i, dur_ns)| (maxocc_base + i as i64 * 10 * NS_PER_S, dur_ns))
         .collect();
     let values: Vec<String> = maxocc
         .iter()
@@ -860,7 +870,14 @@ async fn metrics_explain_and_budget_gates() {
         .await
         .expect("the max-occupancy query's QueryFinish row must exist");
     let (max_want_rows, max_occupancy) = expected_bucket_rows(&maxocc);
-    assert_eq!(max_want_rows, 62, "every reachable power of two is seeded");
+    assert_eq!(
+        max_want_rows, 63,
+        "every reachable bucket is seeded: 2^1..=2^62 plus 2^63 (from a 2^62 + 1 duration)"
+    );
+    assert!(
+        maxocc.iter().any(|(_, d)| *d == (1i64 << 62) + 1),
+        "the 2^63 bucket's seed span must be present"
+    );
     assert_eq!(
         max_row.result_rows, max_want_rows,
         "the same exact identity at maximum occupancy"
@@ -870,7 +887,7 @@ async fn metrics_explain_and_budget_gates() {
         "the static ceiling holds at maximum occupancy too"
     );
     assert!(
-        max_occupancy >= 60,
+        max_occupancy >= 63,
         "the max-occupancy corpus must pack its buckets into few steps to exercise the ceiling \
          (max per-step occupancy {max_occupancy})"
     );

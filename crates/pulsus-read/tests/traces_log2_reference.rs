@@ -10,9 +10,12 @@
 //!   per-bucket tallies, and — the part a "better ladder" could never
 //!   satisfy — the buckets it emitted NO series for.
 //! - **AC8 — the emitted ORDER matches**, through the production
-//!   comparator, which orders on the RENDERED label text
-//!   (`sortResponse`,
-//!   `modules/frontend/combiner/metrics_query_range.go:245-266 @ v3.0.2`).
+//!   comparator (`sortResponse`,
+//!   `modules/frontend/combiner/metrics_query_range.go:245-266 @ v3.0.2`),
+//!   which orders on the label value RENDERED AS GO'S `%g` — the
+//!   `AnyValue.String()`/`CompactTextString` path, NOT the protojson
+//!   body. Two capture corpora exist solely to hold that distinction
+//!   down; see the order test.
 //! - **AC3b — `quantile_over_time` DIVERGES, and we have characterised
 //!   the divergence correctly.** A test-only port of the reference's
 //!   `Log2QuantileWithBucket` (`pkg/traceql/engine_metrics.go:2058-2120
@@ -39,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use pulsus_read::traces::exec::{label_sort_text, sort_series_like_the_reference};
+use pulsus_read::traces::exec::sort_series_like_the_reference;
 use pulsus_read::traces::log2_histogram::{bucket_seconds, log2_bucketize_ns};
 use pulsus_read::{MetricLabel, MetricLabelValue, TraceMetricSeries};
 use serde::Deserialize;
@@ -47,16 +50,16 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 struct Capture {
     corpora: Vec<Corpus>,
-    wire_float_text: WireFloatText,
 }
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
     name: String,
     durations_ns: Vec<i64>,
-    buckets: Vec<CapturedBucket>,
+    /// The buckets IN THE ORDER the reference returned them, each with
+    /// the `doubleValue` text read off its HTTP body.
+    emitted_buckets: Vec<CapturedBucket>,
     absent_buckets_ns: Vec<u64>,
-    emitted_bucket_text_order: Vec<String>,
     count_over_time: usize,
     quantiles: Vec<CapturedQuantile>,
 }
@@ -66,6 +69,7 @@ struct CapturedBucket {
     bucket_ns: u64,
     seconds: f64,
     count: u64,
+    wire_text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,12 +77,6 @@ struct CapturedQuantile {
     p: f64,
     value: f64,
     branch: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireFloatText {
-    reference: BTreeMap<String, String>,
-    pulsusdb: BTreeMap<String, String>,
 }
 
 fn capture() -> Capture {
@@ -105,7 +103,7 @@ fn our_bucket_rule_reproduces_every_captured_reference_histogram() {
     for corpus in capture().corpora {
         let ours = our_tallies(&corpus.durations_ns);
         let theirs: BTreeMap<u64, u64> = corpus
-            .buckets
+            .emitted_buckets
             .iter()
             .map(|b| (b.bucket_ns, b.count))
             .collect();
@@ -115,7 +113,7 @@ fn our_bucket_rule_reproduces_every_captured_reference_histogram() {
             corpus.name
         );
         // The label rendering, bit-exact.
-        for b in &corpus.buckets {
+        for b in &corpus.emitted_buckets {
             assert_eq!(
                 bucket_seconds(b.bucket_ns).to_bits(),
                 b.seconds.to_bits(),
@@ -156,13 +154,35 @@ fn our_bucket_rule_reproduces_every_captured_reference_histogram() {
     }
 }
 
+/// AC8, with no exemptions: the production comparator must reproduce the
+/// order the reference actually emitted, for EVERY captured corpus.
+///
+/// Two of the corpora exist only for this test, and both were measured
+/// on the container rather than derived:
+///
+/// - **`mix1024`** (`2^10` + `2^20 ns`) — the reference emits
+///   `0.001048576` then `0.000001024`. Sorting on the WIRE text would
+///   emit them the other way round, because protojson renders `2^10 ns`
+///   as `0.000001024` while the sort key renders it `1.024e-06`.
+/// - **`mix16k`** (`2^14` + `2^20 ns`, i.e. a 16 µs span beside a 1 ms
+///   span — an ordinary corpus, not an exotic one) — the reference emits
+///   `0.001048576` then `0.000016384`. Here `serde_json` and protojson
+///   AGREE on `0.000016384` and it is Go's `%g` that differs
+///   (`1.6384e-05`), so a comparator built on our own JSON rendering
+///   gets this backwards.
+///
+/// Those two are why [`sort_series_like_the_reference`] compares Go's
+/// `%g` rather than the wire text; without them the wrong comparator
+/// passes every other corpus here.
 #[test]
 fn the_production_comparator_reproduces_the_reference_series_order() {
+    let mut discriminating: Vec<String> = Vec::new();
+    let mut reference_wire_discriminating: Vec<String> = Vec::new();
     for corpus in capture().corpora {
         let mut series: Vec<TraceMetricSeries> = our_tallies(&corpus.durations_ns)
             .into_iter()
-            // SQL hands them over ascending by bucket_ns, which for
-            // mix252 is NOT the order the reference emits.
+            // The SQL hands these over ascending by bucket_ns, which is
+            // NOT the order the reference emits.
             .map(|(bucket_ns, n)| TraceMetricSeries {
                 labels: vec![MetricLabel::double("__bucket", bucket_seconds(bucket_ns))],
                 samples: vec![(0, n as f64)],
@@ -170,53 +190,92 @@ fn the_production_comparator_reproduces_the_reference_series_order() {
             })
             .collect();
         sort_series_like_the_reference(&mut series);
-        let ours: Vec<String> = series
+        let ours: Vec<u64> = series
             .iter()
-            .map(|s| label_sort_text(&s.labels[0].value))
+            .map(|s| {
+                let MetricLabelValue::Double(seconds) = s.labels[0].value else {
+                    panic!("__bucket is a double");
+                };
+                (seconds * 1e9).round() as u64
+            })
             .collect();
-        // `tiny252` is the one corpus whose rendering differs from the
-        // reference's (2^10 ns: we emit `1.024e-6`, protojson emits
-        // `0.000001024` — see `wire_float_text` and AGENT.md), so its
-        // ORDER is compared against the reference's numerically-sorted
-        // equivalent rather than text-for-text.
-        if corpus.name == "tiny252" {
-            assert_eq!(ours, vec!["1.024e-6", "1099.511627776"]);
-            continue;
-        }
+        let theirs: Vec<u64> = corpus.emitted_buckets.iter().map(|b| b.bucket_ns).collect();
         assert_eq!(
-            ours, corpus.emitted_bucket_text_order,
-            "{}: emitted series order",
+            ours, theirs,
+            "{}: our series order must equal the order the reference emitted",
             corpus.name
         );
+
+        // …and the order a comparator keyed on OUR OWN wire text would
+        // have produced, counted per corpus so a corpus that cannot tell
+        // the two rules apart is visibly not carrying the claim.
+        let mut by_our_wire_text = theirs.clone();
+        by_our_wire_text.sort_by_key(|ns| {
+            serde_json::to_string(&bucket_seconds(*ns)).expect("finite bucket label")
+        });
+        if by_our_wire_text != theirs {
+            discriminating.push(corpus.name.clone());
+        }
+
+        // …and the order a comparator keyed on the REFERENCE's own wire
+        // text would have produced. That one is not the sort key either
+        // — `sortResponse` compares `AnyValue.String()` (Go `%g`), not
+        // the protojson body — and `mix1024` is the corpus that proves
+        // it: protojson writes `2^10 ns` as `0.000001024`, which sorts
+        // FIRST, while the reference emitted it SECOND.
+        let mut by_their_wire_text: Vec<u64> = theirs.clone();
+        let wire: BTreeMap<u64, String> = corpus
+            .emitted_buckets
+            .iter()
+            .map(|b| (b.bucket_ns, b.wire_text.clone()))
+            .collect();
+        by_their_wire_text.sort_by_key(|ns| wire[ns].clone());
+        if by_their_wire_text != theirs {
+            reference_wire_discriminating.push(corpus.name.clone());
+        }
     }
+    assert_eq!(
+        discriminating,
+        vec!["mix16k".to_string()],
+        "exactly one captured corpus distinguishes the reference's order from a comparator \
+         keyed on OUR wire text; without it, the wrong comparator passes this test"
+    );
+    assert_eq!(
+        reference_wire_discriminating,
+        vec!["mix1024".to_string(), "mix16k".to_string()],
+        "both order corpora show the reference does NOT sort on its own wire text — which is \
+         why the sort key is Go's %g and not a rendering of the response body"
+    );
 }
 
+/// AC9, recorded rather than filed: the JSON float text, both sides,
+/// measured. Same value, same parse, different text — cosmetic under the
+/// consumer-impact rule, but it is NOT the sort key (see
+/// `the_production_comparator_reproduces_the_reference_series_order`),
+/// so it changes no ordering.
 #[test]
 fn the_wire_float_text_divergence_is_exactly_the_recorded_one() {
-    // AC9, recorded rather than filed. The capture's `pulsusdb` column
-    // must be what our encoder actually emits, or the AGENT.md note is
-    // fiction; the `reference` column is read off the reference's HTTP
-    // body.
-    let cap = capture();
-    for (ns_text, want) in &cap.wire_float_text.pulsusdb {
-        let ns: u64 = ns_text.parse().expect("bucket ns key");
-        assert_eq!(
-            label_sort_text(&MetricLabelValue::Double(bucket_seconds(ns))),
-            *want,
-            "our rendering of {ns} ns"
-        );
+    let mut differing: Vec<(u64, String, String)> = Vec::new();
+    for corpus in capture().corpora {
+        for b in &corpus.emitted_buckets {
+            let ours =
+                serde_json::to_string(&bucket_seconds(b.bucket_ns)).expect("finite bucket label");
+            if ours != b.wire_text {
+                differing.push((b.bucket_ns, b.wire_text.clone(), ours));
+            }
+        }
     }
-    // The divergence is confined to the four buckets where ryu picks
-    // exponent form and protojson picks plain decimal; the VALUES agree
-    // everywhere (same f64, same parse).
-    let differing: Vec<&String> = cap
-        .wire_float_text
-        .reference
-        .iter()
-        .filter(|(k, v)| cap.wire_float_text.pulsusdb.get(*k) != Some(*v))
-        .map(|(k, _)| k)
-        .collect();
-    assert_eq!(differing, vec!["1024"], "recorded text divergences");
+    differing.sort();
+    differing.dedup();
+    // protojson uses `encoding/json`'s rule (exponent form iff
+    // |v| < 1e-6 or >= 1e21, leading zero stripped from the exponent);
+    // ryu switches at a different threshold. Over every bucket the
+    // capture covers, that is one bucket: 2^10 ns.
+    assert_eq!(
+        differing,
+        vec![(1024u64, "0.000001024".to_string(), "1.024e-6".to_string())],
+        "recorded wire-text divergences"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -305,7 +364,7 @@ fn the_oracle_reproduces_every_captured_reference_quantile() {
     let mut witnesses = 0usize;
     for corpus in capture().corpora {
         let buckets: Vec<Bucket> = corpus
-            .buckets
+            .emitted_buckets
             .iter()
             .map(|b| Bucket {
                 max: b.seconds,

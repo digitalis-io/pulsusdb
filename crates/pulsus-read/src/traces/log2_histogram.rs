@@ -49,11 +49,16 @@
 /// sentence rather than a dead branch.
 ///
 /// The SQL twin is `toUInt64(roundToExp2(val - 1)) * 2` guarded by
-/// `WHERE val >= 2` on the OUTER query (after the replay dedup). The
-/// guard is what excludes `v <= 1`, not the expression: a negative `val`
-/// reaching `toUInt64` would produce a large, plausible-looking bucket
-/// rather than an error, which is why the guard is tested live
-/// (`traces_metrics_live.rs`) and not reasoned about.
+/// `WHERE val >= 2` on the OUTER query (after the replay dedup). **The
+/// guard is what excludes `v <= 1`, not the expression**, and the
+/// expression fails silently rather than loudly without it: measured on
+/// ClickHouse 24.8.14.39, `roundToExp2` over `Int64` returns `0` for
+/// every argument `<= 0`, so `-1`, `0` and `1` ns all land in a spurious
+/// `__bucket = 0` series that the reference never emits — no error, no
+/// NULL. That is why the guard is tested live against real rows
+/// (`traces_metrics_live.rs::log2_histogram_membership_and_the_sub_two_ns_guard`,
+/// whose mutant produces exactly that `(0.0, 3.0)` series) rather than
+/// reasoned about.
 pub fn log2_bucketize_ns(v: i64) -> Option<u64> {
     if v < 2 {
         return None;
