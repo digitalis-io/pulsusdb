@@ -1678,9 +1678,10 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
     // exceed the 50-row budget: a clean 422, never an unbounded
     // materialization.
     let ctx = "wide-event-set-is-422";
+    let wide_query = "{ name != event:name }";
     let path = format!(
         "/api/traces/v1/search?q={}&start={w0}&end={w1}",
-        enc("{ name != event:name }")
+        enc(wide_query)
     );
     let res = get(port, &path, ctx);
     assert_eq!(
@@ -1692,4 +1693,23 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
     let json = res.json(ctx);
     assert_eq!(json["status"], "error", "{ctx}");
     assert_eq!(json["errorType"], "query_too_broad", "{ctx}: body {json}");
+
+    // The SUCCESS control, on a second server over the SAME database with
+    // a normal budget (review 2's second test gap). Without it, a 422
+    // could equally mean the query is permanently broken — and it also
+    // exercises the co-load at 400 values through the real route, which
+    // is the widest set anything runs against a live ClickHouse.
+    //
+    // `{ name != event:name }` is ALL-match: none of the 400 event names
+    // is `ev-bulk`, so every element satisfies the inequality and the
+    // span matches.
+    let wide_port = port + 1;
+    let _wide_guard = spawn_ready(wide_port, db, &[]);
+    let ctx = "wide-event-set-succeeds-under-a-normal-budget";
+    let res = search(wide_port, wide_query, w0, w1, "", ctx);
+    assert_eq!(
+        trace_set(&res.json(ctx)),
+        BTreeSet::from([hex(&tid(1))]),
+        "{ctx}: the 422 above must be the BUDGET, not a permanently failing query"
+    );
 }

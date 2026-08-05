@@ -216,6 +216,58 @@ const MEMBERSHIP_ENTRY_BYTES: usize =
 /// Retention charge for one numeric attribute value entry.
 const NUM_VALUE_ENTRY_BYTES: usize =
     std::mem::size_of::<(([u8; 16], [u8; 8]), f64)>() + RETAINED_ENTRY_OVERHEAD;
+/// A destination for streamed rows that can PRICE a row before accepting
+/// it (issue #351 review 2).
+///
+/// Two methods rather than one closure because the ORDER is the whole
+/// point: `cost` runs, the budget is charged, and only then does `accept`
+/// take ownership — so a breach refuses the value instead of retaining
+/// it. Expressing that as a trait puts the order in one place
+/// ([`TraceEngine::stream_rows_charged`]) rather than in every caller.
+trait ChargedRowSink<R> {
+    /// The retained cost of `row` — everything that will still be live
+    /// after `accept` returns.
+    fn cost(&mut self, row: &R) -> usize;
+    /// Takes ownership. Called only after the charge succeeded.
+    fn accept(&mut self, row: R);
+}
+
+/// The closure-pair [`ChargedRowSink`]: a pricing function and a
+/// retaining function, so a caller can keep using closures without the
+/// two drifting apart into separate parameters.
+struct FnRowSink<C, A> {
+    cost: C,
+    accept: A,
+}
+
+impl<R, C: FnMut(&R) -> usize, A: FnMut(R)> ChargedRowSink<R> for FnRowSink<C, A> {
+    fn cost(&mut self, row: &R) -> usize {
+        (self.cost)(row)
+    }
+
+    fn accept(&mut self, row: R) {
+        (self.accept)(row)
+    }
+}
+
+/// Retention charge for ONE co-loaded event/link value (issue #351,
+/// review 2), covering every structure that holds it at the peak:
+///
+/// * its slot in the span's `Vec<String>`/`Vec<f64>`, doubled — a
+///   growing `Vec` can hold up to twice the slots it uses, and the
+///   `String` header (24 bytes) upper-bounds the `f64` slot (8) so one
+///   constant serves both branches;
+/// * a WHOLE map entry plus the hash-table envelope. The map holds one
+///   entry per SPAN, not per value, so charging one per value
+///   over-charges — the direction a budget must err in.
+///
+/// The value's own bytes are added by the caller on the text branch. The
+/// string payload is MOVED out of the decoded row into the vec, so it is
+/// charged once and exists once; the row it came from is dropped before
+/// the next is read.
+const EVENT_VALUE_ENTRY_BYTES: usize = 2 * std::mem::size_of::<String>()
+    + std::mem::size_of::<(SpanKey, EventValues)>()
+    + RETAINED_ENTRY_OVERHEAD;
 /// Retention charge for one direct-child-count co-load entry (issue
 /// #184): the `(trace_id, parent span_id) → count` map entry.
 const CHILD_COUNT_ENTRY_BYTES: usize =
@@ -1355,6 +1407,14 @@ impl TraceEngine {
     /// [`TooBroadReason::TraceGeneratorMemory`]) while every other call
     /// site keeps [`map_trace_read_error`] — a single choke point, two
     /// error taxonomies, never conflated.
+    ///
+    /// **If the returned `Vec` is NOT your retained form, use
+    /// [`Self::stream_rows_charged`] instead** (issue #351 review 2). A
+    /// caller that collects here and then reshapes the rows into another
+    /// structure holds BOTH at the same instant — charged once, live
+    /// twice — and the charge, however careful, describes only one of
+    /// them. The streaming form has no intermediate collection, so the
+    /// caller's structure is the whole peak.
     async fn collect_rows_charged<R: ChRow, F: FnMut(&R) -> usize>(
         &self,
         sql: &str,
@@ -1362,13 +1422,48 @@ impl TraceEngine {
         budget: &mut ByteBudget,
         charged: &mut usize,
         mapper: fn(ChError, &TraceReadConfig) -> ReadError,
-        mut cost: F,
+        cost: F,
     ) -> Result<Vec<R>, ReadError> {
+        let mut rows = Vec::new();
+        {
+            let mut sink = FnRowSink {
+                cost,
+                accept: |row| rows.push(row),
+            };
+            self.stream_rows_charged(sql, settings, budget, charged, mapper, &mut sink)
+                .await?;
+        }
+        Ok(rows)
+    }
+
+    /// The same choke point as [`Self::collect_rows_charged`], for a read
+    /// whose retained form is NOT the row vector (issue #351 review 2).
+    ///
+    /// **Why it exists.** `collect_rows_charged` returns every row, so a
+    /// caller that then reshapes them into another structure holds BOTH
+    /// at once — charged once, live twice. Handing each row to a `sink`
+    /// as it streams removes the intermediate collection entirely: the
+    /// caller's own structure is the only place a value ever lands, and
+    /// the peak live set is that structure plus the single row the driver
+    /// has decoded. `collect_rows_charged` is now this function with a
+    /// `Vec::push` sink, so the two cannot drift on query-text checking,
+    /// settings, error mapping, or charge ORDER.
+    ///
+    /// The charge runs BEFORE the row reaches the sink, so a breach
+    /// refuses the value rather than retaining it.
+    async fn stream_rows_charged<R: ChRow>(
+        &self,
+        sql: &str,
+        settings: &QuerySettings,
+        budget: &mut ByteBudget,
+        charged: &mut usize,
+        mapper: fn(ChError, &TraceReadConfig) -> ReadError,
+        sink: &mut impl ChargedRowSink<R>,
+    ) -> Result<(), ReadError> {
         let sql = escape_query_placeholders(sql);
         if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
             return Err(ReadError::QueryTooBroad(reason));
         }
-        let mut rows = Vec::new();
         let mut stream = self
             .client
             .query_stream::<R>(&sql, settings)
@@ -1376,12 +1471,14 @@ impl TraceEngine {
             .map_err(|e| mapper(e, &self.config))?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| mapper(e, &self.config))?;
-            let bytes = cost(&row);
+            // Price, charge, THEN hand over — the order is the invariant
+            // the sink trait exists to make structural.
+            let bytes = sink.cost(&row);
             budget.charge(bytes)?;
             *charged += bytes;
-            rows.push(row);
+            sink.accept(row);
         }
-        Ok(rows)
+        Ok(())
     }
 
     /// Runs the spanset `| by(...)` distinct-by-key cardinality probe
@@ -1817,13 +1914,33 @@ impl TraceEngine {
         // blow-up would have been a 500 rather than the required 422.
         //
         // Now every row is fixed-width columns plus one byte-capped
-        // string — the documented block shape — and the charge PRECEDES
-        // retention of each value (`collect_rows_charged` charges per row
-        // as it streams; the value is moved into the set afterwards).
-        // Duplicate rows from at-least-once replays need no `DISTINCT`:
-        // ANY-match is unaffected by a repeat and ALL-match compares
+        // string — the documented block shape. Duplicate rows from
+        // at-least-once replays need no `DISTINCT`: ANY-match is
+        // unaffected by a repeat and ALL-match compares
         // `matchCount == elemCount`, which a repeat increments on both
         // sides.
+        //
+        // **The PEAK LIVE SET, stated as a set of structures rather than
+        // as what each charge covers** (the second review's point: the
+        // first row-per-value cut charged once and held twice — a
+        // `Vec<StrValueRow>` of every row AND the per-span map built from
+        // it, both live at the same instant). Streaming into the map
+        // through [`Self::stream_rows_charged`] means that at any moment
+        // the live structures holding a co-loaded value are exactly:
+        //
+        //   1. the per-span `Vec<String>`/`Vec<f64>` inside `map` — one
+        //      slot per value, with a growing `Vec`'s doubling slack;
+        //   2. `map`'s own entry for that span — ONE per span, not per
+        //      value;
+        //   3. the string payload itself, which is MOVED out of the row
+        //      into (1) and so exists once, never copied;
+        //   4. the single row the driver has just decoded, which is
+        //      dropped before the next is read.
+        //
+        // [`EVENT_VALUE_ENTRY_BYTES`] + the payload length upper-bounds
+        // (1)+(2)+(3) per value, and (4) is the documented one-block
+        // Layer-1 residual. No second collection exists to hold anything
+        // a second time.
         for set_idx in 0..plan.event_sets.len() {
             let sql = plan.event_set_sql_for(set_idx, batch_ids);
             charge_explain(
@@ -1835,41 +1952,34 @@ impl TraceEngine {
             )?;
             let mut map: HashMap<SpanKey, EventValues> = HashMap::new();
             if plan.event_sets[set_idx].is_numeric() {
-                let rows: Vec<NumValueRow> = self
-                    .collect_rows_charged(
-                        &sql,
-                        settings,
-                        budget,
-                        batch_charged,
-                        map_trace_read_error,
-                        |_| NUM_VALUE_ENTRY_BYTES,
-                    )
-                    .await?;
-                for row in rows {
-                    let Some(v) = row.v else { continue };
-                    match map
-                        .entry((row.trace_id, row.span_id))
-                        .or_insert_with(|| EventValues::Num(Vec::new()))
-                    {
-                        EventValues::Num(values) => values.push(v),
-                        EventValues::Text(_) => {
-                            unreachable!("a numeric set never decodes text values")
+                let mut sink = FnRowSink {
+                    cost: |_: &NumValueRow| EVENT_VALUE_ENTRY_BYTES,
+                    accept: |row: NumValueRow| {
+                        let Some(v) = row.v else { return };
+                        match map
+                            .entry((row.trace_id, row.span_id))
+                            .or_insert_with(|| EventValues::Num(Vec::new()))
+                        {
+                            EventValues::Num(values) => values.push(v),
+                            EventValues::Text(_) => {
+                                unreachable!("a numeric set never decodes text values")
+                            }
                         }
-                    }
-                }
+                    },
+                };
+                self.stream_rows_charged(
+                    &sql,
+                    settings,
+                    budget,
+                    batch_charged,
+                    map_trace_read_error,
+                    &mut sink,
+                )
+                .await?;
             } else {
-                let rows: Vec<StrValueRow> = self
-                    .collect_rows_charged(
-                        &sql,
-                        settings,
-                        budget,
-                        batch_charged,
-                        map_trace_read_error,
-                        |row: &StrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
-                    )
-                    .await?;
-                for row in rows {
-                    match map
+                let mut sink = FnRowSink {
+                    cost: |row: &StrValueRow| EVENT_VALUE_ENTRY_BYTES + row.v.len(),
+                    accept: |row: StrValueRow| match map
                         .entry((row.trace_id, row.span_id))
                         .or_insert_with(|| EventValues::Text(Vec::new()))
                     {
@@ -1877,8 +1987,17 @@ impl TraceEngine {
                         EventValues::Num(_) => {
                             unreachable!("a text set never decodes numeric values")
                         }
-                    }
-                }
+                    },
+                };
+                self.stream_rows_charged(
+                    &sql,
+                    settings,
+                    budget,
+                    batch_charged,
+                    map_trace_read_error,
+                    &mut sink,
+                )
+                .await?;
             }
             attrs.event_sets.push(map);
         }

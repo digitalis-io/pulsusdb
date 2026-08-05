@@ -435,15 +435,24 @@ mod tests {
     /// any charge could run.
     ///
     /// This asserts the SHAPE, not the text: no aggregate of any kind, no
-    /// `GROUP BY`, one byte-capped value column, and the `(key, scope)`
-    /// index prefix plus date/time/batch pruning intact. A reviewer can
-    /// check the invariant from this test instead of re-deriving it from
-    /// the memory contract.
+    /// `GROUP BY`, one value column, and the `(key, scope)` index prefix
+    /// plus date/time/batch pruning intact. A reviewer can check the
+    /// invariant from this test instead of re-deriving it from the memory
+    /// contract.
+    ///
+    /// **EVERY intrinsic takes the SAME gate** (review 2, [medium]): the
+    /// numeric member used to be checked only for `GROUP BY`, so a
+    /// `DISTINCT`, a `groupArray`/`groupUniqArray` or a window aggregate
+    /// over `val_num` would have reintroduced server-side state without
+    /// failing anything. The banned list and the pruning assertions now
+    /// run over all four, and only the VALUE COLUMN assertion branches —
+    /// which is the one thing that genuinely differs.
     #[test]
     fn the_event_value_read_carries_no_aggregate_so_a_row_stays_bounded() {
         use super::super::filter::EventSetField;
         for set in [
             EventSetField::EventName,
+            EventSetField::EventTimeSinceStart,
             EventSetField::LinkSpanId,
             EventSetField::LinkTraceId,
         ] {
@@ -454,33 +463,38 @@ mod tests {
                 "GROUP BY",
                 "DISTINCT",
                 "any(",
+                "uniq",
+                "OVER (",
             ] {
                 assert!(
                     !sql.contains(banned),
-                    "{set:?}: {banned} would make one ROW grow without bound: {sql}"
+                    "{set:?}: {banned} would put server-side state behind this read \
+                     and let one ROW grow without bound: {sql}"
                 );
             }
-            assert!(
-                sql.contains(&format!("{} AS v", byte_cap_expr("val"))),
-                "{set:?}: the value column must be byte-capped at the source: {sql}"
-            );
+            // The value column: `val_num` for the one numeric member,
+            // the byte-capped `val` for the three string members.
+            if set.is_numeric() {
+                assert!(
+                    sql.contains("val_num AS v"),
+                    "{set:?}: the numeric member reads val_num: {sql}"
+                );
+                assert!(
+                    sql.contains("isNotNull(val_num)"),
+                    "{set:?}: and filters its nulls: {sql}"
+                );
+            } else {
+                assert!(
+                    sql.contains(&format!("{} AS v", byte_cap_expr("val"))),
+                    "{set:?}: the value column must be byte-capped at the source: {sql}"
+                );
+            }
             assert!(sql.contains(&format!("key = '{}'", set.key())), "{sql}");
             assert!(sql.contains(&format!("scope = '{}'", set.scope())), "{sql}");
             assert!(sql.contains("date >= toDate("), "{sql}");
             assert!(sql.contains("timestamp_ns >"), "{sql}");
             assert!(sql.contains("trace_id IN ("), "{sql}");
         }
-        // The numeric member reads `val_num` and filters its nulls, and
-        // is likewise aggregate-free.
-        let sql = event_set_sql(
-            "trace_attrs_idx",
-            EventSetField::EventTimeSinceStart,
-            &[[7u8; 16]],
-            W,
-        );
-        assert!(sql.contains("val_num AS v"), "{sql}");
-        assert!(sql.contains("isNotNull(val_num)"), "{sql}");
-        assert!(!sql.contains("GROUP BY"), "{sql}");
     }
 
     #[test]
