@@ -40,10 +40,9 @@ use super::params::{
 /// | `NotFound` | 404 | `not_found` |
 /// | `NotAcceptable` | 406 | `not_acceptable` |
 /// | `Plan(MetricsPointCap)` (issue #59 static pre-execution rejection) | 422 | `query_too_broad` |
-/// | `Read(QueryTooBroad)` | 422 | `query_too_broad` |
+/// | `Read(…)` | see `read_error_parts` below — matched exhaustively (issue #266) |
 /// | `PoolUnavailable` | 503 | `unavailable` |
-/// | `Read(Clickhouse(Timeout))` | 504 | `timeout` |
-/// | `Read(_)` / `Assemble(_)` | 500 | `internal` |
+/// | `Assemble(_)` | 500 | `internal` |
 #[derive(Debug)]
 pub(crate) enum ApiError {
     Param(TraceIdError),
@@ -223,52 +222,10 @@ impl IntoResponse for ApiError {
                     .to_string(),
                 None,
             ),
-            ApiError::Read(e) => match e {
-                ReadError::QueryTooBroad(_) => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "query_too_broad",
-                    e.to_string(),
-                    None,
-                ),
-                ReadError::Clickhouse(ChError::Timeout(_)) => {
-                    (StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string(), None)
-                }
-                // Issue #240: a LogQL rejection is a client error on every
-                // surface that can carry it — `logs_api::error::
-                // read_error_parts` and `prom_api::error::read_error_parts`
-                // both map it to 400 `bad_data`, matched exhaustively so
-                // this stays correct rather than merely "impossible
-                // today". It WAS unreachable from `traces_api` when this
-                // arm was written, and matching it anyway is why the
-                // #335 Stage B change below landed correctly instead of
-                // falling into the 500 catch-all: TraceQL now constructs
-                // it too, for a present NON-boolean operand under `!`
-                // (`expression (!.a) expected a boolean` — the eval-time
-                // failure the reference reports as well). `Display` is
-                // transparent, so `e.to_string()` is the body, unmodified.
-                //
-                // STATUS DIVERGENCE, deliberate: the reference answers
-                // that query 500, because the failure happens mid-scan
-                // inside its querier. A malformed query is the client's
-                // error, not a server fault, so we keep 400 `bad_data` —
-                // consistent with every other surface carrying this
-                // variant. The accept-surface matrix scores a reference
-                // 500 as INCONCLUSIVE rather than as a rejection, so the
-                // scoreboard is unaffected either way. Pinned end to end
-                // by `traces_search_live::
-                // negation_demands_a_boolean_where_truthiness_tolerates_a_string`.
-                // The other LogQL-only variants stay on the catch-all —
-                // #266 owns that.
-                ReadError::PipelineInvalid { .. } => {
-                    (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None)
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    e.to_string(),
-                    None,
-                ),
-            },
+            ApiError::Read(e) => {
+                let (status, error_type, message) = read_error_parts(e);
+                (status, error_type, message, None)
+            }
             ApiError::Assemble(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -289,6 +246,146 @@ impl IntoResponse for ApiError {
             position,
         };
         (status, Json(body)).into_response()
+    }
+}
+
+/// The `ReadError` half of the table above, matched **exhaustively**
+/// (issue #266) — the shape `logs_api::error::read_error_parts` and
+/// `prom_api::error::read_error_parts` have had all along. The catch-all
+/// this replaces put every unlisted variant on 500 `internal` by
+/// omission, so adding or re-routing a `ReadError` variant was compiler-
+/// forced on two of the three query surfaces and silently absorbed by the
+/// third; it now fails the build on all three.
+///
+/// That absorption is a live hazard, not a tidiness one: Grafana's Tempo
+/// datasource proxies our status and body through verbatim —
+/// `grafana/grafana-tempo-datasource` `pkg/tempo/tempo.go:370,373`
+/// @ `3c7375bb541c3acde1deb068ea7ead9ebfdf56b9` (`v13.1.5-11-g3c7375b`)
+/// copies the upstream headers, then `rw.WriteHeader(resp.StatusCode)`
+/// and `io.Copy(rw, resp.Body)` with no status rewriting. So a rejection
+/// that should be 400 arriving as 500 stops being "your query is wrong"
+/// and becomes "this datasource is failing": Grafana reports the
+/// datasource unhealthy and dependent alert rules go to Error state, over
+/// a database that is fine.
+///
+/// No `ReadError` carries a `position` on this surface, hence the
+/// 3-tuple: the traces envelope's offset indexes a client-supplied string
+/// this renderer can point at (the TraceQL text, or the legacy `tags`
+/// value), and every variant below is raised after parsing. The one
+/// variant that *does* carry a span — [`ReadError::Parse`] — is a **LogQL**
+/// span, which would index a query text this surface never receives.
+///
+/// Reachability, checked at the construction sites rather than assumed:
+/// `git grep 'ReadError::' -- crates/pulsus-read/src/traces
+/// crates/pulsus-server/src/traces_api` shows the traces read path
+/// building only `QueryTooBroad`, `Clickhouse` and `PipelineInvalid`;
+/// `traces/` names no `LogQlError`/`PromqlError`/`HistogramError` (so no
+/// `?` conversion into the `#[from]` variants), the one `PipelineError`
+/// it does touch is mapped to `TracePlanError` in `traces/filter.rs`, and
+/// `traces_api` reaches `pulsus-read` only through `TraceEngine` and the
+/// plan functions. The claims below are wrong if some future traces path
+/// calls a `pulsus-read` entry point outside `traces/` that returns
+/// `ReadError` — which is exactly the case the exhaustive match exists to
+/// force a decision on.
+fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
+    match e {
+        // REACHABLE. The trace scan/result/generator budgets and the
+        // `by()` series cap (docs/api.md §4.2/§4.4).
+        ReadError::QueryTooBroad(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "query_too_broad",
+            e.to_string(),
+        ),
+        // UNREACHABLE here — both are raised by the metrics engine
+        // (`metrics/exec.rs`), which no traces handler calls. Mapped to
+        // this surface's bounded-response family, the same class both
+        // other renderers give them: a well-formed query the engine
+        // declines, never a server fault. `prom_api` spells that class
+        // `execution`; this surface (like `logs_api`) has only
+        // `query_too_broad` in its documented taxonomy — docs/api.md
+        // §4.1's table lists no `execution` type — so the STATUS matches
+        // prom_api and the `errorType` stays in the traces vocabulary.
+        ReadError::NamelessSelectorUnresolvable { .. } | ReadError::HistogramResultUnsupported => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "query_too_broad",
+            e.to_string(),
+        ),
+        // REACHABLE (issue #335 Stage B: a present NON-boolean operand
+        // under `!` — `expression (!.a) expected a boolean`, the eval-time
+        // failure the reference reports as well).
+        //
+        // Issue #240: a LogQL rejection is a client error on every surface
+        // that can carry it — `logs_api::error::read_error_parts` and
+        // `prom_api::error::read_error_parts` both map it to 400
+        // `bad_data`. It WAS unreachable from `traces_api` when this arm
+        // was written, and matching it anyway is why the Stage B change
+        // landed correctly instead of falling into the 500 catch-all.
+        // `Display` is transparent, so `e.to_string()` is the body,
+        // unmodified.
+        //
+        // STATUS DIVERGENCE, deliberate: the reference answers that query
+        // 500, because the failure happens mid-scan inside its querier. A
+        // malformed query is the client's error, not a server fault, so we
+        // keep 400 `bad_data` — consistent with every other surface
+        // carrying this variant. The accept-surface matrix scores a
+        // reference 500 as INCONCLUSIVE rather than as a rejection, so the
+        // scoreboard is unaffected either way. Pinned end to end by
+        // `traces_search_live::
+        // negation_demands_a_boolean_where_truthiness_tolerates_a_string`.
+        ReadError::PipelineInvalid { .. } => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
+        // UNREACHABLE here — every one is raised by the LogQL planner /
+        // pipeline (`logql/plan.rs`, `logql/params.rs`, `logql/window.rs`,
+        // `logql/client_agg.rs`) or is a `?` conversion from a LogQL/PromQL
+        // parse error, and TraceQL's own equivalents arrive as
+        // `ApiError::Query`/`ApiError::Plan` instead. Mapped to the class
+        // they have on BOTH other renderers — a malformed or out-of-domain
+        // client query is 400 `bad_data`, and it stays 400 if the call
+        // graph ever brings one here, rather than becoming a 500 that
+        // blames the database for the client's query.
+        //
+        // `Promql` is uniform 400 here, as it is in `logs_api`, rather
+        // than `prom_api`'s per-inner-variant 400/422/408 split: that
+        // split is a PromQL-API contract (docs/api.md §3's five-type
+        // taxonomy), and reproducing it on a surface that evaluates no
+        // PromQL would invent a `traces` mapping for statuses this
+        // endpoint's documented table does not carry.
+        ReadError::Parse(_)
+        | ReadError::Promql(_)
+        | ReadError::EmptyMatcherSet
+        | ReadError::ContradictoryMatchers
+        | ReadError::InvalidStep
+        | ReadError::DurationOutOfRange { .. }
+        | ReadError::QuerySpanTooLong { .. }
+        | ReadError::MetricPipelineError { .. }
+        | ReadError::PipelineUnsupportedInMetric { .. } => {
+            (StatusCode::BAD_REQUEST, "bad_data", e.to_string())
+        }
+        // UNREACHABLE here — a `metric_hist_samples` row that cannot
+        // rebuild a histogram is a metrics-path data-integrity defect, and
+        // it is a genuine 500 wherever it occurs (both other renderers
+        // agree): the client's request was fine, our stored row was not.
+        ReadError::HistogramDecode(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        }
+        // REACHABLE. Enumerated rather than left on a `_` so a new
+        // `ChError` variant is a decision here too; the mapping is
+        // unchanged from the catch-all era — only `Timeout` is special.
+        // `Connect` staying 500 (where `prom_api` answers 503
+        // `unavailable`) is the pre-existing cross-surface difference this
+        // change deliberately does NOT touch: it is live on both the
+        // traces and logs surfaces, so re-routing it is a wire change with
+        // its own sweep, not a by-product of making the match total.
+        ReadError::Clickhouse(ch) => match ch {
+            ChError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string()),
+            ChError::Connect(_)
+            | ChError::Io(_)
+            | ChError::Server { .. }
+            | ChError::Decode(_)
+            | ChError::Config(_)
+            | ChError::InsertUncertain(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+            }
+        },
     }
 }
 
@@ -403,6 +500,96 @@ mod tests {
             "bad row".to_string(),
         )));
         let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["errorType"], "internal");
+    }
+
+    /// Issue #266: a connect failure keeps the 500 it had under the
+    /// catch-all — enumerating `ChError` did not silently adopt
+    /// `prom_api`'s 503 `unavailable` for it. Re-routing this one is a
+    /// live wire change on two surfaces and is deliberately out of scope.
+    #[tokio::test]
+    async fn read_clickhouse_connect_error_still_maps_to_500_internal() {
+        let err = ApiError::Read(ReadError::Clickhouse(ChError::Connect(
+            "refused".to_string(),
+        )));
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["errorType"], "internal");
+    }
+
+    /// Issue #266: a LogQL-planner client-input rejection is 400
+    /// `bad_data` here as it is on `logs_api`/`prom_api`, not the 500 the
+    /// removed catch-all gave it. Unreachable from a traces handler today
+    /// (the LogQL planner is not on this call graph) — the arm is the
+    /// record of the decision, so a future re-route cannot make it a 500
+    /// by omission.
+    #[tokio::test]
+    async fn a_logql_planner_read_error_maps_to_400_bad_data_not_500() {
+        for err in [
+            ReadError::EmptyMatcherSet,
+            ReadError::ContradictoryMatchers,
+            ReadError::InvalidStep,
+            ReadError::DurationOutOfRange {
+                what: "range",
+                value: 0,
+                max: i64::MAX,
+            },
+            ReadError::QuerySpanTooLong {
+                value: 1,
+                max: pulsus_logql::MAX_QUERY_SPAN_NS,
+            },
+            ReadError::MetricPipelineError {
+                error_type: "JSONParserErr".to_string(),
+                series: "{a=\"b\"}".to_string(),
+            },
+            ReadError::PipelineUnsupportedInMetric {
+                construct: "| json".to_string(),
+            },
+            ReadError::Promql(pulsus_promql::PromqlError::Cancelled),
+        ] {
+            let rendered = format!("{err}");
+            let (status, json) = envelope(ApiError::Read(err)).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {rendered}, got {json}"
+            );
+            assert_eq!(json["errorType"], "bad_data", "for {rendered}");
+            assert!(json.get("position").is_none(), "for {rendered}");
+        }
+    }
+
+    /// Issue #266: the two metrics-engine "engine declines a well-formed
+    /// query" variants take this surface's bounded-response family (the
+    /// 422 `prom_api` gives them, spelled with the `errorType` docs/api.md
+    /// §4.1 defines for traces), not the removed catch-all's 500.
+    #[tokio::test]
+    async fn a_metrics_engine_decline_maps_to_422_query_too_broad_not_500() {
+        for err in [
+            ReadError::NamelessSelectorUnresolvable {
+                reason: "ColdCache".to_string(),
+            },
+            ReadError::HistogramResultUnsupported,
+        ] {
+            let rendered = format!("{err}");
+            let (status, json) = envelope(ApiError::Read(err)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expected 422 for {rendered}, got {json}"
+            );
+            assert_eq!(json["errorType"], "query_too_broad", "for {rendered}");
+        }
+    }
+
+    /// Issue #266: a histogram-decode failure is the one newly explicit
+    /// variant that genuinely IS a 500 — our stored row is malformed, the
+    /// client's request was not. Same verdict on all three renderers.
+    #[tokio::test]
+    async fn a_histogram_decode_failure_stays_500_internal() {
+        let err = ReadError::HistogramDecode(pulsus_model::HistogramError::SchemaOutOfRange(200));
+        let (status, json) = envelope(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(json["errorType"], "internal");
     }
