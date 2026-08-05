@@ -2,8 +2,19 @@
 //! "error","position"?}` (docs/api.md §4.1/§4.2), and the status-code
 //! mapping table pinned by the issue #55 plan (v2's error table + v3's
 //! `406 not_acceptable`) plus issue #57's search rows. Mirrors
-//! `logs_api/error.rs`'s structure; `position` (a byte offset) appears
-//! only on TraceQL parse errors — the fetch surface never carries it.
+//! `logs_api/error.rs`'s structure. `position` (a byte offset) comes from
+//! exactly two families, and both index a string the client supplied on
+//! THIS request: a TraceQL parse failure — [`ApiError::Query`] always,
+//! and [`ApiError::SearchParam`]/[`ApiError::QueryText`] when the inner is
+//! `QueryTextError::Invalid`, the length-cap and semantic rejections
+//! carrying none — and a legacy `tags` logfmt failure,
+//! [`ApiError::Legacy`], always, whose offset indexes the decoded `tags`
+//! value rather than a query expression. The other eleven of the enum's
+//! fifteen variants render no `position`, which is why
+//! [`read_error_parts`] returns no offset at all; and the §4.2 fetch path
+//! raises none of the four that can — it reaches only `Param`,
+//! `NotFound`, `NotAcceptable`, `Read`, `Assemble` and `PoolUnavailable`
+//! (`handlers::trace_by_id_impl`).
 //!
 //! Errors are **always** this JSON envelope, never protobuf, regardless of
 //! the request's `Accept` header (docs/api.md §4.1) — the mounted-but-
@@ -281,24 +292,30 @@ impl IntoResponse for ApiError {
 /// it here its offset still must not be rendered as a traces `position` —
 /// pinned by `a_logql_parse_error_renders_no_traces_position`.
 ///
-/// Reachability, checked at the construction sites rather than assumed:
-/// `git grep 'ReadError::' -- crates/pulsus-read/src/traces
-/// crates/pulsus-server/src/traces_api` shows the traces read path
-/// building only `QueryTooBroad`, `Clickhouse` and `PipelineInvalid`;
-/// `traces/` names no `LogQlError`/`PromqlError`/`HistogramError` (so no
-/// `?` conversion into the `#[from]` variants), the one `PipelineError`
-/// it does touch is mapped to `TracePlanError` in `traces/filter.rs`, and
-/// `traces_api` reaches `pulsus-read` only through `TraceEngine` and the
-/// plan functions. The claims below are wrong if some future traces path
-/// calls a `pulsus-read` entry point outside `traces/` that returns
-/// `ReadError` — which is exactly the case the exhaustive match exists to
-/// force a decision on.
+/// Reachability, checked at the construction sites rather than assumed.
+/// `git grep 'ReadError::' -- crates/pulsus-read/src/traces` — the read
+/// path ALONE, deliberately NOT `traces_api`, whose renderer tests below
+/// construct all fifteen variants on purpose — matches two of that
+/// directory's 13 files, `exec.rs` and `search_eval.rs`, and every
+/// construction outside their `#[cfg(test)]` modules is `QueryTooBroad`,
+/// `Clickhouse` or `PipelineInvalid`. `traces/` names no
+/// `LogQlError`/`PromqlError`/`HistogramError` at all (so nothing there
+/// can `?`-convert into the `#[from]` variants), and the one
+/// `PipelineError` it does touch is mapped to `TracePlanError`
+/// (`traces/filter.rs:624`). Of the `pulsus-read` items `traces_api`
+/// calls, only `TraceEngine`'s methods and
+/// `plan_search`/`plan_trace_metrics` are fallible — `EvalGate::new` and
+/// `canonical_double_bits` return no `Result` at all. The claims below are
+/// wrong if some future traces path calls a `pulsus-read` entry point
+/// outside `traces/` that returns `ReadError` — which is exactly the case
+/// the exhaustive match exists to force a decision on.
 ///
 /// Wire effect of issue #266: no pre-existing conformance fixture, live
 /// assertion or documented wire expectation changed — every status a
-/// client can observe today (the three reachable variants and the five
-/// non-`Timeout` `ChError` inners) is the one it had under the catch-all,
-/// and docs/api.md §4.1-§4.4's error tables are unchanged and still
+/// client can observe today (the three reachable variants, and every one
+/// of `ChError`'s seven inners: `Timeout`'s 504 and the other six's 500)
+/// is the one it had under the catch-all, and docs/api.md §4.1-§4.4's
+/// error tables are unchanged and still
 /// correct. The renderer tests below ARE new: they are fresh pins on
 /// statuses the catch-all left unstated, not edits to existing ones.
 fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
@@ -310,9 +327,11 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
             "query_too_broad",
             e.to_string(),
         ),
-        // UNREACHABLE here — `NamelessSelectorUnresolvable` is raised only
-        // by the metrics engine (`metrics/exec.rs`), which no traces
-        // handler calls, and `HistogramResultUnsupported` has no
+        // UNREACHABLE here — in production `NamelessSelectorUnresolvable`
+        // is constructed only by the metrics engine (`metrics/exec.rs`,
+        // four sites), which no traces handler calls; a `Display` test in
+        // `logql/error.rs` and the renderer test below also build it, as
+        // tests. `HistogramResultUnsupported` has no
         // production construction site left anywhere in the workspace:
         // M7-A5b's histogram encoders replaced that reject
         // (`metrics/exec.rs:3693`), leaving renderer tests as its only
@@ -372,23 +391,34 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         ReadError::Promql(pulsus_promql::PromqlError::Cancelled) => {
             (StatusCode::REQUEST_TIMEOUT, "timeout", e.to_string())
         }
-        // UNREACHABLE here — none of these is constructed anywhere under
-        // `crates/pulsus-read/src/traces` or `traces_api`, and this
-        // surface reaches `pulsus-read` only through `TraceEngine` and the
-        // plan functions (see above). Where they DO come from differs per
-        // variant: the LogQL planner/pipeline builds most of them
-        // (`logql/plan.rs`, `logql/params.rs`, `logql/window.rs`,
-        // `logql/client_agg.rs`), `Parse` exists only as the
-        // `#[from] LogQlError` conversion, `Promql`'s remaining inners are
-        // built by the metrics engine (`metrics/dispatch.rs`,
-        // `metrics/exec.rs`), and `PipelineUnsupportedInMetric` has no
+        // UNREACHABLE here — no PRODUCTION code under
+        // `crates/pulsus-read/src/traces` or `traces_api` constructs any
+        // of these (the renderer tests below build seven of them on
+        // purpose), and this surface's only fallible route into
+        // `pulsus-read` is `TraceEngine` and the plan functions (see
+        // above). Where they DO come from, enumerated pattern by pattern:
+        // the LogQL planner/pipeline builds six of the eight non-`Promql`
+        // patterns — `EmptyMatcherSet`, `ContradictoryMatchers`,
+        // `InvalidStep` and `QuerySpanTooLong` in `logql/plan.rs`,
+        // `DurationOutOfRange` in `logql/params.rs`, `MetricPipelineError`
+        // in `logql/client_agg.rs`. `Parse` has no explicit production
+        // construction site anywhere: it arises from the
+        // `#[from] LogQlError` conversion (the renderer test below builds
+        // one directly, as a test). `PipelineUnsupportedInMetric` has no
         // production construction site left in the workspace either (M6-10
         // replaced that rejection with client aggregation —
-        // `logql/plan.rs:1601`); as with `HistogramResultUnsupported`
+        // `logql/plan.rs:1602`); as with `HistogramResultUnsupported`
         // above, the only code that builds it is renderer tests,
-        // `logs_api/error.rs`'s and the one below. TraceQL's own
-        // equivalents arrive as `ApiError::Query`/`ApiError::Plan`
-        // instead. The eight non-`Promql` patterns take the class BOTH
+        // `logs_api/error.rs`'s and the one below. `Promql` is different
+        // in kind: the metrics engine constructs exactly ONE of its ten
+        // inners directly, `InvalidRegexMatcher` (`metrics/dispatch.rs`,
+        // `metrics/exec.rs` — three sites), and the other nine are raised
+        // inside `pulsus-promql` (`eval/`, `plan.rs`, `parser.rs`) and
+        // reach `ReadError` through its own `#[from] PromqlError`
+        // conversion. TraceQL's own equivalents arrive as
+        // `ApiError::Query`/`ApiError::Plan` instead.
+        //
+        // The eight non-`Promql` patterns take the class BOTH
         // other renderers give them — a malformed or out-of-domain client
         // query is 400 `bad_data`, and it stays 400 if the call graph ever
         // brings one here, rather than becoming a 500 that blames the
@@ -467,9 +497,11 @@ mod tests {
 
     /// Issue #240: the LogQL-class rejection is 400 `bad_data` on this
     /// surface too, with the BARE reason as the whole body (the variant's
-    /// `Display` carries no prefix). Deleting the explicit arm drops this
-    /// to the 500 `internal` catch-all; restoring a decorating `#[error]`
-    /// prefix breaks the byte-exact `error`-field assertion.
+    /// `Display` carries no prefix). Deleting the explicit arm no longer
+    /// compiles — since issue #266 the match is exhaustive, so the arm
+    /// cannot fall back to the 500 `internal` catch-all it would have hit
+    /// before; restoring a decorating `#[error]` prefix breaks the
+    /// byte-exact `error`-field assertion.
     #[tokio::test]
     async fn read_error_pipeline_invalid_maps_to_400_bad_data() {
         let err = ApiError::Read(ReadError::PipelineInvalid {
@@ -761,6 +793,57 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
         assert_eq!(json["position"], 3, "body {json}");
+    }
+
+    /// Issue #266 review round 3: the module header used to say
+    /// `position` appears only on TraceQL parse errors, while
+    /// `ApiError::Legacy` (above) and `ApiError::SearchParam` also emit
+    /// one. The corrected header states the rule per inner, so pin that
+    /// rule rather than leaving it prose: the offset appears for
+    /// `QueryTextError::Invalid` — the validated `query` parameter's
+    /// parse failure — and for neither of that enum's other two inners,
+    /// whichever of the two `ApiError` variants carries it.
+    #[tokio::test]
+    async fn a_query_text_position_appears_for_the_parse_inner_only() {
+        use super::super::querytext::QueryTextError;
+
+        let invalid = || QueryTextError::Invalid {
+            message: "syntax error".to_string(),
+            position: 7,
+        };
+        for err in [
+            ApiError::SearchParam(SearchParamError::QueryText(invalid())),
+            ApiError::QueryText(invalid()),
+        ] {
+            let (status, json) = envelope(err).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(json["errorType"], "bad_data");
+            assert_eq!(json["position"], 7, "body {json}");
+        }
+
+        let offsetless = || {
+            [
+                QueryTextError::TooLong { len: 9, cap: 8 },
+                QueryTextError::Semantic(pulsus_traceql::ValidateError::TypeMismatch {
+                    expr: "1 = `a`".to_string(),
+                }),
+            ]
+        };
+        let [long_a, sem_a] = offsetless();
+        let [long_b, sem_b] = offsetless();
+        for err in [
+            ApiError::SearchParam(SearchParamError::QueryText(long_a)),
+            ApiError::SearchParam(SearchParamError::QueryText(sem_a)),
+            ApiError::QueryText(long_b),
+            ApiError::QueryText(sem_b),
+            // A non-`QueryText` search-parameter failure is about the
+            // request, not a place inside an expression.
+            ApiError::SearchParam(SearchParamError::ConflictingQuery),
+        ] {
+            let (status, json) = envelope(err).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(json.get("position").is_none(), "body {json}");
+        }
     }
 
     #[tokio::test]
