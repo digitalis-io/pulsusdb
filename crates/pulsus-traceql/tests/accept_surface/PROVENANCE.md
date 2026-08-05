@@ -255,6 +255,16 @@ this matrix's own `owning_issue` is the audit issue); a wire divergence
 belongs to whichever planner refuses the query, which is not knowable
 from the class.
 
+**The join both wire gates read through is validated first** (review
+round, `wire_dispositions`): duplicate `query` keys in
+`wire_baseline.json` fail, and every baseline entry must name a matrix
+probe. A duplicate is not cosmetic here — with the earlier
+`.iter().find(...)` lookup an *earlier* copy reading `accept` hid a real
+divergence, and the ownership gate then did not require an owner for it;
+measured, the pre-fix tree is 12/12 green on exactly that mutant. This is
+the Rust spelling of the weakness `wire-baseline-freeze` rejects in every
+file it builds a join from.
+
 ## Operator precedence and associativity
 
 Tightest first. `=` marks agreement from the audit capture, `✔` a
