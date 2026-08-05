@@ -119,15 +119,17 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 2
 ///   3. One non-`.sql` file was ADDED — `log2_reference_capture.json`,
 ///      the byte-committed capture from the pinned Tempo container. The
 ///      walk digests EVERY entry, whatever its extension, so it moves
-///      both numbers by design. (Re-captured twice during review, as
-///      corpora were added to hold down the series-ORDER divergence —
-///      `mix1024`, `mix16k`, `mixladder`. Each time the count stayed at
-///      20 and only the digest moved, which is the split this test's two
-///      assertions exist to make readable.)
+///      both numbers by design. (Re-captured during review as corpora
+///      were added to hold down the series-ORDER divergence —
+///      `mix1024`, `mix16k`, `mixladder` — and the label-TEXT one —
+///      `expform`. Each time the count stayed at 20, because those
+///      corpora live INSIDE the existing JSON, and only the digest
+///      moved: the split this test's two assertions exist to make
+///      readable.)
 ///
 /// Corpus 66 -> 69 entries; `quantile_over_time_multi.sql` and the other
 /// 65 pre-existing goldens are byte-identical.
-const PINNED_SQL_CORPUS: u64 = 0xe854_c940_98c5_92ba;
+const PINNED_SQL_CORPUS: u64 = 0xf391_5f72_212a_f682;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

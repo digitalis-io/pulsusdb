@@ -443,20 +443,30 @@ re-decide from the evidence rather than re-derive it.
   ruling shape as the percentile row above: match the reference where it
   is right, be correct where it is not, record the difference.
 
-- **Consequence: series order only.** Labels, tallies, membership and
-  non-cumulativity are byte-matched to the reference (that half of #252
-  is a Tier-1 parity gate). Values, counts and label text are identical;
-  only the ORDER of the array differs. A client that reads the `__bucket`
-  label — which is how the series is identified — sees no difference at
-  all; only one that indexes the array positionally would, and the
-  reference's own positions are not meaningful to index by.
+- **Consequence: series order only.** The bucket rule, membership,
+  tallies and non-cumulativity are matched to the reference (that half of
+  #252 is a Tier-1 parity gate). Precisely: **label VALUES, tallies,
+  counts and membership are identical; the ORDER of the array differs**,
+  and — separately and independently of this row — the label TEXT differs
+  for the four buckets `2^10 .. 2^13 ns`, where `serde_json`/ryu writes
+  `1.024e-6` and protojson writes `0.000001024` (same `f64`, same parse;
+  recorded, not filed). A client that reads the `__bucket` label — which
+  is how the series is identified — is unaffected by the order; only one
+  indexing the array positionally would be, and the reference's own
+  positions are not meaningful to index by.
 
 - **Where it is enforced.**
-  `crates/pulsus-read/tests/traces_log2_reference.rs::we_emit_ascending_by_bucket_and_the_reference_order_is_recorded_beside_it`
+  `crates/pulsus-read/tests/traces_log2_reference.rs::we_emit_ascending_by_bucket_and_the_reference_order_is_pinned_beside_it`
   asserts our ascending order for every captured corpus AND pins the
-  reference's captured order beside it, enumerating the corpora where the
-  two differ (`mix252`, `mix1024`, `mix16k`, `mixladder`) — so a change on
-  either side fails, and nothing is exempted. A sibling test
-  (`the_reference_does_not_sort_on_its_own_wire_text`) pins the mechanism
-  claim itself. Production: `traces::exec::sort_histogram_series_by_bucket_ascending`.
-  User-facing write-up: docs/api.md §4.4.1.
+  reference's order as an **explicit expected `bucket_ns` sequence per
+  corpus** (`REFERENCE_EMITTED_ORDER`), not as a property restated from
+  the capture — so a change on their side fails, which is the only thing
+  that makes this row checkable. A second table
+  (`IF_SORTED_ON_THE_REFERENCE_WIRE_TEXT`) pins, also as sequences, the
+  order its own JSON body would have given, which differs for `mix1024`,
+  `mix16k` and `mixladder` — the evidence that the sort key is
+  `AnyValue.String()` and not the response text. Both tables are checked
+  for membership against the capture, so a corpus cannot be added or
+  dropped unpinned. Production:
+  `traces::exec::sort_histogram_series_by_bucket_ascending`. User-facing
+  write-up: docs/api.md §4.4.1.

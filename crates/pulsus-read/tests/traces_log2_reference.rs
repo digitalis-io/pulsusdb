@@ -154,27 +154,128 @@ fn our_bucket_rule_reproduces_every_captured_reference_histogram() {
     }
 }
 
+/// The reference's emitted series order, corpus by corpus, as an
+/// EXPLICIT expected sequence — not a property of the capture restated
+/// from it.
+///
+/// This table is the thing the ledger row
+/// `2026-08-05-traceql-histogram-series-order` rests on. Written out in
+/// full so a change on the reference's side fails here: a summary
+/// assertion ("these corpora are non-ascending") would pass for any
+/// other non-ascending order and would therefore pin nothing.
+///
+/// Read it against `%g`, which is the rule producing it — lexicographic
+/// on `strconv.FormatFloat(v, 'g', -1, 64)`:
+///
+/// - `mix252`: `0.001048576` < `2e-09` < `4e-09`;
+/// - `mix1024`: `0.001048576` < `1.024e-06`;
+/// - `mix16k`: `0.001048576` < `1.6384e-05`;
+/// - `mixladder`: `0.001048576` < `1.024e-06` < `1.073741824` < `1.6384e-05`;
+/// - `expform`: `2.048e-06` < `4.096e-06` < `8.192e-06` (ascending here,
+///   by coincidence of the digits);
+/// - the single-bucket and two-ascending-bucket corpora cannot
+///   distinguish any rule and are here for completeness.
+const REFERENCE_EMITTED_ORDER: &[(&str, &[u64])] = &[
+    ("w252", &[1 << 29, 1 << 33]),
+    ("mix252", &[1 << 20, 1 << 1, 1 << 2]),
+    ("u280", &[1 << 29]),
+    ("u300", &[1 << 29]),
+    ("u520", &[1 << 29]),
+    ("tiny252", &[1 << 10, 1 << 40]),
+    ("mix1024", &[1 << 20, 1 << 10]),
+    ("mix16k", &[1 << 20, 1 << 14]),
+    ("mixladder", &[1 << 20, 1 << 10, 1 << 30, 1 << 14]),
+    ("expform", &[1 << 11, 1 << 12, 1 << 13]),
+];
+
+/// The order each corpus would come back in if the reference sorted on
+/// its OWN JSON body instead of on `AnyValue.String()` — pinned
+/// explicitly for the same reason as the table above, and different from
+/// it for `mix1024`, `mix16k` and `mixladder`. Without this, someone
+/// re-deriving the rule from `wire_text` could conclude we might have
+/// matched the reference by sorting on the response.
+const IF_SORTED_ON_THE_REFERENCE_WIRE_TEXT: &[(&str, &[u64])] = &[
+    ("w252", &[1 << 29, 1 << 33]),
+    ("mix252", &[1 << 20, 1 << 1, 1 << 2]),
+    ("u280", &[1 << 29]),
+    ("u300", &[1 << 29]),
+    ("u520", &[1 << 29]),
+    ("tiny252", &[1 << 10, 1 << 40]),
+    // `0.000001024` < `0.001048576` — the opposite of what it emitted.
+    ("mix1024", &[1 << 10, 1 << 20]),
+    // `0.000016384` < `0.001048576` — likewise.
+    ("mix16k", &[1 << 14, 1 << 20]),
+    ("mixladder", &[1 << 10, 1 << 14, 1 << 20, 1 << 30]),
+    ("expform", &[1 << 11, 1 << 12, 1 << 13]),
+];
+
+fn expected(table: &[(&str, &[u64])], name: &str) -> Vec<u64> {
+    table
+        .iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or_else(|| panic!("corpus {name} has no pinned order — add it to the table"))
+        .1
+        .to_vec()
+}
+
 /// AC8 under the owner's 2026-08-05 ruling: **our** order is ascending by
-/// bucket, and the reference's is recorded beside it as the ledgered
-/// divergence `2026-08-05-traceql-histogram-series-order`. Both sides are
-/// pinned per corpus and nothing is exempted, so a change on either side
-/// fails here.
+/// bucket, and the reference's is pinned beside it as the ledgered
+/// divergence. Nothing is exempted and neither side is derived from the
+/// other, so a change on either fails here.
 ///
 /// `mix16k` is the witness the ledger row rests on: a 16 µs span beside a
 /// 1 ms span — an ordinary corpus, not an exotic one — for which the
-/// reference emits `2^20` BEFORE `2^14`. That order is not ascending, not
-/// descending, and not the order of its own JSON body (which writes
-/// `0.000016384`); it is lexicographic on Go's `%g` rendering
-/// (`1.6384e-05`), because `sortResponse` compares `AnyValue.String()`.
-/// `mixladder` is the four-bucket form of the same thing and the example
-/// docs/api.md §4.4.1 quotes: spans at 1 µs, 16 µs, 1 ms and 1 s come
-/// back `1 ms, 1 µs, 1 s, 16 µs`.
+/// reference emits `2^20` BEFORE `2^14`. `mixladder` is the four-bucket
+/// form docs/api.md §4.4.1 quotes: spans at 1 µs, 16 µs, 1 ms and 1 s
+/// come back `1 ms, 1 µs, 1 s, 16 µs`.
 #[test]
-fn we_emit_ascending_by_bucket_and_the_reference_order_is_recorded_beside_it() {
-    let mut diverging: Vec<String> = Vec::new();
-    for corpus in capture().corpora {
-        // Framed the way the engine frames: one series per occupied
-        // bucket, then the production sort.
+fn we_emit_ascending_by_bucket_and_the_reference_order_is_pinned_beside_it() {
+    let corpora = capture().corpora;
+    // Every captured corpus is pinned, and every pin has a corpus —
+    // otherwise a corpus could be added or dropped without the table
+    // noticing.
+    let captured: Vec<&str> = corpora.iter().map(|c| c.name.as_str()).collect();
+    let pinned: Vec<&str> = REFERENCE_EMITTED_ORDER.iter().map(|(n, _)| *n).collect();
+    assert_eq!(captured, pinned, "capture membership vs the pinned table");
+    let wire_pinned: Vec<&str> = IF_SORTED_ON_THE_REFERENCE_WIRE_TEXT
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        captured, wire_pinned,
+        "capture membership vs the wire table"
+    );
+
+    for corpus in &corpora {
+        let theirs: Vec<u64> = corpus.emitted_buckets.iter().map(|b| b.bucket_ns).collect();
+
+        // THEIRS: the exact sequence, pinned. This is what makes the
+        // ledger row checkable rather than asserted.
+        assert_eq!(
+            theirs,
+            expected(REFERENCE_EMITTED_ORDER, &corpus.name),
+            "{}: the reference's emitted series order",
+            corpus.name
+        );
+
+        // …and the order its own JSON body would have given, pinned too,
+        // so the mechanism claim is a sequence and not a name list.
+        let wire: BTreeMap<u64, String> = corpus
+            .emitted_buckets
+            .iter()
+            .map(|b| (b.bucket_ns, b.wire_text.clone()))
+            .collect();
+        let mut by_their_wire = theirs.clone();
+        by_their_wire.sort_by_key(|ns| wire[ns].clone());
+        assert_eq!(
+            by_their_wire,
+            expected(IF_SORTED_ON_THE_REFERENCE_WIRE_TEXT, &corpus.name),
+            "{}: the order the reference's OWN wire text would give",
+            corpus.name
+        );
+
+        // OURS: ascending, always — framed the way the engine frames,
+        // through the production sort.
         let mut series: Vec<TraceMetricSeries> = our_tallies(&corpus.durations_ns)
             .into_iter()
             .map(|(bucket_ns, n)| TraceMetricSeries {
@@ -193,9 +294,6 @@ fn we_emit_ascending_by_bucket_and_the_reference_order_is_recorded_beside_it() {
                 (seconds * 1e9).round() as u64
             })
             .collect();
-        let theirs: Vec<u64> = corpus.emitted_buckets.iter().map(|b| b.bucket_ns).collect();
-
-        // Ours: ascending, always, for every corpus.
         let mut ascending = theirs.clone();
         ascending.sort_unstable();
         assert_eq!(
@@ -208,66 +306,52 @@ fn we_emit_ascending_by_bucket_and_the_reference_order_is_recorded_beside_it() {
             "{}: strictly ascending, {ours:?}",
             corpus.name
         );
-
-        // Theirs: pinned exactly as captured, and recorded as diverging
-        // whenever it is not the ascending order.
-        if theirs != ascending {
-            diverging.push(corpus.name.clone());
-        }
     }
-    // The ledger row's witnesses. `mixladder` is the docs example;
-    // `mix16k` is the one that shows the divergence needs nothing more
-    // exotic than a 16 µs span.
+
+    // The divergence, summarised from the pinned sequences — readable,
+    // and now backed by them rather than standing in for them.
+    let diverging: Vec<&str> = REFERENCE_EMITTED_ORDER
+        .iter()
+        .filter(|(_, order)| {
+            let mut asc = order.to_vec();
+            asc.sort_unstable();
+            asc != *order
+        })
+        .map(|(n, _)| *n)
+        .collect();
     assert_eq!(
         diverging,
-        vec![
-            "mix252".to_string(),
-            "mix1024".to_string(),
-            "mix16k".to_string(),
-            "mixladder".to_string()
-        ],
+        vec!["mix252", "mix1024", "mix16k", "mixladder"],
         "the corpora whose reference order is NOT ascending — the ledgered divergence's \
-         witnesses; if this list empties, the capture lost the evidence the ledger row cites"
+         witnesses"
     );
-}
-
-/// The reference's order is not the order of its own JSON body either —
-/// so nobody re-derives it from `wire_text` and concludes we could have
-/// matched it by sorting on the response. `mix1024` is the discriminator:
-/// protojson writes `2^10 ns` as `0.000001024`, which sorts FIRST, while
-/// the reference emitted it SECOND.
-#[test]
-fn the_reference_does_not_sort_on_its_own_wire_text() {
-    let mut diverging: Vec<String> = Vec::new();
-    for corpus in capture().corpora {
-        let theirs: Vec<u64> = corpus.emitted_buckets.iter().map(|b| b.bucket_ns).collect();
-        let wire: BTreeMap<u64, String> = corpus
-            .emitted_buckets
-            .iter()
-            .map(|b| (b.bucket_ns, b.wire_text.clone()))
-            .collect();
-        let mut by_wire = theirs.clone();
-        by_wire.sort_by_key(|ns| wire[ns].clone());
-        if by_wire != theirs {
-            diverging.push(corpus.name.clone());
-        }
-    }
+    let wire_diverging: Vec<&str> = REFERENCE_EMITTED_ORDER
+        .iter()
+        .zip(IF_SORTED_ON_THE_REFERENCE_WIRE_TEXT)
+        .filter(|((_, emitted), (_, by_wire))| emitted != by_wire)
+        .map(|((n, _), _)| *n)
+        .collect();
     assert_eq!(
-        diverging,
-        vec![
-            "mix1024".to_string(),
-            "mix16k".to_string(),
-            "mixladder".to_string()
-        ],
-        "the corpora the reference orders differently from its own response body"
+        wire_diverging,
+        vec!["mix1024", "mix16k", "mixladder"],
+        "the corpora the reference orders differently from its own response body — the \
+         evidence that its sort key is Go's %g on AnyValue.String(), not the JSON text"
     );
 }
 
 /// AC9, recorded rather than filed: the JSON float text, both sides,
-/// measured. Same value, same parse, different text — cosmetic under the
-/// consumer-impact rule, but it is NOT the sort key (see
-/// `the_production_comparator_reproduces_the_reference_series_order`),
-/// so it changes no ordering.
+/// measured on every member rather than derived for three of them —
+/// which is why the `expform` corpus (`2^11`, `2^12`, `2^13`) is in the
+/// capture at all.
+///
+/// Same value, same parse, different text: protojson uses
+/// `encoding/json`'s rule (exponent form iff `|v| < 1e-6` or `>= 1e21`)
+/// and `serde_json`/ryu switches at a different threshold, so the four
+/// buckets `2^10 .. 2^13 ns` render plain-decimal there and in exponent
+/// form here. Cosmetic under the consumer-impact rule, and it is NOT the
+/// sort key — see
+/// `we_emit_ascending_by_bucket_and_the_reference_order_is_pinned_beside_it`
+/// — so it has no ordering consequence on either side.
 #[test]
 fn the_wire_float_text_divergence_is_exactly_the_recorded_one() {
     let mut differing: Vec<(u64, String, String)> = Vec::new();
@@ -282,14 +366,19 @@ fn the_wire_float_text_divergence_is_exactly_the_recorded_one() {
     }
     differing.sort();
     differing.dedup();
-    // protojson uses `encoding/json`'s rule (exponent form iff
-    // |v| < 1e-6 or >= 1e21, leading zero stripped from the exponent);
-    // ryu switches at a different threshold. Over every bucket the
-    // capture covers, that is one bucket: 2^10 ns.
+    // Over every bucket the capture covers, the divergence is exactly
+    // the exponent-form band `2^10 .. 2^13 ns` — all four measured, none
+    // inferred.
     assert_eq!(
         differing,
-        vec![(1024u64, "0.000001024".to_string(), "1.024e-6".to_string())],
-        "recorded wire-text divergences"
+        vec![
+            (1024u64, "0.000001024".to_string(), "1.024e-6".to_string()),
+            (2048, "0.000002048".to_string(), "2.048e-6".to_string()),
+            (4096, "0.000004096".to_string(), "4.096e-6".to_string()),
+            (8192, "0.000008192".to_string(), "8.192e-6".to_string()),
+        ],
+        "recorded wire-text divergences: the whole of 2^10..2^13, each measured off the \
+         reference's HTTP body, and nothing else in the capture"
     );
 }
 

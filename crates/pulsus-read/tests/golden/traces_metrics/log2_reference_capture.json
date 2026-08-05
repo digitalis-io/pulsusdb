@@ -6,7 +6,7 @@
     "config": "deploy/e2e/tempo.yaml exactly as committed by this change (metrics_generator.storage.path present); without it the reference answers every TraceQL metrics query with no series at all",
     "how": "standalone container on the host, OTLP/HTTP ingest of one resource per corpus (resource.service.name = the corpus's service), then GET /api/metrics/query_range at step=60s over a 20-minute window covering the ingest. Each bucket's `count` is the SUM of that series' samples over the window, so a corpus straddling a step boundary is still recorded exactly; `emitted_buckets` is in the order the reference returned the series, and `wire_text` is the doubleValue text read off the HTTP body (not a re-rendering of a parsed float).",
     "note": "TraceQL metrics visibility lags search visibility by roughly a minute on this build (the live block has to complete), which is why the e2e control polls the reference rather than querying it once",
-    "series_order": "`emitted_buckets` order is RECORDED, not matched: PulsusDB emits histogram series ascending by bucket, a ledgered divergence (2026-08-05-traceql-histogram-series-order). The reference's order is lexicographic on Go's %g rendering of the label - sortResponse compares AnyValue.String(), which is proto.CompactTextString (pkg/tempopb/common/v1/common.pb.go:46 @ v3.0.2) ending at gogo writeAny's default arm, fmt.Fprint, i.e. Go %v/%g - so it is neither numeric nor the order of its own wire text.",
+    "series_order": "`emitted_buckets` order is RECORDED, not matched: PulsusDB emits histogram series ascending by bucket, a ledgered divergence (2026-08-05-traceql-histogram-series-order). Each corpus's reference sequence is pinned as an explicit expectation in tests/traces_log2_reference.rs, so a change on their side fails rather than being absorbed. The reference's order is lexicographic on Go's %g rendering of the label - sortResponse compares AnyValue.String(), which is proto.CompactTextString (pkg/tempopb/common/v1/common.pb.go:46 @ v3.0.2) ending at gogo writeAny's default arm, fmt.Fprint, i.e. Go %v/%g - so it is neither numeric nor the order of its own wire text.",
     "reference_source": "pkg/traceql/engine_metrics.go:2038 Log2Bucketize, :2058 Log2QuantileWithBucket, ast_metrics.go:181 bucketizeDuration, modules/frontend/combiner/metrics_query_range.go:245 sortResponse - all @ v3.0.2 (0c4b926d09234186de39833e9c7ecb5b7614c8b9)"
   },
   "corpora": [
@@ -332,7 +332,7 @@
     {
       "name": "tiny252",
       "service": "tiny252",
-      "why": "JSON float-text witnesses at both ends of the ladder (2^10 ns and 2^40 ns) as the reference renders them ON THE WIRE; its emitted order happens to be ascending, which is why it is not an order witness",
+      "why": "JSON float-text witnesses at both ends of the ladder (2^10 ns and 2^40 ns); its emitted order happens to be ascending, which is why it is not an order witness",
       "durations_ns": [
         600,
         700000000000
@@ -427,7 +427,7 @@
     {
       "name": "mixladder",
       "service": "mixladder",
-      "why": "ORDER witness, the docs/api.md 4.4.1 example: spans at 1 us, 16 us, 1 ms and 1 s come back 1 ms, 1 us, 1 s, 16 us - not ascending, not descending, not the order of the wire text. A determinism device, not a semantic one",
+      "why": "ORDER witness, the docs/api.md 4.4.1 example: spans at 1 us, 16 us, 1 ms and 1 s come back 1 ms, 1 us, 1 s, 16 us - not ascending, not descending, not the order of the wire text",
       "durations_ns": [
         1000,
         16000,
@@ -469,6 +469,45 @@
         536870912
       ],
       "count_over_time": 4,
+      "quantile_query": null,
+      "quantiles": []
+    },
+    {
+      "name": "expform",
+      "service": "expform",
+      "why": "the remaining WIRE-TEXT witnesses 2^11..2^13, so the recorded label-text divergence is measured on every member of 2^10..2^13 rather than derived for three of them",
+      "durations_ns": [
+        1500,
+        3000,
+        6000
+      ],
+      "histogram_query": "{ resource.service.name = \"expform\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 2048,
+          "seconds": 2.048e-06,
+          "count": 1,
+          "wire_text": "0.000002048"
+        },
+        {
+          "bucket_ns": 4096,
+          "seconds": 4.096e-06,
+          "count": 1,
+          "wire_text": "0.000004096"
+        },
+        {
+          "bucket_ns": 8192,
+          "seconds": 8.192e-06,
+          "count": 1,
+          "wire_text": "0.000008192"
+        }
+      ],
+      "absent_buckets_ns": [
+        1024,
+        16384,
+        1048576
+      ],
+      "count_over_time": 3,
       "quantile_query": null,
       "quantiles": []
     }
