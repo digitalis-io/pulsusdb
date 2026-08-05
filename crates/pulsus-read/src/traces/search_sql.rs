@@ -425,101 +425,94 @@ mod tests {
         end_ns: 1_700_010_800_000_000_000,
     };
 
-    /// Issue #351, after review: the event/link value read must carry NO
-    /// server-side state. The first cut used
-    /// `groupUniqArray(...) GROUP BY trace_id, span_id`, whose ARRAY
-    /// column is an unbounded number of capped strings in ONE row —
-    /// breaking the Layer-1 residual bound `traces::exec`'s module doc
-    /// states ("never a-priori row-unbounded") and growing both the
-    /// server-side aggregate state and the client's decoded row before
-    /// any charge could run.
+    /// Issue #351: the event/link value read, asserted as its EXACT
+    /// rendered text — one whole string per intrinsic, variables
+    /// substituted.
     ///
-    /// **A positive SHAPE gate, not a ban list** (review 3, `[medium]`).
-    /// The first version banned seven spellings, and a denylist keeps
-    /// losing this race: `LIMIT 1 BY trace_id, span_id` contains none of
-    /// them and still needs per-group state, and any ban list is
-    /// case-sensitive besides. So this asserts what the statement IS —
-    /// every line must be one of the three clause forms the builder
-    /// emits — which no appended clause, in any spelling or case, can
-    /// satisfy. The clause vocabulary is thereby closed by construction
-    /// rather than by enumeration of what to exclude.
+    /// **Why exact, and why nothing weaker** (review 4). This gate has
+    /// been rebuilt three times and each rebuild was the same defect one
+    /// layer down, because each asserted a PROPERTY of the statement and
+    /// lost to a spelling that satisfied the property:
     ///
-    /// The banned spellings are kept as a SECOND, redundant assertion,
-    /// purely so a failure names the construct a reader recognises; the
-    /// line-shape assertion above is what makes the gate airtight.
+    /// 1. a denylist of aggregate names — `LIMIT 1 BY trace_id, span_id`
+    ///    contains none of them and still needs per-group state;
+    /// 2. the denylist plus `LIMIT` — a lowercase `group by` walks past a
+    ///    case-sensitive substring ban;
+    /// 3. a per-line prefix shape (`WHERE `/`  AND ` continuations) — an
+    ///    appended `  AND trace_id IN (SELECT trace_id FROM
+    ///    trace_attrs_idx group by trace_id)` satisfies the prefix and
+    ///    reintroduces grouping state inside the predicate.
+    ///
+    /// An exact match has no property left to satisfy: nothing can be
+    /// appended, nested, re-cased or re-spaced without changing the
+    /// string. That is what terminates the class instead of moving it
+    /// down another layer.
+    ///
+    /// What the exactness buys, all at once and without a separate
+    /// assertion for each: no aggregate and no subquery anywhere; the
+    /// `(key, scope)` index prefix; date, time and batch pruning; the
+    /// byte-capped `val` for the three string members and `val_num` +
+    /// `isNotNull` for the numeric one; and one row per value, which is
+    /// the memory contract (`traces::exec`'s Layer-1 residual bound —
+    /// an array column would be row-unbounded).
+    ///
+    /// The goldens pin two of these four through a planned query; this
+    /// pins all four at the builder, including both link intrinsics,
+    /// which no golden case reaches.
     #[test]
-    fn the_event_value_read_carries_no_server_side_state() {
+    fn the_event_value_read_renders_exactly_this_sql() {
         use super::super::filter::EventSetField;
-        for set in [
-            EventSetField::EventName,
-            EventSetField::EventTimeSinceStart,
-            EventSetField::LinkSpanId,
-            EventSetField::LinkTraceId,
-        ] {
-            let sql = event_set_sql("trace_attrs_idx", set, &[[7u8; 16]], W);
-
-            // (1) THE SHAPE. Exactly one projection line, one FROM line,
-            // one WHERE line and any number of `  AND` continuations —
-            // and nothing else, ever. A `GROUP BY` / `LIMIT n BY` /
-            // `ORDER BY` / window clause has to occupy a line, and no
-            // such line is admissible.
-            let lines: Vec<&str> = sql.lines().collect();
-            assert!(
-                lines[0].starts_with("SELECT trace_id, span_id, "),
-                "{set:?}: line 0 must be the fixed projection: {sql}"
-            );
+        let cases: [(EventSetField, &str); 4] = [
+            (
+                EventSetField::EventName,
+                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
+                 FROM trace_attrs_idx\n\
+                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
+                 \x20 AND key = 'name'\n\
+                 \x20 AND scope = 'event:intrinsic'\n\
+                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+            ),
+            (
+                EventSetField::EventTimeSinceStart,
+                "SELECT trace_id, span_id, val_num AS v\n\
+                 FROM trace_attrs_idx\n\
+                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
+                 \x20 AND key = 'timeSinceStart'\n\
+                 \x20 AND scope = 'event:intrinsic'\n\
+                 \x20 AND isNotNull(val_num)\n\
+                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+            ),
+            (
+                EventSetField::LinkSpanId,
+                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
+                 FROM trace_attrs_idx\n\
+                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
+                 \x20 AND key = 'spanID'\n\
+                 \x20 AND scope = 'link:intrinsic'\n\
+                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+            ),
+            (
+                EventSetField::LinkTraceId,
+                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
+                 FROM trace_attrs_idx\n\
+                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
+                 \x20 AND key = 'traceID'\n\
+                 \x20 AND scope = 'link:intrinsic'\n\
+                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+            ),
+        ];
+        for (set, expected) in cases {
             assert_eq!(
-                lines[1], "FROM trace_attrs_idx",
-                "{set:?}: line 1 must be the bare FROM: {sql}"
+                event_set_sql("trace_attrs_idx", set, &[[7u8; 16]], W),
+                expected,
+                "{set:?}: the value read is asserted EXACTLY — any difference, including \
+                 an appended clause, a nested subquery, a re-casing or a whitespace \
+                 change, is a deliberate act that belongs in the diff"
             );
-            for (i, line) in lines.iter().enumerate().skip(2) {
-                assert!(
-                    line.starts_with("WHERE ") || line.starts_with("  AND "),
-                    "{set:?}: line {i} is neither a WHERE nor an AND continuation, so the \
-                     statement grew a clause that can hold server-side state: {line:?} in {sql}"
-                );
-            }
-
-            // (2) The named constructs, for a failure a reader
-            // recognises. Redundant with (1) by design.
-            for banned in [
-                "groupUniqArray",
-                "groupArray",
-                "GROUP BY",
-                "DISTINCT",
-                "any(",
-                "uniq",
-                "OVER (",
-                "LIMIT",
-            ] {
-                assert!(
-                    !sql.contains(banned),
-                    "{set:?}: {banned} would put server-side state behind this read: {sql}"
-                );
-            }
-
-            // The value column: `val_num` for the one numeric member,
-            // the byte-capped `val` for the three string members.
-            if set.is_numeric() {
-                assert!(
-                    sql.contains("val_num AS v"),
-                    "{set:?}: the numeric member reads val_num: {sql}"
-                );
-                assert!(
-                    sql.contains("isNotNull(val_num)"),
-                    "{set:?}: and filters its nulls: {sql}"
-                );
-            } else {
-                assert!(
-                    sql.contains(&format!("{} AS v", byte_cap_expr("val"))),
-                    "{set:?}: the value column must be byte-capped at the source: {sql}"
-                );
-            }
-            assert!(sql.contains(&format!("key = '{}'", set.key())), "{sql}");
-            assert!(sql.contains(&format!("scope = '{}'", set.scope())), "{sql}");
-            assert!(sql.contains("date >= toDate("), "{sql}");
-            assert!(sql.contains("timestamp_ns >"), "{sql}");
-            assert!(sql.contains("trace_id IN ("), "{sql}");
         }
     }
 
