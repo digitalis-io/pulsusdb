@@ -2,24 +2,18 @@
 //! "error","position"?}` (docs/api.md §4.1/§4.2), and the status-code
 //! mapping table pinned by the issue #55 plan (v2's error table + v3's
 //! `406 not_acceptable`) plus issue #57's search rows. Mirrors
-//! `logs_api/error.rs`'s structure. `position` (a byte offset) comes from
-//! exactly two families, and both index a string the client supplied on
-//! THIS request: a TraceQL parse failure — [`ApiError::Query`] always,
-//! and [`ApiError::SearchParam`]/[`ApiError::QueryText`] when the inner is
-//! `QueryTextError::Invalid`, the length-cap and semantic rejections
-//! carrying none — and a legacy `tags` logfmt failure,
-//! [`ApiError::Legacy`], always, whose offset indexes the decoded `tags`
-//! value rather than a query expression. The other eleven of the enum's
-//! fifteen variants render no `position`, which is why
-//! [`read_error_parts`] returns no offset at all; and the §4.2 fetch path
-//! raises none of the four that can — it reaches only `Param`,
-//! `NotFound`, `NotAcceptable`, `Read`, `Assemble` and `PoolUnavailable`
-//! (`handlers::trace_by_id_impl`).
+//! `logs_api/error.rs`'s structure.
 //!
-//! Errors are **always** this JSON envelope, never protobuf, regardless of
-//! the request's `Accept` header (docs/api.md §4.1) — the mounted-but-
-//! absent `404` JSON envelope doubles as the conformance suite's mounting
-//! oracle (an unmounted path returns axum's empty `404` instead).
+//! Which variants render a `position` byte offset, and which do not, is
+//! asserted in `the_envelope_table_holds_for_every_api_error_variant`
+//! below — which is also this file's pin on the table in [`ApiError`]'s
+//! doc (issue #266).
+//!
+//! Errors are always this JSON envelope, never protobuf, regardless of the
+//! request's `Accept` header (docs/api.md §4.1) — pinned by
+//! `api_conformance`'s `assert_traces_fetch_route`, case
+//! `absent-404-stays-json`, which also uses the mounted-but-absent `404`
+//! envelope as its mounting oracle.
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -37,47 +31,43 @@ use super::params::{
     TraceIdError,
 };
 
-/// Every failure mode a `/api/traces/v1` handler can return, converted
-/// to the documented error envelope by [`IntoResponse`]:
+/// A `/api/traces/v1` handler's failure, converted to the documented
+/// error envelope by [`IntoResponse`]. The table is asserted case by case
+/// in `the_envelope_table_holds_for_every_api_error_variant`.
 ///
 /// | variant | HTTP | `errorType` |
 /// |---|---|---|
-/// | `Param` / `SearchParam` / `MetricsParam` / `GraphParam` / `TagsParam` / `TagPath` | 400 | `bad_data` |
-/// | `SearchParam(QueryText(Invalid))` (search `query` parse, carries `position`) | 400 | `bad_data` |
-/// | `QueryText(Semantic)` / `SearchParam(QueryText(Semantic))` (issue #328 `traceql.Validate` port, no `position`) | 400 | `bad_data` |
-/// | `Plan` (except the point cap) | 400 | `bad_data` |
-/// | `Query` (TraceQL parse, carries `position`) | 400 | `bad_data` |
-/// | `Legacy` (strict logfmt, carries `position` into `tags`) | 400 | `bad_data` |
+/// | `Param` / `SearchParam` / `MetricsParam` / `GraphParam` / `TagsParam` / `TagPath` / `QueryText` / `Query` / `Legacy` | 400 | `bad_data` |
+/// | `Plan` | 400 | `bad_data` |
+/// | `Plan(MetricsPointCap)` (issue #59 static pre-execution rejection) | 422 | `query_too_broad` |
 /// | `NotFound` | 404 | `not_found` |
 /// | `NotAcceptable` | 406 | `not_acceptable` |
-/// | `Plan(MetricsPointCap)` (issue #59 static pre-execution rejection) | 422 | `query_too_broad` |
-/// | `Read(…)` | see `read_error_parts` below — matched exhaustively (issue #266) |
-/// | `PoolUnavailable` | 503 | `unavailable` |
+/// | `Read(…)` | see [`read_error_parts`] — matched exhaustively (issue #266) |
 /// | `Assemble(_)` | 500 | `internal` |
+/// | `PoolUnavailable` | 503 | `unavailable` |
 #[derive(Debug)]
 pub(crate) enum ApiError {
     Param(TraceIdError),
     /// Search request-parameter failures (issue #57).
     SearchParam(SearchParamError),
-    /// Metrics request-parameter failures (issue #59, no `position`).
+    /// Metrics request-parameter failures (issue #59).
     MetricsParam(MetricsParamError),
-    /// Service-graph request-parameter failures (issue #173, no `position`).
+    /// Service-graph request-parameter failures (issue #173).
     GraphParam(GraphParamError),
-    /// `/tags` request-parameter failures (issue #58, no `position`).
+    /// `/tags` request-parameter failures (issue #58).
     TagsParam(TagsParamError),
-    /// `{tag}` path-parameter failures (issue #58, no `position`).
+    /// `{tag}` path-parameter failures (issue #58).
     TagPath(TagPathError),
     /// Legacy `tags` logfmt failures (issue #57).
     Legacy(LegacyError),
-    /// TraceQL parse failure — `400 bad_data` with a `position` byte
-    /// offset, matching the LogQL parse-error envelope.
+    /// TraceQL parse failure — `400 bad_data`, matching the LogQL
+    /// parse-error envelope.
     Query(TraceQlError),
     /// Query-text admission failure raised by a HANDLER rather than
     /// parameter parsing (issue #328): the executed expression parsed
     /// but failed the reference's semantic validation
-    /// (`querytext::validate_semantics`). `400 bad_data`, the
-    /// `invalid TraceQL query: ` wrapping, no `position` for the
-    /// semantic variant.
+    /// (`querytext::validate_semantics`). `400 bad_data`, with the
+    /// `invalid TraceQL query: ` wrapping.
     QueryText(super::querytext::QueryTextError),
     /// Search planning failure (unsupported field / type mismatch).
     Plan(pulsus_read::TracePlanError),
@@ -168,11 +158,6 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error_type, message, position) = match &self {
             ApiError::Param(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
-            // `position` only when the failure is the query-frontend
-            // validator's parse step on the search `query` parameter
-            // (issue #326) — the same byte offset `ApiError::Query`
-            // reports for a malformed `q`, so a TraceQL parse error looks
-            // the same whichever parameter carried it.
             ApiError::SearchParam(e) => (
                 StatusCode::BAD_REQUEST,
                 "bad_data",
@@ -183,9 +168,8 @@ impl IntoResponse for ApiError {
             ApiError::GraphParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::TagsParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::TagPath(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
-            // Strict logfmt errors carry a byte offset into the decoded
-            // `tags` value (code review round 1 — documented in
-            // docs/api.md §4.2 alongside the TraceQL parse offset).
+            // The offset indexes the decoded `tags` value, not a query
+            // expression (docs/api.md §4.2).
             ApiError::Legacy(e) => (
                 StatusCode::BAD_REQUEST,
                 "bad_data",
@@ -198,20 +182,15 @@ impl IntoResponse for ApiError {
                 e.to_string(),
                 Some(e.span().start),
             ),
-            // Issue #328: the semantic-validation rejection carries the
-            // same envelope whichever parameter carried the expression
-            // (`position` is `None` for the semantic variant — the
-            // reference's Validate errors name no offset).
             ApiError::QueryText(e) => (
                 StatusCode::BAD_REQUEST,
                 "bad_data",
                 e.to_string(),
                 e.position(),
             ),
-            // The metrics point cap is the one plan-time 422 (issue #59
-            // adjudication: a static pre-execution rejection in the
-            // too-broad family — bounded response, never a silent
-            // truncation); every other plan failure stays a 400.
+            // Issue #59 adjudication: a static pre-execution rejection in
+            // the too-broad family — a bounded response, never a silent
+            // truncation.
             ApiError::Plan(e @ pulsus_read::TracePlanError::MetricsPointCap { .. }) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "query_too_broad",
@@ -261,182 +240,67 @@ impl IntoResponse for ApiError {
 }
 
 /// The `ReadError` half of the table above, matched **exhaustively**
-/// (issue #266) — the shape `logs_api::error::read_error_parts` and
-/// `prom_api::error::read_error_parts` have had all along. The catch-all
-/// this replaces put every unlisted variant on 500 `internal` by
-/// omission, so adding or re-routing a `ReadError` variant was compiler-
-/// forced on two of the three query surfaces and silently absorbed by the
-/// third; it now fails the build on all three.
+/// (issue #266): a new or re-routed `ReadError` variant fails the build
+/// here rather than being absorbed onto 500 `internal` by a catch-all.
+/// Do not reintroduce a `_` arm: the compiler cannot object to one, and
+/// issue #266 records why a rejection silently arriving as 500 is a live
+/// hazard rather than a tidiness one.
 ///
-/// That absorption is a live hazard, not a tidiness one: Grafana's Tempo
-/// datasource proxies our status and body through verbatim —
-/// `grafana/grafana-tempo-datasource` `pkg/tempo/tempo.go:370,373`
-/// @ `3c7375bb541c3acde1deb068ea7ead9ebfdf56b9` (`v13.1.5-11-g3c7375b`)
-/// copies the upstream headers, then `rw.WriteHeader(resp.StatusCode)`
-/// and `io.Copy(rw, resp.Body)` with no status rewriting. So a rejection
-/// that should be 400 arriving as 500 stops being "your query is wrong"
-/// and becomes "this datasource is failing": Grafana reports the
-/// datasource unhealthy and dependent alert rules go to Error state, over
-/// a database that is fine.
+/// The return tuple carries no offset: the traces `position` names the
+/// TraceQL expression or legacy `tags` value the client sent, while
+/// [`ReadError::Parse`]'s span indexes a LogQL query text this surface
+/// never receives. Pinned by
+/// `a_logql_parse_error_renders_no_traces_position`.
 ///
-/// No `ReadError` that can reach this surface carries a `position`, hence
-/// the 3-tuple. The traces envelope's offset indexes a client-supplied
-/// string this renderer can point at (the TraceQL text, or the legacy
-/// `tags` value), and each of the three trace-reachable variants —
-/// `QueryTooBroad`, `Clickhouse`, `PipelineInvalid` (enumerated below) —
-/// is raised after that text has parsed, so none of them can name an
-/// offset into it. [`ReadError::Parse`] does carry a span, and it is by
-/// definition a parse failure, but it is a **LogQL** span: an offset into
-/// a query text this surface never receives. It is unreachable here (see
-/// the reachability paragraph below), and if the call graph ever brings
-/// it here its offset still must not be rendered as a traces `position` —
-/// pinned by `a_logql_parse_error_renders_no_traces_position`.
-///
-/// Reachability, checked at the construction sites rather than assumed.
-/// `git grep 'ReadError::' -- crates/pulsus-read/src/traces` — the read
-/// path ALONE, deliberately NOT `traces_api`, whose renderer tests below
-/// construct all fifteen variants on purpose — matches two of that
-/// directory's 13 files, `exec.rs` and `search_eval.rs`, and every
-/// construction outside their `#[cfg(test)]` modules is `QueryTooBroad`,
-/// `Clickhouse` or `PipelineInvalid`. `traces/` names no
-/// `LogQlError`/`PromqlError`/`HistogramError` at all (so nothing there
-/// can `?`-convert into the `#[from]` variants), and the one
-/// `PipelineError` it does touch is mapped to `TracePlanError`
-/// (`traces/filter.rs:624`). Of the `pulsus-read` items `traces_api`
-/// calls, only `TraceEngine`'s methods and
-/// `plan_search`/`plan_trace_metrics` are fallible — `EvalGate::new` and
-/// `canonical_double_bits` return no `Result` at all. The claims below are
-/// wrong if some future traces path calls a `pulsus-read` entry point
-/// outside `traces/` that returns `ReadError` — which is exactly the case
-/// the exhaustive match exists to force a decision on.
-///
-/// Wire effect of issue #266: no pre-existing conformance fixture, live
-/// assertion or documented wire expectation changed — every status a
-/// client can observe today (the three reachable variants, and every one
-/// of `ChError`'s seven inners: `Timeout`'s 504 and the other six's 500)
-/// is the one it had under the catch-all, and docs/api.md §4.1-§4.4's
-/// error tables are unchanged and still
-/// correct. The renderer tests below ARE new: they are fresh pins on
-/// statuses the catch-all left unstated, not edits to existing ones.
+/// Arms record a decision, not a reachability judgement: a variant gets
+/// an explicit mapping whether or not a traces handler can raise it, so a
+/// later re-route cannot turn one into a 500 by omission.
 fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
     match e {
-        // REACHABLE. The trace scan/result/generator budgets and the
-        // `by()` series cap (docs/api.md §4.2/§4.4).
+        // A bounded-response rejection (docs/api.md §4.2/§4.4). Pinned by
+        // `query_too_broad_maps_to_422_query_too_broad`.
         ReadError::QueryTooBroad(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "query_too_broad",
             e.to_string(),
         ),
-        // UNREACHABLE here — in production `NamelessSelectorUnresolvable`
-        // is constructed only by the metrics engine (`metrics/exec.rs`,
-        // four sites), which no traces handler calls; a `Display` test in
-        // `logql/error.rs` and the renderer test below also build it, as
-        // tests. `HistogramResultUnsupported` has no
-        // production construction site left anywhere in the workspace:
-        // M7-A5b's histogram encoders replaced that reject
-        // (`metrics/exec.rs:3693`), leaving renderer tests as its only
-        // constructors (`prom_api/error.rs`'s and the one below), which
-        // build it precisely because nothing else does. Mapped to
-        // this surface's bounded-response family, the same class both
-        // other renderers give them: a well-formed query the engine
-        // declines, never a server fault. `prom_api` spells that class
-        // `execution`; this surface (like `logs_api`) has only
-        // `query_too_broad` in its documented taxonomy — docs/api.md
-        // §4.1's table lists no `execution` type — so the STATUS matches
-        // prom_api and the `errorType` stays in the traces vocabulary.
+        // The engine declined a well-formed query: a bounded-response
+        // rejection, never a server fault. `query_too_broad` is the name
+        // the traces taxonomy gives that class (docs/api.md §4.1). Pinned
+        // by `a_metrics_engine_decline_maps_to_422_query_too_broad_not_500`.
         ReadError::NamelessSelectorUnresolvable { .. } | ReadError::HistogramResultUnsupported => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "query_too_broad",
             e.to_string(),
         ),
-        // REACHABLE (issue #335 Stage B: a present NON-boolean operand
-        // under `!` — `expression (!.a) expected a boolean`, the eval-time
-        // failure the reference reports as well).
-        //
-        // Issue #240: a LogQL rejection is a client error on every surface
-        // that can carry it — `logs_api::error::read_error_parts` and
-        // `prom_api::error::read_error_parts` both map it to 400
-        // `bad_data`. It WAS unreachable from `traces_api` when this arm
-        // was written, and matching it anyway is why the Stage B change
-        // landed correctly instead of falling into the 500 catch-all.
+        // A malformed query is the client's error (issue #240).
         // `Display` is transparent, so `e.to_string()` is the body,
-        // unmodified.
+        // undecorated — pinned by
+        // `read_error_pipeline_invalid_body_is_the_reason_exactly_once`.
         //
-        // STATUS DIVERGENCE, deliberate: the reference answers that query
-        // 500, because the failure happens mid-scan inside its querier. A
-        // malformed query is the client's error, not a server fault, so we
-        // keep 400 `bad_data` — consistent with every other surface
-        // carrying this variant. The accept-surface matrix scores a
-        // reference 500 as INCONCLUSIVE rather than as a rejection, so the
-        // scoreboard is unaffected either way. Pinned end to end by
+        // STATUS DIVERGENCE, deliberate: the reference answers 500,
+        // because the failure happens mid-scan inside its querier. Issue
+        // #335 Stage B made this arm reachable (a present NON-boolean
+        // operand under `!`), and the divergence is pinned end to end by
         // `traces_search_live::
         // negation_demands_a_boolean_where_truthiness_tolerates_a_string`.
         ReadError::PipelineInvalid { .. } => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
-        // UNREACHABLE here, and NOT a malformed request — which is why it
-        // is split out of the uniform 400 below. `Cancelled` is raised at
-        // the PromQL evaluator's cancel checkpoints (`pulsus-promql`
-        // `eval/mod.rs:308,369,432,1577`) once the awaiting request future
-        // has already been dropped: a client disconnect, or the
-        // server-wide `TimeoutLayer` firing first (`middleware.rs:59`,
-        // which answers 408 itself). Nothing about the query was wrong, so
-        // 400 `bad_data` would be a false accusation; this takes
-        // `prom_api`'s mapping for the same variant, 408 `timeout`.
-        // `timeout` is already this surface's documented `errorType`
-        // (docs/api.md §4.1-§4.4 spell the ClickHouse read timeout that
-        // way), so no type outside the traces taxonomy is invented — only
-        // the status is one §4.1's table does not list, and like
-        // `prom_api`'s arm this is unreachable in practice: by the time
-        // the variant exists, the future that would encode the response is
-        // gone. (`prom_api`'s 408 is undocumented for the same reason.)
+        // NOT a malformed request — which is why it is split out of the
+        // uniform 400 below. A cancelled evaluation means the awaiting
+        // request future was already dropped: a client disconnect, or the
+        // server-wide `TimeoutLayer` firing first (`middleware.rs`, itself
+        // a 408). 400 `bad_data` would accuse the client of a bad query.
+        // `timeout` is this surface's documented `errorType` for the
+        // ClickHouse read timeout (docs/api.md §4.1-§4.4). Pinned by
+        // `a_cancelled_promql_evaluation_maps_to_408_timeout_not_400_bad_data`.
         ReadError::Promql(pulsus_promql::PromqlError::Cancelled) => {
             (StatusCode::REQUEST_TIMEOUT, "timeout", e.to_string())
         }
-        // UNREACHABLE here — no PRODUCTION code under
-        // `crates/pulsus-read/src/traces` or `traces_api` constructs any
-        // of these (the renderer tests below build seven of them on
-        // purpose), and this surface's only fallible route into
-        // `pulsus-read` is `TraceEngine` and the plan functions (see
-        // above). Where they DO come from, enumerated pattern by pattern:
-        // the LogQL planner/pipeline builds six of the eight non-`Promql`
-        // patterns — `EmptyMatcherSet`, `ContradictoryMatchers`,
-        // `InvalidStep` and `QuerySpanTooLong` in `logql/plan.rs`,
-        // `DurationOutOfRange` in `logql/params.rs`, `MetricPipelineError`
-        // in `logql/client_agg.rs`. `Parse` has no explicit production
-        // construction site anywhere: it arises from the
-        // `#[from] LogQlError` conversion (the renderer test below builds
-        // one directly, as a test). `PipelineUnsupportedInMetric` has no
-        // production construction site left in the workspace either (M6-10
-        // replaced that rejection with client aggregation —
-        // `logql/plan.rs:1602`); as with `HistogramResultUnsupported`
-        // above, the only code that builds it is renderer tests,
-        // `logs_api/error.rs`'s and the one below. `Promql` is different
-        // in kind: the metrics engine constructs exactly ONE of its ten
-        // inners directly, `InvalidRegexMatcher` (`metrics/dispatch.rs`,
-        // `metrics/exec.rs` — three sites), and the other nine are raised
-        // inside `pulsus-promql` (`eval/`, `plan.rs`, `parser.rs`) and
-        // reach `ReadError` through its own `#[from] PromqlError`
-        // conversion. TraceQL's own equivalents arrive as
-        // `ApiError::Query`/`ApiError::Plan` instead.
-        //
-        // The eight non-`Promql` patterns take the class BOTH
-        // other renderers give them — a malformed or out-of-domain client
-        // query is 400 `bad_data`, and it stays 400 if the call graph ever
-        // brings one here, rather than becoming a 500 that blames the
-        // database for the client's query.
-        //
-        // `Promql` is the exception to that sentence, and only against
-        // `prom_api`. `logs_api` is uniform 400 across every inner (its
-        // own `ReadError::Promql(_)` arm), so this surface agrees with it
-        // apart from `Cancelled` above. `prom_api` instead splits per
-        // inner: `Parse`/`InvalidRegexMatcher` 400 `bad_data` (agreeing
-        // with this arm), then `Unsupported`, `BadMatching`,
-        // `HistogramBucket`, `LabelSet`, `InvalidParameter`, `ScalarOp`
-        // and `ExtendedHistogram` — seven of the ten — 422 `execution`,
-        // and `Cancelled` 408. We do not reproduce that split: it is a
-        // PromQL-API contract (docs/api.md §3's five-type taxonomy) whose
-        // 422 `execution` type §4.1's traces table does not carry, so
-        // reproducing it here would invent a traces mapping for a type
-        // this endpoint does not document.
+        // A malformed or out-of-domain client query is 400 `bad_data`,
+        // never a 500 that blames the database for it — uniformly, the
+        // remaining `Promql` inners included. Pinned by
+        // `a_logql_planner_read_error_maps_to_400_bad_data_not_500` and
+        // `a_non_cancellation_promql_error_maps_to_400_bad_data`.
         ReadError::Parse(_)
         | ReadError::Promql(_)
         | ReadError::EmptyMatcherSet
@@ -448,25 +312,18 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         | ReadError::PipelineUnsupportedInMetric { .. } => {
             (StatusCode::BAD_REQUEST, "bad_data", e.to_string())
         }
-        // UNREACHABLE here — a `metric_hist_samples` row that cannot
-        // rebuild a histogram is a metrics-path data-integrity defect, and
-        // it is a genuine 500 wherever it occurs (both other renderers
-        // agree): the client's request was fine, our stored row was not.
+        // A `metric_hist_samples` row that cannot rebuild a histogram is
+        // our data-integrity defect, not the request's — a genuine 500.
+        // Pinned by `a_histogram_decode_failure_stays_500_internal`.
         ReadError::HistogramDecode(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
         }
-        // REACHABLE — `ReadError::Clickhouse` is one of the three variants
-        // the traces read path builds. The INNERS are enumerated rather
-        // than left on a `_` so a new `ChError` variant is a decision here
-        // too, not because each is individually reachable: a read never
-        // produces `InsertUncertain` (`pulsus-clickhouse`
-        // `client.rs:180`, an insert-path downgrade). The mapping is
-        // unchanged from the catch-all era — only `Timeout` is special.
-        // `Connect` staying 500 (where `prom_api` answers 503
-        // `unavailable`) is the pre-existing cross-surface difference this
-        // change deliberately does NOT touch: it is live on both the
-        // traces and logs surfaces, so re-routing it is a wire change with
-        // its own sweep, not a by-product of making the match total.
+        // The INNERS are enumerated rather than left on a `_` so a new
+        // `ChError` variant is a decision here too — do not collapse this
+        // to a wildcard. `Connect` keeps the 500 it had before issue #266;
+        // re-routing it is a wire change with its own sweep, not a
+        // by-product of making the match total, and is held meanwhile by
+        // `read_clickhouse_connect_error_still_maps_to_500_internal`.
         ReadError::Clickhouse(ch) => match ch {
             ChError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string()),
             ChError::Connect(_)
@@ -495,13 +352,9 @@ mod tests {
         (status, json)
     }
 
-    /// Issue #240: the LogQL-class rejection is 400 `bad_data` on this
-    /// surface too, with the BARE reason as the whole body (the variant's
-    /// `Display` carries no prefix). Deleting the explicit arm no longer
-    /// compiles — since issue #266 the match is exhaustive, so the arm
-    /// cannot fall back to the 500 `internal` catch-all it would have hit
-    /// before; restoring a decorating `#[error]` prefix breaks the
-    /// byte-exact `error`-field assertion.
+    /// Issue #240: the LogQL-class rejection is 400 `bad_data` with the
+    /// BARE reason as the whole body — restoring a decorating `#[error]`
+    /// prefix breaks the byte-exact `error`-field assertion.
     #[tokio::test]
     async fn read_error_pipeline_invalid_maps_to_400_bad_data() {
         let err = ApiError::Read(ReadError::PipelineInvalid {
@@ -598,10 +451,9 @@ mod tests {
         assert_eq!(json["errorType"], "internal");
     }
 
-    /// Issue #266: a connect failure keeps the 500 it had under the
-    /// catch-all — enumerating `ChError` did not silently adopt
-    /// `prom_api`'s 503 `unavailable` for it. Re-routing this one is a
-    /// live wire change on two surfaces and is deliberately out of scope.
+    /// Issue #266: a connect failure keeps the 500 it had before the
+    /// match became exhaustive. Re-routing it is a live wire change and
+    /// is deliberately out of scope here.
     #[tokio::test]
     async fn read_clickhouse_connect_error_still_maps_to_500_internal() {
         let err = ApiError::Read(ReadError::Clickhouse(ChError::Connect(
@@ -613,13 +465,7 @@ mod tests {
     }
 
     /// Issue #266: a LogQL planner/pipeline client-input rejection is 400
-    /// `bad_data` here as it is on `logs_api`/`prom_api`, not the 500 the
-    /// removed catch-all gave it. All are unreachable from a traces
-    /// handler today (the LogQL planner is not on this call graph, and
-    /// `PipelineUnsupportedInMetric` has had no production construction
-    /// site anywhere since M6-10 — the loop below is one of its two, both
-    /// renderer tests) — the arms are the record of the decision, so a
-    /// future re-route cannot make one a 500 by omission.
+    /// `bad_data`, not the 500 the removed catch-all gave it.
     #[tokio::test]
     async fn a_logql_planner_read_error_maps_to_400_bad_data_not_500() {
         for err in [
@@ -657,9 +503,8 @@ mod tests {
 
     /// Issue #266 review round 1: a cancelled PromQL evaluation is a
     /// dropped request future (client disconnect, or the server's own 408
-    /// `TimeoutLayer`), never malformed input — 408 `timeout`, the mapping
-    /// `prom_api` gives the same variant, NOT the uniform 400 `bad_data`
-    /// the other `Promql` inners take here.
+    /// `TimeoutLayer`), never malformed input — 408 `timeout`, not the
+    /// uniform 400 `bad_data` of the arm below it.
     #[tokio::test]
     async fn a_cancelled_promql_evaluation_maps_to_408_timeout_not_400_bad_data() {
         let err = ApiError::Read(ReadError::Promql(pulsus_promql::PromqlError::Cancelled));
@@ -669,11 +514,9 @@ mod tests {
         assert!(json.get("position").is_none(), "body {json}");
     }
 
-    /// Issue #266: every OTHER `Promql` inner stays on the uniform 400
-    /// `bad_data` — deliberately not `prom_api`'s 422 `execution` for the
-    /// declined-evaluation family, whose `errorType` docs/api.md §4.1's
-    /// traces table does not define. `Unsupported` is a 422 on `prom_api`,
-    /// so it pins the divergence rather than merely agreeing with it.
+    /// Issue #266: a non-cancellation `Promql` inner takes the uniform 400
+    /// `bad_data` of the arm it falls into, using the `errorType` vocabulary
+    /// docs/api.md §4.1 defines for traces.
     #[tokio::test]
     async fn a_non_cancellation_promql_error_maps_to_400_bad_data() {
         let err = ApiError::Read(ReadError::Promql(pulsus_promql::PromqlError::Unsupported {
@@ -685,13 +528,11 @@ mod tests {
         assert!(json.get("position").is_none());
     }
 
-    /// Issue #266 review round 1: [`ReadError::Parse`] is the one arm that
-    /// IS a parse failure and DOES carry a span — a **LogQL** span, into a
-    /// query text this surface never receives. It must therefore never
-    /// render a traces `position`, which the renderer guarantees
-    /// structurally (`read_error_parts` returns a 3-tuple and the call
-    /// site supplies `None`); this pins that guarantee against a future
-    /// widening.
+    /// Issue #266 review round 1: [`ReadError::Parse`] carries a **LogQL**
+    /// span, an offset into a query text this surface never receives, so
+    /// it must never render a traces `position`. The renderer guarantees
+    /// that structurally — `read_error_parts` returns a 3-tuple and the
+    /// call site supplies `None` — and this pins it against a widening.
     #[tokio::test]
     async fn a_logql_parse_error_renders_no_traces_position() {
         let inner = pulsus_logql::parse("{").expect_err("must fail");
@@ -707,13 +548,9 @@ mod tests {
     }
 
     /// Issue #266: the two metrics-path "engine declines a well-formed
-    /// query" variants take this surface's bounded-response family (the
-    /// 422 `prom_api` gives them, spelled with the `errorType` docs/api.md
-    /// §4.1 defines for traces), not the removed catch-all's 500. Only
-    /// `NamelessSelectorUnresolvable` is raised by the metrics engine
-    /// today; `HistogramResultUnsupported` has had no production
-    /// construction site since M7-A5b's histogram encoders replaced that
-    /// reject — the loop below is one of its two, both renderer tests.
+    /// query" variants take this surface's bounded-response family — 422
+    /// `query_too_broad`, the `errorType` docs/api.md §4.1 defines for
+    /// traces — not the removed catch-all's 500.
     #[tokio::test]
     async fn a_metrics_engine_decline_maps_to_422_query_too_broad_not_500() {
         for err in [
@@ -733,9 +570,8 @@ mod tests {
         }
     }
 
-    /// Issue #266: a histogram-decode failure is the one newly explicit
-    /// variant that genuinely IS a 500 — our stored row is malformed, the
-    /// client's request was not. Same verdict on all three renderers.
+    /// Issue #266: a histogram-decode failure genuinely IS a 500 — our
+    /// stored row is malformed, the client's request was not.
     #[tokio::test]
     async fn a_histogram_decode_failure_stays_500_internal() {
         let err = ReadError::HistogramDecode(pulsus_model::HistogramError::SchemaOutOfRange(200));
@@ -795,54 +631,202 @@ mod tests {
         assert_eq!(json["position"], 3, "body {json}");
     }
 
-    /// Issue #266 review round 3: the module header used to say
-    /// `position` appears only on TraceQL parse errors, while
-    /// `ApiError::Legacy` (above) and `ApiError::SearchParam` also emit
-    /// one. The corrected header states the rule per inner, so pin that
-    /// rule rather than leaving it prose: the offset appears for
-    /// `QueryTextError::Invalid` — the validated `query` parameter's
-    /// parse failure — and for neither of that enum's other two inners,
-    /// whichever of the two `ApiError` variants carries it.
+    /// Issue #266: where [`ApiError`]'s doc table and the `position` rule
+    /// are asserted rather than restated in prose. A case per variant of
+    /// the enum, plus the two splits the table calls out (`Plan`'s point
+    /// cap, and `QueryText`'s inners under both carriers), each checking
+    /// status, `errorType` and whether a `position` offset is rendered.
+    ///
+    /// It does not fail when a variant is ADDED — nothing can force that.
+    /// Adding a case is the obligation [`IntoResponse`]'s own exhaustive
+    /// `match` creates, the way [`read_error_parts`]'s does for
+    /// `ReadError`.
     #[tokio::test]
-    async fn a_query_text_position_appears_for_the_parse_inner_only() {
+    async fn the_envelope_table_holds_for_every_api_error_variant() {
         use super::super::querytext::QueryTextError;
 
         let invalid = || QueryTextError::Invalid {
             message: "syntax error".to_string(),
             position: 7,
         };
-        for err in [
-            ApiError::SearchParam(SearchParamError::QueryText(invalid())),
-            ApiError::QueryText(invalid()),
-        ] {
-            let (status, json) = envelope(err).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(json["errorType"], "bad_data");
-            assert_eq!(json["position"], 7, "body {json}");
-        }
-
-        let offsetless = || {
-            [
-                QueryTextError::TooLong { len: 9, cap: 8 },
-                QueryTextError::Semantic(pulsus_traceql::ValidateError::TypeMismatch {
-                    expr: "1 = `a`".to_string(),
-                }),
-            ]
+        let semantic = || {
+            QueryTextError::Semantic(pulsus_traceql::ValidateError::TypeMismatch {
+                expr: "1 = `a`".to_string(),
+            })
         };
-        let [long_a, sem_a] = offsetless();
-        let [long_b, sem_b] = offsetless();
-        for err in [
-            ApiError::SearchParam(SearchParamError::QueryText(long_a)),
-            ApiError::SearchParam(SearchParamError::QueryText(sem_a)),
-            ApiError::QueryText(long_b),
-            ApiError::QueryText(sem_b),
-            // A non-`QueryText` search-parameter failure is about the
-            // request, not a place inside an expression.
-            ApiError::SearchParam(SearchParamError::ConflictingQuery),
-        ] {
+        let too_long = || QueryTextError::TooLong { len: 9, cap: 8 };
+
+        // (case, error, status, errorType, renders a `position`)
+        let cases: Vec<(&str, ApiError, StatusCode, &str, bool)> = vec![
+            (
+                "Param",
+                ApiError::Param(TraceIdError::InvalidLength("abc".to_string())),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "SearchParam",
+                ApiError::SearchParam(SearchParamError::ConflictingQuery),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "SearchParam(QueryText(Invalid))",
+                ApiError::SearchParam(SearchParamError::QueryText(invalid())),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                true,
+            ),
+            (
+                "SearchParam(QueryText(TooLong))",
+                ApiError::SearchParam(SearchParamError::QueryText(too_long())),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "SearchParam(QueryText(Semantic))",
+                ApiError::SearchParam(SearchParamError::QueryText(semantic())),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "MetricsParam",
+                ApiError::MetricsParam(MetricsParamError::InvalidStep("500ms".to_string())),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "GraphParam",
+                ApiError::GraphParam(GraphParamError::MissingRange),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "TagsParam",
+                ApiError::TagsParam(TagsParamError::UnsupportedScope("bogus".to_string())),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "TagPath",
+                ApiError::TagPath(TagPathError::EmptyKey),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "Legacy",
+                ApiError::Legacy(LegacyError::UnquotedEquals {
+                    key: "a".to_string(),
+                    pos: 3,
+                }),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                true,
+            ),
+            (
+                "Query",
+                ApiError::Query(pulsus_traceql::parse("{ ").expect_err("must fail")),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                true,
+            ),
+            (
+                "QueryText(Invalid)",
+                ApiError::QueryText(invalid()),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                true,
+            ),
+            (
+                "QueryText(TooLong)",
+                ApiError::QueryText(too_long()),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "QueryText(Semantic)",
+                ApiError::QueryText(semantic()),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "Plan",
+                ApiError::Plan(pulsus_read::TracePlanError::TypeMismatch(
+                    "status supports only = and !=".to_string(),
+                )),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "Plan(MetricsPointCap)",
+                ApiError::Plan(pulsus_read::TracePlanError::MetricsPointCap {
+                    buckets: 12_000,
+                    cap: 11_000,
+                }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "query_too_broad",
+                false,
+            ),
+            (
+                "NotFound",
+                ApiError::NotFound,
+                StatusCode::NOT_FOUND,
+                "not_found",
+                false,
+            ),
+            (
+                "NotAcceptable",
+                ApiError::NotAcceptable,
+                StatusCode::NOT_ACCEPTABLE,
+                "not_acceptable",
+                false,
+            ),
+            (
+                "Read",
+                ApiError::Read(ReadError::EmptyMatcherSet),
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                false,
+            ),
+            (
+                "Assemble",
+                ApiError::Assemble(AssembleError::UnsupportedPayloadType { count: 3 }),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                false,
+            ),
+            (
+                "PoolUnavailable",
+                ApiError::PoolUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                false,
+            ),
+        ];
+
+        for (case, err, want_status, want_type, want_position) in cases {
             let (status, json) = envelope(err).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert!(json.get("position").is_none(), "body {json}");
+            assert_eq!(status, want_status, "{case}: status, body {json}");
+            assert_eq!(json["errorType"], want_type, "{case}: body {json}");
+            assert_eq!(
+                json.get("position").is_some(),
+                want_position,
+                "{case}: `position` presence, body {json}"
+            );
+            if want_position {
+                assert!(json["position"].is_u64(), "{case}: body {json}");
+            }
         }
     }
 
@@ -872,8 +856,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_metrics_point_cap_plan_error_maps_to_422_query_too_broad() {
-        // Issue #59 adjudication: the one plan-time 422 — never conflated
-        // with the 400 bad_data plan family.
+        // Issue #59 adjudication: a static pre-execution rejection, not
+        // the 400 `bad_data` plan family.
         let err = ApiError::Plan(pulsus_read::TracePlanError::MetricsPointCap {
             buckets: 12_000,
             cap: 11_000,
@@ -900,10 +884,9 @@ mod tests {
         assert_eq!(json["errorType"], "query_too_broad");
     }
 
-    /// Issue #57 re-audit AC-conformance: the generator-memory reason
-    /// carries the same envelope as every other `QueryTooBroad` variant
-    /// — no dedicated match arm was needed (`ApiError::Read`'s
-    /// `QueryTooBroad(_)` arm already covers it).
+    /// Issue #57 re-audit AC-conformance: the generator-memory reason is
+    /// covered by `ApiError::Read`'s `QueryTooBroad(_)` arm — no dedicated
+    /// match arm was needed — and names its reason in the body.
     #[tokio::test]
     async fn the_generator_memory_reason_maps_to_422_query_too_broad() {
         let err = ApiError::Read(ReadError::QueryTooBroad(
