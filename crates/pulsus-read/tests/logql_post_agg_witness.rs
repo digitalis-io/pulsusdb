@@ -6106,12 +6106,21 @@ fn every_semantic_refusal_under_the_binary_seam_is_decided_above_the_charge() {
     got.sort_unstable();
 
     /// Every semantic refusal the binary funnel can raise, as the FIVE
-    /// leaf constructors that build them. All five are decided above the
-    /// stage charge — the four operand-shape ones by `decide_shape`
-    /// (class P0, above every charge), the three join ones by
-    /// `decide_binary_refusals` (class P1, under its own charge) — so
-    /// this funnel has no class-(A) member left and every remaining
-    /// post-charge refusal is `Ledger::admit`, i.e. the budget itself.
+    /// leaf constructors that build them. All five are class (P) — the
+    /// operand-shape ones decided by `decide_shape` (P0, above every
+    /// charge, unconditionally), the three join ones by
+    /// `decide_binary_refusals` (P1, under its own charge) — so this
+    /// funnel has no class-(A) member left.
+    ///
+    /// (P1) is decided above the stage charge whenever that charge would
+    /// REFUSE, which is the only case in which its position matters:
+    /// where the charge admits, `decide_binary`'s guard skips the
+    /// preflight and `instant_join` raises the same three errors below
+    /// the charge, with nothing to be preempted by. The one case where a
+    /// budget breach still answers first is the scratch skip
+    /// (`PreflightCharge::acquire` returning `None`), unreachable below
+    /// ~6.75 million combined series and kept reproducible by
+    /// `the_join_refusals_are_preempted_by_the_budget_when_the_preflight_is_skipped`.
     const EXPECT_SEMANTIC_REFUSALS: &[&str] = &[
         "duplicate_one_side_error",
         "grouping_unique_error",

@@ -117,15 +117,26 @@ pub fn combine_binary(
 /// The binary cap seam; see [`apply_vector_aggs_capped`]. The charge is
 /// levied on the measured operands BEFORE the join builds its one-side
 /// index, its match signatures or its output — and **after** every
-/// class-(P) semantic refusal has been decided (issue #290).
+/// class-(P) semantic refusal that this charge could preempt has been
+/// decided (issue #290).
 ///
 /// The order is structural, not a convention. [`decide_binary`] MOVES
-/// both operands into a `BinaryDecided`, and `Ledger::acquire_binary` is
-/// the only way to get them back: an operand cannot reach the join except
-/// through a charge the decision preceded, and the decision cannot be
-/// skipped, conditioned or made over a different pair, because there is
-/// no second pair to name. See docs/architecture.md §5.6.
-#[allow(clippy::too_many_arguments)]
+/// both operands into a `BinaryDecided` — together with the `op` and the
+/// `matching` the decision was made under — and `Ledger::acquire_binary`
+/// is the only way to get any of them back: an operand cannot reach the
+/// join except through a charge the decision preceded, the decision
+/// cannot be made over a different pair (there is no second pair to
+/// name), and it cannot be joined under a different matcher, because the
+/// matcher is a private field of the decision and [`join_decided`] takes
+/// its context from nowhere else. See docs/architecture.md §5.6.
+///
+/// **What "that this charge could preempt" excludes.** The (P1) join
+/// refusals are decided only when this seam's charge would actually
+/// refuse — see [`decide_binary`]'s guard. When the charge admits there
+/// is no budget rejection for anything to be preempted by: the join runs
+/// and the caller gets the join's own answer, which is the answer the
+/// preflight exists to let through. The (P0) shape refusals are decided
+/// unconditionally.
 pub fn combine_binary_capped(
     charged: &mut u64,
     op: BinOp,
@@ -135,8 +146,37 @@ pub fn combine_binary_capped(
     rhs: QueryResult,
     cap: u64,
 ) -> Result<QueryResult, ReadError> {
-    let decided = decide_binary(op, matching, lhs, rhs)?;
-    let (l, lhs, rhs) = Ledger::acquire_binary(charged, decided, cap)?;
+    let decided = decide_binary(op, matching, lhs, rhs, *charged, cap)?;
+    let (l, op, matching, lhs, rhs) = Ledger::acquire_binary(charged, decided, cap)?;
+    join_decided(&l, op, return_bool, matching, lhs, rhs)
+}
+
+/// The join itself, over operands and a decision context that came out of
+/// [`Ledger::acquire_binary`] and could not have come from anywhere else.
+///
+/// **Why this is a separate function** (issue #290, review round 2's
+/// `[medium]`): (P1)'s answer is a function of `op` and `matching`, so
+/// joining under a context the refusals were not decided under is the
+/// same defect as joining operands that were not decided at all. Keeping
+/// the join in [`combine_binary_capped`] left that context nameable —
+/// the caller's own parameters were still in scope, and rebinding them
+/// over the decision's would have compiled and passed. Here they are not
+/// in scope: threading a different `op` or `matching` in means adding a
+/// parameter, which does not compile against the one call site.
+///
+/// `return_bool` is deliberately NOT part of the decision. It selects
+/// what a comparison emits, and `instant_join` detects every duplicate
+/// before its keep filter (its "Duplicate detection — BEFORE the keep
+/// filter" block), so no refusal is a function of it — which is also why
+/// `binary_peak_bytes` does not take it.
+fn join_decided(
+    led: &Ledger<'_>,
+    op: BinOp,
+    return_bool: bool,
+    matching: Option<&VectorMatching>,
+    lhs: QueryResult,
+    rhs: QueryResult,
+) -> Result<QueryResult, ReadError> {
     match (lhs, rhs) {
         (QueryResult::Scalar(l), QueryResult::Scalar(r)) => {
             if is_set_op(op) {
@@ -164,7 +204,7 @@ pub fn combine_binary_capped(
             map_samples(
                 vector_side,
                 |v| scalar_apply(op, return_bool, s, v, true),
-                &l,
+                led,
             )
         }
         (
@@ -177,14 +217,14 @@ pub fn combine_binary_capped(
             map_samples(
                 vector_side,
                 |v| scalar_apply(op, return_bool, s, v, false),
-                &l,
+                led,
             )
         }
         (QueryResult::Vector(a), QueryResult::Vector(b)) => Ok(QueryResult::Vector(
-            combine_vectors(op, return_bool, matching, a, b, &l)?,
+            combine_vectors(op, return_bool, matching, a, b, led)?,
         )),
         (QueryResult::Matrix(a), QueryResult::Matrix(b)) => Ok(QueryResult::Matrix(
-            combine_matrices(op, return_bool, matching, a, b, &l)?,
+            combine_matrices(op, return_bool, matching, a, b, led)?,
         )),
         // Both operands evaluate under the same QuerySpec, so a
         // vector/matrix mix (or a streams/string operand) is structurally
@@ -1829,7 +1869,7 @@ thread_local! {
     static PREFLIGHT_SCRATCH_CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// The class-(P) preflight: every semantic refusal the binary funnel can
+/// The class-(P) preflight: the semantic refusals the binary funnel can
 /// raise, decided from the operands' already-materialised labels and
 /// timestamps **before** the stage charge exists (issue #290).
 ///
@@ -1840,19 +1880,43 @@ thread_local! {
 /// of INPUT COUNTS alone and never of the output's shape, and without
 /// constructing any part of the charged output. All five of this funnel's
 /// semantic refusals pass that test, so this funnel has no class-(A)
-/// member left; every remaining post-charge refusal is [`Ledger::admit`],
-/// i.e. the budget itself.
+/// member left.
+///
+/// **Where the "before the charge" claim stops, exactly.** Two things
+/// leave a refusal below the charge, and neither is a class-(A) member:
+///
+/// 1. **The guard.** (P1) runs only when the stage charge about to be
+///    levied would refuse (`ledger::decide_binary`). When it would not,
+///    the three join refusals are raised by `instant_join` after
+///    `Ledger::acquire_binary` — below the charge, and harmlessly,
+///    because that charge admitted and so preempts nothing.
+/// 2. **The skip.** When the scratch would exceed
+///    [`MAX_BINARY_PREFLIGHT_BYTES`], `PreflightCharge::acquire` returns
+///    `None` and (P1) does not run at all. Behaviour then falls back
+///    byte-for-byte to the pre-#290 ordering, budget-first, which
+///    `the_join_refusals_are_preempted_by_the_budget_when_the_preflight_is_skipped`
+///    keeps reproducible. The skip is unreachable below ~6.75 million
+///    combined series.
+///
+/// (P0) is subject to neither: `decide_shape` runs unconditionally, above
+/// every charge.
 ///
 /// **The scratch is charged before it is allocated.** `decide_shape` is
-/// (P0) — a match on operand discriminants that allocates nothing and
-/// therefore runs above every charge. [`decide_binary_refusals`] is (P1):
-/// it takes a `&PreflightCharge`, which is proof that its six buffers
-/// were priced from `Vec::len()` counts and admitted against
+/// (P0) — a match on operand discriminants that needs no input-scaled
+/// scratch and therefore runs above every charge. (It is not literally
+/// allocation-free: on its two refusing paths it calls an error
+/// constructor that builds the message `String` the client receives, as
+/// every semantic refusal in this crate does under no charge at all.
+/// What it never causes is an allocation whose size an operand can
+/// influence.) [`decide_binary_refusals`] is (P1): it takes a
+/// `&PreflightCharge`, which is proof that its six buffers were priced
+/// from `Vec::len()` counts and admitted against
 /// [`MAX_BINARY_PREFLIGHT_BYTES`] first.
 ///
-/// **This module allocates NOTHING outside those six buffers.** Two
-/// independent mechanisms bound that: a source rule in
-/// `tests/logql_post_agg_witness.rs` (`the_preflight_module_allocates_only_its_six_reserved_buffers`),
+/// **This module causes NO allocation outside those six buffers and the
+/// messages its error constructors build.** Two independent mechanisms
+/// bound that: a source rule in `tests/logql_post_agg_witness.rs`
+/// (`the_preflight_module_allocates_only_its_six_reserved_buffers`),
 /// which sees direct calls only, and the measured allocator gate in
 /// `tests/logql_preflight_alloc_gate.rs`, which is closed over the callee
 /// closure by construction and is the enforcement of the byte bound.
@@ -1950,8 +2014,10 @@ mod preflight {
 
     /// (P0) — the operand-shape dispatch, reproducing the arm
     /// [`super::combine_binary_capped`]'s `match` selects over ALL SEVEN
-    /// [`QueryResult`] variants. Allocates nothing, so it runs above even
-    /// the preflight's own charge and can never be preempted.
+    /// [`QueryResult`] variants. Needs no input-scaled scratch — the only
+    /// thing it allocates is the refusal message itself, on the two arms
+    /// that refuse — so it runs above even the preflight's own charge and
+    /// can never be preempted, at any cap, with any counter.
     pub(super) fn decide_shape(
         op: BinOp,
         lhs: &QueryResult,
@@ -2398,29 +2464,34 @@ mod preflight {
     }
 }
 
-/// The seam `tests/logql_preflight_alloc_gate.rs` brackets with its own
-/// counting global allocator (issue #290 §3).
+/// The seam `tests/logql_preflight_alloc_gate.rs` and
+/// `tests/logql_preflight_guard_gate.rs` bracket with their own counting
+/// global allocators (issue #290 §3).
 ///
-/// `#[doc(hidden)]`, and it exists for that gate: the preflight's
+/// `#[doc(hidden)]`, and it exists for those gates: the preflight's
 /// allocation bound has to be MEASURED, because the source rule that
 /// would otherwise carry it sees direct calls only and a helper defined
 /// outside the scanned module defeats it. An integration-test binary
 /// cannot bracket a private function, and this is the smallest seam that
-/// lets it. The body is `measure_operand` twice and the `PreflightCharge`
-/// block, and nothing else. Precedent:
+/// lets it.
+///
+/// **The body is one call to [`decide_binary`] and nothing else**, so
+/// what the gates measure is the shipped decision path — its (P0) tier,
+/// its measurement, its guard and its (P1) tier — and not a
+/// re-implementation of it that a mutant could leave green. The returned
+/// `BinaryDecided` is dropped rather than charged: dropping frees the
+/// operands, which requests nothing. Precedent:
 /// `tests/logql_json_key_alloc_gate.rs`.
 #[doc(hidden)]
 pub fn preflight_alloc_probe(
     op: BinOp,
     matching: Option<&VectorMatching>,
-    lhs: &QueryResult,
-    rhs: &QueryResult,
+    lhs: QueryResult,
+    rhs: QueryResult,
+    stage_charged: u64,
+    stage_cap: u64,
 ) -> Result<(), ReadError> {
-    let (lm, rm) = (measure_operand(lhs), measure_operand(rhs));
-    match PreflightCharge::acquire(&lm, &rm) {
-        Some(pc) => preflight::decide_binary_refusals(op, matching, lhs, rhs, &pc),
-        None => Ok(()),
-    }
+    decide_binary(op, matching, lhs, rhs, stage_charged, stage_cap).map(|_| ())
 }
 
 /// The funnel's proof token (issue #236 §4.1).
@@ -2499,7 +2570,8 @@ mod ledger {
     }
 
     /// Operands whose every class-(P) refusal has been decided, together
-    /// with the measurement taken FROM THEM (issue #290).
+    /// with the measurement taken FROM THEM **and the decision context
+    /// they were decided under** (issue #290).
     ///
     /// The fields are private to this module: the only constructor is
     /// [`decide_binary`], and the only exit is [`Ledger::acquire_binary`],
@@ -2508,8 +2580,21 @@ mod ledger {
     /// rather than conventional — an operand cannot reach the join except
     /// through a charge the decision preceded, and there is no second
     /// pair for a caller to decide one of and charge the other.
+    ///
+    /// **`op` and `matching` live in here for the same reason the
+    /// operands do.** (P1)'s whole answer is a function of the matcher —
+    /// which side is "one", what the match signature projects, whether
+    /// the identity is the signature or the include-stripped label set —
+    /// and `bytes` is priced under that same matcher. Were the context
+    /// left outside, parent-module code could `mem::swap` or
+    /// `mem::replace` the operand halves of two decisions and then charge
+    /// and join a decided pair under a matcher it was never decided
+    /// under. It cannot: the halves are private and inseparable, so a
+    /// swap moves the whole decision or does not compile.
     #[derive(Debug)]
-    pub(super) struct BinaryDecided {
+    pub(super) struct BinaryDecided<'m> {
+        op: BinOp,
+        matching: Option<&'m VectorMatching>,
         lhs: QueryResult,
         rhs: QueryResult,
         lm: StageInput,
@@ -2517,36 +2602,85 @@ mod ledger {
         bytes: u64,
     }
 
-    /// Decides every class-(P) refusal of the binary funnel, then
-    /// measures and prices the operands it decided over.
+    /// Decides every class-(P) refusal of the binary funnel that the
+    /// stage charge could preempt, then measures and prices the operands
+    /// it decided over.
     ///
-    /// Takes NEITHER `charged` NOR `cap`: the preflight's own admission
-    /// reads only the operands' counts and its own ceiling, so a caller's
-    /// spending cannot make a semantic error unreachable. The tiers are
-    /// (P0) `decide_shape`, uncharged because it allocates nothing; then
-    /// the measurement, which is saturating arithmetic over already
+    /// The tiers are (P0) `decide_shape`, unconditional and above every
+    /// charge because it needs no input-scaled scratch; then the
+    /// measurement, which is saturating arithmetic over already
     /// materialised data; then (P1) `decide_binary_refusals`, under its
     /// own charge, SKIPPED rather than refused when the scratch would
     /// exceed the ceiling.
-    pub(super) fn decide_binary(
+    ///
+    /// # The guard
+    ///
+    /// (P1) runs only when [`stage_charge_would_refuse`] — the SAME
+    /// expression [`Ledger::acquire_for`] rejects on, so the two cannot
+    /// drift — says the charge about to be levied would refuse.
+    ///
+    /// That is the whole condition under which the preflight can change
+    /// an answer. Issue #290 exists because a budget rejection preempted
+    /// a decidable semantic error; where the charge admits there is no
+    /// budget rejection, the join runs, and the caller gets the join's
+    /// own answer — the same answer a preflight would have produced, and
+    /// the same one it produced before #290 existed.
+    /// `a_skipped_preflight_leaves_behaviour_unchanged` asserts that
+    /// equality over 81 930 cases at the production cap.
+    ///
+    /// So an admitted query pays nothing: no scratch is reserved, no
+    /// signature is sorted and no point is read.
+    /// `tests/logql_preflight_guard_gate.rs` measures the bytes at zero;
+    /// `the_guard_reads_no_point_when_the_charge_cannot_refuse` counts
+    /// the point reads; `the_guard_turns_over_at_the_exact_byte_the_charge_refuses_on`
+    /// pins the boundary.
+    ///
+    /// **This is not v2's `include_delta > 0` gate.** That one keyed the
+    /// preflight on a property of the QUERY while leaving an acquisition
+    /// that could still refuse underneath it, so a low cap or a nonzero
+    /// caller counter reopened the defect (plan v2 review, `[blocking]`).
+    /// This one keys on the acquisition itself: it skips exactly when
+    /// that acquisition cannot refuse, at any cap, with any counter, so
+    /// the refusal it protects against does not exist on the skipped
+    /// path. `PreflightCharge::acquire` still reads neither — the
+    /// preflight's own SCRATCH admission is never a function of a
+    /// caller's spending (plan v5 review, `[high]`); only whether there
+    /// is anything to protect is.
+    pub(super) fn decide_binary<'m>(
         op: BinOp,
-        matching: Option<&VectorMatching>,
+        matching: Option<&'m VectorMatching>,
         lhs: QueryResult,
         rhs: QueryResult,
-    ) -> Result<BinaryDecided, ReadError> {
+        stage_charged: u64,
+        stage_cap: u64,
+    ) -> Result<BinaryDecided<'m>, ReadError> {
         super::preflight::decide_shape(op, &lhs, &rhs)?;
         let (lm, rm) = (super::measure_operand(&lhs), super::measure_operand(&rhs));
         let bytes = super::binary_peak_bytes(op, matching, &lm, &rm);
-        if let Some(pc) = PreflightCharge::acquire(&lm, &rm) {
+        if stage_charge_would_refuse(stage_charged, bytes, stage_cap)
+            && let Some(pc) = PreflightCharge::acquire(&lm, &rm)
+        {
             super::preflight::decide_binary_refusals(op, matching, &lhs, &rhs, &pc)?;
         }
         Ok(BinaryDecided {
+            op,
+            matching,
             lhs,
             rhs,
             lm,
             rm,
             bytes,
         })
+    }
+
+    /// **The one definition of "this charge refuses".**
+    ///
+    /// [`Ledger::acquire_for`] rejects on it and [`decide_binary`]'s
+    /// guard runs the (P1) preflight on it. One expression, so a change
+    /// to the refusal condition moves the guard with it and a mutant that
+    /// loosens one loosens both.
+    fn stage_charge_would_refuse(charged: u64, bytes: u64, cap: u64) -> bool {
+        charged.saturating_add(bytes) > cap
     }
 
     /// Proof that a stage's modelled bytes were charged, AND the budget
@@ -2582,17 +2716,31 @@ mod ledger {
         /// the same quantity `binary_peak_bytes` is evaluated over.
         ///
         /// Consumes the decision, levies the charge derived from it, and
-        /// hands back the operands it was decided over. Callers cannot
-        /// name those operands by any other route (issue #290): there is
-        /// no `&StageInput` parameter left to supply a measurement that
-        /// was not taken from them, and no way to obtain a
-        /// [`BinaryDecided`] except from [`decide_binary`].
-        pub(super) fn acquire_binary(
+        /// hands back the operands it was decided over **and the `op` and
+        /// `matching` they were decided under**. Callers cannot name any
+        /// of those by another route (issue #290): there is no
+        /// `&StageInput` parameter left to supply a measurement that was
+        /// not taken from them, no way to obtain a [`BinaryDecided`]
+        /// except from [`decide_binary`], and no way to pair one
+        /// decision's operands with another's matcher, because the two
+        /// are private fields of one value.
+        pub(super) fn acquire_binary<'m>(
             charged: &'a mut u64,
-            decided: BinaryDecided,
+            decided: BinaryDecided<'m>,
             cap: u64,
-        ) -> Result<(Self, QueryResult, QueryResult), ReadError> {
+        ) -> Result<
+            (
+                Self,
+                BinOp,
+                Option<&'m VectorMatching>,
+                QueryResult,
+                QueryResult,
+            ),
+            ReadError,
+        > {
             let BinaryDecided {
+                op,
+                matching,
                 lhs,
                 rhs,
                 lm,
@@ -2606,7 +2754,7 @@ mod ledger {
                 bytes,
                 cap,
             )?;
-            Ok((l, lhs, rhs))
+            Ok((l, op, matching, lhs, rhs))
         }
 
         fn acquire_for(
@@ -2617,7 +2765,7 @@ mod ledger {
             cap: u64,
         ) -> Result<Self, ReadError> {
             let next = charged.saturating_add(bytes);
-            if next > cap {
+            if stage_charge_would_refuse(*charged, bytes, cap) {
                 return Err(ReadError::QueryTooBroad(
                     TooBroadReason::MetricPostAggBytes { bytes: next, cap },
                 ));
@@ -2675,6 +2823,11 @@ use ledger::Ledger;
 // above: `the_enforcement_path_contains_no_debug_assert` delimits its
 // scan region with the literal `"\nuse ledger::Ledger;"`, so folding
 // these into a brace group would silence that gate rather than fail it.
+// `PreflightCharge` is named at this level only by the in-crate tests
+// that drive the preflight's own admission directly: since the probe
+// routes through `decide_binary`, production code reaches the token
+// through `mod ledger` and `mod preflight` alone.
+#[cfg(test)]
 use ledger::PreflightCharge;
 use ledger::decide_binary;
 
@@ -4081,6 +4234,15 @@ mod tests {
         out
     }
 
+    /// A `(stage_charged, stage_cap)` pair whose charge refuses for EVERY
+    /// operand pair — `1 + bytes > 0` holds however small `bytes` is, so
+    /// [`decide_binary`]'s guard never skips. The differential, the shape
+    /// pin and the read counter all drive it: their subject is the
+    /// preflight itself, and a guard that skipped would make them measure
+    /// nothing. What the guard does on the other side of that condition
+    /// is the subject of its own tests.
+    const ALWAYS_REFUSING: (u64, u64) = (1, 0);
+
     /// The three-way relation, for one case. Soundness (the preflight
     /// invents no rejection), completeness (it misses none of the three
     /// join refusals) and message identity are ONE assertion now that all
@@ -4101,7 +4263,14 @@ mod tests {
         let (lm, rm) = (measure_operand(&lhs), measure_operand(&rhs));
         let charge = preflight_scratch_bytes(&lm, &rm);
         PREFLIGHT_SCRATCH_CAP.with(|c| c.set(0));
-        let decided = err_of(decide_binary(op, matching, lhs.clone(), rhs.clone()));
+        let decided = err_of(decide_binary(
+            op,
+            matching,
+            lhs.clone(),
+            rhs.clone(),
+            ALWAYS_REFUSING.0,
+            ALWAYS_REFUSING.1,
+        ));
         let oracle = err_of(join_only(op, return_bool, matching, lhs, rhs));
         assert_eq!(
             decided, oracle,
@@ -4216,7 +4385,14 @@ mod tests {
                 for (ri, _) in variants().into_iter().enumerate() {
                     let lhs = variants().remove(li);
                     let rhs = variants().remove(ri);
-                    let decided = err_of(decide_binary(op, None, lhs.clone(), rhs.clone()));
+                    let decided = err_of(decide_binary(
+                        op,
+                        None,
+                        lhs.clone(),
+                        rhs.clone(),
+                        ALWAYS_REFUSING.0,
+                        ALWAYS_REFUSING.1,
+                    ));
                     let oracle = err_of(join_only(op, false, None, lhs, rhs));
                     assert_eq!(decided, oracle, "op = {op:?} variants = ({li}, {ri})");
                     cases += 1;
@@ -4255,9 +4431,40 @@ mod tests {
         lhs: QueryResult,
         rhs: QueryResult,
     ) -> u64 {
+        points_read_and_scratch_at(ALWAYS_REFUSING, matching, lhs, rhs).0
+    }
+
+    /// `(points read, scratch capacity observed)` for one decision at a
+    /// given `(stage_charged, stage_cap)`.
+    ///
+    /// The scratch figure is `u64::MAX` when
+    /// [`preflight::decide_binary_refusals`] did not reach its single
+    /// exit — the sentinel is written BEFORE the call and only that exit
+    /// overwrites it, so "still the sentinel" means the six
+    /// `Vec::with_capacity` reservations below it never ran.
+    ///
+    /// That reading is exact only for the fixture class the callers use:
+    /// an arithmetic vector⊗vector or matrix⊗matrix pair with series on
+    /// BOTH sides, where neither of `decide_binary_refusals`' two early
+    /// returns (set op or non-join shape; an empty side) applies, so
+    /// entering the function means reserving the buffers. For any other
+    /// shape the sentinel says only "the buffers were not reserved",
+    /// which is weaker than "the function was not entered". The measured
+    /// statement, closed over the whole callee closure, is
+    /// `tests/logql_preflight_guard_gate.rs`.
+    fn points_read_and_scratch_at(
+        (stage_charged, stage_cap): (u64, u64),
+        matching: Option<&VectorMatching>,
+        lhs: QueryResult,
+        rhs: QueryResult,
+    ) -> (u64, u64) {
         PREFLIGHT_POINTS_READ.with(|c| c.set(0));
-        let _ = decide_binary(BinOp::Div, matching, lhs, rhs);
-        PREFLIGHT_POINTS_READ.with(|c| c.get())
+        PREFLIGHT_SCRATCH_CAP.with(|c| c.set(u64::MAX));
+        let _ = decide_binary(BinOp::Div, matching, lhs, rhs, stage_charged, stage_cap);
+        (
+            PREFLIGHT_POINTS_READ.with(|c| c.get()),
+            PREFLIGHT_SCRATCH_CAP.with(|c| c.get()),
+        )
     }
 
     fn on_x_group_left_empty() -> VectorMatching {
@@ -4428,6 +4635,114 @@ mod tests {
         }
     }
 
+    // ---- the guard --------------------------------------------------
+
+    /// **A query the charge admits pays NOTHING for the preflight** —
+    /// no point read, and not one of the six scratch buffers reserved.
+    ///
+    /// This is the ordinary-traffic path: these fixtures model a few
+    /// kilobytes against an 8 GiB cap, so [`decide_binary`]'s guard
+    /// short-circuits before `PreflightCharge::acquire`. Every collision
+    /// shape is driven, INCLUDING the one-to-one fixture with no include
+    /// list, because a guard that only covered grouped joins would be the
+    /// claim this test exists to stop being false.
+    ///
+    /// The second half is what makes the first half evidence: the same
+    /// five fixtures at a refusing charge must reserve buffers, and the
+    /// four with a collision must read points. Without it the test would
+    /// pass on a preflight that had been deleted.
+    #[test]
+    fn the_guard_reads_no_point_when_the_charge_cannot_refuse() {
+        const ADMITS: (u64, u64) = (0, MAX_POST_AGG_BYTES);
+        for n in [4usize, 40] {
+            for (name, m, lhs, rhs) in read_fixtures(n) {
+                let (reads, scratch) = points_read_and_scratch_at(ADMITS, m.as_ref(), lhs, rhs);
+                assert_eq!(
+                    reads, 0,
+                    "{name} ({n} points/series): the admitted path read {reads} points — the \
+                     guard is not short-circuiting"
+                );
+                assert_eq!(
+                    scratch,
+                    u64::MAX,
+                    "{name} ({n} points/series): the admitted path reserved scratch — the guard \
+                     is not short-circuiting before the six buffers"
+                );
+            }
+        }
+
+        // Non-vacuity: at a refusing charge the same fixtures DO the
+        // work. Fixture 0 has no collision, so it reserves its buffers
+        // and reads no point; 1..5 reach the step sweep.
+        for (i, (name, m, lhs, rhs)) in read_fixtures(4).into_iter().enumerate() {
+            let (reads, scratch) =
+                points_read_and_scratch_at(ALWAYS_REFUSING, m.as_ref(), lhs, rhs);
+            assert_ne!(
+                scratch,
+                u64::MAX,
+                "{name}: a refusing charge must run the preflight, or the guard test above \
+                 compares nothing"
+            );
+            if i > 0 {
+                assert!(
+                    reads > 0,
+                    "{name}: a refusing charge must reach the step sweep"
+                );
+            }
+        }
+    }
+
+    /// **The guard skips exactly when the charge admits** — the boundary,
+    /// at the one byte where the answer changes.
+    ///
+    /// At `cap = T` the stage charge admits and the preflight is skipped;
+    /// at `cap = T - 1` it refuses and the preflight runs. Both are
+    /// asserted on the SAME fixture, so the difference is the guard and
+    /// nothing else, and both are asserted on the scratch sentinel rather
+    /// than on the returned error — the answer is the semantic one either
+    /// way at `T - 1`, and at `T` the join produces it a moment later.
+    #[test]
+    fn the_guard_turns_over_at_the_exact_byte_the_charge_refuses_on() {
+        let matching = VectorMatching {
+            on: true,
+            labels: vec!["x".to_string()],
+            group: None,
+        };
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let many = QueryResult::Vector(vec![
+            VectorSample {
+                labels: vec![pair("a", "1"), pair("x", "1")],
+                value: 1.0,
+            },
+            VectorSample {
+                labels: vec![pair("a", "2"), pair("x", "1")],
+                value: 2.0,
+            },
+        ]);
+        let one = QueryResult::Vector(vec![VectorSample {
+            labels: vec![pair("x", "1")],
+            value: 3.0,
+        }]);
+        let (lm, rm) = (measure_operand(&many), measure_operand(&one));
+        let t = binary_peak_bytes(BinOp::Div, Some(&matching), &lm, &rm);
+        assert!(t > 0, "the fixture must model a nonzero envelope");
+
+        let (_, admitted) =
+            points_read_and_scratch_at((0, t), Some(&matching), many.clone(), one.clone());
+        assert_eq!(
+            admitted,
+            u64::MAX,
+            "at cap = T the charge admits, so the preflight must not run"
+        );
+        let (_, refused) = points_read_and_scratch_at((0, t - 1), Some(&matching), many, one);
+        assert_ne!(
+            refused,
+            u64::MAX,
+            "at cap = T - 1 the charge refuses, so the preflight MUST run — this is the byte the \
+             guard turns over on"
+        );
+    }
+
     // ---- the scratch model ------------------------------------------
 
     /// The published figures, by EQUALITY. They are derived
@@ -4520,11 +4835,23 @@ mod tests {
         out
     }
 
-    /// **A skip is behaviour-preserving.** With the ceiling forced to 0
-    /// the (P1) block is never entered, and every case's answer is
-    /// "pre-change behaviour with the (P0) corrections applied": the
-    /// shape refusals still win above the charge, and everything else is
-    /// the join's own answer.
+    /// **A skipped (P1) is behaviour-preserving, by BOTH routes that skip
+    /// it.** Every case's answer is "pre-change behaviour with the (P0)
+    /// corrections applied": the shape refusals still win above the
+    /// charge, and everything else is the join's own answer.
+    ///
+    /// The two routes are asserted on the same case, in the same loop:
+    ///
+    /// * **the guard** — the run at `cap = MAX_POST_AGG_BYTES` with a
+    ///   clean counter, where the charge admits and [`decide_binary`]
+    ///   never enters (P1). This is the ordinary-traffic path, and these
+    ///   81 930 cases are what say the guard changes no answer.
+    /// * **the ceiling** — the same call with the preflight ceiling
+    ///   forced to 0, i.e. the scratch skip.
+    ///
+    /// The ceiling route also has a discriminating test of its own at a
+    /// REFUSING cap, where the guard does not skip and the two come
+    /// apart: `the_join_refusals_are_preempted_by_the_budget_when_the_preflight_is_skipped`.
     ///
     /// The P0-case count is asserted non-zero, because a run in which no
     /// case can distinguish the two oracles proves neither.
@@ -4535,77 +4862,102 @@ mod tests {
         let shapes = axis_d();
         let mut cases = 0usize;
         let mut p0_cases = 0usize;
-        with_preflight_ceiling(0, || {
-            for m in &matchings {
-                for &(dl, dr) in &shapes {
-                    for sl in 0..32u32 {
-                        for sr in 0..32u32 {
-                            let lhs = diff_side(sl, dl);
-                            let rhs = diff_side(sr, dr);
-                            let mut charged = 0u64;
-                            let got = err_of(combine_binary_capped(
-                                &mut charged,
-                                op,
-                                return_bool,
-                                m.as_ref(),
-                                lhs.clone(),
-                                rhs.clone(),
-                                MAX_POST_AGG_BYTES,
-                            ));
-                            let shape = err_of(preflight::decide_shape(op, &lhs, &rhs));
-                            if shape.is_some() {
-                                p0_cases += 1;
-                            }
-                            let want = match shape {
-                                Some(e) => Some(e),
-                                None => err_of(join_only(op, return_bool, m.as_ref(), lhs, rhs)),
-                            };
-                            assert_eq!(got, want, "skip mode diverged at ({sl:#07b}, {sr:#07b})");
-                            cases += 1;
+
+        /// One case, both skip routes. `guard` is the run at the
+        /// production cap with the ceiling left alone — the charge admits
+        /// and (P1) is guarded off; `ceiling` is the same call with the
+        /// scratch ceiling forced to 0.
+        fn both_skips(
+            op: BinOp,
+            return_bool: bool,
+            m: Option<&VectorMatching>,
+            lhs: &QueryResult,
+            rhs: &QueryResult,
+        ) -> (Option<String>, Option<String>) {
+            let mut charged = 0u64;
+            let guard = err_of(combine_binary_capped(
+                &mut charged,
+                op,
+                return_bool,
+                m,
+                lhs.clone(),
+                rhs.clone(),
+                MAX_POST_AGG_BYTES,
+            ));
+            let mut charged = 0u64;
+            let ceiling = with_preflight_ceiling(0, || {
+                err_of(combine_binary_capped(
+                    &mut charged,
+                    op,
+                    return_bool,
+                    m,
+                    lhs.clone(),
+                    rhs.clone(),
+                    MAX_POST_AGG_BYTES,
+                ))
+            });
+            (guard, ceiling)
+        }
+
+        for m in &matchings {
+            for &(dl, dr) in &shapes {
+                for sl in 0..32u32 {
+                    for sr in 0..32u32 {
+                        let lhs = diff_side(sl, dl);
+                        let rhs = diff_side(sr, dr);
+                        let (guard, ceiling) = both_skips(op, return_bool, m.as_ref(), &lhs, &rhs);
+                        let shape = err_of(preflight::decide_shape(op, &lhs, &rhs));
+                        if shape.is_some() {
+                            p0_cases += 1;
                         }
+                        let want = match shape {
+                            Some(e) => Some(e),
+                            None => err_of(join_only(op, return_bool, m.as_ref(), lhs, rhs)),
+                        };
+                        assert_eq!(
+                            guard, want,
+                            "the guarded skip diverged at ({sl:#07b}, {sr:#07b})"
+                        );
+                        assert_eq!(
+                            ceiling, want,
+                            "the ceiling skip diverged at ({sl:#07b}, {sr:#07b})"
+                        );
+                        cases += 1;
                     }
                 }
             }
-            // The axis-A partition carries no scalar or mixed-shape
-            // operand, so the P0 half would be vacuous on it alone; these
-            // pre-committed pairs are what make the distinction real.
-            for op in [BinOp::Div, BinOp::And] {
-                for (lhs, rhs) in [
-                    (QueryResult::Scalar(1.0), QueryResult::Scalar(2.0)),
-                    (QueryResult::Scalar(1.0), QueryResult::Vector(Vec::new())),
-                    (QueryResult::Vector(Vec::new()), QueryResult::Scalar(2.0)),
-                    (
-                        QueryResult::Vector(Vec::new()),
-                        QueryResult::Matrix(Vec::new()),
-                    ),
-                    (
-                        QueryResult::String(String::new()),
-                        QueryResult::Vector(Vec::new()),
-                    ),
-                ] {
-                    let mut charged = 0u64;
-                    let got = err_of(combine_binary_capped(
-                        &mut charged,
-                        op,
-                        false,
-                        None,
-                        lhs.clone(),
-                        rhs.clone(),
-                        MAX_POST_AGG_BYTES,
-                    ));
-                    let shape = err_of(preflight::decide_shape(op, &lhs, &rhs));
-                    if shape.is_some() {
-                        p0_cases += 1;
-                    }
-                    let want = match shape {
-                        Some(e) => Some(e),
-                        None => err_of(join_only(op, false, None, lhs, rhs)),
-                    };
-                    assert_eq!(got, want, "skip mode diverged on a P0 pair");
-                    cases += 1;
+        }
+        // The axis-A partition carries no scalar or mixed-shape operand,
+        // so the P0 half would be vacuous on it alone; these
+        // pre-committed pairs are what make the distinction real.
+        for op in [BinOp::Div, BinOp::And] {
+            for (lhs, rhs) in [
+                (QueryResult::Scalar(1.0), QueryResult::Scalar(2.0)),
+                (QueryResult::Scalar(1.0), QueryResult::Vector(Vec::new())),
+                (QueryResult::Vector(Vec::new()), QueryResult::Scalar(2.0)),
+                (
+                    QueryResult::Vector(Vec::new()),
+                    QueryResult::Matrix(Vec::new()),
+                ),
+                (
+                    QueryResult::String(String::new()),
+                    QueryResult::Vector(Vec::new()),
+                ),
+            ] {
+                let (guard, ceiling) = both_skips(op, false, None, &lhs, &rhs);
+                let shape = err_of(preflight::decide_shape(op, &lhs, &rhs));
+                if shape.is_some() {
+                    p0_cases += 1;
                 }
+                let want = match shape {
+                    Some(e) => Some(e),
+                    None => err_of(join_only(op, false, None, lhs, rhs)),
+                };
+                assert_eq!(guard, want, "the guarded skip diverged on a P0 pair");
+                assert_eq!(ceiling, want, "the ceiling skip diverged on a P0 pair");
+                cases += 1;
             }
-        });
+        }
         assert_eq!(cases, 81_930);
         assert!(
             p0_cases > 0,

@@ -67,6 +67,14 @@ fn grown(len: usize) -> u64 {
     3 * (2 * len as u64).max(32)
 }
 
+/// A `(stage_charged, stage_cap)` pair the stage charge refuses for every
+/// operand pair (`1 + bytes > 0`), so `decide_binary`'s guard never skips
+/// and this gate measures the preflight rather than the guard. The
+/// guard's own measurement — that an ADMITTED charge requests zero bytes
+/// — is `logql_preflight_guard_gate.rs`, its own binary because the
+/// counting allocator is process-global.
+const REFUSING: (u64, u64) = (1, 0);
+
 fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
@@ -179,7 +187,7 @@ fn the_preflight_requests_no_more_than_its_scratch_charge_covers() {
     // Warm every lazily-initialised path so the measured window holds
     // the run and not one-time setup.
     let (w_l, w_r) = (build(4, 2, true), build(4, 0, true));
-    let _ = preflight_alloc_probe(BinOp::Div, None, &w_l, &w_r);
+    let _ = preflight_alloc_probe(BinOp::Div, None, w_l, w_r, REFUSING.0, REFUSING.1);
 
     for &(nl, nr) in &SIZES {
         for (mname, m) in matchings() {
@@ -191,7 +199,14 @@ fn the_preflight_requests_no_more_than_its_scratch_charge_covers() {
                     let charge = preflight_scratch_bytes(&lm, &rm);
 
                     let before = BYTES.load(Ordering::Relaxed);
-                    let out = preflight_alloc_probe(BinOp::Div, m.as_ref(), &lhs, &rhs);
+                    let out = preflight_alloc_probe(
+                        BinOp::Div,
+                        m.as_ref(),
+                        lhs,
+                        rhs,
+                        REFUSING.0,
+                        REFUSING.1,
+                    );
                     let requested = BYTES.load(Ordering::Relaxed) - before;
 
                     let payload = match &out {

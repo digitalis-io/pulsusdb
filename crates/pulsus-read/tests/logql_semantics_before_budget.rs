@@ -26,9 +26,9 @@
 
 use pulsus_logql::{BinOp, MatchGroup, VectorMatching};
 use pulsus_read::logql::{
-    MAX_BINARY_PREFLIGHT_BYTES, MatrixSeries, PREFLIGHT_BYTES_PER_SERIES, PREFLIGHT_FLAT_BYTES,
-    QueryResult, ReadError, TooBroadReason, VectorSample, binary_peak_bytes, combine_binary,
-    combine_binary_capped, measure_vector, preflight_scratch_bytes,
+    MAX_BINARY_PREFLIGHT_BYTES, MAX_POST_AGG_BYTES, MatrixSeries, PREFLIGHT_BYTES_PER_SERIES,
+    PREFLIGHT_FLAT_BYTES, QueryResult, ReadError, TooBroadReason, VectorSample, binary_peak_bytes,
+    combine_binary, combine_binary_capped, measure_vector, preflight_scratch_bytes,
 };
 
 fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -207,13 +207,25 @@ fn a_saturated_budget_does_not_preempt_the_join_refusals() {
     }
 }
 
-/// **AC 3c — the preflight's admission reads neither the caller's
-/// counter nor its cap.** The same six rows with the counter already at
-/// `u64::MAX - 1` return the identical 400. This is the mechanical
-/// statement of the structural fix: `decide_binary` takes no `charged`
-/// and no `cap` parameter, so a caller's spending cannot make a semantic
-/// error unreachable — the composition hazard a shared query-scoped
-/// counter (#260) would otherwise reintroduce.
+/// **AC 3c — a caller's spending cannot make a semantic error
+/// unreachable.** The same six rows with the counter already at
+/// `u64::MAX - 1` return the identical 400 — the composition hazard a
+/// shared query-scoped counter (#260) would otherwise reintroduce.
+///
+/// The mechanism has two halves, and only one of them is "reads neither
+/// the counter nor the cap":
+///
+/// * `PreflightCharge::acquire` takes no `charged` and no `cap`. The
+///   preflight's own SCRATCH admission is a function of the operands'
+///   counts and its own ceiling alone, so an unrelated caller's spending
+///   can never make the preflight unaffordable (plan v5 review's
+///   `[high]`).
+/// * `decide_binary`'s guard DOES read them, in the one direction that
+///   cannot hide an error: it skips (P1) only when the charge about to be
+///   levied would admit, and an admitted charge refuses nothing for the
+///   join's refusal to be preempted by. More spending moves the guard
+///   towards running the preflight, never away from it — which is why an
+///   exhausted counter is the case that runs it, as these rows do.
 #[test]
 fn the_join_refusals_survive_a_counter_that_is_already_exhausted() {
     for (name, op, matching, lhs, rhs, want) in join_refusal_rows() {
@@ -231,10 +243,12 @@ fn the_join_refusals_survive_a_counter_that_is_already_exhausted() {
 
 /// **AC 1 — the three scalar set-operation arms.** `Scalar ⊗ Scalar`,
 /// `Scalar ⊗ vector` and `vector ⊗ Scalar` under a set operator are
-/// class (P0): they allocate nothing to decide, so they run above EVERY
-/// charge, including the preflight's own. The message is asserted equal
-/// to the one `combine_binary` returns at the production cap, so a
-/// saturated budget cannot change the answer, only the timing.
+/// class (P0): deciding them needs no input-scaled scratch (the refusal
+/// message itself is built, as every semantic refusal in this crate is,
+/// under no charge at all), so they run above EVERY charge — the
+/// preflight's own included, and its guard's too. The message is
+/// asserted equal to the one `combine_binary` returns at the production
+/// cap, so a saturated budget cannot change the answer, only the timing.
 #[test]
 fn the_scalar_set_operation_refusals_survive_a_saturated_budget() {
     let cases: Vec<(&str, QueryResult, QueryResult)> = vec![
@@ -446,6 +460,16 @@ fn the_two_budget_disciplines_are_stated_where_a_designer_meets_them() {
 /// many-side series against 256 one-side ones — this is the arithmetic
 /// that says the preflight ran on that shape and was transparent.
 ///
+/// Two conditions have to hold for "the preflight ran", and both are
+/// asserted here:
+///
+/// * the scratch fits under `MAX_BINARY_PREFLIGHT_BYTES`, so
+///   `PreflightCharge::acquire` does not skip it, and
+/// * the stage charge would REFUSE, so `decide_binary`'s guard does not
+///   skip it either. That is the same condition the frozen witness
+///   itself asserts (`bytes > cap` on its O7 leg), restated here over the
+///   modelled envelope so this test does not depend on reading it.
+///
 /// It is also the only place a passing preflight's transparency is
 /// asserted against a FROZEN artifact rather than against the
 /// differential's own fixtures.
@@ -476,6 +500,24 @@ fn the_frozen_o7_amplifier_witness_is_inside_the_preflight_ceiling() {
          {MAX_BINARY_PREFLIGHT_BYTES} B ceiling) — it would then prove nothing about a passing \
          preflight being transparent"
     );
+    // And the stage charge the witness levies REFUSES, so the guard runs
+    // the preflight rather than short-circuiting it. The include list is
+    // the witness's own: 6 000 names, priced against a one side whose
+    // widest value is 1 000 bytes.
+    let matching = on(
+        &["id00"],
+        Some(MatchGroup::Left(
+            (0..6_000u32).map(|i| format!("i{i:05}")).collect(),
+        )),
+    );
+    let modelled = binary_peak_bytes(BinOp::Mul, Some(&matching), &lm, &rm);
+    assert!(
+        modelled > MAX_POST_AGG_BYTES,
+        "the O7 witness would SKIP the preflight through the guard: its modelled envelope \
+         {modelled} B is inside the {MAX_POST_AGG_BYTES} B cap, so the charge would admit and \
+         there would be nothing for the preflight to get in front of"
+    );
+
     // And its one side is unique on the matching labels, so the
     // preflight passes rather than refusing: 256 distinct `id00` values
     // on each side.
