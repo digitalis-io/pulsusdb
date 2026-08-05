@@ -9,13 +9,13 @@
 //!   durations reproduces the reference's emitted `__bucket` set, its
 //!   per-bucket tallies, and — the part a "better ladder" could never
 //!   satisfy — the buckets it emitted NO series for.
-//! - **AC8 — the emitted ORDER matches**, through the production
-//!   comparator (`sortResponse`,
-//!   `modules/frontend/combiner/metrics_query_range.go:245-266 @ v3.0.2`),
-//!   which orders on the label value RENDERED AS GO'S `%g` — the
-//!   `AnyValue.String()`/`CompactTextString` path, NOT the protojson
-//!   body. Two capture corpora exist solely to hold that distinction
-//!   down; see the order test.
+//! - **AC8 — the emitted ORDER deliberately DIVERGES.** We emit
+//!   ascending by bucket; the reference emits lexicographic on a Go
+//!   `%g` rendering of the label (`sortResponse` compares
+//!   `AnyValue.String()`), which is neither numeric nor the order of its
+//!   own JSON body. Owner ruling 2026-08-05, ledgered as
+//!   `2026-08-05-traceql-histogram-series-order`. Both orders are pinned
+//!   per corpus, with `mix16k`/`mixladder` as the witnesses.
 //! - **AC3b — `quantile_over_time` DIVERGES, and we have characterised
 //!   the divergence correctly.** A test-only port of the reference's
 //!   `Log2QuantileWithBucket` (`pkg/traceql/engine_metrics.go:2058-2120
@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use pulsus_read::traces::exec::sort_series_like_the_reference;
+use pulsus_read::traces::exec::sort_histogram_series_by_bucket_ascending;
 use pulsus_read::traces::log2_histogram::{bucket_seconds, log2_bucketize_ns};
 use pulsus_read::{MetricLabel, MetricLabelValue, TraceMetricSeries};
 use serde::Deserialize;
@@ -154,42 +154,36 @@ fn our_bucket_rule_reproduces_every_captured_reference_histogram() {
     }
 }
 
-/// AC8, with no exemptions: the production comparator must reproduce the
-/// order the reference actually emitted, for EVERY captured corpus.
+/// AC8 under the owner's 2026-08-05 ruling: **our** order is ascending by
+/// bucket, and the reference's is recorded beside it as the ledgered
+/// divergence `2026-08-05-traceql-histogram-series-order`. Both sides are
+/// pinned per corpus and nothing is exempted, so a change on either side
+/// fails here.
 ///
-/// Two of the corpora exist only for this test, and both were measured
-/// on the container rather than derived:
-///
-/// - **`mix1024`** (`2^10` + `2^20 ns`) — the reference emits
-///   `0.001048576` then `0.000001024`. Sorting on the WIRE text would
-///   emit them the other way round, because protojson renders `2^10 ns`
-///   as `0.000001024` while the sort key renders it `1.024e-06`.
-/// - **`mix16k`** (`2^14` + `2^20 ns`, i.e. a 16 µs span beside a 1 ms
-///   span — an ordinary corpus, not an exotic one) — the reference emits
-///   `0.001048576` then `0.000016384`. Here `serde_json` and protojson
-///   AGREE on `0.000016384` and it is Go's `%g` that differs
-///   (`1.6384e-05`), so a comparator built on our own JSON rendering
-///   gets this backwards.
-///
-/// Those two are why [`sort_series_like_the_reference`] compares Go's
-/// `%g` rather than the wire text; without them the wrong comparator
-/// passes every other corpus here.
+/// `mix16k` is the witness the ledger row rests on: a 16 µs span beside a
+/// 1 ms span — an ordinary corpus, not an exotic one — for which the
+/// reference emits `2^20` BEFORE `2^14`. That order is not ascending, not
+/// descending, and not the order of its own JSON body (which writes
+/// `0.000016384`); it is lexicographic on Go's `%g` rendering
+/// (`1.6384e-05`), because `sortResponse` compares `AnyValue.String()`.
+/// `mixladder` is the four-bucket form of the same thing and the example
+/// docs/api.md §4.4.1 quotes: spans at 1 µs, 16 µs, 1 ms and 1 s come
+/// back `1 ms, 1 µs, 1 s, 16 µs`.
 #[test]
-fn the_production_comparator_reproduces_the_reference_series_order() {
-    let mut discriminating: Vec<String> = Vec::new();
-    let mut reference_wire_discriminating: Vec<String> = Vec::new();
+fn we_emit_ascending_by_bucket_and_the_reference_order_is_recorded_beside_it() {
+    let mut diverging: Vec<String> = Vec::new();
     for corpus in capture().corpora {
+        // Framed the way the engine frames: one series per occupied
+        // bucket, then the production sort.
         let mut series: Vec<TraceMetricSeries> = our_tallies(&corpus.durations_ns)
             .into_iter()
-            // The SQL hands these over ascending by bucket_ns, which is
-            // NOT the order the reference emits.
             .map(|(bucket_ns, n)| TraceMetricSeries {
                 labels: vec![MetricLabel::double("__bucket", bucket_seconds(bucket_ns))],
                 samples: vec![(0, n as f64)],
                 exemplars: vec![],
             })
             .collect();
-        sort_series_like_the_reference(&mut series);
+        sort_histogram_series_by_bucket_ascending(&mut series);
         let ours: Vec<u64> = series
             .iter()
             .map(|s| {
@@ -200,51 +194,72 @@ fn the_production_comparator_reproduces_the_reference_series_order() {
             })
             .collect();
         let theirs: Vec<u64> = corpus.emitted_buckets.iter().map(|b| b.bucket_ns).collect();
+
+        // Ours: ascending, always, for every corpus.
+        let mut ascending = theirs.clone();
+        ascending.sort_unstable();
         assert_eq!(
-            ours, theirs,
-            "{}: our series order must equal the order the reference emitted",
+            ours, ascending,
+            "{}: PulsusDB emits histogram series ascending by bucket",
+            corpus.name
+        );
+        assert!(
+            ours.windows(2).all(|w| w[0] < w[1]),
+            "{}: strictly ascending, {ours:?}",
             corpus.name
         );
 
-        // …and the order a comparator keyed on OUR OWN wire text would
-        // have produced, counted per corpus so a corpus that cannot tell
-        // the two rules apart is visibly not carrying the claim.
-        let mut by_our_wire_text = theirs.clone();
-        by_our_wire_text.sort_by_key(|ns| {
-            serde_json::to_string(&bucket_seconds(*ns)).expect("finite bucket label")
-        });
-        if by_our_wire_text != theirs {
-            discriminating.push(corpus.name.clone());
+        // Theirs: pinned exactly as captured, and recorded as diverging
+        // whenever it is not the ascending order.
+        if theirs != ascending {
+            diverging.push(corpus.name.clone());
         }
+    }
+    // The ledger row's witnesses. `mixladder` is the docs example;
+    // `mix16k` is the one that shows the divergence needs nothing more
+    // exotic than a 16 µs span.
+    assert_eq!(
+        diverging,
+        vec![
+            "mix252".to_string(),
+            "mix1024".to_string(),
+            "mix16k".to_string(),
+            "mixladder".to_string()
+        ],
+        "the corpora whose reference order is NOT ascending — the ledgered divergence's \
+         witnesses; if this list empties, the capture lost the evidence the ledger row cites"
+    );
+}
 
-        // …and the order a comparator keyed on the REFERENCE's own wire
-        // text would have produced. That one is not the sort key either
-        // — `sortResponse` compares `AnyValue.String()` (Go `%g`), not
-        // the protojson body — and `mix1024` is the corpus that proves
-        // it: protojson writes `2^10 ns` as `0.000001024`, which sorts
-        // FIRST, while the reference emitted it SECOND.
-        let mut by_their_wire_text: Vec<u64> = theirs.clone();
+/// The reference's order is not the order of its own JSON body either —
+/// so nobody re-derives it from `wire_text` and concludes we could have
+/// matched it by sorting on the response. `mix1024` is the discriminator:
+/// protojson writes `2^10 ns` as `0.000001024`, which sorts FIRST, while
+/// the reference emitted it SECOND.
+#[test]
+fn the_reference_does_not_sort_on_its_own_wire_text() {
+    let mut diverging: Vec<String> = Vec::new();
+    for corpus in capture().corpora {
+        let theirs: Vec<u64> = corpus.emitted_buckets.iter().map(|b| b.bucket_ns).collect();
         let wire: BTreeMap<u64, String> = corpus
             .emitted_buckets
             .iter()
             .map(|b| (b.bucket_ns, b.wire_text.clone()))
             .collect();
-        by_their_wire_text.sort_by_key(|ns| wire[ns].clone());
-        if by_their_wire_text != theirs {
-            reference_wire_discriminating.push(corpus.name.clone());
+        let mut by_wire = theirs.clone();
+        by_wire.sort_by_key(|ns| wire[ns].clone());
+        if by_wire != theirs {
+            diverging.push(corpus.name.clone());
         }
     }
     assert_eq!(
-        discriminating,
-        vec!["mix16k".to_string()],
-        "exactly one captured corpus distinguishes the reference's order from a comparator \
-         keyed on OUR wire text; without it, the wrong comparator passes this test"
-    );
-    assert_eq!(
-        reference_wire_discriminating,
-        vec!["mix1024".to_string(), "mix16k".to_string()],
-        "both order corpora show the reference does NOT sort on its own wire text — which is \
-         why the sort key is Go's %g and not a rendering of the response body"
+        diverging,
+        vec![
+            "mix1024".to_string(),
+            "mix16k".to_string(),
+            "mixladder".to_string()
+        ],
+        "the corpora the reference orders differently from its own response body"
     );
 }
 

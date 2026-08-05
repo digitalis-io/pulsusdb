@@ -6,7 +6,8 @@
     "config": "deploy/e2e/tempo.yaml exactly as committed by this change (metrics_generator.storage.path present); without it the reference answers every TraceQL metrics query with no series at all",
     "how": "standalone container on the host, OTLP/HTTP ingest of one resource per corpus (resource.service.name = the corpus's service), then GET /api/metrics/query_range at step=60s over a 20-minute window covering the ingest. Each bucket's `count` is the SUM of that series' samples over the window, so a corpus straddling a step boundary is still recorded exactly; `emitted_buckets` is in the order the reference returned the series, and `wire_text` is the doubleValue text read off the HTTP body (not a re-rendering of a parsed float).",
     "note": "TraceQL metrics visibility lags search visibility by roughly a minute on this build (the live block has to complete), which is why the e2e control polls the reference rather than querying it once",
-    "reference_source": "pkg/traceql/engine_metrics.go:2038 Log2Bucketize, :2058 Log2QuantileWithBucket, ast_metrics.go:181 bucketizeDuration, modules/frontend/combiner/metrics_query_range.go:245 sortResponse (which compares AnyValue.String() = proto.CompactTextString = Go %g, NOT the protojson body) \u2014 all @ v3.0.2 (0c4b926d09234186de39833e9c7ecb5b7614c8b9)"
+    "series_order": "`emitted_buckets` order is RECORDED, not matched: PulsusDB emits histogram series ascending by bucket, a ledgered divergence (2026-08-05-traceql-histogram-series-order). The reference's order is lexicographic on Go's %g rendering of the label - sortResponse compares AnyValue.String(), which is proto.CompactTextString (pkg/tempopb/common/v1/common.pb.go:46 @ v3.0.2) ending at gogo writeAny's default arm, fmt.Fprint, i.e. Go %v/%g - so it is neither numeric nor the order of its own wire text.",
+    "reference_source": "pkg/traceql/engine_metrics.go:2038 Log2Bucketize, :2058 Log2QuantileWithBucket, ast_metrics.go:181 bucketizeDuration, modules/frontend/combiner/metrics_query_range.go:245 sortResponse - all @ v3.0.2 (0c4b926d09234186de39833e9c7ecb5b7614c8b9)"
   },
   "corpora": [
     {
@@ -98,7 +99,7 @@
     {
       "name": "mix252",
       "service": "mix252",
-      "why": "the sub-2ns drop: 0 ns and 1 ns produce no bucket at all while count_over_time still counts all five spans",
+      "why": "the sub-2ns drop: 0 ns and 1 ns produce no bucket at all while count_over_time still counts all five spans. Also the smallest ORDER witness: the reference returns 2^20 before 2^1",
       "durations_ns": [
         0,
         1,
@@ -203,7 +204,7 @@
     {
       "name": "u300",
       "service": "checkout",
-      "why": "the docs/api.md \u00a74.4.1 worked example's corpus: true p99 = 0.3 s, reference p99 = 0.536870912 s",
+      "why": "the docs/api.md 4.4.1 worked example's corpus: true p99 = 0.3 s, reference p99 = 0.536870912 s",
       "durations_ns": [
         300000000,
         300000000,
@@ -331,7 +332,7 @@
     {
       "name": "tiny252",
       "service": "tiny252",
-      "why": "JSON float-text witnesses at both ends of the ladder (2^10 ns and 2^40 ns) as the reference renders them ON THE WIRE",
+      "why": "JSON float-text witnesses at both ends of the ladder (2^10 ns and 2^40 ns) as the reference renders them ON THE WIRE; its emitted order happens to be ascending, which is why it is not an order witness",
       "durations_ns": [
         600,
         700000000000
@@ -362,7 +363,7 @@
     {
       "name": "mix1024",
       "service": "mix1024",
-      "why": "SERIES ORDER, witness 1: 2^10 ns and 2^20 ns. Sorting on the reference's WIRE TEXT would put 0.000001024 first; the reference puts 0.001048576 first, because sortResponse compares AnyValue.String() (Go %g: 1.024e-06), not the protojson body",
+      "why": "ORDER witness: 2^10 ns and 2^20 ns. The reference returns 2^20 first, which is neither ascending nor the order of its own wire text (0.000001024 sorts first there) - the sort key is Go %g on AnyValue.String(), not the response body",
       "durations_ns": [
         600,
         1000000
@@ -394,7 +395,7 @@
     {
       "name": "mix16k",
       "service": "mix16k",
-      "why": "SERIES ORDER, witness 2, and the one that matters for ordinary corpora: a 16 us span (2^14 ns) beside a 1 ms span (2^20 ns). Go %g renders 2^14 as 1.6384e-05 while serde_json/ryu renders it 0.000016384, so a wire-text sort emits 2^14 FIRST and the reference emits it SECOND",
+      "why": "ORDER witness: a 16 us span (2^14 ns) beside a 1 ms span (2^20 ns). The reference returns 2^20 first because %g renders 2^14 as 1.6384e-05",
       "durations_ns": [
         10000,
         1000000
@@ -420,6 +421,54 @@
         2097152
       ],
       "count_over_time": 2,
+      "quantile_query": null,
+      "quantiles": []
+    },
+    {
+      "name": "mixladder",
+      "service": "mixladder",
+      "why": "ORDER witness, the docs/api.md 4.4.1 example: spans at 1 us, 16 us, 1 ms and 1 s come back 1 ms, 1 us, 1 s, 16 us - not ascending, not descending, not the order of the wire text. A determinism device, not a semantic one",
+      "durations_ns": [
+        1000,
+        16000,
+        1000000,
+        1000000000
+      ],
+      "histogram_query": "{ resource.service.name = \"mixladder\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 1048576,
+          "seconds": 0.001048576,
+          "count": 1,
+          "wire_text": "0.001048576"
+        },
+        {
+          "bucket_ns": 1024,
+          "seconds": 1.024e-06,
+          "count": 1,
+          "wire_text": "0.000001024"
+        },
+        {
+          "bucket_ns": 1073741824,
+          "seconds": 1.073741824,
+          "count": 1,
+          "wire_text": "1.073741824"
+        },
+        {
+          "bucket_ns": 16384,
+          "seconds": 1.6384e-05,
+          "count": 1,
+          "wire_text": "0.000016384"
+        }
+      ],
+      "absent_buckets_ns": [
+        512,
+        2048,
+        32768,
+        2097152,
+        536870912
+      ],
+      "count_over_time": 4,
       "quantile_query": null,
       "quantiles": []
     }

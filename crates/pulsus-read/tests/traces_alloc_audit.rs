@@ -56,8 +56,6 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "metrics instant series/samples - one sample per series; series count fixed (quantile), <= 63 reachable buckets (issue #252 histogram) or probe-capped (grouped), same design carve-out as frame_range"),
     ("exec.rs", "frame_instant", ".collect", 2,
      "same bound as frame_instant Vec::new: per-series instant framing over the fixed/probe-capped/64-bucket series count"),
-    ("exec.rs", "go_format_g_shortest", "format!", 4,
-     "the issue #252 series-sort KEY (Go %g, one short String per label): called O(series log series) times inside sort_series_like_the_reference, over a series set already bounded by the same frame_range/frame_instant carve-out (<= 63 reachable buckets, or the probe-capped grouped count) - no row-scale term"),
     ("exec.rs", "apply_series_reduce", ".collect", 2,
      "topk/bottomk client-side reduction (issue #182 P5) over the ALREADY-materialized (probe-capped) series set; the per-timestamp rank/keep buffers are bounded by that series count"),
     ("exec.rs", "attach_range_exemplars", "Vec::new", 1,

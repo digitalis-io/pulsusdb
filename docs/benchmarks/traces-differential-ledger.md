@@ -400,3 +400,63 @@ re-decide from the evidence rather than re-derive it.
   spans every quantile is exactly `0.3`, and over 520 ms spans exactly
   `0.52` — the pair the reference cannot distinguish. User-facing
   write-up: docs/api.md §4.4.1.
+
+### `2026-08-05-traceql-histogram-series-order` (issue #252)
+
+- **What differs.** `histogram_over_time` series ORDER, and nothing else.
+  PulsusDB emits them **ascending by bucket**. The reference emits them
+  in lexicographic order of a *rendering* of the bucket label.
+
+- **The mechanism, so nobody re-derives it wrongly.** `sortResponse`
+  (`modules/frontend/combiner/metrics_query_range.go:245-266 @ v3.0.2`)
+  compares `Label.Value.String()`. That `Value` is a protobuf `AnyValue`
+  whose `String()` is `proto.CompactTextString`
+  (`pkg/tempopb/common/v1/common.pb.go:46 @ v3.0.2`); gogo's text writer
+  ends at `fmt.Fprint(w, v.Interface())` for a scalar
+  (`vendor/github.com/gogo/protobuf/proto/text.go`, the `default:` arm of
+  `writeAny`), i.e. Go's `%v` for a `float64`, i.e.
+  `strconv.FormatFloat(v, 'g', -1, 64)`. So the sort key is Go's `%g` —
+  **not** the protojson text of the response body, and not the value.
+
+- **Measured on the pinned container** (`grafana/tempo:3.0.2@sha256:cda87c21…`,
+  capture corpus `mixladder`). Four spans, at 1 µs, 16 µs, 1 ms and 1 s:
+
+  ```
+  __bucket 0.001048576   (1 ms)
+  __bucket 0.000001024   (1 µs)
+  __bucket 1.073741824   (1 s)
+  __bucket 0.000016384   (16 µs)
+  ```
+
+  Not ascending, not descending, not the order of its own JSON body
+  (which renders `2^10 ns` as `0.000001024`, sorting it first). It needs
+  nothing exotic to appear: the `mix16k` corpus is a 16 µs span beside a
+  1 ms span — the reference returns the 1 ms bucket first, because `%g`
+  writes `2^14 ns` as `1.6384e-05`.
+
+- **Why ours ships** (owner ruling, 2026-08-05, to the question "what
+  would users expect to see"). The reference's order is a **determinism
+  device, not a semantic one** — it exists so two runs agree, and it
+  conveys nothing a client could rely on. A histogram is drawn
+  smallest-bucket-first everywhere a user has seen one, so ascending by
+  bucket is the correct answer to the same question. This is the same
+  ruling shape as the percentile row above: match the reference where it
+  is right, be correct where it is not, record the difference.
+
+- **Consequence: series order only.** Labels, tallies, membership and
+  non-cumulativity are byte-matched to the reference (that half of #252
+  is a Tier-1 parity gate). Values, counts and label text are identical;
+  only the ORDER of the array differs. A client that reads the `__bucket`
+  label — which is how the series is identified — sees no difference at
+  all; only one that indexes the array positionally would, and the
+  reference's own positions are not meaningful to index by.
+
+- **Where it is enforced.**
+  `crates/pulsus-read/tests/traces_log2_reference.rs::we_emit_ascending_by_bucket_and_the_reference_order_is_recorded_beside_it`
+  asserts our ascending order for every captured corpus AND pins the
+  reference's captured order beside it, enumerating the corpora where the
+  two differ (`mix252`, `mix1024`, `mix16k`, `mixladder`) — so a change on
+  either side fails, and nothing is exempted. A sibling test
+  (`the_reference_does_not_sort_on_its_own_wire_text`) pins the mechanism
+  claim itself. Production: `traces::exec::sort_histogram_series_by_bucket_ascending`.
+  User-facing write-up: docs/api.md §4.4.1.

@@ -28,11 +28,13 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_read::logql::{ReadError, TooBroadReason};
+use pulsus_read::traces::log2_histogram;
 use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
 use pulsus_read::{TRACE_METRICS_MAX_SET_ROWS, TraceEngine, TraceMetricsPlan, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
@@ -861,7 +863,7 @@ async fn metrics_explain_and_budget_gates() {
         base,
         now,
     );
-    engine
+    let max_result = engine
         .metrics_range(&max_plan)
         .await
         .expect("max-occupancy histogram executes");
@@ -891,6 +893,45 @@ async fn metrics_explain_and_budget_gates() {
         "the max-occupancy corpus must pack its buckets into few steps to exercise the ceiling \
          (max per-step occupancy {max_occupancy})"
     );
+
+    // Row COUNT is not the claim. The top of the domain has to survive
+    // the whole path — ClickHouse's `toUInt64(...) * 2` producing 2^63,
+    // the RowBinary decode into `MetricLog2BucketRow.bucket_ns: u64`, and
+    // `bucket_seconds` framing it into a label — so assert the EMITTED
+    // `__bucket` values, bit-for-bit, not just how many there are. The
+    // `Int64` form this replaced would have decoded 2^63 as a NEGATIVE
+    // label, which `result_rows` alone cannot see.
+    let emitted: BTreeSet<u64> = max_result
+        .series
+        .iter()
+        .map(|s| {
+            assert_eq!(s.labels.len(), 1, "one __bucket label: {s:?}");
+            assert_eq!(s.labels[0].key, "__bucket");
+            let pulsus_read::MetricLabelValue::Double(seconds) = s.labels[0].value else {
+                panic!("__bucket is a double: {s:?}");
+            };
+            assert!(
+                seconds > 0.0,
+                "a bucket label is positive — a negative one is the signed-overflow bug this \
+                 corpus exists to catch ({seconds})"
+            );
+            seconds.to_bits()
+        })
+        .collect();
+    let want: BTreeSet<u64> = (1..=63u32)
+        .map(|k| log2_histogram::bucket_seconds(1u64 << k).to_bits())
+        .collect();
+    assert_eq!(
+        emitted, want,
+        "every reachable bucket label must arrive intact, 2^1 through 2^63"
+    );
+    let top = log2_histogram::bucket_seconds(1u64 << 63);
+    assert!(
+        emitted.contains(&top.to_bits()),
+        "the 2^63 bucket ({top} s) must be emitted end to end — this is the case the UInt64 \
+         cast exists for, and a pure-Rust unit test cannot reach it"
+    );
+    assert_eq!(top, 9_223_372_036.854_776_f64);
 }
 
 /// Isolates the inner replay-dedup subquery of a log2 histogram range

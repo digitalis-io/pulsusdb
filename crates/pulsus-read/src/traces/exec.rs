@@ -729,7 +729,7 @@ impl TraceEngine {
                         exemplars: Vec::new(),
                     })
                     .collect();
-                sort_series_like_the_reference(&mut series);
+                sort_histogram_series_by_bucket_ascending(&mut series);
                 Ok(TraceMetricsResult { series })
             }
             (kind, None) => {
@@ -1145,7 +1145,7 @@ impl TraceEngine {
                         exemplars: vec![],
                     });
                 }
-                sort_series_like_the_reference(&mut series);
+                sort_histogram_series_by_bucket_ascending(&mut series);
                 Ok(TraceMetricsResult { series })
             }
             (kind, None) => {
@@ -2250,98 +2250,47 @@ fn agg_value(v: f64) -> f64 {
     v / 1_000_000_000.0
 }
 
-/// Orders a series set the way the reference's `sortResponse` does
-/// (`modules/frontend/combiner/metrics_query_range.go:245-266 @ v3.0.2`):
-/// by label COUNT first, then per label index by key, then by the
-/// RENDERED label value — a string comparison, not a numeric one.
+/// Orders `histogram_over_time` series **ascending by bucket** — a
+/// deliberate divergence from the reference, ledgered as
+/// `2026-08-05-traceql-histogram-series-order` (docs/api.md §4.4.1).
 ///
-/// That distinction is the whole point for `histogram_over_time`: the
-/// captured `mix252` corpus comes back in sort-key order `0.001048576`,
-/// `2e-09`, `4e-09` — lexicographic, and the reverse of the numeric
-/// order the SQL returns the buckets in. (Its WIRE text differs from its
-/// sort key: protojson writes `2e-9`. See [`label_sort_key`].)
+/// The reference's `sortResponse`
+/// (`modules/frontend/combiner/metrics_query_range.go:245-266 @ v3.0.2`)
+/// compares `Label.Value.String()`, and that `Value` is a protobuf
+/// `AnyValue` whose `String()` is `proto.CompactTextString`
+/// (`pkg/tempopb/common/v1/common.pb.go:46 @ v3.0.2`), ending at gogo's
+/// `writeAny` `default:` arm — `fmt.Fprint`, i.e. Go's `%v`/`%g` for a
+/// `float64`. So its order is lexicographic on a RENDERING of the
+/// bucket, which is neither numeric nor the order of its own JSON body.
+/// Measured on the pinned container: spans at 1 µs, 16 µs, 1 ms and 1 s
+/// come back `1 ms, 1 µs, 1 s, 16 µs` (capture corpus `mixladder`).
 ///
-/// Applied to the `histogram_over_time` framing only (issue #252's
-/// scope). The reference sorts every metrics response this way; the
-/// other functions' orderings are unchanged here and route to the
-/// wire-envelope follow-up.
-pub fn sort_series_like_the_reference(series: &mut [TraceMetricSeries]) {
-    series.sort_by(|a, b| {
-        a.labels.len().cmp(&b.labels.len()).then_with(|| {
-            a.labels
-                .iter()
-                .zip(b.labels.iter())
-                .map(|(la, lb)| {
-                    la.key
-                        .cmp(&lb.key)
-                        .then_with(|| label_sort_key(&la.value).cmp(&label_sort_key(&lb.value)))
-                })
-                .find(|o| o.is_ne())
-                .unwrap_or(std::cmp::Ordering::Equal)
+/// That is a determinism device, not a semantic one, and a histogram is
+/// drawn smallest-bucket-first everywhere a user has seen one — so we
+/// emit ascending. **Series ORDER only**: labels, tallies, membership
+/// and non-cumulativity all match the reference exactly, and any client
+/// that reads the `__bucket` label rather than the array position sees
+/// no difference at all.
+///
+/// The range arm's `BTreeMap` and the instant arm's `ORDER BY bucket ASC`
+/// already yield this order; sorting here makes the guarantee local to
+/// the framing rather than an inherited property of two other places.
+pub fn sort_histogram_series_by_bucket_ascending(series: &mut [TraceMetricSeries]) {
+    series.sort_by(|a, b| bucket_label(a).total_cmp(&bucket_label(b)));
+}
+
+/// The `__bucket` label's value, or `-inf` for a series without one (a
+/// shape this framing never produces — it keeps the comparator total).
+fn bucket_label(series: &TraceMetricSeries) -> f64 {
+    series
+        .labels
+        .iter()
+        .find(|l| l.key == "__bucket")
+        .and_then(|l| match l.value {
+            MetricLabelValue::Double(d) => Some(d),
+            MetricLabelValue::Str(_) => None,
         })
-    });
-}
-
-/// One label value rendered as the reference's SORT KEY — which is **not**
-/// the wire text.
-///
-/// `sortResponse` compares `Label.Value.String()`, and that `Value` is a
-/// protobuf `AnyValue` whose `String()` is `proto.CompactTextString`
-/// (`pkg/tempopb/common/v1/common.pb.go:46 @ v3.0.2`). gogo's text
-/// writer ends at `fmt.Fprint(w, v.Interface())` for a scalar
-/// (`vendor/github.com/gogo/protobuf/proto/text.go`, the `default:` arm
-/// of `writeAny`), i.e. Go's `%v` for a `float64`, i.e.
-/// `strconv.FormatFloat(v, 'g', -1, 64)`. protojson — which produces the
-/// wire text — uses a DIFFERENT rule (`encoding/json`'s: exponent form
-/// iff `|v| < 1e-6` or `>= 1e21`), so sorting on our own JSON rendering
-/// is not the same comparison.
-///
-/// Go's `'g'` with shortest precision uses exponent form iff
-/// `exp < -4 || exp >= 6` (`eprec` is forced to 6 for shortest), with the
-/// exponent written to at least two digits. `serde_json`/ryu switches at
-/// different thresholds in both directions, so over the reachable
-/// power-of-two bucket ladder (`2^1 .. 2^63 ns`) the two rules ORDER 135
-/// of the 1953 bucket pairs differently. They agree on every pair drawn
-/// from `2^1 .. 2^13 ns`; the first divergence is `2^14 ns` — 16 µs, an
-/// ordinary span width — where `%g` writes `1.6384e-05` and ryu writes
-/// `0.000016384`, and they part again from `2^50 ns` up
-/// (`1.125899906842624e+06` vs `1125899.906842624`). Enumerated in
-/// `sorting_on_the_wire_text_would_misorder_ordinary_corpora` and
-/// measured against the reference on the `mix16k` capture corpus, which
-/// the wire-text rule orders backwards.
-///
-/// Strings sort as themselves; the `%g` shape only applies to doubles.
-pub fn label_sort_key(value: &MetricLabelValue) -> String {
-    match value {
-        MetricLabelValue::Str(s) => s.clone(),
-        MetricLabelValue::Double(d) => go_format_g_shortest(*d),
-    }
-}
-
-/// `strconv.FormatFloat(v, 'g', -1, 64)`. Rust's `{:e}` and `{}` are both
-/// shortest-round-trip, so the digits are Go's digits; only the choice of
-/// form and the exponent's zero-padding have to be reproduced.
-fn go_format_g_shortest(v: f64) -> String {
-    if !v.is_finite() {
-        // Unreachable for a `__bucket`/`p` label; keeps the key total.
-        return format!("{v}");
-    }
-    let sci = format!("{v:e}");
-    let Some((mantissa, exp_text)) = sci.split_once('e') else {
-        return sci;
-    };
-    let Ok(exp) = exp_text.parse::<i32>() else {
-        return sci;
-    };
-    // Go's rule verbatim: `exp < -4 || exp >= eprec` with `eprec = 6`
-    // for shortest precision.
-    if !(-4..6).contains(&exp) {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exp.abs())
-    } else {
-        // Positional shortest — Rust's `Display` never picks exponent form.
-        format!("{v}")
-    }
+        .unwrap_or(f64::NEG_INFINITY)
 }
 
 /// Sanitizes a non-finite aggregate (e.g. `quantilesTDigest` over an empty
@@ -3055,15 +3004,16 @@ mod tests {
     // `traces::log2_histogram`'s own tests with the function itself
     // (issue #252) — `bucket_seconds` is no longer an `exec.rs` local.
 
-    /// Issue #252: the reference orders series by the RENDERED label
-    /// value, not numerically
-    /// (`modules/frontend/combiner/metrics_query_range.go:245-266 @
-    /// v3.0.2`). The `mix252` capture is the witness that makes the
-    /// text and numeric rules disagree: `2^20 ns` has the sort key
-    /// `0.001048576` and sorts BEFORE `2^1 ns` (`2e-09`), the reverse of
-    /// the numeric order the SQL returns them in.
+    /// Issue #252 (owner ruling, 2026-08-05): histogram series come out
+    /// ASCENDING BY BUCKET, whatever order the rows arrived in. The
+    /// reference's own order is lexicographic on a `%g` rendering of the
+    /// label and is neither numeric nor stable in any way a client could
+    /// use — a determinism device, ledgered as
+    /// `2026-08-05-traceql-histogram-series-order`. The captured
+    /// reference orders are pinned in `tests/traces_log2_reference.rs`
+    /// beside ours, so both sides are visible.
     #[test]
-    fn series_are_ordered_by_the_rendered_label_value_not_numerically() {
+    fn histogram_series_are_emitted_ascending_by_bucket() {
         let bucket = |ns: u64| TraceMetricSeries {
             labels: vec![MetricLabel::double(
                 "__bucket",
@@ -3072,87 +3022,31 @@ mod tests {
             samples: vec![(0, 1.0)],
             exemplars: vec![],
         };
-        // SQL order is ascending by bucket_ns: 2, 4, 2^20.
-        let mut series = vec![bucket(2), bucket(4), bucket(1 << 20)];
-        sort_series_like_the_reference(&mut series);
-        let rendered: Vec<String> = series
+        // Deliberately shuffled, and spanning the renderings that make
+        // the reference's own comparator disagree with numeric order
+        // (2^10 and 2^14 render in exponent form under `%g`).
+        let mut series = vec![
+            bucket(1 << 20),
+            bucket(1 << 63),
+            bucket(2),
+            bucket(1 << 14),
+            bucket(1 << 10),
+        ];
+        sort_histogram_series_by_bucket_ascending(&mut series);
+        let ordered: Vec<f64> = series
             .iter()
-            .map(|s| label_sort_key(&s.labels[0].value))
+            .map(|s| match s.labels[0].value {
+                MetricLabelValue::Double(d) => d,
+                MetricLabelValue::Str(_) => panic!("__bucket is a double"),
+            })
             .collect();
-        assert_eq!(rendered, vec!["0.001048576", "2e-09", "4e-09"]);
-    }
-
-    /// The sort key is Go's `%g`, and the wire text is protojson's — two
-    /// different rules over the same `f64`. Pinning both here is what
-    /// keeps `label_sort_key` from silently drifting back into "whatever
-    /// our encoder emits", which is right for `2^1..2^49 ns` and wrong
-    /// above it.
-    ///
-    /// The `%g` column is Go's `strconv.FormatFloat(v, 'g', -1, 64)`:
-    /// exponent form iff `exp < -4 || exp >= 6`, exponent at least two
-    /// digits. The wire column is what `serde_json` emits, cross-checked
-    /// against the reference's own HTTP body in the committed capture.
-    #[test]
-    fn the_sort_key_is_go_percent_g_and_the_wire_text_is_protojson() {
-        for (ns, sort_key, wire) in [
-            (1u64 << 1, "2e-09", "2e-9"),
-            (1 << 2, "4e-09", "4e-9"),
-            // ryu and %g agree here; protojson does NOT (`0.000001024`).
-            (1 << 10, "1.024e-06", "1.024e-6"),
-            (1 << 20, "0.001048576", "0.001048576"),
-            (1 << 29, "0.536870912", "0.536870912"),
-            (1 << 40, "1099.511627776", "1099.511627776"),
-            // %g switches to exponent form at 1e6; ryu does not.
-            (1 << 50, "1.125899906842624e+06", "1125899.906842624"),
-            (1 << 63, "9.223372036854776e+09", "9223372036.854776"),
-        ] {
-            let v = log2_histogram::bucket_seconds(ns);
-            assert_eq!(
-                label_sort_key(&MetricLabelValue::Double(v)),
-                sort_key,
-                "sort key for {ns} ns"
-            );
-            assert_eq!(
-                serde_json::to_string(&v).expect("finite"),
-                wire,
-                "wire text for {ns} ns"
-            );
-        }
-    }
-
-    /// …and the two rules really do produce different ORDERS, so the
-    /// distinction is load-bearing rather than pedantic. The smallest
-    /// bucket at which they part is `2^14 ns` — 16 µs, an ordinary span
-    /// width — where Go's `%g` writes `1.6384e-05` and ryu writes
-    /// `0.000016384`. Measured against the reference on the `mix16k`
-    /// capture corpus (a 16 µs span beside a 1 ms span): it emits
-    /// `0.001048576` FIRST, which only the `%g` key reproduces.
-    #[test]
-    fn sorting_on_the_wire_text_would_misorder_ordinary_corpora() {
-        let key = |ns: u64| {
-            label_sort_key(&MetricLabelValue::Double(log2_histogram::bucket_seconds(
-                ns,
-            )))
-        };
-        let wire =
-            |ns: u64| serde_json::to_string(&log2_histogram::bucket_seconds(ns)).expect("finite");
-        let by = |mut v: Vec<u64>, f: &dyn Fn(u64) -> String| {
-            v.sort_by_key(|ns| f(*ns));
-            v
-        };
-        // The measured witness, both directions.
-        assert_eq!(by(vec![1 << 14, 1 << 20], &key), vec![1 << 20, 1 << 14]);
-        assert_eq!(by(vec![1 << 14, 1 << 20], &wire), vec![1 << 14, 1 << 20]);
-        // Below 2^14 ns the two rules coincide on the whole sub-ladder…
-        let low: Vec<u64> = (1..14).map(|k| 1u64 << k).collect();
-        assert_eq!(by(low.clone(), &key), by(low, &wire));
-        // …and over the full reachable ladder they do not.
-        let ladder: Vec<u64> = (1..=63).map(|k| 1u64 << k).collect();
-        assert_ne!(
-            by(ladder.clone(), &key),
-            by(ladder, &wire),
-            "if these agree, `label_sort_key` has been rewritten into the wire rule"
-        );
+        let want: Vec<f64> = [2u64, 1 << 10, 1 << 14, 1 << 20, 1 << 63]
+            .into_iter()
+            .map(log2_histogram::bucket_seconds)
+            .collect();
+        assert_eq!(ordered, want);
+        // Ascending in the values themselves, not merely equal to a list.
+        assert!(ordered.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
