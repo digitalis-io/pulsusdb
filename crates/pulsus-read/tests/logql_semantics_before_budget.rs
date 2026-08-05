@@ -13,8 +13,10 @@
 //! charge cannot possibly clear — `cap = 0`, and for the shape rows a
 //! caller counter already at `u64::MAX - 1` — and asserts the SEMANTIC
 //! error comes back. The mechanism that makes that true is structural
-//! and lives in the source: `decide_binary` moves both operands in, and
-//! `Ledger::acquire_binary` is the only way to get them back. These rows
+//! and lives in the source: `decide_binary` moves both operands in,
+//! `Ledger::acquire_binary` is the only way to get them back, and what
+//! it hands back is one charged value the join must be given whole, so
+//! no caller can substitute the context it joins under. These rows
 //! are what proves the structure produces the behaviour, at the layer
 //! the user experiences (#335's standing lesson: a gate below the user
 //! reports agreement exactly where divergence lives).

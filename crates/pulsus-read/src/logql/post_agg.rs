@@ -123,12 +123,15 @@ pub fn combine_binary(
 /// The order is structural, not a convention. [`decide_binary`] MOVES
 /// both operands into a `BinaryDecided` — together with the `op` and the
 /// `matching` the decision was made under — and `Ledger::acquire_binary`
-/// is the only way to get any of them back: an operand cannot reach the
-/// join except through a charge the decision preceded, the decision
-/// cannot be made over a different pair (there is no second pair to
-/// name), and it cannot be joined under a different matcher, because the
-/// matcher is a private field of the decision and [`join_decided`] takes
-/// its context from nowhere else. See docs/architecture.md §5.6.
+/// consumes that in turn, handing back nothing loose: its whole result
+/// is one `BinaryCharged`, which owns the charge, the operands and the
+/// context, has private fields, and is what [`join_decided`] must be
+/// given BY VALUE. So an operand cannot reach the join except through a
+/// charge the decision preceded, the decision cannot be made over a
+/// different pair (there is no second pair to name), and it cannot be
+/// joined under a different matcher or against a different budget,
+/// because there is no parameter left to pass either through. See
+/// docs/architecture.md §5.6.
 ///
 /// **What "that this charge could preempt" excludes.** The (P1) join
 /// refusals are decided only when this seam's charge would actually
@@ -147,12 +150,12 @@ pub fn combine_binary_capped(
     cap: u64,
 ) -> Result<QueryResult, ReadError> {
     let decided = decide_binary(op, matching, lhs, rhs, *charged, cap)?;
-    let (l, op, matching, lhs, rhs) = Ledger::acquire_binary(charged, decided, cap)?;
-    join_decided(&l, op, return_bool, matching, lhs, rhs)
+    join_decided(Ledger::acquire_binary(charged, decided, cap)?, return_bool)
 }
 
-/// The join itself, over operands and a decision context that came out of
-/// [`Ledger::acquire_binary`] and could not have come from anywhere else.
+/// The join itself, over a charge, operands and a decision context that
+/// arrive as ONE value out of [`Ledger::acquire_binary`] and could not
+/// have come from anywhere else.
 ///
 /// **Why this is a separate function** (issue #290, review round 2's
 /// `[medium]`): (P1)'s answer is a function of `op` and `matching`, so
@@ -160,23 +163,49 @@ pub fn combine_binary_capped(
 /// same defect as joining operands that were not decided at all. Keeping
 /// the join in [`combine_binary_capped`] left that context nameable —
 /// the caller's own parameters were still in scope, and rebinding them
-/// over the decision's would have compiled and passed. Here they are not
-/// in scope: threading a different `op` or `matching` in means adding a
-/// parameter, which does not compile against the one call site.
+/// over the decision's would have compiled and passed.
 ///
-/// `return_bool` is deliberately NOT part of the decision. It selects
+/// **Why it takes one moved value** (review round 3's `[medium]`):
+/// splitting the function was not enough on its own. `op` and `matching`
+/// are `Copy`, so while `join_decided` still had parameters of those
+/// types, a caller that renamed the destructured bindings could pass its
+/// own alongside the decision's operands — and that mutant compiled.
+/// `Copy` was never the obstacle; carrying the context in loose
+/// arguments was. It now arrives inside [`BinaryCharged`], whose fields
+/// are private to `mod ledger` and whose only constructor is the charge.
+/// The three caller-side ways to substitute a context are each a compile
+/// error, measured on this tree: handing it in beside the decision is
+/// `E0061` (this function takes 2 arguments), overwriting the decision's
+/// with `charged.matching = ..` is `E0616`, and rebuilding the value
+/// around the caller's is `E0451`.
+///
+/// The charge travels in the same value for the same reason — a join
+/// against a ledger the operands were not charged on is context
+/// substitution too, one layer down. It WAS expressible before: at
+/// `9695900` a `Ledger::acquire` over a private counter and an unlimited
+/// cap could be passed to this function's `&Ledger` parameter and it
+/// compiled. There is no such parameter now.
+///
+/// **What remains, stated as what it is.** Editing this function's own
+/// signature and body and its one call site together still produces a
+/// join under a substituted context. No in-language device prevents
+/// that, here or anywhere — it is a rewrite of the mechanism rather
+/// than a use of it, and it is what review of a diff is for. The bound
+/// this doc claims is narrower and checkable: *no caller can substitute
+/// the context without editing this function*.
+///
+/// `return_bool` is the one thing left loose, deliberately. It selects
 /// what a comparison emits, and `instant_join` detects every duplicate
 /// before its keep filter (its "Duplicate detection — BEFORE the keep
 /// filter" block), so no refusal is a function of it — which is also why
-/// `binary_peak_bytes` does not take it.
+/// `binary_peak_bytes` does not take it. Substituting it cannot change
+/// which refusal is raised, only which values a comparison keeps.
 fn join_decided(
-    led: &Ledger<'_>,
-    op: BinOp,
+    charged: BinaryCharged<'_, '_>,
     return_bool: bool,
-    matching: Option<&VectorMatching>,
-    lhs: QueryResult,
-    rhs: QueryResult,
 ) -> Result<QueryResult, ReadError> {
+    let (ledger, op, matching, lhs, rhs) = charged.into_join_context();
+    let led = &ledger;
     match (lhs, rhs) {
         (QueryResult::Scalar(l), QueryResult::Scalar(r)) => {
             if is_set_op(op) {
@@ -2504,9 +2533,13 @@ pub fn preflight_alloc_probe(
 ///
 /// Issue #290 adds a SECOND proof token to the same module,
 /// [`PreflightCharge`], for the class-(P) preflight's own scratch, and
-/// [`BinaryDecided`] — which is not a token but its dual: a value that
-/// OWNS the operands whose refusals have been decided, with no accessor,
-/// so [`Ledger::acquire_binary`] is the only way to get them back.
+/// two values that are not tokens but their dual — values that OWN what
+/// a caller would otherwise pass loose, with no accessor but a consuming
+/// one: [`BinaryDecided`], the operands whose refusals have been decided
+/// (only [`Ledger::acquire_binary`] gets them back), and
+/// [`BinaryCharged`], those operands plus the charge and the decision
+/// context, which only that same function mints and only the join
+/// consumes.
 mod ledger {
     #[cfg(test)]
     use super::MAX_POST_AGG_BYTES;
@@ -2683,6 +2716,57 @@ mod ledger {
         charged.saturating_add(bytes) > cap
     }
 
+    /// A charged decision: the [`Ledger`] the operands were charged on,
+    /// the operands themselves, and the `op`/`matching` they were
+    /// decided under — inseparable until the join takes them (issue
+    /// #290, review round 3's `[medium]`).
+    ///
+    /// **Why the context is not returned loose.** `op` and `matching`
+    /// are `Copy`, so a `join_decided(&led, op, matching, lhs, rhs)`
+    /// leaves the caller free to pass ITS OWN `op`/`matching` — the
+    /// decision's operands joined under a context nothing was decided
+    /// under. Shadowing the caller's bindings only hides that; renaming
+    /// the destructured ones brings it straight back, and it compiled.
+    /// `Copy` is not the constraint. What closes it is that the only
+    /// thing carrying the context into the join is a value that must be
+    /// MOVED in and cannot be built: the fields are private to this
+    /// module (a struct literal outside it is E0451), the only
+    /// constructor is [`Ledger::acquire_binary`], and the only exit is
+    /// [`Self::into_join_context`], which consumes — so detaching the
+    /// context ends that path rather than diverting it, because there is
+    /// no way back to a `BinaryCharged`.
+    ///
+    /// The ledger travels here for the same reason. A join against a
+    /// budget the operands were not charged on is context substitution
+    /// one layer down, and `&Ledger` as a join parameter left it
+    /// expressible: at `9695900`, `Ledger::acquire` over a local counter
+    /// with `cap = u64::MAX` passed to `join_decided` compiled.
+    #[derive(Debug)]
+    pub(super) struct BinaryCharged<'a, 'm> {
+        led: Ledger<'a>,
+        op: BinOp,
+        matching: Option<&'m VectorMatching>,
+        lhs: QueryResult,
+        rhs: QueryResult,
+    }
+
+    impl<'a, 'm> BinaryCharged<'a, 'm> {
+        /// The ONLY exit, and it CONSUMES: what comes out is what went
+        /// in, once. The charge stays live in the returned [`Ledger`],
+        /// which discharges on drop as always.
+        pub(super) fn into_join_context(
+            self,
+        ) -> (
+            Ledger<'a>,
+            BinOp,
+            Option<&'m VectorMatching>,
+            QueryResult,
+            QueryResult,
+        ) {
+            (self.led, self.op, self.matching, self.lhs, self.rhs)
+        }
+    }
+
     /// Proof that a stage's modelled bytes were charged, AND the budget
     /// that charge covers.
     ///
@@ -2716,28 +2800,21 @@ mod ledger {
         /// the same quantity `binary_peak_bytes` is evaluated over.
         ///
         /// Consumes the decision, levies the charge derived from it, and
-        /// hands back the operands it was decided over **and the `op` and
-        /// `matching` they were decided under**. Callers cannot name any
-        /// of those by another route (issue #290): there is no
-        /// `&StageInput` parameter left to supply a measurement that was
-        /// not taken from them, no way to obtain a [`BinaryDecided`]
-        /// except from [`decide_binary`], and no way to pair one
-        /// decision's operands with another's matcher, because the two
-        /// are private fields of one value.
+        /// hands back **one value and nothing loose**: a
+        /// [`BinaryCharged`] owning the charge, the operands it was
+        /// decided over and the `op` and `matching` they were decided
+        /// under. Callers cannot name any of those by another route
+        /// (issue #290): there is no `&StageInput` parameter left to
+        /// supply a measurement that was not taken from them, no way to
+        /// obtain a [`BinaryDecided`] except from [`decide_binary`], and
+        /// no way to pair one decision's operands with another's matcher
+        /// or another's ledger, because all of them are private fields
+        /// of one value that only this function can mint.
         pub(super) fn acquire_binary<'m>(
             charged: &'a mut u64,
             decided: BinaryDecided<'m>,
             cap: u64,
-        ) -> Result<
-            (
-                Self,
-                BinOp,
-                Option<&'m VectorMatching>,
-                QueryResult,
-                QueryResult,
-            ),
-            ReadError,
-        > {
+        ) -> Result<BinaryCharged<'a, 'm>, ReadError> {
             let BinaryDecided {
                 op,
                 matching,
@@ -2747,14 +2824,20 @@ mod ledger {
                 rm,
                 bytes,
             } = decided;
-            let l = Self::acquire_for(
+            let led = Self::acquire_for(
                 charged,
                 lm.series().saturating_add(rm.series()),
                 lm.points().saturating_add(rm.points()),
                 bytes,
                 cap,
             )?;
-            Ok((l, op, matching, lhs, rhs))
+            Ok(BinaryCharged {
+                led,
+                op,
+                matching,
+                lhs,
+                rhs,
+            })
         }
 
         fn acquire_for(
@@ -2819,7 +2902,7 @@ mod ledger {
 }
 
 use ledger::Ledger;
-// Issue #290's two additions, each on its OWN line and AFTER the line
+// Issue #290's additions, each on its OWN line and AFTER the line
 // above: `the_enforcement_path_contains_no_debug_assert` delimits its
 // scan region with the literal `"\nuse ledger::Ledger;"`, so folding
 // these into a brace group would silence that gate rather than fail it.
@@ -2827,6 +2910,7 @@ use ledger::Ledger;
 // that drive the preflight's own admission directly: since the probe
 // routes through `decide_binary`, production code reaches the token
 // through `mod ledger` and `mod preflight` alone.
+use ledger::BinaryCharged;
 #[cfg(test)]
 use ledger::PreflightCharge;
 use ledger::decide_binary;
