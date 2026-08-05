@@ -29,7 +29,7 @@
 //!
 //! Gate: the live leg skips cleanly unless `PULSUSDB_TEMPO_DIFF_URL` is set.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -201,13 +201,60 @@ const DIVERGE: usize = 0;
 const MEANING: usize = 6;
 const CLOSED_MEANING: usize = 7;
 
+/// The audit matrix, **validated at load** on the two properties every
+/// gate in this file reads through:
+///
+/// * **Query uniqueness.** The query is a probe's identity here, and
+///   several gates look one up with `find`, which takes the first match
+///   and says nothing about a second.
+/// * **The `reference` domain.** `accept` | `reject` and nothing else,
+///   because every scoring comparison in this file is a string equality
+///   against that column: an `""` or `"accept "` would not fail as
+///   malformed, it would quietly score as the opposite verdict.
+///
+/// **Why the digest is not enough** (review round, and my earlier
+/// reasoning was wrong here):
+/// [`the_reference_column_is_frozen_against_silent_re_pinning`] digests
+/// `(query, reference)` in order, which makes it a CHANGE TRIPWIRE, not
+/// a uniqueness assertion. Re-pinning is a sanctioned operation, and a
+/// re-pin that duplicates a query moves the digest with it — consistent,
+/// and still two probes scoring off one baseline row.
 fn matrix() -> Matrix {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("accept_surface")
         .join("matrix.json");
     let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&raw).expect("matrix.json must parse")
+    let m: Matrix = serde_json::from_str(&raw).expect("matrix.json must parse");
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut duplicated = Vec::new();
+    let mut malformed = Vec::new();
+    for p in &m.accept_surface_probes {
+        if !seen.insert(p.query.as_str()) {
+            duplicated.push(p.query.clone());
+        }
+        if !matches!(p.reference.as_str(), "accept" | "reject") {
+            malformed.push(format!("{:?} -> reference {:?}", p.query, p.reference));
+        }
+    }
+    assert!(
+        duplicated.is_empty(),
+        "{} duplicate probe key(s) in matrix.json — a probe's query IS its identity, and a \
+         duplicate makes two probes score off one baseline row while the reference digest \
+         stays consistent with itself:\n{}",
+        duplicated.len(),
+        duplicated.join("\n")
+    );
+    assert!(
+        malformed.is_empty(),
+        "{} probe(s) carry a reference verdict outside {{accept, reject}} — every gate here \
+         compares against that column by string equality, so a malformed value scores as the \
+         opposite verdict instead of failing as bad data:\n{}",
+        malformed.len(),
+        malformed.join("\n")
+    );
+    m
 }
 
 /// The committed WIRE-axis column. Only the two fields the joins below
@@ -245,6 +292,12 @@ struct WireProbe {
 ///   so an entry that scores nothing cannot sit there unnoticed. The
 ///   forward half (every probe has an entry) is [`diverges_on_wire`]'s
 ///   panic.
+/// * **The disposition domain** — `accept` | `reject` and nothing else.
+///   The scoring comparison is `disposition != probe.reference`, a
+///   string equality, so `""` or `"accept "` would not fail as
+///   malformed: it would score as a divergence, and on a probe that
+///   really agrees that is a wrong verdict arriving as a plausible one
+///   (review round). Bad data has to fail as bad data.
 ///
 /// Cross-crate, `accept_surface_wire.rs`'s
 /// `every_committed_wire_verdict_is_reproduced_by_the_planner` already
@@ -254,10 +307,8 @@ struct WireProbe {
 /// this file's gates must not depend on it to know that their own join
 /// is sound.
 ///
-/// The matrix side needs no duplicate check here:
-/// [`the_reference_column_is_frozen_against_silent_re_pinning`] digests
-/// `(query, reference)` for all 221 probes in order, so a repeated probe
-/// key cannot be introduced without moving `REFERENCE_DIGEST`.
+/// The matrix side of the join is held to the same two properties by
+/// [`matrix`] itself, at load.
 fn wire_dispositions(m: &Matrix) -> BTreeMap<String, String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -269,6 +320,7 @@ fn wire_dispositions(m: &Matrix) -> BTreeMap<String, String> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     let mut duplicated = Vec::new();
     let mut unmatched = Vec::new();
+    let mut malformed = Vec::new();
     for w in &wire.wire_baseline {
         if map.insert(w.query.clone(), w.pulsus_wire.clone()).is_some() {
             duplicated.push(w.query.clone());
@@ -276,7 +328,18 @@ fn wire_dispositions(m: &Matrix) -> BTreeMap<String, String> {
         if !m.accept_surface_probes.iter().any(|p| p.query == w.query) {
             unmatched.push(w.query.clone());
         }
+        if !matches!(w.pulsus_wire.as_str(), "accept" | "reject") {
+            malformed.push(format!("{:?} -> pulsus_wire {:?}", w.query, w.pulsus_wire));
+        }
     }
+    assert!(
+        malformed.is_empty(),
+        "{} wire baseline entry(ies) carry a disposition outside {{accept, reject}} — the score \
+         is a string equality against the reference column, so a malformed value reads as a \
+         divergence instead of failing as bad data:\n{}",
+        malformed.len(),
+        malformed.join("\n")
+    );
     assert!(
         duplicated.is_empty(),
         "{} duplicate probe key(s) in wire_baseline.json — a probe's query IS its identity on \
@@ -621,9 +684,30 @@ fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
 /// means one thing: **the reference container was re-measured.** Never
 /// update it to make a run go green.
 ///
-/// FNV-1a rather than a hash crate: no new dependency for a
+/// **What the digest function actually is: an FNV-1a-SHAPED rolling
+/// multiplicative digest, and NOT FNV-1a.** It is written inline rather
+/// than pulled from a hash crate — no new dependency for a
 /// change-detector, and the value is regenerated from the assertion
-/// message.
+/// message — but the multiplier below is `0x1000_0000_01b3`, one hex
+/// digit longer than the FNV-1a 64-bit prime `0x100000001b3`. The offset
+/// basis and the xor-then-multiply order are FNV-1a's; the prime is not.
+///
+/// **Deliberately not corrected** (review round, #335): this is a change
+/// DETECTOR, and any odd multiplier over `u64` is one — no verdict,
+/// count or comparison anywhere in this suite depends on the value being
+/// a particular hash. `REFERENCE_DIGEST` is pinned to THIS function, and
+/// a constant whose entire purpose is not to move casually should not be
+/// moved to make a name accurate. So the label is corrected instead of
+/// the arithmetic.
+///
+/// Do not "fix" the multiplier: it would move `REFERENCE_DIGEST` for a
+/// cosmetic reason, which is exactly the move this test exists to make
+/// suspicious. If it is ever changed, that is a re-pin like any other
+/// and must be reviewed as one.
+///
+/// (Found by recomputing the digest independently while building a
+/// mutant: the low 32 bits matched and the high bits did not, which is
+/// what an over-long multiplier looks like.)
 #[test]
 fn the_reference_column_is_frozen_against_silent_re_pinning() {
     const REFERENCE_DIGEST: u64 = 0x95bd_d72a_11e5_6743;
@@ -632,6 +716,9 @@ fn the_reference_column_is_frozen_against_silent_re_pinning() {
     let mut feed = |b: &[u8]| {
         for byte in b {
             h ^= u64::from(*byte);
+            // NOT the FNV-1a prime (`0x100000001b3`) — one hex digit
+            // longer, and left that way on purpose. See the doc comment:
+            // changing it moves REFERENCE_DIGEST for a cosmetic reason.
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
     };
