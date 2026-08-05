@@ -64,11 +64,11 @@ use pulsus_traceql::{
 };
 
 use super::exec::ByteBudget;
-use super::filter::{BoolMatch, NestedSetField};
+use super::filter::{BoolMatch, NestedSetField, SetSide};
 use super::search_plan::{
-    AggSource, GroupKeyResolver, PhysicalEval, PhysicalSelect, PlannedArith, PlannedFilter,
-    PlannedGroupKey, PlannedLeafEval, PlannedOperand, SearchPlan, SelectField, SpansetStage,
-    TraceCtxEval,
+    AggSource, GroupKeyResolver, PhysicalEval, PhysicalSelect, PlannedArith, PlannedBoolTerm,
+    PlannedFilter, PlannedGroupKey, PlannedLeafEval, PlannedOperand, SearchPlan, SelectField,
+    SpansetStage, TraceCtxEval,
 };
 use crate::logql::error::{ReadError, TooBroadReason};
 
@@ -114,6 +114,13 @@ pub struct BatchAttrs {
     pub membership: Vec<HashSet<SpanKey>>,
     pub agg_values: Vec<HashMap<SpanKey, f64>>,
     pub select_values: Vec<HashMap<SpanKey, String>>,
+    /// Per-span MULTI-VALUED event/link value sets (issue #351),
+    /// index-aligned with the plan's `event_sets`
+    /// (`search_sql::event_set_sql`). Empty for every query that does not
+    /// compare an `event:`/`link:` intrinsic against another field. An
+    /// ABSENT span key is the empty set, which is what a span with no
+    /// events is.
+    pub event_sets: Vec<HashMap<SpanKey, EventValues>>,
     /// Per-trace context (`search_sql::trace_ctx_sql`): the trace-wide
     /// time envelope + the `pick_roots`-equivalent root name/service,
     /// keyed by `trace_id`. Window- and cap-independent (full-trace
@@ -122,6 +129,16 @@ pub struct BatchAttrs {
     /// Direct-child counts (`search_sql::child_count_sql`), keyed by
     /// `(trace_id, parent span_id)`; an absent key means 0 children.
     pub child_counts: HashMap<SpanKey, u64>,
+}
+
+/// One span's co-loaded event/link value set (issue #351). Two
+/// variants because the four intrinsics split exactly as their literal
+/// leaves do: `event:timeSinceStart` is read from `val_num`, the other
+/// three from `val`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventValues {
+    Text(Vec<String>),
+    Num(Vec<f64>),
 }
 
 /// One trace's context co-load values (issue #184).
@@ -158,6 +175,9 @@ pub(crate) struct TraceEvalCtx<'a> {
 /// one context parameter.
 struct EvalEnv<'a> {
     attrs: &'a BatchAttrs,
+    /// The batch's event/link value sets (issue #351), borrowed straight
+    /// from [`BatchAttrs`] — no per-span or per-trace copy.
+    event_sets: &'a [HashMap<SpanKey, EventValues>],
     nested_set: Option<&'a NestedSetIndex>,
     ctx: TraceEvalCtx<'a>,
 }
@@ -695,6 +715,103 @@ fn eval_field_compare(
     }
 }
 
+/// One boolean operand's resolved state (issue #351). Four states, not
+/// two: the reference distinguishes "holds `false`" from "holds something
+/// that is not a boolean" from "absent", and each leads somewhere
+/// different — no match, a whole-query failure under `!`, and no match
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoolVal {
+    True,
+    False,
+    /// Present, but not a boolean — `!` fails the whole query on this
+    /// (`pkg/traceql/ast_execute.go:852-858` @ v3.0.2); `=`/`!=` simply
+    /// does not match (`:411-417` returns `StaticFalse` for a
+    /// non-matching operand pair).
+    NotBoolean,
+    /// No value for this span — no match, never an error.
+    Absent,
+}
+
+impl BoolVal {
+    fn of(value: bool) -> BoolVal {
+        if value { BoolVal::True } else { BoolVal::False }
+    }
+
+    fn boolean(self) -> Option<bool> {
+        match self {
+            BoolVal::True => Some(true),
+            BoolVal::False => Some(false),
+            BoolVal::NotBoolean | BoolVal::Absent => None,
+        }
+    }
+}
+
+/// Resolves one [`PlannedBoolTerm`] for a span. Booleans are stored as
+/// the strings `"true"`/`"false"`, so the resolved text is the
+/// discriminator — the same channel `BoolTruth` reads.
+fn eval_bool_term(
+    term: &PlannedBoolTerm,
+    span: &HydratedSpan,
+    env: &EvalEnv<'_>,
+) -> Result<BoolVal, ReadError> {
+    Ok(match term {
+        PlannedBoolTerm::Const(v) => BoolVal::of(*v),
+        PlannedBoolTerm::Value(operand) => match resolve_operand(operand, span, env) {
+            None => BoolVal::Absent,
+            Some(v) => match v.text.as_deref() {
+                Some("true") => BoolVal::True,
+                Some("false") => BoolVal::False,
+                _ => BoolVal::NotBoolean,
+            },
+        },
+        PlannedBoolTerm::Not { term, display } => match eval_bool_term(term, span, env)? {
+            BoolVal::True => BoolVal::False,
+            BoolVal::False => BoolVal::True,
+            BoolVal::Absent => BoolVal::Absent,
+            // The `!` OPERATOR demands a boolean, and a present
+            // non-boolean fails the WHOLE query — the reference's
+            // behaviour and ours since issue #335 Stage B.
+            BoolVal::NotBoolean => {
+                return Err(ReadError::PipelineInvalid {
+                    reason: format!("expression (!{display}) expected a boolean"),
+                });
+            }
+        },
+        PlannedBoolTerm::Nested(leaf) => BoolVal::of(eval_leaf(leaf, span, env)?),
+    })
+}
+
+/// Evaluates a boolean-vs-boolean comparison (issue #351).
+///
+/// BOTH terms are resolved before the operator is applied, even when the
+/// first already decides the outcome: the `!` type failure must fire
+/// either way, which is what the reference does — measured,
+/// `{ .p = .q = !.r }` is a 500 against a string `r` even on spans whose
+/// left side is already `false`.
+fn eval_bool_compare(
+    lhs: &PlannedBoolTerm,
+    rhs: &PlannedBoolTerm,
+    op: ComparisonOp,
+    span: &HydratedSpan,
+    env: &EvalEnv<'_>,
+) -> Result<bool, ReadError> {
+    let l = eval_bool_term(lhs, span, env)?;
+    let r = eval_bool_term(rhs, span, env)?;
+    let (Some(l), Some(r)) = (l.boolean(), r.boolean()) else {
+        return Ok(false);
+    };
+    Ok(match op {
+        ComparisonOp::Eq => l == r,
+        ComparisonOp::Neq => l != r,
+        // An ordering (or regex) operator over two booleans matches
+        // nothing — the operands are still resolved above, so the `!`
+        // type demand stays live. Measured: `{ !.ct < !.cu }` is a 200
+        // with no matches even where both booleans are present.
+        _ => false,
+    })
+}
+
 /// Consumes the next planned leaf, in pre-order, and evaluates it.
 fn eval_planned_leaf(
     filter: &PlannedFilter,
@@ -704,6 +821,19 @@ fn eval_planned_leaf(
 ) -> Result<bool, ReadError> {
     let leaf = &filter.leaves[*leaf_idx];
     *leaf_idx += 1;
+    eval_leaf(leaf, span, env)
+}
+
+/// Evaluates one planned leaf against one span. Split from
+/// [`eval_planned_leaf`] since issue #351: a leaf can now CONTAIN a leaf
+/// (`{ .a = .b = .c }`), and a nested one is not part of the pre-order
+/// stream — it is reached through its parent, never by advancing
+/// `leaf_idx`.
+fn eval_leaf(
+    leaf: &PlannedLeafEval,
+    span: &HydratedSpan,
+    env: &EvalEnv<'_>,
+) -> Result<bool, ReadError> {
     Ok(match leaf {
         // **Boolean truthiness** (issue #335 Stage B, D12 capture).
         // Booleans are stored as the strings `"true"`/`"false"`, so the
@@ -760,7 +890,104 @@ fn eval_planned_leaf(
                 _ => false,
             }
         }
+        // Issue #351: a static-vs-static comparison, decided once at plan
+        // time. Nothing per span but the read of this bool.
+        PlannedLeafEval::Const(v) => *v,
+        PlannedLeafEval::BoolCompare { lhs, rhs, op } => {
+            eval_bool_compare(lhs, rhs, *op, span, env)?
+        }
+        PlannedLeafEval::EventSetCompare {
+            set_idx,
+            scalar,
+            op,
+            side,
+        } => eval_event_set_compare(*set_idx, scalar, *op, *side, span, env),
     })
+}
+
+/// Evaluates a multi-valued event/link comparison for one span (issue
+/// #351), against the batch's `groupUniqArray` co-load.
+///
+/// **ANY-match, `!=` ALL-match** (owner ruling, 2026-08-05) — the
+/// reference's own designed rule for a multi-valued operand:
+/// `pkg/traceql/ast_execute.go:535-627` @ v3.0.2 sets `matchAll` for
+/// `OpNotEqual`/`OpNotRegex` and returns `matchCount == elemCount`,
+/// otherwise `matchCount > 0`. Three consequences fall out of that
+/// arithmetic and each is deliberate:
+///
+/// * a span with NO events matches `!=` (`0 == 0`) — the same absent-key
+///   rule the literal `{ event:name != "x" }` form already follows
+///   (docs/api.md §4.2);
+/// * a cross-TYPE element fails its own element comparison, so it makes
+///   `!=` false rather than true — the element predicate is the same
+///   type gate [`eval_field_compare`] applies to a scalar pair;
+/// * the SCALAR side keeps issue #183's rule unchanged — absent ⇒ no
+///   match for every operator — so it is resolved first and
+///   short-circuits.
+///
+/// Allocation-free: the co-loaded set is borrowed and compared in place,
+/// and an ANY-match returns on its first hit.
+fn eval_event_set_compare(
+    set_idx: usize,
+    scalar: &PlannedOperand,
+    op: ComparisonOp,
+    side: SetSide,
+    span: &HydratedSpan,
+    env: &EvalEnv<'_>,
+) -> bool {
+    let Some(scalar) = resolve_operand(scalar, span, env) else {
+        return false; // absent scalar ⇒ no match (issue #183's rule)
+    };
+    let key = (env.ctx.trace_id, span.span_id);
+    let values = env.event_sets.get(set_idx).and_then(|m| m.get(&key));
+    // `!=` is the ALL-match operator; every other operator is ANY-match.
+    let match_all = matches!(op, ComparisonOp::Neq);
+    let mut matched = 0usize;
+    let mut total = 0usize;
+    match values {
+        // No rows for this span: the empty set. ANY-match finds nothing;
+        // ALL-match is vacuously satisfied.
+        None => {}
+        Some(EventValues::Text(items)) => {
+            for item in items {
+                total += 1;
+                // A numeric-typed scalar against a text element is
+                // cross-type: no match, for every operator.
+                let hit = match (scalar.num, &scalar.text) {
+                    (None, Some(text)) => match side {
+                        SetSide::Lhs => cmp_str(op, item.as_str(), text.as_ref()),
+                        SetSide::Rhs => cmp_str(op, text.as_ref(), item.as_str()),
+                    },
+                    _ => false,
+                };
+                if hit {
+                    matched += 1;
+                    if !match_all {
+                        return true;
+                    }
+                }
+            }
+        }
+        Some(EventValues::Num(items)) => {
+            for item in items {
+                total += 1;
+                let hit = match scalar.num {
+                    Some(n) => match side {
+                        SetSide::Lhs => cmp_f64(op, *item, n),
+                        SetSide::Rhs => cmp_f64(op, n, *item),
+                    },
+                    None => false,
+                };
+                if hit {
+                    matched += 1;
+                    if !match_all {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    match_all && matched == total
 }
 
 /// Evaluates one field expression against one span.
@@ -2144,6 +2371,7 @@ pub(crate) fn evaluate_batch(
         // allocation).
         let env = EvalEnv {
             attrs,
+            event_sets: &attrs.event_sets,
             nested_set: nested_set.as_ref().map(|c| &c.index),
             ctx: TraceEvalCtx {
                 trace_id: trace.trace_id,
@@ -3372,6 +3600,381 @@ mod tests {
             eval(&p, &[trace], &attrs).is_empty(),
             "cross-type and absent-key operands never match"
         );
+    }
+
+    /// Every matched span id across ALL matched traces (issue #351's
+    /// fixtures put one span in each trace, so `matched_ids`'s
+    /// first-trace view would hide most of them — and the per-spanset
+    /// `spss` cap would hide the rest).
+    fn all_matched_ids(matches: &[TraceMatch]) -> Vec<u8> {
+        let mut ids: Vec<u8> = matches
+            .iter()
+            .flat_map(|m| m.spans.iter().map(|s| s.span_id[7]))
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Issue #351: `{ .p = .q = .r }` — a comparison in operand position,
+    /// evaluated LEFT-associatively as `(.p = .q) = .r`.
+    ///
+    /// **This is the container fixture, span for span.** Ten spans were
+    /// pushed to grafana/tempo:3.0.2 with `p`/`q` numeric and `r` of every
+    /// type, and the reference matched exactly two: the one where both
+    /// sides are `true` and the one where both are `false`. A non-boolean
+    /// or absent `r` matches NOTHING, which is why the right operand
+    /// cannot be planned as a truthiness leaf — that would fold "`r` is
+    /// `false`" together with "`r` is absent" and wrongly match span 9.
+    ///
+    /// | span | `p`,`q` | `.r` | reference |
+    /// |---|---|---|---|
+    /// | 1 | 1,1 (true) | `true` | **match** |
+    /// | 2 | 1,1 (true) | `false` | no |
+    /// | 3 | 1,2 (false) | `true` | no |
+    /// | 4 | 1,2 (false) | `false` | **match** |
+    /// | 5 | 1,1 (true) | `"hello"` | no |
+    /// | 6 | 1,2 (false) | `"hello"` | no |
+    /// | 7 | 1,1 (true) | `7` | no |
+    /// | 8 | 1,2 (false) | `7` | no |
+    /// | 9 | 1,1 (true) | absent | no |
+    /// | 10 | 1,2 (false) | absent | no |
+    #[test]
+    fn a_comparison_in_operand_position_compares_booleans_and_nothing_else() {
+        let p = plan(r#"{ .p = .q = .r }"#);
+        // Interning order is the plan's traversal: the nested `(p = q)`
+        // first, then the `r` term.
+        assert_eq!(p.select_attrs_len(), 3);
+        let mut attrs = membership(&p, &[]);
+        // One span per trace, exactly as the container fixture was
+        // pushed — and it keeps every span visible past the per-spanset
+        // `spss` cap.
+        let mut set_num = |idx: usize, s: u8, v: f64| {
+            attrs.select_values[idx].insert((tid(s), sid(s)), v.to_string());
+            attrs.agg_values[idx].insert((tid(s), sid(s)), v);
+        };
+        // `q` equals `p` on spans 1,2,5,7,9 (the left side is `true`) and
+        // differs on 3,4,6,8,10 (`false`).
+        for (s, q) in [
+            (1u8, 1.0),
+            (2, 1.0),
+            (3, 2.0),
+            (4, 2.0),
+            (5, 1.0),
+            (6, 2.0),
+            (7, 1.0),
+            (8, 2.0),
+            (9, 1.0),
+            (10, 2.0),
+        ] {
+            set_num(0, s, 1.0);
+            set_num(1, s, q);
+        }
+        let mut set_text = |s: u8, v: &str| {
+            attrs.select_values[2].insert((tid(s), sid(s)), v.to_string());
+        };
+        set_text(1, "true");
+        set_text(2, "false");
+        set_text(3, "true");
+        set_text(4, "false");
+        set_text(5, "hello");
+        set_text(6, "hello");
+        set_text(7, "7");
+        set_text(8, "7");
+        attrs.agg_values[2].insert((tid(7), sid(7)), 7.0);
+        attrs.agg_values[2].insert((tid(8), sid(8)), 7.0);
+        // spans 9 and 10: `r` absent entirely.
+        let traces: Vec<TraceSpans> = (1..=10)
+            .map(|n| TraceSpans {
+                trace_id: tid(n),
+                spans: vec![span(n, "s", "x", n as i64, 1)],
+            })
+            .collect();
+        assert_eq!(all_matched_ids(&eval(&p, &traces, &attrs)), vec![1, 4]);
+    }
+
+    /// Issue #351: `{ !.bt = !.bu }` and its mixed spelling. Measured
+    /// against the pinned container over four spans carrying both
+    /// booleans: `!bt = !bu` matches exactly where `bt == bu`, and
+    /// `!bt = bu` exactly where they differ. Absent operands match
+    /// nothing (see [`super::filter::BoolTerm::Not`] for why absent is
+    /// no-match here rather than the reference's fetch-dependent 500).
+    #[test]
+    fn a_negation_on_both_sides_compares_the_two_booleans() {
+        for (q, expected) in [
+            (r#"{ !.bt = !.bu }"#, vec![1u8, 2]),
+            (r#"{ !.bt != !.bu }"#, vec![3, 4]),
+            (r#"{ !.bt = .bu }"#, vec![3, 4]),
+            (r#"{ .bt = !.bu }"#, vec![3, 4]),
+            // An ordering operator over two booleans resolves both
+            // operands and matches nothing — `{ !.ct < !.cu }` is a
+            // reference 200 with no rows.
+            (r#"{ !.bt < !.bu }"#, vec![]),
+        ] {
+            let p = plan(q);
+            let mut attrs = membership(&p, &[]);
+            let mut set = |idx: usize, s: u8, v: &str| {
+                attrs.select_values[idx].insert((tid(1), sid(s)), v.to_string());
+            };
+            // 1: true/true · 2: false/false · 3: true/false ·
+            // 4: false/true · 5: bt only · 6: neither.
+            set(0, 1, "true");
+            set(1, 1, "true");
+            set(0, 2, "false");
+            set(1, 2, "false");
+            set(0, 3, "true");
+            set(1, 3, "false");
+            set(0, 4, "false");
+            set(1, 4, "true");
+            set(0, 5, "true");
+            let trace = TraceSpans {
+                trace_id: tid(1),
+                spans: (1..=6).map(|n| span(n, "s", "x", n as i64, 1)).collect(),
+            };
+            assert_eq!(matched_ids(&eval(&p, &[trace], &attrs)), expected, "{q}");
+        }
+    }
+
+    /// Issue #351: the `!` OPERATOR still demands a boolean inside a
+    /// boolean comparison — a PRESENT non-boolean fails the whole query,
+    /// as it does for the bare `{ !.a }` leaf and as the reference does
+    /// (`{ .p = .q = !.r }` against a string `r` is a 500 `expression
+    /// (!.r) expected a boolean, but got TypeString`).
+    ///
+    /// The failing span's LEFT side is already decided, which is the
+    /// point: both operands are resolved before the operator is applied,
+    /// so the type failure cannot be skipped by a short circuit.
+    #[test]
+    fn a_present_non_boolean_under_a_negated_operand_fails_the_whole_query() {
+        let p = plan(r#"{ .p = .q = !.r }"#);
+        let mut attrs = membership(&p, &[]);
+        for idx in 0..2 {
+            attrs.select_values[idx].insert((tid(1), sid(1)), "1".to_string());
+            attrs.agg_values[idx].insert((tid(1), sid(1)), if idx == 0 { 1.0 } else { 2.0 });
+        }
+        attrs.select_values[2].insert((tid(1), sid(1)), "hello".to_string());
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 1)],
+        };
+        let err = evaluate_batch(
+            &p,
+            &[trace],
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect_err("a present non-boolean under `!` must fail the query");
+        match err {
+            ReadError::PipelineInvalid { reason } => {
+                assert!(reason.contains("(!.r) expected a boolean"), "{reason}");
+            }
+            other => panic!("expected a pipeline error, got {other:?}"),
+        }
+    }
+
+    /// Issue #351: a static-vs-static comparison is folded at plan time,
+    /// so it matches every span or none — `{ "x" = "x" }` returns the
+    /// whole store against the pinned container and `{ "x" = "y" }`
+    /// nothing.
+    #[test]
+    fn a_static_comparison_matches_every_span_or_none() {
+        for (q, expected) in [
+            (r#"{ "x" = "x" }"#, vec![1u8, 2]),
+            (r#"{ "x" = "y" }"#, vec![]),
+            (r#"{ "a" < "b" }"#, vec![1, 2]),
+            (r#"{ "b" < "a" }"#, vec![]),
+            // Duration and number are one numeric family in the
+            // reference (`isNumeric` is `Int | Float | Duration`).
+            (r#"{ 1s = 1000000000 }"#, vec![1, 2]),
+            (r#"{ 1s > 2s }"#, vec![]),
+            (r#"{ ok = ok }"#, vec![1, 2]),
+            (r#"{ ok != ok }"#, vec![]),
+        ] {
+            let p = plan(q);
+            let attrs = membership(&p, &[]);
+            let trace = TraceSpans {
+                trace_id: tid(1),
+                spans: vec![span(1, "s", "a", 10, 1), span(2, "s", "b", 20, 1)],
+            };
+            assert_eq!(matched_ids(&eval(&p, &[trace], &attrs)), expected, "{q}");
+        }
+    }
+
+    /// Issue #351, owner ruling 2026-08-05: `{ .a = event:name }` matches
+    /// when ANY of the span's events matches. The fixture is the one the
+    /// reference was probed with, and the expected column is OURS — which
+    /// is exactly where the deliberate divergence lives (the reference
+    /// consults only the FIRST event; ledger row
+    /// `traceql-event-link-operand-any-match`).
+    ///
+    /// | span | events | `.a` | reference | PulsusDB |
+    /// |---|---|---|---|---|
+    /// | 1 | evX,evY,evZ | `evZ` (last) | no | **match** |
+    /// | 2 | evP,evQ,evR | `evP` (first) | match | **match** |
+    /// | 3 | ev1,evM,ev2 | `evM` (middle) | no | **match** |
+    /// | 4 | ev7,ev8 | `evNope` | no | no |
+    /// | 5 | (none) | `evX` | no | no |
+    ///
+    /// Span 4 is the negative control that keeps "any" from degenerating
+    /// into "always"; span 5 is the empty set.
+    #[test]
+    fn an_event_set_comparison_matches_any_event_not_the_first() {
+        let p = plan(r#"{ .a = event:name }"#);
+        assert_eq!(p.event_sets_len(), 1);
+        let mut attrs = membership(&p, &[]);
+        let mut sets = HashMap::new();
+        for (s, events) in [
+            (1u8, vec!["evX", "evY", "evZ"]),
+            (2, vec!["evP", "evQ", "evR"]),
+            (3, vec!["ev1", "evM", "ev2"]),
+            (4, vec!["ev7", "ev8"]),
+        ] {
+            sets.insert(
+                (tid(s), sid(s)),
+                EventValues::Text(events.into_iter().map(str::to_string).collect()),
+            );
+        }
+        attrs.event_sets.push(sets);
+        for (s, a) in [
+            (1u8, "evZ"),
+            (2, "evP"),
+            (3, "evM"),
+            (4, "evNope"),
+            (5, "evX"),
+        ] {
+            attrs.select_values[0].insert((tid(s), sid(s)), a.to_string());
+        }
+        let traces: Vec<TraceSpans> = (1..=5)
+            .map(|n| TraceSpans {
+                trace_id: tid(n),
+                spans: vec![span(n, "s", "x", n as i64, 1)],
+            })
+            .collect();
+        assert_eq!(all_matched_ids(&eval(&p, &traces, &attrs)), vec![1, 2, 3]);
+    }
+
+    /// Issue #351: `!=` is the ALL-match operator — a span matches only
+    /// when EVERY event fails the equality, so a span with NO events
+    /// matches (the same absent-key rule the literal
+    /// `{ event:name != "x" }` form already follows) and one whose LAST
+    /// event matches does not. The reference's own arithmetic:
+    /// `matchCount == elemCount` over the negated element predicate
+    /// (`ast_execute.go:535-627` @ v3.0.2).
+    #[test]
+    fn an_event_set_negation_is_all_match_and_an_empty_set_satisfies_it() {
+        let p = plan(r#"{ .a != event:name }"#);
+        let mut attrs = membership(&p, &[]);
+        let mut sets = HashMap::new();
+        sets.insert(
+            (tid(1), sid(1)),
+            EventValues::Text(vec!["evX".into(), "evY".into(), "evZ".into()]),
+        );
+        sets.insert(
+            (tid(2), sid(2)),
+            EventValues::Text(vec!["evP".into(), "evQ".into()]),
+        );
+        // span 3 has NO event rows at all — the empty set.
+        attrs.event_sets.push(sets);
+        for (s, a) in [(1u8, "evZ"), (2, "nope"), (3, "anything")] {
+            attrs.select_values[0].insert((tid(s), sid(s)), a.to_string());
+        }
+        let traces: Vec<TraceSpans> = (1..=3)
+            .map(|n| TraceSpans {
+                trace_id: tid(n),
+                spans: vec![span(n, "s", "x", n as i64, 1)],
+            })
+            .collect();
+        // span 1 has a matching event → excluded; span 2 none → kept;
+        // span 3 no events → kept.
+        assert_eq!(all_matched_ids(&eval(&p, &traces, &attrs)), vec![2, 3]);
+    }
+
+    /// Issue #351: the ordering operators are NOT symmetric, so the
+    /// set's side is carried through the plan.
+    /// `event:timeSinceStart` is the numeric member, read from `val_num`.
+    ///
+    /// One span, events at 1 ms and 5 ms:
+    /// `{ .a < event:timeSinceStart }` asks whether some event is LATER
+    /// than `.a`; `{ event:timeSinceStart < .a }` whether some event is
+    /// EARLIER. At `.a` = 2 ms both hold; at 9 ms only the second; at
+    /// 0.5 ms only the first.
+    #[test]
+    fn an_event_set_ordering_comparison_respects_the_operand_side() {
+        for (q, a_ns, expected) in [
+            (r#"{ .a < event:timeSinceStart }"#, 2_000_000.0, vec![1u8]),
+            (r#"{ .a < event:timeSinceStart }"#, 9_000_000.0, vec![]),
+            (r#"{ event:timeSinceStart < .a }"#, 2_000_000.0, vec![1]),
+            (r#"{ event:timeSinceStart < .a }"#, 500_000.0, vec![]),
+        ] {
+            let p = plan(q);
+            let mut attrs = membership(&p, &[]);
+            let mut sets = HashMap::new();
+            sets.insert(
+                (tid(1), sid(1)),
+                EventValues::Num(vec![1_000_000.0, 5_000_000.0]),
+            );
+            attrs.event_sets.push(sets);
+            attrs.select_values[0].insert((tid(1), sid(1)), a_ns.to_string());
+            attrs.agg_values[0].insert((tid(1), sid(1)), a_ns);
+            let trace = TraceSpans {
+                trace_id: tid(1),
+                spans: vec![span(1, "s", "x", 10, 1)],
+            };
+            assert_eq!(
+                all_matched_ids(&eval(&p, &[trace], &attrs)),
+                expected,
+                "{q} with .a = {a_ns}"
+            );
+        }
+    }
+
+    /// Issue #351: the two rules that are NOT about the set — an absent
+    /// SCALAR is no match for every operator (issue #183's rule,
+    /// unchanged), and a cross-TYPE element fails its own comparison, so
+    /// it makes `!=` false rather than true.
+    #[test]
+    fn an_event_set_comparison_keeps_the_absent_and_cross_type_rules() {
+        // Absent scalar under `!=`: no match, even though ALL-match over
+        // an empty set would otherwise say yes.
+        let p = plan(r#"{ .a != event:name }"#);
+        let mut attrs = membership(&p, &[]);
+        attrs.event_sets.push(HashMap::new());
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 1)],
+        };
+        assert!(
+            eval(&p, &[trace], &attrs).is_empty(),
+            "an absent scalar never matches"
+        );
+        // Cross-type: a NUMERIC scalar against text event names. `=`
+        // matches nothing, and `!=` does not match either — the element
+        // comparison fails, so `matchCount < elemCount`.
+        for (q, ctx) in [
+            (r#"{ .a = event:name }"#, "eq"),
+            (r#"{ .a != event:name }"#, "neq"),
+        ] {
+            let p = plan(q);
+            let mut attrs = membership(&p, &[]);
+            let mut sets = HashMap::new();
+            sets.insert(
+                (tid(1), sid(1)),
+                EventValues::Text(vec!["5".to_string(), "other".to_string()]),
+            );
+            attrs.event_sets.push(sets);
+            // `.a` is numeric-typed (val_num set) with the coincident
+            // text "5" a real numeric row also carries.
+            attrs.select_values[0].insert((tid(1), sid(1)), "5".to_string());
+            attrs.agg_values[0].insert((tid(1), sid(1)), 5.0);
+            let trace = TraceSpans {
+                trace_id: tid(1),
+                spans: vec![span(1, "s", "x", 10, 1)],
+            };
+            assert!(
+                eval(&p, &[trace], &attrs).is_empty(),
+                "{ctx}: a cross-type element must not match"
+            );
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! hydration / membership / value reads over explicit candidate
 //! `trace_id` lists.
 
+use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{GenTable, LeafGenerator, ZERO_PARENT_SQL};
@@ -266,6 +267,60 @@ pub fn attr_values_sql(
          WHERE {}\n  AND key = {key_literal}{scope_clause}{extra}\n  AND {}\n  AND {}\n\
          GROUP BY trace_id, span_id",
         date_clause(window),
+        time_clause(window),
+        trace_id_in(trace_ids)
+    )
+}
+
+/// Phase 2 — one MULTI-VALUED event/link intrinsic's per-span VALUE SET
+/// over one batch (issue #351): the set `{ .a = event:name }` compares
+/// against.
+///
+/// Index-served on the same `(key, scope)` prefix the literal form
+/// probes, plus the window's date/time pruning and the batch's
+/// `trace_id IN` restriction — the [`attr_values_sql`] shape with
+/// `groupUniqArray` in place of `any`.
+///
+/// **`groupUniqArray`, not `groupArray`, and the choice is load-bearing
+/// twice.** It dedups the `ReplacingMergeTree`/at-least-once row
+/// duplicates that `SELECT DISTINCT` handles on the membership path — a
+/// replayed event row must not become a second set element — and
+/// duplicate elements cannot change ANY-match or ALL-match, so deduping
+/// has no semantic consequence. It also bounds the set at the number of
+/// DISTINCT values rather than the number of events.
+///
+/// **The cardinality is not capped, it is CHARGED.** A cap would silently
+/// change the answer (a span whose 501st distinct event name is the
+/// matching one would stop matching); the executor charges every element
+/// against the request's retention budget instead, so a pathological span
+/// is a clean `422 query_too_broad` — the architecture's "a breach of
+/// either layer is a 422, never an OOM" (docs/schemas.md §7).
+///
+/// String values are byte-capped per element with the shared cap helper,
+/// exactly as the scalar `val` read caps its one value, so both sides of
+/// a comparison are capped consistently.
+pub fn event_set_sql(
+    attrs_table: &str,
+    set: super::filter::EventSetField,
+    trace_ids: &[[u8; 16]],
+    window: TimeWindow,
+) -> String {
+    let (value_col, extra) = if set.is_numeric() {
+        (
+            "groupUniqArray(val_num) AS v".to_string(),
+            "\n  AND isNotNull(val_num)",
+        )
+    } else {
+        (format!("groupUniqArray({}) AS v", byte_cap_expr("val")), "")
+    };
+    format!(
+        "SELECT trace_id, span_id, {value_col}\n\
+         FROM {attrs_table}\n\
+         WHERE {}\n  AND key = {}\n  AND scope = {}{extra}\n  AND {}\n  AND {}\n\
+         GROUP BY trace_id, span_id",
+        date_clause(window),
+        escape::ch_string(set.key()),
+        escape::ch_string(set.scope()),
         time_clause(window),
         trace_id_in(trace_ids)
     )

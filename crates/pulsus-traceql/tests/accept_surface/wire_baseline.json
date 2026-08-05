@@ -1,6 +1,6 @@
 {
-  "WIRE_AGREE_BASELINE": 196,
-  "WIRE_DIVERGE_BASELINE": 25,
+  "WIRE_AGREE_BASELINE": 211,
+  "WIRE_DIVERGE_BASELINE": 10,
   "wire_baseline": [
     {
       "pulsus_wire": "reject",
@@ -55,7 +55,7 @@
       "query": "{ !true }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ !.a = !.b }"
     },
     {
@@ -219,19 +219,19 @@
       "query": "{ .a = trace:rootService }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = event:name }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = event:timeSinceStart }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = link:spanID }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = link:traceID }"
     },
     {
@@ -251,11 +251,11 @@
       "query": "{ trace:duration = .a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ event:name = .a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ link:spanID = .a }"
     },
     {
@@ -311,7 +311,7 @@
       "query": "{ 1 = 2 }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ \"x\" = \"y\" }"
     },
     {
@@ -427,7 +427,7 @@
       "query": "{ -2 ^ 2 = .a }"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = .b = .c }"
     },
     {
@@ -707,11 +707,11 @@
       "query": "{ true } | select(duration)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | select(span:id)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | select(trace:id)"
     },
     {
@@ -767,7 +767,7 @@
       "query": "{ true } | rate() by(span:id)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | rate() by(resource.service.name)"
     },
     {
@@ -803,11 +803,11 @@
       "query": "{ true } | rate() by((.a))"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | quantile_over_time(duration, .5) > 1"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | quantile_over_time(span:duration, .5) > 1"
     },
     {
@@ -819,7 +819,7 @@
       "query": "{ true } | max_over_time(.a) > 1"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | max_over_time(span:duration) > 1"
     },
     {

@@ -1313,9 +1313,19 @@ async fn scan_budget_breach_is_422_query_too_broad() {
 ///    `= 1` anyway (`BoolMatch::Never`), and that is the point: the
 ///    operand is still resolved, so the failure survives. Answering an
 ///    empty 200 here would be a silent wrong answer.
-/// 3. `{ !.a = .b }` — a field on both sides — takes the generic
-///    comparison path rather than the `!`-operand fold, which only covers
-///    a literal operand. Pinned so the fold's BOUNDARY is visible.
+/// 3. `{ !.a = .b }` — a field on both sides — is a BOOLEAN-vs-boolean
+///    comparison since issue #351, so the `!` type demand reaches it too:
+///    the string span fails the whole query with the same message case 2
+///    gives. Before #351 this was a plan-time 400 (`a boolean negation is
+///    not an arithmetic operand`) and the reference answered it; the
+///    replacement pins the demand at the shape's NEW home rather than
+///    deleting the row.
+/// 4. `{ !.c = !.d }` and `{ !.c = .d }` over spans carrying only
+///    booleans: the match sets the reference gives — equal booleans for
+///    the double negation, differing booleans for the mixed spelling.
+///    Case 3 alone could not tell "the query fails" from "the query is
+///    still refused", and neither could tell either from "it matches the
+///    wrong spans".
 ///
 /// STATUS NOTE, deliberate divergence: the reference answers case 2 with a
 /// **500** (`expression (!.a) expected a boolean, but got TypeString`)
@@ -1396,7 +1406,10 @@ async fn negation_demands_a_boolean_where_truthiness_tolerates_a_string() {
     // mentions several attributes.
     assert_eq!(msg, "expression (!.a) expected a boolean", "{ctx}");
 
-    // 3. The fold's boundary: a field on both sides is the generic path.
+    // 3. A field on both sides is a boolean-vs-boolean comparison since
+    //    issue #351, so the `!` type demand still fires on the string span
+    //    — the query fails, and it fails for the SAME stated reason as
+    //    case 2 rather than being refused at plan time.
     let ctx = "negated-operand-vs-field-rhs";
     let res = get(
         port,
@@ -1415,7 +1428,181 @@ async fn negation_demands_a_boolean_where_truthiness_tolerates_a_string() {
     let json = res.json(ctx);
     assert_eq!(json["errorType"], "bad_data", "{ctx}");
     assert_eq!(
-        json["error"], "type mismatch: a boolean negation is not an arithmetic operand",
-        "{ctx}: the generic path must name why it refused, not merely refuse"
+        json["error"], "expression (!.a) expected a boolean",
+        "{ctx}: the boolean-operand path must name the operand it refused"
+    );
+
+    // 4. Issue #351: the match sets, over spans whose booleans are the
+    //    only values in play. Seeded here rather than above so cases 1-3
+    //    keep the string-`a` fixture that makes them able to fail.
+    for (n, name, attrs) in [
+        (4u8, "cd-tt", vec![kv_bool("c", true), kv_bool("d", true)]),
+        (5u8, "cd-ff", vec![kv_bool("c", false), kv_bool("d", false)]),
+        (6u8, "cd-tf", vec![kv_bool("c", true), kv_bool("d", false)]),
+        // `c` alone: an absent operand is NO MATCH, never a failure.
+        (7u8, "cd-t_", vec![kv_bool("c", true)]),
+    ] {
+        ingest(
+            port,
+            vec![span(
+                tid(n),
+                sid(1),
+                None,
+                name,
+                ts(base, n as i64),
+                MS,
+                attrs,
+            )],
+            checkout_resource(),
+            name,
+        );
+    }
+    for (q, expected, ctx) in [
+        (
+            "{ !.c = !.d }",
+            BTreeSet::from([hex(&tid(4)), hex(&tid(5))]),
+            "double-negation-equal-booleans",
+        ),
+        (
+            "{ !.c = .d }",
+            BTreeSet::from([hex(&tid(6))]),
+            "mixed-negation-differing-booleans",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(
+            trace_set(&res.json(ctx)),
+            expected,
+            "{ctx}: {q} must match the reference's span set"
+        );
+    }
+}
+
+/// Issue #351 (owner ruling, 2026-08-05): the MULTI-VALUED event/link
+/// comparison, end to end through the real server and a live ClickHouse.
+///
+/// **This is the leg that can fail.** The semantics live in a per-batch
+/// `groupUniqArray` co-load that no hermetic test executes: the SQL has
+/// to run, the array has to decode into a per-span set, and the
+/// any/all-match rule has to be applied to it. A plan-level check would
+/// pass with the co-load returning nothing at all.
+///
+/// The fixture is the one the reference was probed with, and the
+/// expectation is OURS — which is where the ratified divergence sits
+/// (ledger `traceql-event-link-operand-any-match`):
+///
+/// | span | events | `.a` | reference | PulsusDB |
+/// |---|---|---|---|---|
+/// | 1 | evX,evY,evZ | `evZ` (LAST) | no | **match** |
+/// | 2 | evP,evQ,evR | `evP` (first) | match | **match** |
+/// | 3 | ev1,evM,ev2 | `evM` (middle) | no | **match** |
+/// | 4 | ev7,ev8 | `evNope` | no | no |
+/// | 5 | (no events) | `evX` | no | no |
+///
+/// Span 4 keeps "any" from degenerating into "always"; span 5 is the
+/// empty set, which is the case `!=` turns on.
+#[tokio::test(flavor = "multi_thread")]
+async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_135;
+    let db = "pulsus_traces_search_it_e";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    for (n, name, a, events) in [
+        (1u8, "ev-last", "evZ", vec!["evX", "evY", "evZ"]),
+        (2u8, "ev-first", "evP", vec!["evP", "evQ", "evR"]),
+        (3u8, "ev-mid", "evM", vec!["ev1", "evM", "ev2"]),
+        (4u8, "ev-none", "evNope", vec!["ev7", "ev8"]),
+        (5u8, "ev-empty", "evX", vec![]),
+    ] {
+        let start = ts(base, n as i64);
+        let mut s = span(
+            tid(n),
+            sid(1),
+            None,
+            name,
+            start,
+            MS,
+            vec![kv_str("a", a), kv_str("linked", &hex(&sid(0xAA)))],
+        );
+        s.events = events
+            .iter()
+            .enumerate()
+            .map(
+                |(i, ev)| opentelemetry_proto::tonic::trace::v1::span::Event {
+                    time_unix_nano: start + (i as u64 + 1) * 1_000_000,
+                    name: (*ev).to_string(),
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                },
+            )
+            .collect();
+        // Two links on every span, the SECOND of which is the one `.linked`
+        // names — so a first-link reading would return nothing here.
+        s.links = [sid(0xBB), sid(0xAA)]
+            .iter()
+            .map(|target| opentelemetry_proto::tonic::trace::v1::span::Link {
+                trace_id: tid(0xEE).to_vec(),
+                span_id: target.to_vec(),
+                ..Default::default()
+            })
+            .collect();
+        ingest(port, vec![s], checkout_resource(), name);
+    }
+
+    for (q, expected, ctx) in [
+        // ANY event matches — including the LAST (span 1) and the MIDDLE
+        // (span 3), which the reference's field-vs-field path misses.
+        (
+            "{ .a = event:name }",
+            BTreeSet::from([hex(&tid(1)), hex(&tid(2)), hex(&tid(3))]),
+            "any-event-eq",
+        ),
+        // Operand order is symmetric for `=`.
+        (
+            "{ event:name = .a }",
+            BTreeSet::from([hex(&tid(1)), hex(&tid(2)), hex(&tid(3))]),
+            "any-event-eq-reversed",
+        ),
+        // `!=` is ALL-match: only the spans where NO event matches — and
+        // the span with no events at all, which satisfies it vacuously
+        // (the same absent-key rule the literal form follows).
+        (
+            "{ .a != event:name }",
+            BTreeSet::from([hex(&tid(4)), hex(&tid(5))]),
+            "all-event-neq-including-empty-set",
+        ),
+        // Links behave identically, and `.linked` names the SECOND link.
+        (
+            "{ .linked = link:spanID }",
+            BTreeSet::from([
+                hex(&tid(1)),
+                hex(&tid(2)),
+                hex(&tid(3)),
+                hex(&tid(4)),
+                hex(&tid(5)),
+            ]),
+            "any-link-eq",
+        ),
+    ] {
+        let res = search(port, q, w0, w1, "", ctx);
+        assert_eq!(trace_set(&res.json(ctx)), expected, "{ctx}: {q}");
+    }
+
+    // The literal form is unchanged and still index-served — the control
+    // that says the set co-load did not disturb the membership path.
+    let ctx = "literal-event-name-unchanged";
+    let res = search(port, r#"{ event:name = "evZ" }"#, w0, w1, "", ctx);
+    assert_eq!(
+        trace_set(&res.json(ctx)),
+        BTreeSet::from([hex(&tid(1))]),
+        "{ctx}"
     );
 }

@@ -84,12 +84,12 @@ use super::rows::{
     MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
     MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
     MetricGroupCountRow, MetricHistogramInstantRow, MetricHistogramRow, MetricQuantileInstantRow,
-    MetricQuantileRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
-    TagValueRow, TraceCtxRow,
+    MetricQuantileRow, NumSetRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrSetRow,
+    StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
-    self, BatchAttrs, GroupCardinalityCounter, HydratedSpan, SpanSetGroup, SpanSummary,
-    TraceCtxInfo, TraceMatch, TraceSpans,
+    self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, SpanSetGroup,
+    SpanSummary, TraceCtxInfo, TraceMatch, TraceSpans,
 };
 use super::search_plan::{SearchCtx, SearchPlan};
 use crate::logql::error::{ReadError, TooBroadReason};
@@ -216,6 +216,11 @@ const MEMBERSHIP_ENTRY_BYTES: usize =
 /// Retention charge for one numeric attribute value entry.
 const NUM_VALUE_ENTRY_BYTES: usize =
     std::mem::size_of::<(([u8; 16], [u8; 8]), f64)>() + RETAINED_ENTRY_OVERHEAD;
+/// Per-ELEMENT container overhead for a co-loaded event/link text set
+/// (issue #351): the `String` header beside the bytes it points at, so
+/// the charge covers the whole retained value rather than only its
+/// payload.
+const STR_SET_ELEM_OVERHEAD: usize = std::mem::size_of::<String>();
 /// Retention charge for one direct-child-count co-load entry (issue
 /// #184): the `(trace_id, parent span_id) → count` map entry.
 const CHILD_COUNT_ENTRY_BYTES: usize =
@@ -1799,6 +1804,68 @@ impl TraceEngine {
                 map.insert((row.trace_id, row.span_id), row.v);
             }
             attrs.select_values.push(map);
+        }
+        // Issue #351: the MULTI-VALUED event/link value sets — one
+        // `groupUniqArray` read per distinct intrinsic, on the same
+        // `(key, scope)` index prefix the literal form probes. Issued
+        // only when a leaf compares one against another field
+        // (`needs_event_sets()`), so every other query pays nothing.
+        //
+        // Every element is CHARGED, not capped: the set's cardinality is
+        // data-driven (a span may carry many events), and a cap would
+        // silently change the answer instead of refusing. The charge
+        // makes a pathological span a clean `422 query_too_broad`.
+        for set_idx in 0..plan.event_sets.len() {
+            let sql = plan.event_set_sql_for(set_idx, batch_ids);
+            charge_explain(
+                explain,
+                budget,
+                "phase2_event_sets",
+                &sql,
+                Some(("event/link set = ", plan.event_sets[set_idx].display())),
+            )?;
+            let mut map = HashMap::new();
+            if plan.event_sets[set_idx].is_numeric() {
+                let rows: Vec<NumSetRow> = self
+                    .collect_rows_charged(
+                        &sql,
+                        settings,
+                        budget,
+                        batch_charged,
+                        map_trace_read_error,
+                        |row: &NumSetRow| {
+                            MEMBERSHIP_ENTRY_BYTES + row.v.len() * std::mem::size_of::<f64>()
+                        },
+                    )
+                    .await?;
+                map.reserve(rows.len());
+                for row in rows {
+                    map.insert((row.trace_id, row.span_id), EventValues::Num(row.v));
+                }
+            } else {
+                let rows: Vec<StrSetRow> = self
+                    .collect_rows_charged(
+                        &sql,
+                        settings,
+                        budget,
+                        batch_charged,
+                        map_trace_read_error,
+                        |row: &StrSetRow| {
+                            MEMBERSHIP_ENTRY_BYTES
+                                + row
+                                    .v
+                                    .iter()
+                                    .map(|s| s.len() + STR_SET_ELEM_OVERHEAD)
+                                    .sum::<usize>()
+                        },
+                    )
+                    .await?;
+                map.reserve(rows.len());
+                for row in rows {
+                    map.insert((row.trace_id, row.span_id), EventValues::Text(row.v));
+                }
+            }
+            attrs.event_sets.push(map);
         }
         // Issue #184: the trace-wide co-loads — deliberately WINDOW-FREE
         // `trace_id IN` PK reads (the `root_sql` precedent generalized to

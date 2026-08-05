@@ -288,6 +288,61 @@ pub enum TraceCtxPred {
     TraceId { op: ComparisonOp, value: String },
 }
 
+/// One operand of a BOOLEAN-vs-boolean comparison (issue #351):
+/// `{ .a = .b = .c }` (a comparison in operand position) and
+/// `{ !.a = !.b }` (a negation on both sides).
+///
+/// **Why a distinct term type rather than reusing [`CompareOperand`].**
+/// The three outcomes a boolean operand can have are not two: it can hold
+/// `true`/`false`, hold something that is NOT a boolean, or be absent —
+/// and the reference distinguishes all three. Measured against
+/// grafana/tempo:3.0.2 (`{ .p = .q = .r }` over spans with `p=1, q=1|2`):
+///
+/// | `.r` | result |
+/// |---|---|
+/// | `true` / `false` | matches iff it equals `(p = q)` |
+/// | `"hello"` / `7` | **no match**, no error |
+/// | absent | **no match**, no error |
+///
+/// A truthiness leaf (`.r = true`) cannot express that: it folds
+/// "`false`" and "absent" together, and `((p = q) = .r)` with a `false`
+/// left side must match the first and not the second.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoolTerm {
+    /// A `true`/`false` literal.
+    Const(bool),
+    /// The operand's own value, which must BE a boolean — absent or
+    /// non-boolean is NO MATCH, never an error. That is the `=`/`!=`
+    /// operand rule, and it differs from [`BoolTerm::Not`]'s.
+    Value(CompareOperand),
+    /// The `!` OPERATOR applied to a term. `!` DEMANDS a boolean: a
+    /// present non-boolean fails the whole query, exactly as the bare
+    /// `{ !.a }` leaf does (issue #335 Stage B's D12 capture, and
+    /// re-measured here — `{ .p = .q = !.r }` against a string `r` is a
+    /// reference 500 `expression (!.r) expected a boolean, but got
+    /// TypeString`). The rule is
+    /// `pkg/traceql/ast_execute.go:852-858` @ v3.0.2: `OpNot` errors
+    /// unless the operand's static type is `TypeBoolean`.
+    ///
+    /// **Absent stays NO MATCH here, and that is a deliberate departure.**
+    /// An absent attribute is `TypeNil` there
+    /// (`pkg/traceql/ast_execute.go:889-896`), so `!` errors on it too —
+    /// but only for spans the fetch layer happened to surface, which
+    /// makes the failure depend on the pushdown rather than on the query.
+    /// Measured: `{ !.bt }` alone is a 200 that skips spans without `bt`
+    /// (the condition is pushed down, so they are never evaluated), while
+    /// `{ !.bt = !.bu }` over the SAME spans is a 500 `got TypeNil` (no
+    /// pushdown, so every fetched span is evaluated). One store, one
+    /// attribute, two answers. We keep the one the reference gives in its
+    /// pushdown form — absent is no match — for every shape.
+    Not(Box<BoolTerm>),
+    /// A comparison in operand position — the nested leaf's own boolean
+    /// result. `{ .a = .b = .c }` parses LEFT-associatively, so this is
+    /// the `(.a = .b)` half (verified: `{ (.p = .q) = .r }` returns the
+    /// same spans as the unparenthesised spelling).
+    Nested(Box<LeafEval>),
+}
+
 /// A compiled arithmetic operand tree (issue #185 `arith.*`): numeric
 /// literals fold to `f64`; field operands (an attribute's `val_num`, or a
 /// numeric physical intrinsic) resolve engine-side per candidate span, so
@@ -369,6 +424,78 @@ pub enum LeafEval {
         op: ComparisonOp,
         rhs: ArithNode,
     },
+    /// A comparison between two STATIC operands (issue #351), folded to
+    /// its value at plan time: `{ "x" = "y" }` is `false` for every span
+    /// and `{ "x" = "x" }` is `true` for every span. The reference folds
+    /// the same way — measured against grafana/tempo:3.0.2, `{ "x" = "x" }`
+    /// returns every span and `{ "x" = "y" }` none, on both the search and
+    /// the metrics route.
+    ///
+    /// Folding is also why no per-span work is left: the constant is
+    /// decided once per query, not per candidate span.
+    Const(bool),
+    /// A comparison whose operands are BOOLEAN-valued (issue #351) —
+    /// `{ .a = .b = .c }`, `{ !.a = !.b }`, `{ !.a = .b }`. See
+    /// [`BoolTerm`] for the three-way operand outcome this needs and the
+    /// fixture it was measured with.
+    ///
+    /// Only `=`/`!=` can MATCH: the reference statically rejects an
+    /// ordering operator whose operand type is known-boolean
+    /// (`{ .p = .q < .r }` is a 400 `illegal operation for the given
+    /// types`, and our validator already produces that message), but
+    /// accepts one whose operands are attribute-typed and only turn out
+    /// boolean at run time (`{ !.ct < !.cu }` is a 200 with no matches).
+    /// So an ordering operator here resolves both terms — keeping the
+    /// `!` type demand live — and matches nothing, exactly as
+    /// [`BoolMatch::Never`] does for `{ !.a = 1 }`.
+    BoolCompare {
+        lhs: BoolTerm,
+        rhs: BoolTerm,
+        op: ComparisonOp,
+    },
+    /// A comparison between a MULTI-VALUED span-event / span-link
+    /// intrinsic and a single-valued operand (issue #351) —
+    /// `{ .a = event:name }`, `{ event:name = .a }`.
+    ///
+    /// **ANY-match, and `!=` is ALL-match** (owner ruling, 2026-08-05):
+    /// a span matches `=`/`<`/`>`/`<=`/`>=` when ANY of its events (or
+    /// links) satisfies the comparison, and matches `!=` only when EVERY
+    /// one does — so a span with no events at all matches `!=`, which is
+    /// the same absent-key rule the literal form already follows
+    /// (docs/api.md §4.2). That is the reference's own designed rule for
+    /// a multi-valued operand (`pkg/traceql/ast_execute.go:535-627`
+    /// @ v3.0.2: `matchAll` is set for `OpNotEqual`/`OpNotRegex` and the
+    /// result is `matchCount == elemCount`, otherwise `matchCount > 0`),
+    /// and it is what its own PUSHDOWN path does.
+    ///
+    /// **We deliberately do NOT reproduce what the reference's
+    /// field-vs-field path actually returns** — the FIRST event only.
+    /// That is an artefact of a linear first-match scan over a flat
+    /// per-event list, not a rule: three readers of the same span
+    /// disagree (pushdown any / `AttributeFor` first / `AllAttributes`
+    /// last). Registered as `traceql-event-link-operand-any-match` in
+    /// docs/benchmarks/traces-differential-ledger.md, which carries the
+    /// evidence and the migration copying it would need.
+    ///
+    /// `side` matters only for the ordering operators: `{ .a < event:x }`
+    /// asks whether some element is GREATER than `.a`.
+    EventSetCompare {
+        set: EventSetField,
+        scalar: CompareOperand,
+        op: ComparisonOp,
+        side: SetSide,
+    },
+}
+
+/// Which side of the comparison the multi-valued operand sits on (issue
+/// #351). Only the ordering operators can tell the difference, and they
+/// are not symmetric, so this is carried rather than normalised away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetSide {
+    /// `{ event:name = .a }` — the set is the left operand.
+    Lhs,
+    /// `{ .a = event:name }` — the set is the right operand.
+    Rhs,
 }
 
 /// Which boolean value a `!` operand must hold for its leaf to match
@@ -647,6 +774,79 @@ const LINK_SPAN_ID_KEY: &str = "spanID";
 /// The reserved intrinsic key for `link:traceID` (lowercase-hex `val`) under
 /// [`SCOPE_LINK_INTRINSIC`].
 const LINK_TRACE_ID_KEY: &str = "traceID";
+
+/// One MULTI-VALUED span-event / span-link intrinsic (issue #351): a
+/// span carries many events and many links, so these four resolve to a
+/// SET of values per span rather than to a scalar.
+///
+/// Each is index-served under its dedicated intrinsic scope, one row per
+/// event/link (`otlp_traces.rs` emits them in the span-event / span-link
+/// fan-out), so the set is read by a `groupUniqArray` co-load over the
+/// same `(key, scope)` prefix the literal form probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventSetField {
+    /// `event:name` — the event's name, one row per event.
+    EventName,
+    /// `event:timeSinceStart` — the event's ns offset from its span's
+    /// start, carried in `val_num` (the one numeric member).
+    EventTimeSinceStart,
+    /// `link:spanID` — the referenced span id as lowercase hex.
+    LinkSpanId,
+    /// `link:traceID` — the referenced trace id as lowercase hex.
+    LinkTraceId,
+}
+
+impl EventSetField {
+    /// The reserved index key this intrinsic's rows carry.
+    pub fn key(self) -> &'static str {
+        match self {
+            EventSetField::EventName => EVENT_NAME_KEY,
+            EventSetField::EventTimeSinceStart => EVENT_TIME_SINCE_START_KEY,
+            EventSetField::LinkSpanId => LINK_SPAN_ID_KEY,
+            EventSetField::LinkTraceId => LINK_TRACE_ID_KEY,
+        }
+    }
+
+    /// The dedicated intrinsic scope discriminator — the same hard
+    /// namespace partition the literal form uses, so a sender attribute
+    /// can never enter the set.
+    pub fn scope(self) -> &'static str {
+        match self {
+            EventSetField::EventName | EventSetField::EventTimeSinceStart => SCOPE_EVENT_INTRINSIC,
+            EventSetField::LinkSpanId | EventSetField::LinkTraceId => SCOPE_LINK_INTRINSIC,
+        }
+    }
+
+    /// Whether the values are read from `val_num` (numeric) or `val`
+    /// (text) — the same split the literal leaves make.
+    pub fn is_numeric(self) -> bool {
+        matches!(self, EventSetField::EventTimeSinceStart)
+    }
+
+    /// The intrinsic as the user writes it (error text / display).
+    pub fn display(self) -> &'static str {
+        match self {
+            EventSetField::EventName => "event:name",
+            EventSetField::EventTimeSinceStart => "event:timeSinceStart",
+            EventSetField::LinkSpanId => "link:spanID",
+            EventSetField::LinkTraceId => "link:traceID",
+        }
+    }
+}
+
+/// Recognises a multi-valued span-event / span-link intrinsic in operand
+/// position (issue #351).
+fn event_set_field(field: &Field) -> Option<EventSetField> {
+    match field {
+        Field::Intrinsic(Intrinsic::EventName) => Some(EventSetField::EventName),
+        Field::Intrinsic(Intrinsic::EventTimeSinceStart) => {
+            Some(EventSetField::EventTimeSinceStart)
+        }
+        Field::Intrinsic(Intrinsic::LinkSpanId) => Some(EventSetField::LinkSpanId),
+        Field::Intrinsic(Intrinsic::LinkTraceId) => Some(EventSetField::LinkTraceId),
+        _ => None,
+    }
+}
 
 /// Lowercases a `link:spanID`/`link:traceID` hex literal for the
 /// case-insensitive Eq/Neq comparisons (matching the `span:id`/`trace:id`
@@ -1239,40 +1439,23 @@ fn compare_operand(field: &Field) -> Result<CompareOperand, PlanError> {
         Field::Intrinsic(Intrinsic::RootServiceName) => Ok(CompareOperand::RootServiceName),
         Field::Intrinsic(Intrinsic::InstrumentationName) => Ok(CompareOperand::ScopeName),
         Field::Intrinsic(Intrinsic::InstrumentationVersion) => Ok(CompareOperand::ScopeVersion),
-        // Issue #351: the span-event and span-link intrinsics stay
-        // rejected, and the reason is structural rather than pending
-        // work. They are index-probe MEMBERSHIP leaves over a span's many
-        // events/links (`compile_attr_probe_leaf` on the dedicated
-        // `event:intrinsic` / `link:intrinsic` scopes), so there is no
-        // single per-span value for the other operand to be compared
-        // against.
-        //
-        // The reference DOES answer them, and its semantics are
-        // FIRST-EVENT-ONLY — measured with a discriminating fixture, not
-        // inferred from one example. Four spans, each with an attribute
-        // `a` and several events:
-        //
-        //   events [evX, evY, evZ], a = "evZ" (last)   -> NO match
-        //   events [evP, evQ, evR], a = "evP" (first)  -> MATCH
-        //   events [ev1, evM, ev2], a = "evM" (middle) -> NO match
-        //   events [ev7, ev8],      a = "evNope"       -> NO match
-        //
-        // Every one of those event names IS individually queryable
-        // (`{ event:name = "evZ" }` returns its span), so the data is
-        // fully indexed and the field-vs-field form simply consults the
-        // FIRST event. Stable across three runs.
-        //
-        // This matters for whoever implements it: an "any event matches"
-        // reading — which one positive example would support — is WRONG
-        // and would produce a different result set. Closing these needs
-        // an event/link value co-load this planner does not have.
+        // Issue #351: the span-event and span-link intrinsics are
+        // MULTI-VALUED — a span has many events and many links — so they
+        // are not a [`CompareOperand`] at all. They compile to
+        // [`LeafEval::EventSetCompare`] via [`event_set_field`], which is
+        // reached BEFORE this function in [`compile_field_compare`].
+        // Reaching here means one appeared where a single per-span scalar
+        // was required (both operands multi-valued, an arithmetic
+        // operand, a `!` operand), and that stays a clean 400.
         Field::Intrinsic(
             Intrinsic::EventName
             | Intrinsic::EventTimeSinceStart
             | Intrinsic::LinkSpanId
             | Intrinsic::LinkTraceId,
         ) => Err(PlanError::TypeMismatch(
-            "event/link intrinsics are not supported in a field-vs-field comparison".to_string(),
+            "event/link intrinsics are multi-valued and need a single-valued operand \
+             to compare against"
+                .to_string(),
         )),
         Field::Attribute { scope, key }
             if *scope == AttrScope::Resource && key == "service.name" =>
@@ -1321,6 +1504,22 @@ fn compile_field_compare(
             "a field-vs-field comparison does not support regex operators".to_string(),
         ));
     }
+    // Issue #351: a MULTI-VALUED span-event / span-link operand takes the
+    // set path. Checked before `compare_operand`, which has no scalar to
+    // return for these. Two multi-valued operands have no single-valued
+    // side to compare against and stay a clean 400 (`compare_operand`
+    // produces that message) — no probe asks for it, and a set-vs-set
+    // rule would be a guess.
+    match (event_set_field(lhs), event_set_field(rhs)) {
+        (Some(_), Some(_)) => {}
+        (Some(set), None) => {
+            return compile_event_set_compare(set, compare_operand(rhs)?, op, SetSide::Lhs);
+        }
+        (None, Some(set)) => {
+            return compile_event_set_compare(set, compare_operand(lhs)?, op, SetSide::Rhs);
+        }
+        (None, None) => {}
+    }
     let lhs = compare_operand(lhs)?;
     let rhs = compare_operand(rhs)?;
     // Prune on whichever operand carries an attribute key (the LHS wins a
@@ -1334,6 +1533,212 @@ fn compile_field_compare(
         generator,
         eval: LeafEval::FieldCompare { lhs, rhs, op },
     })
+}
+
+/// Compiles a multi-valued event/link comparison leaf (issue #351).
+///
+/// **Phase-1 pruning follows the operator, because the two operators
+/// prune differently.** Every operator needs the SCALAR operand present
+/// (an absent operand is no match — the issue #183 field-vs-field rule,
+/// unchanged here), so an attribute scalar's key-existence scan is a
+/// valid index-served superset for all of them, and it is preferred.
+/// With a physical-intrinsic scalar there is no attribute key on that
+/// side, and then the operator decides: an ANY-match operator needs at
+/// least one event/link row, so the intrinsic's own `(key, scope)`
+/// key-existence scan is a superset; `!=` is satisfied by a span with NO
+/// events at all, which no positive index can produce, so it falls back
+/// to the complete time-range superset. That is the ratified negation
+/// rule applied to a set.
+fn compile_event_set_compare(
+    set: EventSetField,
+    scalar: CompareOperand,
+    op: ComparisonOp,
+    side: SetSide,
+) -> Result<CompiledLeaf, PlanError> {
+    let generator = match (&scalar, op) {
+        (CompareOperand::Attr { key, scope }, _) => key_existence_generator(key, *scope),
+        (_, ComparisonOp::Neq) => LeafGenerator::time_range(),
+        _ => key_existence_generator(set.key(), Some(set.scope())),
+    };
+    Ok(CompiledLeaf {
+        generator,
+        eval: LeafEval::EventSetCompare {
+            set,
+            scalar,
+            op,
+            side,
+        },
+    })
+}
+
+/// Folds a comparison between two STATIC operands (issue #351) into its
+/// constant value. The reference's own type rules apply, and the
+/// validator has already enforced them by the time a query reaches here
+/// (`{ true = 1 }` / `{ "5" = 5 }` are 400 `binary operations must
+/// operate on the same type`, produced by `pulsus_traceql::validate`), so
+/// the cross-type arm is a total-function fallback rather than a live
+/// rejection path.
+///
+/// **Rule** (`pkg/traceql/enum_statics.go:29-51` @ v3.0.2): operands
+/// match when the types are equal, when BOTH are numeric — and `isNumeric`
+/// is `Int | Float | Duration`, which is why a duration and a bare number
+/// compare — or when either is nil/attribute. The comparison itself is
+/// per type: strings via `strings.Compare`
+/// (`pkg/traceql/ast_execute.go:420-434`), ints natively (`:452-487`),
+/// everything else through the `Float()`/`Equals` catch-all (`:630-660`).
+/// A cross-type pair at RUN time is `StaticFalse` rather than an error
+/// (`:411-417`); statically-typed cross-type pairs never get that far
+/// because `ast_validate.go` rejects them first, which is the 400 above.
+///
+/// Measured against the pinned container: `{ "x" = "x" }`, `{ "a" < "b" }`,
+/// `{ 1 = 1.0 }`, `{ 1s = 1000000000 }`, `{ true = true }`, `{ ok = ok }`
+/// all match every span; `{ "x" = "y" }`, `{ "b" < "a" }`, `{ 1 = 2 }`,
+/// `{ 1s > 2s }` match none — the source rule and the probes agree.
+pub(crate) fn fold_static_compare(
+    lhs: &Value,
+    op: ComparisonOp,
+    rhs: &Value,
+) -> Result<bool, PlanError> {
+    // Regex against a static: the reference answers it (`{ "x" =~ "x" }`
+    // is a 200 that matches every span), we do not. Engine-side regex
+    // compilation is confined to `search_plan`'s sealed `eval_compile`
+    // module (`tests/traces_regex_seal.rs`), so folding it here would put
+    // a second regex compiler in the tree for one non-probe shape. A
+    // clean 400 keeps the verdict this shape already had.
+    if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
+        return Err(PlanError::TypeMismatch(
+            "a regex operator against a static operand is not supported".to_string(),
+        ));
+    }
+    // Numbers and durations are ONE type family here, which is the
+    // reference's rule, not a convenience: `{ 1s = 1000000000 }` is a
+    // match against the pinned container.
+    let num = |v: &Value| -> Option<Result<f64, PlanError>> {
+        match v {
+            Value::Number(raw) => Some(parse_num(raw)),
+            Value::Duration(d) => Some(Ok(d.as_nanos() as f64)),
+            _ => None,
+        }
+    };
+    if let (Some(l), Some(r)) = (num(lhs), num(rhs)) {
+        return Ok(cmp_ord(op, &l?, &r?));
+    }
+    match (lhs, rhs) {
+        (Value::String(l), Value::String(r)) => Ok(cmp_ord(op, l.as_str(), r.as_str())),
+        // Booleans, status and kind carry no ordering in the reference:
+        // `{ true < false }` and `{ status > ok }` are 400s there, and
+        // our validator rejects both before planning.
+        (Value::Bool(l), Value::Bool(r)) => cmp_eq_only(op, l == r),
+        (Value::Status(l), Value::Status(r)) => cmp_eq_only(op, l == r),
+        (Value::Kind(l), Value::Kind(r)) => cmp_eq_only(op, l == r),
+        _ => Err(PlanError::TypeMismatch(
+            "binary operations must operate on the same type".to_string(),
+        )),
+    }
+}
+
+/// The six ordering/equality operators over any ordered pair.
+fn cmp_ord<T: PartialOrd + ?Sized>(op: ComparisonOp, l: &T, r: &T) -> bool {
+    match op {
+        ComparisonOp::Eq => l == r,
+        ComparisonOp::Neq => l != r,
+        ComparisonOp::Gt => l > r,
+        ComparisonOp::Gte => l >= r,
+        ComparisonOp::Lt => l < r,
+        ComparisonOp::Lte => l <= r,
+        // Rejected before this point by `fold_static_compare`.
+        ComparisonOp::Re | ComparisonOp::Nre => false,
+    }
+}
+
+/// Equality-only comparison for the unordered static types.
+fn cmp_eq_only(op: ComparisonOp, equal: bool) -> Result<bool, PlanError> {
+    match op {
+        ComparisonOp::Eq => Ok(equal),
+        ComparisonOp::Neq => Ok(!equal),
+        _ => Err(PlanError::TypeMismatch(
+            "illegal operation for the given types".to_string(),
+        )),
+    }
+}
+
+/// True when an expression is BOOLEAN-VALUED in operand position (issue
+/// #351) — a comparison, a `!` negation, or a `nil` existence check. Such
+/// an operand cannot be compared as a value; it is compared as a boolean
+/// ([`LeafEval::BoolCompare`]).
+fn is_bool_valued(expr: &FieldExpr) -> bool {
+    matches!(
+        expr,
+        FieldExpr::Binary {
+            op: FieldOp::Cmp(_),
+            ..
+        } | FieldExpr::Unary {
+            op: UnaryOp::Not,
+            ..
+        } | FieldExpr::Exists { .. }
+    )
+}
+
+/// Compiles a boolean-vs-boolean comparison leaf (issue #351). Reached
+/// only when at least one side [`is_bool_valued`]; the other side is then
+/// read as a boolean too, which is what the reference does.
+///
+/// No index serves it (a match can come from either side being `true` or
+/// `false`), so the leaf pairs with the complete time-range superset —
+/// the same choice `{ !.a = 1 }` and the nested-set leaves already make.
+fn compile_bool_compare(
+    lhs: &FieldExpr,
+    op: ComparisonOp,
+    rhs: &FieldExpr,
+) -> Result<CompiledLeaf, PlanError> {
+    let lhs = compile_bool_term(lhs)?;
+    let rhs = compile_bool_term(rhs)?;
+    Ok(CompiledLeaf {
+        generator: LeafGenerator::time_range(),
+        eval: LeafEval::BoolCompare { lhs, rhs, op },
+    })
+}
+
+/// Compiles one [`BoolTerm`]. Shapes with no boolean reading (an
+/// arithmetic operand, a non-boolean literal) are a clean 400 — the
+/// verdict they already had before this arm existed.
+fn compile_bool_term(expr: &FieldExpr) -> Result<BoolTerm, PlanError> {
+    match expr {
+        FieldExpr::Literal(Value::Bool(b)) => Ok(BoolTerm::Const(*b)),
+        FieldExpr::Literal(_) => Err(PlanError::TypeMismatch(
+            "a non-boolean static is not a boolean comparison operand".to_string(),
+        )),
+        FieldExpr::Field(field) => Ok(BoolTerm::Value(compare_operand(field)?)),
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => Ok(BoolTerm::Not(Box::new(compile_bool_term(expr)?))),
+        FieldExpr::Unary {
+            op: UnaryOp::Neg, ..
+        } => Err(PlanError::TypeMismatch(
+            "an arithmetic negation is not a boolean comparison operand".to_string(),
+        )),
+        // `!= nil` (presence) and `= nil` (absence) are boolean-valued:
+        // the existence leaf, negated for the absent spelling.
+        FieldExpr::Exists { field, negated } => {
+            let nested = BoolTerm::Nested(Box::new(compile_exists(field)?.eval));
+            Ok(if *negated {
+                BoolTerm::Not(Box::new(nested))
+            } else {
+                nested
+            })
+        }
+        FieldExpr::Binary {
+            op: FieldOp::Cmp(cmp),
+            lhs,
+            rhs,
+        } => Ok(BoolTerm::Nested(Box::new(
+            compile_comparison(lhs, *cmp, rhs)?.eval,
+        ))),
+        FieldExpr::Binary { .. } => Err(PlanError::TypeMismatch(
+            "only a comparison or a negation is a boolean comparison operand".to_string(),
+        )),
+    }
 }
 
 /// Compiles an attribute-existence leaf (issue #185 `existence.*`): the
@@ -1888,39 +2293,7 @@ fn collect(
             // operand shape asks for it, which is not lookahead — both
             // sides are already parsed.
             if let FieldOp::Cmp(cmp) = op {
-                let cmp = *cmp;
-                let leaf = match (lhs.as_ref(), rhs.as_ref()) {
-                    (FieldExpr::Field(f), FieldExpr::Literal(v)) => compile_leaf(f, cmp, v)?,
-                    (FieldExpr::Field(l), FieldExpr::Field(r)) => compile_field_compare(l, cmp, r)?,
-                    // `(!field) op literal`, either way round (issue #335
-                    // Stage B). `!` binding tighter than `=` is the D1
-                    // closure, so this shape only reaches the planner
-                    // after the collapse — before it, `!` sat at
-                    // spanset-filter level and the planner never saw it.
-                    // Measured: `{ !.c = true }` returns the `c = false`
-                    // span and `{ true = !.c }` the same, so the two
-                    // orders are one case.
-                    (
-                        FieldExpr::Unary {
-                            op: UnaryOp::Not,
-                            expr,
-                        },
-                        FieldExpr::Literal(v),
-                    )
-                    | (
-                        FieldExpr::Literal(v),
-                        FieldExpr::Unary {
-                            op: UnaryOp::Not,
-                            expr,
-                        },
-                    ) if matches!(expr.as_ref(), FieldExpr::Field(_)) => {
-                        let FieldExpr::Field(field) = expr.as_ref() else {
-                            unreachable!("guarded by the match arm above");
-                        };
-                        compile_bool_truth(field, BoolMatch::of_comparison(cmp, v))?
-                    }
-                    _ => compile_field_arith(lhs, cmp, rhs)?,
-                };
+                let leaf = compile_comparison(lhs, *cmp, rhs)?;
                 let generator = leaf.generator.clone();
                 leaves.push(leaf);
                 return Ok(vec![generator]);
@@ -1948,6 +2321,63 @@ fn collect(
                 }
             }
         }
+    }
+}
+
+/// Compiles ONE comparison node into its leaf, dispatching on operand
+/// SHAPE (issue #335 Stage B moved this out of the parser; the AST is
+/// uniform and a consumer that needs operand shape asks for it).
+///
+/// A function rather than an inline match since issue #351: a comparison
+/// can now appear INSIDE a comparison (`{ .a = .b = .c }`), so the
+/// dispatch has to be reachable recursively from [`compile_bool_term`].
+/// Arm order is the contract — the earlier, more specific shapes keep
+/// their existing leaves, and the two #351 arms sit between them and the
+/// arithmetic fallback.
+fn compile_comparison(
+    lhs: &FieldExpr,
+    cmp: ComparisonOp,
+    rhs: &FieldExpr,
+) -> Result<CompiledLeaf, PlanError> {
+    match (lhs, rhs) {
+        (FieldExpr::Field(f), FieldExpr::Literal(v)) => compile_leaf(f, cmp, v),
+        (FieldExpr::Field(l), FieldExpr::Field(r)) => compile_field_compare(l, cmp, r),
+        // `(!field) op literal`, either way round (issue #335 Stage B).
+        // `!` binding tighter than `=` is the D1 closure, so this shape
+        // only reaches the planner after the collapse — before it, `!`
+        // sat at spanset-filter level and the planner never saw it.
+        // Measured: `{ !.c = true }` returns the `c = false` span and
+        // `{ true = !.c }` the same, so the two orders are one case.
+        (
+            FieldExpr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            },
+            FieldExpr::Literal(v),
+        )
+        | (
+            FieldExpr::Literal(v),
+            FieldExpr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            },
+        ) if matches!(expr.as_ref(), FieldExpr::Field(_)) => {
+            let FieldExpr::Field(field) = expr.as_ref() else {
+                unreachable!("guarded by the match arm above");
+            };
+            compile_bool_truth(field, BoolMatch::of_comparison(cmp, v))
+        }
+        // Issue #351: two STATIC operands fold to a constant at plan
+        // time — `{ "x" = "y" }`.
+        (FieldExpr::Literal(l), FieldExpr::Literal(r)) => Ok(CompiledLeaf {
+            generator: LeafGenerator::time_range(),
+            eval: LeafEval::Const(fold_static_compare(l, cmp, r)?),
+        }),
+        // Issue #351: a boolean-valued operand — `{ .a = .b = .c }`,
+        // `{ !.a = !.b }`. Checked AFTER the shapes above so the
+        // `{ !.a = true }` leaf and the field-vs-field leaf keep theirs.
+        _ if is_bool_valued(lhs) || is_bool_valued(rhs) => compile_bool_compare(lhs, cmp, rhs),
+        _ => compile_field_arith(lhs, cmp, rhs),
     }
 }
 
@@ -2569,35 +2999,215 @@ mod tests {
         }
     }
 
-    /// The event/link intrinsics stay rejected, and the reason is
-    /// STRUCTURAL rather than pending work: they are index-probe
-    /// membership leaves over a span's many events/links, so there is no
-    /// single per-span value for the other operand to compare against.
-    /// The reference does answer these, with FIRST-EVENT-ONLY semantics —
-    /// established with a discriminating fixture (a span whose LAST event
-    /// matches does not match; one whose FIRST event matches does), not
-    /// from a single positive example, which cannot tell "any" from
-    /// "first" or "all". Closing them needs an event/link value co-load
-    /// this planner does not have.
+    /// Issue #351: the event/link intrinsics are MULTI-VALUED operands.
+    /// Each compiles to a set comparison, in either operand order, with
+    /// the side recorded — the ordering operators are not symmetric and
+    /// a normalised-away side would silently invert them.
+    ///
+    /// Replaces `event_and_link_intrinsics_stay_rejected_as_field_vs_field_operands`,
+    /// which pinned the refusal this issue removes.
     #[test]
-    fn event_and_link_intrinsics_stay_rejected_as_field_vs_field_operands() {
-        for intrinsic in [
-            Intrinsic::EventName,
-            Intrinsic::EventTimeSinceStart,
-            Intrinsic::LinkSpanId,
-            Intrinsic::LinkTraceId,
+    fn event_and_link_intrinsics_compile_to_a_set_comparison_in_either_order() {
+        for (intrinsic, set) in [
+            (Intrinsic::EventName, EventSetField::EventName),
+            (
+                Intrinsic::EventTimeSinceStart,
+                EventSetField::EventTimeSinceStart,
+            ),
+            (Intrinsic::LinkSpanId, EventSetField::LinkSpanId),
+            (Intrinsic::LinkTraceId, EventSetField::LinkTraceId),
         ] {
-            let err = compile_field_compare(
-                &Field::Intrinsic(intrinsic),
-                ComparisonOp::Eq,
-                &Field::Intrinsic(Intrinsic::Name),
-            )
-            .unwrap_err();
-            let PlanError::TypeMismatch(msg) = err else {
-                panic!("{intrinsic:?}: unexpected error kind")
+            let attr = Field::Attribute {
+                scope: AttrScope::Unscoped,
+                key: "a".to_string(),
             };
-            assert!(msg.contains("event/link"), "{intrinsic:?}: {msg}");
+            for (lhs, rhs, expect_side) in [
+                (Field::Intrinsic(intrinsic), attr.clone(), SetSide::Lhs),
+                (attr.clone(), Field::Intrinsic(intrinsic), SetSide::Rhs),
+            ] {
+                let leaf = compile_field_compare(&lhs, ComparisonOp::Eq, &rhs)
+                    .unwrap_or_else(|e| panic!("{intrinsic:?}: {e:?}"));
+                match leaf.eval {
+                    LeafEval::EventSetCompare { set: got, side, .. } => {
+                        assert_eq!(got, set, "{intrinsic:?}");
+                        assert_eq!(side, expect_side, "{intrinsic:?}");
+                    }
+                    other => panic!("{intrinsic:?}: expected a set comparison, got {other:?}"),
+                }
+            }
         }
+    }
+
+    /// Issue #351: the Phase-1 generator follows the OPERATOR, because a
+    /// span with NO events matches `!=` and no positive index can produce
+    /// it — the ratified negation rule, applied to a set.
+    #[test]
+    fn an_event_set_comparison_prunes_on_an_index_except_under_negation() {
+        // Attribute scalar: its key-existence scan is a superset for
+        // EVERY operator (an absent scalar never matches), so both
+        // operators prune on the index.
+        for op in [ComparisonOp::Eq, ComparisonOp::Neq] {
+            let leaf = compile_field_compare(
+                &Field::Attribute {
+                    scope: AttrScope::Unscoped,
+                    key: "a".to_string(),
+                },
+                op,
+                &Field::Intrinsic(Intrinsic::EventName),
+            )
+            .expect("compiles");
+            assert_eq!(leaf.generator.class, GenClass::AttrKeyScan, "{op:?}");
+            assert!(leaf.generator.predicate.contains("key = 'a'"), "{op:?}");
+        }
+        // Physical-intrinsic scalar: `=` prunes on the event intrinsic's
+        // own `(key, scope)` prefix...
+        let leaf = compile_field_compare(
+            &Field::Intrinsic(Intrinsic::Name),
+            ComparisonOp::Eq,
+            &Field::Intrinsic(Intrinsic::EventName),
+        )
+        .expect("compiles");
+        assert_eq!(leaf.generator.class, GenClass::AttrKeyScan);
+        assert_eq!(
+            leaf.generator.predicate,
+            "key = 'name' AND scope = 'event:intrinsic'"
+        );
+        // ...while `!=` cannot: a span with no events at all matches it.
+        let leaf = compile_field_compare(
+            &Field::Intrinsic(Intrinsic::Name),
+            ComparisonOp::Neq,
+            &Field::Intrinsic(Intrinsic::EventName),
+        )
+        .expect("compiles");
+        assert_eq!(leaf.generator.class, GenClass::TimeRange);
+    }
+
+    /// Two multi-valued operands have no single-valued side, and the
+    /// refusal names why rather than merely refusing.
+    #[test]
+    fn two_multi_valued_operands_are_a_clean_type_mismatch() {
+        let err = compile_field_compare(
+            &Field::Intrinsic(Intrinsic::EventName),
+            ComparisonOp::Eq,
+            &Field::Intrinsic(Intrinsic::LinkSpanId),
+        )
+        .unwrap_err();
+        let PlanError::TypeMismatch(msg) = err else {
+            panic!("unexpected error kind")
+        };
+        assert!(msg.contains("multi-valued"), "{msg}");
+    }
+
+    // -- issue #351: static folding + boolean operands ---------------------
+
+    #[test]
+    fn a_static_comparison_folds_to_a_constant_leaf_at_plan_time() {
+        for (q, expected) in [
+            (r#"{ "x" = "y" }"#, false),
+            (r#"{ "x" = "x" }"#, true),
+            (r#"{ "x" != "y" }"#, true),
+            (r#"{ "a" < "b" }"#, true),
+            (r#"{ "b" < "a" }"#, false),
+            (r#"{ 1 = 2 }"#, false),
+            (r#"{ 1s = 1000000000 }"#, true),
+            (r#"{ 1s > 2s }"#, false),
+            (r#"{ ok = ok }"#, true),
+            (r#"{ ok != ok }"#, false),
+            (r#"{ true = true }"#, true),
+            (r#"{ true != false }"#, true),
+        ] {
+            let compiled = compile_span_filter(&first_filter(q)).unwrap();
+            assert_eq!(compiled.leaves.len(), 1, "{q}");
+            assert_eq!(compiled.leaves[0].eval, LeafEval::Const(expected), "{q}");
+            // No index serves a constant, so it pairs with the complete
+            // time-range superset — the same choice `{ false }` already
+            // made as a bare literal.
+            assert_eq!(compiled.generators[0].class, GenClass::TimeRange, "{q}");
+        }
+    }
+
+    #[test]
+    fn a_static_fold_rejects_regex_and_cross_type_operands() {
+        // Regex against two statics: the reference answers it, we do not
+        // (a second engine-side regex compiler for one non-probe shape).
+        let err = compile_span_filter(&first_filter(r#"{ "x" =~ "y" }"#)).unwrap_err();
+        let PlanError::TypeMismatch(msg) = err else {
+            panic!("unexpected error kind")
+        };
+        assert!(msg.contains("regex operator against a static"), "{msg}");
+        // Cross-type never reaches the planner (`pulsus_traceql::validate`
+        // rejects it first), so the arm is exercised directly to keep the
+        // function total rather than merely unreached.
+        let err = fold_static_compare(
+            &Value::String("5".to_string()),
+            ComparisonOp::Eq,
+            &Value::Number("5".to_string()),
+        )
+        .unwrap_err();
+        let PlanError::TypeMismatch(msg) = err else {
+            panic!("unexpected error kind")
+        };
+        assert!(msg.contains("same type"), "{msg}");
+        // An ordering operator over two unordered statics likewise.
+        let err = fold_static_compare(&Value::Bool(true), ComparisonOp::Lt, &Value::Bool(false))
+            .unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch(_)));
+    }
+
+    #[test]
+    fn a_boolean_operand_comparison_compiles_to_terms_not_arithmetic() {
+        // `{ .a = .b = .c }` is LEFT-associative: the nested comparison
+        // is the LHS term, `.c` the value term.
+        let compiled = compile_span_filter(&first_filter(r#"{ .a = .b = .c }"#)).unwrap();
+        assert_eq!(compiled.leaves.len(), 1);
+        match &compiled.leaves[0].eval {
+            LeafEval::BoolCompare { lhs, rhs, op } => {
+                assert_eq!(*op, ComparisonOp::Eq);
+                assert!(
+                    matches!(lhs, BoolTerm::Nested(inner) if matches!(**inner, LeafEval::FieldCompare { .. })),
+                    "{lhs:?}"
+                );
+                assert!(matches!(rhs, BoolTerm::Value(_)), "{rhs:?}");
+            }
+            other => panic!("expected a boolean comparison, got {other:?}"),
+        }
+        // `{ !.a = !.b }` — the `!` OPERATOR on both sides.
+        let compiled = compile_span_filter(&first_filter(r#"{ !.a = !.b }"#)).unwrap();
+        match &compiled.leaves[0].eval {
+            LeafEval::BoolCompare { lhs, rhs, .. } => {
+                assert!(matches!(lhs, BoolTerm::Not(_)), "{lhs:?}");
+                assert!(matches!(rhs, BoolTerm::Not(_)), "{rhs:?}");
+            }
+            other => panic!("expected a boolean comparison, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_existing_negation_and_field_compare_shapes_keep_their_own_leaves() {
+        // Arm order is a contract: `{ !.a = true }` stays the #335 Stage
+        // B truthiness leaf and `{ .a = .b }` stays the #183 field-vs-field
+        // leaf — the #351 arms sit BELOW them.
+        let compiled = compile_span_filter(&first_filter(r#"{ !.a = true }"#)).unwrap();
+        assert!(matches!(
+            compiled.leaves[0].eval,
+            LeafEval::BoolTruth { .. }
+        ));
+        let compiled = compile_span_filter(&first_filter(r#"{ .a = .b }"#)).unwrap();
+        assert!(matches!(
+            compiled.leaves[0].eval,
+            LeafEval::FieldCompare { .. }
+        ));
+    }
+
+    #[test]
+    fn a_non_boolean_operand_beside_a_negation_is_a_clean_type_mismatch() {
+        // `-.a` has no boolean reading; the verdict it had before the
+        // #351 arm existed (a 400) is the verdict it keeps.
+        let err = compile_span_filter(&first_filter(r#"{ -.a = !.b }"#)).unwrap_err();
+        let PlanError::TypeMismatch(msg) = err else {
+            panic!("unexpected error kind")
+        };
+        assert!(msg.contains("arithmetic negation"), "{msg}");
     }
 
     // -- issue #185: existence + arithmetic --------------------------------
