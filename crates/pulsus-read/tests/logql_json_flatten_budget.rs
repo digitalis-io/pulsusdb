@@ -343,6 +343,64 @@ fn the_detected_fields_auto_parse_pass_surfaces_the_breach() {
     );
 }
 
+/// A line whose ancestor key trims to WHITESPACE: it contributes zero
+/// bytes to every label name (`buildSanitizedPrefixFromBuffer` skips an
+/// empty-trimming part, `pkg/logql/log/parser.go:213-228 @ v3.7.4`) but
+/// its full length to every descendant leaf's captured json path
+/// (`buildJSONPathFromPrefixBuffer`, `:234-248`). Under the query path
+/// this line is cheap — the key charges see `m·7` bytes; under
+/// `/detected_fields`' capture it allocates `m·p` path bytes.
+///
+/// This is the axis the key charges CANNOT see (review round 1, medium),
+/// so it is the discriminating case for pricing the capture on the same
+/// ledger: the query path below must still pass, and the capturing path
+/// must raise the SAME 422 rather than allocate unbounded.
+#[test]
+fn a_whitespace_ancestor_is_free_for_keys_and_charged_for_captured_paths() {
+    let line = whitespace_ancestor_line(32_761, 2_979);
+
+    // Query path: capture off, so the ancestor costs nothing and the
+    // line flattens well inside the ledger.
+    let keys = flatten(&line).expect("the query path is far below the budget");
+    assert!(
+        keys < 40_000,
+        "the whitespace ancestor must contribute no key bytes, got {keys}"
+    );
+
+    // `/detected_fields`: capture on — the same ledger refuses.
+    let mut probe = DetectedFieldsProbe::new(10, 100);
+    probe.add_stream(1, &[("app".to_string(), "a".to_string())]);
+    let err = probe
+        .feed_row(&compiled(r#"{app="a"}"#), 1, 0, &line, "")
+        .expect_err("the captured paths must be charged to the row ledger");
+    assert!(
+        matches!(
+            err,
+            ReadError::QueryTooBroad(TooBroadReason::JsonFlattenKeyBytes { .. })
+        ),
+        "expected the json-flatten 422, got {err:?}"
+    );
+}
+
+/// `{"<p spaces>":{"k00000":0, … ×m}}` — see the test above.
+fn whitespace_ancestor_line(p: usize, m: usize) -> String {
+    assert!(m <= 100_000, "the leaf names are five digits wide");
+    let mut s = String::with_capacity(p + 11 * m + 6);
+    s.push_str("{\"");
+    for _ in 0..p {
+        s.push(' ');
+    }
+    s.push_str("\":{");
+    for i in 0..m {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("\"k{i:05}\":0"));
+    }
+    s.push_str("}}");
+    s
+}
+
 /// The metric path reaches the same flatten and the same ledger.
 #[test]
 fn the_metric_path_charges_the_same_key_budget() {

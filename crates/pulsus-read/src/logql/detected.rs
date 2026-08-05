@@ -427,9 +427,19 @@ impl FieldAccumulator {
         self.budget.peak_charged()
     }
 
-    /// Final response entries, sorted by label (deterministic wire order —
-    /// a documented divergence from the reference's Go map order), plus
-    /// whether the retention budget ever refused a charge (issue #244).
+    /// Final response entries, sorted by label, plus whether the
+    /// retention budget ever refused a charge (issue #244).
+    ///
+    /// The sort is a deterministic PIN, not parity: the reference ranges
+    /// a Go map at both slice-build sites and never sorts before
+    /// marshaling (`pkg/querier/queryrange/detected_fields.go:57-75`,
+    /// `pkg/storage/detected/fields.go:54-101`,
+    /// `pkg/util/marshal/marshal.go:182-188 @ v3.7.4`), so its order is
+    /// randomised per iteration and irreproducible even against itself —
+    /// there is no order to mirror. Registered as
+    /// `detected-fields-array-order-pinned` in
+    /// docs/benchmarks/logs-differential-ledger.md; the same treatment
+    /// `label-replace-collision-tie-order` and `approx_topk` get.
     ///
     /// Allocates the response `Vec<DetectedFieldOut>` — RESPONSE-scoped, at
     /// most `field_limit` (<= 5000) entries, once per request. Outside every
@@ -998,6 +1008,8 @@ mod tests {
         );
     }
 
+    /// The `detected-fields-array-order-pinned` ledger row's gate: the
+    /// wire order is label-ascending regardless of accumulation order.
     #[test]
     fn finish_sorts_fields_by_label() {
         let mut acc = FieldAccumulator::new(100);

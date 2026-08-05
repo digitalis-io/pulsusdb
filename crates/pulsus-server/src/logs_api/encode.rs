@@ -345,6 +345,18 @@ pub(crate) fn detected_labels_response(
 /// docs/api.md §2.6): the bare `{"fields":[...],"limit":N}` object,
 /// fields already label-sorted by the engine.
 ///
+/// **Scope of the byte-exactness claim.** Every per-field OBJECT and the
+/// zero-field body are byte-exact against the reference. A populated
+/// body as a whole is NOT, and cannot be: the reference builds its
+/// `fields` slice by ranging a Go map at both build sites and never
+/// sorts before marshaling (`detected_fields.go:57-75`,
+/// `pkg/storage/detected/fields.go:54-101`,
+/// `pkg/util/marshal/marshal.go:182-188 @ v3.7.4`), so its ARRAY ORDER is
+/// randomised per iteration and irreproducible even by itself. We pin
+/// label-ascending — registered as `detected-fields-array-order-pinned`
+/// in docs/benchmarks/logs-differential-ledger.md. Nothing below claims
+/// order parity.
+///
 /// Three shapes are the reference's, byte for byte (all captured from
 /// `grafana/loki:3.7.4` and recorded on issue #258):
 ///  * **zero fields is bare `{}`** (issue #258) — `fields` carries
@@ -1105,14 +1117,20 @@ mod tests {
         assert_eq!(json["explain"]["result_type"], "detected_labels");
     }
 
-    /// Issues #170/#254/#258 byte-exact detected_fields golden, pinned
-    /// against the `grafana/loki:3.7.4` capture recorded on #258:
+    /// Issues #170/#254/#258 detected_fields golden, pinned against the
+    /// `grafana/loki:3.7.4` capture recorded on #258:
     /// label/type/cardinality/parsers/jsonPath per field (the proto field
     /// order), `parsers` as `null` when unattributed, `jsonPath` present
     /// only for a json-flattened field, `limit` as the trailing key — and
     /// NO `pulsus_partial` key on a complete result.
+    ///
+    /// The byte-exactness this pins is the ENVELOPE and each per-field
+    /// OBJECT; the array ORDER is our deterministic pin over the
+    /// reference's irreproducible Go map order, not parity (ledger row
+    /// `detected-fields-array-order-pinned`), which is why the input here
+    /// is already label-sorted.
     #[tokio::test]
-    async fn detected_fields_envelope_is_byte_exact_and_omits_pulsus_partial_when_complete() {
+    async fn detected_fields_field_objects_and_envelope_are_byte_exact_when_complete() {
         let out = DetectedFields {
             fields: vec![
                 DetectedFieldOut {

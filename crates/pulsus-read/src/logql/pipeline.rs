@@ -3249,8 +3249,15 @@ fn eval_label_filter<'v>(
 /// [`super::charge::alloc_block_bytes`]`(key.len())` over every key
 /// string [`flatten_json`] allocates while the row is in the pipeline —
 /// the emitted leaf label names AND the intermediate object prefixes
-/// they are built from, across ALL `| json` stages of the row. It
-/// bounds nothing else: not the extracted VALUES (their bytes are
+/// they are built from, across ALL `| json` stages of the row — plus,
+/// when json-path capture is on (issue #254; only `/detected_fields`
+/// turns it on), everything [`JsonPaths::record`] allocates: each raw
+/// path component, the per-leaf path spine and the slot table. The
+/// capture is on the ledger because it has its own `Θ(L²)` axis the key
+/// charges cannot see — an ancestor that trims to whitespace costs zero
+/// key bytes and full path bytes per descendant leaf (see
+/// [`JsonPaths`]). It bounds nothing else: not the extracted VALUES
+/// (their bytes are
 /// linear in the line — each scalar's text appears once in the input),
 /// not the parsed `serde_json::Value`, not the targeted-extraction form
 /// `| json a="b.c"` (whose label names come from the compiled stage and
@@ -3338,7 +3345,17 @@ impl JsonKeyBudget {
     /// over-approximation of that block for ONE exactly-reserved
     /// allocation, which is exactly the shape the caller builds.
     fn charge_key(&self, content_bytes: usize) -> Result<(), RowBudgetExceeded> {
-        let block = super::charge::alloc_block_bytes(content_bytes as u64);
+        self.charge_block(super::charge::alloc_block_bytes(content_bytes as u64))
+    }
+
+    /// Charges a block a caller derived through a DIFFERENT pinned model
+    /// than [`JsonKeyBudget::charge_key`]'s exactly-reserved one — today
+    /// only [`JsonPaths::record`]'s geometrically-grown slot spine, via
+    /// [`super::charge::grown_alloc_bytes`]. Charging a bare CONTENT
+    /// length through here is the mistake `charge_key` exists to prevent,
+    /// so callers pass a block, never a length (the same split
+    /// `detected.rs`'s `field_entry_bytes` already uses).
+    fn charge_block(&self, block: u64) -> Result<(), RowBudgetExceeded> {
         let remaining = self.remaining.get();
         if block > remaining {
             return Err(RowBudgetExceeded::json_flatten_keys());
@@ -3363,17 +3380,49 @@ impl JsonKeyBudget {
 /// The buffer is CALLER-OWNED so `/detected_fields`' per-row feeder can
 /// recycle its spine across sampled rows, exactly as it recycles the
 /// label scratch; [`JsonPaths::clear`] keeps that capacity.
+///
+/// **Everything it allocates is charged to the ROW's
+/// [`JsonKeyBudget`] before it exists** (review round 1, medium). The
+/// capture is not a free rider on the key charges: a leaf's path is the
+/// RAW ancestor chain, and an ancestor that trims to whitespace
+/// contributes NOTHING to any label name while contributing its full
+/// length to every descendant leaf's path — so `{"<p spaces>":{"k0":0, …
+/// ×m}}` allocates `m·p` path bytes against `0` charged key bytes. That
+/// is the same `Θ(L²)` shape [`MAX_JSON_FLATTEN_KEY_BYTES`] exists to
+/// bound, on an axis the key charges cannot see, so it is priced on the
+/// same ledger rather than a new one: a breach is the SAME
+/// `RowBudget::JsonFlattenKeys` 422 the `| json` flatten already raises
+/// on this endpoint (`tests/logql_json_flatten_budget.rs::
+/// the_detected_fields_auto_parse_pass_surfaces_the_breach`), never a new
+/// rejection surface.
+///
+/// **Peak live set.** For one row: the flattened key strings, every
+/// captured path component, both spines and the slot table come out of
+/// ONE 64 MiB ledger of `alloc_block_bytes`-rounded blocks, so a
+/// capturing row's live flatten+capture heap is `≤ MAX_JSON_FLATTEN_KEY_
+/// BYTES`. Across rows it is one row at a time (`DetectedRowFeeder`
+/// streams), and the accumulator's SURVIVING copy is charged separately
+/// against the per-REQUEST `MAX_DETECTED_FIELD_BYTES` — the same
+/// row-ledger/request-ledger split the keys and the retained values
+/// already use.
 #[derive(Debug, Default)]
 pub(crate) struct JsonPaths {
     /// Indexed by position in the label vector; `None` for a label the
     /// flatten did not produce (a base label, or a leaf that was skipped).
     slots: Vec<Option<Vec<String>>>,
+    /// Slot-spine block bytes already charged for the CURRENT run, so a
+    /// growing table is charged its DELTA rather than its total once per
+    /// leaf. Reset by [`JsonPaths::clear`], which every `| json` stage
+    /// calls on entry — a second stage re-charges from zero, which
+    /// over-charges and never under-charges.
+    charged_slots: u64,
 }
 
 impl JsonPaths {
     /// Drops the previous row's paths, keeping the spine's capacity.
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
+        self.charged_slots = 0;
     }
 
     /// The raw path for the label at `idx`, or `None` when the flatten
@@ -3385,14 +3434,43 @@ impl JsonPaths {
     /// Records `stack ++ [leaf]` for the label now at `idx`, overwriting
     /// any earlier path at that position (the reference's `SetJSONPath`
     /// map write, `labels.go:415`).
-    fn record(&mut self, idx: usize, stack: &[&str], leaf: &str) {
+    ///
+    /// Charge-then-allocate, in three steps, so NOTHING grows before it
+    /// is priced: the slot table's geometric growth
+    /// ([`super::charge::grown_alloc_bytes`], delta only), then the path
+    /// vector's exactly-reserved spine, then each component's `String`
+    /// immediately before it is cloned. A refusal returns with the
+    /// offending allocation never made; the partially-built `path` is a
+    /// local that drops on the way out, and the row aborts to the
+    /// documented 422 (a partial label set is never observed —
+    /// [`flatten_json`]'s own contract).
+    fn record(
+        &mut self,
+        idx: usize,
+        stack: &[&str],
+        leaf: &str,
+        budget: &JsonKeyBudget,
+    ) -> Result<(), RowBudgetExceeded> {
         if self.slots.len() <= idx {
+            let want = super::charge::grown_alloc_bytes(
+                ((idx + 1) * size_of::<Option<Vec<String>>>()) as u64,
+            );
+            if want > self.charged_slots {
+                budget.charge_block(want - self.charged_slots)?;
+                self.charged_slots = want;
+            }
             self.slots.resize_with(idx + 1, || None);
         }
-        let mut path = Vec::with_capacity(stack.len() + 1);
-        path.extend(stack.iter().map(|p| (*p).to_string()));
-        path.push(leaf.to_string());
+        let parts = stack.len() + 1;
+        budget.charge_key(parts * size_of::<String>())?;
+        let mut path = Vec::with_capacity(parts);
+        for part in stack.iter().copied().chain(std::iter::once(leaf)) {
+            budget.charge_key(part.len())?;
+            path.push(part.to_string());
+        }
+        debug_assert_eq!(path.len(), parts, "the charged spine must be the built one");
         self.slots[idx] = Some(path);
+        Ok(())
     }
 }
 
@@ -3720,7 +3798,7 @@ fn insert_flattened<'a, 'v>(
         labels.push((Cow::Owned(key), Cow::Owned(value)));
         if let Some(c) = capture.as_deref_mut() {
             let idx = labels.len() - 1;
-            c.out.record(idx, &c.stack, raw_part);
+            c.out.record(idx, &c.stack, raw_part, budget)?;
         }
         return Ok(());
     }
@@ -3747,7 +3825,7 @@ fn insert_flattened<'a, 'v>(
     };
     let idx = set_label_at(labels, Cow::Owned(renamed), Cow::Owned(value));
     if let Some(c) = capture {
-        c.out.record(idx, &c.stack, raw_part);
+        c.out.record(idx, &c.stack, raw_part, budget)?;
     }
     Ok(())
 }

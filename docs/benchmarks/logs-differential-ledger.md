@@ -213,6 +213,60 @@ Out of this ledger's scope by design:
   guards fixture-referenced entries only); it is registered here so the
   divergence has a ledger identity before any future fixture case lands.
 
+### detected-fields-array-order-pinned (issues #244, #258)
+
+- **Construct:** the ORDER of the `fields` array in a
+  `/detected_fields` `200`. Per-field object shape and the zero-field
+  body are byte-exact (issues #254/#258); this entry is scoped to the
+  array order alone, which is why the endpoint is **not** byte-exact
+  end to end for a populated response.
+- **Reference behaviour (source, not inferred):** irreproducible **Go
+  map iteration order**, at BOTH points that build the slice
+  (`grafana/loki` v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`):
+  - the single-response path fills `fields` with `for k, v := range
+    detectedFields` over a `map[string]*parsedFields`
+    (`pkg/querier/queryrange/detected_fields.go:57-75`, map built at
+    `:282-284`);
+  - the sharded MERGE path repeats it — `detected.MergeFields`
+    accumulates into `map[string]*UnmarshaledDetectedField` and emits
+    `for _, field := range mergedFields`
+    (`pkg/storage/detected/fields.go:54-101`, called from
+    `pkg/querier/queryrange/codec.go:1562-1590`).
+
+  Nothing sorts on the way out: `WriteDetectedFieldsResponseJSON` is a
+  straight `jsoniter` `WriteVal` of the slice as it stands
+  (`pkg/util/marshal/marshal.go:182-188`). Go's spec makes map
+  iteration order unspecified and the runtime randomises it per
+  iteration, so **the reference cannot reproduce its own order between
+  two runs on identical input.** Corroborated by our own capture record:
+  `crates/pulsus-read/tests/logqltest/PROVENANCE.md` rule A4 already
+  transcribes captured fields as a SET for exactly this reason, citing
+  case C1 where `uid` precedes `lvl`; the #258 capture's `msg`, `code`,
+  `detected_level` is another draw from the same distribution, not a
+  rule.
+- **PulsusDB behaviour:** **label-ascending**, pinned in
+  `FieldAccumulator::finish`. This is the ratified treatment of every
+  irreproducible reference tie in this repo — the same call as
+  `label-replace-collision-tie-order` and `approx_topk` beyond the
+  retention cap. Mirroring is not available at any price: there is no
+  order to mirror. The SET of fields, every per-field object and the
+  `limit`/zero-field bodies are reference-exact; only the array order is
+  pinned rather than mirrored.
+- **Consumer impact:** none identified. `fields` is a lookup collection
+  keyed by `label`, the reference ships no order guarantee a client
+  could have depended on, and a deterministic order is strictly easier
+  to consume and to diff.
+- **Not mirrored, deliberately:** `MergeFields` also DROPS `JsonPath`
+  when it rebuilds each field (`fields.go:92-99` sets `Label`, `Type`,
+  `Cardinality`, `Parsers`, `Sketch` — no `JsonPath`), so a sharded
+  reference deployment silently loses the paths a single-shard one
+  returns. We emit them on every response; that is an upstream defect,
+  not a shape to reproduce.
+- **Fixture status:** as the entry above — no
+  `test/fixtures/logs/differential.json` case, registered for identity.
+  Gated by `logs_detected_live.rs`'s label-ordered `fields_of`
+  comparison and `detected.rs::finish_sorts_fields_by_label`.
+
 ### tumbling-vs-sliding-rate — RESOLVED (issue #227)
 
 - **Status:** RESOLVED. The former tumbling divergence is fixed — RANGE
