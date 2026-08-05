@@ -681,6 +681,19 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test trace_ingest_roundtrip
 
+      # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
+      # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
+      # MetricWriter (sync) -> ClickHouse, read back as
+      # reinterpretAsUInt64(value). The literals are chosen so serde_json's
+      # default parser and str::parse disagree by 1 ULP, so this step fails if
+      # the workspace `float_roundtrip` feature is ever dropped.
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: OTLP/JSON metrics ingest stores nearest-representable f64 bits
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test metric_ingest_float_roundtrip
+
       # Issue #75: the Zipkin v2 JSON ingest round-trip — ingest_zipkin ->
       # zipkin::to_otlp -> otlp_traces::parse -> TraceWriter (sync) ->
       # ClickHouse. Proves fingerprint identity (Zipkin summary columns
