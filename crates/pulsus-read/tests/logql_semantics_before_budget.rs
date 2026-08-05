@@ -16,10 +16,13 @@
 //! and lives in the source: `decide_binary` moves both operands in,
 //! `Ledger::acquire_binary` is the only way to get them back, and what
 //! it hands back is one charged value the join must be given whole, so
-//! no caller can substitute the context it joins under. These rows
-//! are what proves the structure produces the behaviour, at the layer
-//! the user experiences (#335's standing lesson: a gate below the user
-//! reports agreement exactly where divergence lives).
+//! no caller can substitute the context by CALLING the join — the only
+//! argument it still takes is `return_bool`. How far that bound reaches,
+//! and where Rust's module-granular visibility stops it, is enumerated on
+//! `join_decided` in the source. These rows are what proves the structure
+//! produces the behaviour, at the layer the user experiences (#335's
+//! standing lesson: a gate below the user reports agreement exactly where
+//! divergence lives).
 //!
 //! The in-crate side of this issue — the 491 520-case differential
 //! against the join itself, the point-read counter, the scratch model

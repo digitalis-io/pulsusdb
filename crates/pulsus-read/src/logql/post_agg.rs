@@ -128,9 +128,12 @@ pub fn combine_binary(
 /// context, has private fields, and is what [`join_decided`] must be
 /// given BY VALUE. So an operand cannot reach the join except through a
 /// charge the decision preceded, the decision cannot be made over a
-/// different pair (there is no second pair to name), and it cannot be
-/// joined under a different matcher or against a different budget,
-/// because there is no parameter left to pass either through. See
+/// different pair (there is no second pair to name), and THIS CALL
+/// cannot join under a different matcher or against a different budget,
+/// because there is no parameter left to pass either through. That last
+/// one is a bound on the call, not on the module — see
+/// [`join_decided`]'s "what remains" for what a second unpacking site
+/// can still do, and why Rust cannot forbid it here. See
 /// docs/architecture.md §5.6.
 ///
 /// **What "that this charge could preempt" excludes.** The (P1) join
@@ -186,13 +189,44 @@ pub fn combine_binary_capped(
 /// cap could be passed to this function's `&Ledger` parameter and it
 /// compiled. There is no such parameter now.
 ///
-/// **What remains, stated as what it is.** Editing this function's own
-/// signature and body and its one call site together still produces a
-/// join under a substituted context. No in-language device prevents
-/// that, here or anywhere — it is a rewrite of the mechanism rather
-/// than a use of it, and it is what review of a diff is for. The bound
-/// this doc claims is narrower and checkable: *no caller can substitute
-/// the context without editing this function*.
+/// **What remains, stated as what it is** (review round 4's
+/// `[medium]`). Two things, and neither of them is a call to this
+/// function. Editing this function's own signature and body and its one
+/// call site together still produces a join under a substituted
+/// context. So does leaving this function entirely untouched and adding
+/// a SIBLING dispatcher in `mod post_agg` that unpacks the carrier
+/// itself: measured on this tree, a mutant that changes only
+/// [`combine_binary_capped`]'s call site and adds such a sibling
+/// compiles, because [`BinaryCharged::into_join_context`] is
+/// `pub(super)` — visible to the whole enclosing module, not to this
+/// function alone.
+///
+/// No tighter visibility is available where the carrier stands, and the
+/// reason is mechanical rather than a missing annotation: a visibility
+/// may name only an ANCESTOR of the item's own module, so an exit
+/// defined in `mod ledger` can be restricted to `ledger` itself or to
+/// `post_agg`/`logql`/`crate`, and to nothing else. Both alternatives
+/// were measured on this tree: naming a sibling module
+/// (`pub(in crate::logql::post_agg::preflight)`) is `E0742`
+/// ("visibilities can only be restricted to ancestor modules"), and
+/// making the exit private is `E0624` at this function's own
+/// destructuring, since this function is not inside `mod ledger`.
+/// Moving this dispatch into `mod ledger` so the exit can be private
+/// would SHRINK the set of code that may unpack a carrier from the file
+/// to that module — it would not empty it, since a sibling inside
+/// `mod ledger` could then do what the one in `mod post_agg` does now.
+/// It is not taken: it buys a smaller surface, not a closed one, at the
+/// cost of putting result-shape query logic inside the module that is
+/// the budget and its proof tokens.
+///
+/// So the bound this doc claims is a bound on the CALL, and it is
+/// checkable: *no caller can substitute the context by calling this
+/// function* — every argument route into it is a compile error
+/// (`E0061`/`E0616`/`E0451`, above), and `return_bool` is the only
+/// parameter left. Substituting needs a second unpacking site, which is
+/// a new function rather than a use of this one — a rewrite of the
+/// mechanism, which no in-language device prevents here or anywhere,
+/// and which is what review of a diff is for.
 ///
 /// `return_bool` is the one thing left loose, deliberately. It selects
 /// what a comparison emits, and `instant_join` detects every duplicate
@@ -2538,8 +2572,10 @@ pub fn preflight_alloc_probe(
 /// one: [`BinaryDecided`], the operands whose refusals have been decided
 /// (only [`Ledger::acquire_binary`] gets them back), and
 /// [`BinaryCharged`], those operands plus the charge and the decision
-/// context, which only that same function mints and only the join
-/// consumes.
+/// context, which only that same function mints and which is consumed
+/// by a single move (by `join_decided` in this tree; the exit is
+/// `pub(super)`, so the bound on WHO may consume it is the module, not
+/// that one function — see its "what remains").
 mod ledger {
     #[cfg(test)]
     use super::MAX_POST_AGG_BYTES;
@@ -2732,9 +2768,20 @@ mod ledger {
     /// MOVED in and cannot be built: the fields are private to this
     /// module (a struct literal outside it is E0451), the only
     /// constructor is [`Ledger::acquire_binary`], and the only exit is
-    /// [`Self::into_join_context`], which consumes — so detaching the
-    /// context ends that path rather than diverting it, because there is
-    /// no way back to a `BinaryCharged`.
+    /// [`Self::into_join_context`], which consumes — so a detached
+    /// context cannot be reattached, because there is no way back to a
+    /// `BinaryCharged`.
+    ///
+    /// **What this does NOT close** (review round 4's `[medium]`). The
+    /// exit is `pub(super)`, so ANY function in `mod post_agg` — not
+    /// only `join_decided` — may consume a carrier and then join under
+    /// its own context; a sibling dispatcher doing exactly that
+    /// compiles, measured. Rust cannot restrict an item to a
+    /// non-ancestor module (`E0742`), and moving the join into this
+    /// module so the exit could be private would shrink that set to
+    /// this module rather than empty it. So the bound claimed for the
+    /// join is a bound on CALLING it; see `join_decided`'s "what
+    /// remains" for the enumeration and the measured error codes.
     ///
     /// The ledger travels here for the same reason. A join against a
     /// budget the operands were not charged on is context substitution
