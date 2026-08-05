@@ -128,13 +128,17 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 2
 ///      readable.) Its `_provenance.config` sentence was then CORRECTED
 ///      in the same issue — it claimed the reference needs a
 ///      `metrics_generator` block to answer TraceQL metrics at all,
-///      which a compose-topology A/B refuted (identical answers with and
-///      without, both corpora, both steps). Digest-only again: no
-///      captured value moved.
+///      which the A/B recorded in `deploy/e2e/tempo.yaml`'s header
+///      refuted (identical settled answers with and without, on both of
+///      that A/B's corpora, at both of its steps). Its
+///      `_provenance.note` followed in the next review round — it
+///      blamed metrics visibility lag on block completion, where the
+///      same A/B shows the lag is the step's right edge. Digest-only
+///      both times: no captured value moved.
 ///
 /// Corpus 66 -> 69 entries; `quantile_over_time_multi.sql` and the other
 /// 65 pre-existing goldens are byte-identical.
-const PINNED_SQL_CORPUS: u64 = 0x97ea_d8f0_ba46_0fc0;
+const PINNED_SQL_CORPUS: u64 = 0x95d7_42ba_d76c_0200;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
