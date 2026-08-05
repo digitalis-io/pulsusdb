@@ -68,6 +68,10 @@ fn test_ctx(db: &str) -> SchemaParams {
 }
 
 const DB: &str = "pulsus_traces_metrics_it";
+/// Issue #252's own throwaway database: the log2-histogram membership,
+/// sub-2ns guard and quantile-divergence corpora need durations the
+/// shared `DB` corpus deliberately does not have.
+const DB_LOG2: &str = "pulsus_traces_metrics_log2_it";
 
 /// Corpus base: "two hours ago", floored to a multiple of 600 (so the
 /// primary test windows are step-aligned by construction for both step
@@ -519,11 +523,14 @@ async fn assert_series_cap_rejects() {
     );
 }
 
-/// P4 (issue #182): `quantile_over_time` (TDigest) and
-/// `histogram_over_time` (exp-`le`). Every corpus span has
-/// `duration_ns = 1_000_000` (0.001 s), so every quantile is 0.001 s, and
-/// the cumulative histogram is 0 below the `1_000_000`-ns value and
-/// `CORPUS_SPANS` at and above it.
+/// P4 (issue #182 / #252): `quantile_over_time` (TDigest) and
+/// `histogram_over_time` (the reference's log2 tally). Every corpus span
+/// has `duration_ns = 1_000_000` (0.001 s), so every quantile is 0.001 s
+/// and the histogram is exactly ONE series — the bucket
+/// `2^20 ns = 0.001048576 s` these durations round up to — carrying the
+/// whole population as a plain tally. Membership, the gap case and the
+/// sub-2ns guard get their own corpus in
+/// [`log2_histogram_membership_and_the_sub_two_ns_guard`].
 async fn assert_quantile_and_histogram(engine: &TraceEngine) {
     let end_s = base_s() + CORPUS_SPANS;
 
@@ -555,10 +562,10 @@ async fn assert_quantile_and_histogram(engine: &TraceEngine) {
         );
     }
 
-    // histogram_over_time instant: one cumulative series per `le` bucket
-    // (`__bucket` label). 1_000_000 ns falls at/below le=4194304 (2^22)
-    // and above le=524288 (2^19), so those two adjacent buckets bracket
-    // the whole population.
+    // histogram_over_time instant (issue #252): membership is
+    // occurrence-only, so a uniform corpus emits exactly ONE series —
+    // the bucket its duration rounds up to — and its value is the plain
+    // tally, not a running total.
     let h_plan = plan_for(
         engine,
         "{} | histogram_over_time(duration)",
@@ -572,34 +579,228 @@ async fn assert_quantile_and_histogram(engine: &TraceEngine) {
         .expect("histogram instant");
     assert_eq!(
         h_res.series.len(),
-        14,
-        "one series per exp-le bucket: {h_res:?}"
+        1,
+        "a uniform corpus occupies exactly one power-of-two bucket: {h_res:?}"
     );
-    let bucket = |le_ns: i64| -> f64 {
-        let target = pulsus_read::MetricLabelValue::Double(le_ns as f64 / 1e9);
-        h_res
+    assert_eq!(
+        h_res.series[0].labels,
+        vec![pulsus_read::MetricLabel::double("__bucket", 0.001048576)],
+        "1_000_000 ns rounds up to 2^20 ns = 0.001048576 s"
+    );
+    assert_eq!(h_res.series[0].samples[0].1, CORPUS_SPANS as f64);
+}
+
+/// Issue #252 AC4/AC2.4/AC3c, on its own throwaway database (the shared
+/// `DB` corpus is uniformly `duration_ns = 1_000_000` and its
+/// aggregation identities must not be perturbed). Four things that need
+/// real rows and a real ClickHouse:
+///
+/// - **membership with a GAP** — a corpus occupying `2^29` and `2^33`
+///   emits exactly those two series and NOTHING for `2^30`/`2^31`/`2^32`
+///   (the fixed-ladder form could not express this);
+/// - **the tallies are plain counts** — they SUM to the deduped span
+///   count, which the cumulative form could not satisfy (AC5's mutant
+///   target);
+/// - **the sub-2ns guard** — spans of `-1`, `0` and `1` ns produce no
+///   `__bucket` series at all while `count_over_time` counts all four
+///   spans. This one is tested rather than reasoned about because the
+///   pushed-down expression does NOT reject them on its own: measured on
+///   24.8.14.39, `toUInt64(roundToExp2(val - 1)) * 2` is `0` for every
+///   `val <= 1`, so dropping the outer `WHERE val >= 2` would emit a
+///   spurious `__bucket = 0` series the reference never emits;
+/// - **AC3c, the ledgered quantile divergence, with its direction** —
+///   over 20 identical 300 ms spans our `quantile_over_time(duration,
+///   0.99)` is exactly `0.3` (the true p99) where the reference returns
+///   `0.536870912`, and over 520 ms spans ours moves to `0.52` where the
+///   reference returns the same `0.536870912` bytes for both.
+#[tokio::test]
+async fn log2_histogram_membership_and_the_sub_two_ns_guard() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-read/tests/traces_metrics_live.rs for setup)"
+        );
+        return;
+    }
+
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_LOG2}")).await;
+    run_init(&admin, &test_ctx(DB_LOG2))
+        .await
+        .expect("run_init");
+
+    let client = {
+        let mut cfg = test_config();
+        cfg.database = DB_LOG2.to_string();
+        ChClient::new(cfg).await.expect("connect data client")
+    };
+
+    // Four services, one corpus each. `gap`: ten 300 ms spans (2^29) and
+    // ten 5 s spans (2^33), leaving 2^30/2^31/2^32 empty — the same
+    // occupancy the committed reference capture's `w252` corpus has.
+    // `guard`: `-1`, `0`, `1` ns and one normal 300 ms span. `u300` /
+    // `u520`: twenty identical spans each.
+    let mut rows: Vec<String> = Vec::new();
+    let push = |svc: &str, idx: i64, dur_ns: i64, rows: &mut Vec<String>| {
+        let id = 1000 + idx;
+        let ts_ns = (base_s() + (idx % 300)) * NS;
+        rows.push(format!(
+            "(toFixedString(unhex('{id:032x}'), 16), toFixedString(unhex('{id:016x}'), 8), \
+             toFixedString(unhex('0000000000000000'), 8), 'op', '{svc}', '', {ts_ns}, \
+             {dur_ns}, 0, 1, 1, 'p')"
+        ));
+    };
+    let mut idx = 0i64;
+    for dur in std::iter::repeat_n(300_000_000i64, 10).chain(std::iter::repeat_n(5_000_000_000, 10))
+    {
+        push("gap", idx, dur, &mut rows);
+        idx += 1;
+    }
+    for dur in [-1i64, 0, 1, 300_000_000] {
+        push("guard", idx, dur, &mut rows);
+        idx += 1;
+    }
+    for dur in std::iter::repeat_n(300_000_000i64, 20) {
+        push("u300", idx, dur, &mut rows);
+        idx += 1;
+    }
+    for dur in std::iter::repeat_n(520_000_000i64, 20) {
+        push("u520", idx, dur, &mut rows);
+        idx += 1;
+    }
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB_LOG2}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, status_message, timestamp_ns, \
+              duration_ns, status_code, kind, payload_type, payload) VALUES {}",
+            rows.join(", ")
+        ),
+    )
+    .await;
+
+    let engine = TraceEngine::new(
+        {
+            let mut cfg = test_config();
+            cfg.database = DB_LOG2.to_string();
+            ChClient::new(cfg).await.expect("connect engine")
+        },
+        engine_config(),
+    );
+    let end_s = base_s() + CORPUS_SPANS;
+    let instant = |q: String| {
+        let engine = &engine;
+        async move {
+            let plan = plan_for(engine, &q, base_s(), end_s, CORPUS_SPANS);
+            engine.metrics_instant(&plan).await.expect("instant")
+        }
+    };
+
+    /// The `(bucket seconds, tally)` pairs of a histogram result, in
+    /// emitted order.
+    fn buckets(result: &TraceMetricsResult) -> Vec<(f64, f64)> {
+        result
             .series
             .iter()
-            .find(|s| {
-                s.labels
-                    .iter()
-                    .any(|l| l.key == "__bucket" && l.value == target)
+            .map(|s| {
+                assert_eq!(s.labels.len(), 1, "one __bucket label: {s:?}");
+                assert_eq!(s.labels[0].key, "__bucket");
+                let pulsus_read::MetricLabelValue::Double(seconds) = s.labels[0].value else {
+                    panic!("__bucket is a double: {s:?}");
+                };
+                assert_eq!(s.samples.len(), 1, "instant form has one sample: {s:?}");
+                (seconds, s.samples[0].1)
             })
-            .unwrap_or_else(|| panic!("no __bucket series for le={le_ns}"))
-            .samples[0]
-            .1
-    };
-    assert_eq!(bucket(524_288), 0.0, "no span <= 524288 ns");
+            .collect()
+    }
+
+    // ---- membership with a deliberate occupancy gap -------------------
+    let gap =
+        instant(r#"{ resource.service.name = "gap" } | histogram_over_time(duration)"#.to_string())
+            .await;
     assert_eq!(
-        bucket(4_194_304),
-        CORPUS_SPANS as f64,
-        "all spans <= 4194304 ns (cumulative)"
+        buckets(&gap),
+        vec![(0.536870912, 10.0), (8.589934592, 10.0)],
+        "exactly the OCCUPIED powers of two, each a plain tally"
+    );
+    // The gap buckets are absent, not zero-valued.
+    for empty in [1.073741824f64, 2.147483648, 4.294967296] {
+        assert!(
+            !gap.series
+                .iter()
+                .any(|s| s.labels[0].value == pulsus_read::MetricLabelValue::Double(empty)),
+            "2^k = {empty}s is empty and must emit NO series: {gap:?}"
+        );
+    }
+    // The tallies SUM to the deduped span count — the identity the
+    // cumulative form cannot satisfy (it would sum to 30 here).
+    let tally_sum: f64 = buckets(&gap).iter().map(|(_, n)| n).sum();
+    assert_eq!(tally_sum, 20.0, "tallies are counts, not running totals");
+    let gap_count = vector_value(
+        &instant(r#"{ resource.service.name = "gap" } | count_over_time()"#.to_string()).await,
+    );
+    assert_eq!(tally_sum, gap_count, "and they account for every span");
+
+    // ---- the sub-2ns guard (AC2.4) ------------------------------------
+    let guard = instant(
+        r#"{ resource.service.name = "guard" } | histogram_over_time(duration)"#.to_string(),
+    )
+    .await;
+    assert_eq!(
+        buckets(&guard),
+        vec![(0.536870912, 1.0)],
+        "only the 300 ms span is bucketed; -1, 0 and 1 ns are dropped from the SERIES"
     );
     assert_eq!(
-        bucket(1 << 40),
-        CORPUS_SPANS as f64,
-        "the top bucket holds all"
+        vector_value(
+            &instant(r#"{ resource.service.name = "guard" } | count_over_time()"#.to_string())
+                .await
+        ),
+        4.0,
+        "…while count_over_time still counts all four spans"
     );
+
+    // ---- AC3c: the ledgered quantile divergence, and its direction ----
+    // `2026-08-05-traceql-quantile-over-time-tdigest`. Uniform corpora
+    // make this a scale-invariant identity rather than a tuned number:
+    // over identical values the true quantile is exact for every p.
+    for (svc, want, want_bucket) in [
+        ("u300", 0.3f64, 0.536870912f64),
+        ("u520", 0.52, 0.536870912),
+    ] {
+        // All four quantiles docs/api.md §4.4.1's table states, not
+        // just p99: a number in that table with no test behind it is a
+        // defect (AC14-example).
+        let q = instant(format!(
+            r#"{{ resource.service.name = "{svc}" }} | quantile_over_time(duration, 0.5, 0.9, 0.99, 1.0)"#
+        ))
+        .await;
+        assert_eq!(q.series.len(), 4, "one series per quantile: {q:?}");
+        for (series, p) in q.series.iter().zip([0.5f64, 0.9, 0.99, 1.0]) {
+            let got = series.samples[0].1;
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{svc}: our p{p} is the TRUE p{p} ({want}), got {got}"
+            );
+            assert!(
+                got < want_bucket,
+                "{svc}: p{p} is strictly below the reference's bucket label {want_bucket}"
+            );
+        }
+        // Both corpora sit in the SAME bucket, which is why the
+        // reference cannot tell them apart.
+        let h = instant(format!(
+            r#"{{ resource.service.name = "{svc}" }} | histogram_over_time(duration)"#
+        ))
+        .await;
+        assert_eq!(buckets(&h), vec![(want_bucket, 20.0)]);
+    }
+    // The pair is the point: theirs is byte-identical across an 86%
+    // rise, ours moves with the data.
+    assert_ne!(0.3f64.to_bits(), 0.52f64.to_bits());
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_LOG2}")).await;
 }
 
 /// P5 (issue #182): `with(exemplars=…)` collects ≥1 `trace:id` exemplar,

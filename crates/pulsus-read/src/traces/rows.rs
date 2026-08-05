@@ -233,21 +233,32 @@ pub struct MetricQuantileInstantRow {
     pub qs: Vec<f64>,
 }
 
-/// One `histogram_over_time` range-query row (`metrics_histogram_range_sql`,
-/// issue #182): the bucket start and the cumulative per-`le`-bucket count
-/// array (`Array(UInt64)`, one entry per exponential boundary).
+/// One `(t, bucket, count)` log2 tally row
+/// (`metrics_log2_bucket_range_sql`, issue #252): the bucket start, the
+/// occupied power-of-two nanosecond bucket, and its plain `count()`.
+/// One row per OCCUPIED `(t, bucket)` — never a fixed-width array, never
+/// cumulative.
+///
+/// `bucket_ns` is `UInt64` because the SQL expression is
+/// `toUInt64(roundToExp2(val - 1)) * 2`: a duration above `2^62` buckets
+/// to `2^63`, which is not representable as `Int64` (it would decode as
+/// a negative `__bucket` label).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
-pub struct MetricHistogramRow {
+pub struct MetricLog2BucketRow {
     #[serde(rename = "t")]
     pub t_ms: i64,
-    pub bkts: Vec<u64>,
+    #[serde(rename = "bucket")]
+    pub bucket_ns: u64,
+    pub n: u64,
 }
 
-/// One `histogram_over_time` instant-query row — the whole-window
-/// cumulative bucket-count array.
+/// One `histogram_over_time` instant-form tally row — the same
+/// `(bucket, count)` over the whole snapped window, no time bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
-pub struct MetricHistogramInstantRow {
-    pub bkts: Vec<u64>,
+pub struct MetricLog2BucketInstantRow {
+    #[serde(rename = "bucket")]
+    pub bucket_ns: u64,
+    pub n: u64,
 }
 
 /// One per-bucket exemplar-collection row (`metrics_exemplar_range_sql`,

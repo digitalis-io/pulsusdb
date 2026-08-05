@@ -1,0 +1,515 @@
+{
+  "_provenance": {
+    "issue": 252,
+    "image": "grafana/tempo:3.0.2@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3",
+    "captured": "2026-08-05",
+    "config": "deploy/e2e/tempo.yaml exactly as committed by this change; 3.0.2 needs no metrics-specific configuration to answer TraceQL metrics queries \u2014 the live-store serves them (cmd/tempo/app/modules.go:719 @ v3.0.2), and an A/B with and without a metrics_generator block returned identical answers on both corpora (issue #252, 2026-08-05)",
+    "how": "standalone container on the host, OTLP/HTTP ingest of one resource per corpus (resource.service.name = the corpus's service), then GET /api/metrics/query_range at step=60s over a 20-minute window covering the ingest. Each bucket's `count` is the SUM of that series' samples over the window, so a corpus straddling a step boundary is still recorded exactly; `emitted_buckets` is in the order the reference returned the series, and `wire_text` is the doubleValue text read off the HTTP body (not a re-rendering of a parsed float).",
+    "note": "the reference reports a step interval only once wall-clock passes its right edge, so at this capture's step=60s a bucket can take up to about a minute to appear. That lag is set by the STEP, not by block completion: at a 5 s step the same histogram appeared 10.1 s after ingest (A/B, issue #252, 2026-08-05). It is why the e2e control polls the reference rather than querying it once",
+    "series_order": "`emitted_buckets` order is RECORDED, not matched: PulsusDB emits histogram series ascending by bucket, a ledgered divergence (2026-08-05-traceql-histogram-series-order). Each corpus's reference sequence is pinned as an explicit expectation in tests/traces_log2_reference.rs, so a change on their side fails rather than being absorbed. The reference's order is lexicographic on Go's %g rendering of the label - sortResponse compares AnyValue.String(), which is proto.CompactTextString (pkg/tempopb/common/v1/common.pb.go:46 @ v3.0.2) ending at gogo writeAny's default arm, fmt.Fprint, i.e. Go %v/%g - so it is neither numeric nor the order of its own wire text.",
+    "reference_source": "pkg/traceql/engine_metrics.go:2038 Log2Bucketize, :2058 Log2QuantileWithBucket, ast_metrics.go:181 bucketizeDuration, modules/frontend/combiner/metrics_query_range.go:245 sortResponse - all @ v3.0.2 (0c4b926d09234186de39833e9c7ecb5b7614c8b9)"
+  },
+  "corpora": [
+    {
+      "name": "w252",
+      "service": "w252",
+      "why": "an occupancy GAP: 2^30, 2^31 and 2^32 sit between the two occupied buckets and the reference emits no series for any of them",
+      "durations_ns": [
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        5000000000,
+        5000000000,
+        5000000000,
+        5000000000,
+        5000000000,
+        5000000000,
+        5000000000,
+        5000000000,
+        5000000000,
+        5000000000
+      ],
+      "histogram_query": "{ resource.service.name = \"w252\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 536870912,
+          "seconds": 0.536870912,
+          "count": 10,
+          "wire_text": "0.536870912"
+        },
+        {
+          "bucket_ns": 8589934592,
+          "seconds": 8.589934592,
+          "count": 10,
+          "wire_text": "8.589934592"
+        }
+      ],
+      "absent_buckets_ns": [
+        1073741824,
+        2147483648,
+        4294967296
+      ],
+      "count_over_time": 20,
+      "quantile_query": "{ resource.service.name = \"w252\" } | quantile_over_time(duration, 0, 0.25, 0.5, 0.75, 0.9, 0.99, 1)",
+      "quantiles": [
+        {
+          "p": 0,
+          "value": 0.2877019981446288,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.25,
+          "value": 0.3796250624970063,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.5,
+          "value": 0.536870912,
+          "branch": "exact"
+        },
+        {
+          "p": 0.75,
+          "value": 2.147483648,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.9,
+          "value": 4.933621867681264,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.99,
+          "value": 8.589934592,
+          "branch": "exact"
+        },
+        {
+          "p": 1,
+          "value": 8.589934592,
+          "branch": "exact"
+        }
+      ]
+    },
+    {
+      "name": "mix252",
+      "service": "mix252",
+      "why": "the sub-2ns drop: 0 ns and 1 ns produce no bucket at all while count_over_time still counts all five spans. Also the smallest ORDER witness: the reference returns 2^20 before 2^1",
+      "durations_ns": [
+        0,
+        1,
+        2,
+        3,
+        1000000
+      ],
+      "histogram_query": "{ resource.service.name = \"mix252\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 1048576,
+          "seconds": 0.001048576,
+          "count": 1,
+          "wire_text": "0.001048576"
+        },
+        {
+          "bucket_ns": 2,
+          "seconds": 2e-09,
+          "count": 1,
+          "wire_text": "2e-9"
+        },
+        {
+          "bucket_ns": 4,
+          "seconds": 4e-09,
+          "count": 1,
+          "wire_text": "4e-9"
+        }
+      ],
+      "absent_buckets_ns": [
+        1,
+        8,
+        16
+      ],
+      "count_over_time": 5,
+      "quantile_query": null,
+      "quantiles": []
+    },
+    {
+      "name": "u280",
+      "service": "checkout-280ms",
+      "why": "one of the three single-bucket corpora whose quantiles are byte-identical: the reference's percentile is a function of the OCCUPIED BUCKET, not of the durations in it",
+      "durations_ns": [
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000,
+        280000000
+      ],
+      "histogram_query": "{ resource.service.name = \"checkout-280ms\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 536870912,
+          "seconds": 0.536870912,
+          "count": 20,
+          "wire_text": "0.536870912"
+        }
+      ],
+      "absent_buckets_ns": [
+        268435456,
+        1073741824
+      ],
+      "count_over_time": 20,
+      "quantile_query": "{ resource.service.name = \"checkout-280ms\" } | quantile_over_time(duration, 0.5, 0.9, 0.99, 1.0)",
+      "quantiles": [
+        {
+          "p": 0.5,
+          "value": 0.3796250624970063,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.9,
+          "value": 0.5009182730924541,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.99,
+          "value": 0.536870912,
+          "branch": "exact"
+        },
+        {
+          "p": 1,
+          "value": 0.536870912,
+          "branch": "exact"
+        }
+      ]
+    },
+    {
+      "name": "u300",
+      "service": "checkout",
+      "why": "the docs/api.md 4.4.1 worked example's corpus: true p99 = 0.3 s, reference p99 = 0.536870912 s",
+      "durations_ns": [
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000,
+        300000000
+      ],
+      "histogram_query": "{ resource.service.name = \"checkout\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 536870912,
+          "seconds": 0.536870912,
+          "count": 20,
+          "wire_text": "0.536870912"
+        }
+      ],
+      "absent_buckets_ns": [
+        268435456,
+        1073741824
+      ],
+      "count_over_time": 20,
+      "quantile_query": "{ resource.service.name = \"checkout\" } | quantile_over_time(duration, 0.5, 0.9, 0.99, 1.0)",
+      "quantiles": [
+        {
+          "p": 0.5,
+          "value": 0.3796250624970063,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.9,
+          "value": 0.5009182730924541,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.99,
+          "value": 0.536870912,
+          "branch": "exact"
+        },
+        {
+          "p": 1,
+          "value": 0.536870912,
+          "branch": "exact"
+        }
+      ]
+    },
+    {
+      "name": "u520",
+      "service": "checkout-520ms",
+      "why": "an 86% rise over checkout-280ms that the reference reports as identical bytes at every p",
+      "durations_ns": [
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000,
+        520000000
+      ],
+      "histogram_query": "{ resource.service.name = \"checkout-520ms\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 536870912,
+          "seconds": 0.536870912,
+          "count": 20,
+          "wire_text": "0.536870912"
+        }
+      ],
+      "absent_buckets_ns": [
+        268435456,
+        1073741824
+      ],
+      "count_over_time": 20,
+      "quantile_query": "{ resource.service.name = \"checkout-520ms\" } | quantile_over_time(duration, 0.5, 0.9, 0.99, 1.0)",
+      "quantiles": [
+        {
+          "p": 0.5,
+          "value": 0.3796250624970063,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.9,
+          "value": 0.5009182730924541,
+          "branch": "interpolated"
+        },
+        {
+          "p": 0.99,
+          "value": 0.536870912,
+          "branch": "exact"
+        },
+        {
+          "p": 1,
+          "value": 0.536870912,
+          "branch": "exact"
+        }
+      ]
+    },
+    {
+      "name": "tiny252",
+      "service": "tiny252",
+      "why": "JSON float-text witnesses at both ends of the ladder (2^10 ns and 2^40 ns); its emitted order happens to be ascending, which is why it is not an order witness",
+      "durations_ns": [
+        600,
+        700000000000
+      ],
+      "histogram_query": "{ resource.service.name = \"tiny252\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 1024,
+          "seconds": 1.024e-06,
+          "count": 1,
+          "wire_text": "0.000001024"
+        },
+        {
+          "bucket_ns": 1099511627776,
+          "seconds": 1099.511627776,
+          "count": 1,
+          "wire_text": "1099.511627776"
+        }
+      ],
+      "absent_buckets_ns": [
+        512,
+        2048
+      ],
+      "count_over_time": 2,
+      "quantile_query": null,
+      "quantiles": []
+    },
+    {
+      "name": "mix1024",
+      "service": "mix1024",
+      "why": "ORDER witness: 2^10 ns and 2^20 ns. The reference returns 2^20 first, which is neither ascending nor the order of its own wire text (0.000001024 sorts first there) - the sort key is Go %g on AnyValue.String(), not the response body",
+      "durations_ns": [
+        600,
+        1000000
+      ],
+      "histogram_query": "{ resource.service.name = \"mix1024\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 1048576,
+          "seconds": 0.001048576,
+          "count": 1,
+          "wire_text": "0.001048576"
+        },
+        {
+          "bucket_ns": 1024,
+          "seconds": 1.024e-06,
+          "count": 1,
+          "wire_text": "0.000001024"
+        }
+      ],
+      "absent_buckets_ns": [
+        512,
+        2048,
+        2097152
+      ],
+      "count_over_time": 2,
+      "quantile_query": null,
+      "quantiles": []
+    },
+    {
+      "name": "mix16k",
+      "service": "mix16k",
+      "why": "ORDER witness: a 16 us span (2^14 ns) beside a 1 ms span (2^20 ns). The reference returns 2^20 first because %g renders 2^14 as 1.6384e-05",
+      "durations_ns": [
+        10000,
+        1000000
+      ],
+      "histogram_query": "{ resource.service.name = \"mix16k\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 1048576,
+          "seconds": 0.001048576,
+          "count": 1,
+          "wire_text": "0.001048576"
+        },
+        {
+          "bucket_ns": 16384,
+          "seconds": 1.6384e-05,
+          "count": 1,
+          "wire_text": "0.000016384"
+        }
+      ],
+      "absent_buckets_ns": [
+        8192,
+        32768,
+        2097152
+      ],
+      "count_over_time": 2,
+      "quantile_query": null,
+      "quantiles": []
+    },
+    {
+      "name": "mixladder",
+      "service": "mixladder",
+      "why": "ORDER witness, the docs/api.md 4.4.1 example: spans at 1 us, 16 us, 1 ms and 1 s come back 1 ms, 1 us, 1 s, 16 us - not ascending, not descending, not the order of the wire text",
+      "durations_ns": [
+        1000,
+        16000,
+        1000000,
+        1000000000
+      ],
+      "histogram_query": "{ resource.service.name = \"mixladder\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 1048576,
+          "seconds": 0.001048576,
+          "count": 1,
+          "wire_text": "0.001048576"
+        },
+        {
+          "bucket_ns": 1024,
+          "seconds": 1.024e-06,
+          "count": 1,
+          "wire_text": "0.000001024"
+        },
+        {
+          "bucket_ns": 1073741824,
+          "seconds": 1.073741824,
+          "count": 1,
+          "wire_text": "1.073741824"
+        },
+        {
+          "bucket_ns": 16384,
+          "seconds": 1.6384e-05,
+          "count": 1,
+          "wire_text": "0.000016384"
+        }
+      ],
+      "absent_buckets_ns": [
+        512,
+        2048,
+        32768,
+        2097152,
+        536870912
+      ],
+      "count_over_time": 4,
+      "quantile_query": null,
+      "quantiles": []
+    },
+    {
+      "name": "expform",
+      "service": "expform",
+      "why": "the remaining WIRE-TEXT witnesses 2^11..2^13, so the recorded label-text divergence is measured on every member of 2^10..2^13 rather than derived for three of them",
+      "durations_ns": [
+        1500,
+        3000,
+        6000
+      ],
+      "histogram_query": "{ resource.service.name = \"expform\" } | histogram_over_time(duration)",
+      "emitted_buckets": [
+        {
+          "bucket_ns": 2048,
+          "seconds": 2.048e-06,
+          "count": 1,
+          "wire_text": "0.000002048"
+        },
+        {
+          "bucket_ns": 4096,
+          "seconds": 4.096e-06,
+          "count": 1,
+          "wire_text": "0.000004096"
+        },
+        {
+          "bucket_ns": 8192,
+          "seconds": 8.192e-06,
+          "count": 1,
+          "wire_text": "0.000008192"
+        }
+      ],
+      "absent_buckets_ns": [
+        1024,
+        16384,
+        1048576
+      ],
+      "count_over_time": 3,
+      "quantile_query": null,
+      "quantiles": []
+    }
+  ]
+}

@@ -12,7 +12,9 @@
 //! SearchPlan`), [`search_sql`] (the pure, byte-frozen SQL builders),
 //! [`search_eval`] (the pure Phase-2 exact evaluator), [`metrics_plan`]/
 //! [`metrics_sql`] (the issue #59 TraceQL metrics planner + byte-frozen
-//! single-query pushdown builders), [`tags_sql`] (the pure §4.3
+//! single-query pushdown builders), [`log2_histogram`] (the reference's
+//! pure `histogram_over_time` bucket rule, issue #252), [`tags_sql`]
+//! (the pure §4.3
 //! tag-discovery builders — catalog-only, issue #58), [`sql`]/[`rows`]
 //! (point-read builder + `ChClient` result-row shapes), and [`exec`]
 //! (`TraceEngine`, the only module here that talks to ClickHouse).
@@ -20,6 +22,7 @@
 pub mod exec;
 pub mod filter;
 pub mod graph_sql;
+pub mod log2_histogram;
 pub mod metrics_plan;
 pub mod metrics_result;
 pub mod metrics_sql;
