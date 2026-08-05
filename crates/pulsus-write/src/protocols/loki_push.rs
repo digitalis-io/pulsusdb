@@ -47,7 +47,10 @@
 use std::collections::HashSet;
 
 use prost::Message;
-use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano, stream_fingerprint};
+use pulsus_model::{
+    Date, Fingerprint, LabelSet, UnixNano, retain_non_empty_values, stream_fingerprint,
+    strip_empty_valued_labels,
+};
 
 use crate::error::LogsIngestError;
 use crate::protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow};
@@ -680,10 +683,25 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 /// through this one seam so the stored `log_samples.structured_metadata`
 /// String is byte-identical across transports by construction.
 ///
+/// - Every EMPTY-VALUED pair is stripped first, BY NAME
+///   ([`strip_empty_valued_labels`]) — the reference's distributor runs the
+///   whole entry's structured metadata through Prometheus' `labels.Builder`,
+///   which deletes empty-valued base labels
+///   (`pkg/distributor/distributor.go:698-722 @ v3.7.4`; issue #259). This is
+///   the one seam every structured-metadata producer funnels through, so the
+///   strip applies to the Loki-push transports and the OTLP-logs scope path
+///   alike, exactly as the reference's single distributor seam does for its
+///   own two transports (`PushHandler` / `OTLPPushHandler` both reach
+///   `pushHandler` -> `Push`, `pkg/distributor/http.go:27-34 @ v3.7.4`).
+///   By-name is the correct primitive HERE and the wrong one for stream
+///   labels, which the reference strips pair-wise; see `parse_label_set`.
 /// - The **empty** set yields `""` (an empty string, NOT `"{}"`) so the read
 ///   path's `structured_metadata.is_empty()` fast-path branch stays on the
 ///   zero-structured-metadata path for entries that carry none — the common
-///   case, and the byte-identity invariant for pre-#97 data.
+///   case, and the byte-identity invariant for pre-#97 data. A set that
+///   becomes empty because every pair was empty-valued yields `""` too: the
+///   entry is still stored, just with no structured metadata (measured — a
+///   push of `{"a":""}` alone stores the line and no SM on the reference).
 /// - A non-empty set is normalized through the same `LabelSet::from_normalized`
 ///   then `to_canonical_json` seam stream labels use, so a structured-metadata
 ///   JSON string is byte-identical in shape to a stream-labels JSON string.
@@ -700,11 +718,18 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 pub(crate) fn structured_metadata_json(
     pairs: impl IntoIterator<Item = (String, String)>,
 ) -> String {
-    let mut iter = pairs.into_iter().peekable();
-    if iter.peek().is_none() {
+    // Materialized because the empty-value strip deletes BY NAME and therefore
+    // needs a second look at the pair list (`strip_empty_valued_labels`). The
+    // per-entry cardinality/byte caps are charged on borrowed data by
+    // `canonical_structured_metadata` BEFORE this is reached, so the `Vec` is
+    // bounded, and `LabelSet::from_normalized` allocates a `BTreeMap` of
+    // `BTreeSet`s from it immediately afterwards either way.
+    let mut pairs: Vec<(String, String)> = pairs.into_iter().collect();
+    strip_empty_valued_labels(&mut pairs);
+    if pairs.is_empty() {
         return String::new();
     }
-    let (labels, _collisions) = LabelSet::from_normalized(iter);
+    let (labels, _collisions) = LabelSet::from_normalized(pairs);
     labels.to_canonical_json()
 }
 
@@ -916,11 +941,20 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
                 )));
             }
         }
-        let pairs = stream
+        let mut pairs = stream
             .stream
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<Vec<_>>();
+        // Empty-valued stream labels are dropped on this transport too — the
+        // reference reaches `syntax.ParseLabels`/`WithoutEmpty` from both
+        // encodings (issue #259); see `parse_label_set`. `stream.stream` is a
+        // key-unique map (`BoundedLabelMap`, last-write-wins) exactly as the
+        // reference's JSON label object is (`pkg/loghttp/labels.go:24-40 @
+        // v3.7.4`), so no duplicate name reaches this strip and the pair-wise
+        // / by-name distinction cannot bite here — the pair-wise primitive is
+        // still the right one, because this is the stream-label seam.
+        retain_non_empty_values(&mut pairs);
         let (labels, collisions) = LabelSet::from_normalized(pairs);
         let entries = stream.values.iter().map(|entry| {
             let timestamp_ns = entry.timestamp.parse::<i64>().map_err(|_| {
@@ -1065,6 +1099,31 @@ fn resolve_pb_timestamp(ts: &Timestamp) -> Result<i64, LogsIngestError> {
 /// [`LogsIngestError::LokiDecode`] (a whole-request 400). Prometheus value
 /// escaping (`\\`, `\"`, `\n`, `\t`, `\r`) is unescaped; the empty set `{}`
 /// yields an empty `LabelSet`.
+///
+/// **Empty-valued labels are dropped** ([`retain_non_empty_values`], issue
+/// #259): the reference parses this same literal with `syntax.ParseLabels`,
+/// which returns `ls.WithoutEmpty()` (`pkg/logql/syntax/parser.go:279-296 @
+/// v3.7.4`) precisely so that an empty-valued label cannot perturb the stream
+/// hash. Measured against `grafana/loki:3.7.4`: `{svc="x", e=""}` and
+/// `{svc="x"}` are the SAME stream, and a whitespace-only value (`e=" "`) is
+/// a DIFFERENT one — only an exactly-empty value is dropped.
+///
+/// The strip is **pair-wise**, not by-name: this literal is the one log-ingest
+/// input that can carry the same name twice (the reference's `labels.New`
+/// sorts without de-duplicating,
+/// `vendor/…/model/labels/labels_stringlabels.go:312-318 @ v3.7.4`), and
+/// `WithoutEmpty` removes only the empty occurrence. Measured on
+/// `grafana/loki:3.7.4`: a protobuf push of `{d="", d="keep"}` **and** one of
+/// `{d="keep", d=""}` both store `d="keep"`. The structured-metadata seam uses
+/// the by-name [`strip_empty_valued_labels`] instead, and for the same input
+/// keeps no `d` at all.
+///
+/// Ordering note for the label-count/length/duplicate bounds (issue #374):
+/// they must be charged on the POST-strip pair list. The reference strips in
+/// `ParseLabels` and only then calls `ValidateLabels`
+/// (`pkg/distributor/validator.go:157-199 @ v3.7.4`), which is why
+/// `{d="", d="keep"}` is a 204 above while `{d="one", d="two"}` is a 400
+/// `has duplicate label name` (both measured).
 fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
     let trimmed = input.trim();
     let inner = trimmed
@@ -1109,6 +1168,7 @@ fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
             break;
         }
     }
+    retain_non_empty_values(&mut pairs);
     Ok(LabelSet::from_normalized(pairs))
 }
 
@@ -2648,6 +2708,217 @@ mod tests {
             out.rows[0].structured_metadata,
             r#"{"trace_id":"abc","user_id":"42"}"#
         );
+    }
+
+    // -- issue #259: empty-valued structured metadata / stream labels ------
+
+    #[test]
+    fn parse_protobuf_strips_empty_valued_structured_metadata() {
+        // Measured on `grafana/loki:3.7.4` (`discover_log_levels: false`): a
+        // push carrying SM `{"a":"","b":"v"}` comes back with `b="v"` only.
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "hello",
+                    vec![label_pair("a", ""), label_pair("b", "v")],
+                )],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert_eq!(out.rows[0].structured_metadata, r#"{"b":"v"}"#);
+    }
+
+    #[test]
+    fn parse_protobuf_entry_whose_whole_metadata_set_is_empty_valued_is_still_stored() {
+        // The ENTRY survives; only its structured metadata goes. `""` (not
+        // `"{}"`) keeps the read path on the zero-SM fast path. Measured: the
+        // reference stores the line and answers with no SM label.
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "hello",
+                    vec![label_pair("a", "")],
+                )],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].body, "hello");
+        assert_eq!(out.rows[0].structured_metadata, "");
+    }
+
+    #[test]
+    fn parse_protobuf_keeps_whitespace_only_structured_metadata_values() {
+        // Only an exactly-empty value is dropped; no trimming. Measured:
+        // `{"a":" "}` round-trips as `a=" "` on the reference.
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "hello",
+                    vec![label_pair("a", " "), label_pair("b", "\t")],
+                )],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            "{\"a\":\" \",\"b\":\"\\t\"}"
+        );
+    }
+
+    #[test]
+    fn parse_protobuf_duplicate_metadata_name_with_one_empty_drops_both() {
+        // Deletion is by NAME (Prometheus' `labels.Builder`), so the non-empty
+        // twin goes too — in EITHER order. Duplicate names are reachable here:
+        // `structured_metadata` is prost's raw repeated field.
+        for sm in [
+            vec![label_pair("a", ""), label_pair("a", "keep")],
+            vec![label_pair("a", "keep"), label_pair("a", "")],
+        ] {
+            let req = PushRequest {
+                streams: vec![StreamAdapter {
+                    labels: r#"{service_name="checkout"}"#.to_string(),
+                    entries: vec![entry_with_sm(1_700_000_000, "hello", sm.clone())],
+                }],
+            };
+            let out = parse_protobuf(&req, 0).unwrap();
+            assert_eq!(out.rows[0].structured_metadata, "", "sm: {sm:?}");
+        }
+    }
+
+    #[test]
+    fn parse_json_strips_empty_valued_structured_metadata_identically() {
+        // Cross-transport identity: the JSON body carrying the same SM yields
+        // the byte-identical stored String as the protobuf one above.
+        let body = br#"{"streams":[{"stream":{"service_name":"checkout"},
+            "values":[["1700000000000000000","hello",{"a":"","b":"v"}]]}]}"#;
+        let out = parse_json(body, 0).unwrap();
+        assert_eq!(out.rows[0].structured_metadata, r#"{"b":"v"}"#);
+
+        let all_empty = br#"{"streams":[{"stream":{"service_name":"checkout"},
+            "values":[["1700000000000000000","hello",{"a":""}]]}]}"#;
+        let out = parse_json(all_empty, 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].structured_metadata, "");
+
+        // Duplicate JSON keys survive deserialization as raw pairs, so the
+        // by-name delete is reachable on this transport too.
+        let dup = br#"{"streams":[{"stream":{"service_name":"checkout"},
+            "values":[["1700000000000000000","hello",{"a":"","a":"keep"}]]}]}"#;
+        let out = parse_json(dup, 0).unwrap();
+        assert_eq!(out.rows[0].structured_metadata, "");
+    }
+
+    #[test]
+    fn empty_valued_stream_labels_are_stripped_on_both_transports() {
+        // `syntax.ParseLabels` returns `ls.WithoutEmpty()`
+        // (`pkg/logql/syntax/parser.go:279-296 @ v3.7.4`). Measured on
+        // `grafana/loki:3.7.4`: `{svc="x", e=""}` and `{svc="x"}` are the SAME
+        // stream. So they must fingerprint alike here.
+        let (with_empty, _) = parse_label_set(r#"{service_name="checkout", e=""}"#).unwrap();
+        let (without, _) = parse_label_set(r#"{service_name="checkout"}"#).unwrap();
+        assert_eq!(
+            with_empty.to_canonical_json(),
+            r#"{"service_name":"checkout"}"#
+        );
+        assert_eq!(
+            stream_fingerprint(&with_empty),
+            stream_fingerprint(&without)
+        );
+
+        // Whitespace is not empty: kept, and a distinct stream.
+        let (ws, _) = parse_label_set(r#"{service_name="checkout", e=" "}"#).unwrap();
+        assert_eq!(
+            ws.to_canonical_json(),
+            r#"{"e":" ","service_name":"checkout"}"#
+        );
+        assert_ne!(stream_fingerprint(&ws), stream_fingerprint(&without));
+
+        // JSON transport agrees, down to the fingerprint.
+        let json = br#"{"streams":[{"stream":{"service_name":"checkout","e":""},
+            "values":[["1700000000000000000","hello"]]}]}"#;
+        let out = parse_json(json, 0).unwrap();
+        assert_eq!(out.streams.len(), 1);
+        assert_eq!(
+            out.streams[0].labels.to_canonical_json(),
+            r#"{"service_name":"checkout"}"#
+        );
+        assert_eq!(out.streams[0].fingerprint, stream_fingerprint(&without));
+        assert_eq!(out.rows[0].fingerprint, stream_fingerprint(&without));
+    }
+
+    /// A duplicate stream-label name where one occurrence is empty keeps the
+    /// non-empty twin — the stream-label seam strips PAIR-WISE, unlike the
+    /// structured-metadata seam above, which deletes the whole name.
+    ///
+    /// Of the two push encodings only the protobuf label literal carries a
+    /// duplicate name this far: the JSON transport's label object is a
+    /// key-unique map on both sides. Measured on `grafana/loki:3.7.4`,
+    /// protobuf, both orders -> `d="keep"`.
+    /// (At `v3.4.2` this seam was `labels.NewBuilder(ls).Labels()`,
+    /// `pkg/logql/syntax/parser.go:254-272 @ v3.4.2`, i.e. by-name — the rule
+    /// changed with the pinned version, so the citation matters more than the
+    /// intuition.)
+    #[test]
+    fn a_duplicate_stream_label_name_with_one_empty_keeps_the_non_empty_twin() {
+        for literal in [
+            r#"{service_name="checkout", d="", d="keep"}"#,
+            r#"{service_name="checkout", d="keep", d=""}"#,
+        ] {
+            let (labels, _) = parse_label_set(literal).unwrap();
+            assert_eq!(
+                labels.to_canonical_json(),
+                r#"{"d":"keep","service_name":"checkout"}"#,
+                "literal: {literal}"
+            );
+        }
+
+        // The same duplicate as STRUCTURED METADATA loses `d` entirely — the
+        // discriminating pair, asserted side by side so the two rules cannot
+        // silently converge.
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "hello",
+                    vec![label_pair("d", ""), label_pair("d", "keep")],
+                )],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert_eq!(out.rows[0].structured_metadata, "");
+    }
+
+    /// A stream whose labels are ALL empty-valued strips down to the empty
+    /// label set, and PulsusDB stores it.
+    ///
+    /// **This is a divergence, not parity.** The reference strips first and
+    /// then rejects the empty remainder in `ValidateLabels`
+    /// (`ls.IsEmpty()` -> `MissingLabelsErrorMsg`,
+    /// `pkg/distributor/validator.go:157-162 @ v3.7.4`). Measured on
+    /// `grafana/loki:3.7.4`: a push of `{"onlyempty":""}` answers `400 error
+    /// at least one label pair is required per stream` on both transports —
+    /// the same answer it gives a literal `{}` push, which PulsusDB also
+    /// accepts today. So this is the pre-existing "we accept a label-less
+    /// stream" divergence being reached by one more input, NOT a new one; it
+    /// belongs to the ingest label-validation work (#374), which owns
+    /// `ValidateLabels`, and is deliberately not fixed here.
+    #[test]
+    fn a_stream_whose_labels_are_all_empty_valued_becomes_the_empty_label_set() {
+        let (labels, _) = parse_label_set(r#"{e=""}"#).unwrap();
+        assert!(labels.is_empty());
+        assert_eq!(labels.service(), "");
+
+        // Identical outcome to the literal empty set we already accepted.
+        let (already_empty, _) = parse_label_set("{}").unwrap();
+        assert_eq!(labels, already_empty);
     }
 
     #[test]

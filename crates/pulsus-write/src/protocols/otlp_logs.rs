@@ -17,7 +17,8 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use pulsus_model::{
-    Date, Fingerprint, LabelSet, UnixNano, canonicalize_label_key, stream_fingerprint,
+    Date, Fingerprint, LabelSet, UnixNano, canonicalize_label_key, retain_non_empty_values,
+    stream_fingerprint, strip_empty_valued_labels,
 };
 
 use crate::error::LogsIngestError;
@@ -241,9 +242,41 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
 /// never swapped. Because scope no longer enters this set, `stream_fingerprint`
 /// is a pure function of the resource labels — a stream pushed with vs.
 /// without scope fingerprints identically, exactly as Loki does.
+///
+/// An EMPTY-VALUED attribute is dropped ([`retain_non_empty_values`], issue
+/// #259): the reference's OTLP path collects the promoted labels into a map
+/// and renders it back into a label-set literal
+/// (`pkg/loghttp/push/otlp.go:240-250 @ v3.7.4`) that the distributor
+/// re-parses with `syntax.ParseLabels`/`WithoutEmpty`
+/// (`pkg/logql/syntax/parser.go:279-296 @ v3.7.4`), so an empty-valued stream
+/// label never reaches storage there either. This keeps the fingerprint a
+/// function of the non-empty labels only — the hash-determinism reason the
+/// reference gives inline. Measured on `grafana/loki:3.7.4` with
+/// `categorize-labels` (so stream labels are read apart from structured
+/// metadata) and an attribute the reference actually promotes — its default
+/// only indexes an allow-list, `pkg/loghttp/push/otlp_config.go:56-74 @
+/// v3.7.4`, whereas PulsusDB promotes every resource attribute (a
+/// pre-existing, separate difference): a resource carrying
+/// `deployment.environment=""` yields the same stream as one omitting it,
+/// while `deployment.environment=" "` yields a distinct one.
+///
+/// The pair-wise primitive is the right one at a stream-label seam; the
+/// structured-metadata seam below uses the by-name
+/// [`strip_empty_valued_labels`] instead. For a LITERALLY duplicated
+/// attribute key the reference is order-dependent — it maps the promoted
+/// attributes last-write-wins before stripping (`otlp.go:193`), measured as
+/// `cloud.region=""` then `="eu"` -> `eu` kept, and `="eu"` then `=""` ->
+/// dropped. PulsusDB resolves a duplicate key by `from_normalized`'s frozen
+/// order-independent rule (issue #4) instead, which already diverges there and
+/// is unchanged by this strip: pair-wise leaves the non-empty twin for
+/// `from_normalized` to resolve exactly as it did before #259. By-name would
+/// NOT have been neutral — it would drop both twins and change a case the
+/// reference keeps.
 fn build_stream_labels(resource: Option<&Resource>) -> (LabelSet, usize) {
     let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    LabelSet::from_normalized(attr_pairs(resource_attrs))
+    let mut pairs: Vec<(String, String)> = attr_pairs(resource_attrs).collect();
+    retain_non_empty_values(&mut pairs);
+    LabelSet::from_normalized(pairs)
 }
 
 /// Builds the per-entry structured-metadata JSON String carrying a log
@@ -261,8 +294,23 @@ fn build_stream_labels(resource: Option<&Resource>) -> (LabelSet, usize) {
 /// - **(b)** two attributes sanitizing to the same key resolve to the LAST in
 ///   wire order (NOT by key/value — the property `LabelSet::from_normalized`'s
 ///   order-independent greatest-key/greatest-value rule cannot satisfy).
-/// - **(c)** an empty-valued scope *attribute* is KEPT; only scope
-///   *name*/*version* are empty-suppressed (#108).
+/// - **(c)** an empty-valued scope *attribute* is DROPPED, as is any other
+///   empty-valued structured-metadata pair; scope *name*/*version* stay
+///   empty-suppressed at their own append site (#108).
+///
+///   Rule (c) is the one that changed with the reference version, and it is
+///   the reason this comment no longer says "KEPT" (issue #259). Loki 3.4.2's
+///   distributor mutated an entry's structured metadata in place, with no
+///   empty-value filter anywhere on the path
+///   (`pkg/distributor/distributor.go:548-557 @ v3.4.2` — assignments to
+///   `structuredMetadata[i].Name/.Value`, no builder); at the pinned v3.7.4
+///   the same block routes through Prometheus' `labels.Builder`, which deletes
+///   empty-valued base labels by name
+///   (`pkg/distributor/distributor.go:698-722 @ v3.7.4`). The 3.4.2 half of
+///   that is read from its source, not re-measured; the v3.7.4 half is
+///   measured on `grafana/loki:3.7.4` (`b318f282`) with an OTLP body carrying
+///   scope attributes `team=""` + `keep="1"`, which comes back with `keep`
+///   and no `team`.
 ///
 /// The resolution is done explicitly HERE, before the [`structured_metadata_json`]
 /// seam, because `from_normalized` mis-resolves (a)/(b). Keys are sanitized with
@@ -274,9 +322,9 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> String {
     let Some(scope) = scope_logs.scope.as_ref() else {
         return String::new();
     };
-    // Ordered (sanitized_key, value): attributes in wire order (no empty-value
-    // filter — rule (c)), then identity appended last so it overwrites any
-    // colliding attribute (rule (a)); each identity field empty-suppressed (#108).
+    // Ordered (sanitized_key, value): attributes in wire order, then identity
+    // appended last so it overwrites any colliding attribute (rule (a)); each
+    // identity field empty-suppressed (#108).
     let mut ordered: Vec<(String, String)> = attr_pairs(&scope.attributes)
         .map(|(key, value)| (canonicalize_label_key(&key), value))
         .collect();
@@ -287,6 +335,24 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> String {
     if !scope.version.is_empty() {
         ordered.push(("scope_version".to_string(), scope.version.clone()));
     }
+    // Rule (c): the by-name strip runs over the WHOLE ordered list — every
+    // attribute AND both identity fields — and BEFORE the last-write-wins pass
+    // (issue #259). Both halves of that placement are load-bearing, each pinned
+    // by a measurement against `grafana/loki:3.7.4`:
+    //
+    // - Before last-write-wins, because the reference deletes by NAME over the
+    //   raw set: two attributes sanitizing to one key with either empty
+    //   (`a.b=""` + `a_b="v"`) lose the key entirely, in both wire orders.
+    //   Resolving first would elect the non-empty `"v"` and keep it.
+    // - Over the identity fields too, because an empty-valued attribute NAMED
+    //   `scope_name` takes the real `scope_name` with it: a body with scope
+    //   name `N`, version `1.0` and attribute `scope_name=""` comes back
+    //   carrying `scope_version="1.0"` and no `scope_name` at all. Stripping
+    //   before the identity append would leave `scope_name="N"` standing.
+    //
+    // Rule (a) (identity outranks a colliding attribute) still holds for
+    // NON-empty values: nothing is stripped, and the append order decides.
+    strip_empty_valued_labels(&mut ordered);
     // Last-write-wins per sanitized key (Loki's rule). Cardinality is tiny;
     // a linear replace-in-place over insertion order needs no new dependency.
     let mut resolved: Vec<(String, String)> = Vec::with_capacity(ordered.len());
@@ -748,26 +814,190 @@ mod tests {
     }
 
     #[test]
-    fn parse_keeps_empty_valued_scope_attribute_while_suppressing_empty_identity() {
-        // Rule (c): an empty-valued scope ATTRIBUTE is retained, while empty
-        // scope name/version stay suppressed — the deliberate asymmetry.
-        let kept = scope_sm(Some(scope(
+    fn parse_drops_empty_valued_scope_attribute_and_suppresses_empty_identity() {
+        // Rule (c) at the pinned v3.7.4 (issue #259): an empty-valued scope
+        // ATTRIBUTE is dropped, exactly like an empty scope name/version. The
+        // 3.4.2-era asymmetry (attribute kept, identity suppressed) is gone —
+        // its distributor had no empty-value filter; v3.7.4's routes structured
+        // metadata through Prometheus' `labels.Builder`, which deletes
+        // empty-valued base labels by name.
+        let dropped = scope_sm(Some(scope(
             "N",
             "1.0",
             vec![kv("emptyattr", Value::StringValue(String::new()))],
         )));
-        assert_eq!(
-            kept,
-            r#"{"emptyattr":"","scope_name":"N","scope_version":"1.0"}"#
-        );
+        assert_eq!(dropped, r#"{"scope_name":"N","scope_version":"1.0"}"#);
 
         let empty_version = scope_sm(Some(scope(
             "N",
             "",
             vec![kv("emptyattr", Value::StringValue(String::new()))],
         )));
-        // `scope_version` absent (suppressed), `emptyattr` present (kept).
-        assert_eq!(empty_version, r#"{"emptyattr":"","scope_name":"N"}"#);
+        // `scope_version` absent (suppressed), `emptyattr` absent (dropped).
+        assert_eq!(empty_version, r#"{"scope_name":"N"}"#);
+
+        // A non-empty neighbour survives, and a WHITESPACE-only value is NOT
+        // empty — only an exactly-empty value is dropped (measured on
+        // `grafana/loki:3.7.4`: `{"a":" "}` round-trips as `a=" "`).
+        let mixed = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![
+                kv("emptyattr", Value::StringValue(String::new())),
+                kv("keep", Value::StringValue("1".to_string())),
+                kv("ws", Value::StringValue(" ".to_string())),
+            ],
+        )));
+        assert_eq!(
+            mixed,
+            r#"{"keep":"1","scope_name":"N","scope_version":"1.0","ws":" "}"#
+        );
+    }
+
+    #[test]
+    fn empty_valued_scope_attribute_drops_its_sanitized_twin_in_either_order() {
+        // The strip runs BEFORE the last-write-wins resolution, so deletion is
+        // by NAME over the whole raw set: two attributes sanitizing to the same
+        // key, one empty, lose BOTH — whichever order they arrive in. Resolving
+        // first would elect the non-empty value in one of the two orders
+        // (issue #259; `labels.Builder.Reset` records the NAME in `del`).
+        let empty_first = scope_sm(Some(scope(
+            "N",
+            "",
+            vec![
+                kv("a.b", Value::StringValue(String::new())),
+                kv("a_b", Value::StringValue("v".to_string())),
+            ],
+        )));
+        assert_eq!(empty_first, r#"{"scope_name":"N"}"#);
+
+        let empty_last = scope_sm(Some(scope(
+            "N",
+            "",
+            vec![
+                kv("a_b", Value::StringValue("v".to_string())),
+                kv("a.b", Value::StringValue(String::new())),
+            ],
+        )));
+        assert_eq!(empty_last, r#"{"scope_name":"N"}"#);
+    }
+
+    /// An empty-valued scope attribute named after an IDENTITY field deletes
+    /// that identity field too — the by-name strip covers `scope_name` and
+    /// `scope_version`, not just the attributes.
+    ///
+    /// Measured on `grafana/loki:3.7.4`: an OTLP body with scope name `N`,
+    /// version `1.0` and attribute `scope_name=""` comes back carrying
+    /// `scope_version="1.0"` and no `scope_name`; the mirror case with
+    /// attribute `scope_version=""` comes back with `scope_name="N"` alone.
+    /// Rule (a) is unaffected — a NON-empty attribute of the same name still
+    /// loses to the identity, asserted last.
+    #[test]
+    fn an_empty_valued_attribute_named_after_an_identity_field_deletes_it_too() {
+        let kills_name = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv("scope_name", Value::StringValue(String::new()))],
+        )));
+        assert_eq!(kills_name, r#"{"scope_version":"1.0"}"#);
+
+        let kills_version = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv("scope_version", Value::StringValue(String::new()))],
+        )));
+        assert_eq!(kills_version, r#"{"scope_name":"N"}"#);
+
+        // Rule (a), unchanged: a non-empty colliding attribute loses to the
+        // identity appended after it, and nothing is deleted.
+        let identity_wins = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv("scope_name", Value::StringValue("attr".to_string()))],
+        )));
+        assert_eq!(identity_wins, r#"{"scope_name":"N","scope_version":"1.0"}"#);
+    }
+
+    #[test]
+    fn empty_valued_resource_attribute_leaves_the_stream_label_set() {
+        // Stream labels get a strip too (issue #259), the PAIR-WISE one: the
+        // reference's OTLP path renders promoted labels back into a label-set
+        // literal that the distributor re-parses through
+        // `syntax.ParseLabels`/`WithoutEmpty`. Two resources differing only by
+        // an empty-valued attribute must therefore fingerprint identically —
+        // measured on `grafana/loki:3.7.4` with `deployment.environment`, one
+        // of the attributes its default config actually promotes to an index
+        // label.
+        let with_empty = build_stream_labels(Some(&Resource {
+            attributes: vec![
+                kv("service.name", Value::StringValue("checkout".to_string())),
+                kv("region", Value::StringValue(String::new())),
+            ],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }));
+        let without = build_stream_labels(Some(&Resource {
+            attributes: vec![kv(
+                "service.name",
+                Value::StringValue("checkout".to_string()),
+            )],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }));
+        assert_eq!(
+            with_empty.0.to_canonical_json(),
+            r#"{"service_name":"checkout"}"#
+        );
+        assert_eq!(with_empty.0, without.0);
+        assert_eq!(
+            stream_fingerprint(&with_empty.0),
+            stream_fingerprint(&without.0)
+        );
+
+        // Whitespace is not empty: it stays, and it changes the fingerprint.
+        let whitespace = build_stream_labels(Some(&Resource {
+            attributes: vec![
+                kv("service.name", Value::StringValue("checkout".to_string())),
+                kv("region", Value::StringValue(" ".to_string())),
+            ],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }));
+        assert_eq!(
+            whitespace.0.to_canonical_json(),
+            r#"{"region":" ","service_name":"checkout"}"#
+        );
+        assert_ne!(
+            stream_fingerprint(&whitespace.0),
+            stream_fingerprint(&without.0)
+        );
+    }
+
+    /// A literally duplicated resource-attribute key, one occurrence empty:
+    /// the pair-wise strip hands `from_normalized` the non-empty twin, so the
+    /// stored label is what it was before #259 and the frozen issue-#4
+    /// collision rule stays the only thing deciding duplicates. Pins the
+    /// neutrality claim in `build_stream_labels`' doc — the by-name strip
+    /// would drop both twins here and fail this test.
+    #[test]
+    fn a_duplicate_resource_attribute_with_one_empty_keeps_the_non_empty_twin() {
+        for attrs in [
+            vec![
+                kv("region", Value::StringValue(String::new())),
+                kv("region", Value::StringValue("eu".to_string())),
+            ],
+            vec![
+                kv("region", Value::StringValue("eu".to_string())),
+                kv("region", Value::StringValue(String::new())),
+            ],
+        ] {
+            let (labels, _) = build_stream_labels(Some(&Resource {
+                attributes: attrs,
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }));
+            assert_eq!(labels.to_canonical_json(), r#"{"region":"eu"}"#);
+        }
     }
 
     #[test]

@@ -29,6 +29,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use prost::Message;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_write::protocols::loki_push::{
@@ -756,6 +757,326 @@ async fn structured_metadata_double_collision_overwrites_the_extracted_slot_once
         !miss_lines.contains(&line.to_string()),
         "the overwritten base `env_extracted=baseval` must NOT match: {miss_lines:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #259: empty-valued structured metadata and empty-valued stream
+// labels are stripped at INGEST, so they are never written. Asserted on the
+// STORED ClickHouse rows (`log_samples.structured_metadata`,
+// `log_streams.labels`) rather than on a query response — the defect is a
+// write-path one, and a read-path assertion could be satisfied by a reader
+// that filtered on the way out.
+// ---------------------------------------------------------------------
+
+/// One `log_samples` row's stored body + structured metadata.
+#[derive(clickhouse::Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct StoredSample {
+    body: String,
+    structured_metadata: String,
+    fingerprint: u64,
+}
+
+/// One `log_streams` row's stored canonical label JSON.
+#[derive(clickhouse::Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct StoredStream {
+    fingerprint: u64,
+    labels: String,
+}
+
+async fn ch_client(db: &str) -> ChClient {
+    let cfg = ChConnConfig {
+        server: ch_host(),
+        http_port: ch_http_port(),
+        database: db.to_string(),
+        proto: ChProto::Http,
+        pool_size: 2,
+        query_timeout: Duration::from_secs(20),
+        ..ChConnConfig::default()
+    };
+    ChClient::new(cfg).await.expect("connect read-back client")
+}
+
+/// Every stored `log_samples` row for `service`, keyed by its `body`. Polls
+/// until `expected` rows have landed (the writer batches), so this never
+/// depends on a fixed sleep.
+async fn stored_samples_by_body(
+    client: &ChClient,
+    db: &str,
+    service: &str,
+    expected: usize,
+) -> HashMap<String, StoredSample> {
+    let sql = format!(
+        "SELECT body, structured_metadata, fingerprint FROM {db}.log_samples \
+         WHERE service = '{service}'"
+    );
+    let mut last = HashMap::new();
+    for _ in 0..80 {
+        let mut out: HashMap<String, StoredSample> = HashMap::new();
+        // Scoped so the pooled connection's lease is released before the next
+        // poll iteration borrows one.
+        {
+            let mut rows = client
+                .query_stream::<StoredSample>(&sql, &QuerySettings::new())
+                .await
+                .expect("query log_samples");
+            while let Some(row) = rows.next().await {
+                let row = row.expect("decode log_samples row");
+                out.insert(row.body.clone(), row);
+            }
+        }
+        if out.len() >= expected {
+            return out;
+        }
+        last = out;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("only {} of {expected} samples landed: {last:?}", last.len());
+}
+
+/// Every stored `log_streams` row for `service`.
+async fn stored_streams(client: &ChClient, db: &str, service: &str) -> Vec<StoredStream> {
+    let sql = format!(
+        "SELECT fingerprint, labels FROM {db}.log_streams WHERE service = '{service}' \
+         GROUP BY fingerprint, labels ORDER BY fingerprint"
+    );
+    let mut out = Vec::new();
+    let mut rows = client
+        .query_stream::<StoredStream>(&sql, &QuerySettings::new())
+        .await
+        .expect("query log_streams");
+    while let Some(row) = rows.next().await {
+        out.push(row.expect("decode log_streams row"));
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_valued_structured_metadata_is_never_stored() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_155;
+    let db = "pulsus_loki_push_empty_sm_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "sm-empty";
+
+    // (1) JSON: one empty-valued pair beside a non-empty one.
+    let mixed = "sm empty value beside a kept one";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm(service, base_ns, mixed, &[("a", ""), ("b", "v")]).as_bytes(),
+    );
+    assert_eq!(res.status, 204, "mixed SM push (body {})", res.body);
+
+    // (2) protobuf: the SAME logical entry, to prove the strip is not
+    // transport-specific.
+    let mixed_proto = "sm empty value beside a kept one over protobuf";
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &protobuf_body_with_sm(service, base_ns + 1, mixed_proto, &[("a", ""), ("b", "v")]),
+    );
+    assert_eq!(
+        res.status, 204,
+        "mixed SM protobuf push (body {})",
+        res.body
+    );
+
+    // (3) an entry whose WHOLE metadata set is empty-valued: the entry is
+    // still stored, with no structured metadata at all.
+    let all_empty = "sm entirely empty valued";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm(service, base_ns + 2, all_empty, &[("a", "")]).as_bytes(),
+    );
+    assert_eq!(res.status, 204, "all-empty SM push (body {})", res.body);
+
+    // (4) whitespace is NOT empty — it must survive verbatim.
+    let whitespace = "sm whitespace value survives";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm(service, base_ns + 3, whitespace, &[("a", " ")]).as_bytes(),
+    );
+    assert_eq!(res.status, 204, "whitespace SM push (body {})", res.body);
+
+    let client = ch_client(db).await;
+    let stored = stored_samples_by_body(&client, db, service, 4).await;
+
+    assert_eq!(
+        stored[mixed].structured_metadata, r#"{"b":"v"}"#,
+        "the empty-valued pair must not be in the STORED JSON"
+    );
+    assert_eq!(
+        stored[mixed_proto].structured_metadata, r#"{"b":"v"}"#,
+        "protobuf stores byte-identically to JSON"
+    );
+    assert_eq!(
+        stored[all_empty].structured_metadata, "",
+        "an all-empty-valued set stores as the empty string (not `{{}}`), and the \
+         entry itself is still stored"
+    );
+    assert_eq!(
+        stored[whitespace].structured_metadata, "{\"a\":\" \"}",
+        "only an exactly-empty value is dropped — no trimming"
+    );
+
+    // Nothing anywhere in this service's stored metadata carries an empty
+    // value. `to_canonical_json` renders a pair as `"k":"v"` with no spacing,
+    // so the three-byte token `:""` appears if and only if some value is
+    // empty — a value that merely CONTAINS `:""` is escaped to `:\"\"` and
+    // does not match.
+    for (body, row) in &stored {
+        assert!(
+            !row.structured_metadata.contains(":\"\""),
+            "stored row {body:?} still carries an empty-valued pair: {}",
+            row.structured_metadata
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_valued_stream_labels_are_never_stored_and_merge_the_stream() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_156;
+    let db = "pulsus_loki_push_empty_labels_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "labels-empty";
+
+    // Two pushes differing ONLY by an empty-valued stream label. On the
+    // reference these are one stream (`syntax.ParseLabels` -> `WithoutEmpty`,
+    // measured on grafana/loki:3.7.4 AND :3.4.2), so they must share one
+    // fingerprint and one `log_streams` label set here.
+    let with_empty_line = "stream carrying an empty-valued label";
+    let body = format!(
+        r#"{{"streams":[{{"stream":{{"service_name":"{service}","env":"prod","region":""}},"values":[["{base_ns}","{with_empty_line}"]]}}]}}"#
+    );
+    let res = push(port, "application/json", body.as_bytes());
+    assert_eq!(res.status, 204, "empty-label push (body {})", res.body);
+
+    let without_line = "stream without the label at all";
+    let ts = base_ns + 1;
+    let body = format!(
+        r#"{{"streams":[{{"stream":{{"service_name":"{service}","env":"prod"}},"values":[["{ts}","{without_line}"]]}}]}}"#
+    );
+    let res = push(port, "application/json", body.as_bytes());
+    assert_eq!(res.status, 204, "no-label push (body {})", res.body);
+
+    // The protobuf label-set literal takes the same route.
+    let proto_line = "stream carrying an empty-valued label over protobuf";
+    let ts = base_ns + 2;
+    let req = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: format!(r#"{{service_name="{service}", env="prod", region=""}}"#),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: ts / 1_000_000_000,
+                    nanos: (ts % 1_000_000_000) as i32,
+                }),
+                line: proto_line.to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        }],
+    };
+    let encoded = snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy compress");
+    let res = push(port, "application/x-protobuf", &encoded);
+    assert_eq!(res.status, 204, "protobuf empty-label push ({})", res.body);
+
+    // A whitespace-only value is a DIFFERENT stream — only exactly-empty is
+    // dropped.
+    let ws_line = "stream carrying a whitespace-valued label";
+    let ts = base_ns + 3;
+    let body = format!(
+        r#"{{"streams":[{{"stream":{{"service_name":"{service}","env":"prod","region":" "}},"values":[["{ts}","{ws_line}"]]}}]}}"#
+    );
+    let res = push(port, "application/json", body.as_bytes());
+    assert_eq!(res.status, 204, "whitespace-label push (body {})", res.body);
+
+    // A duplicate label name with one empty occurrence: the stream-label strip
+    // is PAIR-WISE, so the non-empty twin survives and the stored stream is
+    // `region="eu"`. (The structured-metadata strip is by-name and would leave
+    // no `region` — see `empty_valued_structured_metadata_is_never_stored`.)
+    // Only the protobuf literal can carry a duplicate name this far; measured
+    // on `grafana/loki:3.7.4`, both orders store `region="eu"`.
+    let dup_line = "stream carrying a duplicated label name, one empty";
+    let ts = base_ns + 4;
+    let req = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: format!(r#"{{service_name="{service}", env="prod", region="", region="eu"}}"#),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: ts / 1_000_000_000,
+                    nanos: (ts % 1_000_000_000) as i32,
+                }),
+                line: dup_line.to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        }],
+    };
+    let encoded = snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy compress");
+    let res = push(port, "application/x-protobuf", &encoded);
+    assert_eq!(res.status, 204, "duplicate-label push ({})", res.body);
+
+    let client = ch_client(db).await;
+    let stored = stored_samples_by_body(&client, db, service, 5).await;
+
+    assert_eq!(
+        stored[with_empty_line].fingerprint, stored[without_line].fingerprint,
+        "an empty-valued label must not perturb the stream fingerprint"
+    );
+    assert_eq!(
+        stored[proto_line].fingerprint, stored[without_line].fingerprint,
+        "the protobuf label-set literal takes the same route"
+    );
+    assert_ne!(
+        stored[ws_line].fingerprint, stored[without_line].fingerprint,
+        "a whitespace-only value is kept, so it IS a distinct stream"
+    );
+
+    // The stored `log_streams` rows: three label sets, none carrying
+    // `region=""`.
+    let streams = stored_streams(&client, db, service).await;
+    let mut labels: Vec<String> = streams.iter().map(|s| s.labels.clone()).collect();
+    labels.sort();
+    labels.dedup();
+    assert_eq!(
+        labels,
+        vec![
+            r#"{"env":"prod","region":" ","service_name":"labels-empty"}"#.to_string(),
+            r#"{"env":"prod","region":"eu","service_name":"labels-empty"}"#.to_string(),
+            r#"{"env":"prod","service_name":"labels-empty"}"#.to_string(),
+        ],
+        "stored label sets: the empty-valued one merged away, the whitespace one \
+         stayed, the duplicated name kept its non-empty twin"
+    );
+
+    // Nothing this service stored carries an empty-valued label. Rendered by
+    // `to_canonical_json` as `"k":"v"` with no spacing, so the token `:""`
+    // appears iff some value is empty — a value that merely CONTAINS `:""` is
+    // escaped to `:\"\"` and does not match.
+    for row in &streams {
+        assert!(
+            !row.labels.contains(":\"\""),
+            "stored stream still carries an empty-valued label: {}",
+            row.labels
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

@@ -44,6 +44,106 @@ pub struct LabelSet {
     entries: Vec<(String, String)>,
 }
 
+/// Drops every pair whose value is exactly `""`, leaving any same-named
+/// non-empty pair in place — Prometheus' "an empty label value is the same as
+/// an absent label" rule in its PAIR-WISE form.
+///
+/// This is `labels.Labels.WithoutEmpty()`
+/// (`vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:261-286
+/// @ v3.7.4`), which Loki's log ingest applies to **stream labels**:
+/// `syntax.ParseLabels` ends in `return ls.WithoutEmpty()`
+/// (`pkg/logql/syntax/parser.go:279-296 @ v3.7.4`), with the reason given
+/// inline — an empty value alters the label-set hash, so it must be normalized
+/// away early on the write path or a stream's identity is not deterministic.
+/// Every Loki log receiver reaches it through
+/// `Distributor.parseStreamLabels`, which calls `syntax.ParseLabels` on the
+/// stream's label literal (`pkg/distributor/distributor.go:1363-1375`, reached
+/// from `:648 @ v3.7.4`) — including the OTLP one, whose translation renders
+/// the promoted resource attributes back into exactly such a literal
+/// (`pkg/loghttp/push/otlp.go:240-250 @ v3.7.4`).
+///
+/// Use this — NOT [`strip_empty_valued_labels`] — wherever a STREAM LABEL set
+/// is built. The two differ only when the same name appears twice, which the
+/// reference resolves differently at its two seams; see
+/// [`strip_empty_valued_labels`] for the discriminating measurement.
+///
+/// Only an exactly-empty value is dropped. A whitespace-only value is kept
+/// verbatim and nothing is trimmed — measured on `grafana/loki:3.7.4` at both
+/// receivers: a Loki-push stream label `e=" "` and an OTLP index label
+/// `deployment.environment=" "` both survive, each forming a stream distinct
+/// from one that omits the label.
+///
+/// Deliberately NOT applied by the metrics paths: Prometheus, not Loki, is the
+/// metrics reference, and its own rejection/normalization surface is governed
+/// separately.
+pub fn retain_non_empty_values(pairs: &mut Vec<(String, String)>) {
+    // Borrowed scan first: the overwhelmingly common input has no empty value,
+    // and `retain` on it would still walk every element shifting nothing.
+    if !pairs.iter().any(|(_, value)| value.is_empty()) {
+        return;
+    }
+    pairs.retain(|(_, value)| !value.is_empty());
+}
+
+/// Drops every pair whose NAME carries an empty value anywhere in `pairs` —
+/// the same "empty means absent" rule in its BY-NAME form, applied to a RAW
+/// pair list *before* any key canonicalization.
+///
+/// This is what Prometheus' `labels.Builder` does, and Loki's distributor runs
+/// every entry's **structured metadata** through one
+/// (`pkg/distributor/distributor.go:698-722 @ v3.7.4`): `NewBuilder` calls
+/// `Reset`, which records the NAME of every empty-valued base label in `del`,
+/// and `Labels()` then omits every base label carrying such a name
+/// (`vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:471-521`
+/// — the file actually compiled: it is `//go:build !slicelabels &&
+/// !dedupelabels`, and Loki builds with `-tags netgo` alone,
+/// `Makefile:54-64 @ v3.7.4`). `Builder.Set(n, "")` is likewise
+/// defined as `Del(n)` (`labels_common.go:187-192`), which is how a name that
+/// the distributor *renames* into an existing one takes that one with it.
+///
+/// Use this — NOT [`retain_non_empty_values`] — wherever a STRUCTURED
+/// METADATA set is built.
+///
+/// The discriminating case, measured against `grafana/loki:3.7.4`
+/// (`b318f282`, `allow_structured_metadata: true`, `discover_log_levels:
+/// false`, `discover_service_name: []`) — one duplicate name, one occurrence
+/// empty, pushed both ways round:
+///
+/// | pushed | as structured metadata | as stream labels |
+/// |---|---|---|
+/// | `a=""` then `a="keep"` | no `a` at all | `a="keep"` |
+/// | `a="keep"` then `a=""` | no `a` at all | `a="keep"` |
+///
+/// (Stream labels measured on the Loki-push protobuf transport: of the two
+/// push encodings its label literal is the only one that carries a duplicate
+/// name as far as the strip, because the JSON one decodes its label object
+/// into a map first — both here and on the reference,
+/// `pkg/loghttp/labels.go:24-40 @ v3.7.4`. The OTLP receiver's attribute list
+/// can repeat a key too, and resolves it differently again; that seam is
+/// documented at `otlp_logs::build_stream_labels`. Structured metadata keeps
+/// duplicates on BOTH push encodings: protobuf as a repeated field, JSON
+/// because the reference appends each object key to a slice,
+/// `pkg/loghttp/query.go:182-203 @ v3.7.4`, exactly as we do.)
+///
+/// Only an exactly-empty value is dropped; a whitespace-only value is kept
+/// verbatim (`{"a":" "}` round-trips as `a=" "`) and nothing is trimmed.
+pub fn strip_empty_valued_labels(pairs: &mut Vec<(String, String)>) {
+    // Fast path: the overwhelmingly common case has no empty value at all, so
+    // it costs one borrowed scan and allocates nothing.
+    if !pairs.iter().any(|(_, value)| value.is_empty()) {
+        return;
+    }
+    // Cloned because `retain`'s closure cannot borrow `pairs` while it mutates
+    // them. Only the empty-valued names are cloned, only on this rare path,
+    // and the count is bounded by the caller's per-stream / per-entry cap.
+    let empty_names: BTreeSet<String> = pairs
+        .iter()
+        .filter(|(_, value)| value.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
+    pairs.retain(|(name, _)| !empty_names.contains(name.as_str()));
+}
+
 /// Groups `pairs` by `normalize(key)`, deduplicating identical
 /// `(original_key, value)` pairs within each group (a `BTreeSet` member is
 /// unique by definition). Shared by every `LabelSet` constructor so the
@@ -356,5 +456,72 @@ mod tests {
             set.to_canonical_json(),
             "{\"a_key\":\"quote\\\"and\\\\backslash\",\"m_key\":\"café\",\"z_key\":\"line1\\nline2\"}"
         );
+    }
+
+    // -- empty-value strips (issue #259) -----------------------------------
+
+    #[test]
+    fn both_strips_remove_only_exactly_empty_values() {
+        // Neither trims: a whitespace-only value is a value.
+        let source = pairs(&[("a", ""), ("b", "v"), ("c", " "), ("d", "\t"), ("e", "0")]);
+        let expected = pairs(&[("b", "v"), ("c", " "), ("d", "\t"), ("e", "0")]);
+
+        let mut by_name = source.clone();
+        strip_empty_valued_labels(&mut by_name);
+        assert_eq!(by_name, expected);
+
+        let mut pair_wise = source;
+        retain_non_empty_values(&mut pair_wise);
+        assert_eq!(pair_wise, expected);
+    }
+
+    /// The one case that tells the two apart, and the reason there are two of
+    /// them. Loki's structured-metadata seam is a `labels.Builder`, whose
+    /// `Reset` records the NAME of an empty-valued base label so `Labels()`
+    /// omits every base label carrying it; its stream-label seam is
+    /// `WithoutEmpty()`, which drops the empty PAIR and nothing else.
+    ///
+    /// Measured on `grafana/loki:3.7.4` (`b318f282`) with the same duplicate
+    /// pushed both ways round: as structured metadata (either transport) no
+    /// `a` survives; as protobuf stream labels `a="keep"` survives.
+    #[test]
+    fn by_name_strip_takes_the_non_empty_twin_where_pair_wise_keeps_it() {
+        for source in [
+            pairs(&[("a", ""), ("a", "keep"), ("z", "v")]),
+            pairs(&[("a", "keep"), ("a", ""), ("z", "v")]),
+        ] {
+            let mut by_name = source.clone();
+            strip_empty_valued_labels(&mut by_name);
+            assert_eq!(by_name, pairs(&[("z", "v")]), "by-name, from {source:?}");
+
+            let mut pair_wise = source.clone();
+            retain_non_empty_values(&mut pair_wise);
+            assert_eq!(
+                pair_wise,
+                pairs(&[("a", "keep"), ("z", "v")]),
+                "pair-wise, from {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_strips_preserve_order_and_are_noops_without_empties() {
+        for strip in [
+            strip_empty_valued_labels as fn(&mut Vec<(String, String)>),
+            retain_non_empty_values,
+        ] {
+            let mut p = pairs(&[("z", "1"), ("a", "2"), ("m", "3")]);
+            let before = p.clone();
+            strip(&mut p);
+            assert_eq!(p, before, "input order is preserved, nothing removed");
+
+            let mut all_empty = pairs(&[("a", ""), ("b", "")]);
+            strip(&mut all_empty);
+            assert!(all_empty.is_empty());
+
+            let mut none: Vec<(String, String)> = Vec::new();
+            strip(&mut none);
+            assert!(none.is_empty());
+        }
     }
 }
