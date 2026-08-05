@@ -323,3 +323,80 @@ re-decide from the evidence rather than re-derive it.
   the wire axis. The reference's own verdict is unchanged (it always
   accepted them), so the matrix's ORACLE column is untouched; only what
   we return differs, and only for multi-event spans.
+
+### `2026-08-05-traceql-quantile-over-time-tdigest` (issue #252)
+
+- **What differs.** The reference computes `quantile_over_time` from its
+  internal log2 histogram: `Log2QuantileWithBucket`
+  (`pkg/traceql/engine_metrics.go:2058-2120 @ v3.0.2`) counts through the
+  per-interval bucket tallies until it has `ceil(p × total)` samples and
+  returns the **bucket label** it stopped on, interpolating exponentially
+  between adjacent OCCUPIED buckets when the count lands mid-bucket. The
+  answer is therefore one of at most ~64 values, and it rounds up.
+  PulsusDB computes `quantilesTDigest` over the replay-deduped raw
+  `duration_ns` (`traces::metrics_sql::metrics_quantile_range_sql`, the
+  #173 TDigest precedent).
+
+  `histogram_over_time` is **not** part of this divergence: as of #252 it
+  matches the reference exactly — same power-of-two `__bucket` labels,
+  same per-bucket tallies, only occupied buckets emitted, never
+  cumulative.
+
+- **Why ours ships** (owner ruling 2026-08-05, measured on
+  `grafana/tempo:3.0.2@sha256:cda87c21…`; the capture is committed at
+  `crates/pulsus-read/tests/golden/traces_metrics/log2_reference_capture.json`).
+  Three corpora of 20 spans each, every span 280 ms / 300 ms / 520 ms
+  respectively. All three lie in `(2^28, 2^29]`, so all three occupy the
+  single bucket `2^29 ns = 0.536870912 s`, and the reference returns
+  **byte-identical output for all three**:
+
+  ```
+  p=0.5   0.3796250624970063
+  p=0.9   0.5009182730924541
+  p=0.99  0.536870912
+  p=1.0   0.536870912
+  histogram_over_time(duration) -> {"__bucket": 0.536870912} = 20
+  ```
+
+  - **Their estimator is a function of the OCCUPIED BUCKET, not of the
+    durations in it.** 280, 300 and 520 ms are indistinguishable at every
+    `p` — even `p=0.5`, which is an interpolated value rather than a
+    bucket label. This is the row's load-bearing claim; it is measured,
+    and the AC3b oracle test is what keeps it checkable.
+  - **Thresholds.** A true p99 of 300 ms is reported as 536.87 ms, 79%
+    high, tripping a 500 ms alert the real data never crosses. The bias
+    is one-directional.
+  - **Trends.** 280 ms → 520 ms is an 86% rise that the reference reports
+    as the same bytes on both days. Buckets double in width, so the
+    slower the service the blinder it gets; the worst-case overstatement
+    is ~2× and grows in absolute terms.
+
+- **Not an internal inconsistency.** Both values are consistent with the
+  same histogram — theirs is an *upper bound* within the occupied bucket,
+  ours a *sharper value* inside it. Because `histogram_over_time` is
+  byte-matched, a client can still reconstruct their bound from our
+  buckets; what it additionally gets is a percentile that moves when the
+  data moves.
+
+- **This upholds the 2026-07-26 ruling, it does not reverse it.** What
+  changed since then is only the implementation cost: the log2 tally is
+  now computed anyway for `histogram_over_time`, so matching would be
+  free. Cost was never that ruling's stated reason, and free is not a
+  reason to report a worse number.
+
+- **Scope.** `quantile_over_time` VALUES only. The wire shape (`p=<q>`
+  label, `doubleValue`, sample encoding) is unchanged and remains
+  matched; `histogram_over_time` is matched exactly.
+
+- **Where it is enforced.** `crates/pulsus-read/tests/traces_log2_reference.rs`
+  replays the committed capture through a test-only port of
+  `Log2QuantileWithBucket` (a characterisation oracle, explicitly not a
+  code path) and reproduces every captured reference quantile — exactly
+  on the discrete branches, within a relative error of 1e-12 on the
+  interpolation (observed worst case 1.8e-16); both required mutants
+  (`max_samples ± 1`, neighbour `idx-1 → idx-2`) fail that assertion.
+  `traces_metrics_live.rs::log2_histogram_membership_and_the_sub_two_ns_guard`
+  pins our own side against real ClickHouse: over 20 identical 300 ms
+  spans every quantile is exactly `0.3`, and over 520 ms spans exactly
+  `0.52` — the pair the reference cannot distinguish. User-facing
+  write-up: docs/api.md §4.4.1.

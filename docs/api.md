@@ -460,7 +460,7 @@ GET /api/traces/v1/metrics/query
 | `since` | relative alternative to start/end (`1h`, `30m`) — mutually exclusive with them |
 | `step` | resolution in whole seconds (`60`, `60s`, `5m`, `1h`); auto-derived when omitted |
 
-**Function set (issue #182 — Tempo v3.0.2 parity).** First-stage: `rate()`, `count_over_time()`, and `sum`/`min`/`max`/`avg`/`quantile`/`histogram` `_over_time` over the `duration` target. `quantile_over_time(duration, q, …)` returns one series per quantile (`p=<q>` label); `histogram_over_time(duration)` returns one cumulative-count series per fixed exponential `le` bucket (`__bucket=<le seconds>` label). Grouping: `by(resource.service.name)` returns one series per group value (the group label carries the value). Second stage: `topk(n)`/`bottomk(n)` reduce the series set per timestamp. Hints: `with(sample=…)` is accepted and returns the exact (superset) result; `with(exemplars=…)` attaches representative `trace:id` exemplars per bucket. `compare({selection})` partitions the outer spanset into a `selection` (the inner filter's matching spans) and a `baseline` (the complement) and emits per-attribute meta-series labelled `__meta_type` ∈ {`baseline`,`selection`,`baseline_total`,`selection_total`} plus one scoped attribute label (`key=value`, or `key=nil` for the complement/totals). A trailing metrics-result comparison (`… > 5`) post-filters samples above/below a threshold. Aggregation is executed entirely in ClickHouse (time-bucketed `GROUP BY`, a per-`(trace_id, span_id)` replay-dedup inner query, `quantilesTDigest`/conditional-count pushdown, the compare() attribute cross-tab — docs/schemas.md §4.2). *The **ns→seconds conversion** of duration values, `__bucket` labels and duration thresholds is settled Tier-1 (issue #237): it is the single-rounding `float64(ns)/1e9`, pinned against 17-significant-digit raw-wire captures from the pinned Tempo v3.0.2 container — **not** the two-rounding form issue #232 established for the LogQL rate divisor (a different reference; "fixing" it like #232 would introduce a divergence). The pins are bit-exact unit tests plus wire-byte tests guarded so a bare-substring rewrite has no *accidental* landing site; deliberate circumvention routes are named, bounded residuals (R5/R6 in the `metrics_response.rs` scanner doc), not closed. Quantile algorithm, bucket-ladder membership/cumulativity and per-value counts stay Tier-2 (issues #25/#251/#252); attribute value targets, attribute grouping keys, multi-key grouping, and grouped quantile/histogram route to follow-ups (a clean `400`). `compare()`'s **attribute-key universe is complete and Tempo-matched**: it enumerates every present attribute (span.\*/resource.\*/name/kind/status) plus the **fixed 25-key well-known-attribute set** Tempo v3.0.2 always emits (including well-known-but-absent keys as `key=nil`) — that set is derived clean-room from black-box container observation + the published OTLP semantic-convention docs, and matches Tempo's live key universe byte-for-byte (25/25). `statusMessage`, `rootName`, and `rootServiceName` emit their real values (issue #189, via #184 trace-schema storage) — an empty `statusMessage` is a distinct `""` value, matching Tempo v3.0.2 (not folded into the `key=nil` complement). `instrumentation:name` and `instrumentation:version` likewise emit their real per-span values (issue #192, via the `scope_name`/`scope_version` trace-schema columns) — an empty scope is a distinct `""` value, the same `statusMessage` treatment. The label conventions match Tempo byte-for-byte; exact per-value counts are Tier-2 (#25).*
+**Function set (issue #182 — Tempo v3.0.2 parity).** First-stage: `rate()`, `count_over_time()`, and `sum`/`min`/`max`/`avg`/`quantile`/`histogram` `_over_time` over the `duration` target. `quantile_over_time(duration, q, …)` returns one series per quantile (`p=<q>` label); `histogram_over_time(duration)` returns one **plain-count** series per power-of-two nanosecond bucket that actually occurred (`__bucket=<bucket seconds>` label) — the reference's `Log2Bucketize` model, matched exactly (issue #252, §4.4.1 below). Grouping: `by(resource.service.name)` returns one series per group value (the group label carries the value). Second stage: `topk(n)`/`bottomk(n)` reduce the series set per timestamp. Hints: `with(sample=…)` is accepted and returns the exact (superset) result; `with(exemplars=…)` attaches representative `trace:id` exemplars per bucket. `compare({selection})` partitions the outer spanset into a `selection` (the inner filter's matching spans) and a `baseline` (the complement) and emits per-attribute meta-series labelled `__meta_type` ∈ {`baseline`,`selection`,`baseline_total`,`selection_total`} plus one scoped attribute label (`key=value`, or `key=nil` for the complement/totals). A trailing metrics-result comparison (`… > 5`) post-filters samples above/below a threshold. Aggregation is executed entirely in ClickHouse (time-bucketed `GROUP BY`, a per-`(trace_id, span_id)` replay-dedup inner query, `quantilesTDigest` for quantiles, a `GROUP BY toUInt64(roundToExp2(val - 1)) * 2` log2 tally for the histogram, the compare() attribute cross-tab — docs/schemas.md §4.2). *The **ns→seconds conversion** of duration values, `__bucket` labels and duration thresholds is settled Tier-1 (issue #237): it is the single-rounding `float64(ns)/1e9`, pinned against 17-significant-digit raw-wire captures from the pinned Tempo v3.0.2 container — **not** the two-rounding form issue #232 established for the LogQL rate divisor (a different reference; "fixing" it like #232 would introduce a divergence). The pins are bit-exact unit tests plus wire-byte tests guarded so a bare-substring rewrite has no *accidental* landing site; deliberate circumvention routes are named, bounded residuals (R5/R6 in the `metrics_response.rs` scanner doc), not closed. `histogram_over_time`'s bucket rule, membership and non-cumulativity are **matched and Tier-1-gated** (issue #252: a hermetic replay of a committed reference capture, plus live membership/tally-sum identities); the **quantile algorithm is a deliberate, ledgered divergence** (`quantilesTDigest` over the raw durations, ledger `2026-08-05-traceql-quantile-over-time-tdigest`, §4.4.1) with its own Tier-1 gates; per-value counts and the new tally query's throughput at 1 TB stay Tier-2 (issues #25/#251); attribute value targets, attribute grouping keys, multi-key grouping, and grouped quantile/histogram route to follow-ups (a clean `400`). `compare()`'s **attribute-key universe is complete and Tempo-matched**: it enumerates every present attribute (span.\*/resource.\*/name/kind/status) plus the **fixed 25-key well-known-attribute set** Tempo v3.0.2 always emits (including well-known-but-absent keys as `key=nil`) — that set is derived clean-room from black-box container observation + the published OTLP semantic-convention docs, and matches Tempo's live key universe byte-for-byte (25/25). `statusMessage`, `rootName`, and `rootServiceName` emit their real values (issue #189, via #184 trace-schema storage) — an empty `statusMessage` is a distinct `""` value, matching Tempo v3.0.2 (not folded into the `key=nil` complement). `instrumentation:name` and `instrumentation:version` likewise emit their real per-span values (issue #192, via the `scope_name`/`scope_version` trace-schema columns) — an empty scope is a distinct `""` value, the same `statusMessage` treatment. The label conventions match Tempo byte-for-byte; exact per-value counts are Tier-2 (#25).*
 
 **Response body (Tempo-native, breaking change from earlier versions).** These endpoints are consumed only by the Tempo datasource and now emit the **Tempo-native metrics body**, replacing the earlier Prometheus matrix/vector envelope:
 
@@ -479,6 +479,87 @@ Labels are OTLP protojson `AnyValue` (camelCase `stringValue`/`doubleValue`); `t
 **Bucketing (normative):** buckets are epoch-aligned, **left-closed** intervals `[b, b + step)`. The evaluated window is snapped outward: `S = ⌊start/step⌋·step`, `E = ⌈end/step⌉·step` — an unaligned request over-includes by at most one step on each edge, and every bucket divides by the full step. Empty buckets are omitted (no gap-filling). The instant `query` form evaluates one bucket over the whole snapped window `[S, E)` — `rate` divides by `E − S` seconds — and stamps its single sample at `E`; on an empty window it returns no series (count/rate) or a single zero sample (aggregations).
 
 **Step derivation and the point cap (committed contract):** when `step` is omitted, `step_s = max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)` with `DEFAULT_METRICS_POINTS` = 100. The snapped bucket count `(E − S) / step_s` is capped at `MAX_METRICS_POINTS` = 11000: a range resolving more buckets is rejected **statically before execution** with `422 query_too_broad` — deliberately 422 (the bounded-response family), not Prometheus's 400, and never a silent truncation. Attribute-filter semi-joins carry throwing IN-set limits with the same 422 semantics (docs/schemas.md §4.2).
+
+
+#### 4.4.1 `histogram_over_time` matches Tempo; `quantile_over_time` deliberately does not
+
+Read this if a Tempo dashboard and a PulsusDB dashboard disagree and you
+need to know which number to believe. Every figure below is captured from
+the pinned reference (`grafana/tempo:3.0.2@sha256:cda87c21…`, committed at
+`crates/pulsus-read/tests/golden/traces_metrics/log2_reference_capture.json`)
+and is pinned by a test.
+
+**1. The histogram matches exactly.** `histogram_over_time(duration)`
+rounds each span's duration **up to the next power of two** and labels the
+bucket in float seconds (`Log2Bucketize`,
+`pkg/traceql/engine_metrics.go:2038 @ v3.0.2`; a duration below 2 ns is
+dropped from the series while `count_over_time` still counts the span).
+Only buckets that actually occurred emit a series — there is no ladder,
+and an empty bucket is **absent**, not zero — and each value is a plain
+per-step tally, never cumulative. Nobody should come away thinking this
+half differs. Ingesting twenty 300 ms spans and asking both stores:
+
+```traceql
+{ resource.service.name = "checkout" } | histogram_over_time(duration)
+```
+
+both return exactly one series, `__bucket = 0.536870912` (that is
+`2^29 ns`), with the value `20`.
+
+**2. The percentile deliberately differs.** For
+
+```traceql
+{ resource.service.name = "checkout" } | quantile_over_time(duration, 0.5, 0.9, 0.99, 1.0)
+```
+
+the reference walks its bucket tallies until it has `ceil(p × total)`
+samples and reports the **bucket label** it stopped on, interpolating
+exponentially between occupied buckets when the count lands mid-bucket
+(`Log2QuantileWithBucket`, `engine_metrics.go:2058`). PulsusDB estimates
+from the durations themselves, via `quantilesTDigest` over the
+replay-deduped `duration_ns`.
+
+**3. The measurement, which is the argument.** Three corpora of twenty
+spans each — every span 280 ms, 300 ms and 520 ms respectively. All three
+fall inside the single bucket `2^29 ns = 0.536870912 s`, and the
+reference returns **byte-identical output for all three**:
+
+| p | reference (280 ms, 300 ms and 520 ms corpora — the same bytes) | PulsusDB (300 ms) | PulsusDB (520 ms) |
+|---|---|---|---|
+| 0.5 | `0.3796250624970063` | `0.3` | `0.52` |
+| 0.9 | `0.5009182730924541` | `0.3` | `0.52` |
+| 0.99 | `0.536870912` | `0.3` | `0.52` |
+| 1.0 | `0.536870912` | `0.3` | `0.52` |
+
+Over identical values every quantile is exactly that value, which is why
+the PulsusDB columns are constant down the rows; the point of the table
+is the reference column, which is constant **across corpora**. Its
+estimator is a function of the occupied bucket, not of the durations in
+it. Two consequences you will actually meet:
+
+- a service whose true p99 is 300 ms is reported at 536.87 ms — 79% high
+  — and trips a 500 ms alert the real data never crosses;
+- a rise from 280 ms to 520 ms (86%) produces an unchanged graph.
+
+**4. This is not an inconsistency between our own two functions.** The
+reference's percentile is an upper bound consistent with the histogram;
+ours is a sharper value inside the same bucket. Both agree with the
+buckets we emit, and because the histogram is byte-matched you can still
+reconstruct the reference's bound from our buckets — what you gain is a
+percentile that moves when the data moves.
+
+**5. Why the reference's design is right for the reference.** Tempo
+computes in memory over spans fetched from object storage, so it needs a
+per-span step that is cheap, mergeable across workers and bounded to ~64
+values; a log2 tally is a good answer to that problem. PulsusDB
+aggregates inside ClickHouse next to the data, where the exact estimator
+costs no more, so the constraint that motivates the approximation does
+not apply. The divergence is a consequence of architecture, not a claim
+of superior arithmetic.
+
+**6. The full record**: ledger id `2026-08-05-traceql-quantile-over-time-tdigest`
+in `docs/benchmarks/traces-differential-ledger.md`.
+
 
 ### 4.5 Service graph
 

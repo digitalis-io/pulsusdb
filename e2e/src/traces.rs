@@ -49,7 +49,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 use crate::corpus::Scale;
@@ -1841,11 +1841,264 @@ fn metrics_points_delta(
     delta
 }
 
+// ---------------------------------------------------------------------
+// Issue #252: the reference-positive control on TraceQL metrics.
+//
+// The traces differential's metrics comparison used to run against a
+// Tempo with no metrics-generator configured, which answers every
+// TraceQL metrics query with an empty series set while `/api/search`
+// returns the whole corpus. The comparison therefore diffed our output
+// against nothing and summarised a delta computed from an empty map —
+// a check that could not fail. `deploy/e2e/tempo.yaml` now configures
+// `metrics_generator.storage.path`, and the control below is what keeps
+// that true: it asserts an INDEPENDENTLY SCHEDULED tally for every
+// `(step, bucket)`, derived from the corpus generator's own arithmetic
+// and from neither system's response.
+// ---------------------------------------------------------------------
+
+/// The step the control queries at, and the pad it puts either side of
+/// the corpus. Fixed rather than derived so the window can be aligned to
+/// it, and deliberately SMALLER than the corpus's own span so the
+/// expectation covers several steps: at CI scale the corpus is 24 traces
+/// one second apart, which a 60 s step would collapse into a single
+/// interval — and a single-interval expectation cannot detect correct
+/// totals landing on the wrong step, which is the property AC11b exists
+/// for.
+const CONTROL_STEP_S: i64 = 5;
+const NS_PER_S_I64: i64 = 1_000_000_000;
+
+/// The number of series in a Tempo-native metrics body.
+fn series_count(body: &serde_json::Value) -> usize {
+    body["series"].as_array().map_or(0, Vec::len)
+}
+
+/// The reference's `Log2Bucketize` (`pkg/traceql/engine_metrics.go:2038-2046
+/// @ v3.0.2`): the smallest power of two `>= v`, and `None` for `v < 2`,
+/// which `bucketizeDuration` (`ast_metrics.go:181-188`) turns into
+/// "drop this span from the series".
+///
+/// Transcribed here rather than imported from
+/// `pulsus_read::traces::log2_histogram` on purpose: this crate talks
+/// HTTP to `pulsusdb` only and deliberately carries no read-path/
+/// ClickHouse dependency (see its `Cargo.toml`). The expectation this
+/// feeds must be independent of BOTH systems' responses, which it is
+/// either way; `log2_bucketize_matches_the_reference_rule` below pins
+/// the transcription against the same witnesses the read crate uses.
+fn log2_bucketize_ns(v: i64) -> Option<u64> {
+    if v < 2 {
+        return None;
+    }
+    Some(1u64 << (64 - (v - 1).leading_zeros()))
+}
+
+/// The reference's step assignment
+/// (`IntervalMapperQueryRange::interval`, `engine_metrics.go:1758-1783 @
+/// v3.0.2`): intervals are RIGHT-closed — `(start, start+step]` — and a
+/// timestamp exactly on a boundary belongs to the PREVIOUS interval. A
+/// timestamp outside `(start, end]` is dropped (`-1`).
+///
+/// Deliberately not our own left-closed `[b, b+step)` grid: this
+/// expectation is compared against the REFERENCE's response, so it must
+/// use the reference's rule.
+fn reference_interval(ts_ns: i64, start_ns: i64, end_ns: i64, step_ns: i64) -> Option<i64> {
+    if ts_ns <= start_ns || ts_ns > end_ns {
+        return None;
+    }
+    let offset = ts_ns - start_ns;
+    let mut interval = offset / step_ns;
+    if interval * step_ns == offset {
+        interval -= 1;
+    }
+    Some(interval)
+}
+
+/// The sample timestamp the reference emits for an interval
+/// (`TimestampOf`, `engine_metrics.go:1785-1788 @ v3.0.2`): the
+/// interval's END, not its start. Test-only: the decode in
+/// [`reference_histogram_from_body`] inverts this arithmetic inline, and
+/// `reference_intervals_are_right_closed_and_stamped_at_their_end`
+/// exists to prove the two are exact inverses.
+#[cfg(test)]
+fn reference_interval_timestamp_ms(interval: i64, start_ns: i64, step_ns: i64) -> i64 {
+    (start_ns + (interval + 1) * step_ns) / 1_000_000
+}
+
+/// `(step_index, bucket_ns) -> count`, computed from the corpus
+/// generator's schedule alone — every span's start time and duration are
+/// pure arithmetic on its index (`e2e/src/traces_corpus.rs`), so nothing
+/// here is read back from PulsusDB or from Tempo.
+///
+/// **Span START time is the assignment key**, matching
+/// `StepAggregator.Observe` (`engine_metrics.go:558-564 @ v3.0.2`:
+/// `intervalMapper.Interval(span.StartTimeUnixNanos())`) — children map
+/// by their own start, not by their root's.
+fn expected_reference_histogram(
+    corpus: &TraceCorpus,
+    start_ns: i64,
+    end_ns: i64,
+    step_ns: i64,
+) -> BTreeMap<(i64, u64), u64> {
+    let mut out: BTreeMap<(i64, u64), u64> = BTreeMap::new();
+    for trace in &corpus.traces {
+        for span in &trace.spans {
+            let Some(bucket) = log2_bucketize_ns(span.duration_ns) else {
+                continue;
+            };
+            let Some(interval) = reference_interval(span.start_ns, start_ns, end_ns, step_ns)
+            else {
+                continue;
+            };
+            *out.entry((interval, bucket)).or_default() += 1;
+        }
+    }
+    out
+}
+
+/// The same map, decoded from a reference `histogram_over_time` body.
+/// Samples whose value is zero (or omitted, which is how protojson
+/// renders a zero) are dropped, so the two maps are comparable as
+/// "occupied `(step, bucket)` cells".
+fn reference_histogram_from_body(
+    body: &serde_json::Value,
+    start_ns: i64,
+    step_ns: i64,
+) -> Result<BTreeMap<(i64, u64), u64>> {
+    let mut out: BTreeMap<(i64, u64), u64> = BTreeMap::new();
+    for series in body["series"].as_array().into_iter().flatten() {
+        let bucket_seconds = series["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|l| l["key"].as_str() == Some("__bucket"))
+            .and_then(|l| l["value"]["doubleValue"].as_f64())
+            .ok_or_else(|| anyhow!("a histogram series carries no __bucket label: {series}"))?;
+        // The label is the bucket's nanoseconds divided by 1e9; go back
+        // to the integer power of two so the key is exact.
+        let bucket_ns = (bucket_seconds * 1e9).round() as u64;
+        if !bucket_ns.is_power_of_two() {
+            bail!("__bucket {bucket_seconds} is not a power-of-two nanosecond count");
+        }
+        for sample in series["samples"].as_array().into_iter().flatten() {
+            let ts_ms = sample["timestampMs"]
+                .as_i64()
+                .or_else(|| sample["timestampMs"].as_str().and_then(|s| s.parse().ok()))
+                .ok_or_else(|| anyhow!("sample without a timestampMs: {sample}"))?;
+            let value = sample["value"].as_f64().unwrap_or(0.0);
+            if value == 0.0 {
+                continue; // protojson elides a zero value
+            }
+            let interval = (ts_ms * 1_000_000 - start_ns) / step_ns - 1;
+            *out.entry((interval, bucket_ns)).or_default() += value as u64;
+        }
+    }
+    Ok(out)
+}
+
+/// AC11b (issue #252): the reference must return the histogram the
+/// corpus schedule says it should — the full `(step, bucket) -> count`
+/// map, not merely a non-empty body. A stale window, a partial flush, a
+/// wrong tenant, or samples landing on the wrong steps all fail here;
+/// none of them fail a non-emptiness check.
+///
+/// The window is STEP-ALIGNED on purpose: with `start` a multiple of the
+/// step there is one unambiguous step grid, and a boundary span cannot
+/// land one step either side for a benign reason.
+///
+/// Polled, not queried once: TraceQL metrics visibility lags search
+/// visibility on this build (measured at roughly a minute after ingest
+/// on grafana/tempo:3.0.2 — the live block has to complete first), so a
+/// single shot would be a flake, and the poll's deadline is what turns
+/// "the reference never answered" into a failure.
+async fn assert_reference_metrics_positive_control(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> {
+    let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
+    // One step of pad either side, not the search window's ±1 h: the
+    // step grid stays small and every interval is one the corpus can
+    // actually populate.
+    let start_s = (corpus.first_ts_ns / NS_PER_S_I64 - CONTROL_STEP_S).div_euclid(CONTROL_STEP_S)
+        * CONTROL_STEP_S;
+    let end_s = (corpus.last_ts_ns / NS_PER_S_I64 + 2 * CONTROL_STEP_S).div_euclid(CONTROL_STEP_S)
+        * CONTROL_STEP_S;
+    let (start_ns, end_ns) = (start_s * NS_PER_S_I64, end_s * NS_PER_S_I64);
+    let expected = expected_reference_histogram(corpus, start_ns, end_ns, step_ns);
+    if expected.is_empty() {
+        bail!(
+            "the corpus schedule yields no histogram cells at all — the control would pass \
+             vacuously"
+        );
+    }
+    let q = format!(
+        r#"{{ resource.run_id = "{}" }} | histogram_over_time(duration)"#,
+        corpus.run_id
+    );
+    let params = [
+        ("q", q.clone()),
+        ("start", start_s.to_string()),
+        ("end", end_s.to_string()),
+        ("step", format!("{CONTROL_STEP_S}s")),
+    ];
+    let query_timeout = query_request_timeout(corpus.scale);
+    let last = std::cell::RefCell::new(String::from("(never answered)"));
+    let poll = poll_until(
+        completeness_poll_timeout(corpus.scale),
+        COMPLETENESS_POLL_INTERVAL,
+        || async {
+            let body = get_json_with(
+                ctx,
+                &format!("{}/api/metrics/query_range", ctx.tempo_url),
+                &params,
+                query_timeout,
+            )
+            .await?;
+            let got = reference_histogram_from_body(&body, start_ns, step_ns)?;
+            if got == expected {
+                return Ok(Some(()));
+            }
+            let only_expected: Vec<_> = expected
+                .iter()
+                .filter(|(k, v)| got.get(k) != Some(v))
+                .collect();
+            let only_got: Vec<_> = got
+                .iter()
+                .filter(|(k, v)| expected.get(k) != Some(v))
+                .collect();
+            *last.borrow_mut() = format!(
+                "{} cell(s) expected-but-wrong-or-missing {only_expected:?}; {} cell(s) \
+                 returned-but-unexpected {only_got:?}",
+                only_expected.len(),
+                only_got.len()
+            );
+            Ok(None)
+        },
+    )
+    .await;
+    match poll {
+        Ok(()) => {
+            println!(
+                "pulsus-e2e:   traces reference-positive control: Tempo reproduced all {} \
+                 (step, bucket) histogram cells for {q:?}",
+                expected.len()
+            );
+            Ok(())
+        }
+        Err(err) => Err(err.context(format!(
+            "the reference did not reproduce the corpus's histogram_over_time schedule for \
+             {q:?} over [{start_s}, {end_s}) at {CONTROL_STEP_S}s. This gates the metrics \
+             comparison below, which is otherwise a diff against whatever the reference \
+             happened to return (with no metrics-generator configured, that is an empty \
+             series set). Last observed: {}",
+            last.borrow()
+        ))),
+    }
+}
+
 /// The never-gating comparisons (ratified on #19/#60): tags-vs-Tempo and
-/// TraceQL-metrics-vs-Tempo. Every delta — including a Tempo-side error
-/// (e.g. its metrics endpoint needs the metrics-generator, deliberately
-/// not enabled in `deploy/e2e/tempo.yaml`) — is dumped as an
-/// informational artifact; the section always returns `Ok`.
+/// TraceQL-metrics-vs-Tempo. Every delta is dumped as an informational
+/// artifact and the COMPARISON still never gates — but since issue #252
+/// its PRECONDITION does: `deploy/e2e/tempo.yaml` now enables the
+/// metrics-generator, so the reference actually answers TraceQL metrics
+/// queries, and [`assert_reference_metrics_positive_control`] fails the
+/// scenario if it stops.
+///
 /// Issue #328 (AC 16): both stores must REJECT every pre-committed
 /// semantic-rejection case with a 400 on their search endpoints — the
 /// end-to-end proof that the `traceql.Validate` port answers exactly
@@ -1953,6 +2206,13 @@ async fn run_informational_comparisons(
     // #60 code review, low — an actual comparison, never just "raw
     // bodies preserved"), raw bodies kept alongside, values never
     // gated.
+    // Issue #252 AC11b: the reference-positive CONTENT control, run
+    // before the comparisons below. Until it passes, every "delta"
+    // recorded here is a delta against whatever the reference happened
+    // to return — which, with the pre-#252 `deploy/e2e/tempo.yaml`, was
+    // an empty series set for every query.
+    assert_reference_metrics_positive_control(ctx, corpus).await?;
+
     for raw_q in &fixture.informational.metrics_queries {
         let q = raw_q.replace("{R}", &corpus.run_id);
         let params = [
@@ -1983,6 +2243,20 @@ async fn run_informational_comparisons(
                 // with the same jsonpb-samples reader.
                 let ours = tempo_metrics_points(p);
                 let theirs = tempo_metrics_points(t);
+                // AC11 (issue #252): the cheap anti-vacuity precondition,
+                // direction-neutral by construction — it fires only on
+                // "we have data and they returned nothing", never on a
+                // value difference, so it cannot smuggle in a values
+                // gate. AC11b above is the real content control; this
+                // one gives a clear, fast failure per query.
+                if ours.values().any(|v| *v != 0.0) && series_count(t) == 0 {
+                    bail!(
+                        "reference-positive precondition failed for {q:?}: PulsusDB returned \
+                         points but Tempo returned NO series. The metrics comparison below \
+                         would have reported a delta computed from nothing.\n\
+                         pulsusdb: {p}\ntempo: {t}"
+                    );
+                }
                 let delta = metrics_points_delta(&ours, &theirs);
                 deltas.push(format!("metrics {q:?}: {}", delta.summary()));
                 delta_json = delta.to_json();
@@ -2450,5 +2724,173 @@ mod tests {
             pulsus_search_is_partial(&serde_json::json!({"metrics":{"partial":true}})).unwrap()
         );
         assert!(pulsus_search_is_partial(&serde_json::json!({})).is_err());
+    }
+
+    // ---- Issue #252: the reference-positive control's arithmetic -----
+
+    #[test]
+    fn log2_bucketize_matches_the_reference_rule() {
+        // The same witnesses `pulsus-read`'s own module is pinned
+        // against — this transcription exists only because the e2e crate
+        // deliberately carries no read-path dependency.
+        assert_eq!(log2_bucketize_ns(2), Some(2));
+        assert_eq!(log2_bucketize_ns(3), Some(4));
+        assert_eq!(log2_bucketize_ns(4), Some(4));
+        assert_eq!(log2_bucketize_ns(300_000_000), Some(1 << 29));
+        assert_eq!(log2_bucketize_ns(5_000_000_000), Some(1 << 33));
+        for v in [i64::MIN, -1, 0, 1] {
+            assert_eq!(log2_bucketize_ns(v), None, "v={v}");
+        }
+        assert_eq!(log2_bucketize_ns(i64::MAX), Some(1u64 << 63));
+    }
+
+    #[test]
+    fn reference_intervals_are_right_closed_and_stamped_at_their_end() {
+        let start_ns = 1_700_000_000 * NS_PER_S_I64;
+        let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
+        let end_ns = start_ns + 5 * step_ns;
+        // `(start, start+step]`: the window start itself is OUTSIDE.
+        assert_eq!(
+            reference_interval(start_ns, start_ns, end_ns, step_ns),
+            None
+        );
+        assert_eq!(
+            reference_interval(start_ns + 1, start_ns, end_ns, step_ns),
+            Some(0)
+        );
+        // A timestamp exactly on a boundary belongs to the PREVIOUS
+        // interval — the rule a left-closed grid gets backwards.
+        assert_eq!(
+            reference_interval(start_ns + step_ns, start_ns, end_ns, step_ns),
+            Some(0)
+        );
+        assert_eq!(
+            reference_interval(start_ns + step_ns + 1, start_ns, end_ns, step_ns),
+            Some(1)
+        );
+        assert_eq!(
+            reference_interval(end_ns + 1, start_ns, end_ns, step_ns),
+            None
+        );
+        // The emitted sample timestamp is the interval's END, and the
+        // decode in `reference_histogram_from_body` is its exact inverse.
+        for interval in 0..5i64 {
+            let ts_ms = reference_interval_timestamp_ms(interval, start_ns, step_ns);
+            assert_eq!((ts_ms * 1_000_000 - start_ns) / step_ns - 1, interval);
+        }
+    }
+
+    #[test]
+    fn the_expectation_keys_on_span_start_not_span_end() {
+        // A span whose START is in interval 0 but whose END crosses into
+        // interval 1 must be counted in interval 0 — `StepAggregator`
+        // observes `span.StartTimeUnixNanos()`.
+        let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
+        let start_ns = 1_700_000_000 * NS_PER_S_I64;
+        let end_ns = start_ns + 5 * step_ns;
+        let span_start = start_ns + step_ns - NS_PER_S_I64; // 1 s before the boundary
+        assert_eq!(
+            reference_interval(span_start, start_ns, end_ns, step_ns),
+            Some(0)
+        );
+        let span_end = span_start + 2 * NS_PER_S_I64; // ends in interval 1
+        assert_eq!(
+            reference_interval(span_end, start_ns, end_ns, step_ns),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_shipped_corpus_yields_a_non_vacuous_multi_bucket_expectation() {
+        let fixture = shipped_fixture();
+        let corpus = shipped_corpus(&fixture, fixture.ci.trace_count);
+        let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
+        let start_s = (corpus.first_ts_ns / NS_PER_S_I64 - CONTROL_STEP_S)
+            .div_euclid(CONTROL_STEP_S)
+            * CONTROL_STEP_S;
+        let end_s = (corpus.last_ts_ns / NS_PER_S_I64 + 2 * CONTROL_STEP_S)
+            .div_euclid(CONTROL_STEP_S)
+            * CONTROL_STEP_S;
+        let expected = expected_reference_histogram(
+            &corpus,
+            start_s * NS_PER_S_I64,
+            end_s * NS_PER_S_I64,
+            step_ns,
+        );
+        // Every span is accounted for: the generator emits no sub-2ns
+        // duration and the padded window covers the whole schedule.
+        let counted: u64 = expected.values().sum();
+        assert_eq!(counted as usize, corpus.total_spans());
+        // …and the expectation is genuinely multi-bucket AND multi-step,
+        // or a control built on it could pass on a degenerate response.
+        let buckets: BTreeSet<u64> = expected.keys().map(|(_, b)| *b).collect();
+        let steps: BTreeSet<i64> = expected.keys().map(|(s, _)| *s).collect();
+        assert!(buckets.len() >= 4, "buckets: {buckets:?}");
+        assert!(steps.len() >= 2, "steps: {steps:?}");
+    }
+
+    #[test]
+    fn an_empty_reference_body_can_never_satisfy_the_control() {
+        // AC12's hermetic half: the shape the reference returns with no
+        // metrics-generator configured decodes to an EMPTY map, which
+        // cannot equal a non-empty expectation — so the control fails
+        // rather than passing on nothing. (The full mutant — revert
+        // `deploy/e2e/tempo.yaml` and watch the leg fail — is
+        // CI-authoritative; the reference's empty-body behaviour with
+        // that config was measured directly on grafana/tempo:3.0.2.)
+        let start_ns = 1_700_000_000 * NS_PER_S_I64;
+        let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
+        let empty = serde_json::json!({"series": [], "metrics": {}});
+        let decoded = reference_histogram_from_body(&empty, start_ns, step_ns).unwrap();
+        assert!(decoded.is_empty());
+        // The other shape an unconfigured reference returns — a series
+        // whose every value is elided — also decodes to nothing.
+        let all_zero = serde_json::json!({"series": [{
+            "labels": [{"key": "__bucket", "value": {"doubleValue": 0.536870912}}],
+            "samples": [{"timestampMs": "1700000005000"}, {"timestampMs": "1700000010000"}]
+        }]});
+        assert!(
+            reference_histogram_from_body(&all_zero, start_ns, step_ns)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_reference_body_decodes_to_the_step_bucket_cells_it_states() {
+        let start_ns = 1_700_000_000 * NS_PER_S_I64;
+        let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
+        let body = serde_json::json!({"series": [{
+            "labels": [{"key": "__bucket", "value": {"doubleValue": 0.536870912}}],
+            "samples": [
+                {"timestampMs": "1700000005000", "value": 3},
+                {"timestampMs": "1700000010000", "value": 5}
+            ]
+        }, {
+            "labels": [{"key": "__bucket", "value": {"doubleValue": 2e-9}}],
+            "samples": [{"timestampMs": "1700000005000", "value": 1}]
+        }]});
+        let decoded = reference_histogram_from_body(&body, start_ns, step_ns).unwrap();
+        assert_eq!(
+            decoded,
+            BTreeMap::from([((0, 1 << 29), 3), ((1, 1 << 29), 5), ((0, 2), 1)])
+        );
+        // The same totals with the samples on the WRONG steps decode to
+        // a DIFFERENT map — the property label-set equality plus window
+        // totals cannot see, and the reason AC11b is a per-cell map.
+        let shifted = serde_json::json!({"series": [{
+            "labels": [{"key": "__bucket", "value": {"doubleValue": 0.536870912}}],
+            "samples": [
+                {"timestampMs": "1700000005000", "value": 5},
+                {"timestampMs": "1700000010000", "value": 3}
+            ]
+        }, {
+            "labels": [{"key": "__bucket", "value": {"doubleValue": 2e-9}}],
+            "samples": [{"timestampMs": "1700000005000", "value": 1}]
+        }]});
+        assert_ne!(
+            reference_histogram_from_body(&shifted, start_ns, step_ns).unwrap(),
+            decoded
+        );
     }
 }

@@ -77,13 +77,16 @@ use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
 use super::graph_sql::{self, GraphWindow};
+use super::log2_histogram;
 use super::metrics_plan::{MetricsCtx, PlanKind, TraceMetricsPlan};
-use super::metrics_result::{MetricExemplar, MetricLabel, TraceMetricSeries, TraceMetricsResult};
+use super::metrics_result::{
+    MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
+};
 use super::rows::{
     CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, HydrationRow,
     MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
     MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
-    MetricGroupCountRow, MetricHistogramInstantRow, MetricHistogramRow, MetricQuantileInstantRow,
+    MetricGroupCountRow, MetricLog2BucketInstantRow, MetricLog2BucketRow, MetricQuantileInstantRow,
     MetricQuantileRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
     TagValueRow, TraceCtxRow,
 };
@@ -689,35 +692,44 @@ impl TraceEngine {
                 Ok(TraceMetricsResult { series })
             }
             (PlanKind::Histogram, _) => {
-                // One cumulative-count series per exponential `le` bucket
-                // (`__bucket=<le seconds>`).
-                let bounds = plan.histogram_le_bounds_ns();
-                let mut series: Vec<TraceMetricSeries> = bounds
-                    .iter()
-                    .map(|le| TraceMetricSeries {
-                        labels: vec![MetricLabel::double(
-                            "__bucket",
-                            histogram_bucket_seconds(*le),
-                        )],
-                        samples: Vec::new(),
-                        exemplars: Vec::new(),
-                    })
-                    .collect();
+                // Issue #252: one PLAIN-TALLY series per power-of-two
+                // bucket that actually occurred (`__bucket=<seconds>`).
+                // No ladder, nothing cumulative, and a bucket with no
+                // spans anywhere in the window emits NO series at all —
+                // the reference creates a series on first observation of
+                // the key (`engine_metrics.go:788-793 @ v3.0.2`).
+                //
+                // The SQL orders by `(t, bucket)`, so collecting into a
+                // `BTreeMap` keyed by bucket keeps each series' samples
+                // in timestamp order without a second sort.
+                let mut by_bucket: BTreeMap<u64, Vec<(i64, f64)>> = BTreeMap::new();
                 let mut stream = self
                     .client
-                    .query_stream::<MetricHistogramRow>(&sql, &settings)
+                    .query_stream::<MetricLog2BucketRow>(&sql, &settings)
                     .await
                     .map_err(|e| map_trace_metrics_error(e, &self.config))?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    for (i, s) in series.iter_mut().enumerate() {
-                        let v = row.bkts.get(i).copied().unwrap_or(0);
-                        s.samples.push((row.t_ms, v as f64));
-                    }
+                    by_bucket
+                        .entry(row.bucket_ns)
+                        .or_default()
+                        .push((row.t_ms, row.n as f64));
                 }
-                if series.iter().all(|s| s.samples.is_empty()) {
+                if by_bucket.is_empty() {
                     return Ok(TraceMetricsResult { series: vec![] });
                 }
+                let mut series: Vec<TraceMetricSeries> = by_bucket
+                    .into_iter()
+                    .map(|(bucket_ns, samples)| TraceMetricSeries {
+                        labels: vec![MetricLabel::double(
+                            "__bucket",
+                            log2_histogram::bucket_seconds(bucket_ns),
+                        )],
+                        samples,
+                        exemplars: Vec::new(),
+                    })
+                    .collect();
+                sort_series_like_the_reference(&mut series);
                 Ok(TraceMetricsResult { series })
             }
             (kind, None) => {
@@ -1113,32 +1125,28 @@ impl TraceEngine {
                 })
             }
             (PlanKind::Histogram, _) => {
-                let bounds = plan.histogram_le_bounds_ns();
-                let mut bkts: Vec<u64> = Vec::new();
+                // The instant twin of the range arm: one plain tally per
+                // OCCUPIED power-of-two bucket over the whole snapped
+                // window (issue #252).
+                let mut series: Vec<TraceMetricSeries> = Vec::new();
                 let mut stream = self
                     .client
-                    .query_stream::<MetricHistogramInstantRow>(&sql, &settings)
+                    .query_stream::<MetricLog2BucketInstantRow>(&sql, &settings)
                     .await
                     .map_err(|e| map_trace_metrics_error(e, &self.config))?;
                 while let Some(row) = stream.next().await {
-                    bkts = row
-                        .map_err(|e| map_trace_metrics_error(e, &self.config))?
-                        .bkts;
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    series.push(TraceMetricSeries {
+                        labels: vec![MetricLabel::double(
+                            "__bucket",
+                            log2_histogram::bucket_seconds(row.bucket_ns),
+                        )],
+                        samples: vec![(at_ms, row.n as f64)],
+                        exemplars: vec![],
+                    });
                 }
-                Ok(TraceMetricsResult {
-                    series: bounds
-                        .iter()
-                        .enumerate()
-                        .map(|(i, le)| TraceMetricSeries {
-                            labels: vec![MetricLabel::double(
-                                "__bucket",
-                                histogram_bucket_seconds(*le),
-                            )],
-                            samples: vec![(at_ms, bkts.get(i).copied().unwrap_or(0) as f64)],
-                            exemplars: vec![],
-                        })
-                        .collect(),
-                })
+                sort_series_like_the_reference(&mut series);
+                Ok(TraceMetricsResult { series })
             }
             (kind, None) => {
                 // Ungrouped: exactly one row (aggregate with no GROUP BY).
@@ -2242,18 +2250,54 @@ fn agg_value(v: f64) -> f64 {
     v / 1_000_000_000.0
 }
 
-/// The `__bucket` label's encode-boundary value: the fixed exponential
-/// power-of-two nanosecond `le` boundary rendered as float seconds.
+/// Orders a series set the way the reference's `sortResponse` does
+/// (`modules/frontend/combiner/metrics_query_range.go:245-266 @ v3.0.2`):
+/// by label COUNT first, then per label index by key, then by the
+/// RENDERED label value — a string comparison, not a numeric one.
 ///
-/// Issue #237: the reference converts duration nanoseconds to seconds
-/// with a SINGLE rounding (`float64(ns) / 1e9`), not the two-rounding
-/// `float64(sec) + float64(nsec)/1e9` form that #232 established for the
-/// LogQL rate divisor (see [`agg_value`]). For this site the distinction
-/// is moot regardless: every argument is a power of two
-/// (`HISTOGRAM_LE_BOUNDS_NS`) and the two forms are bit-identical for
-/// every `2^k`, `k = 0..=62`.
-fn histogram_bucket_seconds(le_ns: i64) -> f64 {
-    le_ns as f64 / 1e9
+/// That distinction is the whole point for `histogram_over_time`: the
+/// captured `mix252` corpus emits `0.001048576`, `2e-09`, `4e-09` in
+/// that order, which is lexicographic and the reverse of numeric on the
+/// first element. [`label_sort_text`] renders through the same
+/// `serde_json` the response encoder uses, so the ordering is over the
+/// text a client actually receives.
+///
+/// Applied to the `histogram_over_time` framing only (issue #252's
+/// scope). The reference sorts every metrics response this way; the
+/// other functions' orderings are unchanged here and route to the
+/// wire-envelope follow-up.
+pub fn sort_series_like_the_reference(series: &mut [TraceMetricSeries]) {
+    series.sort_by(|a, b| {
+        a.labels.len().cmp(&b.labels.len()).then_with(|| {
+            a.labels
+                .iter()
+                .zip(b.labels.iter())
+                .map(|(la, lb)| {
+                    la.key
+                        .cmp(&lb.key)
+                        .then_with(|| label_sort_text(&la.value).cmp(&label_sort_text(&lb.value)))
+                })
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+}
+
+/// One label value as the response encoder renders it. Doubles go
+/// through `serde_json` — the encoder
+/// (`pulsus-server/src/traces_api/metrics_response.rs`) serializes the
+/// same `f64` with the same crate, so this is the wire text by
+/// construction rather than by a second formatting rule that could
+/// drift. `serde_json` only fails to serialize an `f64` if it is
+/// non-finite, which a `__bucket` label never is; the fallback keeps the
+/// comparison total rather than panicking.
+pub fn label_sort_text(value: &MetricLabelValue) -> String {
+    match value {
+        MetricLabelValue::Str(s) => s.clone(),
+        MetricLabelValue::Double(d) => {
+            serde_json::to_string(d).unwrap_or_else(|_| "null".to_string())
+        }
+    }
 }
 
 /// Sanitizes a non-finite aggregate (e.g. `quantilesTDigest` over an empty
@@ -2963,35 +3007,78 @@ mod tests {
         (ns / 1_000_000_000) as f64 + (ns % 1_000_000_000) as f64 / 1e9
     }
 
+    // The `__bucket` rendering pins moved to
+    // `traces::log2_histogram`'s own tests with the function itself
+    // (issue #252) — `bucket_seconds` is no longer an `exec.rs` local.
+
+    /// Issue #252: the reference orders series by the RENDERED label
+    /// text, not numerically
+    /// (`modules/frontend/combiner/metrics_query_range.go:245-266 @
+    /// v3.0.2`). The `mix252` capture is the witness that makes the two
+    /// rules disagree: `2^20 ns` renders `0.001048576` and sorts BEFORE
+    /// `2^1 ns` (`2e-9`), which is the reverse of the numeric order the
+    /// SQL returns them in.
     #[test]
-    fn histogram_bucket_seconds_is_rounding_form_independent_for_every_power_of_two() {
-        for k in 0..=62u32 {
-            let ns = 1i64 << k;
-            assert_eq!(
-                histogram_bucket_seconds(ns).to_bits(),
-                two_rounding_seconds(ns).to_bits(),
-                "2^{k} ns must render identically under both rounding forms"
-            );
-        }
-        for le in crate::traces::metrics_plan::HISTOGRAM_LE_BOUNDS_NS {
-            assert_eq!(
-                histogram_bucket_seconds(*le).to_bits(),
-                two_rounding_seconds(*le).to_bits()
-            );
-        }
+    fn series_are_ordered_by_rendered_label_text_not_numerically() {
+        let bucket = |ns: u64| TraceMetricSeries {
+            labels: vec![MetricLabel::double(
+                "__bucket",
+                log2_histogram::bucket_seconds(ns),
+            )],
+            samples: vec![(0, 1.0)],
+            exemplars: vec![],
+        };
+        // SQL order is ascending by bucket_ns: 2, 4, 2^20.
+        let mut series = vec![bucket(2), bucket(4), bucket(1 << 20)];
+        sort_series_like_the_reference(&mut series);
+        let rendered: Vec<String> = series
+            .iter()
+            .map(|s| label_sort_text(&s.labels[0].value))
+            .collect();
+        assert_eq!(rendered, vec!["0.001048576", "2e-9", "4e-9"]);
     }
 
+    /// AC9: what our encoder actually emits for the smallest reachable
+    /// `__bucket` labels, measured on both sides rather than assumed.
+    ///
+    /// The plan's hypothesis was that the reference renders `2e-09`
+    /// where `serde_json`/ryu renders `2e-9`. **Read off the wire, that
+    /// is wrong**: protojson uses `encoding/json`'s rule — exponent form
+    /// iff `|v| < 1e-6` or `|v| >= 1e21`, with the exponent's leading
+    /// zero stripped — so it emits `2e-9` too, and the two agree at the
+    /// small end. Where they differ is `2^10 .. 2^13 ns`
+    /// (`1.024e-6 .. 8.192e-6 s`): ryu picks exponent form, protojson
+    /// picks plain decimal (`0.000001024`). Across the whole reachable
+    /// ladder (`2^1 .. 2^63 ns`) that is the entire divergence — four
+    /// buckets, same value, same parse, different text.
+    ///
+    /// Recorded rather than filed (cosmetic under the consumer-impact
+    /// rule); the measured pair for both sides is committed in the
+    /// capture's `wire_float_text` block and cross-checked by
+    /// `tests/traces_log2_reference.rs`.
     #[test]
-    fn histogram_bucket_seconds_reproduces_the_captured_reference_bucket_labels() {
-        // Observed emitted `__bucket` labels, 2026-07-26 probe run.
-        for (ns, want) in [
-            (1i64 << 29, 0.536870912f64),
-            (1 << 30, 1.073741824),
-            (1 << 31, 2.147483648),
-            (1 << 35, 34.359738368),
-        ] {
-            assert_eq!(histogram_bucket_seconds(ns).to_bits(), want.to_bits());
+    fn the_encoder_renders_the_smallest_buckets_the_way_the_capture_records() {
+        // Agrees with the reference.
+        for (ns, want) in [(2u64, "2e-9"), (1 << 20, "0.001048576")] {
+            assert_eq!(
+                label_sort_text(&MetricLabelValue::Double(log2_histogram::bucket_seconds(
+                    ns
+                ))),
+                want
+            );
         }
+        // Differs from the reference's `0.000001024` — text only.
+        assert_eq!(
+            label_sort_text(&MetricLabelValue::Double(log2_histogram::bucket_seconds(
+                1 << 10
+            ))),
+            "1.024e-6"
+        );
+        assert_eq!(
+            log2_histogram::bucket_seconds(1 << 10).to_bits(),
+            0.000001024f64.to_bits(),
+            "the VALUE is identical; only the rendering differs"
+        );
     }
 
     #[test]

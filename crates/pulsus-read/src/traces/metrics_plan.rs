@@ -93,40 +93,18 @@ pub enum PlanKind {
     /// `quantile_over_time(duration, q…)` — one series per quantile
     /// (`p=<q>` label); the quantile list is carried on the plan.
     Quantile,
-    /// `histogram_over_time(duration)` — one cumulative-count series per
-    /// exponential `le` bucket (`__bucket=<le seconds>` label).
+    /// `histogram_over_time(duration)` — one PLAIN-COUNT series per
+    /// power-of-two nanosecond bucket that actually occurred
+    /// (`__bucket=<bucket seconds>` label), the reference's
+    /// `Log2Bucketize` model (issue #252). There is no ladder and no
+    /// cumulation; membership is data-dependent, bounded at 64 buckets
+    /// per step by the bit width of `Int64`.
     Histogram,
     /// `compare({selection})` — baseline/selection attribute meta-series
     /// (`__meta_type` + one attribute label). The cross-tab/totals SQL is
     /// carried on the plan.
     Compare,
 }
-
-/// The fixed exponential power-of-two nanosecond `le` boundaries for
-/// `histogram_over_time` (issue #182, OQ4). Captured to match the Tempo
-/// v3.0.2 `__bucket` convention (power-of-two nanoseconds rendered as
-/// float seconds — e.g. `2^30 ns = 1.073741824`); the ladder's
-/// *rendering* (the ns→seconds conversion of each bound) is
-/// Tier-1-settled (issue #237 — form-independent for every power of
-/// two, pinned in `exec.rs` tests); the ladder's *membership/shape*
-/// parity vs Tempo stays Tier-2 (issues #252/#25). The series count is
-/// fixed (bounded), so no cardinality probe applies.
-pub const HISTOGRAM_LE_BOUNDS_NS: &[i64] = &[
-    1 << 10, // ~1.02µs
-    1 << 13,
-    1 << 16,
-    1 << 19,
-    1 << 22, // ~4.19ms
-    1 << 25,
-    1 << 28,
-    1 << 30, // ~1.07s
-    1 << 31,
-    1 << 32,
-    1 << 34,
-    1 << 36,
-    1 << 38,
-    1 << 40, // ~1099s
-];
 
 /// The complete, deterministic metrics plan — both SQL forms are
 /// byte-frozen (`tests/traces_metrics_sql.rs`).
@@ -193,11 +171,6 @@ impl TraceMetricsPlan {
     /// The requested quantiles (`PlanKind::Quantile`), in request order.
     pub fn quantiles(&self) -> &[f64] {
         &self.quantiles
-    }
-
-    /// The histogram `le` boundaries in nanoseconds (`PlanKind::Histogram`).
-    pub fn histogram_le_bounds_ns(&self) -> &[i64] {
-        HISTOGRAM_LE_BOUNDS_NS
     }
 
     /// The second-stage `topk`/`bottomk` reduction, if any.
@@ -389,19 +362,8 @@ pub fn plan_trace_metrics(
             ),
         ),
         PlanKind::Histogram => (
-            metrics_sql::metrics_histogram_range_sql(
-                spans,
-                &filter_sql,
-                window,
-                params.step_s,
-                HISTOGRAM_LE_BOUNDS_NS,
-            ),
-            metrics_sql::metrics_histogram_instant_sql(
-                spans,
-                &filter_sql,
-                window,
-                HISTOGRAM_LE_BOUNDS_NS,
-            ),
+            metrics_sql::metrics_log2_bucket_range_sql(spans, &filter_sql, window, params.step_s),
+            metrics_sql::metrics_log2_bucket_instant_sql(spans, &filter_sql, window),
         ),
         // compare() serves from its own cross-tab/totals SQL below.
         PlanKind::Compare => (String::new(), String::new()),
@@ -923,17 +885,30 @@ mod tests {
                 .contains("quantilesTDigest(0.5, 0.9)(val)")
         );
 
+        // Issue #252: the histogram is a log2 tally with NO ladder — a
+        // `GROUP BY` on the pushed-down `Log2Bucketize`, guarded by the
+        // outer sub-2ns drop, and nothing cumulative anywhere.
         let hist = plan("{} | histogram_over_time(duration)");
         assert_eq!(hist.kind(), PlanKind::Histogram);
+        for needle in [
+            "toUInt64(roundToExp2(val - 1)) * 2 AS bucket",
+            "count() AS n",
+            "WHERE val >= 2",
+            "GROUP BY t, bucket",
+        ] {
+            assert!(
+                hist.range_sql().contains(needle),
+                "{needle:?} missing from\n{}",
+                hist.range_sql()
+            );
+        }
         assert!(
-            hist.range_sql().contains("countIf(val <= "),
-            "{}",
+            !hist.range_sql().contains("countIf("),
+            "the fixed cumulative `le` ladder is gone:\n{}",
             hist.range_sql()
         );
-        assert_eq!(
-            hist.histogram_le_bounds_ns().len(),
-            HISTOGRAM_LE_BOUNDS_NS.len()
-        );
+        assert!(hist.instant_sql().contains("GROUP BY bucket"));
+        assert!(hist.instant_sql().contains("WHERE val >= 2"));
     }
 
     #[test]

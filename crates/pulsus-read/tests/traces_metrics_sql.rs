@@ -132,10 +132,33 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
-        // `histogram_over_time(duration)` — cumulative countIf over the
-        // fixed exponential le boundaries, one Array(UInt64) per bucket.
+        // `histogram_over_time(duration)` — issue #252: the reference's
+        // `Log2Bucketize` pushed down as a `GROUP BY` on
+        // `toUInt64(roundToExp2(val - 1)) * 2`, one plain `count()` row
+        // per OCCUPIED `(t, bucket)`, with the sub-2ns drop as the outer
+        // `WHERE val >= 2`. No ladder, nothing cumulative.
         name: "histogram_over_time_duration",
         q: r#"{ span.http.status_code >= 500 } | histogram_over_time(duration)"#,
+        distributed: false,
+    },
+    Case {
+        // AC14-example (issue #252): the docs/api.md §4.4 worked example
+        // for the MATCHED histogram. Its plan is frozen here so the
+        // documented query cannot drift into one that no longer plans;
+        // the numbers the prose states for it are pinned by
+        // `traces_log2_reference.rs` (the reference's) and
+        // `traces_metrics_live.rs` (ours).
+        name: "docs_histogram_worked_example",
+        q: r#"{ resource.service.name = "checkout" } | histogram_over_time(duration)"#,
+        distributed: false,
+    },
+    Case {
+        // AC14-example (issue #252): the §4.4 worked example for the
+        // DIVERGING percentile — same selector, same corpus,
+        // `quantilesTDigest` instead of the reference's bucket walk
+        // (ledger `2026-08-05-traceql-quantile-over-time-tdigest`).
+        name: "docs_quantile_worked_example",
+        q: r#"{ resource.service.name = "checkout" } | quantile_over_time(duration, 0.5, 0.9, 0.99, 1.0)"#,
         distributed: false,
     },
     Case {

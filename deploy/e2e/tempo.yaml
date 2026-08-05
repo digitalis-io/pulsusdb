@@ -32,3 +32,47 @@ storage:
       path: /tmp/tempo/blocks
     wal:
       path: /tmp/tempo/wal
+
+# TraceQL METRICS (`/api/metrics/query_range`, `/api/metrics/query`).
+# Without this block 3.0.2 boots with
+#
+#   msg="metrics-generator is not configured."
+#   err="no metrics_generator.storage.path configured, metrics generator
+#        will be disabled"
+#
+# and then answers EVERY TraceQL metrics query with `{"series":[]}` (or,
+# for `count_over_time`/`rate`, the step grid with every value zero)
+# while `/api/search` still returns the whole ingested corpus. The
+# traces differential's informational metrics comparison
+# (`e2e/src/traces.rs::run_informational_comparisons`) was therefore
+# diffing our output against nothing and summarising a delta computed
+# from an empty series set — a green check that could not fail. Issue
+# #252 adds a reference-positive control that fails the scenario when
+# the reference answers nothing, and this key is what makes that control
+# satisfiable.
+#
+# A/B measured on grafana/tempo:3.0.2 (standalone, OTLP/HTTP ingest of
+# 20 spans of 300 ms, 2026-08-05):
+#   - committed config (no `metrics_generator` block): `/api/search`
+#     returns the traces, `histogram_over_time(duration)` returns no
+#     series for > 200 s of polling;
+#   - this config: the same query returns
+#     `{"__bucket": 0.536870912} = 20` about 75 s after ingest (the
+#     live block has to complete first — metrics visibility lags search
+#     visibility, which is why the harness polls the reference rather
+#     than querying it once).
+#
+# `metrics_generator.storage.path` is the whole fix, deliberately with
+# NO `overrides.defaults.metrics_generator.processors` list: the
+# `local-blocks` processor no longer exists in 3.0.2
+# (`modules/generator/validation/fields.go:19-25 @ v3.0.2` lists
+# service-graphs / span-metrics{,-count,-latency,-size} / host-info
+# only), and configuring it makes the binary log
+# `msg="ignoring unknown metrics-generator processor" processor=local-blocks`
+# every 10 s while changing no result — measured identical, with and
+# without. The newer `local_blocks` / `traces_storage` spellings from
+# current Tempo docs do not exist here either and hard-fail boot
+# (`field local_blocks not found in type generator.ProcessorConfig`).
+metrics_generator:
+  storage:
+    path: /tmp/tempo/generator/wal

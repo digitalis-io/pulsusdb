@@ -220,7 +220,8 @@
     "_comment": "Never-gating comparisons (ratified on #19/#60): tags-vs-Tempo runs parameterlessly against both tag surfaces; each metrics query below runs against both stores' TraceQL-metrics query_range endpoints. Deltas are dumped to target/e2e-artifacts/traces-diff/<variant>/informational-*.json and the scenario returns Ok regardless.",
     "metrics_queries": [
       "{ resource.run_id = \"{R}\" } | rate()",
-      "{ resource.run_id = \"{R}\" && status = error } | count_over_time()"
+      "{ resource.run_id = \"{R}\" && status = error } | count_over_time()",
+    "{ resource.run_id = \"{R}\" } | histogram_over_time(duration)"
     ]
   }
 }

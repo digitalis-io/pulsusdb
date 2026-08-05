@@ -675,21 +675,53 @@ pub fn metrics_quantile_instant_sql(
     )
 }
 
-/// The ungrouped `histogram_over_time` range query (issue #182, OQ4):
-/// pushed-down conditional cumulative counts over fixed exponential
-/// power-of-two nanosecond `le` boundaries, one column per bucket. The
-/// engine emits one cumulative-count series per bucket (`__bucket=<le
-/// seconds>` label). Exact bucket-boundary/value parity vs Tempo is
-/// Tier-2 (issue #25); this pins the exp-`le` shape.
-pub fn metrics_histogram_range_sql(
+/// The pushed-down `Log2Bucketize` — see
+/// [`metrics_log2_bucket_range_sql`] for why each piece is what it is.
+/// Its Rust twin is [`super::log2_histogram::log2_bucketize_ns`].
+const LOG2_BUCKET_EXPR: &str = "toUInt64(roundToExp2(val - 1)) * 2";
+
+/// The ungrouped `histogram_over_time` log2-bucket tally range query
+/// (issue #252): the reference's `Log2Bucketize`
+/// (`pkg/traceql/engine_metrics.go:2038-2046 @ v3.0.2` — the smallest
+/// power of two `>= v`) pushed down as
+/// `toUInt64(roundToExp2(val - 1)) * 2` over the per-`(t, trace_id,
+/// span_id)` replay-deduped `duration_ns`, one row per OCCUPIED
+/// `(t, bucket)`. There is no bucket ladder: the reference's `__bucket`
+/// is a plain `by`-key whose series is created on first observation
+/// (`engine_metrics.go:788-793`), and each tally is a plain count
+/// (`CountOverTimeAggregator`, `:471-477`), never cumulative.
+///
+/// **`WHERE val >= 2` sits on the OUTER query, after the dedup**, for
+/// two reasons: it reproduces the reference's sub-2ns drop
+/// (`ast_metrics.go:181-188`) against the deduped value rather than the
+/// raw rows, and it keeps the inner subquery byte-identical to
+/// [`metrics_agg_range_sql`]'s, so the PREWHERE hoist, `service_time`
+/// projection selection and `trace_attrs_idx` granule pruning are
+/// unchanged. The guard is also what excludes negatives: `roundToExp2`
+/// of a negative argument feeds `toUInt64` and would yield a large,
+/// plausible-looking bucket rather than an error.
+///
+/// `roundToExp2` rounds DOWN and `roundUpToPowerOfTwo` does not exist on
+/// ClickHouse 24.8, hence the `(val - 1) * 2` form. The `toUInt64`
+/// before the doubling is required, not cosmetic: for `val` in
+/// `2^62 + 1 ..= i64::MAX` the reference's bucket is `2^63`, which the
+/// signed form wraps to a NEGATIVE `__bucket` label. Verified on
+/// 24.8.14.39 at `2`, `3`, `536870912`, `2^62`, `2^62 + 1` and
+/// `i64::MAX`; the domain is `2..=i64::MAX` because `duration_ns` is
+/// `Int64` (`crates/pulsus-schema/src/catalog.rs:347`), and nothing is
+/// claimed above it.
+///
+/// The returned row count per step is bounded by 64 — the bit width of
+/// the duration, not a property of the corpus — so the bucket axis can
+/// never breach `traceql_max_series` (which in any case gates `by(...)`
+/// keys, and grouping stays rejected for this function).
+pub fn metrics_log2_bucket_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
     step_s: i64,
-    le_bounds_ns: &[i64],
 ) -> String {
     let step_ms = step_s * 1000;
-    let cols = histogram_bucket_cols(le_bounds_ns);
     let mut inner = format!(
         "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
          INTERVAL {step_ms} MILLISECOND)) AS t, trace_id, span_id,\n         \
@@ -697,35 +729,27 @@ pub fn metrics_histogram_range_sql(
     );
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str("\n  GROUP BY t, trace_id, span_id");
-    format!("SELECT t, {cols} AS bkts\nFROM (\n  {inner}\n)\nGROUP BY t\nORDER BY t ASC")
+    format!(
+        "SELECT t, {LOG2_BUCKET_EXPR} AS bucket, count() AS n\nFROM (\n  {inner}\n)\n\
+         WHERE val >= 2\nGROUP BY t, bucket\nORDER BY t ASC, bucket ASC"
+    )
 }
 
-/// The ungrouped `histogram_over_time` instant query.
-pub fn metrics_histogram_instant_sql(
+/// The ungrouped `histogram_over_time` instant form — the same tally
+/// over the whole snapped window, no time bucket.
+pub fn metrics_log2_bucket_instant_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
-    le_bounds_ns: &[i64],
 ) -> String {
-    let cols = histogram_bucket_cols(le_bounds_ns);
     let mut inner =
         format!("SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ");
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str("\n  GROUP BY trace_id, span_id");
-    format!("SELECT {cols} AS bkts\nFROM (\n  {inner}\n)")
-}
-
-/// Renders the cumulative per-bucket count array
-/// `[countIf(val <= le0), …]` for the histogram's `le` boundaries — one
-/// `Array(UInt64)` column, decoded positionally against the boundary
-/// list.
-fn histogram_bucket_cols(le_bounds_ns: &[i64]) -> String {
-    let items = le_bounds_ns
-        .iter()
-        .map(|le| format!("countIf(val <= {le})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{items}]")
+    format!(
+        "SELECT {LOG2_BUCKET_EXPR} AS bucket, count() AS n\nFROM (\n  {inner}\n)\n\
+         WHERE val >= 2\nGROUP BY bucket\nORDER BY bucket ASC"
+    )
 }
 
 /// The per-bucket exemplar collection query (issue #182 P5): a bounded

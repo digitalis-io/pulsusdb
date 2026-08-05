@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 17)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 20)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -103,7 +103,27 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 1
 /// projection (the Layer-1 residual bound in the `traces::exec` module
 /// doc — an array column is row-unbounded by construction). Still only
 /// those three files; the other 63 are byte-identical to `49cff9a`.
-const PINNED_SQL_CORPUS: u64 = 0xb718_14b9_674a_32fe;
+///
+/// **Moved on issue #252**, for THREE separate reasons in one change —
+/// the situation this test's split count/digest reporting exists for:
+///   1. `histogram_over_time_duration.sql` was REGENERATED. The fixed
+///      14-entry cumulative `le` ladder became the reference's log2
+///      tally (`GROUP BY toUInt64(roundToExp2(val - 1)) * 2` under an
+///      outer `WHERE val >= 2`). Only the OUTER select and its trailing
+///      clauses moved; the inner replay-dedup subquery is byte-identical,
+///      which is what keeps the projection/granule gates valid.
+///   2. Two goldens were ADDED — `docs_histogram_worked_example.sql` and
+///      `docs_quantile_worked_example.sql`, the plans of the two queries
+///      docs/api.md §4.4.1 documents, frozen so a documented example
+///      cannot drift into one that no longer plans.
+///   3. One non-`.sql` file was ADDED — `log2_reference_capture.json`,
+///      the byte-committed capture from the pinned Tempo container. The
+///      walk digests EVERY entry, whatever its extension, so it moves
+///      both numbers by design.
+///
+/// Corpus 66 -> 69 entries; `quantile_over_time_multi.sql` and the other
+/// 65 pre-existing goldens are byte-identical.
+const PINNED_SQL_CORPUS: u64 = 0xfef1_d4ae_c000_15e5;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -235,7 +255,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 66, "the frozen SQL corpus is 49 + 17 = 66 entries");
+    assert_eq!(total, 69, "the frozen SQL corpus is 49 + 20 = 69 entries");
 }
 
 #[test]
@@ -280,7 +300,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     }
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 66 frozen SQL goldens changed. This is not a constant to refresh: it means the \
+        "the 69 frozen SQL goldens changed. This is not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
          PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \
