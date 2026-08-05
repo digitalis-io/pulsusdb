@@ -345,17 +345,25 @@ pub(crate) fn detected_labels_response(
 /// docs/api.md §2.6): the bare `{"fields":[...],"limit":N}` object,
 /// fields already label-sorted by the engine.
 ///
-/// **Scope of the byte-exactness claim.** Every per-field OBJECT and the
-/// zero-field body are byte-exact against the reference. A populated
-/// body as a whole is NOT, and cannot be: the reference builds its
-/// `fields` slice by ranging a Go map at both build sites and never
-/// sorts before marshaling (`detected_fields.go:57-75`,
-/// `pkg/storage/detected/fields.go:54-101`,
-/// `pkg/util/marshal/marshal.go:182-188 @ v3.7.4`), so its ARRAY ORDER is
-/// randomised per iteration and irreproducible even by itself. We pin
-/// label-ascending — registered as `detected-fields-array-order-pinned`
-/// in docs/benchmarks/logs-differential-ledger.md. Nothing below claims
-/// order parity.
+/// **Scope of the byte-exactness claim**, with both exceptions named so
+/// the sentence cannot drift wider than the code:
+///  * the zero-field body IS byte-exact;
+///  * each per-field OBJECT is byte-exact against the reference's
+///    SINGLE-RESPONSE path only — its sharded merge rebuilds fields
+///    without `JsonPath` (`pkg/storage/detected/fields.go:92-99 @
+///    v3.7.4`), which we deliberately decline to reproduce (registered
+///    exception `detected-fields-jsonpath-survives-merge`);
+///  * a populated body AS A WHOLE is not, because of ARRAY ORDER: the
+///    reference builds its `fields` slice by ranging a Go map at both
+///    build sites and never sorts before marshaling
+///    (`detected_fields.go:57-75`, `fields.go:54-101`,
+///    `pkg/util/marshal/marshal.go:182-188`), and the Go spec withholds
+///    any guarantee that order repeats between iterations, so there is
+///    no order guaranteed to exist to mirror. We pin label-ascending
+///    (registered `detected-fields-array-order-pinned`).
+///
+/// Both ledger rows are in docs/benchmarks/logs-differential-ledger.md.
+/// Nothing below claims order parity.
 ///
 /// Three shapes are the reference's, byte for byte (all captured from
 /// `grafana/loki:3.7.4` and recorded on issue #258):

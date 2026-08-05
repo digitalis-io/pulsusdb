@@ -235,10 +235,14 @@ Out of this ledger's scope by design:
 
   Nothing sorts on the way out: `WriteDetectedFieldsResponseJSON` is a
   straight `jsoniter` `WriteVal` of the slice as it stands
-  (`pkg/util/marshal/marshal.go:182-188`). Go's spec makes map
-  iteration order unspecified and the runtime randomises it per
-  iteration, so **the reference cannot reproduce its own order between
-  two runs on identical input.** Corroborated by our own capture record:
+  (`pkg/util/marshal/marshal.go:182-188`). The Go spec leaves map
+  iteration order unspecified and explicitly does not guarantee it is
+  the same from one iteration to the next, and the gc runtime
+  randomises it; so **no reproducible order is guaranteed to exist to
+  mirror.** (That is the precise claim: the spec withholds a
+  reproducibility guarantee. It is not a guarantee that two runs must
+  DIFFER, which nothing states and which this entry does not rely on.)
+  Corroborated by our own capture record:
   `crates/pulsus-read/tests/logqltest/PROVENANCE.md` rule A4 already
   transcribes captured fields as a SET for exactly this reason, citing
   case C1 where `uid` precedes `lvl`; the #258 capture's `msg`, `code`,
@@ -248,24 +252,62 @@ Out of this ledger's scope by design:
   `FieldAccumulator::finish`. This is the ratified treatment of every
   irreproducible reference tie in this repo — the same call as
   `label-replace-collision-tie-order` and `approx_topk` beyond the
-  retention cap. Mirroring is not available at any price: there is no
-  order to mirror. The SET of fields, every per-field object and the
-  `limit`/zero-field bodies are reference-exact; only the array order is
-  pinned rather than mirrored.
+  retention cap. Mirroring is not available at any price: no reproducible
+  order is guaranteed to exist. The SET of fields, and the
+  `limit`/zero-field bodies, are reference-exact; the array ORDER is
+  pinned rather than mirrored. Per-field OBJECT exactness is scoped in
+  `detected-fields-jsonpath-survives-merge` below — it holds against the
+  reference's single-response path, which is what the pinned single-node
+  container serves and what our captures record, and deliberately does
+  not hold against its sharded merge path.
 - **Consumer impact:** none identified. `fields` is a lookup collection
   keyed by `label`, the reference ships no order guarantee a client
   could have depended on, and a deterministic order is strictly easier
   to consume and to diff.
-- **Not mirrored, deliberately:** `MergeFields` also DROPS `JsonPath`
-  when it rebuilds each field (`fields.go:92-99` sets `Label`, `Type`,
-  `Cardinality`, `Parsers`, `Sketch` — no `JsonPath`), so a sharded
-  reference deployment silently loses the paths a single-shard one
-  returns. We emit them on every response; that is an upstream defect,
-  not a shape to reproduce.
 - **Fixture status:** as the entry above — no
   `test/fixtures/logs/differential.json` case, registered for identity.
   Gated by `logs_detected_live.rs`'s label-ordered `fields_of`
   comparison and `detected.rs::finish_sorts_fields_by_label`.
+
+### detected-fields-jsonpath-survives-merge (issues #254, #258)
+
+- **Status: REGISTERED EXCEPTION — a deliberate divergence we decline to
+  mirror, not an observation.** It is the parity mandate's
+  "diverge from defects" arm, and it is the reason the per-field-object
+  byte-exactness claim in `detected-fields-array-order-pinned` is scoped
+  to the reference's single-response path.
+- **Construct:** the presence of `jsonPath` on a per-field object in a
+  `/detected_fields` `200`.
+- **Reference behaviour:** path-dependent, and self-inconsistent. The
+  single-response path carries `JsonPath` through
+  (`pkg/querier/queryrange/detected_fields.go:71 @ v3.7.4`), but the
+  SHARDED merge rebuilds every field as
+  `{Label, Type, Cardinality, Parsers, Sketch}` with **no `JsonPath`
+  field set** (`pkg/storage/detected/fields.go:92-99`), so the key
+  vanishes under `omitempty`. The same query against the same data
+  therefore returns paths on a single-shard deployment and silently
+  loses them on a sharded one. Nothing in the proto or the handler marks
+  this intentional; `MergeFields`'s neighbours (`Parsers`) are carried,
+  so it reads as an omission when `jsonPath` was added.
+- **PulsusDB behaviour:** `jsonPath` is emitted on **every** response,
+  for every json-flattened field, regardless of how the answer was
+  assembled.
+- **Why we diverge rather than mirror:** mirroring would mean dropping a
+  documented, client-consumable field on some responses and not others,
+  with no rule a client could predict — the divergence would be *worse*
+  for the consumer than the parity break. `jsonPath` is exactly the
+  parseable structure the parity bar protects (it is what lets a client
+  turn a detected field into a working `| json <expr>` selector for a
+  nested key, issue #254), so dropping it conditionally is the outcome
+  the bar exists to prevent. This is the standing "match the reference
+  except where it is wrong" ruling applied.
+- **Consumer impact of the divergence:** a client written against a
+  sharded reference deployment sees a key it may not expect. It is
+  additive and `omitempty`-shaped on the reference side, so a decoder
+  that tolerates the single-shard reference tolerates ours.
+- **Fixture status:** no `test/fixtures/logs/differential.json` case.
+  Gated by `logs_detected_live.rs`'s per-field `jsonPath` assertions and
+  `encode.rs`'s byte-exact goldens.
 
 ### tumbling-vs-sliding-rate — RESOLVED (issue #227)
 

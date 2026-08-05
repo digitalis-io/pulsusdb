@@ -3396,15 +3396,38 @@ impl JsonKeyBudget {
 /// the_detected_fields_auto_parse_pass_surfaces_the_breach`), never a new
 /// rejection surface.
 ///
-/// **Peak live set.** For one row: the flattened key strings, every
-/// captured path component, both spines and the slot table come out of
-/// ONE 64 MiB ledger of `alloc_block_bytes`-rounded blocks, so a
-/// capturing row's live flatten+capture heap is `≤ MAX_JSON_FLATTEN_KEY_
-/// BYTES`. Across rows it is one row at a time (`DetectedRowFeeder`
-/// streams), and the accumulator's SURVIVING copy is charged separately
-/// against the per-REQUEST `MAX_DETECTED_FIELD_BYTES` — the same
-/// row-ledger/request-ledger split the keys and the retained values
-/// already use.
+/// **Every owned container in the capture path, and where its charge
+/// sits relative to its growth** (review round 2, high — an earlier
+/// revision priced three of the four and stated a peak that the fourth
+/// falsified; the table is exhaustive so the omission cannot recur
+/// silently):
+///
+/// | container | grows with | charge |
+/// |---|---|---|
+/// | [`JsonPathCapture::stack`] (`Vec<&str>`) | JSON nesting DEPTH | `grown_alloc_bytes` high-water delta in [`JsonPathCapture::push`], **before** the element lands |
+/// | [`JsonPaths::slots`] (`Vec<Option<Vec<String>>>`) | label COUNT | `grown_alloc_bytes` high-water delta in [`JsonPaths::record`], **before** `resize_with` |
+/// | the per-leaf `path` spine (`Vec<String>`) | that leaf's depth | `charge_key(parts × size_of::<String>())`, **before** `Vec::with_capacity` |
+/// | each path component (`String`) | that component's length | `charge_key(part.len())`, **before** `to_string()` |
+///
+/// There is no fifth: `stack` holds `&str` borrowed from the parsed
+/// value (only its spine allocates), `slots`' elements are the `path`
+/// vectors already in the table, and `JsonPathCapture` itself is a stack
+/// local. All four charge the ROW's [`JsonKeyBudget`].
+///
+/// **Peak live set, stated for exactly what the ledger covers.** The
+/// four containers above plus [`flatten_json`]'s key strings are all
+/// deducted from ONE 64 MiB countdown of `alloc_block_bytes`-rounded
+/// blocks, so their combined live heap for a row is
+/// `≤ MAX_JSON_FLATTEN_KEY_BYTES`. Across rows it is one row at a time
+/// (`DetectedRowFeeder` streams), and the accumulator's SURVIVING copy is
+/// charged separately against the per-REQUEST
+/// `MAX_DETECTED_FIELD_BYTES` — the same row-ledger/request-ledger split
+/// the keys and the retained values already use.
+///
+/// What this ledger does **not** bound, unchanged by this change and NOT
+/// claimed: the row's label vector spine and the parsed
+/// `serde_json::Value`. Both predate the capture and sit outside issue
+/// #287's model, which prices key STRINGS.
 #[derive(Debug, Default)]
 pub(crate) struct JsonPaths {
     /// Indexed by position in the label vector; `None` for a label the
@@ -3482,10 +3505,44 @@ impl JsonPaths {
 /// trim EMPTY are pushed too: `buildSanitizedPrefixFromBuffer` skips them
 /// when building the label name, `buildJSONPathFromPrefixBuffer` does
 /// not, so `{"x":{"":1}}` is label `x` with path `["x",""]`.
+///
+/// `stack` is an OWNED container that grows with JSON nesting depth,
+/// which the line controls, so it is charged like every other one — see
+/// [`JsonPathCapture::push`] and the container table on [`JsonPaths`].
+/// It holds `&'v str` borrowed from the parsed value, so only the SPINE
+/// ever allocates.
 #[derive(Debug)]
 struct JsonPathCapture<'v, 'o> {
     stack: Vec<&'v str>,
+    /// High-water block bytes already charged for `stack`. `Vec` never
+    /// shrinks on `pop`, so charging the peak once — rather than per
+    /// push — is both sound and free of double-charging when the walk
+    /// re-descends to a depth it has already paid for.
+    charged_stack: u64,
     out: &'o mut JsonPaths,
+}
+
+impl<'v> JsonPathCapture<'v, '_> {
+    /// Charge-then-push: the spine's geometric growth is priced BEFORE
+    /// the element lands, so a refusal returns with the stack never
+    /// having grown.
+    fn push(&mut self, part: &'v str, budget: &JsonKeyBudget) -> Result<(), RowBudgetExceeded> {
+        let want =
+            super::charge::grown_alloc_bytes(((self.stack.len() + 1) * size_of::<&str>()) as u64);
+        if want > self.charged_stack {
+            budget.charge_block(want - self.charged_stack)?;
+            self.charged_stack = want;
+        }
+        self.stack.push(part);
+        Ok(())
+    }
+
+    /// Leaving an object (`parseObject`'s rollback). Never refunds: the
+    /// ledger is a countdown over PEAK blocks and the spine keeps its
+    /// capacity.
+    fn pop(&mut self) {
+        self.stack.pop();
+    }
 }
 
 /// Owned key/value output by design: extracted values live inside the
@@ -3533,6 +3590,7 @@ fn run_json<'a>(
     if extractions.is_empty() {
         let mut capture = paths.map(|out| JsonPathCapture {
             stack: Vec::new(),
+            charged_stack: 0,
             out,
         });
         flatten_json(
@@ -3655,7 +3713,7 @@ fn flatten_json<'a, 'v>(
                         // empty-trimming ancestor still occupies a path
                         // slot; `parseObject` pops it on the way out.
                         if let Some(c) = capture.as_deref_mut() {
-                            c.stack.push(k);
+                            c.push(k, budget)?;
                         }
                         let res = flatten_json(
                             prefix,
@@ -3667,7 +3725,7 @@ fn flatten_json<'a, 'v>(
                             capture.as_deref_mut(),
                         );
                         if let Some(c) = capture.as_deref_mut() {
-                            c.stack.pop();
+                            c.pop();
                         }
                         res?;
                     }
@@ -3708,7 +3766,7 @@ fn flatten_json<'a, 'v>(
             match v {
                 serde_json::Value::Object(_) => {
                     if let Some(c) = capture.as_deref_mut() {
-                        c.stack.push(k);
+                        c.push(k, budget)?;
                     }
                     let res = flatten_json(
                         &key,
@@ -3720,7 +3778,7 @@ fn flatten_json<'a, 'v>(
                         capture.as_deref_mut(),
                     );
                     if let Some(c) = capture.as_deref_mut() {
-                        c.stack.pop();
+                        c.pop();
                     }
                     res?;
                 }

@@ -401,6 +401,73 @@ fn whitespace_ancestor_line(p: usize, m: usize) -> String {
     s
 }
 
+/// The capture's DEPTH axis — `JsonPathCapture::stack` grows once per
+/// open object (review round 2, high: it was the one owned container the
+/// previous revision left unpriced). It is now charged before it grows,
+/// and this pins the ceiling that makes its peak SMALL, so the two facts
+/// are checkable together.
+///
+/// **What bounds the stack is serde_json's recursion limit, not our
+/// ledger.** Measured here: 126 wrapper objects parse, 127 do not — the
+/// crate's default `RECURSION_LIMIT` of 128. A refused line never
+/// reaches the flatten at all (it is the malformed-JSON class: line
+/// kept, `JSONParserErr` tagged), so the stack can hold at most 127
+/// `&str` = 2 032 content bytes, i.e.
+/// `grown_alloc_bytes(2032) = 12 192` charged bytes out of 64 MiB.
+///
+/// **This test therefore cannot demonstrate a stack-only breach, and
+/// does not pretend to**: 12 KiB cannot exhaust the ledger, so the
+/// charge is defence-in-depth against a future recursion-limit change
+/// rather than a reachable 422 today. What it does gate is the premise —
+/// if serde_json's limit ever moves, the peak arithmetic above stops
+/// holding and this fails. The path-component charges, which CAN
+/// breach, are gated by
+/// `a_whitespace_ancestor_is_free_for_keys_and_charged_for_captured_paths`.
+#[test]
+fn nesting_depth_is_capped_upstream_which_bounds_the_capture_stack() {
+    // The deepest line that parses, and the first that does not.
+    assert_eq!(
+        flatten(&nested_line(126)),
+        Ok(nested_leaf_key_bytes(126)),
+        "126 wrappers must flatten"
+    );
+    let mut probe = DetectedFieldsProbe::new(10, 1000);
+    probe.add_stream(1, &[("app".to_string(), "a".to_string())]);
+    probe
+        .feed_row(&compiled(r#"{app="a"}"#), 1, 0, &nested_line(126), "")
+        .expect("126 wrappers is inside the ledger under capture too");
+
+    // 127 is refused by the JSON parse itself, before the flatten: the
+    // line is kept and tagged, never walked, so no stack is built.
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&nested_line(127)).is_err(),
+        "serde_json's RECURSION_LIMIT must still cap the walk at 127 — if this \
+         moves, JsonPaths' peak-live-set arithmetic must be recomputed"
+    );
+    probe
+        .feed_row(&compiled(r#"{app="a"}"#), 1, 0, &nested_line(127), "")
+        .expect("an over-deep line is the malformed class, never an error");
+}
+
+/// The single leaf key `a_a_…_a_leaf` a `nested_line(d)` emits.
+fn nested_leaf_key_bytes(depth: usize) -> usize {
+    // `d` prefix parts of one byte, joined by `_`, then `_leaf`.
+    depth * 2 + 4
+}
+
+/// `{"a":{"a":{ … ×d … {"leaf":0} … }}}` — `d` wrapper objects, one leaf.
+fn nested_line(depth: usize) -> String {
+    let mut s = String::with_capacity(depth * 6 + 16);
+    for _ in 0..depth {
+        s.push_str("{\"a\":");
+    }
+    s.push_str("{\"leaf\":0}");
+    for _ in 0..depth {
+        s.push('}');
+    }
+    s
+}
+
 /// The metric path reaches the same flatten and the same ledger.
 #[test]
 fn the_metric_path_charges_the_same_key_budget() {
