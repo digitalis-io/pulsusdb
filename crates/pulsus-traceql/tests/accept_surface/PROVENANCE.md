@@ -224,6 +224,47 @@ probe, a compensating swap that leaves the count unchanged, an added
 already-diverging probe, a divergence retired by deleting its probe, and
 a PR that rewrites its own `reference` column to match all fail.
 
+## Wire-axis ownership: `owning_issue` (issue #335 follow-up, 2026-08-05)
+
+A probe that agrees on the parse axis and is a planner 400 against a
+reference 2xx names the issue that owns the gap, in an `owning_issue`
+field on the probe. Ten probes do today, and it moved no verdict, no
+count and no wire disposition — the field is metadata plus the gate that
+requires it.
+
+| probes | owner | evidence |
+|---|---|---|
+| `avg(span:childCount)`, `avg(trace:duration)`, `avg(.a + 1)` | **#335** | the refusing arm is Stage C's own (`search_plan.rs`, the `PipelineStage::Aggregate` source match, comment "the executable subset is decided HERE"); D7 is a #335 class (`closed_by: 335`) and its `wire_status: "open"` note already names exactly these three; they route to `/api/search`, not the metrics planner |
+| `rate() by(.a\|span.a\|name\|span:id)`, `rate() by(.a, .b)`, `quantile_over_time(.a, .5)`, `max_over_time(.a)` | **#182** | the planner's own 400 names it — `by() currently supports grouping by resource.service.name only (issue #182)`, `by() currently supports a single grouping key (issue #182)`, `<func>() currently supports the duration target only (issue #182)` (`metrics_plan.rs`), which is #351's "#182 follow-up" row made machine-readable |
+
+An owner is required while the probe diverges on the wire and forbidden
+once it agrees, so closing a gap deletes its pointer in the same change
+that re-pins the baseline — the `closed_by` posture, one axis over.
+
+**Why it needed its own gate.**
+`a_class_open_on_the_wire_has_a_probe_still_diverging_there` quantifies
+over CLASSES that declare a `wire_status` and reaches a probe only
+through `class`/`closed_class`. A probe that diverges on the wire while
+agreeing on parse has neither field by construction — an agreement may
+not carry `class` — so all ten were invisible to it: replayed against
+the pre-change data, that test is green while
+`a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue`
+names all ten. The parse axis needs no such field because its
+divergences are owned by construction (every class is declared here and
+this matrix's own `owning_issue` is the audit issue); a wire divergence
+belongs to whichever planner refuses the query, which is not knowable
+from the class.
+
+**The join both wire gates read through is validated first** (review
+round, `wire_dispositions`): duplicate `query` keys in
+`wire_baseline.json` fail, and every baseline entry must name a matrix
+probe. A duplicate is not cosmetic here — with the earlier
+`.iter().find(...)` lookup an *earlier* copy reading `accept` hid a real
+divergence, and the ownership gate then did not require an owner for it;
+measured, the pre-fix tree is 12/12 green on exactly that mutant. This is
+the Rust spelling of the weakness `wire-baseline-freeze` rejects in every
+file it builds a join from.
+
 ## Operator precedence and associativity
 
 Tightest first. `=` marks agreement from the audit capture, `✔` a
@@ -323,6 +364,11 @@ Re-record only with a deliberate grammar change, in the same commit:
    `PULSUSDB_TEMPO_DIFF_URL=http://localhost:13201 cargo test -p pulsus-traceql --test accept_surface`.
 
 Adding a probe: append it with both sides recorded and bump the counts.
+
+Re-pinning the wire baseline: a probe that leaves the divergence list
+loses its `owning_issue` in the same change, and one that arrives on it
+gains one (see *Wire-axis ownership* above) — the gate fails either way
+round.
 
 ## The `!` / absence capture (Stage B, AC 4)
 
