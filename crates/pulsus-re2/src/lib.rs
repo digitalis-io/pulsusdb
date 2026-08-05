@@ -39,7 +39,13 @@
 //! returns `Undecidable` at exactly SIX sites, each a closed class
 //! family: the bare-escape check (`\p`/`\P` Unicode properties,
 //! `\u`/`\U`, the `\<`/`\>`/`\b{…}`/`\B{…}` boundary escapes, a
-//! trailing backslash), the same escapes inside a character class, the
+//! trailing backslash), the same escapes inside a character class **that
+//! closes** (issue #336: an unterminated one is a decidable joint
+//! rejection whatever it contains, so `[\p{L}` no longer reaches this
+//! site — the site itself remains, for `[\p{Alphabetic}]`. Note which
+//! quantity that leaves alone: the COUNT of sites and classes is
+//! unchanged, while the SET of patterns reaching them shrank by the
+//! unterminated-class-carrying-an-escape family), the
 //! non-`(?:`/flag group heads (lookarounds, named groups, `(?x`/`(?u`/
 //! `(?#`/…), a `*`/`+` applied to a repetition, a `?` applied to an
 //! already-lazy repetition, and a `{n,m}` above `kMaxRepeat` or
@@ -72,9 +78,9 @@ pub use re2_syntax::{
 };
 
 /// RE2's repetition ceiling — `kMaxRepeat` in `re2/parse.cc`, `maxRepeat`
-/// in Go's `regexp/syntax/parse.go`. The Rust crate has no equivalent
-/// count limit (only a compiled-size budget), so `a{1001}` compiles there
-/// and is rejected by both reference engines.
+/// in Go's `regexp/syntax/parse.go`, which is where this 1000 comes from
+/// and the only reason it is not a round number of our choosing. The
+/// consequence for a user is docs/api.md §9.3's repetition-cap row.
 const RE2_MAX_REPEAT: u64 = 1000;
 
 /// The three-valued RE2 acceptance verdict (issue #328 D1).
@@ -86,10 +92,12 @@ pub enum Re2Verdict {
     /// joint rejection, or the Rust crate rejected it inside the region
     /// where its rejections are trusted to be RE2's too.
     Rejects,
-    /// Undecidable in-process, in EITHER direction: the Rust crate
+    /// Undecidable in-process, in EITHER direction — the Rust crate
     /// accepts beyond RE2 (the [`pattern_requires_re2_authority`]
-    /// classes), or rejects within RE2 (`\Q…\E`, octal escapes, a
-    /// compiled-size overflow). A consumer must treat this as accept.
+    /// classes) or rejects within it. A consumer must treat this as
+    /// accept, which is why docs/api.md §9.3 can list rows reachable on
+    /// no route but trace validation. Membership of either direction is
+    /// §9.3 and §9.4; do not re-enumerate it here.
     Unknown,
 }
 
@@ -101,8 +109,9 @@ pub enum Re2Verdict {
 ///
 /// Decision order (plan v3 D1′):
 /// 1. scan `Undecidable` → `Unknown`;
-/// 2. scan joint-reject (an unterminated class — measured: `[`, `[a`
-///    are rejected by the Rust crate AND by RE2) → `Rejects`;
+/// 2. scan joint-reject (an unterminated class — measured: `[`, `[a`,
+///    and since #336 `[\p{L}`/`[a\` too, are rejected by the Rust crate
+///    AND by RE2) → `Rejects`;
 /// 3. otherwise compile `re2_pattern_to_rust(pattern)`, bare:
 ///    `Ok` → `Accepts`; `CompiledTooBig` → `Unknown` (RE2's budget is
 ///    not ours to guess); any other error → `Unknown` if the pattern
@@ -126,12 +135,13 @@ pub fn re2_verdict(pattern: &str) -> Re2Verdict {
     }
 }
 
-/// `true` when the pattern carries a construct the Rust crate REJECTS
-/// and RE2 accepts, so a compile failure proves nothing about RE2:
-/// `\Q…\E` literal quoting and octal escapes (`\0`–`\7`). Substring
-/// containment on purpose — an escaped `\\Q` also matches, which only
-/// widens `Unknown` (the safe direction; a narrower escape-aware scan
-/// could misclassify and over-reject).
+/// `true` when the pattern carries a construct from docs/api.md §9.4's
+/// first two rows — the ones the Rust crate rejects and RE2 accepts — so
+/// a compile failure here proves nothing about RE2's verdict.
+///
+/// Substring containment on purpose: an escaped `\\Q` also matches, which
+/// only widens `Unknown` (the safe direction; a narrower escape-aware
+/// scan could misclassify and over-reject).
 fn rust_rejects_beyond_its_remit(pattern: &str) -> bool {
     let b = pattern.as_bytes();
     b.windows(2)
@@ -147,10 +157,11 @@ pub fn pattern_requires_re2_authority_for_test(pattern: &str) -> bool {
     pattern_requires_re2_authority(pattern)
 }
 
-/// What the byte just consumed was, for the "a repetition operator needs a
-/// repeatable operand" rule. The Rust crate accepts a repetition applied to
-/// a repetition (`a**` compiles as `(a*)*`); RE2 and Go reject it with
-/// `bad repetition operator`.
+/// What the byte just consumed was, for the "a repetition operator needs
+/// a repeatable operand" rule. This state exists only because the two
+/// engines disagree about a repetition applied to a repetition —
+/// docs/api.md §9.3's repetition-of-repetition row — so the scan has to
+/// track enough structure to spot one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Prev {
     /// Nothing repeatable yet — pattern start, or just after `(` or `|`.
@@ -315,9 +326,13 @@ fn re2_portable_group_head_len(bytes: &[u8]) -> Option<usize> {
 }
 
 /// `b[i]` is a backslash: `true` when the escape it introduces is one only
-/// the storage engine's RE2 can adjudicate. A trailing backslash is
-/// malformed in both engines and can only reach here if the Rust crate
-/// accepted it, so it defers too.
+/// the storage engine's RE2 can adjudicate.
+///
+/// The part no docs table covers, because it is about the ORDER this code
+/// runs in: the scan happens BEFORE any compilation, so a trailing
+/// backslash (`b.get(i + 1) == None`) reaches this arm whatever either
+/// engine would go on to say about the pattern. It defers rather than
+/// deciding. Which engines accept which escapes is docs/api.md §9.3.
 fn escape_requires_re2_authority(b: &[u8], i: usize) -> bool {
     match b.get(i + 1) {
         None => true,
@@ -336,8 +351,10 @@ enum ClassEnd {
     /// The index of the closing `]`.
     Found(usize),
     /// No closing `]` — both engines reject (`[`, `[a`; measured).
+    /// Issue #336: this outcome WINS over `Undecidable`, so `[\p{L}` is a
+    /// decidable joint rejection and not a deferral.
     Unterminated,
-    /// The class carries an escape only RE2 can adjudicate
+    /// The class CLOSES but carries an escape only RE2 can adjudicate
     /// (`[\p{Alphabetic}]`), classified exactly like the bare escape.
     Undecidable,
 }
@@ -345,6 +362,16 @@ enum ClassEnd {
 /// Scans the class opened at `open`, honouring an initial `^` and
 /// backslash escapes. Class contents are scanned, not skipped, so
 /// `[\p{Alphabetic}]` is caught exactly like the bare `\p{Alphabetic}`.
+///
+/// An undecidable escape is REMEMBERED, not returned on sight (issue
+/// #336): whether the class closes is decided first, because an
+/// unterminated class is a joint rejection whatever it contains —
+/// `[\p{L}`, `[\p{Alphabetic}`, `[\u{263A}` and `[a\` are all rejected by
+/// the Rust crate, by Go's `regexp` (`missing closing ]` /
+/// `invalid character class range` / `invalid escape sequence`) and by
+/// ClickHouse 24.8's RE2, measured. Deciding the escape first reported
+/// them `Unknown`, which is the same conflation #328 split for the bare
+/// `[`, one level in.
 ///
 /// A nested `[` is NOT treated as opening a sub-class: RE2 reads it as a
 /// literal, and the class-set-operation reading the Rust crate gives it is
@@ -354,15 +381,23 @@ fn class_end(b: &[u8], open: usize) -> ClassEnd {
     if b.get(i) == Some(&b'^') {
         i += 1;
     }
+    let mut undecidable = false;
     while i < b.len() {
         match b[i] {
             b'\\' => {
-                if escape_requires_re2_authority(b, i) {
-                    return ClassEnd::Undecidable;
-                }
+                undecidable |= escape_requires_re2_authority(b, i);
+                // A trailing backslash steps past the end; the loop
+                // condition then reports the class unterminated, which is
+                // what both engines answer for `[a\`.
                 i += 2;
             }
-            b']' => return ClassEnd::Found(i),
+            b']' => {
+                return if undecidable {
+                    ClassEnd::Undecidable
+                } else {
+                    ClassEnd::Found(i)
+                };
+            }
             _ => i += 1,
         }
     }
@@ -418,12 +453,24 @@ fn parse_repetition(b: &[u8], start: usize) -> Option<Repetition> {
 mod tests {
     use super::*;
 
-    /// The measured #309 case plus the rest of the Rust-accepts/RE2-rejects
-    /// vocabulary. Each premise is pinned: the Rust crate must ACCEPT the
-    /// anchored form, otherwise the vendored parser rejects at plan time and
-    /// the screen would be guarding nothing.
+    /// Patterns the screen defers because the Rust crate's ACCEPTANCE of
+    /// them cannot be trusted to be RE2's. The list is MIXED, which is
+    /// the point and was why this test used to be called
+    /// `…_the_rust_crate_accepts_beyond_re2_…`: false for six of its
+    /// thirteen rows. Some are docs/api.md §9.3 rows; the rest —
+    /// `\p{Greek}`, `\pL`, `\P{L}`, `[\p{L}0-9]`, `(?P<name>a)` and
+    /// `(?<name>a)` — appear in no §9 table because BOTH engines accept
+    /// them (measured, issue #336), so deferring them costs a storage
+    /// round-trip and nothing a user can see. That is deliberate: the
+    /// screen models `\p` and the non-`(?:`/flag group heads WHOLESALE
+    /// rather than enumerating RE2's property table and head vocabulary,
+    /// which is the conservative direction.
+    ///
+    /// Each premise is pinned: the Rust crate must ACCEPT the anchored
+    /// form, otherwise the vendored parser rejects at plan time and the
+    /// screen would be guarding nothing.
     #[test]
-    fn patterns_the_rust_crate_accepts_beyond_re2_are_left_to_the_authority() {
+    fn patterns_the_screen_cannot_adjudicate_are_left_to_the_authority() {
         for pattern in [
             r"\p{Alphabetic}",
             r"\p{Greek}",
@@ -450,10 +497,14 @@ mod tests {
         }
     }
 
-    /// Word-boundary escapes the Rust crate grew and RE2 never had. Pinned
-    /// separately because `\<`/`\>`/`\b{…}` compile only on recent `regex`
-    /// versions; if a future crate version rejects them the screen is
-    /// harmlessly redundant, not wrong.
+    /// Word-boundary escapes the Rust crate grew and RE2 never had as
+    /// assertions. This is a MEANING divergence, not an acceptance one:
+    /// measured for issue #336, Go's `regexp` and ClickHouse's RE2 both
+    /// ACCEPT `\<word\>` — reading `\<` as a literal `<` — so the deferral
+    /// buys the right reading, not a rejection. Pinned separately because
+    /// `\<`/`\>`/`\b{…}` compile only on recent `regex` versions; if a
+    /// future crate version rejects them the screen is harmlessly
+    /// redundant, not wrong.
     #[test]
     fn rust_only_boundary_escapes_are_left_to_the_authority() {
         for pattern in [r"\<word\>", r"\b{start}x", r"\B{end}x"] {
@@ -593,6 +644,37 @@ mod tests {
         for pattern in [r"[\p{Alphabetic}]", r"[a\p{L}]"] {
             assert_eq!(scan(pattern), Scan::Undecidable, "{pattern:?}");
             assert!(pattern_requires_re2_authority(pattern));
+        }
+    }
+
+    /// Issue #336: an unterminated class carrying an undecidable escape
+    /// is still a DECIDABLE joint rejection — the missing `]` rejects it
+    /// in every engine, so the escape never gets to matter. Measured
+    /// three ways for each pattern below: the Rust `regex` crate
+    /// (asserted here as the premise), Go's `regexp` at go1.25.5
+    /// (`missing closing ]` for `[\p{L}`/`[a\`, `invalid character class
+    /// range` for `[\p{Alphabetic}`, `invalid escape sequence` for
+    /// `[\u{263A}`), and ClickHouse 24.8.14.39's RE2 (`Code: 427`
+    /// `cannot compile re2` on all four). Before the fix each was
+    /// `Unknown`.
+    #[test]
+    fn an_unterminated_class_is_a_joint_rejection_whatever_escape_it_carries() {
+        for pattern in [r"[\p{L}", r"[\p{Alphabetic}", r"[\u{263A}", r"[a\"] {
+            assert!(
+                regex::Regex::new(pattern).is_err(),
+                "premise: the Rust crate must REJECT {pattern:?} for the joint claim"
+            );
+            assert_eq!(scan(pattern), Scan::JointReject, "{pattern:?}");
+            assert_eq!(re2_verdict(pattern), Re2Verdict::Rejects, "{pattern:?}");
+            // The boolean screen is unmoved: both outcomes are
+            // non-portable, which is why the frozen corpus baseline
+            // cannot shift.
+            assert!(pattern_requires_re2_authority(pattern), "{pattern:?}");
+        }
+        // The escape still decides when the class DOES close.
+        for pattern in [r"[\p{L}]", r"[\p{Alphabetic}]", r"[\u{263A}]"] {
+            assert_eq!(scan(pattern), Scan::Undecidable, "{pattern:?}");
+            assert_eq!(re2_verdict(pattern), Re2Verdict::Unknown, "{pattern:?}");
         }
     }
 
