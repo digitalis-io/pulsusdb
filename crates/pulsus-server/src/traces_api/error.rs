@@ -242,9 +242,18 @@ impl IntoResponse for ApiError {
 /// The `ReadError` half of the table above, matched **exhaustively**
 /// (issue #266): a new or re-routed `ReadError` variant fails the build
 /// here rather than being absorbed onto 500 `internal` by a catch-all.
-/// Do not reintroduce a `_` arm: the compiler cannot object to one, and
-/// issue #266 records why a rejection silently arriving as 500 is a live
-/// hazard rather than a tidiness one.
+/// Do not reintroduce a `_` arm: the compiler cannot object to one.
+///
+/// That absorption is a live hazard, not a tidiness one: Grafana's Tempo
+/// datasource proxies our status and body through verbatim —
+/// `grafana/grafana-tempo-datasource` `pkg/tempo/tempo.go:370,373`
+/// @ `3c7375bb541c3acde1deb068ea7ead9ebfdf56b9` (`v13.1.5-11-g3c7375b`)
+/// copies the upstream headers, then `rw.WriteHeader(resp.StatusCode)`
+/// and `io.Copy(rw, resp.Body)` with no status rewriting. So a rejection
+/// that should be 400 arriving as 500 stops being "your query is wrong"
+/// and becomes "this datasource is failing": Grafana reports the
+/// datasource unhealthy and dependent alert rules go to Error state, over
+/// a database that is fine.
 ///
 /// The return tuple carries no offset: the traces `position` names the
 /// TraceQL expression or legacy `tags` value the client sent, while
