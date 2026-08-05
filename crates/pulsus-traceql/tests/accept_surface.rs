@@ -91,6 +91,15 @@ struct Probe {
     /// (added with Stage A; the wave-1 D2 closures predate the field).
     #[serde(default)]
     closed_class: Option<String>,
+    /// The issue that owns the gap a probe diverging on the WIRE names
+    /// (#351's convention, made checkable here). Required exactly when a
+    /// probe agrees on the parse axis and diverges on the wire — the
+    /// case that has no `class` to be owned through — and forbidden once
+    /// it agrees on the wire, so a closed gap cannot leave a stale
+    /// pointer behind. See
+    /// [`a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue`].
+    #[serde(default)]
+    owning_issue: Option<u32>,
 }
 
 /// A probe both implementations accept and parse *differently*. `pulsus_parse`
@@ -198,6 +207,43 @@ fn matrix() -> Matrix {
         .join("matrix.json");
     let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&raw).expect("matrix.json must parse")
+}
+
+/// The committed WIRE-axis column. Only the two fields the joins below
+/// need; the file's own shape is held by
+/// `pulsus-read/tests/accept_surface_wire.rs`, which is also what
+/// re-derives `pulsus_wire` from the tree under test.
+#[derive(Deserialize)]
+struct WireBaseline {
+    wire_baseline: Vec<WireProbe>,
+}
+
+#[derive(Deserialize)]
+struct WireProbe {
+    query: String,
+    pulsus_wire: String,
+}
+
+fn wire_baseline() -> WireBaseline {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("accept_surface")
+        .join("wire_baseline.json");
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&raw).expect("wire_baseline.json must parse")
+}
+
+/// Whether a probe's committed wire disposition disagrees with the
+/// reference verdict it was captured against. Panics rather than
+/// defaulting when either side is missing: an unjoinable probe is an
+/// unscored probe, which is the failure mode both wire gates exist to
+/// deny.
+fn diverges_on_wire(wire: &WireBaseline, probe: &Probe) -> bool {
+    wire.wire_baseline
+        .iter()
+        .find(|w| w.query == probe.query)
+        .map(|w| w.pulsus_wire != probe.reference)
+        .unwrap_or_else(|| panic!("{:?} has no wire baseline entry", probe.query))
 }
 
 /// Our side of the scoreboard: `parse ∘ validate` (Stage A of #335). The
@@ -366,36 +412,29 @@ fn every_divergence_carries_a_class_and_every_class_is_used() {
 /// bind the status to the planner's real behaviour, and neither alone
 /// does. Stated rather than assumed: if that suite is deleted, this one
 /// degrades to checking a file against a file.
+///
+/// **The bound on its rule, because it was once read wider than it is
+/// (issue #335 follow-up).** This quantifies over CLASSES that declare a
+/// `wire_status`, and reaches a probe only through `class` /
+/// `closed_class`. A probe that diverges on the wire while AGREEING on
+/// the parse axis has neither field by construction — an agreement may
+/// not carry `class` — so it is invisible here however many of them
+/// there are. Ten such probes were passing this gate while naming
+/// nobody. That half is
+/// [`a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue`];
+/// this one says nothing about it.
 #[test]
 fn a_class_open_on_the_wire_has_a_probe_still_diverging_there() {
-    #[derive(Deserialize)]
-    struct WireBaseline {
-        wire_baseline: Vec<WireProbe>,
-    }
-    #[derive(Deserialize)]
-    struct WireProbe {
-        query: String,
-        pulsus_wire: String,
-    }
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("accept_surface")
-        .join("wire_baseline.json");
-    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let wire: WireBaseline = serde_json::from_str(&raw).expect("wire_baseline.json must parse");
+    let wire = wire_baseline();
     let m = matrix();
 
-    let diverges_on_wire = |query: &str| -> bool {
+    let query_diverges_on_wire = |query: &str| -> bool {
         let probe = m
             .accept_surface_probes
             .iter()
             .find(|p| p.query == query)
             .unwrap_or_else(|| panic!("{query:?} is in the wire baseline but not the matrix"));
-        wire.wire_baseline
-            .iter()
-            .find(|w| w.query == query)
-            .map(|w| w.pulsus_wire != probe.reference)
-            .unwrap_or_else(|| panic!("{query:?} has no wire baseline entry"))
+        diverges_on_wire(&wire, probe)
     };
 
     for c in &m.divergence_classes {
@@ -421,7 +460,7 @@ fn a_class_open_on_the_wire_has_a_probe_still_diverging_there() {
             .collect();
         let diverging = members
             .iter()
-            .filter(|q| diverges_on_wire(q))
+            .filter(|q| query_diverges_on_wire(q))
             .collect::<Vec<_>>();
         match wire_status.as_str() {
             "open" => assert!(
@@ -441,6 +480,72 @@ fn a_class_open_on_the_wire_has_a_probe_still_diverging_there() {
             other => panic!("class {}: bad wire_status {other:?}", c.id),
         }
     }
+}
+
+/// The other half of the wire-axis teeth (issue #335 follow-up): **a
+/// probe that diverges on the wire while agreeing on the parse axis must
+/// name the issue that owns the gap.**
+///
+/// **Why this is a separate rule from the class statuses.** The parse
+/// axis owns its divergences by construction: a diverging probe must
+/// carry a `class`, every class is declared in this matrix, and the
+/// matrix's own `owning_issue` is the audit issue those classes belong
+/// to. A probe that only diverges on the WIRE has no class at all — an
+/// agreement may not carry one — and the gap is not the audit's: it is
+/// whichever planner refuses the query. So the pointer has to be on the
+/// probe, and nothing but this test requires it.
+///
+/// **The absence it was written to see.** Ten probes agreed on parse and
+/// were planner 400s against a reference 2xx while
+/// [`a_class_open_on_the_wire_has_a_probe_still_diverging_there`] stayed
+/// green — three from #335 Stage C's aggregate-argument grammar
+/// (`avg(span:childCount)`, `avg(trace:duration)`, `avg(.a + 1)`), seven
+/// from #182's deferred `by()`/`_over_time()` follow-ups. The seven were
+/// owned in prose only; the three were owned by nobody. A registry that
+/// cannot see an absence is what lets a construct go quiet for months.
+///
+/// **Both directions, so the field cannot rot.** An owner is REQUIRED
+/// while the probe diverges on the wire and FORBIDDEN once it agrees —
+/// closing a gap therefore deletes its pointer in the same change that
+/// re-pins the baseline, exactly as `closed_by` works on the parse axis.
+#[test]
+fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
+    let wire = wire_baseline();
+    let m = matrix();
+
+    let mut unowned = Vec::new();
+    let mut stale = Vec::new();
+    for p in &m.accept_surface_probes {
+        if let Some(issue) = p.owning_issue {
+            assert!(
+                issue > 0,
+                "{:?}: owning_issue must be an issue number",
+                p.query
+            );
+        }
+        let diverges = diverges_on_wire(&wire, p);
+        match (diverges, p.verdict.as_str(), p.owning_issue) {
+            (true, "agree", None) => unowned.push(p.query.clone()),
+            (false, _, Some(issue)) => stale.push(format!("{:?} -> #{issue}", p.query)),
+            _ => {}
+        }
+    }
+
+    assert!(
+        unowned.is_empty(),
+        "{} probe(s) are refused on the wire while agreeing on the parse axis and name no \
+         owning_issue — a planner gap tracked by nothing. Add `owning_issue` naming the issue \
+         that owns the refusal (the planner's own 400 usually names it), or close the gap:\n{}",
+        unowned.len(),
+        unowned.join("\n")
+    );
+    assert!(
+        stale.is_empty(),
+        "{} probe(s) carry an owning_issue but now AGREE on the wire — the gap is closed, so \
+         the pointer goes with it in the same change that re-pins the baseline:\n{}",
+        stale.len(),
+        stale.join("\n")
+    );
 }
 
 /// **The oracle column is frozen independently of the file that holds
