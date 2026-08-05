@@ -1856,26 +1856,53 @@ fn metrics_points_delta(
 // and from neither system's response.
 // ---------------------------------------------------------------------
 
-/// A window the REFERENCE has been observed to answer for this corpus —
-/// the output of [`assert_reference_metrics_positive_control`], and the
-/// only window the informational metrics comparison may use.
+/// A window the REFERENCE has been observed to serve IN FULL for this
+/// corpus — the output of [`assert_reference_metrics_positive_control`],
+/// and the only window the informational metrics comparison may use.
 ///
 /// It exists because "both stores were asked the same question" is not
-/// automatic here. Measured on `grafana/tempo:3.0.2` (issue #252): a
-/// query at a 60 s step returns NOTHING about a corpus until the whole
-/// 60 s interval containing it has elapsed AND cleared the frontend's
-/// `query_end_cutoff` (30 s, `modules/frontend/config.go:146` @ v3.0.2,
-/// applied by `api.ClampDateRangeReq`) — up to ~90 s after the last
-/// span, because `IntervalMapperQueryRange` is RIGHT-closed and an
-/// interval is only served once `end >= interval_end`. At the control's
-/// 5 s step the same corpus is answerable within ~5-10 s. So the step,
-/// not the window width and not ingest lag, is what decides whether the
-/// reference can answer at all.
+/// automatic here, and neither is "both stores answered the same
+/// question". Two separate mechanisms, both measured on
+/// `grafana/tempo:3.0.2` (issue #252):
+///
+/// - **The step decides whether the reference answers at all.** A query
+///   at a 60 s step returns NOTHING about a freshly-ingested corpus
+///   until the whole 60 s interval containing it has elapsed, because
+///   `IntervalMapperQueryRange` is RIGHT-closed and an interval is only
+///   served once `end >= interval_end` (`engine_metrics.go:1758-1800 @
+///   v3.0.2`) — up to ~90 s after the last span. At this control's 5 s
+///   step the same corpus is answerable within ~5-10 s.
+/// - **The frontend clamps `end` per request.** `end` is rewritten to
+///   `now - query_end_cutoff` (30 s,
+///   `modules/frontend/config.go:146 @ v3.0.2`) and re-aligned
+///   downwards, at the moment each request is handled
+///   (`metrics_query_range_handler.go:64-72,150-158 @ v3.0.2`). Sending
+///   two requests with identical parameters therefore does NOT mean
+///   both were served over the same range: the clamp moves with the
+///   wall clock.
+///
+/// The second is why this type is only ever built from an OBSERVED
+/// served range: the control polls until
+/// [`reference_served_end_ms`] equals `end_s`, i.e. until the reference
+/// has demonstrably stopped clamping this window. Once that holds it
+/// keeps holding — the clamp is `now - cutoff` and `now` only advances,
+/// so every later request over the same `end_s` is served over the same
+/// range. Each later request re-checks it anyway rather than trusting
+/// the argument.
 #[derive(Debug, Clone, Copy)]
-struct ServableWindow {
+struct ServedWindow {
     start_s: i64,
     end_s: i64,
     step_s: i64,
+}
+
+impl ServedWindow {
+    /// The window's end as the reference stamps its last sample: unix
+    /// milliseconds (`TimestampOf`, `engine_metrics.go:1786-1789 @
+    /// v3.0.2`).
+    fn end_ms(&self) -> i64 {
+        self.end_s * 1_000
+    }
 }
 
 /// The step the control queries at, and the pad it puts either side of
@@ -1892,6 +1919,98 @@ const NS_PER_S_I64: i64 = 1_000_000_000;
 /// The number of series in a Tempo-native metrics body.
 fn series_count(body: &serde_json::Value) -> usize {
     body["series"].as_array().map_or(0, Vec::len)
+}
+
+/// The end of the last interval the REFERENCE actually served, in unix
+/// milliseconds — read off its own response, not off the request.
+///
+/// It exists because a request parameter is not an answer. The frontend
+/// clamps `end` to `now - query_end_cutoff` (30 s by default,
+/// `modules/frontend/config.go:146 @ v3.0.2`) at the moment it handles
+/// EACH request and then re-aligns the clamped end DOWNWARDS
+/// (`AlignEndToLeft`, `metrics_query_range_handler.go:64-72,150-158` →
+/// `engine_metrics.go:187-198 @ v3.0.2`), so a clamped request is served
+/// over a range at least one whole step shorter than the one asked for.
+/// Two stores answering over different effective ranges is not a
+/// comparison, which is the whole point of [`ServedWindow`].
+///
+/// The reading is exact for the aggregations this scenario compares:
+/// `SeriesSet.ToProto` emits one sample per interval `i <
+/// IntervalCount()` whose value is not NaN, stamped at
+/// `TimestampOf(i) = start + (i+1)*step`
+/// (`engine_metrics.go:365-379,1786-1789 @ v3.0.2`), so the maximum
+/// sample timestamp is `mapper.end` — the served end — as long as the
+/// last interval carries a non-NaN value. `count_over_time`, `rate` and
+/// `histogram_over_time` all count, and a count is `0` for an empty
+/// interval, never NaN (`CountOverTimeAggregator.Sample`,
+/// `engine_metrics.go:473-476`). `min`/`max`/`sum_over_time` initialise
+/// to NaN instead (`engine_metrics.go:519-521`), so if
+/// `informational.metrics_queries` ever gains one, a trailing empty
+/// interval would read short here and this helper needs revisiting —
+/// it would fail loudly rather than pass quietly.
+///
+/// `None` when the reference returned no sample at all, which carries no
+/// claim about the served range either way.
+fn reference_served_end_ms(body: &serde_json::Value) -> Option<i64> {
+    body["series"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|series| series["samples"].as_array())
+        .flatten()
+        .filter_map(|sample| {
+            sample["timestampMs"]
+                .as_i64()
+                .or_else(|| sample["timestampMs"].as_str().and_then(|s| s.parse().ok()))
+        })
+        .max()
+}
+
+/// The reference-positive precondition, as a predicate over the two
+/// stores' points (AC11, issue #252).
+///
+/// **What it has to rule out:** the metrics delta recorded below must
+/// never be computed against a reference response that carries no data
+/// for this query while PulsusDB has data for it — the vacuous
+/// comparison the whole control exists to prevent.
+///
+/// So "the reference answered" has to mean a value that could actually
+/// disagree with ours, not a response shape. There are two ways a
+/// Tempo-native body can carry no data, and only one of them shows up
+/// as `series == []`. Both measured on `grafana/tempo:3.0.2` with the
+/// committed `deploy/e2e/tempo.yaml`, over this control's window and
+/// step, for a selector matching no span (issue #252, 2026-08-05):
+///
+/// 1. `histogram_over_time` returns no series at all — `series=0`;
+/// 2. `rate()` and `count_over_time()` each return ONE series carrying
+///    the whole step grid with every value elided — `series=1
+///    samples=8 nonzero=0`, the body
+///    [`measured_all_zero_reference_skeleton`] reproduces verbatim.
+///
+/// Shape 2 is the state that made the earlier `series_count(t) == 0`
+/// form of this guard unable to fire for two of the three committed
+/// queries: the guard reported "the reference has data here" for a
+/// response that had a shape and no data. Asking for a non-zero point
+/// covers both, since shape 1 has no points at all.
+///
+/// It is reachable without the whole corpus going missing from the
+/// reference — which the control above would catch — whenever a
+/// FILTERED query selects nothing there while selecting spans here:
+/// `status = error` is a different result set from the control's
+/// unfiltered histogram, so the control passing says nothing about it.
+///
+/// Direction-neutral by construction: it never compares one store's
+/// value with the other's, so it cannot smuggle a values gate into an
+/// informational comparison. It stays silent when the reference has any
+/// non-zero point (however different from ours), and when neither store
+/// has data.
+fn reference_positive_precondition_violated(
+    ours: &std::collections::BTreeMap<i64, f64>,
+    theirs: &std::collections::BTreeMap<i64, f64>,
+) -> bool {
+    let has_data =
+        |points: &std::collections::BTreeMap<i64, f64>| points.values().any(|v| *v != 0.0);
+    has_data(ours) && !has_data(theirs)
 }
 
 /// The reference's `Log2Bucketize` (`pkg/traceql/engine_metrics.go:2038-2046
@@ -2031,10 +2150,26 @@ fn reference_histogram_from_body(
 /// on grafana/tempo:3.0.2 — the live block has to complete first), so a
 /// single shot would be a flake, and the poll's deadline is what turns
 /// "the reference never answered" into a failure.
+///
+/// The poll waits for TWO conditions, not one, and the window it returns
+/// is only meaningful because of the second (see [`ServedWindow`]):
+///
+/// 1. every `(step, bucket)` cell the corpus schedule predicts is back —
+///    the content control;
+/// 2. the reference SERVED THROUGH `end_s`, read off the last sample it
+///    stamped ([`reference_served_end_ms`]) — i.e. it has stopped
+///    clamping this window to `now - query_end_cutoff`.
+///
+/// Condition 1 alone cannot see condition 2: the cell map compares only
+/// OCCUPIED cells (a zero sample is dropped as protojson elides it), so
+/// a clamped-away trailing interval — which is empty for this corpus,
+/// since the pad is there precisely to leave it empty — still produces
+/// exactly the expected map. That is why the served end is checked
+/// separately rather than inferred from the cells matching.
 async fn assert_reference_metrics_positive_control(
     ctx: &Ctx,
     corpus: &TraceCorpus,
-) -> Result<ServableWindow> {
+) -> Result<ServedWindow> {
     let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
     // One step of pad either side, not the search window's ±1 h: the
     // step grid stays small and every interval is one the corpus can
@@ -2075,7 +2210,8 @@ async fn assert_reference_metrics_positive_control(
             )
             .await?;
             let got = reference_histogram_from_body(&body, start_ns, step_ns)?;
-            if got == expected {
+            let served_end_ms = reference_served_end_ms(&body);
+            if got == expected && served_end_ms == Some(end_s * 1_000) {
                 return Ok(Some(()));
             }
             let only_expected: Vec<_> = expected
@@ -2088,9 +2224,12 @@ async fn assert_reference_metrics_positive_control(
                 .collect();
             *last.borrow_mut() = format!(
                 "{} cell(s) expected-but-wrong-or-missing {only_expected:?}; {} cell(s) \
-                 returned-but-unexpected {only_got:?}",
+                 returned-but-unexpected {only_got:?}; served end {served_end_ms:?} vs the \
+                 requested {} (a shorter served end is the frontend still clamping this \
+                 window to now - query_end_cutoff)",
                 only_expected.len(),
-                only_got.len()
+                only_got.len(),
+                end_s * 1_000,
             );
             Ok(None)
         },
@@ -2101,10 +2240,10 @@ async fn assert_reference_metrics_positive_control(
             println!(
                 "pulsus-e2e:   traces reference-positive control: Tempo reproduced all {} \
                  (step, bucket) histogram cells for {q:?} over [{start_s}, {end_s}) at \
-                 {CONTROL_STEP_S}s",
+                 {CONTROL_STEP_S}s, and served through {end_s}s unclamped",
                 expected.len()
             );
-            Ok(ServableWindow {
+            Ok(ServedWindow {
                 start_s,
                 end_s,
                 step_s: CONTROL_STEP_S,
@@ -2115,7 +2254,7 @@ async fn assert_reference_metrics_positive_control(
              {q:?} over [{start_s}, {end_s}) at {CONTROL_STEP_S}s. This gates the metrics \
              comparison below, which is otherwise a diff against whatever the reference \
              happened to return (with no metrics-generator configured, that is an empty \
-             series set). Last observed: {}",
+             series set), over whatever range it happened to serve. Last observed: {}",
             last.borrow()
         ))),
     }
@@ -2176,8 +2315,9 @@ async fn assert_rejection_parity(
 
 /// The never-gating comparisons. `window` is deliberately NOT a
 /// parameter: the tags half needs none, and the metrics half must use
-/// the window the reference-positive control validated rather than the
-/// search window (issue #252 — see [`ServableWindow`]).
+/// the window the reference-positive control observed the reference
+/// serve, rather than the search window (issue #252 — see
+/// [`ServedWindow`]).
 async fn run_informational_comparisons(
     ctx: &Ctx,
     corpus: &TraceCorpus,
@@ -2244,25 +2384,33 @@ async fn run_informational_comparisons(
     // recorded here is a delta against whatever the reference happened
     // to return — which, with the pre-#252 `deploy/e2e/tempo.yaml`, was
     // an empty series set for every query.
-    let servable = assert_reference_metrics_positive_control(ctx, corpus).await?;
+    let served = assert_reference_metrics_positive_control(ctx, corpus).await?;
 
-    // Every metrics comparison runs over the window the control just
-    // proved the reference answers, at the same step — not the ±1 h
+    // Every metrics comparison runs over the window the control observed
+    // the reference serve IN FULL, at the same step — not the ±1 h
     // search window at a 60 s step, which the reference cannot serve for
-    // a freshly-ingested corpus (see [`ServableWindow`]) and which asked
+    // a freshly-ingested corpus (see [`ServedWindow`]) and which asked
     // the two stores different questions even when it could: ours
     // answered over the full window while Tempo answered over its
     // clamped, step-aligned one.
     //
-    // No extra polling: the control IS the wait, and a window that ends
-    // in the past stays servable once it is servable.
+    // No extra polling, but the control is NOT by itself the wait, and
+    // it is not positive data for the queries below either. It settles
+    // exactly two things, both about the histogram it ran: that the
+    // reference has this corpus, and that it has stopped clamping this
+    // window's end. The first says nothing about a DIFFERENT query —
+    // `status = error` selects a different span set — which is what the
+    // per-query precondition below is for; the second holds for every
+    // later request only because the clamp is `now - cutoff` and `now`
+    // only advances, and each response is re-checked against it rather
+    // than assumed.
     for raw_q in &fixture.informational.metrics_queries {
         let q = raw_q.replace("{R}", &corpus.run_id);
         let params = [
             ("q", q.clone()),
-            ("start", servable.start_s.to_string()),
-            ("end", servable.end_s.to_string()),
-            ("step", format!("{}s", servable.step_s)),
+            ("start", served.start_s.to_string()),
+            ("end", served.end_s.to_string()),
+            ("step", format!("{}s", served.step_s)),
         ];
         let pulsus = get_json_with(
             ctx,
@@ -2287,17 +2435,41 @@ async fn run_informational_comparisons(
                 let ours = tempo_metrics_points(p);
                 let theirs = tempo_metrics_points(t);
                 // AC11 (issue #252): the cheap anti-vacuity precondition,
-                // direction-neutral by construction — it fires only on
-                // "we have data and they returned nothing", never on a
-                // value difference, so it cannot smuggle in a values
-                // gate. AC11b above is the real content control; this
-                // one gives a clear, fast failure per query.
-                if ours.values().any(|v| *v != 0.0) && series_count(t) == 0 {
+                // per query, direction-neutral by construction — see
+                // [`reference_positive_precondition_violated`] for what
+                // it rules out and why "no series" was too weak a test
+                // of it. AC11b above is the content control on the
+                // histogram; this one covers the queries the control
+                // does not run.
+                if reference_positive_precondition_violated(&ours, &theirs) {
                     bail!(
                         "reference-positive precondition failed for {q:?}: PulsusDB returned \
-                         points but Tempo returned NO series. The metrics comparison below \
-                         would have reported a delta computed from nothing.\n\
-                         pulsusdb: {p}\ntempo: {t}"
+                         non-zero points but Tempo returned NO non-zero point ({} series, {} \
+                         sample timestamps, every value zero or absent). The metrics \
+                         comparison below would have reported a delta computed from \
+                         nothing.\npulsusdb: {p}\ntempo: {t}",
+                        series_count(t),
+                        theirs.len(),
+                    );
+                }
+                // …and it must still be answering over the range the
+                // control observed: the frontend re-applies the
+                // `query_end_cutoff` clamp per request, so identical
+                // request parameters are not by themselves an identical
+                // effective window (see [`reference_served_end_ms`]).
+                // Skipped when the reference returned no sample at all,
+                // which makes no claim about the range either way — the
+                // precondition above is what covers that case.
+                if let Some(served_end_ms) = reference_served_end_ms(t)
+                    && served_end_ms != served.end_ms()
+                {
+                    bail!(
+                        "the reference served {q:?} through {served_end_ms} ms, not the \
+                         {} ms the control observed it serve — the two stores would be \
+                         compared over different effective windows. A SHORTER served end \
+                         is the frontend clamping `end` to now - query_end_cutoff at \
+                         request time.\ntempo: {t}",
+                        served.end_ms(),
                     );
                 }
                 let delta = metrics_points_delta(&ours, &theirs);
@@ -2896,6 +3068,198 @@ mod tests {
             reference_histogram_from_body(&all_zero, start_ns, step_ns)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// The reference's all-zero skeleton, measured on
+    /// `grafana/tempo:3.0.2` with the committed `deploy/e2e/tempo.yaml`
+    /// (issue #252, 2026-08-05): a `rate()` whose selector matches no
+    /// span comes back as ONE series carrying the whole step grid with
+    /// every value elided — `series=1 samples=8 nonzero=0`. Reproduced
+    /// identically for `count_over_time()`, and identically again
+    /// against a Tempo with no metrics-generator configured;
+    /// `histogram_over_time` in the same state returns `series=0`
+    /// instead, which is the asymmetry that let the earlier form of the
+    /// precondition look like it was covering all three queries.
+    ///
+    /// Verbatim apart from the run id in the selector, which is not part
+    /// of the response.
+    fn measured_all_zero_reference_skeleton() -> serde_json::Value {
+        serde_json::json!({"series": [{
+            "labels": [{"key": "__name__", "value": {"stringValue": "rate"}}],
+            "samples": [
+                {"timestampMs": "1785948265000"},
+                {"timestampMs": "1785948270000"},
+                {"timestampMs": "1785948275000"},
+                {"timestampMs": "1785948280000"},
+                {"timestampMs": "1785948285000"},
+                {"timestampMs": "1785948290000"},
+                {"timestampMs": "1785948295000"},
+                {"timestampMs": "1785948300000"}
+            ]
+        }], "metrics": {"completedJobs": 1, "totalJobs": 1}})
+    }
+
+    /// The mutant the reviewed `series_count(t) == 0` form of the
+    /// precondition could not fail on: the reference answers with a
+    /// shape and no data while PulsusDB has real points.
+    ///
+    /// The state is measured, not imagined — see
+    /// [`measured_all_zero_reference_skeleton`]. It is reachable in the
+    /// scenario whenever a FILTERED query selects nothing on the
+    /// reference while selecting spans here, which the unfiltered
+    /// histogram control cannot speak for: different filter, different
+    /// result set.
+    #[test]
+    fn the_precondition_fires_on_a_reference_skeleton_that_carries_no_data() {
+        let theirs_body = measured_all_zero_reference_skeleton();
+        // The old rule's input, spelled out: the body HAS a series, so
+        // `series_count(t) == 0` is false and the guard stayed silent.
+        assert_eq!(series_count(&theirs_body), 1);
+        let ours_body = serde_json::json!({"series": [{
+            "labels": [{"key": "__name__", "value": {"stringValue": "rate"}}],
+            "samples": [
+                {"timestampMs": "1785948275000", "value": 3.8},
+                {"timestampMs": "1785948280000", "value": 4.0}
+            ]
+        }]});
+        let ours = tempo_metrics_points(&ours_body);
+        let theirs = tempo_metrics_points(&theirs_body);
+        // The skeleton reads as points — eight of them — all zero.
+        assert_eq!(theirs.len(), 8);
+        assert!(theirs.values().all(|v| *v == 0.0));
+        assert!(reference_positive_precondition_violated(&ours, &theirs));
+    }
+
+    /// Finding 2's hermetic half: the cell map cannot see a clamp, so
+    /// the control has to read the served end separately.
+    ///
+    /// This is not a hypothetical either. Replaying the harness's
+    /// sequence against `grafana/tempo:3.0.2` (issue #252, 2026-08-05),
+    /// the control's cells matched at +26.3 s after the push with the
+    /// reference still serving `…295000` for a window requested to
+    /// `…300000` — one whole 5 s step short. Both conditions held five
+    /// seconds later. The window the earlier control returned at +26.3 s
+    /// was therefore one the reference was NOT serving.
+    #[test]
+    fn a_matching_cell_map_does_not_mean_the_window_was_served_in_full() {
+        let start_ns = 1_785_948_265 * NS_PER_S_I64;
+        let step_ns = CONTROL_STEP_S * NS_PER_S_I64;
+        let requested = ServedWindow {
+            start_s: 1_785_948_265,
+            end_s: 1_785_948_300,
+            step_s: CONTROL_STEP_S,
+        };
+        // Occupied cells in the first two intervals, and a grid that
+        // stops one step short of the requested end — the shape a
+        // clamped request returns for a corpus whose trailing interval
+        // is empty by construction (the control pads it).
+        let clamped = serde_json::json!({"series": [{
+            "labels": [{"key": "__bucket", "value": {"doubleValue": 0.536870912}}],
+            "samples": [
+                {"timestampMs": "1785948270000", "value": 3},
+                {"timestampMs": "1785948275000", "value": 5},
+                {"timestampMs": "1785948295000"}
+            ]
+        }]});
+        let full = serde_json::json!({"series": [{
+            "labels": [{"key": "__bucket", "value": {"doubleValue": 0.536870912}}],
+            "samples": [
+                {"timestampMs": "1785948270000", "value": 3},
+                {"timestampMs": "1785948275000", "value": 5},
+                {"timestampMs": "1785948300000"}
+            ]
+        }]});
+        // Identical cell maps — the content control passes on both.
+        let cells_clamped = reference_histogram_from_body(&clamped, start_ns, step_ns).unwrap();
+        assert_eq!(
+            cells_clamped,
+            reference_histogram_from_body(&full, start_ns, step_ns).unwrap()
+        );
+        assert!(!cells_clamped.is_empty());
+        // The served end tells them apart, and only it does.
+        assert_ne!(reference_served_end_ms(&clamped), Some(requested.end_ms()));
+        assert_eq!(reference_served_end_ms(&full), Some(requested.end_ms()));
+    }
+
+    #[test]
+    fn the_precondition_stays_silent_unless_the_reference_has_no_data_at_all() {
+        let ours = std::collections::BTreeMap::from([(1000, 4.0), (2000, 5.0)]);
+        // Any non-zero reference point, however far from ours, is data
+        // that could disagree — never this guard's business.
+        let theirs = std::collections::BTreeMap::from([(1000, 0.0), (9000, 0.25)]);
+        assert!(!reference_positive_precondition_violated(&ours, &theirs));
+        // Neither store has data: nothing to compare, nothing to fail.
+        let zeros = std::collections::BTreeMap::from([(1000, 0.0), (2000, 0.0)]);
+        assert!(!reference_positive_precondition_violated(&zeros, &zeros));
+        assert!(!reference_positive_precondition_violated(
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new()
+        ));
+        // Direction-neutral: the reference having data we lack is a
+        // value difference, which this comparison never gates on.
+        assert!(!reference_positive_precondition_violated(&zeros, &ours));
+    }
+
+    /// A response the reference served over a SHORTER range than the one
+    /// requested, measured on `grafana/tempo:3.0.2` (issue #252,
+    /// 2026-08-05): `rate()` asked for `end = 1785948330` — a step-
+    /// aligned "now" — came back stamped no later than `1785948300000`,
+    /// exactly the 30 s `query_end_cutoff` short. Abridged: the
+    /// `exemplars` array and `metrics` object are dropped, the `series`
+    /// entry is verbatim.
+    #[test]
+    fn the_served_end_is_read_from_the_last_sample_even_when_its_value_is_elided() {
+        let clamped = serde_json::json!({"series": [{
+            "labels": [{"key": "__name__", "value": {"stringValue": "rate"}}],
+            "samples": [
+                {"timestampMs": "1785948265000"},
+                {"timestampMs": "1785948270000"},
+                {"timestampMs": "1785948275000", "value": 3.8000000000000003},
+                {"timestampMs": "1785948280000", "value": 4},
+                {"timestampMs": "1785948285000", "value": 4.2},
+                {"timestampMs": "1785948290000", "value": 3.8000000000000003},
+                {"timestampMs": "1785948295000", "value": 3.4000000000000004},
+                {"timestampMs": "1785948300000"}
+            ]
+        }]});
+        // The trailing interval is EMPTY — its value is elided — and the
+        // served end is still readable, which is the whole point: a
+        // window's last interval is normally empty here (the control
+        // pads it on purpose), so a served-end reading that skipped
+        // zero samples would report the clamp that is not there and
+        // miss the one that is.
+        assert_eq!(
+            reference_served_end_ms(&clamped),
+            Some(1_785_948_300_000),
+            "the last sample's timestamp IS the served end"
+        );
+        let requested = ServedWindow {
+            start_s: 1_785_948_265,
+            end_s: 1_785_948_330,
+            step_s: CONTROL_STEP_S,
+        };
+        assert_eq!(requested.end_ms(), 1_785_948_330_000);
+        // …so the per-query check fires: this response answers a
+        // different question from the one the control validated.
+        assert_ne!(reference_served_end_ms(&clamped), Some(requested.end_ms()));
+        // The same reading on an unclamped response of the same shape
+        // equals the requested end, so the check is not one-sided.
+        let unclamped = ServedWindow {
+            start_s: 1_785_948_265,
+            end_s: 1_785_948_300,
+            step_s: CONTROL_STEP_S,
+        };
+        assert_eq!(reference_served_end_ms(&clamped), Some(unclamped.end_ms()));
+        // No sample at all makes no claim about the served range.
+        assert_eq!(
+            reference_served_end_ms(&serde_json::json!({"series": []})),
+            None
+        );
+        assert_eq!(
+            reference_served_end_ms(&measured_all_zero_reference_skeleton()),
+            Some(1_785_948_300_000),
+            "an all-zero skeleton still states the range it was served over"
         );
     }
 
