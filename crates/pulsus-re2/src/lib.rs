@@ -42,7 +42,10 @@
 //! trailing backslash), the same escapes inside a character class **that
 //! closes** (issue #336: an unterminated one is a decidable joint
 //! rejection whatever it contains, so `[\p{L}` no longer reaches this
-//! site — the site itself remains, for `[\p{Alphabetic}]`), the
+//! site — the site itself remains, for `[\p{Alphabetic}]`. Note which
+//! quantity that leaves alone: the COUNT of sites and classes is
+//! unchanged, while the SET of patterns reaching them shrank by the
+//! unterminated-class-carrying-an-escape family), the
 //! non-`(?:`/flag group heads (lookarounds, named groups, `(?x`/`(?u`/
 //! `(?#`/…), a `*`/`+` applied to a repetition, a `?` applied to an
 //! already-lazy repetition, and a `{n,m}` above `kMaxRepeat` or

@@ -633,7 +633,7 @@ Routing note: the alias `GET /api/traces/{traceId}` coexists with native `/api/t
 
 ## 9. Regular expressions
 
-Every regular expression in a PulsusDB query is **RE2** ([google/re2](https://github.com/google/re2)) — the same dialect Loki, Prometheus and Tempo accept, since Go's `regexp` is an RE2 port. RE2 trades features for a linear-time matching guarantee: **there are no backreferences and no lookaround**, here exactly as in those systems. The full syntax is [RE2's own reference](https://github.com/google/re2/wiki/Syntax).
+Every regular expression in a PulsusDB query is **RE2** ([google/re2](https://github.com/google/re2)) — the same dialect Loki, Prometheus and Tempo accept, since Go's `regexp` is an RE2 port. RE2 trades features for a linear-time matching guarantee: **there are no backreferences and no lookaround**, and PulsusDB does not support them either — with one route's exception, noted in §9.3. The full syntax is [RE2's own reference](https://github.com/google/re2/wiki/Syntax).
 
 | Signal | Construct | Anchoring |
 |--------|-----------|-----------|
@@ -651,7 +651,7 @@ A pattern is evaluated in one of two places:
 - **In ClickHouse** (`match()`), whose engine is RE2 itself, whenever the predicate is pushed into the scan: stream and series selectors, trace attribute comparisons, and log line filters that precede any `line_format`.
 - **In process**, with the Rust [`regex`](https://docs.rs/regex) crate, whenever the pattern must run over an already-materialised result: the metrics label cache, PromQL `label_replace` and `info()`, and the LogQL pipeline stages that cannot be pushed down (a line filter after a parser or `line_format`, an `ip(…)` filter, `| regexp`, `| drop`/`| keep`, label filters over parsed labels, `label_replace`).
 
-The Rust crate's grammar is a **superset** of RE2's, and several constructs mean different things in it. On the metrics path, and for `label_replace` on both paths, the pattern is therefore rewritten into the Rust syntax that carries RE2's meaning before it is compiled, so both engines answer the same query the same way.
+The two grammars **overlap without either containing the other**: each accepts constructs the other rejects (§9.3 and §9.4 list both directions), and several constructs both accept mean different things (§9.2). On the metrics path, and for `label_replace` on both signals, the pattern is therefore rewritten into the Rust syntax that carries RE2's meaning before it is compiled. Over the 4,315-pattern corpus of §9.5, every pattern the metrics in-process path actually evaluates then matches the same subjects under both engines.
 
 ### 9.2 Constructs that mean different things in the two engines
 
@@ -677,36 +677,40 @@ The Rust crate's grammar is a **superset** of RE2's, and several constructs mean
   - `| drop` / `| keep` with a `=~` / `!~` matcher,
   - a label filter (`| a=~"…"`) over a label a parser produced.
 
-  A line filter that precedes every `line_format` and carries no `ip(…)` is pushed into ClickHouse instead and gets RE2's reading — so **the same pattern can mean two things in the same query language depending on whether the planner pushed it down**, and moving a filter from before a `line_format` to after it can silently change what it matches. Measured against Loki 3.7.4, which answers the opposite in each case (double-quoted LogQL strings take Go escapes, hence `"\\d"` for the regex `\d`): `{…} | logfmt | a=~"\\d"` matches the line `a=٥`; `| a=~"\\w"` matches `ｗ`; `` | a=~`[a&&b]` `` does not match `&`; `` | a=~`a{bbb}c` `` is rejected outright. Across the 4,315-pattern differential corpus, 120 of the 1,152 patterns both engines compile read differently at these sites.
+  A line filter that precedes every `line_format` and carries no `ip(…)` is pushed into ClickHouse instead and gets RE2's reading — so **the same pattern can mean two things in the same query language depending on whether the planner pushed it down**, and moving a filter from before a `line_format` to after it can silently change what it matches. Measured against Loki 3.7.4, which answers the opposite in each case (double-quoted LogQL strings take Go escapes, hence `"\\d"` for the regex `\d`): `{app="x"} | logfmt | a=~"\\d"` matches the line `a=٥`; `{app="x"} | logfmt | a=~"\\w"` matches `ｗ`; ``{app="x"} | logfmt | a=~`[a&&b]` `` does not match `&`; ``{app="x"} | logfmt | a=~`a{bbb}c` `` is rejected outright. Across the 4,315-pattern differential corpus, 120 of the 1,152 patterns both engines compile read differently at these sites.
 
   **If a LogQL query gives results you did not expect from a `\d`/`\w`/`\s`/`\b` or a character-class pattern, this is the first thing to check.** The workaround that always works is to spell the class out — `[0-9]` for `\d`, `[0-9A-Za-z_]` for `\w`, `[\t\n\f\r ]` for `\s` — which both engines read the same way. For a *line* filter you can also keep it ahead of every `line_format`, which pushes it down; a label filter over a parsed label, `| regexp` and `| drop`/`| keep` have no pushed-down form, so only the spelled-out class helps there. **Metrics and traces are not affected** — PromQL label matchers, `label_replace` and `info()` all apply the rewrite, and trace attribute comparisons are evaluated by ClickHouse's RE2. This is a defect rather than a design choice; it is not fixed as of this writing, and issue #336 carries the measurement.
 - LogQL `label_format` templates use Go template functions with their own regex arguments, which are compiled by the Rust crate directly.
 
 ### 9.3 Patterns PulsusDB accepts that the reference rejects
 
-These are queries that PulsusDB can answer and that Loki, Prometheus and Tempo answer with `400`. In every case the reference's engine has a limit the Rust `regex` crate does not — RE2 caps repetition counts and carries a fixed, small Unicode-property table where the Rust crate carries the full UCD.
+These are patterns Loki, Prometheus and Tempo answer with `400`, and at least one PulsusDB route does not — the *where* column says which route, and for several rows it is only one. **Two different mechanisms produce that, and the "how" column says which** — they behave differently, so do not read the table as one phenomenon:
 
-The last column says *where* the pattern survives, because a query only reaches the Rust crate on some routes:
+- **Rust accepts it** — the pattern reaches the Rust `regex` crate, which compiles it, and the query is answered with the Rust crate's reading. The crate simply has no equivalent of the limit RE2 imposes: no repetition cap, the full UCD rather than RE2's fixed property table, and its own extensions.
+- **nothing decides it** — the Rust crate rejects the pattern *too*, so every route that compiles agrees with the reference. It survives only on trace search's `query=` parameter, which is validated and never executed: the validator's verdict is three-valued and an undecidable pattern is treated as accepted. Nothing is evaluated, so there is no wrong answer — only a `200` where the reference sends `400`.
 
-- **in process** — the warm metrics label cache, PromQL `label_replace`/`info()`, and LogQL pipeline stages the planner could not push down. A route that reaches storage instead hands the pattern to ClickHouse's RE2, which rejects it (`400`), so the *same* metrics query can be answered or rejected depending on the label cache's state.
+The "where" column then names the routes, because a query only reaches the Rust crate on some of them:
+
+- **in process** — the warm metrics label cache, PromQL `label_replace`/`info()`, and LogQL pipeline stages the planner could not push down. A route that reaches storage instead hands the pattern to ClickHouse's RE2, which rejects (`400`) every row marked *in process* or *LogQL in process only* — measured on all of them — so the *same* metrics query can be answered or rejected depending on the label cache's state.
 - **LogQL in process only** — accepted only where the pattern is compiled as written (§9.2); the metrics rewrite turns it into something the Rust crate itself rejects.
-- **trace validation only** — trace search's `query=` parameter is checked and never executed, so nothing rejects it there; that route's residual is enumerated per class in `docs/benchmarks/traces-differential-ledger.md` (`traceql-validate-re2-unknown-residual`). Everything in this table is accepted there.
+- **trace validation only** — as above; that route's residual is enumerated per class in `docs/benchmarks/traces-differential-ledger.md` (`traceql-validate-re2-unknown-residual`). Every row below is accepted there, including the rows that are also accepted elsewhere.
 
-| Pattern class | Example | Where PulsusDB accepts it |
-|---------------|---------|---------------------------|
-| Unicode properties outside RE2's fixed table | `\p{Alphabetic}`, `[\p{Alphabetic}]` — in-table names (`\p{L}`, `\p{Lu}`, `\p{Greek}`, `\p{Han}`) are accepted by both, and `\p{Word}` is rejected by both | in process |
-| Repetition above RE2's `kMaxRepeat` of 1000 | `a{1001}`, `a{2,1001}`, `a{1001,}`, `a{100000}` | in process |
-| Repetition of a repetition | `a**`, `a*+`, `a++`, `a?*`, `a{2}{3}`, `a*??`, `a{2,3}+` | in process |
-| An unrecognised POSIX class name | `[[:foo:]]`, `[a[:zzz:]]`, `[[:^foo:]]` | in process |
-| Non-RE2 group heads | `(?x…)` extended mode, `(?u…)`, `(?i-u:…)`, `(?R)` — which the Rust crate reads as its own CRLF-mode flag, so the pattern silently matches everything | in process |
-| `\U`-form escapes | `\U0001F600` | in process |
-| `\u{…}` escapes | `\u{263A}` | LogQL in process only |
-| Lookaround | `(?=x)`, `(?!x)`, `(?<=x)`, `(?<!x)` | trace validation only — the Rust crate rejects lookaround too, so every other surface agrees with the reference |
-| Comment groups; a trailing backslash | `(?#c)a`, `a\` | trace validation only |
+| Pattern class | Example | How | Where |
+|---------------|---------|-----|-------|
+| Unicode properties outside RE2's fixed table | `\p{Alphabetic}`, `[\p{Alphabetic}]` — in-table names (`\p{L}`, `\p{Lu}`, `\p{Greek}`, `\p{Han}`) are accepted by both, and `\p{Word}` is rejected by both | Rust accepts | in process |
+| Repetition above RE2's `kMaxRepeat` of 1000 | `a{1001}`, `a{2,1001}`, `a{1001,}`, `a{100000}` | Rust accepts | in process |
+| Repetition of a repetition | `a**`, `a*+`, `a++`, `a?*`, `a{2}{3}`, `a*??`, `a{2,3}+` | Rust accepts | in process |
+| An unrecognised POSIX class name | `[[:foo:]]`, `[a[:zzz:]]`, `[[:^foo:]]` | Rust accepts | in process |
+| Non-RE2 group heads | `(?x…)` extended mode, `(?u…)`, `(?i-u:…)`, `(?R)` — which the Rust crate reads as its own CRLF-mode flag, so the pattern silently matches everything | Rust accepts | in process |
+| `\U`-form escapes | `\U0001F600` | Rust accepts | in process |
+| `\u{…}` escapes | `\u{263A}` | Rust accepts | LogQL in process only |
+| Lookaround | `(?=x)`, `(?!x)`, `(?<=x)`, `(?<!x)` | nothing decides it | trace validation only |
+| Comment groups; a trailing backslash | `(?#c)a`, `a\` | nothing decides it | trace validation only |
+| A pattern over the Rust crate's compiled-size budget | `(?:(?:(?:(?:[0-9a-f]{32}){32}){32}){32})` | nothing decides it — the crate rejects it as `CompiledTooBig`, and that budget is not RE2's, so its rejection says nothing about RE2's verdict | trace validation only |
 
 ### 9.4 Patterns PulsusDB rejects that the reference accepts
 
-The narrower and more disruptive direction: a query that works against Loki or Prometheus and returns `400` here. Each is a construct RE2 accepts and the Rust `regex` crate does not.
+The narrower and more disruptive direction. One mechanism produces all of it: each row is a construct RE2 accepts and the Rust `regex` crate rejects, so wherever PulsusDB compiles the pattern **as written** the compile fails and the query is a `400`. The paragraph under the table says which routes do that — on logs, all of them. (The last row is annotated LogQL-only for exactly this reason: the metrics path compiles the rewrite, not the pattern as written, and the rewrite escapes the braces.)
 
 | Pattern class | Example | Rust `regex` error |
 |---------------|---------|--------------------|
@@ -721,7 +725,7 @@ On logs these are rejected at plan time, before the pattern reaches ClickHouse, 
 
 ### 9.5 How this was measured, and what is not covered
 
-The tables above were produced by compiling each pattern against four engines and crossing the verdicts: Go's `regexp` (go1.25.5 — the reference implementation behind LogQL, PromQL and TraceQL), the digest-pinned `grafana/loki:3.7.4` oracle at the wire (`|~` and `{app=~…}`, accept = `2xx`, reject = `400`), ClickHouse 24.8.14.39's RE2, and the Rust `regex` crate 1.13.0 as PulsusDB compiles it. Go and Loki agreed on every probe; Go and ClickHouse's RE2 agreed on everything except `\C`, which C++ RE2 accepts as "any byte" and Go rejects (PulsusDB rejects it, matching the reference).
+The tables above were produced by compiling each pattern against four engines and crossing the verdicts: Go's `regexp` (go1.25.5 — the reference implementation behind LogQL, PromQL and TraceQL), the digest-pinned `grafana/loki:3.7.4` oracle at the wire (`|~` and `{app=~…}`, accept = `2xx`, reject = `400`), ClickHouse 24.8.14.39's RE2, and the Rust `regex` crate 1.13.0 as PulsusDB compiles it. Go's `regexp` is the oracle of record because it can be run over the whole corpus; the container was probed on 26 patterns spanning most of the classes above, and agreed with Go on all 26, which is what licenses using Go in its place for the classes not probed at the wire. Go and ClickHouse's RE2 agreed on everything except `\C`, which C++ RE2 accepts as "any byte" and Go rejects (PulsusDB rejects it, matching the reference).
 
 Stated gaps:
 

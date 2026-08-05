@@ -7,8 +7,13 @@
 //! RE2 (issue #280, which made RE2 the authority on *acceptance*). The
 //! in-process paths — the warm label cache, `concrete_name_matches`,
 //! `info()`'s ignore-set matchers, `label_replace` — compile with the Rust
-//! `regex` crate instead, whose grammar is a **superset**: several
-//! constructs are accepted by both engines and mean different things.
+//! `regex` crate instead, whose grammar **overlaps** RE2's without
+//! containing it (issue #336: neither contains the other — the Rust crate
+//! rejects `\Q…\E` and octal escapes, which RE2 accepts, and the
+//! acceptance screen below has an arm for exactly that,
+//! `rust_rejects_beyond_its_remit`). What this module handles is the
+//! overlap: several constructs are accepted by both engines and mean
+//! different things.
 //! Those are value divergences, not status ones — the query succeeds and
 //! returns the wrong rows, with nothing to indicate it:
 //!
