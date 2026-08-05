@@ -448,15 +448,79 @@ enum LfOp {
     /// `name != ip("…")`. The label value is parsed as an IP and tested for
     /// membership in the compiled range. Unlike the numeric `Compare` filter,
     /// this NEVER errors: a missing label or an unparseable value is simply a
-    /// non-match (reference v3.7.3-verified — no `__error__`/`__error_details__`
-    /// is ever set). `=` drops the non-match; `!=` keeps it.
+    /// non-match — no `__error__`/`__error_details__` is ever set.
+    /// `=` drops the non-match; `!=` keeps it.
+    ///
+    /// **Two divergences from the reference live in that last sentence, both
+    /// pre-dating and untouched by issue #248, both in `filterTy`
+    /// (`pkg/logql/log/ip.go:123-145 @ v3.7.4`) rather than in where the
+    /// filter may sit.** They are reported on #248 for a follow-up, not fixed
+    /// here, and are container-measured on `grafana/loki:3.7.4`:
+    ///
+    /// 1. A **missing label** is `false` for `!=` too in the reference —
+    ///    `lbs.Get` failing returns before the `=`/`!=` switch (`ip.go:128-132`),
+    ///    so the line is DROPPED. PulsusDB keeps it.
+    /// 2. The reference **scans** the label value for an embedded address
+    ///    (`ipFilter.filter`, `ip.go:183-226` — the same routine the `ip()`
+    ///    LINE filter uses, and the one our [`super::ip::line_has_ip_in`]
+    ///    mirrors), so `addr="10.1.2.3:8080"` and `addr="client 10.1.2.3 ok"`
+    ///    both match `ip("10.0.0.0/8")`. PulsusDB parses the WHOLE value and
+    ///    misses both.
+    ///
+    /// The matcher is always well formed: a MALFORMED `ip()` pattern that the
+    /// reference does not reject compiles to [`LfOp::IpMalformed`] instead.
     Ip {
         name: String,
         matcher: IpMatcher,
         negated: bool,
     },
+    /// A `name = ip("…")` / `name != ip("…")` filter whose PATTERN is
+    /// malformed, in a position where the reference never surfaces the
+    /// pattern error (issue #248 — see [`LabelFilterSite`]).
+    ///
+    /// The reference's `NewIPLabelFilter` cannot fail: it stores the parse
+    /// error on the node and leaves the matcher nil
+    /// (`pkg/logql/log/ip.go:94-103 @ v3.7.4`), so the filter stays in the
+    /// program and runs. It then evaluates to `true` on an entry carrying a
+    /// pipeline error and `false` otherwise — for `=` AND `!=` alike, and
+    /// whatever the label holds, because the `HasErr` and nil-matcher checks
+    /// both precede the `=`/`!=` switch (`ip.go:123-145 @ v3.7.4`).
+    ///
+    /// It therefore carries no name, no matcher and no negation: none of
+    /// those inputs can change its verdict.
+    IpMalformed,
     And,
     Or,
+}
+
+/// Where a `| <label filter>` expression sits in the pipeline, which is the
+/// whole of what decides whether a malformed `ip()` pattern is REPORTED or
+/// silently deferred (issue #248).
+///
+/// **Two variants because the reference's grammar has exactly two sites.**
+/// `git grep -n labelFilter v3.7.4 -- pkg/logql/syntax/syntax.y` returns
+/// nine lines: its `%type` declaration (58), its own production
+/// (302, 307-311), and exactly two USES elsewhere — line 221
+/// (`PIPE labelFilter`, a pipeline stage) and line 160
+/// (`unwrapExpr PIPE labelFilter`, a post-`unwrap` filter). `| drop` and
+/// `| keep` take `namedMatchers` (371-373), not a `labelFilter`, so no
+/// third site can carry an `ip()` pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelFilterSite {
+    /// A `| <label filter>` PIPELINE stage. The reference builds its stage
+    /// through `LabelFilterExpr.Stage()`
+    /// (`pkg/logql/syntax/ast.go:801-809 @ v3.7.4`), which type-switches on
+    /// the stage's WHOLE filterer and returns `ip.PatternError()` only when
+    /// that filterer IS the `ip()` filter — the one place in the reference a
+    /// deferred pattern error is ever surfaced.
+    PipelineStage,
+    /// A post-`unwrap` filter. The reference reduces `Unwrap.PostFilters`
+    /// with `log.ReduceAndLabelFilter`
+    /// (`pkg/logql/syntax/extractor.go:76,187 @ v3.7.4`), which builds the
+    /// filterer directly and never calls `Stage()` — so a malformed pattern
+    /// is accepted here in EVERY position, a lone filter included
+    /// (container-measured on `grafana/loki:3.7.4`).
+    PostUnwrap,
 }
 
 /// The inline verdict-stack width.
@@ -535,7 +599,10 @@ impl fmt::Debug for CompiledLabelFilter {
         let mut stack: Vec<(usize, u8, usize)> = vec![(root, 0, 0)];
         while let Some((i, step, level)) = stack.pop() {
             match &self.ops[i] {
-                leaf @ (LfOp::Match { .. } | LfOp::Compare { .. } | LfOp::Ip { .. }) => {
+                leaf @ (LfOp::Match { .. }
+                | LfOp::Compare { .. }
+                | LfOp::Ip { .. }
+                | LfOp::IpMalformed) => {
                     walk::dbg_own(f, leaf, alt, level)?;
                 }
                 LfOp::And | LfOp::Or => {
@@ -910,7 +977,16 @@ fn compile_stage(
             Ok(Some(compile_parser(p)?))
         }
         Stage::LabelFilter(expr) => {
-            let filter = compile_label_filter(expr)?;
+            // Issue #248: the parser admits label filters after `| unwrap`
+            // only, so a label-filter stage reached with the unwrap already
+            // compiled IS one of the reference's `Unwrap.PostFilters` — the
+            // one position where it never surfaces an `ip()` pattern error.
+            let site = if st.has_unwrap {
+                LabelFilterSite::PostUnwrap
+            } else {
+                LabelFilterSite::PipelineStage
+            };
+            let filter = compile_label_filter(expr, site)?;
             // A numeric comparison can add `__error__` on a
             // conversion failure — that changes the label set, so
             // it must route through the fan-out path (correctness
@@ -1146,10 +1222,16 @@ impl CompiledPipeline {
                         negated: bg,
                     },
                 ) => an == bn && am == bm && ag == bg,
-                (LfOp::And, LfOp::And) | (LfOp::Or, LfOp::Or) => true,
+                // A malformed-pattern leaf is a CONSTANT (issue #248): two of
+                // them behave identically whatever label or operator they were
+                // written with, so they compare equal.
+                (LfOp::IpMalformed, LfOp::IpMalformed)
+                | (LfOp::And, LfOp::And)
+                | (LfOp::Or, LfOp::Or) => true,
                 (LfOp::Match { .. }, _)
                 | (LfOp::Compare { .. }, _)
                 | (LfOp::Ip { .. }, _)
+                | (LfOp::IpMalformed, _)
                 | (LfOp::And, _)
                 | (LfOp::Or, _) => false,
             }
@@ -2319,7 +2401,10 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternTok>, PipelineError> {
 /// the exact node count; the FIRST error still wins in source order,
 /// because post-order visits the leaves left to right and `?` returns on
 /// the first failing one.
-fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, PipelineError> {
+fn compile_label_filter(
+    expr: &LabelFilterExpr,
+    site: LabelFilterSite,
+) -> Result<CompiledLabelFilter, PipelineError> {
     // A single-leaf filter — `| x="1"`, by far the common shape — needs
     // no traversal at all, so it costs exactly ONE allocation (the `ops`
     // vector), matching the pre-#272 profile of zero `Box`es plus this
@@ -2332,6 +2417,18 @@ fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, P
     } else {
         walk::postorder_into::<pulsus_logql::LabelFilterScc>(expr, &mut nodes);
     }
+    // Issue #248 — the ONE condition under which a malformed `ip()` pattern
+    // is reported, and the exact analogue of `LabelFilterExpr.Stage()`
+    // (`pkg/logql/syntax/ast.go:801-809 @ v3.7.4`): the stage's whole
+    // filterer must BE the `ip()` filter. `leaf_only` says the expression is
+    // a single node, so inside the `Ip` arm below it says that node is this
+    // one. Parentheses are transparent in both grammars
+    // (`syntax.y:307 @ v3.7.4` yields the inner filter, and our parser
+    // returns it unwrapped), so `| (a=ip("x"))` reports like `| a=ip("x")`.
+    // Anywhere else — nested under `and`/`or`/`,`, or any post-`unwrap`
+    // position — the error is dropped and the filter runs as
+    // [`LfOp::IpMalformed`].
+    let report_pattern_error = leaf_only && matches!(site, LabelFilterSite::PipelineStage);
     let mut ops: Vec<LfOp> = Vec::with_capacity(nodes.len());
     let mut has_compare = false;
     let mut live: u32 = 0;
@@ -2362,15 +2459,19 @@ fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, P
                 value,
                 negated,
             } => {
-                let matcher = IpMatcher::parse(value)
-                    .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?;
                 // The IP label filter never mutates the label set (it
                 // cannot error), so it does not force the label-mutating
                 // fan-out path — `has_compare` stays as it was.
-                LfOp::Ip {
-                    name: name.clone(),
-                    matcher,
-                    negated: *negated,
+                match IpMatcher::parse(value) {
+                    Ok(matcher) => LfOp::Ip {
+                        name: name.clone(),
+                        matcher,
+                        negated: *negated,
+                    },
+                    Err(e) if report_pattern_error => {
+                        return Err(PipelineError::BadIpFilter(e.to_string()));
+                    }
+                    Err(_) => LfOp::IpMalformed,
                 }
             }
             LabelFilterExpr::And(..) => LfOp::And,
@@ -3203,6 +3304,14 @@ fn eval_label_filter<'v>(
                     .is_some_and(|ip| matcher.contains(&ip));
                 Some(if *negated { !matched } else { matched })
             }
+            // Issue #248: a malformed pattern the reference did not reject.
+            // `ip.go:123-145 @ v3.7.4` checks `HasErr` first (pass), then the
+            // label, then `f.ip == nil` — all BEFORE the `=`/`!=` switch, so
+            // the verdict is `true` on an errored entry and `false` on every
+            // other, for both operators. Container-measured on
+            // `grafana/loki:3.7.4`: `| logfmt | addr != ip("nope") or b="y"`
+            // returns only the `b="y"` line, so `!=` does NOT negate to true.
+            LfOp::IpMalformed => Some(errs.has_err()),
             LfOp::And => {
                 // Post-order leaves [.., lhs, rhs] on the tail; BOTH were
                 // evaluated, in source order, before this op runs.
@@ -6110,5 +6219,154 @@ mod tests {
         expected.push((ERROR_DETAILS_LABEL.to_string(), DET.to_string()));
         expected.sort();
         assert_eq!(with_sm, expected);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #248: a MALFORMED `ip()` label-filter pattern is rejected in
+    // exactly one position and silently deferred everywhere else.
+    //
+    // Rule read off the reference: `NewIPLabelFilter` cannot fail — it
+    // stores the error and leaves the matcher nil
+    // (`pkg/logql/log/ip.go:94-103 @ v3.7.4`) — and the ONLY caller of
+    // `PatternError()` is `LabelFilterExpr.Stage()`
+    // (`pkg/logql/syntax/ast.go:801-809 @ v3.7.4`; `git grep -n PatternError
+    // pkg/` at v3.7.4 returns its declaration at `ip.go:117-121` and that one
+    // call site), which type-switches on the stage's whole filterer.
+    // Post-`unwrap` filters never reach it:
+    // they are reduced with `log.ReduceAndLabelFilter`
+    // (`pkg/logql/syntax/extractor.go:76,187 @ v3.7.4`).
+    //
+    // Every accept/reject and every verdict below was also measured on
+    // `grafana/loki:3.7.4` (digest
+    // `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+    // `discover_log_levels: false`); the corpus file
+    // `tests/logqltest/corpus/b20_nested_ip.test` carries the captures.
+    // -----------------------------------------------------------------
+
+    /// The one reported position: the malformed filter IS the whole
+    /// `| <label filter>` stage. Parentheses are transparent in both
+    /// grammars (`syntax.y:307 @ v3.7.4`), so the wrapped form reports too.
+    #[test]
+    fn a_lone_malformed_ip_pipeline_stage_is_rejected() {
+        for query in [
+            r#"{x="y"} | logfmt | addr = ip("nope")"#,
+            r#"{x="y"} | logfmt | (addr = ip("nope"))"#,
+            r#"{x="y"} | logfmt | addr != ip("nope")"#,
+            r#"{x="y"} | logfmt | addr = ip("")"#,
+            r#"{x="y"} | logfmt | addr = ip("10.0.0.0/99")"#,
+            // A second stage is still a stage of its own.
+            r#"{x="y"} | logfmt | b="x" | addr = ip("nope")"#,
+        ] {
+            let err = CompiledPipeline::compile(&stages_of(query))
+                .expect_err(query)
+                .to_string();
+            assert!(err.contains("ip()"), "{query}: {err}");
+        }
+    }
+
+    /// Nested under any of the reference's four `labelFilter` combinators
+    /// (`and`, `,`, `or`, and parenthesised nesting) the pattern error is
+    /// never surfaced — the reference answers 200.
+    #[test]
+    fn a_malformed_ip_nested_under_and_or_comma_compiles() {
+        for query in [
+            r#"{x="y"} | logfmt | addr = ip("nope") and b="x""#,
+            r#"{x="y"} | logfmt | b="x" and addr = ip("nope")"#,
+            r#"{x="y"} | logfmt | addr = ip("nope"), b="x""#,
+            r#"{x="y"} | logfmt | addr = ip("nope") or b="x""#,
+            r#"{x="y"} | logfmt | b="x" or addr = ip("nope")"#,
+            r#"{x="y"} | logfmt | addr != ip("nope") and b="x""#,
+            r#"{x="y"} | logfmt | (addr = ip("nope") and b="x")"#,
+            r#"{x="y"} | logfmt | (addr = ip("nope") or b="zzz") or b="x""#,
+            // The nested form does not poison a LATER lone stage's report,
+            // and a later lone stage does not un-defer the nested one.
+            r#"{x="y"} | logfmt | addr = ip("nope") or b="x" | b="x""#,
+        ] {
+            CompiledPipeline::compile(&stages_of(query)).expect(query);
+        }
+    }
+
+    /// Post-`unwrap` filters are reduced, never staged, so EVERY position
+    /// is accepted there — a lone malformed filter included (measured: the
+    /// reference answers 200 for `… | unwrap val | addr = ip("nope")` and
+    /// 400 for the same filter placed before the `unwrap`).
+    #[test]
+    fn a_malformed_ip_after_unwrap_compiles_in_every_position() {
+        for query in [
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | addr = ip("nope") [5m])"#,
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | (addr = ip("nope")) [5m])"#,
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | addr != ip("nope") [5m])"#,
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | addr = ip("nope") and b="x" [5m])"#,
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | b="x" | addr = ip("nope") [5m])"#,
+        ] {
+            CompiledPipeline::compile(&stages_of(query)).expect(query);
+        }
+        // The same filter one stage earlier — before the `unwrap` — is a
+        // pipeline stage again, and reports.
+        let query = r#"sum_over_time({x="y"} | logfmt | addr = ip("nope") | unwrap val [5m])"#;
+        CompiledPipeline::compile(&stages_of(query)).expect_err(query);
+    }
+
+    /// The verdict on a clean entry is `false` for `=` AND `!=` alike —
+    /// `ip.go`'s nil-matcher check precedes the operator switch, so `!=`
+    /// does not negate to `true`. Discriminating measurement: the
+    /// reference returns only the `b="y"` line for the `!=` query.
+    #[test]
+    fn a_malformed_nested_ip_is_false_for_both_operators() {
+        let kept = |query: &str, body: &str| {
+            run_sm_labels(
+                query,
+                body,
+                &[("service_name", "ipnest")],
+                &EMPTY_STRUCTURED_METADATA,
+            )
+            .is_some()
+        };
+        let eq_or = r#"{x="y"} | logfmt | addr = ip("nope") or b="x""#;
+        assert!(kept(eq_or, "addr=10.1.2.3 b=x"), "the `or` arm holds");
+        assert!(!kept(eq_or, "addr=10.1.2.3 b=y"), "both arms false");
+
+        let ne_or = r#"{x="y"} | logfmt | addr != ip("nope") or b="y""#;
+        assert!(
+            !kept(ne_or, "addr=10.1.2.3 b=x"),
+            "`!=` must NOT negate the malformed leaf to true"
+        );
+        assert!(kept(ne_or, "addr=192.168.1.1 b=y"), "the `or` arm holds");
+
+        let eq_and = r#"{x="y"} | logfmt | addr = ip("nope") and b="x""#;
+        assert!(!kept(eq_and, "addr=10.1.2.3 b=x"), "the `and` is false");
+    }
+
+    /// On an ERRORED entry the malformed leaf passes unconditionally, the
+    /// same short-circuit a well-formed `ip()` takes (`ip.go:124-127`
+    /// checks `HasErr` before the nil-matcher check).
+    #[test]
+    fn a_malformed_nested_ip_passes_an_errored_entry() {
+        let kept = |query: &str, body: &str| {
+            run_sm_labels(
+                query,
+                body,
+                &[("service_name", "ipjson")],
+                &EMPTY_STRUCTURED_METADATA,
+            )
+        };
+        for query in [
+            r#"{x="y"} | json | addr = ip("nope") or b="zzz""#,
+            r#"{x="y"} | json | addr != ip("nope") or b="zzz""#,
+        ] {
+            let got = kept(query, "not json at all").unwrap_or_else(|| panic!("{query}"));
+            assert!(
+                got.iter().any(|(k, _)| k == ERROR_LABEL),
+                "{query}: {got:?}"
+            );
+        }
+        // A CLEAN entry takes the `false` branch, so the `and` drops it.
+        assert_eq!(
+            kept(
+                r#"{x="y"} | json | addr = ip("nope") and b="zzz""#,
+                r#"{"addr":"10.1.2.3","b":"x"}"#
+            ),
+            None
+        );
     }
 }

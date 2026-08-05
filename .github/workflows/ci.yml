@@ -600,10 +600,10 @@ jobs:
       # answer against the committed expectation, so a capture that goes
       # STALE is caught rather than trusted forever. NIGHTLY/dispatch
       # only: drift is a property of time passing, not of the commit
-      # under test, and the leg needs ~80 sequential pushes.
+      # under test, and the leg needs ~90 sequential pushes.
       #
       # It verifies VALUES; it does not verify provenance markers — it
-      # reads them to decide which rows it may compare. 77 of the 993
+      # reads them to decide which rows it may compare. 90 of the 1,013
       # rows the markers permit are physically reachable; the gap is
       # enumerated by reason in the test, dominated by 678 template rows
       # pinned to an absolute date the reference will not serve.

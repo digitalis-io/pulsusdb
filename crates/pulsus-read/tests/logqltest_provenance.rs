@@ -911,7 +911,14 @@ fn check_e_ledger_rows_claiming_corpus_gating_are_named_by_a_marker() {
 /// grouped `avg_over_time` row whose captured value was a
 /// frontend-dependent `sum/count` rather than the reducer's.
 /// 1_165 + 7 = 1_172.
-const CAPTURED: usize = 1_172;
+///
+/// Issue #248 added `b20_nested_ip.test`'s 25 rows — 20 `eval` plus 5
+/// `eval_fail` — in one capture run against the pinned v3.7.4 container
+/// (accept/reject disposition AND every value). They carry the file's
+/// `captured` default; as elsewhere, an `eval_fail`'s `msg:` gate is
+/// PulsusDB's own wording while the REJECTION it pins was captured.
+/// 1_172 + 25 = 1_197.
+const CAPTURED: usize = 1_197;
 /// Issue #343 added `b19_offset.test`'s 9 rows: hand-derived from the
 /// semantics measured on that issue, over a fixture authored here rather
 /// than taken from the container, so they are `derived` and not
@@ -921,4 +928,4 @@ const CAPTURED: usize = 1_172;
 const DERIVED: usize = 31;
 const DIVERGENCE: usize = 17;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_252;
+const TOTAL: usize = 1_277;

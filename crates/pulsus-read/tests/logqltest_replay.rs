@@ -15,14 +15,22 @@
 //! issue exists because a coverage figure got read as stronger than it
 //! was, so the vocabulary is split and each figure is pinned separately:
 //!
-//! | figure | means | today |
+//! | figure | means | pinned by |
 //! |---|---|---|
-//! | `captured` | directives claiming container capture | 1135 |
-//! | [`PROVENANCE_PERMITS`] | rows the marker classification ALLOWS a replay to compare | 948 |
-//! | [`REACHABLE`] | rows a live replay can PHYSICALLY compare today | 77 |
+//! | `captured` | directives claiming container capture | `CAPTURED` in `logqltest_provenance.rs` |
+//! | [`PROVENANCE_PERMITS`] | rows the marker classification ALLOWS a replay to compare | this file |
+//! | [`REACHABLE`] | rows a live replay can PHYSICALLY compare today | this file |
+//!
+//! The values live ONLY on those constants, each asserted against a figure
+//! recomputed from the corpus. They were restated here as literals until
+//! issue #248, by which point two of the three had drifted (the table said
+//! 1135/948/77 against actual 1172/993/77) — a hand-copied number beside a
+//! machine-checked one is a false claim waiting to happen, so the copies
+//! are gone rather than re-synced.
 //!
 //! `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg was
-//! built, and the name was wrong: 678 of those 948 are pinned to an
+//! built, and the name was wrong: the [`Unreachable::AbsoluteTimestamp`]
+//! bucket — the large majority of them — is pinned to an
 //! absolute date the reference will not serve, so no replay can ever
 //! reach them. That is the SAME conflation this issue opened with,
 //! reproduced one level further in — we corrected `captured` vs
@@ -74,8 +82,8 @@ enum Unreachable {
     /// - it cannot be pushed AS-IS, because the reference serves only
     ///   the last ~3 hours (see [`INGESTION_WINDOW`]).
     ///
-    /// **This is the single largest lever on reachability — 678 rows,
-    /// more than eight times what the live leg reaches — and it is
+    /// **This is the single largest lever on reachability — 678 rows, far
+    /// more than the live leg reaches in total — and it is
     /// blocked by the CORPUS, not by this harness.** Unblocking it means
     /// re-capturing those files against RELATIVE time, which is corpus
     /// work with its own capture procedure and its own review, not a
@@ -177,8 +185,9 @@ const CONFIG_DELTA_FILES: &[(&str, &str)] = &[
 /// exclusion list reads exactly like a right one. The live replay is
 /// expected to surface them as flapping failures — a row that passes and
 /// fails across runs with no change to either side — and they should be
-/// marked from that evidence, not from a guess. Until then the 948 is an
-/// upper bound on what is genuinely replayable, not a measurement of it.
+/// marked from that evidence, not from a guess. Until then
+/// [`PROVENANCE_PERMITS`] is an upper bound on what is genuinely
+/// replayable, not a measurement of it.
 fn classify() -> Vec<Row> {
     let mut out = Vec::new();
     let dir = logqltest::corpus_dir();
@@ -561,21 +570,28 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// queries (30 instant, 8 on a step grid) and this slice replays log
 /// (streams) queries at a single instant — so they land in the
 /// enumerated gap, not in the coverage.
-const TOTAL_DIRECTIVES: usize = 1_252;
+///
+/// Issue #248 adds `b20_nested_ip.test`: TOTAL 1_252 -> 1_277 (20 `eval`
+/// rows and 5 `eval_fail` rows), `our-error-text (eval_fail)` 63 -> 68,
+/// and so [`PROVENANCE_PERMITS`] 993 -> 1_013. Thirteen of the permitted
+/// rows are streams queries at a single instant over a relative-offset
+/// load set, so [`REACHABLE`] moves for the first time since the leg was
+/// built: 77 -> 90. The other seven are metric queries (228 -> 235).
+const TOTAL_DIRECTIVES: usize = 1_277;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 993;
+const PROVENANCE_PERMITS: usize = 1_013;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
 /// [`UNREACHABLE_BY_REASON`] — it is not a shortfall to be quietly
 /// absorbed into one number.
-const REACHABLE: usize = 77;
+const REACHABLE: usize = 90;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \
-not a capture claim (ported)=29, our-error-text (eval_fail)=63, pinned-divergence=17";
+not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergence=17";
 
 /// Issue #344: `metric query` 191 -> 221 and `range/matrix eval`
 /// 2 -> 10. All 38 of `b18_range_agg_grouping.test`'s newly-permitted
@@ -584,7 +600,7 @@ not a capture claim (ported)=29, our-error-text (eval_fail)=63, pinned-divergenc
 /// the ENUMERATED gap rather than the coverage. Both are levers the
 /// module docs already name.
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \
-metric query (slice: streams only)=228, range/matrix eval (slice: instant only)=10";
+metric query (slice: streams only)=235, range/matrix eval (slice: instant only)=10";
 
 /// How far back the first slot sits. Bounded above by
 /// [`INGESTION_WINDOW`] and below by the total slot span; both are
@@ -772,9 +788,9 @@ fn live_replay_of_the_reachable_rows_against_the_reference() {
          THE COMMITTED CORPUS VALUES ARE NOT IMPLICATED — do not go looking at them. Two runs \
          push the same corpus labels at overlapping absolute times, so the reference merges \
          them into ONE stream and a stale line lands inside a case's own span. No query window \
-         can separate them. Had this gone undetected it would have surfaced as `N of 77 \
-         replayed rows disagree with the reference`, sending you after captures that are \
-         fine.\n\n\
+         can separate them. Had this gone undetected it would have surfaced as `N of \
+         {REACHABLE} replayed rows disagree with the reference`, sending you after captures \
+         that are fine.\n\n\
          CI always starts a fresh container, so this check exists for LOCAL runs — which also \
          means CI can never exercise it.\n\n\
          Fix: restart the container, then re-run.\n  \

@@ -20,9 +20,9 @@ marker table still holds and is now load-bearing in code.
 
 | figure | means | today |
 |---|---|---|
-| `captured` | directives claiming container capture | 1172 |
-| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | 993 |
-| `REACHABLE` | rows a live replay can PHYSICALLY compare | 77 |
+| `captured` | directives claiming container capture | 1197 |
+| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | 1013 |
+| `REACHABLE` | rows a live replay can PHYSICALLY compare | 90 |
 
 `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg existed,
 and that name was wrong: most of those rows can never be reached. The
@@ -37,10 +37,11 @@ enumerated by reason, not absorbed:
   and it is blocked by the CORPUS, not the harness:** unblocking it means
   re-capturing those files against RELATIVE time, which is corpus work
   with its own capture procedure and review.
-- **metric query — 228.** The first slice replays log (streams) queries
+- **metric query — 235.** The first slice replays log (streams) queries
   only. Issue #344 added 37 (`b18_range_agg_grouping.test`'s executed
   grouped range aggregations, including the two cross-stream tie rows its
-  instant `first`/`last` delivery-order fix unblocked).
+  instant `first`/`last` delivery-order fix unblocked); issue #248 added
+  7 (`b20_nested_ip.test`'s post-`unwrap` and `count_over_time` rows).
 - **range/matrix — 10.** Needs the step grid replayed too. Issue #344
   added 8 (the same file's sliding-path rows, which include the
   cross-stream `StableHash` tie).
@@ -429,6 +430,45 @@ divergence is #264's, not this row's.
 | C3 | 131071 | bare selector | /loki/api/v1/query | 400 | log queries are not supported as an instant query type, ... (parser ACCEPTED the text; the rejection is the instant-log-query type check downstream of parse) |
 | C4 | 131072 | bare selector | /loki/api/v1/query | 400 | parse error : input size too long (131072 > 131072) |
 ```
+
+## Issue #248 — nested `ip()` corpus (`b20_nested_ip.test`)
+
+- **Image:** `grafana/loki:3.7.4`, digest
+  `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`.
+  Identity read from the RUNNING process (`/loki/api/v1/status/buildinfo`
+  → `{"version":"3.7.4","revision":"b318f282",...}`), not from a header.
+  Captured 2026-08-05 in one run. Every row was re-run against a freshly
+  started container on 2026-08-06 and re-produced its committed value; the
+  seven METRIC rows were re-run separately on a clean container, because
+  the live replay leg is streams-only and so does not cover them.
+- **Config:** `ci/logql/config.yaml` plus `discover_log_levels: false`, the
+  §230 step-2 delta — without it the distributor injects a
+  `detected_level` stream label the hermetic store does not reproduce.
+  The file's header therefore does NOT declare a config requirement and it
+  is NOT in `CONFIG_DELTA_FILES`: the delta changes only that injected
+  label, which the live replay leg strips before comparing, so a replay
+  against the CI oracle (which has level discovery on) stays conclusive.
+  Contrast `b12`/`b14`, where the injected level changes the answer.
+- **Streams captured through `query_range`** (v3.7.4 rejects instant log
+  queries), metric rows through `query`; the `.test` replays both as
+  `eval instant`, per §230 step 3.
+- **What is captured:** the accept/reject disposition AND every value, in
+  the same run — including the reference's own 400 bodies
+  (`parse error : stage '| addr=ip("nope")' : ip: invalid pattern:
+  "nope"`). As elsewhere, an `eval_fail` row's `msg:` gate gates
+  PulsusDB's own Display, not that body.
+- **The rule is read from the source, not inferred from the captures**:
+  `NewIPLabelFilter` cannot fail (`pkg/logql/log/ip.go:94-103 @ v3.7.4`)
+  and `PatternError()` has exactly one caller,
+  `LabelFilterExpr.Stage()` (`pkg/logql/syntax/ast.go:801-809 @ v3.7.4`).
+  The post-`unwrap` rows exist because the source says
+  `ReduceAndLabelFilter` bypasses that call
+  (`pkg/logql/syntax/extractor.go:76,187 @ v3.7.4`) — a case no amount of
+  probing the nesting forms would have suggested looking for. The file
+  covers both sites because the grammar has only two: `git grep -n
+  labelFilter v3.7.4 -- pkg/logql/syntax/syntax.y` returns nine lines —
+  the `%type` declaration (58), the production itself (302, 307-311), and
+  two uses, 221 (a pipeline stage) and 160 (a post-`unwrap` filter).
 
 ## Issue #244 — `/detected_fields` corpus (`b14_detected_fields.test`)
 
