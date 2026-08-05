@@ -28,11 +28,13 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_read::logql::{ReadError, TooBroadReason};
+use pulsus_read::traces::log2_histogram;
 use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
 use pulsus_read::{TRACE_METRICS_MAX_SET_ROWS, TraceEngine, TraceMetricsPlan, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
@@ -310,6 +312,10 @@ fn plan_for(engine: &TraceEngine, q: &str, start_ns: i64, end_ns: i64) -> TraceM
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct QueryLogRow {
     read_rows: u64,
+    /// Issue #252 AC13: the histogram's row count is now data-dependent
+    /// (one row per occupied `(t, bucket)`), so the gate asserts it as an
+    /// exact identity against the seeded durations.
+    result_rows: u64,
     projections: Vec<String>,
 }
 
@@ -320,7 +326,7 @@ async fn query_log_like(client: &ChClient, like_fragments: &[&str]) -> Option<Qu
         predicate.push_str(&format!(" AND query LIKE '%{fragment}%'"));
     }
     let sql = format!(
-        "SELECT read_rows, projections FROM system.query_log \
+        "SELECT read_rows, result_rows, projections FROM system.query_log \
          WHERE {predicate} ORDER BY event_time_microseconds DESC LIMIT 1"
     );
     let mut stream = client
@@ -654,4 +660,332 @@ async fn metrics_explain_and_budget_gates() {
         ),
         "compare cap breach is a 422 query_too_broad, got {err:?}"
     );
+
+    // ---- Issue #252 AC7: the NEW histogram SQL shape carries the same
+    // pushdown as the count/agg forms. The whole design rests on the
+    // inner replay-dedup subquery being byte-identical to
+    // `metrics_agg_range_sql`'s, so both index behaviours are gated on
+    // the histogram's own generated SQL, with the same assertions and
+    // the same thresholds as gates 1 and 2 above. The quantile form
+    // rides along: its SQL is unchanged by #252, and pinning it here is
+    // what makes "unchanged" checkable rather than asserted. ----------
+    for (label, q) in [
+        (
+            "histogram",
+            r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 } | histogram_over_time(duration)"#,
+        ),
+        (
+            "quantile",
+            r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 } | quantile_over_time(duration, 0.5, 0.9)"#,
+        ),
+    ] {
+        let plan = plan_for(&engine, q, base, now);
+        assert!(
+            plan.range_sql().contains("PREWHERE service = 'checkout'"),
+            "{label}: the hoist survives into the generated SQL:\n{}",
+            plan.range_sql()
+        );
+        let raw = explain_raw(&client, plan.range_sql()).await;
+        assert!(
+            raw.contains("service_time"),
+            "{label}: the service-equality form must still select the service_time \
+             projection:\n{raw}"
+        );
+        let result = plan.range_sql().to_string();
+        engine
+            .metrics_range(&plan)
+            .await
+            .unwrap_or_else(|e| panic!("{label} range executes: {e}\n{result}"));
+        exec(&client, "SYSTEM FLUSH LOGS").await;
+        let marker = if label == "histogram" {
+            "roundToExp2"
+        } else {
+            "quantilesTDigest"
+        };
+        let row = query_log_like(&client, &["PREWHERE service = \\'checkout\\'", marker])
+            .await
+            .unwrap_or_else(|| panic!("{label}: the query's QueryFinish row must exist"));
+        assert!(
+            row.projections.iter().any(|p| p.contains("service_time")),
+            "{label}: query_log.projections must name service_time, got {:?}",
+            row.projections
+        );
+        // Same granule-aware bound as gate 1 — do NOT re-tighten.
+        assert!(
+            row.read_rows < CORPUS_SPANS + CORPUS_SPANS / 2,
+            "{label}: the spans side must be served by the service_time projection's prefix, \
+             not a full scan (read {})",
+            row.read_rows
+        );
+
+        // …and the attribute form's semi-join still prunes on the
+        // (key, val) prefix, with time pruning isolated inside the dense
+        // env=prod prefix (the gate-2 discriminator).
+        let attr_q = q.replace(
+            r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 }"#,
+            r#"{ .env = "prod" }"#,
+        );
+        let full = plan_for(&engine, &attr_q, base, now);
+        let narrow = plan_for(&engine, &attr_q, now - 30 * 60 * NS_PER_S, now);
+        let (full_sel, full_total) = table_primary_key_granules(
+            &explain_raw(&client, &extract_semi_join_subquery(full.range_sql())).await,
+            "trace_attrs_idx",
+        );
+        let (narrow_sel, _) = table_primary_key_granules(
+            &explain_raw(&client, &extract_semi_join_subquery(narrow.range_sql())).await,
+            "trace_attrs_idx",
+        );
+        assert!(
+            full_sel <= full_total && full_sel > 0,
+            "{label}: the semi-join's prefix read must engage the attr primary key \
+             ({full_sel}/{full_total})"
+        );
+        assert!(
+            narrow_sel < full_sel,
+            "{label}: the narrow window must prune strictly fewer granules within the SAME \
+             dense (key, val) prefix (narrow {narrow_sel} vs full {full_sel})"
+        );
+    }
+
+    // ---- Issue #252 AC13: the log2 histogram's cost, gated ------------
+    // What this asserts and NOTHING more: (1) the scan is untouched —
+    // `read_rows` equals a count-only query over the byte-identical inner
+    // dedup subquery, so the change is post-scan on this corpus; (2)
+    // `result_rows` equals `Σ over steps (distinct occupied buckets)`
+    // computed independently from the seeded durations — an exact
+    // identity that fails on over- AND under-emission; (3) the same
+    // identity at MAXIMUM occupancy, where the row count is largest;
+    // (4) the static `64 × steps` ceiling on both corpora.
+    //
+    // Deliberately NOT asserted: `memory_usage`, query time, or any
+    // resource budget, at typical or worst-case occupancy — those are
+    // scale questions that route to #25 rather than to a CI assertion
+    // that would be flaky (docs/schemas.md §9: no wall-time in CI).
+    let hist_plan = plan_for(&engine, "{} | histogram_over_time(duration)", base, now);
+    let hist_sql = hist_plan.range_sql();
+    assert!(
+        hist_sql.contains("toUInt64(roundToExp2(val - 1)) * 2 AS bucket"),
+        "the log2 bucket expression is in the generated SQL:\n{hist_sql}"
+    );
+    // The count-only twin over the SAME inner subquery: the outer
+    // aggregate is all that differs, so any `read_rows` gap is the
+    // aggregation touching rows the scan did not.
+    let inner = extract_log2_inner(hist_sql);
+    let count_only = format!("SELECT count() AS scan_identity_probe FROM (\n  {inner}\n)");
+    exec(&client, &count_only).await;
+    engine
+        .metrics_range(&hist_plan)
+        .await
+        .expect("histogram range executes");
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    let probe_row = query_log_like(&client, &["scan_identity_probe"])
+        .await
+        .expect("the count-only probe's QueryFinish row must exist");
+    let hist_row = query_log_like(&client, &["roundToExp2"])
+        .await
+        .expect("the histogram query's QueryFinish row must exist");
+    assert_eq!(
+        hist_row.read_rows, probe_row.read_rows,
+        "the log2 histogram must read exactly the rows its inner dedup subquery reads — the \
+         change is post-scan (histogram {} vs count-only {})",
+        hist_row.read_rows, probe_row.read_rows
+    );
+
+    // The independent expectation, from the seeding rule alone.
+    let seeded: Vec<(i64, i64)> = (0..CORPUS_SPANS)
+        .map(|n| {
+            let spread = WINDOW_NS / CORPUS_SPANS as i64;
+            (base + n as i64 * spread, n as i64 * 10_000)
+        })
+        .collect();
+    let (want_rows, want_max_occupancy) = expected_bucket_rows(&seeded);
+    assert_eq!(
+        hist_row.result_rows, want_rows,
+        "one row per OCCUPIED (step, bucket), computed from the seeded durations"
+    );
+    let steps = distinct_steps(&seeded);
+    assert!(
+        hist_row.result_rows <= 64 * steps,
+        "the static ceiling: {} rows > 64 × {steps} steps",
+        hist_row.result_rows
+    );
+    assert!(
+        want_max_occupancy > 1,
+        "the seeded corpus must actually occupy several buckets per step, or the identity is \
+         vacuous (max per-step occupancy {want_max_occupancy})"
+    );
+
+    // Maximum occupancy: one span per reachable power of two, so every
+    // one of the 62 storable buckets is occupied at once and the exact
+    // identity is exercised where the row count is largest.
+    // Anchored to a step START and packed 10 s apart, so all 63 land in
+    // ONE step: the ceiling is only exercised where a single step
+    // carries every bucket.
+    //
+    // `1i64 << k` for k in 1..=62 occupies buckets 2^1..2^62, and the
+    // extra `2^62 + 1` span occupies 2^63 — the TOP of the reachable
+    // range, which is the whole reason `bucket_ns` is `UInt64` and the
+    // SQL casts before doubling. Without it this corpus would claim
+    // "every reachable bucket" while leaving the one that motivated the
+    // type untested.
+    let maxocc_base = step_start_ns(base + WINDOW_NS / 2) + 60 * NS_PER_S;
+    let maxocc: Vec<(i64, i64)> = (1..=62u32)
+        .map(|k| 1i64 << k)
+        .chain(std::iter::once((1i64 << 62) + 1))
+        .enumerate()
+        .map(|(i, dur_ns)| (maxocc_base + i as i64 * 10 * NS_PER_S, dur_ns))
+        .collect();
+    let values: Vec<String> = maxocc
+        .iter()
+        .enumerate()
+        .map(|(i, (ts_ns, dur_ns))| {
+            let id = 8_000_000 + i as u64;
+            format!(
+                "(toFixedString(unhex('{id:032x}'), 16), toFixedString(unhex('{id:016x}'), 8), \
+                 toFixedString(unhex('0000000000000000'), 8), 'op', 'maxocc', {ts_ns}, \
+                 {dur_ns}, 0, 1, 1, 'p')"
+            )
+        })
+        .collect();
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload) VALUES {}",
+            values.join(", ")
+        ),
+    )
+    .await;
+    let max_plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "maxocc" } | histogram_over_time(duration)"#,
+        base,
+        now,
+    );
+    let max_result = engine
+        .metrics_range(&max_plan)
+        .await
+        .expect("max-occupancy histogram executes");
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    let max_row = query_log_like(&client, &["roundToExp2", "maxocc"])
+        .await
+        .expect("the max-occupancy query's QueryFinish row must exist");
+    let (max_want_rows, max_occupancy) = expected_bucket_rows(&maxocc);
+    assert_eq!(
+        max_want_rows, 63,
+        "every reachable bucket is seeded: 2^1..=2^62 plus 2^63 (from a 2^62 + 1 duration)"
+    );
+    assert!(
+        maxocc.iter().any(|(_, d)| *d == (1i64 << 62) + 1),
+        "the 2^63 bucket's seed span must be present"
+    );
+    assert_eq!(
+        max_row.result_rows, max_want_rows,
+        "the same exact identity at maximum occupancy"
+    );
+    assert!(
+        max_row.result_rows <= 64 * distinct_steps(&maxocc),
+        "the static ceiling holds at maximum occupancy too"
+    );
+    assert!(
+        max_occupancy >= 63,
+        "the max-occupancy corpus must pack its buckets into few steps to exercise the ceiling \
+         (max per-step occupancy {max_occupancy})"
+    );
+
+    // Row COUNT is not the claim. The top of the domain has to survive
+    // the whole path — ClickHouse's `toUInt64(...) * 2` producing 2^63,
+    // the RowBinary decode into `MetricLog2BucketRow.bucket_ns: u64`, and
+    // `bucket_seconds` framing it into a label — so assert the EMITTED
+    // `__bucket` values, bit-for-bit, not just how many there are. The
+    // `Int64` form this replaced would have decoded 2^63 as a NEGATIVE
+    // label, which `result_rows` alone cannot see.
+    let emitted: BTreeSet<u64> = max_result
+        .series
+        .iter()
+        .map(|s| {
+            assert_eq!(s.labels.len(), 1, "one __bucket label: {s:?}");
+            assert_eq!(s.labels[0].key, "__bucket");
+            let pulsus_read::MetricLabelValue::Double(seconds) = s.labels[0].value else {
+                panic!("__bucket is a double: {s:?}");
+            };
+            assert!(
+                seconds > 0.0,
+                "a bucket label is positive — a negative one is the signed-overflow bug this \
+                 corpus exists to catch ({seconds})"
+            );
+            seconds.to_bits()
+        })
+        .collect();
+    let want: BTreeSet<u64> = (1..=63u32)
+        .map(|k| log2_histogram::bucket_seconds(1u64 << k).to_bits())
+        .collect();
+    assert_eq!(
+        emitted, want,
+        "every reachable bucket label must arrive intact, 2^1 through 2^63"
+    );
+    let top = log2_histogram::bucket_seconds(1u64 << 63);
+    assert!(
+        emitted.contains(&top.to_bits()),
+        "the 2^63 bucket ({top} s) must be emitted end to end — this is the case the UInt64 \
+         cast exists for, and a pure-Rust unit test cannot reach it"
+    );
+    assert_eq!(top, 9_223_372_036.854_776_f64);
+}
+
+/// Isolates the inner replay-dedup subquery of a log2 histogram range
+/// SQL — the text between `FROM (` and the outer `WHERE val >= 2`. Used
+/// to build a count-only query over the byte-identical scan.
+fn extract_log2_inner(sql: &str) -> String {
+    let start = sql
+        .find("FROM (\n  ")
+        .unwrap_or_else(|| panic!("no inner subquery in\n{sql}"))
+        + "FROM (\n  ".len();
+    let rel_end = sql[start..]
+        .find("\n)\nWHERE val >= 2")
+        .unwrap_or_else(|| panic!("no inner-subquery terminator in\n{sql}"));
+    sql[start..start + rel_end].to_string()
+}
+
+/// `(Σ over steps of distinct occupied buckets, the largest per-step
+/// occupancy)` for a `(timestamp_ns, duration_ns)` schedule, derived the
+/// way the SQL derives it: floor the timestamp to the step grid, drop
+/// `duration < 2`, round the rest up to the next power of two.
+fn expected_bucket_rows(spans: &[(i64, i64)]) -> (u64, usize) {
+    let mut per_step: std::collections::BTreeMap<i64, std::collections::BTreeSet<u64>> =
+        std::collections::BTreeMap::new();
+    for (ts_ns, dur_ns) in spans {
+        let Some(bucket) = pulsus_read::traces::log2_histogram::log2_bucketize_ns(*dur_ns) else {
+            continue;
+        };
+        per_step
+            .entry(step_start_ns(*ts_ns))
+            .or_default()
+            .insert(bucket);
+    }
+    let total: usize = per_step.values().map(std::collections::BTreeSet::len).sum();
+    let max = per_step
+        .values()
+        .map(std::collections::BTreeSet::len)
+        .max()
+        .unwrap_or(0);
+    (total as u64, max)
+}
+
+/// The number of distinct steps a schedule touches.
+fn distinct_steps(spans: &[(i64, i64)]) -> u64 {
+    spans
+        .iter()
+        .map(|(ts_ns, _)| step_start_ns(*ts_ns))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64
+}
+
+/// `toStartOfInterval(…, INTERVAL 3600000 MILLISECOND)` in Rust: the
+/// step grid is anchored at the epoch, so the bucket start is the
+/// timestamp floored to a multiple of the step.
+fn step_start_ns(ts_ns: i64) -> i64 {
+    const STEP_NS: i64 = 3_600 * NS_PER_S;
+    ts_ns.div_euclid(STEP_NS) * STEP_NS
 }
