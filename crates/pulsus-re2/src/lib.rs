@@ -445,12 +445,25 @@ fn parse_repetition(b: &[u8], start: usize) -> Option<Repetition> {
 mod tests {
     use super::*;
 
-    /// The measured #309 case plus the rest of the Rust-accepts/RE2-rejects
-    /// vocabulary. Each premise is pinned: the Rust crate must ACCEPT the
-    /// anchored form, otherwise the vendored parser rejects at plan time and
-    /// the screen would be guarding nothing.
+    /// Patterns the screen defers because the Rust crate's ACCEPTANCE of
+    /// them cannot be trusted to be RE2's. The list is MIXED, and issue
+    /// #336 measured it member by member against Go's `regexp`,
+    /// ClickHouse 24.8's RE2 and the pinned Loki v3.7.4 container: RE2
+    /// REJECTS `\p{Alphabetic}`, `\u{263A}`, `\U0001F600`, `(?x) a b `,
+    /// `(?i-u:foo)`, `a{1001}` and `a{2,1001}` — and ACCEPTS `\p{Greek}`,
+    /// `\pL`, `\P{L}`, `[\p{L}0-9]`, `(?P<name>a)` and `(?<name>a)`. This
+    /// test was named `…_the_rust_crate_accepts_beyond_re2_…`, which was
+    /// false for those last six. Deferring them costs a storage
+    /// round-trip and nothing else: the screen models `\p` and the
+    /// non-`(?:`/flag group heads WHOLESALE rather than enumerating RE2's
+    /// property table and head vocabulary, which is the conservative
+    /// direction on purpose.
+    ///
+    /// Each premise is pinned: the Rust crate must ACCEPT the anchored
+    /// form, otherwise the vendored parser rejects at plan time and the
+    /// screen would be guarding nothing.
     #[test]
-    fn patterns_the_rust_crate_accepts_beyond_re2_are_left_to_the_authority() {
+    fn patterns_the_screen_cannot_adjudicate_are_left_to_the_authority() {
         for pattern in [
             r"\p{Alphabetic}",
             r"\p{Greek}",
@@ -477,10 +490,14 @@ mod tests {
         }
     }
 
-    /// Word-boundary escapes the Rust crate grew and RE2 never had. Pinned
-    /// separately because `\<`/`\>`/`\b{…}` compile only on recent `regex`
-    /// versions; if a future crate version rejects them the screen is
-    /// harmlessly redundant, not wrong.
+    /// Word-boundary escapes the Rust crate grew and RE2 never had as
+    /// assertions. This is a MEANING divergence, not an acceptance one:
+    /// measured for issue #336, Go's `regexp` and ClickHouse's RE2 both
+    /// ACCEPT `\<word\>` — reading `\<` as a literal `<` — so the deferral
+    /// buys the right reading, not a rejection. Pinned separately because
+    /// `\<`/`\>`/`\b{…}` compile only on recent `regex` versions; if a
+    /// future crate version rejects them the screen is harmlessly
+    /// redundant, not wrong.
     #[test]
     fn rust_only_boundary_escapes_are_left_to_the_authority() {
         for pattern in [r"\<word\>", r"\b{start}x", r"\B{end}x"] {

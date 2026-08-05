@@ -5,8 +5,9 @@
 //! compiles every label-matcher regex with Go's `regexp` — an RE2 port —
 //! and this engine's storage path hands the same pattern to ClickHouse's
 //! RE2 (issue #280, which made RE2 the authority on *acceptance*). The
-//! in-process paths — the warm label cache, `concrete_name_matches`,
-//! `info()`'s ignore-set matchers, `label_replace` — compile with the Rust
+//! in-process paths that ROUTE THROUGH THIS MODULE — the warm label
+//! cache, `concrete_name_matches`, `info()`'s ignore-set matchers,
+//! `label_replace` on both signals — compile with the Rust
 //! `regex` crate instead, whose grammar **overlaps** RE2's without
 //! containing it (issue #336: neither contains the other — the Rust crate
 //! rejects `\Q…\E` and octal escapes, which RE2 accepts, and the
@@ -15,7 +16,14 @@
 //! overlap: several constructs are accepted by both engines and mean
 //! different things.
 //! Those are value divergences, not status ones — the query succeeds and
-//! returns the wrong rows, with nothing to indicate it:
+//! returns the wrong rows, with nothing to indicate it.
+//!
+//! NOT every in-process regex site routes through here, and the list above
+//! is the ones that do — `pulsus-read`'s LogQL pipeline compiles the
+//! user's pattern with the Rust crate and does NOT call
+//! [`re2_pattern_to_rust`], so the table below is live there (issue #336,
+//! open; docs/api.md §9.1's "as written" rows). Adding a caller means
+//! adding it to that list, not assuming it:
 //!
 //! | construct | RE2 / Go `regexp` | Rust `regex` |
 //! |---|---|---|
@@ -25,8 +33,14 @@
 //! | `[a~~b]` | class of `a`, `~`, `b` | symmetric difference |
 //! | `[a--b]` | range `a`–`-`, i.e. **rejected** | difference — matches `a` |
 //! | `[a[b]]` | class of `a`, `[`, `b`, then a literal `]` | nested class (union) |
-//! | `[]a]` | class of `]`, `a` (leading `]` is a literal) | *(differs)* |
 //! | `a{bbb}c`, `a{,5}` | literal braces | malformed repetition — rejected |
+//!
+//! `[]a]` sat on that table until issue #336, marked "*(differs)*" on the
+//! Rust side. It does not differ: **both** engines read a leading `]` as a
+//! literal, so `[]a]` is the class `{']', 'a'}` in each — measured against
+//! Go's `regexp`, ClickHouse 24.8's RE2 and `regex` 1.13.0. The class
+//! rewrite still escapes it, which is a harmless no-op rather than a
+//! correction, and the row was removed because it was never a divergence.
 //!
 //! [`re2_pattern_to_rust`] rewrites those constructs into Rust syntax with
 //! RE2's meaning, and leaves everything else byte-identical. The rewrite is
@@ -44,11 +58,18 @@
 //! rendered literal agree on every probe subject.
 //!
 //! **Not** in scope here — acceptance divergences, where one engine
-//! rejects what the other compiles (`\p{Alphabetic}`, `a{1001}`, `\Q…\E`,
-//! `(?P<n>…)`). Those are `metrics::re2_authority`'s job: it screens them
-//! off the in-process path so RE2 returns the verdict. A rewrite whose
-//! output the Rust crate rejects therefore costs a storage round-trip and
-//! never a wrong answer.
+//! rejects what the other compiles: `\p{Alphabetic}` and `a{1001}` (Rust
+//! accepts, RE2 rejects) and `\Q…\E` (RE2 accepts, Rust rejects). Those
+//! are `metrics::re2_authority`'s job: it screens them off the in-process
+//! path so RE2 returns the verdict. A rewrite whose output the Rust crate
+//! rejects therefore costs a storage round-trip and never a wrong answer.
+//!
+//! `(?P<n>…)` was listed here as an acceptance divergence and is not one
+//! — **both** engines accept named groups, which are RE2's own syntax
+//! (measured against Go's `regexp`, ClickHouse RE2 and the pinned Loki
+//! v3.7.4 container, issue #336). It is still screened, for the different
+//! reason that the screen defers every non-`(?:`/flag group head wholesale
+//! rather than modelling each one.
 
 use std::borrow::Cow;
 

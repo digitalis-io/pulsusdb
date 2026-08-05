@@ -635,23 +635,29 @@ Routing note: the alias `GET /api/traces/{traceId}` coexists with native `/api/t
 
 Every regular expression in a PulsusDB query is **RE2** ([google/re2](https://github.com/google/re2)) — the same dialect Loki, Prometheus and Tempo accept, since Go's `regexp` is an RE2 port. RE2 trades features for a linear-time matching guarantee: **there are no backreferences and no lookaround**, and PulsusDB does not support them either — with one route's exception, noted in §9.3. The full syntax is [RE2's own reference](https://github.com/google/re2/wiki/Syntax).
 
-| Signal | Construct | Anchoring |
-|--------|-----------|-----------|
-| Logs | stream selector `{app=~"…"}`, label filter `\| a=~"…"`, `\| drop`/`\| keep` matcher, `label_replace` | fully anchored — `^(?:…)$` |
-| Logs | line filter `\|~` / `!~`, `\| regexp "…"` | unanchored (substring search) |
-| Metrics | label matcher `=~` / `!~`, `label_replace`, `info()` ignore set | fully anchored |
-| Traces | attribute/intrinsic comparison `=~` / `!~` | fully anchored |
-
 The rest of this section records where PulsusDB's behaviour is *not* identical to those references. Everything in it was measured, not inferred; §9.5 says how, and names the cases still unverified.
 
-### 9.1 Two engines, one dialect
+### 9.1 Where each pattern is compiled
 
-A pattern is evaluated in one of two places:
+Two engines evaluate regexes here: **ClickHouse's `match()`, which is RE2 itself**, for any predicate pushed into the scan, and the Rust [`regex`](https://docs.rs/regex) crate in process, for a pattern that must run over an already-materialised result. The two grammars **overlap without either containing the other** — each accepts constructs the other rejects (§9.3 and §9.4 give both directions), and several constructs both accept mean different things (§9.2). So which engine compiles a pattern, and whether it compiles it as the user wrote it, decides which of the following sections applies. That is a property of each construct, so it is a column rather than a rule:
 
-- **In ClickHouse** (`match()`), whose engine is RE2 itself, whenever the predicate is pushed into the scan: stream and series selectors, trace attribute comparisons, and log line filters that precede any `line_format`.
-- **In process**, with the Rust [`regex`](https://docs.rs/regex) crate, whenever the pattern must run over an already-materialised result: the metrics label cache, PromQL `label_replace` and `info()`, and the LogQL pipeline stages that cannot be pushed down (a line filter after a parser or `line_format`, an `ip(…)` filter, `| regexp`, `| drop`/`| keep`, label filters over parsed labels, `label_replace`).
+| Signal | Construct | Anchoring | Compiled by |
+|--------|-----------|-----------|-------------|
+| Logs | stream selector `{app=~"…"}` | `^(?:…)$` | ClickHouse (RE2) |
+| Logs | line filter `\|~` / `!~` — before any `line_format`, no `ip(…)` alternative | unanchored | ClickHouse (RE2) |
+| Logs | line filter `\|~` / `!~` — after a `line_format`, **or** with an `ip(…)` alternative | unanchored | in process, **as written** |
+| Logs | `\| regexp "…"` | unanchored | in process, **as written** |
+| Logs | label filter `\| a=~"…"` over a parser-produced label | `^(?:…)$` | in process, **as written** |
+| Logs | `\| drop` / `\| keep` matcher | `^(?:…)$` | in process, **as written** |
+| Logs | `label_replace(…)` | `^(?:…)$` | in process, **rewritten** |
+| Metrics | label matcher `=~` / `!~` | `^(?:…)$` | ClickHouse (RE2) when the selector reaches storage; in process, **rewritten**, when it is answered from the warm label cache |
+| Metrics | `label_replace`, `info()` ignore set | `^(?s:…)$` / `^(?:…)$` | in process, **rewritten** |
+| Traces | attribute/intrinsic comparison `=~` / `!~` | `^(?:…)$` | ClickHouse (RE2) |
+| Traces | search's `query=` parameter | — | **not compiled** — validated by a three-valued syntax check, never executed |
 
-The two grammars **overlap without either containing the other**: each accepts constructs the other rejects (§9.3 and §9.4 list both directions), and several constructs both accept mean different things (§9.2). On the metrics path, and for `label_replace` on both signals, the pattern is therefore rewritten into the Rust syntax that carries RE2's meaning before it is compiled. Over the 4,315-pattern corpus of §9.5, every pattern the metrics in-process path actually evaluates then matches the same subjects under both engines.
+**Rewritten** means the pattern is first translated into the Rust syntax that carries RE2's meaning, so the in-process engine reads it as RE2 does; over the 4,315-pattern corpus of §9.5, every pattern the metrics in-process path evaluates then matches the same subjects under both engines. **As written** means no such translation happens — that is §9.2's known divergence, and it is a defect rather than a design choice.
+
+Separately from evaluation, **every LogQL regex except `label_replace`'s is also compiled in process at plan time as a validity check**, including the ones ClickHouse goes on to evaluate. That is why a LogQL pattern the Rust crate cannot compile is rejected even when it would have been pushed down (§9.4).
 
 ### 9.2 Constructs that mean different things in the two engines
 
@@ -668,18 +674,11 @@ The two grammars **overlap without either containing the other**: each accepts c
 
 (`[]a]` is *not* on this list: both engines read a leading `]` as a literal, measured on both.)
 
-**Where the rewrite is applied.** Pushed-down predicates need no rewrite — ClickHouse *is* RE2. The metrics in-process path and `label_replace` on both signals apply it. Two surfaces do not:
+**Where this table bites.** It applies to exactly the constructs §9.1 marks **as written** — every one of them a LogQL pipeline stage — and to nothing else. Two consequences:
 
-- **Known divergence, open and unfixed — LogQL pipeline stages evaluated in process do not apply the rewrite (issue #336).** These five sites compile the pattern exactly as written, so every row of the table above is live in them:
-  - a line filter (`|~` / `!~`) that follows a `line_format`,
-  - a line filter with an `ip(…)` alternative,
-  - `| regexp "…"`,
-  - `| drop` / `| keep` with a `=~` / `!~` matcher,
-  - a label filter (`| a=~"…"`) over a label a parser produced.
+- **Known divergence, open and unfixed (issue #336).** The five **as written** rows of §9.1 do not apply the rewrite, so every row of the table above is live in them. The LogQL line filter appears in §9.1 twice, once on each side, and that is the whole of the problem: the same filter compiles in ClickHouse before a `line_format` and in process after one — so **the same pattern can mean two things in the same query language depending on whether the planner pushed it down**, and moving a filter across a `line_format`, or adding an `ip(…)` alternative to it, can silently change what it matches. Measured against Loki 3.7.4, which answers the opposite in each case (double-quoted LogQL strings take Go escapes, hence `"\\d"` for the regex `\d`): `{app="x"} | logfmt | a=~"\\d"` matches the line `a=٥`; `{app="x"} | logfmt | a=~"\\w"` matches `ｗ`; ``{app="x"} | logfmt | a=~`[a&&b]` `` does not match `&`; ``{app="x"} | logfmt | a=~`a{bbb}c` `` is rejected outright. Across the 4,315-pattern differential corpus, 120 of the 1,152 patterns both engines compile read differently at these sites.
 
-  A line filter that precedes every `line_format` and carries no `ip(…)` is pushed into ClickHouse instead and gets RE2's reading — so **the same pattern can mean two things in the same query language depending on whether the planner pushed it down**, and moving a filter from before a `line_format` to after it can silently change what it matches. Measured against Loki 3.7.4, which answers the opposite in each case (double-quoted LogQL strings take Go escapes, hence `"\\d"` for the regex `\d`): `{app="x"} | logfmt | a=~"\\d"` matches the line `a=٥`; `{app="x"} | logfmt | a=~"\\w"` matches `ｗ`; ``{app="x"} | logfmt | a=~`[a&&b]` `` does not match `&`; ``{app="x"} | logfmt | a=~`a{bbb}c` `` is rejected outright. Across the 4,315-pattern differential corpus, 120 of the 1,152 patterns both engines compile read differently at these sites.
-
-  **If a LogQL query gives results you did not expect from a `\d`/`\w`/`\s`/`\b` or a character-class pattern, this is the first thing to check.** The workaround that always works is to spell the class out — `[0-9]` for `\d`, `[0-9A-Za-z_]` for `\w`, `[\t\n\f\r ]` for `\s` — which both engines read the same way. For a *line* filter you can also keep it ahead of every `line_format`, which pushes it down; a label filter over a parsed label, `| regexp` and `| drop`/`| keep` have no pushed-down form, so only the spelled-out class helps there. **Metrics and traces are not affected** — PromQL label matchers, `label_replace` and `info()` all apply the rewrite, and trace attribute comparisons are evaluated by ClickHouse's RE2. This is a defect rather than a design choice; it is not fixed as of this writing, and issue #336 carries the measurement.
+  **If a LogQL query gives results you did not expect from a `\d`/`\w`/`\s`/`\b` or a character-class pattern, this is the first thing to check.** The workaround that always works is to spell the class out — `[0-9]` for `\d`, `[0-9A-Za-z_]` for `\w`, `[\t\n\f\r ]` for `\s` — which both engines read the same way. For a *line* filter you can also move it onto §9.1's ClickHouse row — ahead of every `line_format`, with no `ip(…)` alternative; the other four **as written** rows have no ClickHouse counterpart, so only the spelled-out class helps there. **Nothing outside the five **as written** rows is affected** — every other row of §9.1 is either ClickHouse's RE2 or a **rewritten** compile. This is a defect rather than a design choice; it is not fixed as of this writing, and issue #336 carries the measurement.
 - LogQL `label_format` templates use Go template functions with their own regex arguments, which are compiled by the Rust crate directly.
 
 ### 9.3 Patterns PulsusDB accepts that the reference rejects
@@ -710,18 +709,18 @@ The "where" column then names the routes, because a query only reaches the Rust 
 
 ### 9.4 Patterns PulsusDB rejects that the reference accepts
 
-The narrower and more disruptive direction. One mechanism produces all of it: each row is a construct RE2 accepts and the Rust `regex` crate rejects, so wherever PulsusDB compiles the pattern **as written** the compile fails and the query is a `400`. The paragraph under the table says which routes do that — on logs, all of them. (The last row is annotated LogQL-only for exactly this reason: the metrics path compiles the rewrite, not the pattern as written, and the rewrite escapes the braces.)
+The narrower and more disruptive direction. One mechanism produces all of it: each row is a construct RE2 accepts and the Rust `regex` crate rejects, so a route that hands it to the crate answers `400`. Which routes those are differs by row, because the §9.1 rewrite changes some patterns and not others — that is the last column, using §9.1's two labels:
 
-| Pattern class | Example | Rust `regex` error |
-|---------------|---------|--------------------|
-| `\Q…\E` literal quoting | `\Qa*\E`, a bare `\Q` | `unrecognized escape sequence` |
-| Octal escapes | `\0`, `\12`, `\101` | `backreferences are not supported` |
-| A repetition applied to a flag-setting group | `a(?i){2}`, `a(?i)*`, `a(?i)+`, `a(?i)?` | `repetition operator missing expression` |
-| A repeated flag letter in a group head | `(?ss:ab)`, `(?ii)a`, `(?i-ii)a` | `duplicate flag` |
-| An empty flag group | `(?)a` | `repetition operator missing expression` |
-| Literal braces (LogQL only — the metrics rewrite escapes them, §9.2) | `a{bbb}c`, `a{,5}`, `a{}` | `repetition quantifier expects a valid decimal` |
+| Pattern class | Example | Rust `regex` error | Rejected on |
+|---------------|---------|--------------------|-------------|
+| `\Q…\E` literal quoting | `\Qa*\E`, a bare `\Q` | `unrecognized escape sequence` | **as written** and **rewritten** alike — the rewrite leaves it unchanged |
+| Octal escapes | `\0`, `\12`, `\101` | `backreferences are not supported` | **as written** and **rewritten** alike |
+| A repetition applied to a flag-setting group | `a(?i){2}`, `a(?i)*`, `a(?i)+`, `a(?i)?` | `repetition operator missing expression` | **as written** and **rewritten** alike |
+| A repeated flag letter in a group head | `(?ss:ab)`, `(?ii)a`, `(?i-ii)a` | `duplicate flag` | **as written** and **rewritten** alike |
+| An empty flag group | `(?)a` | `repetition operator missing expression` | **as written** and **rewritten** alike |
+| Literal braces | `a{bbb}c`, `a{,5}`, `a{}` | `repetition quantifier expects a valid decimal` | **as written** only — the rewrite escapes the braces, so every **rewritten** route (all of metrics, and LogQL `label_replace`) accepts these |
 
-On logs these are rejected at plan time, before the pattern reaches ClickHouse, because every LogQL regex — pushed down or not — is validated by an in-process compile of the pattern as written; measured, `{app="x"} |~ "a{bbb}c"` is a plan-time rejection here and a `200` on Loki 3.7.4. On metrics the outcome is route-dependent: a selector answered in process, or one with no storage fallback to learn a verdict from, returns `400`, while a predicate that reaches ClickHouse is compiled by RE2 and answered. `[a--b]` is rejected by PulsusDB *and* by the reference, so it is agreement, not a divergence.
+ClickHouse's RE2 accepts every row above, so a predicate it compiles is answered. On logs that rarely helps: §9.1's plan-time validity check compiles every LogQL regex except `label_replace`'s as written, so these are rejected before reaching ClickHouse even when they would have been pushed down — measured, `{app="x"} |~ "a{bbb}c"` is a plan-time rejection here and a `200` on Loki 3.7.4. On metrics the outcome follows §9.1's row: a selector that reaches storage is answered, one served from the warm label cache compiles the rewrite. `[a--b]` is rejected by PulsusDB *and* by the reference, so it is agreement, not a divergence.
 
 ### 9.5 How this was measured, and what is not covered
 
