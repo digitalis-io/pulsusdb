@@ -1261,7 +1261,7 @@ impl CompiledPipeline {
         sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Result<Option<Cow<'a, str>>, RowBudgetExceeded> {
-        match self.run_mode_into(body, base, ts_ns, sm, None, labels, false)? {
+        match self.run_mode_into(body, base, ts_ns, sm, None, labels, false, None)? {
             (MetricRun::Dropped, _) => Ok(None),
             (MetricRun::Kept { line, .. }, _) => Ok(Some(line)),
         }
@@ -1287,6 +1287,29 @@ impl CompiledPipeline {
         ts_ns: i64,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Result<(Option<Cow<'a, str>>, bool), RowBudgetExceeded> {
+        self.run_into_reporting_err_with_json_paths(body, base, ts_ns, labels, None)
+    }
+
+    /// As [`CompiledPipeline::run_into_reporting_err`], additionally
+    /// capturing each full-flatten `| json` leaf's RAW key path into
+    /// `json_paths` (issue #254) — the reference's `NewJSONParser(true)`
+    /// mode, which ONLY `/detected_fields` uses
+    /// (`pkg/querier/queryrange/detected_fields.go:410` vs the query
+    /// path's `NewJSONParser(false)`, `pkg/logql/syntax/ast.go:758 @
+    /// v3.7.4`). Every other entrypoint passes `None` and allocates
+    /// nothing for it.
+    ///
+    /// The sink is addressed by LABEL POSITION and is cleared by each
+    /// `| json` stage that runs, so after a successful call
+    /// `json_paths.get(i)` is the path for `labels[i]`.
+    pub(crate) fn run_into_reporting_err_with_json_paths<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        ts_ns: i64,
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        json_paths: Option<&mut JsonPaths>,
+    ) -> Result<(Option<Cow<'a, str>>, bool), RowBudgetExceeded> {
         match self.run_mode_into(
             body,
             base,
@@ -1295,6 +1318,7 @@ impl CompiledPipeline {
             None,
             labels,
             false,
+            json_paths,
         )? {
             (MetricRun::Dropped, has_err) => Ok((None, has_err)),
             (MetricRun::Kept { line, .. }, has_err) => Ok((Some(line), has_err)),
@@ -1342,6 +1366,7 @@ impl CompiledPipeline {
                 grouping,
                 labels,
                 true,
+                None,
             )?
             .0)
     }
@@ -1359,6 +1384,7 @@ impl CompiledPipeline {
         grouping: Option<&RangeGrouping>,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
         metric: bool,
+        mut json_paths: Option<&mut JsonPaths>,
     ) -> Result<(MetricRun<'a>, bool), RowBudgetExceeded> {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
         let mut value: Option<f64> = None;
@@ -1421,9 +1447,14 @@ impl CompiledPipeline {
                         return Ok((MetricRun::Dropped, errs.has_err()));
                     }
                 }
-                CompiledStage::Json { extractions } => {
-                    run_json(&line, extractions, labels, &mut errs, &json_key_budget)?
-                }
+                CompiledStage::Json { extractions } => run_json(
+                    &line,
+                    extractions,
+                    labels,
+                    &mut errs,
+                    &json_key_budget,
+                    json_paths.as_deref_mut(),
+                )?,
                 CompiledStage::Logfmt {
                     strict,
                     keep_empty,
@@ -2905,10 +2936,24 @@ fn set_label<'a>(
     name: Cow<'a, str>,
     value: Cow<'a, str>,
 ) {
-    if let Some(entry) = labels.iter_mut().find(|(k, _)| *k == name) {
-        entry.1 = value;
+    set_label_at(labels, name, value);
+}
+
+/// [`set_label`] returning the POSITION the label now occupies — the
+/// address [`JsonPaths`] keys its capture by, so a collision rename that
+/// overwrites an existing slot re-points that slot's path instead of
+/// appending an orphan.
+fn set_label_at<'a>(
+    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    name: Cow<'a, str>,
+    value: Cow<'a, str>,
+) -> usize {
+    if let Some(idx) = labels.iter().position(|(k, _)| *k == name) {
+        labels[idx].1 = value;
+        idx
     } else {
         labels.push((name, value));
+        labels.len() - 1
     }
 }
 
@@ -3303,6 +3348,68 @@ impl JsonKeyBudget {
     }
 }
 
+/// The RAW JSON key path behind each label a full-flatten `| json`
+/// emitted, addressed by the label's POSITION in the row's label vector.
+///
+/// This is the reference's `LabelsBuilder.jsonPaths` map
+/// (`pkg/logql/log/labels.go:128,415,421 @ v3.7.4`), and like the
+/// reference it is **opt-in per run**: only `/detected_fields` builds its
+/// json parser with capture on (`NewJSONParser(true)`,
+/// `pkg/querier/queryrange/detected_fields.go:410`), while the query path
+/// builds it off (`pkg/logql/syntax/ast.go:758`). The query path
+/// therefore pays one `Option` branch per emitted leaf and allocates
+/// nothing.
+///
+/// The buffer is CALLER-OWNED so `/detected_fields`' per-row feeder can
+/// recycle its spine across sampled rows, exactly as it recycles the
+/// label scratch; [`JsonPaths::clear`] keeps that capacity.
+#[derive(Debug, Default)]
+pub(crate) struct JsonPaths {
+    /// Indexed by position in the label vector; `None` for a label the
+    /// flatten did not produce (a base label, or a leaf that was skipped).
+    slots: Vec<Option<Vec<String>>>,
+}
+
+impl JsonPaths {
+    /// Drops the previous row's paths, keeping the spine's capacity.
+    pub(crate) fn clear(&mut self) {
+        self.slots.clear();
+    }
+
+    /// The raw path for the label at `idx`, or `None` when the flatten
+    /// captured none for it — the reference's `GetJSONPath` miss.
+    pub(crate) fn get(&self, idx: usize) -> Option<&[String]> {
+        self.slots.get(idx)?.as_deref()
+    }
+
+    /// Records `stack ++ [leaf]` for the label now at `idx`, overwriting
+    /// any earlier path at that position (the reference's `SetJSONPath`
+    /// map write, `labels.go:415`).
+    fn record(&mut self, idx: usize, stack: &[&str], leaf: &str) {
+        if self.slots.len() <= idx {
+            self.slots.resize_with(idx + 1, || None);
+        }
+        let mut path = Vec::with_capacity(stack.len() + 1);
+        path.extend(stack.iter().map(|p| (*p).to_string()));
+        path.push(leaf.to_string());
+        self.slots[idx] = Some(path);
+    }
+}
+
+/// The walk-local half of the capture: the RAW key parts of the objects
+/// currently open, mirroring the reference's `JSONParser.prefixBuffer`
+/// (`pkg/logql/log/parser.go:107-115,128-135 @ v3.7.4`) — pushed on
+/// entering an object, popped on leaving it (`parseObject`'s explicit
+/// `j.prefixBuffer = j.prefixBuffer[:prefixLen]` rollback). Parts that
+/// trim EMPTY are pushed too: `buildSanitizedPrefixFromBuffer` skips them
+/// when building the label name, `buildJSONPathFromPrefixBuffer` does
+/// not, so `{"x":{"":1}}` is label `x` with path `["x",""]`.
+#[derive(Debug)]
+struct JsonPathCapture<'v, 'o> {
+    stack: Vec<&'v str>,
+    out: &'o mut JsonPaths,
+}
+
 /// Owned key/value output by design: extracted values live inside the
 /// per-line `serde_json::Value`, which drops at the end of this stage —
 /// the parse itself dominates the cost (bounded to pushdown-surviving
@@ -3311,13 +3418,26 @@ impl JsonKeyBudget {
 /// `budget` is the ROW's ([`MAX_JSON_FLATTEN_KEY_BYTES`]); only the
 /// full-flatten arm spends from it, since only that arm derives label
 /// names from the line.
+///
+/// `paths` is the opt-in [`JsonPaths`] sink (see its doc): it is CLEARED
+/// on entry — including on the malformed-line early return, so a failed
+/// json attempt never leaves a previous attempt's paths visible — and
+/// only the full-flatten arm writes to it, matching the reference, whose
+/// `SetJSONPath` calls live exclusively in `JSONParser.parseLabelValue`
+/// and never in `JSONExpressionParser` (`pkg/logql/log/parser.go:161,196
+/// @ v3.7.4`).
 fn run_json<'a>(
     line: &str,
     extractions: &'a [(String, Vec<JsonPathSeg>)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     errs: &mut ErrorSlots<'a>,
     budget: &JsonKeyBudget,
+    paths: Option<&mut JsonPaths>,
 ) -> Result<(), RowBudgetExceeded> {
+    let mut paths = paths;
+    if let Some(p) = paths.as_deref_mut() {
+        p.clear();
+    }
     let parsed: serde_json::Value = match serde_json::from_str(line) {
         Ok(v @ serde_json::Value::Object(_)) => v,
         // A non-object top level (or a parse failure) is the malformed
@@ -3333,7 +3453,19 @@ fn run_json<'a>(
         }
     };
     if extractions.is_empty() {
-        flatten_json("", Depth::Root, &parsed, labels, &mut errs.dirty, budget)?;
+        let mut capture = paths.map(|out| JsonPathCapture {
+            stack: Vec::new(),
+            out,
+        });
+        flatten_json(
+            "",
+            Depth::Root,
+            &parsed,
+            labels,
+            &mut errs.dirty,
+            budget,
+            capture.as_mut(),
+        )?;
     } else {
         for (label, path) in extractions {
             let value = lookup_json_path(&parsed, path)
@@ -3414,13 +3546,14 @@ fn run_json<'a>(
 /// precondition rather than the arithmetic —
 /// `tests/logql_json_key_alloc_gate.rs` measures the requests and fails
 /// on that shape.
-fn flatten_json<'a>(
+fn flatten_json<'a, 'v>(
     prefix: &str,
     depth: Depth,
-    value: &serde_json::Value,
+    value: &'v serde_json::Value,
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     dirty: &mut bool,
     budget: &JsonKeyBudget,
+    mut capture: Option<&mut JsonPathCapture<'v, '_>>,
 ) -> Result<(), RowBudgetExceeded> {
     if let serde_json::Value::Object(map) = value {
         for (k, v) in map {
@@ -3438,7 +3571,27 @@ fn flatten_json<'a>(
                 match v {
                     // Transparent: the child is named by the prefix alone.
                     serde_json::Value::Object(_) => {
-                        flatten_json(prefix, Depth::Nested, v, labels, dirty, budget)?;
+                        // The reference pushes the raw key onto
+                        // `prefixBuffer` BEFORE testing whether it
+                        // sanitizes to anything (`nextKeyPrefix`), so an
+                        // empty-trimming ancestor still occupies a path
+                        // slot; `parseObject` pops it on the way out.
+                        if let Some(c) = capture.as_deref_mut() {
+                            c.stack.push(k);
+                        }
+                        let res = flatten_json(
+                            prefix,
+                            Depth::Nested,
+                            v,
+                            labels,
+                            dirty,
+                            budget,
+                            capture.as_deref_mut(),
+                        );
+                        if let Some(c) = capture.as_deref_mut() {
+                            c.stack.pop();
+                        }
+                        res?;
                     }
                     // At depth 0 the reference's `parseLabelValue` takes
                     // `sanitizeLabelKey(key, true) == ""` as `!ok` and
@@ -3458,6 +3611,7 @@ fn flatten_json<'a>(
                             Depth::Nested,
                             json_scalar_to_string(scalar),
                             budget,
+                            capture.as_deref_mut(),
                         )?;
                     }
                     _ => {}
@@ -3475,7 +3629,22 @@ fn flatten_json<'a>(
             );
             match v {
                 serde_json::Value::Object(_) => {
-                    flatten_json(&key, Depth::Nested, v, labels, dirty, budget)?;
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.stack.push(k);
+                    }
+                    let res = flatten_json(
+                        &key,
+                        Depth::Nested,
+                        v,
+                        labels,
+                        dirty,
+                        budget,
+                        capture.as_deref_mut(),
+                    );
+                    if let Some(c) = capture.as_deref_mut() {
+                        c.stack.pop();
+                    }
+                    res?;
                 }
                 scalar => insert_flattened(
                     labels,
@@ -3486,6 +3655,7 @@ fn flatten_json<'a>(
                     depth,
                     json_scalar_to_string(scalar),
                     budget,
+                    capture.as_deref_mut(),
                 )?,
             }
         }
@@ -3525,20 +3695,33 @@ const DUPLICATE_SUFFIX: &str = "_extracted";
 /// before it is built — the unsuffixed `key` it replaces was already
 /// charged when built, which the budget's sentence covers (every key
 /// string the flatten allocates, not every key it emits).
+///
+/// `capture` (opt-in, see [`JsonPaths`]) records the raw path against the
+/// FINAL label name, renamed or not — the reference sets it after the
+/// `_extracted` rebuild and against the suffixed key
+/// (`pkg/logql/log/parser.go:152-163` at depth 0, `:183-198` deeper @
+/// v3.7.4), and its `buildJSONPathFromPrefixBuffer` trims the suffix back
+/// off the raw part, which is why the path recorded here is always the
+/// UNSUFFIXED `raw_part`.
 #[allow(clippy::too_many_arguments)]
-fn insert_flattened<'a>(
+fn insert_flattened<'a, 'v>(
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     dirty: &mut bool,
     key: String,
     prefix: &str,
-    raw_part: &str,
+    raw_part: &'v str,
     depth: Depth,
     value: String,
     budget: &JsonKeyBudget,
+    mut capture: Option<&mut JsonPathCapture<'v, '_>>,
 ) -> Result<(), RowBudgetExceeded> {
     *dirty = true;
     if get_label(labels, &key).is_none() {
         labels.push((Cow::Owned(key), Cow::Owned(value)));
+        if let Some(c) = capture.as_deref_mut() {
+            let idx = labels.len() - 1;
+            c.out.record(idx, &c.stack, raw_part);
+        }
         return Ok(());
     }
     let renamed = match depth {
@@ -3562,7 +3745,10 @@ fn insert_flattened<'a>(
             s
         }
     };
-    set_label(labels, Cow::Owned(renamed), Cow::Owned(value));
+    let idx = set_label_at(labels, Cow::Owned(renamed), Cow::Owned(value));
+    if let Some(c) = capture {
+        c.out.record(idx, &c.stack, raw_part);
+    }
     Ok(())
 }
 

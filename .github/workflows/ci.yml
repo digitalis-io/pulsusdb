@@ -1119,8 +1119,10 @@ jobs:
       # X-Pulsus-Explain); detected_fields' SM/json/logfmt fields, the
       # pinned six types, limit/line_limit, the sparse-filter
       # post-pipeline paging fix (late matches found, complete), the
-      # budget-truncated pulsus_partial spawn, and /loki alias
-      # byte-identity. Ports 31155-31156. Reuses this job's ClickHouse
+      # budget-truncated pulsus_partial spawn, /loki alias byte-identity,
+      # and the reference wire shapes fixed in #254/#258 (per-field
+      # jsonPath, `parsers: null` when unattributed, and the bare `{}`
+      # zero-field body). Ports 31155-31156. Reuses this job's ClickHouse
       # 24.8 container.
       - name: Live logs detected labels/fields suite
         env:

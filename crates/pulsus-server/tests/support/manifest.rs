@@ -119,11 +119,15 @@ pub enum Surface {
     /// `GET|POST /api/logs/v1/detected_fields` and its
     /// `/loki/api/v1/detected_fields` alias (issue #170, docs/api.md
     /// §2.6) — success is the bare `{"fields":[...],"limit":N}` object;
-    /// against this suite's empty databases the exact body is
-    /// `{"fields":[],"limit":1000}` (the default field limit; the
-    /// additive `pulsus_partial` key is absent on complete results) —
-    /// the mounting oracle. Errors are the LogsQuery JSON envelope
-    /// (`position` present exactly on LogQL parse errors).
+    /// against this suite's empty databases the exact body is the
+    /// reference's bare `{}` (issue #258: `fields` is `omitempty` and
+    /// `limit` is only assigned when fields exist; the additive
+    /// `pulsus_partial` key is absent on complete results). That body is
+    /// NOT the mounting oracle — `{}` identifies no handler — so
+    /// `api_conformance::assert_detected_fields_handler_identity` proves
+    /// mounting from the `X-Pulsus-Explain` fingerprint instead. Errors
+    /// are the LogsQuery JSON envelope (`position` present exactly on
+    /// LogQL parse errors).
     LogsDetectedFields,
     /// `/api/v1/*` — the Prometheus HTTP API JSON query envelope
     /// (`{"status","errorType","error"}`, no `position`).

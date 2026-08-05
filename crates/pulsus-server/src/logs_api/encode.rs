@@ -343,21 +343,60 @@ pub(crate) fn detected_labels_response(
 
 /// Encodes a `/api/logs/v1/detected_fields` result (issue #170,
 /// docs/api.md §2.6): the bare `{"fields":[...],"limit":N}` object,
-/// fields already label-sorted by the engine, `parsers` always an array
-/// (`[]` when unattributed — deterministic-shape divergence from the
-/// reference's nil-slice marshaling). `pulsus_partial: true` is the
-/// additive #90-convention not-the-complete-answer signal — budget-
-/// truncated sampling OR (issue #244) a retention-capped cardinality —
-/// **omitted when false** so complete responses stay byte-identical to
-/// the reference shape; `explain` joins as a sibling key when requested.
+/// fields already label-sorted by the engine.
+///
+/// Three shapes are the reference's, byte for byte (all captured from
+/// `grafana/loki:3.7.4` and recorded on issue #258):
+///  * **zero fields is bare `{}`** (issue #258) — `fields` carries
+///    `[(gogoproto.jsontag) = "fields,omitempty"]` so a nil slice
+///    disappears, and `limit` is only ever assigned inside
+///    `if len(fields) > 0 || len(values) > 0`
+///    (`pkg/logproto/logproto.proto:470-472`,
+///    `pkg/querier/queryrange/detected_fields.go:85-87 @ v3.7.4`). `limit`
+///    is CORRECT alongside a populated `fields`, so only the empty case
+///    changes;
+///  * **`parsers` is `null`, not `[]`, when unattributed** — the jsontag
+///    is a bare `"parsers"` (NO `omitempty`, so the key is always
+///    present) and the handler explicitly maps the empty slice to nil
+///    before marshaling (`logproto.proto:481`,
+///    `detected_fields.go:64-66`);
+///  * **`jsonPath`** (issue #254) is emitted for a json-flattened field
+///    and OMITTED otherwise — `[(gogoproto.jsontag) =
+///    "jsonPath,omitempty"]` (`logproto.proto:483`).
+///
+/// `pulsus_partial: true` is the additive #90-convention
+/// not-the-complete-answer signal — budget-truncated sampling OR (issue
+/// #244) a retention-capped cardinality — **omitted when false** so
+/// complete responses stay byte-identical to the reference shape;
+/// `explain` joins as a sibling key when requested. Both additive keys
+/// survive into the zero-field body, which is otherwise `{}`.
 pub(crate) fn detected_fields_response(
     out: DetectedFields,
     limit: u32,
     explain: Option<PlanExplain>,
 ) -> Response {
+    let partial = out.truncated || out.retention_capped;
+    if out.fields.is_empty() {
+        // The reference's zero-field body carries NEITHER key; ours adds
+        // only the two documented additive ones, in the same order the
+        // populated body places them.
+        let mut body = String::from("{");
+        if partial {
+            body.push_str("\"pulsus_partial\":true");
+        }
+        if let Some(e) = explain.as_ref() {
+            if body.len() > 1 {
+                body.push(',');
+            }
+            body.push_str("\"explain\":");
+            body.push_str(&explain_json(e));
+        }
+        body.push('}');
+        return json_response(Body::from(body));
+    }
     let prefix = b"{\"fields\":[".to_vec();
     let mut tail = format!("],\"limit\":{limit}");
-    if out.truncated || out.retention_capped {
+    if partial {
         tail.push_str(",\"pulsus_partial\":true");
     }
     let suffix = explain_suffix(tail, explain.as_ref());
@@ -366,24 +405,50 @@ pub(crate) fn detected_fields_response(
         prefix,
         out.fields,
         |f: &DetectedFieldOut| {
-            let mut parsers = String::new();
-            for (i, p) in f.parsers.iter().enumerate() {
-                if i > 0 {
-                    parsers.push(',');
-                }
-                parsers.push_str(&json_string(p));
+            let mut item = String::new();
+            item.push_str("{\"label\":");
+            item.push_str(&json_string(&f.label));
+            item.push_str(",\"type\":");
+            item.push_str(&json_string(f.field_type));
+            item.push_str(&format!(",\"cardinality\":{}", f.cardinality));
+            item.push_str(",\"parsers\":");
+            push_json_string_array(&mut item, &f.parsers, JsonStringArray::NullWhenEmpty);
+            if let Some(path) = f.json_path.as_deref().filter(|p| !p.is_empty()) {
+                item.push_str(",\"jsonPath\":");
+                push_json_string_array(&mut item, path, JsonStringArray::AlwaysArray);
             }
-            format!(
-                "{{\"label\":{},\"type\":{},\"cardinality\":{},\"parsers\":[{}]}}",
-                json_string(&f.label),
-                json_string(f.field_type),
-                f.cardinality,
-                parsers
-            )
-            .into_bytes()
+            item.push('}');
+            item.into_bytes()
         },
         suffix,
     ))
+}
+
+/// How [`push_json_string_array`] renders the EMPTY case — the reference
+/// distinguishes a nil slice from an empty one on the wire, and
+/// `/detected_fields` needs both spellings in the same object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonStringArray {
+    /// Go's nil-slice marshaling: `null` rather than `[]`.
+    NullWhenEmpty,
+    /// Always the array (never reached for an `omitempty` key, whose
+    /// caller omits it instead).
+    AlwaysArray,
+}
+
+fn push_json_string_array<S: AsRef<str>>(out: &mut String, items: &[S], empty: JsonStringArray) {
+    if items.is_empty() && empty == JsonStringArray::NullWhenEmpty {
+        out.push_str("null");
+        return;
+    }
+    out.push('[');
+    for (i, s) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_string(s.as_ref()));
+    }
+    out.push(']');
 }
 
 /// Encodes a `/api/logs/v1/patterns` result (M7-C3, issue #171, docs/api.md
@@ -1040,11 +1105,12 @@ mod tests {
         assert_eq!(json["explain"]["result_type"], "detected_labels");
     }
 
-    /// Issue #170 byte-exact detected_fields golden: label/type/
-    /// cardinality/parsers per field (the proto field order), `parsers`
-    /// always an array, `limit` as the trailing key — and NO
-    /// `pulsus_partial` key on a complete result (byte-identity to the
-    /// reference shape).
+    /// Issues #170/#254/#258 byte-exact detected_fields golden, pinned
+    /// against the `grafana/loki:3.7.4` capture recorded on #258:
+    /// label/type/cardinality/parsers/jsonPath per field (the proto field
+    /// order), `parsers` as `null` when unattributed, `jsonPath` present
+    /// only for a json-flattened field, `limit` as the trailing key — and
+    /// NO `pulsus_partial` key on a complete result.
     #[tokio::test]
     async fn detected_fields_envelope_is_byte_exact_and_omits_pulsus_partial_when_complete() {
         let out = DetectedFields {
@@ -1054,12 +1120,14 @@ mod tests {
                     field_type: "int",
                     cardinality: 2,
                     parsers: vec!["json"],
+                    json_path: Some(vec!["count".to_string()]),
                 },
                 DetectedFieldOut {
                     label: "trace_id".to_string(),
                     field_type: "string",
                     cardinality: 1,
                     parsers: Vec::new(),
+                    json_path: None,
                 },
             ],
             truncated: false,
@@ -1069,12 +1137,51 @@ mod tests {
         let body = body_string(res).await;
         assert_eq!(
             body,
-            r#"{"fields":[{"label":"count","type":"int","cardinality":2,"parsers":["json"]},{"label":"trace_id","type":"string","cardinality":1,"parsers":[]}],"limit":1000}"#
+            r#"{"fields":[{"label":"count","type":"int","cardinality":2,"parsers":["json"],"jsonPath":["count"]},{"label":"trace_id","type":"string","cardinality":1,"parsers":null}],"limit":1000}"#
         );
     }
 
+    /// Issue #254: a NESTED json field carries every raw path component,
+    /// in order — the reference's `buildJSONPathFromPrefixBuffer`
+    /// (`pkg/logql/log/parser.go:234-248 @ v3.7.4`).
+    #[tokio::test]
+    async fn detected_fields_json_path_carries_every_nested_component() {
+        let out = DetectedFields {
+            fields: vec![DetectedFieldOut {
+                label: "user_id".to_string(),
+                field_type: "int",
+                cardinality: 3,
+                parsers: vec!["json"],
+                json_path: Some(vec!["user".to_string(), "id".to_string()]),
+            }],
+            truncated: false,
+            retention_capped: false,
+        };
+        let body = body_string(detected_fields_response(out, 1000, None)).await;
+        assert_eq!(
+            body,
+            r#"{"fields":[{"label":"user_id","type":"int","cardinality":3,"parsers":["json"],"jsonPath":["user","id"]}],"limit":1000}"#
+        );
+    }
+
+    /// Issue #258: the zero-field body is bare `{}` — `fields` is
+    /// `omitempty` and `limit` is only assigned when `len(fields) > 0`
+    /// (`pkg/querier/queryrange/detected_fields.go:85-87 @ v3.7.4`).
+    /// Captured from the pinned container on #258.
+    #[tokio::test]
+    async fn detected_fields_zero_fields_is_the_bare_empty_object() {
+        let out = DetectedFields {
+            fields: Vec::new(),
+            truncated: false,
+            retention_capped: false,
+        };
+        let res = detected_fields_response(out, 1000, None);
+        assert_eq!(body_string(res).await, "{}");
+    }
+
     /// Issue #170 plan v2: a budget-truncated sample carries the additive
-    /// `pulsus_partial: true` key (the #90 wire convention).
+    /// `pulsus_partial: true` key (the #90 wire convention) — the ONLY
+    /// key in an otherwise-empty body (issue #258).
     #[tokio::test]
     async fn detected_fields_envelope_carries_pulsus_partial_true_on_truncation() {
         let out = DetectedFields {
@@ -1084,7 +1191,7 @@ mod tests {
         };
         let res = detected_fields_response(out, 1000, None);
         let body = body_string(res).await;
-        assert_eq!(body, r#"{"fields":[],"limit":1000,"pulsus_partial":true}"#);
+        assert_eq!(body, r#"{"pulsus_partial":true}"#);
     }
 
     /// Issue #244: a retention-capped accumulation (the byte ceiling
@@ -1099,7 +1206,52 @@ mod tests {
         };
         let res = detected_fields_response(out, 1000, None);
         let body = body_string(res).await;
-        assert_eq!(body, r#"{"fields":[],"limit":1000,"pulsus_partial":true}"#);
+        assert_eq!(body, r#"{"pulsus_partial":true}"#);
+    }
+
+    /// A truncated non-empty result keeps `limit` AND `pulsus_partial`:
+    /// #258 narrowed the omission to the zero-field case only.
+    #[tokio::test]
+    async fn detected_fields_non_empty_truncated_keeps_limit_and_pulsus_partial() {
+        let out = DetectedFields {
+            fields: vec![DetectedFieldOut {
+                label: "lvl".to_string(),
+                field_type: "string",
+                cardinality: 1,
+                parsers: vec!["logfmt"],
+                json_path: None,
+            }],
+            truncated: true,
+            retention_capped: false,
+        };
+        let body = body_string(detected_fields_response(out, 1000, None)).await;
+        assert_eq!(
+            body,
+            r#"{"fields":[{"label":"lvl","type":"string","cardinality":1,"parsers":["logfmt"]}],"limit":1000,"pulsus_partial":true}"#
+        );
+    }
+
+    /// The additive keys compose in the zero-field body in the same order
+    /// the populated body places them.
+    #[tokio::test]
+    async fn detected_fields_zero_fields_composes_pulsus_partial_and_explain() {
+        let mut explain = PlanExplain::new("detected_fields");
+        explain.push("stage1_stream_resolution", "SELECT 1", None);
+        let out = DetectedFields {
+            fields: Vec::new(),
+            truncated: true,
+            retention_capped: false,
+        };
+        let body = body_string(detected_fields_response(out, 500, Some(explain))).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json.get("fields").is_none(), "body {body}");
+        assert!(json.get("limit").is_none(), "body {body}");
+        assert_eq!(json["pulsus_partial"], true);
+        assert_eq!(json["explain"]["result_type"], "detected_fields");
+        assert!(
+            body.starts_with(r#"{"pulsus_partial":true,"explain":"#),
+            "body {body}"
+        );
     }
 
     #[tokio::test]
@@ -1114,8 +1266,10 @@ mod tests {
         let res = detected_fields_response(out, 500, Some(explain));
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["fields"], serde_json::json!([]));
-        assert_eq!(json["limit"], 500);
+        // Issue #258: an empty result carries neither `fields` nor
+        // `limit`; `explain` is the whole body.
+        assert!(json.get("fields").is_none(), "body {body}");
+        assert!(json.get("limit").is_none(), "body {body}");
         assert!(json.get("pulsus_partial").is_none());
         assert_eq!(json["explain"]["result_type"], "detected_fields");
     }
@@ -1144,6 +1298,7 @@ mod tests {
                         field_type: "string",
                         cardinality: 4,
                         parsers: vec!["logfmt"],
+                        json_path: None,
                     }],
                     truncated: false,
                     retention_capped: false,

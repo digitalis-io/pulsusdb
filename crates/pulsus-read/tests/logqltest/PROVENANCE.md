@@ -493,7 +493,11 @@ DESC` under `Direction::Backward`, matching the reference's
   limit — a same-entry case must not be added.
 - **A4** — label-sorted expected blocks; transcribe the captured fields
   as a set (the reference's order is Go map order); drop the reference's
-  `jsonPath` key (#254 — PulsusDB does not emit it).
+  `jsonPath` key. (#254 has since implemented `jsonPath`; the corpus's
+  field grammar is four whitespace-delimited tokens and carries no fifth
+  column, so widening it to compare paths needs a fresh capture. Path
+  parity is pinned hermetically in `logql/detected.rs`'s
+  `json_path_*` tests and on the wire by `logs_detected_live.rs`.)
 - **A5** — a case disagreeing for any reason other than the registered
   cardinality divergence is DROPPED AND FILED, never worked around.
 
@@ -547,7 +551,9 @@ The complete set of normalizations applied to each response body:
    is recorded as the trailing `limit=N`.
 2. **Object keys sorted alphabetically**, not kept in the response's own
    key order (hence `cardinality` first).
-3. **`jsonPath` omitted** (A4; #254 — PulsusDB does not emit it).
+3. **`jsonPath` omitted** (A4) — the corpus grammar has no column for
+   it; #254 implemented the key, but re-widening the grammar needs a
+   fresh capture.
 4. **Fields transcribed as a SET** (A4) — the line order carries NO
    information, the reference's is Go map order (visible in C1, where
    `uid` precedes `lvl`).
