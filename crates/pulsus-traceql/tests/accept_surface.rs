@@ -709,19 +709,21 @@ fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
 /// mutant: the low 32 bits matched and the high bits did not, which is
 /// what an over-long multiplier looks like.)
 ///
-/// **Where else this multiplier appears, swept rather than assumed.**
-/// `git grep -nIE '[Ff][Nn][Vv]|01b3|01B3|0100_0193|cbf2_9ce4|cbf29ce4|811c_9dc5|811c9dc5'`
-/// — the NAME plus both offset bases and both prime tails in every
-/// `_`-separated spelling, so a site that uses the constants without
-/// saying "FNV" is still found. Five implementations. The other
-/// change-detector, `pulsus-read/tests/golden_sql_freeze.rs`, is
-/// deliberately this same function and says so. The three that feed an
-/// IDENTITY all use the real primes and must:
-/// `logql/labels.rs::fnv1a64` (label-set fingerprint),
-/// `logql/cms.rs` (the byte-exact `hashn` sketch port), and
-/// `promql/eval/quote.rs` (a checksum compared against a Go snippet
-/// that multiplies by `0x100000001b3`). So the over-long multiplier is
-/// confined to the two change-detectors, where it is immaterial.
+/// **Where else this multiplier appears: run the sweep. There is no
+/// list here on purpose.**
+///
+/// ```text
+/// git grep -nIE '[Ff][Nn][Vv]|01b3|01B3|0100_0193|cbf2_9ce4|cbf29ce4|811c_9dc5|811c9dc5'
+/// ```
+///
+/// It matches the name case-insensitively plus both FNV offset bases
+/// and both prime tails in every `_`-separated spelling, so it finds a
+/// site that uses the constants without ever writing "FNV". Read its
+/// output; do not trust a summary of it, including a past one. Three
+/// hand-written enumerations of that output were attempted on #335 and
+/// each was false in a new way — a count, then a classification, then
+/// the argument bounding what the pattern could not see. A list in a
+/// comment is a snapshot nothing re-checks; the command is the answer.
 #[test]
 fn the_reference_column_is_frozen_against_silent_re_pinning() {
     const REFERENCE_DIGEST: u64 = 0x95bd_d72a_11e5_6743;
