@@ -151,7 +151,19 @@ The original entry, kept for the trail:
   pins the conflation itself, so the row cannot outlive the AST that
   causes it.
 
-### `traceql-pow-integer-operand-swap` (issue #335 Stage B)
+### `traceql-pow-integer-operand-swap` (issue #335 Stage B; source located #351)
+
+- **Where a reader meets it in the reference's source** (added on #351,
+  after the v3.0.2 tree was read directly): `pkg/traceql/ast_execute.go`
+  defines `intPow(base, exp int)` at `:940-942` and CALLS it as
+  `intPow(rhsN, lhsN)` at `:486` (and again in the array-element path at
+  `:741`) for `lhs ^ rhs` — the arguments are transposed at the call
+  site, not in the helper. The float catch-all at `:652` is
+  `math.Pow(lhs.Float(), rhs.Float())`, in the correct order, which is
+  exactly why the condition below is load-bearing: the two paths
+  disagree, and the literal's spelling picks the path. The measurements
+  came first; this citation explains why they look the way they do and
+  generalises past the inputs that were probed.
 
 - **Reference behaviour (measured, `grafana/tempo@sha256:aa8df8d0…`,
   v3.0.2):** the `^` operator **swaps its operands on the INTEGER path**.
@@ -207,3 +219,107 @@ The original entry, kept for the trail:
   finding is not a criticism of the audit: seeing it took a three-term
   structural probe plus a characterisation of the operator, neither of
   which a single-value comparison can motivate.
+
+### `traceql-event-link-operand-any-match` (issue #351)
+
+**Owner ruling, 2026-08-05.** The row exists so the next reader can
+re-decide from the evidence rather than re-derive it.
+
+- **What PulsusDB does.** When a span-event or span-link intrinsic
+  (`event:name`, `event:timeSinceStart`, `link:spanID`, `link:traceID`)
+  is compared against another FIELD, the span matches if **any** of its
+  events (or links) satisfies the comparison; `!=` matches only when
+  **every** one does, so a span with no events at all satisfies it. Six
+  probes: `{ .a = event:name }` and the three other intrinsics, plus the
+  two reverse-order spellings.
+
+- **What the reference does.** It answers the same queries from the
+  **FIRST event only**. Measured against the pinned container
+  (`grafana/tempo@sha256:aa8df8d0…`, v3.0.2) with a discriminating
+  fixture — one positive example cannot tell "any" from "first" from
+  "all", so the fixture varies WHICH event matches:
+
+  | events on the span | `.a` holds | reference | PulsusDB |
+  |---|---|---|---|
+  | `evX, evY, evZ` | `evZ` (last) | no match | **match** |
+  | `evP, evQ, evR` | `evP` (first) | **match** | **match** |
+  | `ev1, evM, ev2` | `evM` (middle) | no match | **match** |
+  | `ev7, ev8` | `evNope` | no match | no match |
+
+  Each of those event names is individually queryable there
+  (`{ event:name = "evZ" }` returns its span), so the data is fully
+  indexed and present; the field-vs-field form simply consults the first
+  entry. Stable across three runs.
+
+  The negated form was measured on the same store and agrees with that
+  reading from the other side: `{ .a != event:name }` returns the
+  `evZ`-last and `evM`-middle spans there (their FIRST event differs, so
+  the reference keeps them) and not the `evP`-first span. Ours excludes
+  all three, because in each of them SOME event matches. Two independent
+  confirmations of the same divergence, in opposite directions.
+
+  **One edge the reference and PulsusDB already agree on:** its `!=`
+  also returns spans with NO events at all (measured — the link-only
+  spans in the same fixture come back), which is the empty-set rule we
+  implement. So the disagreement is confined to spans that HAVE events
+  and where the matching one is not the first.
+
+- **The reference's own behaviour VARIES BY ROUTE, which is why this is
+  not a contract to copy.** Three readers of the same span disagree, and
+  each is reachable from user queries:
+
+  | route | which event | citation (v3.0.2) |
+  |---|---|---|
+  | pushdown / fetch conditions (`{ event:name = "evZ" }`) | **any** | the parquet condition iterator matches any event row — measured: the span whose LAST event is `evZ` is returned |
+  | `AttributeFor` (the field-vs-field path) | **first** | `tempodb/encoding/vparquet4/block_traceql.go:128-152` — `find` returns the first entry whose attribute matches; reached for intrinsics at `:227-241`; one entry per event is appended at `:3683-3691` |
+  | `AllAttributes` (response projection) | **last** | `tempodb/encoding/vparquet4/block_traceql.go:65-104` — a `map[Attribute]Static`, so the last write wins |
+
+  The first-event answer is a property of a linear first-match scan over
+  a flat per-event list, not a designed rule. It is also indefensible on
+  its own terms from the user's side: adding an OLDER event to a span
+  would change whether it matches, though the event asked about did not
+  change.
+
+- **Ours is the reference's own DESIGNED multi-value rule.**
+  `pkg/traceql/ast_execute.go:535-627` @ v3.0.2 compares a scalar against
+  an array elementwise: `matchAll` is set for `OpNotEqual`/`OpNotRegex`
+  and the result is `matchCount == elemCount`, otherwise `matchCount > 0`.
+  We implement that arithmetic exactly, which is where three of our
+  edge-case answers come from — an empty set satisfies `!=`
+  (`0 == 0`), a cross-type element makes `!=` false rather than true,
+  and an absent scalar operand never matches (issue #183's rule,
+  unchanged).
+
+- **The migration copying the reference would require.** Not
+  implementable on this storage without a breaking schema change plus a
+  rebuild of stored data:
+
+  - event/link rows in `trace_attrs_idx` carry the **span's**
+    `timestamp_ns`, with no event ordinal
+    (`crates/pulsus-write/src/protocols/otlp_traces.rs`, the span-event
+    and span-link fan-out);
+  - the table is a `ReplacingMergeTree` ordered by
+    `(key, val, scope, timestamp_ns, trace_id, span_id)`, so two events
+    with the SAME name on one span collapse into one row — the ordering
+    information is destroyed by construction, not merely unrecorded;
+  - so "first event" needs a new indexed ordinal column (migration +
+    write-path change + backfill of existing data), or a per-span
+    payload decode in the Phase-2 hot loop.
+
+  Paying that to reproduce a self-inconsistent artefact was judged the
+  wrong trade for a query shape that is rare next to the literal form
+  `{ event:name = "timeout" }`, which is common and already agrees.
+
+- **Where it is enforced.** `filter::LeafEval::EventSetCompare` +
+  `search_eval::eval_event_set_compare` (the rule), the hermetic
+  `an_event_set_comparison_matches_any_event_not_the_first` /
+  `an_event_set_negation_is_all_match_and_an_empty_set_satisfies_it`
+  (the fixture table above, span for span), and the live
+  `event_and_link_comparisons_match_any_event_over_real_clickhouse`,
+  which runs the co-load against a real ClickHouse — the hermetic tests
+  cannot execute the per-batch value read the semantics depend on.
+
+- **Accept-surface effect:** the six probes move `reject → accept` on
+  the wire axis. The reference's own verdict is unchanged (it always
+  accepted them), so the matrix's ORACLE column is untouched; only what
+  we return differs, and only for multi-event spans.

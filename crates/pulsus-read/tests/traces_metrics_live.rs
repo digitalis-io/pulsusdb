@@ -1080,6 +1080,19 @@ async fn metrics_internal_consistency_identities() {
 
     // ---- AC4 (a)+(b) across the gated filter shapes --------------------
     assert_identities(&engine, "{}", CORPUS_SPANS).await;
+    // Issue #351: `{ true }` is EXACTLY the `{ }` match-all on the metrics
+    // route — the corpus's canonical "match everything" filter, and the
+    // reference's own rule (`pkg/traceql/ast_conditions.go:13-31` @ v3.0.2
+    // appends a match-all condition when the filter body is a `Static`
+    // whose `Bool()` is true). Asserted against the SAME independent count
+    // as `{}` above, over real rows: a filter that merely stopped 400-ing
+    // but selected the wrong spans fails here, where a plan-only check
+    // could not see it. `{ false }` is its empty counterpart, and the
+    // folded static comparisons are the same two constants.
+    assert_identities(&engine, "{ true }", CORPUS_SPANS).await;
+    assert_identities(&engine, r#"{ "x" = "x" }"#, CORPUS_SPANS).await;
+    assert_identities(&engine, "{ false }", 0).await;
+    assert_identities(&engine, r#"{ "x" = "y" }"#, 0).await;
     assert_identities(
         &engine,
         r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 }"#,

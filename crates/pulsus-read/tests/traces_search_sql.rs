@@ -289,6 +289,33 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // Issue #351: an event intrinsic compared against a FIELD is
+        // multi-valued — the plan carries a per-value co-load (one row
+        // per value, NO aggregate: an array column would make one row
+        // grow with the span's event count) and the leaf prunes on the
+        // attribute operand's key-existence scan, valid for every
+        // operator since an absent scalar never matches.
+        name: "event_name_vs_attr",
+        q: r#"{ .a = event:name }"#,
+        distributed: false,
+    },
+    Case {
+        // Issue #351, the negated form: `!=` is ALL-match, so a span with
+        // NO events matches it and no positive index can produce that —
+        // the generator falls back to the time-range superset once the
+        // scalar side is a physical intrinsic rather than an attribute.
+        name: "event_name_vs_name_neq",
+        q: "{ name != event:name }",
+        distributed: false,
+    },
+    Case {
+        // Issue #351: the numeric member reads `val_num` (and filters the
+        // nulls out), the string members read the byte-capped `val`.
+        name: "event_time_since_start_vs_attr",
+        q: "{ .a > event:timeSinceStart }",
+        distributed: false,
+    },
+    Case {
         // `event.<key>` attribute (issue #192 PR-B): index-served via the
         // `(key, val, scope)` prefix with `scope = 'event'`, exactly like any
         // `span.`/`resource.` attribute leaf.
@@ -470,6 +497,14 @@ fn composite(case: &Case) -> String {
         out.push_str(&format!(
             "\n== phase2 select values[{field_idx}] ==\n{}\n",
             plan.select_values_sql_for(field_idx, &BATCH)
+        ));
+    }
+    // Issue #351: the multi-valued event/link SET co-loads, only when a
+    // leaf compares one against another field.
+    for set_idx in 0..plan.event_sets_len() {
+        out.push_str(&format!(
+            "\n== phase2 event set[{set_idx}] ==\n{}\n",
+            plan.event_set_sql_for(set_idx, &BATCH)
         ));
     }
     // Issue #184: the trace-wide co-loads (window-free by design), only

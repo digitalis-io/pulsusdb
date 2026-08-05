@@ -14,6 +14,7 @@
 //! hydration / membership / value reads over explicit candidate
 //! `trace_id` lists.
 
+use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{GenTable, LeafGenerator, ZERO_PARENT_SQL};
@@ -271,6 +272,68 @@ pub fn attr_values_sql(
     )
 }
 
+/// Phase 2 — one MULTI-VALUED event/link intrinsic's per-span values over
+/// one batch (issue #351): the values `{ .a = event:name }` compares
+/// against, **one row per value**.
+///
+/// Index-served on the same `(key, scope)` prefix the literal form
+/// probes, plus the window's date/time pruning and the batch's
+/// `trace_id IN` restriction. Same rows read as the scalar
+/// [`attr_values_sql`] would read; only the projection differs.
+///
+/// **NO aggregate — deliberately, and this is the memory contract, not a
+/// style choice.** The first cut of this read used
+/// `groupUniqArray(...) GROUP BY trace_id, span_id`, and it broke the
+/// Layer-1 residual bound this module's own contract states: "at most
+/// `TRACE_SEARCH_MAX_BLOCK_ROWS` rows × (fixed-width columns + string
+/// columns each capped at [`TRACE_STR_COL_CAP`] bytes at the source) —
+/// never a-priori row-unbounded" (`traces::exec` module doc,
+/// docs/schemas.md §7). An ARRAY column is an unbounded number of capped
+/// strings in ONE row, so a single span with enough distinct event names
+/// made both the server-side aggregate state and the client's decoded row
+/// grow without any of that bound applying — and phase-2 reads carry no
+/// `max_memory_usage` (only phase-1 generators do), so a server-side
+/// blow-up would have surfaced as a 500 rather than the required 422.
+///
+/// Row-per-value restores the stated shape exactly: every row is
+/// fixed-width columns plus ONE byte-capped string, the read is bounded
+/// by `max_rows_to_read`/`max_bytes_to_read` (both `throw`, both already
+/// mapped to `422 query_too_broad`), and the executor charges each value
+/// against the retention budget BEFORE retaining it.
+///
+/// **Duplicate rows need no server-side `DISTINCT`.** At-least-once
+/// replays can repeat a value, and repetition is inert under both
+/// matching rules: ANY-match is unaffected by a repeat, and ALL-match
+/// compares `matchCount == elemCount`, which a duplicated element
+/// increments on both sides. Dropping the `DISTINCT` removes the last
+/// server-side hash state from this read.
+///
+/// String values are byte-capped with the shared cap helper, exactly as
+/// the scalar `val` read caps its one value, so both sides of a
+/// comparison are capped consistently.
+pub fn event_set_sql(
+    attrs_table: &str,
+    set: super::filter::EventSetField,
+    trace_ids: &[[u8; 16]],
+    window: TimeWindow,
+) -> String {
+    let (value_col, extra) = if set.is_numeric() {
+        ("val_num AS v".to_string(), "\n  AND isNotNull(val_num)")
+    } else {
+        (format!("{} AS v", byte_cap_expr("val")), "")
+    };
+    format!(
+        "SELECT trace_id, span_id, {value_col}\n\
+         FROM {attrs_table}\n\
+         WHERE {}\n  AND key = {}\n  AND scope = {}{extra}\n  AND {}\n  AND {}",
+        date_clause(window),
+        escape::ch_string(set.key()),
+        escape::ch_string(set.scope()),
+        time_clause(window),
+        trace_id_in(trace_ids)
+    )
+}
+
 /// Root/summary hydration for the final winners — a `trace_id` PK read
 /// with **no time predicate and no row cap** (plan v4 delta 4 + code
 /// review round 1: the actual root may predate the search window OR sit
@@ -361,6 +424,97 @@ mod tests {
         start_ns: 1_700_000_000_000_000_000,
         end_ns: 1_700_010_800_000_000_000,
     };
+
+    /// Issue #351: the event/link value read, asserted as its EXACT
+    /// rendered text — one whole string per intrinsic, variables
+    /// substituted.
+    ///
+    /// **Why exact, and why nothing weaker** (review 4). This gate has
+    /// been rebuilt three times and each rebuild was the same defect one
+    /// layer down, because each asserted a PROPERTY of the statement and
+    /// lost to a spelling that satisfied the property:
+    ///
+    /// 1. a denylist of aggregate names — `LIMIT 1 BY trace_id, span_id`
+    ///    contains none of them and still needs per-group state;
+    /// 2. the denylist plus `LIMIT` — a lowercase `group by` walks past a
+    ///    case-sensitive substring ban;
+    /// 3. a per-line prefix shape (`WHERE `/`  AND ` continuations) — an
+    ///    appended `  AND trace_id IN (SELECT trace_id FROM
+    ///    trace_attrs_idx group by trace_id)` satisfies the prefix and
+    ///    reintroduces grouping state inside the predicate.
+    ///
+    /// An exact match has no property left to satisfy: nothing can be
+    /// appended, nested, re-cased or re-spaced without changing the
+    /// string. That is what terminates the class instead of moving it
+    /// down another layer.
+    ///
+    /// What the exactness buys, all at once and without a separate
+    /// assertion for each: no aggregate and no subquery anywhere; the
+    /// `(key, scope)` index prefix; date, time and batch pruning; the
+    /// byte-capped `val` for the three string members and `val_num` +
+    /// `isNotNull` for the numeric one; and one row per value, which is
+    /// the memory contract (`traces::exec`'s Layer-1 residual bound —
+    /// an array column would be row-unbounded).
+    ///
+    /// The goldens pin two of these four through a planned query; this
+    /// pins all four at the builder, including both link intrinsics,
+    /// which no golden case reaches.
+    #[test]
+    fn the_event_value_read_renders_exactly_this_sql() {
+        use super::super::filter::EventSetField;
+        let cases: [(EventSetField, &str); 4] = [
+            (
+                EventSetField::EventName,
+                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
+                 FROM trace_attrs_idx\n\
+                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
+                 \x20 AND key = 'name'\n\
+                 \x20 AND scope = 'event:intrinsic'\n\
+                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+            ),
+            (
+                EventSetField::EventTimeSinceStart,
+                "SELECT trace_id, span_id, val_num AS v\n\
+                 FROM trace_attrs_idx\n\
+                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
+                 \x20 AND key = 'timeSinceStart'\n\
+                 \x20 AND scope = 'event:intrinsic'\n\
+                 \x20 AND isNotNull(val_num)\n\
+                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+            ),
+            (
+                EventSetField::LinkSpanId,
+                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
+                 FROM trace_attrs_idx\n\
+                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
+                 \x20 AND key = 'spanID'\n\
+                 \x20 AND scope = 'link:intrinsic'\n\
+                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+            ),
+            (
+                EventSetField::LinkTraceId,
+                "SELECT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v\n\
+                 FROM trace_attrs_idx\n\
+                 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')\n\
+                 \x20 AND key = 'traceID'\n\
+                 \x20 AND scope = 'link:intrinsic'\n\
+                 \x20 AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000\n\
+                 \x20 AND trace_id IN (unhex('07070707070707070707070707070707'))",
+            ),
+        ];
+        for (set, expected) in cases {
+            assert_eq!(
+                event_set_sql("trace_attrs_idx", set, &[[7u8; 16]], W),
+                expected,
+                "{set:?}: the value read is asserted EXACTLY — any difference, including \
+                 an appended clause, a nested subquery, a re-casing or a whitespace \
+                 change, is a deliberate act that belongs in the diff"
+            );
+        }
+    }
 
     #[test]
     fn date_literal_renders_the_unix_epoch_and_a_modern_date() {

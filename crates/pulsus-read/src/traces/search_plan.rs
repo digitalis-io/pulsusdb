@@ -17,8 +17,8 @@ use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{
-    self, ArithNode, AttrProbe, BoolMatch, CompareOperand, LeafEval, NestedSetField,
-    PhysicalPredicate, PlanError, SpanFilterCtx, TraceCtxPred,
+    self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, LeafEval,
+    NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx, TraceCtxPred,
 };
 use super::search_sql;
 
@@ -263,6 +263,43 @@ pub(crate) enum PlannedLeafEval {
         op: ComparisonOp,
         rhs: PlannedArith,
     },
+    /// A static-vs-static comparison, folded at plan time (issue #351) —
+    /// `{ "x" = "y" }`. No per-span work at all.
+    Const(bool),
+    /// A boolean-vs-boolean comparison (issue #351) — `{ .a = .b = .c }`,
+    /// `{ !.a = !.b }`.
+    BoolCompare {
+        lhs: PlannedBoolTerm,
+        rhs: PlannedBoolTerm,
+        op: ComparisonOp,
+    },
+    /// A multi-valued event/link comparison (issue #351) — ANY-match,
+    /// `!=` ALL-match, evaluated against `event_sets[set_idx]`'s per-span
+    /// value set.
+    EventSetCompare {
+        set_idx: usize,
+        scalar: PlannedOperand,
+        op: ComparisonOp,
+        side: SetSide,
+    },
+}
+
+/// One planned [`BoolTerm`] (issue #351). Mirrors the compiled term, with
+/// attribute operands interned into the batch value reads and the `!`
+/// operand's display rendered once per query for the type-failure
+/// message — never per span.
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedBoolTerm {
+    Const(bool),
+    Value(PlannedOperand),
+    Not {
+        term: Box<PlannedBoolTerm>,
+        /// The negated operand as the user wrote it, for the
+        /// `expression (!{display}) expected a boolean` failure — the
+        /// same rendering [`PlannedLeafEval::BoolTruth`] carries.
+        display: String,
+    },
+    Nested(Box<PlannedLeafEval>),
 }
 
 /// A planned arithmetic operand tree (issue #185): literals are folded;
@@ -447,6 +484,11 @@ pub struct SearchPlan {
     pub(crate) agg_fields: Vec<AttrFieldRef>,
     /// Distinct attribute `select()` `val` reads.
     pub(crate) select_attrs: Vec<AttrFieldRef>,
+    /// Distinct MULTI-VALUED event/link SET reads (issue #351), in
+    /// first-appearance order. Empty for every query that does not
+    /// compare an `event:`/`link:` intrinsic against another field, so
+    /// nothing else pays for the co-load.
+    pub(crate) event_sets: Vec<EventSetField>,
     pub(crate) aggregates: Vec<PlannedAggregate>,
     pub(crate) select_fields: Vec<SelectField>,
     /// Spanset-level `| by(fields)` grouping keys (issue #185); empty when
@@ -541,6 +583,13 @@ impl SearchPlan {
         self.select_attrs.len()
     }
 
+    /// Number of distinct event/link SET reads (issue #351; golden
+    /// suite). Zero for every query that compares no `event:`/`link:`
+    /// intrinsic against another field.
+    pub fn event_sets_len(&self) -> usize {
+        self.event_sets.len()
+    }
+
     /// One membership read's SQL for a candidate batch (exposed for the
     /// golden suite; `exec` drives the same builder).
     pub fn membership_sql_for(&self, probe_idx: usize, trace_ids: &[[u8; 16]]) -> String {
@@ -619,6 +668,24 @@ impl SearchPlan {
             trace_ids,
             self.window,
         )
+    }
+
+    /// One event/link intrinsic's per-span VALUE SET batch read (issue
+    /// #351; exposed for the golden suite, `exec` drives the same
+    /// builder).
+    pub fn event_set_sql_for(&self, set_idx: usize, trace_ids: &[[u8; 16]]) -> String {
+        search_sql::event_set_sql(
+            &self.attrs_table,
+            self.event_sets[set_idx],
+            trace_ids,
+            self.window,
+        )
+    }
+
+    /// Whether this plan reads any event/link value set (issue #351) —
+    /// gates the per-batch co-load so every other query pays nothing.
+    pub fn needs_event_sets(&self) -> bool {
+        !self.event_sets.is_empty()
     }
 }
 
@@ -1188,6 +1255,29 @@ fn plan_pipeline(
                                 "select() of a nested-set intrinsic is not supported".to_string(),
                             ));
                         }
+                        // Issue #351: `select(span:id)` / `select(trace:id)`
+                        // are accepted and project NOTHING — not a
+                        // shortcut, the reference's own rule. Its
+                        // response builder skips seven intrinsics when
+                        // filling a span's attribute list
+                        // (`pkg/traceql/engine.go:322-331` @ v3.0.2:
+                        // `name`, `duration`, `traceDuration`,
+                        // `rootServiceName`, `rootName`, `trace:id`,
+                        // `span:id`) because each is already carried in
+                        // the response envelope — `spanID`/`traceID`
+                        // here, exactly as there. Measured: the body of
+                        // `{ .z = "zz" } | select(span:id)` is identical
+                        // to the same query with no `select()` at all,
+                        // while `select(span:parentID)` DOES add an
+                        // attribute.
+                        //
+                        // The other five skipped intrinsics need no arm:
+                        // `name`/`duration` already project (their
+                        // physical arms above emit the envelope's own
+                        // fields), and the trace-level three are still
+                        // rejected below — those are #182's rows, not
+                        // this issue's.
+                        Field::Intrinsic(Intrinsic::SpanId | Intrinsic::TraceId) => continue,
                         // Issue #184: `select()` projection of the
                         // trace-level/scoped intrinsics is out of scope
                         // (filtering only) — a clean 400, mirroring
@@ -1195,9 +1285,7 @@ fn plan_pipeline(
                         Field::Intrinsic(
                             Intrinsic::StatusMessage
                             | Intrinsic::ChildCount
-                            | Intrinsic::SpanId
                             | Intrinsic::ParentId
-                            | Intrinsic::TraceId
                             | Intrinsic::TraceDuration
                             | Intrinsic::RootName
                             | Intrinsic::RootServiceName
@@ -1343,6 +1431,170 @@ fn plan_group_key(
     Ok(PlannedGroupKey { display, resolver })
 }
 
+/// The plan-time accumulators a leaf mapping writes into: the interned
+/// attribute probes / value reads, and the co-load flags an operand
+/// needs. Bundled since issue #351 because the mapping became RECURSIVE
+/// (a comparison can be an operand of a comparison), and threading seven
+/// `&mut` bindings through a recursive call is how they get mismatched.
+struct LeafPlanSink<'a> {
+    probes: &'a mut Vec<AttrProbe>,
+    probe_predicates: &'a mut Vec<String>,
+    agg_fields: &'a mut Vec<AttrFieldRef>,
+    select_attrs: &'a mut Vec<AttrFieldRef>,
+    /// The distinct event/link SET reads (issue #351).
+    event_sets: &'a mut Vec<EventSetField>,
+    nested_set: &'a mut bool,
+    trace_ctx: &'a mut bool,
+    child_count: &'a mut bool,
+}
+
+/// Maps one compiled leaf to its planned form, interning every attribute
+/// read and raising every co-load flag it needs. Recursive since issue
+/// #351: [`LeafEval::BoolCompare`] can hold a nested leaf.
+fn plan_leaf_eval(
+    eval: &LeafEval,
+    sink: &mut LeafPlanSink<'_>,
+) -> Result<PlannedLeafEval, PlanError> {
+    Ok(match eval {
+        LeafEval::Physical(p) => PlannedLeafEval::Physical(plan_physical(p)?),
+        LeafEval::Attr { probe, negated } => PlannedLeafEval::Attr {
+            probe_idx: intern_probe(probe, sink.probes, sink.probe_predicates)?,
+            negated: *negated,
+        },
+        LeafEval::NestedSet { field, op, value } => {
+            *sink.nested_set = true;
+            PlannedLeafEval::NestedSet {
+                field: *field,
+                op: *op,
+                value: *value,
+            }
+        }
+        LeafEval::BoolTruth { operand, want } => PlannedLeafEval::BoolTruth {
+            display: compare_operand_display(operand),
+            operand: plan_operand(
+                operand,
+                sink.agg_fields,
+                sink.select_attrs,
+                sink.nested_set,
+                sink.trace_ctx,
+                sink.child_count,
+            ),
+            want: *want,
+        },
+        LeafEval::FieldCompare { lhs, rhs, op } => PlannedLeafEval::FieldCompare {
+            lhs: plan_operand(
+                lhs,
+                sink.agg_fields,
+                sink.select_attrs,
+                sink.nested_set,
+                sink.trace_ctx,
+                sink.child_count,
+            ),
+            rhs: plan_operand(
+                rhs,
+                sink.agg_fields,
+                sink.select_attrs,
+                sink.nested_set,
+                sink.trace_ctx,
+                sink.child_count,
+            ),
+            op: *op,
+        },
+        LeafEval::TraceCtx(pred) => {
+            PlannedLeafEval::TraceCtx(plan_trace_ctx(pred, sink.trace_ctx, sink.child_count)?)
+        }
+        LeafEval::Arith { lhs, op, rhs } => PlannedLeafEval::Arith {
+            lhs: plan_arith(
+                lhs,
+                sink.agg_fields,
+                sink.select_attrs,
+                sink.nested_set,
+                sink.trace_ctx,
+                sink.child_count,
+            ),
+            op: *op,
+            rhs: plan_arith(
+                rhs,
+                sink.agg_fields,
+                sink.select_attrs,
+                sink.nested_set,
+                sink.trace_ctx,
+                sink.child_count,
+            ),
+        },
+        LeafEval::Const(v) => PlannedLeafEval::Const(*v),
+        LeafEval::BoolCompare { lhs, rhs, op } => PlannedLeafEval::BoolCompare {
+            lhs: plan_bool_term(lhs, sink)?,
+            rhs: plan_bool_term(rhs, sink)?,
+            op: *op,
+        },
+        LeafEval::EventSetCompare {
+            set,
+            scalar,
+            op,
+            side,
+        } => PlannedLeafEval::EventSetCompare {
+            set_idx: intern_event_set(*set, sink.event_sets),
+            scalar: plan_operand(
+                scalar,
+                sink.agg_fields,
+                sink.select_attrs,
+                sink.nested_set,
+                sink.trace_ctx,
+                sink.child_count,
+            ),
+            op: *op,
+            side: *side,
+        },
+    })
+}
+
+/// Interns one event/link SET read, returning its batch index. Appends
+/// only, so indices stay stable — the same contract the attribute
+/// interning follows.
+fn intern_event_set(set: EventSetField, sets: &mut Vec<EventSetField>) -> usize {
+    if let Some(idx) = sets.iter().position(|s| *s == set) {
+        return idx;
+    }
+    sets.push(set);
+    sets.len() - 1
+}
+
+/// Maps one compiled [`BoolTerm`] (issue #351), interning its reads.
+fn plan_bool_term(
+    term: &BoolTerm,
+    sink: &mut LeafPlanSink<'_>,
+) -> Result<PlannedBoolTerm, PlanError> {
+    Ok(match term {
+        BoolTerm::Const(v) => PlannedBoolTerm::Const(*v),
+        BoolTerm::Value(operand) => PlannedBoolTerm::Value(plan_operand(
+            operand,
+            sink.agg_fields,
+            sink.select_attrs,
+            sink.nested_set,
+            sink.trace_ctx,
+            sink.child_count,
+        )),
+        BoolTerm::Not(inner) => PlannedBoolTerm::Not {
+            display: bool_term_display(inner),
+            term: Box::new(plan_bool_term(inner, sink)?),
+        },
+        BoolTerm::Nested(leaf) => PlannedBoolTerm::Nested(Box::new(plan_leaf_eval(leaf, sink)?)),
+    })
+}
+
+/// The `!` operand's rendering for the type-failure message. Only the
+/// [`BoolTerm::Value`] arm can ever reach that message (a nested leaf
+/// always yields a boolean), so the other arms exist to keep this total.
+fn bool_term_display(term: &BoolTerm) -> String {
+    match term {
+        BoolTerm::Value(operand) => compare_operand_display(operand),
+        BoolTerm::Const(v) => v.to_string(),
+        BoolTerm::Not(inner) => format!("!{}", bool_term_display(inner)),
+        BoolTerm::Nested(_) => "expression".to_string(),
+    }
+}
+
 /// Plans one search request. Pure and deterministic — the same inputs
 /// always produce byte-identical SQL (the golden-suite contract).
 pub fn plan_search(
@@ -1372,81 +1624,24 @@ pub fn plan_search(
     // indices stay stable.
     let mut agg_fields: Vec<AttrFieldRef> = Vec::new();
     let mut select_attrs: Vec<AttrFieldRef> = Vec::new();
+    // Issue #351: the distinct event/link SET reads, interned by the same
+    // append-only rule so indices stay stable.
+    let mut event_sets: Vec<EventSetField> = Vec::new();
     for spanset_filter in spanset_filters {
         let compiled = filter::compile_span_filter(spanset_filter)?;
         let mut leaves = Vec::with_capacity(compiled.leaves.len());
         for leaf in &compiled.leaves {
-            let planned = match &leaf.eval {
-                LeafEval::Physical(p) => PlannedLeafEval::Physical(plan_physical(p)?),
-                LeafEval::Attr { probe, negated } => PlannedLeafEval::Attr {
-                    probe_idx: intern_probe(probe, &mut probes, &mut probe_predicates)?,
-                    negated: *negated,
-                },
-                LeafEval::NestedSet { field, op, value } => {
-                    nested_set = true;
-                    PlannedLeafEval::NestedSet {
-                        field: *field,
-                        op: *op,
-                        value: *value,
-                    }
-                }
-                LeafEval::BoolTruth { operand, want } => PlannedLeafEval::BoolTruth {
-                    display: compare_operand_display(operand),
-                    operand: plan_operand(
-                        operand,
-                        &mut agg_fields,
-                        &mut select_attrs,
-                        &mut nested_set,
-                        &mut trace_ctx,
-                        &mut child_count,
-                    ),
-                    want: *want,
-                },
-                LeafEval::FieldCompare { lhs, rhs, op } => PlannedLeafEval::FieldCompare {
-                    lhs: plan_operand(
-                        lhs,
-                        &mut agg_fields,
-                        &mut select_attrs,
-                        &mut nested_set,
-                        &mut trace_ctx,
-                        &mut child_count,
-                    ),
-                    rhs: plan_operand(
-                        rhs,
-                        &mut agg_fields,
-                        &mut select_attrs,
-                        &mut nested_set,
-                        &mut trace_ctx,
-                        &mut child_count,
-                    ),
-                    op: *op,
-                },
-                LeafEval::TraceCtx(pred) => PlannedLeafEval::TraceCtx(plan_trace_ctx(
-                    pred,
-                    &mut trace_ctx,
-                    &mut child_count,
-                )?),
-                LeafEval::Arith { lhs, op, rhs } => PlannedLeafEval::Arith {
-                    lhs: plan_arith(
-                        lhs,
-                        &mut agg_fields,
-                        &mut select_attrs,
-                        &mut nested_set,
-                        &mut trace_ctx,
-                        &mut child_count,
-                    ),
-                    op: *op,
-                    rhs: plan_arith(
-                        rhs,
-                        &mut agg_fields,
-                        &mut select_attrs,
-                        &mut nested_set,
-                        &mut trace_ctx,
-                        &mut child_count,
-                    ),
-                },
+            let mut sink = LeafPlanSink {
+                probes: &mut probes,
+                probe_predicates: &mut probe_predicates,
+                agg_fields: &mut agg_fields,
+                select_attrs: &mut select_attrs,
+                event_sets: &mut event_sets,
+                nested_set: &mut nested_set,
+                trace_ctx: &mut trace_ctx,
+                child_count: &mut child_count,
             };
-            leaves.push(planned);
+            leaves.push(plan_leaf_eval(&leaf.eval, &mut sink)?);
         }
         filters.push(PlannedFilter { leaves });
         // Cross-spanset `{A} op {B}` candidates are the superset union of
@@ -1527,6 +1722,7 @@ pub fn plan_search(
         probe_predicates,
         agg_fields,
         select_attrs,
+        event_sets,
         aggregates: pipeline.aggregates,
         select_fields: pipeline.select_fields,
         group_by: pipeline.group_by,
@@ -1951,7 +2147,7 @@ mod tests {
             r#"{ .k = "v" } | select(rootName)"#,
             r#"{ .k = "v" } | select(rootServiceName)"#,
             r#"{ .k = "v" } | select(span:childCount)"#,
-            r#"{ .k = "v" } | select(trace:id)"#,
+            r#"{ .k = "v" } | select(span:parentID)"#,
         ] {
             let query = parse(q).expect("parse");
             assert!(
@@ -1962,6 +2158,37 @@ mod tests {
                 "{q}"
             );
         }
+    }
+
+    /// Issue #351: `select(span:id)` / `select(trace:id)` are ACCEPTED
+    /// and project nothing — the reference skips exactly these (among
+    /// seven) when filling a span's response attributes, because both are
+    /// already in the envelope (`pkg/traceql/engine.go:322-331` @ v3.0.2).
+    /// This test replaces the `trace:id` row of the rejection table
+    /// above, which pinned the behaviour the issue exists to change.
+    ///
+    /// Both halves are asserted: accepted, AND no projection — an accept
+    /// that quietly added an attribute would be a different response from
+    /// the reference's.
+    #[test]
+    fn select_of_an_envelope_carried_id_intrinsic_is_accepted_and_projects_nothing() {
+        for q in [
+            r#"{ .k = "v" } | select(span:id)"#,
+            r#"{ .k = "v" } | select(trace:id)"#,
+            r#"{ .k = "v" } | select(span:id, trace:id)"#,
+        ] {
+            let p = plan(q);
+            assert!(
+                p.select_fields.is_empty(),
+                "{q} must project no select() field, got {:?}",
+                p.select_fields
+            );
+        }
+        // The control: a projecting `select()` beside them still projects,
+        // so "empty" above is the id intrinsics' doing and not a lost
+        // stage.
+        let p = plan(r#"{ .k = "v" } | select(span:id, .other, trace:id)"#);
+        assert_eq!(p.select_fields.len(), 1);
     }
 
     #[test]

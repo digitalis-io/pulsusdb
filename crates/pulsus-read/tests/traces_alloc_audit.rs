@@ -88,8 +88,10 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "dedup set entries at the standard hash cost ([u8;8] + RETAINED_ENTRY_OVERHEAD) charged before insert; replays contains-checked first, charge nothing"),
     ("exec.rs", "batch_attrs", ".collect", 3,
      "membership set + agg map + issue-#184 child-count map entries charged per row during streaming (MEMBERSHIP/NUM_VALUE/CHILD_COUNT_ENTRY_BYTES)"),
-    ("exec.rs", "batch_attrs", "HashMap::", 2,
-     "select-value + issue-#184 trace-context maps: entries charged per row during streaming (entry + string lengths); both released with the batch"),
+    ("exec.rs", "batch_attrs", "HashMap::", 3,
+     "select-value + issue-#184 trace-context + issue-#351 event/link value maps: entries charged per row during streaming (entry + string lengths), all released with the batch. The event/link map is built ONLY when a leaf compares an event/link intrinsic against another field, and its cardinality is charged rather than capped — a cap would silently change the answer (a span whose 501st distinct event name is the matching one would stop matching), a charge makes a pathological span a clean 422"),
+    ("exec.rs", "batch_attrs", "Vec::new", 2,
+     "issue #351, the per-span event/link value vecs (text + numeric). PEAK LIVE SET, not per-charge coverage: at any instant a co-loaded value is held by exactly (1) this vec's CAPACITY, (2) its span's single map entry, (3) the string payload MOVED out of the decoded row, and (4) the driver's transiently buffered BLOCK (up to max_block_size rows, each fixed-width columns plus one capped string — the Layer-1 residual shape, not a single row). EVENT_VALUE_ENTRY_BYTES + the payload upper-bounds (1)+(2)+(3): the vec slot is charged at VEC_INITIAL_RESERVATION_SLOTS (4) per value, NOT 2x, because a fresh Vec's first push reserves 4 slots and a 2x charge undercharges the first value of every span by half; and a whole map entry is charged per VALUE though the map holds one per SPAN. The read streams through stream_rows_charged directly into the map, so no second collection exists: the earlier cut used collect_rows_charged and held the row Vec AND the map at once, charged once and live twice"),
     // ---- search_eval.rs -------------------------------------------------
     ("search_eval.rs", "charged_set", "HashSet::", 1,
      "the ChargedSet constructor itself: capacity pre-charged before with_capacity"),
@@ -122,8 +124,15 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
     ("search_eval.rs", "hex_lower", "String::with_capacity", 1,
      "the lowercase-hex rendering of span:id / span:parentID / trace:id when one of them is a FIELD-VS-FIELD operand. FLAGGED, NOT ABSORBED: this is a PER-SPAN allocation in the Phase-2 hot loop -- 16 or 32 bytes per candidate span per such comparison -- and it is the one part of issue #351 that is not free. It is bounded (<= 32 bytes, no growth, freed within the leaf) and occurs only for queries naming an id intrinsic on both-operand form, which the accept-surface matrix has 3 of. The allocation-free shape is to compare the attribute text against the id bytes without materialising the hex; recorded as a follow-up rather than done here, because it changes the ResolvedVal contract that every operand shares"),
     // ---- issue #335 Stage B: the non-boolean `!` operand error --------
-    ("search_eval.rs", "eval_planned_leaf", "format!", 1,
+    // (the leaf match moved from `eval_planned_leaf` to `eval_leaf` in
+    // issue #351 — a leaf can now contain a leaf, so the match had to be
+    // reachable without advancing the pre-order cursor. Same site, same
+    // error path, new enclosing fn name.)
+    ("search_eval.rs", "eval_leaf", "format!", 1,
      "the PipelineInvalid message for a present NON-boolean operand under `!` (`expression (!.a) expected a boolean`), matching the reference's whole-query failure. On the ERROR path only: the BoolTruth arm compares the co-loaded value against the strings \"true\"/\"false\" and allocates nothing when it matches either, so the per-span hot loop is unaffected and the allocation happens once, immediately before the query is abandoned"),
+    // ---- issue #351: boolean-operand comparisons ----------------------
+    ("search_eval.rs", "eval_bool_term", "format!", 1,
+     "the same `!` type-failure message for a NEGATED term inside a boolean-vs-boolean comparison (`{ !.a = !.b }`, `{ .p = .q = !.r }`). ERROR path only, and it is the last thing the query does: every non-error path compares the co-loaded text against \"true\"/\"false\" and allocates nothing, so the per-span hot loop pays a text comparison and no allocation. The rest of issue #351 allocates nothing at all - a static comparison is folded at PLAN time into a constant, and a boolean term resolves through the existing operand co-load"),
     // ---- issue #172 + #183: structural relation intermediates -----------
     ("search_eval.rs", "rel_descendants", "HashMap::", 1,
      "parent->children adjacency map (incl. its per-entry child Vecs via or_default): spans x DESCENDANT_TRANSIENT_BYTES envelope (key + Vec header + child slot with doubling slack) charged before allocation, released after the walk"),

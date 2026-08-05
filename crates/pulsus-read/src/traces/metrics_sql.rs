@@ -185,6 +185,12 @@ pub fn compile_filter_bool(
     }
 }
 
+/// A constant-folded filter subtree's SQL (issue #351): the same `1` the
+/// `{ }` match-all renders, or `0` for the empty one.
+fn static_bool_sql(value: bool) -> String {
+    if value { "1" } else { "0" }.to_string()
+}
+
 /// Renders one filter subtree as a boolean SQL expression: binary nodes
 /// are always parenthesized (`(lhs AND rhs)`), physical leaves render via
 /// the shared compiler's pre-escaped fragments, attribute leaves become
@@ -204,6 +210,14 @@ fn render_expr(
             lhs,
             rhs,
         } => {
+            // Issue #351: two STATIC operands fold to a constant, exactly
+            // as they do on the search route (`filter::compile_leaf`'s
+            // sibling arm) — `{ "x" = "y" } | rate()` is a reference 200
+            // with no series and `{ "x" = "x" } | rate()` the same series
+            // as `{ } | rate()`.
+            if let (FieldExpr::Literal(l), FieldExpr::Literal(r)) = (lhs.as_ref(), rhs.as_ref()) {
+                return Ok(static_bool_sql(filter::fold_static_compare(l, *op, r)?));
+            }
             let (FieldExpr::Field(field), FieldExpr::Literal(value)) = (lhs.as_ref(), rhs.as_ref())
             else {
                 return Err(PlanError::TypeMismatch(
@@ -248,6 +262,24 @@ fn render_expr(
                 LeafEval::Arith { .. } => Err(PlanError::TypeMismatch(
                     "arithmetic comparisons are not supported in metrics filters".to_string(),
                 )),
+                // Issue #351: `compile_leaf` never yields either of these
+                // — a static fold is handled above, before the leaf is
+                // compiled, and a boolean-operand comparison is a
+                // different AST shape. Kept for exhaustiveness.
+                LeafEval::Const(_) => Err(PlanError::TypeMismatch(
+                    "static comparisons are folded before leaf compilation".to_string(),
+                )),
+                LeafEval::BoolCompare { .. } => Err(PlanError::TypeMismatch(
+                    "boolean-operand comparisons are not supported in metrics filters".to_string(),
+                )),
+                // Issue #351: the multi-valued event/link comparison
+                // resolves from a per-batch SET co-load only the search
+                // engine performs — the same reason nested-set and the
+                // trace-level intrinsics are refused here. Search remains
+                // their surface.
+                LeafEval::EventSetCompare { .. } => Err(PlanError::TypeMismatch(
+                    "event/link comparisons are not supported in metrics filters".to_string(),
+                )),
             }
         }
         // Attribute existence (issue #185 `existence.*`): a key-only
@@ -291,6 +323,23 @@ fn render_expr(
         FieldExpr::Field(_) => Err(PlanError::TypeMismatch(
             "bare field truthiness is not supported in metrics filters".to_string(),
         )),
+        // Issue #351: `{ true }` is the corpus's canonical "match
+        // everything" filter and is EXACTLY `{ }` in the reference —
+        // `pkg/traceql/ast.go:459-469` @ v3.0.2 matches a span iff the
+        // filter expression executes to boolean `true`, and a `Static`
+        // executes to itself (`ast_execute.go:885-887`); the fetch layer
+        // even special-cases it, appending a match-all condition when the
+        // body is a `Static` whose `Bool()` is true
+        // (`ast_conditions.go:13-31`, comment: "For empty spansets { }
+        // ensure there is something that matches all spans"). So `{ true }`
+        // renders `1` and `{ false }` renders `0`, exactly as
+        // `compile_filter_bool(None)` renders `1` for `{ }`.
+        //
+        // A NON-boolean static (`{ 1 }`, `{ "x" }`) never reaches here:
+        // `pulsus_traceql::validate` rejects it as `span filter field
+        // expressions must resolve to a boolean`, the reference's own
+        // message and its own 400.
+        FieldExpr::Literal(Value::Bool(b)) => Ok(static_bool_sql(*b)),
         FieldExpr::Literal(_) => Err(PlanError::TypeMismatch(
             "bare boolean statics are not supported in metrics filters".to_string(),
         )),
@@ -976,6 +1025,40 @@ mod tests {
         let f = compile_filter_predicate(None, "trace_attrs_idx", W).unwrap();
         assert_eq!(f.prewhere, None);
         assert_eq!(f.where_expr, None);
+    }
+
+    /// Issue #351: `{ true }` is the corpus's canonical "match
+    /// everything" filter, and on the metrics route it must be EXACTLY
+    /// `{ }` — `pkg/traceql/ast.go:459-469` @ v3.0.2 keeps a span iff the
+    /// filter expression executes to boolean `true`, and a `Static`
+    /// executes to itself. `{ false }` is its empty counterpart.
+    /// Measured: `{ true } | rate()` returns the same series as
+    /// `{ } | rate()` against the pinned container, and `{ false }` /
+    /// `{ "x" = "y" }` return no series at all.
+    #[test]
+    fn a_boolean_static_filter_is_the_match_all_or_match_none_constant() {
+        for (q, expected) in [
+            ("{ true }", "1"),
+            ("{ false }", "0"),
+            (r#"{ "x" = "x" }"#, "1"),
+            (r#"{ "x" = "y" }"#, "0"),
+            ("{ 1s = 1000000000 }", "1"),
+        ] {
+            let f = compile(q);
+            assert_eq!(f.prewhere, None, "{q}");
+            assert_eq!(f.where_expr.as_deref(), Some(expected), "{q}");
+        }
+        // Composed with a real leaf, the constant is just another
+        // conjunct — `{ true && X }` is `X` in the reference.
+        let f = compile(r#"{ true && .a = "1" }"#);
+        assert!(
+            f.where_expr
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("(1 AND "),
+            "{:?}",
+            f.where_expr
+        );
     }
 
     #[test]

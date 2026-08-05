@@ -1,15 +1,15 @@
-//! Issue #335 Stage C: the 63 SQL goldens' whole-corpus content freeze —
+//! Issue #335 Stage C: the 66 SQL goldens' whole-corpus content freeze —
 //! the mechanism that makes "this change edits zero SQL goldens" a fact a
 //! reviewer can check **from the diff**, instead of a claim to be taken on
 //! trust.
 //!
-//! **The problem it solves.** `golden/traces_search/*.sql` (46) and
+//! **The problem it solves.** `golden/traces_search/*.sql` (49) and
 //! `golden/traces_metrics/*.sql` (17) are the semantic witness every
 //! TraceQL grammar change is measured against: they live in another crate
 //! from `Display`, so they catch a meaning change our own rendering
-//! cannot see. Every such change therefore reports "the 63 SQL goldens
+//! cannot see. Every such change therefore reports "the 66 SQL goldens
 //! take zero edits" — and until now that sentence was verifiable only by
-//! trusting the author's `git status`, or by re-listing 63 paths by hand.
+//! trusting the author's `git status`, or by re-listing 66 paths by hand.
 //! A reviewer working from a patch had no single artefact to look at.
 //!
 //! **The mechanism.** One digest over the whole corpus — every file's
@@ -18,8 +18,8 @@
 //! `accept_surface.rs::the_reference_column_is_frozen_against_silent_re_pinning`
 //! posture): a data-only edit fails here, so any golden movement forces a
 //! visible source-line change in the same diff. `PINNED_SQL_CORPUS`
-//! unchanged in a diff therefore MEANS all 63 files are byte-identical —
-//! one line to look at rather than 63.
+//! unchanged in a diff therefore MEANS all 66 files are byte-identical —
+//! one line to look at rather than 66.
 //!
 //! The count is asserted separately from the digest so the failure says
 //! which happened: a file added or removed reads differently from a file
@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 46), ("traces_metrics", 17)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 17)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -76,15 +76,34 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 46), ("traces_metrics", 1
 /// that question to the next byte; a length prefix removes it.
 ///
 /// Verified to certify the PRE-change corpus: recomputed independently
-/// over `49cff9a`'s 63 golden blobs — under this encoding — it is this
-/// value, so the constant pins the goldens as they stood before issue
-/// #335 Stage C, which is what makes "Stage C edits zero SQL goldens" a
-/// checkable statement rather than a claim.
+/// over `49cff9a`'s 63 golden blobs — under this encoding — it was
+/// `0xfd4a_e0c5_99df_bc38`, so the constant pinned the goldens as they
+/// stood before issue #335 Stage C, which is what made "Stage C edits
+/// zero SQL goldens" a checkable statement rather than a claim.
 ///
 /// **Never update this to make a run go green.** Moving it means one
 /// thing: the frozen SQL corpus was deliberately regenerated, and the
 /// change says which query's output moved and why.
-const PINNED_SQL_CORPUS: u64 = 0xfd4a_e0c5_99df_bc38;
+///
+/// **Moved on issue #351** (owner ruling, 2026-08-05), for ADDITIONS
+/// only: three new `traces_search` cases pin the multi-valued event/link
+/// value read's SQL — `event_name_vs_attr`, `event_name_vs_name_neq`
+/// (the negated form, whose generator must fall back to the time-range
+/// superset because a span with NO events matches `!=`), and
+/// `event_time_since_start_vs_attr` (the numeric member, read from
+/// `val_num`). The corpus went 63 → 66 entries; **no PRE-EXISTING
+/// golden's bytes changed**, which the separate membership assertion
+/// above makes visible — a count that moves by exactly the number of new
+/// files, beside a digest that moves, reads differently from a digest
+/// that moves alone.
+///
+/// Moved a second time in the same issue, after review: the three NEW
+/// goldens were regenerated when the read dropped its
+/// `groupUniqArray(...) GROUP BY` aggregate for a row-per-value
+/// projection (the Layer-1 residual bound in the `traces::exec` module
+/// doc — an array column is row-unbounded by construction). Still only
+/// those three files; the other 63 are byte-identical to `49cff9a`.
+const PINNED_SQL_CORPUS: u64 = 0xb718_14b9_674a_32fe;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -216,7 +235,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 63, "the frozen SQL corpus is 46 + 17 = 63 entries");
+    assert_eq!(total, 66, "the frozen SQL corpus is 49 + 17 = 66 entries");
 }
 
 #[test]
@@ -261,7 +280,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     }
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 63 frozen SQL goldens changed. This is not a constant to refresh: it means the \
+        "the 66 frozen SQL goldens changed. This is not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
          PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \
