@@ -1289,23 +1289,29 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   DURATION`.
 ///
 ///   Those are LEXER verdicts. On the WIRE the whole negative band is a
-///   `200`, and `i64::MIN` is a `200` too unless it is the first of its
-///   pair to reach a given frontend (issue #248 rounds 5 and 6; round 5
-///   reported the `400` as unconditional). Cold, it is `400 this data is
-///   no longer available, it is past now - max_query_lookback (0s)`:
+///   `200` SAVE `i64::MIN` itself, which a frontend that has not already
+///   answered its neighbour REFUSES (issue #248 rounds 5 to 7; round 5
+///   reported that `400` as unconditional, round 6's wording made the
+///   `200` unconditional instead, and it is neither). The refusal is
+///   `400 this data is no longer available, it is past now -
+///   max_query_lookback (0s)`:
 ///   the value parses, and what refuses it is Go's `-offset` overflowing
 ///   at that one value inside the shard resolver's `through =
 ///   end.Add(-Offset)` while `from = start.Add(-(Interval + Offset))`
 ///   moves the other way, inverting the window
 ///   (`pkg/querier/queryrange/shard_resolver.go:94-104`,
 ///   rejected at `pkg/querier/limits/validation.go:92-94` @ v3.7.4).
-///   Warm, `cache_index_stats_results` (default true,
+///   Only a warm cache turns it into a `200`:
+///   `cache_index_stats_results` (default true,
 ///   `pkg/querier/queryrange/roundtrip.go:66`) answers it from the
 ///   `i64::MIN + 1` entry — the two are one nanosecond apart and the
-///   index-stats request is in milliseconds — and it is a `200`. Either
-///   way it is an artefact of one value, not a bound, and the accepted
-///   band this paragraph describes is unchanged. The order-dependent
-///   probe table is in the `five-year-span-cap` ledger row.
+///   index-stats request is in milliseconds. Set that option to `false`
+///   and the `400` stands in every probe order. It is an artefact of one
+///   value rather than a bound — `i64::MIN + 1` is a `200` in any order,
+///   with the cache on or off — but the accepted band this paragraph
+///   describes therefore stops one value short of the domain. The
+///   order-dependent probe table is in the `five-year-span-cap` ledger
+///   row.
 ///
 ///   That asymmetry is not an accident of its own: the magnitude is lexed
 ///   by `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`), which
@@ -1315,9 +1321,9 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   `time.ParseDuration`, whose floor is `-1<<63`. A leading `-` fails
 ///   the Prometheus parser outright (it demands a leading digit), so the
 ///   negative form always lands on the stdlib fallback and reaches
-///   `i64::MIN`. Recorded because our cap sits far inside it: the whole
-///   `i64` band is reference-accepted and PulsusDB-refused, ledgered as
-///   `five-year-span-cap`.
+///   `i64::MIN`. Recorded because our cap sits far inside it: the `i64`
+///   band, its negative endpoint aside, is reference-accepted and
+///   PulsusDB-refused, ledgered as `five-year-span-cap`.
 ///
 /// The keyword goes through [`is_kw`] like every other keyword in this
 /// file (issue #339's rule): the reference's lexer folds keywords, so
@@ -1634,13 +1640,28 @@ mod tests {
     /// one layer above the code it fixed, and undetectable from below. The
     /// cap subsumes it: nothing past 43,800 h reaches a conversion at all.
     ///
-    /// Every OFFSET rejected here is a reference **200** — measured on
-    /// the digest-pinned v3.7.4 oracle `grafana/loki@sha256:87f0a067…`,
-    /// buildinfo `3.7.4` / `b318f282`: `offset ±43801h` and
+    /// The offsets rejected here that the reference's own lexer ACCEPTS
+    /// are reference **200**s — measured on the digest-pinned v3.7.4
+    /// oracle `grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` /
+    /// `b318f282`: `offset ±43801h` and
     /// `offset 2562047h47m16s854ms775us807ns` are all 200s, instant and
     /// range alike, because the offset cancels out of the window
     /// `max_query_length` is measured over. That is the ledgered
     /// `five-year-span-cap` divergence and this test is what pins it.
+    ///
+    /// The three out-of-`i64` literals in the refusal list below are NOT
+    /// that. All three are measured reference `400`s at the LEXER on the
+    /// same oracle: `9223372036854775808ns` and `18446744073709551615ns`
+    /// both give `parse error at line 1, col 38: syntax error: unexpected
+    /// NUMBER, expecting DURATION`, and `-9223372036854775809ns` gives
+    /// `unexpected -, expecting DURATION`. The rule behind them is
+    /// `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`): the
+    /// vendored `model.ParseDuration` refuses `v > 1<<63/unit.mult` as
+    /// `duration out of range`
+    /// (`vendor/github.com/prometheus/common/model/time.go:249-254`) and
+    /// the stdlib fallback overflows too, so no DURATION token exists.
+    /// Those rows are reject PARITY, not divergence — the paragraph
+    /// above used to cover them with an "every".
     ///
     /// The `[range]` half is NOT symmetric with it, which this comment
     /// used to imply by saying "both literals": on a range query the

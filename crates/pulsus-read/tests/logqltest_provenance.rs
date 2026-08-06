@@ -1050,8 +1050,9 @@ fn is_number_word(tok: &str) -> bool {
 /// number: a marked region may contain no digit and no numeral, whatever
 /// follows it. There is nothing left to enumerate on the noun side; on
 /// the numeral side [`CARDINAL_NUMERALS`] is complete for standard
-/// spellings and [`NUMERAL_VARIANTS`] is an explicitly open list of the
-/// rest.
+/// spellings and nothing more, with [`NUMERAL_VARIANTS`] a hand list of
+/// non-standard ones that is labelled incomplete and is not claimed to
+/// cover the remainder.
 ///
 /// The cost is deliberate: prose inside a marked region cannot say "one
 /// level up" or "the two halves" either. That is the contract — these
@@ -1324,24 +1325,30 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
 /// further** (issue #248 round 6). Round 5 said it was closed outright;
 /// the next review round injected `nought rows` and it passed, which is
 /// the sixth hole. [`CARDINAL_NUMERALS`] is exactly what a speller
-/// emits, and [`spelling_uses_only_this_set`] proves it; every OTHER
-/// spelling of a cardinal — `nought`, `naught`, `aught`, `nil`,
-/// `zilch` — sits in [`NUMERAL_VARIANTS`], which is hand-written, is
-/// labelled incomplete, and names the words it leaves out on purpose
-/// (`ought`, `none`, `a`: exact quantities that are also ordinary
-/// function words, whose inclusion would redden count-free prose). So
+/// emits, and [`spelling_uses_only_this_set`] proves it. A spelling
+/// OUTSIDE that set is caught only if somebody has written it down:
+/// [`NUMERAL_VARIANTS`] holds the ones somebody has (`nought`, `naught`,
+/// `aught`, `nil`, `zilch`), is hand-written, is labelled incomplete,
+/// and names the words it leaves out on purpose (`ought`, `none`, `a`:
+/// exact quantities that are also ordinary function words, whose
+/// inclusion would redden count-free prose). It is a sample of the
+/// non-standard spellings, never the set of them. So
 /// the honest sentence is: **this covers digits, the standard cardinal
 /// spellings in full, and the listed variants; it is not closed against
 /// archaic or dialect forms.**
 ///
-/// **The guard's own failure surface, bounded.** A guard whose sentence
-/// is wider than its assertion is the same defect one level up, so every
-/// way this one could go quietly green has a mutant that reddens it.
+/// **The guard's own failure surface, bounded on the side that can be.**
+/// A guard whose sentence is wider than its assertion is the same defect
+/// one level up. Every STRUCTURAL way this one could go quietly green
+/// has a mutant that reddens it, and that side is closed (the split
+/// below says why); the COUNT-FORM side is a word list, so its rows are
+/// the forms already known and not every form there is.
 /// Every row below was applied to a real file, run and reverted on issue
-/// #248 round 5 (the structural ones on round 4 as well); the count-form
-/// rows are additionally COMMITTED as
-/// [`a_count_in_prose_is_detected_in_every_form_it_can_take`], so they
-/// are re-proved on every run rather than on the day someone ran them:
+/// #248 rounds 5 and 7 (the structural ones on round 4 as well); the
+/// count-form rows are additionally COMMITTED as
+/// [`every_count_form_known_to_have_evaded_this_guard_is_detected`], so
+/// they are re-proved on every run rather than on the day someone ran
+/// them:
 ///
 /// | mutant | what fails |
 /// |---|---|
@@ -1475,6 +1482,13 @@ fn check_f_marked_regions_state_no_corpus_count() {
 
 /// The count-form mutants of check F, committed instead of hand-applied.
 ///
+/// The name is the honest one: these are the forms KNOWN to have got
+/// past this guard, not every form a count can take. The count-form side
+/// of the rule is a word list ([`NUMERAL_VARIANTS`]) and cannot claim
+/// more — the earlier name said "in every form it can take", which
+/// contradicted the exhaustiveness split in
+/// [`check_f_marked_regions_state_no_corpus_count`]'s own doc.
+///
 /// Every entry in the first list is a sentence that either shipped
 /// inside a marked region or was injected there by a reviewer and passed
 /// — `nought rows` is the round-6 finding, `zero rows` the round-5 one,
@@ -1493,7 +1507,7 @@ fn check_f_marked_regions_state_no_corpus_count() {
 /// reddened on them would be turned off within a week. Its last three
 /// entries pin the words [`NUMERAL_VARIANTS`] refuses on that ground.
 #[test]
-fn a_count_in_prose_is_detected_in_every_form_it_can_take() {
+fn every_count_form_known_to_have_evaded_this_guard_is_detected() {
     for prose in [
         // Digits, in the shape that shipped three times.
         "The latest block added 11 rows.",
