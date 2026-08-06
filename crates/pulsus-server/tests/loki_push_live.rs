@@ -1184,3 +1184,154 @@ async fn over_wide_label_value_is_rejected_and_stores_nothing() {
         "the accepted control push must still have registered its stream"
     );
 }
+
+/// Issue #374 review: the reference writes the good streams of a mixed batch
+/// and answers `400` afterwards (`pkg/distributor/distributor.go:645-655,
+/// 780-790, 929 @ v3.7.4`). Proven at the highest tier — the good line is read
+/// back out of ClickHouse while the response was a `400` — because a client
+/// that loses its good data on one malformed stream loses it permanently: a
+/// `400` is not retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_batch_stores_the_good_streams_and_still_answers_400() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_156;
+    let db = "pulsus_loki_push_mixed_batch_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "checkout-mixed";
+    let over = "b".repeat(2049);
+    let good_line = "mixed batch good line";
+    let bad_line = "mixed batch bad line";
+
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[
+                {{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","{good_line}"]]}},
+                {{"stream":{{"service_name":"{service}-bad","app":"{over}"}},"values":[["{base_ns}","{bad_line}"]]}}
+            ]}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 400, "a mixed batch still answers 400");
+    assert!(
+        res.body
+            .ends_with(&format!("has label value too long: '{over}'")),
+        "the 400 body is the reference's message for the one bad stream: {}",
+        res.body
+    );
+
+    // The good stream was written anyway, and is queryable.
+    let lines = wait_for_line(port, service, base_ns, good_line);
+    assert!(lines.contains(&good_line.to_string()), "{lines:?}");
+    assert_eq!(
+        ch_count(
+            db,
+            &format!("SELECT count() AS c FROM log_samples WHERE body = '{good_line}'"),
+        )
+        .await,
+        1,
+        "the good stream of a mixed batch must be stored"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!("SELECT count() AS c FROM log_samples WHERE body = '{bad_line}'"),
+        )
+        .await,
+        0,
+        "the bad stream of a mixed batch must not be"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!("SELECT count() AS c FROM log_streams WHERE service = '{service}-bad'"),
+        )
+        .await,
+        0,
+        "the bad stream must not be registered"
+    );
+}
+
+/// Issue #374 review: `WithoutEmpty` (`pkg/logql/syntax/parser.go:296 @
+/// v3.7.4`) runs before `labels.StableHash`, so an empty-valued label must not
+/// reach the stored label set. Both pushes must land in ONE stream row with
+/// ONE label set, not two — a validator-only filter would give two.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_valued_label_does_not_split_the_stream() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_157;
+    let db = "pulsus_loki_push_empty_label_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "checkout-empty";
+    let plain_line = "empty label plain";
+    let padded_line = "empty label padded";
+
+    for (line, labels) in [
+        (plain_line, format!(r#"{{"service_name":"{service}"}}"#)),
+        (
+            padded_line,
+            format!(r#"{{"service_name":"{service}","ignored":""}}"#),
+        ),
+    ] {
+        let res = push(
+            port,
+            "application/json",
+            format!(r#"{{"streams":[{{"stream":{labels},"values":[["{base_ns}","{line}"]]}}]}}"#)
+                .as_bytes(),
+        );
+        assert_eq!(res.status, 204, "{line}: {}", res.body);
+    }
+
+    wait_for_line(port, service, base_ns, plain_line);
+    wait_for_line(port, service, base_ns, padded_line);
+
+    // One stream row, one fingerprint: the empty-valued label never reached
+    // the identity.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count(DISTINCT fingerprint) AS c FROM log_streams \
+                 WHERE service = '{service}'"
+            ),
+        )
+        .await,
+        1,
+        "an empty-valued label must not split the stream"
+    );
+    // ...and it is not stored as a label either.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_streams \
+                 WHERE service = '{service}' AND position(labels, 'ignored') > 0"
+            ),
+        )
+        .await,
+        0,
+        "an empty-valued label must not be stored"
+    );
+    // Both lines belong to that one stream.
+    let both = query_streams(port, "/api/logs/v1", service, base_ns);
+    assert_eq!(both.len(), 1, "both pushes belong to one stream: {both:?}");
+    assert_eq!(
+        both[0].0,
+        [("service_name".to_string(), service.to_string())]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+    );
+}

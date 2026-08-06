@@ -114,23 +114,53 @@ pub async fn ingest(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Respo
     // maliciously deep body/attribute tree is a whole-request 400/`code = 3`
     // reject, the same classification a decode failure gets. `ingest` returns
     // `Response` (not `Result`), so this matches rather than `?`-propagates.
-    let parsed = match otlp_logs::parse(&request, now_ns) {
+    let mut parsed = match otlp_logs::parse(&request, now_ns) {
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
+    // Stream-local label-bound failures (issue #374). Upstream reports them
+    // through the gRPC status, not through OTLP partial success — its
+    // `OTLPPushHandler` shares the distributor's validation path and its
+    // `push.OTLPError` writer turns the accumulated `400` into a
+    // `google.rpc.Status` (`pkg/distributor/http.go:28-33 @ v3.7.4`) — and the
+    // streams that passed are written first, as on the Loki-push path.
+    let stream_errors = std::mem::take(&mut parsed.stream_errors);
+    // "Return early if none of the streams contained entries"
+    // (`pkg/distributor/distributor.go:786-789 @ v3.7.4`).
+    if !stream_errors.is_empty() && parsed.rows.is_empty() && parsed.streams.is_empty() {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            3,
+            group_stream_errors(stream_errors),
+        );
+    }
 
     if is_async(&headers) {
         return match sink.admit(parsed) {
-            Ok(()) => export_response(StatusCode::ACCEPTED, rejected, rejected_message),
+            Ok(()) if stream_errors.is_empty() => {
+                export_response(StatusCode::ACCEPTED, rejected, rejected_message)
+            }
+            Ok(()) => status_response(
+                StatusCode::BAD_REQUEST,
+                3,
+                group_stream_errors(stream_errors),
+            ),
             Err(Backpressure) => backpressure_response(),
         };
     }
 
     match sink.admit_flush(parsed) {
         Ok(wait) => match wait.await {
-            Ok(()) => export_response(StatusCode::OK, rejected, rejected_message),
+            Ok(()) if stream_errors.is_empty() => {
+                export_response(StatusCode::OK, rejected, rejected_message)
+            }
+            Ok(()) => status_response(
+                StatusCode::BAD_REQUEST,
+                3,
+                group_stream_errors(stream_errors),
+            ),
             Err(err) => error_response(err),
         },
         Err(Backpressure) => backpressure_response(),
@@ -366,25 +396,80 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
         Err(err) => return rw_error_response(&err),
     };
 
-    let parsed = match decode_loki_push(&headers, &body, now_ns) {
+    let mut parsed = match decode_loki_push(&headers, &body, now_ns) {
         Ok(parsed) => parsed,
         Err(err) => return rw_error_response(&err),
     };
+    // Stream-local label-bound failures (issue #374): the streams that passed
+    // are still admitted, and the `400` is answered after they are — see
+    // [`group_stream_errors`].
+    let stream_errors = std::mem::take(&mut parsed.stream_errors);
+    // "Return early if none of the streams contained entries"
+    // (`pkg/distributor/distributor.go:786-789 @ v3.7.4`): when every stream
+    // in the request failed there is nothing to write, so the sink is not
+    // touched at all.
+    if !stream_errors.is_empty() && parsed.rows.is_empty() && parsed.streams.is_empty() {
+        return plain_text_response(StatusCode::BAD_REQUEST, group_stream_errors(stream_errors));
+    }
 
     if is_async(&headers) {
         return match sink.admit(parsed) {
-            Ok(()) => rw_success_response(StatusCode::ACCEPTED),
+            Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::ACCEPTED),
+            Ok(()) => {
+                plain_text_response(StatusCode::BAD_REQUEST, group_stream_errors(stream_errors))
+            }
             Err(Backpressure) => rw_backpressure_response(),
         };
     }
 
     match sink.admit_flush(parsed) {
         Ok(wait) => match wait.await {
-            Ok(()) => rw_success_response(StatusCode::NO_CONTENT),
+            Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::NO_CONTENT),
+            Ok(()) => {
+                plain_text_response(StatusCode::BAD_REQUEST, group_stream_errors(stream_errors))
+            }
             Err(err) => rw_error_response(&err),
         },
         Err(Backpressure) => rw_backpressure_response(),
     }
+}
+
+/// Renders accumulated stream-local validation failures the way the reference
+/// renders them into the `400` body: `util.GroupedErrors.Error()`
+/// (`pkg/util/errors.go:105-131 @ v3.7.4`) groups identical messages, joins
+/// distinct groups with `"; "`, and prefixes `"N errors like: "` to each group
+/// as soon as there is more than one group or more than one occurrence. A lone
+/// failure — the only case a single-stream push can produce, and the one
+/// clients actually see — is therefore the bare message.
+///
+/// Group order is first-seen here and Go map iteration order upstream, i.e.
+/// deliberately randomized there; a multi-failure body is not byte-reproducible
+/// upstream at all, so there is nothing to match beyond the format.
+fn group_stream_errors(errors: Vec<String>) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for message in errors {
+        match counts.entry(message.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => *slot.get_mut() += 1,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(1);
+                order.push(message);
+            }
+        }
+    }
+    let unique = order.len();
+    let mut out = String::new();
+    for (i, message) in order.iter().enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        let n = counts[message];
+        if unique > 1 || n > 1 {
+            out.push_str(&format!("{n} errors like: "));
+        }
+        out.push_str(message);
+    }
+    out
 }
 
 /// Content-negotiates and decodes a Loki push body into [`ParsedLogs`]. See
@@ -649,7 +734,6 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::OversizeBody { .. }
         | LogsIngestError::OversizeMessage { .. }
         | LogsIngestError::LokiDecode(_)
-        | LogsIngestError::LabelLimit(_)
         | LogsIngestError::ZipkinDecode(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
@@ -1136,7 +1220,7 @@ mod tests {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
                     attributes: vec![KeyValue {
-                        key: "app".to_string(),
+                        key: "k8s.pod.name".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::StringValue(value.clone())),
                         }),
@@ -1166,7 +1250,7 @@ mod tests {
         assert_eq!(status.code, 3);
         assert_eq!(
             status.message,
-            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'")
+            format!("stream '{{k8s_pod_name=\"{value}\"}}' has label value too long: '{value}'")
         );
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
@@ -2563,6 +2647,112 @@ mod tests {
                 .ends_with("' has 16 label names; limit 15")
         );
         assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// Issue #374 at the wire: the reference writes the streams that passed
+    /// and answers `400` afterwards (`pkg/distributor/distributor.go:645-655,
+    /// 780-790, 929 @ v3.7.4`), so a client does not lose the good half of a
+    /// mixed batch — which matters because a well-behaved shipper does not
+    /// retry a `400`.
+    #[tokio::test]
+    async fn loki_mixed_batch_admits_the_good_streams_and_still_answers_400() {
+        let body = format!(
+            r#"{{"streams":[
+                {{"stream":{{"app":"good"}},"values":[["1700000000000000000","a"]]}},
+                {{"stream":{{"app":"{}"}},"values":[["1700000000000000000","b"]]}}
+            ]}}"#,
+            "b".repeat(2049)
+        );
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            body.into_bytes(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            plain_text_body(res)
+                .await
+                .contains("has label value too long")
+        );
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].rows.len(), 1);
+        assert_eq!(admitted[0].streams.len(), 1);
+        assert_eq!(admitted[0].streams[0].labels.get("app"), Some("good"));
+    }
+
+    /// The OTLP twin: same partial write, reported through the gRPC status
+    /// rather than through OTLP partial success, exactly as upstream's
+    /// `OTLPPushHandler` does (it shares the distributor's validation path,
+    /// `pkg/distributor/http.go:28-33 @ v3.7.4`).
+    #[tokio::test]
+    async fn logs_mixed_batch_admits_the_good_resources_and_still_answers_400() {
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let resource = |value: String| ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "k8s.pod.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue(value)),
+                    }),
+                    key_strindex: 0,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: Some(AnyValue {
+                        value: Some(Value::StringValue("hello".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        };
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![resource("good".to_string()), resource("b".repeat(2049))],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert!(status.message.contains("has label value too long"));
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].rows.len(), 1);
+        assert_eq!(
+            admitted[0].streams[0].labels.get("k8s_pod_name"),
+            Some("good")
+        );
+    }
+
+    /// `util.GroupedErrors.Error()` (`pkg/util/errors.go:111-131 @ v3.7.4`):
+    /// a lone failure is the bare message, and anything else is prefixed with
+    /// its occurrence count and joined with `"; "`.
+    #[test]
+    fn stream_errors_are_grouped_the_way_the_reference_groups_them() {
+        assert_eq!(group_stream_errors(vec!["one".to_string()]), "one");
+        assert_eq!(
+            group_stream_errors(vec!["one".to_string(), "one".to_string()]),
+            "2 errors like: one"
+        );
+        assert_eq!(
+            group_stream_errors(vec![
+                "one".to_string(),
+                "two".to_string(),
+                "one".to_string()
+            ]),
+            "2 errors like: one; 1 errors like: two"
+        );
     }
 
     #[tokio::test]

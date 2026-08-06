@@ -636,10 +636,44 @@ pub struct Timestamp {
 pub const MAX_STREAMS_PER_REQUEST: usize = 1_000_000;
 /// See [`MAX_STREAMS_PER_REQUEST`].
 pub const MAX_ENTRIES_PER_STREAM: usize = 100_000;
-/// See [`MAX_STREAMS_PER_REQUEST`]. Bounds the label count parsed out of one
-/// stream's label-set literal (protobuf) or JSON `stream` map, checked
-/// before the label `Vec` is handed to `LabelSet::from_normalized`.
+/// See [`MAX_STREAMS_PER_REQUEST`]. Bounds the count of **retained**
+/// (non-empty-valued) labels parsed out of one stream's label-set literal
+/// (protobuf) or JSON `stream` map, checked before the label `Vec` is handed
+/// to `LabelSet::from_normalized`.
+///
+/// Empty-valued labels do not count: they are dropped before anything is
+/// validated or stored (`syntax.ParseLabels`' closing `ls.WithoutEmpty()`,
+/// `pkg/logql/syntax/parser.go:296 @ v3.7.4`), so counting them here would
+/// refuse streams the reference accepts — 15 real labels padded with 250
+/// empty-valued ones is a `204` upstream.
+///
+/// The reference has no label-*count* guard of its own; a stream carrying
+/// more than 256 non-empty labels is refused here with this cap's message and
+/// upstream with `has N label names; limit 15`. Both are `400` — the wording
+/// differs only for input more than 17x over the parity bound. Ledgered.
 pub const MAX_LABELS_PER_STREAM: usize = 256;
+/// `maxStreamLabelsSize` (`pkg/logql/syntax/parser.go:22 @ v3.7.4`): the
+/// reference's own bound on one stream's label-set literal, charged in
+/// `syntax.ParseLabels` and again in `ParseLokiRequest`
+/// (`pkg/loghttp/push/push.go:420-422 @ v3.7.4`). Adopted verbatim so a wide
+/// literal is refused at the same width on both sides.
+pub const MAX_STREAM_LABELS_BYTES: usize = (1 << 24) - 1;
+/// PulsusDB-only structural guard on the number of **raw** `(key, value)`
+/// pairs in one JSON `stream` object, counted during deserialization.
+///
+/// The protobuf transport needs no equivalent — it drops empty values as it
+/// reads the literal, so its allocation is bounded by
+/// [`MAX_LABELS_PER_STREAM`] retained pairs regardless of how many empty ones
+/// the literal carries. The JSON transport must keep them until
+/// [`parse_json`] has checked every key against [`is_valid_label_name`] (an
+/// empty-valued label with a malformed name is a reject upstream, because the
+/// literal is parsed before `WithoutEmpty` runs) and until the map's
+/// last-write-wins collapse has happened, so this bounds that intermediate.
+/// The reference bounds the same intermediate by the rendered literal's size
+/// (16 MiB, [`MAX_STREAM_LABELS_BYTES`]); ours fires earlier, on a stream
+/// carrying more than 65,536 raw keys of which 15 or fewer are non-empty.
+/// Ledgered.
+pub const MAX_RAW_LABEL_PAIRS_PER_STREAM: usize = 65_536;
 /// The **aggregate** entry budget across all streams (issue #77 delta 1,
 /// review [high] finding): the per-dimension product
 /// `MAX_STREAMS_PER_REQUEST × MAX_ENTRIES_PER_STREAM` (1M × 100k) far
@@ -827,29 +861,37 @@ fn validate_bounds(
 /// of `req` and `now_ns` only, no I/O, no clock reads (the caller is the
 /// only clock boundary). Fallible on a per-entry timestamp overflow —
 /// which, unlike OTLP's per-record partial-success drop, is a whole-request
-/// `LokiDecode` failure here (Loki is all-or-nothing) — and on a stream whose
-/// labels breach one of the four per-stream label bounds
-/// ([`log_label_limits::validate_stream_labels`], issue #374).
+/// `LokiDecode` failure here (upstream a malformed JSON timestamp likewise
+/// fails the whole body, in its `jsoniter` decoder).
 ///
-/// The label bounds are charged on the **raw** parsed pairs, before
-/// `LabelSet::from_normalized` collapses a repeat, because the duplicate-name
-/// bound would otherwise be unobservable — the protobuf `labels` literal is
-/// the one log transport that can carry `{foo="bar", foo="barf"}` to this
-/// point, exactly as it is upstream.
+/// A stream whose labels breach one of the four per-stream label bounds
+/// (issue #374) is **not** a whole-request failure: it is dropped and its
+/// message accumulated into [`ParsedLogs::stream_errors`], because upstream
+/// `PushWithResolver` `continue`s past it, writes the remaining streams and
+/// answers `400` afterwards (`pkg/distributor/distributor.go:645-655,
+/// 780-790, 929 @ v3.7.4`).
+///
+/// The bounds are charged on the parsed pairs before `LabelSet::from_normalized`
+/// collapses a repeat, because the duplicate-name bound would otherwise be
+/// unobservable — the protobuf `labels` literal is the one log transport that
+/// can carry `{foo="bar", foo="barf"}` to this point, exactly as it is upstream.
 pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
     let mut out = ParsedLogs::default();
     let mut seen_streams: HashSet<(Fingerprint, Date)> = HashSet::new();
     for stream in &req.streams {
-        let pairs = parse_label_pairs(&stream.labels)?;
+        let stream_labels =
+            log_label_limits::StreamLabels::from_pairs(parse_label_pairs(&stream.labels)?);
         // A stream with no entries is skipped before validation upstream
         // (`pkg/distributor/distributor.go:639-641 @ v3.7.4`), so an
         // entry-less stream with over-wide labels is accepted there and here.
-        if !stream.entries.is_empty() {
-            log_label_limits::validate_stream_labels(
-                pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-            )?;
+        // A breach drops just this stream (`distributor.go:645-655`).
+        if !stream.entries.is_empty()
+            && let Err(err) = stream_labels.validate()
+        {
+            out.stream_errors.push(err.to_string());
+            continue;
         }
-        let (labels, collisions) = LabelSet::from_normalized(pairs);
+        let (labels, collisions) = LabelSet::from_normalized(stream_labels.into_pairs());
         let entries = stream.entries.iter().map(|entry| {
             let timestamp_ns = match entry.timestamp.as_ref() {
                 Some(ts) => resolve_pb_timestamp(ts)?,
@@ -934,25 +976,32 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
                 )));
             }
         }
-        // Same four per-stream label bounds as the protobuf path (issue #374),
-        // charged before any row is materialized. `stream.stream` is a
-        // `BTreeMap`, so a repeated JSON key has already collapsed
-        // last-write-wins and the duplicate-name bound is vacuous here — which
-        // is also what the reference does with a duplicate JSON key (measured:
+        // `WithoutEmpty` + the four per-stream label bounds (issue #374),
+        // charged before any row is materialized. The empty-value drop happens
+        // here rather than in the decoder because the map's last-write-wins
+        // collapse must come first: `{"foo":"bar","foo":""}` leaves `foo`
+        // empty upstream too, so the stream ends up with no labels at all.
+        // `stream.stream` is a `BTreeMap`, so a repeated JSON key has already
+        // collapsed and the duplicate-name bound is vacuous here — which is
+        // also what the reference does with a duplicate JSON key (measured:
         // `{"foo":"bar","foo":"barf"}` answers `204` on `grafana/loki:3.7.4`).
         // Skipped for an entry-less stream, as upstream skips it before
-        // validating (`pkg/distributor/distributor.go:639-641 @ v3.7.4`).
-        if !stream.values.is_empty() {
-            log_label_limits::validate_stream_labels(
-                stream.stream.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-            )?;
+        // validating (`pkg/distributor/distributor.go:639-641 @ v3.7.4`); a
+        // breach drops just this stream (`distributor.go:645-655`).
+        let stream_labels = log_label_limits::StreamLabels::from_pairs(
+            stream
+                .stream
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>(),
+        );
+        if !stream.values.is_empty()
+            && let Err(err) = stream_labels.validate()
+        {
+            out.stream_errors.push(err.to_string());
+            continue;
         }
-        let pairs = stream
-            .stream
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<Vec<_>>();
-        let (labels, collisions) = LabelSet::from_normalized(pairs);
+        let (labels, collisions) = LabelSet::from_normalized(stream_labels.into_pairs());
         let entries = stream.values.iter().map(|entry| {
             let timestamp_ns = entry.timestamp.parse::<i64>().map_err(|_| {
                 LogsIngestError::LokiDecode(format!(
@@ -1100,14 +1149,37 @@ fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
     Ok(LabelSet::from_normalized(parse_label_pairs(input)?))
 }
 
-/// Parses a Loki `StreamAdapter.labels` string into its **raw** `(name,
-/// value)` pairs, in wire order and without deduplication. Rejects a
-/// missing/unbalanced brace, a missing `=`, an unterminated/ malformed
-/// quoted value, or more than [`MAX_LABELS_PER_STREAM`] pairs as
-/// [`LogsIngestError::LokiDecode`] (a whole-request 400). Prometheus value
-/// escaping (`\\`, `\"`, `\n`, `\t`, `\r`) is unescaped; the empty set `{}`
-/// yields no pairs.
+/// Parses a Loki `StreamAdapter.labels` string into the `(name, value)` pairs
+/// of one stream, in wire order and **without deduplication** (so the
+/// duplicate-name bound can see a repeat) but **with empty values dropped**,
+/// which is what `syntax.ParseLabels` returns upstream — its closing
+/// `ls.WithoutEmpty()` (`pkg/logql/syntax/parser.go:296 @ v3.7.4`) runs after
+/// the literal is parsed and before anything is validated, hashed or stored.
+/// Dropping them here rather than after collection also keeps an
+/// empty-valued label from consuming [`MAX_LABELS_PER_STREAM`]: the reference
+/// has no per-stream label *count* guard at all, only the 16 MiB literal-size
+/// one adopted below, so a stream of 15 real labels padded with any number of
+/// empty-valued ones is accepted there and here.
+///
+/// Rejects a missing/unbalanced brace, a missing `=`, an unterminated/
+/// malformed quoted value, or a literal over [`MAX_STREAM_LABELS_BYTES`] as
+/// [`LogsIngestError::LokiDecode`], and more than [`MAX_LABELS_PER_STREAM`]
+/// retained pairs as [`LogsIngestError::OversizeMessage`] — all whole-request
+/// 400s. Prometheus value escaping (`\\`, `\"`, `\n`, `\t`, `\r`) is
+/// unescaped; the empty set `{}` yields no pairs.
 fn parse_label_pairs(input: &str) -> Result<Vec<(String, String)>, LogsIngestError> {
+    // `maxStreamLabelsSize`, charged on the raw literal exactly as
+    // `syntax.ParseLabels` charges it (`pkg/logql/syntax/parser.go:280-281 @
+    // v3.7.4`) and again at `pkg/loghttp/push/push.go:420-422 @ v3.7.4`. This
+    // is the reference's only bound on how wide one stream's literal may be,
+    // and with empty values dropped as they are read it bounds this
+    // function's allocation too.
+    if input.len() > MAX_STREAM_LABELS_BYTES {
+        return Err(LogsIngestError::LokiDecode(format!(
+            "stream labels size {} exceeds limit of {MAX_STREAM_LABELS_BYTES} bytes",
+            input.len()
+        )));
+    }
     let trimmed = input.trim();
     let inner = trimmed
         .strip_prefix('{')
@@ -1139,7 +1211,13 @@ fn parse_label_pairs(input: &str) -> Result<Vec<(String, String)>, LogsIngestErr
         expect_byte(bytes, &mut i, b'=', input)?;
         skip_ws(bytes, &mut i);
         let value = read_quoted(bytes, &mut i, input)?;
-        pairs.push((key, value));
+        // `WithoutEmpty`, applied after the name grammar has been checked —
+        // upstream order too, since the promql metric parser inside
+        // `ParseLabels` rejects a malformed name before `WithoutEmpty` runs
+        // (measured: `{a.b=""}` is `400 couldn't parse labels` there).
+        if !value.is_empty() {
+            pairs.push((key, value));
+        }
         skip_ws(bytes, &mut i);
         if i >= bytes.len() {
             break;
@@ -1519,11 +1597,27 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
     }
 }
 
-/// The per-stream `stream` label map, bounded at [`MAX_LABELS_PER_STREAM`]
-/// **during** deserialization. Counts RAW `next_entry` pairs (not the
-/// dedup-collapsing `BTreeMap` length) so a duplicate JSON key cannot evade the
-/// cap — the same rationale as [`BoundedStructuredMetadata`]. Last-write-wins
-/// dedup (the prior `BTreeMap` semantics) is preserved for the retained value.
+/// The per-stream `stream` label map, bounded **during** deserialization.
+///
+/// Two counts, because the reference has two different reasons to refuse a
+/// wide label map and only one of them is about parity:
+///
+/// - RAW `next_entry` pairs against [`MAX_RAW_LABEL_PAIRS_PER_STREAM`], the
+///   structural guard on this map's own growth.
+/// - RAW pairs with a **non-empty** value against [`MAX_LABELS_PER_STREAM`].
+///   Empty-valued labels are dropped before the stream is validated, hashed or
+///   stored (`ls.WithoutEmpty()`, `pkg/logql/syntax/parser.go:296 @ v3.7.4`),
+///   so charging them against the label cap would refuse streams the reference
+///   accepts. They are still *retained* here: [`parse_json`] must check their
+///   names against [`is_valid_label_name`] (upstream parses the literal before
+///   `WithoutEmpty` runs, so `{"a.b":""}` is a reject there) and the map's
+///   last-write-wins collapse must happen before the drop, since
+///   `{"foo":"bar","foo":""}` leaves `foo` empty upstream and must here too.
+///
+/// Both are counted on RAW pairs rather than the dedup-collapsing `BTreeMap`
+/// length so a duplicate JSON key cannot evade either — the same rationale as
+/// [`BoundedStructuredMetadata`]. Last-write-wins dedup (the prior `BTreeMap`
+/// semantics) is preserved for the retained value.
 struct BoundedLabelMap(std::collections::BTreeMap<String, String>);
 
 impl<'de> serde::Deserialize<'de> for BoundedLabelMap {
@@ -1545,13 +1639,23 @@ impl<'de> serde::Deserialize<'de> for BoundedLabelMap {
             {
                 let mut labels = std::collections::BTreeMap::new();
                 let mut seen = 0usize;
+                let mut non_empty = 0usize;
                 while let Some((k, v)) = map.next_entry::<String, String>()? {
-                    if seen >= MAX_LABELS_PER_STREAM {
-                        // Charge-before-allocate on RAW pair count, so duplicate
-                        // keys cannot collapse under the cap.
+                    // Charge-before-allocate on RAW pair counts, so duplicate
+                    // keys cannot collapse under either cap.
+                    if seen >= MAX_RAW_LABEL_PAIRS_PER_STREAM {
                         return Err(serde::de::Error::custom(format!(
-                            "stream labels exceed the {MAX_LABELS_PER_STREAM} per-stream bound"
+                            "stream label pairs exceed the \
+                             {MAX_RAW_LABEL_PAIRS_PER_STREAM} per-stream bound"
                         )));
+                    }
+                    if !v.is_empty() {
+                        if non_empty >= MAX_LABELS_PER_STREAM {
+                            return Err(serde::de::Error::custom(format!(
+                                "stream labels exceed the {MAX_LABELS_PER_STREAM} per-stream bound"
+                            )));
+                        }
+                        non_empty += 1;
                     }
                     seen += 1;
                     labels.insert(k, v);
@@ -2442,11 +2546,13 @@ mod tests {
         let body = format!(
             r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","hello"]]}}]}}"#
         );
-        let err = parse_json(body.as_bytes(), 0).unwrap_err();
-        assert!(matches!(err, LogsIngestError::LabelLimit(_)), "{err:?}");
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert!(out.rows.is_empty());
+        assert_eq!(out.stream_errors.len(), 1);
         assert!(
-            err.to_string().ends_with("' has 256 label names; limit 15"),
-            "{err}"
+            out.stream_errors[0].ends_with("' has 256 label names; limit 15"),
+            "{}",
+            out.stream_errors[0]
         );
     }
 
@@ -2485,26 +2591,32 @@ mod tests {
         assert_eq!(out.rows[0].body, "hello");
     }
 
-    // -- per-stream label bounds (issue #374) ------------------------------
+    // -- per-stream label rules (issue #374) -------------------------------
     //
-    // Reference: `pkg/distributor/validator.go:157-199 @ v3.7.4`. The bound
-    // logic and its edges live in `log_label_limits`; these cases pin that
-    // BOTH Loki-push transports reach it, and that the reachability of the
-    // duplicate-name bound differs between them exactly as it does upstream.
+    // Reference: `pkg/distributor/validator.go:157-199 @ v3.7.4`, reached from
+    // `parseStreamLabels` (`distributor.go:1370-1387`). The rules and their
+    // edges live in `log_label_limits`; these cases pin that BOTH Loki-push
+    // transports reach them, that the empty-value drop reaches the stored
+    // identity and not just the validator, that a breach costs only its own
+    // stream, and that the reachability of the duplicate-name bound differs
+    // between the transports exactly as it does upstream.
 
     fn json_body_with_labels(map: &str) -> String {
         format!(r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","hi"]]}}]}}"#)
     }
 
+    /// The single-stream shape a client sees: no rows admitted, one message.
+    fn only_stream_error(out: &ParsedLogs) -> &str {
+        assert!(out.rows.is_empty(), "a rejected stream contributes no rows");
+        assert_eq!(out.stream_errors.len(), 1, "{:?}", out.stream_errors);
+        &out.stream_errors[0]
+    }
+
     #[test]
     fn parse_json_rejects_a_label_value_over_2048_bytes() {
         let body = json_body_with_labels(&format!(r#"{{"app":"{}"}}"#, "b".repeat(2049)));
-        let err = parse_json(body.as_bytes(), 0).unwrap_err();
-        assert!(matches!(err, LogsIngestError::LabelLimit(_)), "{err:?}");
-        assert!(
-            err.to_string().contains("has label value too long"),
-            "{err}"
-        );
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert!(only_stream_error(&out).contains("has label value too long"));
     }
 
     #[test]
@@ -2516,8 +2628,8 @@ mod tests {
     #[test]
     fn parse_json_rejects_a_label_name_over_1024_bytes() {
         let body = json_body_with_labels(&format!(r#"{{"{}":"v"}}"#, "a".repeat(1025)));
-        let err = parse_json(body.as_bytes(), 0).unwrap_err();
-        assert!(err.to_string().contains("has label name too long"), "{err}");
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert!(only_stream_error(&out).contains("has label name too long"));
     }
 
     #[test]
@@ -2536,11 +2648,8 @@ mod tests {
                 .len(),
             1
         );
-        let err = parse_json(json_body_with_labels(&map(16)).as_bytes(), 0).unwrap_err();
-        assert!(
-            err.to_string().ends_with("' has 16 label names; limit 15"),
-            "{err}"
-        );
+        let out = parse_json(json_body_with_labels(&map(16)).as_bytes(), 0).unwrap();
+        assert!(only_stream_error(&out).ends_with("' has 16 label names; limit 15"));
     }
 
     #[test]
@@ -2566,6 +2675,108 @@ mod tests {
         );
         let out = parse_json(body.as_bytes(), 0).unwrap();
         assert!(out.rows.is_empty());
+        assert!(out.stream_errors.is_empty());
+    }
+
+    /// `WithoutEmpty` (`pkg/logql/syntax/parser.go:296 @ v3.7.4`) runs before
+    /// the hash, so an empty-valued label must not reach the stored label set
+    /// or the fingerprint — accepting it on both sides but storing it on one
+    /// would silently split a stream in two.
+    #[test]
+    fn parse_json_an_empty_valued_label_is_absent_from_the_stored_stream() {
+        let with_empty = parse_json(
+            json_body_with_labels(r#"{"a":"1","ignored":""}"#).as_bytes(),
+            0,
+        )
+        .unwrap();
+        let without = parse_json(json_body_with_labels(r#"{"a":"1"}"#).as_bytes(), 0).unwrap();
+        assert_eq!(with_empty.streams.len(), 1);
+        assert_eq!(with_empty.streams[0].labels.get("ignored"), None);
+        assert_eq!(with_empty.streams[0].labels, without.streams[0].labels);
+        assert_eq!(
+            with_empty.streams[0].fingerprint,
+            without.streams[0].fingerprint
+        );
+        assert_eq!(with_empty.rows[0].fingerprint, without.rows[0].fingerprint);
+    }
+
+    /// The map's last-write-wins collapse happens BEFORE the empty-value drop,
+    /// as it does upstream (`loghttp.LabelSet` is a map, rendered and only then
+    /// parsed by `syntax.ParseLabels`), so a key whose last occurrence is empty
+    /// leaves the stream with no labels at all rather than with the earlier
+    /// value.
+    #[test]
+    fn parse_json_a_key_whose_last_occurrence_is_empty_leaves_no_label() {
+        let body = json_body_with_labels(r#"{"foo":"bar","foo":""}"#);
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert_eq!(out.streams.len(), 1);
+        assert_eq!(out.streams[0].labels.get("foo"), None);
+    }
+
+    /// Review finding: empty-valued labels must not consume the decode-time
+    /// label cap either, or the reference's answer is pre-empted by ours at
+    /// 16 non-empty labels rather than at 257. 16 + 241 empty is 257 raw pairs.
+    #[test]
+    fn parse_json_empty_labels_do_not_consume_the_decode_time_label_cap() {
+        let mut pairs: Vec<String> = (0..16).map(|i| format!(r#""l{i}":"v""#)).collect();
+        pairs.extend((0..241).map(|i| format!(r#""e{i}":"""#)));
+        let body = json_body_with_labels(&format!("{{{}}}", pairs.join(",")));
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert!(
+            only_stream_error(&out).ends_with("' has 16 label names; limit 15"),
+            "{:?}",
+            out.stream_errors
+        );
+
+        // ...and 15 non-empty padded the same way is accepted outright, which
+        // is what `grafana/loki:3.7.4` answers (`204`).
+        let mut ok: Vec<String> = (0..15).map(|i| format!(r#""l{i}":"v""#)).collect();
+        ok.extend((0..250).map(|i| format!(r#""e{i}":"""#)));
+        let body = json_body_with_labels(&format!("{{{}}}", ok.join(",")));
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert_eq!(out.streams[0].labels.len(), 15);
+    }
+
+    /// `validator.go:164-167 @ v3.7.4`: a stream carrying `__aggregated_metric__`
+    /// or `__pattern__` returns before all four bounds. PulsusDB never
+    /// generates such a stream, but a client can push one on either side.
+    #[test]
+    fn parse_json_an_internal_stream_is_exempt_from_the_bounds() {
+        for internal in ["__aggregated_metric__", "__pattern__"] {
+            let mut pairs: Vec<String> = (0..16).map(|i| format!(r#""l{i}":"v""#)).collect();
+            pairs.push(format!(r#""{internal}":"x""#));
+            let body = json_body_with_labels(&format!("{{{}}}", pairs.join(",")));
+            let out = parse_json(body.as_bytes(), 0).unwrap();
+            assert!(out.stream_errors.is_empty(), "{internal}");
+            assert_eq!(out.rows.len(), 1, "{internal}");
+        }
+    }
+
+    /// The reference writes the streams that passed and answers `400` after
+    /// them (`distributor.go:645-655, 780-790, 929 @ v3.7.4`), so one
+    /// malformed stream must not cost a client the rest of its batch.
+    #[test]
+    fn parse_json_a_bad_stream_costs_only_itself() {
+        let body = format!(
+            r#"{{"streams":[
+                {{"stream":{{"app":"good"}},"values":[["1700000000000000000","a"]]}},
+                {{"stream":{{"app":"{}"}},"values":[["1700000000000000000","b"]]}},
+                {{"stream":{{"app":"also_good"}},"values":[["1700000000000000000","c"]]}}
+            ]}}"#,
+            "b".repeat(2049)
+        );
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(out.streams.len(), 2);
+        assert_eq!(out.stream_errors.len(), 1);
+        assert!(out.stream_errors[0].contains("has label value too long"));
+        let stored: Vec<&str> = out
+            .streams
+            .iter()
+            .map(|s| s.labels.get("app").unwrap_or_default())
+            .collect();
+        assert_eq!(stored, vec!["good", "also_good"]);
     }
 
     #[test]
@@ -2579,11 +2790,27 @@ mod tests {
                 entries: vec![entry(1_700_000_000, 0, "a")],
             }],
         };
-        let err = parse_protobuf(&req, 0).unwrap_err();
+        let out = parse_protobuf(&req, 0).unwrap();
         assert_eq!(
-            err.to_string(),
+            only_stream_error(&out),
             "stream '{foo=\"bar\", foo=\"barf\"}' has duplicate label name: 'foo'"
         );
+    }
+
+    /// `WithoutEmpty` runs before the duplicate test upstream (the literal is
+    /// parsed with both copies, then filtered), so a repeat whose other copy
+    /// is empty-valued is not a duplicate.
+    #[test]
+    fn parse_protobuf_a_repeat_whose_other_copy_is_empty_is_not_a_duplicate() {
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{foo="bar", foo=""}"#.to_string(),
+                entries: vec![entry(1_700_000_000, 0, "a")],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert_eq!(out.streams[0].labels.get("foo"), Some("bar"));
     }
 
     #[test]
@@ -2595,10 +2822,9 @@ mod tests {
                 entries: vec![entry(1_700_000_000, 0, "a")],
             }],
         };
-        let err = parse_protobuf(&req, 0).unwrap_err();
-        assert!(matches!(err, LogsIngestError::LabelLimit(_)), "{err:?}");
+        let out = parse_protobuf(&req, 0).unwrap();
         assert_eq!(
-            err.to_string(),
+            only_stream_error(&out),
             format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'")
         );
     }
@@ -2619,11 +2845,8 @@ mod tests {
             }],
         };
         assert_eq!(parse_protobuf(&req(literal(15)), 0).unwrap().rows.len(), 1);
-        let err = parse_protobuf(&req(literal(16)), 0).unwrap_err();
-        assert!(
-            err.to_string().ends_with("' has 16 label names; limit 15"),
-            "{err}"
-        );
+        let out = parse_protobuf(&req(literal(16)), 0).unwrap();
+        assert!(only_stream_error(&out).ends_with("' has 16 label names; limit 15"));
         // `service_name` is not counted (`validator.go:169-174 @ v3.7.4`), so
         // 15 labels plus one is still accepted.
         let with_service = format!(
@@ -2641,9 +2864,95 @@ mod tests {
                 entries: vec![],
             }],
         };
-        assert!(parse_protobuf(&req, 0).unwrap().rows.is_empty());
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert!(out.rows.is_empty());
+        assert!(out.stream_errors.is_empty());
     }
 
+    #[test]
+    fn parse_protobuf_an_empty_valued_label_is_absent_from_the_stored_stream() {
+        let req = |labels: &str| PushRequest {
+            streams: vec![StreamAdapter {
+                labels: labels.to_string(),
+                entries: vec![entry(1_700_000_000, 0, "a")],
+            }],
+        };
+        let with_empty = parse_protobuf(&req(r#"{a="1", ignored=""}"#), 0).unwrap();
+        let without = parse_protobuf(&req(r#"{a="1"}"#), 0).unwrap();
+        assert_eq!(with_empty.streams[0].labels.get("ignored"), None);
+        assert_eq!(
+            with_empty.streams[0].fingerprint,
+            without.streams[0].fingerprint
+        );
+    }
+
+    /// Empty-valued labels do not consume [`MAX_LABELS_PER_STREAM`] on this
+    /// transport either: the literal is parsed with 16 real labels and 241
+    /// empty ones and still answers the reference's count message.
+    #[test]
+    fn parse_protobuf_empty_labels_do_not_consume_the_label_cap() {
+        let mut pairs: Vec<String> = (0..16).map(|i| format!(r#"l{i}="v""#)).collect();
+        pairs.extend((0..241).map(|i| format!(r#"e{i}="""#)));
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: format!("{{{}}}", pairs.join(", ")),
+                entries: vec![entry(1_700_000_000, 0, "a")],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert!(only_stream_error(&out).ends_with("' has 16 label names; limit 15"));
+    }
+
+    #[test]
+    fn parse_protobuf_an_internal_stream_is_exempt_from_the_bounds() {
+        for internal in ["__aggregated_metric__", "__pattern__"] {
+            let mut pairs: Vec<String> = (0..16).map(|i| format!(r#"l{i}="v""#)).collect();
+            pairs.push(format!(r#"{internal}="x""#));
+            let req = PushRequest {
+                streams: vec![StreamAdapter {
+                    labels: format!("{{{}}}", pairs.join(", ")),
+                    entries: vec![entry(1_700_000_000, 0, "a")],
+                }],
+            };
+            let out = parse_protobuf(&req, 0).unwrap();
+            assert!(out.stream_errors.is_empty(), "{internal}");
+            assert_eq!(out.rows.len(), 1, "{internal}");
+        }
+    }
+
+    #[test]
+    fn parse_protobuf_a_bad_stream_costs_only_itself() {
+        let req = PushRequest {
+            streams: vec![
+                StreamAdapter {
+                    labels: r#"{app="good"}"#.to_string(),
+                    entries: vec![entry(1_700_000_000, 0, "a")],
+                },
+                StreamAdapter {
+                    labels: r#"{foo="bar", foo="barf"}"#.to_string(),
+                    entries: vec![entry(1_700_000_000, 0, "b")],
+                },
+            ],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.streams[0].labels.get("app"), Some("good"));
+        assert_eq!(out.stream_errors.len(), 1);
+        assert!(out.stream_errors[0].contains("has duplicate label name"));
+    }
+
+    /// `maxStreamLabelsSize` (`pkg/logql/syntax/parser.go:22,280-281 @
+    /// v3.7.4`): the reference's own bound on one stream's label literal,
+    /// adopted verbatim.
+    #[test]
+    fn parse_label_pairs_rejects_a_literal_over_sixteen_mebibytes() {
+        let literal = format!(r#"{{app="{}"}}"#, "b".repeat(MAX_STREAM_LABELS_BYTES));
+        let err = parse_label_set(&literal).unwrap_err();
+        let LogsIngestError::LokiDecode(msg) = err else {
+            panic!("expected LokiDecode, got a different variant");
+        };
+        assert!(msg.contains("exceeds limit of"), "{msg}");
+    }
     // -- parse -------------------------------------------------------------
 
     #[test]
