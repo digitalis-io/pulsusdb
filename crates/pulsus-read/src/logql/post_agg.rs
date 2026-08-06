@@ -211,8 +211,7 @@ pub fn combine_binary_capped(
 /// destructuring, since this function is not inside `mod ledger`.
 /// Moving this dispatch into `mod ledger` so the exit could be private
 /// is not taken: it would put result-shape query logic inside the module
-/// that is the budget and its proof tokens. A second unpacking site is
-/// a new function in a diff, which is what review of a diff is for.
+/// that is the budget and its proof tokens.
 ///
 /// `return_bool` is the one thing left loose, deliberately. It selects
 /// what a comparison emits, and `instant_join` detects every duplicate
