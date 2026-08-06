@@ -200,13 +200,28 @@ pub struct StructuredMetadataCtx {
     /// "" == absent.
     pub details: String,
     /// At least one NON-EMPTY ordinary SM entry reached `Set` — the
-    /// reference's `hasAdd()`. Empty-valued entries are excluded because the
-    /// reference's distributor strips them before they can reach the builder
-    /// (`pkg/distributor/distributor.go:698-723` through Prometheus'
-    /// `labels.Builder`, which deletes empty-valued base labels —
-    /// `labels_slicelabels.go:404-412`); PulsusDB stores them (#259), and
-    /// counting only non-empty entries here keeps the details-visibility
-    /// gate reference-exact regardless of what ingest stored (live-probed).
+    /// reference's `hasAdd()` (`pkg/logql/log/labels.go:216-223 @ v3.7.4`).
+    ///
+    /// Note the reference's own `Set` does NOT test the value: an empty-valued
+    /// ordinary entry reaching it WOULD dirty the builder. It never reaches
+    /// it, because the distributor already deleted the pair at ingest
+    /// (`pkg/distributor/distributor.go:698-722 @ v3.7.4`, through Prometheus'
+    /// `labels.Builder`, which deletes empty-valued base labels by name —
+    /// `labels_stringlabels.go:471-521`). So the non-empty test HERE is a
+    /// read-path stand-in for a write-path strip, added by #238 when PulsusDB
+    /// still stored empty-valued structured metadata.
+    ///
+    /// PulsusDB's ingest now performs that strip (#259 —
+    /// `pulsus_model::strip_empty_valued_labels` at every structured-metadata
+    /// seam), so no row this build writes can carry an empty-valued ordinary
+    /// SM pair, and for those rows the test is unreachable. It is kept, not
+    /// removed: a row written by an OLDER build would otherwise start
+    /// rendering `__error_details__` where the reference renders nothing, and
+    /// the rule is a committed #238 decision (pinned by
+    /// `empty_ordinary_sm_values_do_not_set_has_ordinary` below) that #259 is
+    /// not the issue to reopen. It compensates for nothing else — the only
+    /// source of an empty-valued ordinary entry here is a stored
+    /// `log_samples.structured_metadata` JSON.
     pub has_ordinary: bool,
 }
 

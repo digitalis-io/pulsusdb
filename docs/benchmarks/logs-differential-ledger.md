@@ -1698,3 +1698,111 @@ absence of a corpus row for an oversight.
   stream, then query `avg_over_time`, `avg_over_time … by (env)`,
   `avg_over_time … without ()`, `stdvar_over_time` and
   `stdvar_over_time … by (env)` at an instant covering them.
+
+### inadmissible-label-name-status (issue #259)
+
+- **Status: REGISTERED EXCEPTION — a deliberate divergence we decline to
+  mirror.** Adjudicated on issue #259; this row is the ledger half the
+  adjudication asked for, alongside the docs/api.md §8.2 note.
+- **Construct:** the response STATUS for a structured-metadata name (or an
+  OTLP attribute key) the reference refuses outright — an empty name, or one
+  that sanitizes to nothing but underscores
+  (`otlptranslator.LabelNamer.Build`,
+  `vendor/github.com/prometheus/otlptranslator/label_namer.go:66-90 @
+  v3.7.4`).
+- **Reference behaviour, measured on `grafana/loki:3.7.4`:** it disagrees
+  with ITSELF. `POST /loki/api/v1/push` answers **500** (both encodings),
+  `POST /otlp/v1/logs` answers **400**, for the identical condition.
+- **Why the 500 is accidental rather than designed.** The push error escapes
+  the distributor's validation closure as a bare `errors.New` carrying no
+  gRPC status (`pkg/distributor/distributor.go:703-706 @ v3.7.4`), so
+  `httpgrpc.HTTPResponseFromError` fails and `pushHandler` falls into its
+  status-less `else` branch (`pkg/distributor/http.go:170-180`) — while
+  every sibling failure in that same loop is client-classified `400` through
+  `validationErrors`. Provenance agrees: the `if err != nil { return err }`
+  arrived in Loki commit `09d831ea85`, *"chore: upgrade Prometheus to
+  208187eaa19b (#18756)"*, a mechanical bump adding the minimum needed to
+  compile once `Build` grew an `error` return. Before it, the same input
+  produced no error at all.
+- **PulsusDB behaviour:** **400 on both transports.** The input is entirely
+  client-controlled and no retry can succeed, while `5xx` is precisely the
+  class log agents retry — a 500 makes a well-behaved agent retry an
+  unfixable body forever and books it against server-error SLOs. It is also
+  what the reference itself answers on one of its own two transports.
+- **What IS byte-identical.** The push response body, terminator included:
+  the reference writes every push error through `push.HTTPError` ->
+  `http.Error` -> `fmt.Fprintln` (`pkg/loghttp/push/push.go:606-608 @
+  v3.7.4`), so its body is `label name is empty\n` — the same 20 bytes
+  PulsusDB writes. On OTLP the reference wraps the same text in
+  `symbolizer lookup: ` (`pkg/loghttp/push/otlp.go:613 @ v3.7.4`) and
+  PulsusDB reproduces that prefix, so the `google.rpc.Status` MESSAGE is
+  byte-identical.
+- **Related, pre-existing, not owned here:** the enclosing
+  `google.rpc.Status` differs in one field — the reference deliberately
+  omits `code` (`grpcstatus.New(0, errorStr)`, `push.go:571-582 @ v3.7.4`,
+  "Status 0 because we omit the Status.code field") while every PulsusDB
+  OTLP receiver sets `code = 3` for a 400-class failure, a receiver-wide
+  contract from issue #8 that predates this issue and applies to all four
+  signals.
+- **Fixture status:** no `test/fixtures/logs/differential.json` case (the
+  differential corpus carries no inadmissible name, and its oracle is still
+  `grafana/loki:3.4.2`, which predates `Build` returning an error at all).
+  Gated hermetically by `ingest/http.rs`'s
+  `loki_inadmissible_structured_metadata_name_is_400_on_both_encodings`,
+  `otlp_inadmissible_attribute_key_returns_400_with_status_code_3` and
+  `every_loki_push_error_body_is_lf_terminated`, and live by
+  `loki_push_live.rs`'s
+  `inadmissible_structured_metadata_names_are_refused_and_nothing_is_stored`.
+
+### inadmissible-label-name-echo-escaping (issue #259)
+
+- **Status: REGISTERED EXCEPTION — a USER-VISIBLE runtime-rendering
+  difference we do not chase.** Verdict, status and sentence all match; only
+  the echoed name's escaping differs. A client CAN reach it: see the
+  reachability note below, which corrects an earlier version of this row
+  that argued the difference was unreachable.
+- **Construct:** the `%q`-quoted name inside
+  `normalization for label name %q resulted in invalid name %q`.
+- **Reference behaviour:** Go's `fmt` `%q` (`strconv.Quote`), whose
+  printability table is Go's own.
+- **PulsusDB behaviour:** Rust's `{:?}` (`char::escape_debug`), whose
+  printability table is Rust's own.
+- **The exact, bounded difference.** Comparing the two renderings over all
+  1 112 064 codepoints: they agree on every assigned, printable,
+  non-combining character. Every disagreement is a control character
+  (`"\x01"` vs `"\u{1}"`, `"\x00"` vs `"\0"`), a format/separator
+  character (`"\u00a0"` vs `"\u{a0}"`), an unassigned or private-use
+  codepoint, or a `Grapheme_Extend` mark (Go prints U+0301 raw, Rust
+  escapes it). The only exceptions carrying a letter/number/punctuation/
+  symbol category at all are U+FF9E and U+FF9F, themselves
+  `Grapheme_Extend`. On the 80-name matrix the whole rule was replayed
+  over, accept/reject agrees **80/80** and the message agrees **71/80**.
+- **Reachability — a client CAN hit this, and sees different bytes.** A lone
+  combining mark is exactly the sort of name this rule refuses, so it is a
+  reachable input rather than a theoretical one. Measured on
+  `grafana/loki:3.7.4` (`b318f282`), pushing structured metadata keyed
+  `U+0301` on both push encodings and as an OTLP attribute:
+
+  | side | response body |
+  |---|---|
+  | reference | `normalization for label name "<CC 81>" resulted in invalid name "_"` — the raw two UTF-8 bytes inside the quotes |
+  | PulsusDB | `normalization for label name "\u{301}" resulted in invalid name "_"` — eight ASCII bytes |
+
+  What is bounded is the CLASS of characters that differ, never the
+  reachability. An earlier version of this row said the difference was one
+  "no consumer can act on"; that was wrong, and this row says so instead of
+  re-deriving a narrower bound.
+- **Why we do not mirror it:** the two tables track different Unicode
+  versions and move with each runtime's releases, so byte agreement here is
+  not a stable property either side can hold — Go's `%q` printability is
+  `strconv.IsPrint`'s generated table (categories L/M/N/P/S plus ASCII
+  space), Rust's `{:?}` additionally escapes `Grapheme_Extend`, and neither
+  is reachable from the other's standard library. Reproducing Go's would
+  mean vendoring a Unicode category table and pinning it to the Go release
+  that built the image. The impact is bounded to the echoed name: the name
+  is refused either way, with the same condition and the same sentence, and
+  no PulsusDB response status changes.
+- **Fixture status:** pinned by `label_name.rs`'s
+  `the_escape_syntax_for_an_unprintable_name_is_our_runtimes_not_the_references`,
+  which carries the reference's measured rendering beside ours for every
+  member of the known set.

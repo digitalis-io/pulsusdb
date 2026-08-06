@@ -18,7 +18,7 @@
   "golden": {
     "service": "from_dot",
     "labels_json": "{\"service_name\":\"from_dot\"}",
-    "structured_metadata_json": "{\"dup_key\":\"v_us\",\"emptyattr\":\"\",\"scope_name\":\"collide-scope\",\"scope_version\":\"1.0.0\",\"service_name\":\"from_underscore\"}",
+    "structured_metadata_json": "{\"dup_key\":\"v_us\",\"scope_name\":\"collide-scope\",\"scope_version\":\"1.0.0\",\"service_name\":\"from_underscore\"}",
     "fingerprint": 18200076898363330321,
     "body": "duplicate key collision",
     "severity": 3,

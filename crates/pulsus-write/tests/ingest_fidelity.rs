@@ -56,12 +56,18 @@
 //! **Scope note (issue #109).** Stream labels are now **resource** attributes
 //! only; a log record's `InstrumentationScope` (name/version/attributes) lands
 //! in per-entry **structured metadata** (`log_samples.structured_metadata`),
-//! not the label set — Loki 3.4.2 parity, live-probe-pinned. Case 2 exercises
-//! a scope with an attribute (`team`) flowing to SM; case 3 exercises the
-//! collision-resolution rules (a)/(b)/(c) — a scope attribute colliding onto
-//! `scope_name`, two attributes sanitizing to one key (last-write-wins), and
-//! an empty-valued attribute retained — with the resolved SM golden asserted
-//! byte-identical on both paths.
+//! not the label set — live-probe-pinned. Case 2 exercises a scope with an
+//! attribute (`team`) flowing to SM; case 3 exercises the collision-resolution
+//! rules (a)/(b)/(c) — a scope attribute colliding onto `scope_name`, two
+//! attributes sanitizing to one key (last-write-wins), and an empty-valued
+//! attribute DROPPED (rule (c), flipped by issue #259: the 3.4.2 distributor
+//! kept it, the pinned v3.7.4 one deletes it through Prometheus'
+//! `labels.Builder` — measured on one container per version with the same
+//! OTLP body, `grafana/loki:3.4.2` returning the empty-valued attribute and
+//! `grafana/loki:3.7.4` dropping it; see
+//! `otlp_logs::build_scope_structured_metadata` for the body and both source
+//! citations) — with the resolved SM golden asserted byte-identical on both
+//! paths.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, reusing the harness pattern
 //! from `crates/pulsus-schema/tests/live_schema.rs` /
@@ -421,8 +427,15 @@ fn sql_escape(s: &str) -> String {
 /// fixture's raw scope fields, never calling `otlp_logs`. Sanitizes attribute
 /// keys with `canonicalize_label_key` (the same primitive
 /// `LabelSet::from_normalized` uses, so the resolved keys are its fixed
-/// points), resolves collisions by last-write-wins in the ordered list
-/// `[attributes …, scope_name?, scope_version?]`, then serializes through the
+/// points), builds the ordered list `[attributes …, scope_name?,
+/// scope_version?]`, drops every empty-valued pair BY NAME over that WHOLE
+/// list — identity fields included, so an empty attribute named `scope_name`
+/// takes the real one with it (issue #259 — Loki 3.7.4's distributor runs an
+/// entry's structured metadata through Prometheus' `labels.Builder`, which
+/// deletes empty-valued base labels; spelled out inline here rather than
+/// calling `pulsus_model::strip_empty_valued_labels`, so Path B stays
+/// independent of the code Path A exercises) — then resolves what is left by
+/// last-write-wins, and serializes through the
 /// same `LabelSet::from_normalized` + `to_canonical_json` seam — which, over
 /// already-unique keys, only sorts + JSON-encodes. Empty set -> `""`.
 fn path_b_scope_structured_metadata(f: &Fixture) -> String {
@@ -438,6 +451,13 @@ fn path_b_scope_structured_metadata(f: &Fixture) -> String {
     if !f.file.scope_version.is_empty() {
         ordered.push(("scope_version".to_string(), f.file.scope_version.clone()));
     }
+    // A name carrying an empty value anywhere loses EVERY occurrence.
+    let empty_names: Vec<String> = ordered
+        .iter()
+        .filter(|(_, value)| value.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
+    ordered.retain(|(name, _)| !empty_names.contains(name));
     let mut resolved: Vec<(String, String)> = Vec::with_capacity(ordered.len());
     for (key, value) in ordered {
         if let Some(slot) = resolved.iter_mut().find(|(k, _)| *k == key) {

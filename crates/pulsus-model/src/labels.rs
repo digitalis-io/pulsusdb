@@ -44,6 +44,175 @@ pub struct LabelSet {
     entries: Vec<(String, String)>,
 }
 
+/// Drops every pair whose value is exactly `""`, leaving any same-named
+/// non-empty pair in place — Prometheus' "an empty label value is the same as
+/// an absent label" rule in its PAIR-WISE form.
+///
+/// This is `labels.Labels.WithoutEmpty()`
+/// (`vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:261-286
+/// @ v3.7.4`), which Loki's log ingest applies to **stream labels**:
+/// `syntax.ParseLabels` ends in `return ls.WithoutEmpty()`
+/// (`pkg/logql/syntax/parser.go:279-296 @ v3.7.4`), with the reason given
+/// inline — an empty value alters the label-set hash, so it must be normalized
+/// away early on the write path or a stream's identity is not deterministic.
+/// Every Loki log receiver reaches it through
+/// `Distributor.parseStreamLabels`, which calls `syntax.ParseLabels` on the
+/// stream's label literal (`pkg/distributor/distributor.go:1363-1375`, reached
+/// from `:648 @ v3.7.4`) — including the OTLP one, whose translation renders
+/// the promoted resource attributes back into exactly such a literal
+/// (`pkg/loghttp/push/otlp.go:240-250 @ v3.7.4`).
+///
+/// Use this — NOT [`strip_empty_valued_labels`] — wherever a STREAM LABEL set
+/// is built. The two differ only when the same name appears twice, which the
+/// reference resolves differently at its two seams; see
+/// [`strip_empty_valued_labels`] for the discriminating measurement.
+///
+/// Only an exactly-empty value is dropped. A whitespace-only value is kept
+/// verbatim and nothing is trimmed — measured on `grafana/loki:3.7.4` at both
+/// receivers: a Loki-push stream label `e=" "` and an OTLP index label
+/// `deployment.environment=" "` both survive, each forming a stream distinct
+/// from one that omits the label.
+///
+/// Deliberately NOT applied by the metrics paths: Prometheus, not Loki, is the
+/// metrics reference, and its own rejection/normalization surface is governed
+/// separately.
+pub fn retain_non_empty_values(pairs: &mut Vec<(String, String)>) {
+    // Borrowed scan first: the overwhelmingly common input has no empty value,
+    // and `retain` on it would still walk every element shifting nothing.
+    if !pairs.iter().any(|(_, value)| value.is_empty()) {
+        return;
+    }
+    pairs.retain(|(_, value)| !value.is_empty());
+}
+
+/// Drops every pair an empty-valued pair suppresses — the same "empty means
+/// absent" rule in its BY-NAME form, where the name that decides is the
+/// **canonicalized** one ([`canonicalize_label_key`]), not the raw one.
+///
+/// This is what Prometheus' `labels.Builder` does, and Loki's distributor runs
+/// every entry's **structured metadata** through one
+/// (`pkg/distributor/distributor.go:698-722 @ v3.7.4`). Three of its
+/// primitives combine into the rule this function reproduces:
+///
+/// 1. `NewBuilder` calls `Reset`, which records the RAW name of every
+///    empty-valued base label in `del`, and `Labels()` omits every base label
+///    carrying a name in `del`
+///    (`vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:471-521`
+///    — the file actually compiled: it is `//go:build !slicelabels &&
+///    !dedupelabels`, and Loki builds with `-tags netgo` alone,
+///    `Makefile:54-64 @ v3.7.4`).
+/// 2. The distributor's loop **renames first**: for a name whose normalized
+///    form differs it runs `Del(raw)` then `Set(normalized, value)`
+///    (`distributor.go:702-712`), and `Set(n, "")` is defined as `Del(n)`
+///    (`labels_common.go:187-192`). So an empty-valued pair deletes its
+///    NORMALIZED name too — and takes any same-normalized twin with it.
+/// 3. `Del` removes the name from `add` as well, while `Set` does not remove
+///    it from `del`, and `Labels()` emits `add` regardless of `del`
+///    (`labels_stringlabels.go:483-521`). So a renamed non-empty pair
+///    *resurrects* a name an empty twin had deleted — unless a later renamed
+///    empty pair deletes it again. The rule is therefore order-dependent, and
+///    this function reproduces that too.
+///
+/// Use this — NOT [`retain_non_empty_values`] — wherever a STRUCTURED
+/// METADATA set is built.
+///
+/// **`normalized` here is PulsusDB's [`canonicalize_label_key`], the name the
+/// pair is actually STORED under, not the reference's `LabelNamer.Build`.**
+/// The rule is then statable against our own data — *an empty-valued entry
+/// suppresses every entry stored under the same label name* — and the two
+/// agree wherever the two renamings agree. Where they do not (`a..b` and
+/// `a__b` normalize to `a_b` there and to `a__b` here; `9bad` gains a `key_`
+/// prefix there), the suppression groups differently: measured on
+/// `grafana/loki:3.7.4`, `{a..b="", a_b="keep"}` stores nothing there and
+/// `a_b="keep"` here. That residual is entailed by the label-RENAMING
+/// divergence registered in docs/api.md §8.2 (issue #259) and disappears with
+/// it; it is not a second rule. See `protocols::label_name`'s
+/// `sanitize_differs_from_our_storage_canonicalization`.
+///
+/// The discriminating cases, all measured against `grafana/loki:3.7.4`
+/// (`b318f282`, `allow_structured_metadata: true`, `discover_log_levels:
+/// false`, `discover_service_name: []`), pushed as structured metadata on the
+/// snappy-protobuf and JSON encodings alike (both agree):
+///
+/// | pushed, in this order | stored |
+/// |---|---|
+/// | `a=""`, `a="keep"` | nothing |
+/// | `a.b=""`, `a_b="keep"` | nothing — the empty pair renames ONTO the twin |
+/// | `a_b="keep"`, `a.b=""` | nothing — same, order-independent |
+/// | `a.b="keep"`, `a_b=""` | `a_b="keep"` — the rename resurrects the deleted name |
+/// | `a_b=""`, `a.b="keep"` | `a_b="keep"` — same, order-independent |
+/// | `a.b=""`, `a.b="keep"` | `a_b="keep"` — the second pair's rename resurrects |
+/// | `a.b="keep"`, `a.b=""` | nothing — the SECOND rename deletes what the first added |
+/// | `a.b=""`, `c="v"` | `c="v"` |
+///
+/// The same set pushed as STREAM labels keeps the non-empty twin in every
+/// row: that seam strips the empty **pair** only ([`retain_non_empty_values`]).
+///
+/// (Stream labels measured on the Loki-push protobuf transport: of the two
+/// push encodings its label literal is the only one that carries a duplicate
+/// name as far as the strip, because the JSON one decodes its label object
+/// into a map first — both here and on the reference,
+/// `pkg/loghttp/labels.go:24-40 @ v3.7.4`. The OTLP receiver's attribute list
+/// can repeat a key too, and resolves it differently again; that seam is
+/// documented at `otlp_logs::build_stream_labels`. Structured metadata keeps
+/// duplicates on BOTH push encodings: protobuf as a repeated field, JSON
+/// because the reference appends each object key to a slice,
+/// `pkg/loghttp/query.go:182-203 @ v3.7.4`, exactly as we do.)
+///
+/// Only an exactly-empty value is dropped; a whitespace-only value is kept
+/// verbatim (`{"a":" "}` round-trips as `a=" "`) and nothing is trimmed.
+///
+/// A caller that has already canonicalized its keys (the OTLP scope path)
+/// passes canonicalize fixed points, for which no pair is "renamed" and the
+/// rule degenerates to the plain by-name delete it was before.
+pub fn strip_empty_valued_labels(pairs: &mut Vec<(String, String)>) {
+    // Fast path: the overwhelmingly common case has no empty value at all, so
+    // it costs one borrowed scan and allocates nothing. Sound because with no
+    // empty value `del` stays empty and every renamed pair is re-added under
+    // its normalized name — which is where the downstream
+    // `LabelSet::from_normalized` puts it anyway.
+    if !pairs.iter().any(|(_, value)| value.is_empty()) {
+        return;
+    }
+    // The builder's `del`, seeded by `Reset` with the RAW name of every
+    // empty-valued pair. Names are cloned only on this rare path, and the
+    // count is bounded by the caller's per-entry cap.
+    let mut deleted: BTreeSet<String> = pairs
+        .iter()
+        .filter(|(_, value)| value.is_empty())
+        .map(|(name, _)| name.clone())
+        .collect();
+    // The builder's `add`, as indices into `pairs`: a renamed non-empty pair
+    // survives even when its normalized name is in `del`. Keeping every such
+    // pair (rather than only the last, as `Set` does) leaves the winner among
+    // colliding non-empty pairs to `LabelSet::from_normalized`'s frozen rule,
+    // exactly as it is decided when no empty value is present at all.
+    let mut added: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, (name, value)) in pairs.iter().enumerate() {
+        let normalized = canonicalize_label_key(name);
+        if normalized == *name {
+            continue;
+        }
+        deleted.insert(name.clone());
+        if value.is_empty() {
+            // `Set(normalized, "")` == `Del(normalized)`, which also drops
+            // whatever an earlier renamed pair had added under that name.
+            added.remove(&normalized);
+            deleted.insert(normalized);
+        } else {
+            added.entry(normalized).or_default().push(index);
+        }
+    }
+    let resurrected: BTreeSet<usize> = added.into_values().flatten().collect();
+    let original = std::mem::take(pairs);
+    pairs.reserve(original.len());
+    for (index, pair) in original.into_iter().enumerate() {
+        if resurrected.contains(&index) || !deleted.contains(&pair.0) {
+            pairs.push(pair);
+        }
+    }
+}
+
 /// Groups `pairs` by `normalize(key)`, deduplicating identical
 /// `(original_key, value)` pairs within each group (a `BTreeSet` member is
 /// unique by definition). Shared by every `LabelSet` constructor so the
@@ -356,5 +525,158 @@ mod tests {
             set.to_canonical_json(),
             "{\"a_key\":\"quote\\\"and\\\\backslash\",\"m_key\":\"café\",\"z_key\":\"line1\\nline2\"}"
         );
+    }
+
+    // -- empty-value strips (issue #259) -----------------------------------
+
+    #[test]
+    fn both_strips_remove_only_exactly_empty_values() {
+        // Neither trims: a whitespace-only value is a value.
+        let source = pairs(&[("a", ""), ("b", "v"), ("c", " "), ("d", "\t"), ("e", "0")]);
+        let expected = pairs(&[("b", "v"), ("c", " "), ("d", "\t"), ("e", "0")]);
+
+        let mut by_name = source.clone();
+        strip_empty_valued_labels(&mut by_name);
+        assert_eq!(by_name, expected);
+
+        let mut pair_wise = source;
+        retain_non_empty_values(&mut pair_wise);
+        assert_eq!(pair_wise, expected);
+    }
+
+    /// The one case that tells the two apart, and the reason there are two of
+    /// them. Loki's structured-metadata seam is a `labels.Builder`, whose
+    /// `Reset` records the NAME of an empty-valued base label so `Labels()`
+    /// omits every base label carrying it; its stream-label seam is
+    /// `WithoutEmpty()`, which drops the empty PAIR and nothing else.
+    ///
+    /// Measured on `grafana/loki:3.7.4` (`b318f282`) with the same duplicate
+    /// pushed both ways round: as structured metadata (either transport) no
+    /// `a` survives; as protobuf stream labels `a="keep"` survives.
+    #[test]
+    fn by_name_strip_takes_the_non_empty_twin_where_pair_wise_keeps_it() {
+        for source in [
+            pairs(&[("a", ""), ("a", "keep"), ("z", "v")]),
+            pairs(&[("a", "keep"), ("a", ""), ("z", "v")]),
+        ] {
+            let mut by_name = source.clone();
+            strip_empty_valued_labels(&mut by_name);
+            assert_eq!(by_name, pairs(&[("z", "v")]), "by-name, from {source:?}");
+
+            let mut pair_wise = source.clone();
+            retain_non_empty_values(&mut pair_wise);
+            assert_eq!(
+                pair_wise,
+                pairs(&[("a", "keep"), ("z", "v")]),
+                "pair-wise, from {source:?}"
+            );
+        }
+    }
+
+    /// The by-name delete runs on the NORMALIZED name, so an empty-valued
+    /// pair whose key canonicalizes onto another pair's key takes that pair
+    /// with it — and a renamed non-empty pair resurrects a name an empty twin
+    /// deleted, because the reference's `Set` adds where `Del` only deletes.
+    ///
+    /// Every row measured on `grafana/loki:3.7.4` (`b318f282`), pushed as
+    /// structured metadata on the snappy-protobuf encoding and, where the
+    /// shape survives a JSON object, on the JSON one too — both agree. The
+    /// expectation below is the pair list AFTER the strip; the stored key
+    /// follows from `LabelSet::from_normalized` (`a.b` -> `a_b`).
+    #[test]
+    fn the_by_name_strip_deletes_after_normalization_and_a_rename_resurrects() {
+        for (source, expected, note) in [
+            (
+                pairs(&[("a.b", ""), ("a_b", "keep")]),
+                Vec::new(),
+                "the empty pair renames ONTO the twin and deletes it",
+            ),
+            (
+                pairs(&[("a_b", "keep"), ("a.b", "")]),
+                Vec::new(),
+                "…in either order",
+            ),
+            (
+                pairs(&[("a.b", "keep"), ("a_b", "")]),
+                pairs(&[("a.b", "keep")]),
+                "the rename re-adds `a_b`, which outranks the delete",
+            ),
+            (
+                pairs(&[("a_b", ""), ("a.b", "keep")]),
+                pairs(&[("a.b", "keep")]),
+                "…in either order",
+            ),
+            (
+                pairs(&[("a.b", ""), ("a.b", "keep")]),
+                pairs(&[("a.b", "keep")]),
+                "the second pair's rename resurrects what the first deleted",
+            ),
+            (
+                pairs(&[("a.b", "keep"), ("a.b", "")]),
+                Vec::new(),
+                "…and the reverse order deletes what the first added",
+            ),
+            (
+                pairs(&[("a.b", ""), ("c", "v")]),
+                pairs(&[("c", "v")]),
+                "an unrelated pair is untouched",
+            ),
+            (
+                pairs(&[("a.b", "x"), ("a_b", ""), ("a_b", "keep")]),
+                pairs(&[("a.b", "x")]),
+                "the delete covers every base pair carrying the name",
+            ),
+        ] {
+            let mut stripped = source.clone();
+            strip_empty_valued_labels(&mut stripped);
+            assert_eq!(stripped, expected, "{note}, from {source:?}");
+        }
+    }
+
+    /// The residual of the label-RENAMING divergence registered in
+    /// docs/api.md §8.2, pinned so it stays visible: the reference groups
+    /// `a..b`, `a__b` and `a_b` under one name (`LabelNamer.Build` collapses
+    /// consecutive invalid runes) while PulsusDB stores them as three, so the
+    /// suppression groups differently. Measured on `grafana/loki:3.7.4`:
+    /// `{a..b="", a_b="keep"}` and `{a__b="", a_b="keep"}` both store NOTHING
+    /// there, and `{9bad="", key_9bad="keep"}` likewise (`9bad` gains a
+    /// `key_` prefix there). This is one divergence, not two: fixing the
+    /// renaming fixes these rows with no change to the rule above.
+    #[test]
+    fn the_normalized_delete_groups_by_our_renaming_not_the_references() {
+        for source in [
+            pairs(&[("a..b", ""), ("a_b", "keep")]),
+            pairs(&[("a__b", ""), ("a_b", "keep")]),
+            pairs(&[("9bad", ""), ("key_9bad", "keep")]),
+        ] {
+            let mut stripped = source.clone();
+            strip_empty_valued_labels(&mut stripped);
+            assert_eq!(
+                stripped.len(),
+                1,
+                "the non-empty twin survives here and does not on the reference: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_strips_preserve_order_and_are_noops_without_empties() {
+        for strip in [
+            strip_empty_valued_labels as fn(&mut Vec<(String, String)>),
+            retain_non_empty_values,
+        ] {
+            let mut p = pairs(&[("z", "1"), ("a", "2"), ("m", "3")]);
+            let before = p.clone();
+            strip(&mut p);
+            assert_eq!(p, before, "input order is preserved, nothing removed");
+
+            let mut all_empty = pairs(&[("a", ""), ("b", "")]);
+            strip(&mut all_empty);
+            assert!(all_empty.is_empty());
+
+            let mut none: Vec<(String, String)> = Vec::new();
+            strip(&mut none);
+            assert!(none.is_empty());
+        }
     }
 }
