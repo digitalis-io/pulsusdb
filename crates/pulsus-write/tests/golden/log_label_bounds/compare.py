@@ -519,8 +519,9 @@ drained("metadata-non-string",
         '{"streams":[{"stream":{"app":"s"},"values":[["%s","x",{%s,"bad":[]}]]}],"Streams":[%s]}'
         % (_fixed_ts, _pairs(2, "m"), _fixed_win))
 # The `stream` map's drain, in the one shape upstream also refuses: 20,000
-# levels of nesting is past ITS ceiling too (residual 8).  The non-string shape
-# below cannot show agreement, because upstream does not type a label value at
+# levels of nesting is past ITS ceiling too, so both sides are 400 -- by
+# different routes, which is the point of pairing it with the row below.  That
+# one cannot show agreement, because upstream does not type a label value at
 # all (residual 9) -- which is exactly why both spellings are here.
 drained("label-map-deep",
         '{"streams":[{"stream":{%s,"deep":%s},"stream":{"app":"w"},"values":%s}]}'
@@ -534,37 +535,69 @@ drained("label-map-non-string",
         % (_pairs(2), _final),
         expect="DIFF")
 
-# ---- one nesting ceiling for the body, and where the two ceilings differ ---
-# Residual 8.  Arbitrary nesting reaches only values the decoder does not keep:
-# an unknown key, or a run past a cap.  All of them now deserialize through
-# serde, so serde_json's RECURSION_LIMIT of 128 (de.rs:63,1375 @ 1.0.150)
-# covers them -- the ceiling every typed value already had.  Upstream's is
-# jsoniter's maxDepth = 10000 (iter.go:331-338 @ v1.1.12), reached by the
-# iter.Skip() that walks a stream object before its unmarshaler runs.
-# Both boundaries are bisected, not assumed, and both sides count the envelope
-# object as one level: we accept 126 and refuse 127, Loki accepts 9,999 and
-# refuses 10,000.
+# ---- one nesting ceiling for the body, at the reference's number -----------
+# Arbitrary nesting reaches only values the decoder does not keep: an unknown
+# key, or a run past a cap.  Upstream's ceiling is jsoniter's maxDepth = 10000
+# (iter.go:331-338 @ v1.1.12) -- but the count it applies to is not "brackets
+# to the left", and it differs per position, which is why each row below
+# carries its own literal:
+#   - the envelope object counts (oneFieldStructDecoder increments,
+#     reflect_struct_decoder.go:574-594 @ jsoniter v1.1.12);
+#   - the `streams` ARRAY does not (sliceDecoder never increments,
+#     reflect_slice.go:59-99);
+#   - the stream object and everything under it do, because LogProtoStream has
+#     an UnmarshalJSON (pkg/loghttp/query.go:99 @ loki v3.7.4) that jsoniter
+#     reaches through unmarshalerDecoder / SkipAndReturnBytes, whose
+#     iter.Skip() walks the object with ReadObjectCB / ReadArrayCB
+#     (iter_skip_strict.go:85-99, iter_object.go:115, iter_array.go:31).
+# So the deepest ACCEPTED nest is 9,999 under an unknown envelope key, 9,998
+# under an unknown key inside a stream and 9,996 as an entry's fourth element.
+# All six boundary numbers were bisected against these two servers.
+# Before issue #374 round 14 PulsusDB refused everything past 126 in all three
+# positions (serde_json's RECURSION_LIMIT of 128, de.rs:63,1375 @ 1.0.150);
+# `-126`/`-127` are the two rows that recorded it, `-127` having been the
+# over-rejection itself.
 _deep = lambda n: "[" * n + "]" * n
-# The boundary rows keep a `now` timestamp: upstream ACCEPTS three of the four
-# and stores the line, so a stale one would be refused for the wrong reason.
-for _d, _expect in ((126, "SAME"), (127, "DIFF"), (9_999, "DIFF")):
-    case("json/ignored-depth-%d" % _d, "json",
-         ('{"streams":[' + _win + '],"junk":' + _deep(_d) + "}").encode(),
-         "application/json", expect=_expect)
-# Past both ceilings -- refused at decode on both sides, so fixed timestamps
-# again, in each of the three positions such a value can reach.
-case("json/ignored-depth-10000", "json",
-     ('{"streams":[' + _fixed_win + '],"junk":' + _deep(10_000) + "}").encode(),
-     "application/json")
-case("json/ignored-depth-200000-envelope-key", "json",
-     ('{"streams":[' + _fixed_win + '],"junk":' + _deep(200_000) + "}").encode(),
-     "application/json")
-case("json/ignored-depth-200000-stream-key", "json",
-     ('{"streams":[{"stream":{"app":"a"},"values":' + _fixed_final
-      + ',"junk":' + _deep(200_000) + "}]}").encode(), "application/json")
-case("json/ignored-depth-200000-entry-4th-element", "json",
-     ('{"streams":[{"stream":{"app":"a"},"values":[["' + _fixed_ts + '","x",{},'
-      + _deep(200_000) + "]]}]}").encode(), "application/json")
+_at_envelope = lambda n: '{"streams":[%s],"junk":%s}' % (_win, _deep(n))
+_at_stream = lambda n: ('{"streams":[{"stream":{"app":"a"},"values":%s,"junk":%s}]}'
+                        % (_final, _deep(n)))
+_at_entry = lambda n: ('{"streams":[{"stream":{"app":"a"},"values":[["%s","x",{},%s]]}]}'
+                       % (TS, _deep(n)))
+# Rows upstream ACCEPTS keep a `now` timestamp -- it stores the line, so a
+# stale one would be refused for the wrong reason.  Rows both sides refuse at
+# decode take the fixed one, because their error quotes a window of the request
+# back and a `now` in it would make this transcript unreproducible.
+_fixed = lambda body: body.replace(TS, _fixed_ts)
+for _name, _mk, _accepted in (("envelope-key", _at_envelope, 9_999),
+                              ("stream-key", _at_stream, 9_998),
+                              ("entry-4th-element", _at_entry, 9_996)):
+    case("json/ignored-depth-%s-%d" % (_name, _accepted), "json",
+         _mk(_accepted).encode(), "application/json")
+    case("json/ignored-depth-%s-%d" % (_name, _accepted + 1), "json",
+         _fixed(_mk(_accepted + 1)).encode(), "application/json")
+    # Far past both, in the same position: the shape round 12 measured.
+    case("json/ignored-depth-%s-200000" % _name, "json",
+         _fixed(_mk(200_000)).encode(), "application/json")
+case("json/ignored-depth-126", "json", _at_envelope(126).encode(), "application/json")
+case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/json")
+
+# ---- and one thing an ignored value is checked for that is NOT depth --------
+# Upstream's skip does not skip every number: `trySkipNumber` walks a run of
+# digits with at most one dot and skips it unevaluated, and hands anything else
+# -- an exponent, in practice -- to ParseFloat, which fails on OVERFLOW
+# (iter_skip_strict.go:10-59, iter_float.go:186-204 @ jsoniter v1.1.12).  So an
+# ignored 1e999 is 400 there and an ignored 400-digit integer is 204, and a
+# decoder that captured the value as raw text without applying this would agree
+# about depth while quietly accepting what upstream refuses.  The `-int` row is
+# the discriminator: same magnitude, no exponent, never evaluated.
+for _name, _value in (("overflow", "1e999"),
+                      ("at-max", "1.7976931348623157e308"),
+                      ("past-max", "1.7976931348623159e308"),
+                      ("underflow", "1e-999"),
+                      ("int", "9" * 400),
+                      ("nested", "[[[1e999]]]")):
+    case("json/ignored-number-%s" % _name, "json",
+         ('{"streams":[' + _win + '],"junk":' + _value + "}").encode(), "application/json")
 
 # ---- Loki push, protobuf -------------------------------------------------
 def pb(labels, line="hi"):
@@ -843,8 +876,36 @@ def trim(s, n=100000):
     `bbbb...`.  The squash lives here, in the harness, so that a fresh run
     reproduces the checked-in transcript's bodies rather than a
     differently-post-processed copy of them.
+
+    Two things upstream puts in a body are not a function of the request, and
+    both are normalized here so that a fresh run reproduces the checked-in
+    transcript BYTE FOR BYTE -- which is what the reproduce recipe in the
+    transcript's preamble asks a reader to check.  Each is a reordering or an
+    elision of what the server sent, never an edit of it, and each is applied
+    to both sides.  No verdict depends on either: verdicts are statuses.
+
+    1. A body reporting several DISTINCT validation failures groups them as
+       `N errors like: ...; M errors like: ...`, built from a Go map whose
+       iteration order is deliberately randomized -- so the same request comes
+       back with the groups in either order (40 sends of
+       json/two-distinct-failures gave 39 of one order and 1 of the other).
+       Sorted.
+    2. A jsoniter decode error appends `error found in #N byte of ...|<window>
+       |..., bigger context ...`, where the window and the offset into it are
+       positions in the CURRENT READ BUFFER -- so they move with however the
+       body happened to be chunked over the wire (measured: #10 in one run and
+       #9 in the next, same request).  Elided.  14 of the recorded bodies carry
+       one; the message before it, which is the part that says what upstream
+       objected to, is kept in full.
     """
     s = s.replace("\n", "\\n")
+    groups = re.split(r"; (?=\d+ errors like: )", s)
+    if len(groups) > 1 and re.match(r"\d+ errors like: ", groups[0]):
+        trailer = "\\n" if s.endswith("\\n") else ""
+        groups[-1] = groups[-1][: len(groups[-1]) - len(trailer)]
+        s = "; ".join(sorted(groups)) + trailer
+    s = re.sub(r"error found in #\d+ byte of .*?(?=(?:\\n)?$)",
+               "error found in #<n> byte of <parser window elided>", s)
     s = re.sub(r"([A-Za-z0-9])\1{99,}", lambda m: f"<{m.group(1)}x{len(m.group(0))}>", s)
     return s if len(s) <= n else s[:n] + f"…[{len(s)} bytes]"
 

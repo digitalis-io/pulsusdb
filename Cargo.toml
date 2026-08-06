@@ -66,7 +66,12 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 # port was needed.
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ch_cityhash102 = "0.1"
-serde_json = "1"
+# `raw_value` is a feature of serde_json itself and pulls in no further
+# dependency. The Loki JSON push decoder uses it to capture a value it discards
+# as borrowed text, so the reference's own nesting bound can be applied to it
+# rather than the crate's fixed 128-level `RECURSION_LIMIT` (issue #374,
+# `loki_push::DrainedAny`).
+serde_json = { version = "1", features = ["raw_value"] }
 
 # OTLP logs (issue #8), metrics (issue #27), and traces (issue #54)
 # receivers. `opentelemetry-proto` supplies `prost`-generated OTLP message

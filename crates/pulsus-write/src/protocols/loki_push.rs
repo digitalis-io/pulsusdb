@@ -972,12 +972,12 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
 /// the reference answers `204` (issue #374 round 11).
 ///
 /// Past the cap the remainder is **parsed and discarded, not skipped**: the
-/// same type rules, the same message text and the same 128-level depth ceiling
-/// apply to it as to what was retained (the `Drained*` group at the bottom of
-/// this module), so crossing a cap cannot turn checking off. What stops is
+/// same type rules, the same message text and the same nesting ceiling apply to
+/// it as to what was retained (the `Drained*` group at the bottom of this
+/// module), so crossing a cap cannot turn checking off. What stops is
 /// retention: a drained run's own peak is one element — one `JsonEntry`, one
-/// `(key, value)` pair's worth of parse scratch, one nesting chain of at most
-/// 128 `Deserialize` frames — dropped before the next is read. That peak is
+/// `(key, value)` pair's worth of parse scratch, one borrowed slice of the body
+/// for a value of arbitrary shape — dropped before the next is read. That peak is
 /// bounded by [`MAX_STREAMS_PER_REQUEST`]` + 1` streams and, per stream,
 /// [`MAX_ENTRIES_PER_STREAM`]` + 1` entries of RETAINED material plus one
 /// in-flight element; the input itself is bounded before decode by the 64 MiB
@@ -1535,7 +1535,9 @@ impl<'de> serde::Deserialize<'de> for JsonPush {
                             .unwrap_or_default(),
                         );
                     } else {
-                        map.next_value::<DrainedAny>()?;
+                        map.next_value_seed(DrainedAny {
+                            open_containers: OPEN_CONTAINERS_AT_ENVELOPE_KEY,
+                        })?;
                     }
                 }
                 Ok(JsonPush {
@@ -1776,7 +1778,9 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
                             }
                         }
                         _ => {
-                            map.next_value::<DrainedAny>()?;
+                            map.next_value_seed(DrainedAny {
+                                open_containers: OPEN_CONTAINERS_INSIDE_STREAM,
+                            })?;
                         }
                     }
                 }
@@ -2089,7 +2093,12 @@ impl<'de> serde::Deserialize<'de> for JsonEntry {
                     .unwrap_or_default();
                 // Parse-and-discard any trailing element beyond the third:
                 // checked like every other value, retained nowhere.
-                while seq.next_element::<DrainedAny>()?.is_some() {}
+                while seq
+                    .next_element_seed(DrainedAny {
+                        open_containers: OPEN_CONTAINERS_INSIDE_ENTRY,
+                    })?
+                    .is_some()
+                {}
                 Ok(JsonEntry {
                     timestamp,
                     line,
@@ -2131,101 +2140,183 @@ impl<'de> serde::Deserialize<'de> for JsonEntry {
 //
 // The reference checks a discarded value for the same reason: jsoniter decodes
 // every occurrence of a repeated field in full before the last one wins
-// (`reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`), a stream object
-// reaches its hand-written unmarshaler only after `iter.Skip()` has walked it,
-// and that walk carries jsoniter's own depth bound (`maxDepth = 10000`,
-// `iter.go:331-338`, error `exceeded max depth`; measured: depth 10,000 is
-// `204` upstream, 10,001 is `400`).
+// (`reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`), and a stream object
+// reaches its hand-written unmarshaler only after `iter.Skip()` has walked it.
+//
+// Depth is the one thing a discarded value is NOT checked for by the same
+// mechanism as a retained one, and deliberately so. `serde_json`'s ceiling is a
+// fixed 128 and cannot be raised, so recursing a value of arbitrary shape
+// through `Deserialize` — round 12's fix — refused 127..9,999 levels the
+// reference accepts and stores (measured on both servers). [`DrainedAny`]
+// therefore captures such a value as raw text and charges its nesting against
+// the reference's own bound, [`MAX_JSON_NESTING_DEPTH`]; the typed drains keep
+// serde's 128, which nothing legal reaches, because a container in any of their
+// positions is a type error before its depth is looked at.
 
-/// Parse-and-discard for a JSON value of any shape.
+/// The nesting ceiling for a JSON push body, counted the way the reference
+/// counts: every container open at once, from the top of the body, and the
+/// 10,001st is refused. Upstream's is `maxDepth = 10000`, checked by
+/// `incrementDepth` (`vendor/github.com/json-iterator/go/iter.go:331-338 @
+/// jsoniter v1.1.12`, error `exceeded max depth`), and this is that number
+/// rather than a number of ours.
+const MAX_JSON_NESTING_DEPTH: u32 = 10_000;
+
+// Containers already open ABOVE a discarded value, in the reference's
+// accounting — which is not simply "how many brackets are to the left of it",
+// because two of the four levels a Loki push nests through do not count:
+//
+// - the push envelope object DOES count: `loghttp.PushRequest` is decoded by
+//   jsoniter's `oneFieldStructDecoder`, which increments
+//   (`reflect_struct_decoder.go:574-594 @ jsoniter v1.1.12`);
+// - the `streams` ARRAY does NOT: `sliceDecoder::Decode` never calls
+//   `incrementDepth` (`reflect_slice.go:59-99`);
+// - the stream object and everything under it DO: `LogProtoStream` has an
+//   `UnmarshalJSON` (`pkg/loghttp/query.go:99-121 @ loki v3.7.4`), so jsoniter
+//   reaches it through `unmarshalerDecoder`, whose `SkipAndReturnBytes`
+//   (`reflect_marshaler.go:192`) walks the whole object with `iter.Skip()` →
+//   `ReadObjectCB` / `ReadArrayCB`, both of which increment
+//   (`iter_skip_strict.go:85-99`, `iter_object.go:115`, `iter_array.go:31`).
+//   The hand-written unmarshaler's own second pass is `jsonparser`, which
+//   counts nothing — the skip is where the bound lives.
+//
+// Bisected against `grafana/loki@sha256:87f0a067…` in all three positions:
+// accepted at 9,999 / 9,998 / 9,996 and refused one deeper, which is exactly
+// `MAX_JSON_NESTING_DEPTH` minus each constant below (issue #374 round 14).
+
+/// Under an unknown key of the push envelope: the envelope object.
+const OPEN_CONTAINERS_AT_ENVELOPE_KEY: u32 = 1;
+/// Under an unknown key inside a stream object: the envelope object and the
+/// stream object (the `streams` array between them does not count).
+const OPEN_CONTAINERS_INSIDE_STREAM: u32 = 2;
+/// At an entry's fourth-and-later element: those two plus the `values` array
+/// and the entry array.
+const OPEN_CONTAINERS_INSIDE_ENTRY: u32 = 4;
+
+/// Parse-and-discard for a JSON value of any shape — the value under a key
+/// this decoder does not read.
 ///
-/// Retains nothing at all — not even a scalar's bytes — while still failing on
-/// malformed JSON and, through `serde_json`'s `RECURSION_LIMIT`, on nesting
-/// past 128 levels. That ceiling is the same one every typed value in this
-/// decoder already has, which is the point: it is now the body's ONE depth
-/// rule rather than a rule with an ignored-value hole in it. It is tighter than
-/// the reference's 10,000 (residual 8 of the `ingest-label-bounds` ledger row);
-/// a legal Loki push nests six deep.
-struct DrainedAny;
+/// Captured as raw text and then scanned once, by [`check_ignored_value`], for
+/// the two things the reference's own skip still checks in a value nobody
+/// reads: nesting depth and out-of-range numbers. The capture is `serde_json`'s
+/// own `RawValue`, filled by `Deserializer::ignore_value` (`de.rs:1285-1292 @
+/// serde_json 1.0.150`) — the same bracket-matching walk `IgnoredAny` performs,
+/// so malformed JSON still fails at the same byte, no type is imposed on a
+/// value the reference does not type either, and nothing is retained:
+/// `parse_json` decodes from a slice, so the captured text borrows the request
+/// body and the scan keeps a `u32`.
+///
+/// The depth rule is [`MAX_JSON_NESTING_DEPTH`], the reference's, with
+/// `open_containers` carrying the levels already open above this value so the
+/// count is the whole body's. Recursing through `Deserialize` instead — which
+/// round 12 did, to close the hole `IgnoredAny` left — put these values under
+/// `serde_json`'s FIXED 128-level `RECURSION_LIMIT` (`de.rs:63,1375`) and so
+/// refused 127..9,999 levels the reference accepts and stores (issue #374
+/// round 14). Typed values keep that 128 ceiling, which nothing legal reaches:
+/// arbitrary shape is only legal where a `Drained*` sits, and every other
+/// position rejects a container on its type before its depth matters.
+struct DrainedAny {
+    open_containers: u32,
+}
 
-impl<'de> serde::Deserialize<'de> for DrainedAny {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl<'de> serde::de::DeserializeSeed<'de> for DrainedAny {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        struct AnyVisitor;
-        impl<'de> serde::de::Visitor<'de> for AnyVisitor {
-            type Value = DrainedAny;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("any JSON value")
-            }
-
-            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_i128<E: serde::de::Error>(self, _: i128) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_u128<E: serde::de::Error>(self, _: u128) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_bytes<E: serde::de::Error>(self, _: &[u8]) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(DrainedAny)
-            }
-
-            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                serde::Deserialize::deserialize(deserializer)
-            }
-
-            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                serde::Deserialize::deserialize(deserializer)
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                // Recursing through `Deserialize` rather than skipping is what
-                // puts every level under `serde_json`'s depth counter.
-                while seq.next_element::<DrainedAny>()?.is_some() {}
-                Ok(DrainedAny)
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                while map.next_entry::<DrainedString, DrainedAny>()?.is_some() {}
-                Ok(DrainedAny)
-            }
-        }
-        deserializer.deserialize_any(AnyVisitor)
+        let raw = <&serde_json::value::RawValue as serde::Deserialize>::deserialize(deserializer)?;
+        check_ignored_value(raw.get(), self.open_containers)
     }
+}
+
+/// Applies the two rules the reference's SKIP applies to a value nobody reads:
+/// nesting against [`MAX_JSON_NESTING_DEPTH`], starting from the
+/// `open_containers` levels already open above this one, and the number rule
+/// below.
+///
+/// `raw` has already been validated as one well-formed JSON value by the
+/// capture that produced it, so this is a byte scan and not a parser: brackets
+/// balance, strings terminate, and the only thing that can hide a `[` is a
+/// string, which is why the scan tracks quoting and escaping. Iterative by
+/// construction — a body may nest far deeper than this ceiling and must be
+/// refused rather than overflow the stack finding out.
+fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> Result<(), E> {
+    let bytes = raw.as_bytes();
+    let mut depth = open_containers;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > MAX_JSON_NESTING_DEPTH {
+                    return Err(serde::de::Error::custom(format!(
+                        "exceeded max depth ({MAX_JSON_NESTING_DEPTH})"
+                    )));
+                }
+                i += 1;
+            }
+            // Saturating rather than `- 1` only because a scan should not
+            // depend on the capture's balance for its own soundness.
+            b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'+' | b'-' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                check_ignored_number(&raw[start..i])?;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+/// The reference's rule for a NUMBER inside a value it skips, which is not
+/// "any JSON number is fine": jsoniter's `trySkipNumber` walks over a run of
+/// digits with at most one dot and skips it unevaluated, but anything else —
+/// an exponent, in practice — makes it hand the token to `ReadFloat64`
+/// (`iter_skip_strict.go:10-21,23-59 @ jsoniter v1.1.12`), whose slow path is
+/// `strconv.ParseFloat(str, 64)` (`iter_float.go:186-204`). Go returns
+/// `ErrRange` there only for OVERFLOW, and the `ReadBigFloat` retry that
+/// follows re-reads an already-consumed buffer and reports `readNumberAsString:
+/// invalid number` — so a skipped `1e999` is a `400` upstream while a skipped
+/// 400-digit integer, which never leaves the fast path, is a `204`.
+///
+/// Measured on `grafana/loki@sha256:87f0a067…` under an unknown envelope key
+/// (issue #374 round 14): `1e999`, `1e309`, `-1e309` and
+/// `1.7976931348623159e308` are `400`; `1e308`, `1.7976931348623157e308`,
+/// `1e-999`, `5e-324`, `0e999`, 400 nines and `12345678901234567890` are `204`.
+/// Underflow is accepted on both sides because Go's `floatBits` raises its
+/// overflow flag only upward, and Rust's `f64` parse likewise yields a finite
+/// zero rather than an error.
+fn check_ignored_number<E: serde::de::Error>(token: &str) -> Result<(), E> {
+    let magnitude = token.strip_prefix('-').unwrap_or(token);
+    if magnitude.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && magnitude.bytes().filter(|b| *b == b'.').count() <= 1
+    {
+        return Ok(());
+    }
+    // A parse failure is unreachable: the capture already validated this token
+    // as a JSON number, and every JSON number parses. Inventing a rejection for
+    // it would be a rejection the reference does not have.
+    if token.parse::<f64>().is_ok_and(|value| !value.is_finite()) {
+        return Err(serde::de::Error::custom("invalid number"));
+    }
+    Ok(())
 }
 
 /// Parse-and-discard for a JSON string, with `String`'s accept surface and
@@ -2291,7 +2382,9 @@ impl<'de> serde::Deserialize<'de> for DrainedStream {
                             map.next_value::<Option<DrainedValues>>()?;
                         }
                         _ => {
-                            map.next_value::<DrainedAny>()?;
+                            map.next_value_seed(DrainedAny {
+                                open_containers: OPEN_CONTAINERS_INSIDE_STREAM,
+                            })?;
                         }
                     }
                 }
@@ -3714,24 +3807,34 @@ mod tests {
         }
     }
 
-    /// One nesting ceiling for the whole body, with no ignored-value hole in it.
+    /// One nesting ceiling for the whole body, at the reference's number and in
+    /// the reference's units.
     ///
     /// `serde_json` bounds typed deserialization at 128 levels
     /// (`RECURSION_LIMIT`, `de.rs:63,1375 @ 1.0.150`) but implements
     /// `IgnoredAny` as an ITERATIVE skip that the counter never sees, so before
     /// round 12 a value under a key this decoder does not read — or past a cap —
-    /// could nest arbitrarily deep. The reference bounds exactly these values
-    /// too: jsoniter walks a stream object with `iter.Skip()` before its
-    /// unmarshaler ever runs, under `maxDepth = 10000` (`iter.go:331-338 @
-    /// jsoniter v1.1.12`, error `exceeded max depth`). Measured: a 200,000-level
-    /// nest under an unknown envelope key, under an unknown key inside a stream,
-    /// and as an entry's fourth element was `400` upstream and `204` here.
+    /// could nest arbitrarily deep. Recursing it through `Deserialize` instead
+    /// (round 12) closed that hole by imposing 128 on it, which over-refused:
+    /// upstream stores those bodies up to `maxDepth = 10000` (`iter.go:331-338
+    /// @ jsoniter v1.1.12`, error `exceeded max depth`).
     ///
-    /// Ours is the tighter ceiling (128 against 10,000; a legal push nests six),
-    /// so 129..10,000 is a recorded divergence — residual 8 of the
-    /// `ingest-label-bounds` ledger row — not a claim of parity.
+    /// So the boundary is asserted at upstream's number, per position and to the
+    /// level — bisected on `grafana/loki@sha256:87f0a067…` at 9,999 / 9,998 /
+    /// 9,996 accepted and one deeper refused. The offsets are not decoration:
+    /// they are what the reference counts, and reading them off its decoders
+    /// (`reflect_slice.go` increments nothing, so the `streams` array is free;
+    /// `iter.Skip()` walks the stream object, so everything under it is not)
+    /// is the difference between matching the rule and matching one example of
+    /// it. A single global constant here would be wrong in two of the four
+    /// positions.
     #[test]
-    fn parse_json_bounds_nesting_depth_in_ignored_and_drained_values() {
+    fn parse_json_bounds_nesting_depth_at_the_references_ceiling() {
+        /// One position a value of arbitrary shape can reach: its name, the
+        /// deepest nest MEASURED as accepted upstream there, and a builder that
+        /// puts a given nest in it.
+        type DepthPosition<'a> = (&'static str, usize, Box<dyn Fn(&str) -> String + 'a>);
+
         let nest = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
         let entry = r#"["1700000000000000000","x"]"#;
         let win = r#"{"stream":{"app":"w"},"values":[["1700000000000000000","final"]]}"#;
@@ -3743,51 +3846,184 @@ mod tests {
             entries.push_str(entry);
         }
 
-        // Every position a value of arbitrary shape can legally reach: the two
-        // unknown-key arms and an entry's fourth element — the last one both
-        // inside a RETAINED entry and inside a drained one, which is the arm the
-        // cap deferral introduced.
-        let position = |depth: usize| {
-            let deep = nest(depth);
-            [
-                (
-                    "unknown envelope key",
-                    format!(r#"{{"streams":[{win}],"junk":{deep}}}"#),
-                ),
-                (
-                    "unknown key inside a stream",
+        // Every position a value of arbitrary shape can legally reach, with the
+        // deepest nest MEASURED as accepted there — the two unknown-key arms and
+        // an entry's fourth element, the last one both inside a RETAINED entry
+        // and inside a drained one, which is the arm the cap deferral
+        // introduced. The three numbers are literals from the bisection against
+        // upstream, not `MAX_JSON_NESTING_DEPTH` minus a constant of ours: a
+        // test that computed them the way the decoder does would agree with the
+        // decoder about a wrong offset.
+        let positions: [DepthPosition; 4] = [
+            (
+                "unknown envelope key",
+                9_999,
+                Box::new(|deep| format!(r#"{{"streams":[{win}],"junk":{deep}}}"#)),
+            ),
+            (
+                "unknown key inside a stream",
+                9_998,
+                Box::new(|deep| {
                     format!(
                         r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[{entry}],"junk":{deep}}}]}}"#
-                    ),
-                ),
-                (
-                    "an entry's fourth element",
+                    )
+                }),
+            ),
+            (
+                "an entry's fourth element",
+                9_996,
+                Box::new(|deep| {
                     format!(
                         r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{{}},{deep}]]}}]}}"#
-                    ),
-                ),
-                (
-                    // Superseded, so that at 64 levels the request is accepted
-                    // rather than refused by the entries cap itself — the depth
-                    // ceiling is then the only thing that can refuse it at 200.
-                    "an entry's fourth element, past the entries cap",
+                    )
+                }),
+            ),
+            (
+                // Superseded, so that the request is accepted at the ceiling
+                // rather than refused by the entries cap itself — depth is then
+                // the only thing that can refuse it above.
+                "an entry's fourth element, past the entries cap",
+                9_996,
+                Box::new(|deep| {
                     format!(
                         r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[{entries},["1700000000000000000","x",{{}},{deep}]],"values":[{entry}]}}]}}"#
-                    ),
-                ),
-            ]
-        };
+                    )
+                }),
+            ),
+        ];
 
-        for (position, body) in position(64) {
-            parse_json(body.as_bytes(), 0)
+        for (position, deepest_accepted, body) in positions {
+            parse_json(body(&nest(deepest_accepted)).as_bytes(), 0).unwrap_or_else(|e| {
+                panic!("{position}: {deepest_accepted} levels are accepted upstream: {e}")
+            });
+            let err = json_loki_decode_message(&body(&nest(deepest_accepted + 1)));
+            assert!(
+                err.contains("exceeded max depth"),
+                "{position}: {} levels are refused upstream, got {err:?}",
+                deepest_accepted + 1
+            );
+            // The ceiling is not what refuses an ordinary push: a legal one
+            // nests six, and a discarded value of ordinary depth still decodes.
+            parse_json(body(&nest(64)).as_bytes(), 0)
                 .unwrap_or_else(|e| panic!("{position}: 64 levels must decode: {e}"));
         }
-        for (position, body) in position(200) {
-            let err = json_loki_decode_message(&body);
-            assert!(
-                err.contains("recursion limit exceeded"),
-                "{position}: 200 levels must be refused by the depth ceiling, got {err:?}"
-            );
+    }
+
+    /// A discarded value is still SYNTAX, and the capture that carries it past
+    /// serde's recursion limit must not carry it past that.
+    ///
+    /// [`DrainedAny`] no longer walks the value through `Deserialize`; it takes
+    /// `serde_json`'s raw capture, which is `Deserializer::ignore_value` —
+    /// exactly what `IgnoredAny` was — so malformed JSON under an ignored key
+    /// still fails, and a string full of brackets is a string rather than 200
+    /// levels of nesting. Both are what the byte scan in
+    /// [`check_ignored_value`] could plausibly get wrong.
+    #[test]
+    fn parse_json_a_discarded_value_is_still_syntax_checked_and_strings_are_not_nesting() {
+        let win = r#"{"stream":{"app":"w"},"values":[["1700000000000000000","final"]]}"#;
+        for junk in [r#"{"a":}"#, "[1,]", "tru", r#"{"a" 1}"#, "01"] {
+            let body = format!(r#"{{"streams":[{win}],"junk":{junk}}}"#);
+            parse_json(body.as_bytes(), 0)
+                .expect_err(&format!("malformed ignored value {junk:?} must be refused"));
+        }
+        // 200,000 brackets, none of them nesting: a quoted string, an escaped
+        // quote inside one, and a `\\` that ends the escape rather than
+        // starting one. (`\\` also has to end the escape for the SCAN, or the
+        // closing quote after it is read as escaped and the rest of the body
+        // disappears into a string.)
+        let brackets = "[".repeat(200_000);
+        for junk in [
+            format!(r#""{brackets}""#),
+            format!(r#""\"{brackets}""#),
+            format!(r#"["a\\","{brackets}"]"#),
+        ] {
+            let body = format!(r#"{{"streams":[{win}],"junk":{junk}}}"#);
+            parse_json(body.as_bytes(), 0)
+                .unwrap_or_else(|e| panic!("brackets inside a string are not depth: {e}"));
+        }
+    }
+
+    /// A number inside a discarded value is not simply skipped either.
+    ///
+    /// Capturing the value as raw text rather than deserializing it means
+    /// nothing evaluates the numbers in it — and the reference DOES evaluate
+    /// some of them: `trySkipNumber` skips a run of digits with at most one dot
+    /// unevaluated, and hands anything else (an exponent, in practice) to
+    /// `ParseFloat`, which fails on overflow (`iter_skip_strict.go:10-59`,
+    /// `iter_float.go:186-204 @ jsoniter v1.1.12`). So a discarded `1e999` is a
+    /// `400` upstream while a discarded 400-digit integer is a `204`, and
+    /// closing the depth over-rejection without this would have opened an
+    /// acceptance one in its place.
+    ///
+    /// Every row measured on `grafana/loki@sha256:87f0a067…` under an unknown
+    /// envelope key (issue #374 round 14) — including the pair either side of
+    /// `f64::MAX`, which is where "overflow" is actually decided, and the
+    /// underflow rows, which are accepted on both sides for the same reason.
+    #[test]
+    fn parse_json_a_discarded_number_follows_the_references_overflow_rule() {
+        const WIN: &str = r#"{"stream":{"app":"w"},"values":[["1700000000000000000","final"]]}"#;
+        let refused = [
+            "1e999",
+            "1e309",
+            "-1e309",
+            "1.7976931348623159e308",
+            "1e1000000000000000000000",
+        ];
+        // 400 nines is the row that makes the fast path part of the rule
+        // rather than decoration: it overflows `f64` and upstream stores it,
+        // because a run of digits with no exponent is never evaluated at all.
+        // A decoder that range-checked EVERY number would pass every other row
+        // here and fail this one.
+        let digits_400 = "9".repeat(400);
+        let accepted = [
+            "1e308",
+            "1.7976931348623157e308",
+            "1e-999",
+            "5e-324",
+            "0e999",
+            "-0e999",
+            "12345678901234567890",
+            "1.5e3",
+            digits_400.as_str(),
+            "-0.0",
+        ];
+        /// One position an ignored value can sit in: its name, and a builder
+        /// that puts a given value there.
+        type NumberPosition = (&'static str, fn(&str) -> String);
+
+        let positions: [NumberPosition; 3] = [
+            ("unknown envelope key", |junk| {
+                format!(r#"{{"streams":[{WIN}],"junk":{junk}}}"#)
+            }),
+            ("unknown key inside a stream", |junk| {
+                format!(
+                    r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x"]],"junk":{junk}}}]}}"#
+                )
+            }),
+            ("an entry's fourth element", |junk| {
+                format!(
+                    r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{{}},{junk}]]}}]}}"#
+                )
+            }),
+        ];
+
+        for (position, body) in positions {
+            for number in refused {
+                let err = json_loki_decode_message(&body(number));
+                assert!(
+                    err.contains("invalid number"),
+                    "{position}: {number} is refused upstream, got {err:?}"
+                );
+            }
+            for number in accepted {
+                parse_json(body(number).as_bytes(), 0).unwrap_or_else(|e| {
+                    panic!("{position}: {number} is accepted upstream and stored: {e}")
+                });
+            }
+            // A deep value's numbers are checked too, not just a shallow one's.
+            let nested = format!("[[[{}]]]", refused[0]);
+            let err = json_loki_decode_message(&body(&nested));
+            assert!(err.contains("invalid number"), "{position} nested: {err:?}");
         }
     }
 

@@ -1940,13 +1940,31 @@ back up here.
   producing the same message) by
   `loki_push::tests::parse_json_a_drained_value_is_checked_exactly_like_a_retained_one`,
   and on the wire by the `json/drained-*` harness cases.
+  **The same applies to a value under a key neither side reads**, and there
+  the checks are the reference's SKIP's rather than a type's: nesting depth
+  (residual 8) and out-of-range numbers. Upstream's `trySkipNumber` walks a
+  run of digits with at most one dot and skips it unevaluated, but hands
+  anything else — an exponent, in practice — to `ParseFloat`, which fails on
+  OVERFLOW (`iter_skip_strict.go:10-59`, `iter_float.go:186-204 @ jsoniter
+  v1.1.12`), so an ignored `1e999` is `400` there while an ignored 400-digit
+  integer is `204`. Round 12 matched that by accident, because `serde`
+  evaluated every number it walked; round 14, which reads such a value as
+  raw text instead, applies the rule explicitly rather than inheriting it —
+  the two are told apart by `json/ignored-number-int` against
+  `json/ignored-number-overflow`, and by
+  `loki_push::tests::parse_json_a_discarded_number_follows_the_references_overflow_rule`,
+  whose rows are measured in each of the three positions.
 - **Multi-failure bodies** are grouped as `util.GroupedErrors.Error()`
   groups them (`pkg/util/errors.go:105-131 @ v3.7.4`): identical messages
   collapsed with an `N errors like: ` prefix, distinct groups joined with
   `"; "`, a lone failure rendered bare. Group ORDER is a Go map walk
   upstream and therefore deliberately randomized; ours is first-seen.
   There is no byte-reproducible upstream body to match for more than one
-  distinct failure, only the format.
+  distinct failure, only the format — 40 sends of one such request returned
+  two orderings, 36 and 4. The transcript sorts the groups for exactly that
+  reason, in `compare.py`'s `trim`, so that its stated reproduce recipe
+  ("diff empty") holds; the sort is applied to both sides and cannot reach a
+  verdict, which is a status.
 - **Residual 1 — the rendered label set inside the message.** Every one of
   the four messages interpolates the stream's label set, and the
   reference's copy carries a `service_name` label its own push parser
@@ -2101,37 +2119,62 @@ back up here.
   `MAX_STREAMS_PER_REQUEST + 1` streams, `MAX_ENTRIES_PER_STREAM + 1`
   entries per stream, `MAX_STRUCTURED_METADATA_PER_ENTRY + 1` pairs per
   entry — plus ONE in-flight element being read and dropped, and the input
-  is bounded before decode by the 64 MiB decompressed body cap. The
-  `IgnoredAny` drain this replaced could not say that: `ignore_value` grows
-  a scratch `Vec` by one byte per open bracket with no depth bound at all,
-  so a discarded 200,000-level value moved subject RSS by ~800 kB. After
-  the change the same body is refused by the depth ceiling (residual 8) and
-  five repetitions of it leave RSS unmoved (49,160 kB before and after,
-  measured on the same process).
-- **Residual 8 — the JSON body's nesting ceiling is 128 levels, not
-  10,000.** Nesting of arbitrary depth reaches only values this decoder
-  does not keep: a key it does not read (an unknown envelope key, an
+  is bounded before decode by the 64 MiB decompressed body cap. A value of
+  arbitrary shape costs even less: it is captured as a BORROWED slice of the
+  request body and scanned for nesting with a counter (residual 8), so the
+  only memory it costs is the body it is already part of.
+  **What RSS can and cannot show about that.** It is too coarse an
+  instrument for this claim, and an earlier round of this issue over-read
+  it. Measured on a freshly started subject: five 400 kB, 200,000-level
+  bodies — all refused — took RSS from 30,824 kB to 36,412 kB, and the next
+  five ORDINARY pushes took it back DOWN to 35,720 kB. That is a few MB of
+  allocator churn in both directions, neither a retained cost nor a leak;
+  the earlier round read a flat pair of numbers off one long-warmed process
+  and reported the absolute figure as though it were a property of the
+  change. What is bounded is bounded structurally, above, and does not rest
+  on an RSS sample.
+- **Residual 8 — CLOSED in round 14; kept for the record because the
+  numbering is cited elsewhere.** For one round the JSON body's nesting
+  ceiling was 128 levels rather than the reference's 10,000, and that was an
+  over-rejection of ours: bodies the reference accepts and STORES were
+  refused here. Nesting of arbitrary depth reaches only values this decoder
+  does not keep — a key it does not read (an unknown envelope key, an
   unknown key inside a stream object, an entry's fourth+ element) or a run
-  past one of the caps above. All of them are now deserialized through
-  `serde`, which puts them under `serde_json`'s `RECURSION_LIMIT` of 128
-  (`de.rs:63,1375 @ 1.0.150`) — the ceiling every typed value in the body
-  already had, so this is one rule for the whole body rather than a rule
-  with a hole in it. The reference bounds the same values at 10,000:
-  jsoniter walks a stream object with `iter.Skip()` before the hand-written
-  unmarshaler ever runs, under `maxDepth = 10000` (`iter.go:331-338 @
-  jsoniter v1.1.12`, vendored), answering `400 … incrementDepth: exceeded
-  max depth`. Both boundaries measured by bisection on
-  `{"streams":[…],"junk":<N-deep array>}`: PulsusDB accepts 126 and refuses
-  127 (`recursion limit exceeded`), Loki accepts 9,999 and refuses 10,000 —
-  both being "total nesting ≤ ceiling", the envelope object counting as one
-  level. So 127..9,999 levels under an ignored key is `400` here and `204`
-  there. A legal Loki push nests six deep, and the alternative was the
-  `IgnoredAny` skip, which had no ceiling at all: a 200,000-level value was
-  `204` here against upstream's `400`, and the depth cap is a resource
-  guard, not a parity rule. Harness: the `json/ignored-depth-*` cases,
-  which carry both boundaries; hermetically,
-  `loki_push::tests::parse_json_bounds_nesting_depth_in_ignored_and_drained_values`
-  covers every position such a value can reach.
+  past one of the caps above. Round 12 deserialized all of them through
+  `serde`, which put them under `serde_json`'s `RECURSION_LIMIT` of 128
+  (`de.rs:63,1375 @ 1.0.150`); that constant is fixed and cannot be raised,
+  so 127..9,999 levels under an ignored key was `400` here and `204` there
+  (bisected on both servers: we accepted 126, upstream accepted 9,999).
+  Round 14 charges depth against **the reference's own bound** instead. A
+  value of arbitrary shape is captured as raw text — `serde_json`'s
+  `RawValue`, filled by the same `Deserializer::ignore_value` walk
+  `IgnoredAny` used, so syntax is still checked and nothing is retained —
+  and its nesting is charged against `maxDepth = 10000` (`iter.go:331-338 @
+  jsoniter v1.1.12`, vendored, error `exceeded max depth`), its numbers
+  against the reference's own skip-time overflow rule (the bullet above).
+  Typed values
+  keep serde's 128, which nothing legal reaches: a container in any of those
+  positions is a type error before its depth is looked at.
+  **What upstream counts is not the brackets to the left of the value**, and
+  reading that off its decoders rather than off one measured example is what
+  makes this parity rather than a coincidence at one position. The envelope
+  object counts (`oneFieldStructDecoder` increments,
+  `reflect_struct_decoder.go:574-594`); the `streams` ARRAY does not
+  (`sliceDecoder` never increments, `reflect_slice.go:59-99`); the stream
+  object and everything under it do, because `LogProtoStream` has an
+  `UnmarshalJSON` (`pkg/loghttp/query.go:99 @ v3.7.4`) that jsoniter reaches
+  through `unmarshalerDecoder`/`SkipAndReturnBytes`, whose `iter.Skip()`
+  walks the object with `ReadObjectCB`/`ReadArrayCB`
+  (`iter_skip_strict.go:85-99`). So the deepest ACCEPTED nest is 9,999 under
+  an unknown envelope key, 9,998 under an unknown key inside a stream and
+  9,996 as an entry's fourth element — all six boundaries bisected against
+  the two servers, all six now agreeing. Harness: the `json/ignored-depth-*`
+  cases, three positions × (deepest accepted, first refused, 200,000) plus
+  126/127; hermetically,
+  `loki_push::tests::parse_json_bounds_nesting_depth_at_the_references_ceiling`
+  asserts those literals, and
+  `loki_push::tests::parse_json_a_discarded_value_is_still_syntax_checked_and_strings_are_not_nesting`
+  pins what the byte scan must not confuse for nesting.
 - **Residual 9 — a non-string value in a `stream` label map.** Upstream does
   not type these: `LabelSet.UnmarshalJSON` runs
   `jsonparser.ParseString(val)` over the raw bytes of whatever the value is
@@ -2153,7 +2196,8 @@ back up here.
   byte-identically to `grafana/loki@sha256:87f0a067…` and to a running
   PulsusDB, over both Loki-push encodings and both OTLP encodings. Statuses
   agree everywhere except residual 3's second half (in both its spellings)
-  and residuals 4, 5, 6, 7, 8 and 9, which the harness carries as expected
+  and residuals 4, 5, 6, 7 and 9 — residual 8 was closed in round 14 and its
+  rows are agreements now — which the harness carries as expected
   divergences so that they stay the ones that were recorded; the case,
   agreement and divergence counts are on
   `compare.py`'s generated summary line at the end of the transcript's

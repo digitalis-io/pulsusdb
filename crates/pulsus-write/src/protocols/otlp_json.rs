@@ -249,9 +249,13 @@ where
 /// incrementDepth: exceeded max depth` there (jsoniter's `maxDepth = 10000`).
 /// Nesting inside a KNOWN `AnyValue` is a different matter and is capped at 32
 /// by `AnyValueSeed`; this is the unknown-key path only. The Loki-push decoder
-/// closed the same hole by deserializing discarded values through `serde`
-/// (issue #374 round 12); doing it here is a rejection-surface change across
-/// both OTLP transports and is NOT done — flagged, not fixed.
+/// closed the same hole in `loki_push::DrainedAny`, which captures a discarded
+/// value as raw text and charges its nesting against the reference's own
+/// `maxDepth = 10000` (issue #374 rounds 12 and 14 — round 12 recursed it
+/// through `serde` instead and had to be corrected, because serde_json's fixed
+/// 128 refuses bodies the reference stores). Doing the same here is a
+/// rejection-surface change across both OTLP transports and is NOT done —
+/// flagged, not fixed.
 /// KNOWN scalar keys are still buffered (their values
 /// are bounded by the scalar field's own type) and replayed so the derive keeps
 /// enforcing duplicate-known-scalar rejection and every ADR-0004 leaf semantic.

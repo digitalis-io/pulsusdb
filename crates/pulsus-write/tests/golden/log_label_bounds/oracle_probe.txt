@@ -33,6 +33,20 @@ Reproduce (and check that the span still reproduces):
       | diff - fresh.txt                  # empty == the span reproduces
   # To regenerate, splice fresh.txt over that span; do NOT redirect over the
   # whole file, which would delete this preamble and the notes at the end.
+  #
+  # That diff is expected to be EMPTY, and two normalizations in compare.py's
+  # `trim` are what make it so -- both applied to both sides, neither able to
+  # change a verdict, because verdicts are statuses:
+  #   - a multi-failure body groups its failures in Go MAP order, which is
+  #     randomized (40 sends of json/two-distinct-failures returned two
+  #     orderings, 36 and 4), so the groups are sorted;
+  #   - a jsoniter decode error quotes a window of the request and an offset
+  #     into the CURRENT READ BUFFER, which move with how the body was chunked
+  #     over the wire (#10 in one run, #9 in the next, same request), so that
+  #     tail is elided. 14 bodies carry one; what upstream objected to is kept.
+  # Both were measured on this pin, and each is a reordering or an elision of
+  # what the server sent, never an edit of it. Two consecutive full runs of the
+  # harness diff empty; the checked-in span was captured from the first of them.
 
   No config file: the image's built-in single-binary config leaves every
   limit at its default, which is the point -- the numbers below are the flag
@@ -101,12 +115,36 @@ control. Hermetically the same thing is asserted as message EQUALITY across
 below-cap / past-cap / past-cap-and-superseded, by
 `loki_push::tests::parse_json_a_drained_value_is_checked_exactly_like_a_retained_one`.
 
-The `json/ignored-depth-*` group is the depth half of that, and the two
-ceilings differ: ours is serde_json's 128, the reference's is jsoniter's
-10,000. Both boundaries were bisected against these two servers rather than
-read off a constant, and both are carried here -- 126/127 for us, 9,999/10,000
-for it -- so the recorded divergence stays a NARROWER ceiling and cannot
-quietly become a missing one.
+The `json/ignored-depth-*` group is the depth half of that, and the ceiling is
+the reference's: jsoniter's maxDepth = 10000 (iter.go:331-338 @ v1.1.12).
+What that counts is NOT the brackets to the left of the value, which is why
+each row carries its own boundary literal and why a single constant would be
+wrong in two of the three positions: the envelope object counts
+(oneFieldStructDecoder increments, reflect_struct_decoder.go:574-594), the
+`streams` ARRAY does not (sliceDecoder never increments,
+reflect_slice.go:59-99), and the stream object and everything under it do,
+because LogProtoStream has an UnmarshalJSON (pkg/loghttp/query.go:99 @ v3.7.4)
+that jsoniter reaches through SkipAndReturnBytes, whose iter.Skip() walks the
+object with ReadObjectCB / ReadArrayCB (iter_skip_strict.go:85-99). So the
+deepest ACCEPTED nest is 9,999 under an unknown envelope key, 9,998 under an
+unknown key inside a stream and 9,996 as an entry's fourth element; each row
+is paired with the first level refused, all six bisected against these two
+servers rather than read off a constant. `-126` and `-127` are the shallow
+end: 127 was PulsusDB's own over-rejection until round 14 (serde_json's fixed
+RECURSION_LIMIT of 128), and both are now agreements. The three `-200000`
+rows keep the far-past-everything shape in each position, so a ceiling that
+went missing on one side could not pass as a ceiling that merely differs.
+
+The `json/ignored-number-*` group is there because depth is not the only thing
+upstream's skip still checks. `trySkipNumber` walks a run of digits with at
+most one dot and skips it unevaluated, but hands anything else -- an exponent,
+in practice -- to `ParseFloat`, which fails on OVERFLOW
+(iter_skip_strict.go:10-59, iter_float.go:186-204 @ jsoniter v1.1.12). So an
+ignored `1e999` is 400 there and an ignored 400-digit integer is 204. Reading
+a discarded value as raw text is what makes the depth rows above agree, and on
+its own it would have opened this hole in exchange -- `-int` is the row that
+tells the two apart, and `-at-max`/`-past-max` sit either side of `f64::MAX`,
+which is where "overflow" is actually decided.
 
 Several cases are large by design: `-streams-stream-count` and
 `drained-streams-non-object` carry 1,000,001 stream objects (3 MB),
@@ -125,15 +163,15 @@ shown as \n; OTLP bodies are google.rpc.Status protobufs, so the leading
 framing byte prints as a replacement character (Loki's carries only the
 message field; ours also carries `code = 3`, our OTLP-error convention).
 
-One recorded BODY is not reproducible, and the verdict table is unaffected:
-`json/two-distinct-failures` carries two upstream error groups, and group
-order there is a Go map walk -- deliberately randomized, as the ledger says --
-so that line can come back with the two groups swapped. Everything else in
-the span is deterministic. Cases whose reject quotes a window of the REQUEST
-back carry a fixed timestamp rather than `now` for exactly that reason (they
-are refused at decode, before a timestamp is looked at, so freshness cannot
-matter to them); the rows upstream accepts keep `now`. Two consecutive runs
-of the whole harness diffed empty when this span was captured.
+Every recorded body reproduces. Two things upstream puts in one are not a
+function of the request -- the order of a multi-failure body's error groups,
+and the read-buffer window a jsoniter decode error quotes -- and compare.py's
+`trim` sorts the first and elides the second; the reproduce recipe above says
+what was measured and why neither can move a verdict. A third, the request
+window quoted back in a reject, is handled in the CASES instead: those bodies
+carry a fixed timestamp rather than `now` (they are refused at decode, before
+a timestamp is looked at, so freshness cannot matter to them), while the rows
+upstream accepts keep `now`.
 
 case                                                       loki  pulsus  verdict  expected
 json/15-labels                                             204   204     SAME     SAME
@@ -208,13 +246,23 @@ json/drained-label-map-deep                                400   400     SAME   
 json/drained-label-map-deep-under-cap                      400   400     SAME     SAME
 json/drained-label-map-non-string                          204   400     DIFF     DIFF
 json/drained-label-map-non-string-under-cap                204   400     DIFF     DIFF
+json/ignored-depth-envelope-key-9999                       204   204     SAME     SAME
+json/ignored-depth-envelope-key-10000                      400   400     SAME     SAME
+json/ignored-depth-envelope-key-200000                     400   400     SAME     SAME
+json/ignored-depth-stream-key-9998                         204   204     SAME     SAME
+json/ignored-depth-stream-key-9999                         400   400     SAME     SAME
+json/ignored-depth-stream-key-200000                       400   400     SAME     SAME
+json/ignored-depth-entry-4th-element-9996                  204   204     SAME     SAME
+json/ignored-depth-entry-4th-element-9997                  400   400     SAME     SAME
+json/ignored-depth-entry-4th-element-200000                400   400     SAME     SAME
 json/ignored-depth-126                                     204   204     SAME     SAME
-json/ignored-depth-127                                     204   400     DIFF     DIFF
-json/ignored-depth-9999                                    204   400     DIFF     DIFF
-json/ignored-depth-10000                                   400   400     SAME     SAME
-json/ignored-depth-200000-envelope-key                     400   400     SAME     SAME
-json/ignored-depth-200000-stream-key                       400   400     SAME     SAME
-json/ignored-depth-200000-entry-4th-element                400   400     SAME     SAME
+json/ignored-depth-127                                     204   204     SAME     SAME
+json/ignored-number-overflow                               400   400     SAME     SAME
+json/ignored-number-at-max                                 204   204     SAME     SAME
+json/ignored-number-past-max                               400   400     SAME     SAME
+json/ignored-number-underflow                              204   204     SAME     SAME
+json/ignored-number-int                                    204   204     SAME     SAME
+json/ignored-number-nested                                 400   400     SAME     SAME
 pb/duplicate-distinct                                      400   400     SAME     SAME
 pb/257-nonempty                                            400   400     SAME     SAME
 pb/duplicate-identical                                     400   400     SAME     SAME
@@ -305,7 +353,7 @@ otlp/index-key-map-value-long-nested-value                 400   400     SAME   
 otlp/index-key-int-value                                   204   200     SAME     SAME
 otlp/index-key-array-value-long                            400   400     SAME     SAME
 
-status agreement: 155/168 (13 recorded divergence(s): ['json/65537-raw-empty-keys', 'json/duplicate-key-65537-raw', 'json/superseded-shared-budget', 'json/drained-label-map-non-string', 'json/drained-label-map-non-string-under-cap', 'json/ignored-depth-127', 'json/ignored-depth-9999', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
+status agreement: 167/178 (11 recorded divergence(s): ['json/65537-raw-empty-keys', 'json/duplicate-key-65537-raw', 'json/superseded-shared-budget', 'json/drained-label-map-non-string', 'json/drained-label-map-non-string-under-cap', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
 unexpected verdicts: []
 
 ====================================================================================================
@@ -375,8 +423,8 @@ bodies
     loki   400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
     pulsus 400: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'
 --- json/two-distinct-failures [SAME]
-    loki   400: 1 errors like: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'; 1 errors like: stream '{<ax1025>="v", service_name="unknown_service"}' has label name too long: '<ax1025>'\n
-    pulsus 400: 1 errors like: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'; 1 errors like: stream '{<ax1025>="v"}' has label name too long: '<ax1025>'
+    loki   400: 1 errors like: stream '{<ax1025>="v", service_name="unknown_service"}' has label name too long: '<ax1025>'; 1 errors like: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
+    pulsus 400: 1 errors like: stream '{<ax1025>="v"}' has label name too long: '<ax1025>'; 1 errors like: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'
 --- json/control-bytes-in-sibling-label [SAME]
     loki   400: stream '{app="<bx2049>", ctl="x\vy\fz\b", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
     pulsus 400: stream '{app="<bx2049>", ctl="x\vy\fz\b"}' has label value too long: '<bx2049>'
@@ -498,28 +546,28 @@ bodies
     loki   204: 
     pulsus 204: 
 --- json/drained-streams-non-object [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Value looks like object, but can't find closing '}' symbol, error found in #10 byte of ...|{},{},{},0],"Streams|..., bigger context ...|,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},0],"Streams":[{"stream":{"app":"w"},"values":[["170|...\n
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Value looks like object, but can't find closing '}' symbol, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid type: integer `0`, expected a Loki stream object with `stream` and `values` at line 1 column 3000016
 --- json/drained-streams-non-object-under-cap [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Value looks like object, but can't find closing '}' symbol, error found in #10 byte of ...|":[{},{},0],"Streams|..., bigger context ...|{"streams":[{},{},0],"Streams":[{"stream":{"app":"w"},"values":[["170|...\n
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Value looks like object, but can't find closing '}' symbol, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid type: integer `0`, expected a Loki stream object with `stream` and `values` at line 1 column 19
 --- json/drained-values-non-array [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Malformed JSON error, error found in #10 byte of ...|"FINAL"]]}]}|..., bigger context ...|,"values":[["1700000000000000000","FINAL"]]}]}|...\n
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Malformed JSON error, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid type: integer `0`, expected a [timestamp, line] Loki log entry array at line 1 column 2800073
 --- json/drained-values-non-array-under-cap [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Malformed JSON error, error found in #10 byte of ...|"FINAL"]]}]}|..., bigger context ...|x"],0],"values":[["1700000000000000000","FINAL"]]}]}|...\n
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Malformed JSON error, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid type: integer `0`, expected a [timestamp, line] Loki log entry array at line 1 column 101
 --- json/drained-metadata-non-string [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Value is string, but can't find closing '"' symbol, error found in #10 byte of ...|ad":[]}]]}],"Streams|..., bigger context ...|:"v","m254":"v","m255":"v","m256":"v","bad":[]}]]}],"Streams":[{"stream":{"app":"w"},"values":[["170|...\n
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Value is string, but can't find closing '"' symbol, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid type: sequence, expected a string at line 1 column 2795
 --- json/drained-metadata-non-string-under-cap [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Value is string, but can't find closing '"' symbol, error found in #10 byte of ...|ad":[]}]]}],"Streams|..., bigger context ...|0000000000000","x",{"m0":"v","m1":"v","bad":[]}]]}],"Streams":[{"stream":{"app":"w"},"values":[["170|...\n
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: Streams: []loghttp.LogProtoStream: unmarshalerDecoder: Value is string, but can't find closing '"' symbol, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid type: sequence, expected a string at line 1 column 96
 --- json/drained-label-map-deep [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #9 byte of ...|[[[[[[[[[[[[[[[[[[[|..., bigger context ...|[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[|...\n
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid type: sequence, expected a string at line 1 column 840901
 --- json/drained-label-map-deep-under-cap [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #10 byte of ...|[[[[[[[[[[[[[[[[[[[[|..., bigger context ...|[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[|...\n
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid type: sequence, expected a string at line 1 column 48
 --- json/drained-label-map-non-string [DIFF]
     loki   204: 
@@ -527,27 +575,57 @@ bodies
 --- json/drained-label-map-non-string-under-cap [DIFF]
     loki   204: 
     pulsus 400: malformed Loki push request: invalid type: sequence, expected a string at line 1 column 47
+--- json/ignored-depth-envelope-key-9999 [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/ignored-depth-envelope-key-10000 [SAME]
+    loki   400: loghttp.PushRequest.incrementDepth: exceeded max depth, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: exceeded max depth (10000) at line 1 column 20087
+--- json/ignored-depth-envelope-key-200000 [SAME]
+    loki   400: loghttp.PushRequest.incrementDepth: exceeded max depth, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: exceeded max depth (10000) at line 1 column 400087
+--- json/ignored-depth-stream-key-9998 [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/ignored-depth-stream-key-9999 [SAME]
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: exceeded max depth (10000) at line 1 column 20083
+--- json/ignored-depth-stream-key-200000 [SAME]
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: exceeded max depth (10000) at line 1 column 400085
+--- json/ignored-depth-entry-4th-element-9996 [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/ignored-depth-entry-4th-element-9997 [SAME]
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: exceeded max depth (10000) at line 1 column 20069
+--- json/ignored-depth-entry-4th-element-200000 [SAME]
+    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: exceeded max depth (10000) at line 1 column 400075
 --- json/ignored-depth-126 [SAME]
     loki   204: 
     pulsus 204: 
---- json/ignored-depth-127 [DIFF]
+--- json/ignored-depth-127 [SAME]
     loki   204: 
-    pulsus 400: malformed Loki push request: recursion limit exceeded at line 1 column 213
---- json/ignored-depth-9999 [DIFF]
+    pulsus 204: 
+--- json/ignored-number-overflow [SAME]
+    loki   400: loghttp.PushRequest.readNumberAsString: invalid number, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: invalid number at line 1 column 92
+--- json/ignored-number-at-max [SAME]
     loki   204: 
-    pulsus 400: malformed Loki push request: recursion limit exceeded at line 1 column 213
---- json/ignored-depth-10000 [SAME]
-    loki   400: loghttp.PushRequest.incrementDepth: exceeded max depth, error found in #10 byte of ...|[[[[[[[[[[]]]]]]]]]]|..., bigger context ...|[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]|...\n
-    pulsus 400: malformed Loki push request: recursion limit exceeded at line 1 column 213
---- json/ignored-depth-200000-envelope-key [SAME]
-    loki   400: loghttp.PushRequest.incrementDepth: exceeded max depth, error found in #10 byte of ...|[[[[[[[[[[[[[[[[[[[[|..., bigger context ...|[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[|...\n
-    pulsus 400: malformed Loki push request: recursion limit exceeded at line 1 column 213
---- json/ignored-depth-200000-stream-key [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #10 byte of ...|[[[[[[[[[[[[[[[[[[[[|..., bigger context ...|[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[|...\n
-    pulsus 400: malformed Loki push request: recursion limit exceeded at line 1 column 209
---- json/ignored-depth-200000-entry-4th-element [SAME]
-    loki   400: loghttp.PushRequest.Streams: []loghttp.LogProtoStream: incrementDepth: exceeded max depth, error found in #10 byte of ...|[[[[[[[[[[[[[[[[[[[[|..., bigger context ...|[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[|...\n
-    pulsus 400: malformed Loki push request: recursion limit exceeded at line 1 column 197
+    pulsus 204: 
+--- json/ignored-number-past-max [SAME]
+    loki   400: loghttp.PushRequest.readNumberAsString: invalid number, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: invalid number at line 1 column 109
+--- json/ignored-number-underflow [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/ignored-number-int [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/ignored-number-nested [SAME]
+    loki   400: loghttp.PushRequest.readNumberAsString: invalid number, error found in #<n> byte of <parser window elided>\n
+    pulsus 400: malformed Loki push request: invalid number at line 1 column 98
 --- pb/duplicate-distinct [SAME]
     loki   400: stream '{foo="bar", foo="barf", service_name="unknown_service"}' has duplicate label name: 'foo'\n
     pulsus 400: stream '{foo="bar", foo="barf"}' has duplicate label name: 'foo'
@@ -931,23 +1009,12 @@ json/drained-label-map-non-string, json/drained-label-map-non-string-under-cap
     `"values":[null,["ts","x"]]` 204 upstream (which skips null elements,
     pkg/loghttp/query.go:131-134) and 400 here.
 
-json/ignored-depth-127, json/ignored-depth-9999
-    The two sides' nesting ceilings, at OUR boundary and one below THEIRS.
-    Arbitrary nesting can only reach a value the decoder does not keep, and
-    all of those now deserialize through serde, which puts them under
-    serde_json's RECURSION_LIMIT of 128 (de.rs:63,1375 @ 1.0.150).
-    Upstream's ceiling is jsoniter's maxDepth = 10000 (iter.go:331-338 @
-    v1.1.12), reached by the iter.Skip() that walks a stream object before
-    its unmarshaler runs. Both boundaries were bisected against these two
-    servers, not assumed: we accept 126 and refuse 127, Loki accepts 9,999
-    and refuses 10,000, both counting the envelope object as one level. So
-    127..9,999 is 204 there and 400 here. Their discriminators are
-    `json/ignored-depth-126` (204/204, the last depth both accept) and
-    `json/ignored-depth-10000` (400/400, the first both refuse) -- without
-    them the group could not distinguish "a tighter ceiling" from "no
-    ceiling on one side". The three `-200000-` cases place the same shape in
-    each of the three positions such a value can reach; before round 12 all
-    three were 204 here against upstream's 400, because
-    `serde::de::IgnoredAny` is an iterative skip the depth counter never
-    sees. Ledger residual 8: a resource guard, deliberately tighter than the
-    reference's, against a legal push that nests six deep.
+nesting depth -- withdrawn as a divergence in round 14
+    Round 12 closed the ignored-value depth hole by recursing those values
+    through serde, which put them under serde_json's FIXED RECURSION_LIMIT of
+    128 (de.rs:63,1375 @ 1.0.150): 127..9,999 levels were then 204 upstream
+    and 400 here, recorded as `json/ignored-depth-127` and
+    `json/ignored-depth-9999`. Round 14 charges depth against upstream's own
+    ceiling instead of serde's, per position, and all nine boundary rows of
+    the `json/ignored-depth-*` group now agree -- see that group's note in the
+    preamble for how the reference counts. Ledger residual 8 is closed.
