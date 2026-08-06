@@ -1278,10 +1278,22 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   layer down, where a saturating shift relocated the evaluation
 ///   window, and nothing downstream can detect an already-altered offset.
 ///
-///   **The cap is OURS; the reference has none here.** MEASURED on the
-///   digest-pinned v3.7.4 oracle (`grafana/loki@sha256:87f0a067…`,
-///   `/status/buildinfo` reporting `3.7.4` / `b318f282`), the reference
-///   accepts the whole `i64` nanosecond domain, asymmetrically:
+///   **The cap is OURS; the reference caps no offset magnitude here.**
+///   MEASURED on the digest-pinned v3.7.4 oracle
+///   (`grafana/loki@sha256:87f0a067…`, `/status/buildinfo` reporting
+///   `3.7.4` / `b318f282`), the reference's LEXER admits the whole `i64`
+///   nanosecond domain, asymmetrically. The LEXER, said deliberately:
+///   HTTP acceptance stops one value short of that band, and the
+///   endpoint it drops is the next paragraph's subject, so this sentence
+///   is not a wire-acceptance claim (issue #248 round 9; the same
+///   sentence had already been narrowed the same way at three other
+///   sites — `limits.rs`'s `MAX_QUERY_SPAN_NS`, `docs/features.md`'s
+///   LogQL parity paragraph, and the `five-year-span-cap` ledger row —
+///   and this was the fourth. Those four are the whole set: the places
+///   that describe the reference's treatment of an out-of-cap `offset`
+///   are the files naming the `five-year-span-cap` ledger row, and the
+///   fifth of those, `pulsus_read`'s `QuerySpanTooLong`, quantifies over
+///   no band at all).
 ///   `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) → 200, one ns
 ///   more → 400 `syntax error: unexpected NUMBER, expecting DURATION`;
 ///   `offset -9223372036854775808ns` (`i64::MIN`) is the lexer's floor,
@@ -1323,10 +1335,15 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   v3.7.4) — and a leading `-` fails its leading-digit check (`:219`)
 ///   besides, so neither endpoint reaches `model`'s overflow branches at
 ///   all; the stdlib decides both. There the total accumulates in a
-///   `uint64` the loop lets reach `1<<63` (`go1.25.5
-///   src/time/format.go:1707`), and a negative returns at `if neg {
-///   return -Duration(d) }` (`:1711`) BEFORE the positive-only
-///   `d > 1<<63-1` (`:1714`). Hence a ceiling of `i64::MAX` and a floor
+///   `uint64` the loop lets reach `1<<63` (`src/time/format.go:1707` at
+///   go1.25.5, `:1717` at the go1.26.5 the reference is actually built
+///   with), and a negative returns at `if neg {
+///   return -Duration(d) }` (`:1711` / `:1721`) BEFORE the positive-only
+///   `d > 1<<63-1` (`:1714` / `:1724`) — the two toolchains' arithmetic
+///   is identical and the line numbers are the whole of the difference,
+///   compared in
+///   [`tests::both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`].
+///   Hence a ceiling of `i64::MAX` and a floor
 ///   of `i64::MIN`, one check on each side. Recorded because our cap
 ///   sits far inside it: the `i64` band, its negative endpoint aside, is
 ///   reference-accepted and PulsusDB-refused, ledgered as
@@ -1681,10 +1698,37 @@ mod tests {
     /// never reaches `v > 1<<63/unit.mult` or `dur > 1<<63-1`
     /// (`:249-255`); the `-` form stops one check earlier still, at the
     /// leading-digit test (`:219`). All three are therefore decided by
-    /// the stdlib, and the first row's branch is not the other two's
-    /// (`go1.25.5 src/time/format.go`; `ParseDuration` and `leadingInt`
-    /// are both byte-identical in go1.23, so the branch does not turn on
-    /// the toolchain):
+    /// the stdlib, and the first row's branch is not the other two's.
+    /// Line numbers below are `go1.25.5 src/time/format.go`'s; the
+    /// TOOLCHAIN THE REFERENCE ITSELF USES IS go1.26.5, and that is now
+    /// the version compared rather than assumed (issue #248 round 9 —
+    /// an earlier wording generalised from go1.23 and go1.25.5, neither
+    /// of which the reference builds with). Loki v3.7.4 declares
+    /// `go 1.26.5` (`go.mod:3`, `cmd/loki/Dockerfile:1
+    /// ARG GO_VERSION=1.26.5`) and the digest-pinned image's own binary
+    /// agrees: `go version -m` on `/usr/bin/loki` extracted from
+    /// `grafana/loki@sha256:87f0a067…` prints `go1.26.5` and
+    /// `mod github.com/grafana/loki/v3 v3.0.0-20260722033256-b318f2829f0a`
+    /// (`/status/buildinfo` cannot answer this — its `goVersion` field
+    /// is empty in that image). Against go1.26.5's `src/time/format.go`:
+    /// `leadingInt` is byte-identical to go1.25.5's and at the SAME
+    /// lines (`:1554-1572`, ceiling `:1566`), `unitMap` is
+    /// byte-identical (moved to `:1615`), and `ParseDuration` differs at
+    /// ten lines, ALL of them error construction —
+    /// `errors.New("time: … " + quote(orig))` became
+    /// `&parseDurationError{…}`, whose `Error()` renders the identical
+    /// string (`:1606-1613`). No arithmetic, no control flow: the three
+    /// branches cited below sit unchanged at `:1717` / `:1721` /
+    /// `:1724`, i.e. go1.25.5's `:1707` / `:1711` / `:1714` shifted by
+    /// the ten lines that type occupies. Measured as well as read: nine
+    /// literals — the three refusals and two discriminators below,
+    /// `-9223372036854775808ns`, both `i64::MAX` spellings
+    /// (`9223372036854775807ns` and
+    /// `2562047h47m16s854ms775us807ns`) and the one-nanosecond-over
+    /// `2562047h47m16s854ms775us808ns` — through `time.ParseDuration`
+    /// under BOTH toolchains give byte-identical verdicts and error
+    /// texts. So the branch does not turn on the toolchain, and that is
+    /// now checked at the one toolchain that matters:
     ///
     /// - `9223372036854775808ns` is `1<<63` EXACTLY. `leadingInt`
     ///   admits it — its ceiling is `1<<63` itself (`:1566`) — and the
