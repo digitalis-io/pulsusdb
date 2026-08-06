@@ -780,11 +780,30 @@ not "fix" us toward the panic.
   | request span `43800h` (our cap) | `400`, same message |
   | `count_over_time({app="x"}[720h])` over a `1h` request span | `400 … (query length: 721h1m0s, limit: 30d1h)` |
   | `count_over_time({app="x"}[2562047h])` over a `1h` request span | `400 … (query length: 2562047h47m16.854775807s, …)` |
-  | `count_over_time({app="x"}[43800h])` as an INSTANT query | no answer inside 90 s |
+  | `count_over_time({app="x"}[43800h])` as an INSTANT query | never answers: the connection is closed with no HTTP status line at all (38 s and 60 s on two runs). `split_instant_metric_queries_by_interval` defaults to `1h` (`pkg/validation/limits.go:434 @ v3.7.4`) and is reduced only for a SHORTER range vector (`pkg/querier/queryrange/splitters.go:206-215`), so this decomposes into 43,800 subqueries |
   | `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`), instant and range | `200` |
-  | `offset -9223372036854775807ns` (`i64::MIN + 1`) | `200` |
-  | `offset -9223372036854775808ns` (`i64::MIN`) | `400 this data is no longer available, it is past now - max_query_lookback (0s)` |
+  | `offset -9223372036854775807ns` (`i64::MIN + 1`) | `200`, in any order |
+  | `offset -9223372036854775808ns` (`i64::MIN`) on a frontend that has not seen the neighbouring value | `400 this data is no longer available, it is past now - max_query_lookback (0s)`, instant and range alike |
+  | the same, after `i64::MIN + 1` has been probed on that frontend | `200` |
   | `offset ±43800h` | `200` |
+
+  **The `i64::MIN` row depends on probe ORDER, and that is the whole of
+  the disagreement it caused** (issue #248 round 6: one round measured
+  only the `400`, review measured only the `200`, and both reproduce on
+  demand). `cache_index_stats_results` defaults to `true`
+  (`pkg/querier/queryrange/roundtrip.go:66 @ v3.7.4`) and the two offsets
+  differ by one nanosecond — indistinguishable in the
+  millisecond-resolution index-stats request the shard resolver issues,
+  so whichever runs FIRST decides. Reproducible in either direction on a
+  freshly booted container:
+
+  | container | probe order | verdicts |
+  |---|---|---|
+  | `ci/logql/config.yaml` as shipped | `i64::MIN`, `i64::MIN + 1`, `i64::MIN` | `400`, `200`, `200` |
+  | the same plus `query_range.cache_index_stats_results: false` | `i64::MIN + 1`, `i64::MIN`, `i64::MIN + 1`, `i64::MIN` | `200`, `400`, `200`, `400` |
+
+  With the stats cache off, the `400` is the reference's verdict at that
+  value in every order; with it on, a warm entry hides it.
 
   **The rules behind them, from the source.** `max_query_length` defaults
   to `721h` (`pkg/validation/limits.go:371 @ v3.7.4`) and is enforced at
@@ -797,18 +816,37 @@ not "fix" us toward the panic.
   range-selector-adjusted window `[start - ([range] + offset),
   end - offset]` (`pkg/querier/queryrange/shard_resolver.go:94-104`), so
   the `[range]` literal COUNTS against `max_query_length` on a range
-  query while the offset CANCELS. And exactly at `offset i64::MIN` Go's
-  negation overflows to itself, so `end.Add(-offset)` moves the window
-  BACK 292 years while `start.Add(-([range]+offset))` moves it forward:
-  `through < from`, which is the `ErrQueryTooOld` above
-  (`pkg/querier/limits/validation.go:92-94`) — a one-value artefact, not
-  a bound.
+  query while the offset CANCELS.
+
+  **The `i64::MIN` `400`, traced end to end** (round 6 — round 5 named
+  the right overflow but the wrong caller, and left the caching out).
+  The query-frontend's AST mapper decides whether the request is
+  shardable from `maxRangeVectorAndOffsetDuration`
+  (`pkg/querier/queryrange/split_by_interval.go:262-278 @ v3.7.4`),
+  which takes `r.Offset` only when `r.Offset > maxOffset` — a NEGATIVE
+  offset therefore contributes `0`, the schema lookup at
+  `querysharding.go:167` sees the UNSHIFTED window, finds a valid TSDB
+  period and proceeds. The shard resolver then computes the real window
+  as `diff := Interval + Offset; from = start.Add(-diff);
+  through = end.Add(-Offset)`
+  (`pkg/querier/queryrange/shard_resolver.go:94-104`). At `Offset =
+  i64::MIN` Go's `-Offset` overflows to `i64::MIN` itself, so `through`
+  moves 292 years BACK, while `-diff` does not overflow (`Interval`
+  pulls the sum off the rail) and `from` moves 292 years FORWARD. That
+  inverted window reaches `IndexStats` (`pkg/querier/querier.go:535`),
+  whose `ValidateQueryTimeRangeLimits` takes the `through.Before(from)`
+  branch (`pkg/querier/limits/validation.go:92-94`, message at
+  `pkg/util/validation/validate.go:7`) and returns `400`; the container
+  logs it as `middleware=QueryShard.astMapperware msg="failed mapping
+  AST"`. At `i64::MIN + 1` both endpoints move forward together and the
+  window stays ordered — a one-value artefact, not a bound.
 - **What is left of the divergence, stated exactly.** On the request span
   and on a RANGE query's `[range]`, the reference's default config
   already refuses far more than our cap does (`721h` against our
   `43,800h`), so there our cap can only fire where it also rejects. The
   divergence is real for the `offset` magnitude (a `200` there at every
-  value but `i64::MIN`, a `400` here past 5 years) and for an INSTANT
+  value but `i64::MIN`, and a `200` even at `i64::MIN` once the stats
+  cache is warm; a `400` here past 5 years) and for an INSTANT
   query's `[range]`, which the reference admits and then decomposes into
   per-hour subqueries that do not answer in practice.
 - **PulsusDB behaviour (the delta): NOTHING IN A LogQL QUERY MAY SPAN MORE

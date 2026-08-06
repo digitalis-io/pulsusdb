@@ -42,8 +42,17 @@ prose may carry **no digit and no number word at all** — not a count
 spelled out (`nine`, `twenty-one`, `zero`), not a per-issue delta, and
 not an ordinary English `one` or `two` either. The rule used to be
 "no number word in front of a counting noun", and reviewers kept finding
-the next word it did not know; the ban is now flat, so there is nothing
-left to enumerate. Name the reason, point at the constant.
+the next word it did not know; the ban is now flat, which removes the
+counting-noun list entirely. **What the ban COVERS is stated exactly, and
+it is not everything:** digits, the standard spelling of every cardinal
+below `10^21` (complete — the check derives it from a speller), and a
+hand-written list of variant spellings (`nought`, `naught`, `aught`,
+`nil`, `zilch`). It is **not** closed against archaic or dialect forms,
+nor against words that name an exact quantity but are ordinary function
+words — `ought`, `none`, `both`, `a` are deliberately left out, because a
+guard that reddens on `we ought to` gets switched off. Saying "closed"
+here was wrong already and review found `nought` the next round.
+Name the reason, point at the constant.
 `check_f_marked_regions_state_no_corpus_count`
 (`logqltest_provenance.rs`) fails on any, and when a figure really moves,
 the recomputing assertion prints its new value.

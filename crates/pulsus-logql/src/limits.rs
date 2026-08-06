@@ -58,9 +58,14 @@ pub const MAX_QUERY_BYTES: usize = 131_072;
 /// span is already a `400 the query time range exceeds the limit`. The
 /// offset cancels in that subtraction and stays unbounded: `offset
 /// 2562047h47m16s854ms775us807ns` (`i64::MAX`) is a 200 there, and so is
-/// every other value in the domain except exactly `i64::MIN`, where Go's
-/// negation overflow inverts the window into a 400. So this cap diverges
-/// on the offset magnitude, and on an INSTANT query's `[range]` (which
+/// every other value in the domain — including `i64::MIN`, whose `400`
+/// (Go's negation overflowing inside the shard resolver, inverting the
+/// window) is not even stable: `cache_index_stats_results` defaults to
+/// true and the neighbouring value shares its millisecond-resolution
+/// cache key, so probing `i64::MIN + 1` first turns `i64::MIN` into a
+/// 200. Round 6 of issue #248 settled that; the ledger row carries the
+/// order-dependent probe table. So this cap diverges at every offset
+/// magnitude past 43,800 h, and on an INSTANT query's `[range]` (which
 /// the reference admits and then splits into per-hour subqueries that do
 /// not answer in practice); on a range query it fires only where the
 /// reference, at its shipped default, refuses first.

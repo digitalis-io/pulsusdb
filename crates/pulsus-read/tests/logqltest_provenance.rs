@@ -929,27 +929,29 @@ const NO_COUNT_REQUIRED: &[(&str, &str)] = &[
     ("ci.yml", "ci-replay-leg"),
 ];
 
-/// **The closed lexicon of English cardinal numerals.**
+/// **The STANDARD spelling of every English cardinal below 10^21.**
 ///
-/// Where it comes from: every non-negative integer below 10^21 is
-/// spelled in English out of exactly these tokens, combined with hyphens
-/// and juxtaposition — the units and teens below twenty, the eight tens,
-/// and the scale words. Nothing else is needed and nothing else occurs,
-/// which is what makes this a SET rather than a list somebody extends
-/// when a reviewer finds the next word. [`spelling_uses_only_this_set`]
-/// re-derives it from an independent speller.
+/// Where it comes from: spell any non-negative integer below 10^21 the
+/// ordinary way and the result is built out of exactly these tokens,
+/// combined with hyphens and juxtaposition — the units and teens below
+/// twenty, the eight tens, and the scale words.
+/// [`spelling_uses_only_this_set`] re-derives that from an independent
+/// speller, so this set is complete *for what a speller emits* and
+/// carries nothing dead.
 ///
-/// Where it stops: 10^21. `sextillion` and the Latinate series above it
-/// are not here, on the ground that a corpus count reaching 10^21 is not
-/// the failure this guard exists for. Extending the set upward is
-/// mechanical if that ever stops being true.
+/// **That is a narrower claim than "the closed lexicon of English
+/// cardinals", which is what this doc said in issue #248 round 5 and
+/// which was false by the next review round: `nought` is an English
+/// cardinal zero, it is not a token any speller emits, and `nought rows`
+/// went straight through.** English keeps more than one spelling for the
+/// same cardinal, so a speller cannot enumerate them; the extra ones are
+/// listed in [`NUMERAL_VARIANTS`], by hand and WITHOUT a completeness
+/// claim. What is closed here is the standard-spelling side alone.
 ///
-/// The four earlier versions of this rule enumerated what counts as a
-/// number and each shipped with the next word missing — `zero` was the
-/// fifth hole (issue #248 round 5). The enumeration is now closed by
-/// construction instead: a token IS a numeral or it is not, and no
-/// review round can find a cardinal numeral that is absent, because the
-/// families below are the whole of English's numeral vocabulary.
+/// Where it stops on the other axis: 10^21. `sextillion` and the
+/// Latinate series above it are not here, on the ground that a corpus
+/// count reaching 10^21 is not the failure this guard exists for.
+/// Extending the set upward is mechanical if that ever stops being true.
 const CARDINAL_NUMERALS: &[&str] = &[
     // Units and teens — every integer below twenty.
     "zero",
@@ -991,6 +993,25 @@ const CARDINAL_NUMERALS: &[&str] = &[
     "quintillion",
 ];
 
+/// Non-standard spellings of a cardinal — mostly of zero.
+///
+/// **Not complete, and deliberately so.** These are the words that name
+/// an exact cardinal but that no speller produces, so
+/// [`spelling_uses_only_this_set`] cannot derive them and cannot check
+/// them: each is here because somebody wrote it down. `nought` arrived
+/// as a review finding on issue #248 (round 6) after the round-5 doc
+/// claimed the numeral side was closed.
+///
+/// **What is deliberately NOT here, and why.** `ought` is a dialect zero
+/// ("ought-six") and a very common modal verb; `none`, `both`, `single`
+/// and `a` name exact quantities and are ordinary English function
+/// words. Adding any of them would redden prose that states no count at
+/// all, and a guard that reddens on "we ought to" gets switched off
+/// within a week — so the guard keeps the false-negative instead, and
+/// says so. Archaic and dialect spellings beyond this list are out of
+/// scope for the same reason.
+const NUMERAL_VARIANTS: &[&str] = &["nought", "naught", "aught", "nil", "zilch"];
+
 /// Quantity words that are NOT cardinal numerals.
 ///
 /// **This list is not complete and cannot be made complete**, and that is
@@ -998,8 +1019,7 @@ const CARDINAL_NUMERALS: &[&str] = &[
 /// quantifiers (`a handful`, `a bunch`, `plenty`, `umpteen`), so no
 /// enumeration terminates. It carries the ones already known to have
 /// evaded the guard, and the residual is named in
-/// [`check_f_marked_regions_state_no_corpus_count`]'s doc — the
-/// completeness claim belongs to [`CARDINAL_NUMERALS`] alone.
+/// [`check_f_marked_regions_state_no_corpus_count`]'s doc.
 const INEXACT_QUANTITY_WORDS: &[&str] = &["dozen", "score", "couple", "handful"];
 
 /// Whether a token spells a quantity.
@@ -1012,7 +1032,9 @@ fn is_number_word(tok: &str) -> bool {
     let lower = tok.to_ascii_lowercase();
     let known = |p: &str| {
         let p = p.strip_suffix('s').unwrap_or(p);
-        CARDINAL_NUMERALS.contains(&p) || INEXACT_QUANTITY_WORDS.contains(&p)
+        CARDINAL_NUMERALS.contains(&p)
+            || NUMERAL_VARIANTS.contains(&p)
+            || INEXACT_QUANTITY_WORDS.contains(&p)
     };
     let mut parts = lower.split('-').filter(|p| !p.is_empty()).peekable();
     parts.peek().is_some() && parts.all(known)
@@ -1026,8 +1048,10 @@ fn is_number_word(tok: &str) -> bool {
 /// one shipped as a silent pass, and four rounds of review each found
 /// the next missing word. This one asks only whether the token is a
 /// number: a marked region may contain no digit and no numeral, whatever
-/// follows it. There is nothing left to enumerate on the noun side, and
-/// [`CARDINAL_NUMERALS`] closes the other side.
+/// follows it. There is nothing left to enumerate on the noun side; on
+/// the numeral side [`CARDINAL_NUMERALS`] is complete for standard
+/// spellings and [`NUMERAL_VARIANTS`] is an explicitly open list of the
+/// rest.
 ///
 /// The cost is deliberate: prose inside a marked region cannot say "one
 /// level up" or "the two halves" either. That is the contract — these
@@ -1294,8 +1318,21 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
 /// counting as prose. Adding `zero` would have fixed the instance and
 /// left the shape, so the shape went instead: a marked region may carry
 /// **no digit and no numeral**, full stop. The noun side no longer
-/// exists to be incomplete, and the numeral side is closed by
-/// [`CARDINAL_NUMERALS`].
+/// exists to be incomplete.
+///
+/// **The numeral side is complete for standard spellings and no
+/// further** (issue #248 round 6). Round 5 said it was closed outright;
+/// the next review round injected `nought rows` and it passed, which is
+/// the sixth hole. [`CARDINAL_NUMERALS`] is exactly what a speller
+/// emits, and [`spelling_uses_only_this_set`] proves it; every OTHER
+/// spelling of a cardinal — `nought`, `naught`, `aught`, `nil`,
+/// `zilch` — sits in [`NUMERAL_VARIANTS`], which is hand-written, is
+/// labelled incomplete, and names the words it leaves out on purpose
+/// (`ought`, `none`, `a`: exact quantities that are also ordinary
+/// function words, whose inclusion would redden count-free prose). So
+/// the honest sentence is: **this covers digits, the standard cardinal
+/// spellings in full, and the listed variants; it is not closed against
+/// archaic or dialect forms.**
 ///
 /// **The guard's own failure surface, bounded.** A guard whose sentence
 /// is wider than its assertion is the same defect one level up, so every
@@ -1312,6 +1349,7 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
 /// | a spelled count, `nine rows` | the same (committed) |
 /// | a COMPOUND spelled count, `twenty-one rows` | the same, via [`is_number_word`] (committed) |
 /// | a spelled ZERO, `zero rows` | the same (committed) |
+/// | a VARIANT zero, `nought rows` | the same, via [`NUMERAL_VARIANTS`] (committed) |
 /// | a bare numeral with no noun after it | the same (committed) |
 /// | a count on a MARKER line's own tail | the same — the marker's tail is scanned, not skipped |
 /// | a marker PAIR deleted | [`NO_COUNT_REQUIRED`] misses the region id |
@@ -1323,16 +1361,27 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
 /// | a duplicated id | ids must be unique |
 /// | a region's prose deleted, markers kept | a required region must still carry prose |
 ///
-/// **There is no fifteenth.** A region reaching the scan is exactly four
-/// parts — an open marker, an id, a body, an end marker — and the table
-/// mutates each part in each way it can go wrong: present/absent,
-/// renamed on one side/both, and (for the body) emptied. The marker
-/// tokens are two, both above. The count forms are digits and numerals,
-/// and numerals are now the closed set rather than a sample of it, so
-/// "the next missing word" is not a mutant that exists. Blank lines do
-/// NOT count as prose, which the mutant table found: `M10` first passed
-/// because markers around a single empty line cleared the "still has
-/// text" floor.
+/// **Where the table IS exhaustive, and where it is not.** Round 5
+/// claimed "there is no fifteenth" over the whole table and the next
+/// round found one, so the claim is now split.
+///
+/// STRUCTURE — exhaustive. A region reaching the scan is exactly four
+/// parts (an open marker, an id, a body, an end marker) and the
+/// structural rows mutate each part in each way it can go wrong:
+/// present/absent, renamed on one side/both, and (for the body)
+/// emptied. The marker tokens are two, both above. Blank lines do NOT
+/// count as prose, which the mutant table itself found: `M10` first
+/// passed because markers around a single empty line cleared the "still
+/// has text" floor.
+///
+/// COUNT FORMS — not exhaustive, and the residual is a WORD LIST, not a
+/// shape. Digits are closed by `is_ascii_digit`; standard cardinal
+/// spellings are closed by [`spelling_uses_only_this_set`]; variant
+/// spellings are a hand list. So the mutant that still exists is
+/// "another spelling of a number nobody wrote down", and the next one
+/// found extends [`NUMERAL_VARIANTS`] rather than reshaping the rule.
+/// Naming that is the point: five rounds tried to close this by adding
+/// the word review had just found, and the sixth found the next one.
 ///
 /// What remains is not a hole in the guard but a hole in its INPUT, and
 /// it is the next paragraph.
@@ -1340,12 +1389,14 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
 /// **What it cannot see, stated rather than implied:** a count inside
 /// backticks, a count in a file outside [`NO_COUNT_ROOTS`], a count in a
 /// region nobody marked, an ORDINAL standing in for a count ("the third
-/// block landed"), and a vague quantifier outside the deliberately
+/// block landed"), a vague quantifier outside the deliberately
 /// incomplete [`INEXACT_QUANTITY_WORDS`] ("a bunch", "plenty",
-/// "umpteen"). Those last two are the residual the inversion does not
-/// remove: English's numerals are closed, its quantifiers are not. The
-/// marker is the contract — prose that carries counts must be inside one
-/// — and [`NO_COUNT_REQUIRED`] keeps the known regions from evaporating.
+/// "umpteen"), and a spelling of a cardinal outside
+/// [`NUMERAL_VARIANTS`] — including the ones that list excludes on
+/// purpose ("we ought to", "none of the rows"). Those are the residual
+/// the inversion does not remove. The marker is the contract — prose
+/// that carries counts must be inside one — and [`NO_COUNT_REQUIRED`]
+/// keeps the known regions from evaporating.
 #[test]
 fn check_f_marked_regions_state_no_corpus_count() {
     let mut files = Vec::new();
@@ -1426,14 +1477,21 @@ fn check_f_marked_regions_state_no_corpus_count() {
 ///
 /// Every entry in the first list is a sentence that either shipped
 /// inside a marked region or was injected there by a reviewer and passed
-/// — `zero rows` is the round-5 finding, `twenty-one rows` the round-4
-/// one, `nine rows` the round-3 one. A hand-applied mutant proves the
-/// guard catches it on the day it is run; this proves it on every run.
+/// — `nought rows` is the round-6 finding, `zero rows` the round-5 one,
+/// `twenty-one rows` the round-4 one, `nine rows` the round-3 one. A
+/// hand-applied mutant proves the guard catches it on the day it is run;
+/// this proves it on every run.
+///
+/// The first list also carries one sentence per [`NUMERAL_VARIANTS`]
+/// entry, so that list cannot shrink silently — the same shape
+/// [`spelling_uses_only_this_set`] gives [`CARDINAL_NUMERALS`], which is
+/// the only kind of completeness either side can honestly claim.
 ///
 /// The second list is the other direction, and it is the one that keeps
 /// the rule usable: an issue reference, a version, a date, a plan step
 /// and anything inside backticks are NOT counts, and a guard that
-/// reddened on them would be turned off within a week.
+/// reddened on them would be turned off within a week. Its last three
+/// entries pin the words [`NUMERAL_VARIANTS`] refuses on that ground.
 #[test]
 fn a_count_in_prose_is_detected_in_every_form_it_can_take() {
     for prose in [
@@ -1444,8 +1502,17 @@ fn a_count_in_prose_is_detected_in_every_form_it_can_take() {
         // Spelled, compound (round 4).
         "The latest block added twenty-one rows.",
         // Spelled zero (round 5) — the fifth hole, and the reason the
-        // rule is now "no numeral" rather than "no known numeral".
+        // rule became "no numeral" rather than "no known numeral".
         "The latest block added zero rows.",
+        // A VARIANT spelling of zero (round 6) — the sixth hole, and the
+        // reason the rule no longer claims the numeral side is closed.
+        // One per NUMERAL_VARIANTS entry, so deleting any of them reddens
+        // here rather than shipping as a silent pass.
+        "The latest block added nought rows.",
+        "The latest block added naught rows.",
+        "The latest block added aught rows.",
+        "The latest block added nil rows.",
+        "The latest block added zilch rows.",
         // A plural scale word.
         "Hundreds of directives replay against the container.",
         // Quantity words that are not numerals — the deliberately
@@ -1474,6 +1541,13 @@ fn a_count_in_prose_is_detected_in_every_form_it_can_take() {
         "The value lives on `CAPTURED = 1_208` and is recomputed there.",
         "A one-off mistake is not a numeral, nor is a well-formed pattern.",
         "The prose says which rows moved a figure and why.",
+        // The words NUMERAL_VARIANTS leaves out on purpose. Each names an
+        // exact quantity and each is an ordinary function word, so the
+        // guard keeps the false negative rather than reddening prose that
+        // states no count. Pinned here so "just add it" fails loudly.
+        "A reviewer ought to read the constant instead.",
+        "None of the rows in that block moved.",
+        "Both halves of the marker must carry the id.",
     ] {
         assert!(
             count_claims(prose).is_empty(),
@@ -1486,6 +1560,10 @@ fn a_count_in_prose_is_detected_in_every_form_it_can_take() {
 /// [`CARDINAL_NUMERALS`] is complete for exactly what it claims: every
 /// non-negative integer below 10^21 spells out of it and nothing in it
 /// is dead.
+///
+/// It does NOT claim to hold every English word for a cardinal —
+/// `nought` is one and is not derivable from a speller. That half lives
+/// in [`NUMERAL_VARIANTS`] and is checked by example only.
 ///
 /// The speller carries its OWN literals, duplicated on purpose, so this
 /// is a cross-check between two independent listings and not a
@@ -1579,7 +1657,7 @@ fn spelling_uses_only_this_set() {
     assert!(
         dead.is_empty(),
         "CARDINAL_NUMERALS carries {dead:?}, which no integer below 10^21 spells with — a typo, \
-         or a word that does not belong to the closed numeral lexicon"
+         or a variant spelling that belongs in NUMERAL_VARIANTS instead"
     );
 }
 

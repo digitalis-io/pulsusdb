@@ -1288,17 +1288,24 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   one ns more negative → 400 `syntax error: unexpected -, expecting
 ///   DURATION`.
 ///
-///   Those are LEXER verdicts, and the negative end of the band is a
-///   `200` on the wire everywhere except at exactly `i64::MIN`, which
-///   this comment used to report as a `200` (issue #248 round 5
-///   re-measured it: `i64::MIN + 1` → 200, `i64::MIN` → `400 this data
-///   is no longer available, it is past now - max_query_lookback (0s)`).
-///   The value parses; what refuses it is Go's negation overflowing at
-///   that one value inside `end.Add(-offset)`, inverting the window
-///   (`pkg/querier/queryrange/shard_resolver.go:104`,
-///   `pkg/querier/limits/validation.go:92-94` @ v3.7.4). It is an
-///   artefact of one value, not a bound, and the accepted band this
-///   paragraph describes is otherwise unchanged.
+///   Those are LEXER verdicts. On the WIRE the whole negative band is a
+///   `200`, and `i64::MIN` is a `200` too unless it is the first of its
+///   pair to reach a given frontend (issue #248 rounds 5 and 6; round 5
+///   reported the `400` as unconditional). Cold, it is `400 this data is
+///   no longer available, it is past now - max_query_lookback (0s)`:
+///   the value parses, and what refuses it is Go's `-offset` overflowing
+///   at that one value inside the shard resolver's `through =
+///   end.Add(-Offset)` while `from = start.Add(-(Interval + Offset))`
+///   moves the other way, inverting the window
+///   (`pkg/querier/queryrange/shard_resolver.go:94-104`,
+///   rejected at `pkg/querier/limits/validation.go:92-94` @ v3.7.4).
+///   Warm, `cache_index_stats_results` (default true,
+///   `pkg/querier/queryrange/roundtrip.go:66`) answers it from the
+///   `i64::MIN + 1` entry — the two are one nanosecond apart and the
+///   index-stats request is in milliseconds — and it is a `200`. Either
+///   way it is an artefact of one value, not a bound, and the accepted
+///   band this paragraph describes is unchanged. The order-dependent
+///   probe table is in the `five-year-span-cap` ledger row.
 ///
 ///   That asymmetry is not an accident of its own: the magnitude is lexed
 ///   by `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`), which

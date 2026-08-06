@@ -37,7 +37,12 @@
 //! rule is now enforced rather than restated: inside such a region,
 //! comment text carries no digit and no number word at all — the
 //! narrower "a number word in front of a counting noun" rule kept
-//! meeting a word it did not know. `check_f_marked_regions_state_no_corpus_count`
+//! meeting a word it did not know. That ban covers digits, the standard
+//! spelling of every cardinal the check's speller emits, and a listed
+//! set of variants (`nought` and friends); it is NOT closed against
+//! archaic, dialect or function-word forms, and the check's own doc
+//! names which it declines and why.
+//! `check_f_marked_regions_state_no_corpus_count`
 //! (`logqltest_provenance.rs`) fails on any; `logqltest/PROVENANCE.md`
 //! §"Counts live on the constants" carries the rule itself. Each marker
 //! names its region — the id in parentheses, repeated on the `end` — and
