@@ -239,9 +239,20 @@ where
 /// vendored source), so they IGNORE unknown fields. An unknown key that is absent
 /// from the replayed buffer therefore yields a BYTE-IDENTICAL result to one that
 /// is present-and-ignored — so we simply drop it, skipping its value with
-/// `IgnoredAny` (depth-bounded by serde_json's own recursion limit) rather than
-/// deserializing an attacker-controlled unknown value tree into a
-/// `serde_json::Value` first. KNOWN scalar keys are still buffered (their values
+/// `IgnoredAny` rather than deserializing an attacker-controlled unknown value
+/// tree into a `serde_json::Value` first. **`IgnoredAny` is NOT depth-bounded**,
+/// which this comment used to claim: `serde_json` implements it as
+/// `Deserializer::ignore_value`, an ITERATIVE bracket-matching skip over a
+/// scratch `Vec` (`de.rs:1102 @ 1.0.150`) that the crate's `RECURSION_LIMIT`
+/// never sees. Measured on `/v1/logs` against `grafana/loki@sha256:87f0a067…`:
+/// a 200,000-level array under an unknown key is `200` here and `400
+/// incrementDepth: exceeded max depth` there (jsoniter's `maxDepth = 10000`).
+/// Nesting inside a KNOWN `AnyValue` is a different matter and is capped at 32
+/// by `AnyValueSeed`; this is the unknown-key path only. The Loki-push decoder
+/// closed the same hole by deserializing discarded values through `serde`
+/// (issue #374 round 12); doing it here is a rejection-surface change across
+/// both OTLP transports and is NOT done — flagged, not fixed.
+/// KNOWN scalar keys are still buffered (their values
 /// are bounded by the scalar field's own type) and replayed so the derive keeps
 /// enforcing duplicate-known-scalar rejection and every ADR-0004 leaf semantic.
 fn buffer_scalar_or_skip<'de, A>(

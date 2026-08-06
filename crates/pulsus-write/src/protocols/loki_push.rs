@@ -953,23 +953,35 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
 /// a JSON stream and its equivalent protobuf stream produce byte-identical
 /// `ParsedLogs`. Each `values` entry deserializes as `(ts, line)` plus an
 /// optional third structured-metadata object, decoded into
-/// `structured_metadata` ([`JsonEntry`]'s `Deserialize`, issue #97); only a
-/// fourth+ element is drained without being materialized.
+/// `structured_metadata` ([`JsonEntry`]'s `Deserialize`, issue #97); a fourth+
+/// element is parsed and discarded rather than retained.
 ///
 /// [`JsonPush`]/[`JsonStream`] use bounded [`serde::de::DeserializeSeed`]
-/// visitors (issue #77) that stop materializing the `streams` array
+/// visitors (issue #77) that stop RETAINING the `streams` array
 /// ([`MAX_STREAMS_PER_REQUEST`]), each stream's `values` array
 /// ([`MAX_ENTRIES_PER_STREAM`]), the per-stream `stream` label map
 /// ([`MAX_RAW_LABEL_PAIRS_PER_STREAM`]) and an entry's structured metadata
-/// ([`MAX_STRUCTURED_METADATA_PER_ENTRY`]) one element past the cap, draining
-/// the remainder unallocated — so `serde_json` cannot grow those `Vec`s/maps
-/// unbounded. Each **reports** through the `MAX + 1` over-cap sentinel it leaves
-/// behind ([`validate_bounds`], [`JsonStream::raw_label_pairs`],
+/// ([`MAX_STRUCTURED_METADATA_PER_ENTRY`]) one element past the cap — so
+/// `serde_json` cannot grow those `Vec`s/maps unbounded. Each **reports**
+/// through the `MAX + 1` over-cap sentinel it leaves behind
+/// ([`validate_bounds`], [`JsonStream::raw_label_pairs`],
 /// `canonical_structured_metadata`), which is read AFTER the envelope's
 /// last-wins resolution — the same two-phase shape [`decode_protobuf`] has
 /// always had. Charging them at the moment they trip instead refused a request
 /// whose over-cap value a later occurrence of the same key superseded, which
 /// the reference answers `204` (issue #374 round 11).
+///
+/// Past the cap the remainder is **parsed and discarded, not skipped**: the
+/// same type rules, the same message text and the same 128-level depth ceiling
+/// apply to it as to what was retained (the `Drained*` group at the bottom of
+/// this module), so crossing a cap cannot turn checking off. What stops is
+/// retention: a drained run's own peak is one element — one `JsonEntry`, one
+/// `(key, value)` pair's worth of parse scratch, one nesting chain of at most
+/// 128 `Deserialize` frames — dropped before the next is read. That peak is
+/// bounded by [`MAX_STREAMS_PER_REQUEST`]` + 1` streams and, per stream,
+/// [`MAX_ENTRIES_PER_STREAM`]` + 1` entries of RETAINED material plus one
+/// in-flight element; the input itself is bounded before decode by the 64 MiB
+/// decompressed body cap.
 ///
 /// The two SHARED cross-request counters are the exception and are immediately
 /// fatal: the aggregate entry count ([`MAX_TOTAL_ENTRIES_PER_REQUEST`]) and the
@@ -1523,7 +1535,7 @@ impl<'de> serde::Deserialize<'de> for JsonPush {
                             .unwrap_or_default(),
                         );
                     } else {
-                        map.next_value::<serde::de::IgnoredAny>()?;
+                        map.next_value::<DrainedAny>()?;
                     }
                 }
                 Ok(JsonPush {
@@ -1654,7 +1666,13 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
                         // the cap against a `streams` occurrence a LATER one may
                         // still supersede, which the reference never sees (issue
                         // #374 round 11: last-wins resolves before any bound).
-                        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                        //
+                        // Drained is not unchecked: [`DrainedStream`] applies
+                        // the same key switch and the same type rules as the
+                        // retained arm below and keeps none of the result, so a
+                        // malformed element past the cap is the 400 it is
+                        // before the cap (issue #374 round 12).
+                        while seq.next_element::<DrainedStream>()?.is_some() {}
                         break;
                     }
                     let Some(stream) = seq.next_element_seed(StreamSeed {
@@ -1758,7 +1776,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
                             }
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            map.next_value::<DrainedAny>()?;
                         }
                     }
                 }
@@ -1837,12 +1855,12 @@ impl<'de> serde::Deserialize<'de> for BoundedLabelMap {
                 loop {
                     if raw_pairs > MAX_RAW_LABEL_PAIRS_PER_STREAM {
                         // Cap reached: drain the remaining pairs WITHOUT
-                        // materializing them, leaving `raw_pairs` at the
-                        // `MAX + 1` sentinel `parse_json` rejects.
-                        while map
-                            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-                            .is_some()
-                        {}
+                        // retaining them, leaving `raw_pairs` at the `MAX + 1`
+                        // sentinel `parse_json` rejects. Still string-typed:
+                        // [`DrainedString`] is `String`'s accept surface and
+                        // `String`'s message, so a non-string value past the
+                        // cap fails as it does before it (issue #374 round 12).
+                        while map.next_entry::<DrainedString, DrainedString>()?.is_some() {}
                         break;
                     }
                     let Some((k, v)) = map.next_entry::<String, String>()? else {
@@ -1895,16 +1913,21 @@ impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed<'_> {
                 let mut values: Vec<JsonEntry> = Vec::new();
                 loop {
                     if values.len() > MAX_ENTRIES_PER_STREAM {
-                        // Cap reached: drain the remainder WITHOUT materializing
-                        // it (and without charging the shared counters for what
-                        // is never retained), leaving the vec at the `MAX + 1`
+                        // Cap reached: drain the remainder WITHOUT retaining it
+                        // (and without charging the shared counters for what is
+                        // never retained), leaving the vec at the `MAX + 1`
                         // over-cap sentinel [`validate_bounds`] rejects — the
                         // JSON twin of `StreamAdapter::merge_field`'s tag-2
                         // drain. Deferred rather than raised because a LATER
                         // `values` (or `streams`) occurrence can supersede this
                         // whole array, and the reference charges nothing against
                         // a value it has discarded (issue #374 round 11).
-                        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                        //
+                        // Each drained element is still the real [`JsonEntry`],
+                        // dropped as soon as it is read: one entry's worth of
+                        // peak retention, and one implementation of the entry
+                        // type rule for both sides of the cap (round 12).
+                        while seq.next_element::<JsonEntry>()?.is_some() {}
                         break;
                     }
                     let Some(entry) = seq.next_element::<JsonEntry>()? else {
@@ -2011,16 +2034,18 @@ impl<'de> serde::Deserialize<'de> for BoundedStructuredMetadata {
                 let mut pairs: Vec<(String, String)> = Vec::new();
                 loop {
                     if pairs.len() > MAX_STRUCTURED_METADATA_PER_ENTRY {
-                        // Cap reached: drain the remainder WITHOUT materializing
-                        // it, leaving the `MAX + 1` over-cap sentinel
+                        // Cap reached: drain the remainder WITHOUT retaining it,
+                        // leaving the `MAX + 1` over-cap sentinel
                         // `canonical_structured_metadata` rejects — exactly what
                         // `EntryAdapter::merge_field`'s tag-3 drain leaves on the
                         // protobuf path. Raising here would charge the cap against
                         // an entry a later `values` occurrence may supersede.
-                        while map
-                            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-                            .is_some()
-                        {}
+                        // Still string-typed past the cap ([`DrainedString`]):
+                        // upstream types these too (`dataType != String` is
+                        // `MalformedStringError`, `pkg/loghttp/query.go:186-188
+                        // @ v3.7.4`), and a `"bad":[]` past pair 257 was `204`
+                        // here against its `400` (issue #374 round 12).
+                        while map.next_entry::<DrainedString, DrainedString>()?.is_some() {}
                         break;
                     }
                     let Some((key, value)) = map.next_entry::<String, String>()? else {
@@ -2062,9 +2087,9 @@ impl<'de> serde::Deserialize<'de> for JsonEntry {
                     .next_element::<BoundedStructuredMetadata>()?
                     .map(|b| b.0)
                     .unwrap_or_default();
-                // Drain any trailing element beyond the third without
-                // materializing it.
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                // Parse-and-discard any trailing element beyond the third:
+                // checked like every other value, retained nowhere.
+                while seq.next_element::<DrainedAny>()?.is_some() {}
                 Ok(JsonEntry {
                     timestamp,
                     line,
@@ -2073,6 +2098,269 @@ impl<'de> serde::Deserialize<'de> for JsonEntry {
             }
         }
         deserializer.deserialize_seq(EntryVisitor)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parse-and-discard
+// ---------------------------------------------------------------------------
+//
+// Every JSON value this decoder does not keep is still PARSED: its structure,
+// its scalar types and its nesting depth are checked exactly as a retained
+// value's are, and only the retention stops. Two kinds of value are discarded:
+//
+// - a value under a key this decoder does not read (an unknown envelope key, an
+//   unknown key inside a stream object, a fourth+ element of an entry array) —
+//   [`DrainedAny`], which accepts any shape, because the reference does not
+//   type these either;
+// - the remainder of a `streams` / `stream` / `values` / structured-metadata
+//   run past its cap, which the cap defers on so that a later occurrence of the
+//   same key can supersede it — [`DrainedStream`], [`DrainedLabelMap`],
+//   [`DrainedValues`] and [`DrainedString`], each mirroring the type rule of
+//   the retained arm beside it, message text included.
+//
+// `serde::de::IgnoredAny` is what these replace and is the wrong tool for
+// either: `serde_json` implements it as `Deserializer::ignore_value`, a
+// bracket-matching skip that checks no types and — being iterative over a
+// scratch `Vec` rather than recursive — is not covered by the crate's
+// `RECURSION_LIMIT` (`de.rs:1102` / `de.rs:63,1375` @ serde_json 1.0.150). Both
+// gaps were observable: `{"m0".."m256"…,"bad":[]}` and `[…100001 entries…,0]`,
+// each superseded by a valid occurrence, were `400` upstream and `204` here,
+// while the SAME malformed tail below the cap was `400` on both — the cap was
+// what switched the checking off (issue #374 round 12).
+//
+// The reference checks a discarded value for the same reason: jsoniter decodes
+// every occurrence of a repeated field in full before the last one wins
+// (`reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`), a stream object
+// reaches its hand-written unmarshaler only after `iter.Skip()` has walked it,
+// and that walk carries jsoniter's own depth bound (`maxDepth = 10000`,
+// `iter.go:331-338`, error `exceeded max depth`; measured: depth 10,000 is
+// `204` upstream, 10,001 is `400`).
+
+/// Parse-and-discard for a JSON value of any shape.
+///
+/// Retains nothing at all — not even a scalar's bytes — while still failing on
+/// malformed JSON and, through `serde_json`'s `RECURSION_LIMIT`, on nesting
+/// past 128 levels. That ceiling is the same one every typed value in this
+/// decoder already has, which is the point: it is now the body's ONE depth
+/// rule rather than a rule with an ignored-value hole in it. It is tighter than
+/// the reference's 10,000 (residual 8 of the `ingest-label-bounds` ledger row);
+/// a legal Loki push nests six deep.
+struct DrainedAny;
+
+impl<'de> serde::Deserialize<'de> for DrainedAny {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct AnyVisitor;
+        impl<'de> serde::de::Visitor<'de> for AnyVisitor {
+            type Value = DrainedAny;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_i128<E: serde::de::Error>(self, _: i128) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_u128<E: serde::de::Error>(self, _: u128) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_bytes<E: serde::de::Error>(self, _: &[u8]) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(DrainedAny)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                serde::Deserialize::deserialize(deserializer)
+            }
+
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                serde::Deserialize::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // Recursing through `Deserialize` rather than skipping is what
+                // puts every level under `serde_json`'s depth counter.
+                while seq.next_element::<DrainedAny>()?.is_some() {}
+                Ok(DrainedAny)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                while map.next_entry::<DrainedString, DrainedAny>()?.is_some() {}
+                Ok(DrainedAny)
+            }
+        }
+        deserializer.deserialize_any(AnyVisitor)
+    }
+}
+
+/// Parse-and-discard for a JSON string, with `String`'s accept surface and
+/// `String`'s `expecting` text — so a drained label or structured-metadata
+/// value fails exactly as the retained one beside it does, down to the message
+/// (`invalid type: sequence, expected a string`), and allocates nothing.
+struct DrainedString;
+
+impl<'de> serde::Deserialize<'de> for DrainedString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StrVisitor;
+        impl serde::de::Visitor<'_> for StrVisitor {
+            type Value = DrainedString;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(DrainedString)
+            }
+        }
+        deserializer.deserialize_str(StrVisitor)
+    }
+}
+
+/// Parse-and-discard for one `streams` element past
+/// [`MAX_STREAMS_PER_REQUEST`]. Mirrors [`StreamSeed`]'s key switch — the same
+/// three arms, the same `expecting` — but keeps nothing and charges nothing:
+/// the shared counters bound RETAINED materialization, and this element is
+/// dropped as it is read.
+struct DrainedStream;
+
+impl<'de> serde::Deserialize<'de> for DrainedStream {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StreamVisitor;
+        impl<'de> serde::de::Visitor<'de> for StreamVisitor {
+            type Value = DrainedStream;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a Loki stream object with `stream` and `values`")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                while let Some(key) = map.next_key::<std::borrow::Cow<str>>()? {
+                    match key.as_ref() {
+                        "stream" => {
+                            map.next_value::<DrainedLabelMap>()?;
+                        }
+                        // `Option` for the same reason [`NullableSeed`] exists
+                        // on the retained arm: `"values":null` is not a type
+                        // error there and must not be one here.
+                        "values" => {
+                            map.next_value::<Option<DrainedValues>>()?;
+                        }
+                        _ => {
+                            map.next_value::<DrainedAny>()?;
+                        }
+                    }
+                }
+                Ok(DrainedStream)
+            }
+        }
+        deserializer.deserialize_map(StreamVisitor)
+    }
+}
+
+/// Parse-and-discard for a `stream` label map inside a drained stream: the
+/// string-typed pairs [`BoundedLabelMap`] would keep, kept nowhere. No cap —
+/// the map it describes is already discarded, so there is no count for one to
+/// report through.
+struct DrainedLabelMap;
+
+impl<'de> serde::Deserialize<'de> for DrainedLabelMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MapVisitor;
+        impl<'de> serde::de::Visitor<'de> for MapVisitor {
+            type Value = DrainedLabelMap;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a Loki stream label map of string values")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                while map.next_entry::<DrainedString, DrainedString>()?.is_some() {}
+                Ok(DrainedLabelMap)
+            }
+        }
+        deserializer.deserialize_map(MapVisitor)
+    }
+}
+
+/// Parse-and-discard for a `values` array inside a drained stream. Each element
+/// is deserialized as the real [`JsonEntry`] and dropped immediately — the
+/// entry type rule has exactly one implementation, so a drained entry and a
+/// retained one cannot drift apart. Peak retention is one entry.
+struct DrainedValues;
+
+impl<'de> serde::Deserialize<'de> for DrainedValues {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SeqVisitor;
+        impl<'de> serde::de::Visitor<'de> for SeqVisitor {
+            type Value = DrainedValues;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of Loki log entries")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while seq.next_element::<JsonEntry>()?.is_some() {}
+                Ok(DrainedValues)
+            }
+        }
+        deserializer.deserialize_seq(SeqVisitor)
     }
 }
 
@@ -3320,6 +3608,187 @@ mod tests {
                 || err.to_string().contains("total_entries"),
             "{err}"
         );
+    }
+
+    /// Issue #374 round 12: crossing a cap must stop RETENTION, not checking.
+    ///
+    /// Deferring the caps (round 11) left the remainder of an over-cap run to
+    /// `serde::de::IgnoredAny`, which in `serde_json` is a bracket-matching skip
+    /// (`Deserializer::ignore_value`, `de.rs:1102 @ 1.0.150`) that validates no
+    /// types — so a malformed tail past the cap was accepted where the same tail
+    /// before the cap was refused, and the reference refuses both (it decodes
+    /// every occurrence of a repeated field in full,
+    /// `reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`). Measured on
+    /// `grafana/loki@sha256:87f0a067…`: 257 metadata pairs then `"bad":[]`
+    /// superseded was `400` there and `204` here, as was 100,001 entries then a
+    /// bare `0`; the SAME tails one element BELOW the cap were `400` on both.
+    ///
+    /// Each row is a TRIPLE — the malformed tail below the cap (the typed path),
+    /// past the cap (the drained path) and past the cap inside a superseded
+    /// occurrence — and all three must produce the SAME message. Equality is
+    /// what makes this an anti-drift pin rather than three "it 400s" assertions:
+    /// the drained arm has its own `Deserialize` impl, and a divergence in its
+    /// `expecting` text or its accept surface fails here.
+    #[test]
+    fn parse_json_a_drained_value_is_checked_exactly_like_a_retained_one() {
+        // Everything after " at line" is the byte offset, which necessarily
+        // differs between a tail at element 3 and the same tail at element
+        // 100,002.
+        fn rule(body: &str) -> String {
+            let msg = json_loki_decode_message(body);
+            msg.split(" at line").next().unwrap_or(&msg).to_string()
+        }
+        let repeat = |unit: &str, n: usize| {
+            let mut s = String::with_capacity((unit.len() + 1) * n);
+            for i in 0..n {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(unit);
+            }
+            s
+        };
+        let final_values = r#"[["1700000000000000000","final"]]"#;
+        let win = format!(r#"{{"stream":{{"app":"w"}},"values":{final_values}}}"#);
+
+        let empty_streams = repeat("{}", MAX_STREAMS_PER_REQUEST + 1);
+        let entries = repeat(r#"["1700000000000000000","x"]"#, MAX_ENTRIES_PER_STREAM + 1);
+        let raw_pairs = repeat(r#""dup":"v""#, MAX_RAW_LABEL_PAIRS_PER_STREAM + 1);
+        let sm_pairs = repeat(r#""dup":"v""#, MAX_STRUCTURED_METADATA_PER_ENTRY + 1);
+
+        // (drain, below the cap, past the cap, past the cap and superseded)
+        let cases = [
+            (
+                "streams: a non-object element",
+                r#"{"streams":[{},{},0]}"#.to_string(),
+                format!(r#"{{"streams":[{empty_streams},0]}}"#),
+                format!(r#"{{"streams":[{empty_streams},0],"Streams":[{win}]}}"#),
+                "invalid type: integer `0`, expected a Loki stream object with `stream` and `values`",
+            ),
+            (
+                "stream map: a non-string label value",
+                format!(
+                    r#"{{"streams":[{{"stream":{{"a":"b","bad":[]}},"values":{final_values}}}]}}"#
+                ),
+                format!(
+                    r#"{{"streams":[{{"stream":{{{raw_pairs},"bad":[]}},"values":{final_values}}}]}}"#
+                ),
+                format!(
+                    r#"{{"streams":[{{"stream":{{{raw_pairs},"bad":[]}},"stream":{{"app":"w"}},"values":{final_values}}}]}}"#
+                ),
+                "invalid type: sequence, expected a string",
+            ),
+            (
+                "values: a non-array element",
+                r#"{"streams":[{"stream":{"a":"b"},"values":[["1700000000000000000","x"],0]}]}"#
+                    .to_string(),
+                format!(r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[{entries},0]}}]}}"#),
+                format!(
+                    r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[{entries},0],"values":{final_values}}}]}}"#
+                ),
+                "invalid type: integer `0`, expected a [timestamp, line] Loki log entry array",
+            ),
+            (
+                "structured metadata: a non-string value",
+                r#"{"streams":[{"stream":{"a":"b"},"values":[["1700000000000000000","x",{"m":"v","bad":[]}]]}]}"#
+                    .to_string(),
+                format!(
+                    r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{{{sm_pairs},"bad":[]}}]]}}]}}"#
+                ),
+                format!(
+                    r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{{{sm_pairs},"bad":[]}}]]}}],"Streams":[{win}]}}"#
+                ),
+                "invalid type: sequence, expected a string",
+            ),
+        ];
+
+        for (drain, below, past, superseded, expected) in cases {
+            let below_rule = rule(&below);
+            assert_eq!(below_rule, expected, "{drain}: below the cap");
+            assert_eq!(rule(&past), below_rule, "{drain}: past the cap");
+            assert_eq!(
+                rule(&superseded),
+                below_rule,
+                "{drain}: past the cap, superseded"
+            );
+        }
+    }
+
+    /// One nesting ceiling for the whole body, with no ignored-value hole in it.
+    ///
+    /// `serde_json` bounds typed deserialization at 128 levels
+    /// (`RECURSION_LIMIT`, `de.rs:63,1375 @ 1.0.150`) but implements
+    /// `IgnoredAny` as an ITERATIVE skip that the counter never sees, so before
+    /// round 12 a value under a key this decoder does not read — or past a cap —
+    /// could nest arbitrarily deep. The reference bounds exactly these values
+    /// too: jsoniter walks a stream object with `iter.Skip()` before its
+    /// unmarshaler ever runs, under `maxDepth = 10000` (`iter.go:331-338 @
+    /// jsoniter v1.1.12`, error `exceeded max depth`). Measured: a 200,000-level
+    /// nest under an unknown envelope key, under an unknown key inside a stream,
+    /// and as an entry's fourth element was `400` upstream and `204` here.
+    ///
+    /// Ours is the tighter ceiling (128 against 10,000; a legal push nests six),
+    /// so 129..10,000 is a recorded divergence — residual 8 of the
+    /// `ingest-label-bounds` ledger row — not a claim of parity.
+    #[test]
+    fn parse_json_bounds_nesting_depth_in_ignored_and_drained_values() {
+        let nest = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        let entry = r#"["1700000000000000000","x"]"#;
+        let win = r#"{"stream":{"app":"w"},"values":[["1700000000000000000","final"]]}"#;
+        let mut entries = String::new();
+        for i in 0..MAX_ENTRIES_PER_STREAM + 1 {
+            if i > 0 {
+                entries.push(',');
+            }
+            entries.push_str(entry);
+        }
+
+        // Every position a value of arbitrary shape can legally reach: the two
+        // unknown-key arms and an entry's fourth element — the last one both
+        // inside a RETAINED entry and inside a drained one, which is the arm the
+        // cap deferral introduced.
+        let position = |depth: usize| {
+            let deep = nest(depth);
+            [
+                (
+                    "unknown envelope key",
+                    format!(r#"{{"streams":[{win}],"junk":{deep}}}"#),
+                ),
+                (
+                    "unknown key inside a stream",
+                    format!(
+                        r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[{entry}],"junk":{deep}}}]}}"#
+                    ),
+                ),
+                (
+                    "an entry's fourth element",
+                    format!(
+                        r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{{}},{deep}]]}}]}}"#
+                    ),
+                ),
+                (
+                    // Superseded, so that at 64 levels the request is accepted
+                    // rather than refused by the entries cap itself — the depth
+                    // ceiling is then the only thing that can refuse it at 200.
+                    "an entry's fourth element, past the entries cap",
+                    format!(
+                        r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[{entries},["1700000000000000000","x",{{}},{deep}]],"values":[{entry}]}}]}}"#
+                    ),
+                ),
+            ]
+        };
+
+        for (position, body) in position(64) {
+            parse_json(body.as_bytes(), 0)
+                .unwrap_or_else(|e| panic!("{position}: 64 levels must decode: {e}"));
+        }
+        for (position, body) in position(200) {
+            let err = json_loki_decode_message(&body);
+            assert!(
+                err.contains("recursion limit exceeded"),
+                "{position}: 200 levels must be refused by the depth ceiling, got {err:?}"
+            );
+        }
     }
 
     /// The case fold does not skip the per-stream label bounds: an over-wide

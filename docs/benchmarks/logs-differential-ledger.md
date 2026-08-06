@@ -1905,9 +1905,9 @@ back up here.
   a valid one is `204` there, with the valid one's line stored. PulsusDB's
   decode-time caps used to be charged where they trip, so those bodies were
   `400` here. They are now charged **after** the envelope resolves: the
-  `streams`, `values` and `structured_metadata` visitors stop materializing
-  one element past their cap and drain the rest, and the `MAX + 1` sentinel
-  they leave behind is read by `validate_bounds` /
+  `streams`, `values` and `structured_metadata` visitors stop RETAINING
+  one element past their cap and parse the rest without keeping it, and the
+  `MAX + 1` sentinel they leave behind is read by `validate_bounds` /
   `canonical_structured_metadata`; the JSON `stream` map carries its raw
   pair count out to `parse_json`; and `MAX_LABELS_PER_STREAM` is counted on
   the labels that survive rather than on raw pairs — 257 repetitions of one
@@ -1922,6 +1922,24 @@ back up here.
   status cannot see, is
   `loki_push_live::a_superseded_over_cap_value_is_accepted_and_the_final_one_is_stored`.
   The two SHARED cross-request counters are the exception, residual 7.
+  **What "discarded" does not mean: unread.** The remainder past a cap is
+  parsed in full — element types, object structure and nesting depth are
+  checked exactly as they are on the retained side of the cap, message text
+  included — and only the retention stops. The first cut of this deferral
+  drained with `serde::de::IgnoredAny`, which `serde_json` implements as a
+  bracket-matching skip (`Deserializer::ignore_value`, `de.rs:1102 @
+  1.0.150`) that types nothing, so crossing a cap silently switched the
+  checking off: 257 structured-metadata pairs followed by `"bad":[]`, and
+  100,001 entries followed by a bare `0`, each superseded by a valid
+  occurrence, were `400` upstream and `204` here — while the SAME tails one
+  element below the cap were `400` on both sides. Upstream does not skip a
+  superseded value either: jsoniter decodes every occurrence of a repeated
+  field in full before the last one wins
+  (`reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`). Pinned as
+  triples (below the cap / past it / past it and superseded, all three
+  producing the same message) by
+  `loki_push::tests::parse_json_a_drained_value_is_checked_exactly_like_a_retained_one`,
+  and on the wire by the `json/drained-*` harness cases.
 - **Multi-failure bodies** are grouped as `util.GroupedErrors.Error()`
   groups them (`pkg/util/errors.go:105-131 @ v3.7.4`): identical messages
   collapsed with an `N errors like: ` prefix, distinct groups joined with
@@ -2053,12 +2071,22 @@ back up here.
   across every occurrence, and a supersession does not give it back while
   the superseding value is still decoding — so deferring them would mean
   decoding past the budget to find out whether it mattered, trading a
-  rejection divergence for a resource one. The reference has no equivalent:
-  its only bound on this path is the 100 MiB compressed body
-  (`distributor.max-recv-msg-size` default `100<<20`,
-  `pkg/distributor/distributor.go:124 @ v3.7.4`, applied by `io.LimitReader`
-  in `parsePushRequestBody`, `pkg/loghttp/push/push.go:322-325`), inside
-  which jsoniter materializes a superseded value in full and throws it away.
+  rejection divergence for a resource one. The reference has no equivalent
+  bound on DECODING: the only limit a push body meets before it is decoded
+  is the 100 MiB compressed body (`distributor.max-recv-msg-size` default
+  `100<<20`, `pkg/distributor/distributor.go:124 @ v3.7.4`, applied by
+  `io.LimitReader` in `parsePushRequestBody`,
+  `pkg/loghttp/push/push.go:322-325`), inside which jsoniter materializes a
+  superseded value in full and throws it away. That is not the same as "no
+  other limit": what SURVIVES decoding is forwarded to the ingesters over
+  gRPC and meets a 4 MiB message ceiling there
+  (`server.grpc-max-recv-msg-size-bytes` default `4*1024*1024`,
+  `vendor/github.com/grafana/dskit/server/server.go:220`, vendored at
+  v3.7.4), which answers `500 rpc error: code = ResourceExhausted desc =
+  grpc: received message larger than max (4600096 vs. 4194304)` — measured.
+  A surviving 100,001-entry stream is that `500` upstream against our `400`,
+  which is why those two neighbours are asserted hermetically rather than
+  carried as harness rows.
   Reachable, and measured rather than reasoned: 38 superseded streams of
   100,000 minimal entries is a 34 MB body — inside both that 100 MiB and our
   own 64 MiB decompressed cap — and answers `204` upstream with the
@@ -2067,11 +2095,65 @@ back up here.
   streams (27 MB, under the budget) agrees `204`/`204` and stores the same
   line. Harness: `json/superseded-shared-budget` and its `-under`
   discriminator.
+  **What the deferral itself costs, stated exactly.** A drained run is
+  parsed, so it costs parse time over the rest of the body; what it does
+  NOT cost is retention. Peak retained is what the caps admit —
+  `MAX_STREAMS_PER_REQUEST + 1` streams, `MAX_ENTRIES_PER_STREAM + 1`
+  entries per stream, `MAX_STRUCTURED_METADATA_PER_ENTRY + 1` pairs per
+  entry — plus ONE in-flight element being read and dropped, and the input
+  is bounded before decode by the 64 MiB decompressed body cap. The
+  `IgnoredAny` drain this replaced could not say that: `ignore_value` grows
+  a scratch `Vec` by one byte per open bracket with no depth bound at all,
+  so a discarded 200,000-level value moved subject RSS by ~800 kB. After
+  the change the same body is refused by the depth ceiling (residual 8) and
+  five repetitions of it leave RSS unmoved (49,160 kB before and after,
+  measured on the same process).
+- **Residual 8 — the JSON body's nesting ceiling is 128 levels, not
+  10,000.** Nesting of arbitrary depth reaches only values this decoder
+  does not keep: a key it does not read (an unknown envelope key, an
+  unknown key inside a stream object, an entry's fourth+ element) or a run
+  past one of the caps above. All of them are now deserialized through
+  `serde`, which puts them under `serde_json`'s `RECURSION_LIMIT` of 128
+  (`de.rs:63,1375 @ 1.0.150`) — the ceiling every typed value in the body
+  already had, so this is one rule for the whole body rather than a rule
+  with a hole in it. The reference bounds the same values at 10,000:
+  jsoniter walks a stream object with `iter.Skip()` before the hand-written
+  unmarshaler ever runs, under `maxDepth = 10000` (`iter.go:331-338 @
+  jsoniter v1.1.12`, vendored), answering `400 … incrementDepth: exceeded
+  max depth`. Both boundaries measured by bisection on
+  `{"streams":[…],"junk":<N-deep array>}`: PulsusDB accepts 126 and refuses
+  127 (`recursion limit exceeded`), Loki accepts 9,999 and refuses 10,000 —
+  both being "total nesting ≤ ceiling", the envelope object counting as one
+  level. So 127..9,999 levels under an ignored key is `400` here and `204`
+  there. A legal Loki push nests six deep, and the alternative was the
+  `IgnoredAny` skip, which had no ceiling at all: a 200,000-level value was
+  `204` here against upstream's `400`, and the depth cap is a resource
+  guard, not a parity rule. Harness: the `json/ignored-depth-*` cases,
+  which carry both boundaries; hermetically,
+  `loki_push::tests::parse_json_bounds_nesting_depth_in_ignored_and_drained_values`
+  covers every position such a value can reach.
+- **Residual 9 — a non-string value in a `stream` label map.** Upstream does
+  not type these: `LabelSet.UnmarshalJSON` runs
+  `jsonparser.ParseString(val)` over the raw bytes of whatever the value is
+  and stores the result (`pkg/loghttp/labels.go:29-37 @ v3.7.4`), so
+  `{"stream":{"a":123}}` is `204` there and stores the label `a="123"`,
+  while `serde` refuses it here with `invalid type: integer 123, expected a
+  string`. Pre-existing and not introduced by any of this row's work — it
+  is the retained path's rule, and the only thing round 12 changed is that
+  the same rule now also applies PAST the raw-pair cap, where an
+  `IgnoredAny` drain used to let a non-string value through (measured
+  `204`/`204` by accident before, `204`/`400` consistently after). Adjacent
+  and the same mechanism: `"values":[null,["ts","x"]]` is `204` upstream,
+  which skips null elements explicitly (`if ty == jsonparser.Null { return
+  }`, `pkg/loghttp/query.go:131-134 @ v3.7.4`), and `400` here. Both belong
+  to a value-typing change, not to this row's cap ordering. Harness:
+  `json/drained-label-map-non-string` and its `-under-cap` control, both
+  recorded divergences.
 - **Measured side by side**: every case in the harness is sent
   byte-identically to `grafana/loki@sha256:87f0a067…` and to a running
   PulsusDB, over both Loki-push encodings and both OTLP encodings. Statuses
   agree everywhere except residual 3's second half (in both its spellings)
-  and residuals 4, 5, 6 and 7, which the harness carries as expected
+  and residuals 4, 5, 6, 7, 8 and 9, which the harness carries as expected
   divergences so that they stay the ones that were recorded; the case,
   agreement and divergence counts are on
   `compare.py`'s generated summary line at the end of the transcript's

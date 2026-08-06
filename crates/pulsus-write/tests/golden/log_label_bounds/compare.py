@@ -451,10 +451,15 @@ case("json/duplicate-key-65537-raw", "json",
 # The one residual in this family, measured rather than reasoned: 38 superseded
 # streams of 100k minimal entries (34 MB, inside BOTH sides' body limits) puts
 # the SHARED byte budget past 256 MiB before the surviving occurrence is even
-# read.  Upstream's only bound on this path is the 100 MiB compressed body
-# (`distributor.max-recv-msg-size`, distributor.go:124, applied by
-# io.LimitReader in parsePushRequestBody, push.go:322-325 @ v3.7.4), so it
-# answers 204 and stores FINAL.  A control at 30 streams agrees 204/204.
+# read.  Upstream applies no size bound WHILE DECODING beyond the 100 MiB
+# compressed body (`distributor.max-recv-msg-size`, distributor.go:124, applied
+# by io.LimitReader in parsePushRequestBody, push.go:322-325 @ v3.7.4), so it
+# answers 204 and stores FINAL.  (It is not unbounded overall: what survives
+# decoding meets a 4 MiB gRPC ceiling on the way to the ingesters --
+# `server.grpc-max-recv-msg-size-bytes`, dskit server.go:220 -- which is a 500,
+# not a 400, and is why the two 100,001-entry `-survives` neighbours are
+# asserted hermetically instead of here.)  A control at 30 streams agrees
+# 204/204.
 _bulk = ('{"stream":{"a":"b"},"values":['
          + ",".join('["1",""]' for _ in range(100_000)) + "]}")
 case("json/superseded-shared-budget", "json",
@@ -463,6 +468,103 @@ case("json/superseded-shared-budget", "json",
 case("json/superseded-shared-budget-under", "json",
      ('{"streams":[' + ",".join(_bulk for _ in range(30)) + '],"Streams":[' + _win + "]}").encode(),
      "application/json")
+
+# ---- crossing a cap stops RETENTION, not checking -------------------------
+# Round 12.  The deferral above left the remainder of an over-cap run to
+# serde::de::IgnoredAny, which serde_json implements as a bracket-matching skip
+# (Deserializer::ignore_value, de.rs:1102 @ 1.0.150) that checks no types -- so
+# a malformed tail PAST a cap was accepted where the same tail BEFORE it was
+# refused.  Upstream checks a discarded value too: jsoniter decodes every
+# occurrence of a repeated field in full before the last wins
+# (reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12).
+#
+# Every row is a PAIR with its `-under-cap` control, and the control is what
+# makes the row mean something: it is the same malformed tail one element
+# BELOW the cap, so a "fix" that made the cap unreachable would leave the pair
+# agreeing for the wrong reason.  Each over-cap row below was 204 here and 400
+# upstream before this round; each control was already 400/400 (or, for the
+# label map, already the residual-9 400/204).
+#
+# These bodies are refused at DECODE on both sides, before any timestamp is
+# looked at, so they carry a FIXED timestamp rather than `now`: Loki's decode
+# errors quote a window of the body back, and a `now` timestamp inside that
+# window makes the recorded transcript unreproducible.  The one row that must
+# stay fresh is `label-map-non-string`, which upstream accepts and stores.
+_bad = "0"
+_fixed_ts = "1700000000000000000"
+_fixed_final = '[["' + _fixed_ts + '","FINAL"]]'
+_fixed_win = '{"stream":{"app":"w"},"values":' + _fixed_final + "}"
+_pairs = lambda n, k="k": ",".join('"%s%d":"v"' % (k, i) for i in range(n))
+_entries = lambda n: ",".join('["' + _fixed_ts + '","x"]' for _ in range(n))
+
+
+def drained(name, over, under, expect="SAME"):
+    case("json/drained-" + name, "json", over.encode(), "application/json", expect=expect)
+    case("json/drained-" + name + "-under-cap", "json", under.encode(),
+         "application/json", expect=expect)
+
+
+drained("streams-non-object",
+        '{"streams":[%s,%s],"Streams":[%s]}'
+        % (",".join("{}" for _ in range(1_000_001)), _bad, _fixed_win),
+        '{"streams":[{},{},%s],"Streams":[%s]}' % (_bad, _fixed_win))
+drained("values-non-array",
+        '{"streams":[{"stream":{"app":"s"},"values":[%s,%s],"values":%s}]}'
+        % (_entries(100_001), _bad, _fixed_final),
+        '{"streams":[{"stream":{"app":"s"},"values":[%s,%s],"values":%s}]}'
+        % (_entries(2), _bad, _fixed_final))
+drained("metadata-non-string",
+        '{"streams":[{"stream":{"app":"s"},"values":[["%s","x",{%s,"bad":[]}]]}],"Streams":[%s]}'
+        % (_fixed_ts, _pairs(257, "m"), _fixed_win),
+        '{"streams":[{"stream":{"app":"s"},"values":[["%s","x",{%s,"bad":[]}]]}],"Streams":[%s]}'
+        % (_fixed_ts, _pairs(2, "m"), _fixed_win))
+# The `stream` map's drain, in the one shape upstream also refuses: 20,000
+# levels of nesting is past ITS ceiling too (residual 8).  The non-string shape
+# below cannot show agreement, because upstream does not type a label value at
+# all (residual 9) -- which is exactly why both spellings are here.
+drained("label-map-deep",
+        '{"streams":[{"stream":{%s,"deep":%s},"stream":{"app":"w"},"values":%s}]}'
+        % (_pairs(65_537), "[" * 20_000 + "]" * 20_000, _fixed_final),
+        '{"streams":[{"stream":{%s,"deep":%s},"stream":{"app":"w"},"values":%s}]}'
+        % (_pairs(2), "[" * 20_000 + "]" * 20_000, _fixed_final))
+drained("label-map-non-string",
+        '{"streams":[{"stream":{%s,"bad":[]},"stream":{"app":"w"},"values":%s}]}'
+        % (_pairs(65_537), _final),
+        '{"streams":[{"stream":{%s,"bad":[]},"stream":{"app":"w"},"values":%s}]}'
+        % (_pairs(2), _final),
+        expect="DIFF")
+
+# ---- one nesting ceiling for the body, and where the two ceilings differ ---
+# Residual 8.  Arbitrary nesting reaches only values the decoder does not keep:
+# an unknown key, or a run past a cap.  All of them now deserialize through
+# serde, so serde_json's RECURSION_LIMIT of 128 (de.rs:63,1375 @ 1.0.150)
+# covers them -- the ceiling every typed value already had.  Upstream's is
+# jsoniter's maxDepth = 10000 (iter.go:331-338 @ v1.1.12), reached by the
+# iter.Skip() that walks a stream object before its unmarshaler runs.
+# Both boundaries are bisected, not assumed, and both sides count the envelope
+# object as one level: we accept 126 and refuse 127, Loki accepts 9,999 and
+# refuses 10,000.
+_deep = lambda n: "[" * n + "]" * n
+# The boundary rows keep a `now` timestamp: upstream ACCEPTS three of the four
+# and stores the line, so a stale one would be refused for the wrong reason.
+for _d, _expect in ((126, "SAME"), (127, "DIFF"), (9_999, "DIFF")):
+    case("json/ignored-depth-%d" % _d, "json",
+         ('{"streams":[' + _win + '],"junk":' + _deep(_d) + "}").encode(),
+         "application/json", expect=_expect)
+# Past both ceilings -- refused at decode on both sides, so fixed timestamps
+# again, in each of the three positions such a value can reach.
+case("json/ignored-depth-10000", "json",
+     ('{"streams":[' + _fixed_win + '],"junk":' + _deep(10_000) + "}").encode(),
+     "application/json")
+case("json/ignored-depth-200000-envelope-key", "json",
+     ('{"streams":[' + _fixed_win + '],"junk":' + _deep(200_000) + "}").encode(),
+     "application/json")
+case("json/ignored-depth-200000-stream-key", "json",
+     ('{"streams":[{"stream":{"app":"a"},"values":' + _fixed_final
+      + ',"junk":' + _deep(200_000) + "}]}").encode(), "application/json")
+case("json/ignored-depth-200000-entry-4th-element", "json",
+     ('{"streams":[{"stream":{"app":"a"},"values":[["' + _fixed_ts + '","x",{},'
+      + _deep(200_000) + "]]}]}").encode(), "application/json")
 
 # ---- Loki push, protobuf -------------------------------------------------
 def pb(labels, line="hi"):
