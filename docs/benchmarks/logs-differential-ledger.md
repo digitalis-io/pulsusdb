@@ -1698,3 +1698,108 @@ absence of a corpus row for an oversight.
   stream, then query `avg_over_time`, `avg_over_time … by (env)`,
   `avg_over_time … without ()`, `stdvar_over_time` and
   `stdvar_over_time … by (env)` at an instant covering them.
+
+### `malformed-query-refused-in-every-window` (issue #380, owner ruling 2026-08-06 — deliberate, the reference is wrong here)
+
+- **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
+  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`,
+  `ci/logql/config.yaml`). The same malformed query,
+  `{app="checkout"} | addr = ip("nope")`, over different windows:
+
+  | window | status |
+  |---|---|
+  | 1 h ending now | `400` `parse error : stage '\| addr=ip("nope")' : ip: invalid pattern: "nope"` |
+  | 1 h ending 2 h ago | `400` |
+  | 1 h ending 3 h ago | `200`, empty |
+  | 1 h ending ten years ago | `200`, empty |
+  | `start=0&end=1` | `200`, empty |
+  | 1 h starting a day from now | `400` |
+
+- **The boundary is `query_ingesters_within` (3 h by default), NOT
+  `max_query_lookback`.** The lookback middleware
+  (`pkg/querier/queryrange/limits.go:167-181 @ v3.7.4`) was the first
+  explanation offered for this — on issue #380, and in a comment on
+  `logql_nested_ip_matrix.rs` — and it is wrong: the pinned container
+  reports `max_query_lookback: 0s` on `/config`, which is the shipped
+  default (`pkg/validation/limits.go:379 @ v3.7.4`), so that branch never
+  runs. Bisecting the window by hour puts the transition exactly at 3 h,
+  the default `query_ingesters_within`.
+
+- **The rule, from the source.** When a query's END precedes
+  `now - query_ingesters_within`, the ingester is not consulted at all
+  and only the store is —
+  `BuildQueryIntervalsWithLookback` returns a nil ingester interval
+  (`pkg/querier/intervals.go:32-38 @ v3.7.4`, via
+  `isWithinIngesterMaxLookbackPeriod`, `pkg/querier/querier.go:277-287`).
+  The store's `SelectLogs` then returns `iter.NoopEntryIterator` as soon
+  as no chunk matches (`pkg/storage/store.go:491 @ v3.7.4`) — **before**
+  `expr.Pipeline()` at `:497`. The same 3 h boundary was measured
+  independently on issue #352, from the other side: pushes older than it
+  succeed and then answer nothing (`logqltest_replay.rs`'s
+  `INGESTION_WINDOW` table). The malformed `ip()` pattern is raised
+  when the pipeline is BUILT (`log.NewIPLabelFilter` records the error
+  and leaves the matcher nil, `pkg/logql/log/ip.go:94-103`;
+  `PatternError()`'s only caller is `LabelFilterExpr.Stage()`,
+  `pkg/logql/syntax/ast.go:801-809`), so it is never raised and the query
+  answers 200-empty.
+
+- **The class is pipeline-BUILD errors, not parse errors** — measured,
+  and it corrects issue #380's body, which said this applies to "every
+  parse-time-invalid construct". Each query below over a 1 h window
+  ending now vs a 1 h window ending 4 h ago:
+
+  | query | recent | 4 h old |
+  |---|---|---|
+  | `{app="checkout"} \| addr = ip("nope")` | `400` | `200` |
+  | `{app="checkout"} \| line_format "{{"` | `400` | `200` |
+  | `{app="checkout"} \| json \| label_format a=b,a=c` | `400` | `200` |
+  | `{app="checkout"} \|\|\|` | `400` | `400` |
+  | `{app=` | `400` | `400` |
+  | `count_over_time({app="x"}[5m]) +` | `400` | `400` |
+  | `{app="checkout"} \| unwrap foo \| __error__=` \`x\` | `400` | `400` |
+
+  A syntax error is refused in both windows; an error the parser accepts
+  and the pipeline builder rejects is refused only while the ingester is
+  in the query's path.
+
+- **PulsusDB behaviour (the delta): a malformed query is a `400` in every
+  window.** Nothing about our rejection depends on the dates asked for:
+  `plan()` and `CompiledPipeline::compile` both run before any I/O
+  (`logql/exec.rs:612`, `:906`, `:2290`, `:2576`, propagated with `?` and
+  surfaced by `logs_api/error.rs` as a 400), so an invalid pipeline
+  cannot reach a "no chunks, return empty" path in the first place.
+
+- **Why we do not copy it** (owner ruling, 2026-08-06). Answering `200`
+  with no results for a query that has a typo in it is wrong: the user
+  reads an empty result as "no logs matched", not "your query is
+  broken", and the same query gets both answers depending on which dates
+  they picked. `{app="checkout"} | addr = ip("nope")` is malformed
+  whatever window you ask for.
+
+- **Reachability — the five-year span cap does not narrow this** (issue
+  #380 option 3, measured). The divergence needs a window whose END is
+  more than `query_ingesters_within` in the past; it puts no lower bound
+  on the SPAN, and the natural cases are tiny (1 h ending 4 h ago, 1 h
+  ten years ago, `start=0&end=1` — all far under 5 years), so
+  `five-year-span-cap` fires on none of them. In the other direction, a
+  span big enough to trip our cap is already refused by the reference on
+  its own `max_query_length` (default 721 h = `30d1h`): measured,
+  `start=0` to ten-years-ago is a `400 the query time range exceeds the
+  limit (query length: 408519h40m31s, limit: 30d1h)` there. So the cap
+  only ever fires where the reference also rejects, and the divergence
+  surface is exactly what this entry describes.
+
+- Gated by `b20_nested_ip.test`'s
+  `# provenance: divergence(malformed-query-refused-in-every-window)`
+  row, which pins that the lone malformed `ip()` filter is refused by the
+  value evaluator with no window in the picture at all.
+
+- **Re-derivation.** `podman run -d -p 13380:3100 -v
+  ci/logql/config.yaml:/etc/loki/local-config.yaml:ro
+  grafana/loki@sha256:87f0a067…`, wait for `/ready`, then `curl -sS -G
+  --data-urlencode 'query={app="checkout"} | addr = ip("nope")'
+  --data-urlencode start=… --data-urlencode end=…
+  http://localhost:13380/loki/api/v1/query_range` with the windows in the
+  first table. `curl -s http://localhost:13380/config | grep
+  max_query_lookback` shows the `0s` that rules out the lookback
+  middleware.

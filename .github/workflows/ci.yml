@@ -608,7 +608,7 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_json_key_sanitization
 
-      # corpus-counts: none
+      # corpus-counts: none (ci-replay-leg)
       # Issue #352 step 3: the LogQL corpus replay. Takes each reachable
       # corpus case's `load` to this same reference and compares its
       # answer against the committed expectation, so a capture that goes
@@ -630,7 +630,7 @@ jobs:
       # PROVENANCE.md). The `corpus-counts: none` marker above makes that
       # rule enforceable rather than advisory; see
       # `check_f_marked_regions_state_no_corpus_count`.
-      # corpus-counts: end
+      # corpus-counts: end (ci-replay-leg)
       - name: LogQL corpus replay leg (issue #352, nightly)
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:

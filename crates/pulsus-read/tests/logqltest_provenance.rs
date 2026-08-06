@@ -907,16 +907,32 @@ const NO_COUNT_ROOTS: &[(&str, &[&str])] = &[
     ("../../docs", &["md"]),
 ];
 
-/// Files that must still contribute a region. A renamed or mistyped
-/// marker would otherwise turn this check into a green no-op — the exact
-/// failure mode that let three stale counts through.
-const NO_COUNT_REQUIRED: &[&str] = &[
-    "PROVENANCE.md",
-    "logqltest_replay.rs",
-    "logqltest_provenance.rs",
-    "ci.yml",
+/// Every region that must still exist, as `(file, region id)`. A
+/// renamed, mistyped or deleted marker would otherwise turn this check
+/// into a green no-op — the exact failure mode that let three stale
+/// counts through.
+///
+/// This lists REGIONS, not files, and that distinction is the finding it
+/// was rewritten for: `PROVENANCE.md` carries two regions, so a
+/// file-name list stayed GREEN when the first marker pair was deleted
+/// and the second one kept the file in the set. Each open marker now
+/// names its own id (`corpus-counts: none (<id>)`) and its `end` repeats
+/// it, so losing, renaming or gutting any single region fails here by
+/// name.
+const NO_COUNT_REQUIRED: &[(&str, &str)] = &[
+    ("PROVENANCE.md", "provenance-replay-coverage"),
+    ("PROVENANCE.md", "provenance-template-corpus"),
+    ("logqltest_replay.rs", "replay-module-doc"),
+    ("logqltest_replay.rs", "replay-absolute-timestamp"),
+    ("logqltest_replay.rs", "replay-coverage-constants"),
+    ("logqltest_provenance.rs", "provenance-corpus-constants"),
+    ("ci.yml", "ci-replay-leg"),
 ];
 
+/// Spelled quantities. Tens without a units word (`sixty`) are here too:
+/// the list is read through [`is_number_word`], which also resolves the
+/// hyphenated compounds (`twenty-one`) that a flat membership test read
+/// as ordinary words.
 const NUMBER_WORDS: &[&str] = &[
     "one",
     "two",
@@ -941,10 +957,28 @@ const NUMBER_WORDS: &[&str] = &[
     "thirty",
     "forty",
     "fifty",
+    "sixty",
+    "seventy",
+    "eighty",
+    "ninety",
     "dozen",
     "hundred",
     "thousand",
+    "million",
 ];
+
+/// Whether a token spells a quantity.
+///
+/// A hyphenated compound counts when EVERY part does: `twenty-one` and
+/// `thirty-five` are numbers, `one-off` and `well-formed` are not. The
+/// flat `NUMBER_WORDS.contains()` this replaces saw `twenty-one rows` as
+/// an ordinary word and let it through — the same class of hole as the
+/// file-name region list above, one token further in.
+fn is_number_word(tok: &str) -> bool {
+    let lower = tok.to_ascii_lowercase();
+    let mut parts = lower.split('-').filter(|p| !p.is_empty()).peekable();
+    parts.peek().is_some() && parts.all(|p| NUMBER_WORDS.contains(&p))
+}
 
 /// What a corpus count counts. A number-word immediately before one of
 /// these is the shape that shipped in round 3 ("added nine more `eval`
@@ -984,13 +1018,64 @@ fn files_under(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The comment/prose lines of a marked region, with the marker lines
-/// themselves dropped. Code is not scanned: the counts BELONG in code.
-fn marked_prose(path: &Path, text: &str) -> Vec<(usize, String)> {
+/// One marked region: the id its markers carry, where it opens, and its
+/// comment/prose lines with the marker lines themselves dropped. Code is
+/// not scanned: the counts BELONG in code.
+#[derive(Debug)]
+struct MarkedRegion {
+    id: String,
+    open_line: usize,
+    /// Every scanned line, the two marker lines' own tails included.
+    prose: Vec<(usize, String)>,
+    /// Of those, the lines BETWEEN the markers. Markers around nothing
+    /// would otherwise satisfy the "this region still has prose" floor.
+    body_lines: usize,
+}
+
+/// The id a marker line carries, e.g. `corpus-counts: none (ci-replay-leg)`.
+///
+/// Required, and required to match on the region's `end`: an id is what
+/// makes a LOST region visible to [`NO_COUNT_REQUIRED`], which a file
+/// name cannot do for the second region in a file.
+fn marker_id(path: &Path, line_no: usize, kind: &str, rest: &str) -> String {
+    let rest = rest.trim();
+    let id = rest
+        .strip_prefix('(')
+        .and_then(|r| r.split(')').next())
+        .unwrap_or_default();
+    assert!(
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+        "{path:?}:{line_no}: `corpus-counts: {kind}` must name its region, as \
+         `corpus-counts: {kind} (<id>)` with a lowercase-and-dashes id — an unnamed region \
+         cannot be missed when it disappears (see NO_COUNT_REQUIRED)"
+    );
+    id.to_string()
+}
+
+/// What a marker line says after its id, scanned like any other prose —
+/// otherwise the one line the parser consumes is the one line a count
+/// could hide on.
+fn marker_prose(line_no: usize, rest: &str) -> Vec<(usize, String)> {
+    let tail = rest
+        .trim()
+        .split_once(')')
+        .map(|(_, tail)| tail.trim())
+        .unwrap_or("");
+    if tail.is_empty() {
+        Vec::new()
+    } else {
+        vec![(line_no, tail.to_string())]
+    }
+}
+
+fn marked_regions(path: &Path, text: &str) -> Vec<MarkedRegion> {
     let is_md = path.extension().is_some_and(|e| e == "md");
     let is_yml = path.extension().is_some_and(|e| e == "yml");
-    let mut out = Vec::new();
-    let mut open_at: Option<usize> = None;
+    let mut out: Vec<MarkedRegion> = Vec::new();
+    let mut open: Option<MarkedRegion> = None;
     let mut in_fence = false;
     for (i, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -1008,25 +1093,46 @@ fn marked_prose(path: &Path, text: &str) -> Vec<(usize, String)> {
             .trim_start_matches("//")
             .trim_start_matches('#')
             .trim();
-        if bare.starts_with("corpus-counts: none") {
+        if let Some(rest) = bare.strip_prefix("corpus-counts: none") {
             assert!(
-                open_at.is_none(),
+                open.is_none(),
                 "{path:?}:{}: a `corpus-counts: none` region is already open",
                 i + 1
             );
-            open_at = Some(i + 1);
+            // The marker line's OWN tail is prose too: regions open with
+            // `none (<id>) — why this region exists`, and skipping the
+            // whole line would leave exactly one line nobody scans.
+            open = Some(MarkedRegion {
+                id: marker_id(path, i + 1, "none", rest),
+                open_line: i + 1,
+                prose: marker_prose(i + 1, rest),
+                body_lines: 0,
+            });
             continue;
         }
-        if bare.starts_with("corpus-counts: end") {
-            assert!(
-                open_at.is_some(),
-                "{path:?}:{}: `corpus-counts: end` closes nothing",
-                i + 1
+        if let Some(rest) = bare.strip_prefix("corpus-counts: end") {
+            let mut region = open.take().unwrap_or_else(|| {
+                panic!("{path:?}:{}: `corpus-counts: end` closes nothing", i + 1)
+            });
+            region.prose.extend(marker_prose(i + 1, rest));
+            let id = marker_id(path, i + 1, "end", rest);
+            assert_eq!(
+                id,
+                region.id,
+                "{path:?}:{}: `corpus-counts: end ({id})` closes the region opened at line {} as \
+                 `{}` — the ids must match, or a region can be silently re-labelled out of \
+                 NO_COUNT_REQUIRED",
+                i + 1,
+                region.open_line,
+                region.id
             );
-            open_at = None;
+            out.push(region);
             continue;
         }
-        if open_at.is_none() || in_fence {
+        let Some(region) = open.as_mut() else {
+            continue;
+        };
+        if in_fence {
             continue;
         }
         let prose = if is_md {
@@ -1038,15 +1144,20 @@ fn marked_prose(path: &Path, text: &str) -> Vec<(usize, String)> {
                 .or_else(|| line.strip_prefix("///"))
                 .or_else(|| line.strip_prefix("//"))
         };
-        if let Some(p) = prose {
-            out.push((i + 1, p.to_string()));
+        // Blank lines are not prose: a region gutted down to its markers
+        // and a blank line would otherwise clear the "still has text"
+        // floor below (it did, on the first run of the mutant battery).
+        if let Some(p) = prose.map(str::trim).filter(|p| !p.is_empty()) {
+            region.prose.push((i + 1, p.to_string()));
+            region.body_lines += 1;
         }
     }
-    assert!(
-        open_at.is_none(),
-        "{path:?}: a `corpus-counts: none` region opened at line {} is never closed",
-        open_at.unwrap_or(0)
-    );
+    if let Some(region) = open {
+        panic!(
+            "{path:?}: `corpus-counts: none ({})` opened at line {} is never closed",
+            region.id, region.open_line
+        );
+    }
     out
 }
 
@@ -1116,12 +1227,44 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
 /// number and none fixed the class, because nothing failed when the next
 /// copy drifted. This is that thing.
 ///
+/// **The guard's own failure surface, bounded.** A guard whose sentence
+/// is wider than its assertion is the same defect one level up, so every
+/// way this one could go quietly green has a mutant that reddens it,
+/// each applied and reverted on issue #248's final round:
+///
+/// | mutant | what fails |
+/// |---|---|
+/// | a digit count inside a region | the region-states-a-count list |
+/// | a spelled count, `nine rows` | the same |
+/// | a COMPOUND spelled count, `twenty-one rows` | the same, via [`is_number_word`] |
+/// | a count on a MARKER line's own tail | the same — the marker's tail is scanned, not skipped |
+/// | a marker PAIR deleted | [`NO_COUNT_REQUIRED`] misses the region id |
+/// | the open marker alone deleted | `end` closes nothing |
+/// | the `end` alone deleted | the next `none` finds a region already open |
+/// | an id renamed on one side | open/end ids must match |
+/// | an id renamed on both sides | the id is missing from [`NO_COUNT_REQUIRED`] |
+/// | an id dropped entirely | a marker must name its region |
+/// | a duplicated id | ids must be unique |
+/// | a region's prose deleted, markers kept | a required region must still carry prose |
+///
+/// **There is no thirteenth.** A region reaching the scan is exactly
+/// four parts — an open marker, an id, a body, an end marker — and the
+/// table mutates each part in each way it can go wrong: present/absent,
+/// renamed on one side/both, and (for the body) emptied. The marker
+/// tokens are two, both above; the count forms are digits and words,
+/// both above. Blank lines do NOT count as prose, which the mutant table
+/// found: `M10` first passed because markers around a single empty line
+/// cleared the "still has text" floor.
+///
+/// What remains is not a hole in the guard but a hole in its INPUT, and
+/// it is the next paragraph.
+///
 /// **What it cannot see, stated rather than implied:** a count inside
 /// backticks, a count in a file outside [`NO_COUNT_ROOTS`], a count in a
 /// region nobody marked, and a quantity spelled in a way
-/// [`NUMBER_WORDS`] does not list ("a handful"). The marker is the
-/// contract: prose that carries counts must be inside one, and
-/// [`NO_COUNT_REQUIRED`] keeps the known regions from evaporating.
+/// [`is_number_word`] does not resolve ("a handful", "a couple"). The
+/// marker is the contract: prose that carries counts must be inside one,
+/// and [`NO_COUNT_REQUIRED`] keeps the known regions from evaporating.
 #[test]
 fn check_f_marked_regions_state_no_corpus_count() {
     let mut files = Vec::new();
@@ -1129,7 +1272,8 @@ fn check_f_marked_regions_state_no_corpus_count() {
         files_under(&manifest_path(root), exts, &mut files);
     }
     let mut violations: Vec<String> = Vec::new();
-    let mut contributing: Vec<String> = Vec::new();
+    // (file name, region id, prose lines) for every region found.
+    let mut found: Vec<(String, String, usize)> = Vec::new();
     let mut scanned_lines = 0usize;
 
     for path in &files {
@@ -1142,33 +1286,36 @@ fn check_f_marked_regions_state_no_corpus_count() {
             .expect("file name")
             .to_string_lossy()
             .into_owned();
-        contributing.push(name.clone());
-        for (line_no, prose) in marked_prose(path, &text) {
-            scanned_lines += 1;
-            let cleaned = strip_code_spans(&prose);
-            let toks: Vec<&str> = cleaned.split_whitespace().map(trimmed_token).collect();
-            for (i, tok) in toks.iter().enumerate() {
-                let lower = tok.to_ascii_lowercase();
-                if tok.chars().any(|c| c.is_ascii_digit())
-                    && !is_allowed_numeric(tok, i.checked_sub(1).map(|p| toks[p]))
-                {
-                    violations.push(format!(
-                        "{name}:{line_no}: `{tok}` — a corpus count belongs on the constant \
-                         that recomputes it, not in prose"
-                    ));
-                }
-                if NUMBER_WORDS.contains(&lower.as_str())
-                    && toks
-                        .iter()
-                        .skip(i + 1)
-                        .take(3)
-                        .any(|t| COUNT_NOUNS.contains(&t.to_ascii_lowercase().as_str()))
-                {
-                    violations.push(format!(
-                        "{name}:{line_no}: `{tok}` counts {} — spell out no count here; name \
-                         the rows and point at the constant",
-                        toks.get(i + 1).copied().unwrap_or("")
-                    ));
+        for region in marked_regions(path, &text) {
+            found.push((name.clone(), region.id.clone(), region.body_lines));
+            scanned_lines += region.body_lines;
+            for (line_no, prose) in region.prose {
+                let cleaned = strip_code_spans(&prose);
+                let toks: Vec<&str> = cleaned.split_whitespace().map(trimmed_token).collect();
+                for (i, tok) in toks.iter().enumerate() {
+                    if tok.chars().any(|c| c.is_ascii_digit())
+                        && !is_allowed_numeric(tok, i.checked_sub(1).map(|p| toks[p]))
+                    {
+                        violations.push(format!(
+                            "{name}:{line_no} ({}): `{tok}` — a corpus count belongs on the \
+                             constant that recomputes it, not in prose",
+                            region.id
+                        ));
+                    }
+                    if is_number_word(tok)
+                        && toks
+                            .iter()
+                            .skip(i + 1)
+                            .take(3)
+                            .any(|t| COUNT_NOUNS.contains(&t.to_ascii_lowercase().as_str()))
+                    {
+                        violations.push(format!(
+                            "{name}:{line_no} ({}): `{tok}` counts {} — spell out no count here; \
+                             name the rows and point at the constant",
+                            region.id,
+                            toks.get(i + 1).copied().unwrap_or("")
+                        ));
+                    }
                 }
             }
         }
@@ -1180,16 +1327,38 @@ fn check_f_marked_regions_state_no_corpus_count() {
         violations.len(),
         violations.join("\n")
     );
-    for want in NO_COUNT_REQUIRED {
+    // A region id must be unique repo-wide, or `NO_COUNT_REQUIRED` would
+    // be satisfied by whichever copy survived.
+    let mut ids: Vec<&str> = found.iter().map(|(_, id, _)| id.as_str()).collect();
+    ids.sort_unstable();
+    let dupes: Vec<&&str> = ids
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| &w[0])
+        .collect();
+    assert!(
+        dupes.is_empty(),
+        "`corpus-counts` region ids must be unique; duplicated: {dupes:?}"
+    );
+
+    for (file, id) in NO_COUNT_REQUIRED {
+        let region = found.iter().find(|(f, i, _)| f == file && i == id);
+        let Some((_, _, prose_lines)) = region else {
+            panic!(
+                "{file} no longer carries the `corpus-counts: none ({id})` region — a mistyped, \
+                 renamed or deleted marker turns this check into a no-op, which is how the class \
+                 survived three corrections. A file-name list could not see this: {file} may \
+                 hold other regions and stay in the set. Found: {found:?}"
+            );
+        };
+        // Markers around nothing pass every assertion above vacuously.
         assert!(
-            contributing.iter().any(|f| f == want),
-            "{want} no longer carries a `corpus-counts: none` region — a mistyped or deleted \
-             marker turns this check into a no-op, which is how the class survived three \
-             corrections. Found regions in: {contributing:?}"
+            *prose_lines > 0,
+            "{file}: the `corpus-counts: none ({id})` region has no prose left — the markers \
+             survived and the text they govern did not"
         );
     }
-    // The scan must be reading real prose: an empty region set passes
-    // every assertion above vacuously.
+    // Coarse backstop on the scan as a whole, above the per-region floor.
     assert!(
         scanned_lines > 60,
         "check F scanned only {scanned_lines} prose lines — the regions have collapsed"
@@ -1289,8 +1458,8 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
     }
 }
 
-// corpus-counts: none — the values below are recomputed from the corpus
-// and asserted by `check_e_...`; the prose says which rows moved them and
+// corpus-counts: none (provenance-corpus-constants) — the values below are
+// recomputed from the corpus and asserted by `check_e_...`; the prose says which rows moved them and
 // why, never how many. Issue #248 restated a delta here and got it wrong
 // while the arithmetic beside it was right, which is the whole reason the
 // rule is now mechanical (`check_f_marked_regions_state_no_corpus_count`).
@@ -1328,7 +1497,7 @@ const CAPTURED: usize = 1_208;
 /// boundary fix added the domain-edge rows (each off-axis row with its
 /// on-axis control), same file default.
 const DERIVED: usize = 31;
-const DIVERGENCE: usize = 17;
+const DIVERGENCE: usize = 18;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_288;
-// corpus-counts: end
+const TOTAL: usize = 1_289;
+// corpus-counts: end (provenance-corpus-constants)

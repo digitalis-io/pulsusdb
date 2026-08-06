@@ -9,7 +9,7 @@ the #218 lesson): a one-ULP perturbation reddens the runner
 
 ## Replay coverage: separate figures, never one (issue #352 step 3)
 
-<!-- corpus-counts: none -->
+<!-- corpus-counts: none (provenance-replay-coverage) -->
 
 The live replay leg (`logqltest_replay.rs`) is built. It takes each
 reachable case's `load` to the digest-pinned reference and compares the
@@ -39,10 +39,20 @@ outlived every correction.
 **So the rule is mechanical, and the region you are reading is inside
 it.** Between a `corpus-counts: none` marker and its `corpus-counts: end`,
 no comment or prose may state a count derived from the corpus — not in
-digits, not spelled out, not as a per-issue delta. Name the reason, point
-at the constant. `check_f_marked_regions_state_no_corpus_count`
+digits, not spelled out (`nine`, `twenty-one`), not as a per-issue delta.
+Name the reason, point at the constant.
+`check_f_marked_regions_state_no_corpus_count`
 (`logqltest_provenance.rs`) fails on one, and when a figure really moves,
 the recomputing assertion prints its new value.
+
+**Each marker names its region**, as `corpus-counts: none (<id>)` with the
+same id repeated on its `corpus-counts: end`, and every id is listed in
+that check's `NO_COUNT_REQUIRED`. So the check fails BY NAME when a region
+is deleted, renamed, un-named, duplicated or emptied — the earlier version
+listed file names instead, and this file carries a region in more than one
+section, so deleting the first pair left the file in the set and the check
+stayed green. Adding a region means adding its id to that list; the
+marker line's own tail is scanned like any other prose.
 
 `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg existed,
 and that name was wrong: most of those rows can never be reached. The
@@ -95,7 +105,7 @@ rather than reporting the stale lines as corpus mismatches. CI always
 starts a fresh container, which is why an unchecked assumption here would
 have held in CI and misled every local run.
 
-<!-- corpus-counts: end -->
+<!-- corpus-counts: end (provenance-replay-coverage) -->
 
 ## Pinned reference
 
@@ -313,7 +323,7 @@ not the pure value path).
 
 ## Issue #230 — template-engine corpus (`t1…t6_*.test`)
 
-<!-- corpus-counts: none -->
+<!-- corpus-counts: none (provenance-template-corpus) -->
 
 The `t*` files pin the `line_format`/`label_format` template engine —
 `eval` rows in all six, plus the `eval_fail` reject-parity cases, which
@@ -329,7 +339,7 @@ differential ledger do quote this corpus's size, and
 `check_f_quoted_template_corpus_counts_match_the_corpus` recomputes it
 from the files rather than trusting either.)
 
-<!-- corpus-counts: end -->
+<!-- corpus-counts: end (provenance-template-corpus) -->
 
 **Toolchain of record:**
 the pinned image's binary is built with **go1.26.5** (`go version -m`

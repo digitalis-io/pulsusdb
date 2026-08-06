@@ -405,15 +405,26 @@ fn the_pre_248_eager_rule_disagrees_with_the_reference_wherever_the_filter_defer
 // ---------------------------------------------------------------------
 
 /// **The window has to be a servable one, and that is measured, not
-/// stylistic.** `limitsMiddleware.Do` returns `NewEmptyResponse(r)` —
-/// HTTP 200, empty — for any request whose whole range sits before
-/// `max_query_lookback` (`pkg/querier/queryrange/limits.go:167-181 @
-/// v3.7.4`), so the query never reaches the engine, `Stage()` never runs
-/// and a malformed `ip()` never surfaces. Measured on the pinned
-/// container: the same lone malformed filter is a 400 over a recent
-/// window and a 200 over `start=0&end=1` or a window ten years back.
-/// Putting this matrix to a degenerate window would have scored the
-/// reference as accepting all of it.
+/// stylistic.** On the pinned container the same lone malformed filter
+/// is a 400 over a recent window and a 200, empty, over `start=0&end=1`
+/// or a window ten years back. Putting this matrix to a degenerate
+/// window would have scored the reference as accepting all of it, so the
+/// window below ends at `now`.
+///
+/// The boundary is `querier.query_ingesters_within` (3 h by default),
+/// bisected by the hour on the pinned container (issue #380): once the
+/// query's END is older than that the ingester leaves the query's path
+/// (`pkg/querier/intervals.go:32-38 @ v3.7.4`) and only the store is
+/// asked, and the store returns `iter.NoopEntryIterator` as soon as no
+/// chunk matches (`pkg/storage/store.go:491 @ v3.7.4`) — before
+/// `expr.Pipeline()` at `:497`, which is where a malformed `ip()`
+/// surfaces. **It is NOT `limitsMiddleware.Do`'s `max_query_lookback`
+/// short-circuit** (`pkg/querier/queryrange/limits.go:167-181 @
+/// v3.7.4`), which this comment asserted until #380 measured it: the
+/// pinned container reports `max_query_lookback: 0s` on `/config`, the
+/// shipped default (`pkg/validation/limits.go:379 @ v3.7.4`), so that
+/// branch never runs. Ledgered as
+/// `malformed-query-refused-in-every-window`.
 fn reference_verdict(base: &str, query: &str) -> (Verdict, String) {
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -1,6 +1,7 @@
-// corpus-counts: none — this module doc is where the class started: it
-// carried a table of hand-copied coverage figures, and they had drifted
-// by the time anyone looked. The region keeps them from coming back.
+// corpus-counts: none (replay-module-doc) — this module doc is where the
+// class started: it carried a table of hand-copied coverage figures, and
+// they had drifted by the time anyone looked. The region keeps them from
+// coming back.
 //! Issue #352 step 2/3: which corpus rows a live replay may compare, and
 //! the coverage figure that keeps `captured` from being read as
 //! `replayed`.
@@ -37,7 +38,11 @@
 //! region, comment text states no corpus-derived count, in digits or in
 //! words. `check_f_marked_regions_state_no_corpus_count`
 //! (`logqltest_provenance.rs`) fails on one; `logqltest/PROVENANCE.md`
-//! §"Counts live on the constants" carries the rule itself.
+//! §"Counts live on the constants" carries the rule itself. Each marker
+//! names its region — the id in parentheses, repeated on the `end` — and
+//! that id is pinned in `NO_COUNT_REQUIRED`, so a region that disappears
+//! fails by name rather than leaving the file's other regions to cover
+//! for it.
 //!
 //! `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg was
 //! built, and the name was wrong: the [`Unreachable::AbsoluteTimestamp`]
@@ -47,7 +52,7 @@
 //! reproduced one level further in — we corrected `captured` vs
 //! `replayable` and immediately built `replayable` vs `reached`. Hence
 //! three names, three constants, and the gap enumerated by reason.
-// corpus-counts: end
+// corpus-counts: end (replay-module-doc)
 
 mod logqltest;
 
@@ -84,7 +89,7 @@ enum Unreplayed {
 /// container can physically serve.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Unreachable {
-    // corpus-counts: none
+    // corpus-counts: none (replay-absolute-timestamp)
     /// The case's samples carry an ABSOLUTE timestamp (the template
     /// files `t1`-`t6`, pinned to 2026-07-27), and neither way of
     /// replaying it works:
@@ -104,7 +109,7 @@ enum Unreachable {
     /// procedure and its own review, not a slice of the replay. Recorded
     /// here so whoever picks it up knows where the bucket went.
     AbsoluteTimestamp,
-    // corpus-counts: end
+    // corpus-counts: end (replay-absolute-timestamp)
     /// A metric query. The first slice replays log (streams) queries
     /// only; metric results need vector/scalar comparison against the
     /// reference's own JSON shapes.
@@ -601,9 +606,9 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
     );
 }
 
-// corpus-counts: none — every figure below is recomputed from the corpus
-// and asserted by `coverage_is_pinned_and_names_every_exclusion_at_both_
-// levels`. The VALUES live in the code; this prose says which rows moved
+// corpus-counts: none (replay-coverage-constants) — every figure below is
+// recomputed from the corpus and asserted by
+// `coverage_is_pinned_and_names_every_exclusion_at_both_levels`. The VALUES live in the code; this prose says which rows moved
 // them and why, never how many (issue #248, third round).
 /// Pinned coverage (issue #352 steps 2-3). Separate figures, never one.
 ///
@@ -633,7 +638,7 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// file — a numeric conversion failing to the LEFT of a leaf that reads
 /// the error state — and every row of it is a streams query at a single
 /// instant, so all the figures move together.
-const TOTAL_DIRECTIVES: usize = 1_288;
+const TOTAL_DIRECTIVES: usize = 1_289;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
@@ -647,7 +652,7 @@ const PROVENANCE_PERMITS: usize = 1_024;
 const REACHABLE: usize = 101;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \
-not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergence=17";
+not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergence=18";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice
@@ -656,7 +661,7 @@ not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergenc
 /// module docs already name.
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \
 metric query (slice: streams only)=235, range/matrix eval (slice: instant only)=10";
-// corpus-counts: end
+// corpus-counts: end (replay-coverage-constants)
 
 /// How far back the first slot sits. Bounded above by
 /// [`INGESTION_WINDOW`] and below by the total slot span; both are
