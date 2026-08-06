@@ -1288,9 +1288,9 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   one ns more negative → 400 `syntax error: unexpected -, expecting
 ///   DURATION`.
 ///
-///   Those are LEXER verdicts. On the WIRE the whole negative band is a
-///   `200` SAVE `i64::MIN` itself, which a frontend that has not already
-///   answered its neighbour REFUSES (issue #248 rounds 5 to 7; round 5
+///   Those are LEXER verdicts. On the WIRE the whole negative `i64` band
+///   is a `200` SAVE `i64::MIN` itself, which a frontend that has not
+///   already answered its neighbour REFUSES (issue #248 rounds 5 to 7; round 5
 ///   reported that `400` as unconditional, round 6's wording made the
 ///   `200` unconditional instead, and it is neither). The refusal is
 ///   `400 this data is no longer available, it is past now -
@@ -1313,17 +1313,27 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   order-dependent probe table is in the `five-year-span-cap` ledger
 ///   row.
 ///
-///   That asymmetry is not an accident of its own: the magnitude is lexed
-///   by `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`), which
-///   tries `model.ParseDuration` first — vendored
-///   `prometheus/common/model/time.go:249-255`, rejecting `dur > 1<<63-1`
-///   as `duration out of range` — and falls back to Go's
-///   `time.ParseDuration`, whose floor is `-1<<63`. A leading `-` fails
-///   the Prometheus parser outright (it demands a leading digit), so the
-///   negative form always lands on the stdlib fallback and reaches
-///   `i64::MIN`. Recorded because our cap sits far inside it: the `i64`
-///   band, its negative endpoint aside, is reference-accepted and
-///   PulsusDB-refused, ledgered as `five-year-span-cap`.
+///   That asymmetry is not an accident of its own, and it is ONE
+///   function's doing. The magnitude is lexed by `parseDuration` (v3.7.4
+///   `pkg/logql/syntax/lex.go:326`), which tries the vendored
+///   `model.ParseDuration` and falls back to Go's `time.ParseDuration`.
+///   Both endpoints above are spelled in units `model` does not have —
+///   its map is `ms`/`s`/`m`/`h`/`d`/`w`/`y`, no `us` and no `ns`
+///   (`vendor/github.com/prometheus/common/model/time.go:189-200` @
+///   v3.7.4) — and a leading `-` fails its leading-digit check (`:219`)
+///   besides, so neither endpoint reaches `model`'s overflow branches at
+///   all; the stdlib decides both. There the total accumulates in a
+///   `uint64` the loop lets reach `1<<63` (`go1.25.5
+///   src/time/format.go:1707`), and a negative returns at `if neg {
+///   return -Duration(d) }` (`:1711`) BEFORE the positive-only
+///   `d > 1<<63-1` (`:1714`). Hence a ceiling of `i64::MAX` and a floor
+///   of `i64::MIN`, one check on each side. Recorded because our cap
+///   sits far inside it: the `i64` band, its negative endpoint aside, is
+///   reference-accepted and PulsusDB-refused, ledgered as
+///   `five-year-span-cap`. PAST that band the reference refuses too (the
+///   three rows in
+///   [`tests::both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`]),
+///   so there is no divergence out there to record.
 ///
 /// The keyword goes through [`is_kw`] like every other keyword in this
 /// file (issue #339's rule): the reference's lexer folds keywords, so
@@ -1654,14 +1664,50 @@ mod tests {
     /// same oracle: `9223372036854775808ns` and `18446744073709551615ns`
     /// both give `parse error at line 1, col 38: syntax error: unexpected
     /// NUMBER, expecting DURATION`, and `-9223372036854775809ns` gives
-    /// `unexpected -, expecting DURATION`. The rule behind them is
-    /// `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`): the
-    /// vendored `model.ParseDuration` refuses `v > 1<<63/unit.mult` as
-    /// `duration out of range`
-    /// (`vendor/github.com/prometheus/common/model/time.go:249-254`) and
-    /// the stdlib fallback overflows too, so no DURATION token exists.
-    /// Those rows are reject PARITY, not divergence — the paragraph
-    /// above used to cover them with an "every".
+    /// `unexpected -, expecting DURATION`. Those rows are reject PARITY,
+    /// not divergence — the paragraph above used to cover them with an
+    /// "every".
+    ///
+    /// **Which branch refuses each — TWO branches over the three rows,
+    /// not one and not three.**
+    /// `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`) tries the
+    /// vendored `model.ParseDuration` and falls back to Go's
+    /// `time.ParseDuration`. NEITHER of `model`'s two overflow checks is
+    /// what fires here, which this comment used to say it was: its unit
+    /// map is `ms`/`s`/`m`/`h`/`d`/`w`/`y` with no `ns` at all
+    /// (`vendor/github.com/prometheus/common/model/time.go:189-200` @
+    /// v3.7.4, prometheus/common v0.67.5), so a pure-`ns` literal stops
+    /// at the unit lookup with `unknown unit "ns"` (`:240-242`) and
+    /// never reaches `v > 1<<63/unit.mult` or `dur > 1<<63-1`
+    /// (`:249-255`); the `-` form stops one check earlier still, at the
+    /// leading-digit test (`:219`). All three are therefore decided by
+    /// the stdlib, and the first row's branch is not the other two's
+    /// (`go1.25.5 src/time/format.go`; `ParseDuration` and `leadingInt`
+    /// are both byte-identical in go1.23, so the branch does not turn on
+    /// the toolchain):
+    ///
+    /// - `9223372036854775808ns` is `1<<63` EXACTLY. `leadingInt`
+    ///   admits it — its ceiling is `1<<63` itself (`:1566`) — and the
+    ///   in-loop `d > 1<<63` (`:1707`) does not fire either. What
+    ///   refuses it is the trailing POSITIVE-ONLY `d > 1<<63-1`
+    ///   (`:1714`), which is also why the identical magnitude spelled
+    ///   `-9223372036854775808ns` parses: `if neg { return -Duration(d) }`
+    ///   (`:1711`) returns before that check.
+    /// - `18446744073709551615ns` (`1<<64 - 1`) never reaches a unit at
+    ///   all: `leadingInt` overflows on the digits at `x > 1<<63`
+    ///   (`:1566`).
+    /// - `-9223372036854775809ns` is that SAME `leadingInt` overflow, on
+    ///   the magnitude, after `model` refused the leading `-`. So these
+    ///   two share a branch and the first row does not.
+    ///
+    /// Which branch it is cannot be read off the wire — the lexer
+    /// discards `parseDuration`'s error and emits NUMBER (or, for the
+    /// `-` form, the `-` rune), so all of them surface as the one syntax
+    /// error. Established by running the vendored file and the stdlib
+    /// over these literals plus two discriminators that separate
+    /// `leadingInt` from the unit lookup: `9223372036854775808x` gives
+    /// `unknown unit "x"` (so `leadingInt` passed) while
+    /// `18446744073709551615x` gives `invalid duration` (so it did not).
     ///
     /// The `[range]` half is NOT symmetric with it, which this comment
     /// used to imply by saying "both literals": on a range query the

@@ -56,9 +56,10 @@ pub const MAX_QUERY_BYTES: usize = 131_072;
 /// range query BOTH the request span and the `[range]` selector are
 /// bounded there far tighter than here — `[720h]` over a `1h` request
 /// span is already a `400 the query time range exceeds the limit`. The
-/// offset cancels in that subtraction and stays unbounded: `offset
+/// offset cancels in that subtraction and stays unbounded across the
+/// band its own lexer admits — `i64` nanoseconds: `offset
 /// 2562047h47m16s854ms775us807ns` (`i64::MAX`) is a 200 there, and so is
-/// every other value in the domain SAVE ONE. The exception is
+/// every other value in THAT band SAVE ONE. The exception is
 /// `i64::MIN`, and its `200` is conditional in a way this comment used
 /// to leave out. A frontend that has not already answered the
 /// neighbouring value REFUSES it — `400 this data is no longer
@@ -73,13 +74,21 @@ pub const MAX_QUERY_BYTES: usize = 131_072;
 /// (`i64::MIN + 1` is a 200 in any order, in both configurations), but
 /// it is a REFUSAL wherever no neighbouring probe has cached it away.
 /// Rounds 6 and 7 of issue #248 settled that; the ledger row carries the
-/// order-dependent probe table. So this cap diverges at every offset
-/// magnitude past 43,800 h — bar the negative endpoint just described,
-/// where a cold reference refuses too — and on an INSTANT query's
-/// `[range]` (which
-/// the reference admits and then splits into per-hour subqueries that do
-/// not answer in practice); on a range query it fires only where the
-/// reference, at its shipped default, refuses first.
+/// order-dependent probe table. So past 43,800 h this cap diverges at
+/// every offset magnitude THE REFERENCE'S LEXER ADMITS — that `i64`
+/// nanosecond band, bar the negative endpoint just described, where a
+/// cold reference refuses too. Outside the band it does not diverge at
+/// all, which the sentence this replaces missed by quantifying over
+/// magnitude alone: `offset 9223372036854775808ns` is 292 years, far
+/// past this cap, and is a reference `400` at the lexer — reject
+/// parity. The three out-of-band literals this crate pins are
+/// enumerated, and the branch that refuses each named, in `parser.rs`'s
+/// `both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`
+/// (issue #248 round 8). It also diverges on an INSTANT query's
+/// `[range]` (which the reference admits and then splits into per-hour
+/// subqueries that do not answer in practice); on a range query it
+/// fires only where the reference, at its shipped default, refuses
+/// first.
 ///
 /// Same status as [`MAX_QUERY_BYTES`] — `400 bad_data` — and the two
 /// literal forms are enforced at the same layer it is, the parser, so no

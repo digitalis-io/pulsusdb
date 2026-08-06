@@ -844,11 +844,38 @@ not "fix" us toward the panic.
   and on a RANGE query's `[range]`, the reference's default config
   already refuses far more than our cap does (`721h` against our
   `43,800h`), so there our cap can only fire where it also rejects. The
-  divergence is real for the `offset` magnitude (a `200` there at every
+  divergence is real for the `offset` magnitude WITHIN THE BAND THE
+  REFERENCE'S LEXER ADMITS — `i64` nanoseconds (a `200` there at every
   value but `i64::MIN`, and a `200` even at `i64::MIN` once the stats
-  cache is warm; a `400` here past 5 years) and for an INSTANT
+  cache is warm; a `400` here past 5 years) — and for an INSTANT
   query's `[range]`, which the reference admits and then decomposes into
   per-hour subqueries that do not answer in practice.
+- **Past that band there is nothing to diverge from** (issue #248 round
+  8; the qualifier in the bullet above is that round's — it used to
+  quantify over magnitude alone, which counted these rows as
+  divergences). A magnitude too large for a Go `time.Duration` never
+  becomes a DURATION token, so the reference refuses it at the lexer.
+  Re-measured on the same oracle in round 8, in
+  `count_over_time({app="x"}[5m] offset <lit>)` (which is where the
+  column comes from): `9223372036854775808ns` and
+  `18446744073709551615ns` are `400 parse error at line 1, col 38:
+  syntax error: unexpected NUMBER, expecting DURATION`, and
+  `-9223372036854775809ns` is the same with `unexpected -, expecting
+  DURATION`. The neighbouring endpoints bracket them —
+  `9223372036854775807ns` and `2562047h47m16s854ms775us807ns` (both
+  `i64::MAX`) are `200`s, and one nanosecond more,
+  `2562047h47m16s854ms775us808ns`, is the NUMBER refusal again.
+  PulsusDB refuses those three out-of-band literals too (`offset too
+  long`), so they are reject parity — a different message, the same
+  `400 bad_data` class.
+  WHICH branch refuses each is not observable from the wire (the lexer
+  discards `parseDuration`'s error), and it is two branches over the
+  three rows — none of them one of `model.ParseDuration`'s, whose unit
+  map has no `ns`, so an `ns` literal leaves it at the unit lookup. The
+  source-level account, with the two discriminating probes that separate
+  Go's `leadingInt` overflow from its trailing positive-only range
+  check, is at `crates/pulsus-logql/src/parser.rs`'s
+  `both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`.
 - **PulsusDB behaviour (the delta): NOTHING IN A LogQL QUERY MAY SPAN MORE
   THAN 5 YEARS** — `MAX_QUERY_SPAN_NS` = 157,680,000,000,000,000 ns =
   43,800 h = 5 × 365 d. One rule, three places, all against that one
