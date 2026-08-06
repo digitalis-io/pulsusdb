@@ -1756,9 +1756,11 @@ absence of a corpus row for an oversight.
 
 ### inadmissible-label-name-echo-escaping (issue #259)
 
-- **Status: REGISTERED EXCEPTION — a runtime-rendering difference we do not
-  chase.** Verdict, status and sentence all match; only the echoed name's
-  escaping differs.
+- **Status: REGISTERED EXCEPTION — a USER-VISIBLE runtime-rendering
+  difference we do not chase.** Verdict, status and sentence all match; only
+  the echoed name's escaping differs. A client CAN reach it: see the
+  reachability note below, which corrects an earlier version of this row
+  that argued the difference was unreachable.
 - **Construct:** the `%q`-quoted name inside
   `normalization for label name %q resulted in invalid name %q`.
 - **Reference behaviour:** Go's `fmt` `%q` (`strconv.Quote`), whose
@@ -1775,12 +1777,31 @@ absence of a corpus row for an oversight.
   symbol category at all are U+FF9E and U+FF9F, themselves
   `Grapheme_Extend`. On the 80-name matrix the whole rule was replayed
   over, accept/reject agrees **80/80** and the message agrees **71/80**.
+- **Reachability — a client CAN hit this, and sees different bytes.** A lone
+  combining mark is exactly the sort of name this rule refuses, so it is a
+  reachable input rather than a theoretical one. Measured on
+  `grafana/loki:3.7.4` (`b318f282`), pushing structured metadata keyed
+  `U+0301` on both push encodings and as an OTLP attribute:
+
+  | side | response body |
+  |---|---|
+  | reference | `normalization for label name "<CC 81>" resulted in invalid name "_"` — the raw two UTF-8 bytes inside the quotes |
+  | PulsusDB | `normalization for label name "\u{301}" resulted in invalid name "_"` — eight ASCII bytes |
+
+  What is bounded is the CLASS of characters that differ, never the
+  reachability. An earlier version of this row said the difference was one
+  "no consumer can act on"; that was wrong, and this row says so instead of
+  re-deriving a narrower bound.
 - **Why we do not mirror it:** the two tables track different Unicode
   versions and move with each runtime's releases, so byte agreement here is
-  not a stable property either side can hold. Reproducing Go's table would
-  mean vendoring and pinning it for a difference no consumer can act on —
-  the name is refused either way, with the same status and the same
-  sentence.
+  not a stable property either side can hold — Go's `%q` printability is
+  `strconv.IsPrint`'s generated table (categories L/M/N/P/S plus ASCII
+  space), Rust's `{:?}` additionally escapes `Grapheme_Extend`, and neither
+  is reachable from the other's standard library. Reproducing Go's would
+  mean vendoring a Unicode category table and pinning it to the Go release
+  that built the image. The impact is bounded to the echoed name: the name
+  is refused either way, with the same condition and the same sentence, and
+  no PulsusDB response status changes.
 - **Fixture status:** pinned by `label_name.rs`'s
   `the_escape_syntax_for_an_unprintable_name_is_our_runtimes_not_the_references`,
   which carries the reference's measured rendering beside ours for every

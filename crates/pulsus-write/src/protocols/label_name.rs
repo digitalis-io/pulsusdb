@@ -48,9 +48,12 @@ const SYMBOLIZER_LOOKUP_PREFIX: &str = "symbolizer lookup: ";
 /// (`label_namer.go:66-90 @ v3.7.4`):
 ///
 /// 1. `len(label) == 0` -> `label name is empty`. EXACTLY the empty string;
-///    nothing is trimmed, so this is a third empty-name rule distinct from
-///    both empty-VALUE strips in [`pulsus_model::retain_non_empty_values`] /
-///    [`pulsus_model::strip_empty_valued_labels`].
+///    nothing is trimmed. This is rule 4 of the four distinct notions of
+///    "empty" docs/api.md §8.2 lists side by side, and it is none of the
+///    other three — the pair-wise value strip
+///    ([`pulsus_model::retain_non_empty_values`]), the by-name value delete
+///    and its delete-after-normalization half (both
+///    [`pulsus_model::strip_empty_valued_labels`]).
 /// 2. the sanitized name consists only of `_` ->
 ///    `normalization for label name %q resulted in invalid name %q`. A
 ///    whitespace-only name lands HERE, not in (1): `" "` sanitizes to `"_"`.
@@ -87,12 +90,27 @@ const SYMBOLIZER_LOOKUP_PREFIX: &str = "symbolizer lookup: ";
 /// `%q` there and Rust's `{:?}` here, which spell an escape differently
 /// (`"\x01"` vs `"\u{1}"`, `"\x00"` vs `"\0"`, `"\u00a0"` vs `"\u{a0}"`) or
 /// disagree on whether a combining mark is printable (Go prints U+0301 raw,
-/// Rust escapes it). That set is bounded, not open-ended: comparing the two
-/// renderings over all 1 112 064 codepoints, they agree on every assigned,
-/// printable, non-combining character — the only letters/digits/punctuation/
-/// symbols in the whole disagreeing set are U+FF9E and U+FF9F, the two
-/// halfwidth katakana sound marks (which are `Grapheme_Extend`). Registered
-/// as a divergence in docs/api.md §8.2 and
+/// Rust escapes it).
+///
+/// **That difference is user-reachable and user-visible.** What is bounded is
+/// the character CLASS, never the reachability: a lone combining mark is
+/// precisely the sort of name this rule refuses, so a client keying
+/// structured metadata `"\u{301}"` reads `…label name "́"…` (the raw UTF-8
+/// bytes `cc 81`) from the reference and `…label name "\u{301}"…` from
+/// PulsusDB — measured at the wire on both push encodings and on OTLP. Only
+/// the quoted echo differs: the name is refused either way, with the same
+/// condition and the same sentence. Comparing the two renderings over all
+/// 1 112 064 codepoints, they agree on every assigned, printable,
+/// non-combining character — the only letters/digits/punctuation/symbols in
+/// the whole disagreeing set are U+FF9E and U+FF9F, the two halfwidth
+/// katakana sound marks (which are `Grapheme_Extend`). Not fixed because Go's
+/// `%q` printability is `strconv.IsPrint`'s own generated table (Unicode
+/// categories L/M/N/P/S plus ASCII space) while Rust's `{:?}` additionally
+/// escapes `Grapheme_Extend`, and neither table is reachable from the other's
+/// standard library: matching bytes would mean vendoring a Unicode category
+/// table and pinning it to the Go release that built the container image,
+/// which moves independently of ours. Registered as a USER-VISIBLE divergence
+/// in docs/api.md §8.2 and
 /// docs/benchmarks/logs-differential-ledger.md; pinned by
 /// `the_escape_syntax_for_an_unprintable_name_is_our_runtimes_not_the_references`.
 pub(crate) fn validate_label_name(name: &str) -> Result<(), LogsIngestError> {
@@ -403,14 +421,22 @@ mod tests {
     /// replayed over; the left column is what `grafana/loki:3.7.4` wrote on
     /// the wire for the same name, measured.
     ///
-    /// Bounded, not open-ended: comparing `%q` with `{:?}` over all
+    /// **These are reachable names, and the difference is user-visible.** The
+    /// last row is the demonstration: a lone U+0301 is a legitimate
+    /// structured-metadata key to send, it is refused by both sides, and the
+    /// two refusal bodies differ — the reference's carries the raw two bytes
+    /// `cc 81` inside the quotes where ours carries the eight ASCII bytes
+    /// `\u{301}` (measured on both push encodings and on OTLP, issue #259
+    /// re-review). What is bounded is the CLASS of characters that differ,
+    /// not whether a client can hit one: comparing `%q` with `{:?}` over all
     /// 1 112 064 codepoints, the two agree on every assigned printable
-    /// non-combining character. Everything they disagree about is a control
-    /// character, a format/separator character, an unassigned or private-use
-    /// codepoint, or a `Grapheme_Extend` mark — the only exceptions carrying
-    /// a letter/number/punctuation/symbol category at all are U+FF9E and
-    /// U+FF9F, themselves `Grapheme_Extend`. Verdict and status are
-    /// unaffected: all of these are refused by both, with the same sentence.
+    /// non-combining character, and everything they disagree about is a
+    /// control character, a format/separator character, an unassigned or
+    /// private-use codepoint, or a `Grapheme_Extend` mark — the only
+    /// exceptions carrying a letter/number/punctuation/symbol category at all
+    /// are U+FF9E and U+FF9F, themselves `Grapheme_Extend`. Verdict and
+    /// condition are unaffected: all of these are refused by both, with the
+    /// same sentence.
     #[test]
     fn the_escape_syntax_for_an_unprintable_name_is_our_runtimes_not_the_references() {
         for (name, reference_text, ours) in [
@@ -431,8 +457,17 @@ mod tests {
                 "our rendering of {name:?}"
             );
         }
-        // …and the characters a client actually sends render identically on
-        // both sides, which is why the divergence is narrow.
+        // The reachable case, asserted at the byte level because that is
+        // where it bites: the reference's response body carries U+0301 as its
+        // raw two UTF-8 bytes inside the quotes, ours as eight ASCII ones.
+        assert_eq!("\"\u{301}\"".as_bytes(), b"\"\xcc\x81\"");
+        assert!(
+            reject_message("\u{301}").is_ascii(),
+            "ours escapes the mark instead of emitting it"
+        );
+        // …and a name built only from characters the two quoters agree on
+        // renders identically, which is what keeps the difference to the
+        // class named above rather than to any refused name.
         for name in ["µ", "日本", "🙂", "__é__", "\t", "\"", "\\", "-_-"] {
             assert!(validate_label_name(name).is_err(), "{name:?}");
         }

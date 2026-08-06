@@ -1204,6 +1204,47 @@ mod tests {
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
 
+    /// Issue #259 re-review: the same at a log RECORD's attributes, whose
+    /// values issue #109's placement discards — so before this check the
+    /// identical body was a `200` here and a `400` on `grafana/loki:3.7.4`
+    /// (measured at the wire, body
+    /// `\x12&symbolizer lookup: label name is empty`). Nothing reaches the
+    /// sink: it is the whole-request class, exactly as for a resource key.
+    #[tokio::test]
+    async fn otlp_inadmissible_record_attribute_key_returns_400_with_status_code_3() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("hello".to_string())),
+                        }),
+                        attributes: vec![opentelemetry_proto::tonic::common::v1::KeyValue {
+                            key: String::new(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("v".to_string())),
+                            }),
+                            key_strindex: 0,
+                        }],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), request.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert_eq!(status.message, "symbolizer lookup: label name is empty");
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn body_over_the_64_mib_cap_returns_400_with_status_code_3() {
         // Raw length alone exceeds `MAX_DECOMPRESSED_BYTES`; `read_capped_body`

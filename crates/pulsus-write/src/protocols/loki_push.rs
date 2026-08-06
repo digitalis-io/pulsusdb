@@ -684,15 +684,19 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 /// through this one seam so the stored `log_samples.structured_metadata`
 /// String is byte-identical across transports by construction.
 ///
-/// - Every EMPTY-VALUED pair is stripped first, BY NAME
-///   ([`strip_empty_valued_labels`]) — the reference's distributor runs the
-///   whole entry's structured metadata through Prometheus' `labels.Builder`,
-///   which deletes empty-valued base labels
-///   (`pkg/distributor/distributor.go:698-722 @ v3.7.4`; issue #259). This is
-///   the one seam every structured-metadata producer funnels through, so the
-///   strip applies to the Loki-push transports and the OTLP-logs scope path
-///   alike, exactly as the reference's single distributor seam does for its
-///   own two transports (`PushHandler` / `OTLPPushHandler` both reach
+/// - Every EMPTY-VALUED pair is stripped first, BY NAME — and by the
+///   NORMALIZED name, so an empty pair suppresses whatever shares the key it
+///   will be stored under ([`strip_empty_valued_labels`]). The reference's
+///   distributor runs the whole entry's structured metadata through
+///   Prometheus' `labels.Builder`, renaming each pair into it *before* the
+///   empty-value delete takes effect, and a rename re-adds a name a delete
+///   had taken (`pkg/distributor/distributor.go:698-722 @ v3.7.4`; issue
+///   #259). Measured: `{"a.b":"", "a_b":"keep"}` stores nothing at all, while
+///   `{"a.b":"keep", "a_b":""}` stores `a_b="keep"`. This is the one seam
+///   every structured-metadata producer funnels through, so the strip applies
+///   to the Loki-push transports and the OTLP-logs scope path alike, exactly
+///   as the reference's single distributor seam does for its own two
+///   transports (`PushHandler` / `OTLPPushHandler` both reach
 ///   `pushHandler` -> `Push`, `pkg/distributor/http.go:27-34 @ v3.7.4`).
 ///   By-name is the correct primitive HERE and the wrong one for stream
 ///   labels, which the reference strips pair-wise; see `parse_label_set`.
@@ -708,6 +712,15 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 ///   JSON string is byte-identical in shape to a stream-labels JSON string.
 ///   The normalization collision count is intentionally discarded: SM is
 ///   per-entry and never contributes to the stream-label collision metric.
+///   **Which of two colliding NON-empty pairs wins is a separate, pre-existing
+///   divergence, flagged not fixed:** `from_normalized`'s frozen greatest-key/
+///   greatest-value rule (issue #4) elects a different pair from the
+///   reference's plain last-`Set`-wins — measured on `grafana/loki:3.7.4`,
+///   `{"a.b":"x", "a_b":"keep"}` stores `a_b="x"` there and `a_b="keep"` here.
+///   It is independent of the empty-value rule above (it needs no empty pair
+///   to appear, and the strip's fast path does not run for such an input);
+///   closing it means pre-resolving last-write-wins here, as the OTLP path
+///   already does for its own seam.
 ///
 /// This core carries **no** cardinality cap — the Loki-push cap check lives in
 /// [`canonical_structured_metadata`] (charge-before-allocate, before this is
@@ -719,8 +732,9 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 pub(crate) fn structured_metadata_json(
     pairs: impl IntoIterator<Item = (String, String)>,
 ) -> String {
-    // Materialized because the empty-value strip deletes BY NAME and therefore
-    // needs a second look at the pair list (`strip_empty_valued_labels`). The
+    // Materialized because the empty-value strip deletes by NORMALIZED NAME
+    // and therefore needs a second look at the pair list
+    // (`strip_empty_valued_labels`, which canonicalizes each name itself). The
     // per-entry cardinality/byte caps are charged on borrowed data by
     // `canonical_structured_metadata` BEFORE this is reached, so the `Vec` is
     // bounded, and `LabelSet::from_normalized` allocates a `BTreeMap` of
@@ -2830,6 +2844,91 @@ mod tests {
             "values":[["1700000000000000000","hello",{"a":"","a":"keep"}]]}]}"#;
         let out = parse_json(dup, 0).unwrap();
         assert_eq!(out.rows[0].structured_metadata, "");
+    }
+
+    /// The delete is by the NORMALIZED name, so an empty-valued pair whose
+    /// key canonicalizes onto another pair's key takes that pair with it —
+    /// and a renamed non-empty pair resurrects a name an empty twin deleted
+    /// (the reference's `Set` adds where `Del` only deletes;
+    /// `pkg/distributor/distributor.go:698-722 @ v3.7.4` over
+    /// `labels_stringlabels.go:471-521`).
+    ///
+    /// Every row measured on `grafana/loki:3.7.4` (`b318f282`,
+    /// `discover_log_levels: false`, `discover_service_name: []`) by pushing
+    /// the same pairs as structured metadata over hand-encoded
+    /// snappy/protobuf and reading them back with `categorize-labels`. Before
+    /// this fix, rows 1, 2 and 4 stored `{"a_b":"keep"}` here and nothing
+    /// there, and row 5 stored nothing here and `{"a_b":"keep"}` there — a
+    /// divergence in BOTH directions, because the strip ran on the raw name.
+    #[test]
+    fn a_normalized_metadata_name_collision_with_one_empty_follows_the_references_builder() {
+        for (sm, expected) in [
+            (vec![label_pair("a.b", ""), label_pair("a_b", "keep")], ""),
+            (vec![label_pair("a_b", "keep"), label_pair("a.b", "")], ""),
+            (
+                vec![label_pair("a.b", "keep"), label_pair("a_b", "")],
+                r#"{"a_b":"keep"}"#,
+            ),
+            (
+                vec![label_pair("a_b", ""), label_pair("a.b", "keep")],
+                r#"{"a_b":"keep"}"#,
+            ),
+            (
+                vec![label_pair("a.b", ""), label_pair("a.b", "keep")],
+                r#"{"a_b":"keep"}"#,
+            ),
+            (vec![label_pair("a.b", "keep"), label_pair("a.b", "")], ""),
+            (
+                vec![label_pair("a.b", ""), label_pair("c", "v")],
+                r#"{"c":"v"}"#,
+            ),
+            (
+                vec![
+                    label_pair("a.b", "x"),
+                    label_pair("a_b", ""),
+                    label_pair("a_b", "keep"),
+                ],
+                r#"{"a_b":"x"}"#,
+            ),
+        ] {
+            let out = parse_protobuf(&sm_request(sm.clone()), 0).unwrap();
+            assert_eq!(out.rows[0].structured_metadata, expected, "sm: {sm:?}");
+        }
+        // The discriminating control: with a name that needs no renaming,
+        // BOTH occurrences go in either order — measured, `{a="", a="keep"}`
+        // stores nothing on the reference. Rows 5 and 6 above differ from
+        // this one only by the `.` that makes the name renameable.
+        for sm in [
+            vec![label_pair("a", ""), label_pair("a", "keep")],
+            vec![label_pair("a", "keep"), label_pair("a", "")],
+        ] {
+            let out = parse_protobuf(&sm_request(sm.clone()), 0).unwrap();
+            assert_eq!(out.rows[0].structured_metadata, "", "sm: {sm:?}");
+        }
+    }
+
+    /// The same rule on the JSON encoding, whose structured-metadata object
+    /// keeps duplicate keys as raw pairs exactly as the reference's does
+    /// (`pkg/loghttp/query.go:182-203 @ v3.7.4`). Every row was pushed to
+    /// `grafana/loki:3.7.4` as JSON as well as protobuf, and the two agree.
+    #[test]
+    fn a_normalized_metadata_name_collision_is_resolved_identically_on_the_json_encoding() {
+        for (sm, expected) in [
+            (r#"{"a.b":"","a_b":"keep"}"#, ""),
+            (r#"{"a_b":"keep","a.b":""}"#, ""),
+            (r#"{"a.b":"keep","a_b":""}"#, r#"{"a_b":"keep"}"#),
+            (r#"{"a_b":"","a.b":"keep"}"#, r#"{"a_b":"keep"}"#),
+            (r#"{"a.b":"","a.b":"keep"}"#, r#"{"a_b":"keep"}"#),
+            (r#"{"a.b":"keep","a.b":""}"#, ""),
+            (r#"{"a.b":"","c":"v"}"#, r#"{"c":"v"}"#),
+        ] {
+            let body = format!(
+                r#"{{"streams":[{{"stream":{{"service_name":"checkout"}},
+                "values":[["1700000000000000000","hello",{sm}]]}}]}}"#
+            );
+            let out = parse_json(body.as_bytes(), 0).unwrap();
+            assert_eq!(out.rows[0].structured_metadata, expected, "sm: {sm}");
+        }
     }
 
     /// Builds a one-entry protobuf push carrying exactly `sm`.

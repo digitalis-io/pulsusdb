@@ -906,12 +906,94 @@ async fn empty_valued_structured_metadata_is_never_stored() {
     );
     assert_eq!(res.status, 204, "whitespace SM push (body {})", res.body);
 
+    // (5)-(8) the delete runs on the NORMALIZED name, so an empty pair
+    // suppresses whatever shares the key it would be stored under — and a
+    // renamed non-empty pair resurrects a name a delete took. All four rows
+    // measured on `grafana/loki:3.7.4`, each on both push encodings.
+    let collides = "sm empty pair renames onto its twin";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm(
+            service,
+            base_ns + 4,
+            collides,
+            &[("a.b", ""), ("a_b", "keep")],
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 204, "collision SM push (body {})", res.body);
+
+    let collides_proto = "sm empty pair renames onto its twin over protobuf";
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &protobuf_body_with_sm(
+            service,
+            base_ns + 5,
+            collides_proto,
+            &[("a.b", ""), ("a_b", "keep")],
+        ),
+    );
+    assert_eq!(
+        res.status, 204,
+        "collision SM protobuf push (body {})",
+        res.body
+    );
+
+    let resurrects = "sm rename resurrects the deleted name";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm(
+            service,
+            base_ns + 6,
+            resurrects,
+            &[("a.b", "keep"), ("a_b", "")],
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 204, "resurrect SM push (body {})", res.body);
+
+    let resurrects_proto = "sm rename resurrects the deleted name over protobuf";
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &protobuf_body_with_sm(
+            service,
+            base_ns + 7,
+            resurrects_proto,
+            &[("a.b", ""), ("a.b", "keep")],
+        ),
+    );
+    assert_eq!(
+        res.status, 204,
+        "resurrect SM protobuf push (body {})",
+        res.body
+    );
+
     let client = ch_client(db).await;
-    let stored = stored_samples_by_body(&client, db, service, 4).await;
+    let stored = stored_samples_by_body(&client, db, service, 8).await;
 
     assert_eq!(
         stored[mixed].structured_metadata, r#"{"b":"v"}"#,
         "the empty-valued pair must not be in the STORED JSON"
+    );
+    assert_eq!(
+        stored[collides].structured_metadata, "",
+        "`a.b=\"\"` normalizes onto `a_b` and deletes it, so nothing is stored"
+    );
+    assert_eq!(
+        stored[collides_proto].structured_metadata, "",
+        "…identically on the protobuf encoding"
+    );
+    assert_eq!(
+        stored[resurrects].structured_metadata, r#"{"a_b":"keep"}"#,
+        "a renamed non-empty pair outranks the delete its empty twin recorded"
+    );
+    assert_eq!(
+        stored[resurrects_proto].structured_metadata, r#"{"a_b":"keep"}"#,
+        "…and a duplicate renameable name resurrects in this order too"
     );
     assert_eq!(
         stored[mixed_proto].structured_metadata, r#"{"b":"v"}"#,

@@ -164,6 +164,26 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
             let structured_metadata = build_scope_structured_metadata(scope_logs)?;
 
             for record in &scope_logs.log_records {
+                // A log record's attribute KEYS are validated even though
+                // issue #109's placement stores none of their values (only
+                // resource attributes and the scope reach storage here): on
+                // the reference every non-dropped record attribute goes
+                // through the same `attributeToLabels` — and therefore the
+                // same `LabelNamer.Build` — that its resource and scope
+                // attributes do (`pkg/loghttp/push/otlp.go:488-499 @ v3.7.4`,
+                // reaching `:603-614`), with the default log-attribute action
+                // being `StructuredMetadata`
+                // (`ActionForLogAttribute` -> `actionForAttribute`'s fallthrough,
+                // `pkg/loghttp/push/otlp_config.go:90-116 @ v3.7.4`). Measured
+                // on `grafana/loki:3.7.4`: a record attribute keyed `""` is
+                // `400 symbolizer lookup: label name is empty` and one keyed
+                // `" "` the normalization message, while PulsusDB answered
+                // `200` before this check existed — an admissibility hole one
+                // function away from the two seams that already had it.
+                // Whole-request 400, the reference's own class here (its
+                // `rangeErr` aborts `ParseOTLPRequest`), so it precedes the
+                // per-record partial-success rejections below.
+                validate_otlp_attribute_names(record.attributes.iter().map(|kv| kv.key.as_str()))?;
                 let timestamp_ns = match resolve_timestamp_ns(record, now_ns) {
                     Ok(ts) => ts,
                     Err(message) => {
@@ -344,9 +364,17 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, Log
     // by a measurement against `grafana/loki:3.7.4`:
     //
     // - Before last-write-wins, because the reference deletes by NAME over the
-    //   raw set: two attributes sanitizing to one key with either empty
+    //   unresolved set: two attributes sanitizing to one key with either empty
     //   (`a.b=""` + `a_b="v"`) lose the key entirely, in both wire orders.
-    //   Resolving first would elect the non-empty `"v"` and keep it.
+    //   Resolving first would elect the non-empty `"v"` and keep it. This seam
+    //   is order-INdependent where the push seam is not, and for the reason
+    //   the reference itself is: its OTLP translation has already run
+    //   `LabelNamer.Build` over every attribute key
+    //   (`pkg/loghttp/push/otlp.go:603-614 @ v3.7.4`) before the distributor's
+    //   builder sees them, so no pair is renamed there and the resurrect
+    //   asymmetry documented at `strip_empty_valued_labels` cannot fire. The
+    //   keys handed over here are `canonicalize_label_key` fixed points for
+    //   exactly the same reason.
     // - Over the identity fields too, because an empty-valued attribute NAMED
     //   `scope_name` takes the real `scope_name` with it: a body with scope
     //   name `N`, version `1.0` and attribute `scope_name=""` comes back
@@ -389,6 +417,12 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, Log
 /// Validating HERE rather than at the two call sites keeps that one-function
 /// correspondence, and puts the check ahead of both the pair-wise stream-label
 /// strip and the by-name structured-metadata strip.
+///
+/// A log record's attributes are the one OTLP attribute kind that does NOT
+/// reach this function — issue #109's placement discards their values, so no
+/// pair list is built for them — and their keys are therefore validated by
+/// the same rule directly in [`parse`], where that note carries the
+/// measurement.
 fn attr_pairs(attrs: &[KeyValue]) -> Result<Vec<(String, String)>, LogsIngestError> {
     // Borrowed pass first: a rejected key costs no clone.
     validate_otlp_attribute_names(attrs.iter().map(|kv| kv.key.as_str()))?;
@@ -764,6 +798,91 @@ mod tests {
                 vec![kv("日本", Value::StringValue("v".to_string()))]
             ),
             r#"symbolizer lookup: normalization for label name "日本" resulted in invalid name "_""#
+        );
+    }
+
+    /// Runs `super::parse` over one record carrying the given RECORD
+    /// attributes (a resource and scope that are both admissible), returning
+    /// the whole-request rejection message.
+    fn record_attribute_reject_message(record_attrs: Vec<KeyValue>) -> String {
+        match super::parse(&record_attribute_request(record_attrs), 0) {
+            Err(LogsIngestError::InvalidLabelName(message)) => message,
+            other => panic!("expected InvalidLabelName, got {other:?}"),
+        }
+    }
+
+    fn record_attribute_request(record_attrs: Vec<KeyValue>) -> ExportLogsServiceRequest {
+        request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", Value::StringValue("svc".to_string()))],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(scope("N", "1.0", vec![])),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: string_body("x"),
+                    attributes: record_attrs,
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }])
+    }
+
+    /// Issue #259 re-review: a log RECORD's attribute keys are validated too,
+    /// even though issue #109's placement stores none of their values. On the
+    /// reference every non-dropped record attribute reaches the same
+    /// `attributeToLabels`/`LabelNamer.Build` its resource and scope
+    /// attributes do (`pkg/loghttp/push/otlp.go:488-499 -> :603-614 @
+    /// v3.7.4`), the default action for a log attribute being
+    /// `StructuredMetadata` (`otlp_config.go:90-116 @ v3.7.4`).
+    ///
+    /// Measured on `grafana/loki:3.7.4`, `POST /otlp/v1/logs`: a record
+    /// attribute keyed `""` answers `400` with body
+    /// `\x12&symbolizer lookup: label name is empty`, and one keyed `" "` the
+    /// normalization message. PulsusDB answered `200` to both before this
+    /// check — the values were discarded, so the key never reached a seam.
+    #[test]
+    fn an_inadmissible_otlp_record_attribute_key_rejects_the_whole_request() {
+        assert_eq!(
+            record_attribute_reject_message(vec![
+                kv("ok", Value::StringValue("1".to_string())),
+                kv("", Value::StringValue("v".to_string())),
+            ]),
+            "symbolizer lookup: label name is empty"
+        );
+        assert_eq!(
+            record_attribute_reject_message(vec![kv(" ", Value::StringValue("v".to_string()))]),
+            r#"symbolizer lookup: normalization for label name " " resulted in invalid name "_""#
+        );
+        // An empty VALUE does not rescue the name here either: the key check
+        // is ahead of every strip, on this seam as on the other two.
+        assert_eq!(
+            record_attribute_reject_message(vec![kv("", Value::StringValue(String::new()))]),
+            "symbolizer lookup: label name is empty"
+        );
+    }
+
+    /// The accept half: an admissible record-attribute key is a 200, and its
+    /// VALUE is still discarded — validating the key does not move issue
+    /// #109's placement decision (record attributes are not stored).
+    #[test]
+    fn an_admissible_otlp_record_attribute_key_is_accepted_and_its_value_still_discarded() {
+        let out = super::parse(
+            &record_attribute_request(vec![
+                kv("http.method", Value::StringValue("GET".to_string())),
+                kv("naïve", Value::StringValue("yes".to_string())),
+            ]),
+            0,
+        )
+        .expect("admissible record attribute keys");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(
+            out.rows[0].structured_metadata, r#"{"scope_name":"N","scope_version":"1.0"}"#,
+            "record attributes contribute nothing to storage (issue #109)"
         );
     }
 
