@@ -22,7 +22,7 @@ use pulsus_model::{
 };
 
 use crate::error::LogsIngestError;
-use crate::protocols::label_name::validate_label_names;
+use crate::protocols::label_name::validate_otlp_attribute_names;
 use crate::protocols::loki_push::structured_metadata_json;
 
 /// A `SeverityNumber` outside this range (including the `0`/unset default)
@@ -375,7 +375,7 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, Log
 /// strings, so a non-string attribute (bool/int/double/array/kvlist/bytes)
 /// renders the same way a non-string body would.
 /// Every RAW attribute key is validated first
-/// ([`validate_label_name`](crate::protocols::label_name::validate_label_name),
+/// ([`validate_otlp_attribute_names`](crate::protocols::label_name::validate_otlp_attribute_names),
 /// issue #259), so this is the structural mirror of the reference's
 /// `attributeToLabels` — the one function on its OTLP path that runs
 /// `LabelNamer.Build` over every resource, scope and record attribute key
@@ -383,12 +383,15 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, Log
 /// whole-request 400, which is exactly what the reference answers there
 /// (measured: an empty resource, scope or record attribute key returns
 /// `400 symbolizer lookup: label name is empty` on `grafana/loki:3.7.4`).
+/// It is the OTLP-flavoured validator because the `symbolizer lookup: `
+/// prefix is added at this very seam on the reference (`otlp.go:613`) and
+/// nowhere on its push path — same rule, different bytes on the wire.
 /// Validating HERE rather than at the two call sites keeps that one-function
 /// correspondence, and puts the check ahead of both the pair-wise stream-label
 /// strip and the by-name structured-metadata strip.
 fn attr_pairs(attrs: &[KeyValue]) -> Result<Vec<(String, String)>, LogsIngestError> {
     // Borrowed pass first: a rejected key costs no clone.
-    validate_label_names(attrs.iter().map(|kv| kv.key.as_str()))?;
+    validate_otlp_attribute_names(attrs.iter().map(|kv| kv.key.as_str()))?;
     Ok(attrs
         .iter()
         .map(|kv| (kv.key.clone(), any_value_to_string(kv.value.as_ref())))
@@ -716,37 +719,58 @@ mod tests {
     /// Measured on `grafana/loki:3.7.4`, OTLP/JSON to `/otlp/v1/logs`: an
     /// empty resource, scope OR record attribute key returns
     /// `400 symbolizer lookup: label name is empty`; a `" "` or `"_"` key
-    /// returns the normalization message. Before this change every one of
-    /// those bodies was a `200` here.
+    /// returns the same prefix in front of the normalization message. Before
+    /// this change every one of those bodies was a `200` here.
+    ///
+    /// The prefix is the transport's, not the rule's: the identical name as
+    /// push structured metadata carries no prefix at all (see
+    /// `label_name::only_the_otlp_seam_carries_the_symbolizer_lookup_prefix`).
     #[test]
     fn an_inadmissible_otlp_attribute_key_rejects_the_whole_request() {
         let empty = kv("", Value::StringValue("v".to_string()));
         assert_eq!(
             attribute_reject_message(vec![empty.clone()], vec![]),
-            "label name is empty"
+            "symbolizer lookup: label name is empty"
         );
         assert_eq!(
             attribute_reject_message(vec![], vec![empty]),
-            "label name is empty"
+            "symbolizer lookup: label name is empty"
         );
         // An empty VALUE does not rescue an inadmissible name: the key check
         // runs ahead of both strips.
         assert_eq!(
             attribute_reject_message(vec![], vec![kv("", Value::StringValue(String::new()))]),
-            "label name is empty"
+            "symbolizer lookup: label name is empty"
         );
         assert_eq!(
             attribute_reject_message(vec![kv(" ", Value::StringValue("v".to_string()))], vec![]),
-            r#"normalization for label name " " resulted in invalid name "_""#
+            r#"symbolizer lookup: normalization for label name " " resulted in invalid name "_""#
         );
         assert_eq!(
             attribute_reject_message(vec![], vec![kv("_", Value::StringValue("v".to_string()))]),
-            r#"normalization for label name "_" resulted in invalid name "_""#
+            r#"symbolizer lookup: normalization for label name "_" resulted in invalid name "_""#
+        );
+        // A non-ASCII key the reference ACCEPTS stays accepted here, and the
+        // two it refuses are refused with the same sentence (issue #259
+        // re-review: `naïve` vs `µ` / `日本`, all three measured on the
+        // container).
+        assert_eq!(
+            attribute_reject_message(vec![kv("µ", Value::StringValue("v".to_string()))], vec![]),
+            r#"symbolizer lookup: normalization for label name "µ" resulted in invalid name "_""#
+        );
+        assert_eq!(
+            attribute_reject_message(
+                vec![],
+                vec![kv("日本", Value::StringValue("v".to_string()))]
+            ),
+            r#"symbolizer lookup: normalization for label name "日本" resulted in invalid name "_""#
         );
     }
 
     /// The accept half of the same seam: a dotted OTLP attribute key is what
     /// this receiver exists to carry, so it must stay a 200 on both sides.
+    /// `naïve` rides along because the reference ADMITS it (measured — it
+    /// keeps four ASCII letters), unlike `µ`/`日本`, which keep none.
     #[test]
     fn an_admissible_otlp_attribute_key_is_still_accepted_on_both_sides() {
         let request = request(vec![ResourceLogs {
@@ -759,7 +783,10 @@ mod tests {
                 scope: Some(scope(
                     "N",
                     "",
-                    vec![kv("http.method", Value::StringValue("GET".to_string()))],
+                    vec![
+                        kv("http.method", Value::StringValue("GET".to_string())),
+                        kv("naïve", Value::StringValue("yes".to_string())),
+                    ],
                 )),
                 log_records: vec![LogRecord {
                     time_unix_nano: 1_700_000_000_000_000_000,
@@ -773,7 +800,7 @@ mod tests {
         let out = super::parse(&request, 0).expect("admissible attribute keys");
         assert_eq!(
             out.rows[0].structured_metadata,
-            r#"{"http_method":"GET","scope_name":"N"}"#
+            r#"{"http_method":"GET","na_ve":"yes","scope_name":"N"}"#
         );
         assert_eq!(
             out.streams[0].labels.to_canonical_json(),

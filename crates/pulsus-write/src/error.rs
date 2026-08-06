@@ -106,9 +106,34 @@ pub enum LogsIngestError {
     /// [`validate_label_name`](crate::protocols::label_name::validate_label_name)
     /// for the rule and its two call sites in the reference.
     ///
-    /// The payload is the reference's error text VERBATIM, and the variant
-    /// deliberately renders it with no envelope of our own, so the body a
-    /// client reads is byte-identical to the reference's for the same input.
+    /// The payload is the reference's error text, and the variant deliberately
+    /// renders it with no envelope of OUR own (`#[error("{0}")]`) — every
+    /// envelope in it belongs to the reference. Each transport puts a
+    /// different one there, which is why the payload is built per seam:
+    ///
+    /// | seam | payload | reference |
+    /// |---|---|---|
+    /// | Loki push | `label name is empty` | bare error, `pkg/distributor/distributor.go:703-706 @ v3.7.4` |
+    /// | OTLP | `symbolizer lookup: label name is empty` | `fmt.Errorf("symbolizer lookup: %w", …)`, `pkg/loghttp/push/otlp.go:613 @ v3.7.4` |
+    ///
+    /// **What is byte-identical, exactly.** On the Loki push transport the
+    /// whole response BODY is: the reference's writer appends `\n`
+    /// (`http.Error` -> `fmt.Fprintln`, `pkg/loghttp/push/push.go:606-608 @
+    /// v3.7.4`) and so does ours
+    /// ([`loki_error_response`](crate::ingest::http)) — measured, the same 20
+    /// bytes `label name is empty\n`. On the OTLP transport the `message`
+    /// STRING is byte-identical, but the enclosing `google.rpc.Status` is not:
+    /// the reference omits the `code` field deliberately
+    /// (`grpcstatus.New(0, errorStr)`, `push.go:571-582 @ v3.7.4`, "Status 0
+    /// because we omit the Status.code field") while this receiver sets
+    /// `code = 3` for every 400-class failure on every signal (issue #8/#15
+    /// architect plan amendment 2) — a pre-existing, receiver-wide contract,
+    /// not something this variant chose. A third, narrow difference lives
+    /// inside the normalization message on both transports: the offending
+    /// name is echoed through each runtime's debug quoter, which spell an
+    /// escape differently for an unprintable name (see
+    /// [`validate_label_name`](crate::protocols::label_name::validate_label_name)
+    /// for the exhaustive bound and docs/api.md §8.2 for the ledger entry).
     ///
     /// Whole-request 400-class failure — the reference has no partial-success
     /// channel on either affected transport — so it joins [`classify`]'s 400

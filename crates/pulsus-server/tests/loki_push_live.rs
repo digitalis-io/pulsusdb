@@ -945,11 +945,16 @@ async fn empty_valued_structured_metadata_is_never_stored() {
 /// wire on both push encodings, and nothing is stored for it.
 ///
 /// Measured against `grafana/loki:3.7.4` (image ID `fe5a84aafad8`, index
-/// digest `sha256:87f0a067…`, git revision `b318f282`) with the same four
-/// bodies: it refuses all four too, with the same message text. The STATUS is
-/// a deliberate divergence — it answers `500` here and `400` for the identical
-/// condition on its own OTLP receiver; docs/api.md §8.2 has the reasoning.
-/// Before this change every one of these four was a `204` that stored a row.
+/// digest `sha256:87f0a067…`, git revision `b318f282`) with the same
+/// bodies: it refuses each of them too, and the response BODY BYTES match —
+/// terminating `\n` included, which is why the assertion below compares the
+/// whole body rather than a `.trim()`ed one. (An earlier revision trimmed,
+/// and could not have seen a missing terminator; the reference writes every
+/// push error through `http.Error` -> `fmt.Fprintln`,
+/// `pkg/loghttp/push/push.go:606-608 @ v3.7.4`.) The STATUS is a deliberate
+/// divergence — it answers `500` here and `400` for the identical condition
+/// on its own OTLP receiver; docs/api.md §8.2 has the reasoning.
+/// Before this change every one of these bodies was a `204` that stored a row.
 #[tokio::test(flavor = "multi_thread")]
 async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_stored() {
     if !should_run() {
@@ -983,6 +988,23 @@ async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_store
             ("_", "v"),
             r#"normalization for label name "_" resulted in invalid name "_""#,
         ),
+        // Non-ASCII names, both encodings. `µ` and `日本` keep no ASCII
+        // alphanumeric at all, so they sanitize to a lone `_` and are
+        // refused — measured on `grafana/loki:3.7.4`, which answers these
+        // exact sentences. Their admitted counterpart `naïve` is pushed
+        // below.
+        (
+            4,
+            "application/json",
+            ("µ", "v"),
+            r#"normalization for label name "µ" resulted in invalid name "_""#,
+        ),
+        (
+            5,
+            "application/x-protobuf",
+            ("日本", "v"),
+            r#"normalization for label name "日本" resulted in invalid name "_""#,
+        ),
     ] {
         let line = format!("sm name case {offset}");
         let ts = base_ns + offset;
@@ -1004,31 +1026,58 @@ async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_store
             "case {offset} ({content_type}): {}",
             res.body
         );
-        assert_eq!(res.body.trim(), expected, "case {offset} ({content_type})");
+        // Exact bytes, terminator included — NOT `.trim()`ed. The reference's
+        // own body for each of these is `<message>\n`.
+        assert_eq!(
+            res.body,
+            format!("{expected}\n"),
+            "case {offset} ({content_type}): body bytes {:?}",
+            res.body.as_bytes()
+        );
     }
 
-    // An admissible name pushed afterwards proves the receiver is still
-    // healthy and gives the stored-row query something to find, so "no rows
-    // for the rejected bodies" is a real absence rather than a dead server.
+    // Admissible names pushed afterwards prove the receiver is still healthy
+    // and give the stored-row query something to find, so "no rows for the
+    // rejected bodies" is a real absence rather than a dead server.
     let ok_line = "sm name admissible";
     let res = push(
         port,
         "application/json",
-        json_body_with_sm(service, base_ns + 4, ok_line, &[("a.b", "v")]).as_bytes(),
+        json_body_with_sm(service, base_ns + 6, ok_line, &[("a.b", "v")]).as_bytes(),
     );
     assert_eq!(res.status, 204, "admissible SM name push: {}", res.body);
 
+    // The accept side of the non-ASCII trio: `naïve` keeps four ASCII
+    // letters, so the reference admits it (measured, 204) where it refuses
+    // `µ` and `日本` above. Stored under PulsusDB's own canonical key —
+    // `na_ve`, one `_` per non-ASCII CHARACTER, not per byte.
+    let naive_line = "sm name admissible non-ascii";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm(service, base_ns + 7, naive_line, &[("naïve", "v")]).as_bytes(),
+    );
+    assert_eq!(
+        res.status, 204,
+        "admissible naive SM name push: {}",
+        res.body
+    );
+
     let client = ch_client(db).await;
-    let stored = stored_samples_by_body(&client, db, service, 1).await;
+    let stored = stored_samples_by_body(&client, db, service, 2).await;
     assert_eq!(
         stored.len(),
-        1,
-        "only the admissible push may be stored, found: {:?}",
+        2,
+        "only the admissible pushes may be stored, found: {:?}",
         stored.keys().collect::<Vec<_>>()
     );
     assert_eq!(
         stored[ok_line].structured_metadata, r#"{"a_b":"v"}"#,
         "an admissible dotted name is canonicalized, not rejected"
+    );
+    assert_eq!(
+        stored[naive_line].structured_metadata, r#"{"na_ve":"v"}"#,
+        "an admissible non-ASCII name is canonicalized per character"
     );
 }
 
