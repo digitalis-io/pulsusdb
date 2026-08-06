@@ -288,6 +288,77 @@ case("json/no-streams-key", "json", b"{}", "application/json")
 # (400 on an unknown field) would silently break that agreement.
 case("json/no-streams-unrelated-key", "json", b'{"nope":1}', "application/json")
 
+# The envelope's `streams` key is matched with ASCII case folding, and a
+# repeat of it is last-wins.  `loghttp.PushRequest` is a one-field struct
+# decoded by jsoniter reflection (`pkg/loghttp/query.go:91-93 @ v3.7.4`) and
+# `jsoniter.NewDecoder` runs `ConfigDefault`, whose `CaseSensitive` is false:
+# the wire key is folded over 'A'..'Z' before it is hashed, the field decoder
+# re-runs on every match and the slice decoder re-grows from index zero
+# (`iter_object.go:85-87`, `reflect_struct_decoder.go:36-41,574-590`,
+# `reflect_slice.go:66-99 @ jsoniter v1.1.12`, vendored in the Loki tree).
+#
+# These cases measure the WIRE only.  Status agreement is exactly what missed
+# this before: both sides answered 204 while PulsusDB silently dropped the
+# lines.  The storage half is asserted by
+# `loki_push_live::a_case_variant_streams_key_is_accepted_and_its_lines_are_stored`
+# and by `loki_push::tests::parse_json_matches_the_streams_key_case_insensitively`.
+def envelope(key, label="a", line="hi"):
+    return ('{"' + key + '":[{"stream":{"app":"' + label + '"},'
+            '"values":[["' + TS + '","' + line + '"]]}]}').encode()
+
+
+for _spelling in ("Streams", "STREAMS", "StReAmS", "streamS"):
+    case(f"json/streams-key-{_spelling}", "json", envelope(_spelling), "application/json")
+# The key on the wire is not the bytes `Streams`; both decoders unescape
+# before folding.
+case("json/streams-key-escaped-capital", "json", envelope(r"\u0053treams"),
+     "application/json")
+# Anchored and ASCII-only: a key that merely contains or extends the field
+# name is unknown, so the request is stream-less on both sides.
+for _name, _spelling in (("trailing-space", "streams "),
+                         ("leading-space", " streams"),
+                         ("extra-s", "streamss"),
+                         ("prefixed", "xstreams")):
+    case(f"json/streams-key-near-miss-{_name}", "json",
+         envelope(_spelling), "application/json")
+# Last-wins across spellings, and the last occurrence decides whether the
+# request is stream-less at all.  `null` overwrites with nil
+# (`reflect_slice.go:69-72`), so it empties the request like `[]` does.
+case("json/streams-key-repeated", "json",
+     b'{"streams":[{"stream":{"app":"a"},"values":[["' + TS.encode() + b'","first"]]}],'
+     b'"Streams":[{"stream":{"app":"b"},"values":[["' + TS.encode() + b'","second"]]}]}',
+     "application/json")
+case("json/streams-key-repeated-trailing-empty", "json",
+     b'{"Streams":[{"stream":{"app":"a"},"values":[["' + TS.encode() + b'","first"]]}],'
+     b'"streams":[]}', "application/json")
+case("json/streams-key-null", "json", b'{"streams":null}', "application/json")
+case("json/streams-key-null-then-populated", "json",
+     b'{"streams":null,"Streams":[{"stream":{"app":"a"},"values":[["'
+     + TS.encode() + b'","second"]]}]}', "application/json")
+# The fold is one field's, not the decoder's: a stream object is decoded by a
+# hand-written `LogProtoStream.UnmarshalJSON` switching on `string(key)`
+# (`query.go:99-121`), so `Stream`/`Values` are unknown keys on both sides --
+# 204 with nothing stored, which is why the live test reads the rows back.
+case("json/stream-object-keys-are-case-sensitive", "json",
+     b'{"streams":[{"Stream":{"app":"a"},"Values":[["' + TS.encode() + b'","hi"]]}]}',
+     "application/json")
+# ...but a repeat of those keys is last-wins there too, except that a `null`
+# `values` returns before assigning and leaves the entries alone
+# (`query.go:110-112`).
+case("json/stream-object-keys-repeated", "json",
+     b'{"streams":[{"stream":{"app":"first"},"stream":{"app":"second"},"values":[["'
+     + TS.encode() + b'","hi"]]}]}', "application/json")
+case("json/values-null-after-entries", "json",
+     b'{"streams":[{"stream":{"app":"a"},"values":[["' + TS.encode()
+     + b'","kept"]],"values":null}]}', "application/json")
+case("json/values-null-alone", "json",
+     b'{"streams":[{"stream":{"app":"a"},"values":null}]}', "application/json")
+# The fold does not skip the per-stream bounds: the over-wide value under a
+# case variant is the same 400 it is under `streams`.
+case("json/case-variant-value-2049", "json",
+     ('{"Streams":[{"stream":{"app":"' + B1 + '"},"values":[["' + TS
+      + '","x"]]}]}').encode(), "application/json")
+
 # ---- Loki push, protobuf -------------------------------------------------
 def pb(labels, line="hi"):
     return push_request([(labels, [(int(TS), line)])])
@@ -405,40 +476,47 @@ case("otlp/record-less-over-wide-resource+good", "otlp",
 # outranks the stream-less 422 above.  The reference has no depth cap -- the
 # record-BEARING control is 204 there and 400 here -- so nothing upstream fixes
 # the order between the two.  The at-cap neighbours are the discriminators:
-# the same record-less shape one level shallower, 422 on both sides.
+# the same record-less shape one AnyValue node shallower -- exactly at the cap,
+# the deepest tree still accepted -- 422 on both sides.  Measured edge, both
+# transports: depth 32 -> 422/422, depth 33 -> 422/400.
 MAX_ANYVALUE_DEPTH = 32  # crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH
 
 
-def deep_json_value(levels):
-    """An OTLP/JSON AnyValue nesting `levels` container levels around a scalar
-    leaf.  ArrayValue (3 JSON levels per AnyValue level) rather than
-    KvlistValue (4), so serde_json's own 128-deep recursion limit is not what
-    answers first."""
+def deep_json_value(depth):
+    """An OTLP/JSON AnyValue tree `depth` AnyValue nodes deep, the leaf
+    included -- the SAME unit as MAX_ANYVALUE_DEPTH and as the reject
+    message's `depth count N`, so `depth == MAX_ANYVALUE_DEPTH` is the last
+    accepted tree and `+ 1` is the first refused one.  (Counting the wrappers
+    instead put the over-deep cases two past the edge, so their at-cap
+    neighbour was not adjacent to them.)  ArrayValue (3 JSON levels per
+    AnyValue node) rather than KvlistValue (4), so serde_json's own 128-deep
+    recursion limit is not what answers first."""
     v = {"stringValue": "leaf"}
-    for _ in range(levels):
+    for _ in range(1, depth):
         v = {"arrayValue": {"values": [v]}}
     return v
 
 
-def otlp_deep_json(levels, records=0):
+def otlp_deep_json(depth, records=0):
     """A record-less (by default) OTLP/JSON request whose sole resource
-    attribute nests `levels` deep."""
+    attribute nests `depth` AnyValue nodes deep."""
     return json.dumps({"resourceLogs": [{
-        "resource": {"attributes": [{"key": "deep", "value": deep_json_value(levels)}]},
+        "resource": {"attributes": [{"key": "deep", "value": deep_json_value(depth)}]},
         "scopeLogs": [{"logRecords": [
             {"timeUnixNano": TS, "body": {"stringValue": "hi"}} for _ in range(records)]}],
     }]}, separators=(",", ":")).encode()
 
 
-def otlp_deep_pb(levels, records=0):
+def otlp_deep_pb(depth, records=0):
     """The same shape as an OTLP protobuf body, hand-encoded with the writer
     above -- the protobuf transport reaches the cap by a different route (the
-    wire pre-scan, not the JSON deserializer), so it is its own case.
+    wire pre-scan, not the JSON deserializer), so it is its own case.  `depth`
+    counts AnyValue nodes, as above.
     ExportLogsServiceRequest{1: ResourceLogs{1: Resource{1: KeyValue}, 2:
     ScopeLogs{2: LogRecord}}}; AnyValue{1: string, 5: ArrayValue{1: values}};
     LogRecord{1: fixed64 time, 5: AnyValue body}."""
     value = bytes_field(1, b"leaf")  # AnyValue.string_value
-    for _ in range(levels):
+    for _ in range(1, depth):
         value = bytes_field(5, bytes_field(1, value))  # array_value -> values
     kv_pair = bytes_field(1, b"deep") + bytes_field(2, value)
     record = (tag(1, 1) + int(TS).to_bytes(8, "little")
@@ -450,13 +528,13 @@ def otlp_deep_pb(levels, records=0):
 case("otlp/record-less-over-deep-attr", "otlp",
      otlp_deep_json(MAX_ANYVALUE_DEPTH + 1), "application/json", expect="DIFF")
 case("otlp/record-less-at-cap-attr", "otlp",
-     otlp_deep_json(MAX_ANYVALUE_DEPTH - 1), "application/json")
+     otlp_deep_json(MAX_ANYVALUE_DEPTH), "application/json")
 case("otlp/record-bearing-over-deep-attr", "otlp",
      otlp_deep_json(MAX_ANYVALUE_DEPTH + 1, records=1), "application/json", expect="DIFF")
 case("otlppb/record-less-over-deep-attr", "otlppb",
      otlp_deep_pb(MAX_ANYVALUE_DEPTH + 1), "application/x-protobuf", expect="DIFF")
 case("otlppb/record-less-at-cap-attr", "otlppb",
-     otlp_deep_pb(MAX_ANYVALUE_DEPTH - 1), "application/x-protobuf")
+     otlp_deep_pb(MAX_ANYVALUE_DEPTH), "application/x-protobuf")
 case("otlppb/record-bearing-over-deep-attr", "otlppb",
      otlp_deep_pb(MAX_ANYVALUE_DEPTH + 1, records=1), "application/x-protobuf",
      expect="DIFF")

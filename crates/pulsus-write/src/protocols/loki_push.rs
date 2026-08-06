@@ -1429,14 +1429,48 @@ impl<'de> serde::Deserialize<'de> for JsonPush {
                 let decoded_bytes = Cell::new(0usize);
                 let mut streams: Option<Vec<JsonStream>> = None;
                 while let Some(key) = map.next_key::<std::borrow::Cow<str>>()? {
-                    if key == "streams" {
-                        if streams.is_some() {
-                            return Err(serde::de::Error::duplicate_field("streams"));
-                        }
-                        streams = Some(map.next_value_seed(StreamsSeed {
-                            total_entries: &total_entries,
-                            decoded_bytes: &decoded_bytes,
-                        })?);
+                    // ASCII-case-insensitive, and a repeat overwrites — both
+                    // are the reference's, and both are observable (measured:
+                    // `Streams`/`STREAMS`/`StReAmS`/`streamS` and an escaped
+                    // `"Streams"` all store their lines upstream, and of
+                    // two spellings the LAST one is what gets stored).
+                    //
+                    // `loghttp.PushRequest` is a one-field struct decoded by
+                    // jsoniter reflection (`pkg/loghttp/query.go:91-93 @
+                    // v3.7.4`), and `jsoniter.NewDecoder` uses `ConfigDefault`,
+                    // whose `CaseSensitive` is false. The field map then gets a
+                    // `strings.ToLower` alias per tag and the wire key is folded
+                    // a byte at a time over `'A'..='Z'` only
+                    // (`reflect_struct_decoder.go:36-41`, `iter_object.go:49-90`
+                    // @ jsoniter v1.1.12, vendored) — so the rule is ASCII
+                    // folding, which is exactly `eq_ignore_ascii_case`. (Upstream
+                    // compares an FNV hash of the folded key rather than the key;
+                    // a colliding spelling would decode there too. That is an
+                    // artifact of its decoder, not a rule, and is not reproduced.)
+                    //
+                    // The overwrite is the same decoder's: `oneFieldStructDecoder`
+                    // re-invokes the field decoder on every matching key and
+                    // `sliceDecoder` re-grows from zero, so the last occurrence
+                    // wins (`reflect_struct_decoder.go:574-590`,
+                    // `reflect_slice.go:66-99`). Rejecting the repeat as a
+                    // duplicate field — which is what this did — was a `400`
+                    // against upstream's `204`.
+                    if key.eq_ignore_ascii_case("streams") {
+                        // Bytes and entries charged by a superseded occurrence
+                        // stay charged: the shared counters bound what this
+                        // request made us materialize, and we did materialize it.
+                        //
+                        // `null` overwrites with nil upstream — `sliceDecoder`
+                        // takes `UnsafeSetNil` before it ever reaches the
+                        // elements — so `{"streams":[one],"streams":null}` is a
+                        // stream-less request, measured `422`, not `204`.
+                        streams = Some(
+                            map.next_value_seed(NullableSeed(StreamsSeed {
+                                total_entries: &total_entries,
+                                decoded_bytes: &decoded_bytes,
+                            }))?
+                            .unwrap_or_default(),
+                        );
                     } else {
                         map.next_value::<serde::de::IgnoredAny>()?;
                     }
@@ -1472,6 +1506,57 @@ fn charge_json_decoded_bytes<E: serde::de::Error>(
     }
     decoded_bytes.set(new_total);
     Ok(())
+}
+
+/// Wraps a [`DeserializeSeed`](serde::de::DeserializeSeed) so a JSON `null`
+/// yields `None` instead of an "invalid type" failure — `serde_json`'s
+/// `deserialize_seq` rejects `null` outright
+/// (`peek_invalid_type`), while both of the reference's JSON envelope decoders
+/// treat it as "no value here". What they do NEXT differs, so the two callers
+/// differ too and each says why: the `streams` slice is overwritten with nil
+/// (`reflect_slice.go:66-73 @ jsoniter v1.1.12`, vendored in the Loki tree),
+/// whereas a stream's `values` is left untouched (`case "values": if ty ==
+/// jsonparser.Null { return nil }`, `pkg/loghttp/query.go:110-112 @ v3.7.4`).
+struct NullableSeed<S>(S);
+
+impl<'de, S> serde::de::DeserializeSeed<'de> for NullableSeed<S>
+where
+    S: serde::de::DeserializeSeed<'de>,
+{
+    type Value = Option<S::Value>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OptVisitor<S>(S);
+        impl<'de, S> serde::de::Visitor<'de> for OptVisitor<S>
+        where
+            S: serde::de::DeserializeSeed<'de>,
+        {
+            type Value = Option<S::Value>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON value or null")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                self.0.deserialize(deserializer).map(Some)
+            }
+        }
+        deserializer.deserialize_option(OptVisitor(self.0))
+    }
 }
 
 /// Bounded [`DeserializeSeed`](serde::de::DeserializeSeed) for the `streams`
@@ -1568,12 +1653,17 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
             {
                 let mut stream: Option<std::collections::BTreeMap<String, String>> = None;
                 let mut values: Option<Vec<JsonEntry>> = None;
+                // Exact-match keys, unlike the envelope's `streams` above: a
+                // stream object is decoded by a hand-written
+                // `LogProtoStream.UnmarshalJSON` that switches on
+                // `string(key)` (`pkg/loghttp/query.go:99-121 @ v3.7.4`), so
+                // upstream ignores `Stream`/`Values` too — measured, both
+                // sides `204` storing nothing. A repeat, though, overwrites
+                // there (the switch simply runs again), so a duplicate key is
+                // last-wins here as well and not a `400`.
                 while let Some(key) = map.next_key::<std::borrow::Cow<str>>()? {
                     match key.as_ref() {
                         "stream" => {
-                            if stream.is_some() {
-                                return Err(serde::de::Error::duplicate_field("stream"));
-                            }
                             let labels = map.next_value::<BoundedLabelMap>()?.0;
                             // Charge the RETAINED (post-dedup) label pairs (issue
                             // #168): the raw-pair count is already capped at
@@ -1588,13 +1678,19 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
                             stream = Some(labels);
                         }
                         "values" => {
-                            if values.is_some() {
-                                return Err(serde::de::Error::duplicate_field("values"));
+                            // `null` is the one place the reference does NOT
+                            // overwrite: its decoder returns from the callback
+                            // before touching `s.Entries`, so a `null` after a
+                            // populated `values` keeps the entries (measured
+                            // `204`, line stored).
+                            if let Some(entries) =
+                                map.next_value_seed(NullableSeed(ValuesSeed {
+                                    total_entries: self.total_entries,
+                                    decoded_bytes: self.decoded_bytes,
+                                }))?
+                            {
+                                values = Some(entries);
                             }
-                            values = Some(map.next_value_seed(ValuesSeed {
-                                total_entries: self.total_entries,
-                                decoded_bytes: self.decoded_bytes,
-                            })?);
                         }
                         _ => {
                             map.next_value::<serde::de::IgnoredAny>()?;
@@ -2680,6 +2776,175 @@ mod tests {
         let out = parse_json(body.as_bytes(), 0).unwrap();
         assert_eq!(out.streams.len(), 1);
         assert_eq!(out.streams[0].labels.get("foo"), Some("barf"));
+    }
+
+    /// The envelope's `streams` key is matched with ASCII case folding, so
+    /// every case variant carries its lines through to storage. Upstream
+    /// `loghttp.PushRequest` is decoded by jsoniter reflection under
+    /// `ConfigDefault` (`CaseSensitive: false`), which folds `'A'..='Z'` in the
+    /// wire key before hashing it (`iter_object.go:85-87`,
+    /// `reflect_struct_decoder.go:36-41 @ jsoniter v1.1.12`). Measured on
+    /// `grafana/loki@sha256:87f0a067…`: all four spellings `204`, and each
+    /// line reads back out of `/loki/api/v1/query_range`.
+    ///
+    /// The escaped spelling is here because upstream folds the *unescaped*
+    /// key (`readStringSlowPath` then the same fold), as `serde_json` hands us
+    /// the unescaped key — so the two agree for a reason, not by luck.
+    #[test]
+    fn parse_json_matches_the_streams_key_case_insensitively() {
+        for spelling in ["streams", "Streams", "STREAMS", "StReAmS", "streamS"] {
+            let body = format!(
+                r#"{{"{spelling}":[{{"stream":{{"app":"a"}},"values":[["1700000000000000000","hi"]]}}]}}"#
+            );
+            let out = parse_json(body.as_bytes(), 0).unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            assert_eq!(out.rows.len(), 1, "{spelling}");
+            assert_eq!(out.rows[0].body, "hi", "{spelling}");
+            assert_eq!(out.streams.len(), 1, "{spelling}");
+        }
+        // `\u0053treams`: the key on the wire is not the bytes `Streams`,
+        // but both decoders unescape before folding.
+        let escaped = br#"{"\u0053treams":[{"stream":{"app":"a"},
+             "values":[["1700000000000000000","hi"]]}]}"#;
+        let out = parse_json(escaped, 0).expect("escaped uppercase spelling");
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    /// The neighbour that keeps the fold ASCII-only and anchored: a key that
+    /// merely CONTAINS the field name, or differs outside `[A-Za-z]`, is an
+    /// unknown key and the request is stream-less. Upstream compares the whole
+    /// folded key, so `"streams "` measures `422` there too.
+    #[test]
+    fn parse_json_case_folding_does_not_widen_the_streams_key() {
+        for spelling in ["streams ", " streams", "stream", "streamss", "xstreams"] {
+            let body = format!(
+                r#"{{"{spelling}":[{{"stream":{{"app":"a"}},"values":[["1700000000000000000","hi"]]}}]}}"#
+            );
+            let err = parse_json(body.as_bytes(), 0).expect_err(spelling);
+            assert!(
+                matches!(err, LogsIngestError::MissingStreams),
+                "{spelling}: {err:?}"
+            );
+        }
+    }
+
+    /// A repeated `streams` key — same spelling or a different case of it —
+    /// is last-wins, not a duplicate-field error. `oneFieldStructDecoder`
+    /// re-runs the field decoder on every match and `sliceDecoder` re-grows
+    /// from index zero (`reflect_struct_decoder.go:574-590`,
+    /// `reflect_slice.go:66-99 @ jsoniter v1.1.12`). Measured: `204` with only
+    /// the LAST occurrence's line stored, where we used to answer `400`.
+    #[test]
+    fn parse_json_a_repeated_streams_key_is_last_wins() {
+        let two = |first: &str, second: &str| {
+            format!(
+                r#"{{"{first}":[{{"stream":{{"app":"a"}},"values":[["1700000000000000000","first"]]}}],"{second}":[{{"stream":{{"app":"b"}},"values":[["1700000000000000000","second"]]}}]}}"#
+            )
+        };
+        for (first, second) in [
+            ("streams", "streams"),
+            ("streams", "Streams"),
+            ("Streams", "streams"),
+        ] {
+            let body = two(first, second);
+            let out =
+                parse_json(body.as_bytes(), 0).unwrap_or_else(|e| panic!("{first}/{second}: {e}"));
+            assert_eq!(out.rows.len(), 1, "{first}/{second}");
+            assert_eq!(out.rows[0].body, "second", "{first}/{second}");
+        }
+    }
+
+    /// The same last-wins rule reaches the stream-less `422`: an empty or
+    /// `null` last occurrence discards a populated earlier one. `null`
+    /// overwrites because `sliceDecoder` takes `UnsafeSetNil` before it looks
+    /// at any element (`reflect_slice.go:69-72`). Measured `422` for both, and
+    /// nothing of the first occurrence is stored.
+    #[test]
+    fn parse_json_a_trailing_empty_or_null_streams_key_empties_the_request() {
+        let populated =
+            r#""Streams":[{"stream":{"app":"a"},"values":[["1700000000000000000","first"]]}]"#;
+        for trailing in [r#""streams":[]"#, r#""streams":null"#] {
+            let body = format!("{{{populated},{trailing}}}");
+            let err = parse_json(body.as_bytes(), 0).expect_err(&body);
+            assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
+        }
+        // ...and the reverse order keeps the populated one.
+        let body = format!(r#"{{"streams":null,{populated}}}"#);
+        let out = parse_json(body.as_bytes(), 0).expect("null then populated");
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    /// A stream object's own keys are NOT case-folded: upstream decodes it
+    /// with a hand-written `UnmarshalJSON` that switches on `string(key)`
+    /// (`pkg/loghttp/query.go:99-121 @ v3.7.4`), so `Stream`/`Values` are
+    /// unknown keys on both sides — measured `204` on Loki with nothing
+    /// stored. This is the discriminating neighbour of the envelope test
+    /// above: the fold is one field's, not the decoder's.
+    #[test]
+    fn parse_json_a_stream_objects_keys_are_case_sensitive() {
+        let body =
+            br#"{"streams":[{"Stream":{"app":"a"},"Values":[["1700000000000000000","hi"]]}]}"#;
+        let out = parse_json(body, 0).expect("unknown stream keys are ignored, not rejected");
+        assert!(out.rows.is_empty());
+        assert!(out.streams.is_empty());
+        assert!(out.stream_errors.is_empty());
+    }
+
+    /// Repeated `stream` / `values` keys inside one stream object are
+    /// last-wins for the same reason — the reference's switch simply runs
+    /// again — except that a `null` `values` returns from the callback before
+    /// assigning, so it leaves the entries alone (`query.go:110-112`).
+    /// Measured: all four `204`, storing `nd-second` / `line-nv-second` /
+    /// `line-vn`, where we used to answer `400`.
+    #[test]
+    fn parse_json_repeated_stream_object_keys_are_last_wins() {
+        let out = parse_json(
+            br#"{"streams":[{"stream":{"app":"first"},"stream":{"app":"second"},
+                 "values":[["1700000000000000000","hi"]]}]}"#,
+            0,
+        )
+        .expect("repeated stream key");
+        assert_eq!(out.streams.len(), 1);
+        assert_eq!(out.streams[0].labels.get("app"), Some("second"));
+
+        let out = parse_json(
+            br#"{"streams":[{"stream":{"app":"a"},"values":[["1700000000000000000","first"]],
+                 "values":[["1700000000000000000","second"]]}]}"#,
+            0,
+        )
+        .expect("repeated values key");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].body, "second");
+
+        // `null` after a populated `values` keeps the entries...
+        let out = parse_json(
+            br#"{"streams":[{"stream":{"app":"a"},"values":[["1700000000000000000","kept"]],
+                 "values":null}]}"#,
+            0,
+        )
+        .expect("null values after a populated one");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].body, "kept");
+
+        // ...and `null` alone is an entry-less stream, which is still a stream.
+        let out = parse_json(br#"{"streams":[{"stream":{"app":"a"},"values":null}]}"#, 0)
+            .expect("null values alone");
+        assert!(out.rows.is_empty());
+        assert!(out.stream_errors.is_empty());
+    }
+
+    /// The case fold does not skip the per-stream label bounds: an over-wide
+    /// value pushed under `Streams` is the same `400` it is under `streams`
+    /// (measured — Loki answers `400 stream '{app="bbb…"}' has label value
+    /// too long, whereas this branch used to answer `422` before the fold).
+    #[test]
+    fn parse_json_a_case_variant_streams_key_still_charges_the_label_bounds() {
+        let body = format!(
+            r#"{{"Streams":[{{"stream":{{"app":"{}"}},"values":[["1700000000000000000","x"]]}}]}}"#,
+            "b".repeat(2049)
+        );
+        let out = parse_json(body.as_bytes(), 0).expect("bad stream is dropped, not a 422");
+        assert!(out.rows.is_empty());
+        assert!(only_stream_error(&out).contains("label value too long"));
     }
 
     /// Issue #374: `PushWithResolver` refuses a push with no streams at all

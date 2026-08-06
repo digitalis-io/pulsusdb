@@ -64,6 +64,17 @@ by `otlp_logs::tests::an_index_attribute_and_its_near_miss_collide_on_the_unvali
 and, out of live ClickHouse, by
 `loki_push_live::an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label`.
 
+The `json/streams-key-*` group is the second place a status cannot settle
+the question, and is why the group exists. Loki matches the envelope's
+`streams` field with ASCII case folding, so `Streams`/`STREAMS`/`StReAmS`
+are accepted AND stored; before issue #374 both sides answered 204 here
+while PulsusDB silently dropped the lines, so status agreement reported
+parity over data loss. These cases pin the wire; the storage half is
+asserted by
+`loki_push_live::a_case_variant_streams_key_is_accepted_and_its_lines_are_stored`
+(each spelling's line read back out of ClickHouse) and hermetically by
+`loki_push::tests::parse_json_matches_the_streams_key_case_insensitively`.
+
 Long runs of one alphanumeric are squashed as <cxN> = N repetitions of c
 (100 or more) -- by compare.py's own `trim`, so a fresh run reproduces these
 bodies rather than a hand-post-processed copy of them.
@@ -100,6 +111,24 @@ json/entry-less-stream-over-wide                           204   204     SAME   
 json/no-streams                                            422   422     SAME     SAME
 json/no-streams-key                                        422   422     SAME     SAME
 json/no-streams-unrelated-key                              422   422     SAME     SAME
+json/streams-key-Streams                                   204   204     SAME     SAME
+json/streams-key-STREAMS                                   204   204     SAME     SAME
+json/streams-key-StReAmS                                   204   204     SAME     SAME
+json/streams-key-streamS                                   204   204     SAME     SAME
+json/streams-key-escaped-capital                           204   204     SAME     SAME
+json/streams-key-near-miss-trailing-space                  422   422     SAME     SAME
+json/streams-key-near-miss-leading-space                   422   422     SAME     SAME
+json/streams-key-near-miss-extra-s                         422   422     SAME     SAME
+json/streams-key-near-miss-prefixed                        422   422     SAME     SAME
+json/streams-key-repeated                                  204   204     SAME     SAME
+json/streams-key-repeated-trailing-empty                   422   422     SAME     SAME
+json/streams-key-null                                      422   422     SAME     SAME
+json/streams-key-null-then-populated                       204   204     SAME     SAME
+json/stream-object-keys-are-case-sensitive                 204   204     SAME     SAME
+json/stream-object-keys-repeated                           204   204     SAME     SAME
+json/values-null-after-entries                             204   204     SAME     SAME
+json/values-null-alone                                     204   204     SAME     SAME
+json/case-variant-value-2049                               400   400     SAME     SAME
 pb/duplicate-distinct                                      400   400     SAME     SAME
 pb/257-nonempty                                            400   400     SAME     SAME
 pb/duplicate-identical                                     400   400     SAME     SAME
@@ -190,7 +219,7 @@ otlp/index-key-map-value-long-nested-value                 400   400     SAME   
 otlp/index-key-int-value                                   204   200     SAME     SAME
 otlp/index-key-array-value-long                            400   400     SAME     SAME
 
-status agreement: 109/116 (7 recorded divergence(s): ['json/65537-raw-empty-keys', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
+status agreement: 127/134 (7 recorded divergence(s): ['json/65537-raw-empty-keys', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
 unexpected verdicts: []
 
 ====================================================================================================
@@ -277,6 +306,60 @@ bodies
 --- json/no-streams-unrelated-key [SAME]
     loki   422: error at least one valid stream is required for ingestion\n
     pulsus 422: error at least one valid stream is required for ingestion
+--- json/streams-key-Streams [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/streams-key-STREAMS [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/streams-key-StReAmS [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/streams-key-streamS [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/streams-key-escaped-capital [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/streams-key-near-miss-trailing-space [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
+--- json/streams-key-near-miss-leading-space [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
+--- json/streams-key-near-miss-extra-s [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
+--- json/streams-key-near-miss-prefixed [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
+--- json/streams-key-repeated [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/streams-key-repeated-trailing-empty [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
+--- json/streams-key-null [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
+--- json/streams-key-null-then-populated [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/stream-object-keys-are-case-sensitive [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/stream-object-keys-repeated [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/values-null-after-entries [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/values-null-alone [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/case-variant-value-2049 [SAME]
+    loki   400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
+    pulsus 400: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'
 --- pb/duplicate-distinct [SAME]
     loki   400: stream '{foo="bar", foo="barf", service_name="unknown_service"}' has duplicate label name: 'foo'\n
     pulsus 400: stream '{foo="bar", foo="barf"}' has duplicate label name: 'foo'
@@ -589,8 +672,10 @@ otlp/record-bearing-over-deep-attr, otlppb/record-bearing-over-deep-attr
     outranks the stream-less 422 -- a body that is both record-less and
     over-deep is 400 here and 422 upstream. Pre-existing, not introduced by
     the 422: the same 400 comes out of the branch point 5969a94. The at-cap
-    neighbours (`*-at-cap-attr`, one level shallower) are the
-    discriminators: the same record-less shape, 422 on both sides. Ledger
+    neighbours (`*-at-cap-attr`) are the discriminators: the same
+    record-less shape one AnyValue node shallower, which is exactly at the
+    cap and the deepest tree still accepted, 422 on both sides. Measured
+    edge, both transports: depth 32 -> 422/422, depth 33 -> 422/400. Ledger
     residual 6; the ordering is pinned hermetically by
     `otlp_logs::tests::the_depth_cap_outranks_the_stream_less_check`.
 

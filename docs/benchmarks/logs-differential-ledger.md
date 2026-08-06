@@ -1864,6 +1864,42 @@ back up here.
   error body it writes (`grpcstatus.New(0, errorStr)`,
   `pkg/loghttp/push/push.go:571-581 @ v3.7.4`), a pre-existing difference
   across our whole OTLP error family rather than one of this status.
+- **How the JSON envelope's own keys are matched**, which is what
+  decides whether the `422` above is reached at all. `loghttp.PushRequest`
+  is a one-field struct (`pkg/loghttp/query.go:91-93 @ v3.7.4`) decoded by
+  `jsoniter.NewDecoder`, i.e. under `ConfigDefault`, whose `CaseSensitive`
+  is false. So the reference matches `streams` with **ASCII case folding**
+  — the wire key is folded over `'A'..'Z'` before it is compared, and the
+  tag gets a `strings.ToLower` alias
+  (`iter_object.go:49-90`, `reflect_struct_decoder.go:36-41 @ jsoniter
+  v1.1.12`, vendored in the Loki tree) — and a **repeat of the key is
+  last-wins**, because the field decoder re-runs on every match and the
+  slice decoder re-grows from index zero
+  (`reflect_struct_decoder.go:574-590`, `reflect_slice.go:66-99`); a
+  `null` overwrites with nil, so it empties the request exactly as `[]`
+  does. Measured on the pinned oracle: `Streams`, `STREAMS`, `StReAmS`,
+  `streamS` and an escaped `"\u0053treams"` are all `204` **and the lines
+  read back out of `/loki/api/v1/query_range`**; of two spellings only the
+  last one's line is stored.
+
+  PulsusDB matched the key byte-for-byte, which was invisible while it
+  answered `204` (the case variant was an unknown key, so the push was
+  empty and silently dropped) and became a `422` once the stream-less
+  check above landed. It now folds the same way and is last-wins, so both
+  the divergence and the silent drop that preceded it are closed. Note
+  which layer the rule lives on: a stream object's own `stream`/`values`
+  keys are decoded by a hand-written `LogProtoStream.UnmarshalJSON` that
+  switches on `string(key)` (`query.go:99-121 @ v3.7.4`), so those stay
+  case-**sensitive** on both sides (measured: `Stream`/`Values` are `204`
+  storing nothing) — while a repeat of them is last-wins there too, except
+  that a `null` `values` returns before assigning and leaves the entries
+  alone (`query.go:110-112`). The same question over the other ingest
+  envelope has no gap: OTLP/JSON is decoded by pdata's generated
+  field switch, exact match plus the proto3 snake_case alias, and all
+  seven spellings of `resourceLogs` measured identically on both sides.
+  Harness: the `json/streams-key-*`, `json/stream-object-keys-*` and
+  `json/values-null-*` cases; storage, which a status cannot see, is
+  `loki_push_live::a_case_variant_streams_key_is_accepted_and_its_lines_are_stored`.
 - **Multi-failure bodies** are grouped as `util.GroupedErrors.Error()`
   groups them (`pkg/util/errors.go:105-131 @ v3.7.4`): identical messages
   collapsed with an `N errors like: ` prefix, distinct groups joined with
@@ -1959,16 +1995,17 @@ back up here.
   `422`.** PulsusDB bounds OTLP `AnyValue` nesting at
   `MAX_ANYVALUE_DEPTH` = 32 (finding #54, a stack-safety guard); the
   reference has no such bound — a record-*bearing* resource whose
-  attribute nests 33 levels is `204` upstream and `400` here, measured on
-  both transports. Because both our transports charge the cap inside
+  attribute nests 33 `AnyValue` nodes deep is `204` upstream and `400`
+  here, measured on both transports. Because both our transports charge the cap inside
   decode (`otlp_prescan::prescan_logs` for protobuf,
   `otlp_json::AnyValueSeed` for JSON, and `ensure_logs_anyvalue_depth`
   repeats it as `parse`'s first statement), a body that is *both*
   record-less *and* over-deep answers `400` here where the reference
   answers `422` — the depth reject wins because it runs first. Measured
   on both transports (`otlp/record-less-over-deep-attr`,
-  `otlppb/record-less-over-deep-attr`; their at-cap neighbours, one level
-  shallower, are `422` on both sides), and **pre-existing**: the same `400` comes out of the
+  `otlppb/record-less-over-deep-attr`, at depth 33; their at-cap
+  neighbours, one `AnyValue` node shallower at depth 32 — the deepest tree
+  still accepted — are `422` on both sides), and **pre-existing**: the same `400` comes out of the
   branch point `5969a94`, so neither the bounds nor the `422` introduced
   it. Nothing upstream fixes the order between a bound the reference does
   not have and one it does, so the order is stated rather than matched.

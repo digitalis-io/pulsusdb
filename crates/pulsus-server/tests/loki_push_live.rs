@@ -1679,3 +1679,136 @@ async fn a_stream_less_push_is_422_on_both_receivers_and_stores_nothing() {
         "only the control push registers a stream"
     );
 }
+
+/// Issue #374 review round 9: the envelope's `streams` key is matched with
+/// ASCII case folding, and a repeat of it is last-wins.
+///
+/// `loghttp.PushRequest` is a one-field struct decoded by jsoniter reflection
+/// (`pkg/loghttp/query.go:91-93 @ v3.7.4`); `jsoniter.NewDecoder` runs
+/// `ConfigDefault`, whose `CaseSensitive` is false, so the wire key is folded
+/// over `'A'..='Z'` before it is matched, and the field decoder re-runs on
+/// every match while the slice decoder re-grows from zero
+/// (`iter_object.go:85-87`, `reflect_struct_decoder.go:36-41,574-590`,
+/// `reflect_slice.go:66-99 @ jsoniter v1.1.12`).
+///
+/// Live rather than hermetic because status agreement is exactly what missed
+/// this: before #374 both sides answered `204` here and we silently dropped
+/// the lines, so only a read-back can tell "accepted" from "accepted and
+/// stored". Measured on `grafana/loki@sha256:87f0a067…`: `204` for every
+/// spelling with the line queryable afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_case_variant_streams_key_is_accepted_and_its_lines_are_stored() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_160;
+    let db = "pulsus_loki_push_streams_case_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    const MISSING: &str = "error at least one valid stream is required for ingestion";
+    let one = |spelling: &str, service: &str, line: &str| {
+        format!(
+            r#"{{"{spelling}":[{{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","{line}"]]}}]}}"#
+        )
+    };
+
+    // Every spelling is accepted AND stores its line.
+    for spelling in ["streams", "Streams", "STREAMS", "StReAmS", "streamS"] {
+        let service = format!("case-374-{spelling}");
+        let line = format!("case variant {spelling}");
+        let res = push(
+            port,
+            "application/json",
+            one(spelling, &service, &line).as_bytes(),
+        );
+        assert_eq!(res.status, 204, "{spelling} -> 204 (body {})", res.body);
+        let lines = wait_for_line(port, &service, base_ns, &line);
+        assert!(
+            lines.contains(&line),
+            "{spelling}: the line must be queryable, got {lines:?}"
+        );
+    }
+    assert_eq!(
+        wait_for_count(
+            db,
+            "SELECT count() AS c FROM log_streams WHERE service LIKE 'case-374-%'",
+            5,
+        )
+        .await,
+        5,
+        "all five spellings register their stream"
+    );
+
+    // A repeat is last-wins, across spellings: only the second line is stored.
+    let dup = format!(
+        "{{{},{}}}",
+        one("streams", "case-374-dup", "dup first")
+            .trim_start_matches('{')
+            .trim_end_matches('}'),
+        one("Streams", "case-374-dup", "dup second")
+            .trim_start_matches('{')
+            .trim_end_matches('}'),
+    );
+    let res = push(port, "application/json", dup.as_bytes());
+    assert_eq!(res.status, 204, "repeated key -> 204 (body {})", res.body);
+    let lines = wait_for_line(port, "case-374-dup", base_ns, "dup second");
+    assert!(
+        lines.contains(&"dup second".to_string()) && !lines.contains(&"dup first".to_string()),
+        "only the last occurrence is stored, got {lines:?}"
+    );
+
+    // ...and a trailing empty occurrence discards the populated earlier one,
+    // which is how the stream-less `422` is reached from a body that does
+    // carry a stream.
+    let discard = format!(
+        r#"{{{},"streams":[]}}"#,
+        one("Streams", "case-374-discarded", "discarded line")
+            .trim_start_matches('{')
+            .trim_end_matches('}'),
+    );
+    let res = push(port, "application/json", discard.as_bytes());
+    assert_eq!(res.status, 422, "trailing empty (body {})", res.body);
+    assert_eq!(res.body, MISSING);
+
+    // The fold does not skip the per-stream label bounds: an over-wide value
+    // under `Streams` is the same `400` it is under `streams`.
+    let wide = format!(
+        r#"{{"Streams":[{{"stream":{{"service_name":"case-374-wide","app":"{}"}},"values":[["{base_ns}","wide line"]]}}]}}"#,
+        "b".repeat(2049)
+    );
+    let res = push(port, "application/json", wide.as_bytes());
+    assert_eq!(
+        res.status, 400,
+        "over-wide under Streams (body {})",
+        res.body
+    );
+    assert!(
+        res.body.contains("label value too long"),
+        "the bound's message, not the envelope's: {}",
+        res.body
+    );
+
+    // Nothing that was refused left a row behind.
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_streams \
+             WHERE service IN ('case-374-discarded', 'case-374-wide')",
+        )
+        .await,
+        0,
+        "the refused pushes register nothing"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_samples WHERE body = 'dup first'",
+        )
+        .await,
+        0,
+        "the superseded occurrence stores nothing"
+    );
+}
