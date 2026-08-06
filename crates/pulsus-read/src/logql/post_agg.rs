@@ -444,7 +444,7 @@ fn grouping_unique_error() -> ReadError {
     // label the many-side series differed on, two distinct many series
     // collapse onto one output identity. Witness, shipped and green:
     // `group_left_include_collapsing_distinct_many_labels_is_grouping_unique_error`
-    // (crates/pulsus-read/tests/logql_metric_agg_golden.rs:2549), oracle-
+    // (crates/pulsus-read/tests/logql_metric_agg_golden.rs), oracle-
     // pinned byte-identical against `grafana/loki:3.4.2`.
     ReadError::PipelineInvalid {
         reason: "multiple matches for labels: grouping labels must ensure unique matches"
@@ -2053,9 +2053,9 @@ mod preflight {
     /// compared through a filtered walk of the BORROWED label slice, and
     /// no output label vector is ever materialised.
     ///
-    /// The two modes are mutually exclusive (`one_to_one =
-    /// include.is_none()`, `instant_join`'s `:387`), so exactly one
-    /// collision error is possible per step.
+    /// The two modes are mutually exclusive — `instant_join`'s
+    /// `let one_to_one = include.is_none();` — so exactly one collision
+    /// error is possible per step.
     #[derive(Clone, Copy)]
     enum Identity<'a> {
         /// Identity is the match signature; a repeat is
@@ -2068,10 +2068,13 @@ mod preflight {
         /// elements are only ever compared when they share the match
         /// signature `key`, and a shared `key` means
         /// `one_by_key.get(&key)` returned the SAME one-side element `r`
-        /// (`instant_join`'s `:400-403`). The include overlay is
-        /// therefore identical for both — a fixed set of `(name, value)`
-        /// pairs to insert and a fixed set of names to delete
-        /// (`:421-431`) — and the two parts have disjoint key sets, so
+        /// (`instant_join`'s `let Some(r) = one_by_key.get(&key) else`).
+        /// The include overlay is therefore identical for both — a fixed
+        /// set of `(name, value)` pairs to insert and a fixed set of
+        /// names to delete (the `else` arm of `instant_join`'s
+        /// `let labels: MatchSig = if one_to_one`, where the include
+        /// names drive `set_label_sorted`/`remove_label_sorted`) — and
+        /// the two parts have disjoint key sets, so
         /// `final_labels(l1) == final_labels(l2)` iff
         /// `filter(l1, k ∉ include) == filter(l2, k ∉ include)`.
         Grouped(&'a [String]),
@@ -2142,14 +2145,14 @@ mod preflight {
 
     /// (P1) — the three join refusals, decided over the WHOLE join.
     ///
-    /// `duplicate_one_side_error` (`instant_join`'s `:392`),
-    /// `multiple_matches_error` (`:442`) and `grouping_unique_error`
-    /// (`:449`) are all functions of the operands' labels and of which
-    /// series are present at which timestamp. This reproduces
-    /// `combine_matrices`' ascending step order (`:589`) and
-    /// `instant_join`'s within-step order — the one-side index before the
-    /// many loop — so the error it returns is the error the join would
-    /// have returned, at the same step.
+    /// `duplicate_one_side_error`, `multiple_matches_error` and
+    /// `grouping_unique_error` — the three `instant_join` raises — are
+    /// all functions of the operands' labels and of which series are
+    /// present at which timestamp. This reproduces `combine_matrices`'
+    /// ascending step order — its `for &t in &timestamps` over the
+    /// timestamp union — and `instant_join`'s within-step order — the
+    /// one-side index before the many loop — so the error it returns is
+    /// the error the join would have returned, at the same step.
     pub(super) fn decide_binary_refusals<'a>(
         op: BinOp,
         matching: Option<&VectorMatching>,
@@ -2170,8 +2173,9 @@ mod preflight {
             return Ok(());
         }
         let (n_l, n_r) = (operand_series(lhs), operand_series(rhs));
-        // `instant_join`'s `:372` short-circuit: a side with no series is
-        // empty at every step, so no step can reach the one-side index.
+        // `instant_join`'s `if lhs.is_empty() || rhs.is_empty()`
+        // short-circuit: a side with no series is empty at every step, so
+        // no step can reach the one-side index.
         if n_l == 0 || n_r == 0 {
             return Ok(());
         }
@@ -2191,8 +2195,9 @@ mod preflight {
         let out = (|| -> Result<(), ReadError> {
             project_side(lhs, &mut sides_l, pc);
             project_side(rhs, &mut sides_r, pc);
-            // `instant_join`'s own role assignment, transcribed
-            // (`:379-383`).
+            // `instant_join`'s own role assignment, transcribed — its
+            // `let (many, one, include, swapped)` match on
+            // `matching.and_then(|m| m.group.as_ref())`.
             let (many, one, ident, swapped) = match matching.and_then(|m| m.group.as_ref()) {
                 None => (&sides_l[..], &sides_r[..], Identity::OneToOne, false),
                 Some(MatchGroup::Left(inc)) => (
@@ -2364,9 +2369,10 @@ mod preflight {
     /// Precedence transcribes `instant_join`: the one-side index is built
     /// before the many loop, so a duplicate one-side signature wins over
     /// a many-side repeat at the SAME step; and `combine_matrices`'
-    /// ascending union (`:589`) makes the earliest step win across steps.
-    /// Both are gated by `:372`'s short-circuit — a step where either
-    /// side is empty refuses nothing.
+    /// ascending union (its `for &t in &timestamps`) makes the earliest
+    /// step win across steps. Both are gated by `instant_join`'s
+    /// `if lhs.is_empty() || rhs.is_empty()` short-circuit — a step where
+    /// either side is empty refuses nothing.
     ///
     /// Each point is read exactly once, when it is pushed: `O(P log S)`
     /// time, `O(S)` auxiliary, never more than `P` reads.
@@ -2433,11 +2439,12 @@ mod preflight {
                 let next = cursors[pos as usize] as usize + 1;
                 if next < s.points.len() {
                     let nt = s.points.at(next);
-                    // The operands are ascending by construction
-                    // (`exec.rs:120-121`). If one is not, the preflight
-                    // DECIDES NOTHING and the join decides as it always
-                    // did — an incomplete preflight is safe, an unsound
-                    // one is not.
+                    // The operands are ascending by construction —
+                    // `MatrixSeries::points` in `logql/exec.rs` is
+                    // declared "`(step_ns, value)`, ascending by step".
+                    // If one is not, the preflight DECIDES NOTHING and
+                    // the join decides as it always did — an incomplete
+                    // preflight is safe, an unsound one is not.
                     if nt <= t {
                         return None;
                     }
@@ -2463,7 +2470,7 @@ mod preflight {
 
     /// `match_signature`'s `on`/`ignoring` filter, as a predicate rather
     /// than a projection — the preflight must not materialise a
-    /// `MatchSig`, which `match_signature` clones (`:270-288`).
+    /// `MatchSig`, which `match_signature` materialises with `.cloned()`.
     fn keep_label(k: &str, matching: Option<&VectorMatching>) -> bool {
         match matching {
             None => true,
@@ -4240,9 +4247,9 @@ mod tests {
     /// The three pre-committed timestamp assignments. `T0` puts every
     /// series on every step; `T1` gives colliding pairs steps they never
     /// share (the admit-side control, and the source of steps where one
-    /// side is empty and the other is not — `instant_join`'s `:372`
-    /// short-circuit); `T2` overlaps partially, so "earliest step wins"
-    /// is exercised.
+    /// side is empty and the other is not — `instant_join`'s
+    /// `if lhs.is_empty() || rhs.is_empty()` short-circuit); `T2`
+    /// overlaps partially, so "earliest step wins" is exercised.
     fn diff_stamps(pattern: usize, i: usize) -> &'static [i64] {
         match pattern {
             0 => &[1, 2, 3],

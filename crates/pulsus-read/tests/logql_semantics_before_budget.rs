@@ -121,9 +121,9 @@ fn join_refusal_rows() -> Vec<(
         ),
         (
             // (b) the earliest steps are EMPTY on one side, so
-            // `instant_join`'s `:372` short-circuit returns before the
-            // one-side index is built — the case that defeated the
-            // first design.
+            // `instant_join`'s `if lhs.is_empty() || rhs.is_empty()`
+            // short-circuit returns before the one-side index is built —
+            // the case that defeated the first design.
             "matrix, empty leading steps on one side",
             BinOp::Div,
             Some(on(&["x"], Some(MatchGroup::Left(Vec::new())))),
@@ -177,7 +177,7 @@ fn join_refusal_rows() -> Vec<(
         (
             // (f) the include-copy collapse of
             // `group_left_include_collapsing_distinct_many_labels_is_grouping_unique_error`
-            // (tests/logql_metric_agg_golden.rs:2549), oracle-pinned
+            // (tests/logql_metric_agg_golden.rs), oracle-pinned
             // byte-identical against `grafana/loki:3.4.2`. The one side
             // has no `y`, so copying the `y` include DROPS it from both
             // distinct many-side series.
