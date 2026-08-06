@@ -306,11 +306,12 @@ fn build_stream_labels(resource: Option<&Resource>) -> (LabelSet, usize) {
 ///   `structuredMetadata[i].Name/.Value`, no builder); at the pinned v3.7.4
 ///   the same block routes through Prometheus' `labels.Builder`, which deletes
 ///   empty-valued base labels by name
-///   (`pkg/distributor/distributor.go:698-722 @ v3.7.4`). The 3.4.2 half of
-///   that is read from its source, not re-measured; the v3.7.4 half is
-///   measured on `grafana/loki:3.7.4` (`b318f282`) with an OTLP body carrying
-///   scope attributes `team=""` + `keep="1"`, which comes back with `keep`
-///   and no `team`.
+///   (`pkg/distributor/distributor.go:698-722 @ v3.7.4`). Both halves are
+///   measured, each on its own container, with the SAME OTLP body: a scope
+///   named `N` version `1.0` carrying attributes `team=""` + `keep="1"`, plus
+///   record attributes `sm_empty=""` + `sm_keep="2"`. `grafana/loki:3.4.2`
+///   (`4fa045d3`) returns `keep`, `sm_keep`, **and** `team=""`, `sm_empty=""`;
+///   `grafana/loki:3.7.4` (`b318f282`) returns only `keep` and `sm_keep`.
 ///
 /// The resolution is done explicitly HERE, before the [`structured_metadata_json`]
 /// seam, because `from_normalized` mis-resolves (a)/(b). Keys are sanitized with

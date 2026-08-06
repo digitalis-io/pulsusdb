@@ -2899,17 +2899,34 @@ mod tests {
     /// A stream whose labels are ALL empty-valued strips down to the empty
     /// label set, and PulsusDB stores it.
     ///
-    /// **This is a divergence, not parity.** The reference strips first and
-    /// then rejects the empty remainder in `ValidateLabels`
-    /// (`ls.IsEmpty()` -> `MissingLabelsErrorMsg`,
-    /// `pkg/distributor/validator.go:157-162 @ v3.7.4`). Measured on
-    /// `grafana/loki:3.7.4`: a push of `{"onlyempty":""}` answers `400 error
-    /// at least one label pair is required per stream` on both transports —
-    /// the same answer it gives a literal `{}` push, which PulsusDB also
-    /// accepts today. So this is the pre-existing "we accept a label-less
-    /// stream" divergence being reached by one more input, NOT a new one; it
-    /// belongs to the ingest label-validation work (#374), which owns
-    /// `ValidateLabels`, and is deliberately not fixed here.
+    /// **This is a divergence, and which one depends on how the reference is
+    /// configured** — an earlier revision of this comment claimed
+    /// unconditionally that it answers 400, which is wrong under its own
+    /// defaults. Its push path normally never reaches the empty-label check:
+    /// `ParseLokiRequest` runs `syntax.ParseLabels` (the strip) and then, for
+    /// any stream carrying no `service_name`, sets one from
+    /// `discover_service_name` — falling back to the literal `unknown_service`
+    /// when no configured name is present (`pkg/loghttp/push/push.go:425-452 @
+    /// v3.7.4`). That list defaults to thirteen names, i.e. non-empty
+    /// (`pkg/validation/limits.go:329-341 @ v3.7.4`), so the label set is no
+    /// longer empty by the time `ValidateLabels` tests `ls.IsEmpty()` ->
+    /// `MissingLabelsErrorMsg` (`pkg/distributor/validator.go:156-162 @
+    /// v3.7.4`). Measured on two `grafana/loki:3.7.4` containers differing
+    /// only in that setting:
+    ///
+    /// | pushed | stock config | `discover_service_name: []` |
+    /// |---|---|---|
+    /// | `{}` | 204, stored as `{service_name="unknown_service"}` | 400 `error at least one label pair is required per stream` |
+    /// | `{"onlyempty":""}` | 204, stored in that SAME stream | 400, same text |
+    ///
+    /// PulsusDB answers neither: 204, storing the empty label set. It
+    /// implements neither half — no `discover_service_name` equivalent at all
+    /// (pre-existing and not specific to this input: a push of `{"keep":"v"}`
+    /// likewise stores without the synthesised `service_name`), and no
+    /// `ValidateLabels`, which is #374's. Measured at our own wire with the
+    /// same two bodies: both 204, both landing in one `log_streams` row whose
+    /// `labels` is `{}`. Issue #259 changes only which inputs reach that row —
+    /// the literal `{}` push already did.
     #[test]
     fn a_stream_whose_labels_are_all_empty_valued_becomes_the_empty_label_set() {
         let (labels, _) = parse_label_set(r#"{e=""}"#).unwrap();

@@ -62,8 +62,12 @@
 //! attributes sanitizing to one key (last-write-wins), and an empty-valued
 //! attribute DROPPED (rule (c), flipped by issue #259: the 3.4.2 distributor
 //! kept it, the pinned v3.7.4 one deletes it through Prometheus'
-//! `labels.Builder` — measured on both containers) — with the resolved SM
-//! golden asserted byte-identical on both paths.
+//! `labels.Builder` — measured on one container per version with the same
+//! OTLP body, `grafana/loki:3.4.2` returning the empty-valued attribute and
+//! `grafana/loki:3.7.4` dropping it; see
+//! `otlp_logs::build_scope_structured_metadata` for the body and both source
+//! citations) — with the resolved SM golden asserted byte-identical on both
+//! paths.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, reusing the harness pattern
 //! from `crates/pulsus-schema/tests/live_schema.rs` /
