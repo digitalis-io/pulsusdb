@@ -17,9 +17,9 @@
 //! `Ledger::acquire_binary` is the only way to get them back, and what
 //! it hands back is one charged value the join must be given whole, so
 //! no caller can substitute the context by CALLING the join — the only
-//! argument it still takes is `return_bool`. How far that bound reaches,
-//! and where Rust's module-granular visibility stops it, is enumerated on
-//! `join_decided` in the source. These rows are what proves the structure
+//! argument it still takes is `return_bool`. That bounds the call and
+//! not the module around it; `join_decided`'s doc in the source says
+//! what it reaches. These rows are what proves the structure
 //! produces the behaviour, at the layer the user experiences (#335's
 //! standing lesson: a gate below the user reports agreement exactly where
 //! divergence lives).
