@@ -158,12 +158,13 @@ pub use plan::{
 };
 pub use post_agg::{
     B_INCLUDE, B_LABEL, B_MANY, B_PAIR, B_POINT, B_SERIES, BinaryTerm, ChainTerm,
-    MAX_POST_AGG_BYTES, StageInput, W_APPROX_TOPK, W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT,
+    MAX_BINARY_PREFLIGHT_BYTES, MAX_POST_AGG_BYTES, PREFLIGHT_BYTES_PER_SERIES,
+    PREFLIGHT_FLAT_BYTES, StageInput, W_APPROX_TOPK, W_GROUPNAME, W_LABEL_BYTE, W_PAIR, W_POINT,
     W_SERIES, W_STAGE_SERIES, apply_label_replace, apply_label_replace_capped, apply_vector_aggs,
     apply_vector_aggs_capped, binary_peak_bytes, binary_peak_bytes_without, combine_binary,
     combine_binary_capped, group_name_bytes, include_bytes, label_replace_peak_bytes,
     leaf_min_entry_bytes, measure_matrix, measure_vector, post_agg_peak_bytes,
-    post_agg_peak_bytes_without,
+    post_agg_peak_bytes_without, preflight_alloc_probe, preflight_scratch_bytes,
 };
 pub use variants::{
     MAX_VARIANT_FANOUT_STATE_BYTES, VARIANT_LABEL, VariantArena, VariantsAggState,

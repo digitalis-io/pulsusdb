@@ -720,8 +720,9 @@ not "fix" us toward the panic.
   ceiling would sit in the tens of gigabytes and stop protecting
   anything. Refusing where the reference OOMs is PulsusDB being correct
   — the reference being unbounded is not copied (the
-  `template-output-budget` precedent). Unlike O6/O7 this funnel is
-  wired today, which is why the row exists now. Gated by
+  `template-output-budget` precedent). This funnel is wired today, as
+  O6's and O7's are — rows (d) and (e) above, driven end to end by
+  `both_amplifiers_are_refused_end_to_end_from_query_text`. Gated by
   `o8_the_label_replace_template_threshold_bounds_where_refusal_is_possible`
   (below `L_MIN` admitted over the whole feasible region, refusable at
   `L_MIN`, `$` gearing exact) and
