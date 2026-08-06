@@ -215,6 +215,37 @@ async fn drop_db(db: &str) {
         .expect("drop db");
 }
 
+/// A single-column `count()` against `db`, used to prove a rejected push
+/// left NOTHING behind — the response status alone cannot show that.
+async fn ch_count(db: &str, sql: &str) -> u64 {
+    let cfg = ChConnConfig {
+        server: ch_host(),
+        http_port: ch_http_port(),
+        database: db.to_string(),
+        proto: ChProto::Http,
+        pool_size: 2,
+        query_timeout: Duration::from_secs(20),
+        ..ChConnConfig::default()
+    };
+    let client = ChClient::new(cfg).await.expect("connect count client");
+
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct CountRow {
+        c: u64,
+    }
+    // The stream is scoped to this helper so its pooled connection lease is
+    // released before the caller's next query.
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .expect("count query");
+    futures::StreamExt::next(&mut stream)
+        .await
+        .expect("count returns exactly one row")
+        .expect("decode count row")
+        .c
+}
+
 // ---------------------------------------------------------------------
 // Push body builders.
 // ---------------------------------------------------------------------
@@ -1009,5 +1040,147 @@ async fn pushed_stream_appears_in_tail() {
     assert_eq!(
         sm, expected_sm,
         "the tailed SM-bearing frame must fan structured metadata into its stream labels (AC-9)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #374: the four per-stream label bounds, at the wire, end to end.
+//
+// Reference: `pkg/distributor/validator.go:157-199 @ v3.7.4`, reached from
+// `pkg/distributor/distributor.go:1380 @ v3.7.4`. Statuses and message text
+// were captured side by side against the pinned `grafana/loki:3.7.4`
+// container (revision `b318f282`) — 12 JSON cases and 6 protobuf cases, all
+// agreeing on status; the text agrees except for the `service_name` label
+// the reference's own `discover_service_name` injects and PulsusDB does not
+// (a pre-existing difference, no status effect).
+//
+// The response status alone is not the claim being proven here. Before this
+// change the same push answered `204` AND stored the row, so the test reads
+// `log_streams`/`log_samples` back out of ClickHouse to show the reject left
+// nothing behind.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_wide_label_value_is_rejected_and_stores_nothing() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_155;
+    let db = "pulsus_loki_push_label_bounds_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "checkout-374";
+    let over = "b".repeat(2049);
+
+    // A control push FIRST: the same shape with an in-bounds value must be
+    // accepted and stored, so a later zero row count cannot be explained by
+    // the writer being broken or the query being wrong.
+    let control_line = "label bounds control line";
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[{{"stream":{{"service_name":"{service}","app":"{}"}},"values":[["{base_ns}","{control_line}"]]}}]}}"#,
+            "b".repeat(2048)
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        res.status, 204,
+        "at-bound value accepted (body {})",
+        res.body
+    );
+
+    // 1 byte more is a 400 carrying the reference's message verbatim.
+    let rejected_line = "label bounds rejected line";
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[{{"stream":{{"service_name":"{service}-rejected","app":"{over}"}},"values":[["{base_ns}","{rejected_line}"]]}}]}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 400, "over-bound value rejected");
+    assert_eq!(
+        res.body,
+        format!(
+            "stream '{{app=\"{over}\", service_name=\"{service}-rejected\"}}' \
+             has label value too long: '{over}'"
+        ),
+        "the 400 body is the reference's message"
+    );
+
+    // The same bound on the protobuf transport, plus the duplicate-name
+    // bound — reachable only there, here and upstream.
+    let res = push(port, "application/x-protobuf", &{
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: format!(r#"{{service_name="{service}-pb", app="{over}"}}"#),
+                entries: vec![EntryAdapter {
+                    timestamp: Some(Timestamp {
+                        seconds: base_ns / 1_000_000_000,
+                        nanos: (base_ns % 1_000_000_000) as i32,
+                    }),
+                    line: "pb rejected line".to_string(),
+                    structured_metadata: Vec::new(),
+                }],
+            }],
+        };
+        snap::raw::Encoder::new()
+            .compress_vec(&req.encode_to_vec())
+            .expect("snappy compress")
+    });
+    assert_eq!(res.status, 400, "over-bound value rejected on protobuf too");
+    assert!(
+        res.body
+            .ends_with(&format!("has label value too long: '{over}'")),
+        "protobuf 400 body: {}",
+        res.body
+    );
+
+    // The control line must land, so the read-back below is discriminating.
+    let control = wait_for_line(port, service, base_ns, control_line);
+    assert!(
+        control.contains(&control_line.to_string()),
+        "the at-bound control line must be queryable: {control:?}"
+    );
+
+    // Nothing from the rejected pushes reached storage: no sample, and no
+    // stream registration either (a stream row is written before the first
+    // sample, so checking only `log_samples` would miss a half-applied push).
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_samples \
+             WHERE body IN ('label bounds rejected line', 'pb rejected line')",
+        )
+        .await,
+        0,
+        "a rejected push must store no sample"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_streams \
+                 WHERE service IN ('{service}-rejected', '{service}-pb')"
+            ),
+        )
+        .await,
+        0,
+        "a rejected push must register no stream"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!("SELECT count() AS c FROM log_streams WHERE service = '{service}'"),
+        )
+        .await,
+        1,
+        "the accepted control push must still have registered its stream"
     );
 }

@@ -3,6 +3,7 @@
 //! bytes to normalized rows — no I/O, trivially unit-testable against
 //! captured fixtures.
 
+pub mod log_label_limits;
 pub mod loki_push;
 pub mod otlp_depth;
 pub mod otlp_exp_histogram;

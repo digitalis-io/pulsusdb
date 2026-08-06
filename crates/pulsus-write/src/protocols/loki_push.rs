@@ -50,6 +50,7 @@ use prost::Message;
 use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano, stream_fingerprint};
 
 use crate::error::LogsIngestError;
+use crate::protocols::log_label_limits;
 use crate::protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow};
 use crate::protocols::otlp_prescan::MAX_DECODED_BYTES;
 
@@ -824,14 +825,31 @@ fn validate_bounds(
 
 /// Parses a decoded [`PushRequest`] into normalized rows. Pure: a function
 /// of `req` and `now_ns` only, no I/O, no clock reads (the caller is the
-/// only clock boundary). Fallible only on a per-entry timestamp overflow —
+/// only clock boundary). Fallible on a per-entry timestamp overflow —
 /// which, unlike OTLP's per-record partial-success drop, is a whole-request
-/// `LokiDecode` failure here (Loki is all-or-nothing).
+/// `LokiDecode` failure here (Loki is all-or-nothing) — and on a stream whose
+/// labels breach one of the four per-stream label bounds
+/// ([`log_label_limits::validate_stream_labels`], issue #374).
+///
+/// The label bounds are charged on the **raw** parsed pairs, before
+/// `LabelSet::from_normalized` collapses a repeat, because the duplicate-name
+/// bound would otherwise be unobservable — the protobuf `labels` literal is
+/// the one log transport that can carry `{foo="bar", foo="barf"}` to this
+/// point, exactly as it is upstream.
 pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
     let mut out = ParsedLogs::default();
     let mut seen_streams: HashSet<(Fingerprint, Date)> = HashSet::new();
     for stream in &req.streams {
-        let (labels, collisions) = parse_label_set(&stream.labels)?;
+        let pairs = parse_label_pairs(&stream.labels)?;
+        // A stream with no entries is skipped before validation upstream
+        // (`pkg/distributor/distributor.go:639-641 @ v3.7.4`), so an
+        // entry-less stream with over-wide labels is accepted there and here.
+        if !stream.entries.is_empty() {
+            log_label_limits::validate_stream_labels(
+                pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            )?;
+        }
+        let (labels, collisions) = LabelSet::from_normalized(pairs);
         let entries = stream.entries.iter().map(|entry| {
             let timestamp_ns = match entry.timestamp.as_ref() {
                 Some(ts) => resolve_pb_timestamp(ts)?,
@@ -915,6 +933,19 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
                     "stream label name {name:?} is invalid (must match [a-zA-Z_][a-zA-Z0-9_]*)"
                 )));
             }
+        }
+        // Same four per-stream label bounds as the protobuf path (issue #374),
+        // charged before any row is materialized. `stream.stream` is a
+        // `BTreeMap`, so a repeated JSON key has already collapsed
+        // last-write-wins and the duplicate-name bound is vacuous here — which
+        // is also what the reference does with a duplicate JSON key (measured:
+        // `{"foo":"bar","foo":"barf"}` answers `204` on `grafana/loki:3.7.4`).
+        // Skipped for an entry-less stream, as upstream skips it before
+        // validating (`pkg/distributor/distributor.go:639-641 @ v3.7.4`).
+        if !stream.values.is_empty() {
+            log_label_limits::validate_stream_labels(
+                stream.stream.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            )?;
         }
         let pairs = stream
             .stream
@@ -1059,13 +1090,24 @@ fn resolve_pb_timestamp(ts: &Timestamp) -> Result<i64, LogsIngestError> {
 
 /// Parses a Loki `StreamAdapter.labels` string — a Prometheus label-set
 /// literal `{key="value", key2="value2"}` — into a [`LabelSet`] via the
-/// same `LabelSet::from_normalized` seam every other path uses. Rejects a
+/// same `LabelSet::from_normalized` seam every other path uses. See
+/// [`parse_label_pairs`] for the accepted grammar and the rejections; this
+/// wrapper only adds the canonicalizing collapse, so it is used where the
+/// **raw** pairs are not needed (the duplicate-name bound in
+/// [`log_label_limits`] must see them before they collapse).
+#[cfg(test)]
+fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
+    Ok(LabelSet::from_normalized(parse_label_pairs(input)?))
+}
+
+/// Parses a Loki `StreamAdapter.labels` string into its **raw** `(name,
+/// value)` pairs, in wire order and without deduplication. Rejects a
 /// missing/unbalanced brace, a missing `=`, an unterminated/ malformed
 /// quoted value, or more than [`MAX_LABELS_PER_STREAM`] pairs as
 /// [`LogsIngestError::LokiDecode`] (a whole-request 400). Prometheus value
 /// escaping (`\\`, `\"`, `\n`, `\t`, `\r`) is unescaped; the empty set `{}`
-/// yields an empty `LabelSet`.
-fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
+/// yields no pairs.
+fn parse_label_pairs(input: &str) -> Result<Vec<(String, String)>, LogsIngestError> {
     let trimmed = input.trim();
     let inner = trimmed
         .strip_prefix('{')
@@ -1082,7 +1124,7 @@ fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
     skip_ws(bytes, &mut i);
     if i >= bytes.len() {
         // Empty set `{}` (or `{  }`).
-        return Ok(LabelSet::from_normalized(pairs));
+        return Ok(pairs);
     }
     loop {
         if pairs.len() >= MAX_LABELS_PER_STREAM {
@@ -1109,7 +1151,7 @@ fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
             break;
         }
     }
-    Ok(LabelSet::from_normalized(pairs))
+    Ok(pairs)
 }
 
 fn skip_ws(bytes: &[u8], i: &mut usize) {
@@ -2356,10 +2398,18 @@ mod tests {
 
     #[test]
     fn parse_json_accepts_at_cap_labels_and_entries() {
-        // Positive (no false reject): exactly MAX_LABELS_PER_STREAM distinct
-        // labels and a small in-bounds values array still parse.
+        // Positive (no false reject): exactly MAX_LABEL_NAMES_PER_STREAM
+        // distinct labels and a small in-bounds values array still parse.
+        //
+        // This test used to build MAX_LABELS_PER_STREAM (256) labels — that is
+        // the decode-time `BoundedLabelMap` materialization cap, and since
+        // issue #374 it is no longer the binding one: the ingest bound (15
+        // names) rejects first. `parse_json_at_cap_label_map_is_rejected_by_
+        // the_ingest_bound_not_the_map_cap` below keeps the 256-label case and
+        // pins WHICH bound answers, so the map cap's positive edge is still
+        // covered.
         let mut map = String::from("{");
-        for i in 0..MAX_LABELS_PER_STREAM {
+        for i in 0..log_label_limits::MAX_LABEL_NAMES_PER_STREAM {
             if i > 0 {
                 map.push(',');
             }
@@ -2372,6 +2422,32 @@ mod tests {
         let out = parse_json(body.as_bytes(), 0).unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0].body, "hello");
+    }
+
+    #[test]
+    fn parse_json_at_cap_label_map_is_rejected_by_the_ingest_bound_not_the_map_cap() {
+        // Exactly MAX_LABELS_PER_STREAM (256) distinct labels: the decode-time
+        // `BoundedLabelMap` cap still admits it (that cap fires at 257), and
+        // the issue #374 ingest bound is what rejects. Asserting the message
+        // discriminates the two — a regression that moved the map cap down to
+        // 256 would produce "stream labels exceed" instead.
+        let mut map = String::from("{");
+        for i in 0..MAX_LABELS_PER_STREAM {
+            if i > 0 {
+                map.push(',');
+            }
+            map.push_str(&format!(r#""k{i}":"v{i}""#));
+        }
+        map.push('}');
+        let body = format!(
+            r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","hello"]]}}]}}"#
+        );
+        let err = parse_json(body.as_bytes(), 0).unwrap_err();
+        assert!(matches!(err, LogsIngestError::LabelLimit(_)), "{err:?}");
+        assert!(
+            err.to_string().ends_with("' has 256 label names; limit 15"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2407,6 +2483,165 @@ mod tests {
         let out = parse_json(body.as_bytes(), 0).unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0].body, "hello");
+    }
+
+    // -- per-stream label bounds (issue #374) ------------------------------
+    //
+    // Reference: `pkg/distributor/validator.go:157-199 @ v3.7.4`. The bound
+    // logic and its edges live in `log_label_limits`; these cases pin that
+    // BOTH Loki-push transports reach it, and that the reachability of the
+    // duplicate-name bound differs between them exactly as it does upstream.
+
+    fn json_body_with_labels(map: &str) -> String {
+        format!(r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","hi"]]}}]}}"#)
+    }
+
+    #[test]
+    fn parse_json_rejects_a_label_value_over_2048_bytes() {
+        let body = json_body_with_labels(&format!(r#"{{"app":"{}"}}"#, "b".repeat(2049)));
+        let err = parse_json(body.as_bytes(), 0).unwrap_err();
+        assert!(matches!(err, LogsIngestError::LabelLimit(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("has label value too long"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_json_accepts_a_label_value_at_2048_bytes() {
+        let body = json_body_with_labels(&format!(r#"{{"app":"{}"}}"#, "b".repeat(2048)));
+        assert_eq!(parse_json(body.as_bytes(), 0).unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn parse_json_rejects_a_label_name_over_1024_bytes() {
+        let body = json_body_with_labels(&format!(r#"{{"{}":"v"}}"#, "a".repeat(1025)));
+        let err = parse_json(body.as_bytes(), 0).unwrap_err();
+        assert!(err.to_string().contains("has label name too long"), "{err}");
+    }
+
+    #[test]
+    fn parse_json_rejects_sixteen_labels_and_accepts_fifteen() {
+        let map = |n: usize| {
+            let inner = (0..n)
+                .map(|i| format!(r#""l{i}":"v""#))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        };
+        assert_eq!(
+            parse_json(json_body_with_labels(&map(15)).as_bytes(), 0)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        let err = parse_json(json_body_with_labels(&map(16)).as_bytes(), 0).unwrap_err();
+        assert!(
+            err.to_string().ends_with("' has 16 label names; limit 15"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_json_duplicate_label_key_collapses_and_is_accepted() {
+        // `BoundedLabelMap` is a `BTreeMap`, so a repeated JSON key is
+        // last-write-wins before any bound sees it. The reference behaves the
+        // same way (measured on `grafana/loki:3.7.4`:
+        // `{"foo":"bar","foo":"barf"}` -> `204`), so the duplicate-name bound
+        // is unreachable on this transport by construction, not by omission.
+        let body = json_body_with_labels(r#"{"foo":"bar","foo":"barf"}"#);
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert_eq!(out.streams.len(), 1);
+        assert_eq!(out.streams[0].labels.get("foo"), Some("barf"));
+    }
+
+    #[test]
+    fn parse_json_entry_less_stream_skips_the_label_bounds() {
+        // `pkg/distributor/distributor.go:639-641 @ v3.7.4` continues past a
+        // stream with no entries before validating it.
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{"app":"{}"}},"values":[]}}]}}"#,
+            "b".repeat(4096)
+        );
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert!(out.rows.is_empty());
+    }
+
+    #[test]
+    fn parse_protobuf_rejects_a_duplicate_label_name() {
+        // The one log transport that can carry a repeat to the bound, here and
+        // upstream (measured on `grafana/loki:3.7.4`: `{foo="bar",
+        // foo="barf"}` -> `400 ... has duplicate label name: 'foo'`).
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{foo="bar", foo="barf"}"#.to_string(),
+                entries: vec![entry(1_700_000_000, 0, "a")],
+            }],
+        };
+        let err = parse_protobuf(&req, 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "stream '{foo=\"bar\", foo=\"barf\"}' has duplicate label name: 'foo'"
+        );
+    }
+
+    #[test]
+    fn parse_protobuf_rejects_a_label_value_over_2048_bytes() {
+        let value = "b".repeat(2049);
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: format!(r#"{{app="{value}"}}"#),
+                entries: vec![entry(1_700_000_000, 0, "a")],
+            }],
+        };
+        let err = parse_protobuf(&req, 0).unwrap_err();
+        assert!(matches!(err, LogsIngestError::LabelLimit(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'")
+        );
+    }
+
+    #[test]
+    fn parse_protobuf_rejects_sixteen_labels_and_accepts_fifteen_plus_service_name() {
+        let literal = |n: usize| {
+            let inner = (0..n)
+                .map(|i| format!(r#"l{i}="v""#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{inner}}}")
+        };
+        let req = |labels: String| PushRequest {
+            streams: vec![StreamAdapter {
+                labels,
+                entries: vec![entry(1_700_000_000, 0, "a")],
+            }],
+        };
+        assert_eq!(parse_protobuf(&req(literal(15)), 0).unwrap().rows.len(), 1);
+        let err = parse_protobuf(&req(literal(16)), 0).unwrap_err();
+        assert!(
+            err.to_string().ends_with("' has 16 label names; limit 15"),
+            "{err}"
+        );
+        // `service_name` is not counted (`validator.go:169-174 @ v3.7.4`), so
+        // 15 labels plus one is still accepted.
+        let with_service = format!(
+            "{{{}, service_name=\"checkout\"}}",
+            literal(15).trim_matches(|c| c == '{' || c == '}')
+        );
+        assert_eq!(parse_protobuf(&req(with_service), 0).unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn parse_protobuf_entry_less_stream_skips_the_label_bounds() {
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: format!(r#"{{app="{}"}}"#, "b".repeat(4096)),
+                entries: vec![],
+            }],
+        };
+        assert!(parse_protobuf(&req, 0).unwrap().rows.is_empty());
     }
 
     // -- parse -------------------------------------------------------------

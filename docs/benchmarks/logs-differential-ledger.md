@@ -1697,3 +1697,90 @@ absence of a corpus row for an oversight.
   stream, then query `avg_over_time`, `avg_over_time … by (env)`,
   `avg_over_time … without ()`, `stdvar_over_time` and
   `stdvar_over_time … by (env)` at an instant covering them.
+
+## Issue #374 — the four per-stream label bounds at log ingest
+
+### `ingest-label-bounds` (issue #374 — parity ADOPTED; two named residuals)
+
+PulsusDB previously bounded a log push only by counts (streams per
+request, entries per stream, entries per request) and by decode-time
+materialization caps. Nothing measured a label name, a label value, the
+number of labels in a stream, or a repeated name — so a push the
+reference refuses with `400` was accepted and stored. Issue #374 adopts
+the reference's four bounds; this entry records what now matches and the
+two places where the observable still differs.
+
+- **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
+  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`),
+  `pkg/distributor/validator.go:157-199 @ v3.7.4` reached from
+  `pkg/distributor/distributor.go:1380 @ v3.7.4`. In order: at most 15
+  label names (`entry for stream '%s' has %d label names; limit %d`),
+  names at most 1024 bytes (`stream '%s' has label name too long: '%s'`),
+  values at most 2048 bytes (`stream '%s' has label value too long:
+  '%s'`), no repeated name (`stream '%s' has duplicate label name:
+  '%s'`). All four are `400`. Limits are the flag defaults at
+  `pkg/validation/limits.go:324-326 @ v3.7.4`; messages are
+  `pkg/validation/validate.go:58-69 @ v3.7.4`.
+- **What PulsusDB now does: the same four checks, in the same order, at
+  the same limits, on BOTH log receivers** —
+  `crates/pulsus-write/src/protocols/log_label_limits.rs`, called from
+  `loki_push::parse_protobuf`/`parse_json` and from `otlp_logs::parse`.
+  The reference validates its OTLP logs endpoint through the identical
+  distributor seam (`pkg/distributor/http.go:28-33 @ v3.7.4`), so both
+  paths are in scope, not just the Loki-push one. Two inherited rules
+  come with it, both load-bearing for the accept surface: an
+  empty-valued label is neither counted nor length-checked
+  (`syntax.ParseLabels` ends in `WithoutEmpty`,
+  `pkg/logql/syntax/parser.go:279-296 @ v3.7.4`), and `service_name` does
+  not count toward the 15 (`validator.go:169-174`), making the effective
+  rule "at most 15 labels other than `service_name`".
+- **Measured agreement.** 12 JSON-transport cases and 6 protobuf-transport
+  cases sent byte-identically to the container and to a running PulsusDB:
+  **status identical in all 18**, including both 15-vs-16 edges, both
+  1024/1025 and 2048/2049 edges, the empty-valued-label cases, the
+  check-order cases, and the duplicate-name cases.
+- **Residual 1 — the rendered label set inside the message.** Every one of
+  the four messages interpolates the stream's label set, and the
+  reference's copy carries a `service_name` label its own push parser
+  injected (`discover_service_name`, e.g.
+  `service_name="unknown_service"`, or the value of an `app` label).
+  PulsusDB does not implement service-name discovery, so its rendered set
+  omits that label. This is a pre-existing difference in what we store,
+  not something #374 introduced, and it never changes a status: the
+  reference decrements its own injected label out of the count, so the
+  counts agree exactly (17 user labels reports `has 17 label names` on
+  both). Message bodies are otherwise byte-identical, minus the trailing
+  newline Go's `http.Error` appends to every Loki plain-text error — a
+  pre-existing property of all our Loki-push error bodies, not of these
+  four.
+- **Residual 2 — a rejected push is atomic here, partial there.** The
+  reference validates every stream in a request, writes the ones that
+  pass, and *still* answers `400` naming the ones that did not
+  (`distributor.go:780-790, 929 @ v3.7.4`, joining the errors through
+  `util.GroupedErrors` whose order is a Go map walk). PulsusDB refuses
+  the whole request, which is what it already does for every other Loki
+  push rejection (`docs/api.md` §8.2, "Loki has no partial-success
+  channel"). A client that sends one bad stream among good ones gets
+  `400` from both; on the reference the good streams are stored, here
+  they are not, and the client must retry them.
+- **Not adopted, and why:** the per-stream label-map materialization cap
+  (`MAX_LABELS_PER_STREAM` = 256) stays where it is. It is a
+  charge-before-allocate decode guard, and it must stay above 15 because
+  empty-valued labels are materialized but not counted. A stream with
+  more than 256 raw pairs therefore still rejects with PulsusDB's own
+  `stream labels exceed the 256 per-stream bound` / `labels count …`
+  message rather than the reference's `has N label names; limit 15` —
+  same `400`, different wording, for inputs at least 17× over the bound.
+- **Pinned by** `log_label_limits`'s own unit tests (the four bounds, both
+  edges each, the `service_name` decrement, the empty-value rule and the
+  three check-order cases),
+  `loki_push::tests::parse_json_*`/`parse_protobuf_*` and
+  `otlp_logs::tests::parse_*` (both receivers reach the bounds),
+  `ingest/http.rs`'s
+  `loki_over_long_label_value_is_400_with_the_reference_message` /
+  `loki_over_wide_stream_is_400_with_the_reference_message` /
+  `logs_over_long_resource_attribute_value_returns_400_with_status_code_3`
+  (the wire status and body), and the live
+  `crates/pulsus-server/tests/loki_push_live.rs::over_wide_label_value_is_rejected_and_stores_nothing`
+  (`400` at the wire **and** zero rows in `log_samples`/`log_streams`,
+  with an at-bound control push proving the read-back discriminates).

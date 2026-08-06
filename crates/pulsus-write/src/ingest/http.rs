@@ -649,6 +649,7 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::OversizeBody { .. }
         | LogsIngestError::OversizeMessage { .. }
         | LogsIngestError::LokiDecode(_)
+        | LogsIngestError::LabelLimit(_)
         | LogsIngestError::ZipkinDecode(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
@@ -1117,6 +1118,57 @@ mod tests {
         let res = post_body(router(sink.clone()), request_body_of_len(target_len), &[]).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    /// Issue #374 at the wire, OTLP logs transport: the same bound, reached
+    /// from a resource attribute, is a whole-request `400` / `code = 3` —
+    /// **not** a per-record partial success — and the sink is never admitted
+    /// to. Upstream reaches the identical validator from `/otlp/v1/logs`
+    /// (`pkg/distributor/http.go:32 @ v3.7.4`), so this is the OTLP twin of
+    /// `loki_over_long_label_value_is_400_with_the_reference_message`.
+    #[tokio::test]
+    async fn logs_over_long_resource_attribute_value_returns_400_with_status_code_3() {
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let value = "b".repeat(2049);
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "app".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue(value.clone())),
+                        }),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("hello".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert_eq!(
+            status.message,
+            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'")
+        );
+        assert!(sink.admitted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2459,6 +2511,57 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(!plain_text_body(res).await.is_empty());
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// Issue #374 at the wire, Loki-push transport: an over-long label value
+    /// is a `400` whose plain-text body is the reference's message verbatim
+    /// (measured on `grafana/loki:3.7.4`, which answers
+    /// `400 stream '{app="bbb…"}' has label value too long: 'bbb…'`), and the
+    /// sink is never admitted to.
+    #[tokio::test]
+    async fn loki_over_long_label_value_is_400_with_the_reference_message() {
+        let value = "b".repeat(2049);
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{"app":"{value}"}},"values":[["1700000000000000000","x"]]}}]}}"#
+        );
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            body.into_bytes(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            plain_text_body(res).await,
+            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'")
+        );
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loki_over_wide_stream_is_400_with_the_reference_message() {
+        let labels = (0..16)
+            .map(|i| format!(r#""l{i}":"v""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{{labels}}},"values":[["1700000000000000000","x"]]}}]}}"#
+        );
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            body.into_bytes(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            plain_text_body(res)
+                .await
+                .ends_with("' has 16 label names; limit 15")
+        );
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
 

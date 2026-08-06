@@ -96,6 +96,29 @@ pub enum LogsIngestError {
     #[error("malformed Loki push request: {0}")]
     LokiDecode(String),
 
+    /// A log stream's label set breached one of the four per-stream label
+    /// bounds the reference enforces at ingest (issue #374,
+    /// `pkg/distributor/validator.go:157-199 @ v3.7.4`): too many label names,
+    /// a label name over 1024 bytes, a label value over 2048 bytes, or a
+    /// duplicate label name. Applies to **both** log receivers — the Loki push
+    /// path and the OTLP logs path — because the reference validates both
+    /// through the same distributor seam
+    /// (`pkg/distributor/http.go:28-33 @ v3.7.4`). Raised by
+    /// [`crate::protocols::log_label_limits::validate_stream_labels`].
+    ///
+    /// The payload is the reference's message verbatim (the four templates in
+    /// `pkg/validation/validate.go:58-69 @ v3.7.4`) with **no** PulsusDB
+    /// prefix, so the `400` body a client reads matches it. That is why this
+    /// is not folded into [`Self::LokiDecode`], whose `Display` prepends
+    /// `malformed Loki push request: ` — wrong bytes on the Loki path and the
+    /// wrong protocol name on the OTLP one. Same `(400, code = 3)` group as
+    /// the structural/decode variants — see [`classify`]'s 400 arm
+    /// (`ingest/http.rs`).
+    ///
+    /// [`classify`]: crate::ingest::http
+    #[error("{0}")]
+    LabelLimit(String),
+
     /// A Zipkin v2 JSON span array (issue #75, `POST /api/v2/spans`) was not
     /// decodable into the span model: malformed JSON, or a span carrying a
     /// non-hex / wrong-length `traceId`/`id`/`parentId` or an

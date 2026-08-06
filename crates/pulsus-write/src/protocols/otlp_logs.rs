@@ -154,6 +154,23 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
             // a stream label; issue #109), reused across every record in it —
             // never re-derived per record.
             let (labels, collisions) = build_stream_labels(resource_logs.resource.as_ref());
+            // The four per-stream label bounds (issue #374). The reference
+            // reaches this path too: `/otlp/v1/logs` translates to
+            // `logproto.Stream`s and then runs the *same*
+            // `Distributor.PushWithResolver` -> `parseStreamLabels` ->
+            // `ValidateLabels` as `/loki/api/v1/push`
+            // (`pkg/distributor/http.go:28-33 @ v3.7.4`); there is no separate
+            // OTLP validator. Charged on the canonicalized, deduplicated set,
+            // matching the reference — its OTLP translation writes through a
+            // `labels.Builder`, so the names checked are the *converted* ones
+            // and a repeated attribute key has already collapsed. Whole-request
+            // `Err`, the same class as the depth guard above, not a per-record
+            // partial-success drop. Skipped for a scope with no records:
+            // upstream skips an entry-less stream before validating it
+            // (`pkg/distributor/distributor.go:639-641 @ v3.7.4`).
+            if !scope_logs.log_records.is_empty() {
+                crate::protocols::log_label_limits::validate_stream_labels(labels.iter())?;
+            }
             out.collisions += collisions as u64;
             let fingerprint = stream_fingerprint(&labels);
             let service = labels.service().to_string();
@@ -1465,5 +1482,154 @@ mod tests {
         }]);
         let err = super::parse(&req, 0).expect_err("over-depth resource attribute is rejected");
         assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
+    }
+
+    // -- per-stream label bounds (issue #374) ------------------------------
+    //
+    // The OTLP logs path is not a separate validation path upstream: the
+    // reference's `/otlp/v1/logs` handler funnels into the same
+    // `Distributor.PushWithResolver` -> `parseStreamLabels` -> `ValidateLabels`
+    // as `/loki/api/v1/push` (`pkg/distributor/http.go:28-33 @ v3.7.4`). These
+    // cases pin that the bounds are reached from resource attributes; the
+    // bound logic and its edges are covered in `log_label_limits`.
+
+    fn logs_with_resource_attrs(attrs: Vec<KeyValue>) -> ExportLogsServiceRequest {
+        request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: attrs,
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("hello"),
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        }])
+    }
+
+    #[test]
+    fn parse_rejects_a_resource_attribute_value_over_2048_bytes() {
+        let value = "b".repeat(2049);
+        let req = logs_with_resource_attrs(vec![kv("app", Value::StringValue(value.clone()))]);
+        let err = super::parse(&req, 0).expect_err("an over-long label value is rejected");
+        assert!(matches!(err, LogsIngestError::LabelLimit(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'")
+        );
+    }
+
+    #[test]
+    fn parse_accepts_a_resource_attribute_value_at_2048_bytes() {
+        let req = logs_with_resource_attrs(vec![kv("app", Value::StringValue("b".repeat(2048)))]);
+        assert_eq!(super::parse(&req, 0).unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_a_resource_attribute_key_over_1024_bytes() {
+        let key = "a".repeat(1025);
+        let req = logs_with_resource_attrs(vec![kv(&key, Value::StringValue("v".to_string()))]);
+        let err = super::parse(&req, 0).expect_err("an over-long label name is rejected");
+        assert!(err.to_string().contains("has label name too long"), "{err}");
+    }
+
+    /// The bound is charged on the CANONICALIZED name, as upstream charges it
+    /// on the converted one: `.`-separated OTel keys keep their byte length
+    /// through `canonicalize_label_key`, so a 1025-byte dotted key is over.
+    #[test]
+    fn the_label_name_bound_is_charged_after_canonicalization() {
+        let key = format!("a.{}", "b".repeat(1022)); // 1024 bytes -> at the bound
+        let req = logs_with_resource_attrs(vec![kv(&key, Value::StringValue("v".to_string()))]);
+        assert_eq!(super::parse(&req, 0).unwrap().rows.len(), 1);
+        let over = format!("a.{}", "b".repeat(1023)); // 1025 bytes
+        let req = logs_with_resource_attrs(vec![kv(&over, Value::StringValue("v".to_string()))]);
+        let err = super::parse(&req, 0).expect_err("1025 canonicalized bytes is over the bound");
+        assert!(
+            err.to_string().contains(&format!(
+                "has label name too long: 'a_{}'",
+                "b".repeat(1023)
+            )),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_sixteen_resource_attributes_and_accepts_fifteen() {
+        let attrs = |n: usize| {
+            (0..n)
+                .map(|i| kv(&format!("l{i}"), Value::StringValue("v".to_string())))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            super::parse(&logs_with_resource_attrs(attrs(15)), 0)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        let err = super::parse(&logs_with_resource_attrs(attrs(16)), 0)
+            .expect_err("16 resource attributes is over the bound");
+        assert!(
+            err.to_string().ends_with("' has 16 label names; limit 15"),
+            "{err}"
+        );
+        // `service.name` canonicalizes to `service_name`, which is not
+        // counted (`validator.go:169-174 @ v3.7.4`).
+        let mut with_service = attrs(15);
+        with_service.push(kv(
+            "service.name",
+            Value::StringValue("checkout".to_string()),
+        ));
+        assert_eq!(
+            super::parse(&logs_with_resource_attrs(with_service), 0)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+    }
+
+    /// `pkg/distributor/distributor.go:639-641 @ v3.7.4` skips an entry-less
+    /// stream before validating it.
+    #[test]
+    fn a_scope_with_no_records_skips_the_label_bounds() {
+        let req = request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv("app", Value::StringValue("b".repeat(4096)))],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![])],
+            schema_url: String::new(),
+        }]);
+        assert!(super::parse(&req, 0).unwrap().rows.is_empty());
+    }
+
+    /// Scope attributes are structured metadata, not stream labels (#109), so
+    /// they are outside the bound — matching upstream, whose OTLP translation
+    /// puts them in structured metadata too.
+    #[test]
+    fn scope_attributes_are_not_subject_to_the_stream_label_bounds() {
+        let req = request(vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "s".to_string(),
+                    version: String::new(),
+                    attributes: vec![kv("wide", Value::StringValue("b".repeat(4096)))],
+                    dropped_attributes_count: 0,
+                }),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: string_body("hello"),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }]);
+        assert_eq!(super::parse(&req, 0).unwrap().rows.len(), 1);
     }
 }
