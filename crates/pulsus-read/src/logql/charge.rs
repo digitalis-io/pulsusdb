@@ -7,6 +7,16 @@
 //! ([`group_entry_bytes`], [`map_entry_bytes`], [`label_set_bytes`],
 //! [`rendered_labels_json_len`]) and the charge/discharge pairs the
 //! stateful aggregators call before they allocate.
+//!
+//! **Two disciplines govern every seam priced here, and a new cap owes
+//! both** — see docs/architecture.md §5.6. *Charge before you allocate:*
+//! no allocation whose size a caller can influence happens before it is
+//! charged against a budget that can refuse it. *Rule out meaning before
+//! you refuse for resources:* a rejection the system can determine
+//! WITHOUT allocating must be evaluated before any reservation that
+//! could refuse first, or the client is told the wrong thing about their
+//! own request. §5.6 carries the (P)/(A) classifying test that makes the
+//! second one applicable rather than aspirational.
 
 use super::error::{ReadError, TooBroadReason};
 use pulsus_logql::RangeAggOp;

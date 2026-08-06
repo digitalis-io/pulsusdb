@@ -3744,9 +3744,12 @@ fn lr_template_of_len(l: usize) -> LabelReplaceSpec {
 /// the mechanism behind one sentence of `MAX_POST_AGG_BYTES`' doc:
 /// at `L = 0` the WHOLE region is admitted (the guarantee's third
 /// clause); strictly below `L_MIN` refusal is impossible anywhere in
-/// `D`; at `L_MIN` it is possible. Unlike O6/O7 this funnel is WIRED
+/// `D`; at `L_MIN` it is possible. This funnel is WIRED
 /// (`apply_label_replace` refuses live), so the divergence carries a
-/// ledger row now: `label-replace-template-amplification`.
+/// ledger row: `label-replace-template-amplification`. So are O6's and
+/// O7's — `both_amplifiers_are_refused_end_to_end_from_query_text`
+/// drives those two from real query text, and they carry rows (d) and
+/// (e) of the issue #236 section.
 #[test]
 fn o8_the_label_replace_template_threshold_bounds_where_refusal_is_possible() {
     let o = derive_o8(MAX_POST_AGG_BYTES);
@@ -4852,8 +4855,15 @@ fn the_stage_counter_returns_to_zero_on_every_return_path() {
     assert!(refused.is_err());
     assert_eq!(charged, 0, "a refused acquire must not mutate the counter");
 
-    // (3) an Err raised INSIDE the chain: a duplicate one-side signature
-    // makes `instant_join` fail after the charge is in force.
+    // (3) an Err raised inside the funnel: a duplicate one-side
+    // signature. Since issue #290 this is decided by the class-(P)
+    // preflight, under the PREFLIGHT's charge and before
+    // `Ledger::acquire_binary` exists — which is the point of that issue,
+    // and which makes this case exercise the new `Drop`-free early
+    // return rather than the old mid-chain one. The property it pins is
+    // unchanged: an early `?` anywhere in the funnel still leaves the
+    // caller's counter at zero. Case (4) below keeps a witness for the
+    // "an error AFTER the stage charge is in force" half.
     let dup = vec![
         VectorSample {
             labels: vec![("id00".to_string(), "a".to_string())],
@@ -4886,6 +4896,37 @@ fn the_stage_counter_returns_to_zero_on_every_return_path() {
     assert_eq!(
         charged, 0,
         "an early `?` inside the chain must still discharge"
+    );
+
+    // (4) an Err raised AFTER the stage charge is in force: the
+    // post-charge `admit` shortfall of
+    // `admit_refuses_a_collection_wider_than_its_charge` — charge for a
+    // one-series shape, hand the stage a 64-series operand.
+    let small = StageInput::for_derivation(1, 1, 4, 32, 1, 4, 1, 1);
+    let bytes = post_agg_peak_bytes(&small, &aggs);
+    let wide = Fixture {
+        series: 64,
+        ..CHAIN_BASE
+    };
+    let mut charged = 0u64;
+    let admitted = apply_vector_aggs_capped(
+        &mut charged,
+        QueryResult::Vector(build_vector(&wide, false)),
+        &aggs,
+        bytes,
+    );
+    assert!(
+        matches!(
+            admitted,
+            Err(ReadError::QueryTooBroad(
+                TooBroadReason::MetricPostAggBytes { .. }
+            ))
+        ),
+        "the admission shortfall must refuse cleanly, got {admitted:?}"
+    );
+    assert_eq!(
+        charged, 0,
+        "an `admit` refusal after the stage charge must still discharge"
     );
 }
 
@@ -4953,9 +4994,34 @@ fn the_enforcement_path_contains_no_debug_assert() {
         "`mod ledger` contains a debug_assert — the charge and the admission must hold in \
          release exactly as in debug"
     );
+    // Issue #290 adds a SECOND proof token to this module, so the pin
+    // becomes a COUNT: `.contains` would have stayed green with
+    // `Ledger::admit` mutated to `-> bool`, satisfied by
+    // `PreflightCharge::admit`'s identical line. The count also asserts
+    // the funnel's shape out loud — EVERY proof token admits, with that
+    // `Result`-returning signature — so a token that does not admit
+    // reddens here and needs a design decision, not a number edit.
+    let admits = module
+        .matches("fn admit(&self, series: u64, points: u64) -> Result<(), ReadError>")
+        .count();
+    assert_eq!(
+        admits,
+        PROOF_TOKENS.len(),
+        "`mod ledger` declares {} proof tokens ({PROOF_TOKENS:?}) but {admits} `admit` \
+         signatures returning a Result — every proof token must admit, and must do so by \
+         returning rather than asserting",
+        PROOF_TOKENS.len()
+    );
+    // The region is carved out by a `str::find` on the two `use` lines
+    // below `mod ledger`, so a refactor that moved `PreflightCharge` out
+    // of the module would silently stop the no-`debug_assert` ban
+    // covering it. Since issue #290 deleted the second detector (v9's
+    // subtraction), THIS ASSERT IS NOW THE ONLY ONE that catches that
+    // move — do not remove it on the assumption something else does.
     assert!(
-        module.contains("fn admit(&self, series: u64, points: u64) -> Result<(), ReadError>"),
-        "`admit` must return a Result rather than assert"
+        module.contains("struct PreflightCharge"),
+        "`PreflightCharge` is no longer declared inside `mod ledger`, so the enforcement-path \
+         scan has silently stopped covering it"
     );
 }
 
@@ -4988,9 +5054,15 @@ mod region_census {
         /// Every parameter's type, as the set of path idents it mentions,
         /// plus `("String","String")` tuples flattened to `StringPair`.
         pub param_types: BTreeSet<String>,
-        /// Bare call names, `Type::name` paths, `.method` names and
-        /// `name!` macros.
+        /// Bare call names, `Type::name` paths, `.method` names,
+        /// `name!` macros and `Type::Variant { .. }` struct expressions.
         pub callees: BTreeSet<String>,
+        /// The `::`-joined chain of enclosing INLINE modules, `None` at
+        /// file scope. Issue #290 needs it to scope a rule to
+        /// `mod preflight` and its nested `mod points`, which
+        /// `free_fns`/`closure` cannot express because they range over
+        /// free functions by bare name.
+        pub module: Option<String>,
     }
 
     #[derive(Default)]
@@ -5019,6 +5091,24 @@ mod region_census {
         fn visit_expr_method_call(&mut self, node: &syn::ExprMethodCall) {
             self.callees.insert(format!(".{}", node.method));
             syn::visit::visit_expr_method_call(self, node);
+        }
+        /// `ReadError::PipelineInvalid { .. }` is a STRUCT expression, not
+        /// a call, so `visit_expr_call` cannot see it — and the semantic
+        /// refusals of this region are all struct variants. Only the
+        /// two-segment `Type::Variant` form is recorded: a bare
+        /// `StageInput { .. }` would put a type name into a set the
+        /// call-graph closure resolves against.
+        fn visit_expr_struct(&mut self, node: &syn::ExprStruct) {
+            let segs: Vec<String> = node
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            if segs.len() >= 2 {
+                self.callees.insert(segs[segs.len() - 2..].join("::"));
+            }
+            syn::visit::visit_expr_struct(self, node);
         }
         fn visit_macro(&mut self, node: &syn::Macro) {
             if let Some(seg) = node.path.segments.last() {
@@ -5150,7 +5240,7 @@ mod region_census {
         })
     }
 
-    fn walk_items(file: &str, items: &[syn::Item], out: &mut Vec<FnInfo>) {
+    fn walk_items(file: &str, module: Option<&str>, items: &[syn::Item], out: &mut Vec<FnInfo>) {
         for item in items {
             match item {
                 syn::Item::Fn(f) => {
@@ -5163,6 +5253,7 @@ mod region_census {
                         name: f.sig.ident.to_string(),
                         param_types: sig_types(&f.sig),
                         callees: b.callees,
+                        module: module.map(str::to_string),
                     });
                 }
                 syn::Item::Impl(i) => {
@@ -5186,6 +5277,7 @@ mod region_census {
                                 name: f.sig.ident.to_string(),
                                 param_types: sig_types(&f.sig),
                                 callees: b.callees,
+                                module: module.map(str::to_string),
                             });
                         }
                     }
@@ -5195,7 +5287,12 @@ mod region_census {
                         continue; // PRODUCTION source only.
                     }
                     if let Some((_, inner)) = &m.content {
-                        walk_items(file, inner, out);
+                        let name = m.ident.to_string();
+                        let nested = match module {
+                            Some(outer) => format!("{outer}::{name}"),
+                            None => name,
+                        };
+                        walk_items(file, Some(&nested), inner, out);
                     }
                 }
                 _ => {}
@@ -5239,7 +5336,7 @@ mod region_census {
             let text = std::fs::read_to_string(path).expect("read source");
             let parsed = syn::parse_file(&text)
                 .unwrap_or_else(|e| panic!("{name} does not parse as Rust: {e}"));
-            walk_items(&name, &parsed.items, &mut out);
+            walk_items(&name, None, &parsed.items, &mut out);
             names.push(name);
         }
         (names, out)
@@ -5310,6 +5407,45 @@ mod region_census {
         out
     }
 
+    /// Every type owning an `acquire*` constructor in ANY file the
+    /// census parses — not just `post_agg.rs` (issue #290).
+    ///
+    /// A FREE `acquire*` function has no owner to derive, and skipping it
+    /// silently would be an escape: it panics instead, naming the
+    /// function, because a derivation that cannot classify an input must
+    /// say so rather than return a smaller set. `Some("<impl>")` —
+    /// `walk_items`' fallback for a non-path `self_ty` — is not a second
+    /// escape either: it inserts the literal `<impl>`, which equals no
+    /// `PROOF_TOKENS` entry, so the equality reddens naming it.
+    ///
+    /// **What this closes and what it does not.** It closes "a proof
+    /// token exists whose type the census's predicates do not know
+    /// about", for a token minted by an `acquire*` constructor in any
+    /// file `collect()` parses. It does NOT close a token minted by a
+    /// constructor named something else, nor one declared in a
+    /// subdirectory module the non-recursive walk never reads (#302);
+    /// both are accepted open, and both are empty at this commit —
+    /// `git grep -n "fn acquire" -- crates/pulsus-read/src/logql/`
+    /// returns four hits, all inherent methods of `Ledger` or
+    /// `PreflightCharge` in `post_agg.rs`.
+    pub fn token_owners(all: &[FnInfo]) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for f in all.iter().filter(|f| f.name.starts_with("acquire")) {
+            match &f.owner {
+                Some(owner) => {
+                    out.insert(owner.clone());
+                }
+                None => panic!(
+                    "`{}` in {} is a FREE `acquire*` constructor: `token_owners` derives proof \
+                     tokens from inherent-impl owners and cannot classify it. Give it an owner \
+                     or extend this derivation — do not delete the assert.",
+                    f.display, f.file
+                ),
+            }
+        }
+        out
+    }
+
     /// Free functions by name. A name defined twice is a loud failure:
     /// the closure would otherwise resolve to whichever came first.
     pub fn free_fns(all: &[FnInfo]) -> BTreeMap<String, FnInfo> {
@@ -5330,6 +5466,47 @@ mod region_census {
         }
         out
     }
+}
+
+/// **Every proof-token type in `mod ledger`** (issue #290).
+///
+/// Each of the census's token-keyed predicates is generated from this
+/// list — the minting roots, the `public_roots` "must MINT, never
+/// receive" assert, `admit_helpers`, `Member.mints`,
+/// `Member.takes_ledger` and `Member.calls_admit` — so adding a THIRD
+/// token is one edit here rather than six edits nobody will find.
+/// `the_enforcement_path_contains_no_debug_assert`'s `fn admit` pin is
+/// keyed on its LENGTH, which asserts the funnel's shape out loud: every
+/// proof token admits, with that identical `Result`-returning signature.
+///
+/// **NOT keyed by it:** that test's raw `"mod ledger {"` /
+/// `"\nuse ledger::Ledger;"` delimiters. Those are strings about a
+/// module's TEXT, not about a token type; token-keying them would make
+/// the region end depend on import ordering for no gain, and the
+/// `struct PreflightCharge` containment assert beside them is what turns
+/// a silent scope loss into a loud failure instead.
+///
+/// The list itself is DERIVED-checked by `region_census::token_owners`,
+/// so a token nobody added to it fails by name rather than going
+/// invisible.
+const PROOF_TOKENS: &[&str] = &["Ledger", "PreflightCharge"];
+
+fn takes_a_proof_token(f: &region_census::FnInfo) -> bool {
+    PROOF_TOKENS.iter().any(|t| f.param_types.contains(*t))
+}
+
+fn mints_a_proof_token(f: &region_census::FnInfo) -> bool {
+    f.callees.iter().any(|c| {
+        PROOF_TOKENS
+            .iter()
+            .any(|t| c.starts_with(&format!("{t}::acquire")))
+    })
+}
+
+fn admits_directly(f: &region_census::FnInfo) -> bool {
+    f.callees
+        .iter()
+        .any(|c| c == ".admit" || PROOF_TOKENS.iter().any(|t| *c == format!("{t}::admit")))
 }
 
 /// A body ALLOCATES if it mentions any of these. Deliberately
@@ -5370,6 +5547,10 @@ const ALLOC_TOKENS: &[&str] = &[
 /// the set it publishes.
 const STAGE_DATA_TYPES: &[&str] = &[
     "QueryResult",
+    // Issue #290's borrowed operand view. A view type must not be able
+    // to hide a helper from the census, so it joins the class rather
+    // than sitting outside it.
+    "SideSeries",
     "RangeSeries",
     "InstantSeries",
     "MatrixSeries",
@@ -5451,11 +5632,7 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
     // census when they started charging.
     let mut roots: Vec<String> = free
         .values()
-        .filter(|f| {
-            f.callees
-                .iter()
-                .any(|c| c == "Ledger::acquire" || c == "Ledger::acquire_binary")
-        })
+        .filter(|f| mints_a_proof_token(f))
         .map(|f| f.name.clone())
         .collect();
     // Plus the region's PUBLIC boundary, DERIVED from `mod.rs`'s
@@ -5499,7 +5676,7 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
     for public in public_roots {
         let f = &free[&public];
         assert!(
-            !f.param_types.contains("Ledger"),
+            !takes_a_proof_token(f),
             "`{public}` is a public entry point of the region and must MINT the charge, never \
              receive one"
         );
@@ -5530,20 +5707,16 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
         }
     }
 
-    // The direct admission helpers, DERIVED: a free fn that takes the
-    // token and whose whole job is to call `Ledger::admit` (`admit_range`
+    // The direct admission helpers, DERIVED: a free fn that takes A
+    // PROOF TOKEN (issue #290: either of them) and whose whole job is to
+    // call that token's `admit` (`admit_range`
     // computes `points` as one `O(series)` sum, `admit_instant`/
     // `admit_join` are `O(1)`). An Entry reaches `admit` through one of
     // these, and recognising them is what keeps Entry from reading as
     // Element.
     let admit_helpers: std::collections::BTreeSet<String> = free
         .values()
-        .filter(|f| {
-            f.param_types.contains("Ledger")
-                && f.callees
-                    .iter()
-                    .any(|c| c == ".admit" || c == "Ledger::admit")
-        })
+        .filter(|f| takes_a_proof_token(f) && admits_directly(f))
         .map(|f| f.name.clone())
         .collect();
 
@@ -5565,15 +5738,10 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
             Member {
                 name: info.name.clone(),
                 file: info.file.clone(),
-                mints: info
-                    .callees
-                    .iter()
-                    .any(|c| c == "Ledger::acquire" || c == "Ledger::acquire_binary"),
-                takes_ledger: info.param_types.contains("Ledger"),
-                calls_admit: info
-                    .callees
-                    .iter()
-                    .any(|c| c == ".admit" || c == "Ledger::admit" || admit_helpers.contains(c)),
+                mints: mints_a_proof_token(info),
+                takes_ledger: takes_a_proof_token(info),
+                calls_admit: admits_directly(info)
+                    || info.callees.iter().any(|c| admit_helpers.contains(c)),
                 allocates: ALLOC_TOKENS.iter().any(|t| info.callees.contains(*t)),
                 stage_data: STAGE_DATA_TYPES
                     .iter()
@@ -5589,7 +5757,8 @@ fn census_members() -> (Vec<String>, Vec<Member>) {
 /// ruling): a member that matches none of them fails the census.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum RegionClass {
-    /// Mints the charge: reaches `Ledger::acquire`, takes no `&Ledger`.
+    /// Mints the charge: reaches some proof token's `acquire*`
+    /// constructor and takes no proof token itself.
     Root,
     /// Receives a fresh stage-level collection; admits it unconditionally.
     Entry,
@@ -5655,11 +5824,25 @@ fn the_token_taking_set_is_derived_from_the_call_graph() {
     // themselves — they measure, charge and delegate — so the census
     // does not obligate them, and publishing them here would be claiming
     // an obligation the predicates do not derive.
-    const EXPECT_ROOT: &[&str] = &["apply_vector_aggs_capped", "combine_binary_capped"];
+    //
+    // Issue #290: `combine_binary_capped` LEFT this table. It is still a
+    // Root — it still mints through `Ledger::acquire_binary` — but it no
+    // longer allocates: its one allocating expression was the inline
+    // `ReadError::PipelineInvalid { reason: "...".to_string() }` of the
+    // incompatible-types arm, and that arm now calls
+    // `incompatible_types_error()`, the single constructor the class-(P)
+    // preflight shares with it so the two cannot drift. The obligated
+    // set is `allocates AND stage_data`, so publishing it here would
+    // claim an obligation the predicates no longer derive.
+    const EXPECT_ROOT: &[&str] = &["apply_vector_aggs_capped"];
     const EXPECT_ENTRY: &[&str] = &[
         "approx_topk_instant",
         "combine_matrices",
         "combine_vectors",
+        // Issue #290's class-(P) preflight: reserves its six scratch
+        // buffers and admits the operand pair it was charged for through
+        // `admit_operands` before any of them is filled.
+        "decide_binary_refusals",
         "group_instant",
         "group_range",
         "instant_join",
@@ -5674,7 +5857,12 @@ fn the_token_taking_set_is_derived_from_the_call_graph() {
         "sort_instant",
     ];
     const EXPECT_ELEMENT: &[&str] = &[
+        // Issue #290's three preflight stage helpers. Each fills a
+        // buffer the Entry reserved at a count it charged for.
+        "collision_groups",
+        "earliest_offending_step",
         "match_signature",
+        "project_side",
         // Issue #276: one series' in-place `label_replace` rewrite; its
         // expansion/insert allocations are priced per series by
         // `label_replace_peak_bytes`.
@@ -5831,6 +6019,179 @@ fn the_external_caller_map_of_the_funnel_closure_is_pinned() {
          production entry site that must acquire a token or a second charging regime that \
          cannot"
     );
+}
+
+/// **The proof-token list is derived-checked** (issue #290).
+///
+/// `PROOF_TOKENS` keys six of the census's predicates, so a token type
+/// nobody added to it would go invisible in all six at once. This is what
+/// says so, by name.
+///
+/// **Where it stops, said out loud.** It closes "a proof token exists
+/// whose type the predicates do not know about" for a token minted by an
+/// `acquire*` constructor in any file `collect()` parses, and it turns a
+/// FREE such constructor into a named panic. It does NOT close a token
+/// minted by a constructor named something else, nor one declared in
+/// `src/logql/template/` or `src/logql/testkit/`, which the
+/// non-recursive walk never reads (#302). Both are accepted open by
+/// ruling, and both are empty at this commit.
+#[test]
+fn the_proof_token_list_is_derived_from_the_acquire_constructors() {
+    let (_, all) = region_census::collect();
+    let derived = region_census::token_owners(&all);
+    let published: std::collections::BTreeSet<String> =
+        PROOF_TOKENS.iter().map(|t| (*t).to_string()).collect();
+    assert_eq!(
+        derived, published,
+        "a type mints a proof token that `PROOF_TOKENS` does not name (or names one that no \
+         longer mints). Six census predicates are generated from that list, so the difference \
+         is a hole in all six — it needs adjudication, not a list edit"
+    );
+}
+
+/// **No semantic refusal may live below the charge** (issue #290 §7).
+///
+/// The set of functions under `combine_binary_capped` that construct a
+/// NON-budget `ReadError` is derived from the call graph and compared
+/// against the published answer. A sixth one is a refusal the class-(P)
+/// preflight does not decide, which is the defect this issue closes,
+/// reappearing one layer down.
+///
+/// **Limit, stated rather than implied.** The closure walks FREE
+/// functions inside `src/logql/*.rs` only, so a refusal introduced inside
+/// an inherent method, or in a subdirectory module, is invisible to it —
+/// the same scope `region_census` has everywhere else. What covers the
+/// wire is the runtime rows in `tests/logql_semantics_before_budget.rs`;
+/// this covers the enumeration.
+#[test]
+fn every_semantic_refusal_under_the_binary_seam_is_decided_above_the_charge() {
+    let (_, all) = region_census::collect();
+    let free = region_census::free_fns(&all);
+
+    // The callee closure of the binary seam, to a fixpoint.
+    let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut frontier = vec!["combine_binary_capped".to_string()];
+    while let Some(name) = frontier.pop() {
+        if !closure.insert(name.clone()) {
+            continue;
+        }
+        let Some(info) = free.get(&name) else {
+            continue;
+        };
+        for callee in &info.callees {
+            let bare = callee.rsplit("::").next().unwrap_or(callee);
+            if free.contains_key(bare) && !closure.contains(bare) {
+                frontier.push(bare.to_string());
+            }
+        }
+    }
+    assert!(
+        closure.contains("instant_join"),
+        "the binary seam's closure lost the join: {closure:?}"
+    );
+
+    let mut got: Vec<&str> = closure
+        .iter()
+        .filter_map(|n| free.get(n))
+        .filter(|f| {
+            f.callees.iter().any(|c| {
+                c.starts_with("ReadError::")
+                    // The budget's own refusal is not a semantic one —
+                    // it is the thing that must never preempt them.
+                    && c != "ReadError::QueryTooBroad"
+            })
+        })
+        .map(|f| f.name.as_str())
+        .collect();
+    got.sort_unstable();
+
+    /// Every semantic refusal the binary funnel can raise, as the FIVE
+    /// leaf constructors that build them. All five are class (P) — the
+    /// operand-shape ones decided by `decide_shape` (P0, above every
+    /// charge, unconditionally), the three join ones by
+    /// `decide_binary_refusals` (P1, under its own charge) — so this
+    /// funnel has no class-(A) member left.
+    ///
+    /// (P1) is decided above the stage charge whenever that charge would
+    /// REFUSE, which is the only case in which its position matters:
+    /// where the charge admits, `decide_binary`'s guard skips the
+    /// preflight and `instant_join` raises the same three errors below
+    /// the charge, with nothing to be preempted by. The one case where a
+    /// budget breach still answers first is the scratch skip
+    /// (`PreflightCharge::acquire` returning `None`), unreachable below
+    /// ~6.75 million combined series and kept reproducible by
+    /// `the_join_refusals_are_preempted_by_the_budget_when_the_preflight_is_skipped`.
+    const EXPECT_SEMANTIC_REFUSALS: &[&str] = &[
+        "duplicate_one_side_error",
+        "grouping_unique_error",
+        "incompatible_types_error",
+        "multiple_matches_error",
+        "set_op_scalar_error",
+    ];
+    assert_eq!(
+        got, EXPECT_SEMANTIC_REFUSALS,
+        "a semantic refusal under the binary seam is not in the published set. It must be \
+         decided in `preflight::decide_shape` or `preflight::decide_binary_refusals` and added \
+         here with the acceptance row that pins it — never added silently, and never left below \
+         `Ledger::acquire_binary` where a budget breach can answer first"
+    );
+}
+
+/// **`mod preflight` allocates only its six reserved buffers** — the
+/// SOURCE half, and it is defence in depth, not the enforcement (issue
+/// #290 §3).
+///
+/// `FnInfo.callees` records DIRECT calls, so what this can support is
+/// exactly: *no function defined in `mod preflight` names an allocating
+/// token outside the allowed set*. It cannot see a helper defined
+/// elsewhere that the preflight calls. The byte bound itself is measured,
+/// by `tests/logql_preflight_alloc_gate.rs`, which is closed over the
+/// callee closure by construction.
+///
+/// The forbidden set is derived by SUBTRACTION, so a token added to
+/// `ALLOC_TOKENS` later is automatically forbidden here.
+#[test]
+fn the_preflight_module_allocates_only_its_six_reserved_buffers() {
+    /// Reserving a buffer at a count known up front, filling it, and
+    /// sorting it in place are what the six-buffer charge prices.
+    /// `sort_by` is absent on purpose: it allocates `n/2`.
+    const PREFLIGHT_ALLOWED_ALLOC: &[&str] = &[
+        ".push",
+        ".sort_unstable",
+        ".sort_unstable_by",
+        ".sort_unstable_by_key",
+        ".with_capacity",
+        "Vec::with_capacity",
+    ];
+    let (_, all) = region_census::collect();
+    let scanned: Vec<&region_census::FnInfo> = all
+        .iter()
+        .filter(|f| {
+            f.module
+                .as_deref()
+                .is_some_and(|m| m == "preflight" || m.starts_with("preflight::"))
+        })
+        .collect();
+    assert!(
+        scanned.len() >= 8,
+        "only {} functions found in `mod preflight` — the module scope is wrong",
+        scanned.len()
+    );
+    for f in &scanned {
+        for token in ALLOC_TOKENS {
+            if PREFLIGHT_ALLOWED_ALLOC.contains(token) {
+                continue;
+            }
+            assert!(
+                !f.callees.contains(*token),
+                "`{}` (module {:?}) names the allocating token `{token}`. The class-(P) \
+                 preflight's charge prices SIX exactly-reserved buffers and nothing else; an \
+                 allocation outside them is uncharged scratch above the stage charge",
+                f.display,
+                f.module
+            );
+        }
+    }
 }
 
 /// The generator's companion for the census: prints the derived
