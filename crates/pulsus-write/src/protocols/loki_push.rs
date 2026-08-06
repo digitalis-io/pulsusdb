@@ -647,6 +647,13 @@ pub const MAX_ENTRIES_PER_STREAM: usize = 100_000;
 /// refuse streams the reference accepts — 15 real labels padded with 250
 /// empty-valued ones is a `204` upstream.
 ///
+/// Neither do superseded ones. The count is charged on the SURVIVING map —
+/// [`parse_json`] for the JSON transport, [`parse_label_pairs`] for the
+/// protobuf one — never on raw occurrences, because 257 repetitions of one JSON
+/// key are one label upstream and a whole superseded `stream`/`streams` value is
+/// no labels at all (measured `204` upstream against our `400`, issue #374
+/// round 11).
+///
 /// The reference has no label-*count* guard of its own; a stream carrying
 /// more than 256 non-empty labels is refused here with this cap's message and
 /// upstream with `has N label names; limit 15`. Both are `400` — the wording
@@ -659,7 +666,10 @@ pub const MAX_LABELS_PER_STREAM: usize = 256;
 /// literal is refused at the same width on both sides.
 pub const MAX_STREAM_LABELS_BYTES: usize = (1 << 24) - 1;
 /// PulsusDB-only structural guard on the number of **raw** `(key, value)`
-/// pairs in one JSON `stream` object, counted during deserialization.
+/// pairs in one JSON `stream` object, counted during deserialization (which is
+/// where the materialization stops) and reported by [`parse_json`] off the
+/// count [`JsonStream::raw_label_pairs`] carries, so a superseded `stream`
+/// occurrence discards its breach along with its pairs.
 ///
 /// The protobuf transport needs no equivalent — it drops empty values as it
 /// reads the literal, so its allocation is bounded by
@@ -947,21 +957,29 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
 /// fourth+ element is drained without being materialized.
 ///
 /// [`JsonPush`]/[`JsonStream`] use bounded [`serde::de::DeserializeSeed`]
-/// visitors (issue #77) that cap the `streams` array
+/// visitors (issue #77) that stop materializing the `streams` array
 /// ([`MAX_STREAMS_PER_REQUEST`]), each stream's `values` array
-/// ([`MAX_ENTRIES_PER_STREAM`]) plus a **shared cross-stream** aggregate
-/// ([`MAX_TOTAL_ENTRIES_PER_REQUEST`], threaded through a single
-/// [`Cell`](std::cell::Cell) counter), and the per-stream `stream` label map
-/// ([`MAX_LABELS_PER_STREAM`]) — all **during** deserialization, so
-/// `serde_json` cannot grow those `Vec`s/map unbounded before the count checks.
-/// A shared `decoded_bytes` [`Cell`](std::cell::Cell) additionally charges the
-/// `size_of`-estimated BYTES each stream/entry/label-map materializes against
-/// the [`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`] budget (issue
-/// #168), rejecting once the running estimate crosses it — the JSON twin of the
-/// protobuf [`decode_protobuf`] byte re-sum (count caps bound element counts,
-/// not the materialized heap fan-out). The excess is rejected as
-/// [`LogsIngestError::LokiDecode`] mid-parse; the post-decode [`validate_bounds`]
-/// re-sum below is a harmless secondary guard for in-bounds input. Each stream's label **names** are validated against the
+/// ([`MAX_ENTRIES_PER_STREAM`]), the per-stream `stream` label map
+/// ([`MAX_RAW_LABEL_PAIRS_PER_STREAM`]) and an entry's structured metadata
+/// ([`MAX_STRUCTURED_METADATA_PER_ENTRY`]) one element past the cap, draining
+/// the remainder unallocated — so `serde_json` cannot grow those `Vec`s/maps
+/// unbounded. Each **reports** through the `MAX + 1` over-cap sentinel it leaves
+/// behind ([`validate_bounds`], [`JsonStream::raw_label_pairs`],
+/// `canonical_structured_metadata`), which is read AFTER the envelope's
+/// last-wins resolution — the same two-phase shape [`decode_protobuf`] has
+/// always had. Charging them at the moment they trip instead refused a request
+/// whose over-cap value a later occurrence of the same key superseded, which
+/// the reference answers `204` (issue #374 round 11).
+///
+/// The two SHARED cross-request counters are the exception and are immediately
+/// fatal: the aggregate entry count ([`MAX_TOTAL_ENTRIES_PER_REQUEST`]) and the
+/// `size_of`-estimated BYTES each stream/entry/label-map materializes
+/// ([`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`], issue #168), both
+/// threaded through one [`Cell`](std::cell::Cell). They measure memory this
+/// request has already cost across every occurrence, which a supersession does
+/// not refund while the superseding value is still decoding; deferring them
+/// would mean decoding past the budget to find out. The residual is ledgered.
+/// Each stream's label **names** are validated against the
 /// same strict [`is_valid_label_name`] grammar the protobuf path enforces
 /// (issue #115) before canonicalization, so an invalid name (`9bad`, `a.b`,
 /// non-ASCII) is a whole-request reject on both transports, not a silent
@@ -981,6 +999,33 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
     let mut out = ParsedLogs::default();
     let mut seen_streams: HashSet<(Fingerprint, Date)> = HashSet::new();
     for stream in &push.streams {
+        // The two per-stream label caps, charged HERE rather than inside the
+        // decoder, because both are only meaningful once the JSON envelope's
+        // last-wins resolution has run: a repeated `stream` key replaces the
+        // whole map, and a repeated key WITHIN the map replaces just that
+        // label. Upstream never sees a discarded occurrence at all — its
+        // `LabelSet.UnmarshalJSON` assigns into a `map[string]string`
+        // (`pkg/loghttp/labels.go:25-40 @ v3.7.4`) and its one-field envelope
+        // decoder re-runs the field decoder per occurrence — so charging a cap
+        // against a value it has already thrown away is a `400` against its
+        // `204` (measured, issue #374 round 11). Whole-request rejects: these
+        // are our structural guards, not the reference's per-stream bounds
+        // below, and it has no equivalent to either.
+        if stream.raw_label_pairs > MAX_RAW_LABEL_PAIRS_PER_STREAM {
+            return Err(LogsIngestError::LokiDecode(format!(
+                "stream label pairs exceed the {MAX_RAW_LABEL_PAIRS_PER_STREAM} per-stream bound"
+            )));
+        }
+        // Counted on the labels that SURVIVE: distinct keys whose final value is
+        // non-empty. Empty values are dropped before the stream is validated,
+        // hashed or stored (`ls.WithoutEmpty()`, `pkg/logql/syntax/parser.go:296
+        // @ v3.7.4`), so they cost nothing here either.
+        let surviving_labels = stream.stream.values().filter(|v| !v.is_empty()).count();
+        if surviving_labels > MAX_LABELS_PER_STREAM {
+            return Err(LogsIngestError::LokiDecode(format!(
+                "stream labels exceed the {MAX_LABELS_PER_STREAM} per-stream bound"
+            )));
+        }
         // Route JSON label keys through the SAME strict label-name grammar the
         // protobuf literal path enforces (issue #115) — before the infallible
         // `from_normalized` canonicalizes them — so a name that is invalid on
@@ -1388,15 +1433,21 @@ struct JsonPush {
     streams: Vec<JsonStream>,
 }
 
-/// One Loki stream: a `stream` label map (bounded at [`MAX_LABELS_PER_STREAM`]
-/// **during** deserialization by [`BoundedLabelMap`], counting RAW pairs so a
-/// duplicate JSON key cannot evade the cap — the same anti-evasion posture as
-/// [`BoundedStructuredMetadata`]) and a `values` array (bounded per-stream at
-/// [`MAX_ENTRIES_PER_STREAM`] and across streams via the shared aggregate
-/// counter). Deserialized only through [`StreamSeed`], which threads that
-/// shared counter in; a missing key yields the prior `#[serde(default)]` empty.
+/// One Loki stream: a `stream` label map (decoded by [`BoundedLabelMap`], which
+/// carries its RAW pair count out so [`parse_json`] can charge
+/// [`MAX_RAW_LABEL_PAIRS_PER_STREAM`] against the map that SURVIVED a repeated
+/// `stream` key) and a `values` array (capped per-stream at
+/// [`MAX_ENTRIES_PER_STREAM`]` + 1` during decode and charged across streams
+/// against the shared aggregate counter). Deserialized only through
+/// [`StreamSeed`], which threads that shared counter in; a missing key yields
+/// the prior `#[serde(default)]` empty.
 struct JsonStream {
     stream: std::collections::BTreeMap<String, String>,
+    /// RAW `stream` pairs behind the collapsed map above, saturated at
+    /// [`MAX_RAW_LABEL_PAIRS_PER_STREAM`]` + 1`. Travels WITH the map (a
+    /// repeated `stream` key replaces both together), so the count always
+    /// describes the labels that survived last-wins resolution.
+    raw_label_pairs: usize,
     values: Vec<JsonEntry>,
 }
 
@@ -1560,9 +1611,11 @@ where
 }
 
 /// Bounded [`DeserializeSeed`](serde::de::DeserializeSeed) for the `streams`
-/// array: caps element count at [`MAX_STREAMS_PER_REQUEST`] and seeds each
-/// element with the shared aggregate counter. Mirrors
-/// [`BoundedStructuredMetadata`]'s abort-before-materializing-the-remainder.
+/// array: stops materializing at [`MAX_STREAMS_PER_REQUEST`]` + 1` elements and
+/// seeds each element with the shared aggregate counter. Mirrors
+/// [`BoundedStructuredMetadata`]'s drain-the-remainder, and like it leaves the
+/// over-cap sentinel for a post-resolution check ([`validate_bounds`]) rather
+/// than rejecting a value a later `streams` occurrence may discard.
 struct StreamsSeed<'c> {
     total_entries: &'c std::cell::Cell<usize>,
     decoded_bytes: &'c std::cell::Cell<usize>,
@@ -1591,17 +1644,26 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
                 A: serde::de::SeqAccess<'de>,
             {
                 let mut streams: Vec<JsonStream> = Vec::new();
-                while let Some(stream) = seq.next_element_seed(StreamSeed {
-                    total_entries: self.total_entries,
-                    decoded_bytes: self.decoded_bytes,
-                })? {
-                    if streams.len() >= MAX_STREAMS_PER_REQUEST {
-                        // Charge-before-allocate: reject the over-cap stream
-                        // without retaining the remainder of the array.
-                        return Err(serde::de::Error::custom(format!(
-                            "streams exceeds the {MAX_STREAMS_PER_REQUEST} per-request bound"
-                        )));
+                loop {
+                    if streams.len() > MAX_STREAMS_PER_REQUEST {
+                        // Cap reached: drain the remainder WITHOUT materializing
+                        // it, leaving the vec at the `MAX + 1` over-cap sentinel
+                        // the deferred [`validate_bounds`] rejects — the same
+                        // shape `PushRequest::merge_field`'s tag-1 drain leaves
+                        // on the protobuf path. Raising here instead would charge
+                        // the cap against a `streams` occurrence a LATER one may
+                        // still supersede, which the reference never sees (issue
+                        // #374 round 11: last-wins resolves before any bound).
+                        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                        break;
                     }
+                    let Some(stream) = seq.next_element_seed(StreamSeed {
+                        total_entries: self.total_entries,
+                        decoded_bytes: self.decoded_bytes,
+                    })?
+                    else {
+                        break;
+                    };
                     // Charge this stream's shell bytes (issue #168) before
                     // retaining it — its entries and label pairs were charged
                     // during their own deserialization inside `StreamSeed`.
@@ -1651,7 +1713,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
             where
                 A: serde::de::MapAccess<'de>,
             {
-                let mut stream: Option<std::collections::BTreeMap<String, String>> = None;
+                let mut stream: Option<BoundedLabelMap> = None;
                 let mut values: Option<Vec<JsonEntry>> = None;
                 // Exact-match keys, unlike the envelope's `streams` above: a
                 // stream object is decoded by a hand-written
@@ -1664,16 +1726,19 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
                 while let Some(key) = map.next_key::<std::borrow::Cow<str>>()? {
                     match key.as_ref() {
                         "stream" => {
-                            let labels = map.next_value::<BoundedLabelMap>()?.0;
+                            let labels = map.next_value::<BoundedLabelMap>()?;
                             // Charge the RETAINED (post-dedup) label pairs (issue
                             // #168): the raw-pair count is already capped at
-                            // MAX_LABELS_PER_STREAM by `BoundedLabelMap`, so the
-                            // over-step is bounded to one map.
+                            // MAX_RAW_LABEL_PAIRS_PER_STREAM by
+                            // `BoundedLabelMap`'s drain, so the over-step is
+                            // bounded to one map.
                             charge_json_decoded_bytes(
                                 self.decoded_bytes,
-                                labels
-                                    .len()
-                                    .saturating_mul(std::mem::size_of::<(String, String)>()),
+                                labels.labels.len().saturating_mul(std::mem::size_of::<(
+                                    String,
+                                    String,
+                                )>(
+                                )),
                             )?;
                             stream = Some(labels);
                         }
@@ -1697,8 +1762,13 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
                         }
                     }
                 }
+                let stream = stream.unwrap_or(BoundedLabelMap {
+                    labels: std::collections::BTreeMap::new(),
+                    raw_pairs: 0,
+                });
                 Ok(JsonStream {
-                    stream: stream.unwrap_or_default(),
+                    stream: stream.labels,
+                    raw_label_pairs: stream.raw_pairs,
                     values: values.unwrap_or_default(),
                 })
             }
@@ -1710,28 +1780,40 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
     }
 }
 
-/// The per-stream `stream` label map, bounded **during** deserialization.
+/// The per-stream `stream` label map, decoded with its RAW pair count carried
+/// alongside the dedup-collapsing `BTreeMap`.
 ///
-/// Two counts, because the reference has two different reasons to refuse a
-/// wide label map and only one of them is about parity:
+/// Two counts, because the reference has two different reasons to refuse a wide
+/// label map and only one of them is about this map's own growth:
 ///
-/// - RAW `next_entry` pairs against [`MAX_RAW_LABEL_PAIRS_PER_STREAM`], the
-///   structural guard on this map's own growth.
-/// - RAW pairs with a **non-empty** value against [`MAX_LABELS_PER_STREAM`].
-///   Empty-valued labels are dropped before the stream is validated, hashed or
-///   stored (`ls.WithoutEmpty()`, `pkg/logql/syntax/parser.go:296 @ v3.7.4`),
-///   so charging them against the label cap would refuse streams the reference
-///   accepts. They are still *retained* here: [`parse_json`] must check their
-///   names against [`is_valid_label_name`] (upstream parses the literal before
-///   `WithoutEmpty` runs, so `{"a.b":""}` is a reject there) and the map's
-///   last-write-wins collapse must happen before the drop, since
-///   `{"foo":"bar","foo":""}` leaves `foo` empty upstream and must here too.
+/// - [`MAX_RAW_LABEL_PAIRS_PER_STREAM`] on RAW `next_entry` pairs — the
+///   structural memory guard. Enforced here in the sense that matters (past the
+///   cap nothing further is materialized), but *reported* by [`parse_json`] off
+///   the carried `raw_pairs` count, so a `stream` occurrence a later one
+///   supersedes takes its breach with it.
+/// - [`MAX_LABELS_PER_STREAM`] on the labels that actually survive. That count
+///   is not knowable inside this visitor: `{"a":"1","a":"2"}` is ONE label
+///   upstream (`LabelSet.UnmarshalJSON` assigns into a `map[string]string`,
+///   `pkg/loghttp/labels.go:25-40 @ v3.7.4`, and has no count bound of its own),
+///   and `{"a":"1","a":""}` is none at all, because empty values are dropped
+///   before the stream is validated, hashed or stored (`ls.WithoutEmpty()`,
+///   `pkg/logql/syntax/parser.go:296 @ v3.7.4`). Charging RAW pairs here refused
+///   257 repetitions of one key that upstream stores as a single label
+///   (measured `204` vs our `400`), so the cap moved to [`parse_json`], where
+///   the map has collapsed and the survivor is in hand.
 ///
-/// Both are counted on RAW pairs rather than the dedup-collapsing `BTreeMap`
-/// length so a duplicate JSON key cannot evade either — the same rationale as
-/// [`BoundedStructuredMetadata`]. Last-write-wins dedup (the prior `BTreeMap`
-/// semantics) is preserved for the retained value.
-struct BoundedLabelMap(std::collections::BTreeMap<String, String>);
+/// Empty-valued pairs are still *retained*: [`parse_json`] checks their names
+/// against [`is_valid_label_name`] (upstream parses the literal before
+/// `WithoutEmpty` runs, so `{"a.b":""}` is a reject there) and the map's
+/// last-write-wins collapse must happen before the drop, since
+/// `{"foo":"bar","foo":""}` leaves `foo` empty upstream and must here too.
+struct BoundedLabelMap {
+    labels: std::collections::BTreeMap<String, String>,
+    /// RAW `next_entry` pairs, saturated at [`MAX_RAW_LABEL_PAIRS_PER_STREAM`]`
+    /// + 1` — the over-cap sentinel, exactly like the `+ 1` element counts the
+    /// `streams`/`values`/`structured_metadata` drains leave behind.
+    raw_pairs: usize,
+}
 
 impl<'de> serde::Deserialize<'de> for BoundedLabelMap {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1740,7 +1822,7 @@ impl<'de> serde::Deserialize<'de> for BoundedLabelMap {
     {
         struct LabelMapVisitor;
         impl<'de> serde::de::Visitor<'de> for LabelMapVisitor {
-            type Value = std::collections::BTreeMap<String, String>;
+            type Value = BoundedLabelMap;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str("a Loki stream label map of string values")
@@ -1751,40 +1833,38 @@ impl<'de> serde::Deserialize<'de> for BoundedLabelMap {
                 A: serde::de::MapAccess<'de>,
             {
                 let mut labels = std::collections::BTreeMap::new();
-                let mut seen = 0usize;
-                let mut non_empty = 0usize;
-                while let Some((k, v)) = map.next_entry::<String, String>()? {
-                    // Charge-before-allocate on RAW pair counts, so duplicate
-                    // keys cannot collapse under either cap.
-                    if seen >= MAX_RAW_LABEL_PAIRS_PER_STREAM {
-                        return Err(serde::de::Error::custom(format!(
-                            "stream label pairs exceed the \
-                             {MAX_RAW_LABEL_PAIRS_PER_STREAM} per-stream bound"
-                        )));
+                let mut raw_pairs = 0usize;
+                loop {
+                    if raw_pairs > MAX_RAW_LABEL_PAIRS_PER_STREAM {
+                        // Cap reached: drain the remaining pairs WITHOUT
+                        // materializing them, leaving `raw_pairs` at the
+                        // `MAX + 1` sentinel `parse_json` rejects.
+                        while map
+                            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                            .is_some()
+                        {}
+                        break;
                     }
-                    if !v.is_empty() {
-                        if non_empty >= MAX_LABELS_PER_STREAM {
-                            return Err(serde::de::Error::custom(format!(
-                                "stream labels exceed the {MAX_LABELS_PER_STREAM} per-stream bound"
-                            )));
-                        }
-                        non_empty += 1;
-                    }
-                    seen += 1;
+                    let Some((k, v)) = map.next_entry::<String, String>()? else {
+                        break;
+                    };
+                    raw_pairs += 1;
                     labels.insert(k, v);
                 }
-                Ok(labels)
+                Ok(BoundedLabelMap { labels, raw_pairs })
             }
         }
-        deserializer.deserialize_map(LabelMapVisitor).map(Self)
+        deserializer.deserialize_map(LabelMapVisitor)
     }
 }
 
 /// Bounded [`DeserializeSeed`](serde::de::DeserializeSeed) for a stream's
-/// `values` array: caps element count per stream at [`MAX_ENTRIES_PER_STREAM`]
-/// and charges each entry into the shared cross-stream aggregate counter,
-/// rejecting once it exceeds [`MAX_TOTAL_ENTRIES_PER_REQUEST`] — both **during**
-/// deserialization, before the `Vec<JsonEntry>` grows past the cap.
+/// `values` array: stops materializing at [`MAX_ENTRIES_PER_STREAM`]` + 1`
+/// elements per stream (the sentinel [`validate_bounds`] rejects after the
+/// envelope resolves) and charges each RETAINED entry into the shared
+/// cross-stream aggregate counter, rejecting on the spot once it exceeds
+/// [`MAX_TOTAL_ENTRIES_PER_REQUEST`] — both **during** deserialization, so the
+/// `Vec<JsonEntry>` never grows past the cap.
 struct ValuesSeed<'c> {
     total_entries: &'c std::cell::Cell<usize>,
     decoded_bytes: &'c std::cell::Cell<usize>,
@@ -1813,12 +1893,35 @@ impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed<'_> {
                 A: serde::de::SeqAccess<'de>,
             {
                 let mut values: Vec<JsonEntry> = Vec::new();
-                while let Some(entry) = seq.next_element::<JsonEntry>()? {
-                    if values.len() >= MAX_ENTRIES_PER_STREAM {
-                        return Err(serde::de::Error::custom(format!(
-                            "entries exceeds the {MAX_ENTRIES_PER_STREAM} per-stream bound"
-                        )));
+                loop {
+                    if values.len() > MAX_ENTRIES_PER_STREAM {
+                        // Cap reached: drain the remainder WITHOUT materializing
+                        // it (and without charging the shared counters for what
+                        // is never retained), leaving the vec at the `MAX + 1`
+                        // over-cap sentinel [`validate_bounds`] rejects — the
+                        // JSON twin of `StreamAdapter::merge_field`'s tag-2
+                        // drain. Deferred rather than raised because a LATER
+                        // `values` (or `streams`) occurrence can supersede this
+                        // whole array, and the reference charges nothing against
+                        // a value it has discarded (issue #374 round 11).
+                        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                        break;
                     }
+                    let Some(entry) = seq.next_element::<JsonEntry>()? else {
+                        break;
+                    };
+                    // The two SHARED counters below stay immediately fatal, and
+                    // deliberately so: unlike the per-occurrence caps they
+                    // measure what this request has ALREADY made us materialize
+                    // across every occurrence, and a supersession does not give
+                    // that memory back while the superseding value is still
+                    // decoding. Deferring them would mean materializing past the
+                    // budget to find out whether the occurrence survives — a
+                    // resource divergence traded for a rejection one. The
+                    // residual (a superseded occurrence carrying more than
+                    // MAX_TOTAL_ENTRIES_PER_REQUEST entries, which needs ≈46 MB
+                    // of body, is `400` here and `204` upstream) is recorded in
+                    // docs/benchmarks/logs-differential-ledger.md.
                     let new_total = self.total_entries.get().saturating_add(1);
                     if new_total > MAX_TOTAL_ENTRIES_PER_REQUEST {
                         return Err(serde::de::Error::custom(format!(
@@ -1875,11 +1978,15 @@ struct JsonEntry {
 
 /// The optional third `values` element (`{"k":"v", ...}`), decoded into RAW
 /// `(key, value)` pairs with the [`MAX_STRUCTURED_METADATA_PER_ENTRY`] bound
-/// enforced DURING deserialization (charge-before-allocate): the visitor
-/// aborts at pair 257 before materializing the rest of the object. A dedup-
+/// bounding materialization DURING deserialization (charge-before-allocate):
+/// the visitor stops retaining at pair 257 and drains the rest of the object,
+/// leaving the `MAX + 1` sentinel that `canonical_structured_metadata` — which
+/// runs after every last-wins resolution — turns into the reject. A dedup-
 /// collapsing `BTreeMap` would (a) allocate every key before any bound check
 /// and (b) fold duplicate keys, letting a duplicate-key object evade the
-/// per-entry cardinality bound — so raw pairs are counted instead. Downstream
+/// per-entry cardinality bound — so raw pairs are counted instead, which is
+/// also how the reference accumulates them (`unmarshalHTTPToLogProtoEntry`
+/// appends every pair, `pkg/loghttp/query.go:181-196 @ v3.7.4`). Downstream
 /// dedup/canonicalization is left to [`canonical_structured_metadata`]'s
 /// `LabelSet::from_normalized`, exactly as the protobuf path does.
 struct BoundedStructuredMetadata(Vec<(String, String)>);
@@ -1902,14 +2009,23 @@ impl<'de> serde::Deserialize<'de> for BoundedStructuredMetadata {
                 A: serde::de::MapAccess<'de>,
             {
                 let mut pairs: Vec<(String, String)> = Vec::new();
-                while let Some((key, value)) = map.next_entry::<String, String>()? {
-                    if pairs.len() >= MAX_STRUCTURED_METADATA_PER_ENTRY {
-                        // Charge-before-allocate: reject at the 257th raw pair
-                        // (pre-dedup) without materializing the remainder.
-                        return Err(serde::de::Error::custom(format!(
-                            "structured_metadata exceeds the {MAX_STRUCTURED_METADATA_PER_ENTRY}-pair per-entry bound"
-                        )));
+                loop {
+                    if pairs.len() > MAX_STRUCTURED_METADATA_PER_ENTRY {
+                        // Cap reached: drain the remainder WITHOUT materializing
+                        // it, leaving the `MAX + 1` over-cap sentinel
+                        // `canonical_structured_metadata` rejects — exactly what
+                        // `EntryAdapter::merge_field`'s tag-3 drain leaves on the
+                        // protobuf path. Raising here would charge the cap against
+                        // an entry a later `values` occurrence may supersede.
+                        while map
+                            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                            .is_some()
+                        {}
+                        break;
                     }
+                    let Some((key, value)) = map.next_entry::<String, String>()? else {
+                        break;
+                    };
                     pairs.push((key, value));
                 }
                 Ok(pairs)
@@ -2490,44 +2606,56 @@ mod tests {
         }
     }
 
+    /// The `(field, actual)` of the [`LogsIngestError::OversizeMessage`] a body
+    /// rejects with. `actual` is the count the decoder actually MATERIALIZED,
+    /// so asserting it is `MAX + 1` for a body carrying far more proves the
+    /// drain ran — the JSON twin of the protobuf `+ 1` sentinel assertions.
+    fn json_oversize(body: &str) -> (&'static str, usize) {
+        match parse_json(body.as_bytes(), 0).unwrap_err() {
+            LogsIngestError::OversizeMessage { field, actual, .. } => (field, actual),
+            other => panic!("expected OversizeMessage, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_json_rejects_too_many_streams_during_deserialize() {
         // AC (too many streams / JSON): more than MAX_STREAMS_PER_REQUEST empty
-        // stream objects. The bounded seed rejects DURING deserialize with its
-        // own message — the non-vacuity signal vs. the derived + validate_bounds
-        // `OversizeMessage`.
+        // stream objects. The seed stops materializing at MAX + 1 and drains the
+        // rest; `validate_bounds` — which runs after the envelope's last-wins
+        // resolution — turns that sentinel into the reject. `actual` is the
+        // materialized count, so `MAX + 1` out of `MAX + 8` encoded proves the
+        // drain rather than a full unpack.
         let mut body = String::with_capacity(4 * MAX_STREAMS_PER_REQUEST);
         body.push_str(r#"{"streams":["#);
-        for i in 0..=MAX_STREAMS_PER_REQUEST {
+        for i in 0..MAX_STREAMS_PER_REQUEST + 8 {
             if i > 0 {
                 body.push(',');
             }
             body.push_str("{}");
         }
         body.push_str("]}");
-        let msg = json_loki_decode_message(&body);
-        assert!(
-            msg.contains("streams exceeds"),
-            "the reject must be the bounded-seed streams message: {msg:?}"
+        assert_eq!(
+            json_oversize(&body),
+            ("streams", MAX_STREAMS_PER_REQUEST + 1)
         );
     }
 
     #[test]
     fn parse_json_rejects_too_many_entries_per_stream_during_deserialize() {
-        // AC (too many entries-per-stream / JSON).
+        // AC (too many entries-per-stream / JSON), same shape as the streams
+        // case above: MAX + 1 materialized out of MAX + 8 encoded.
         let mut body = String::new();
         body.push_str(r#"{"streams":[{"stream":{"a":"b"},"values":["#);
-        for i in 0..=MAX_ENTRIES_PER_STREAM {
+        for i in 0..MAX_ENTRIES_PER_STREAM + 8 {
             if i > 0 {
                 body.push(',');
             }
             body.push_str(r#"["1700000000000000000","x"]"#);
         }
         body.push_str("]}]}");
-        let msg = json_loki_decode_message(&body);
-        assert!(
-            msg.contains("entries exceeds"),
-            "the reject must be the bounded-seed entries message: {msg:?}"
+        assert_eq!(
+            json_oversize(&body),
+            ("entries", MAX_ENTRIES_PER_STREAM + 1)
         );
     }
 
@@ -2592,12 +2720,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_duplicate_label_keys_cannot_evade_the_map_cap() {
-        // AC-9 anti-evasion (labels / JSON): a label map whose keys are all the
-        // SAME string would collapse to one entry in a BTreeMap, evading the
-        // cap; counting RAW pairs during the visit rejects it.
+    fn parse_json_duplicate_label_keys_collapse_before_the_label_cap_is_charged() {
+        // Issue #374 round 11: a label map whose keys are all the SAME string is
+        // ONE label upstream — `LabelSet.UnmarshalJSON` assigns into a
+        // `map[string]string` (`pkg/loghttp/labels.go:25-40 @ v3.7.4`) and has
+        // no count bound at all. Counting RAW pairs against
+        // MAX_LABELS_PER_STREAM refused this at 257 repetitions where the
+        // reference answers 204 and stores the line (measured). The cap is now
+        // charged on the surviving map, so the collapse comes first.
         let mut map = String::from("{");
         for i in 0..=MAX_LABELS_PER_STREAM {
+            if i > 0 {
+                map.push(',');
+            }
+            map.push_str(&format!(r#""dup":"v{i}""#));
+        }
+        map.push_str(r#","app":"x"}"#);
+        let body =
+            format!(r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","x"]]}}]}}"#);
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        // Last-write-wins, exactly as the reference's map assignment is.
+        assert_eq!(
+            out.streams[0].labels.iter().collect::<Vec<_>>(),
+            [
+                ("app", "x"),
+                ("dup", format!("v{MAX_LABELS_PER_STREAM}").as_str()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_json_duplicate_label_keys_cannot_evade_the_raw_pair_guard() {
+        // What the collapse above must NOT cost: the raw-pair count is still the
+        // structural guard on the intermediate map, and repeating one key does
+        // not evade it. 65,537 repetitions materialize 65,537 pairs and are
+        // refused; the drain then stops, so nothing past the sentinel is built.
+        let mut map = String::with_capacity(16 * MAX_RAW_LABEL_PAIRS_PER_STREAM);
+        map.push('{');
+        for i in 0..MAX_RAW_LABEL_PAIRS_PER_STREAM + 8 {
             if i > 0 {
                 map.push(',');
             }
@@ -2608,8 +2769,8 @@ mod tests {
             format!(r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","x"]]}}]}}"#);
         let msg = json_loki_decode_message(&body);
         assert!(
-            msg.contains("stream labels exceed"),
-            "duplicate keys must still trip the RAW-pair label-map cap: {msg:?}"
+            msg.contains("stream label pairs exceed"),
+            "duplicate keys must still trip the RAW-pair guard: {msg:?}"
         );
     }
 
@@ -2930,6 +3091,235 @@ mod tests {
             .expect("null values alone");
         assert!(out.rows.is_empty());
         assert!(out.stream_errors.is_empty());
+    }
+
+    /// Issue #374 round 11: last-wins resolves BEFORE any of our structural
+    /// caps is charged, so an occurrence the reference has already discarded
+    /// cannot decide the request.
+    ///
+    /// The reference never looks at a superseded value at all — its one-field
+    /// envelope decoder re-runs the field decoder per occurrence
+    /// (`reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`) and a stream
+    /// object's hand-written switch re-runs per key (`pkg/loghttp/query.go:99-121
+    /// @ v3.7.4`) — so a cap-breaking first occurrence followed by a valid last
+    /// one is `204` there, and the last one's line is stored. Measured against
+    /// `grafana/loki@sha256:87f0a067…` for every row below; each was `400` here
+    /// before this change.
+    ///
+    /// This is the whole enumeration of "a cap chargeable before a resolution
+    /// point", not the three that were probed: three resolution points
+    /// (`streams`, `stream`, `values`) crossed with the four per-occurrence caps
+    /// that can be reached inside each. The fourth resolution point — duplicate
+    /// keys collapsing inside one `stream` map — is
+    /// `parse_json_duplicate_label_keys_collapse_before_the_label_cap_is_charged`.
+    /// The two SHARED counters (`MAX_TOTAL_ENTRIES_PER_REQUEST`,
+    /// `MAX_DECODED_BYTES`) are deliberately NOT in this set; see
+    /// `parse_json_a_superseded_value_still_charges_the_shared_budget`.
+    ///
+    /// Each row is a PAIR: the over-cap value superseded (accepted, final line
+    /// stored) and the same value last (rejected, naming its own cap). Without
+    /// the second half, deleting the cap outright would pass.
+    #[test]
+    fn parse_json_a_superseded_over_cap_value_does_not_decide_the_request() {
+        let entry = r#"["1700000000000000000","final"]"#;
+        let good_values = format!("[{entry}]");
+        let good_stream = format!(r#"{{"stream":{{"app":"win"}},"values":{good_values}}}"#);
+
+        let repeat = |unit: &str, n: usize| {
+            let mut s = String::with_capacity(unit.len() * n + n);
+            for i in 0..n {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(unit);
+            }
+            s
+        };
+        // One element past each cap, so the pairs below are cap/cap+1 edges.
+        let over_values = format!(
+            "[{}]",
+            repeat(r#"["1700000000000000000","x"]"#, MAX_ENTRIES_PER_STREAM + 1)
+        );
+        let over_labels = {
+            let mut m = String::from("{");
+            for i in 0..=MAX_LABELS_PER_STREAM {
+                if i > 0 {
+                    m.push(',');
+                }
+                m.push_str(&format!(r#""k{i}":"v""#));
+            }
+            m.push('}');
+            m
+        };
+        let over_raw_pairs = format!(
+            "{{{}}}",
+            repeat(r#""dup":"v""#, MAX_RAW_LABEL_PAIRS_PER_STREAM + 1)
+        );
+        let over_sm = format!(
+            r#"[["1700000000000000000","x",{{{}}}]]"#,
+            repeat(r#""dup":"v""#, MAX_STRUCTURED_METADATA_PER_ENTRY + 1)
+        );
+        let over_streams = format!("[{}]", repeat("{}", MAX_STREAMS_PER_REQUEST + 1));
+
+        // (case, superseded-first body, same-value-last body, the cap's message)
+        let cases = [
+            (
+                "streams / entries cap",
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"a"}},"values":{over_values}}}],"StReAmS":[{good_stream}]}}"#
+                ),
+                format!(
+                    r#"{{"StReAmS":[{good_stream}],"streams":[{{"stream":{{"app":"a"}},"values":{over_values}}}]}}"#
+                ),
+                "entries count",
+            ),
+            (
+                "streams / label count",
+                format!(
+                    r#"{{"streams":[{{"stream":{over_labels},"values":{good_values}}}],"Streams":[{good_stream}]}}"#
+                ),
+                format!(
+                    r#"{{"Streams":[{good_stream}],"streams":[{{"stream":{over_labels},"values":{good_values}}}]}}"#
+                ),
+                "stream labels exceed",
+            ),
+            (
+                "streams / raw label pairs",
+                format!(
+                    r#"{{"streams":[{{"stream":{over_raw_pairs},"values":{good_values}}}],"Streams":[{good_stream}]}}"#
+                ),
+                format!(
+                    r#"{{"Streams":[{good_stream}],"streams":[{{"stream":{over_raw_pairs},"values":{good_values}}}]}}"#
+                ),
+                "stream label pairs exceed",
+            ),
+            (
+                "streams / structured metadata",
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"a"}},"values":{over_sm}}}],"Streams":[{good_stream}]}}"#
+                ),
+                format!(
+                    r#"{{"Streams":[{good_stream}],"streams":[{{"stream":{{"app":"a"}},"values":{over_sm}}}]}}"#
+                ),
+                "structured_metadata count",
+            ),
+            (
+                "streams / stream count",
+                format!(r#"{{"streams":{over_streams},"Streams":[{good_stream}]}}"#),
+                format!(r#"{{"Streams":[{good_stream}],"streams":{over_streams}}}"#),
+                "streams count",
+            ),
+            (
+                "stream / label count",
+                format!(
+                    r#"{{"streams":[{{"stream":{over_labels},"stream":{{"app":"win"}},"values":{good_values}}}]}}"#
+                ),
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"win"}},"stream":{over_labels},"values":{good_values}}}]}}"#
+                ),
+                "stream labels exceed",
+            ),
+            (
+                "stream / raw label pairs",
+                format!(
+                    r#"{{"streams":[{{"stream":{over_raw_pairs},"stream":{{"app":"win"}},"values":{good_values}}}]}}"#
+                ),
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"win"}},"stream":{over_raw_pairs},"values":{good_values}}}]}}"#
+                ),
+                "stream label pairs exceed",
+            ),
+            (
+                "values / entries cap",
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"win"}},"values":{over_values},"values":{good_values}}}]}}"#
+                ),
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"win"}},"values":{good_values},"values":{over_values}}}]}}"#
+                ),
+                "entries count",
+            ),
+            (
+                "values / structured metadata",
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"win"}},"values":{over_sm},"values":{good_values}}}]}}"#
+                ),
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"win"}},"values":{good_values},"values":{over_sm}}}]}}"#
+                ),
+                "structured_metadata count",
+            ),
+        ];
+
+        for (case, superseded, surviving, cap_message) in cases {
+            let out = parse_json(superseded.as_bytes(), 0)
+                .unwrap_or_else(|e| panic!("{case}: superseded value still decided it: {e}"));
+            assert_eq!(out.rows.len(), 1, "{case}");
+            assert_eq!(out.rows[0].body, "final", "{case}");
+            assert!(
+                out.stream_errors.is_empty(),
+                "{case}: {:?}",
+                out.stream_errors
+            );
+
+            let err = parse_json(surviving.as_bytes(), 0)
+                .err()
+                .unwrap_or_else(|| panic!("{case}: the SURVIVING over-cap value was admitted"));
+            assert!(
+                err.to_string().contains(cap_message),
+                "{case}: expected the cap {cap_message:?}, got {err}"
+            );
+        }
+    }
+
+    /// The two counters that stay immediately fatal, and why the row above stops
+    /// where it does. `MAX_TOTAL_ENTRIES_PER_REQUEST` and `MAX_DECODED_BYTES`
+    /// are charged across every occurrence and are NOT given back when one is
+    /// superseded: they measure memory this request has already cost, and the
+    /// superseding value decodes while the superseded one is still alive, so
+    /// deferring them would mean decoding past the budget to find out whether it
+    /// mattered. The reference has no equivalent — its only bound on the JSON
+    /// push path is the 100 MiB compressed body (`distributor.max-recv-msg-size`,
+    /// `pkg/distributor/distributor.go:124 @ v3.7.4`, applied by
+    /// `io.LimitReader` in `parsePushRequestBody`, `pkg/loghttp/push/push.go:322-325`)
+    /// — so this is a stated divergence, ledgered, not an oversight.
+    ///
+    /// Cheap to pin without a 46 MB body: two streams whose entry counts sum
+    /// past the aggregate inside ONE superseded occurrence reject exactly as
+    /// they do without the second occurrence.
+    #[test]
+    fn parse_json_a_superseded_value_still_charges_the_shared_budget() {
+        let per = MAX_ENTRIES_PER_STREAM;
+        let streams = MAX_TOTAL_ENTRIES_PER_REQUEST / per + 1; // 51 -> 5.1M
+        let mut one = String::from(r#"{"stream":{"a":"b"},"values":["#);
+        for i in 0..per {
+            if i > 0 {
+                one.push(',');
+            }
+            one.push_str(r#"["1700000000000000000","x"]"#);
+        }
+        one.push_str("]}");
+        let mut big = String::from("[");
+        for i in 0..streams {
+            if i > 0 {
+                big.push(',');
+            }
+            big.push_str(&one);
+        }
+        big.push(']');
+        let body = format!(
+            r#"{{"streams":{big},"Streams":[{{"stream":{{"app":"win"}},"values":[["1700000000000000000","final"]]}}]}}"#
+        );
+        let err = parse_json(body.as_bytes(), 0)
+            .expect_err("the shared budget is charged across occurrences");
+        // #168's byte budget crosses first at ~4.8M entries; the count cap is the
+        // backstop behind it. Either way the request is refused, which is the
+        // divergence being recorded.
+        assert!(
+            err.to_string().contains("decoded bytes (estimated)")
+                || err.to_string().contains("total_entries"),
+            "{err}"
+        );
     }
 
     /// The case fold does not skip the per-stream label bounds: an over-wide
@@ -3722,16 +4112,13 @@ mod tests {
 
     #[test]
     fn parse_json_structured_metadata_out_of_range_is_a_whole_request_error() {
-        // The JSON path enforces the per-entry bound DURING serde decode (the
-        // `BoundedStructuredMetadata` visitor aborts at pair 257 via
-        // `serde::de::Error::custom`), which `parse_json` maps to a whole-request
-        // `LokiDecode` — NOT the `OversizeMessage` the protobuf path raises from
-        // `canonical_structured_metadata`, which the 257th-pair decode abort
-        // never reaches. Asserting the exact variant AND that the message names
-        // the per-entry bound proves it was the bound that fired, not an
-        // incidental decode error.
+        // The JSON visitor stops materializing at pair 257 and drains the rest;
+        // `canonical_structured_metadata` — which runs after the envelope's
+        // last-wins resolution — raises the SAME `OversizeMessage` the protobuf
+        // path does from the same call site. `actual` is the materialized count,
+        // so `MAX + 1` out of `MAX + 8` encoded proves the drain ran.
         let mut obj = String::from("{");
-        for i in 0..=MAX_STRUCTURED_METADATA_PER_ENTRY {
+        for i in 0..MAX_STRUCTURED_METADATA_PER_ENTRY + 8 {
             if i > 0 {
                 obj.push(',');
             }
@@ -3741,26 +4128,22 @@ mod tests {
         let body = format!(
             r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{obj}]]}}]}}"#
         );
-        let err = parse_json(body.as_bytes(), 0).unwrap_err();
-        let LogsIngestError::LokiDecode(msg) = err else {
-            panic!("expected LokiDecode, got {err:?}");
-        };
-        assert!(
-            msg.contains("structured_metadata exceeds") && msg.contains("per-entry bound"),
-            "the decode error must name the per-entry bound: {msg:?}"
+        assert_eq!(
+            json_oversize(&body),
+            ("structured_metadata", MAX_STRUCTURED_METADATA_PER_ENTRY + 1)
         );
     }
 
     #[test]
     fn parse_json_duplicate_structured_metadata_keys_cannot_evade_the_bound() {
-        // A duplicate-key object would collapse to ONE entry in a `BTreeMap`,
-        // evading the cardinality bound; counting RAW pairs during decode
-        // rejects it. 257 repetitions of one key abort at pair 257 with the same
-        // whole-request `LokiDecode` (the serde visitor's per-entry-bound custom
-        // error) the distinct-key case raises — asserted precisely so the test
-        // names what it checks.
+        // Unlike a stream's `stream` map, structured metadata is NOT collapsed
+        // by the reference before it is counted: `unmarshalHTTPToLogProtoEntry`
+        // appends every pair to a slice (`pkg/loghttp/query.go:181-196 @
+        // v3.7.4`), so raw pairs are the right unit on both sides and a
+        // duplicate-key object cannot evade the bound. 257 repetitions of one
+        // key raise the same `OversizeMessage` the distinct-key case does.
         let mut obj = String::from("{");
-        for i in 0..=MAX_STRUCTURED_METADATA_PER_ENTRY {
+        for i in 0..MAX_STRUCTURED_METADATA_PER_ENTRY + 8 {
             if i > 0 {
                 obj.push(',');
             }
@@ -3770,13 +4153,9 @@ mod tests {
         let body = format!(
             r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{obj}]]}}]}}"#
         );
-        let err = parse_json(body.as_bytes(), 0).unwrap_err();
-        let LogsIngestError::LokiDecode(msg) = err else {
-            panic!("expected LokiDecode, got {err:?}");
-        };
-        assert!(
-            msg.contains("structured_metadata exceeds") && msg.contains("per-entry bound"),
-            "the decode error must name the per-entry bound: {msg:?}"
+        assert_eq!(
+            json_oversize(&body),
+            ("structured_metadata", MAX_STRUCTURED_METADATA_PER_ENTRY + 1)
         );
     }
 

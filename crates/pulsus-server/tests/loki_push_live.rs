@@ -1812,3 +1812,162 @@ async fn a_case_variant_streams_key_is_accepted_and_its_lines_are_stored() {
         "the superseded occurrence stores nothing"
     );
 }
+
+/// Issue #374 review round 11: last-wins resolves BEFORE any of our structural
+/// caps is charged, so a superseded occurrence that breaks one cannot refuse
+/// the request.
+///
+/// The reference never inspects a discarded value — its one-field envelope
+/// decoder re-runs the field decoder per occurrence
+/// (`reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`) and a stream
+/// object's hand-written switch re-runs per key (`pkg/loghttp/query.go:99-121 @
+/// v3.7.4`) — so `204` with the LAST occurrence's line stored is the whole
+/// answer. Measured on `grafana/loki@sha256:87f0a067…` for all three shapes
+/// below; each was `400` here before this change.
+///
+/// Live, and read back, because this is the same trap the case-folding bug fell
+/// into: a status assertion alone passes on "accepted and silently dropped".
+/// Each shape therefore asserts the final line queryable, the superseded
+/// stream's own labels absent, and — the discriminating half — the SAME value
+/// placed last still refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_over_cap_value_is_accepted_and_the_final_one_is_stored() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_161;
+    let db = "pulsus_loki_push_superseded_caps_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    // 257 distinct labels: one past MAX_LABELS_PER_STREAM. `sup_label` marks the
+    // stream so its absence is queryable rather than merely uncounted.
+    let over_labels = {
+        let mut m = String::from(r#"{"service_name":"sup-374-labels""#);
+        for i in 0..257 {
+            m.push_str(&format!(r#","k{i}":"v""#));
+        }
+        m.push('}');
+        m
+    };
+    // 100_001 entries: one past MAX_ENTRIES_PER_STREAM, the reviewer's probe.
+    let over_values = {
+        let mut v = String::with_capacity(3_000_000);
+        v.push('[');
+        for i in 0..100_001 {
+            if i > 0 {
+                v.push(',');
+            }
+            v.push_str(&format!(r#"["{base_ns}","sup line"]"#));
+        }
+        v.push(']');
+        v
+    };
+    let win = |service: &str| {
+        format!(r#"{{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","FINAL"]]}}"#)
+    };
+
+    let cases: [(&str, String, String, &str); 3] = [
+        (
+            // A superseded `streams` occurrence whose stream is over the label
+            // cap, under a case-folded spelling of the same key.
+            "streams / label count",
+            format!(
+                r#"{{"streams":[{{"stream":{over_labels},"values":[["{base_ns}","sup line"]]}}],"StReAmS":[{}]}}"#,
+                win("win-374-a")
+            ),
+            format!(
+                r#"{{"StReAmS":[{}],"streams":[{{"stream":{over_labels},"values":[["{base_ns}","sup line"]]}}]}}"#,
+                win("win-374-a")
+            ),
+            "win-374-a",
+        ),
+        (
+            // A superseded `stream` key inside one stream object.
+            "stream / label count",
+            format!(
+                r#"{{"streams":[{{"stream":{over_labels},"stream":{{"service_name":"win-374-b"}},"values":[["{base_ns}","FINAL"]]}}]}}"#
+            ),
+            format!(
+                r#"{{"streams":[{{"stream":{{"service_name":"win-374-b"}},"stream":{over_labels},"values":[["{base_ns}","FINAL"]]}}]}}"#
+            ),
+            "win-374-b",
+        ),
+        (
+            // A superseded `values` key carrying 100_001 entries.
+            "values / entries cap",
+            format!(
+                r#"{{"streams":[{{"stream":{{"service_name":"win-374-c"}},"values":{over_values},"values":[["{base_ns}","FINAL"]]}}]}}"#
+            ),
+            format!(
+                r#"{{"streams":[{{"stream":{{"service_name":"win-374-c"}},"values":[["{base_ns}","FINAL"]],"values":{over_values}}}]}}"#
+            ),
+            "win-374-c",
+        ),
+    ];
+
+    for (case, superseded, surviving, service) in &cases {
+        let res = push(port, "application/json", superseded.as_bytes());
+        assert_eq!(
+            res.status, 204,
+            "{case}: superseded over-cap value still decided it (body {})",
+            res.body
+        );
+        let lines = wait_for_line(port, service, base_ns, "FINAL");
+        assert!(
+            lines.contains(&"FINAL".to_string()) && !lines.contains(&"sup line".to_string()),
+            "{case}: only the final occurrence's line is stored, got {lines:?}"
+        );
+
+        // The same value LAST is still refused — without this half, deleting
+        // the cap outright would pass.
+        let res = push(port, "application/json", surviving.as_bytes());
+        assert_eq!(
+            res.status, 400,
+            "{case}: the SURVIVING over-cap value was admitted (body {})",
+            res.body
+        );
+    }
+
+    // Storage, not statuses: three winning streams, and nothing from any
+    // superseded or refused occurrence.
+    assert_eq!(
+        wait_for_count(
+            db,
+            "SELECT count() AS c FROM log_streams WHERE service LIKE 'win-374-%'",
+            3,
+        )
+        .await,
+        3,
+        "each case registers exactly its winning stream"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_streams WHERE service = 'sup-374-labels'",
+        )
+        .await,
+        0,
+        "the superseded stream is never registered"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_samples WHERE body = 'sup line'"
+        )
+        .await,
+        0,
+        "no superseded line is stored"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_samples WHERE body = 'FINAL'"
+        )
+        .await,
+        3,
+        "exactly the three final lines are stored"
+    );
+}

@@ -359,6 +359,111 @@ case("json/case-variant-value-2049", "json",
      ('{"Streams":[{"stream":{"app":"' + B1 + '"},"values":[["' + TS
       + '","x"]]}]}').encode(), "application/json")
 
+# ---- last-wins resolves BEFORE any structural cap is charged --------------
+# Round 11.  The reference never inspects a superseded value, so a cap-breaking
+# first occurrence followed by a valid last one is 204 there and the last one's
+# line is stored.  Charging our decode-time caps where they trip answered 400.
+#
+# This is the ENUMERATION, not a sample: three resolution points (the envelope
+# `streams` key, a stream object's `stream` key, its `values` key) crossed with
+# every per-occurrence cap reachable inside each.
+#
+# `-survives` is the discriminating neighbour -- the same over-cap value placed
+# LAST, which must still be refused, so that deleting a cap outright cannot pass
+# the superseded half.  It is only here for the caps whose surviving answer
+# upstream is about labels: with 100,001 entries or 1,000,001 streams surviving,
+# Loki answers 500 from its ingester's 4 MiB gRPC message limit and PulsusDB
+# answers 400, which says nothing about the cap.  Those two neighbours are
+# asserted precisely, on the error itself, by
+# `loki_push::tests::parse_json_a_superseded_over_cap_value_does_not_decide_the_request`
+# (every row of this enumeration, both directions) and, on stored state, by
+# `loki_push_live::a_superseded_over_cap_value_is_accepted_and_the_final_one_is_stored`.
+#
+# The two SHARED counters are deliberately absent: MAX_TOTAL_ENTRIES_PER_REQUEST
+# and MAX_DECODED_BYTES measure what the whole request has already materialized
+# and stay immediately fatal, so a superseded occurrence past them IS a
+# divergence -- `json/superseded-shared-budget` below, expect="DIFF".
+_final = '[["' + TS + '","FINAL"]]'
+_win = '{"stream":{"app":"w"},"values":' + _final + '}'
+_over_values = "[" + ",".join('["' + TS + '","x"]' for _ in range(100_001)) + "]"
+_over_labels = "{" + ",".join('"k%d":"v"' % i for i in range(257)) + "}"
+_over_raw = "{" + ",".join('"dup":"v"' for _ in range(65_537)) + "}"
+_over_sm = '[["' + TS + '","x",{' + ",".join('"m%d":"v"' % i for i in range(257)) + "}]]"
+_over_streams = "[" + ",".join("{}" for _ in range(1_000_001)) + "]"
+
+
+def superseded(name, body, survives=None):
+    case("json/superseded-" + name, "json", body.encode(), "application/json")
+    if survives:
+        case("json/superseded-" + name + "-survives", "json", survives.encode(),
+             "application/json")
+
+
+superseded("streams-entries",
+           '{"streams":[{"stream":{"app":"s"},"values":%s}],"StReAmS":[%s]}'
+           % (_over_values, _win))
+superseded("streams-label-count",
+           '{"streams":[{"stream":%s,"values":%s}],"Streams":[%s]}'
+           % (_over_labels, _final, _win),
+           '{"Streams":[%s],"streams":[{"stream":%s,"values":%s}]}'
+           % (_win, _over_labels, _final))
+# No `-survives` twin: 65,537 raw pairs LAST is the ledgered raw-pair
+# divergence, measured on its own as json/duplicate-key-65537-raw below.
+superseded("streams-raw-pairs",
+           '{"streams":[{"stream":%s,"values":%s}],"Streams":[%s]}'
+           % (_over_raw, _final, _win))
+superseded("streams-structured-metadata",
+           '{"streams":[{"stream":{"app":"s"},"values":%s}],"Streams":[%s]}' % (_over_sm, _win),
+           '{"Streams":[%s],"streams":[{"stream":{"app":"s"},"values":%s}]}' % (_win, _over_sm))
+superseded("streams-stream-count",
+           '{"streams":%s,"Streams":[%s]}' % (_over_streams, _win))
+superseded("stream-label-count",
+           '{"streams":[{"stream":%s,"stream":{"app":"w"},"values":%s}]}'
+           % (_over_labels, _final),
+           '{"streams":[{"stream":{"app":"w"},"stream":%s,"values":%s}]}'
+           % (_over_labels, _final))
+superseded("stream-raw-pairs",
+           '{"streams":[{"stream":%s,"stream":{"app":"w"},"values":%s}]}'
+           % (_over_raw, _final))
+superseded("values-entries",
+           '{"streams":[{"stream":{"app":"w"},"values":%s,"values":%s}]}'
+           % (_over_values, _final))
+superseded("values-structured-metadata",
+           '{"streams":[{"stream":{"app":"w"},"values":%s,"values":%s}]}' % (_over_sm, _final),
+           '{"streams":[{"stream":{"app":"w"},"values":%s,"values":%s}]}' % (_final, _over_sm))
+
+# The fourth resolution point: duplicate keys collapse INSIDE one `stream` map
+# (`LabelSet.UnmarshalJSON` assigns into a map[string]string,
+# `pkg/loghttp/labels.go:25-40 @ v3.7.4`, and has no count bound of its own), so
+# 257 repetitions of one key are ONE label upstream.
+case("json/duplicate-key-257-collapses", "json",
+     ('{"streams":[{"stream":{'
+      + ",".join('"dup":"v%d"' % i for i in range(257))
+      + ',"app":"w"},"values":' + _final + "}]}").encode(), "application/json")
+# ...but the RAW-pair guard is not evaded by repeating a key, and that guard is
+# the ledgered divergence (65,537 raw pairs, one label: 204 there, 400 here) --
+# the same row as json/65537-raw-empty-keys, reached by the other spelling.
+case("json/duplicate-key-65537-raw", "json",
+     ('{"streams":[{"stream":{'
+      + ",".join('"dup":"v"' for _ in range(65_537))
+      + ',"app":"w"},"values":' + _final + "}]}").encode(), "application/json",
+     expect="DIFF")
+# The one residual in this family, measured rather than reasoned: 38 superseded
+# streams of 100k minimal entries (34 MB, inside BOTH sides' body limits) puts
+# the SHARED byte budget past 256 MiB before the surviving occurrence is even
+# read.  Upstream's only bound on this path is the 100 MiB compressed body
+# (`distributor.max-recv-msg-size`, distributor.go:124, applied by
+# io.LimitReader in parsePushRequestBody, push.go:322-325 @ v3.7.4), so it
+# answers 204 and stores FINAL.  A control at 30 streams agrees 204/204.
+_bulk = ('{"stream":{"a":"b"},"values":['
+         + ",".join('["1",""]' for _ in range(100_000)) + "]}")
+case("json/superseded-shared-budget", "json",
+     ('{"streams":[' + ",".join(_bulk for _ in range(38)) + '],"Streams":[' + _win + "]}").encode(),
+     "application/json", expect="DIFF")
+case("json/superseded-shared-budget-under", "json",
+     ('{"streams":[' + ",".join(_bulk for _ in range(30)) + '],"Streams":[' + _win + "]}").encode(),
+     "application/json")
+
 # ---- Loki push, protobuf -------------------------------------------------
 def pb(labels, line="hi"):
     return push_request([(labels, [(int(TS), line)])])
