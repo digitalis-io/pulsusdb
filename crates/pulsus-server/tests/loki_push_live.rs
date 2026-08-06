@@ -941,6 +941,97 @@ async fn empty_valued_structured_metadata_is_never_stored() {
     }
 }
 
+/// Issue #259: an inadmissible structured-metadata NAME is refused at the
+/// wire on both push encodings, and nothing is stored for it.
+///
+/// Measured against `grafana/loki:3.7.4` (image ID `fe5a84aafad8`, index
+/// digest `sha256:87f0a067…`, git revision `b318f282`) with the same four
+/// bodies: it refuses all four too, with the same message text. The STATUS is
+/// a deliberate divergence — it answers `500` here and `400` for the identical
+/// condition on its own OTLP receiver; docs/api.md §8.2 has the reasoning.
+/// Before this change every one of these four was a `204` that stored a row.
+#[tokio::test(flavor = "multi_thread")]
+async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_stored() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_158;
+    let db = "pulsus_loki_push_sm_name_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "sm-name";
+
+    for (offset, content_type, sm, expected) in [
+        // The empty name — the first rejection condition — on both encodings.
+        (0i64, "application/json", ("", ""), "label name is empty"),
+        (1, "application/x-protobuf", ("", ""), "label name is empty"),
+        // The second condition: whitespace is not "empty", it sanitizes to
+        // `_`. Its empty VALUE does not rescue it — the name is checked
+        // first, so this is a reject rather than a silent strip.
+        (
+            2,
+            "application/json",
+            (" ", ""),
+            r#"normalization for label name " " resulted in invalid name "_""#,
+        ),
+        (
+            3,
+            "application/x-protobuf",
+            ("_", "v"),
+            r#"normalization for label name "_" resulted in invalid name "_""#,
+        ),
+    ] {
+        let line = format!("sm name case {offset}");
+        let ts = base_ns + offset;
+        let res = if content_type == "application/json" {
+            push(
+                port,
+                content_type,
+                json_body_with_sm(service, ts, &line, &[sm]).as_bytes(),
+            )
+        } else {
+            push(
+                port,
+                content_type,
+                &protobuf_body_with_sm(service, ts, &line, &[sm]),
+            )
+        };
+        assert_eq!(
+            res.status, 400,
+            "case {offset} ({content_type}): {}",
+            res.body
+        );
+        assert_eq!(res.body.trim(), expected, "case {offset} ({content_type})");
+    }
+
+    // An admissible name pushed afterwards proves the receiver is still
+    // healthy and gives the stored-row query something to find, so "no rows
+    // for the rejected bodies" is a real absence rather than a dead server.
+    let ok_line = "sm name admissible";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm(service, base_ns + 4, ok_line, &[("a.b", "v")]).as_bytes(),
+    );
+    assert_eq!(res.status, 204, "admissible SM name push: {}", res.body);
+
+    let client = ch_client(db).await;
+    let stored = stored_samples_by_body(&client, db, service, 1).await;
+    assert_eq!(
+        stored.len(),
+        1,
+        "only the admissible push may be stored, found: {:?}",
+        stored.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stored[ok_line].structured_metadata, r#"{"a_b":"v"}"#,
+        "an admissible dotted name is canonicalized, not rejected"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_valued_stream_labels_are_never_stored_and_merge_the_stream() {
     if !should_run() {

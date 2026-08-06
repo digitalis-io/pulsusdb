@@ -22,6 +22,7 @@ use pulsus_model::{
 };
 
 use crate::error::LogsIngestError;
+use crate::protocols::label_name::validate_label_names;
 use crate::protocols::loki_push::structured_metadata_json;
 
 /// A `SeverityNumber` outside this range (including the `0`/unset default)
@@ -154,13 +155,13 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
             // (resource attributes ONLY — scope is structured metadata, not
             // a stream label; issue #109), reused across every record in it —
             // never re-derived per record.
-            let (labels, collisions) = build_stream_labels(resource_logs.resource.as_ref());
+            let (labels, collisions) = build_stream_labels(resource_logs.resource.as_ref())?;
             out.collisions += collisions as u64;
             let fingerprint = stream_fingerprint(&labels);
             let service = labels.service().to_string();
             // The scope's per-entry structured metadata, computed once per
             // ScopeLogs and cloned onto every record it contains.
-            let structured_metadata = build_scope_structured_metadata(scope_logs);
+            let structured_metadata = build_scope_structured_metadata(scope_logs)?;
 
             for record in &scope_logs.log_records {
                 let timestamp_ns = match resolve_timestamp_ns(record, now_ns) {
@@ -272,11 +273,11 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
 /// `from_normalized` to resolve exactly as it did before #259. By-name would
 /// NOT have been neutral — it would drop both twins and change a case the
 /// reference keeps.
-fn build_stream_labels(resource: Option<&Resource>) -> (LabelSet, usize) {
+fn build_stream_labels(resource: Option<&Resource>) -> Result<(LabelSet, usize), LogsIngestError> {
     let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    let mut pairs: Vec<(String, String)> = attr_pairs(resource_attrs).collect();
+    let mut pairs = attr_pairs(resource_attrs)?;
     retain_non_empty_values(&mut pairs);
-    LabelSet::from_normalized(pairs)
+    Ok(LabelSet::from_normalized(pairs))
 }
 
 /// Builds the per-entry structured-metadata JSON String carrying a log
@@ -319,14 +320,15 @@ fn build_stream_labels(resource: Option<&Resource>) -> (LabelSet, usize) {
 /// post-resolution pairs are unique canonicalize fixed points — the seam then
 /// re-canonicalizes idempotently, finds no collision, and only sorts +
 /// JSON-encodes (byte-identical to the Loki-push SM representation).
-fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> String {
+fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, LogsIngestError> {
     let Some(scope) = scope_logs.scope.as_ref() else {
-        return String::new();
+        return Ok(String::new());
     };
     // Ordered (sanitized_key, value): attributes in wire order, then identity
     // appended last so it overwrites any colliding attribute (rule (a)); each
     // identity field empty-suppressed (#108).
-    let mut ordered: Vec<(String, String)> = attr_pairs(&scope.attributes)
+    let mut ordered: Vec<(String, String)> = attr_pairs(&scope.attributes)?
+        .into_iter()
         .map(|(key, value)| (canonicalize_label_key(&key), value))
         .collect();
     if !scope.name.is_empty() {
@@ -364,7 +366,7 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> String {
             resolved.push((key, value));
         }
     }
-    structured_metadata_json(resolved)
+    Ok(structured_metadata_json(resolved))
 }
 
 /// Renders a `KeyValue` list to `(key, value)` label pairs, using the same
@@ -372,10 +374,25 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> String {
 /// ([`any_value_to_string`]) for the value side — label values are always
 /// strings, so a non-string attribute (bool/int/double/array/kvlist/bytes)
 /// renders the same way a non-string body would.
-fn attr_pairs(attrs: &[KeyValue]) -> impl Iterator<Item = (String, String)> + '_ {
-    attrs
+/// Every RAW attribute key is validated first
+/// ([`validate_label_name`](crate::protocols::label_name::validate_label_name),
+/// issue #259), so this is the structural mirror of the reference's
+/// `attributeToLabels` — the one function on its OTLP path that runs
+/// `LabelNamer.Build` over every resource, scope and record attribute key
+/// alike (`pkg/loghttp/push/otlp.go:603-614 @ v3.7.4`). A rejected key is a
+/// whole-request 400, which is exactly what the reference answers there
+/// (measured: an empty resource, scope or record attribute key returns
+/// `400 symbolizer lookup: label name is empty` on `grafana/loki:3.7.4`).
+/// Validating HERE rather than at the two call sites keeps that one-function
+/// correspondence, and puts the check ahead of both the pair-wise stream-label
+/// strip and the by-name structured-metadata strip.
+fn attr_pairs(attrs: &[KeyValue]) -> Result<Vec<(String, String)>, LogsIngestError> {
+    // Borrowed pass first: a rejected key costs no clone.
+    validate_label_names(attrs.iter().map(|kv| kv.key.as_str()))?;
+    Ok(attrs
         .iter()
         .map(|kv| (kv.key.clone(), any_value_to_string(kv.value.as_ref())))
+        .collect())
 }
 
 /// Resolves a log record's `timestamp_ns`: `time_unix_nano` if non-zero,
@@ -539,6 +556,18 @@ mod tests {
         }
     }
 
+    /// The attribute-key check (issue #259) made `build_stream_labels`
+    /// fallible. Every caller of this shim uses admissible keys; the
+    /// dedicated rejection tests call `super::parse` and observe the `Err`.
+    fn stream_labels(attributes: Vec<KeyValue>) -> (LabelSet, usize) {
+        build_stream_labels(Some(&Resource {
+            attributes,
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }))
+        .expect("test resource attribute keys are admissible")
+    }
+
     fn string_body(s: &str) -> Option<AnyValue> {
         Some(AnyValue {
             value: Some(Value::StringValue(s.to_string())),
@@ -646,6 +675,110 @@ mod tests {
             attributes,
             dropped_attributes_count: 0,
         }
+    }
+
+    /// Runs `super::parse` over one record carrying the given resource and
+    /// scope attributes, returning the whole-request rejection message.
+    fn attribute_reject_message(
+        resource_attrs: Vec<KeyValue>,
+        scope_attrs: Vec<KeyValue>,
+    ) -> String {
+        let request = request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: resource_attrs,
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(scope("N", "1.0", scope_attrs)),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: string_body("x"),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }]);
+        match super::parse(&request, 0) {
+            Err(LogsIngestError::InvalidLabelName(message)) => message,
+            other => panic!("expected InvalidLabelName, got {other:?}"),
+        }
+    }
+
+    /// Issue #259: the OTLP receiver validates every RAW attribute key —
+    /// resource (stream labels) and scope (structured metadata) alike, since
+    /// both flow through `attr_pairs`, the structural mirror of the
+    /// reference's `attributeToLabels` (`pkg/loghttp/push/otlp.go:603-614 @
+    /// v3.7.4`, the one function on its OTLP path that runs `LabelNamer.Build`
+    /// over every attribute key).
+    ///
+    /// Measured on `grafana/loki:3.7.4`, OTLP/JSON to `/otlp/v1/logs`: an
+    /// empty resource, scope OR record attribute key returns
+    /// `400 symbolizer lookup: label name is empty`; a `" "` or `"_"` key
+    /// returns the normalization message. Before this change every one of
+    /// those bodies was a `200` here.
+    #[test]
+    fn an_inadmissible_otlp_attribute_key_rejects_the_whole_request() {
+        let empty = kv("", Value::StringValue("v".to_string()));
+        assert_eq!(
+            attribute_reject_message(vec![empty.clone()], vec![]),
+            "label name is empty"
+        );
+        assert_eq!(
+            attribute_reject_message(vec![], vec![empty]),
+            "label name is empty"
+        );
+        // An empty VALUE does not rescue an inadmissible name: the key check
+        // runs ahead of both strips.
+        assert_eq!(
+            attribute_reject_message(vec![], vec![kv("", Value::StringValue(String::new()))]),
+            "label name is empty"
+        );
+        assert_eq!(
+            attribute_reject_message(vec![kv(" ", Value::StringValue("v".to_string()))], vec![]),
+            r#"normalization for label name " " resulted in invalid name "_""#
+        );
+        assert_eq!(
+            attribute_reject_message(vec![], vec![kv("_", Value::StringValue("v".to_string()))]),
+            r#"normalization for label name "_" resulted in invalid name "_""#
+        );
+    }
+
+    /// The accept half of the same seam: a dotted OTLP attribute key is what
+    /// this receiver exists to carry, so it must stay a 200 on both sides.
+    #[test]
+    fn an_admissible_otlp_attribute_key_is_still_accepted_on_both_sides() {
+        let request = request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv("k8s.pod.name", Value::StringValue("pod-1".to_string()))],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(scope(
+                    "N",
+                    "",
+                    vec![kv("http.method", Value::StringValue("GET".to_string()))],
+                )),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: string_body("x"),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }]);
+        let out = super::parse(&request, 0).expect("admissible attribute keys");
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            r#"{"http_method":"GET","scope_name":"N"}"#
+        );
+        assert_eq!(
+            out.streams[0].labels.to_canonical_json(),
+            r#"{"k8s_pod_name":"pod-1"}"#
+        );
     }
 
     #[test]
@@ -929,22 +1062,14 @@ mod tests {
         // measured on `grafana/loki:3.7.4` with `deployment.environment`, one
         // of the attributes its default config actually promotes to an index
         // label.
-        let with_empty = build_stream_labels(Some(&Resource {
-            attributes: vec![
-                kv("service.name", Value::StringValue("checkout".to_string())),
-                kv("region", Value::StringValue(String::new())),
-            ],
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        }));
-        let without = build_stream_labels(Some(&Resource {
-            attributes: vec![kv(
-                "service.name",
-                Value::StringValue("checkout".to_string()),
-            )],
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        }));
+        let with_empty = stream_labels(vec![
+            kv("service.name", Value::StringValue("checkout".to_string())),
+            kv("region", Value::StringValue(String::new())),
+        ]);
+        let without = stream_labels(vec![kv(
+            "service.name",
+            Value::StringValue("checkout".to_string()),
+        )]);
         assert_eq!(
             with_empty.0.to_canonical_json(),
             r#"{"service_name":"checkout"}"#
@@ -956,14 +1081,10 @@ mod tests {
         );
 
         // Whitespace is not empty: it stays, and it changes the fingerprint.
-        let whitespace = build_stream_labels(Some(&Resource {
-            attributes: vec![
-                kv("service.name", Value::StringValue("checkout".to_string())),
-                kv("region", Value::StringValue(" ".to_string())),
-            ],
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        }));
+        let whitespace = stream_labels(vec![
+            kv("service.name", Value::StringValue("checkout".to_string())),
+            kv("region", Value::StringValue(" ".to_string())),
+        ]);
         assert_eq!(
             whitespace.0.to_canonical_json(),
             r#"{"region":" ","service_name":"checkout"}"#
@@ -992,11 +1113,7 @@ mod tests {
                 kv("region", Value::StringValue(String::new())),
             ],
         ] {
-            let (labels, _) = build_stream_labels(Some(&Resource {
-                attributes: attrs,
-                dropped_attributes_count: 0,
-                entity_refs: vec![],
-            }));
+            let (labels, _) = stream_labels(attrs);
             assert_eq!(labels.to_canonical_json(), r#"{"region":"eu"}"#);
         }
     }

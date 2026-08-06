@@ -53,6 +53,7 @@ use pulsus_model::{
 };
 
 use crate::error::LogsIngestError;
+use crate::protocols::label_name::validate_label_names;
 use crate::protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow};
 use crate::protocols::otlp_prescan::MAX_DECODED_BYTES;
 
@@ -741,12 +742,25 @@ pub(crate) fn structured_metadata_json(
 /// byte budget (`byte_count`, computed by the caller with `.len()` on borrowed
 /// strings, so the reject path performs zero clones) — an entry breaching
 /// either is a whole-request [`LogsIngestError::OversizeMessage`] (Loki is
-/// all-or-nothing), never a silent truncation — then delegates to the shared
-/// [`structured_metadata_json`] core (where the clone/escape happens, past both
-/// checks).
-fn canonical_structured_metadata(
+/// all-or-nothing), never a silent truncation — then validates every RAW name
+/// ([`validate_label_name`](crate::protocols::label_name::validate_label_name),
+/// issue #259) and only then delegates to the shared
+/// [`structured_metadata_json`] core (where the clone/escape happens, past all
+/// three checks).
+///
+/// `names` borrows the same pairs `pairs` clones from, so the whole reject
+/// path — caps and names alike — allocates nothing. The name check is placed
+/// AFTER the caps because the reference orders it that way: `ValidateEntry`
+/// (which carries its structured-metadata count/size limits) runs at
+/// `pkg/distributor/distributor.go:690 @ v3.7.4`, the `labelNamer.Build` loop
+/// at `:702-706`, so an entry breaching both reports the limit. It is placed
+/// BEFORE [`structured_metadata_json`] because that is where the empty-VALUE
+/// strip lives, and the reference validates the raw name first — measured, a
+/// pair with name `" "` and value `""` is rejected, not stripped.
+fn canonical_structured_metadata<'a>(
     pair_count: usize,
     byte_count: usize,
+    names: impl IntoIterator<Item = &'a str>,
     pairs: impl IntoIterator<Item = (String, String)>,
 ) -> Result<String, LogsIngestError> {
     if pair_count == 0 {
@@ -766,6 +780,7 @@ fn canonical_structured_metadata(
             actual: byte_count,
         });
     }
+    validate_label_names(names)?;
     Ok(structured_metadata_json(pairs))
 }
 
@@ -869,6 +884,7 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
             let structured_metadata = canonical_structured_metadata(
                 sm.len(),
                 byte_count,
+                sm.iter().map(|p| p.name.as_str()),
                 sm.iter().map(|p| (p.name.clone(), p.value.clone())),
             )?;
             Ok((timestamp_ns, entry.line.clone(), structured_metadata))
@@ -972,6 +988,7 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
             let structured_metadata = canonical_structured_metadata(
                 sm.len(),
                 byte_count,
+                sm.iter().map(|(k, _)| k.as_str()),
                 sm.iter().map(|(k, v)| (k.clone(), v.clone())),
             )?;
             Ok((timestamp_ns, entry.line.clone(), structured_metadata))
@@ -2813,6 +2830,145 @@ mod tests {
             "values":[["1700000000000000000","hello",{"a":"","a":"keep"}]]}]}"#;
         let out = parse_json(dup, 0).unwrap();
         assert_eq!(out.rows[0].structured_metadata, "");
+    }
+
+    /// Builds a one-entry protobuf push carrying exactly `sm`.
+    fn sm_request(sm: Vec<LabelPairAdapter>) -> PushRequest {
+        PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry_with_sm(1_700_000_000, "hello", sm)],
+            }],
+        }
+    }
+
+    fn sm_reject_message(err: LogsIngestError) -> String {
+        match err {
+            LogsIngestError::InvalidLabelName(message) => message,
+            other => panic!("expected InvalidLabelName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_structured_metadata_name_is_rejected_on_both_transports() {
+        // Measured on `grafana/loki:3.7.4`: this body is rejected, with the
+        // body text asserted below, on BOTH push encodings — it does not
+        // reach the empty-value strip. Before issue #259 closed this, both
+        // transports answered 204 and stored the entry with no metadata.
+        let pb = sm_reject_message(
+            parse_protobuf(&sm_request(vec![label_pair("", "")]), 0).unwrap_err(),
+        );
+        assert_eq!(pb, "label name is empty");
+
+        let json = br#"{"streams":[{"stream":{"service_name":"checkout"},
+            "values":[["1700000000000000000","hello",{"":""}]]}]}"#;
+        assert_eq!(sm_reject_message(parse_json(json, 0).unwrap_err()), pb);
+
+        // A non-empty value, and a good pair alongside, change nothing: the
+        // reject is whole-request (the reference has no partial-success
+        // channel on this path).
+        assert_eq!(
+            sm_reject_message(
+                parse_protobuf(
+                    &sm_request(vec![label_pair("", "v"), label_pair("ok", "1")]),
+                    0
+                )
+                .unwrap_err()
+            ),
+            pb
+        );
+        let json_mixed = br#"{"streams":[{"stream":{"service_name":"checkout"},
+            "values":[["1700000000000000000","hello",{"":"v","ok":"1"}]]}]}"#;
+        assert_eq!(
+            sm_reject_message(parse_json(json_mixed, 0).unwrap_err()),
+            pb
+        );
+    }
+
+    #[test]
+    fn a_structured_metadata_name_that_sanitizes_to_underscores_is_rejected_on_both_transports() {
+        // The SECOND rejection condition, reported with different text —
+        // whitespace-only is NOT "empty" (nothing is trimmed anywhere), it
+        // sanitizes to `_`. Measured on both push encodings.
+        let expected = r#"normalization for label name " " resulted in invalid name "_""#;
+        assert_eq!(
+            sm_reject_message(
+                parse_protobuf(&sm_request(vec![label_pair(" ", "v")]), 0).unwrap_err()
+            ),
+            expected
+        );
+        let json = br#"{"streams":[{"stream":{"service_name":"checkout"},
+            "values":[["1700000000000000000","hello",{" ":"v"}]]}]}"#;
+        assert_eq!(
+            sm_reject_message(parse_json(json, 0).unwrap_err()),
+            expected
+        );
+
+        assert_eq!(
+            sm_reject_message(
+                parse_protobuf(&sm_request(vec![label_pair("_", "v")]), 0).unwrap_err()
+            ),
+            r#"normalization for label name "_" resulted in invalid name "_""#
+        );
+    }
+
+    #[test]
+    fn a_structured_metadata_name_is_validated_before_the_empty_value_strip() {
+        // The discriminating ORDER case, and the reason the check cannot live
+        // inside `structured_metadata_json`: name `" "` with value `""` would
+        // be stripped to nothing — and a stripped set is stored as `""`, a
+        // 204 — if the strip ran first. Measured on `grafana/loki:3.7.4`: the
+        // same body is rejected on all three seams.
+        assert_eq!(
+            sm_reject_message(
+                parse_protobuf(&sm_request(vec![label_pair(" ", "")]), 0).unwrap_err()
+            ),
+            r#"normalization for label name " " resulted in invalid name "_""#
+        );
+        assert_eq!(
+            sm_reject_message(
+                parse_protobuf(&sm_request(vec![label_pair("", "")]), 0).unwrap_err()
+            ),
+            "label name is empty"
+        );
+    }
+
+    #[test]
+    fn the_structured_metadata_caps_outrank_the_name_check() {
+        // Ordering pinned against the reference, which runs `ValidateEntry`
+        // (carrying the metadata limits) at `distributor.go:690 @ v3.7.4` and
+        // the `labelNamer.Build` loop only at `:702-706`. An entry breaching
+        // both reports the CAP.
+        let mut sm = vec![label_pair("", "v")];
+        sm.extend(
+            (0..=MAX_STRUCTURED_METADATA_PER_ENTRY).map(|i| label_pair(&format!("k{i}"), "v")),
+        );
+        assert!(matches!(
+            parse_protobuf(&sm_request(sm), 0).unwrap_err(),
+            LogsIngestError::OversizeMessage {
+                field: "structured_metadata",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_structured_metadata_name_the_reference_admits_is_still_stored_canonicalized() {
+        // The accept half: a dotted OTLP-style name is sanitized, not
+        // rejected — `a.b` stores as `a_b` here and on the reference
+        // (measured, read back with `categorize-labels`).
+        let out = parse_protobuf(&sm_request(vec![label_pair("a.b", "v")]), 0).unwrap();
+        assert_eq!(out.rows[0].structured_metadata, r#"{"a_b":"v"}"#);
+        // A leading underscore and a dunder-wrapped name are admitted too.
+        let out = parse_protobuf(
+            &sm_request(vec![label_pair("_x", "1"), label_pair("__foo__", "2")]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            r#"{"__foo__":"2","_x":"1"}"#
+        );
     }
 
     #[test]

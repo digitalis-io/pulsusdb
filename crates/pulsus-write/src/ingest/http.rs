@@ -649,6 +649,11 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::OversizeBody { .. }
         | LogsIngestError::OversizeMessage { .. }
         | LogsIngestError::LokiDecode(_)
+        // 400 on BOTH transports, which is what the reference answers on its
+        // OTLP receiver and a deliberate divergence from the `500` its
+        // Loki-push receiver answers for the identical input (issue #259) —
+        // the rationale, with the reference line numbers, is on the variant.
+        | LogsIngestError::InvalidLabelName(_)
         | LogsIngestError::ZipkinDecode(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
@@ -1117,6 +1122,48 @@ mod tests {
         let res = post_body(router(sink.clone()), request_body_of_len(target_len), &[]).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    /// Issue #259, OTLP half: an inadmissible resource-attribute key is a
+    /// `400` / `code = 3` here, which is what `grafana/loki:3.7.4` answers
+    /// for the same body on `/otlp/v1/logs` (measured: `400 symbolizer
+    /// lookup: label name is empty`). Nothing reaches the sink.
+    #[tokio::test]
+    async fn otlp_inadmissible_attribute_key_returns_400_with_status_code_3() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
+                    attributes: vec![opentelemetry_proto::tonic::common::v1::KeyValue {
+                        key: String::new(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue("v".to_string())),
+                        }),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("hello".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), request.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert_eq!(status.message, "label name is empty");
+        assert!(sink.admitted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2293,7 +2340,9 @@ mod tests {
     // (PulsusDB). Reuses `MockSink` (the `LogSink` double) and the
     // remote-write `snappy_compress`/`plain_text_body` helpers.
 
-    use crate::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
+    use crate::protocols::loki_push::{
+        EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter, Timestamp,
+    };
 
     fn valid_loki_protobuf_body() -> Vec<u8> {
         let req = PushRequest {
@@ -2460,6 +2509,62 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(!plain_text_body(res).await.is_empty());
         assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// Issue #259, at the WIRE rather than at `parse`: an inadmissible
+    /// structured-metadata name is a `400` whose body is the reference's
+    /// error text verbatim.
+    ///
+    /// This is a DELIBERATE, measured divergence in the status only.
+    /// `grafana/loki:3.7.4` answers `500 label name is empty` on this very
+    /// body (hand-encoded snappy/protobuf and JSON alike) because the error
+    /// escapes its validation closure carrying no gRPC status
+    /// (`pkg/distributor/distributor.go:703-706 @ v3.7.4` ->
+    /// `pkg/distributor/http.go:170-180`, the status-less `else` branch),
+    /// while answering `400 symbolizer lookup: label name is empty` for the
+    /// identical condition on its own OTLP receiver
+    /// (`pkg/loghttp/push/otlp.go:611-614`). We answer `400` on both: the
+    /// input is client-controlled and no retry can succeed, and `5xx` is the
+    /// class log agents retry. See `LogsIngestError::InvalidLabelName` and
+    /// docs/api.md §8.2.
+    #[tokio::test]
+    async fn loki_inadmissible_structured_metadata_name_is_400_on_both_encodings() {
+        for (body, content_type) in [
+            (
+                snappy_compress(
+                    &PushRequest {
+                        streams: vec![StreamAdapter {
+                            labels: r#"{a="b"}"#.to_string(),
+                            entries: vec![EntryAdapter {
+                                timestamp: Some(Timestamp {
+                                    seconds: 1_700_000_000,
+                                    nanos: 0,
+                                }),
+                                line: "hello".to_string(),
+                                structured_metadata: vec![LabelPairAdapter {
+                                    name: String::new(),
+                                    value: String::new(),
+                                }],
+                            }],
+                        }],
+                    }
+                    .encode_to_vec(),
+                ),
+                "application/x-protobuf",
+            ),
+            (
+                br#"{"streams":[{"stream":{"a":"b"},
+                    "values":[["1700000000000000000","hello",{"":""}]]}]}"#
+                    .to_vec(),
+                "application/json",
+            ),
+        ] {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = call_loki(&sink, body, &[("content-type", content_type)]).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{content_type}");
+            assert_eq!(plain_text_body(res).await, "label name is empty");
+            assert!(sink.admitted.lock().unwrap().is_empty(), "{content_type}");
+        }
     }
 
     #[tokio::test]

@@ -96,6 +96,43 @@ pub enum LogsIngestError {
     #[error("malformed Loki push request: {0}")]
     LokiDecode(String),
 
+    /// A label name that the reference's ingest path refuses to name a label
+    /// with at all (issue #259): an EMPTY structured-metadata / attribute
+    /// name, or one that sanitizes to nothing but underscores. Both come from
+    /// the single reference predicate
+    /// `otlptranslator.LabelNamer.Build`
+    /// (`vendor/github.com/prometheus/otlptranslator/label_namer.go:66-90 @
+    /// v3.7.4`); see
+    /// [`validate_label_name`](crate::protocols::label_name::validate_label_name)
+    /// for the rule and its two call sites in the reference.
+    ///
+    /// The payload is the reference's error text VERBATIM, and the variant
+    /// deliberately renders it with no envelope of our own, so the body a
+    /// client reads is byte-identical to the reference's for the same input.
+    ///
+    /// Whole-request 400-class failure — the reference has no partial-success
+    /// channel on either affected transport — so it joins [`classify`]'s 400
+    /// arm (`ingest/http.rs`). That is a DELIBERATE, measured divergence on
+    /// one of the two transports: the reference answers this same condition
+    /// `400` on its OTLP receiver (the error surfaces during request parsing,
+    /// `pkg/loghttp/push/otlp.go:611-614 @ v3.7.4` -> `pkg/distributor/http.go:88-98`)
+    /// but `500` on its Loki-push receiver, where the error escapes the
+    /// validation closure carrying no gRPC status
+    /// (`pkg/distributor/distributor.go:703-706 @ v3.7.4`) and falls into
+    /// `pushHandler`'s status-less `else` branch
+    /// (`pkg/distributor/http.go:170-180`). Every sibling failure in that same
+    /// loop is client-classified through `validationErrors` ->
+    /// `httpgrpc.Errorf(http.StatusBadRequest, ...)`, and the `return err` was
+    /// added mechanically when the upstream `Build` grew an `error` return
+    /// (Loki commit `09d831ea85`, "chore: upgrade Prometheus to
+    /// 208187eaa19b"). The input is entirely client-controlled and no retry
+    /// can succeed, while `5xx` is precisely the class log agents retry, so
+    /// PulsusDB answers `400` on both transports (docs/api.md §8.2).
+    ///
+    /// [`classify`]: crate::ingest::http
+    #[error("{0}")]
+    InvalidLabelName(String),
+
     /// A Zipkin v2 JSON span array (issue #75, `POST /api/v2/spans`) was not
     /// decodable into the span model: malformed JSON, or a span carrying a
     /// non-hex / wrong-length `traceId`/`id`/`parentId` or an
