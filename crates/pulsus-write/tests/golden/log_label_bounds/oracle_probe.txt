@@ -9,10 +9,17 @@ Subject: pulsusdb built from this branch, PULSUS_COMPAT_ENDPOINTS=1,
 
 Evidence for the `ingest-label-bounds` row in
 docs/benchmarks/logs-differential-ledger.md. A manual capture -- NOT run in
-CI; `compare.py` in this directory reproduces it, and exits non-zero if any
-case's verdict is not the one recorded here.
+CI.
 
-Reproduce:
+`compare.py` in this directory regenerates PART of this file: the case table,
+the summary line and the body dump -- everything from the `case ... expected`
+header line down to the `#### end of generated section ####` marker, which the
+script prints as its last line. That span is compare.py's stdout verbatim.
+THIS PREAMBLE AND THE `recorded divergences` NOTES AFTER THE MARKER ARE
+HAND-MAINTAINED: the script neither writes nor checks them. It does exit
+non-zero if any case's verdict is not the one recorded in the span.
+
+Reproduce (and check that the span still reproduces):
   podman run -d --rm --name pulsus-loki-374 -p 13174:3100 \
       docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc
   podman run -d --rm --name pulsus-ch-374 -p 19174:8123 \
@@ -20,9 +27,12 @@ Reproduce:
   PULSUS_HOST=127.0.0.1 PULSUS_PORT=18374 CLICKHOUSE_SERVER=localhost \
       CLICKHOUSE_HTTP_PORT=19174 CLICKHOUSE_DB=pulsus_374_final \
       PULSUS_COMPAT_ENDPOINTS=1 ./target/debug/pulsusdb &
-  python3 compare.py > oracle_probe.txt   # LOKI_PORT / PULSUS_PORT override
-                                          # the ports; keep this preamble and
-                                          # the trailing notes
+  python3 compare.py > fresh.txt          # LOKI_PORT / PULSUS_PORT override
+                                          # the ports
+  sed -n '/^case  /,/^#### end of generated/p' oracle_probe.txt \
+      | diff - fresh.txt                  # empty == the span reproduces
+  # To regenerate, splice fresh.txt over that span; do NOT redirect over the
+  # whole file, which would delete this preamble and the notes at the end.
 
   No config file: the image's built-in single-binary config leaves every
   limit at its default, which is the point -- the numbers below are the flag
@@ -55,8 +65,8 @@ and, out of live ClickHouse, by
 `loki_push_live::an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label`.
 
 Long runs of one alphanumeric are squashed as <cxN> = N repetitions of c
-(100 or more) -- by compare.py's own `trim`, so the redirect above
-reproduces these bodies rather than a hand-post-processed copy of them.
+(100 or more) -- by compare.py's own `trim`, so a fresh run reproduces these
+bodies rather than a hand-post-processed copy of them.
 Loki's plain-text bodies carry a trailing newline from Go's http.Error,
 shown as \n; OTLP bodies are google.rpc.Status protobufs, so the leading
 framing byte prints as a replacement character (Loki's carries only the
@@ -89,6 +99,7 @@ json/control-bytes-in-sibling-label                        400   400     SAME   
 json/entry-less-stream-over-wide                           204   204     SAME     SAME
 json/no-streams                                            422   422     SAME     SAME
 json/no-streams-key                                        422   422     SAME     SAME
+json/no-streams-unrelated-key                              422   422     SAME     SAME
 pb/duplicate-distinct                                      400   400     SAME     SAME
 pb/257-nonempty                                            400   400     SAME     SAME
 pb/duplicate-identical                                     400   400     SAME     SAME
@@ -120,6 +131,12 @@ otlp/empty-request                                         422   422     SAME   
 otlp/no-log-records                                        422   422     SAME     SAME
 otlp/no-scope-logs                                         422   422     SAME     SAME
 otlp/record-less-over-wide-resource+good                   204   200     SAME     SAME
+otlp/record-less-over-deep-attr                            422   400     DIFF     DIFF
+otlp/record-less-at-cap-attr                               422   422     SAME     SAME
+otlp/record-bearing-over-deep-attr                         204   400     DIFF     DIFF
+otlppb/record-less-over-deep-attr                          422   400     DIFF     DIFF
+otlppb/record-less-at-cap-attr                             422   422     SAME     SAME
+otlppb/record-bearing-over-deep-attr                       204   400     DIFF     DIFF
 otlp/raw/service.name/value-2049                           400   400     SAME     SAME
 otlp/canonical/service_name/value-2049                     204   200     SAME     SAME
 otlp/raw/service.namespace/value-2049                      400   400     SAME     SAME
@@ -173,7 +190,7 @@ otlp/index-key-map-value-long-nested-value                 400   400     SAME   
 otlp/index-key-int-value                                   204   200     SAME     SAME
 otlp/index-key-array-value-long                            400   400     SAME     SAME
 
-status agreement: 106/109 (3 recorded divergence(s): ['json/65537-raw-empty-keys', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
+status agreement: 109/116 (7 recorded divergence(s): ['json/65537-raw-empty-keys', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
 unexpected verdicts: []
 
 ====================================================================================================
@@ -255,6 +272,9 @@ bodies
     loki   422: error at least one valid stream is required for ingestion\n
     pulsus 422: error at least one valid stream is required for ingestion
 --- json/no-streams-key [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
+--- json/no-streams-unrelated-key [SAME]
     loki   422: error at least one valid stream is required for ingestion\n
     pulsus 422: error at least one valid stream is required for ingestion
 --- pb/duplicate-distinct [SAME]
@@ -350,6 +370,24 @@ bodies
 --- otlp/record-less-over-wide-resource+good [SAME]
     loki   204: 
     pulsus 200: 
+--- otlp/record-less-over-deep-attr [DIFF]
+    loki   422: 9error at least one valid stream is required for ingestion
+    pulsus 400: emalformed OTLP/JSON request body: AnyValue nesting depth exceeds the bound of 32 at line 1 column 866
+--- otlp/record-less-at-cap-attr [SAME]
+    loki   422: 9error at least one valid stream is required for ingestion
+    pulsus 422: 9error at least one valid stream is required for ingestion
+--- otlp/record-bearing-over-deep-attr [DIFF]
+    loki   204: 
+    pulsus 400: emalformed OTLP/JSON request body: AnyValue nesting depth exceeds the bound of 32 at line 1 column 866
+--- otlppb/record-less-over-deep-attr [DIFF]
+    loki   422: 9error at least one valid stream is required for ingestion
+    pulsus 400: BAnyValue nesting depth count 33 exceeds the documented limit of 32
+--- otlppb/record-less-at-cap-attr [SAME]
+    loki   422: 9error at least one valid stream is required for ingestion
+    pulsus 422: 9error at least one valid stream is required for ingestion
+--- otlppb/record-bearing-over-deep-attr [DIFF]
+    loki   204: 
+    pulsus 400: BAnyValue nesting depth count 33 exceeds the documented limit of 32
 --- otlp/raw/service.name/value-2049 [SAME]
     loki   400: � stream '{service_name="<bx2049>"}' has label value too long: '<bx2049>'
     pulsus 400: � stream '{service_name="<bx2049>"}' has label value too long: '<bx2049>'
@@ -506,6 +544,7 @@ bodies
 --- otlp/index-key-array-value-long [SAME]
     loki   400: � stream '{k8s_pod_name="[\"<bx2049>\"]", service_name="unknown_service"}' has label value too long: '["<bx2049>"]'
     pulsus 400: � stream '{k8s_pod_name="[\"<bx2049>\"]"}' has label value too long: '["<bx2049>"]'
+#### end of generated section ####
 
 ====================================================================
 recorded divergences
@@ -538,6 +577,22 @@ otlp/index-key-map-value-long-nested-key
     difference, not the bound: the same payload with a long nested VALUE
     (`otlp/index-key-map-value-long-nested-value`) is 400 on both sides,
     by different routes. Belongs with issue #109, not here.
+
+otlp/record-less-over-deep-attr, otlppb/record-less-over-deep-attr
+otlp/record-bearing-over-deep-attr, otlppb/record-bearing-over-deep-attr
+    PulsusDB caps OTLP AnyValue nesting at 32 (MAX_ANYVALUE_DEPTH, finding
+    #54 -- a stack-safety guard); the reference has no such cap, which the
+    record-BEARING pair shows directly: 204 there, 400 here. Both PulsusDB
+    transports charge the cap during DECODE (otlp_prescan::prescan_logs for
+    protobuf, otlp_json::AnyValueSeed for JSON, and
+    ensure_logs_anyvalue_depth repeats it as parse's first statement), so it
+    outranks the stream-less 422 -- a body that is both record-less and
+    over-deep is 400 here and 422 upstream. Pre-existing, not introduced by
+    the 422: the same 400 comes out of the branch point 5969a94. The at-cap
+    neighbours (`*-at-cap-attr`, one level shallower) are the
+    discriminators: the same record-less shape, 422 on both sides. Ledger
+    residual 6; the ordering is pinned hermetically by
+    `otlp_logs::tests::the_depth_cap_outranks_the_stream_less_check`.
 
 json/65537-raw-empty-keys
     65,537 raw JSON keys in one `stream` object, all empty-valued.

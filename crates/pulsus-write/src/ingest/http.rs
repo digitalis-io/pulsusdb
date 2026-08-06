@@ -2813,7 +2813,12 @@ mod tests {
     /// v3.7.4`), which the distributor then refuses with the same `422`.
     /// Every shape of "no records" measures `422` on the container, so all
     /// four are here. The `google.rpc.Status.code` stays `3`, our OTLP error
-    /// convention (upstream omits the field on every OTLP error body).
+    /// convention (upstream omits the field on every OTLP error body). One
+    /// PulsusDB-only bound outranks this `422` and is not in these four: an
+    /// over-deep `AnyValue` is rejected during decode, so a record-less body
+    /// that also breaches `MAX_ANYVALUE_DEPTH` is a `400` here — ledger
+    /// residual 6, pinned by
+    /// `otlp_logs::tests::the_depth_cap_outranks_the_stream_less_check`.
     #[tokio::test]
     async fn logs_request_with_no_log_records_is_422_with_the_reference_message() {
         use opentelemetry_proto::tonic::common::v1::KeyValue;
@@ -2866,6 +2871,100 @@ mod tests {
                 "error at least one valid stream is required for ingestion"
             );
             assert!(sink.admitted.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Ledger residual 6, measured at the layer a client meets. A record-less
+    /// body that ALSO nests a resource attribute past `MAX_ANYVALUE_DEPTH` is
+    /// `400`, not the `422` above: both transports charge the depth cap during
+    /// decode, so the stream count is never reached. The reference has no
+    /// depth cap and answers `422` for this body — measured on
+    /// `grafana/loki@sha256:87f0a067…`, harness cases
+    /// `otlp/record-less-over-deep-attr` and `otlppb/…`. Pre-existing (the
+    /// same `400` comes out of the branch point `5969a94`); the docs state
+    /// the order rather than matching it, and this is what makes that
+    /// statement falsifiable at the wire. The at-cap request is the
+    /// discriminator: identical shape one level shallower, and it *is* the
+    /// `422`, so neither assertion can pass merely because the body is
+    /// record-less.
+    #[tokio::test]
+    async fn a_record_less_over_deep_request_is_400_not_the_stream_less_422() {
+        use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValue};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let nested = |levels: usize| {
+            let mut value = AnyValue {
+                value: Some(Value::StringValue("leaf".to_string())),
+            };
+            for _ in 1..levels {
+                value = AnyValue {
+                    value: Some(Value::ArrayValue(ArrayValue {
+                        values: vec![value],
+                    })),
+                };
+            }
+            value
+        };
+        // A JSON spelling of the same tree, so the JSON deserializer's own
+        // depth accounting is exercised rather than the protobuf pre-scan's.
+        let nested_json = |levels: usize| {
+            let mut value = r#"{"stringValue":"leaf"}"#.to_string();
+            for _ in 1..levels {
+                value = format!(r#"{{"arrayValue":{{"values":[{value}]}}}}"#);
+            }
+            format!(
+                r#"{{"resourceLogs":[{{"resource":{{"attributes":[{{"key":"deep","value":{value}}}]}},"scopeLogs":[{{"logRecords":[]}}]}}]}}"#
+            )
+            .into_bytes()
+        };
+        let request = |levels: usize| ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "deep".to_string(),
+                        value: Some(nested(levels)),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let cap = crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH;
+        let json = [("content-type", "application/json")];
+        for (body, headers) in [
+            (request(cap + 1).encode_to_vec(), &[][..]),
+            (nested_json(cap + 1), &json[..]),
+        ] {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = post_body(router(sink.clone()), body, headers).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            let status = decode_status_body(res).await;
+            assert!(
+                status.message.contains("depth"),
+                "the depth cap answers, not MissingStreams: {}",
+                status.message
+            );
+            assert!(sink.admitted.lock().unwrap().is_empty());
+        }
+        // One level shallower: the same record-less shape reaches the `422`.
+        for (body, headers) in [
+            (request(cap).encode_to_vec(), &[][..]),
+            (nested_json(cap), &json[..]),
+        ] {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = post_body(router(sink.clone()), body, headers).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                decode_status_body(res).await.message,
+                "error at least one valid stream is required for ingestion"
+            );
         }
     }
 

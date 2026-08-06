@@ -1847,13 +1847,18 @@ back up here.
   empty push request when `ld.LogRecordCount() == 0`
   (`pkg/loghttp/push/otlp.go:144-146 @ v3.7.4`). PulsusDB answered `204` /
   `200` and stored nothing; it now answers `422` with the reference's
-  message on both receivers. The count is on the streams the request
+  message on both receivers. On the JSON push transport the count is what
+  decides, not the shape of the object: `{"streams":[]}`, `{}` and a body
+  whose only key is an unrelated one (`{"nope":1}` — the spelling issue
+  #259 measured) are one case, `422` on both sides, because both decoders
+  ignore an unknown field rather than refusing it. The count is on the streams the request
   *carries*, so the two neighbouring shapes stay accepted: a stream with
   labels and no entries is still a stream (`204` on both), and a stream
   whose labels breach a bound is a `400`, not a `422`. Charged at
   `loki_push::validate_bounds` (the one seam both Loki-push encodings
-  reach) and at the top of `otlp_logs::parse` (where the reference charges
-  it). The `422` body carries no PulsusDB prefix, exactly like the four
+  reach) and in `otlp_logs::parse` — after decode, before any per-record
+  work and before the per-stream bounds, but *after* the `AnyValue` depth
+  cap, which is residual 6 below. The `422` body carries no PulsusDB prefix, exactly like the four
   bound messages; on the OTLP path it rides the same `google.rpc.Status`
   with `code = 3` — upstream's `OTLPError` omits the code field on *every*
   error body it writes (`grpcstatus.New(0, errorStr)`,
@@ -1950,10 +1955,33 @@ back up here.
   bound: `400` upstream, `200` here. The same payload with a long nested
   *value* is `400` on both, by different routes. This is the
   attribute-flattening difference, not the bound; it belongs with #109.
+- **Residual 6 — the `AnyValue` depth cap outranks the stream-less
+  `422`.** PulsusDB bounds OTLP `AnyValue` nesting at
+  `MAX_ANYVALUE_DEPTH` = 32 (finding #54, a stack-safety guard); the
+  reference has no such bound — a record-*bearing* resource whose
+  attribute nests 33 levels is `204` upstream and `400` here, measured on
+  both transports. Because both our transports charge the cap inside
+  decode (`otlp_prescan::prescan_logs` for protobuf,
+  `otlp_json::AnyValueSeed` for JSON, and `ensure_logs_anyvalue_depth`
+  repeats it as `parse`'s first statement), a body that is *both*
+  record-less *and* over-deep answers `400` here where the reference
+  answers `422` — the depth reject wins because it runs first. Measured
+  on both transports (`otlp/record-less-over-deep-attr`,
+  `otlppb/record-less-over-deep-attr`; their at-cap neighbours, one level
+  shallower, are `422` on both sides), and **pre-existing**: the same `400` comes out of the
+  branch point `5969a94`, so neither the bounds nor the `422` introduced
+  it. Nothing upstream fixes the order between a bound the reference does
+  not have and one it does, so the order is stated rather than matched.
+  Reordering it is not a local change either: the record count cannot be
+  read before the body is decoded, and the depth cap is charged *during*
+  decode precisely so the over-deep tree is never materialized or
+  recursed into — the JSON seed refuses before descending further, the
+  protobuf pre-scan before `prost` allocates. Deferring it would undo
+  that.
 - **Measured side by side**: every case in the harness is sent
   byte-identically to `grafana/loki@sha256:87f0a067…` and to a running
-  PulsusDB, over both Loki-push encodings and the OTLP receiver. Statuses
-  agree everywhere except residual 3's second half and residuals 4 and 5,
+  PulsusDB, over both Loki-push encodings and both OTLP encodings. Statuses
+  agree everywhere except residual 3's second half and residuals 4, 5 and 6,
   which the harness carries as expected divergences so that they stay the
   ones that were recorded; the case, agreement and divergence counts are on
   `compare.py`'s generated summary line at the end of the transcript's
@@ -2021,4 +2049,8 @@ back up here.
   neighbours beside it at each tier
   (`parse_json_entry_less_stream_alone_is_not_a_stream_less_request`,
   `parse_accepts_a_request_whose_records_are_all_in_one_resource`,
-  `loki_push_with_an_entry_less_stream_is_still_accepted`).
+  `loki_push_with_an_entry_less_stream_is_still_accepted`). Its one
+  exception — residual 6's ordering against the `AnyValue` depth cap — is
+  pinned by `the_depth_cap_outranks_the_stream_less_check`, whose at-cap
+  neighbour is inside the same test, and on the wire by the four
+  `*-over-deep-attr` harness cases.

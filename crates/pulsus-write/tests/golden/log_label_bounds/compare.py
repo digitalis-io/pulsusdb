@@ -7,6 +7,12 @@ Loki: 127.0.0.1:13174.  PulsusDB: 127.0.0.1:18374 (override with LOKI_PORT /
 PULSUS_PORT when another agent holds those ports).
 See oracle_probe.txt in this directory for the recorded run and the recipe.
 
+Stdout is the case table, the summary line and the body dump, terminated by
+GENERATED_END -- that span of oracle_probe.txt and no more.  The preamble and
+the recorded-divergences notes in that file are hand-maintained prose; this
+script neither writes nor checks them, so regenerate by replacing the span
+rather than redirecting over the whole file.
+
 Needs a Loki source checkout containing the pinned revision, because the
 eighteen index-label names are read out of it rather than transcribed here
 (LOKI_SRC, default /home/hayato/git/loki). Exits non-zero if it cannot.
@@ -276,6 +282,11 @@ case("json/entry-less-stream-over-wide", "json",
 # IS a stream and stays accepted.
 case("json/no-streams", "json", b'{"streams":[]}', "application/json")
 case("json/no-streams-key", "json", b"{}", "application/json")
+# A JSON object carrying an UNRELATED key -- #259 measured this body and read
+# it as a third case.  It is not: both sides ignore the unknown key, find no
+# streams and answer the same 422.  Pinned because a stricter JSON decode
+# (400 on an unknown field) would silently break that agreement.
+case("json/no-streams-unrelated-key", "json", b'{"nope":1}', "application/json")
 
 # ---- Loki push, protobuf -------------------------------------------------
 def pb(labels, line="hi"):
@@ -360,7 +371,9 @@ case("otlp/mixed-good-and-bad-indexed", "otlp",
 # No log records at all -> an EMPTY converted push request
 # (`if ld.LogRecordCount() == 0`, otlp.go:144-146 @ v3.7.4) -> the same 422 the
 # stream-less Loki-push cases get.  Every shape of "no records" is one case
-# upstream because LogRecordCount sums over all (resource, scope) pairs.
+# upstream because LogRecordCount sums over all (resource, scope) pairs.  On
+# OUR side one bound outranks it -- the AnyValue depth cap, `*-over-deep-attr`
+# below.
 def otlp_records(resources):
     """resources: list of (attrs dict, record count)."""
     return json.dumps({"resourceLogs": [
@@ -386,6 +399,67 @@ case("otlp/no-scope-logs", "otlp",
 case("otlp/record-less-over-wide-resource+good", "otlp",
      otlp_records([({"k8s.pod.name": C}, 0), ({"service.name": "good"}, 1)]),
      "application/json")
+
+# Ledger residual 6: PulsusDB caps AnyValue nesting at 32 (finding #54, a
+# stack-safety guard) and charges it during DECODE on both transports, so it
+# outranks the stream-less 422 above.  The reference has no depth cap -- the
+# record-BEARING control is 204 there and 400 here -- so nothing upstream fixes
+# the order between the two.  The at-cap neighbours are the discriminators:
+# the same record-less shape one level shallower, 422 on both sides.
+MAX_ANYVALUE_DEPTH = 32  # crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH
+
+
+def deep_json_value(levels):
+    """An OTLP/JSON AnyValue nesting `levels` container levels around a scalar
+    leaf.  ArrayValue (3 JSON levels per AnyValue level) rather than
+    KvlistValue (4), so serde_json's own 128-deep recursion limit is not what
+    answers first."""
+    v = {"stringValue": "leaf"}
+    for _ in range(levels):
+        v = {"arrayValue": {"values": [v]}}
+    return v
+
+
+def otlp_deep_json(levels, records=0):
+    """A record-less (by default) OTLP/JSON request whose sole resource
+    attribute nests `levels` deep."""
+    return json.dumps({"resourceLogs": [{
+        "resource": {"attributes": [{"key": "deep", "value": deep_json_value(levels)}]},
+        "scopeLogs": [{"logRecords": [
+            {"timeUnixNano": TS, "body": {"stringValue": "hi"}} for _ in range(records)]}],
+    }]}, separators=(",", ":")).encode()
+
+
+def otlp_deep_pb(levels, records=0):
+    """The same shape as an OTLP protobuf body, hand-encoded with the writer
+    above -- the protobuf transport reaches the cap by a different route (the
+    wire pre-scan, not the JSON deserializer), so it is its own case.
+    ExportLogsServiceRequest{1: ResourceLogs{1: Resource{1: KeyValue}, 2:
+    ScopeLogs{2: LogRecord}}}; AnyValue{1: string, 5: ArrayValue{1: values}};
+    LogRecord{1: fixed64 time, 5: AnyValue body}."""
+    value = bytes_field(1, b"leaf")  # AnyValue.string_value
+    for _ in range(levels):
+        value = bytes_field(5, bytes_field(1, value))  # array_value -> values
+    kv_pair = bytes_field(1, b"deep") + bytes_field(2, value)
+    record = (tag(1, 1) + int(TS).to_bytes(8, "little")
+              + bytes_field(5, bytes_field(1, b"hi")))
+    scope = bytes_field(2, b"".join(bytes_field(2, record) for _ in range(records)))
+    return bytes_field(1, bytes_field(1, bytes_field(1, kv_pair)) + scope)
+
+
+case("otlp/record-less-over-deep-attr", "otlp",
+     otlp_deep_json(MAX_ANYVALUE_DEPTH + 1), "application/json", expect="DIFF")
+case("otlp/record-less-at-cap-attr", "otlp",
+     otlp_deep_json(MAX_ANYVALUE_DEPTH - 1), "application/json")
+case("otlp/record-bearing-over-deep-attr", "otlp",
+     otlp_deep_json(MAX_ANYVALUE_DEPTH + 1, records=1), "application/json", expect="DIFF")
+case("otlppb/record-less-over-deep-attr", "otlppb",
+     otlp_deep_pb(MAX_ANYVALUE_DEPTH + 1), "application/x-protobuf", expect="DIFF")
+case("otlppb/record-less-at-cap-attr", "otlppb",
+     otlp_deep_pb(MAX_ANYVALUE_DEPTH - 1), "application/x-protobuf")
+case("otlppb/record-bearing-over-deep-attr", "otlppb",
+     otlp_deep_pb(MAX_ANYVALUE_DEPTH + 1, records=1), "application/x-protobuf",
+     expect="DIFF")
 
 # -- raw vs canonical spelling, over the reference's whole list -------------
 for _k in ALL_IDX:
@@ -471,6 +545,7 @@ PATHS = {
     "json": ("/loki/api/v1/push", "/loki/api/v1/push"),
     "pb": ("/loki/api/v1/push", "/loki/api/v1/push"),
     "otlp": ("/otlp/v1/logs", "/v1/logs"),
+    "otlppb": ("/otlp/v1/logs", "/v1/logs"),
 }
 
 
@@ -480,15 +555,18 @@ def trim(s, n=100000):
     A run of 100 or more of the same alphanumeric character becomes
     `<cxN>` -- the bodies quote label names and values that are 1025, 2049
     or 65537 bytes of one letter, and an unsquashed transcript is 370 KB of
-    `bbbb...`.  The squash lives here, in the harness, so that
-    `python3 compare.py > oracle_probe.txt` reproduces the checked-in
-    transcript's bodies rather than a differently-post-processed copy of
-    them.
+    `bbbb...`.  The squash lives here, in the harness, so that a fresh run
+    reproduces the checked-in transcript's bodies rather than a
+    differently-post-processed copy of them.
     """
     s = s.replace("\n", "\\n")
     s = re.sub(r"([A-Za-z0-9])\1{99,}", lambda m: f"<{m.group(1)}x{len(m.group(0))}>", s)
     return s if len(s) <= n else s[:n] + f"…[{len(s)} bytes]"
 
+
+# Closes the span this script generates.  Chosen so it cannot collide with a
+# generated line: body blocks start `--- `, rules are `=` * 100.
+GENERATED_END = "#### end of generated section ####"
 
 unexpected = []
 rows = []
@@ -523,4 +601,10 @@ for name, ls, ps, v, expect, lb, pbo in rows:
     print(f"--- {name} [{v}]")
     print(f"    loki   {ls}: {lb}")
     print(f"    pulsus {ps}: {pbo}")
+# Everything this script writes lies between the `case ... expected` header
+# above and this marker; oracle_probe.txt's preamble and its recorded-
+# divergences notes are hand-maintained around it.  The marker is what makes
+# "the script regenerates that span" checkable with one `sed`+`diff` -- the
+# recipe is in the transcript's preamble.
+print(GENERATED_END)
 sys.exit(1 if unexpected else 0)

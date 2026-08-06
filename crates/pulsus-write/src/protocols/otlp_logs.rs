@@ -147,7 +147,9 @@ pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestEr
 /// [`otlp_depth::MAX_ANYVALUE_DEPTH`](crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH)
 /// — a whole-request, atomic structural failure (400 / `code = 3`), exactly
 /// like a decode error — or iff the request carries no log records at all
-/// ([`LogsIngestError::MissingStreams`], 422; issue #374). Malformed
+/// ([`LogsIngestError::MissingStreams`], 422; issue #374). The depth check is
+/// charged first, so a request that is both over-deep and record-less is the
+/// `400`, not the `422` (see the body). Malformed
 /// per-record timestamps stay per-record partial-success rejections inside
 /// the `Ok`.
 pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
@@ -169,9 +171,17 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
     // `(ResourceLogs, ScopeLogs)` pair, so `{}`, `{"resourceLogs":[]}`, a
     // resource with no `scopeLogs`, and a scope with an empty `logRecords` are
     // one case, and all four measure `422` on
-    // `grafana/loki@sha256:87f0a067…`. Charged here, at the position the
-    // reference charges it — after decode (a malformed body is still `400`)
-    // and before any per-record work.
+    // `grafana/loki@sha256:87f0a067…`. Charged here: after decode, before any
+    // per-record work, and before the per-stream label bounds — but NOT before
+    // the `AnyValue` depth cap. Both transports charge that cap inside decode
+    // (`otlp_prescan::prescan_logs` for protobuf, `otlp_json::AnyValueSeed`
+    // for JSON) and `ensure_logs_anyvalue_depth` above repeats it, so a
+    // record-less body that ALSO nests an attribute past
+    // `MAX_ANYVALUE_DEPTH` answers `400` here where the reference answers this
+    // `422`. Measured on both transports, and present on the branch point
+    // `5969a94` too — the depth cap is a PulsusDB-only bound the reference has
+    // no equivalent of, so its ordering against this check is ours to state,
+    // not the reference's to dictate. Ledger residual 6 (`ingest-label-bounds`).
     if req
         .resource_logs
         .iter()
@@ -1708,6 +1718,58 @@ mod tests {
         };
         let out = super::parse(&request(vec![empty, full]), 0).unwrap();
         assert_eq!(out.rows.len(), 1);
+    }
+
+    /// Issue #374, ledger residual 6: the `AnyValue` depth cap is charged
+    /// BEFORE the stream-less check, so a request that is both record-less
+    /// and over-deep is the depth `400`, not the `422`. The reference has no
+    /// depth cap and answers `422` for this body — measured on both
+    /// transports against `grafana/loki@sha256:87f0a067…`.
+    ///
+    /// This pins `parse`'s OWN order only. On the wire the cap is charged
+    /// earlier still, inside decode, so `parse`'s guard never gets the chance
+    /// — the wire order is pinned by
+    /// `ingest::http::tests::a_record_less_over_deep_request_is_400_not_the_stream_less_422`
+    /// and by the harness's `*-over-deep-attr` cases. Both layers are worth
+    /// pinning: this one keeps a direct library caller of `parse` on the same
+    /// rule the wire has.
+    ///
+    /// The at-cap neighbour below is the discriminator: one level shallower,
+    /// the same record-less shape, and it *does* reach the `422` — so this
+    /// test cannot pass merely because the request is record-less.
+    #[test]
+    fn the_depth_cap_outranks_the_stream_less_check() {
+        let over_deep = |levels| {
+            request(vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "deep".to_string(),
+                        value: Some(nested_body(levels)),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                // No records anywhere: on its own this is `MissingStreams`.
+                scope_logs: vec![simple_scope_logs(vec![])],
+                schema_url: String::new(),
+            }])
+        };
+        let err = super::parse(
+            &over_deep(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1),
+            0,
+        )
+        .expect_err("record-less AND over-deep");
+        assert!(
+            matches!(err, LogsIngestError::OversizeMessage { .. }),
+            "depth cap must win over MissingStreams, got {err:?}"
+        );
+        let err = super::parse(
+            &over_deep(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH),
+            0,
+        )
+        .expect_err("record-less, within the depth cap");
+        assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
     }
 
     #[test]
