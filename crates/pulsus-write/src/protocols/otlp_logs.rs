@@ -1912,6 +1912,105 @@ mod tests {
         assert_eq!(out.streams[0].labels.len(), 17);
     }
 
+    /// The gap the bounds do not cover, pinned on **stored state** rather than
+    /// on the wire verdict (issue #374 round-3 review; adjudicated to #109).
+    ///
+    /// The wire verdict agrees with the reference:
+    /// `{service.name: "ok", service_name: "x"*2049}` is accepted by both,
+    /// because upstream matches the raw dotted name and routes the underscored
+    /// one to structured metadata, which no bound reaches. Storage does not
+    /// agree. We index every resource attribute (#109), both spellings
+    /// canonicalize onto `service_name`, and `from_normalized`'s frozen
+    /// collision rule (#4) keeps the greatest *original* key — `_` (0x5F)
+    /// sorts after `.` (0x2E) — so the **unvalidated** near-miss wins and a
+    /// 2049-byte value is stored under the label the validator passed at two
+    /// bytes. Both the stored value and the stream's identity follow the
+    /// winner, which is why this asserts labels and fingerprint: four rounds
+    /// of oracle status comparison could not see it.
+    #[test]
+    fn an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value() {
+        let wide = "x".repeat(2049);
+        let out = super::parse(
+            &logs_with_resource_attrs(vec![
+                attr("service.name", "ok"),
+                attr("service_name", &wide),
+            ]),
+            0,
+        )
+        .unwrap();
+
+        // Accepted: only the raw `service.name` is charged, and "ok" is in
+        // bounds. This half is parity — the oracle answers 204.
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+
+        // The stored label is one collapsed `service_name`, holding the value
+        // no bound was charged on.
+        let stored = &out.streams[0].labels;
+        assert_eq!(stored.len(), 1, "both spellings collapse onto one label");
+        assert_eq!(stored.get("service_name"), Some(wide.as_str()));
+        assert!(
+            stored.get("service_name").map(str::len)
+                > Some(log_label_limits::MAX_LABEL_VALUE_BYTES),
+            "an indexed, stored label wider than the bound this module introduces"
+        );
+
+        // The identity follows the winner too: this stream is the one a bare
+        // over-wide `service_name` push produces, not the `{service_name="ok"}`
+        // the bound was charged on.
+        let near_miss_alone = super::parse(
+            &logs_with_resource_attrs(vec![attr("service_name", &wide)]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.streams[0].fingerprint, near_miss_alone.streams[0].fingerprint,
+            "the unvalidated value fixes the stream's identity"
+        );
+        let validated = super::parse(
+            &logs_with_resource_attrs(vec![attr("service.name", "ok")]),
+            0,
+        )
+        .unwrap();
+        assert_ne!(
+            out.streams[0].fingerprint, validated.streams[0].fingerprint,
+            "the validated value does not"
+        );
+    }
+
+    /// The same shape reaches the other two bounds, so the gap is not specific
+    /// to the value length: a near-miss spelling carries an over-long label
+    /// *name* into storage, and near-miss spellings that do not collide take
+    /// the stored label count past `MAX_LABEL_NAMES_PER_STREAM`.
+    #[test]
+    fn near_miss_spellings_store_labels_past_the_name_and_count_bounds() {
+        let long_name = format!("k8s.{}", "n".repeat(1025));
+        let out = super::parse(
+            &logs_with_resource_attrs(vec![attr("service.name", "ok"), attr(&long_name, "v")]),
+            0,
+        )
+        .unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        let stored_name = long_name.replace('.', "_");
+        assert!(
+            out.streams[0].labels.get(&stored_name).is_some()
+                && stored_name.len() > log_label_limits::MAX_LABEL_NAME_BYTES,
+            "an indexed, stored label name longer than the bound"
+        );
+
+        // 15 raw index attributes pass the count bound; the 17 underscored
+        // look-alikes are not counted, and 15 of them do not collide with the
+        // 15 raw ones either — the stored set is 17 wide.
+        let mut attrs = indexed(15);
+        attrs.extend(INDEXED.iter().map(|k| attr(&k.replace('.', "_"), "v")));
+        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert!(
+            out.streams[0].labels.len() > log_label_limits::MAX_LABEL_NAMES_PER_STREAM,
+            "stored label count {} is past the bound",
+            out.streams[0].labels.len()
+        );
+    }
+
     /// One label set per `ResourceLogs`, so a resource with several scopes
     /// reports its breach once, not once per scope — the reference builds one
     /// `logproto.Stream` per resource label set too.

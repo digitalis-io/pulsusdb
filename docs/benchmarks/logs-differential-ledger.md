@@ -1795,6 +1795,30 @@ places where the observable still differs.
   and 128 entries per line, `pkg/validation/limits.go:60-61 @ v3.7.4`)
   there; mapping those onto data we store as stream labels belongs with
   the #109 attribute-placement decision, not here.
+
+  **This reaches a validated label too, and that half is about storage
+  rather than about the accept surface.** `{service.name: "ok",
+  service_name: "x"*2049}` is accepted by the oracle (`204`) and by
+  PulsusDB (`200`) — the rejection surface agrees, because upstream
+  indexes the dotted spelling and routes the underscored one to
+  structured metadata. But we index both (#109), both canonicalize onto
+  `service_name`, and `from_normalized`'s frozen collision rule (#4)
+  keeps the greatest *original* key, where `_` (0x5F) sorts after `.`
+  (0x2E). So the unvalidated near-miss wins: 2049 bytes are stored under
+  a label the validator passed at two, and the stream's fingerprint
+  follows the winner. This is not a divergence introduced here — it is
+  what indexing every attribute means once a bound exists on a subset of
+  them — but it does mean a reader of the four bounds cannot conclude
+  that a *stored* label obeys them. The module doc of
+  `crates/pulsus-write/src/protocols/log_label_limits.rs` states that as
+  a limit of what the bound covers, and the fix (indexing what the
+  reference indexes) is #109's. Pinned on stored state rather than on the
+  wire verdict by
+  `otlp_logs::tests::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value`
+  and
+  `loki_push_live::an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label`;
+  the harness's four `otlp/index-key-vs-near-miss/*` cases measure only
+  the wire half, and say so.
 - **A breach is stream-local.** The reference validates every stream,
   `continue`s past the ones that fail, writes the ones that pass, and
   only then answers `400` (`distributor.go:645-655, 780-790, 929 @
@@ -1898,9 +1922,9 @@ places where the observable still differs.
   bound: `400` upstream, `200` here. The same payload with a long nested
   *value* is `400` on both, by different routes. This is the
   attribute-flattening difference, not the bound; it belongs with #109.
-- **Measured side by side**, 99 cases sent byte-identically to
+- **Measured side by side**, 101 cases sent byte-identically to
   `grafana/loki@sha256:87f0a067…` and to a running PulsusDB — 25 Loki-push
-  JSON, 13 Loki-push protobuf, 61 OTLP — with **status agreement in 96**,
+  JSON, 13 Loki-push protobuf, 63 OTLP — with **status agreement in 98**,
   the three exceptions being residual 3's second half and residuals 4 and
   5, which the harness carries as expected divergences so that they stay
   the ones that were recorded. The
@@ -1914,7 +1938,15 @@ places where the observable still differs.
   disagrees with it about membership, which is where that defect lived.
   The `otlp/raw/…` and `otlp/canonical/…` pairs are now generated from the
   reference's own list for that reason; re-running the current cases
-  against that implementation produces 25 unexpected verdicts.
+  against that implementation produces 25 unexpected verdicts. **The list
+  itself is read out of the reference too** —
+  `git show b318f282:pkg/loghttp/push/otlp_config.go`, parsed at run time,
+  with a non-zero exit rather than a fallback if it cannot be read —
+  because pairs generated over a hand-copied list are still drawn from our
+  own model of the rule. **And these are statuses:** the four
+  `otlp/index-key-vs-near-miss/*` cases agree on the wire and diverge in
+  what is stored, which is why that half is asserted on stored state
+  instead (see the raw-name paragraph above).
 - **Pinned by** `log_label_limits`'s own unit tests (the four bounds, both
   edges each, the `service_name` decrement, the empty-value rule and its
   effect on stored identity, the internal-stream exemption, the
@@ -1938,9 +1970,13 @@ places where the observable still differs.
   `logs_mixed_batch_admits_the_good_resources_and_still_answers_400` /
   `stream_errors_are_grouped_the_way_the_reference_groups_them` (the wire
   status, body and admission), and the live
-  `crates/pulsus-server/tests/loki_push_live.rs` trio
+  `crates/pulsus-server/tests/loki_push_live.rs` quartet
   `over_wide_label_value_is_rejected_and_stores_nothing`,
-  `a_mixed_batch_stores_the_good_streams_and_still_answers_400` and
+  `a_mixed_batch_stores_the_good_streams_and_still_answers_400`,
   `an_empty_valued_label_does_not_split_the_stream` (`400` at the wire
   **and** the matching row counts read back out of ClickHouse, with an
-  at-bound control push proving the read-back discriminates).
+  at-bound control push proving the read-back discriminates) and
+  `an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label` — the one
+  case the wire cannot show, where both sides answer success and the
+  stored label and fingerprint are read back to show the 2049-byte value
+  on an indexed label.

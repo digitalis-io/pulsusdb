@@ -105,6 +105,48 @@
 //! into a `BTreeMap` and OTLP attributes go through `LabelSet::from_normalized`
 //! — so check 4 is reachable on the protobuf literal path and vacuous
 //! elsewhere, matching.
+//!
+//! # What these bounds do not cover: a stored label can exceed them
+//!
+//! On the OTLP logs path the bounds are charged on the eighteen resource
+//! attributes the reference indexes as stream labels
+//! ([`validate_otlp_index_labels`]), while PulsusDB stores **every** resource
+//! attribute as a stream label (issue #109). So a label that is indexed here —
+//! queryable, and part of the stream's fingerprint — can be wider than
+//! [`MAX_LABEL_VALUE_BYTES`], carry a name longer than
+//! [`MAX_LABEL_NAME_BYTES`], and take the stored label count past
+//! [`MAX_LABEL_NAMES_PER_STREAM`]. Two paths reach it:
+//!
+//! - an attribute whose raw name is not one of the eighteen —
+//!   `{app: "x"*2049}` stores a 2049-byte `app` label;
+//! - an attribute whose raw name merely *canonicalizes onto* one of the
+//!   eighteen — `{service.name: "ok", service_name: "x"*2049}`. Only
+//!   `service.name` is validated; both collapse onto `service_name` in
+//!   storage, and `from_normalized`'s frozen collision rule (issue #4) keeps
+//!   the greatest *original* key, where `_` (0x5F) sorts after `.` (0x2E). The
+//!   unvalidated near-miss therefore always wins, and the stored value of a
+//!   validated label is one no bound was ever charged on.
+//!
+//! This is not a divergence note. Both examples are accepted by the reference
+//! too — it routes those attributes to structured metadata, which is unbounded
+//! there as well — so the accept surface this module exists to match still
+//! agrees. It is recorded because it is inconsistent on PulsusDB's own terms:
+//! this module introduces a bound, and a path exists that stores an indexed
+//! label exceeding it, which a reader of the bound would not expect.
+//!
+//! Neither fix belongs to this module. Charging the bounds on every attribute
+//! refuses ordinary OTLP payloads the reference accepts (measured — see
+//! [`validate_otlp_index_labels`]); not indexing the other attributes changes
+//! stored stream identities. The second is issue #109, which owns the
+//! difference in *what* we index and therefore owns this gap.
+//!
+//! The Loki-push transports have no such gap: every pair in the pushed literal
+//! is a stream label and every one of them is validated. Pinned by
+//! `an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value` in
+//! `otlp_logs.rs` (stored labels and fingerprint) and by
+//! `an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label` in
+//! `crates/pulsus-server/tests/loki_push_live.rs` (read back out of
+//! ClickHouse).
 
 use pulsus_model::SERVICE_NAME_LABEL;
 use thiserror::Error;
@@ -126,14 +168,23 @@ pub struct LabelLimitError(String);
 /// `validation.max-label-names-per-series` default
 /// (`pkg/validation/limits.go:326 @ v3.7.4`). Counted after empty-valued
 /// labels are excluded and after the `service_name` decrement.
+///
+/// A stored OTLP stream can carry more labels than this — see the module doc's
+/// *What these bounds do not cover*.
 pub const MAX_LABEL_NAMES_PER_STREAM: usize = 15;
 
 /// `validation.max-length-label-name` default
 /// (`pkg/validation/limits.go:324 @ v3.7.4`), in bytes.
+///
+/// A stored OTLP stream label's name can be longer than this — see the module
+/// doc's *What these bounds do not cover*.
 pub const MAX_LABEL_NAME_BYTES: usize = 1024;
 
 /// `validation.max-length-label-value` default
 /// (`pkg/validation/limits.go:325 @ v3.7.4`), in bytes.
+///
+/// A stored OTLP stream label's value can be longer than this — see the module
+/// doc's *What these bounds do not cover*.
 pub const MAX_LABEL_VALUE_BYTES: usize = 2048;
 
 /// `constants.AggregatedMetricLabel`
@@ -339,11 +390,18 @@ const OTLP_INDEX_ATTRIBUTES: [&str; 18] = [
 ///
 /// `LabelSet::from_normalized` performs the canonicalize-then-collapse that
 /// upstream's `attributeToLabels` + `streamLabels[name] = value` map assignment
-/// performs, and it is the *same* call that decides what is stored, so the
-/// value a bound is charged on is the value that would be written. The
-/// resulting set is then run through [`StreamLabels`] for `WithoutEmpty` and
-/// the name sort, exactly as `parseStreamLabels` re-parses the rendered literal
-/// upstream.
+/// performs, and it is the *same* call that decides what is stored, so within
+/// the filtered subset the value a bound is charged on is the value that would
+/// be written. The resulting set is then run through [`StreamLabels`] for
+/// `WithoutEmpty` and the name sort, exactly as `parseStreamLabels` re-parses
+/// the rendered literal upstream.
+///
+/// **Only within the subset.** Storage collapses the *whole* attribute list
+/// (issue #109), so a non-indexed attribute canonicalizing onto an indexed name
+/// can win that collapse and be stored under a name this function validated a
+/// different value for — `{service.name: "ok", service_name: "x"*2049}` stores
+/// 2049 bytes under `service_name`. See the module doc's *What these bounds do
+/// not cover*; the fix belongs to issue #109.
 ///
 /// Two raw index attributes that collide on one canonical name (only reachable
 /// from a repeated wire key, since the 18 raw names canonicalize to 18 distinct

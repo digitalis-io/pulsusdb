@@ -9,6 +9,11 @@
 //! entries + labels — i.e. it fingerprints into the same physical rows the
 //! read path (#72/#73) and tail (#74) expect.
 //!
+//! Issue #374 added the per-stream label bounds' live gates here, and with
+//! them one case on the sibling OTLP logs receiver (`POST /v1/logs`): the
+//! bounds' coverage gap is only visible in what was **stored**, so it is
+//! asserted against ClickHouse rather than against a status.
+//!
 //! This is the "live producer→us→query" round-trip the task-manager Q3
 //! adjudication names as strongest: the committed real-promtail-capture
 //! fixture (`crates/pulsus-write/tests/loki_push_fixtures.rs`) is the
@@ -1333,5 +1338,227 @@ async fn an_empty_valued_label_does_not_split_the_stream() {
         [("service_name".to_string(), service.to_string())]
             .into_iter()
             .collect::<std::collections::BTreeMap<_, _>>()
+    );
+}
+
+// ---------------------------------------------------------------------
+// The OTLP logs receiver: what the bounds do NOT cover, at the storage
+// tier (issue #374 round-3 review, adjudicated to #109).
+// ---------------------------------------------------------------------
+
+/// An OTLP/JSON logs body: one `ResourceLogs` per entry, its resource
+/// attributes in wire order (so a repeated or colliding key is preserved as
+/// sent), each carrying one record.
+fn otlp_json_body(resources: &[(Vec<(&str, String)>, &str)], ts_ns: i64) -> Vec<u8> {
+    let resource_logs: Vec<serde_json::Value> = resources
+        .iter()
+        .map(|(attrs, line)| {
+            let attributes: Vec<serde_json::Value> = attrs
+                .iter()
+                .map(|(k, v)| serde_json::json!({"key": k, "value": {"stringValue": v}}))
+                .collect();
+            serde_json::json!({
+                "resource": {"attributes": attributes},
+                "scopeLogs": [{"logRecords": [{
+                    "timeUnixNano": ts_ns.to_string(),
+                    "body": {"stringValue": line},
+                }]}],
+            })
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "resourceLogs": resource_logs })).expect("otlp body")
+}
+
+fn otlp_push(port: u16, body: &[u8]) -> HttpResponse {
+    http_request(port, "POST", "/v1/logs", Some("application/json"), body)
+        .expect("otlp push reachable")
+}
+
+/// Polls `sql` until it returns `want` or the deadline passes — the OTLP
+/// receiver's rows reach ClickHouse through the same asynchronous writer the
+/// push path uses.
+async fn wait_for_count(db: &str, sql: &str, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = ch_count(db, sql).await;
+        if got == want || Instant::now() >= deadline {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// Issue #374: the bounds this branch introduces do not cover every label it
+/// stores, and this is the case that shows it **at the storage tier**, which
+/// is the only tier that can see it.
+///
+/// `{service.name: "ok", service_name: <2049 B>}` is accepted by the pinned
+/// oracle (`204`) and by PulsusDB (`200`) — the rejection surface #374 exists
+/// to match does agree, because upstream matches the raw dotted spelling only
+/// (`otlp.go:193`, `otlp_config.go:88-99 @ v3.7.4`) and routes the underscored
+/// one to structured metadata, which no bound reaches. Storage does not agree:
+/// we index every resource attribute (#109), both spellings canonicalize onto
+/// `service_name`, and `from_normalized`'s frozen rule (#4) keeps the greatest
+/// original key — `_` (0x5F) after `.` (0x2E) — so the **unvalidated** value
+/// is the one written, and it is 2049 bytes wide under a label the validator
+/// passed at two. The stream's identity follows it too.
+///
+/// Four rounds of status-only oracle comparison could not see any of this.
+/// The hermetic twin is
+/// `otlp_logs::tests::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value`;
+/// this one reads the labels and the fingerprints back out of ClickHouse.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_158;
+    let db = "pulsus_loki_push_otlp_near_miss_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let wide = "x".repeat(2049);
+    let probe = "otlp-near-miss-374";
+
+    // All three resources carry the same marker attribute, so one query sees
+    // exactly these streams and the fingerprints are directly comparable.
+    let marker = ("k8s.pod.name", probe.to_string());
+    let body = otlp_json_body(
+        &[
+            // (a) the validated index name AND its unvalidated near-miss.
+            (
+                vec![
+                    marker.clone(),
+                    ("service.name", "ok".to_string()),
+                    ("service_name", wide.clone()),
+                ],
+                "otlp near miss both",
+            ),
+            // (b) the near-miss alone: the same stored label set as (a).
+            (
+                vec![marker.clone(), ("service_name", wide.clone())],
+                "otlp near miss alone",
+            ),
+            // (c) the control — only the validated index name, so the value
+            // the bound was charged on is the one stored.
+            (
+                vec![marker.clone(), ("service.name", "ok".to_string())],
+                "otlp near miss control",
+            ),
+        ],
+        base_ns,
+    );
+    let res = otlp_push(port, &body);
+    assert_eq!(
+        res.status, 200,
+        "the oracle accepts this body too (204); body {}",
+        res.body
+    );
+
+    let of_probe =
+        format!("FROM log_streams WHERE JSONExtractString(labels, 'k8s_pod_name') = '{probe}'");
+
+    // Two streams, not three: (a) and (b) share one fingerprint because the
+    // near-miss won the collapse in both, and (c) is a different stream.
+    assert_eq!(
+        wait_for_count(
+            db,
+            &format!("SELECT count(DISTINCT fingerprint) AS c {of_probe}"),
+            2
+        )
+        .await,
+        2,
+        "(a) and (b) must be one stream and (c) another"
+    );
+
+    // The stored label is the 2049-byte value no bound was charged on...
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c {of_probe} \
+                 AND JSONExtractString(labels, 'service_name') = '{wide}'"
+            ),
+        )
+        .await,
+        1,
+        "the unvalidated near-miss value must be the stored one"
+    );
+    // ...and it is (a)'s stream, not merely (b)'s. This is the assertion that
+    // distinguishes the rule: were the collapse to keep the VALIDATED
+    // `service.name` value, (a) would land in the `ok` stream instead and
+    // every count above would look exactly the same.
+    let wide_stream = format!(
+        "fingerprint IN (SELECT fingerprint FROM log_streams \
+         WHERE JSONExtractString(labels, 'service_name') = '{wide}')"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_samples WHERE {wide_stream} \
+                 AND body IN ('otlp near miss both', 'otlp near miss alone')"
+            ),
+        )
+        .await,
+        2,
+        "the record pushed WITH the validated `service.name` must be stored \
+         under the over-wide label too"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_samples WHERE fingerprint IN \
+                 (SELECT fingerprint FROM log_streams \
+                  WHERE JSONExtractString(labels, 'k8s_pod_name') = '{probe}' \
+                  AND JSONExtractString(labels, 'service_name') = 'ok') \
+                 AND body != 'otlp near miss control'"
+            ),
+        )
+        .await,
+        0,
+        "the validated value's stream carries only the control record"
+    );
+    // ...wider than the bound this branch introduces, as an INDEXED label.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c {of_probe} \
+                 AND length(JSONExtractString(labels, 'service_name')) > 2048"
+            ),
+        )
+        .await,
+        1,
+        "exactly one stored stream exceeds the 2048-byte label value bound"
+    );
+    // The control stores the validated value, so the read-back above is not
+    // explained by every stream carrying the wide one.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c {of_probe} \
+                 AND JSONExtractString(labels, 'service_name') = 'ok'"
+            ),
+        )
+        .await,
+        1,
+        "the control stream stores the validated value"
+    );
+    // And all three lines landed: nothing here was refused.
+    assert_eq!(
+        wait_for_count(
+            db,
+            "SELECT count() AS c FROM log_samples WHERE body IN \
+             ('otlp near miss both', 'otlp near miss alone', 'otlp near miss control')",
+            3,
+        )
+        .await,
+        3,
+        "all three records are accepted and stored"
     );
 }

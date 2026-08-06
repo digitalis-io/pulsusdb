@@ -7,9 +7,10 @@ Oracle: docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fd
 Subject: pulsusdb built from this branch, PULSUS_COMPAT_ENDPOINTS=1,
         against ClickHouse 24.8.14.39.
 
-Byte-frozen evidence for the `ingest-label-bounds` row in
-docs/benchmarks/logs-differential-ledger.md. A one-time manual capture --
-NOT run in CI; `compare.py` in this directory reproduces it.
+Evidence for the `ingest-label-bounds` row in
+docs/benchmarks/logs-differential-ledger.md. A manual capture -- NOT run in
+CI; `compare.py` in this directory reproduces it, and exits non-zero if any
+case's verdict is not the one recorded here.
 
 Reproduce:
   podman run -d --rm --name pulsus-loki-374 -p 13174:3100 \
@@ -21,124 +22,145 @@ Reproduce:
   PULSUS_HOST=127.0.0.1 PULSUS_PORT=18374 CLICKHOUSE_SERVER=localhost \
       CLICKHOUSE_HTTP_PORT=19174 CLICKHOUSE_DB=pulsus_374_final \
       PULSUS_COMPAT_ENDPOINTS=1 ./target/debug/pulsusdb &
-  python3 compare.py
+  python3 compare.py          # LOKI_PORT / PULSUS_PORT override the ports
 
   (loki.yaml: auth_enabled false, tsdb/filesystem schema v13, replication
   factor 1, inmemory ring, allow_structured_metadata true,
   reject_old_samples false -- every limit left at its default, which is the
   point: the numbers below are the flag defaults.)
 
+compare.py also needs a Loki source checkout containing revision b318f282
+(LOKI_SRC, default /home/hayato/git/loki): the eighteen OTLP index-label
+names are READ out of `pkg/loghttp/push/otlp_config.go` at that revision
+with `git show`, not transcribed into the harness. A case set generated
+over a copied list is still a case set drawn from our own model of the
+rule -- which is exactly how a wrong selection rule passed 44/44 in an
+earlier round. The script exits non-zero rather than falling back to a copy
+if it cannot read the reference.
+
 Success statuses differ by protocol and are treated as equal: Loki answers
 204 on /loki/api/v1/push and on /otlp/v1/logs; PulsusDB answers 204 on
 /loki/api/v1/push and 200 on /v1/logs (the OTLP spec's success code).
 
-Long runs are squashed as <cxN> = N repetitions of c. Loki's plain-text
-bodies carry a trailing newline from Go's http.Error, shown as \n; OTLP
-bodies are google.rpc.Status protobufs, so the leading framing byte prints
-as a replacement character.
+These are statuses, and a status cannot see what was STORED. The four
+`otlp/index-key-vs-near-miss/*` cases agree here and diverge in storage:
+upstream keeps the near-miss spelling as structured metadata while we index
+it, both spellings canonicalize onto one label name, and our collision rule
+keeps the near-miss -- so a 2049-byte value lands on a stream label the
+bound passed at two bytes. That half is asserted on stored state instead,
+by `otlp_logs::tests::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value`
+and, out of live ClickHouse, by
+`loki_push_live::an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label`.
 
-Each case                                                   loki  pulsus  verdict  expected
-json/15-labels                                         204   204     SAME     SAME
-json/16-labels                                         400   400     SAME     SAME
-json/15+service_name                                   204   204     SAME     SAME
-json/16+service_name                                   400   400     SAME     SAME
-json/15+one-empty                                      204   204     SAME     SAME
-json/name-1024                                         204   204     SAME     SAME
-json/name-1025                                         400   400     SAME     SAME
-json/value-2048                                        204   204     SAME     SAME
-json/value-2049                                        400   400     SAME     SAME
-json/empty-valued-2000B-name                           204   204     SAME     SAME
-json/count-outranks-length                             400   400     SAME     SAME
-json/name-outranks-value-same-label                    400   400     SAME     SAME
-json/sorted-order-picks-the-label                      400   400     SAME     SAME
-json/duplicate-key-collapses                           204   204     SAME     SAME
-json/16-nonempty+241-empty                             400   400     SAME     SAME
-json/15-nonempty+250-empty                             204   204     SAME     SAME
-json/257-nonempty                                      400   400     SAME     SAME
-json/65537-raw-empty-keys                              204   400     DIFF     DIFF
-json/internal-aggregated-metric-16-labels              204   204     SAME     SAME
-json/internal-pattern-over-long-value                  204   204     SAME     SAME
-json/mixed-good-and-bad                                400   400     SAME     SAME
-json/two-distinct-failures                             400   400     SAME     SAME
-json/control-bytes-in-sibling-label                    400   400     SAME     SAME
-json/entry-less-stream-over-wide                       204   204     SAME     SAME
-pb/duplicate-distinct                                  400   400     SAME     SAME
-pb/257-nonempty                                        400   400     SAME     SAME
-pb/duplicate-identical                                 400   400     SAME     SAME
-pb/value-2049                                          400   400     SAME     SAME
-pb/16-labels                                           400   400     SAME     SAME
-pb/count-outranks-duplicate                            400   400     SAME     SAME
-pb/value-outranks-later-duplicate                      400   400     SAME     SAME
-pb/earlier-duplicate-outranks-value                    400   400     SAME     SAME
-pb/repeat-with-empty-copy-is-not-duplicate             204   204     SAME     SAME
-pb/empty-copy-first-is-not-duplicate                   204   204     SAME     SAME
-pb/distinct-duplicate-is-still-a-duplicate             400   400     SAME     SAME
-pb/16-nonempty+241-empty                               400   400     SAME     SAME
-pb/internal-pattern-16-labels                          204   204     SAME     SAME
-otlp/indexed-value-2049                                400   400     SAME     SAME
-otlp/indexed-value-2048                                204   200     SAME     SAME
-otlp/16-indexed                                        400   400     SAME     SAME
-otlp/15-indexed                                        204   200     SAME     SAME
-otlp/15-indexed+service.name                           204   200     SAME     SAME
-otlp/15-indexed+40-non-indexed                         204   200     SAME     SAME
-otlp/non-indexed-value-2049                            204   200     SAME     SAME
-otlp/non-indexed-name-1025                             204   200     SAME     SAME
-otlp/16-non-indexed                                    204   200     SAME     SAME
-otlp/15-indexed+one-empty-indexed                      204   200     SAME     SAME
-otlp/16-indexed+__pattern__                            400   400     SAME     SAME
-otlp/mixed-good-and-bad-indexed                        400   400     SAME     SAME
-otlp/raw/service.name/value-2049                       400   400     SAME     SAME
-otlp/canonical/service_name/value-2049                 204   200     SAME     SAME
-otlp/raw/service.namespace/value-2049                  400   400     SAME     SAME
-otlp/canonical/service_namespace/value-2049            204   200     SAME     SAME
-otlp/raw/service.instance.id/value-2049                400   400     SAME     SAME
-otlp/canonical/service_instance_id/value-2049          204   200     SAME     SAME
-otlp/raw/deployment.environment/value-2049             400   400     SAME     SAME
-otlp/canonical/deployment_environment/value-2049       204   200     SAME     SAME
-otlp/raw/deployment.environment.name/value-2049        400   400     SAME     SAME
-otlp/canonical/deployment_environment_name/value-2049  204   200     SAME     SAME
-otlp/raw/cloud.region/value-2049                       400   400     SAME     SAME
-otlp/canonical/cloud_region/value-2049                 204   200     SAME     SAME
-otlp/raw/cloud.availability_zone/value-2049            400   400     SAME     SAME
-otlp/canonical/cloud_availability_zone/value-2049      204   200     SAME     SAME
-otlp/raw/k8s.cluster.name/value-2049                   400   400     SAME     SAME
-otlp/canonical/k8s_cluster_name/value-2049             204   200     SAME     SAME
-otlp/raw/k8s.namespace.name/value-2049                 400   400     SAME     SAME
-otlp/canonical/k8s_namespace_name/value-2049           204   200     SAME     SAME
-otlp/raw/k8s.pod.name/value-2049                       400   400     SAME     SAME
-otlp/canonical/k8s_pod_name/value-2049                 204   200     SAME     SAME
-otlp/raw/k8s.container.name/value-2049                 400   400     SAME     SAME
-otlp/canonical/k8s_container_name/value-2049           204   200     SAME     SAME
-otlp/raw/container.name/value-2049                     400   400     SAME     SAME
-otlp/canonical/container_name/value-2049               204   200     SAME     SAME
-otlp/raw/k8s.replicaset.name/value-2049                400   400     SAME     SAME
-otlp/canonical/k8s_replicaset_name/value-2049          204   200     SAME     SAME
-otlp/raw/k8s.deployment.name/value-2049                400   400     SAME     SAME
-otlp/canonical/k8s_deployment_name/value-2049          204   200     SAME     SAME
-otlp/raw/k8s.statefulset.name/value-2049               400   400     SAME     SAME
-otlp/canonical/k8s_statefulset_name/value-2049         204   200     SAME     SAME
-otlp/raw/k8s.daemonset.name/value-2049                 400   400     SAME     SAME
-otlp/canonical/k8s_daemonset_name/value-2049           204   200     SAME     SAME
-otlp/raw/k8s.cronjob.name/value-2049                   400   400     SAME     SAME
-otlp/canonical/k8s_cronjob_name/value-2049             204   200     SAME     SAME
-otlp/raw/k8s.job.name/value-2049                       400   400     SAME     SAME
-otlp/canonical/k8s_job_name/value-2049                 204   200     SAME     SAME
-otlp/near-miss/service-name/value-2049                 204   200     SAME     SAME
-otlp/near-miss/service name/value-2049                 204   200     SAME     SAME
-otlp/near-miss/service/name/value-2049                 204   200     SAME     SAME
-otlp/near-miss/cloud-region/value-2049                 204   200     SAME     SAME
-otlp/17-canonical-spellings                            204   200     SAME     SAME
-json/service_name-value-2049                           400   400     SAME     SAME
-otlp/duplicate-index-key/bad-last                      400   200     DIFF     DIFF
-otlp/duplicate-index-key/bad-first                     204   200     SAME     SAME
-otlp/index-key-vs-near-miss/bad-on-near-miss           204   200     SAME     SAME
-otlp/index-key-vs-near-miss/bad-on-index               400   400     SAME     SAME
-otlp/index-key-map-value-long-nested-key               400   200     DIFF     DIFF
-otlp/index-key-map-value-long-nested-value             400   400     SAME     SAME
-otlp/index-key-int-value                               204   200     SAME     SAME
-otlp/index-key-array-value-long                        400   400     SAME     SAME
+Long runs of one alphanumeric are squashed as <cxN> = N repetitions of c
+(100 or more). Loki's plain-text bodies carry a trailing newline from Go's
+http.Error, shown as \n; OTLP bodies are google.rpc.Status protobufs, so
+the leading framing byte prints as a replacement character.
 
-status agreement: 96/99 (3 recorded divergence(s): ['json/65537-raw-empty-keys', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
+Each case                                                       loki  pulsus  verdict  expected
+json/15-labels                                             204   204     SAME     SAME
+json/16-labels                                             400   400     SAME     SAME
+json/15+service_name                                       204   204     SAME     SAME
+json/16+service_name                                       400   400     SAME     SAME
+json/15+one-empty                                          204   204     SAME     SAME
+json/name-1024                                             204   204     SAME     SAME
+json/name-1025                                             400   400     SAME     SAME
+json/value-2048                                            204   204     SAME     SAME
+json/value-2049                                            400   400     SAME     SAME
+json/empty-valued-2000B-name                               204   204     SAME     SAME
+json/count-outranks-length                                 400   400     SAME     SAME
+json/name-outranks-value-same-label                        400   400     SAME     SAME
+json/sorted-order-picks-the-label                          400   400     SAME     SAME
+json/duplicate-key-collapses                               204   204     SAME     SAME
+json/16-nonempty+241-empty                                 400   400     SAME     SAME
+json/15-nonempty+250-empty                                 204   204     SAME     SAME
+json/257-nonempty                                          400   400     SAME     SAME
+json/65537-raw-empty-keys                                  204   400     DIFF     DIFF
+json/internal-aggregated-metric-16-labels                  204   204     SAME     SAME
+json/internal-pattern-over-long-value                      204   204     SAME     SAME
+json/mixed-good-and-bad                                    400   400     SAME     SAME
+json/two-distinct-failures                                 400   400     SAME     SAME
+json/control-bytes-in-sibling-label                        400   400     SAME     SAME
+json/entry-less-stream-over-wide                           204   204     SAME     SAME
+pb/duplicate-distinct                                      400   400     SAME     SAME
+pb/257-nonempty                                            400   400     SAME     SAME
+pb/duplicate-identical                                     400   400     SAME     SAME
+pb/value-2049                                              400   400     SAME     SAME
+pb/16-labels                                               400   400     SAME     SAME
+pb/count-outranks-duplicate                                400   400     SAME     SAME
+pb/value-outranks-later-duplicate                          400   400     SAME     SAME
+pb/earlier-duplicate-outranks-value                        400   400     SAME     SAME
+pb/repeat-with-empty-copy-is-not-duplicate                 204   204     SAME     SAME
+pb/empty-copy-first-is-not-duplicate                       204   204     SAME     SAME
+pb/distinct-duplicate-is-still-a-duplicate                 400   400     SAME     SAME
+pb/16-nonempty+241-empty                                   400   400     SAME     SAME
+pb/internal-pattern-16-labels                              204   204     SAME     SAME
+otlp/indexed-value-2049                                    400   400     SAME     SAME
+otlp/indexed-value-2048                                    204   200     SAME     SAME
+otlp/16-indexed                                            400   400     SAME     SAME
+otlp/15-indexed                                            204   200     SAME     SAME
+otlp/15-indexed+service.name                               204   200     SAME     SAME
+otlp/15-indexed+40-non-indexed                             204   200     SAME     SAME
+otlp/non-indexed-value-2049                                204   200     SAME     SAME
+otlp/non-indexed-name-1025                                 204   200     SAME     SAME
+otlp/16-non-indexed                                        204   200     SAME     SAME
+otlp/15-indexed+one-empty-indexed                          204   200     SAME     SAME
+otlp/16-indexed+__pattern__                                400   400     SAME     SAME
+otlp/mixed-good-and-bad-indexed                            400   400     SAME     SAME
+otlp/raw/service.name/value-2049                           400   400     SAME     SAME
+otlp/canonical/service_name/value-2049                     204   200     SAME     SAME
+otlp/raw/service.namespace/value-2049                      400   400     SAME     SAME
+otlp/canonical/service_namespace/value-2049                204   200     SAME     SAME
+otlp/raw/service.instance.id/value-2049                    400   400     SAME     SAME
+otlp/canonical/service_instance_id/value-2049              204   200     SAME     SAME
+otlp/raw/deployment.environment/value-2049                 400   400     SAME     SAME
+otlp/canonical/deployment_environment/value-2049           204   200     SAME     SAME
+otlp/raw/deployment.environment.name/value-2049            400   400     SAME     SAME
+otlp/canonical/deployment_environment_name/value-2049      204   200     SAME     SAME
+otlp/raw/cloud.region/value-2049                           400   400     SAME     SAME
+otlp/canonical/cloud_region/value-2049                     204   200     SAME     SAME
+otlp/raw/cloud.availability_zone/value-2049                400   400     SAME     SAME
+otlp/canonical/cloud_availability_zone/value-2049          204   200     SAME     SAME
+otlp/raw/k8s.cluster.name/value-2049                       400   400     SAME     SAME
+otlp/canonical/k8s_cluster_name/value-2049                 204   200     SAME     SAME
+otlp/raw/k8s.namespace.name/value-2049                     400   400     SAME     SAME
+otlp/canonical/k8s_namespace_name/value-2049               204   200     SAME     SAME
+otlp/raw/k8s.pod.name/value-2049                           400   400     SAME     SAME
+otlp/canonical/k8s_pod_name/value-2049                     204   200     SAME     SAME
+otlp/raw/k8s.container.name/value-2049                     400   400     SAME     SAME
+otlp/canonical/k8s_container_name/value-2049               204   200     SAME     SAME
+otlp/raw/container.name/value-2049                         400   400     SAME     SAME
+otlp/canonical/container_name/value-2049                   204   200     SAME     SAME
+otlp/raw/k8s.replicaset.name/value-2049                    400   400     SAME     SAME
+otlp/canonical/k8s_replicaset_name/value-2049              204   200     SAME     SAME
+otlp/raw/k8s.deployment.name/value-2049                    400   400     SAME     SAME
+otlp/canonical/k8s_deployment_name/value-2049              204   200     SAME     SAME
+otlp/raw/k8s.statefulset.name/value-2049                   400   400     SAME     SAME
+otlp/canonical/k8s_statefulset_name/value-2049             204   200     SAME     SAME
+otlp/raw/k8s.daemonset.name/value-2049                     400   400     SAME     SAME
+otlp/canonical/k8s_daemonset_name/value-2049               204   200     SAME     SAME
+otlp/raw/k8s.cronjob.name/value-2049                       400   400     SAME     SAME
+otlp/canonical/k8s_cronjob_name/value-2049                 204   200     SAME     SAME
+otlp/raw/k8s.job.name/value-2049                           400   400     SAME     SAME
+otlp/canonical/k8s_job_name/value-2049                     204   200     SAME     SAME
+otlp/near-miss/service-name/value-2049                     204   200     SAME     SAME
+otlp/near-miss/service name/value-2049                     204   200     SAME     SAME
+otlp/near-miss/service/name/value-2049                     204   200     SAME     SAME
+otlp/near-miss/cloud-region/value-2049                     204   200     SAME     SAME
+otlp/17-canonical-spellings                                204   200     SAME     SAME
+json/service_name-value-2049                               400   400     SAME     SAME
+otlp/duplicate-index-key/bad-last                          400   200     DIFF     DIFF
+otlp/duplicate-index-key/bad-first                         204   200     SAME     SAME
+otlp/index-key-vs-near-miss/bad-on-near-miss               204   200     SAME     SAME
+otlp/index-key-vs-near-miss/bad-on-index                   400   400     SAME     SAME
+otlp/index-key-vs-near-miss/service_name-bad-on-near-miss  204   200     SAME     SAME
+otlp/index-key-vs-near-miss/service_name-bad-on-index      400   400     SAME     SAME
+otlp/index-key-map-value-long-nested-key                   400   200     DIFF     DIFF
+otlp/index-key-map-value-long-nested-value                 400   400     SAME     SAME
+otlp/index-key-int-value                                   204   200     SAME     SAME
+otlp/index-key-array-value-long                            400   400     SAME     SAME
+
+status agreement: 98/101 (3 recorded divergence(s): ['json/65537-raw-empty-keys', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
 unexpected verdicts: []
 
 ====================================================================================================
@@ -429,6 +451,12 @@ bodies
 --- otlp/index-key-vs-near-miss/bad-on-index [SAME]
     loki   400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
     pulsus 400: � stream '{k8s_pod_name="<bx2049>"}' has label value too long: '<bx2049>'
+--- otlp/index-key-vs-near-miss/service_name-bad-on-near-miss [SAME]
+    loki   204: 
+    pulsus 200: 
+--- otlp/index-key-vs-near-miss/service_name-bad-on-index [SAME]
+    loki   400: � stream '{service_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{service_name="<bx2049>"}' has label value too long: '<bx2049>'
 --- otlp/index-key-map-value-long-nested-key [DIFF]
     loki   400: �stream '{service_name_<ax1025>="v"}' has label name too long: 'service_name_<ax1025>'
     pulsus 200: 

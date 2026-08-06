@@ -3,17 +3,76 @@
 for issue #374's per-stream label rules.
 
 Sends byte-identical bodies to both and records (status, body) for each.
-Loki: 127.0.0.1:13174.  PulsusDB: 127.0.0.1:18374.
+Loki: 127.0.0.1:13174.  PulsusDB: 127.0.0.1:18374 (override with LOKI_PORT /
+PULSUS_PORT when another agent holds those ports).
 See oracle_probe.txt in this directory for the recorded run and the recipe.
+
+Needs a Loki source checkout containing the pinned revision, because the
+eighteen index-label names are read out of it rather than transcribed here
+(LOKI_SRC, default /home/hayato/git/loki). Exits non-zero if it cannot.
 """
 import http.client
 import json
+import os
+import re
+import subprocess
 import sys
 import time
 
-LOKI = ("127.0.0.1", 13174)
-PULSUS = ("127.0.0.1", 18374)
+LOKI = ("127.0.0.1", int(os.environ.get("LOKI_PORT", "13174")))
+PULSUS = ("127.0.0.1", int(os.environ.get("PULSUS_PORT", "18374")))
 TS = str(int(time.time() * 1e9))
+
+# The oracle container's revision, from /loki/api/v1/status/buildinfo.
+LOKI_SRC = os.environ.get("LOKI_SRC", "/home/hayato/git/loki")
+LOKI_PIN = "b318f2829f0ae2094ab3a1e90780450e9e4b03be"  # v3.7.4
+
+
+def reference_index_labels():
+    """The `default_resource_attributes_as_index_labels` defaults, READ from
+    the pinned reference (`pkg/loghttp/push/otlp_config.go:56-75 @ v3.7.4`),
+    not transcribed.
+
+    `git show <pin>:<path>` reads the blob at that revision, so the answer does
+    not depend on what the checkout happens to have checked out. Failure to
+    read it is fatal: a silent fallback to a copied list is exactly the defect
+    the generated cases exist to rule out — a case set drawn from our own model
+    of the rule cannot distinguish our model from the reference's.
+
+    Drift against PulsusDB's own `OTLP_INDEX_ATTRIBUTES` is caught
+    behaviourally rather than textually: every name here gets a raw case
+    expecting `400` on both sides and a canonicalized case expecting `204`, so
+    a name we index and the reference does not (or the reverse) lands as an
+    UNEXPECTED verdict and exits non-zero.
+    """
+    path = "pkg/loghttp/push/otlp_config.go"
+    proc = subprocess.run(
+        ["git", "-C", LOKI_SRC, "show", f"{LOKI_PIN}:{path}"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        sys.exit(
+            f"cannot read {path} at {LOKI_PIN[:8]} from {LOKI_SRC}: "
+            f"{proc.stderr.strip()}\n"
+            "Set LOKI_SRC to a Loki checkout containing that revision "
+            "(v3.7.4). The list is deliberately not transcribed here."
+        )
+    m = re.search(
+        r"cfg\.DefaultOTLPResourceAttributesAsIndexLabels\s*=\s*\[\]string\{(.*?)\n\t\}",
+        proc.stdout,
+        re.S,
+    )
+    if not m:
+        sys.exit(
+            f"{path}@{LOKI_PIN[:8]}: could not locate the "
+            "DefaultOTLPResourceAttributesAsIndexLabels literal — the "
+            "reference moved it, so the generated cases would be silently wrong"
+        )
+    names = re.findall(r'"([^"]+)"', m.group(1))
+    if not names:
+        sys.exit(f"{path}@{LOKI_PIN[:8]}: index-label literal parsed empty")
+    return names
 
 
 # --- snappy block format, literal-only (valid, no back-references) ---------
@@ -257,14 +316,13 @@ case("pb/internal-pattern-16-labels", "pb",
 # earlier 44-case set sampled only (a) exact dotted names and (b) obviously
 # arbitrary names, so it could not distinguish the raw rule from a
 # canonicalized one -- which is how a canonicalized selection passed 44/44.
-ALL_IDX = ["service.name"] + [
-       "service.namespace", "service.instance.id", "deployment.environment",
-       "deployment.environment.name", "cloud.region", "cloud.availability_zone",
-       "k8s.cluster.name", "k8s.namespace.name", "k8s.pod.name",
-       "k8s.container.name", "container.name", "k8s.replicaset.name",
-       "k8s.deployment.name", "k8s.statefulset.name", "k8s.daemonset.name",
-       "k8s.cronjob.name", "k8s.job.name"]
-IDX = ALL_IDX[1:]
+#
+# The LIST itself is read out of the reference too (reference_index_labels()
+# above), not copied: a generated set of pairs over a transcribed list is still
+# a set drawn from our model of the rule.  ALL_IDX[0] is `service.name`, which
+# the count bound discounts, so IDX is the rest.
+ALL_IDX = reference_index_labels()
+IDX = [k for k in ALL_IDX if k != "service.name"]
 idx = lambda n: {k: "v" for k in IDX[:n]}
 
 case("otlp/indexed-value-2049", "otlp", otlp_json([{"k8s.pod.name": B1}]), "application/json")
@@ -325,10 +383,27 @@ case("otlp/duplicate-index-key/bad-first", "otlp",
 # ...whereas an index name colliding with its own near-miss spelling is only a
 # collision HERE (upstream indexes the dotted one and makes the other
 # structured metadata), and agrees in both orders.
+#
+# THE WIRE AGREEING IS NOT STORAGE AGREEING, and these four cases only measure
+# the wire.  Both sides accept; upstream then stores the near-miss as
+# structured metadata while we store it as an index label, and our collision
+# rule (#4: greatest ORIGINAL key, and `_` 0x5F sorts after `.` 0x2E) hands the
+# label to the UNVALIDATED near-miss -- so a 2049-byte value is stored under a
+# name the bound passed at two bytes.  Statuses cannot see that; the stored
+# labels and the fingerprint are asserted in
+# otlp_logs.rs::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value
+# and, out of live ClickHouse, in loki_push_live.rs::
+# an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label.  The cause is
+# that we index every OTLP attribute where the reference indexes eighteen
+# (#109); this issue matches the rejection surface, and it does.
 case("otlp/index-key-vs-near-miss/bad-on-near-miss", "otlp",
      otlp_json([[("k8s.pod.name", "ok"), ("k8s_pod_name", B1)]]), "application/json")
 case("otlp/index-key-vs-near-miss/bad-on-index", "otlp",
      otlp_json([[("k8s.pod.name", B1), ("k8s_pod_name", "ok")]]), "application/json")
+case("otlp/index-key-vs-near-miss/service_name-bad-on-near-miss", "otlp",
+     otlp_json([[("service.name", "ok"), ("service_name", B1)]]), "application/json")
+case("otlp/index-key-vs-near-miss/service_name-bad-on-index", "otlp",
+     otlp_json([[("service.name", B1), ("service_name", "ok")]]), "application/json")
 
 # Attribute value types other than string.  A MAP value under an index key
 # fans out into several labels upstream, prefixed with the parent's
