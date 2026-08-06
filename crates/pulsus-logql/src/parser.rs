@@ -1314,11 +1314,20 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   arithmetic, and `b19_offset.test`'s
 ///   `offset-domain-edge-exact-arithmetic` block, read by hand.
 ///   Sweep 3, unbounded-acceptance phrases within ±12 lines of a line
-///   matching `offset`, keyword-free. The matcher is exactly
-///   `unbounded|uncapped|no cap|imposes no|admits|accepts (any|the|every)`
-///   — no elision — run as `for f in $(git grep -lI -i offset); do grep
-///   -i -C12 -E offset "$f" | grep -qiE "$PH" && echo "$f"; done | sort
-///   -u` → 13 files, the 9 not also in sweep 1 read by hand and carrying
+///   matching `offset`, keyword-free. The matcher is INLINED into the
+///   command, never held in a shell variable, so what is printed is what
+///   runs in a shell that has never seen this file. An earlier revision
+///   spelled the matcher out in prose and passed it as `"$PH"` without
+///   showing the assignment: run as printed, `$PH` expands to the empty
+///   regex, which every line matches, and the loop selects every file it
+///   scans instead of 13 — 229 files, both at `42806d2` and over the tree
+///   carrying this sentence, since the scanned set is `git grep -lI -i
+///   offset` and this file was already in it (issue #248 round 12,
+///   reproduced with `env -u PH`).
+///   `for f in $(git grep -lI -i offset); do grep -i -C12 -E offset "$f" |
+///   grep -qiE 'unbounded|uncapped|no cap|imposes no|admits|accepts (any|the|every)' &&
+///   echo "$f"; done | sort -u`
+///   → 13 files, the 9 not also in sweep 1 read by hand and carrying
 ///   no claim about the reference's offset band: a TraceQL cap, a
 ///   parser-vendoring note, `admits_instant`, a local named `uncapped`,
 ///   and three copies of "the only unbounded quantity left is where the
