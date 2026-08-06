@@ -213,12 +213,18 @@ pub fn combine_binary_capped(
 /// is not taken: it would put result-shape query logic inside the module
 /// that is the budget and its proof tokens.
 ///
-/// `return_bool` is the one thing left loose, deliberately. It selects
-/// what a comparison emits, and `instant_join` detects every duplicate
-/// before its keep filter (its "Duplicate detection — BEFORE the keep
-/// filter" block), so no refusal is a function of it — which is also why
-/// `binary_peak_bytes` does not take it. Substituting it cannot change
-/// which refusal is raised, only which values a comparison keeps.
+/// `return_bool` is still a parameter, and it is NOT a piece of the
+/// decision context that was left outside the carrier: nothing is
+/// decided under it. [`decide_binary`] takes the operands, the
+/// operator, the matcher and the budget, and `return_bool` is not among
+/// them; neither is it among [`binary_peak_bytes`]' arguments. So there
+/// is no `return_bool` the refusals were decided or the charge priced
+/// under, for this call to be able to disagree with. What it selects is
+/// what a comparison EMITS: under `bool` every matched pair yields a
+/// sample valued 0/1, and without it only the pairs the comparison holds
+/// for survive, carrying the value their own arm keeps — the source left
+/// operand's in [`instant_join`], and in [`scalar_apply`] the VECTOR
+/// side's whichever side that is (`5 < vec(10)` keeps `10`).
 fn join_decided(
     charged: BinaryCharged<'_, '_>,
     return_bool: bool,
@@ -1930,24 +1936,35 @@ thread_local! {
 /// semantic refusals pass that test, so this funnel has no class-(A)
 /// member left.
 ///
-/// **Where the "before the charge" claim stops, exactly.** Two things
-/// leave a refusal below the charge, and neither is a class-(A) member:
+/// **Where the "before the charge" claim stops.** (P1) is conditional.
+/// What holds however it is deferred is that no refusal is LOST, only
+/// moved: `instant_join` still performs all three of its own checks, so
+/// a (P1) refusal the preflight did not decide is raised there instead,
+/// below `Ledger::acquire_binary`. The two conditions `ledger::decide_binary`
+/// spells for itself are the conjuncts of its own `if`, and they differ
+/// in what a deferral there costs:
 ///
-/// 1. **The guard.** (P1) runs only when the stage charge about to be
-///    levied would refuse (`ledger::decide_binary`). When it would not,
-///    the three join refusals are raised by `instant_join` after
-///    `Ledger::acquire_binary` — below the charge, and harmlessly,
-///    because that charge admitted and so preempts nothing.
-/// 2. **The skip.** When the scratch would exceed
+/// 1. **The guard**, the first conjunct. (P1) runs only when the stage
+///    charge about to be levied would refuse. When it would not, the
+///    join's refusals are raised below the charge harmlessly, because
+///    that charge admitted and so preempts nothing.
+/// 2. **The skip**, the second. When the scratch would exceed
 ///    [`MAX_BINARY_PREFLIGHT_BYTES`], `PreflightCharge::acquire` returns
 ///    `None` and (P1) does not run at all. Behaviour then falls back
-///    byte-for-byte to the pre-#290 ordering, budget-first, which
+///    byte-for-byte to the pre-#290 ordering, budget-first — here the
+///    budget DOES answer first, which
 ///    `the_join_refusals_are_preempted_by_the_budget_when_the_preflight_is_skipped`
 ///    keeps reproducible. The skip is unreachable below ~6.75 million
 ///    combined series.
 ///
-/// (P0) is subject to neither: `decide_shape` runs unconditionally, above
-/// every charge.
+/// Deferring a refusal does not reclassify it: (P) is a property of the
+/// refusal — decidable from the inputs in input-sized scratch — not of
+/// where it happens to be decided, and
+/// `every_semantic_refusal_under_the_binary_seam_is_decided_above_the_charge`
+/// derives the funnel's non-budget refusal constructors from the call
+/// graph and pins them against a published answer, within the scope that
+/// test states. (P0) is subject to neither condition: `decide_shape` runs
+/// unconditionally, above every charge.
 ///
 /// **The scratch is charged before it is allocated.** `decide_shape` is
 /// (P0) — a match on operand discriminants that needs no input-scaled
@@ -4274,13 +4291,17 @@ mod tests {
 
     /// Axis A — `(op, return_bool)`, six entries.
     ///
-    /// Six and not ten: `return_bool` is read at exactly one place,
-    /// inside `if op.is_comparison()` (`instant_join`'s `:410-419`), and
-    /// its only effect is on `value`/`keep`; `keep` gates `out.push`
-    /// AFTER every duplicate check (`:438-454`). `set_op_join` never
-    /// reads it. So it cannot change any refusal for any op — `(Gt, true)`
-    /// is kept as a control and pairing it with the four non-comparison
-    /// ops adds no reachable branch.
+    /// Six and not ten, and the reason is scoped to what THESE runs
+    /// drive. `diff_side` builds vector and matrix operands only, so the
+    /// reader of `return_bool` they reach is `instant_join`'s
+    /// `if op.is_comparison()` block. `scalar_apply` reads it too, on the
+    /// scalar arms this axis never produces; `set_op_join` does not read
+    /// it at all. In that block the
+    /// effect is on `value`/`keep`, and `keep` gates `out.push` AFTER the
+    /// duplicate checks (`instant_join`'s "Duplicate detection — BEFORE
+    /// the keep filter"). `(Gt, true)` is kept as the control that says
+    /// so, and pairing `true` with the non-comparison ops adds no branch
+    /// these runs would take.
     const AXIS_A: [(BinOp, bool); 6] = [
         (BinOp::Div, false),
         (BinOp::Gt, false),
