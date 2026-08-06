@@ -1280,8 +1280,11 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///
 ///   **The cap is OURS; the reference caps no offset magnitude here.**
 ///   MEASURED on the digest-pinned v3.7.4 oracle
-///   (`grafana/loki@sha256:87f0a067…`, `/status/buildinfo` reporting
-///   `3.7.4` / `b318f282`), the reference's LEXER admits the whole `i64`
+///   (`grafana/loki@sha256:87f0a067…`, `/loki/api/v1/status/buildinfo`
+///   reporting `3.7.4` / `b318f282` — that is the only path the
+///   reference serves it on, `pkg/loki/loki.go:603 @ v3.7.4`; bare
+///   `/status/buildinfo` and `/api/v1/status/buildinfo` are both a
+///   measured `404`), the reference's LEXER admits the whole `i64`
 ///   nanosecond domain, asymmetrically. The LEXER, said deliberately:
 ///   HTTP acceptance stops one value short of that band, and the
 ///   endpoint it drops is the next paragraph's subject, so this sentence
@@ -1289,11 +1292,22 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   sentence had already been narrowed the same way at three other
 ///   sites — `limits.rs`'s `MAX_QUERY_SPAN_NS`, `docs/features.md`'s
 ///   LogQL parity paragraph, and the `five-year-span-cap` ledger row —
-///   and this was the fourth. Those four are the whole set: the places
-///   that describe the reference's treatment of an out-of-cap `offset`
-///   are the files naming the `five-year-span-cap` ledger row, and the
-///   fifth of those, `pulsus_read`'s `QuerySpanTooLong`, quantifies over
-///   no band at all).
+///   and this was the fourth. Those four are the whole set. The
+///   enumerating sweep is `git grep -l five-year-span-cap` → five files,
+///   whose fifth, `pulsus_read`'s `QuerySpanTooLong`, quantifies over no
+///   band at all — but that sweep is CIRCULAR on its own (a file could
+///   describe the band and never name the row), so it is closed by two
+///   that do not use the keyword and whose residues were read by hand:
+///   every line pairing `offset` with a band marker (`i64`, `2562047`,
+///   `9223372036854775…`, `43800`/`43801`) — 27 files, the 22 outside
+///   the five are type declarations and unrelated subsystems — and every
+///   PARAGRAPH pairing `offset` with an unbounded-acceptance phrase
+///   (`unbounded`, `no cap`, `uncapped`, `admits`, `accepts any/the/every`,
+///   `imposes no`, …) — 15 files, the 11 outside the five carry no claim
+///   about the reference. Line-scoping that second sweep would NOT close
+///   it: the ledger row's own claim spans lines and a line-scoped variant
+///   misses it, i.e. it drops a KNOWN member. Re-run in issue #248 round
+///   10.)
 ///   `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) → 200, one ns
 ///   more → 400 `syntax error: unexpected NUMBER, expecting DURATION`;
 ///   `offset -9223372036854775808ns` (`i64::MIN`) is the lexer's floor,
@@ -1709,8 +1723,22 @@ mod tests {
     /// agrees: `go version -m` on `/usr/bin/loki` extracted from
     /// `grafana/loki@sha256:87f0a067…` prints `go1.26.5` and
     /// `mod github.com/grafana/loki/v3 v3.0.0-20260722033256-b318f2829f0a`
-    /// (`/status/buildinfo` cannot answer this — its `goVersion` field
-    /// is empty in that image). Against go1.26.5's `src/time/format.go`:
+    /// (the build-info endpoint cannot answer this. Its `goVersion` is
+    /// empty, and structurally so, not by accident of this image:
+    /// `versionHandler` reads the package var `build.GoVersion`
+    /// directly (`pkg/loki/version_handler.go:12-20`,
+    /// `pkg/util/build/build.go:14-21` @ v3.7.4) rather than
+    /// `build.GetVersion()`, which is the accessor whose `init()` fills
+    /// the field from `runtime.Version()` (`build.go:23-30`); and the
+    /// release `ldflags` set Branch/Version/Revision/BuildUser/BuildDate
+    /// and NOT `GoVersion` (`Makefile:46-50` @ v3.7.4). Measured on the
+    /// pinned digest: `GET /loki/api/v1/status/buildinfo` → `200`
+    /// `{"version":"3.7.4","revision":"b318f282",…,"goVersion":""}`.
+    /// That path is the endpoint — the only one it is served on
+    /// (`pkg/loki/loki.go:603`); bare `/status/buildinfo` and
+    /// `/api/v1/status/buildinfo` are both `404`, which is what this
+    /// comment named until issue #248 round 10).
+    /// Against go1.26.5's `src/time/format.go`:
     /// `leadingInt` is byte-identical to go1.25.5's and at the SAME
     /// lines (`:1554-1572`, ceiling `:1566`), `unitMap` is
     /// byte-identical (moved to `:1615`), and `ParseDuration` differs at
