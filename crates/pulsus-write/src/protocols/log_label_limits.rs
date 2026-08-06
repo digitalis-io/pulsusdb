@@ -11,9 +11,9 @@
 //! `Distributor.pushHandler` -> `PushWithResolver` -> `parseStreamLabels`
 //! (`pkg/distributor/http.go:28-33 @ v3.7.4`), so PulsusDB applies it on the
 //! Loki-push path *and* the OTLP logs path — though not on the same data
-//! there: see [`validate_otlp_index_labels`], because only 18 named resource
-//! attributes become stream labels upstream and the rest become structured
-//! metadata, which this validator never sees.
+//! there: see [`validate_otlp_index_labels`], because only 18 raw resource
+//! attribute names become stream labels upstream and the rest become
+//! structured metadata, which this validator never sees.
 //!
 //! # The empty-value drop is part of the stream's identity, not of validation
 //!
@@ -157,7 +157,12 @@ pub const PATTERN_LABEL: &str = "__pattern__";
 /// metric parser does), which is what makes bound 4 reachable on the protobuf
 /// literal transport. Sorting is by name only and stable, so equal names stay
 /// in wire order exactly as `labels.Labels` has them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// The inner `Vec` is private and there is deliberately no `Default`, no
+/// `From` and no second constructor, so "[`Self::from_pairs`] is the only way
+/// to obtain a stream's pairs" is enforced by the compiler rather than by
+/// convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamLabels(Vec<(String, String)>);
 
 impl StreamLabels {
@@ -275,44 +280,54 @@ impl StreamLabels {
 }
 
 /// The resource attributes the reference turns into **stream labels** on its
-/// OTLP logs endpoint, canonicalized into our label form.
+/// OTLP logs endpoint, in their **raw OTel spelling** — the spelling the
+/// selection is made on.
 ///
 /// `distributor.otlp.default_resource_attributes_as_index_labels`
-/// (`pkg/loghttp/push/otlp_config.go:56-73 @ v3.7.4`), in the OTel spelling:
-/// `service.name`, `service.namespace`, `service.instance.id`,
-/// `deployment.environment`, `deployment.environment.name`, `cloud.region`,
-/// `cloud.availability_zone`, `k8s.cluster.name`, `k8s.namespace.name`,
-/// `k8s.pod.name`, `k8s.container.name`, `container.name`,
-/// `k8s.replicaset.name`, `k8s.deployment.name`, `k8s.statefulset.name`,
-/// `k8s.daemonset.name`, `k8s.cronjob.name`, `k8s.job.name`. Every *other*
-/// resource attribute becomes structured metadata there
-/// (`OTLPConfig.actionForAttribute`'s fallthrough), and structured metadata
-/// never reaches `ValidateLabels`.
+/// (`pkg/loghttp/push/otlp_config.go:56-73 @ v3.7.4`). Every *other* resource
+/// attribute becomes structured metadata (`OTLPConfig.actionForAttribute`'s
+/// fallthrough at `otlp_config.go:88-99`), and structured metadata never
+/// reaches `ValidateLabels`.
 ///
-/// Sorted, so the lookup below is a binary search.
-const OTLP_INDEX_LABELS: [&str; 18] = [
-    "cloud_availability_zone",
-    "cloud_region",
-    "container_name",
-    "deployment_environment",
-    "deployment_environment_name",
-    "k8s_cluster_name",
-    "k8s_container_name",
-    "k8s_cronjob_name",
-    "k8s_daemonset_name",
-    "k8s_deployment_name",
-    "k8s_job_name",
-    "k8s_namespace_name",
-    "k8s_pod_name",
-    "k8s_replicaset_name",
-    "k8s_statefulset_name",
-    "service_instance_id",
-    "service_name",
-    "service_namespace",
+/// **Raw, not canonicalized, and that ordering is observable.** `otlp.go:193 @
+/// v3.7.4` calls `otlpConfig.ActionForResourceAttribute(k)` on the wire key `k`
+/// and only *then* calls `attributeToLabels(k, …)`, which canonicalizes via
+/// `otlptranslator.LabelNamer.Build` (`otlp.go:610-614 @ v3.7.4`); the match
+/// inside `actionForAttribute` is `cfgAttr == attribute`, exact string equality
+/// (`otlp_config.go:88-99 @ v3.7.4`). So an attribute whose raw name merely
+/// *canonicalizes into* this list — `service_name`, `service-name`, anything of
+/// the form `service?name` — is structured metadata upstream and is bounded by
+/// nothing. Measured on `grafana/loki@sha256:87f0a067…`: a resource carrying
+/// `{service_name: "x"*2049}` answers `204`, where `{service.name: "x"*2049}`
+/// answers `400`.
+///
+/// Sorted, so the lookup below is a binary search (pinned by
+/// `the_index_attribute_list_is_sorted_for_binary_search`).
+const OTLP_INDEX_ATTRIBUTES: [&str; 18] = [
+    "cloud.availability_zone",
+    "cloud.region",
+    "container.name",
+    "deployment.environment",
+    "deployment.environment.name",
+    "k8s.cluster.name",
+    "k8s.container.name",
+    "k8s.cronjob.name",
+    "k8s.daemonset.name",
+    "k8s.deployment.name",
+    "k8s.job.name",
+    "k8s.namespace.name",
+    "k8s.pod.name",
+    "k8s.replicaset.name",
+    "k8s.statefulset.name",
+    "service.instance.id",
+    "service.name",
+    "service.namespace",
 ];
 
 /// Validates an OTLP resource's labels, charging the four bounds on the subset
-/// the reference indexes as stream labels ([`OTLP_INDEX_LABELS`]).
+/// the reference indexes as stream labels — selected from the **raw** attribute
+/// names ([`OTLP_INDEX_ATTRIBUTES`]) and canonicalized afterwards, which is the
+/// order `otlp.go:180-212 @ v3.7.4` does it in.
 ///
 /// PulsusDB stores every resource attribute as a stream label (issue #109);
 /// the reference stores only those 18 that way and routes the rest to
@@ -322,14 +337,31 @@ const OTLP_INDEX_LABELS: [&str; 18] = [
 /// a 2049-byte value, or 16 arbitrary attributes, answers `204` there. Charging
 /// them on the indexed subset reproduces its answer in both directions.
 ///
-/// The `LabelSet` is sorted, key-unique and empty-free by construction (see
-/// [`StreamLabels::from_pairs`], applied before it was built), so the filtered
-/// view is exactly the subset of what was stored.
-pub fn validate_otlp_index_labels(labels: &pulsus_model::LabelSet) -> Result<(), LabelLimitError> {
+/// `LabelSet::from_normalized` performs the canonicalize-then-collapse that
+/// upstream's `attributeToLabels` + `streamLabels[name] = value` map assignment
+/// performs, and it is the *same* call that decides what is stored, so the
+/// value a bound is charged on is the value that would be written. The
+/// resulting set is then run through [`StreamLabels`] for `WithoutEmpty` and
+/// the name sort, exactly as `parseStreamLabels` re-parses the rendered literal
+/// upstream.
+///
+/// Two raw index attributes that collide on one canonical name (only reachable
+/// from a repeated wire key, since the 18 raw names canonicalize to 18 distinct
+/// labels) resolve by `from_normalized`'s frozen rule (issue #4) rather than by
+/// upstream's last-write-wins; that is the pre-existing collision divergence,
+/// not a bound of its own — see docs/benchmarks/logs-differential-ledger.md.
+pub fn validate_otlp_index_labels<I>(raw_attributes: I) -> Result<(), LabelLimitError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let indexed: Vec<(String, String)> = raw_attributes
+        .into_iter()
+        .filter(|(key, _)| OTLP_INDEX_ATTRIBUTES.binary_search(&key.as_str()).is_ok())
+        .collect();
+    let (labels, _collisions) = pulsus_model::LabelSet::from_normalized(indexed);
     StreamLabels::from_pairs(
         labels
             .iter()
-            .filter(|(name, _)| OTLP_INDEX_LABELS.binary_search(name).is_ok())
             .map(|(name, value)| (name.to_string(), value.to_string())),
     )
     .validate()
@@ -561,11 +593,29 @@ mod tests {
     }
 
     /// `WithoutEmpty` runs before the duplicate test, so a repeated name whose
-    /// second copy is empty-valued is not a duplicate — upstream the parser
+    /// other copy is empty-valued is not a duplicate — upstream the parser
     /// keeps both and `WithoutEmpty` then drops one.
+    ///
+    /// **Both orders**, because the rule that applies here is the one that
+    /// drops the empty *pair* (`ls.WithoutEmpty()`,
+    /// `pkg/logql/syntax/parser.go:279-296 @ v3.7.4`), not the delete-by-name
+    /// rule a `labels.Builder` applies to structured metadata
+    /// (`distributor.go:698-722 @ v3.7.4`, issue #259). Delete-by-name would
+    /// lose the surviving twin as well, so the two rules disagree on exactly
+    /// this input and only the pair rule keeps the label. Measured on
+    /// `grafana/loki@sha256:87f0a067…`: both orders are `204` and store the
+    /// non-empty value, while `{d="one", d="two"}` is `400`.
     #[test]
     fn a_repeat_whose_other_copy_is_empty_valued_is_not_a_duplicate() {
-        assert!(check(&[("foo", "bar"), ("foo", "")]).is_ok());
+        for pairs in [[("foo", "bar"), ("foo", "")], [("foo", ""), ("foo", "bar")]] {
+            assert!(check(&pairs).is_ok(), "{pairs:?}");
+            assert_eq!(
+                labels(&pairs).into_pairs(),
+                vec![("foo".to_string(), "bar".to_string())],
+                "the surviving twin is kept, not deleted by name: {pairs:?}"
+            );
+        }
+        assert!(err(&[("foo", "one"), ("foo", "two")]).contains("duplicate label name"));
     }
 
     /// Check 1 precedes checks 2-4: a stream that is too wide *and* carries
@@ -699,5 +749,143 @@ mod tests {
         let mut out = String::new();
         push_go_quoted(&mut out, "naïve→\u{a0}");
         assert_eq!(out, "\"naïve→\u{a0}\"");
+    }
+    // -- the OTLP index-label subset --------------------------------------
+
+    fn otlp(attrs: &[(&str, &str)]) -> Result<(), LabelLimitError> {
+        validate_otlp_index_labels(
+            attrs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+        )
+    }
+
+    /// `binary_search` is only a correct membership test on a sorted slice, so
+    /// the list's order is load-bearing, not cosmetic: an out-of-order entry
+    /// would silently stop being an index attribute.
+    #[test]
+    fn the_index_attribute_list_is_sorted_for_binary_search() {
+        let mut sorted = OTLP_INDEX_ATTRIBUTES;
+        sorted.sort_unstable();
+        assert_eq!(OTLP_INDEX_ATTRIBUTES, sorted);
+        for name in OTLP_INDEX_ATTRIBUTES {
+            assert!(
+                OTLP_INDEX_ATTRIBUTES.binary_search(&name).is_ok(),
+                "{name} is not findable"
+            );
+        }
+    }
+
+    /// Enumerated from the reference's own list
+    /// (`otlp_config.go:56-73 @ v3.7.4`), not from the cases we happened to
+    /// think of: for **every** one of the 18, the raw dotted spelling is an
+    /// index label and is bounded, and the same name spelled with the
+    /// separators already canonicalized is *not* an index label and is bounded
+    /// by nothing — because `ActionForResourceAttribute` matches the wire key
+    /// by exact string equality before `attributeToLabels` canonicalizes
+    /// (`otlp.go:193 @ v3.7.4`). Measured on the container for
+    /// `service.name`/`service_name`; the rule is the same string comparison
+    /// for the other 17.
+    #[test]
+    fn every_index_attribute_is_bounded_in_its_raw_spelling_only() {
+        let over = "b".repeat(MAX_LABEL_VALUE_BYTES + 1);
+        for raw in OTLP_INDEX_ATTRIBUTES {
+            let message = otlp(&[(raw, over.as_str())])
+                .expect_err("raw index attribute must be bounded")
+                .to_string();
+            assert!(message.contains("has label value too long"), "{raw}");
+
+            let canonical = pulsus_model::canonicalize_label_key(raw);
+            assert_ne!(canonical, raw, "{raw} must have a distinct canonical form");
+            assert!(
+                otlp(&[(canonical.as_str(), over.as_str())]).is_ok(),
+                "{canonical} must not be an index label"
+            );
+        }
+    }
+
+    /// The same collision through the other separators a client can spell:
+    /// `service-name`, `service name` and `service/name` all canonicalize to
+    /// `service_name` here and are all structured metadata upstream.
+    #[test]
+    fn a_key_that_merely_canonicalizes_into_the_index_list_is_not_bounded() {
+        let over = "b".repeat(MAX_LABEL_VALUE_BYTES + 1);
+        for spelling in [
+            "service_name",
+            "service-name",
+            "service name",
+            "service/name",
+        ] {
+            assert_eq!(
+                pulsus_model::canonicalize_label_key(spelling),
+                SERVICE_NAME_LABEL
+            );
+            assert!(otlp(&[(spelling, over.as_str())]).is_ok(), "{spelling}");
+        }
+    }
+
+    /// ...and it does not count towards the 15 either: 15 raw index attributes
+    /// plus any number of near-miss spellings is accepted.
+    #[test]
+    fn near_miss_spellings_do_not_count_towards_the_label_bound() {
+        let mut attrs: Vec<(&str, &str)> = OTLP_INDEX_ATTRIBUTES[..15]
+            .iter()
+            .map(|k| (*k, "v"))
+            .collect();
+        attrs.push(("service_name", "checkout"));
+        attrs.push(("k8s_pod_name", "p"));
+        attrs.push(("cloud-region", "r"));
+        assert!(otlp(&attrs).is_ok());
+    }
+
+    /// `service.name` is the only one of the 18 whose canonical form is
+    /// discounted from the count (`validator.go:169-174 @ v3.7.4`), so 15 raw
+    /// index attributes plus it is 15 counted, and 16 without it is 16.
+    #[test]
+    fn the_count_bound_over_index_attributes_discounts_service_name() {
+        let sixteen: Vec<(&str, &str)> = OTLP_INDEX_ATTRIBUTES[..16]
+            .iter()
+            .map(|k| (*k, "v"))
+            .collect();
+        assert!(sixteen.iter().all(|(k, _)| *k != "service.name"));
+        assert!(
+            otlp(&sixteen)
+                .unwrap_err()
+                .to_string()
+                .contains("has 16 label names; limit 15")
+        );
+
+        let mut fifteen_plus_service: Vec<(&str, &str)> = OTLP_INDEX_ATTRIBUTES[..15]
+            .iter()
+            .map(|k| (*k, "v"))
+            .collect();
+        fifteen_plus_service.push(("service.name", "checkout"));
+        assert!(otlp(&fifteen_plus_service).is_ok());
+    }
+
+    /// The 18 raw names canonicalize to 18 distinct labels, so the duplicate
+    /// bound is unreachable on this transport from *distinct* keys — matching
+    /// upstream, where `streamLabels` is a map. Only a repeated wire key can
+    /// collide, and `from_normalized` collapses that before the bound is
+    /// charged, exactly as the map assignment does.
+    #[test]
+    fn index_attributes_cannot_collide_into_a_duplicate() {
+        let canonical: std::collections::BTreeSet<String> = OTLP_INDEX_ATTRIBUTES
+            .iter()
+            .map(|k| pulsus_model::canonicalize_label_key(k))
+            .collect();
+        assert_eq!(canonical.len(), OTLP_INDEX_ATTRIBUTES.len());
+        assert!(otlp(&[("k8s.pod.name", "a"), ("k8s.pod.name", "b")]).is_ok());
+    }
+
+    /// An empty-valued index attribute is dropped before the bounds, and a
+    /// non-indexed attribute never reaches them at all.
+    #[test]
+    fn the_index_subset_drops_empty_values_and_ignores_non_indexed_attributes() {
+        let over = "b".repeat(MAX_LABEL_VALUE_BYTES + 1);
+        assert!(otlp(&[("k8s.pod.name", "")]).is_ok());
+        assert!(otlp(&[("app", over.as_str())]).is_ok());
+        let long_key = "a".repeat(MAX_LABEL_NAME_BYTES + 1);
+        assert!(otlp(&[(long_key.as_str(), "v")]).is_ok());
     }
 }

@@ -1738,7 +1738,16 @@ places where the observable still differs.
     created"). `{a="1", ignored=""}` is therefore one stream with one
     fingerprint on both sides. `StreamLabels` is the single seam that
     applies it, and the value it validates is the value handed to
-    `LabelSet::from_normalized`;
+    `LabelSet::from_normalized` — so the bounds are charged on the
+    stripped set, never on the raw pair list. The rule that applies to a
+    *stream label* drops the empty **pair**; the rule that applies to
+    *structured metadata* deletes **by name** (a `labels.Builder` reset,
+    `distributor.go:698-722 @ v3.7.4`, issue #259). The two disagree on
+    exactly one input, a repeated name with one empty copy: the pair rule
+    keeps the surviving twin, delete-by-name would lose it too. Measured
+    on the oracle in both orders — `{d="", d="keep"}` and `{d="keep",
+    d=""}` are `204` and store `d="keep"`, while `{d="one", d="two"}` is
+    `400`;
   - a stream carrying `__aggregated_metric__` or `__pattern__` is exempt
     from all four bounds (`validator.go:164-167 @ v3.7.4`). PulsusDB
     generates no such stream, but both are ordinary client-settable label
@@ -1748,8 +1757,9 @@ places where the observable still differs.
     labels other than `service_name`";
   - a stream with no entries is skipped before validation
     (`distributor.go:639-641`).
-- **The OTLP subset.** On its OTLP logs endpoint the reference splits a
-  resource's attributes in two before the distributor ever sees them
+- **The OTLP subset, selected on the RAW attribute name.** On its OTLP
+  logs endpoint the reference splits a resource's attributes in two before
+  the distributor ever sees them
   (`pkg/loghttp/push/otlp.go:180-212 @ v3.7.4`): the 18 names in
   `distributor.otlp.default_resource_attributes_as_index_labels`
   (`pkg/loghttp/push/otlp_config.go:56-73 @ v3.7.4`) become stream labels,
@@ -1763,12 +1773,28 @@ places where the observable still differs.
   charged on the indexed subset instead, which reproduces the oracle's
   answer in both directions: `k8s.pod.name` with a 2049-byte value is
   `400` on both, 16 indexed attributes is `400` on both, 15 indexed plus
-  40 arbitrary ones is accepted by both. The consequence is that a
-  non-indexed OTLP resource attribute is bounded by nothing here and by
-  the structured-metadata limits (64 kB and 128 entries per line,
-  `pkg/validation/limits.go:60-61 @ v3.7.4`) there; mapping those onto
-  data we store as stream labels belongs with the #109
-  attribute-placement decision, not here.
+  40 arbitrary ones is accepted by both.
+
+  The subset is selected from the **raw wire key**, not from the
+  canonicalized label name, and the difference is observable.
+  `otlp.go:193 @ v3.7.4` calls `otlpConfig.ActionForResourceAttribute(k)`
+  on `k` and only then calls `attributeToLabels(k, …)`, which
+  canonicalizes through `otlptranslator.LabelNamer.Build`
+  (`otlp.go:610-614 @ v3.7.4`); the match inside `actionForAttribute` is
+  `cfgAttr == attribute`, exact string equality (`otlp_config.go:88-99 @
+  v3.7.4`). An attribute whose raw name merely *canonicalizes into* the
+  list — `service_name`, `service-name`, `k8s_pod_name`, anything of the
+  form `service?name` for a non-alphanumeric `?` — is structured metadata
+  upstream and is bounded by nothing. Measured: `{service_name:
+  "x"*2049}` is `204` on the oracle where `{service.name: "x"*2049}` is
+  `400`. Both directions are now measured for **all 18** names, generated
+  from the reference's list rather than sampled.
+
+  The consequence is that a non-indexed OTLP resource attribute is
+  bounded by nothing here and by the structured-metadata limits (64 kB
+  and 128 entries per line, `pkg/validation/limits.go:60-61 @ v3.7.4`)
+  there; mapping those onto data we store as stream labels belongs with
+  the #109 attribute-placement decision, not here.
 - **A breach is stream-local.** The reference validates every stream,
   `continue`s past the ones that fail, writes the ones that pass, and
   only then answers `400` (`distributor.go:645-655, 780-790, 929 @
@@ -1833,6 +1859,10 @@ places where the observable still differs.
     17x over the parity bound. Empty-valued labels no longer count
     towards it on either transport, so the 16-non-empty-plus-241-empty
     stream that used to hit this cap now gets the reference's message.
+    Measured on both transports (`json/257-nonempty`, `pb/257-nonempty`):
+    `400` on both sides, ours reading `stream labels exceed the 256
+    per-stream bound` and `labels count 257 exceeds the documented limit
+    of 256` respectively.
   - `MAX_RAW_LABEL_PAIRS_PER_STREAM` = 65,536 raw `(key, value)` pairs in
     one JSON `stream` object. The JSON transport must retain
     empty-valued pairs until their names have been grammar-checked and
@@ -1841,22 +1871,65 @@ places where the observable still differs.
     drops empty values as it reads the literal. A stream carrying more
     than 65,536 raw JSON keys of which 15 or fewer are non-empty is
     accepted upstream (within the 16 MiB rendered-literal bound) and
-    refused here.
-- **Measured side by side**, 44 cases sent byte-identically to
-  `grafana/loki@sha256:87f0a067…` and to a running PulsusDB — 22 Loki-push
-  JSON, 10 Loki-push protobuf, 12 OTLP — with **status agreement in all
-  44**. The transcript and the harness that produced it are checked in at
-  `crates/pulsus-write/tests/golden/log_label_bounds/`.
+    refused here. Measured (`json/65537-raw-empty-keys`): `204` there,
+    `400` here reading `stream label pairs exceed the 65536 per-stream
+    bound`.
+- **Residual 4 — a repeated OTLP index-attribute key.** A resource that
+  carries the same index attribute twice with different values is
+  resolved last-write-wins upstream (`streamLabels` is a map,
+  `otlp.go:191-193 @ v3.7.4`), so the bound is charged on whichever value
+  came last. PulsusDB collapses the repeat through
+  `LabelSet::from_normalized`, whose resolution is issue #4's frozen
+  greatest-`(key, value)` rule, so the bound is charged on the value that
+  would actually be stored. Measured: `[k8s.pod.name="ok",
+  k8s.pod.name="b"*2049]` is `400` upstream and `200` here; the reverse
+  order agrees. Matching upstream's choice would mean validating a value
+  we do not store — the defect this issue's first round was about — so
+  the real fix is to change the collision rule for OTLP resource
+  attributes, which changes stored stream identities and belongs to
+  #4/#109. OTLP's data model requires attribute keys to be unique within
+  a map, so this is undefined input.
+- **Residual 5 — a map-valued OTLP index attribute.**
+  `attributeToLabels` (`otlp.go:602-640 @ v3.7.4`) recurses into a map
+  value and emits one label per leaf, named `<parent>_<leaf>`, so a
+  1025-byte nested key becomes an over-long label NAME upstream.
+  PulsusDB renders a map attribute to a single JSON-valued label (issue
+  #109), so the long key ends up inside a value that is under the value
+  bound: `400` upstream, `200` here. The same payload with a long nested
+  *value* is `400` on both, by different routes. This is the
+  attribute-flattening difference, not the bound; it belongs with #109.
+- **Measured side by side**, 99 cases sent byte-identically to
+  `grafana/loki@sha256:87f0a067…` and to a running PulsusDB — 25 Loki-push
+  JSON, 13 Loki-push protobuf, 61 OTLP — with **status agreement in 96**,
+  the three exceptions being residual 3's second half and residuals 4 and
+  5, which the harness carries as expected divergences so that they stay
+  the ones that were recorded. The
+  transcript and the harness that produced it are checked in at
+  `crates/pulsus-write/tests/golden/log_label_bounds/`; the harness exits
+  non-zero on any verdict that is not its expected one.
+  An earlier 44-case version of that harness scored 44/44 against an
+  implementation that selected the OTLP subset on the canonicalized name,
+  because every OTLP case it sent used either an exact dotted index name
+  or an obviously arbitrary one — never a raw key whose canonical form
+  disagrees with it about membership, which is where that defect lived.
+  The `otlp/raw/…` and `otlp/canonical/…` pairs are now generated from the
+  reference's own list for that reason; re-running the current cases
+  against that implementation produces 25 unexpected verdicts.
 - **Pinned by** `log_label_limits`'s own unit tests (the four bounds, both
   edges each, the `service_name` decrement, the empty-value rule and its
   effect on stored identity, the internal-stream exemption, the
   check-order cases including count-vs-duplicate and value-vs-duplicate,
   and the whole ASCII range of the Go quoting transcribed from
-  `strconv.Quote`), `loki_push::tests::parse_json_*`/`parse_protobuf_*`
+  `strconv.Quote`; plus
+  `every_index_attribute_is_bounded_in_its_raw_spelling_only`, which walks
+  the reference's own 18-name list and asserts both directions rather
+  than sampling), `loki_push::tests::parse_json_*`/`parse_protobuf_*`
   and `otlp_logs::tests::*` (both receivers reach the rules, empty labels
   do not consume the decode caps, the OTLP bounds are charged on the
-  indexed subset while the empty-value drop is not, a bad stream costs
-  only itself),
+  raw-name-selected indexed subset while the empty-value drop is not —
+  `every_raw_index_name_bounds_and_its_canonical_spelling_does_not`,
+  `a_raw_attribute_that_only_canonicalizes_into_an_index_name_is_not_bounded`
+  — and a bad stream costs only itself),
   `ingest/http.rs`'s
   `loki_over_long_label_value_is_400_with_the_reference_message` /
   `loki_over_wide_stream_is_400_with_the_reference_message` /

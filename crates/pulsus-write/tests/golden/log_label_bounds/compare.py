@@ -3,7 +3,7 @@
 for issue #374's per-stream label rules.
 
 Sends byte-identical bodies to both and records (status, body) for each.
-Loki: 127.0.0.1:13100.  PulsusDB: 127.0.0.1:18374.
+Loki: 127.0.0.1:13174.  PulsusDB: 127.0.0.1:18374.
 See oracle_probe.txt in this directory for the recorded run and the recipe.
 """
 import http.client
@@ -11,7 +11,7 @@ import json
 import sys
 import time
 
-LOKI = ("127.0.0.1", 13100)
+LOKI = ("127.0.0.1", 13174)
 PULSUS = ("127.0.0.1", 18374)
 TS = str(int(time.time() * 1e9))
 
@@ -98,17 +98,20 @@ def stream(labels, line="hi"):
 
 # --- OTLP/JSON ------------------------------------------------------------
 def otlp_json(resources):
-    """resources: list of dict-of-attrs"""
+    """resources: list of dict-of-attrs, or of lists of (k, value-object)
+    pairs when a case needs duplicate keys or a non-string attribute value."""
+    def kvs(attrs):
+        pairs = attrs.items() if isinstance(attrs, dict) else attrs
+        return [
+            {"key": k, "value": v if isinstance(v, dict) else {"stringValue": v}}
+            for k, v in pairs
+        ]
+
     return json.dumps(
         {
             "resourceLogs": [
                 {
-                    "resource": {
-                        "attributes": [
-                            {"key": k, "value": {"stringValue": v}}
-                            for k, v in attrs.items()
-                        ]
-                    },
+                    "resource": {"attributes": kvs(attrs)},
                     "scopeLogs": [
                         {
                             "logRecords": [
@@ -130,8 +133,11 @@ def otlp_json(resources):
 CASES = []
 
 
-def case(name, transport, body, ctype):
-    CASES.append((name, transport, body, ctype))
+def case(name, transport, body, ctype, expect="SAME"):
+    """expect="SAME": statuses must agree.  expect="DIFF": a KNOWN divergence,
+    recorded so that it stays the one we recorded rather than silently
+    changing.  Either way the run fails only on an UNEXPECTED verdict."""
+    CASES.append((name, transport, body, ctype, expect))
 
 
 A = "a" * 1024
@@ -173,6 +179,17 @@ case("json/16-nonempty+241-empty", "json",
      loki_json([stream({**n16, **{f"e{i}": "" for i in range(241)}})]), "application/json")
 case("json/15-nonempty+250-empty", "json",
      loki_json([stream({**n15, **{f"e{i}": "" for i in range(250)}})]), "application/json")
+# The two PulsusDB-only structural caps the reference does not have, both
+# directions (ledger residual 3).  257 non-empty labels: 400 on both, but our
+# wording is the decode cap's, not `has N label names; limit 15`.  65,537 raw
+# JSON keys of which none are non-empty: accepted upstream (WithoutEmpty drops
+# them all), refused here by MAX_RAW_LABEL_PAIRS_PER_STREAM.
+case("json/257-nonempty", "json",
+     loki_json([stream({f"n{i}": "v" for i in range(257)})]), "application/json")
+case("json/65537-raw-empty-keys", "json",
+     loki_json([stream({f"e{i}": "" for i in range(65537)})]), "application/json",
+     expect="DIFF")
+
 case("json/internal-aggregated-metric-16-labels", "json",
      loki_json([stream({**n16, "__aggregated_metric__": "x"})]), "application/json")
 case("json/internal-pattern-over-long-value", "json",
@@ -194,6 +211,9 @@ def pb(labels, line="hi"):
 
 
 case("pb/duplicate-distinct", "pb", pb('{foo="bar", foo="barf"}'), "application/x-protobuf")
+case("pb/257-nonempty", "pb",
+     pb("{" + ", ".join(f'n{i}="v"' for i in range(257)) + "}"),
+     "application/x-protobuf")
 case("pb/duplicate-identical", "pb", pb('{foo="bar", foo="bar"}'), "application/x-protobuf")
 case("pb/value-2049", "pb", pb('{app="%s"}' % B1), "application/x-protobuf")
 case("pb/16-labels", "pb",
@@ -207,6 +227,15 @@ case("pb/earlier-duplicate-outranks-value", "pb",
      pb('{aaa="1", aaa="2", zzz="%s"}' % C), "application/x-protobuf")
 case("pb/repeat-with-empty-copy-is-not-duplicate", "pb",
      pb('{foo="bar", foo=""}'), "application/x-protobuf")
+# ...and in the other order.  The rule that applies to STREAM labels drops the
+# empty pair (ls.WithoutEmpty(), parser.go:279-296 @ v3.7.4) and keeps the
+# surviving twin; the delete-by-name rule a labels.Builder applies to
+# STRUCTURED METADATA (distributor.go:698-722, issue #259) would lose the twin
+# too, so this input is exactly where the two rules disagree.
+case("pb/empty-copy-first-is-not-duplicate", "pb",
+     pb('{d="", d="keep"}'), "application/x-protobuf")
+case("pb/distinct-duplicate-is-still-a-duplicate", "pb",
+     pb('{d="one", d="two"}'), "application/x-protobuf")
 case("pb/16-nonempty+241-empty", "pb",
      pb("{" + ", ".join(f'l{i}="v"' for i in range(16)) + ", "
         + ", ".join(f'e{i}=""' for i in range(241)) + "}"), "application/x-protobuf")
@@ -218,12 +247,24 @@ case("pb/internal-pattern-16-labels", "pb",
 # Only the 18 names in `default_resource_attributes_as_index_labels` become
 # stream labels upstream (otlp_config.go:56-73 @ v3.7.4); everything else is
 # structured metadata and never reaches ValidateLabels. Both halves are here.
-IDX = ["service.namespace", "service.instance.id", "deployment.environment",
+# The selection is made on the RAW wire key: otlp.go:193 calls
+# ActionForResourceAttribute(k) and only then attributeToLabels(k, ...)
+# canonicalizes, and the match inside actionForAttribute is `cfgAttr ==
+# attribute`, exact string equality (otlp_config.go:88-99 @ v3.7.4).  So the
+# two directions below are generated from the reference's OWN list rather than
+# sampled: the dotted spelling is an index label and is bounded, the same name
+# already spelled with underscores is structured metadata and is not.  The
+# earlier 44-case set sampled only (a) exact dotted names and (b) obviously
+# arbitrary names, so it could not distinguish the raw rule from a
+# canonicalized one -- which is how a canonicalized selection passed 44/44.
+ALL_IDX = ["service.name"] + [
+       "service.namespace", "service.instance.id", "deployment.environment",
        "deployment.environment.name", "cloud.region", "cloud.availability_zone",
        "k8s.cluster.name", "k8s.namespace.name", "k8s.pod.name",
        "k8s.container.name", "container.name", "k8s.replicaset.name",
        "k8s.deployment.name", "k8s.statefulset.name", "k8s.daemonset.name",
        "k8s.cronjob.name", "k8s.job.name"]
+IDX = ALL_IDX[1:]
 idx = lambda n: {k: "v" for k in IDX[:n]}
 
 case("otlp/indexed-value-2049", "otlp", otlp_json([{"k8s.pod.name": B1}]), "application/json")
@@ -244,6 +285,69 @@ case("otlp/16-indexed+__pattern__", "otlp",
 case("otlp/mixed-good-and-bad-indexed", "otlp",
      otlp_json([{"k8s.pod.name": "good"}, {"k8s.pod.name": B1}]), "application/json")
 
+# -- raw vs canonical spelling, over the reference's whole list -------------
+for _k in ALL_IDX:
+    case(f"otlp/raw/{_k}/value-2049", "otlp", otlp_json([{_k: B1}]), "application/json")
+    case(f"otlp/canonical/{_k.replace('.', '_')}/value-2049", "otlp",
+         otlp_json([{_k.replace(".", "_"): B1}]), "application/json")
+
+# Other separators that canonicalize onto an index label here and are
+# structured metadata upstream.
+for _k in ("service-name", "service name", "service/name", "cloud-region"):
+    case(f"otlp/near-miss/{_k}/value-2049", "otlp", otlp_json([{_k: B1}]),
+         "application/json")
+
+# 17 underscored look-alikes: not index labels, so not counted.
+case("otlp/17-canonical-spellings", "otlp",
+     otlp_json([{k.replace(".", "_"): "v" for k in ALL_IDX}]), "application/json")
+
+# The cross-transport twin of the defect: the SAME label name is bounded on
+# /loki/api/v1/push (where it is a literal label) and unbounded on the OTLP
+# receiver (where it is a raw attribute name that is not one of the 18).
+# Neither transport's cases alone can see the two rules being swapped.
+case("json/service_name-value-2049", "json",
+     loki_json([stream({"service_name": B1})]), "application/json")
+
+# A REPEATED wire key on an index attribute.  Upstream's streamLabels is a
+# map, so the last write wins (otlp.go:191-193 @ v3.7.4) and the bound is
+# charged on whichever value came last; ours collapses through
+# LabelSet::from_normalized, whose resolution is issue #4's frozen
+# greatest-(key, value) rule, so the bound is charged on the value we would
+# actually store.  Recorded rather than matched: matching upstream's choice
+# here means validating a value we do not store, which is the defect round 1
+# of this issue was about.  Pre-existing -- the previous implementation
+# validated the same collapsed LabelSet.
+case("otlp/duplicate-index-key/bad-last", "otlp",
+     otlp_json([[("k8s.pod.name", "ok"), ("k8s.pod.name", B1)]]), "application/json",
+     expect="DIFF")
+case("otlp/duplicate-index-key/bad-first", "otlp",
+     otlp_json([[("k8s.pod.name", B1), ("k8s.pod.name", "ok")]]), "application/json")
+# ...whereas an index name colliding with its own near-miss spelling is only a
+# collision HERE (upstream indexes the dotted one and makes the other
+# structured metadata), and agrees in both orders.
+case("otlp/index-key-vs-near-miss/bad-on-near-miss", "otlp",
+     otlp_json([[("k8s.pod.name", "ok"), ("k8s_pod_name", B1)]]), "application/json")
+case("otlp/index-key-vs-near-miss/bad-on-index", "otlp",
+     otlp_json([[("k8s.pod.name", B1), ("k8s_pod_name", "ok")]]), "application/json")
+
+# Attribute value types other than string.  A MAP value under an index key
+# fans out into several labels upstream, prefixed with the parent's
+# canonicalized name (otlp.go:602-640 @ v3.7.4), so a long nested key becomes a
+# long LABEL NAME there; we render the map to one JSON-valued label (#109).
+case("otlp/index-key-map-value-long-nested-key", "otlp",
+     otlp_json([[("service.name", {"kvlistValue": {"values": [
+         {"key": A1, "value": {"stringValue": "v"}}]}})]]),
+     "application/json", expect="DIFF")
+case("otlp/index-key-map-value-long-nested-value", "otlp",
+     otlp_json([[("service.name", {"kvlistValue": {"values": [
+         {"key": "inner", "value": {"stringValue": B1}}]}})]]),
+     "application/json")
+case("otlp/index-key-int-value", "otlp",
+     otlp_json([[("k8s.pod.name", {"intValue": "42"})]]), "application/json")
+case("otlp/index-key-array-value-long", "otlp",
+     otlp_json([[("k8s.pod.name", {"arrayValue": {"values": [
+         {"stringValue": B1}]}})]]), "application/json")
+
 PATHS = {
     "json": ("/loki/api/v1/push", "/loki/api/v1/push"),
     "pb": ("/loki/api/v1/push", "/loki/api/v1/push"),
@@ -256,32 +360,37 @@ def trim(s, n=100000):
     return s if len(s) <= n else s[:n] + f"…[{len(s)} bytes]"
 
 
-agree = 0
-disagree = []
+unexpected = []
 rows = []
-for name, transport, body, ctype in CASES:
+for name, transport, body, ctype, expect in CASES:
     lpath, ppath = PATHS[transport]
     ls, lb = post(LOKI, lpath, body, ctype)
     ps, pb_ = post(PULSUS, ppath, body, ctype)
+    # 200 and 204 are both "accepted": Loki answers 204 on /otlp/v1/logs,
+    # PulsusDB answers the OTLP spec's 200 on /v1/logs.
     same = (ls in (200, 204)) == (ps in (200, 204)) and (ls == ps or {ls, ps} <= {200, 204})
-    if same:
-        agree += 1
-    else:
-        disagree.append(name)
-    rows.append((name, ls, ps, "SAME" if same else "DIFF", trim(lb), trim(pb_)))
+    verdict = "SAME" if same else "DIFF"
+    if verdict != expect:
+        unexpected.append(name)
+    rows.append((name, ls, ps, verdict, expect, trim(lb), trim(pb_)))
 
 w = max(len(r[0]) for r in rows)
-print(f"{'case'.ljust(w)}  loki  pulsus  verdict")
-for name, ls, ps, v, lb, pbo in rows:
-    print(f"{name.ljust(w)}  {ls:<4}  {ps:<6}  {v}")
+print(f"{'case'.ljust(w)}  loki  pulsus  verdict  expected")
+for name, ls, ps, v, expect, lb, pbo in rows:
+    flag = "" if v == expect else "   <-- UNEXPECTED"
+    print(f"{name.ljust(w)}  {ls:<4}  {ps:<6}  {v:<7}  {expect}{flag}")
 print()
-print(f"status agreement: {agree}/{len(rows)}; differing: {disagree}")
+agree = sum(1 for r in rows if r[3] == "SAME")
+known = [r[0] for r in rows if r[4] == "DIFF"]
+print(f"status agreement: {agree}/{len(rows)} "
+      f"({len(known)} recorded divergence(s): {known})")
+print(f"unexpected verdicts: {unexpected}")
 print()
 print("=" * 100)
 print("bodies")
 print("=" * 100)
-for name, ls, ps, v, lb, pbo in rows:
+for name, ls, ps, v, expect, lb, pbo in rows:
     print(f"--- {name} [{v}]")
     print(f"    loki   {ls}: {lb}")
     print(f"    pulsus {ps}: {pbo}")
-sys.exit(0)
+sys.exit(1 if unexpected else 0)

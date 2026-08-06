@@ -14,7 +14,6 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
-use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use pulsus_model::{
     Date, Fingerprint, LabelSet, UnixNano, canonicalize_label_key, stream_fingerprint,
@@ -169,7 +168,12 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
         // structured metadata, not a stream label; issue #109), so there is
         // exactly one label set per `ResourceLogs` — built once here rather
         // than re-derived for every scope, and never per record.
-        let (labels, collisions) = build_stream_labels(resource_logs.resource.as_ref());
+        let resource_attrs = resource_logs
+            .resource
+            .as_ref()
+            .map(|resource| resource.attributes.as_slice())
+            .unwrap_or(&[]);
+        let (labels, collisions) = build_stream_labels(resource_attrs);
         // `WithoutEmpty` + the four per-stream label bounds (issue #374).
         // `WithoutEmpty` is applied inside `build_stream_labels` above, before
         // `from_normalized`, because the reference drops empty values before
@@ -178,10 +182,12 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
         // distributor re-parses through `syntax.ParseLabels`
         // (`distributor.go:1370 @ v3.7.4`).
         //
-        // The four bounds, though, are charged on a SUBSET: the resource
-        // attributes the reference turns into stream labels. Upstream splits a
-        // resource's attributes in two (`otlp.go:180-212 @ v3.7.4`,
-        // `OTLPConfig.ActionForResourceAttribute`) — the 18 names in
+        // The four bounds, though, are charged on a SUBSET, selected from the
+        // RAW attribute names: upstream splits a resource's attributes in two
+        // (`otlp.go:180-212 @ v3.7.4`) by calling
+        // `otlpConfig.ActionForResourceAttribute(k)` on the wire key `k` and
+        // only then canonicalizing it with `attributeToLabels`
+        // (`otlp.go:193,610-614 @ v3.7.4`). The 18 names in
         // `distributor.otlp.default_resource_attributes_as_index_labels`
         // (`pkg/loghttp/push/otlp_config.go:56-73 @ v3.7.4`) become stream
         // labels, and every other attribute becomes structured metadata, which
@@ -190,8 +196,12 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
         // payloads the reference accepts: measured against
         // `grafana/loki@sha256:87f0a067…`, a resource carrying `app` with a
         // 2049-byte value, or 16 arbitrary attributes, answers `204` there and
-        // stores the attribute as structured metadata. Charging them on the
-        // attributes it *does* index reproduces its answer either way.
+        // stores the attribute as structured metadata. So would selecting on
+        // the CANONICALIZED name: `{service_name: "x"*2049}` is `204` there,
+        // because the raw key `service_name` is not one of the 18 — only
+        // `service.name` is. Selecting on the raw names reproduces its answer
+        // either way, so `attr_pairs` is re-walked here rather than the built
+        // `LabelSet` being filtered.
         //
         // The remainder is not left unbounded upstream — it lands under the
         // structured-metadata limits at `ValidateEntry` (64 kB and 128 entries
@@ -209,7 +219,10 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
             .scope_logs
             .iter()
             .any(|scope_logs| !scope_logs.log_records.is_empty());
-        if has_records && let Err(err) = log_label_limits::validate_otlp_index_labels(&labels) {
+        if has_records
+            && let Err(err) =
+                log_label_limits::validate_otlp_index_labels(attr_pairs(resource_attrs))
+        {
             out.stream_errors.push(err.to_string());
             continue;
         }
@@ -301,8 +314,7 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
 /// never swapped. Because scope no longer enters this set, `stream_fingerprint`
 /// is a pure function of the resource labels — a stream pushed with vs.
 /// without scope fingerprints identically, exactly as Loki does.
-fn build_stream_labels(resource: Option<&Resource>) -> (LabelSet, usize) {
-    let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
+fn build_stream_labels(resource_attrs: &[KeyValue]) -> (LabelSet, usize) {
     // `StreamLabels::from_pairs` applies `WithoutEmpty` (issue #374) BEFORE
     // `from_normalized`: an empty-valued resource attribute is neither
     // validated nor stored, so it cannot change the stream's fingerprint and
@@ -524,6 +536,7 @@ mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
     use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+    use opentelemetry_proto::tonic::resource::v1::Resource;
 
     /// The `AnyValue` depth guard (finding #54) made `super::parse` fallible.
     /// Every legacy assertion below constructs shallow, in-bounds requests, so
@@ -1824,6 +1837,79 @@ mod tests {
         assert_eq!(out.streams.len(), 2);
         assert_eq!(out.stream_errors.len(), 1);
         assert!(out.stream_errors[0].contains("has label value too long"));
+    }
+
+    /// The subset is selected on the **raw** attribute name, which is what
+    /// `ActionForResourceAttribute` matches (`otlp.go:193 @ v3.7.4`, exact
+    /// string equality at `otlp_config.go:88-99`) before `attributeToLabels`
+    /// canonicalizes it. `service_name` is not one of the 18 raw names — only
+    /// `service.name` is — so upstream routes it to structured metadata and no
+    /// bound applies. Measured on `grafana/loki@sha256:87f0a067…`: a resource
+    /// carrying `{service_name: "x"*2049}` answers `204` there.
+    #[test]
+    fn a_raw_attribute_that_only_canonicalizes_into_an_index_name_is_not_bounded() {
+        let value = "x".repeat(2049);
+        for spelling in [
+            "service_name",
+            "service-name",
+            "k8s_pod_name",
+            "cloud-region",
+        ] {
+            let req = logs_with_resource_attrs(vec![attr(spelling, &value)]);
+            let out = super::parse(&req, 0).unwrap();
+            assert!(
+                out.stream_errors.is_empty(),
+                "{spelling}: {:?}",
+                out.stream_errors
+            );
+            assert_eq!(out.rows.len(), 1, "{spelling}");
+        }
+    }
+
+    /// The other direction of the same rule, over the reference's whole list
+    /// rather than one sample: every raw index name bounds, and the same name
+    /// with its separators already canonicalized does not.
+    #[test]
+    fn every_raw_index_name_bounds_and_its_canonical_spelling_does_not() {
+        let value = "x".repeat(2049);
+        let mut raw_index = INDEXED.to_vec();
+        raw_index.push("service.name");
+        for raw in raw_index {
+            let out = super::parse(&logs_with_resource_attrs(vec![attr(raw, &value)]), 0).unwrap();
+            assert_eq!(out.stream_errors.len(), 1, "{raw} must be bounded");
+            assert!(
+                out.stream_errors[0].contains("has label value too long"),
+                "{raw}"
+            );
+
+            let canonical = raw.replace('.', "_");
+            let out =
+                super::parse(&logs_with_resource_attrs(vec![attr(&canonical, &value)]), 0).unwrap();
+            assert!(
+                out.stream_errors.is_empty(),
+                "{canonical} must not be bounded: {:?}",
+                out.stream_errors
+            );
+        }
+    }
+
+    /// A near-miss spelling is not counted towards the 15 either, so 15 raw
+    /// index attributes alongside a full set of underscored look-alikes is
+    /// accepted — and all of them are still stored as stream labels (#109).
+    #[test]
+    fn near_miss_spellings_are_stored_but_not_counted() {
+        let mut attrs = indexed(15);
+        attrs.extend(
+            INDEXED
+                .iter()
+                .map(|k| attr(&k.replace('.', "_"), "v"))
+                .collect::<Vec<_>>(),
+        );
+        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        // The 15 raw and the 17 underscored spellings canonicalize onto the
+        // same 17 label names, so the stored set is 17 wide.
+        assert_eq!(out.streams[0].labels.len(), 17);
     }
 
     /// One label set per `ResourceLogs`, so a resource with several scopes
