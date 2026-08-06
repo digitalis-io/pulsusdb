@@ -7,7 +7,9 @@ time. Every expected value is **bit-exact** (`f64::to_bits`, no tolerance —
 the #218 lesson): a one-ULP perturbation reddens the runner
 (`a_perturbed_expected_value_reddens_the_runner`).
 
-## Replay coverage: three numbers, never one (issue #352 step 3)
+## Replay coverage: separate figures, never one (issue #352 step 3)
+
+<!-- corpus-counts: none -->
 
 The live replay leg (`logqltest_replay.rs`) is built. It takes each
 reachable case's `load` to the digest-pinned reference and compares the
@@ -24,38 +26,51 @@ marker table still holds and is now load-bearing in code.
 | `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | `logqltest_replay.rs` |
 | `REACHABLE` | rows a live replay can PHYSICALLY compare | `logqltest_replay.rs` |
 
+### Counts live on the constants, and nowhere else
+
 Each of those constants is asserted against a figure recomputed from the
-corpus, so it cannot go stale silently. A copy in this file can, and did:
-the `today` column this table used to carry was re-synced by issue #248
-and stale again by its second round, four days later. Read the constants.
+corpus, so it cannot go stale silently. A copy in prose cannot be, and
+issue #248 shipped a stale one in each of its three rounds — the table's
+old `today` column, then the sentence that explained why the column went,
+then a delta restated in the gap enumeration below and again on
+`CAPTURED`'s own doc comment. Each was corrected as a number; the class
+outlived every correction.
+
+**So the rule is mechanical, and the region you are reading is inside
+it.** Between a `corpus-counts: none` marker and its `corpus-counts: end`,
+no comment or prose may state a count derived from the corpus — not in
+digits, not spelled out, not as a per-issue delta. Name the reason, point
+at the constant. `check_f_marked_regions_state_no_corpus_count`
+(`logqltest_provenance.rs`) fails on one, and when a figure really moves,
+the recomputing assertion prints its new value.
 
 `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg existed,
 and that name was wrong: most of those rows can never be reached. The
 same conflation this issue opened with, one level further in. The gap is
-enumerated by reason, not absorbed:
+enumerated by reason, not absorbed; the per-reason breakdown is
+`UNREACHABLE_BY_REASON`, recomputed and asserted beside the reasons:
 
-- **absolute-timestamp (template corpus) — 678.** `t1`-`t6` samples carry
-  a fixed 2026-07-27 timestamp. They cannot be time-shifted (the expected
-  value is a function of the timestamp — `t5_time.test` is 258 rows of
-  exactly that) and cannot be pushed as-is (outside the reference's ~3h
-  ingestion window). **This is the single largest lever on reachability,
-  and it is blocked by the CORPUS, not the harness:** unblocking it means
+- **absolute-timestamp (template corpus).** The `t1`-`t6` samples carry a
+  fixed 2026-07-27 timestamp. They cannot be time-shifted (the expected
+  value is a function of the timestamp — `t5_time.test` is rows of
+  exactly that and nothing else) and cannot be pushed as-is (outside the
+  reference's ingestion window, `INGESTION_WINDOW`). **This is the single
+  largest lever on reachability — asserted, not asserted-in-prose:
+  `the_template_corpus_is_the_largest_unreachable_bucket` — and it is
+  blocked by the CORPUS, not the harness:** unblocking it means
   re-capturing those files against RELATIVE time, which is corpus work
   with its own capture procedure and review.
-- **metric query — 235.** The first slice replays log (streams) queries
-  only. Issue #344 added 37 (`b18_range_agg_grouping.test`'s executed
-  grouped range aggregations, including the two cross-stream tie rows its
-  instant `first`/`last` delivery-order fix unblocked); issue #248 added
-  7 (`b20_nested_ip.test`'s post-`unwrap` and `count_over_time` rows).
-  Its second round added 9 rows to that same file and none of them landed
-  here — they are all streams queries, so all 9 are reachable.
-- **range/matrix — 10.** Needs the step grid replayed too. Issue #344
-  added 8 (the same file's sliding-path rows, which include the
-  cross-stream `StableHash` tie).
+- **metric query.** The first slice replays log (streams) queries only,
+  so `b18_range_agg_grouping.test`'s executed grouped range aggregations
+  (issue #344) and `b20_nested_ip.test`'s post-`unwrap` and
+  `count_over_time` rows (issue #248) land here rather than in the
+  coverage.
+- **range/matrix.** Needs the step grid replayed too — `b18`'s
+  sliding-path rows, which include the cross-stream `StableHash` tie.
 
 ### Two properties of the reference that shaped the leg, both measured
 
-**It serves only the last ~3 hours.** A push older than that returns
+**It serves only the last few hours.** A push older than that returns
 `204` and is then invisible — a success that answers nothing, which reads
 exactly like a replay finding a mismatch. The measured table is in
 `INGESTION_WINDOW`, and `slots_fit_inside_the_measured_ingestion_window`
@@ -65,8 +80,9 @@ asserts the slice's slots stay inside it arithmetically.
 is in `ci/logql/config.yaml`. The corpus was captured with it off, so the
 label is stripped before comparison — the leg's ONE normalisation, named
 at the constant. The better fix is `discover_log_levels: false` in that
-config, which would also unblock the 121 config-delta rows in
-`b12_error_pair_model` and `b14_detected_fields`; it is deliberately not
+config, which would also unblock the config-delta files that need exactly
+that setting (`b12_error_pair_model`, `b14_detected_fields`; their share
+of the exclusion is in `EXCLUDED_BY_PROVENANCE`); it is deliberately not
 done from inside this leg, because that config is shared with the syntax
 and json-key legs. **Follow-up, with both legs re-verified.**
 
@@ -78,6 +94,8 @@ separate them. The leg checks for a prior run and fails with instructions
 rather than reporting the stale lines as corpus mismatches. CI always
 starts a fresh container, which is why an unchecked assumption here would
 have held in CI and misled every local run.
+
+<!-- corpus-counts: end -->
 
 ## Pinned reference
 
@@ -295,13 +313,25 @@ not the pure value path).
 
 ## Issue #230 — template-engine corpus (`t1…t6_*.test`)
 
+<!-- corpus-counts: none -->
+
 The `t*` files pin the `line_format`/`label_format` template engine —
-688 directives: 678 `eval` (t1 60 + t2 228 + t3 34 + t4 29 + t5 258 +
-t6 69) plus 10 `eval_fail` reject-parity cases (all in t1) — every
-value AND execution-error string captured verbatim from
-`grafana/loki:3.7.4`, never hand-authored. (Re-derive with
-`grep -c '^eval ' / '^eval_fail'` per file; an earlier "676 cases"
-claim mixed the two directive kinds without saying so.) **Toolchain of record:**
+`eval` rows in all six, plus the `eval_fail` reject-parity cases, which
+are all in `t1` — every value AND execution-error string captured
+verbatim from `grafana/loki:3.7.4`, never hand-authored. (Count them with
+`grep -ac '^eval ' / '^eval_fail'` per file rather than reading a figure
+here: this paragraph used to carry the inventory, and an even earlier
+version of it mixed both directive kinds into a single number without
+saying so. The `-a` is load-bearing — `t5_time.test` trips GNU grep's
+binary heuristic, and without it the command prints NOTHING for that
+file, which reads exactly like zero. `docs/features.md` and the logs
+differential ledger do quote this corpus's size, and
+`check_f_quoted_template_corpus_counts_match_the_corpus` recomputes it
+from the files rather than trusting either.)
+
+<!-- corpus-counts: end -->
+
+**Toolchain of record:**
 the pinned image's binary is built with **go1.26.5** (`go version -m`
 on the extracted binary) — semantics citations against an older local
 Go tree are advisory only; on any disagreement the container capture

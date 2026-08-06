@@ -1,6 +1,6 @@
 //! Issue #240: the provenance / surface gates behind the LogQL error
 //! envelope change (shaped on `traces_alloc_audit.rs`'s source-census
-//! idiom). Four checks, all fail-closed:
+//! idiom). Every check here is fail-closed:
 //!
 //! - **A/B** — the `msg_exact:` corpus values and the committed
 //!   `pulsus-240-bodies` capture table in `logqltest/PROVENANCE.md` are
@@ -22,6 +22,9 @@
 //!   ENUMERATE (D4 the `ESCAPE_ITEMS` table by visibility and full
 //!   signature, both directions; D5 no re-exports; D6 test-region
 //!   kinds), plus D7's exemption call-site table.
+//! - **F** — a `corpus-counts: none` region states no count the corpus
+//!   derives. Issue #248 corrected one stale copy per round for three
+//!   rounds without the class ever failing a test; this is the test.
 //!
 //! Layering (so no check is mistaken for another): Check D bounds
 //! `escape.rs`'s **surface**; cross-module reach of the private raw
@@ -891,45 +894,441 @@ fn check_e_ledger_rows_claiming_corpus_gating_are_named_by_a_marker() {
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
 
+// ---------------------------------------------------------------------
+// Check F — a `corpus-counts: none` region states no corpus count.
+// ---------------------------------------------------------------------
+
+/// Where a marked region may live: (directory relative to this crate,
+/// extensions scanned). Directories, not a file list, so a new file next
+/// to the ones below is covered the day it is written.
+const NO_COUNT_ROOTS: &[(&str, &[&str])] = &[
+    ("tests", &["rs", "md"]),
+    ("../../.github/workflows", &["yml"]),
+    ("../../docs", &["md"]),
+];
+
+/// Files that must still contribute a region. A renamed or mistyped
+/// marker would otherwise turn this check into a green no-op — the exact
+/// failure mode that let three stale counts through.
+const NO_COUNT_REQUIRED: &[&str] = &[
+    "PROVENANCE.md",
+    "logqltest_replay.rs",
+    "logqltest_provenance.rs",
+    "ci.yml",
+];
+
+const NUMBER_WORDS: &[&str] = &[
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+    "thirty",
+    "forty",
+    "fifty",
+    "dozen",
+    "hundred",
+    "thousand",
+];
+
+/// What a corpus count counts. A number-word immediately before one of
+/// these is the shape that shipped in round 3 ("added nine more `eval`
+/// rows"); a number-word anywhere else ("one level further in") is
+/// ordinary English and is left alone.
+const COUNT_NOUNS: &[&str] = &[
+    "row",
+    "rows",
+    "directive",
+    "directives",
+    "case",
+    "cases",
+    "eval",
+    "evals",
+    "eval_fail",
+    "entry",
+    "entries",
+    "file",
+    "files",
+];
+
+fn files_under(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        panic!("check F root {dir:?} does not exist");
+    };
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            files_under(&p, exts, out);
+        } else if p
+            .extension()
+            .is_some_and(|e| exts.iter().any(|x| *x == e.to_string_lossy()))
+        {
+            out.push(p);
+        }
+    }
+}
+
+/// The comment/prose lines of a marked region, with the marker lines
+/// themselves dropped. Code is not scanned: the counts BELONG in code.
+fn marked_prose(path: &Path, text: &str) -> Vec<(usize, String)> {
+    let is_md = path.extension().is_some_and(|e| e == "md");
+    let is_yml = path.extension().is_some_and(|e| e == "yml");
+    let mut out = Vec::new();
+    let mut open_at: Option<usize> = None;
+    let mut in_fence = false;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if is_md && line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        // A marker OPENS a line, after whatever comment syntax the file
+        // uses; a mention of one mid-sentence (this file's own prose, and
+        // PROVENANCE.md's statement of the rule) is not a marker.
+        let bare = line
+            .trim_start_matches("<!--")
+            .trim_start_matches("//!")
+            .trim_start_matches("///")
+            .trim_start_matches("//")
+            .trim_start_matches('#')
+            .trim();
+        if bare.starts_with("corpus-counts: none") {
+            assert!(
+                open_at.is_none(),
+                "{path:?}:{}: a `corpus-counts: none` region is already open",
+                i + 1
+            );
+            open_at = Some(i + 1);
+            continue;
+        }
+        if bare.starts_with("corpus-counts: end") {
+            assert!(
+                open_at.is_some(),
+                "{path:?}:{}: `corpus-counts: end` closes nothing",
+                i + 1
+            );
+            open_at = None;
+            continue;
+        }
+        if open_at.is_none() || in_fence {
+            continue;
+        }
+        let prose = if is_md {
+            Some(line)
+        } else if is_yml {
+            line.strip_prefix('#')
+        } else {
+            line.strip_prefix("//!")
+                .or_else(|| line.strip_prefix("///"))
+                .or_else(|| line.strip_prefix("//"))
+        };
+        if let Some(p) = prose {
+            out.push((i + 1, p.to_string()));
+        }
+    }
+    assert!(
+        open_at.is_none(),
+        "{path:?}: a `corpus-counts: none` region opened at line {} is never closed",
+        open_at.unwrap_or(0)
+    );
+    out
+}
+
+/// Drops the spans a count never hides in — backticked code, HTML
+/// comments — so what remains is prose a reader reads as a claim.
+fn strip_code_spans(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_tick = false;
+    let mut rest = line;
+    while let Some(at) = rest.find("<!--") {
+        out.push_str(&rest[..at]);
+        match rest[at..].find("-->") {
+            Some(end) => rest = &rest[at + end + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    let mut cleaned = String::with_capacity(out.len());
+    for c in out.chars() {
+        if c == '`' {
+            in_tick = !in_tick;
+            cleaned.push(' ');
+        } else if !in_tick {
+            cleaned.push(c);
+        }
+    }
+    cleaned
+}
+
+fn trimmed_token(t: &str) -> &str {
+    t.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '#')
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+}
+
+/// A token carrying digits that is NOT a count: an issue reference, an
+/// ISO date, a version, or a plan step. Everything else with a digit in
+/// it is a claim about how many, which is what the region forbids.
+fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
+    // `#344's` is the same reference as `#344`.
+    let tok = tok.split('\'').next().unwrap_or(tok);
+    if let Some(rest) = tok.strip_prefix('#') {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    if tok.len() == 10
+        && tok.as_bytes()[4] == b'-'
+        && tok.as_bytes()[7] == b'-'
+        && tok.chars().filter(|c| c.is_ascii_digit()).count() == 8
+    {
+        return true;
+    }
+    if let Some(rest) = tok.strip_prefix('v')
+        && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+    {
+        return true;
+    }
+    matches!(prev, Some("step") | Some("steps"))
+}
+
+/// **F: inside a `corpus-counts: none` region, prose states no count.**
+///
+/// Issue #248 corrected a stale corpus count in each of its three
+/// rounds — the `today` column, the sentence explaining why that column
+/// went, then a delta restated in two more places. Every round fixed the
+/// number and none fixed the class, because nothing failed when the next
+/// copy drifted. This is that thing.
+///
+/// **What it cannot see, stated rather than implied:** a count inside
+/// backticks, a count in a file outside [`NO_COUNT_ROOTS`], a count in a
+/// region nobody marked, and a quantity spelled in a way
+/// [`NUMBER_WORDS`] does not list ("a handful"). The marker is the
+/// contract: prose that carries counts must be inside one, and
+/// [`NO_COUNT_REQUIRED`] keeps the known regions from evaporating.
+#[test]
+fn check_f_marked_regions_state_no_corpus_count() {
+    let mut files = Vec::new();
+    for (root, exts) in NO_COUNT_ROOTS {
+        files_under(&manifest_path(root), exts, &mut files);
+    }
+    let mut violations: Vec<String> = Vec::new();
+    let mut contributing: Vec<String> = Vec::new();
+    let mut scanned_lines = 0usize;
+
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if !text.contains("corpus-counts: none") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        contributing.push(name.clone());
+        for (line_no, prose) in marked_prose(path, &text) {
+            scanned_lines += 1;
+            let cleaned = strip_code_spans(&prose);
+            let toks: Vec<&str> = cleaned.split_whitespace().map(trimmed_token).collect();
+            for (i, tok) in toks.iter().enumerate() {
+                let lower = tok.to_ascii_lowercase();
+                if tok.chars().any(|c| c.is_ascii_digit())
+                    && !is_allowed_numeric(tok, i.checked_sub(1).map(|p| toks[p]))
+                {
+                    violations.push(format!(
+                        "{name}:{line_no}: `{tok}` — a corpus count belongs on the constant \
+                         that recomputes it, not in prose"
+                    ));
+                }
+                if NUMBER_WORDS.contains(&lower.as_str())
+                    && toks
+                        .iter()
+                        .skip(i + 1)
+                        .take(3)
+                        .any(|t| COUNT_NOUNS.contains(&t.to_ascii_lowercase().as_str()))
+                {
+                    violations.push(format!(
+                        "{name}:{line_no}: `{tok}` counts {} — spell out no count here; name \
+                         the rows and point at the constant",
+                        toks.get(i + 1).copied().unwrap_or("")
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "a `corpus-counts: none` region states {} count(s):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+    for want in NO_COUNT_REQUIRED {
+        assert!(
+            contributing.iter().any(|f| f == want),
+            "{want} no longer carries a `corpus-counts: none` region — a mistyped or deleted \
+             marker turns this check into a no-op, which is how the class survived three \
+             corrections. Found regions in: {contributing:?}"
+        );
+    }
+    // The scan must be reading real prose: an empty region set passes
+    // every assertion above vacuously.
+    assert!(
+        scanned_lines > 60,
+        "check F scanned only {scanned_lines} prose lines — the regions have collapsed"
+    );
+}
+
+/// The other half of the rule: **a count that must appear in prose is
+/// gated, not trusted.**
+///
+/// `docs/features.md` and the logs differential ledger both quote the
+/// template-engine corpus's size, and a reader of either would take the
+/// figure at face value. They are the same class as the copies issue
+/// #248 kept correcting — except that deleting them would remove a scale
+/// claim the docs exist to make. So they stay, and this recomputes them
+/// from `t1…t6_*.test` and fails when either doc drifts from the corpus,
+/// in either direction.
+///
+/// (The re-derivation recipe in PROVENANCE.md is `grep -ac`, with the
+/// `-a`: `t5_time.test` trips GNU grep's binary heuristic and a plain
+/// `grep -c '^eval '` silently prints nothing for it, which reads as
+/// zero. This check reads the files directly and cannot be fooled that
+/// way.)
+#[test]
+fn check_f_quoted_template_corpus_counts_match_the_corpus() {
+    let dir = manifest_path("tests/logqltest/corpus");
+    let mut per_file: Vec<(String, usize)> = Vec::new();
+    let (mut evals, mut fails) = (0usize, 0usize);
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("corpus dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('t'))
+                && p.extension().is_some_and(|e| e == "test")
+        })
+        .collect();
+    entries.sort();
+    for p in &entries {
+        let text = std::fs::read_to_string(p).expect("read t-file");
+        let e = text
+            .lines()
+            .filter(|l| l.starts_with("eval") && !l.starts_with("eval_fail"))
+            .count();
+        let f = text.lines().filter(|l| l.starts_with("eval_fail")).count();
+        per_file.push((
+            p.file_name().expect("name").to_string_lossy().into_owned(),
+            e,
+        ));
+        evals += e;
+        fails += f;
+    }
+    assert!(
+        per_file.len() >= 6,
+        "expected the whole template corpus, found {per_file:?}"
+    );
+    let total = evals + fails;
+    let breakdown = per_file
+        .iter()
+        .map(|(_, e)| e.to_string())
+        .collect::<Vec<_>>()
+        .join("+");
+
+    let features = read("../../docs/features.md");
+    let ledger = read("../../docs/benchmarks/logs-differential-ledger.md");
+    let pins: &[(&str, &str, String)] = &[
+        (
+            "docs/features.md",
+            &features,
+            format!(
+                "{total} container-captured corpus directives ({evals} `eval` + {fails} `eval_fail`"
+            ),
+        ),
+        (
+            "docs/benchmarks/logs-differential-ledger.md",
+            &ledger,
+            format!("{total} container-captured corpus directives — {evals} `eval`"),
+        ),
+        (
+            "docs/benchmarks/logs-differential-ledger.md",
+            &ledger,
+            format!("({breakdown} across"),
+        ),
+        (
+            "docs/benchmarks/logs-differential-ledger.md",
+            &ledger,
+            format!("{fails} `eval_fail` reject-parity cases"),
+        ),
+    ];
+    for (name, text, want) in pins {
+        assert!(
+            text.contains(want.as_str()),
+            "{name} no longer says {want:?}. The template corpus now holds {evals} `eval` + \
+             {fails} `eval_fail` = {total} directives ({breakdown}); update the doc, or — if \
+             you reworded rather than re-counted — update this pin."
+        );
+    }
+}
+
+// corpus-counts: none — the values below are recomputed from the corpus
+// and asserted by `check_e_...`; the prose says which rows moved them and
+// why, never how many. Issue #248 restated a delta here and got it wrong
+// while the arithmetic beside it was right, which is the whole reason the
+// rule is now mechanical (`check_f_marked_regions_state_no_corpus_count`).
 /// Pinned corpus provenance counts (issue #352 step 1).
 ///
-/// Issue #344 (execution half): 1_135 -> 1_163. `b18_range_agg_grouping
-/// .test` gained 28 `eval` rows — the eight accepted operations executed,
-/// the `by`/`without`/empty-list/duplicate/absent-name shapes, `by` on the
-/// unwrapped label, and eight `eval range` rows for the sliding path
+/// Issue #344 (execution half): `b18_range_agg_grouping.test` gained
+/// `eval` rows — the accepted operations executed, the
+/// `by`/`without`/empty-list/duplicate/absent-name shapes, `by` on the
+/// unwrapped label, and the `eval range` rows for the sliding path
 /// (which include the cross-stream `StableHash` tie). Every value came
 /// from one fresh capture against the pinned v3.7.4 container, so they
-/// carry the file's `captured` default; none of the 22 pre-existing
-/// `eval_fail` rows was removed, but the eight "not yet executed"
-/// refusals among them became `eval` rows. Two more landed with the
-/// instant `first`/`last` delivery-order fix in the same issue — the
-/// cross-stream tie rows that were briefly excluded while our instant
-/// reducer still used a value tiebreak. 1_161 -> 1_163 -> 1_165. Review
-/// round 1 added seven more and removed one: the fingerprint-vs-
-/// StableHash inversion section (5), `avg_over_time`'s ungrouped
-/// recurrence pin (1), the post-unwrap-filter error pair (2), minus the
-/// grouped `avg_over_time` row whose captured value was a
-/// frontend-dependent `sum/count` rather than the reducer's.
-/// 1_165 + 7 = 1_172.
+/// carry the file's `captured` default; no pre-existing `eval_fail` row
+/// was removed, but its "not yet executed" refusals became `eval` rows.
+/// More landed with the instant `first`/`last` delivery-order fix in the
+/// same issue — the cross-stream tie rows that were briefly excluded
+/// while our instant reducer still used a value tiebreak. The first
+/// added the fingerprint-vs-`StableHash` inversion section,
+/// `avg_over_time`'s ungrouped recurrence pin and the post-unwrap-filter
+/// error pair, and removed the grouped `avg_over_time` row whose
+/// captured value was a frontend-dependent `sum/count` rather than the
+/// reducer's.
 ///
-/// Issue #248 added `b20_nested_ip.test`'s 25 rows — 20 `eval` plus 5
-/// `eval_fail` — in one capture run against the pinned v3.7.4 container
-/// (accept/reject disposition AND every value). They carry the file's
-/// `captured` default; as elsewhere, an `eval_fail`'s `msg:` gate is
-/// PulsusDB's own wording while the REJECTION it pins was captured.
-/// 1_172 + 25 = 1_197. Its second round added nine more `eval` rows to
-/// the same file, captured in the same way from the same image: the
-/// error-ordering block, where a numeric conversion fails to the LEFT of
-/// a leaf that reads the error state, plus two chained-short-circuit rows.
-/// 1_197 + 11 = 1_208.
+/// Issue #248 added `b20_nested_ip.test` — `eval` plus `eval_fail` rows,
+/// in one capture run against the pinned v3.7.4 container (accept/reject
+/// disposition AND every value). They carry the file's `captured`
+/// default; as elsewhere, an `eval_fail`'s `msg:` gate is PulsusDB's own
+/// wording while the REJECTION it pins was captured. Its second round
+/// added the error-ordering block to the same file, captured in the same
+/// way from the same image: a numeric conversion failing to the LEFT of a
+/// leaf that reads the error state, plus the chained-short-circuit rows.
 const CAPTURED: usize = 1_208;
-/// Issue #343 added `b19_offset.test`'s 9 rows: hand-derived from the
-/// semantics measured on that issue, over a fixture authored here rather
-/// than taken from the container, so they are `derived` and not
-/// `captured`. 16 -> 25. Its boundary fix added the 6 domain-edge rows
-/// (three off-axis, each with its on-axis control), same file default:
-/// 25 -> 31.
+/// Issue #343 added `b19_offset.test`: hand-derived from the semantics
+/// measured on that issue, over a fixture authored here rather than taken
+/// from the container, so they are `derived` and not `captured`. Its
+/// boundary fix added the domain-edge rows (each off-axis row with its
+/// on-axis control), same file default.
 const DERIVED: usize = 31;
 const DIVERGENCE: usize = 17;
 const PORTED: usize = 32;
 const TOTAL: usize = 1_288;
+// corpus-counts: end

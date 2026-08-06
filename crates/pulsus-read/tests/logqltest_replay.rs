@@ -1,3 +1,6 @@
+// corpus-counts: none — this module doc is where the class started: it
+// carried a table of hand-copied coverage figures, and they had drifted
+// by the time anyone looked. The region keeps them from coming back.
 //! Issue #352 step 2/3: which corpus rows a live replay may compare, and
 //! the coverage figure that keeps `captured` from being read as
 //! `replayed`.
@@ -11,9 +14,9 @@
 //! `logqltest/PROVENANCE.md` §"Provenance markers" for why no mechanism
 //! can close that gap.
 //!
-//! **Three different numbers, and none of them is the others.** This
-//! issue exists because a coverage figure got read as stronger than it
-//! was, so the vocabulary is split and each figure is pinned separately:
+//! **Separate numbers, and none of them is the others.** This issue
+//! exists because a coverage figure got read as stronger than it was, so
+//! the vocabulary is split and each figure is pinned separately:
 //!
 //! | figure | means | pinned by |
 //! |---|---|---|
@@ -23,10 +26,18 @@
 //!
 //! The values live ONLY on those constants, each asserted against a figure
 //! recomputed from the corpus. This table used to restate them as
-//! literals, and two of the three had drifted before issue #248 noticed —
-//! a hand-copied number beside a machine-checked one is a false claim
+//! literals, and they had drifted before issue #248 noticed — a
+//! hand-copied number beside a machine-checked one is a false claim
 //! waiting to happen, so the copies were removed rather than re-synced,
 //! and none is quoted here. Read the constants.
+//!
+//! **`corpus-counts: none` regions.** Issue #248 corrected a stale copy
+//! in each of its three rounds and the class survived every correction,
+//! so the rule is now enforced rather than restated: inside such a
+//! region, comment text states no corpus-derived count, in digits or in
+//! words. `check_f_marked_regions_state_no_corpus_count`
+//! (`logqltest_provenance.rs`) fails on one; `logqltest/PROVENANCE.md`
+//! §"Counts live on the constants" carries the rule itself.
 //!
 //! `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg was
 //! built, and the name was wrong: the [`Unreachable::AbsoluteTimestamp`]
@@ -36,6 +47,7 @@
 //! reproduced one level further in — we corrected `captured` vs
 //! `replayable` and immediately built `replayable` vs `reached`. Hence
 //! three names, three constants, and the gap enumerated by reason.
+// corpus-counts: end
 
 mod logqltest;
 
@@ -72,24 +84,27 @@ enum Unreplayed {
 /// container can physically serve.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Unreachable {
+    // corpus-counts: none
     /// The case's samples carry an ABSOLUTE timestamp (the template
     /// files `t1`-`t6`, pinned to 2026-07-27), and neither way of
     /// replaying it works:
     ///
     /// - it cannot be time-SHIFTED, because the expected value is a
-    ///   function of the timestamp — `t5_time.test` is 258 rows of
-    ///   exactly that;
-    /// - it cannot be pushed AS-IS, because the reference serves only
-    ///   the last ~3 hours (see [`INGESTION_WINDOW`]).
+    ///   function of the timestamp — `t5_time.test` is rows of exactly
+    ///   that and nothing else;
+    /// - it cannot be pushed AS-IS, because the reference serves only a
+    ///   recent window (see [`INGESTION_WINDOW`]).
     ///
-    /// **This is the single largest lever on reachability — 678 rows, far
-    /// more than the live leg reaches in total — and it is
-    /// blocked by the CORPUS, not by this harness.** Unblocking it means
-    /// re-capturing those files against RELATIVE time, which is corpus
-    /// work with its own capture procedure and its own review, not a
-    /// slice of the replay. Recorded here so whoever picks it up knows
-    /// where the 678 went.
+    /// **This is the single largest lever on reachability — bigger than
+    /// everything the live leg reaches put together, which
+    /// [`the_template_corpus_is_the_largest_unreachable_bucket`] asserts
+    /// rather than claims — and it is blocked by the CORPUS, not by this
+    /// harness.** Unblocking it means re-capturing those files against
+    /// RELATIVE time, which is corpus work with its own capture
+    /// procedure and its own review, not a slice of the replay. Recorded
+    /// here so whoever picks it up knows where the bucket went.
     AbsoluteTimestamp,
+    // corpus-counts: end
     /// A metric query. The first slice replays log (streams) queries
     /// only; metric results need vector/scalar comparison against the
     /// reference's own JSON shapes.
@@ -417,13 +432,52 @@ fn coverage_is_pinned_and_names_every_exclusion_at_both_levels() {
         UNREACHABLE_BY_REASON,
         "the unreachable breakdown moved"
     );
-    // The three figures must compose, so none can be quoted as another:
+    // The figures must compose, so none can be quoted as another:
     // permitted = reached + unreachable, exactly.
     let unreachable_total: usize = unreach.values().sum();
     assert_eq!(
         reachable + unreachable_total,
         permits,
         "reached + unreachable must account for every permitted row"
+    );
+}
+
+/// The claim [`Unreachable::AbsoluteTimestamp`] makes in prose — "the
+/// single largest lever on reachability, bigger than everything the live
+/// leg reaches put together" — asserted instead of asserted-in-prose.
+///
+/// A comparative claim drifts exactly like a copied count does, and this
+/// one is load-bearing: it is the reason the template corpus is named as
+/// the thing to fix first. The prose now carries no figure at all
+/// (issue #248 round 3), so this is what keeps it honest.
+#[test]
+fn the_template_corpus_is_the_largest_unreachable_bucket() {
+    let rows = classify();
+    let mut unreach: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut reachable = 0usize;
+    for r in &rows {
+        if r.provenance.is_ok() {
+            match &r.reach {
+                Ok(_) => reachable += 1,
+                Err(u) => *unreach.entry(unreachable_key(u)).or_default() += 1,
+            }
+        }
+    }
+    let template = unreach
+        .remove(unreachable_key(&Unreachable::AbsoluteTimestamp))
+        .expect("the template corpus must still be an unreachable bucket");
+    for (k, v) in &unreach {
+        assert!(
+            template > *v,
+            "{k} ({v}) is no longer smaller than the template-corpus bucket ({template}) — \
+             the 'single largest lever' claim in Unreachable::AbsoluteTimestamp's docs and in \
+             PROVENANCE.md is now false"
+        );
+    }
+    assert!(
+        template > reachable,
+        "the template-corpus bucket ({template}) no longer exceeds everything the live leg \
+         reaches ({reachable}) — correct the claim, do not widen it"
     );
 }
 
@@ -547,43 +601,38 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
     );
 }
 
-/// Pinned coverage (issue #352 steps 2-3). THREE figures, never one.
+// corpus-counts: none — every figure below is recomputed from the corpus
+// and asserted by `coverage_is_pinned_and_names_every_exclusion_at_both_
+// levels`. The VALUES live in the code; this prose says which rows moved
+// them and why, never how many (issue #248, third round).
+/// Pinned coverage (issue #352 steps 2-3). Separate figures, never one.
 ///
-/// Issue #343 added `b19_offset.test`'s 9 rows, and its boundary fix 6
-/// more (the domain-edge rows). They move the TOTAL and the `derived`
-/// exclusion only: `derived` is not a capture claim, so
-/// [`PROVENANCE_PERMITS`] does not move, and they are metric queries,
-/// which this slice cannot reach in any case.
+/// Issue #343 added `b19_offset.test`, and its boundary fix the
+/// domain-edge rows. They move the TOTAL and the `derived` exclusion
+/// only: `derived` is not a capture claim, so [`PROVENANCE_PERMITS`]
+/// does not move, and they are metric queries, which this slice cannot
+/// reach in any case.
 ///
-/// Issue #344's execution half moves all three provenance figures.
-/// `b18_range_agg_grouping.test` gained 28 captured `eval` rows and
-/// converted 10 `eval_fail` rows (the interim "not yet executed"
-/// refusals) into `eval`s, and its instant `first`/`last`
-/// delivery-order fix added the two cross-stream tie rows: TOTAL
-/// 1_215 -> 1_245, `our-error-text (eval_fail)` 71 -> 61, and so
-/// `PROVENANCE_PERMITS` 948 -> 993 (the rows added across both rounds
-/// plus the 10 that stopped being our own error text; review round 1 net
-/// +5 permitted — seven captured rows added, one grouped-`avg` row
-/// removed, and two of the new ones are `eval_fail`s carrying our own
-/// error text, which the markers do not permit a replay to compare).
-/// [`REACHABLE`] does NOT move: every newly-permitted row is a metric
-/// queries (30 instant, 8 on a step grid) and this slice replays log
+/// Issue #344's execution half moves all the provenance figures.
+/// `b18_range_agg_grouping.test` gained captured `eval` rows and
+/// converted its interim "not yet executed" `eval_fail` refusals into
+/// `eval`s, and its instant `first`/`last` delivery-order fix added the
+/// cross-stream tie rows; the first review round added captured rows and
+/// a grouped-`avg` row whose captured value was a frontend-dependent
+/// `sum/count`. [`REACHABLE`] does NOT move: every newly-permitted row
+/// is a metric query, some on a step grid, and this slice replays log
 /// (streams) queries at a single instant — so they land in the
 /// enumerated gap, not in the coverage.
 ///
-/// Issue #248 adds `b20_nested_ip.test`: TOTAL 1_252 -> 1_277 (20 `eval`
-/// rows and 5 `eval_fail` rows), `our-error-text (eval_fail)` 63 -> 68,
-/// and so [`PROVENANCE_PERMITS`] 993 -> 1_013. Thirteen of the permitted
-/// rows are streams queries at a single instant over a relative-offset
-/// load set, so [`REACHABLE`] moves for the first time since the leg was
-/// built: 77 -> 90. The other seven are metric queries (228 -> 235).
-///
-/// Its second round adds eleven more `eval` rows to that same file — the
-/// error-ordering block, where a numeric conversion fails to the LEFT of
-/// a leaf that reads the error state. All eleven are streams queries at a
-/// single instant over a relative-offset load set, so all three figures
-/// move together: TOTAL 1_277 -> 1_288, [`PROVENANCE_PERMITS`]
-/// 1_013 -> 1_024, [`REACHABLE`] 90 -> 101.
+/// Issue #248 adds `b20_nested_ip.test` (`eval` rows plus reject-parity
+/// `eval_fail` rows, which carry our own error text and so are not
+/// permitted). Most of the permitted ones are streams queries at a
+/// single instant over a relative-offset load set, so [`REACHABLE`]
+/// moves for the first time since the leg was built; the rest are metric
+/// queries. Its second round adds the error-ordering block to the same
+/// file — a numeric conversion failing to the LEFT of a leaf that reads
+/// the error state — and every row of it is a streams query at a single
+/// instant, so all the figures move together.
 const TOTAL_DIRECTIVES: usize = 1_288;
 
 /// What the provenance markers ALLOW a replay to compare. Named
@@ -600,14 +649,14 @@ const REACHABLE: usize = 101;
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \
 not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergence=17";
 
-/// Issue #344: `metric query` 191 -> 221 and `range/matrix eval`
-/// 2 -> 10. All 38 of `b18_range_agg_grouping.test`'s newly-permitted
-/// rows are metric queries, 8 of them on a step grid, and this slice
+/// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
+/// rows are metric queries, some of them on a step grid, and this slice
 /// replays log (streams) queries at a single instant — so they enlarge
 /// the ENUMERATED gap rather than the coverage. Both are levers the
 /// module docs already name.
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \
 metric query (slice: streams only)=235, range/matrix eval (slice: instant only)=10";
+// corpus-counts: end
 
 /// How far back the first slot sits. Bounded above by
 /// [`INGESTION_WINDOW`] and below by the total slot span; both are
@@ -644,8 +693,9 @@ hand-authored value that happens to be right passes; a genuine capture gone stal
 ///
 /// **This is a normalisation, and it is the only one.** The honest fix is
 /// `discover_log_levels: false` in that config, which would also unblock
-/// the two config-delta files that need exactly that setting
-/// (`b12_error_pair_model`, `b14_detected_fields` — 121 rows). It is
+/// the config-delta files that need exactly that setting
+/// (`b12_error_pair_model`, `b14_detected_fields`; their share of the
+/// exclusion is in [`EXCLUDED_BY_PROVENANCE`]). It is
 /// deliberately NOT done here: that config is shared with the syntax leg
 /// and the json-key leg, and changing what two other suites measure from
 /// inside a third suite's first slice is how a shared oracle drifts.
