@@ -66,7 +66,26 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 # port was needed.
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ch_cityhash102 = "0.1"
-serde_json = "1"
+# `float_roundtrip` (issue #270): serde_json's DEFAULT number parser is not
+# correctly rounded — a decimal literal can decode to an `f64` a bit away from
+# the nearest representable value. A value decoded wrongly at ingest is wrong
+# permanently: the wire text is gone once the row is stored, and the stored f64
+# does not say which literal produced it.
+#
+# Bare JSON numbers reach an f64 through this parser on the three OTLP/JSON
+# ingest routes — `/v1/metrics` (`asDouble`, histogram `sum`/`min`/`max`/
+# `explicitBounds`, exemplars, summary quantiles, `zeroThreshold`) and
+# `/v1/logs` + `/v1/traces` (`AnyValue.doubleValue`) — and on two of the read
+# path's three JSON decodes, LogQL `| json` and the `fromJson` template
+# function (`| unpack` promotes only string fields, so no float reaches it).
+#
+# Gates, all built from literals on which the two parsers disagree, since a
+# fixture of round numbers cannot see this at all:
+# crates/pulsus-write/tests/otlp_json_float_roundtrip.rs (hermetic, every
+# float-bearing OTLP/JSON leaf) and metric_ingest_float_roundtrip.rs (live,
+# the stored bits), plus crates/pulsus-read/tests/logql_json_float_roundtrip.rs
+# for the read path.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # OTLP logs (issue #8), metrics (issue #27), and traces (issue #54)
 # receivers. `opentelemetry-proto` supplies `prost`-generated OTLP message

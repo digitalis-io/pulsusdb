@@ -419,6 +419,12 @@ pub struct TagValues {
 /// `used == live allocations` exactness invariant (and its unit tests)
 /// therefore applies to the success path and to the pre-error prefix of
 /// a failing path, never to post-error bookkeeping.
+///
+/// **Two disciplines govern this seam** — see docs/architecture.md §5.6.
+/// Charging before allocating is the one this type exists for; the other
+/// is that a breach here must not preempt a refusal the request already
+/// earned for its MEANING, which §5.6's (P)/(A) test is how to tell
+/// apart.
 #[derive(Debug)]
 pub(crate) struct ByteBudget {
     used: usize,
