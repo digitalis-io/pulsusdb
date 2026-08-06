@@ -14,20 +14,22 @@ case's verdict is not the one recorded here.
 
 Reproduce:
   podman run -d --rm --name pulsus-loki-374 -p 13174:3100 \
-      -v ./loki.yaml:/etc/loki/local-config.yaml:ro,Z \
-      docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc \
-      -config.file=/etc/loki/local-config.yaml
+      docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc
   podman run -d --rm --name pulsus-ch-374 -p 19174:8123 \
       docker.io/clickhouse/clickhouse-server:24.8
   PULSUS_HOST=127.0.0.1 PULSUS_PORT=18374 CLICKHOUSE_SERVER=localhost \
       CLICKHOUSE_HTTP_PORT=19174 CLICKHOUSE_DB=pulsus_374_final \
       PULSUS_COMPAT_ENDPOINTS=1 ./target/debug/pulsusdb &
-  python3 compare.py          # LOKI_PORT / PULSUS_PORT override the ports
+  python3 compare.py > oracle_probe.txt   # LOKI_PORT / PULSUS_PORT override
+                                          # the ports; keep this preamble and
+                                          # the trailing notes
 
-  (loki.yaml: auth_enabled false, tsdb/filesystem schema v13, replication
-  factor 1, inmemory ring, allow_structured_metadata true,
-  reject_old_samples false -- every limit left at its default, which is the
-  point: the numbers below are the flag defaults.)
+  No config file: the image's built-in single-binary config leaves every
+  limit at its default, which is the point -- the numbers below are the flag
+  defaults. (An earlier capture mounted an equivalent all-defaults loki.yaml;
+  every verdict recorded then held unchanged under the stock config.)
+  compare.py sends `now` timestamps, so the default one-week
+  reject_old_samples window is never in play.
 
 compare.py also needs a Loki source checkout containing revision b318f282
 (LOKI_SRC, default /home/hayato/git/loki): the eighteen OTLP index-label
@@ -53,11 +55,14 @@ and, out of live ClickHouse, by
 `loki_push_live::an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label`.
 
 Long runs of one alphanumeric are squashed as <cxN> = N repetitions of c
-(100 or more). Loki's plain-text bodies carry a trailing newline from Go's
-http.Error, shown as \n; OTLP bodies are google.rpc.Status protobufs, so
-the leading framing byte prints as a replacement character.
+(100 or more) -- by compare.py's own `trim`, so the redirect above
+reproduces these bodies rather than a hand-post-processed copy of them.
+Loki's plain-text bodies carry a trailing newline from Go's http.Error,
+shown as \n; OTLP bodies are google.rpc.Status protobufs, so the leading
+framing byte prints as a replacement character (Loki's carries only the
+message field; ours also carries `code = 3`, our OTLP-error convention).
 
-Each case                                                       loki  pulsus  verdict  expected
+case                                                       loki  pulsus  verdict  expected
 json/15-labels                                             204   204     SAME     SAME
 json/16-labels                                             400   400     SAME     SAME
 json/15+service_name                                       204   204     SAME     SAME
@@ -82,6 +87,8 @@ json/mixed-good-and-bad                                    400   400     SAME   
 json/two-distinct-failures                                 400   400     SAME     SAME
 json/control-bytes-in-sibling-label                        400   400     SAME     SAME
 json/entry-less-stream-over-wide                           204   204     SAME     SAME
+json/no-streams                                            422   422     SAME     SAME
+json/no-streams-key                                        422   422     SAME     SAME
 pb/duplicate-distinct                                      400   400     SAME     SAME
 pb/257-nonempty                                            400   400     SAME     SAME
 pb/duplicate-identical                                     400   400     SAME     SAME
@@ -94,6 +101,7 @@ pb/repeat-with-empty-copy-is-not-duplicate                 204   204     SAME   
 pb/empty-copy-first-is-not-duplicate                       204   204     SAME     SAME
 pb/distinct-duplicate-is-still-a-duplicate                 400   400     SAME     SAME
 pb/16-nonempty+241-empty                                   400   400     SAME     SAME
+pb/no-streams                                              422   422     SAME     SAME
 pb/internal-pattern-16-labels                              204   204     SAME     SAME
 otlp/indexed-value-2049                                    400   400     SAME     SAME
 otlp/indexed-value-2048                                    204   200     SAME     SAME
@@ -107,6 +115,11 @@ otlp/16-non-indexed                                        204   200     SAME   
 otlp/15-indexed+one-empty-indexed                          204   200     SAME     SAME
 otlp/16-indexed+__pattern__                                400   400     SAME     SAME
 otlp/mixed-good-and-bad-indexed                            400   400     SAME     SAME
+otlp/no-resource-logs                                      422   422     SAME     SAME
+otlp/empty-request                                         422   422     SAME     SAME
+otlp/no-log-records                                        422   422     SAME     SAME
+otlp/no-scope-logs                                         422   422     SAME     SAME
+otlp/record-less-over-wide-resource+good                   204   200     SAME     SAME
 otlp/raw/service.name/value-2049                           400   400     SAME     SAME
 otlp/canonical/service_name/value-2049                     204   200     SAME     SAME
 otlp/raw/service.namespace/value-2049                      400   400     SAME     SAME
@@ -160,7 +173,7 @@ otlp/index-key-map-value-long-nested-value                 400   400     SAME   
 otlp/index-key-int-value                                   204   200     SAME     SAME
 otlp/index-key-array-value-long                            400   400     SAME     SAME
 
-status agreement: 98/101 (3 recorded divergence(s): ['json/65537-raw-empty-keys', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
+status agreement: 106/109 (3 recorded divergence(s): ['json/65537-raw-empty-keys', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
 unexpected verdicts: []
 
 ====================================================================================================
@@ -238,6 +251,12 @@ bodies
 --- json/entry-less-stream-over-wide [SAME]
     loki   204: 
     pulsus 204: 
+--- json/no-streams [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
+--- json/no-streams-key [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
 --- pb/duplicate-distinct [SAME]
     loki   400: stream '{foo="bar", foo="barf", service_name="unknown_service"}' has duplicate label name: 'foo'\n
     pulsus 400: stream '{foo="bar", foo="barf"}' has duplicate label name: 'foo'
@@ -274,6 +293,9 @@ bodies
 --- pb/16-nonempty+241-empty [SAME]
     loki   400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
     pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v"}' has 16 label names; limit 15
+--- pb/no-streams [SAME]
+    loki   422: error at least one valid stream is required for ingestion\n
+    pulsus 422: error at least one valid stream is required for ingestion
 --- pb/internal-pattern-16-labels [SAME]
     loki   204: 
     pulsus 204: 
@@ -313,6 +335,21 @@ bodies
 --- otlp/mixed-good-and-bad-indexed [SAME]
     loki   400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
     pulsus 400: � stream '{k8s_pod_name="<bx2049>"}' has label value too long: '<bx2049>'
+--- otlp/no-resource-logs [SAME]
+    loki   422: 9error at least one valid stream is required for ingestion
+    pulsus 422: 9error at least one valid stream is required for ingestion
+--- otlp/empty-request [SAME]
+    loki   422: 9error at least one valid stream is required for ingestion
+    pulsus 422: 9error at least one valid stream is required for ingestion
+--- otlp/no-log-records [SAME]
+    loki   422: 9error at least one valid stream is required for ingestion
+    pulsus 422: 9error at least one valid stream is required for ingestion
+--- otlp/no-scope-logs [SAME]
+    loki   422: 9error at least one valid stream is required for ingestion
+    pulsus 422: 9error at least one valid stream is required for ingestion
+--- otlp/record-less-over-wide-resource+good [SAME]
+    loki   204: 
+    pulsus 200: 
 --- otlp/raw/service.name/value-2049 [SAME]
     loki   400: � stream '{service_name="<bx2049>"}' has label value too long: '<bx2049>'
     pulsus 400: � stream '{service_name="<bx2049>"}' has label value too long: '<bx2049>'

@@ -77,6 +77,10 @@ def reference_index_labels():
 
 # --- snappy block format, literal-only (valid, no back-references) ---------
 def snappy_raw(data: bytes) -> bytes:
+    if not data:
+        # A zero-length block is just the varint length, with no literal to
+        # tag — the encoding the empty-`PushRequest` case below needs.
+        return b"\x00"
     out = bytearray()
     v = len(data)
     while True:
@@ -264,6 +268,15 @@ case("json/entry-less-stream-over-wide", "json",
      json.dumps({"streams": [{"stream": {"app": C}, "values": []}]},
                 separators=(",", ":")).encode(), "application/json")
 
+# A push carrying NO streams is refused before any validation runs:
+# `PushWithResolver` returns 422 MissingStreamsErrorMsg for len(req.Streams)
+# == 0 (distributor.go:579-581 @ v3.7.4).  Both JSON spellings, plus the
+# empty protobuf message below.  Their discriminating neighbour is
+# json/entry-less-stream-over-wide above: a stream with labels and no entries
+# IS a stream and stays accepted.
+case("json/no-streams", "json", b'{"streams":[]}', "application/json")
+case("json/no-streams-key", "json", b"{}", "application/json")
+
 # ---- Loki push, protobuf -------------------------------------------------
 def pb(labels, line="hi"):
     return push_request([(labels, [(int(TS), line)])])
@@ -298,6 +311,7 @@ case("pb/distinct-duplicate-is-still-a-duplicate", "pb",
 case("pb/16-nonempty+241-empty", "pb",
      pb("{" + ", ".join(f'l{i}="v"' for i in range(16)) + ", "
         + ", ".join(f'e{i}=""' for i in range(241)) + "}"), "application/x-protobuf")
+case("pb/no-streams", "pb", push_request([]), "application/x-protobuf")
 case("pb/internal-pattern-16-labels", "pb",
      pb("{" + ", ".join(f'l{i}="v"' for i in range(16)) + ', __pattern__="x"}'),
      "application/x-protobuf")
@@ -342,6 +356,36 @@ case("otlp/16-indexed+__pattern__", "otlp",
      otlp_json([{**idx(16), "__pattern__": "x"}]), "application/json")
 case("otlp/mixed-good-and-bad-indexed", "otlp",
      otlp_json([{"k8s.pod.name": "good"}, {"k8s.pod.name": B1}]), "application/json")
+
+# No log records at all -> an EMPTY converted push request
+# (`if ld.LogRecordCount() == 0`, otlp.go:144-146 @ v3.7.4) -> the same 422 the
+# stream-less Loki-push cases get.  Every shape of "no records" is one case
+# upstream because LogRecordCount sums over all (resource, scope) pairs.
+def otlp_records(resources):
+    """resources: list of (attrs dict, record count)."""
+    return json.dumps({"resourceLogs": [
+        {"resource": {"attributes": [
+            {"key": k, "value": {"stringValue": v}} for k, v in attrs.items()]},
+         "scopeLogs": [{"logRecords": [
+             {"timeUnixNano": TS, "body": {"stringValue": "hi"}}
+             for _ in range(n)]}]}
+        for attrs, n in resources]}, separators=(",", ":")).encode()
+
+
+case("otlp/no-resource-logs", "otlp", b'{"resourceLogs":[]}', "application/json")
+case("otlp/empty-request", "otlp", b"{}", "application/json")
+case("otlp/no-log-records", "otlp",
+     otlp_records([({"service.name": "probe"}, 0)]), "application/json")
+case("otlp/no-scope-logs", "otlp",
+     json.dumps({"resourceLogs": [{"resource": {"attributes": [
+         {"key": "service.name", "value": {"stringValue": "probe"}}]},
+         "scopeLogs": []}]}, separators=(",", ":")).encode(), "application/json")
+# ...and the neighbour: one record anywhere in the request is enough, and the
+# record-less resource beside it is not validated even though its label is far
+# over the bound (distributor.go:639-641 skips an entry-less stream).
+case("otlp/record-less-over-wide-resource+good", "otlp",
+     otlp_records([({"k8s.pod.name": C}, 0), ({"service.name": "good"}, 1)]),
+     "application/json")
 
 # -- raw vs canonical spelling, over the reference's whole list -------------
 for _k in ALL_IDX:
@@ -431,7 +475,18 @@ PATHS = {
 
 
 def trim(s, n=100000):
+    """Renders one response body for the transcript.
+
+    A run of 100 or more of the same alphanumeric character becomes
+    `<cxN>` -- the bodies quote label names and values that are 1025, 2049
+    or 65537 bytes of one letter, and an unsquashed transcript is 370 KB of
+    `bbbb...`.  The squash lives here, in the harness, so that
+    `python3 compare.py > oracle_probe.txt` reproduces the checked-in
+    transcript's bodies rather than a differently-post-processed copy of
+    them.
+    """
     s = s.replace("\n", "\\n")
+    s = re.sub(r"([A-Za-z0-9])\1{99,}", lambda m: f"<{m.group(1)}x{len(m.group(0))}>", s)
     return s if len(s) <= n else s[:n] + f"…[{len(s)} bytes]"
 
 

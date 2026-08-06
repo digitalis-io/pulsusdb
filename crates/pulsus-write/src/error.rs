@@ -2,7 +2,8 @@
 //! Every variant maps to exactly one whole-request `(HTTP status,
 //! google.rpc.Status.code)` pair (architect plan amendment 2,
 //! `src/ingest/http.rs`) — malformed/decompression/oversize classes to
-//! HTTP 400 / `code = 3` (`INVALID_ARGUMENT`), everything else here
+//! HTTP 400 / `code = 3` (`INVALID_ARGUMENT`), the stream-less-request
+//! class to HTTP 422 / `code = 3`, everything else here
 //! (channel/body-read failures not attributable to the payload) to HTTP
 //! 500 / `code = 13` (`INTERNAL`). Sink backpressure (HTTP 429 / `code =
 //! 8`, `RESOURCE_EXHAUSTED`) is deliberately not a variant of this enum —
@@ -108,6 +109,28 @@ pub enum LogsIngestError {
     /// [`classify`]: crate::ingest::http
     #[error("malformed Zipkin v2 request: {0}")]
     ZipkinDecode(String),
+
+    /// A log push carried no streams at all (issue #374). The reference
+    /// answers this before it validates anything: `PushWithResolver` returns
+    /// `httpgrpc.Errorf(http.StatusUnprocessableEntity,
+    /// validation.MissingStreamsErrorMsg)` for a converted push request with
+    /// `len(req.Streams) == 0` (`pkg/distributor/distributor.go:580-581 @
+    /// v3.7.4`), and the message is `validation.MissingStreamsErrorMsg`
+    /// verbatim (`pkg/validation/validate.go:15 @ v3.7.4`) — hence no
+    /// PulsusDB prefix on the `Display` impl, the same reason the per-stream
+    /// bound messages carry none.
+    ///
+    /// **422, not 400** — this is the only variant in the enum outside the
+    /// 400/500 split, because the reference deliberately puts a stream-less
+    /// push outside the malformed-payload class: the body decoded fine, it
+    /// just carries nothing to ingest. Measured on
+    /// `grafana/loki@sha256:87f0a067…` (buildinfo `3.7.4` / `b318f282`):
+    /// `{"streams":[]}` and `{}` on `/loki/api/v1/push`, and an OTLP body
+    /// whose `logRecords` are empty (or absent) on `/otlp/v1/logs`, all
+    /// answer `422` with this message; a stream that carries labels but no
+    /// entries answers `204`, because it is still a stream.
+    #[error("error at least one valid stream is required for ingestion")]
+    MissingStreams,
 
     /// A sync-mode ([`crate::ingest::LogSink::admit_flush`]) request's
     /// completion future resolved with an error the writer core did not

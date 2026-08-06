@@ -146,8 +146,10 @@ pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestEr
 /// `Err` iff a body/attribute `AnyValue` tree nests deeper than
 /// [`otlp_depth::MAX_ANYVALUE_DEPTH`](crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH)
 /// — a whole-request, atomic structural failure (400 / `code = 3`), exactly
-/// like a decode error; malformed per-record timestamps stay per-record
-/// partial-success rejections inside the `Ok`.
+/// like a decode error — or iff the request carries no log records at all
+/// ([`LogsIngestError::MissingStreams`], 422; issue #374). Malformed
+/// per-record timestamps stay per-record partial-success rejections inside
+/// the `Ok`.
 pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
     // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
     // maliciously deep body/attribute tree before any value is rendered or a
@@ -156,6 +158,27 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
     // previously infallible) — a whole-request, atomic 400/`code = 3` reject,
     // the same class as a decode failure.
     crate::protocols::otlp_depth::ensure_logs_anyvalue_depth(req)?;
+
+    // A request carrying no log records at all is `422`, not an empty success
+    // (issue #374). Upstream's OTLP translation returns an EMPTY push request
+    // for one — `if ld.LogRecordCount() == 0 { return &logproto.PushRequest{},
+    // nil }`, the first statement of `otlpToLokiPushRequest`
+    // (`pkg/loghttp/push/otlp.go:144-146 @ v3.7.4`) — and `PushWithResolver`
+    // then refuses a stream-less push (`pkg/distributor/distributor.go:579-581
+    // @ v3.7.4`). `LogRecordCount()` sums the records over every
+    // `(ResourceLogs, ScopeLogs)` pair, so `{}`, `{"resourceLogs":[]}`, a
+    // resource with no `scopeLogs`, and a scope with an empty `logRecords` are
+    // one case, and all four measure `422` on
+    // `grafana/loki@sha256:87f0a067…`. Charged here, at the position the
+    // reference charges it — after decode (a malformed body is still `400`)
+    // and before any per-record work.
+    if req
+        .resource_logs
+        .iter()
+        .all(|rl| rl.scope_logs.iter().all(|sl| sl.log_records.is_empty()))
+    {
+        return Err(LogsIngestError::MissingStreams);
+    }
 
     let mut out = ParsedLogs::default();
     // Dedups stream registration within this request by `(fingerprint,
@@ -578,10 +601,16 @@ mod tests {
         }
     }
 
+    /// An empty request used to parse to empty output and answer `200`;
+    /// issue #374 made it the reference's `422`. The rule and every shape of
+    /// it are pinned in
+    /// [`parse_rejects_a_request_with_no_log_records`]; this case stays as
+    /// the one that used to assert the opposite, so the change is visible
+    /// where the old contract was written down.
     #[test]
-    fn parse_of_empty_request_returns_empty_output() {
-        let out = parse(&request(vec![]), 1_000);
-        assert_eq!(out, ParsedLogs::default());
+    fn parse_of_empty_request_is_a_stream_less_request() {
+        let err = super::parse(&request(vec![]), 1_000).expect_err("no log records");
+        assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
     }
 
     #[test]
@@ -1616,6 +1645,71 @@ mod tests {
         INDEXED[..n].iter().map(|k| attr(k, "v")).collect()
     }
 
+    /// Issue #374: a request carrying no log records converts to an EMPTY
+    /// push request upstream (`ld.LogRecordCount() == 0`,
+    /// `pkg/loghttp/push/otlp.go:144-146 @ v3.7.4`), which the distributor
+    /// then refuses with `422` (`distributor.go:579-581 @ v3.7.4`). All four
+    /// shapes of "no records" measure `422` on
+    /// `grafana/loki@sha256:87f0a067…`, including the one the review found —
+    /// a resource with attributes and an empty `logRecords`.
+    #[test]
+    fn parse_rejects_a_request_with_no_log_records() {
+        let empty_scope = ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![attr("service.name", "probe")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![])],
+            schema_url: String::new(),
+        };
+        let no_scopes = ResourceLogs {
+            scope_logs: vec![],
+            ..empty_scope.clone()
+        };
+        for req in [
+            request(vec![]),
+            request(vec![no_scopes]),
+            request(vec![empty_scope.clone()]),
+            request(vec![empty_scope.clone(), empty_scope]),
+        ] {
+            let err = super::parse(&req, 0).expect_err("no log records");
+            assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                "error at least one valid stream is required for ingestion"
+            );
+        }
+    }
+
+    /// The discriminating neighbour: one record anywhere in the request is
+    /// enough, even in a resource that carries no attributes at all (measured
+    /// `204` upstream — its own `service_name` discovery gives that resource a
+    /// label), and even when a record-less resource sits beside it.
+    #[test]
+    fn parse_accepts_a_request_whose_records_are_all_in_one_resource() {
+        let empty = ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![attr("service.name", "empty")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![])],
+            schema_url: String::new(),
+        };
+        let full = ResourceLogs {
+            resource: None,
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("hello"),
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        };
+        let out = super::parse(&request(vec![empty, full]), 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+    }
+
     #[test]
     fn parse_rejects_an_indexed_attribute_value_over_2048_bytes() {
         let value = "b".repeat(2049);
@@ -1703,20 +1797,39 @@ mod tests {
     }
 
     /// `pkg/distributor/distributor.go:639-641 @ v3.7.4` skips an entry-less
-    /// stream before validating it.
+    /// stream before validating it. The over-wide resource needs a
+    /// record-carrying sibling to be observed at all: alone it would make the
+    /// whole request stream-less, which is the `422` above, not this rule.
+    /// Measured on `grafana/loki@sha256:87f0a067…` as `204` (case
+    /// `otlp/record-less-over-wide-resource+good`).
     #[test]
     fn a_resource_with_no_records_skips_the_label_bounds() {
-        let req = request(vec![ResourceLogs {
-            resource: Some(Resource {
-                attributes: vec![attr("k8s.pod.name", &"b".repeat(4096))],
-                dropped_attributes_count: 0,
-                entity_refs: vec![],
-            }),
-            scope_logs: vec![simple_scope_logs(vec![])],
-            schema_url: String::new(),
-        }]);
+        let req = request(vec![
+            ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![attr("k8s.pod.name", &"b".repeat(4096))],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![simple_scope_logs(vec![])],
+                schema_url: String::new(),
+            },
+            ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![attr("service.name", "good")],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: string_body("hello"),
+                    ..Default::default()
+                }])],
+                schema_url: String::new(),
+            },
+        ]);
         let out = super::parse(&req, 0).unwrap();
-        assert!(out.rows.is_empty());
+        assert_eq!(out.rows.len(), 1);
         assert!(out.stream_errors.is_empty());
     }
 

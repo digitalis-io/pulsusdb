@@ -1701,15 +1701,19 @@ absence of a corpus row for an oversight.
 
 ## Issue #374 — the per-stream label rules at log ingest
 
-### `ingest-label-bounds` (issue #374 — parity ADOPTED; three named residuals)
+### `ingest-label-bounds` (issue #374 — parity ADOPTED; residuals named below)
 
 PulsusDB previously bounded a log push only by counts (streams per
 request, entries per stream, entries per request) and by decode-time
 materialization caps. Nothing measured a label name, a label value, the
 number of labels in a stream, or a repeated name — so a push the
 reference refuses with `400` was accepted and stored. Issue #374 adopts
-the reference's rules; this entry records what now matches and the three
-places where the observable still differs.
+the reference's rules; this entry records what now matches and, under
+**Residual N** headings, every place where the observable still differs.
+Neither the title nor the prose restates how many there are: the sentence
+that did said "three named residuals" while the list below it named five. Same rule for the case counts — they live on `compare.py`'s own
+summary line in the transcript, which is generated, and are not copied
+back up here.
 
 - **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
   (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`),
@@ -1831,6 +1835,30 @@ places where the observable still differs.
   `distributor.go:786-789`. This is not a cosmetic difference: a `400` is
   not retried by a well-behaved log shipper, so refusing the batch
   atomically would destroy the good streams permanently.
+- **A push with no streams is `422`, before any of this runs** (found by
+  the round-5 review, and **pre-existing** — measured identically on the
+  branch point `5969a94`, so neither the empty-value drop nor the bounds
+  made it reachable). `PushWithResolver` returns
+  `httpgrpc.Errorf(StatusUnprocessableEntity,
+  validation.MissingStreamsErrorMsg)` for `len(req.Streams) == 0`
+  (`distributor.go:579-581 @ v3.7.4`; message at
+  `pkg/validation/validate.go:15`), which on the OTLP receiver covers any
+  payload with no log records at all — its translation short-circuits to an
+  empty push request when `ld.LogRecordCount() == 0`
+  (`pkg/loghttp/push/otlp.go:144-146 @ v3.7.4`). PulsusDB answered `204` /
+  `200` and stored nothing; it now answers `422` with the reference's
+  message on both receivers. The count is on the streams the request
+  *carries*, so the two neighbouring shapes stay accepted: a stream with
+  labels and no entries is still a stream (`204` on both), and a stream
+  whose labels breach a bound is a `400`, not a `422`. Charged at
+  `loki_push::validate_bounds` (the one seam both Loki-push encodings
+  reach) and at the top of `otlp_logs::parse` (where the reference charges
+  it). The `422` body carries no PulsusDB prefix, exactly like the four
+  bound messages; on the OTLP path it rides the same `google.rpc.Status`
+  with `code = 3` — upstream's `OTLPError` omits the code field on *every*
+  error body it writes (`grpcstatus.New(0, errorStr)`,
+  `pkg/loghttp/push/push.go:571-581 @ v3.7.4`), a pre-existing difference
+  across our whole OTLP error family rather than one of this status.
 - **Multi-failure bodies** are grouped as `util.GroupedErrors.Error()`
   groups them (`pkg/util/errors.go:105-131 @ v3.7.4`): identical messages
   collapsed with an `N errors like: ` prefix, distinct groups joined with
@@ -1922,12 +1950,14 @@ places where the observable still differs.
   bound: `400` upstream, `200` here. The same payload with a long nested
   *value* is `400` on both, by different routes. This is the
   attribute-flattening difference, not the bound; it belongs with #109.
-- **Measured side by side**, 101 cases sent byte-identically to
-  `grafana/loki@sha256:87f0a067…` and to a running PulsusDB — 25 Loki-push
-  JSON, 13 Loki-push protobuf, 63 OTLP — with **status agreement in 98**,
-  the three exceptions being residual 3's second half and residuals 4 and
-  5, which the harness carries as expected divergences so that they stay
-  the ones that were recorded. The
+- **Measured side by side**: every case in the harness is sent
+  byte-identically to `grafana/loki@sha256:87f0a067…` and to a running
+  PulsusDB, over both Loki-push encodings and the OTLP receiver. Statuses
+  agree everywhere except residual 3's second half and residuals 4 and 5,
+  which the harness carries as expected divergences so that they stay the
+  ones that were recorded; the case, agreement and divergence counts are on
+  `compare.py`'s generated summary line at the end of the transcript's
+  table, and are deliberately not copied into this row. The
   transcript and the harness that produced it are checked in at
   `crates/pulsus-write/tests/golden/log_label_bounds/`; the harness exits
   non-zero on any verdict that is not its expected one.
@@ -1970,13 +2000,25 @@ places where the observable still differs.
   `logs_mixed_batch_admits_the_good_resources_and_still_answers_400` /
   `stream_errors_are_grouped_the_way_the_reference_groups_them` (the wire
   status, body and admission), and the live
-  `crates/pulsus-server/tests/loki_push_live.rs` quartet
+  `crates/pulsus-server/tests/loki_push_live.rs` quintet
   `over_wide_label_value_is_rejected_and_stores_nothing`,
   `a_mixed_batch_stores_the_good_streams_and_still_answers_400`,
   `an_empty_valued_label_does_not_split_the_stream` (`400` at the wire
   **and** the matching row counts read back out of ClickHouse, with an
-  at-bound control push proving the read-back discriminates) and
+  at-bound control push proving the read-back discriminates),
+  `a_stream_less_push_is_422_on_both_receivers_and_stores_nothing` and
   `an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label` — the one
   case the wire cannot show, where both sides answer success and the
   stored label and fingerprint are read back to show the 2049-byte value
-  on an indexed label.
+  on an indexed label. The stream-less `422` is pinned at every tier: the
+  parsers (`parse_json_rejects_a_request_with_no_streams`,
+  `decode_protobuf_rejects_a_request_with_no_streams`,
+  `parse_rejects_a_request_with_no_log_records`), the wire
+  (`loki_push_with_no_streams_is_422_with_the_reference_message`,
+  `loki_protobuf_push_with_no_streams_is_422`,
+  `logs_request_with_no_log_records_is_422_with_the_reference_message`),
+  and — because a status-only rule is easy to over-apply — its accepted
+  neighbours beside it at each tier
+  (`parse_json_entry_less_stream_alone_is_not_a_stream_less_request`,
+  `parse_accepts_a_request_whose_records_are_all_in_one_resource`,
+  `loki_push_with_an_entry_less_stream_is_still_accepted`).

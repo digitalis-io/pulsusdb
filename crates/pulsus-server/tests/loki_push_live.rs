@@ -1562,3 +1562,120 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
         "all three records are accepted and stored"
     );
 }
+
+/// Issue #374 review round 5: a push carrying **no streams at all** is `422`,
+/// not an empty success. Upstream refuses it before any validation —
+/// `PushWithResolver` returns `httpgrpc.Errorf(StatusUnprocessableEntity,
+/// validation.MissingStreamsErrorMsg)` for `len(req.Streams) == 0`
+/// (`pkg/distributor/distributor.go:579-581 @ v3.7.4`), and its OTLP
+/// translation makes a record-less payload exactly that empty request
+/// (`ld.LogRecordCount() == 0`, `pkg/loghttp/push/otlp.go:144-146`). Measured
+/// on `grafana/loki@sha256:87f0a067…`: `422` on both receivers.
+///
+/// Run live rather than only at the wire because the status is half the
+/// claim: the *neighbouring* shape — a stream that carries labels but no
+/// entries — is `204` upstream and must stay accepted here, and neither shape
+/// may leave a row behind. A control push proves the read-back would have
+/// seen one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_less_push_is_422_on_both_receivers_and_stores_nothing() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_159;
+    let db = "pulsus_loki_push_stream_less_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "stream-less-374";
+    const MISSING: &str = "error at least one valid stream is required for ingestion";
+
+    // Loki push, both JSON spellings of "no streams".
+    for body in [r#"{"streams":[]}"#, "{}"] {
+        let res = push(port, "application/json", body.as_bytes());
+        assert_eq!(res.status, 422, "{body} -> 422 (body {})", res.body);
+        assert_eq!(res.body, MISSING, "the 422 body is the reference's message");
+    }
+    // ...and the protobuf transport, where "no streams" is an empty message.
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &snap::raw::Encoder::new()
+            .compress_vec(&PushRequest { streams: vec![] }.encode_to_vec())
+            .expect("snappy compress"),
+    );
+    assert_eq!(res.status, 422, "empty protobuf push (body {})", res.body);
+    assert_eq!(res.body, MISSING);
+
+    // OTLP: a resource with attributes but an empty `logRecords` — the shape
+    // the review measured — plus the empty request.
+    for body in [
+        serde_json::to_vec(&serde_json::json!({"resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": service}}
+            ]},
+            "scopeLogs": [{"logRecords": []}],
+        }]}))
+        .expect("otlp body"),
+        serde_json::to_vec(&serde_json::json!({"resourceLogs": []})).expect("otlp body"),
+    ] {
+        let res = otlp_push(port, &body);
+        assert_eq!(res.status, 422, "record-less OTLP (body {})", res.body);
+        // The OTLP error body is a `google.rpc.Status`: field 2 is the
+        // message, and the reference's text is carried verbatim.
+        assert!(
+            res.body.contains(MISSING),
+            "the 422 status message is the reference's: {}",
+            res.body
+        );
+    }
+
+    // The neighbour that must NOT be refused: a stream with labels and no
+    // entries is still a stream (`distributor.go:639-641` only skips it when
+    // validating), measured `204` upstream.
+    let res = push(
+        port,
+        "application/json",
+        format!(r#"{{"streams":[{{"stream":{{"service_name":"{service}-idle"}},"values":[]}}]}}"#)
+            .as_bytes(),
+    );
+    assert_eq!(
+        res.status, 204,
+        "entry-less stream accepted (body {})",
+        res.body
+    );
+
+    // A control push, so the zero counts below are not a broken writer.
+    let control_line = "stream-less control line";
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[{{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","{control_line}"]]}}]}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 204, "control push accepted (body {})", res.body);
+    let control = wait_for_line(port, service, base_ns, control_line);
+    assert!(
+        control.contains(&control_line.to_string()),
+        "the control line must be queryable: {control:?}"
+    );
+
+    // Neither the refused pushes nor the entry-less stream registered
+    // anything; the control did.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_streams \
+                 WHERE service IN ('{service}-idle', '{service}')"
+            ),
+        )
+        .await,
+        1,
+        "only the control push registers a stream"
+    );
+}

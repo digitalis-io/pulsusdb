@@ -382,9 +382,11 @@ pub async fn ingest_remote_write(
 ///   filed).
 ///
 /// Response codes are oracle-pinned where Loki has an equivalent (204
-/// success both encodings, 400 plain-text malformed/oversize) and PulsusDB-
-/// contract where it does not (202 async, 429 backpressure) — see the issue
-/// #77 v2 response matrix.
+/// success both encodings, 400 plain-text malformed/oversize, 422 for a push
+/// carrying no streams at all — issue #374,
+/// `pkg/distributor/distributor.go:579-581 @ v3.7.4`) and PulsusDB-contract
+/// where it does not (202 async, 429 backpressure) — see the issue #77 v2
+/// response matrix.
 pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Response {
     let now_ns = now_unix_nanos();
 
@@ -737,6 +739,16 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::ZipkinDecode(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
+        // A push with no streams is `422`, not `400` (issue #374): the
+        // reference classifies it away from the malformed-payload family
+        // (`pkg/distributor/distributor.go:580-581 @ v3.7.4`, measured `422`
+        // on both receivers of `grafana/loki@sha256:87f0a067…`). The
+        // `google.rpc.Status.code` stays `3` — upstream's `OTLPError` writer
+        // omits the field entirely on every error it writes
+        // (`grpcstatus.New(0, errorStr)`, `pkg/loghttp/push/push.go:571-581 @
+        // v3.7.4`), which is a pre-existing, request-wide difference from our
+        // OTLP error bodies rather than anything specific to this status.
+        LogsIngestError::MissingStreams => (StatusCode::UNPROCESSABLE_ENTITY, 3),
         LogsIngestError::BodyRead(_) | LogsIngestError::FlushFailed(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, 13)
         }
@@ -2733,6 +2745,128 @@ mod tests {
             admitted[0].streams[0].labels.get("k8s_pod_name"),
             Some("good")
         );
+    }
+
+    /// Issue #374 at the wire, Loki-push transport: a push carrying no
+    /// streams is `422`, not an empty success. Measured on
+    /// `grafana/loki@sha256:87f0a067…`: `{"streams":[]}` answers
+    /// `422 error at least one valid stream is required for ingestion`
+    /// (`pkg/distributor/distributor.go:579-581 @ v3.7.4`).
+    #[tokio::test]
+    async fn loki_push_with_no_streams_is_422_with_the_reference_message() {
+        for body in [&br#"{"streams":[]}"#[..], &br#"{}"#[..]] {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = call_loki(
+                &sink,
+                body.to_vec(),
+                &[("content-type", "application/json")],
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                plain_text_body(res).await,
+                "error at least one valid stream is required for ingestion"
+            );
+            assert!(sink.admitted.lock().unwrap().is_empty());
+        }
+    }
+
+    /// The protobuf half of the same rule: an empty (but well-formed)
+    /// `logproto.PushRequest` is the same `422`, charged at
+    /// `decode_protobuf`'s shared `validate_bounds` seam.
+    #[tokio::test]
+    async fn loki_protobuf_push_with_no_streams_is_422() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            snappy_compress(&[]),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            plain_text_body(res).await,
+            "error at least one valid stream is required for ingestion"
+        );
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// The discriminating neighbour: a stream that carries labels but no
+    /// entries IS a stream, so it is `204` — `len(req.Streams)` counts it and
+    /// only the per-stream loop skips it (`distributor.go:639-641 @ v3.7.4`).
+    /// Measured `204` on the same container. Without this case the `422`
+    /// above would also pass an implementation that rejected on "no rows".
+    #[tokio::test]
+    async fn loki_push_with_an_entry_less_stream_is_still_accepted() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            br#"{"streams":[{"stream":{"app":"a"},"values":[]}]}"#.to_vec(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// The OTLP twin: `otlpToLokiPushRequest` returns an empty push request
+    /// when `ld.LogRecordCount() == 0` (`pkg/loghttp/push/otlp.go:144-146 @
+    /// v3.7.4`), which the distributor then refuses with the same `422`.
+    /// Every shape of "no records" measures `422` on the container, so all
+    /// four are here. The `google.rpc.Status.code` stays `3`, our OTLP error
+    /// convention (upstream omits the field on every OTLP error body).
+    #[tokio::test]
+    async fn logs_request_with_no_log_records_is_422_with_the_reference_message() {
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let resource = || {
+            Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue("probe".to_string())),
+                    }),
+                    key_strindex: 0,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            })
+        };
+        let requests = [
+            ExportLogsServiceRequest {
+                resource_logs: vec![],
+            },
+            ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    resource: resource(),
+                    scope_logs: vec![],
+                    schema_url: String::new(),
+                }],
+            },
+            ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    resource: resource(),
+                    scope_logs: vec![ScopeLogs {
+                        scope: None,
+                        log_records: vec![],
+                        schema_url: String::new(),
+                    }],
+                    schema_url: String::new(),
+                }],
+            },
+        ];
+        for req in requests {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = post_body(router(sink.clone()), req.encode_to_vec(), &[]).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let status = decode_status_body(res).await;
+            assert_eq!(status.code, 3);
+            assert_eq!(
+                status.message,
+                "error at least one valid stream is required for ingestion"
+            );
+            assert!(sink.admitted.lock().unwrap().is_empty());
+        }
     }
 
     /// `util.GroupedErrors.Error()` (`pkg/util/errors.go:111-131 @ v3.7.4`):

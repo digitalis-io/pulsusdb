@@ -825,10 +825,27 @@ pub fn decode_protobuf(body: &[u8]) -> Result<PushRequest, LogsIngestError> {
 /// protobuf ([`decode_protobuf`]) and JSON ([`parse_json`]) paths so the
 /// same aggregate `Vec<LogRow>` amplification is bounded identically before
 /// either materializes a row.
+///
+/// Also the seam for the reference's *lower* bound on the same field (issue
+/// #374): a push carrying no streams is refused with `422`. That check is the
+/// distributor's rather than a decode cap, but this is the one place both
+/// Loki-push encodings reach with the request's stream count in hand, so
+/// putting it here keeps one definition instead of one per encoding.
 fn validate_bounds(
     num_streams: usize,
     entries_per_stream: impl Iterator<Item = usize>,
 ) -> Result<(), LogsIngestError> {
+    // "Return early if request does not contain any streams" —
+    // `PushWithResolver` answers `422` before it validates a single label
+    // (`pkg/distributor/distributor.go:579-581 @ v3.7.4`). Counted on the
+    // streams the request CARRIES, not on what survives: a stream with labels
+    // and no entries still counts (measured `204`), and so does one whose
+    // labels breach a bound (measured `400`, not `422`). Our own
+    // `MAX_STREAMS_PER_REQUEST` ceiling below is the opposite end of the same
+    // field, so the two live together.
+    if num_streams == 0 {
+        return Err(LogsIngestError::MissingStreams);
+    }
     if num_streams > MAX_STREAMS_PER_REQUEST {
         return Err(LogsIngestError::OversizeMessage {
             field: "streams",
@@ -2663,6 +2680,44 @@ mod tests {
         let out = parse_json(body.as_bytes(), 0).unwrap();
         assert_eq!(out.streams.len(), 1);
         assert_eq!(out.streams[0].labels.get("foo"), Some("barf"));
+    }
+
+    /// Issue #374: `PushWithResolver` refuses a push with no streams at all
+    /// before it validates anything (`distributor.go:579-581 @ v3.7.4`).
+    /// Both JSON spellings of "no streams" — the empty array and the absent
+    /// key — measure `422` on `grafana/loki@sha256:87f0a067…`.
+    #[test]
+    fn parse_json_rejects_a_request_with_no_streams() {
+        for body in [r#"{"streams":[]}"#, "{}"] {
+            let err = parse_json(body.as_bytes(), 0).expect_err(body);
+            assert!(
+                matches!(err, LogsIngestError::MissingStreams),
+                "{body}: {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "error at least one valid stream is required for ingestion"
+            );
+        }
+    }
+
+    /// The protobuf half: an empty, well-formed `PushRequest` is the same
+    /// `422`, charged at [`decode_protobuf`]'s shared [`validate_bounds`]
+    /// seam rather than at [`parse_protobuf`].
+    #[test]
+    fn decode_protobuf_rejects_a_request_with_no_streams() {
+        let err = decode_protobuf(&[]).expect_err("empty push request");
+        assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
+    }
+
+    /// The discriminating neighbour of the two tests above: a stream with no
+    /// entries is still a stream, so the request is accepted. `len(streams)`
+    /// is counted on the wire, before the per-stream loop skips it.
+    #[test]
+    fn parse_json_entry_less_stream_alone_is_not_a_stream_less_request() {
+        let out = parse_json(br#"{"streams":[{"stream":{"app":"a"},"values":[]}]}"#, 0).unwrap();
+        assert!(out.rows.is_empty());
+        assert!(out.stream_errors.is_empty());
     }
 
     #[test]
