@@ -28,16 +28,17 @@
 //! The values live ONLY on those constants, each asserted against a figure
 //! recomputed from the corpus. This table used to restate them as
 //! literals, and they had drifted before issue #248 noticed — a
-//! hand-copied number beside a machine-checked one is a false claim
+//! hand-copied number beside a machine-checked figure is a false claim
 //! waiting to happen, so the copies were removed rather than re-synced,
 //! and none is quoted here. Read the constants.
 //!
 //! **`corpus-counts: none` regions.** Issue #248 corrected a stale copy
-//! in each of its three rounds and the class survived every correction,
-//! so the rule is now enforced rather than restated: inside such a
-//! region, comment text states no corpus-derived count, in digits or in
-//! words. `check_f_marked_regions_state_no_corpus_count`
-//! (`logqltest_provenance.rs`) fails on one; `logqltest/PROVENANCE.md`
+//! in round after round and the class survived every correction, so the
+//! rule is now enforced rather than restated: inside such a region,
+//! comment text carries no digit and no number word at all — the
+//! narrower "a number word in front of a counting noun" rule kept
+//! meeting a word it did not know. `check_f_marked_regions_state_no_corpus_count`
+//! (`logqltest_provenance.rs`) fails on any; `logqltest/PROVENANCE.md`
 //! §"Counts live on the constants" carries the rule itself. Each marker
 //! names its region — the id in parentheses, repeated on the `end` — and
 //! that id is pinned in `NO_COUNT_REQUIRED`, so a region that disappears
@@ -49,9 +50,10 @@
 //! bucket — the large majority of them — is pinned to an
 //! absolute date the reference will not serve, so no replay can ever
 //! reach them. That is the SAME conflation this issue opened with,
-//! reproduced one level further in — we corrected `captured` vs
-//! `replayable` and immediately built `replayable` vs `reached`. Hence
-//! three names, three constants, and the gap enumerated by reason.
+//! reproduced a level further in — we corrected `captured` vs
+//! `replayable` and immediately built `replayable` vs `reached`. Hence a
+//! separate name and a separate constant for each, and the gap
+//! enumerated by reason.
 // corpus-counts: end (replay-module-doc)
 
 mod logqltest;
@@ -610,7 +612,7 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 // recomputed from the corpus and asserted by
 // `coverage_is_pinned_and_names_every_exclusion_at_both_levels`. The VALUES live in the code; this prose says which rows moved
 // them and why, never how many (issue #248, third round).
-/// Pinned coverage (issue #352 steps 2-3). Separate figures, never one.
+/// Pinned coverage (issue #352 steps 2-3). Separate figures, never merged.
 ///
 /// Issue #343 added `b19_offset.test`, and its boundary fix the
 /// domain-edge rows. They move the TOTAL and the `derived` exclusion
@@ -631,7 +633,7 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 ///
 /// Issue #248 adds `b20_nested_ip.test` (`eval` rows plus reject-parity
 /// `eval_fail` rows, which carry our own error text and so are not
-/// permitted). Most of the permitted ones are streams queries at a
+/// permitted). Most of the permitted rows are streams queries at a
 /// single instant over a relative-offset load set, so [`REACHABLE`]
 /// moves for the first time since the leg was built; the rest are metric
 /// queries. Its second round adds the error-ordering block to the same
@@ -648,7 +650,7 @@ const PROVENANCE_PERMITS: usize = 1_024;
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
 /// [`UNREACHABLE_BY_REASON`] — it is not a shortfall to be quietly
-/// absorbed into one number.
+/// absorbed into a single figure.
 const REACHABLE: usize = 101;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \

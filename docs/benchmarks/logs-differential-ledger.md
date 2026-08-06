@@ -763,13 +763,54 @@ not "fix" us toward the panic.
 
 ### `five-year-span-cap` (issue #343, owner mandate — a deliberate limit, not a defect)
 
-- **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
-  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`): both
-  LogQL duration literals are accepted across the whole `i64` nanosecond
-  domain — `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) and
-  `offset -9223372036854775808ns` (`i64::MIN`) are 200s, as is
-  `[2562047h]`, a 292-year window — and the query's own `start`-to-`end`
-  span is not bounded at all.
+- **Reference behaviour, RE-MEASURED** on the digest-pinned v3.7.4 oracle
+  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`,
+  `ci/logql/config.yaml`, 2026-08-06). **This bullet used to say that the
+  reference accepts both duration literals across the whole `i64`
+  nanosecond domain and bounds no query span at all. Two thirds of that
+  is wrong**, and it was wrong when written: issue #380 re-measured
+  `max_query_length` while establishing something else, and the
+  contradiction with this row (and with `docs/features.md`) went
+  unnoticed until issue #248's last round. The measurements:
+
+  | probe | verdict |
+  |---|---|
+  | request span `720h`, `721h` | `200` |
+  | request span `721h1s` | `400 the query time range exceeds the limit (query length: 721h0m1s, limit: 30d1h)` |
+  | request span `43800h` (our cap) | `400`, same message |
+  | `count_over_time({app="x"}[720h])` over a `1h` request span | `400 … (query length: 721h1m0s, limit: 30d1h)` |
+  | `count_over_time({app="x"}[2562047h])` over a `1h` request span | `400 … (query length: 2562047h47m16.854775807s, …)` |
+  | `count_over_time({app="x"}[43800h])` as an INSTANT query | no answer inside 90 s |
+  | `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`), instant and range | `200` |
+  | `offset -9223372036854775807ns` (`i64::MIN + 1`) | `200` |
+  | `offset -9223372036854775808ns` (`i64::MIN`) | `400 this data is no longer available, it is past now - max_query_lookback (0s)` |
+  | `offset ±43800h` | `200` |
+
+  **The rules behind them, from the source.** `max_query_length` defaults
+  to `721h` (`pkg/validation/limits.go:371 @ v3.7.4`) and is enforced at
+  `pkg/querier/queryrange/limits.go:194-201` and
+  `pkg/querier/limits/validation.go:88-91` with the message at
+  `pkg/util/validation/validate.go:5`; there is no dedicated `[range]`
+  cap in the shipped config, `max_query_range` defaulting to `0s`
+  (`limits.go:374-375`, consulted only when nonzero,
+  `pkg/logql/engine.go:388-395`). The length is measured over the
+  range-selector-adjusted window `[start - ([range] + offset),
+  end - offset]` (`pkg/querier/queryrange/shard_resolver.go:94-104`), so
+  the `[range]` literal COUNTS against `max_query_length` on a range
+  query while the offset CANCELS. And exactly at `offset i64::MIN` Go's
+  negation overflows to itself, so `end.Add(-offset)` moves the window
+  BACK 292 years while `start.Add(-([range]+offset))` moves it forward:
+  `through < from`, which is the `ErrQueryTooOld` above
+  (`pkg/querier/limits/validation.go:92-94`) — a one-value artefact, not
+  a bound.
+- **What is left of the divergence, stated exactly.** On the request span
+  and on a RANGE query's `[range]`, the reference's default config
+  already refuses far more than our cap does (`721h` against our
+  `43,800h`), so there our cap can only fire where it also rejects. The
+  divergence is real for the `offset` magnitude (a `200` there at every
+  value but `i64::MIN`, a `400` here past 5 years) and for an INSTANT
+  query's `[range]`, which the reference admits and then decomposes into
+  per-hour subqueries that do not answer in practice.
 - **PulsusDB behaviour (the delta): NOTHING IN A LogQL QUERY MAY SPAN MORE
   THAN 5 YEARS** — `MAX_QUERY_SPAN_NS` = 157,680,000,000,000,000 ns =
   43,800 h = 5 × 365 d. One rule, three places, all against that one
@@ -1785,8 +1826,9 @@ absence of a corpus row for an oversight.
   span big enough to trip our cap is already refused by the reference on
   its own `max_query_length` (default 721 h = `30d1h`): measured,
   `start=0` to ten-years-ago is a `400 the query time range exceeds the
-  limit (query length: 408519h40m31s, limit: 30d1h)` there. So the cap
-  only ever fires where the reference also rejects, and the divergence
+  limit (query length: 408519h40m31s, limit: 30d1h)` there. So the SPAN
+  half of that cap only ever fires where the reference also rejects (its
+  `offset` half does not — see `five-year-span-cap`), and the divergence
   surface is exactly what this entry describes.
 
 - Gated by `b20_nested_ip.test`'s

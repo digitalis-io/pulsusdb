@@ -30,33 +30,36 @@ marker table still holds and is now load-bearing in code.
 
 Each of those constants is asserted against a figure recomputed from the
 corpus, so it cannot go stale silently. A copy in prose cannot be, and
-issue #248 shipped a stale one in each of its three rounds — the table's
-old `today` column, then the sentence that explained why the column went,
+issue #248 shipped a stale copy in round after round — the table's old
+`today` column, then the sentence that explained why the column went,
 then a delta restated in the gap enumeration below and again on
 `CAPTURED`'s own doc comment. Each was corrected as a number; the class
 outlived every correction.
 
 **So the rule is mechanical, and the region you are reading is inside
 it.** Between a `corpus-counts: none` marker and its `corpus-counts: end`,
-no comment or prose may state a count derived from the corpus — not in
-digits, not spelled out (`nine`, `twenty-one`), not as a per-issue delta.
-Name the reason, point at the constant.
+prose may carry **no digit and no number word at all** — not a count
+spelled out (`nine`, `twenty-one`, `zero`), not a per-issue delta, and
+not an ordinary English `one` or `two` either. The rule used to be
+"no number word in front of a counting noun", and reviewers kept finding
+the next word it did not know; the ban is now flat, so there is nothing
+left to enumerate. Name the reason, point at the constant.
 `check_f_marked_regions_state_no_corpus_count`
-(`logqltest_provenance.rs`) fails on one, and when a figure really moves,
+(`logqltest_provenance.rs`) fails on any, and when a figure really moves,
 the recomputing assertion prints its new value.
 
 **Each marker names its region**, as `corpus-counts: none (<id>)` with the
 same id repeated on its `corpus-counts: end`, and every id is listed in
 that check's `NO_COUNT_REQUIRED`. So the check fails BY NAME when a region
 is deleted, renamed, un-named, duplicated or emptied — the earlier version
-listed file names instead, and this file carries a region in more than one
-section, so deleting the first pair left the file in the set and the check
-stayed green. Adding a region means adding its id to that list; the
+listed file names instead, and this file carries regions in separate
+sections, so deleting the earlier pair left the file in the set and the
+check stayed green. Adding a region means adding its id to that list; the
 marker line's own tail is scanned like any other prose.
 
 `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg existed,
 and that name was wrong: most of those rows can never be reached. The
-same conflation this issue opened with, one level further in. The gap is
+same conflation this issue opened with, a level further in. The gap is
 enumerated by reason, not absorbed; the per-reason breakdown is
 `UNREACHABLE_BY_REASON`, recomputed and asserted beside the reasons:
 
@@ -78,7 +81,7 @@ enumerated by reason, not absorbed; the per-reason breakdown is
 - **range/matrix.** Needs the step grid replayed too — `b18`'s
   sliding-path rows, which include the cross-stream `StableHash` tie.
 
-### Two properties of the reference that shaped the leg, both measured
+### The properties of the reference that shaped the leg, each measured
 
 **It serves only the last few hours.** A push older than that returns
 `204` and is then invisible — a success that answers nothing, which reads
@@ -88,7 +91,7 @@ asserts the slice's slots stay inside it arithmetically.
 
 **It injects `detected_level`** when `discover_log_levels` is on, which it
 is in `ci/logql/config.yaml`. The corpus was captured with it off, so the
-label is stripped before comparison — the leg's ONE normalisation, named
+label is stripped before comparison — the leg's ONLY normalisation, named
 at the constant. The better fix is `discover_log_levels: false` in that
 config, which would also unblock the config-delta files that need exactly
 that setting (`b12_error_pair_model`, `b14_detected_fields`; their share
@@ -98,8 +101,8 @@ and json-key legs. **Follow-up, with both legs re-verified.**
 
 ### The container must be fresh
 
-Two runs push the same corpus labels at overlapping absolute times, so
-the reference sees one stream and merges the entries; no query window can
+A repeat run pushes the same corpus labels at overlapping absolute times,
+so the reference sees a single stream and merges the entries; no window can
 separate them. The leg checks for a prior run and fails with instructions
 rather than reporting the stale lines as corpus mismatches. CI always
 starts a fresh container, which is why an unchecked assumption here would
@@ -326,16 +329,16 @@ not the pure value path).
 <!-- corpus-counts: none (provenance-template-corpus) -->
 
 The `t*` files pin the `line_format`/`label_format` template engine —
-`eval` rows in all six, plus the `eval_fail` reject-parity cases, which
-are all in `t1` — every value AND execution-error string captured
-verbatim from `grafana/loki:3.7.4`, never hand-authored. (Count them with
-`grep -ac '^eval ' / '^eval_fail'` per file rather than reading a figure
-here: this paragraph used to carry the inventory, and an even earlier
-version of it mixed both directive kinds into a single number without
-saying so. The `-a` is load-bearing — `t5_time.test` trips GNU grep's
-binary heuristic, and without it the command prints NOTHING for that
-file, which reads exactly like zero. `docs/features.md` and the logs
-differential ledger do quote this corpus's size, and
+`eval` rows across the whole set, plus the `eval_fail` reject-parity
+cases, which are all in `t1` — every value AND execution-error string
+captured verbatim from `grafana/loki:3.7.4`, never hand-authored. (Count
+them with `grep -ac '^eval ' / '^eval_fail'` per file rather than reading
+a figure here: this paragraph used to carry the inventory, and an even
+earlier version of it mixed both directive kinds into a single number
+without saying so. The `-a` is load-bearing — `t5_time.test` trips GNU
+grep's binary heuristic, and without it the command prints NOTHING for
+that file, which reads exactly like an empty corpus. `docs/features.md`
+and the logs differential ledger do quote this corpus's size, and
 `check_f_quoted_template_corpus_counts_match_the_corpus` recomputes it
 from the files rather than trusting either.)
 

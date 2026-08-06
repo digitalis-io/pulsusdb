@@ -40,16 +40,30 @@ pub const MAX_QUERY_BYTES: usize = 131_072;
 /// told plainly rather than silently handed a different answer.
 ///
 /// **A DELIBERATE DIVERGENCE — the only limit here that is ours rather
-/// than the reference's.** grafana/loki v3.7.4 accepts an offset and a
-/// range anywhere in the `i64` nanosecond domain, and bounds no query
-/// span at all — measured on the digest-pinned oracle:
-/// `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) is a 200 there, as
-/// is `offset -9223372036854775808ns` (`i64::MIN`), and `[2562047h]` (a
-/// 292-year window) is a 200. Retention is days to months and nobody
+/// than the reference's.** Retention is days to months and nobody
 /// queries five years of logs, so this refuses nothing a real deployment
 /// does while removing the whole class of absurd-input arithmetic that
 /// issue #343 chased down four successive layers. Ledgered as
 /// `five-year-span-cap` in docs/benchmarks/logs-differential-ledger.md.
+///
+/// **How much of it is a divergence, re-measured** (issue #248 round 5,
+/// digest-pinned v3.7.4 oracle). This comment used to say the reference
+/// "bounds no query span at all"; it does bound one.
+/// `max_query_length` defaults to `721h`
+/// (`pkg/validation/limits.go:371` @ v3.7.4) over the window
+/// `[start - ([range] + offset), end - offset]`
+/// (`pkg/querier/queryrange/shard_resolver.go:94-104` @ v3.7.4), so on a
+/// range query BOTH the request span and the `[range]` selector are
+/// bounded there far tighter than here — `[720h]` over a `1h` request
+/// span is already a `400 the query time range exceeds the limit`. The
+/// offset cancels in that subtraction and stays unbounded: `offset
+/// 2562047h47m16s854ms775us807ns` (`i64::MAX`) is a 200 there, and so is
+/// every other value in the domain except exactly `i64::MIN`, where Go's
+/// negation overflow inverts the window into a 400. So this cap diverges
+/// on the offset magnitude, and on an INSTANT query's `[range]` (which
+/// the reference admits and then splits into per-hour subqueries that do
+/// not answer in practice); on a range query it fires only where the
+/// reference, at its shipped default, refuses first.
 ///
 /// Same status as [`MAX_QUERY_BYTES`] — `400 bad_data` — and the two
 /// literal forms are enforced at the same layer it is, the parser, so no

@@ -614,7 +614,7 @@ jobs:
       # answer against the committed expectation, so a capture that goes
       # STALE is caught rather than trusted forever. NIGHTLY/dispatch
       # only: drift is a property of time passing, not of the commit
-      # under test, and the leg makes one sequential push per reachable
+      # under test, and the leg makes a sequential push per reachable
       # row.
       #
       # It verifies VALUES; it does not verify provenance markers — it
@@ -625,8 +625,8 @@ jobs:
       # figures live on REACHABLE / PROVENANCE_PERMITS in
       # logqltest_replay.rs, which assert them against the corpus, and
       # are deliberately not restated here: a hand-copied count beside a
-      # machine-checked one drifts (issue #248 found one in each of its
-      # three rounds — this comment, the test's own module doc, and
+      # machine-checked figure drifts (issue #248 found a stale copy in
+      # round after round — this comment, the test's own module doc, and
       # PROVENANCE.md). The `corpus-counts: none` marker above makes that
       # rule enforceable rather than advisory; see
       # `check_f_marked_regions_state_no_corpus_count`.

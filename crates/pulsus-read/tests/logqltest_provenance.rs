@@ -31,7 +31,7 @@
 //! escapers is **rustc**'s job (E0603/E0624, measured on this layout);
 //! the `_checked` **bodies** are the mutation tests' job (AC7(e)).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -929,11 +929,30 @@ const NO_COUNT_REQUIRED: &[(&str, &str)] = &[
     ("ci.yml", "ci-replay-leg"),
 ];
 
-/// Spelled quantities. Tens without a units word (`sixty`) are here too:
-/// the list is read through [`is_number_word`], which also resolves the
-/// hyphenated compounds (`twenty-one`) that a flat membership test read
-/// as ordinary words.
-const NUMBER_WORDS: &[&str] = &[
+/// **The closed lexicon of English cardinal numerals.**
+///
+/// Where it comes from: every non-negative integer below 10^21 is
+/// spelled in English out of exactly these tokens, combined with hyphens
+/// and juxtaposition — the units and teens below twenty, the eight tens,
+/// and the scale words. Nothing else is needed and nothing else occurs,
+/// which is what makes this a SET rather than a list somebody extends
+/// when a reviewer finds the next word. [`spelling_uses_only_this_set`]
+/// re-derives it from an independent speller.
+///
+/// Where it stops: 10^21. `sextillion` and the Latinate series above it
+/// are not here, on the ground that a corpus count reaching 10^21 is not
+/// the failure this guard exists for. Extending the set upward is
+/// mechanical if that ever stops being true.
+///
+/// The four earlier versions of this rule enumerated what counts as a
+/// number and each shipped with the next word missing — `zero` was the
+/// fifth hole (issue #248 round 5). The enumeration is now closed by
+/// construction instead: a token IS a numeral or it is not, and no
+/// review round can find a cardinal numeral that is absent, because the
+/// families below are the whole of English's numeral vocabulary.
+const CARDINAL_NUMERALS: &[&str] = &[
+    // Units and teens — every integer below twenty.
+    "zero",
     "one",
     "two",
     "three",
@@ -953,6 +972,7 @@ const NUMBER_WORDS: &[&str] = &[
     "seventeen",
     "eighteen",
     "nineteen",
+    // Tens.
     "twenty",
     "thirty",
     "forty",
@@ -961,44 +981,79 @@ const NUMBER_WORDS: &[&str] = &[
     "seventy",
     "eighty",
     "ninety",
-    "dozen",
+    // Scales, ascending to 10^18.
     "hundred",
     "thousand",
     "million",
+    "billion",
+    "trillion",
+    "quadrillion",
+    "quintillion",
 ];
+
+/// Quantity words that are NOT cardinal numerals.
+///
+/// **This list is not complete and cannot be made complete**, and that is
+/// stated here rather than implied: English has an open supply of vague
+/// quantifiers (`a handful`, `a bunch`, `plenty`, `umpteen`), so no
+/// enumeration terminates. It carries the ones already known to have
+/// evaded the guard, and the residual is named in
+/// [`check_f_marked_regions_state_no_corpus_count`]'s doc — the
+/// completeness claim belongs to [`CARDINAL_NUMERALS`] alone.
+const INEXACT_QUANTITY_WORDS: &[&str] = &["dozen", "score", "couple", "handful"];
 
 /// Whether a token spells a quantity.
 ///
 /// A hyphenated compound counts when EVERY part does: `twenty-one` and
-/// `thirty-five` are numbers, `one-off` and `well-formed` are not. The
-/// flat `NUMBER_WORDS.contains()` this replaces saw `twenty-one rows` as
-/// an ordinary word and let it through — the same class of hole as the
-/// file-name region list above, one token further in.
+/// `thirty-five` are numbers, `one-off` and `well-formed` are not. A
+/// trailing plural `s` is stripped first, so `hundreds` and `dozens`
+/// resolve like their singulars.
 fn is_number_word(tok: &str) -> bool {
     let lower = tok.to_ascii_lowercase();
+    let known = |p: &str| {
+        let p = p.strip_suffix('s').unwrap_or(p);
+        CARDINAL_NUMERALS.contains(&p) || INEXACT_QUANTITY_WORDS.contains(&p)
+    };
     let mut parts = lower.split('-').filter(|p| !p.is_empty()).peekable();
-    parts.peek().is_some() && parts.all(|p| NUMBER_WORDS.contains(&p))
+    parts.peek().is_some() && parts.all(known)
 }
 
-/// What a corpus count counts. A number-word immediately before one of
-/// these is the shape that shipped in round 3 ("added nine more `eval`
-/// rows"); a number-word anywhere else ("one level further in") is
-/// ordinary English and is left alone.
-const COUNT_NOUNS: &[&str] = &[
-    "row",
-    "rows",
-    "directive",
-    "directives",
-    "case",
-    "cases",
-    "eval",
-    "evals",
-    "eval_fail",
-    "entry",
-    "entries",
-    "file",
-    "files",
-];
+/// Every count claim on one line of prose, as `(token, why)`.
+///
+/// The rule is INVERTED from the one this replaces. That one asked
+/// whether a number word was followed by a noun from a `COUNT_NOUNS`
+/// list — an AND over two open-ended enumerations, so a miss in either
+/// one shipped as a silent pass, and four rounds of review each found
+/// the next missing word. This one asks only whether the token is a
+/// number: a marked region may contain no digit and no numeral, whatever
+/// follows it. There is nothing left to enumerate on the noun side, and
+/// [`CARDINAL_NUMERALS`] closes the other side.
+///
+/// The cost is deliberate: prose inside a marked region cannot say "one
+/// level up" or "the two halves" either. That is the contract — these
+/// regions describe WHICH rows moved and why, and the quantities live on
+/// the constants that recompute them.
+fn count_claims(prose: &str) -> Vec<(String, &'static str)> {
+    let cleaned = strip_code_spans(prose);
+    let toks: Vec<&str> = cleaned.split_whitespace().map(trimmed_token).collect();
+    let mut out = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        if tok.chars().any(|c| c.is_ascii_digit())
+            && !is_allowed_numeric(tok, i.checked_sub(1).map(|p| toks[p]))
+        {
+            out.push((
+                (*tok).to_string(),
+                "a count belongs on the constant that recomputes it, not in prose",
+            ));
+        } else if is_number_word(tok) {
+            out.push((
+                (*tok).to_string(),
+                "spell out no quantity here; name the rows and point at the constant",
+            ));
+        }
+    }
+    out
+}
 
 fn files_under(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -1216,7 +1271,10 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
     {
         return true;
     }
-    matches!(prev, Some("step") | Some("steps"))
+    matches!(
+        prev.map(str::to_ascii_lowercase).as_deref(),
+        Some("step") | Some("steps")
+    )
 }
 
 /// **F: inside a `corpus-counts: none` region, prose states no count.**
@@ -1227,16 +1285,34 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
 /// number and none fixed the class, because nothing failed when the next
 /// copy drifted. This is that thing.
 ///
+/// **The rule is a prohibition, not a pattern match** (issue #248 round
+/// 5). It used to be "a number word followed within three tokens by a
+/// noun from `COUNT_NOUNS`" — an AND over two open-ended lists, so a
+/// word missing from either shipped as a silent pass. `zero rows` was
+/// the fifth such hole found by review, after filename-keyed regions,
+/// compound number words, the marker line's own tail and blank lines
+/// counting as prose. Adding `zero` would have fixed the instance and
+/// left the shape, so the shape went instead: a marked region may carry
+/// **no digit and no numeral**, full stop. The noun side no longer
+/// exists to be incomplete, and the numeral side is closed by
+/// [`CARDINAL_NUMERALS`].
+///
 /// **The guard's own failure surface, bounded.** A guard whose sentence
 /// is wider than its assertion is the same defect one level up, so every
-/// way this one could go quietly green has a mutant that reddens it,
-/// each applied and reverted on issue #248's final round:
+/// way this one could go quietly green has a mutant that reddens it.
+/// Every row below was applied to a real file, run and reverted on issue
+/// #248 round 5 (the structural ones on round 4 as well); the count-form
+/// rows are additionally COMMITTED as
+/// [`a_count_in_prose_is_detected_in_every_form_it_can_take`], so they
+/// are re-proved on every run rather than on the day someone ran them:
 ///
 /// | mutant | what fails |
 /// |---|---|
-/// | a digit count inside a region | the region-states-a-count list |
-/// | a spelled count, `nine rows` | the same |
-/// | a COMPOUND spelled count, `twenty-one rows` | the same, via [`is_number_word`] |
+/// | a digit count inside a region | [`count_claims`] (committed regression) |
+/// | a spelled count, `nine rows` | the same (committed) |
+/// | a COMPOUND spelled count, `twenty-one rows` | the same, via [`is_number_word`] (committed) |
+/// | a spelled ZERO, `zero rows` | the same (committed) |
+/// | a bare numeral with no noun after it | the same (committed) |
 /// | a count on a MARKER line's own tail | the same — the marker's tail is scanned, not skipped |
 /// | a marker PAIR deleted | [`NO_COUNT_REQUIRED`] misses the region id |
 /// | the open marker alone deleted | `end` closes nothing |
@@ -1247,24 +1323,29 @@ fn is_allowed_numeric(tok: &str, prev: Option<&str>) -> bool {
 /// | a duplicated id | ids must be unique |
 /// | a region's prose deleted, markers kept | a required region must still carry prose |
 ///
-/// **There is no thirteenth.** A region reaching the scan is exactly
-/// four parts — an open marker, an id, a body, an end marker — and the
-/// table mutates each part in each way it can go wrong: present/absent,
+/// **There is no fifteenth.** A region reaching the scan is exactly four
+/// parts — an open marker, an id, a body, an end marker — and the table
+/// mutates each part in each way it can go wrong: present/absent,
 /// renamed on one side/both, and (for the body) emptied. The marker
-/// tokens are two, both above; the count forms are digits and words,
-/// both above. Blank lines do NOT count as prose, which the mutant table
-/// found: `M10` first passed because markers around a single empty line
-/// cleared the "still has text" floor.
+/// tokens are two, both above. The count forms are digits and numerals,
+/// and numerals are now the closed set rather than a sample of it, so
+/// "the next missing word" is not a mutant that exists. Blank lines do
+/// NOT count as prose, which the mutant table found: `M10` first passed
+/// because markers around a single empty line cleared the "still has
+/// text" floor.
 ///
 /// What remains is not a hole in the guard but a hole in its INPUT, and
 /// it is the next paragraph.
 ///
 /// **What it cannot see, stated rather than implied:** a count inside
 /// backticks, a count in a file outside [`NO_COUNT_ROOTS`], a count in a
-/// region nobody marked, and a quantity spelled in a way
-/// [`is_number_word`] does not resolve ("a handful", "a couple"). The
-/// marker is the contract: prose that carries counts must be inside one,
-/// and [`NO_COUNT_REQUIRED`] keeps the known regions from evaporating.
+/// region nobody marked, an ORDINAL standing in for a count ("the third
+/// block landed"), and a vague quantifier outside the deliberately
+/// incomplete [`INEXACT_QUANTITY_WORDS`] ("a bunch", "plenty",
+/// "umpteen"). Those last two are the residual the inversion does not
+/// remove: English's numerals are closed, its quantifiers are not. The
+/// marker is the contract — prose that carries counts must be inside one
+/// — and [`NO_COUNT_REQUIRED`] keeps the known regions from evaporating.
 #[test]
 fn check_f_marked_regions_state_no_corpus_count() {
     let mut files = Vec::new();
@@ -1290,32 +1371,8 @@ fn check_f_marked_regions_state_no_corpus_count() {
             found.push((name.clone(), region.id.clone(), region.body_lines));
             scanned_lines += region.body_lines;
             for (line_no, prose) in region.prose {
-                let cleaned = strip_code_spans(&prose);
-                let toks: Vec<&str> = cleaned.split_whitespace().map(trimmed_token).collect();
-                for (i, tok) in toks.iter().enumerate() {
-                    if tok.chars().any(|c| c.is_ascii_digit())
-                        && !is_allowed_numeric(tok, i.checked_sub(1).map(|p| toks[p]))
-                    {
-                        violations.push(format!(
-                            "{name}:{line_no} ({}): `{tok}` — a corpus count belongs on the \
-                             constant that recomputes it, not in prose",
-                            region.id
-                        ));
-                    }
-                    if is_number_word(tok)
-                        && toks
-                            .iter()
-                            .skip(i + 1)
-                            .take(3)
-                            .any(|t| COUNT_NOUNS.contains(&t.to_ascii_lowercase().as_str()))
-                    {
-                        violations.push(format!(
-                            "{name}:{line_no} ({}): `{tok}` counts {} — spell out no count here; \
-                             name the rows and point at the constant",
-                            region.id,
-                            toks.get(i + 1).copied().unwrap_or("")
-                        ));
-                    }
+                for (tok, why) in count_claims(&prose) {
+                    violations.push(format!("{name}:{line_no} ({}): `{tok}` — {why}", region.id));
                 }
             }
         }
@@ -1362,6 +1419,167 @@ fn check_f_marked_regions_state_no_corpus_count() {
     assert!(
         scanned_lines > 60,
         "check F scanned only {scanned_lines} prose lines — the regions have collapsed"
+    );
+}
+
+/// The count-form mutants of check F, committed instead of hand-applied.
+///
+/// Every entry in the first list is a sentence that either shipped
+/// inside a marked region or was injected there by a reviewer and passed
+/// — `zero rows` is the round-5 finding, `twenty-one rows` the round-4
+/// one, `nine rows` the round-3 one. A hand-applied mutant proves the
+/// guard catches it on the day it is run; this proves it on every run.
+///
+/// The second list is the other direction, and it is the one that keeps
+/// the rule usable: an issue reference, a version, a date, a plan step
+/// and anything inside backticks are NOT counts, and a guard that
+/// reddened on them would be turned off within a week.
+#[test]
+fn a_count_in_prose_is_detected_in_every_form_it_can_take() {
+    for prose in [
+        // Digits, in the shape that shipped three times.
+        "The latest block added 11 rows.",
+        // Spelled, plain.
+        "The latest block added nine rows.",
+        // Spelled, compound (round 4).
+        "The latest block added twenty-one rows.",
+        // Spelled zero (round 5) — the fifth hole, and the reason the
+        // rule is now "no numeral" rather than "no known numeral".
+        "The latest block added zero rows.",
+        // A plural scale word.
+        "Hundreds of directives replay against the container.",
+        // Quantity words that are not numerals — the deliberately
+        // incomplete half of the rule, carrying the ones already known
+        // to have evaded it.
+        "A dozen more landed in the same capture run.",
+        "A handful of rows landed in the same capture run.",
+        // No count NOUN anywhere: the old rule needed one within three
+        // tokens and this shape walked straight past it.
+        "The corpus grew by three.",
+        "Rows added: seven",
+        // A number word on the far side of the old three-token window.
+        "Nine of the rows that the round added were captured.",
+    ] {
+        assert!(
+            !count_claims(prose).is_empty(),
+            "check F would not catch {prose:?} inside a marked region"
+        );
+    }
+
+    for prose in [
+        "Issue #248 corrected a stale copy in each round.",
+        "Measured on v3.7.4 against the digest-pinned oracle.",
+        "Captured 2026-08-06 on the pinned container.",
+        "Step 2 of the plan renames the marker.",
+        "The value lives on `CAPTURED = 1_208` and is recomputed there.",
+        "A one-off mistake is not a numeral, nor is a well-formed pattern.",
+        "The prose says which rows moved a figure and why.",
+    ] {
+        assert!(
+            count_claims(prose).is_empty(),
+            "check F reddens on {prose:?}, which states no count: {:?}",
+            count_claims(prose)
+        );
+    }
+}
+
+/// [`CARDINAL_NUMERALS`] is complete for exactly what it claims: every
+/// non-negative integer below 10^21 spells out of it and nothing in it
+/// is dead.
+///
+/// The speller carries its OWN literals, duplicated on purpose, so this
+/// is a cross-check between two independent listings and not a
+/// tautology: deleting `seventy` from [`CARDINAL_NUMERALS`] leaves the
+/// speller emitting it and reddens the first assertion, while a typo in
+/// the set (`nintey`) leaves a token nothing can spell and reddens the
+/// second.
+#[test]
+fn spelling_uses_only_this_set() {
+    fn spell(n: u128, out: &mut Vec<&'static str>) {
+        const UNITS: [&str; 20] = [
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+        ];
+        const TENS: [&str; 10] = [
+            "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+        ];
+        const SCALES: [(u128, &str); 7] = [
+            (1_000_000_000_000_000_000, "quintillion"),
+            (1_000_000_000_000_000, "quadrillion"),
+            (1_000_000_000_000, "trillion"),
+            (1_000_000_000, "billion"),
+            (1_000_000, "million"),
+            (1_000, "thousand"),
+            (100, "hundred"),
+        ];
+        for (value, name) in SCALES {
+            if n >= value {
+                spell(n / value, out);
+                out.push(name);
+                if !n.is_multiple_of(value) {
+                    spell(n % value, out);
+                }
+                return;
+            }
+        }
+        if n < 20 {
+            out.push(UNITS[n as usize]);
+        } else {
+            out.push(TENS[(n / 10) as usize]);
+            if !n.is_multiple_of(10) {
+                out.push(UNITS[(n % 10) as usize]);
+            }
+        }
+    }
+
+    // Below a thousand exercises every unit, teen and ten in every
+    // combination; the anchors reach each scale word above it.
+    let mut reached: BTreeSet<&'static str> = BTreeSet::new();
+    let anchors = [
+        1_000_000u128,
+        1_000_000_000,
+        1_000_000_000_000,
+        1_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+        999_999_999_999_999_999_999,
+    ];
+    for n in (0u128..=1_000).chain(anchors) {
+        let mut spelled = Vec::new();
+        spell(n, &mut spelled);
+        for tok in spelled {
+            assert!(
+                CARDINAL_NUMERALS.contains(&tok),
+                "{n} spells with `{tok}`, which CARDINAL_NUMERALS does not carry"
+            );
+            reached.insert(tok);
+        }
+    }
+    let dead: Vec<&&str> = CARDINAL_NUMERALS
+        .iter()
+        .filter(|w| !reached.contains(*w))
+        .collect();
+    assert!(
+        dead.is_empty(),
+        "CARDINAL_NUMERALS carries {dead:?}, which no integer below 10^21 spells with — a typo, \
+         or a word that does not belong to the closed numeral lexicon"
     );
 }
 
@@ -1470,7 +1688,7 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// `by`/`without`/empty-list/duplicate/absent-name shapes, `by` on the
 /// unwrapped label, and the `eval range` rows for the sliding path
 /// (which include the cross-stream `StableHash` tie). Every value came
-/// from one fresh capture against the pinned v3.7.4 container, so they
+/// from a fresh capture against the pinned v3.7.4 container, so they
 /// carry the file's `captured` default; no pre-existing `eval_fail` row
 /// was removed, but its "not yet executed" refusals became `eval` rows.
 /// More landed with the instant `first`/`last` delivery-order fix in the
@@ -1483,7 +1701,7 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// reducer's.
 ///
 /// Issue #248 added `b20_nested_ip.test` — `eval` plus `eval_fail` rows,
-/// in one capture run against the pinned v3.7.4 container (accept/reject
+/// in a single capture run against the pinned v3.7.4 container (accept/reject
 /// disposition AND every value). They carry the file's `captured`
 /// default; as elsewhere, an `eval_fail`'s `msg:` gate is PulsusDB's own
 /// wording while the REJECTION it pins was captured. Its second round

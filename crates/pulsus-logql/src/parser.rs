@@ -1284,8 +1284,21 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   accepts the whole `i64` nanosecond domain, asymmetrically:
 ///   `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) → 200, one ns
 ///   more → 400 `syntax error: unexpected NUMBER, expecting DURATION`;
-///   `offset -9223372036854775808ns` (`i64::MIN`) → 200, one ns more
-///   negative → 400 `syntax error: unexpected -, expecting DURATION`.
+///   `offset -9223372036854775808ns` (`i64::MIN`) is the lexer's floor,
+///   one ns more negative → 400 `syntax error: unexpected -, expecting
+///   DURATION`.
+///
+///   Those are LEXER verdicts, and the negative end of the band is a
+///   `200` on the wire everywhere except at exactly `i64::MIN`, which
+///   this comment used to report as a `200` (issue #248 round 5
+///   re-measured it: `i64::MIN + 1` → 200, `i64::MIN` → `400 this data
+///   is no longer available, it is past now - max_query_lookback (0s)`).
+///   The value parses; what refuses it is Go's negation overflowing at
+///   that one value inside `end.Add(-offset)`, inverting the window
+///   (`pkg/querier/queryrange/shard_resolver.go:104`,
+///   `pkg/querier/limits/validation.go:92-94` @ v3.7.4). It is an
+///   artefact of one value, not a bound, and the accepted band this
+///   paragraph describes is otherwise unchanged.
 ///
 ///   That asymmetry is not an accident of its own: the magnitude is lexed
 ///   by `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`), which
@@ -1343,10 +1356,12 @@ fn parse_offset(cursor: &mut Cursor<'_>) -> Result<Option<i64>, LogQlError> {
 /// never a clamped value: someone asking for a stupid number is told
 /// plainly rather than silently handed a different answer.
 ///
-/// **A deliberate divergence.** The reference bounds neither literal
-/// below the `i64` domain and bounds no query span at all; retention is
-/// days to months, so this refuses nothing a real deployment does.
-/// Ledgered as `five-year-span-cap`.
+/// **A deliberate divergence**, and a narrower one than this comment
+/// used to claim: the reference DOES bound a query's span, through
+/// `max_query_length` (default `721h`), over a window that includes the
+/// `[range]` selector but not the offset. Retention is days to months,
+/// so this refuses nothing a real deployment does. The re-measurement
+/// and the source lines are on the `five-year-span-cap` ledger row.
 fn check_span(
     what: &'static str,
     nanos: u64,
@@ -1612,12 +1627,21 @@ mod tests {
     /// one layer above the code it fixed, and undetectable from below. The
     /// cap subsumes it: nothing past 43,800 h reaches a conversion at all.
     ///
-    /// Every rejected case here is a reference **200** (measured on the
-    /// digest-pinned v3.7.4 oracle `grafana/loki@sha256:87f0a067…`,
-    /// buildinfo `3.7.4` / `b318f282`: it accepts the whole `i64`
-    /// nanosecond domain for both literals, e.g. `offset 2562047h` and
-    /// `[2562047h]`). That is the ledgered `five-year-span-cap`
-    /// divergence, and this test is what pins it.
+    /// Every OFFSET rejected here is a reference **200** — measured on
+    /// the digest-pinned v3.7.4 oracle `grafana/loki@sha256:87f0a067…`,
+    /// buildinfo `3.7.4` / `b318f282`: `offset ±43801h` and
+    /// `offset 2562047h47m16s854ms775us807ns` are all 200s, instant and
+    /// range alike, because the offset cancels out of the window
+    /// `max_query_length` is measured over. That is the ledgered
+    /// `five-year-span-cap` divergence and this test is what pins it.
+    ///
+    /// The `[range]` half is NOT symmetric with it, which this comment
+    /// used to imply by saying "both literals": on a range query the
+    /// selector counts against `max_query_length` (`[720h]` over a `1h`
+    /// request span is already a 400 there), and on an instant query the
+    /// reference admits it and then decomposes it into per-hour
+    /// subqueries that do not answer. Issue #248 round 5 re-measured
+    /// both; the ledger row carries the table.
     #[test]
     fn both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp() {
         const CAP: i64 = MAX_QUERY_SPAN_NS;
