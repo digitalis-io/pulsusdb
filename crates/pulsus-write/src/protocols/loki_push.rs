@@ -2922,7 +2922,7 @@ mod tests {
     /// PulsusDB answers neither: 204, storing the empty label set. It
     /// implements neither half — no `discover_service_name` equivalent at all
     /// (pre-existing and not specific to this input: a push of `{"keep":"v"}`
-    /// likewise stores without the synthesised `service_name`), and no
+    /// likewise stores without the synthesized `service_name`), and no
     /// `ValidateLabels`, which is #374's. Measured at our own wire with the
     /// same two bodies: both 204, both landing in one `log_streams` row whose
     /// `labels` is `{}`. Issue #259 changes only which inputs reach that row —
