@@ -1282,9 +1282,11 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   MEASURED on the digest-pinned v3.7.4 oracle
 ///   (`grafana/loki@sha256:87f0a067…`, `/loki/api/v1/status/buildinfo`
 ///   reporting `3.7.4` / `b318f282` — that is the only path the
-///   reference serves it on, `pkg/loki/loki.go:603 @ v3.7.4`; bare
-///   `/status/buildinfo` and `/api/v1/status/buildinfo` are both a
-///   measured `404`), the reference's LEXER admits the whole `i64`
+///   reference serves it on, registered twice at that one path:
+///   `pkg/loki/loki.go:601 @ v3.7.4` on the internal server, guarded by
+///   `if t.Cfg.InternalServer.Enable`, and `:603` unconditionally on the
+///   public one; bare `/status/buildinfo` and `/api/v1/status/buildinfo`
+///   are both a measured `404`), the reference's LEXER admits the whole `i64`
 ///   nanosecond domain, asymmetrically. The LEXER, said deliberately:
 ///   HTTP acceptance stops one value short of that band, and the
 ///   endpoint it drops is the next paragraph's subject, so this sentence
@@ -1292,22 +1294,58 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   sentence had already been narrowed the same way at three other
 ///   sites — `limits.rs`'s `MAX_QUERY_SPAN_NS`, `docs/features.md`'s
 ///   LogQL parity paragraph, and the `five-year-span-cap` ledger row —
-///   and this was the fourth. Those four are the whole set. The
-///   enumerating sweep is `git grep -l five-year-span-cap` → five files,
+///   and this was the fourth.
+///
+///   **FOUR SITES ARE AUDITED. THE SET IS NOT PROVEN CLOSED**, and a
+///   fifth unqualified claim may exist in wording none of the sweeps
+///   below matches. Rounds 9 and 10 wrote "those four are the whole
+///   set"; the sweeps do not carry a universal, so the claim is
+///   withdrawn (issue #248 round 11). They are written out verbatim
+///   here, counts as of `3e04428`, so the next reader re-runs them
+///   instead of trusting a number.
+///   Sweep 1, the keyword: `git grep -lI five-year-span-cap` → 5 files,
 ///   whose fifth, `pulsus_read`'s `QuerySpanTooLong`, quantifies over no
-///   band at all — but that sweep is CIRCULAR on its own (a file could
-///   describe the band and never name the row), so it is closed by two
-///   that do not use the keyword and whose residues were read by hand:
-///   every line pairing `offset` with a band marker (`i64`, `2562047`,
-///   `9223372036854775…`, `43800`/`43801`) — 27 files, the 22 outside
-///   the five are type declarations and unrelated subsystems — and every
-///   PARAGRAPH pairing `offset` with an unbounded-acceptance phrase
-///   (`unbounded`, `no cap`, `uncapped`, `admits`, `accepts any/the/every`,
-///   `imposes no`, …) — 15 files, the 11 outside the five carry no claim
-///   about the reference. Line-scoping that second sweep would NOT close
-///   it: the ledger row's own claim spans lines and a line-scoped variant
-///   misses it, i.e. it drops a KNOWN member. Re-run in issue #248 round
-///   10.)
+///   band at all. CIRCULAR on its own — a file could describe the band
+///   and never name the row.
+///   Sweep 2, band markers, keyword-free:
+///   `git grep -nI -iE 'offset' | grep -E 'i64|2562047|9223372036854775|43800|43801'`
+///   → 88 lines in 27 files AT `3e04428`; the 23 not also in sweep 1 are
+///   `pub offset_ns: i64`-class type declarations, PromQL/OTLP/template
+///   arithmetic, and `b19_offset.test`'s
+///   `offset-domain-edge-exact-arithmetic` block, read by hand.
+///   Sweep 3, unbounded-acceptance phrases within ±12 lines of a line
+///   matching `offset`, keyword-free. The matcher is exactly
+///   `unbounded|uncapped|no cap|imposes no|admits|accepts (any|the|every)`
+///   — no elision — run as `for f in $(git grep -lI -i offset); do grep
+///   -i -C12 -E offset "$f" | grep -qiE "$PH" && echo "$f"; done | sort
+///   -u` → 13 files, the 9 not also in sweep 1 read by hand and carrying
+///   no claim about the reference's offset band: a TraceQL cap, a
+///   parser-vendoring note, `admits_instant`, a local named `uncapped`,
+///   and three copies of "the only unbounded quantity left is where the
+///   REQUEST sits", which is the other ledger row.
+///
+///   Three ways those sweeps fall short of closure, each reproducible.
+///   NEITHER keyword-free sweep contains sweep 1's set: both MISS
+///   `crates/pulsus-read/src/logql/error.rs`, so each drops a KNOWN
+///   member. Round 10 charged that failure against a line-scoped variant
+///   of sweep 3 only and offered sweep 3 as the repair; sweep 3 has it
+///   too, and had it silently: round 10 gave sweep 2's residue as 22 of
+///   27, which subtracts all five keyword files from it. Only four are
+///   in it, so the residue is 23. Compute the intersection; do not
+///   subtract an assumed containment.
+///   Sweep 3's count is a function of its matcher — widening it by
+///   `whole i64|entire|no limit` takes 13 → 20 — so no single number
+///   from it means anything without the list beside it. And sweep 2
+///   COUNTS ITS OWN DESCRIPTION: the line spelling out its markers,
+///   above, matches it, so its total moves whenever this paragraph is
+///   edited. That is the entire 87-vs-88 disagreement between rounds 10
+///   and 11: 87 at `b3bd6c3`, 88 at `3e04428` — the one added line being
+///   this sweep's own text — and neither round quoted the SHA it counted
+///   at, which is why two correct measurements read as a contradiction.
+///   Writing this paragraph out costs two more self-matches and saves
+///   one, so over the tree carrying this sentence the same command
+///   returns 89. Quote the SHA with the number or do not quote the
+///   number.)
 ///   `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) → 200, one ns
 ///   more → 400 `syntax error: unexpected NUMBER, expecting DURATION`;
 ///   `offset -9223372036854775808ns` (`i64::MIN`) is the lexer's floor,
@@ -1723,21 +1761,40 @@ mod tests {
     /// agrees: `go version -m` on `/usr/bin/loki` extracted from
     /// `grafana/loki@sha256:87f0a067…` prints `go1.26.5` and
     /// `mod github.com/grafana/loki/v3 v3.0.0-20260722033256-b318f2829f0a`
-    /// (the build-info endpoint cannot answer this. Its `goVersion` is
-    /// empty, and structurally so, not by accident of this image:
-    /// `versionHandler` reads the package var `build.GoVersion`
-    /// directly (`pkg/loki/version_handler.go:12-20`,
-    /// `pkg/util/build/build.go:14-21` @ v3.7.4) rather than
-    /// `build.GetVersion()`, which is the accessor whose `init()` fills
-    /// the field from `runtime.Version()` (`build.go:23-30`); and the
-    /// release `ldflags` set Branch/Version/Revision/BuildUser/BuildDate
-    /// and NOT `GoVersion` (`Makefile:46-50` @ v3.7.4). Measured on the
+    /// (the build-info endpoint cannot answer this. Measured on the
     /// pinned digest: `GET /loki/api/v1/status/buildinfo` → `200`
     /// `{"version":"3.7.4","revision":"b318f282",…,"goVersion":""}`.
-    /// That path is the endpoint — the only one it is served on
-    /// (`pkg/loki/loki.go:603`); bare `/status/buildinfo` and
-    /// `/api/v1/status/buildinfo` are both `404`, which is what this
-    /// comment named until issue #248 round 10).
+    /// That path is the endpoint — the only one it is served on,
+    /// registered at that one path twice: `pkg/loki/loki.go:601 @ v3.7.4`
+    /// on the internal server, behind `if t.Cfg.InternalServer.Enable`,
+    /// and `:603` unconditionally on the public one; bare
+    /// `/status/buildinfo` and `/api/v1/status/buildinfo` are both `404`,
+    /// which is what this comment named until issue #248 round 10.
+    ///
+    /// **Empty in the RELEASE build, which is the build we pin — not
+    /// unpopulatable in principle.** The release `ldflags` set
+    /// Branch/Version/Revision/BuildUser/BuildDate and NOT `GoVersion`
+    /// (`Makefile:46-50` @ v3.7.4), and `versionHandler` reads the
+    /// package var `build.GoVersion` directly
+    /// (`pkg/loki/version_handler.go:12-20`,
+    /// `pkg/util/build/build.go:14-21` @ v3.7.4) rather than
+    /// `build.GetVersion()`, the accessor whose `init()` fills the field
+    /// from `runtime.Version()` (`build.go:23-30`) — so nothing in a
+    /// release build ever assigns it. That is a fact about the shipped
+    /// binary, not about the tree: `-X …/pkg/util/build.GoVersion=…` at
+    /// link time, or a plain assignment, populates it, and the
+    /// reference's own `version_handler_test.go:20 @ v3.7.4` sets
+    /// `build.GoVersion = "42"` and requires the handler to echo it
+    /// (`:36` in the expected literal opened at `:30`, `assert.JSONEq`
+    /// at `:40`) —
+    /// RUN, not merely read: `go test ./pkg/loki/ -run
+    /// '^TestVersionHandler$'` on the v3.7.4 checkout passes, under the
+    /// go1.26.5 the module declares. Round 10 wrote "structurally so,
+    /// not by accident of this image", which claims no build of the tree
+    /// can populate it; a missing ldflag cannot show that, and that
+    /// passing test refutes it. What the ldflag DOES establish is the
+    /// only thing this comment needs — the release binary we pin
+    /// reports it empty (issue #248 round 11)).
     /// Against go1.26.5's `src/time/format.go`:
     /// `leadingInt` is byte-identical to go1.25.5's and at the SAME
     /// lines (`:1554-1572`, ceiling `:1566`), `unitMap` is
