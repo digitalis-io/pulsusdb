@@ -600,13 +600,19 @@ jobs:
       # answer against the committed expectation, so a capture that goes
       # STALE is caught rather than trusted forever. NIGHTLY/dispatch
       # only: drift is a property of time passing, not of the commit
-      # under test, and the leg needs ~90 sequential pushes.
+      # under test, and the leg makes one sequential push per reachable
+      # row.
       #
       # It verifies VALUES; it does not verify provenance markers — it
-      # reads them to decide which rows it may compare. 90 of the 1,013
+      # reads them to decide which rows it may compare. Only some of the
       # rows the markers permit are physically reachable; the gap is
-      # enumerated by reason in the test, dominated by 678 template rows
-      # pinned to an absolute date the reference will not serve.
+      # enumerated by reason in the test, dominated by the template rows
+      # pinned to an absolute date the reference will not serve. The
+      # figures live on REACHABLE / PROVENANCE_PERMITS in
+      # logqltest_replay.rs, which assert them against the corpus, and
+      # are deliberately not restated here: a hand-copied count beside a
+      # machine-checked one drifts (issue #248 round 2 found exactly
+      # that, in this comment and in the test's own module doc).
       - name: LogQL corpus replay leg (issue #352, nightly)
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:

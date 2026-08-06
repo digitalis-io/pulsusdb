@@ -917,8 +917,12 @@ fn check_e_ledger_rows_claiming_corpus_gating_are_named_by_a_marker() {
 /// (accept/reject disposition AND every value). They carry the file's
 /// `captured` default; as elsewhere, an `eval_fail`'s `msg:` gate is
 /// PulsusDB's own wording while the REJECTION it pins was captured.
-/// 1_172 + 25 = 1_197.
-const CAPTURED: usize = 1_197;
+/// 1_172 + 25 = 1_197. Its second round added nine more `eval` rows to
+/// the same file, captured in the same way from the same image: the
+/// error-ordering block, where a numeric conversion fails to the LEFT of
+/// a leaf that reads the error state, plus two chained-short-circuit rows.
+/// 1_197 + 11 = 1_208.
+const CAPTURED: usize = 1_208;
 /// Issue #343 added `b19_offset.test`'s 9 rows: hand-derived from the
 /// semantics measured on that issue, over a fixture authored here rather
 /// than taken from the container, so they are `derived` and not
@@ -928,4 +932,4 @@ const CAPTURED: usize = 1_197;
 const DERIVED: usize = 31;
 const DIVERGENCE: usize = 17;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_277;
+const TOTAL: usize = 1_288;

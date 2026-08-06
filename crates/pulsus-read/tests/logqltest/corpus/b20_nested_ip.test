@@ -7,8 +7,11 @@
 # /loki/api/v1/status/buildinfo answered {"version":"3.7.4",
 # "revision":"b318f282","branch":"release-3.7.x"} — the same b318f282 the
 # pinned digest and the Go checkout at v3.7.4 resolve to. Captured
-# 2026-08-05; every row re-run against a freshly started container on
-# 2026-08-06 and re-produced its committed value.
+# 2026-08-05, with the error-ordering block below added 2026-08-06 from
+# the same image; every row re-run against a freshly started container on
+# 2026-08-06 and re-produced its committed value — the streams rows
+# through `logqltest_replay`'s live leg, the seven metric rows and the
+# metric `eval_fail` by hand, since that leg is streams-only.
 #
 # THE RULE, read off the reference's structure and then measured.
 # `log.NewIPLabelFilter` cannot fail: it records the parse error on the
@@ -181,3 +184,100 @@ eval instant at 60s sum_over_time({service_name="svc-ipuw"} | logfmt | unwrap va
 # stage again — reports.
 eval_fail instant at 60s sum_over_time({service_name="svc-ipuw"} | logfmt | addr = ip("nope") | unwrap val [5m])
   msg: ip()
+
+clear
+
+# --- the error set to the LEFT of the leaf that reads it ---------------
+#
+# Round 2 of this issue. The `ip()` leaves above read the entry's error
+# state — `filterTy` returns true on `lbs.HasErr()` before it looks at
+# anything else (ip.go:123-127 @ v3.7.4) — and the reference's own
+# `SetErr` is IMMEDIATE: a numeric-family label filter that cannot convert
+# its value calls `lbs.SetErr(errLabelFilter)` right there and returns
+# TRUE (label_filter.go:313-319 @ v3.7.4 for the float family; the bytes
+# and duration families are the same shape at :182-188 and :250-256).
+# `BinaryLabelFilter.Process` (label_filter.go:90-98) then evaluates its
+# operands left to right on the SAME `LabelsBuilder`, so everything to the
+# right of a failed conversion sees `HasErr() == true`.
+#
+# Two consequences, and neither is about `ip()` patterns specifically:
+#
+#   1. a malformed OR well-formed `ip()` leaf to the right of a failed
+#      numeric conversion is TRUE, whatever the label holds and whichever
+#      operator it was written with — and so is `__error__ = "…"`;
+#   2. `or` SHORT-CIRCUITS (`if !b.And && lok`, label_filter.go:92-94)
+#      while `and` does not, so a numeric filter to the right of a TRUE
+#      `or` operand never runs and never sets the error. The pair
+#      `b = "x" or n > 1` / `n > 1 or b = "x"` below is the discriminator:
+#      identical entries returned, `__error__` on one and not the other.
+#
+# The load is arranged so that every `ip()` row DISCRIMINATES: the entry
+# whose conversion fails carries the address OUTSIDE 10.0.0.0/8 and the
+# clean entry carries the one inside it, so a leaf that evaluated the
+# address instead of the error state would answer with the other entry.
+load
+  {service_name="svc-iperr"}
+  0s  n=bad addr=192.168.1.1 b=x
+  5s  n=5 addr=10.1.2.3 b=y
+
+# The failed conversion carries the malformed `ip()` leaf, so the errored
+# entry survives an `and` that would otherwise drop it. The clean entry
+# (n=5 > 1 is true, no error) takes the leaf's `false` branch and is
+# dropped — one line in, one line out, but not the same one.
+eval instant at 60s {service_name="svc-iperr"} | logfmt | n > 1 and addr = ip("nope")
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"bad\": invalid syntax", addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+
+# `,` is `and` (syntax.y:310 @ v3.7.4).
+eval instant at 60s {service_name="svc-iperr"} | logfmt | n > 1, addr = ip("nope")
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"bad\": invalid syntax", addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+
+# ORDER IS THE WHOLE POINT: swap the operands and the `ip()` leaf runs
+# BEFORE the error exists, so it is false and the `and` drops both entries.
+eval instant at 60s {service_name="svc-iperr"} | logfmt | addr = ip("nope") and n > 1
+
+# `!=` does not negate the errored-entry branch either — `HasErr` is
+# checked before the operator switch.
+eval instant at 60s {service_name="svc-iperr"} | logfmt | n > 1 and addr != ip("nope")
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"bad\": invalid syntax", addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+
+# A WELL-FORMED `ip()` leaf takes the same branch: the entry that comes
+# back first is the one whose addr is NOT in 10.0.0.0/8, because its addr
+# was never tested.
+eval instant at 60s {service_name="svc-iperr"} | logfmt | n > 1 and addr = ip("10.0.0.0/8")
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"bad\": invalid syntax", addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+  {addr="10.1.2.3", b="y", n="5", service_name="svc-iperr"}  5s  n=5 addr=10.1.2.3 b=y
+
+# `__error__` is read from the slot the same filter just wrote
+# (`labelValue`, label_filter.go:418-424).
+eval instant at 60s {service_name="svc-iperr"} | logfmt | n > 1 and __error__ = "LabelFilterErr"
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"bad\": invalid syntax", addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+
+# Under `or` the failed conversion's own `true` already carries the entry.
+eval instant at 60s {service_name="svc-iperr"} | logfmt | n > 1 or addr = ip("nope")
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"bad\": invalid syntax", addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+  {addr="10.1.2.3", b="y", n="5", service_name="svc-iperr"}  5s  n=5 addr=10.1.2.3 b=y
+
+# THE SHORT-CIRCUIT DISCRIMINATOR, first half: `b = "x"` is true on the
+# 0s entry, so `n > 1` is never evaluated and no error is ever set.
+eval instant at 60s {service_name="svc-iperr"} | logfmt | b = "x" or n > 1
+  {addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+  {addr="10.1.2.3", b="y", n="5", service_name="svc-iperr"}  5s  n=5 addr=10.1.2.3 b=y
+
+# The short-circuit CHAINS. `a or b or c` parses left-deep, so `b = "x"`
+# being true must skip `c = "zzz"`, `n > 1` and BOTH `or` nodes: a jump
+# that stopped one level up would land on `n > 1`, evaluate it and set
+# `__error__` on the first entry. Four wide, so two-deep-by-accident is
+# ruled out too.
+eval instant at 60s {service_name="svc-iperr"} | logfmt | b = "x" or c = "zzz" or n > 1
+  {addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+  {addr="10.1.2.3", b="y", n="5", service_name="svc-iperr"}  5s  n=5 addr=10.1.2.3 b=y
+
+eval instant at 60s {service_name="svc-iperr"} | logfmt | b = "x" or c = "zzz" or c = "qqq" or n > 1
+  {addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+  {addr="10.1.2.3", b="y", n="5", service_name="svc-iperr"}  5s  n=5 addr=10.1.2.3 b=y
+
+# Second half: the SAME two operands the other way round return the SAME
+# two entries — with `__error__` on the first.
+eval instant at 60s {service_name="svc-iperr"} | logfmt | n > 1 or b = "x"
+  {__error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"bad\": invalid syntax", addr="192.168.1.1", b="x", n="bad", service_name="svc-iperr"}  0s  n=bad addr=192.168.1.1 b=x
+  {addr="10.1.2.3", b="y", n="5", service_name="svc-iperr"}  5s  n=5 addr=10.1.2.3 b=y

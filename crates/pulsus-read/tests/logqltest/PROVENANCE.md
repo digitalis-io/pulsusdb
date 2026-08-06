@@ -18,11 +18,16 @@ caught rather than trusted forever.
 marker only to decide which rows it may compare. That statement above the
 marker table still holds and is now load-bearing in code.
 
-| figure | means | today |
+| figure | means | where the number lives |
 |---|---|---|
-| `captured` | directives claiming container capture | 1197 |
-| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | 1013 |
-| `REACHABLE` | rows a live replay can PHYSICALLY compare | 90 |
+| `captured` | directives claiming container capture | `CAPTURED`, `logqltest_provenance.rs` |
+| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | `logqltest_replay.rs` |
+| `REACHABLE` | rows a live replay can PHYSICALLY compare | `logqltest_replay.rs` |
+
+Each of those constants is asserted against a figure recomputed from the
+corpus, so it cannot go stale silently. A copy in this file can, and did:
+the `today` column this table used to carry was re-synced by issue #248
+and stale again by its second round, four days later. Read the constants.
 
 `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg existed,
 and that name was wrong: most of those rows can never be reached. The
@@ -42,6 +47,8 @@ enumerated by reason, not absorbed:
   grouped range aggregations, including the two cross-stream tie rows its
   instant `first`/`last` delivery-order fix unblocked); issue #248 added
   7 (`b20_nested_ip.test`'s post-`unwrap` and `count_over_time` rows).
+  Its second round added 9 rows to that same file and none of them landed
+  here — they are all streams queries, so all 9 are reachable.
 - **range/matrix — 10.** Needs the step grid replayed too. Issue #344
   added 8 (the same file's sliding-path rows, which include the
   cross-stream `StableHash` tie).

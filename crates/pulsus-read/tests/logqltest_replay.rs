@@ -22,11 +22,11 @@
 //! | [`REACHABLE`] | rows a live replay can PHYSICALLY compare today | this file |
 //!
 //! The values live ONLY on those constants, each asserted against a figure
-//! recomputed from the corpus. They were restated here as literals until
-//! issue #248, by which point two of the three had drifted (the table said
-//! 1135/948/77 against actual 1172/993/77) — a hand-copied number beside a
-//! machine-checked one is a false claim waiting to happen, so the copies
-//! are gone rather than re-synced.
+//! recomputed from the corpus. This table used to restate them as
+//! literals, and two of the three had drifted before issue #248 noticed —
+//! a hand-copied number beside a machine-checked one is a false claim
+//! waiting to happen, so the copies were removed rather than re-synced,
+//! and none is quoted here. Read the constants.
 //!
 //! `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg was
 //! built, and the name was wrong: the [`Unreachable::AbsoluteTimestamp`]
@@ -577,18 +577,25 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// rows are streams queries at a single instant over a relative-offset
 /// load set, so [`REACHABLE`] moves for the first time since the leg was
 /// built: 77 -> 90. The other seven are metric queries (228 -> 235).
-const TOTAL_DIRECTIVES: usize = 1_277;
+///
+/// Its second round adds eleven more `eval` rows to that same file — the
+/// error-ordering block, where a numeric conversion fails to the LEFT of
+/// a leaf that reads the error state. All eleven are streams queries at a
+/// single instant over a relative-offset load set, so all three figures
+/// move together: TOTAL 1_277 -> 1_288, [`PROVENANCE_PERMITS`]
+/// 1_013 -> 1_024, [`REACHABLE`] 90 -> 101.
+const TOTAL_DIRECTIVES: usize = 1_288;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_013;
+const PROVENANCE_PERMITS: usize = 1_024;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
 /// [`UNREACHABLE_BY_REASON`] — it is not a shortfall to be quietly
 /// absorbed into one number.
-const REACHABLE: usize = 90;
+const REACHABLE: usize = 101;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \
 not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergence=17";
