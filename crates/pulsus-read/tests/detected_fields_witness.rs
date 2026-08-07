@@ -599,6 +599,81 @@ fn case_d_mixed_axes_are_charged_before_retention() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #253: what actually bounds the response vector once the
+// field-name `limit` has no ceiling.
+// ---------------------------------------------------------------------
+
+/// `FieldAccumulator::finish`'s doc used to say the response vector holds
+/// "at most `field_limit` (<= 5000) entries". Issue #253 removed the 5000,
+/// so that number is gone from the prose and the property is derived here
+/// instead: run the SAME field-name generator at `field_limit = u32::MAX`
+/// under two retention budgets, one exactly twice the other, and show the
+/// admitted count tracks the BUDGET.
+///
+/// No admitted count is written down — a literal would be another number
+/// recorded once and never rechecked. What is asserted is the shape: both
+/// runs cap, both admit strictly fewer than the `N` names offered (so
+/// `u32::MAX` admitted nothing extra), and doubling the budget admits at
+/// least 1.9x as many.
+///
+/// **Why a reintroduced ceiling cannot pass.** A count ceiling `C` at or
+/// below what a run's budget would have admitted makes that run stop
+/// *before* the budget ever refuses a charge, so its `retention_capped`
+/// comes back `false`. `C` below the smaller budget's count trips the
+/// smaller run; `C` between the two trips the larger one. Both were run:
+/// `C = 3000` failed on "the smaller budget must refuse a field name" and
+/// `C = 5000` — the cap #253 removed — failed on "the larger budget must
+/// refuse a field name" (issue #253 implementation notes). The 1.9x
+/// comparison is the backstop for the case where a ceiling somehow leaves
+/// both runs capped. A ceiling ABOVE what the larger budget admits is not
+/// observable here and none is claimed to be.
+///
+/// The budgets are `RETENTION_BUDGET_SMALL`/`_LARGE` rather than the
+/// production 64 MiB so the run stays sub-second; they are still large
+/// enough that both admitted counts sit above 5000-class ceilings.
+#[test]
+fn field_count_is_bounded_by_the_retention_budget_not_by_the_parameter() {
+    let _guard = lock_serial();
+    /// Distinct short field names offered — comfortably more than the
+    /// larger budget can admit, so the generator is never the binding
+    /// constraint.
+    const N: usize = 40_000;
+    const RETENTION_BUDGET_SMALL: u64 = 8 * MIB;
+    const RETENTION_BUDGET_LARGE: u64 = 2 * RETENTION_BUDGET_SMALL;
+
+    let run = |budget: u64| {
+        // `line_limit = 1` and `field_limit = u32::MAX`: `observe_pair`
+        // bypasses the feeding gate, so neither the entry axis nor the
+        // parameter can be what limits either run.
+        let mut probe = DetectedFieldsProbe::with_byte_budget(1, u32::MAX, budget);
+        let mut name = String::with_capacity(16);
+        for i in 0..N {
+            name.clear();
+            write!(name, "f{i:08}").expect("write");
+            probe.observe_pair(&name, "v", None);
+        }
+        let (fields, capped) = probe.finish();
+        (fields.len(), capped)
+    };
+
+    let (small, small_capped) = run(RETENTION_BUDGET_SMALL);
+    let (large, large_capped) = run(RETENTION_BUDGET_LARGE);
+
+    assert!(small_capped, "the smaller budget must refuse a field name");
+    assert!(large_capped, "the larger budget must refuse a field name");
+    assert!(
+        small < N && large < N,
+        "field_limit = u32::MAX must admit nothing extra: {small} / {large} of {N} offered"
+    );
+    assert!(
+        large * 10 >= small * 19,
+        "doubling the retention budget must roughly double the admitted count — \
+         {small} at {RETENTION_BUDGET_SMALL} B vs {large} at {RETENTION_BUDGET_LARGE} B \
+         means something other than the budget is binding"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Case E: the sampled-row axis is streamed (AC 11).
 // ---------------------------------------------------------------------
 

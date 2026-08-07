@@ -388,10 +388,58 @@ mod tests {
         assert!(body.contains("line_limit"), "{body}");
     }
 
+    /// Issue #253: the field-name axis has NO ceiling. Reaching the
+    /// poolless `503` is what proves param validation passed (this
+    /// module's established idiom, below) — pre-#253 every one of these
+    /// was a `400`. The reference answers `200` to all of them
+    /// (`grafana/loki:3.7.4`, measured 2026-08-07); `4294967296` and
+    /// above is where its unchecked `uint32()` wraps and ours saturates.
     #[tokio::test]
-    async fn detected_fields_limit_above_the_cap_is_400() {
-        let (status, _body) = fields_get(Some(&format!("{SELECTOR}&limit=999999"))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+    async fn detected_fields_limit_far_above_the_entry_cap_passes_validation_then_503_without_a_pool()
+     {
+        for qs in [
+            "limit=5001",
+            "limit=50000",
+            "limit=1000000",
+            "limit=2147483647",
+            "limit=4294967295",
+            "limit=4294967296",
+            "limit=9223372036854775807",
+            "field_limit=5001",
+            "field_limit=4294967295",
+            // Present-but-empty is absent, so the alias is what is used.
+            "limit=&field_limit=5001",
+            "limit=",
+            "line_limit=",
+        ] {
+            let (status, body) = fields_get(Some(&format!("{SELECTOR}&{qs}"))).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{qs} must pass validation: {body}"
+            );
+        }
+    }
+
+    /// The reject surface that stays: non-positive and non-`Atoi`
+    /// spellings are still a `400`, on both parameters (the reference
+    /// answers `400` to each of these too).
+    #[tokio::test]
+    async fn detected_fields_non_positive_and_non_numeric_limits_are_still_400() {
+        for qs in [
+            "limit=0",
+            "limit=-1",
+            "limit=00",
+            "limit=abc",
+            "limit=1.5",
+            "limit=9223372036854775808",
+            "field_limit=0",
+            "line_limit=0",
+            "line_limit=5001",
+        ] {
+            let (status, _body) = fields_get(Some(&format!("{SELECTOR}&{qs}"))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{qs} must be a 400");
+        }
     }
 
     /// A full log-selector query WITH a pipeline is shape-valid on
