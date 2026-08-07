@@ -51,9 +51,9 @@
 //!   parse → plan → the pipeline compile that runs before any I/O. Every
 //!   position is a `query_range`-shaped query, so the sites it actually
 //!   drives are `exec.rs:612` (streams), `:906` (metric, incl. every
-//!   binary leaf), `plan.rs`'s variant validation and `variants.rs:509`
-//!   — NOT `exec.rs:2290`/`:2576`, which are `/detected_fields` and
-//!   `/tail` and are covered as described under "unmeasured routes".
+//!   binary leaf), `plan.rs`'s variant validation and `variants.rs:509`.
+//!   NOT `exec.rs:2290` or `:2576` — see "unmeasured routes and
+//!   uncovered call sites" below.
 //! - [`the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression`]
 //!   — hermetic, the discrimination check: the rule PulsusDB shipped at
 //!   `7980344` (the `| logfmt` compile arm cloned the expression string
@@ -121,18 +121,18 @@
 //!   expression returns is not this issue; only the resolved source key
 //!   is adopted here, because it is the sub-grammar's own output.
 //!
-//! **Unmeasured routes, named with the reason.** `/patterns` is a 404 on
+//! **Unmeasured routes and uncovered call sites, named with the
+//! reason.** `/patterns` is a 404 on
 //! the pinned container (its pattern ingester is off in
 //! `ci/logql/config.yaml`), so it cannot report a syntax verdict.
-//! `/tail` is a WebSocket and this harness speaks HTTP only. Its
-//! PulsusDB counterpart (`tail_setup`, `exec.rs:2576`) calls the same
-//! `CompiledPipeline::compile` on the same `StreamsPlan::pipeline` that
-//! `exec.rs:612` does, so the RULE is covered by the streams positions —
-//! but that call SITE is not driven by anything in this file, and saying
-//! "the hermetic half already covers it" would be a claim about the site
-//! rather than the rule. `/detected_fields` (`exec.rs:2290`) is likewise
-//! not driven here; it is measured live by
-//! [`live_surface_axis_agrees`]'s route table.
+//! `/tail` is a WebSocket and this harness speaks HTTP only, so nothing
+//! here drives `tail_setup` (`exec.rs:2576`). Nothing here drives
+//! `/detected_fields` (`exec.rs:2290`) either: every position is a
+//! `query_range`-shaped query. **Both call sites are uncovered by this
+//! file.** That is stated and left visible rather than described as
+//! covered by something else — three earlier revisions of this sentence
+//! each named a different mechanism as covering them, and each was
+//! wrong.
 
 use std::process::Command;
 
@@ -394,12 +394,16 @@ const EXPRESSIONS: &[Expression] = &[
 /// Where the `| logfmt` extraction sits. `{Q}` is the expression's
 /// `quoted` text, dropped into `a="{Q}"`.
 ///
-/// Every PulsusDB entry point that runs a pipeline compiles it before any
-/// I/O — streams `exec.rs:612`, metric `exec.rs:906` (each leaf of a
-/// binary plan through `run_metric_node` → `run_metric_inner`),
-/// `detected_fields` `exec.rs:2290`, `tail` `exec.rs:2576` — so no
-/// position is exempt, and the table asserts that by holding the verdict
-/// CONSTANT across positions rather than recording one per position.
+/// Every position is a `query_range`-shaped query, so between them they
+/// drive `exec.rs:612` (streams), `:906` (metric, each leaf of a binary
+/// plan through `run_metric_node` → `run_metric_inner`), `plan.rs`'s
+/// variant validation and `variants.rs:509`. They do NOT drive
+/// `exec.rs:2290` (`detected_fields`) or `:2576` (`tail`) — see the
+/// module docs' "uncovered call sites". The table holds an expression's
+/// verdict CONSTANT across positions rather than recording one per
+/// position, which
+/// [`live_matrix_against_the_reference`] puts to the container point by
+/// point.
 struct Position {
     name: &'static str,
     template: &'static str,
@@ -815,7 +819,9 @@ fn pulsus_verdict(query: &str) -> (Verdict, String) {
     };
     let mut pipelines: Vec<Vec<pulsus_logql::Stage>> = Vec::new();
     match &planned {
-        // `exec.rs:612` (streams), `:2290` (detected_fields), `:2576` (tail).
+        // The compile `exec.rs:612` performs. `:2290` and `:2576` compile
+        // the same `StreamsPlan::pipeline` the same way, but nothing in
+        // this file reaches those two entry points.
         Plan::Streams(sp) => pipelines.push(sp.pipeline.clone()),
         // `exec.rs:906` (`run_metric_inner`).
         Plan::Metric(mp) => pipelines.extend(mp.client.iter().map(|c| c.pipeline.clone())),
@@ -1008,16 +1014,31 @@ fn pulsus_agrees_with_the_captured_reference_verdicts() {
 /// **The exception set is pinned, and it is exactly ONE position.**
 /// Without this, a future change could add a divergence by giving a
 /// position a non-`Agrees` outcome and everything would still be green.
-/// Every disagreement is enumerated by name and its direction asserted.
+/// Every disagreement is enumerated by name.
 ///
-/// The other direction — the reference refuses and we accept — must now
-/// be EMPTY. `variants_variant_side` was that bucket until #247 round 2
-/// made `build_variants_node` validate a variant's own pipeline, and an
-/// empty assertion is what stops it coming back.
+/// **The other direction — the reference refuses and we accept — cannot
+/// be expressed here at all, which is stronger than asserting it is
+/// empty and is why no such assertion exists.** [`Point::pulsus`] returns
+/// `self.layer.reference()` for every outcome, and [`Point::reference`]
+/// differs from it only by relaxing `Reject` to `Accept` for
+/// [`Outcome::CommonSideRefusedHere`] — so `(Accept, Reject)` is
+/// unreachable and the arm below is an `unreachable!`. What closed that
+/// direction was DELETING the `VariantSideNotValidated` outcome when
+/// #247 round 2 made `build_variants_node` validate a variant's own
+/// pipeline: recording such a divergence is now a compile error, not a
+/// test failure.
+///
+/// **What actually guards the production rule** — verified by deleting
+/// `CompiledPipeline::compile(common_stages(pipeline))?` from
+/// `build_variants_node` and re-running:
+/// [`pulsus_agrees_with_the_captured_reference_verdicts`] fails on 17 of
+/// 431 points, [`the_compile_sites_are_enumerated_from_the_callers_of_the_compiler`]
+/// fails with `plan.rs` going 1 → 0, and `plan.rs`'s
+/// `variant_pipelines_are_validated_though_nothing_runs_them` fails.
+/// This test is NOT among them, and an earlier revision credited it.
 #[test]
 fn points_disagree_with_the_reference_only_where_the_table_says_so() {
     let points = matrix();
-    let mut we_accept_they_refuse = Vec::new();
     let mut we_refuse_they_accept = Vec::new();
     for p in &points {
         if p.pulsus() == p.reference() {
@@ -1035,7 +1056,11 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
             p.label
         );
         match (p.pulsus(), p.reference()) {
-            (Verdict::Accept, Verdict::Reject) => we_accept_they_refuse.push(p.label.as_str()),
+            (Verdict::Accept, Verdict::Reject) => unreachable!(
+                "{}: `Point::pulsus()` cannot return Accept where `Point::reference()` returns \
+                 Reject — see this test's doc comment",
+                p.label
+            ),
             (Verdict::Reject, Verdict::Accept) => {
                 assert_eq!(p.outcome, Outcome::CommonSideRefusedHere, "{}", p.label);
                 we_refuse_they_accept.push(p.label.as_str());
@@ -1043,13 +1068,6 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
             other => panic!("{}: impossible verdict pair {other:?}", p.label),
         }
     }
-    assert!(
-        we_accept_they_refuse.is_empty(),
-        "PulsusDB accepts {} queries the reference refuses. That is the higher-priority \
-         direction and #247 closed the whole of it, so a new one is a regression rather than \
-         a divergence to record: {we_accept_they_refuse:?}",
-        we_accept_they_refuse.len()
-    );
     // The remaining divergence is exactly the sub-grammar expressions at
     // the one position that carries it — computed from the table.
     let sub_grammar = EXPRESSIONS
@@ -1064,49 +1082,52 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
     );
     eprintln!(
         "LEDGERED divergence — the reference answers 200-empty, we answer 400 ({} points, all \
-         `variants_common_side`): {}\nOPEN in the other direction: none.",
+         `variants_common_side`): {}",
         we_refuse_they_accept.len(),
         we_refuse_they_accept.join(", "),
     );
 }
 
-/// **The oracle's variants arm, and an honest account of how weak this
-/// tie is.** [`pulsus_verdict`]'s variants arm is a hand-written
-/// reproduction of `VariantArena::build` (`variants.rs:507-540`): it
-/// compiles the common pipeline, then `common ++ tail` per variant. The
-/// real code does the second half with `extended_with` instead, so there
-/// is no shared code keeping them honest. This test asks the REAL
-/// `VariantArena::build` for a verdict on each planned query and asserts
-/// it matches the oracle's.
+/// **The oracle's variants arm is tied to the code it mirrors, and the
+/// tie is falsifiable today.** [`pulsus_verdict`]'s variants arm is a
+/// hand-written reproduction of `VariantArena::build`
+/// (`variants.rs:507-540`): it compiles the common pipeline, then
+/// `common ++ tail` per variant. The real code does the second half with
+/// `extended_with`, so there is no shared code keeping them honest. This
+/// test asks the REAL `VariantArena::build` for a verdict on each planned
+/// query and asserts it matches the oracle's.
 ///
-/// **It does not currently discriminate, and that was checked rather
-/// than assumed.** Two perturbations of the oracle's arm were tried and
-/// NEITHER reddens anything in this file:
+/// **What makes it discriminate is the last query in the list**: a
+/// malformed stage in a variant's TAIL, after the `unwrap`.
+/// `build_variants_node`'s validation sees only the prefix
+/// (`common_stages`, everything before the first `Stage::Unwrap`), and
+/// the `MetricNode::leaves()` arm compiles only the common pipeline,
+/// which is well formed — so the ONLY thing that refuses it is this arm
+/// assembling `common ++ tail`. Three perturbations were applied and the
+/// results checked, not assumed:
 ///
-/// - dropping `common` from `common ++ tail` — masked, because the
-///   `Plan::MetricBinary` arm already compiles the scan plan's client
-///   pipeline through `MetricNode::leaves()`, and for a variants node
-///   that IS the common pipeline;
-/// - dropping the tail — masked, because `build_variants_node` now
-///   compiles each variant's whole own pipeline (tail included) at plan
-///   time for #247, so a malformed tail is refused before any arena is
-///   built.
+/// - neutralising the arm so it emits nothing — **reddens**;
+/// - dropping the tail from the assembly — **reddens**;
+/// - dropping `common` from the assembly — does NOT redden, because the
+///   bad regex is in the tail and still fails without the prefix.
 ///
-/// So the arm is redundant with two other paths today, and this test is a
-/// TRIPWIRE for when that stops being true rather than a check that
-/// currently proves the two agree. It is not a code-sharing refactor on
-/// purpose: `extended_with` exists to avoid recompiling the common
-/// pipeline's regexes once per tail (`pipeline.rs:1155-1162`), so making
-/// the oracle call it would couple this fixture to a performance
-/// mechanism instead of to the rule.
+/// That last one is a real mask, so it is **asserted inside the test**
+/// rather than left to a future reader: `leaves()` must keep yielding the
+/// variants scan plan. Removing `MetricNode::Variants { scan, .. } =>
+/// out.push(scan)` from `plan.rs` reddens this test with a message saying
+/// the arm has become load-bearing. (An earlier revision of this comment
+/// called the whole thing a tripwire for #397 and credited masks that a
+/// third perturbation showed were doing all the work; the arm was dead
+/// code and nothing here would have said so.)
 ///
-/// **Carried to #397.** When a variant gets a live pipeline of its own,
-/// both masks come off — the arm becomes load-bearing, and whoever does
-/// that work must make this test discriminate (or delete the arm in
-/// favour of the real one) rather than trusting it as it stands. Tails
-/// are already non-empty for `unwrap` variants (measured: `sum_over_time(…
-/// | unwrap v | v > 1 …)` plans a two-stage tail), so the assembly this
-/// arm performs is real code, not a placeholder.
+/// It is deliberately not a code-sharing refactor: `extended_with` exists
+/// to avoid recompiling the common pipeline's regexes once per tail
+/// (`pipeline.rs:1155-1162`), so making the oracle call it would couple
+/// this fixture to a performance mechanism instead of to the rule.
+///
+/// **Still relevant to #397.** When a variant gets a live pipeline of its
+/// own, this arm's assembly must match the engine's for every stage, not
+/// only for the one tail shape pinned here.
 #[test]
 fn the_oracle_agrees_with_the_real_variant_arena() {
     for query in [
@@ -1120,6 +1141,16 @@ fn the_oracle_agrees_with_the_real_variant_arena() {
         r#"variants(count_over_time({service_name="m"} [5m])) of ({service_name="m"} | logfmt a="b.c" [5m])"#,
         // two variants, one with a tail
         r#"variants(count_over_time({service_name="m"} [5m]), sum_over_time({service_name="m"} | logfmt | unwrap v [5m])) of ({service_name="m"} | logfmt [5m])"#,
+        // **THE DISCRIMINATING CASE.** A malformed stage in a variant's
+        // TAIL — after the `unwrap`, so `build_variants_node`'s
+        // prefix-only validation cannot see it, and the `leaves()` arm
+        // compiles only the common pipeline, which is well formed. The
+        // ONLY thing that refuses it is the arm under test assembling
+        // `common ++ tail`, exactly as `VariantArena::build` does with
+        // `extended_with`. Neutralising the arm, dropping `common` from
+        // the assembly, or dropping the tail each makes this row
+        // disagree.
+        r#"variants(sum_over_time({service_name="m"} | logfmt | unwrap v | lbl=~"(" [5m])) of ({service_name="m"} | logfmt [5m])"#,
     ] {
         let (ours, why) = pulsus_verdict(query);
         // The engine's own answer, from the code the oracle mirrors.
@@ -1137,13 +1168,31 @@ fn the_oracle_agrees_with_the_real_variant_arena() {
             panic!("{query}: a variants query must plan to a node tree");
         };
         let mut engine = Verdict::Accept;
+        let mut saw_variants = false;
         pulsus_logql::walk::preorder::<MetricNodeScc>(node, |n| {
             if let MetricNode::Variants { scan, variants, .. } = n {
+                saw_variants = true;
                 let common: Vec<pulsus_logql::Stage> = scan
                     .client
                     .as_ref()
                     .map(|c| c.pipeline.clone())
                     .unwrap_or_default();
+                // **THE MASK, ASSERTED.** Dropping `common` from the
+                // arm's `common ++ tail` is invisible today only because
+                // `MetricNode::leaves()` independently yields this same
+                // scan plan, whose client pipeline IS the common one, and
+                // [`pulsus_verdict`] compiles every leaf. If `leaves()`
+                // stops yielding it, the arm's `common` half silently
+                // becomes the only thing compiling the common pipeline —
+                // so assert the mask rather than rely on a reader
+                // noticing a doc comment at that moment.
+                assert!(
+                    planned_leaves_include(node, &common),
+                    "{query}: `MetricNode::leaves()` no longer yields the variants scan plan, \
+                     so the common pipeline is now compiled ONLY by `pulsus_verdict`'s variants \
+                     arm. That arm is a hand-written mirror of `VariantArena::build`; it is now \
+                     load-bearing and needs a case that discriminates its `common` half."
+                );
                 if VariantArena::build(&common, variants, MAX_VARIANT_FANOUT_STATE_BYTES, 0)
                     .is_err()
                 {
@@ -1151,6 +1200,7 @@ fn the_oracle_agrees_with_the_real_variant_arena() {
                 }
             }
         });
+        assert!(saw_variants, "{query}: planned without a variants node");
         assert_eq!(
             ours, engine,
             "{query}: the matrix oracle says {ours:?} ({why}) but `VariantArena::build` says \
@@ -1158,6 +1208,16 @@ fn the_oracle_agrees_with_the_real_variant_arena() {
              this test's doc comment and issue #397."
         );
     }
+}
+
+/// Whether `MetricNode::leaves()` yields a plan whose client pipeline is
+/// `want` — the mask [`the_oracle_agrees_with_the_real_variant_arena`]
+/// asserts.
+fn planned_leaves_include(node: &MetricNode, want: &[pulsus_logql::Stage]) -> bool {
+    node.leaves()
+        .into_iter()
+        .filter_map(|l| l.client.as_ref())
+        .any(|c| c.pipeline == want)
 }
 
 /// **The compile sites are enumerated from the code that CALLS the
@@ -1196,11 +1256,12 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
             4,
             0,
             "streams :612, metric :906 (incl. every binary leaf), detected_fields :2290, tail \
-             :2576. `POSITIONS` reaches the first TWO of these and no more: every position is \
-             a `query_range`-shaped log or metric query, so none of them runs \
-             `detected_fields` or `tail`. `/detected_fields` is covered instead by \
-             `live_surface_axis_agrees`'s route table, and `/tail` is named in this file's \
-             module docs as unmeasured (WebSocket) with the reason",
+             :2576. `POSITIONS` reaches the first TWO and no more: every position is a \
+             `query_range`-shaped log or metric query, so nothing in this file executes \
+             `detected_fields` or `tail`. Those two call sites are therefore UNCOVERED by \
+             this file, and left visibly so — the sub-grammar RULE they would exercise is \
+             the same one the streams positions already pin, but the sites themselves are \
+             not driven by anything here",
         ),
         (
             "plan.rs",
@@ -1290,10 +1351,14 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
 ///
 /// - **CLOSED** — the pre-#247 tree disagreed with the reference and we
 ///   now agree. This is what the issue is for.
-/// - **STILL OPEN** — both trees disagree with the reference. Asserted
-///   EMPTY. It held the `variants_variant_side` points until round 2
-///   made `build_variants_node` validate a variant's own pipeline; the
-///   assertion is what stops that bucket refilling.
+/// - **STILL OPEN** — both trees disagree with the reference. Held the
+///   `variants_variant_side` points until round 2 made
+///   `build_variants_node` validate a variant's own pipeline. It is now
+///   an `unreachable!` rather than an assertion: the bucket is not
+///   expressible, because `Point::pulsus()` never returns Accept where
+///   `Point::reference()` returns Reject — see
+///   [`points_disagree_with_the_reference_only_where_the_table_says_so`]
+///   for what does guard the production rule.
 /// - **INTRODUCED** — the pre-#247 tree AGREED with the reference and we
 ///   now do not. The `variants_common_side` points, where the reference
 ///   answers 200-empty and we answer 400. Recorded here rather than
@@ -1306,7 +1371,7 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
 #[test]
 fn the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression() {
     let points = matrix();
-    let (mut closed, mut still_open, mut introduced) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut closed, mut introduced) = (Vec::new(), Vec::new());
     let (mut already_rejecting, mut controls) = (Vec::new(), 0usize);
     for p in &points {
         let (before, now, theirs) = (p.layer.pre_247(), p.pulsus(), p.reference());
@@ -1321,7 +1386,10 @@ fn the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression() {
                 );
                 closed.push(p.label.as_str());
             }
-            (false, false) => still_open.push(p.label.as_str()),
+            // Unreachable for the same reason `points_disagree_…`'s
+            // `(Accept, Reject)` arm is: `Point::pulsus()` never returns
+            // Accept where `Point::reference()` returns Reject.
+            (false, false) => unreachable!("{}: STILL OPEN is not expressible", p.label),
             (true, false) => introduced.push(p.label.as_str()),
             (true, true) => {
                 if theirs == Verdict::Reject {
@@ -1333,7 +1401,7 @@ fn the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression() {
         }
     }
     assert_eq!(
-        closed.len() + still_open.len() + introduced.len() + already_rejecting.len() + controls,
+        closed.len() + introduced.len() + already_rejecting.len() + controls,
         points.len(),
         "the four buckets must partition the matrix"
     );
@@ -1358,14 +1426,6 @@ fn the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression() {
         .iter()
         .filter(|e| e.layer == Layer::SubGrammar)
         .count();
-    // STILL OPEN must be EMPTY: #247 closes every point where the
-    // reference refuses and the pre-#247 tree did not, including the
-    // `variants_variant_side` ones that round 2 added.
-    assert!(
-        still_open.is_empty(),
-        "#247 leaves {} point(s) where the reference refuses and we do not: {still_open:?}",
-        still_open.len()
-    );
     assert_eq!(introduced.len(), sub_grammar, "INTRODUCED: {introduced:?}");
     assert!(
         introduced
@@ -1374,13 +1434,11 @@ fn the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression() {
         "an introduced divergence outside the common side: {introduced:?}"
     );
     eprintln!(
-        "of {} matrix points: {} CLOSED by #247; {} STILL OPEN ({}); {} INTRODUCED ({}); {} \
+        "of {} matrix points: {} CLOSED by #247; {} INTRODUCED ({}); {} \
          already refused on both trees at 7980344, which pin a rule and DISCRIMINATE NOTHING \
          ({}); {} accept-side controls.",
         points.len(),
         closed.len(),
-        still_open.len(),
-        still_open.join(", "),
         introduced.len(),
         introduced.join(", "),
         already_rejecting.len(),

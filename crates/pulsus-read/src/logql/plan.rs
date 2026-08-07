@@ -4715,8 +4715,10 @@ mod tests {
     /// (`pkg/logql/evaluator.go:1417`, `:1422 @ v3.7.4`) — and the first
     /// three classes below were measured as 400 on the pinned container.
     ///
-    /// Deleting the `CompiledPipeline::compile(pipeline)?` line in
-    /// `build_variants_node` reddens this on the first case.
+    /// Deleting the `CompiledPipeline::compile(common_stages(pipeline))?`
+    /// line in `build_variants_node` reddens this on the first case
+    /// (verified). The argument is the DISCARDED PREFIX, not the whole
+    /// pipeline — see that line's own comment for why.
     #[test]
     fn variant_pipelines_are_validated_though_nothing_runs_them() {
         for query in [
