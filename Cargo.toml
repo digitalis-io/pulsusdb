@@ -66,6 +66,12 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 # port was needed.
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ch_cityhash102 = "0.1"
+# `raw_value` is a feature of serde_json itself and pulls in no further
+# dependency. The Loki JSON push decoder uses it to capture a value it discards
+# as borrowed text, so the reference's own nesting bound can be applied to it
+# rather than the crate's fixed 128-level `RECURSION_LIMIT` (issue #374,
+# `loki_push::DrainedAny`).
+#
 # `float_roundtrip` (issue #270): serde_json's DEFAULT number parser is not
 # correctly rounded — a decimal literal can decode to an `f64` a bit away from
 # the nearest representable value. A value decoded wrongly at ingest is wrong
@@ -85,7 +91,7 @@ ch_cityhash102 = "0.1"
 # float-bearing OTLP/JSON leaf) and metric_ingest_float_roundtrip.rs (live,
 # the stored bits), plus crates/pulsus-read/tests/logql_json_float_roundtrip.rs
 # for the read path.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 
 # OTLP logs (issue #8), metrics (issue #27), and traces (issue #54)
 # receivers. `opentelemetry-proto` supplies `prost`-generated OTLP message

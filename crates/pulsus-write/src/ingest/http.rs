@@ -114,23 +114,53 @@ pub async fn ingest(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Respo
     // maliciously deep body/attribute tree is a whole-request 400/`code = 3`
     // reject, the same classification a decode failure gets. `ingest` returns
     // `Response` (not `Result`), so this matches rather than `?`-propagates.
-    let parsed = match otlp_logs::parse(&request, now_ns) {
+    let mut parsed = match otlp_logs::parse(&request, now_ns) {
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
+    // Stream-local label-bound failures (issue #374). Upstream reports them
+    // through the gRPC status, not through OTLP partial success — its
+    // `OTLPPushHandler` shares the distributor's validation path and its
+    // `push.OTLPError` writer turns the accumulated `400` into a
+    // `google.rpc.Status` (`pkg/distributor/http.go:28-33 @ v3.7.4`) — and the
+    // streams that passed are written first, as on the Loki-push path.
+    let stream_errors = std::mem::take(&mut parsed.stream_errors);
+    // "Return early if none of the streams contained entries"
+    // (`pkg/distributor/distributor.go:786-789 @ v3.7.4`).
+    if !stream_errors.is_empty() && parsed.rows.is_empty() && parsed.streams.is_empty() {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            3,
+            group_stream_errors(stream_errors),
+        );
+    }
 
     if is_async(&headers) {
         return match sink.admit(parsed) {
-            Ok(()) => export_response(StatusCode::ACCEPTED, rejected, rejected_message),
+            Ok(()) if stream_errors.is_empty() => {
+                export_response(StatusCode::ACCEPTED, rejected, rejected_message)
+            }
+            Ok(()) => status_response(
+                StatusCode::BAD_REQUEST,
+                3,
+                group_stream_errors(stream_errors),
+            ),
             Err(Backpressure) => backpressure_response(),
         };
     }
 
     match sink.admit_flush(parsed) {
         Ok(wait) => match wait.await {
-            Ok(()) => export_response(StatusCode::OK, rejected, rejected_message),
+            Ok(()) if stream_errors.is_empty() => {
+                export_response(StatusCode::OK, rejected, rejected_message)
+            }
+            Ok(()) => status_response(
+                StatusCode::BAD_REQUEST,
+                3,
+                group_stream_errors(stream_errors),
+            ),
             Err(err) => error_response(err),
         },
         Err(Backpressure) => backpressure_response(),
@@ -352,9 +382,11 @@ pub async fn ingest_remote_write(
 ///   filed).
 ///
 /// Response codes are oracle-pinned where Loki has an equivalent (204
-/// success both encodings, 400 plain-text malformed/oversize) and PulsusDB-
-/// contract where it does not (202 async, 429 backpressure) — see the issue
-/// #77 v2 response matrix.
+/// success both encodings, 400 plain-text malformed/oversize, 422 for a push
+/// carrying no streams at all — issue #374,
+/// `pkg/distributor/distributor.go:579-581 @ v3.7.4`) and PulsusDB-contract
+/// where it does not (202 async, 429 backpressure) — see the issue #77 v2
+/// response matrix.
 pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Response {
     let now_ns = now_unix_nanos();
 
@@ -366,25 +398,60 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
         Err(err) => return loki_error_response(&err),
     };
 
-    let parsed = match decode_loki_push(&headers, &body, now_ns) {
+    let mut parsed = match decode_loki_push(&headers, &body, now_ns) {
         Ok(parsed) => parsed,
         Err(err) => return loki_error_response(&err),
     };
+    // Stream-local label-bound failures (issue #374): the streams that passed
+    // are still admitted, and the `400` is answered after they are — see
+    // [`group_stream_errors`].
+    let stream_errors = std::mem::take(&mut parsed.stream_errors);
+    // "Return early if none of the streams contained entries"
+    // (`pkg/distributor/distributor.go:786-789 @ v3.7.4`): when every stream
+    // in the request failed there is nothing to write, so the sink is not
+    // touched at all.
+    if !stream_errors.is_empty() && parsed.rows.is_empty() && parsed.streams.is_empty() {
+        return loki_stream_errors_response(stream_errors);
+    }
 
     if is_async(&headers) {
         return match sink.admit(parsed) {
-            Ok(()) => rw_success_response(StatusCode::ACCEPTED),
+            Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::ACCEPTED),
+            Ok(()) => loki_stream_errors_response(stream_errors),
             Err(Backpressure) => loki_backpressure_response(),
         };
     }
 
     match sink.admit_flush(parsed) {
         Ok(wait) => match wait.await {
-            Ok(()) => rw_success_response(StatusCode::NO_CONTENT),
+            Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::NO_CONTENT),
+            Ok(()) => loki_stream_errors_response(stream_errors),
             Err(err) => loki_error_response(&err),
         },
         Err(Backpressure) => loki_backpressure_response(),
     }
+}
+
+/// `/loki/api/v1/push`'s stream-local validation `400`: the grouped messages
+/// with [`loki_error_response`]'s LF terminator.
+///
+/// Same reason, same writer. The reference binds ONE error writer for the
+/// whole endpoint — `pushHandler(w, r, push.ParseLokiRequest, push.HTTPError,
+/// …)` (`pkg/distributor/http.go:27-30 @ v3.7.4`) — and a label-bound breach
+/// leaves `PushWithResolver` as an `httpgrpc` error that the same handler
+/// hands to that writer (`http.go:161-171`), i.e. to `http.Error` ->
+/// `fmt.Fprintln` (`pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Measured on
+/// `grafana/loki@sha256:87f0a067…`: a 2049-byte `app` value answers `400`
+/// whose last body byte is `0x0a`.
+///
+/// The OTLP path deliberately does NOT go through here — its body is a
+/// `google.rpc.Status` protobuf written by `push.OTLPError`, which has no
+/// terminator (`pkg/distributor/http.go:32-33 @ v3.7.4`).
+fn loki_stream_errors_response(errors: Vec<String>) -> Response {
+    plain_text_response(
+        StatusCode::BAD_REQUEST,
+        format!("{}\n", group_stream_errors(errors)),
+    )
 }
 
 /// `/loki/api/v1/push`'s whole-request error response: [`classify`]'s status
@@ -419,6 +486,44 @@ fn loki_backpressure_response() -> Response {
         StatusCode::TOO_MANY_REQUESTS,
         "sink is applying backpressure: buffers are full\n".to_string(),
     )
+}
+
+/// Renders accumulated stream-local validation failures the way the reference
+/// renders them into the `400` body: `util.GroupedErrors.Error()`
+/// (`pkg/util/errors.go:105-131 @ v3.7.4`) groups identical messages, joins
+/// distinct groups with `"; "`, and prefixes `"N errors like: "` to each group
+/// as soon as there is more than one group or more than one occurrence. A lone
+/// failure — the only case a single-stream push can produce, and the one
+/// clients actually see — is therefore the bare message.
+///
+/// Group order is first-seen here and Go map iteration order upstream, i.e.
+/// deliberately randomized there; a multi-failure body is not byte-reproducible
+/// upstream at all, so there is nothing to match beyond the format.
+fn group_stream_errors(errors: Vec<String>) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for message in errors {
+        match counts.entry(message.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => *slot.get_mut() += 1,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(1);
+                order.push(message);
+            }
+        }
+    }
+    let unique = order.len();
+    let mut out = String::new();
+    for (i, message) in order.iter().enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        let n = counts[message];
+        if unique > 1 || n > 1 {
+            out.push_str(&format!("{n} errors like: "));
+        }
+        out.push_str(message);
+    }
+    out
 }
 
 /// Content-negotiates and decodes a Loki push body into [`ParsedLogs`]. See
@@ -691,6 +796,16 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::ZipkinDecode(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
+        // A push with no streams is `422`, not `400` (issue #374): the
+        // reference classifies it away from the malformed-payload family
+        // (`pkg/distributor/distributor.go:580-581 @ v3.7.4`, measured `422`
+        // on both receivers of `grafana/loki@sha256:87f0a067…`). The
+        // `google.rpc.Status.code` stays `3` — upstream's `OTLPError` writer
+        // omits the field entirely on every error it writes
+        // (`grpcstatus.New(0, errorStr)`, `pkg/loghttp/push/push.go:571-581 @
+        // v3.7.4`), which is a pre-existing, request-wide difference from our
+        // OTLP error bodies rather than anything specific to this status.
+        LogsIngestError::MissingStreams => (StatusCode::UNPROCESSABLE_ENTITY, 3),
         LogsIngestError::BodyRead(_) | LogsIngestError::FlushFailed(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, 13)
         }
@@ -1156,6 +1271,57 @@ mod tests {
         let res = post_body(router(sink.clone()), request_body_of_len(target_len), &[]).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    /// Issue #374 at the wire, OTLP logs transport: the same bound, reached
+    /// from a resource attribute, is a whole-request `400` / `code = 3` —
+    /// **not** a per-record partial success — and the sink is never admitted
+    /// to. Upstream reaches the identical validator from `/otlp/v1/logs`
+    /// (`pkg/distributor/http.go:32 @ v3.7.4`), so this is the OTLP twin of
+    /// `loki_over_long_label_value_is_400_with_the_reference_message`.
+    #[tokio::test]
+    async fn logs_over_long_resource_attribute_value_returns_400_with_status_code_3() {
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let value = "b".repeat(2049);
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "k8s.pod.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue(value.clone())),
+                        }),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("hello".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert_eq!(
+            status.message,
+            format!("stream '{{k8s_pod_name=\"{value}\"}}' has label value too long: '{value}'")
+        );
+        assert!(sink.admitted.lock().unwrap().is_empty());
     }
 
     /// Issue #259, OTLP half: an inadmissible resource-attribute key is a
@@ -2590,6 +2756,385 @@ mod tests {
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
 
+    /// Issue #374 at the wire, Loki-push transport: an over-long label value
+    /// is a `400` whose plain-text body is the reference's message verbatim
+    /// (measured on `grafana/loki:3.7.4`, which answers
+    /// `400 stream '{app="bbb…"}' has label value too long: 'bbb…'`), and the
+    /// sink is never admitted to.
+    #[tokio::test]
+    async fn loki_over_long_label_value_is_400_with_the_reference_message() {
+        let value = "b".repeat(2049);
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{"app":"{value}"}},"values":[["1700000000000000000","x"]]}}]}}"#
+        );
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            body.into_bytes(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            plain_text_body(res).await,
+            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'\n"),
+            "the reference LF-terminates every error body on this endpoint"
+        );
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loki_over_wide_stream_is_400_with_the_reference_message() {
+        let labels = (0..16)
+            .map(|i| format!(r#""l{i}":"v""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{{labels}}},"values":[["1700000000000000000","x"]]}}]}}"#
+        );
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            body.into_bytes(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            plain_text_body(res)
+                .await
+                .ends_with("' has 16 label names; limit 15\n")
+        );
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// Issue #374 at the wire: the reference writes the streams that passed
+    /// and answers `400` afterwards (`pkg/distributor/distributor.go:645-655,
+    /// 780-790, 929 @ v3.7.4`), so a client does not lose the good half of a
+    /// mixed batch — which matters because a well-behaved shipper does not
+    /// retry a `400`.
+    #[tokio::test]
+    async fn loki_mixed_batch_admits_the_good_streams_and_still_answers_400() {
+        let body = format!(
+            r#"{{"streams":[
+                {{"stream":{{"app":"good"}},"values":[["1700000000000000000","a"]]}},
+                {{"stream":{{"app":"{}"}},"values":[["1700000000000000000","b"]]}}
+            ]}}"#,
+            "b".repeat(2049)
+        );
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            body.into_bytes(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            plain_text_body(res)
+                .await
+                .contains("has label value too long")
+        );
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].rows.len(), 1);
+        assert_eq!(admitted[0].streams.len(), 1);
+        assert_eq!(admitted[0].streams[0].labels.get("app"), Some("good"));
+    }
+
+    /// The OTLP twin: same partial write, reported through the gRPC status
+    /// rather than through OTLP partial success, exactly as upstream's
+    /// `OTLPPushHandler` does (it shares the distributor's validation path,
+    /// `pkg/distributor/http.go:28-33 @ v3.7.4`).
+    #[tokio::test]
+    async fn logs_mixed_batch_admits_the_good_resources_and_still_answers_400() {
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let resource = |value: String| ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "k8s.pod.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue(value)),
+                    }),
+                    key_strindex: 0,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: Some(AnyValue {
+                        value: Some(Value::StringValue("hello".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        };
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![resource("good".to_string()), resource("b".repeat(2049))],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert!(status.message.contains("has label value too long"));
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].rows.len(), 1);
+        assert_eq!(
+            admitted[0].streams[0].labels.get("k8s_pod_name"),
+            Some("good")
+        );
+    }
+
+    /// Issue #374 at the wire, Loki-push transport: a push carrying no
+    /// streams is `422`, not an empty success. Measured on
+    /// `grafana/loki@sha256:87f0a067…`: `{"streams":[]}` answers
+    /// `422 error at least one valid stream is required for ingestion`
+    /// (`pkg/distributor/distributor.go:579-581 @ v3.7.4`).
+    #[tokio::test]
+    async fn loki_push_with_no_streams_is_422_with_the_reference_message() {
+        for body in [&br#"{"streams":[]}"#[..], &br#"{}"#[..]] {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = call_loki(
+                &sink,
+                body.to_vec(),
+                &[("content-type", "application/json")],
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                plain_text_body(res).await,
+                "error at least one valid stream is required for ingestion\n"
+            );
+            assert!(sink.admitted.lock().unwrap().is_empty());
+        }
+    }
+
+    /// The protobuf half of the same rule: an empty (but well-formed)
+    /// `logproto.PushRequest` is the same `422`, charged at
+    /// `decode_protobuf`'s shared `validate_bounds` seam.
+    #[tokio::test]
+    async fn loki_protobuf_push_with_no_streams_is_422() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            snappy_compress(&[]),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            plain_text_body(res).await,
+            "error at least one valid stream is required for ingestion\n"
+        );
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// The discriminating neighbour: a stream that carries labels but no
+    /// entries IS a stream, so it is `204` — `len(req.Streams)` counts it and
+    /// only the per-stream loop skips it (`distributor.go:639-641 @ v3.7.4`).
+    /// Measured `204` on the same container. Without this case the `422`
+    /// above would also pass an implementation that rejected on "no rows".
+    #[tokio::test]
+    async fn loki_push_with_an_entry_less_stream_is_still_accepted() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            br#"{"streams":[{"stream":{"app":"a"},"values":[]}]}"#.to_vec(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// The OTLP twin: `otlpToLokiPushRequest` returns an empty push request
+    /// when `ld.LogRecordCount() == 0` (`pkg/loghttp/push/otlp.go:144-146 @
+    /// v3.7.4`), which the distributor then refuses with the same `422`.
+    /// Every shape of "no records" measures `422` on the container, so all
+    /// four are here. The `google.rpc.Status.code` stays `3`, our OTLP error
+    /// convention (upstream omits the field on every OTLP error body). One
+    /// PulsusDB-only bound outranks this `422` and is not in these four: an
+    /// over-deep `AnyValue` is rejected during decode, so a record-less body
+    /// that also breaches `MAX_ANYVALUE_DEPTH` is a `400` here — ledger
+    /// residual 6, pinned by
+    /// `otlp_logs::tests::the_depth_cap_outranks_the_stream_less_check`.
+    #[tokio::test]
+    async fn logs_request_with_no_log_records_is_422_with_the_reference_message() {
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let resource = || {
+            Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue("probe".to_string())),
+                    }),
+                    key_strindex: 0,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            })
+        };
+        let requests = [
+            ExportLogsServiceRequest {
+                resource_logs: vec![],
+            },
+            ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    resource: resource(),
+                    scope_logs: vec![],
+                    schema_url: String::new(),
+                }],
+            },
+            ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    resource: resource(),
+                    scope_logs: vec![ScopeLogs {
+                        scope: None,
+                        log_records: vec![],
+                        schema_url: String::new(),
+                    }],
+                    schema_url: String::new(),
+                }],
+            },
+        ];
+        for req in requests {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = post_body(router(sink.clone()), req.encode_to_vec(), &[]).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let status = decode_status_body(res).await;
+            assert_eq!(status.code, 3);
+            assert_eq!(
+                status.message,
+                "error at least one valid stream is required for ingestion"
+            );
+            assert!(sink.admitted.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Ledger residual 6, measured at the layer a client meets. A record-less
+    /// body that ALSO nests a resource attribute past `MAX_ANYVALUE_DEPTH` is
+    /// `400`, not the `422` above: both transports charge the depth cap during
+    /// decode, so the stream count is never reached. The reference has no
+    /// depth cap and answers `422` for this body — measured on
+    /// `grafana/loki@sha256:87f0a067…`, harness cases
+    /// `otlp/record-less-over-deep-attr` and `otlppb/…`. Pre-existing (the
+    /// same `400` comes out of the branch point `5969a94`); the docs state
+    /// the order rather than matching it, and this is what makes that
+    /// statement falsifiable at the wire. The at-cap request is the
+    /// discriminator: identical shape one level shallower, and it *is* the
+    /// `422`, so neither assertion can pass merely because the body is
+    /// record-less.
+    #[tokio::test]
+    async fn a_record_less_over_deep_request_is_400_not_the_stream_less_422() {
+        use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValue};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let nested = |levels: usize| {
+            let mut value = AnyValue {
+                value: Some(Value::StringValue("leaf".to_string())),
+            };
+            for _ in 1..levels {
+                value = AnyValue {
+                    value: Some(Value::ArrayValue(ArrayValue {
+                        values: vec![value],
+                    })),
+                };
+            }
+            value
+        };
+        // A JSON spelling of the same tree, so the JSON deserializer's own
+        // depth accounting is exercised rather than the protobuf pre-scan's.
+        let nested_json = |levels: usize| {
+            let mut value = r#"{"stringValue":"leaf"}"#.to_string();
+            for _ in 1..levels {
+                value = format!(r#"{{"arrayValue":{{"values":[{value}]}}}}"#);
+            }
+            format!(
+                r#"{{"resourceLogs":[{{"resource":{{"attributes":[{{"key":"deep","value":{value}}}]}},"scopeLogs":[{{"logRecords":[]}}]}}]}}"#
+            )
+            .into_bytes()
+        };
+        let request = |levels: usize| ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "deep".to_string(),
+                        value: Some(nested(levels)),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let cap = crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH;
+        let json = [("content-type", "application/json")];
+        for (body, headers) in [
+            (request(cap + 1).encode_to_vec(), &[][..]),
+            (nested_json(cap + 1), &json[..]),
+        ] {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = post_body(router(sink.clone()), body, headers).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            let status = decode_status_body(res).await;
+            assert!(
+                status.message.contains("depth"),
+                "the depth cap answers, not MissingStreams: {}",
+                status.message
+            );
+            assert!(sink.admitted.lock().unwrap().is_empty());
+        }
+        // One level shallower: the same record-less shape reaches the `422`.
+        for (body, headers) in [
+            (request(cap).encode_to_vec(), &[][..]),
+            (nested_json(cap), &json[..]),
+        ] {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = post_body(router(sink.clone()), body, headers).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                decode_status_body(res).await.message,
+                "error at least one valid stream is required for ingestion"
+            );
+        }
+    }
+
+    /// `util.GroupedErrors.Error()` (`pkg/util/errors.go:111-131 @ v3.7.4`):
+    /// a lone failure is the bare message, and anything else is prefixed with
+    /// its occurrence count and joined with `"; "`.
+    #[test]
+    fn stream_errors_are_grouped_the_way_the_reference_groups_them() {
+        assert_eq!(group_stream_errors(vec!["one".to_string()]), "one");
+        assert_eq!(
+            group_stream_errors(vec!["one".to_string(), "one".to_string()]),
+            "2 errors like: one"
+        );
+        assert_eq!(
+            group_stream_errors(vec![
+                "one".to_string(),
+                "two".to_string(),
+                "one".to_string()
+            ]),
+            "2 errors like: one; 1 errors like: two"
+        );
+    }
+
     /// Issue #259, at the WIRE rather than at `parse`: an inadmissible
     /// structured-metadata name is a `400` whose body is byte-identical to
     /// the reference's — trailing `\n` included, since its push receiver
@@ -2691,12 +3236,29 @@ mod tests {
     /// stream label name over hand-encoded snappy/protobuf (`400`), and an
     /// inadmissible structured-metadata name (`500`).
     ///
-    /// This walks one error of each class THIS handler can produce (decode,
-    /// oversize, backpressure, flush failure, inadmissible name) so a future
-    /// error path cannot quietly drop the terminator. The inadmissible-name
-    /// case additionally has its exact bytes pinned by
-    /// `loki_inadmissible_structured_metadata_name_is_400_on_both_encodings`,
-    /// since that is the one message whose text is the reference's.
+    /// This walks one error of each class THIS handler can produce — decode,
+    /// oversize, backpressure, flush failure, inadmissible name, the
+    /// stream-less `422`, and the stream-local label-bound `400` in both its
+    /// forms (nothing written, and written-then-refused) — so a future error
+    /// path cannot quietly drop the terminator. The last three are issue
+    /// #374's and go through [`loki_stream_errors_response`] rather than
+    /// [`loki_error_response`], which is exactly why they are listed: they are
+    /// the bodies a per-variant terminator would have missed. The
+    /// inadmissible-name case additionally has its exact bytes pinned by
+    /// `loki_inadmissible_structured_metadata_name_is_400_on_both_encodings`
+    /// — that is the one message whose text is the reference's — but a
+    /// separate test cannot make an enumeration complete, so the body is
+    /// carried HERE too rather than counted from over there.
+    ///
+    /// Why that list is all of them. Every error answer in
+    /// [`ingest_loki_push`] leaves through one of exactly three functions:
+    /// [`loki_error_response`] (the capped body read, the decode — which is
+    /// where both the inadmissible name and the stream-less `422` are
+    /// charged — and the flush failure), [`loki_stream_errors_response`], and
+    /// [`loki_backpressure_response`]. The cases below reach all three. The
+    /// two async-mode arms (`X-Pulsus-Async: 1`) answer through the same two
+    /// of those functions as the sync twins listed here, so they cannot carry
+    /// a different terminator; that closes the enumeration.
     #[tokio::test]
     async fn every_loki_push_error_body_is_lf_terminated() {
         let oversize = vec![0u8; decompress::MAX_DECOMPRESSED_BYTES + 1024];
@@ -2729,6 +3291,47 @@ mod tests {
                 "flush failure",
                 Outcome::FlushFails,
                 valid_loki_json_body(),
+                "application/json",
+            ),
+            // Issue #259's: an empty structured-metadata name, the one body
+            // whose exact bytes are the reference's.
+            (
+                "inadmissible structured-metadata name",
+                Outcome::Admit,
+                br#"{"streams":[{"stream":{"a":"b"},
+                    "values":[["1700000000000000000","hello",{"":""}]]}]}"#
+                    .to_vec(),
+                "application/json",
+            ),
+            // Issue #374's three: the stream-less 422 and the stream-local
+            // 400, once with nothing to write and once written-then-refused.
+            (
+                "no streams at all",
+                Outcome::Admit,
+                br#"{"streams":[]}"#.to_vec(),
+                "application/json",
+            ),
+            (
+                "every stream breaches a label bound",
+                Outcome::Admit,
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"{}"}},"values":[["1700000000000000000","x"]]}}]}}"#,
+                    "b".repeat(2049)
+                )
+                .into_bytes(),
+                "application/json",
+            ),
+            (
+                "one stream breaches, the other is written",
+                Outcome::Admit,
+                format!(
+                    r#"{{"streams":[
+                        {{"stream":{{"app":"good"}},"values":[["1700000000000000000","a"]]}},
+                        {{"stream":{{"app":"{}"}},"values":[["1700000000000000000","b"]]}}
+                    ]}}"#,
+                    "b".repeat(2049)
+                )
+                .into_bytes(),
                 "application/json",
             ),
         ];

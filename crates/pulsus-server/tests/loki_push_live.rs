@@ -9,6 +9,11 @@
 //! entries + labels — i.e. it fingerprints into the same physical rows the
 //! read path (#72/#73) and tail (#74) expect.
 //!
+//! Issue #374 added the per-stream label bounds' live gates here, and with
+//! them one case on the sibling OTLP logs receiver (`POST /v1/logs`): the
+//! bounds' coverage gap is only visible in what was **stored**, so it is
+//! asserted against ClickHouse rather than against a status.
+//!
 //! This is the "live producer→us→query" round-trip the task-manager Q3
 //! adjudication names as strongest: the committed real-promtail-capture
 //! fixture (`crates/pulsus-write/tests/loki_push_fixtures.rs`) is the
@@ -214,6 +219,37 @@ async fn drop_db(db: &str) {
         )
         .await
         .expect("drop db");
+}
+
+/// A single-column `count()` against `db`, used to prove a rejected push
+/// left NOTHING behind — the response status alone cannot show that.
+async fn ch_count(db: &str, sql: &str) -> u64 {
+    let cfg = ChConnConfig {
+        server: ch_host(),
+        http_port: ch_http_port(),
+        database: db.to_string(),
+        proto: ChProto::Http,
+        pool_size: 2,
+        query_timeout: Duration::from_secs(20),
+        ..ChConnConfig::default()
+    };
+    let client = ChClient::new(cfg).await.expect("connect count client");
+
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct CountRow {
+        c: u64,
+    }
+    // The stream is scoped to this helper so its pooled connection lease is
+    // released before the caller's next query.
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .expect("count query");
+    futures::StreamExt::next(&mut stream)
+        .await
+        .expect("count returns exactly one row")
+        .expect("decode count row")
+        .c
 }
 
 // ---------------------------------------------------------------------
@@ -856,7 +892,7 @@ async fn empty_valued_structured_metadata_is_never_stored() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_155;
+    let port = 31_162;
     let db = "pulsus_loki_push_empty_sm_it";
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
@@ -1043,7 +1079,7 @@ async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_store
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_158;
+    let port = 31_164;
     let db = "pulsus_loki_push_sm_name_it";
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
@@ -1169,7 +1205,7 @@ async fn empty_valued_stream_labels_are_never_stored_and_merge_the_stream() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_156;
+    let port = 31_163;
     let db = "pulsus_loki_push_empty_labels_it";
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
@@ -1552,5 +1588,941 @@ async fn pushed_stream_appears_in_tail() {
     assert_eq!(
         sm, expected_sm,
         "the tailed SM-bearing frame must fan structured metadata into its stream labels (AC-9)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #374: the four per-stream label bounds, at the wire, end to end.
+//
+// Reference: `pkg/distributor/validator.go:157-199 @ v3.7.4`, reached from
+// `pkg/distributor/distributor.go:1380 @ v3.7.4`. Statuses and message text
+// were captured side by side against the pinned `grafana/loki:3.7.4`
+// container (revision `b318f282`) — 12 JSON cases and 6 protobuf cases, all
+// agreeing on status; the text agrees except for the `service_name` label
+// the reference's own `discover_service_name` injects and PulsusDB does not
+// (a pre-existing difference, no status effect).
+//
+// The response status alone is not the claim being proven here. Before this
+// change the same push answered `204` AND stored the row, so the test reads
+// `log_streams`/`log_samples` back out of ClickHouse to show the reject left
+// nothing behind.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_wide_label_value_is_rejected_and_stores_nothing() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_155;
+    let db = "pulsus_loki_push_label_bounds_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "checkout-374";
+    let over = "b".repeat(2049);
+
+    // A control push FIRST: the same shape with an in-bounds value must be
+    // accepted and stored, so a later zero row count cannot be explained by
+    // the writer being broken or the query being wrong.
+    let control_line = "label bounds control line";
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[{{"stream":{{"service_name":"{service}","app":"{}"}},"values":[["{base_ns}","{control_line}"]]}}]}}"#,
+            "b".repeat(2048)
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        res.status, 204,
+        "at-bound value accepted (body {})",
+        res.body
+    );
+
+    // 1 byte more is a 400 carrying the reference's message verbatim.
+    let rejected_line = "label bounds rejected line";
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[{{"stream":{{"service_name":"{service}-rejected","app":"{over}"}},"values":[["{base_ns}","{rejected_line}"]]}}]}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 400, "over-bound value rejected");
+    assert_eq!(
+        res.body,
+        format!(
+            "stream '{{app=\"{over}\", service_name=\"{service}-rejected\"}}' \
+             has label value too long: '{over}'\n"
+        ),
+        "the 400 body is the reference's message"
+    );
+
+    // The same bound on the protobuf transport, plus the duplicate-name
+    // bound — reachable only there, here and upstream.
+    let res = push(port, "application/x-protobuf", &{
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: format!(r#"{{service_name="{service}-pb", app="{over}"}}"#),
+                entries: vec![EntryAdapter {
+                    timestamp: Some(Timestamp {
+                        seconds: base_ns / 1_000_000_000,
+                        nanos: (base_ns % 1_000_000_000) as i32,
+                    }),
+                    line: "pb rejected line".to_string(),
+                    structured_metadata: Vec::new(),
+                }],
+            }],
+        };
+        snap::raw::Encoder::new()
+            .compress_vec(&req.encode_to_vec())
+            .expect("snappy compress")
+    });
+    assert_eq!(res.status, 400, "over-bound value rejected on protobuf too");
+    assert!(
+        res.body
+            .ends_with(&format!("has label value too long: '{over}'\n")),
+        "protobuf 400 body: {}",
+        res.body
+    );
+
+    // The control line must land, so the read-back below is discriminating.
+    let control = wait_for_line(port, service, base_ns, control_line);
+    assert!(
+        control.contains(&control_line.to_string()),
+        "the at-bound control line must be queryable: {control:?}"
+    );
+
+    // Nothing from the rejected pushes reached storage: no sample, and no
+    // stream registration either (a stream row is written before the first
+    // sample, so checking only `log_samples` would miss a half-applied push).
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_samples \
+             WHERE body IN ('label bounds rejected line', 'pb rejected line')",
+        )
+        .await,
+        0,
+        "a rejected push must store no sample"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_streams \
+                 WHERE service IN ('{service}-rejected', '{service}-pb')"
+            ),
+        )
+        .await,
+        0,
+        "a rejected push must register no stream"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!("SELECT count() AS c FROM log_streams WHERE service = '{service}'"),
+        )
+        .await,
+        1,
+        "the accepted control push must still have registered its stream"
+    );
+}
+
+/// Issue #374 review: the reference writes the good streams of a mixed batch
+/// and answers `400` afterwards (`pkg/distributor/distributor.go:645-655,
+/// 780-790, 929 @ v3.7.4`). Proven at the highest tier — the good line is read
+/// back out of ClickHouse while the response was a `400` — because a client
+/// that loses its good data on one malformed stream loses it permanently: a
+/// `400` is not retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_batch_stores_the_good_streams_and_still_answers_400() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_156;
+    let db = "pulsus_loki_push_mixed_batch_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "checkout-mixed";
+    let over = "b".repeat(2049);
+    let good_line = "mixed batch good line";
+    let bad_line = "mixed batch bad line";
+
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[
+                {{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","{good_line}"]]}},
+                {{"stream":{{"service_name":"{service}-bad","app":"{over}"}},"values":[["{base_ns}","{bad_line}"]]}}
+            ]}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 400, "a mixed batch still answers 400");
+    assert!(
+        res.body
+            .ends_with(&format!("has label value too long: '{over}'\n")),
+        "the 400 body is the reference's message for the one bad stream: {}",
+        res.body
+    );
+
+    // The good stream was written anyway, and is queryable.
+    let lines = wait_for_line(port, service, base_ns, good_line);
+    assert!(lines.contains(&good_line.to_string()), "{lines:?}");
+    assert_eq!(
+        ch_count(
+            db,
+            &format!("SELECT count() AS c FROM log_samples WHERE body = '{good_line}'"),
+        )
+        .await,
+        1,
+        "the good stream of a mixed batch must be stored"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!("SELECT count() AS c FROM log_samples WHERE body = '{bad_line}'"),
+        )
+        .await,
+        0,
+        "the bad stream of a mixed batch must not be"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!("SELECT count() AS c FROM log_streams WHERE service = '{service}-bad'"),
+        )
+        .await,
+        0,
+        "the bad stream must not be registered"
+    );
+}
+
+/// Issue #374 review: `WithoutEmpty` (`pkg/logql/syntax/parser.go:296 @
+/// v3.7.4`) runs before `labels.StableHash`, so an empty-valued label must not
+/// reach the stored label set. Both pushes must land in ONE stream row with
+/// ONE label set, not two — a validator-only filter would give two.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_valued_label_does_not_split_the_stream() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_157;
+    let db = "pulsus_loki_push_empty_label_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "checkout-empty";
+    let plain_line = "empty label plain";
+    let padded_line = "empty label padded";
+
+    for (line, labels) in [
+        (plain_line, format!(r#"{{"service_name":"{service}"}}"#)),
+        (
+            padded_line,
+            format!(r#"{{"service_name":"{service}","ignored":""}}"#),
+        ),
+    ] {
+        let res = push(
+            port,
+            "application/json",
+            format!(r#"{{"streams":[{{"stream":{labels},"values":[["{base_ns}","{line}"]]}}]}}"#)
+                .as_bytes(),
+        );
+        assert_eq!(res.status, 204, "{line}: {}", res.body);
+    }
+
+    wait_for_line(port, service, base_ns, plain_line);
+    wait_for_line(port, service, base_ns, padded_line);
+
+    // One stream row, one fingerprint: the empty-valued label never reached
+    // the identity.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count(DISTINCT fingerprint) AS c FROM log_streams \
+                 WHERE service = '{service}'"
+            ),
+        )
+        .await,
+        1,
+        "an empty-valued label must not split the stream"
+    );
+    // ...and it is not stored as a label either.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_streams \
+                 WHERE service = '{service}' AND position(labels, 'ignored') > 0"
+            ),
+        )
+        .await,
+        0,
+        "an empty-valued label must not be stored"
+    );
+    // Both lines belong to that one stream.
+    let both = query_streams(port, "/api/logs/v1", service, base_ns);
+    assert_eq!(both.len(), 1, "both pushes belong to one stream: {both:?}");
+    assert_eq!(
+        both[0].0,
+        [("service_name".to_string(), service.to_string())]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+    );
+}
+
+// ---------------------------------------------------------------------
+// The OTLP logs receiver: what the bounds do NOT cover, at the storage
+// tier (issue #374 round-3 review, adjudicated to #109).
+// ---------------------------------------------------------------------
+
+/// An OTLP/JSON logs body: one `ResourceLogs` per entry, its resource
+/// attributes in wire order (so a repeated or colliding key is preserved as
+/// sent), each carrying one record.
+fn otlp_json_body(resources: &[(Vec<(&str, String)>, &str)], ts_ns: i64) -> Vec<u8> {
+    let resource_logs: Vec<serde_json::Value> = resources
+        .iter()
+        .map(|(attrs, line)| {
+            let attributes: Vec<serde_json::Value> = attrs
+                .iter()
+                .map(|(k, v)| serde_json::json!({"key": k, "value": {"stringValue": v}}))
+                .collect();
+            serde_json::json!({
+                "resource": {"attributes": attributes},
+                "scopeLogs": [{"logRecords": [{
+                    "timeUnixNano": ts_ns.to_string(),
+                    "body": {"stringValue": line},
+                }]}],
+            })
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "resourceLogs": resource_logs })).expect("otlp body")
+}
+
+fn otlp_push(port: u16, body: &[u8]) -> HttpResponse {
+    http_request(port, "POST", "/v1/logs", Some("application/json"), body)
+        .expect("otlp push reachable")
+}
+
+/// Polls `sql` until it returns `want` or the deadline passes — the OTLP
+/// receiver's rows reach ClickHouse through the same asynchronous writer the
+/// push path uses.
+async fn wait_for_count(db: &str, sql: &str, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = ch_count(db, sql).await;
+        if got == want || Instant::now() >= deadline {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// Issue #374: the bounds this branch introduces do not cover every label it
+/// stores, and this is the case that shows it **at the storage tier**, which
+/// is the only tier that can see it.
+///
+/// `{service.name: "ok", service_name: <2049 B>}` is accepted by the pinned
+/// oracle (`204`) and by PulsusDB (`200`) — the rejection surface #374 exists
+/// to match does agree, because upstream matches the raw dotted spelling only
+/// (`otlp.go:193`, `otlp_config.go:88-99 @ v3.7.4`) and routes the underscored
+/// one to structured metadata, which no bound reaches. Storage does not agree:
+/// we index every resource attribute (#109), both spellings canonicalize onto
+/// `service_name`, and `from_normalized`'s frozen rule (#4) keeps the greatest
+/// original key — `_` (0x5F) after `.` (0x2E) — so the **unvalidated** value
+/// is the one written, and it is 2049 bytes wide under a label the validator
+/// passed at two. The stream's identity follows it too.
+///
+/// Four rounds of status-only oracle comparison could not see any of this.
+/// The hermetic twin is
+/// `otlp_logs::tests::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value`;
+/// this one reads the labels and the fingerprints back out of ClickHouse.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_158;
+    let db = "pulsus_loki_push_otlp_near_miss_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let wide = "x".repeat(2049);
+    let probe = "otlp-near-miss-374";
+
+    // All three resources carry the same marker attribute, so one query sees
+    // exactly these streams and the fingerprints are directly comparable.
+    let marker = ("k8s.pod.name", probe.to_string());
+    let body = otlp_json_body(
+        &[
+            // (a) the validated index name AND its unvalidated near-miss.
+            (
+                vec![
+                    marker.clone(),
+                    ("service.name", "ok".to_string()),
+                    ("service_name", wide.clone()),
+                ],
+                "otlp near miss both",
+            ),
+            // (b) the near-miss alone: the same stored label set as (a).
+            (
+                vec![marker.clone(), ("service_name", wide.clone())],
+                "otlp near miss alone",
+            ),
+            // (c) the control — only the validated index name, so the value
+            // the bound was charged on is the one stored.
+            (
+                vec![marker.clone(), ("service.name", "ok".to_string())],
+                "otlp near miss control",
+            ),
+        ],
+        base_ns,
+    );
+    let res = otlp_push(port, &body);
+    assert_eq!(
+        res.status, 200,
+        "the oracle accepts this body too (204); body {}",
+        res.body
+    );
+
+    let of_probe =
+        format!("FROM log_streams WHERE JSONExtractString(labels, 'k8s_pod_name') = '{probe}'");
+
+    // Two streams, not three: (a) and (b) share one fingerprint because the
+    // near-miss won the collapse in both, and (c) is a different stream.
+    assert_eq!(
+        wait_for_count(
+            db,
+            &format!("SELECT count(DISTINCT fingerprint) AS c {of_probe}"),
+            2
+        )
+        .await,
+        2,
+        "(a) and (b) must be one stream and (c) another"
+    );
+
+    // The stored label is the 2049-byte value no bound was charged on...
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c {of_probe} \
+                 AND JSONExtractString(labels, 'service_name') = '{wide}'"
+            ),
+        )
+        .await,
+        1,
+        "the unvalidated near-miss value must be the stored one"
+    );
+    // ...and it is (a)'s stream, not merely (b)'s. This is the assertion that
+    // distinguishes the rule: were the collapse to keep the VALIDATED
+    // `service.name` value, (a) would land in the `ok` stream instead and
+    // every count above would look exactly the same.
+    let wide_stream = format!(
+        "fingerprint IN (SELECT fingerprint FROM log_streams \
+         WHERE JSONExtractString(labels, 'service_name') = '{wide}')"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_samples WHERE {wide_stream} \
+                 AND body IN ('otlp near miss both', 'otlp near miss alone')"
+            ),
+        )
+        .await,
+        2,
+        "the record pushed WITH the validated `service.name` must be stored \
+         under the over-wide label too"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_samples WHERE fingerprint IN \
+                 (SELECT fingerprint FROM log_streams \
+                  WHERE JSONExtractString(labels, 'k8s_pod_name') = '{probe}' \
+                  AND JSONExtractString(labels, 'service_name') = 'ok') \
+                 AND body != 'otlp near miss control'"
+            ),
+        )
+        .await,
+        0,
+        "the validated value's stream carries only the control record"
+    );
+    // ...wider than the bound this branch introduces, as an INDEXED label.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c {of_probe} \
+                 AND length(JSONExtractString(labels, 'service_name')) > 2048"
+            ),
+        )
+        .await,
+        1,
+        "exactly one stored stream exceeds the 2048-byte label value bound"
+    );
+    // The control stores the validated value, so the read-back above is not
+    // explained by every stream carrying the wide one.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c {of_probe} \
+                 AND JSONExtractString(labels, 'service_name') = 'ok'"
+            ),
+        )
+        .await,
+        1,
+        "the control stream stores the validated value"
+    );
+    // And all three lines landed: nothing here was refused.
+    assert_eq!(
+        wait_for_count(
+            db,
+            "SELECT count() AS c FROM log_samples WHERE body IN \
+             ('otlp near miss both', 'otlp near miss alone', 'otlp near miss control')",
+            3,
+        )
+        .await,
+        3,
+        "all three records are accepted and stored"
+    );
+}
+
+/// Issue #374 review round 5: a push carrying **no streams at all** is `422`,
+/// not an empty success. Upstream refuses it before any validation —
+/// `PushWithResolver` returns `httpgrpc.Errorf(StatusUnprocessableEntity,
+/// validation.MissingStreamsErrorMsg)` for `len(req.Streams) == 0`
+/// (`pkg/distributor/distributor.go:579-581 @ v3.7.4`), and its OTLP
+/// translation makes a record-less payload exactly that empty request
+/// (`ld.LogRecordCount() == 0`, `pkg/loghttp/push/otlp.go:144-146`). Measured
+/// on `grafana/loki@sha256:87f0a067…`: `422` on both receivers.
+///
+/// Run live rather than only at the wire because the status is half the
+/// claim: the *neighbouring* shape — a stream that carries labels but no
+/// entries — is `204` upstream and must stay accepted here, and neither shape
+/// may leave a row behind. A control push proves the read-back would have
+/// seen one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_less_push_is_422_on_both_receivers_and_stores_nothing() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_159;
+    let db = "pulsus_loki_push_stream_less_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "stream-less-374";
+    const MISSING: &str = "error at least one valid stream is required for ingestion";
+    // The Loki push endpoint LF-terminates every error body it writes
+    // (`push.HTTPError` -> `http.Error` -> `fmt.Fprintln`,
+    // `pkg/loghttp/push/push.go:606-608 @ v3.7.4`); measured on
+    // `grafana/loki:3.7.4`, this 422's last byte is `0x0a`. The OTLP twin
+    // below carries the same text inside a `google.rpc.Status` and has no
+    // terminator at all.
+    let missing_lf = format!("{MISSING}\n");
+
+    // Loki push, both JSON spellings of "no streams".
+    for body in [r#"{"streams":[]}"#, "{}"] {
+        let res = push(port, "application/json", body.as_bytes());
+        assert_eq!(res.status, 422, "{body} -> 422 (body {})", res.body);
+        assert_eq!(
+            res.body, missing_lf,
+            "the 422 body is the reference's message, terminator included"
+        );
+    }
+    // ...and the protobuf transport, where "no streams" is an empty message.
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &snap::raw::Encoder::new()
+            .compress_vec(&PushRequest { streams: vec![] }.encode_to_vec())
+            .expect("snappy compress"),
+    );
+    assert_eq!(res.status, 422, "empty protobuf push (body {})", res.body);
+    assert_eq!(res.body, missing_lf);
+
+    // OTLP: a resource with attributes but an empty `logRecords` — the shape
+    // the review measured — plus the empty request.
+    for body in [
+        serde_json::to_vec(&serde_json::json!({"resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": service}}
+            ]},
+            "scopeLogs": [{"logRecords": []}],
+        }]}))
+        .expect("otlp body"),
+        serde_json::to_vec(&serde_json::json!({"resourceLogs": []})).expect("otlp body"),
+    ] {
+        let res = otlp_push(port, &body);
+        assert_eq!(res.status, 422, "record-less OTLP (body {})", res.body);
+        // The OTLP error body is a `google.rpc.Status`: field 2 is the
+        // message, and the reference's text is carried verbatim.
+        assert!(
+            res.body.contains(MISSING),
+            "the 422 status message is the reference's: {}",
+            res.body
+        );
+    }
+
+    // The neighbour that must NOT be refused: a stream with labels and no
+    // entries is still a stream (`distributor.go:639-641` only skips it when
+    // validating), measured `204` upstream.
+    let res = push(
+        port,
+        "application/json",
+        format!(r#"{{"streams":[{{"stream":{{"service_name":"{service}-idle"}},"values":[]}}]}}"#)
+            .as_bytes(),
+    );
+    assert_eq!(
+        res.status, 204,
+        "entry-less stream accepted (body {})",
+        res.body
+    );
+
+    // A control push, so the zero counts below are not a broken writer.
+    let control_line = "stream-less control line";
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[{{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","{control_line}"]]}}]}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 204, "control push accepted (body {})", res.body);
+    let control = wait_for_line(port, service, base_ns, control_line);
+    assert!(
+        control.contains(&control_line.to_string()),
+        "the control line must be queryable: {control:?}"
+    );
+
+    // Neither the refused pushes nor the entry-less stream registered
+    // anything; the control did.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_streams \
+                 WHERE service IN ('{service}-idle', '{service}')"
+            ),
+        )
+        .await,
+        1,
+        "only the control push registers a stream"
+    );
+}
+
+/// Issue #374 review round 9: the envelope's `streams` key is matched with
+/// ASCII case folding, and a repeat of it is last-wins.
+///
+/// `loghttp.PushRequest` is a one-field struct decoded by jsoniter reflection
+/// (`pkg/loghttp/query.go:91-93 @ v3.7.4`); `jsoniter.NewDecoder` runs
+/// `ConfigDefault`, whose `CaseSensitive` is false, so the wire key is folded
+/// over `'A'..='Z'` before it is matched, and the field decoder re-runs on
+/// every match while the slice decoder re-grows from zero
+/// (`iter_object.go:85-87`, `reflect_struct_decoder.go:36-41,574-590`,
+/// `reflect_slice.go:66-99 @ jsoniter v1.1.12`).
+///
+/// Live rather than hermetic because status agreement is exactly what missed
+/// this: before #374 both sides answered `204` here and we silently dropped
+/// the lines, so only a read-back can tell "accepted" from "accepted and
+/// stored". Measured on `grafana/loki@sha256:87f0a067…`: `204` for every
+/// spelling with the line queryable afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_case_variant_streams_key_is_accepted_and_its_lines_are_stored() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_160;
+    let db = "pulsus_loki_push_streams_case_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    // LF-terminated, like every error body this endpoint writes -- see the
+    // stream-less test above.
+    const MISSING: &str = "error at least one valid stream is required for ingestion\n";
+    let one = |spelling: &str, service: &str, line: &str| {
+        format!(
+            r#"{{"{spelling}":[{{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","{line}"]]}}]}}"#
+        )
+    };
+
+    // Every spelling is accepted AND stores its line.
+    for spelling in ["streams", "Streams", "STREAMS", "StReAmS", "streamS"] {
+        let service = format!("case-374-{spelling}");
+        let line = format!("case variant {spelling}");
+        let res = push(
+            port,
+            "application/json",
+            one(spelling, &service, &line).as_bytes(),
+        );
+        assert_eq!(res.status, 204, "{spelling} -> 204 (body {})", res.body);
+        let lines = wait_for_line(port, &service, base_ns, &line);
+        assert!(
+            lines.contains(&line),
+            "{spelling}: the line must be queryable, got {lines:?}"
+        );
+    }
+    assert_eq!(
+        wait_for_count(
+            db,
+            "SELECT count() AS c FROM log_streams WHERE service LIKE 'case-374-%'",
+            5,
+        )
+        .await,
+        5,
+        "all five spellings register their stream"
+    );
+
+    // A repeat is last-wins, across spellings: only the second line is stored.
+    let dup = format!(
+        "{{{},{}}}",
+        one("streams", "case-374-dup", "dup first")
+            .trim_start_matches('{')
+            .trim_end_matches('}'),
+        one("Streams", "case-374-dup", "dup second")
+            .trim_start_matches('{')
+            .trim_end_matches('}'),
+    );
+    let res = push(port, "application/json", dup.as_bytes());
+    assert_eq!(res.status, 204, "repeated key -> 204 (body {})", res.body);
+    let lines = wait_for_line(port, "case-374-dup", base_ns, "dup second");
+    assert!(
+        lines.contains(&"dup second".to_string()) && !lines.contains(&"dup first".to_string()),
+        "only the last occurrence is stored, got {lines:?}"
+    );
+
+    // ...and a trailing empty occurrence discards the populated earlier one,
+    // which is how the stream-less `422` is reached from a body that does
+    // carry a stream.
+    let discard = format!(
+        r#"{{{},"streams":[]}}"#,
+        one("Streams", "case-374-discarded", "discarded line")
+            .trim_start_matches('{')
+            .trim_end_matches('}'),
+    );
+    let res = push(port, "application/json", discard.as_bytes());
+    assert_eq!(res.status, 422, "trailing empty (body {})", res.body);
+    assert_eq!(res.body, MISSING);
+
+    // The fold does not skip the per-stream label bounds: an over-wide value
+    // under `Streams` is the same `400` it is under `streams`.
+    let wide = format!(
+        r#"{{"Streams":[{{"stream":{{"service_name":"case-374-wide","app":"{}"}},"values":[["{base_ns}","wide line"]]}}]}}"#,
+        "b".repeat(2049)
+    );
+    let res = push(port, "application/json", wide.as_bytes());
+    assert_eq!(
+        res.status, 400,
+        "over-wide under Streams (body {})",
+        res.body
+    );
+    assert!(
+        res.body.contains("label value too long"),
+        "the bound's message, not the envelope's: {}",
+        res.body
+    );
+
+    // Nothing that was refused left a row behind.
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_streams \
+             WHERE service IN ('case-374-discarded', 'case-374-wide')",
+        )
+        .await,
+        0,
+        "the refused pushes register nothing"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_samples WHERE body = 'dup first'",
+        )
+        .await,
+        0,
+        "the superseded occurrence stores nothing"
+    );
+}
+
+/// Issue #374 review round 11: last-wins resolves BEFORE any of our structural
+/// caps is charged, so a superseded occurrence that breaks one cannot refuse
+/// the request.
+///
+/// The reference never inspects a discarded value — its one-field envelope
+/// decoder re-runs the field decoder per occurrence
+/// (`reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`) and a stream
+/// object's hand-written switch re-runs per key (`pkg/loghttp/query.go:99-121 @
+/// v3.7.4`) — so `204` with the LAST occurrence's line stored is the whole
+/// answer. Measured on `grafana/loki@sha256:87f0a067…` for all three shapes
+/// below; each was `400` here before this change.
+///
+/// Live, and read back, because this is the same trap the case-folding bug fell
+/// into: a status assertion alone passes on "accepted and silently dropped".
+/// Each shape therefore asserts the final line queryable, the superseded
+/// stream's own labels absent, and — the discriminating half — the SAME value
+/// placed last still refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_over_cap_value_is_accepted_and_the_final_one_is_stored() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_161;
+    let db = "pulsus_loki_push_superseded_caps_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    // 257 distinct labels: one past MAX_LABELS_PER_STREAM. `sup_label` marks the
+    // stream so its absence is queryable rather than merely uncounted.
+    let over_labels = {
+        let mut m = String::from(r#"{"service_name":"sup-374-labels""#);
+        for i in 0..257 {
+            m.push_str(&format!(r#","k{i}":"v""#));
+        }
+        m.push('}');
+        m
+    };
+    // 100_001 entries: one past MAX_ENTRIES_PER_STREAM, the reviewer's probe.
+    let over_values = {
+        let mut v = String::with_capacity(3_000_000);
+        v.push('[');
+        for i in 0..100_001 {
+            if i > 0 {
+                v.push(',');
+            }
+            v.push_str(&format!(r#"["{base_ns}","sup line"]"#));
+        }
+        v.push(']');
+        v
+    };
+    let win = |service: &str| {
+        format!(r#"{{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","FINAL"]]}}"#)
+    };
+
+    let cases: [(&str, String, String, &str); 3] = [
+        (
+            // A superseded `streams` occurrence whose stream is over the label
+            // cap, under a case-folded spelling of the same key.
+            "streams / label count",
+            format!(
+                r#"{{"streams":[{{"stream":{over_labels},"values":[["{base_ns}","sup line"]]}}],"StReAmS":[{}]}}"#,
+                win("win-374-a")
+            ),
+            format!(
+                r#"{{"StReAmS":[{}],"streams":[{{"stream":{over_labels},"values":[["{base_ns}","sup line"]]}}]}}"#,
+                win("win-374-a")
+            ),
+            "win-374-a",
+        ),
+        (
+            // A superseded `stream` key inside one stream object.
+            "stream / label count",
+            format!(
+                r#"{{"streams":[{{"stream":{over_labels},"stream":{{"service_name":"win-374-b"}},"values":[["{base_ns}","FINAL"]]}}]}}"#
+            ),
+            format!(
+                r#"{{"streams":[{{"stream":{{"service_name":"win-374-b"}},"stream":{over_labels},"values":[["{base_ns}","FINAL"]]}}]}}"#
+            ),
+            "win-374-b",
+        ),
+        (
+            // A superseded `values` key carrying 100_001 entries.
+            "values / entries cap",
+            format!(
+                r#"{{"streams":[{{"stream":{{"service_name":"win-374-c"}},"values":{over_values},"values":[["{base_ns}","FINAL"]]}}]}}"#
+            ),
+            format!(
+                r#"{{"streams":[{{"stream":{{"service_name":"win-374-c"}},"values":[["{base_ns}","FINAL"]],"values":{over_values}}}]}}"#
+            ),
+            "win-374-c",
+        ),
+    ];
+
+    for (case, superseded, surviving, service) in &cases {
+        let res = push(port, "application/json", superseded.as_bytes());
+        assert_eq!(
+            res.status, 204,
+            "{case}: superseded over-cap value still decided it (body {})",
+            res.body
+        );
+        let lines = wait_for_line(port, service, base_ns, "FINAL");
+        assert!(
+            lines.contains(&"FINAL".to_string()) && !lines.contains(&"sup line".to_string()),
+            "{case}: only the final occurrence's line is stored, got {lines:?}"
+        );
+
+        // The same value LAST is still refused — without this half, deleting
+        // the cap outright would pass.
+        let res = push(port, "application/json", surviving.as_bytes());
+        assert_eq!(
+            res.status, 400,
+            "{case}: the SURVIVING over-cap value was admitted (body {})",
+            res.body
+        );
+    }
+
+    // Storage, not statuses: three winning streams, and nothing from any
+    // superseded or refused occurrence.
+    assert_eq!(
+        wait_for_count(
+            db,
+            "SELECT count() AS c FROM log_streams WHERE service LIKE 'win-374-%'",
+            3,
+        )
+        .await,
+        3,
+        "each case registers exactly its winning stream"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_streams WHERE service = 'sup-374-labels'",
+        )
+        .await,
+        0,
+        "the superseded stream is never registered"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_samples WHERE body = 'sup line'"
+        )
+        .await,
+        0,
+        "no superseded line is stored"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            "SELECT count() AS c FROM log_samples WHERE body = 'FINAL'"
+        )
+        .await,
+        3,
+        "exactly the three final lines are stored"
     );
 }

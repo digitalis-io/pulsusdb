@@ -2018,3 +2018,758 @@ absence of a corpus row for an oversight.
   first table. `curl -s http://localhost:13380/config | grep
   max_query_lookback` shows the `0s` that rules out the lookback
   middleware.
+
+## Issue #374 — the per-stream label rules at log ingest
+
+### `ingest-label-bounds` (issue #374 — parity ADOPTED; residuals named below)
+
+PulsusDB previously bounded a log push only by counts (streams per
+request, entries per stream, entries per request) and by decode-time
+materialization caps. Nothing measured a label name, a label value, the
+number of labels in a stream, or a repeated name — so a push the
+reference refuses with `400` was accepted and stored. Issue #374 adopts
+the reference's rules; this entry records what now matches and, under
+**Residual N** headings, every place where the observable still differs.
+Neither the title nor the prose restates how many there are: the sentence
+that did said "three named residuals" while the list below it named five. Same rule for the case counts — they live on `compare.py`'s own
+summary line in the transcript, which is generated, and are not copied
+back up here.
+
+- **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
+  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`),
+  `pkg/distributor/validator.go:157-199 @ v3.7.4` reached from
+  `pkg/distributor/distributor.go:1370-1387 @ v3.7.4`. In order: at most
+  15 label names (`entry for stream '%s' has %d label names; limit %d`),
+  names at most 1024 bytes (`stream '%s' has label name too long: '%s'`),
+  values at most 2048 bytes (`stream '%s' has label value too long:
+  '%s'`), no repeated name (`stream '%s' has duplicate label name:
+  '%s'`). All four are `400`. Limits are the flag defaults at
+  `pkg/validation/limits.go:324-326 @ v3.7.4`; messages are
+  `pkg/validation/validate.go:58-69 @ v3.7.4`.
+- **What PulsusDB now does: the same rules, in the same order, at the
+  same limits, on BOTH log receivers** —
+  `crates/pulsus-write/src/protocols/log_label_limits.rs`, called from
+  `loki_push::parse_protobuf`/`parse_json` and from `otlp_logs::parse`.
+  The reference validates its OTLP logs endpoint through the identical
+  distributor seam (`pkg/distributor/http.go:28-33 @ v3.7.4`), so both
+  paths are in scope, not just the Loki-push one — but not on the same
+  data, see "the OTLP subset" below. Four inherited rules come with the
+  bounds, each load-bearing:
+  - an empty-valued label is **dropped before the stream is hashed**, not
+    merely skipped by the validator (`syntax.ParseLabels` ends in
+    `ls.WithoutEmpty()`, `pkg/logql/syntax/parser.go:279-296 @ v3.7.4`,
+    whose comment gives the reason: empty values "alter the Hash values
+    created"). `{a="1", ignored=""}` is therefore one stream with one
+    fingerprint on both sides. `StreamLabels` is the single seam that
+    applies it, and the value it validates is the value handed to
+    `LabelSet::from_normalized` — so the bounds are charged on the
+    stripped set, never on the raw pair list. The rule that applies to a
+    *stream label* drops the empty **pair**; the rule that applies to
+    *structured metadata* deletes **by name** (a `labels.Builder` reset,
+    `distributor.go:698-722 @ v3.7.4`, issue #259). The two disagree on
+    exactly one input, a repeated name with one empty copy: the pair rule
+    keeps the surviving twin, delete-by-name would lose it too. Measured
+    on the oracle in both orders — `{d="", d="keep"}` and `{d="keep",
+    d=""}` are `204` and store `d="keep"`, while `{d="one", d="two"}` is
+    `400`;
+  - a stream carrying `__aggregated_metric__` or `__pattern__` is exempt
+    from all four bounds (`validator.go:164-167 @ v3.7.4`). PulsusDB
+    generates no such stream, but both are ordinary client-settable label
+    names on both sides, so the exemption is part of the accept surface;
+  - `service_name` does not count toward the 15
+    (`validator.go:169-174`), making the effective rule "at most 15
+    labels other than `service_name`";
+  - a stream with no entries is skipped before validation
+    (`distributor.go:639-641`).
+- **The OTLP subset, selected on the RAW attribute name.** On its OTLP
+  logs endpoint the reference splits a resource's attributes in two before
+  the distributor ever sees them
+  (`pkg/loghttp/push/otlp.go:180-212 @ v3.7.4`): the 18 names in
+  `distributor.otlp.default_resource_attributes_as_index_labels`
+  (`pkg/loghttp/push/otlp_config.go:56-73 @ v3.7.4`) become stream labels,
+  and every other attribute becomes structured metadata, which
+  `ValidateLabels` never sees. PulsusDB indexes them all as stream labels
+  (issue #109). Charging the four bounds on our whole set is therefore
+  NOT parity — measured on the pinned oracle, a resource carrying `app`
+  with a 2049-byte value, a 1025-byte attribute key, or 16 arbitrary
+  attributes all answer `204` there (the attribute is stored as
+  structured metadata and fans into the query response). The bounds are
+  charged on the indexed subset instead, which reproduces the oracle's
+  answer in both directions: `k8s.pod.name` with a 2049-byte value is
+  `400` on both, 16 indexed attributes is `400` on both, 15 indexed plus
+  40 arbitrary ones is accepted by both.
+
+  The subset is selected from the **raw wire key**, not from the
+  canonicalized label name, and the difference is observable.
+  `otlp.go:193 @ v3.7.4` calls `otlpConfig.ActionForResourceAttribute(k)`
+  on `k` and only then calls `attributeToLabels(k, …)`, which
+  canonicalizes through `otlptranslator.LabelNamer.Build`
+  (`otlp.go:610-614 @ v3.7.4`); the match inside `actionForAttribute` is
+  `cfgAttr == attribute`, exact string equality (`otlp_config.go:88-99 @
+  v3.7.4`). An attribute whose raw name merely *canonicalizes into* the
+  list — `service_name`, `service-name`, `k8s_pod_name`, anything of the
+  form `service?name` for a non-alphanumeric `?` — is structured metadata
+  upstream and is bounded by nothing. Measured: `{service_name:
+  "x"*2049}` is `204` on the oracle where `{service.name: "x"*2049}` is
+  `400`. Both directions are now measured for **all 18** names, generated
+  from the reference's list rather than sampled.
+
+  The consequence is that a non-indexed OTLP resource attribute is
+  bounded by nothing here and by the structured-metadata limits (64 kB
+  and 128 entries per line, `pkg/validation/limits.go:60-61 @ v3.7.4`)
+  there; mapping those onto data we store as stream labels belongs with
+  the #109 attribute-placement decision, not here.
+
+  **This reaches a validated label too, and that half is about storage
+  rather than about the accept surface.** `{service.name: "ok",
+  service_name: "x"*2049}` is accepted by the oracle (`204`) and by
+  PulsusDB (`200`) — the rejection surface agrees, because upstream
+  indexes the dotted spelling and routes the underscored one to
+  structured metadata. But we index both (#109), both canonicalize onto
+  `service_name`, and `from_normalized`'s frozen collision rule (#4)
+  keeps the greatest *original* key, where `_` (0x5F) sorts after `.`
+  (0x2E). So the unvalidated near-miss wins: 2049 bytes are stored under
+  a label the validator passed at two, and the stream's fingerprint
+  follows the winner. This is not a divergence introduced here — it is
+  what indexing every attribute means once a bound exists on a subset of
+  them — but it does mean a reader of the four bounds cannot conclude
+  that a *stored* label obeys them. The module doc of
+  `crates/pulsus-write/src/protocols/log_label_limits.rs` states that as
+  a limit of what the bound covers, and the fix (indexing what the
+  reference indexes) is #109's. Pinned on stored state rather than on the
+  wire verdict by
+  `otlp_logs::tests::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value`
+  and
+  `loki_push_live::an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label`;
+  the harness's four `otlp/index-key-vs-near-miss/*` cases measure only
+  the wire half, and say so.
+- **A breach is stream-local.** The reference validates every stream,
+  `continue`s past the ones that fail, writes the ones that pass, and
+  only then answers `400` (`distributor.go:645-655, 780-790, 929 @
+  v3.7.4`). PulsusDB now does the same: `ParsedLogs::stream_errors`
+  carries the failing streams' messages, the rest of the batch is
+  admitted, and the response is `400` — plain text on the Loki path, a
+  `google.rpc.Status` with `code = 3` on the OTLP path (upstream's
+  `push.OTLPError` writer does the same). When no stream survives,
+  nothing is written and nothing is admitted, matching
+  `distributor.go:786-789`. This is not a cosmetic difference: a `400` is
+  not retried by a well-behaved log shipper, so refusing the batch
+  atomically would destroy the good streams permanently.
+- **A push with no streams is `422`, before any of this runs** (found by
+  the round-5 review, and **pre-existing** — measured identically on the
+  branch point `5969a94`, so neither the empty-value drop nor the bounds
+  made it reachable). `PushWithResolver` returns
+  `httpgrpc.Errorf(StatusUnprocessableEntity,
+  validation.MissingStreamsErrorMsg)` for `len(req.Streams) == 0`
+  (`distributor.go:579-581 @ v3.7.4`; message at
+  `pkg/validation/validate.go:15`), which on the OTLP receiver covers any
+  payload with no log records at all — its translation short-circuits to an
+  empty push request when `ld.LogRecordCount() == 0`
+  (`pkg/loghttp/push/otlp.go:144-146 @ v3.7.4`). PulsusDB answered `204` /
+  `200` and stored nothing; it now answers `422` with the reference's
+  message on both receivers. On the JSON push transport the count is what
+  decides, not the shape of the object: `{"streams":[]}`, `{}` and a body
+  whose only key is an unrelated one (`{"nope":1}` — the spelling issue
+  #259 measured) are one case, `422` on both sides, because both decoders
+  ignore an unknown field rather than refusing it. The count is on the streams the request
+  *carries*, so the two neighbouring shapes stay accepted: a stream with
+  labels and no entries is still a stream (`204` on both), and a stream
+  whose labels breach a bound is a `400`, not a `422`. Charged at
+  `loki_push::validate_bounds` (the one seam both Loki-push encodings
+  reach) and in `otlp_logs::parse` — after decode, before any per-record
+  work and before the per-stream bounds, but *after* the `AnyValue` depth
+  cap, which is residual 6 below. The `422` body carries no PulsusDB prefix, exactly like the four
+  bound messages; on the OTLP path it rides the same `google.rpc.Status`
+  with `code = 3` — upstream's `OTLPError` omits the code field on *every*
+  error body it writes (`grpcstatus.New(0, errorStr)`,
+  `pkg/loghttp/push/push.go:571-581 @ v3.7.4`), a pre-existing difference
+  across our whole OTLP error family rather than one of this status.
+- **How the JSON envelope's own keys are matched**, which is what
+  decides whether the `422` above is reached at all. `loghttp.PushRequest`
+  is a one-field struct (`pkg/loghttp/query.go:91-93 @ v3.7.4`) decoded by
+  `jsoniter.NewDecoder`, i.e. under `ConfigDefault`, whose `CaseSensitive`
+  is false. So the reference matches `streams` with **ASCII case folding**
+  — the wire key is folded over `'A'..'Z'` before it is compared, and the
+  tag gets a `strings.ToLower` alias
+  (`iter_object.go:49-90`, `reflect_struct_decoder.go:36-41 @ jsoniter
+  v1.1.12`, vendored in the Loki tree) — and a **repeat of the key is
+  last-wins**, because the field decoder re-runs on every match and the
+  slice decoder re-grows from index zero
+  (`reflect_struct_decoder.go:574-590`, `reflect_slice.go:66-99`); a
+  `null` overwrites with nil, so it empties the request exactly as `[]`
+  does. Measured on the pinned oracle: `Streams`, `STREAMS`, `StReAmS`,
+  `streamS` and an escaped `"\u0053treams"` are all `204` **and the lines
+  read back out of `/loki/api/v1/query_range`**; of two spellings only the
+  last one's line is stored.
+
+  PulsusDB matched the key byte-for-byte, which was invisible while it
+  answered `204` (the case variant was an unknown key, so the push was
+  empty and silently dropped) and became a `422` once the stream-less
+  check above landed. It now folds the same way and is last-wins, so both
+  the divergence and the silent drop that preceded it are closed. Note
+  which layer the rule lives on: a stream object's own `stream`/`values`
+  keys are decoded by a hand-written `LogProtoStream.UnmarshalJSON` that
+  switches on `string(key)` (`query.go:99-121 @ v3.7.4`), so those stay
+  case-**sensitive** on both sides (measured: `Stream`/`Values` are `204`
+  storing nothing) — while a repeat of them is last-wins there too, except
+  that a `null` `values` returns before assigning and leaves the entries
+  alone (`query.go:110-112`). The same question over the other ingest
+  envelope has no gap: OTLP/JSON is decoded by pdata's generated
+  field switch, exact match plus the proto3 snake_case alias, and all
+  seven spellings of `resourceLogs` measured identically on both sides.
+  Harness: the `json/streams-key-*`, `json/stream-object-keys-*` and
+  `json/values-null-*` cases; storage, which a status cannot see, is
+  `loki_push_live::a_case_variant_streams_key_is_accepted_and_its_lines_are_stored`.
+- **Where last-wins puts our own structural caps.** Because the reference
+  never inspects a superseded value, a cap-breaking occurrence followed by
+  a valid one is `204` there, with the valid one's line stored. PulsusDB's
+  decode-time caps used to be charged where they trip, so those bodies were
+  `400` here. They are now charged **after** the envelope resolves: the
+  `streams`, `values` and `structured_metadata` visitors stop RETAINING
+  one element past their cap and parse the rest without keeping it, and the
+  `MAX + 1` sentinel they leave behind is read by `validate_bounds` /
+  `canonical_structured_metadata`; the JSON `stream` map carries its raw
+  pair count out to `parse_json`; and `MAX_LABELS_PER_STREAM` is counted on
+  the labels that survive rather than on raw pairs — 257 repetitions of one
+  key are ONE label upstream, because `LabelSet.UnmarshalJSON` assigns into
+  a `map[string]string` and has no count bound of its own
+  (`pkg/loghttp/labels.go:25-40 @ v3.7.4`). The protobuf transport needs
+  none of this: every cap there is on a repeated (merged) field, and its
+  two singular fields (`labels`, `line`) carry no decode-time cap.
+  Enumerated rather than sampled — three resolution points (`streams`,
+  `stream`, `values`) crossed with every per-occurrence cap reachable
+  inside each, as the `json/superseded-*` harness cases; storage, which a
+  status cannot see, is
+  `loki_push_live::a_superseded_over_cap_value_is_accepted_and_the_final_one_is_stored`.
+  The two SHARED cross-request counters are the exception, residual 7.
+  **What "discarded" does not mean: unread.** The remainder past a cap is
+  parsed in full — element types, object structure and nesting depth are
+  checked exactly as they are on the retained side of the cap, message text
+  included — and only the retention stops. The first cut of this deferral
+  drained with `serde::de::IgnoredAny`, which `serde_json` implements as a
+  bracket-matching skip (`Deserializer::ignore_value`, `de.rs:1102 @
+  1.0.150`) that types nothing, so crossing a cap silently switched the
+  checking off: 257 structured-metadata pairs followed by `"bad":[]`, and
+  100,001 entries followed by a bare `0`, each superseded by a valid
+  occurrence, were `400` upstream and `204` here — while the SAME tails one
+  element below the cap were `400` on both sides. Upstream does not skip a
+  superseded value either: jsoniter decodes every occurrence of a repeated
+  field in full before the last one wins
+  (`reflect_struct_decoder.go:574-590 @ jsoniter v1.1.12`). Pinned as
+  triples (below the cap / past it / past it and superseded, all three
+  producing the same message) by
+  `loki_push::tests::parse_json_a_drained_value_is_checked_exactly_like_a_retained_one`,
+  and on the wire by the `json/drained-*` harness cases.
+  **The same applies to a value under a key neither side reads**, and there
+  the checks are the reference's SKIP's rather than a type's: nesting depth
+  (residual 8) and out-of-range numbers. The number rule begins at `Skip`'s
+  DISPATCH, which picks the reader from the value's FIRST BYTE and nothing
+  else: `case '0'` calls `ReadFloat32` and `case '-', '1'..'9'` calls
+  `skipNumber` (`iter_skip.go:72-96`, `:83-87 @ jsoniter v1.1.12`). So a
+  token starting with `0` is range-checked against **`f32`** — `0.35e39` is
+  `400` on both sides, while `-0.35e39` and `3.5e38`, the same magnitude and
+  equally out of `f32` range, are `204` on both because their first byte
+  routes them elsewhere. On that other route, upstream's `trySkipNumber` walks
+  a run of digits with at most one dot and skips it unevaluated; everything
+  else — an exponent, in practice — leaves that fast path and is PARSED by
+  `ParseFloat`, which fails on OVERFLOW of **`f64`**
+  (`iter_skip_strict.go:10-21,24-59`,
+  `iter_float.go:299-315`), so an ignored `1e999` is `400`
+  there. Round 12 matched that by
+  accident, because `serde` evaluated every number it walked; round 14, which
+  reads such a value as raw text instead, applies the rule explicitly rather
+  than inheriting it — the two are told apart by `json/ignored-number-int`
+  against `json/ignored-number-overflow`, and by
+  `loki_push::tests::parse_json_a_discarded_number_follows_the_references_overflow_rule`,
+  whose rows are measured in each of the three positions. That is the
+  EXPONENT axis and it agrees exactly, invariantly under wire framing and
+  byte offset; the `f32` route, closed in round 18, agrees the same way and
+  for a stronger reason — it never enters the read-buffer-bounded fast path
+  at all. The LENGTH of a digits-only run does not agree and is not
+  matched: **residual 10**.
+- **Multi-failure bodies** are grouped as `util.GroupedErrors.Error()`
+  groups them (`pkg/util/errors.go:105-131 @ v3.7.4`): identical messages
+  collapsed with an `N errors like: ` prefix, distinct groups joined with
+  `"; "`, a lone failure rendered bare. Group ORDER is a Go map walk
+  upstream and therefore deliberately randomized; ours is first-seen.
+  There is no byte-reproducible upstream body to match for more than one
+  distinct failure, only the format: repeated batches of 40 sends of one such
+  request return BOTH orderings, one dominating and the other a minority of
+  the batch — and a batch showing only one order has been observed too. Only
+  "both orders occur" is a measurement; no split is quoted here, because a
+  split is a fresh sample every time, and quoting one as though it were a
+  figure is what left this row's artifacts disagreeing over two review rounds
+  (rounds 15 and 16, each `[low]`). The transcript sorts the groups for exactly that
+  reason, in `compare.py`'s `trim`, so that its stated reproduce recipe
+  ("diff empty") holds; the sort is applied to both sides and cannot reach a
+  verdict, which is a status.
+- **The `400` body is LF-terminated on the Loki push path**, and only
+  there. The reference binds one error writer per push endpoint —
+  `push.HTTPError` for `/loki/api/v1/push`, `push.OTLPError` for the OTLP
+  one (`pkg/distributor/http.go:27-33 @ v3.7.4`) — and a label-bound breach
+  leaves `PushWithResolver` as an `httpgrpc` error handed to that same
+  writer (`http.go:161-171`), i.e. to `http.Error` -> `fmt.Fprintln`
+  (`pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Measured on the pinned
+  oracle: a 2049-byte label value answers `400` whose last body byte is
+  `0x0a`. Merged in from issue #259, which established the same terminator
+  for this endpoint's decode-failure bodies; the stream-local `400` this
+  row adds is written through the same seam and had to follow. The OTLP
+  body is a `google.rpc.Status` protobuf and carries no terminator. In the
+  transcript below, every case where BOTH sides answer `400` now agrees on
+  it; the six where exactly one side terminates are the six where exactly
+  one side answers `400` at all, i.e. the recorded status divergences.
+  Gated by `ingest/http.rs`'s `every_loki_push_error_body_is_lf_terminated`,
+  which #259 wrote as an enumeration over the endpoint's error classes and
+  which this row extends with its three: the stream-less `422` and the
+  stream-local `400` in both its forms (nothing written, and
+  written-then-refused).
+- **Residual 1 — the rendered label set inside the message.** Every one of
+  the four messages interpolates the stream's label set, and the
+  reference's copy carries a `service_name` label its own push parser
+  injected (`discover_service_name`, `pkg/loghttp/push/push.go:441-453 @
+  v3.7.4`, on by default — e.g. `service_name="unknown_service"`, or the
+  value of an `app` label). PulsusDB does not implement service-name
+  discovery, so its rendered set omits that label. This is a pre-existing
+  difference in what we store, not something #374 introduced, and it
+  never changes a status: the reference decrements its own injected label
+  out of the count, so the counts agree exactly (17 user labels reports
+  `has 17 label names` on both). The same injection is why the
+  reference's `MissingLabelsErrorMsg` is unreachable there and not
+  implemented here, and why a stream whose labels are all empty-valued is
+  stored as `{service_name="unknown_service"}` upstream and with no
+  labels here.
+  Loki error bodies additionally carry the trailing newline Go's
+  `http.Error` appends, which none of our Loki plain-text error bodies
+  have — also pre-existing, and not specific to these four.
+- **Residual 2 — non-ASCII escaping in the rendered label set.**
+  Prometheus' `Labels.String` (`model/labels/labels_common.go:57-80`,
+  vendored at `v3.7.4`) renders every label value through Go's
+  `strconv.Quote` and every non-legacy label name likewise. PulsusDB
+  reproduces that exactly for every code point below `U+0080` — `\"`,
+  `\\`, `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, and `\xNN` for the
+  remaining C0 controls and `DEL` — and passes code points at or above
+  `U+0080` through verbatim, where Go emits `\uXXXX` for those its
+  `strconv.IsPrint` rejects (non-ASCII spaces, format and unassigned code
+  points such as `U+00A0` or `U+200B`). Matching that last class needs
+  Go's ~750-line `isPrint` range tables ported for the sole benefit of an
+  error string; the difference is confined to the bytes of a `400` body
+  for a stream that has already breached a bound, and never changes what
+  is accepted.
+- **Residual 3 — two PulsusDB-only structural caps that the reference
+  does not have.** The reference bounds a stream's label literal by SIZE
+  only (`maxStreamLabelsSize` = 16 MiB, `pkg/logql/syntax/parser.go:22 @
+  v3.7.4`), which PulsusDB now adopts verbatim on the protobuf transport.
+  Two count caps remain on top of it:
+  - `MAX_LABELS_PER_STREAM` = 256 **surviving** labels per stream —
+    distinct names whose final value is non-empty, counted after the
+    envelope's last-wins resolution rather than on raw pairs. A stream with
+    more than 256 such labels is `400` on both sides, but ours says
+    `stream labels exceed the 256 per-stream bound` where the reference
+    says `has N label names; limit 15`. Wording only, and only for input
+    more than 17x over the parity bound. Neither empty-valued labels nor
+    superseded ones count on either transport, so the
+    16-non-empty-plus-241-empty stream that used to hit this cap gets the
+    reference's message and 257 repetitions of one key are accepted as the
+    one label the reference stores (`json/duplicate-key-257-collapses`,
+    `204` on both). Measured on both transports (`json/257-nonempty`,
+    `pb/257-nonempty`): `400` on both sides, ours reading `stream labels
+    exceed the 256 per-stream bound` and `labels count 257 exceeds the
+    documented limit of 256` respectively.
+  - `MAX_RAW_LABEL_PAIRS_PER_STREAM` = 65,536 raw `(key, value)` pairs in
+    one JSON `stream` object. The JSON transport must retain
+    empty-valued pairs until their names have been grammar-checked and
+    the map's last-write-wins collapse has happened, so this bounds that
+    intermediate; the protobuf transport needs no equivalent because it
+    drops empty values as it reads the literal. A stream carrying more
+    than 65,536 raw JSON keys that collapse to 15 or fewer surviving
+    labels is accepted upstream (within the 16 MiB rendered-literal bound)
+    and refused here. Measured in both spellings —
+    `json/65537-raw-empty-keys` (65,537 distinct empty-valued keys) and
+    `json/duplicate-key-65537-raw` (65,537 repetitions of one key): `204`
+    there, `400` here reading `stream label pairs exceed the 65536
+    per-stream bound`. The count travels with the map it describes, so a
+    superseded `stream` occurrence takes its breach with it
+    (`json/superseded-stream-raw-pairs`, `204` on both).
+- **Residual 4 — a repeated OTLP index-attribute key.** A resource that
+  carries the same index attribute twice with different values is
+  resolved last-write-wins upstream (`streamLabels` is a map,
+  `otlp.go:191-193 @ v3.7.4`), so the bound is charged on whichever value
+  came last. PulsusDB collapses the repeat through
+  `LabelSet::from_normalized`, whose resolution is issue #4's frozen
+  greatest-`(key, value)` rule, so the bound is charged on the value that
+  would actually be stored. Measured: `[k8s.pod.name="ok",
+  k8s.pod.name="b"*2049]` is `400` upstream and `200` here; the reverse
+  order agrees. Matching upstream's choice would mean validating a value
+  we do not store — the defect this issue's first round was about — so
+  the real fix is to change the collision rule for OTLP resource
+  attributes, which changes stored stream identities and belongs to
+  #4/#109. OTLP's data model requires attribute keys to be unique within
+  a map, so this is undefined input.
+- **Residual 5 — a map-valued OTLP index attribute.**
+  `attributeToLabels` (`otlp.go:602-640 @ v3.7.4`) recurses into a map
+  value and emits one label per leaf, named `<parent>_<leaf>`, so a
+  1025-byte nested key becomes an over-long label NAME upstream.
+  PulsusDB renders a map attribute to a single JSON-valued label (issue
+  #109), so the long key ends up inside a value that is under the value
+  bound: `400` upstream, `200` here. The same payload with a long nested
+  *value* is `400` on both, by different routes. This is the
+  attribute-flattening difference, not the bound; it belongs with #109.
+- **Residual 6 — the `AnyValue` depth cap outranks the stream-less
+  `422`.** PulsusDB bounds OTLP `AnyValue` nesting at
+  `MAX_ANYVALUE_DEPTH` = 32 (finding #54, a stack-safety guard); the
+  reference has no such bound — a record-*bearing* resource whose
+  attribute nests 33 `AnyValue` nodes deep is `204` upstream and `400`
+  here, measured on both transports. Because both our transports charge the cap inside
+  decode (`otlp_prescan::prescan_logs` for protobuf,
+  `otlp_json::AnyValueSeed` for JSON, and `ensure_logs_anyvalue_depth`
+  repeats it as `parse`'s first statement), a body that is *both*
+  record-less *and* over-deep answers `400` here where the reference
+  answers `422` — the depth reject wins because it runs first. Measured
+  on both transports (`otlp/record-less-over-deep-attr`,
+  `otlppb/record-less-over-deep-attr`, at depth 33; their at-cap
+  neighbours, one `AnyValue` node shallower at depth 32 — the deepest tree
+  still accepted — are `422` on both sides), and **pre-existing**: the same `400` comes out of the
+  branch point `5969a94`, so neither the bounds nor the `422` introduced
+  it. Nothing upstream fixes the order between a bound the reference does
+  not have and one it does, so the order is stated rather than matched.
+  Reordering it is not a local change either: the record count cannot be
+  read before the body is decoded, and the depth cap is charged *during*
+  decode precisely so the over-deep tree is never materialized or
+  recursed into — the JSON seed refuses before descending further, the
+  protobuf pre-scan before `prost` allocates. Deferring it would undo
+  that.
+- **Residual 7 — a superseded occurrence still charges the SHARED decode
+  budget.** The per-occurrence caps are charged after last-wins resolves
+  (the bullet above), but the two counters that run across the WHOLE
+  request are not: `MAX_TOTAL_ENTRIES_PER_REQUEST` = 5,000,000 entries and
+  `MAX_DECODED_BYTES` = 256 MiB of `size_of`-estimated materialization stay
+  immediately fatal. They measure memory the request has already cost
+  across every occurrence, and a supersession does not give it back while
+  the superseding value is still decoding — so deferring them would mean
+  decoding past the budget to find out whether it mattered, trading a
+  rejection divergence for a resource one. The reference has no equivalent
+  bound on DECODING: the only limit a push body meets before it is decoded
+  is the 100 MiB compressed body (`distributor.max-recv-msg-size` default
+  `100<<20`, `pkg/distributor/distributor.go:124 @ v3.7.4`, applied by
+  `io.LimitReader` in `parsePushRequestBody`,
+  `pkg/loghttp/push/push.go:322-325`), inside which jsoniter materializes a
+  superseded value in full and throws it away. That is not the same as "no
+  other limit": what SURVIVES decoding is forwarded to the ingesters over
+  gRPC and meets a 4 MiB message ceiling there
+  (`server.grpc-max-recv-msg-size-bytes` default `4*1024*1024`,
+  `vendor/github.com/grafana/dskit/server/server.go:220`, vendored at
+  v3.7.4), which answers `500 rpc error: code = ResourceExhausted desc =
+  grpc: received message larger than max (4600096 vs. 4194304)` — measured.
+  A surviving 100,001-entry stream is that `500` upstream against our `400`,
+  which is why those two neighbours are asserted hermetically rather than
+  carried as harness rows.
+  Reachable, and measured rather than reasoned: 38 superseded streams of
+  100,000 minimal entries is a 34 MB body — inside both that 100 MiB and our
+  own 64 MiB decompressed cap — and answers `204` upstream with the
+  surviving line stored, `400` here (`decoded bytes (estimated) 268435520
+  exceed the request decode budget of 268435456`). The same shape at 30
+  streams (27 MB, under the budget) agrees `204`/`204` and stores the same
+  line. Harness: `json/superseded-shared-budget` and its `-under`
+  discriminator.
+  **What the deferral itself costs, stated exactly.** A drained run is
+  parsed, so it costs parse time over the rest of the body; what it does
+  NOT cost is retention. Peak retained is what the caps admit —
+  `MAX_STREAMS_PER_REQUEST + 1` streams, `MAX_ENTRIES_PER_STREAM + 1`
+  entries per stream, `MAX_STRUCTURED_METADATA_PER_ENTRY + 1` pairs per
+  entry — plus ONE in-flight element being read and dropped, and the input
+  is bounded before decode by the 64 MiB decompressed body cap. A value of
+  arbitrary shape costs even less: it is captured as a BORROWED slice of the
+  request body and scanned for nesting with a counter (residual 8), so the
+  only memory it costs is the body it is already part of.
+  **What RSS can and cannot show about that.** It is too coarse an
+  instrument for this claim, and an earlier round of this issue over-read
+  it. Measured on a freshly started subject: five 400 kB, 200,000-level
+  bodies — all refused — took RSS from 30,824 kB to 36,412 kB, and the next
+  five ORDINARY pushes took it back DOWN to 35,720 kB. That is a few MB of
+  allocator churn in both directions, neither a retained cost nor a leak;
+  the earlier round read a flat pair of numbers off one long-warmed process
+  and reported the absolute figure as though it were a property of the
+  change. What is bounded is bounded structurally, above, and does not rest
+  on an RSS sample.
+- **Residual 8 — CLOSED in round 14; kept for the record because the
+  numbering is cited elsewhere.** For one round the JSON body's nesting
+  ceiling was 128 levels rather than the reference's 10,000, and that was an
+  over-rejection of ours: bodies the reference accepts and STORES were
+  refused here. Nesting of arbitrary depth reaches only values this decoder
+  does not keep — a key it does not read (an unknown envelope key, an
+  unknown key inside a stream object, an entry's fourth+ element) or a run
+  past one of the caps above. Round 12 deserialized all of them through
+  `serde`, which put them under `serde_json`'s `RECURSION_LIMIT` of 128
+  (`de.rs:63,1375 @ 1.0.150`); that constant is fixed and cannot be raised,
+  so 127..9,999 levels under an ignored key was `400` here and `204` there
+  (bisected on both servers: we accepted 126, upstream accepted 9,999).
+  Round 14 charges depth against **the reference's own bound** instead. A
+  value of arbitrary shape is captured as raw text — `serde_json`'s
+  `RawValue`, filled by the same `Deserializer::ignore_value` walk
+  `IgnoredAny` used, so syntax is still checked and nothing is retained —
+  and its nesting is charged against `maxDepth = 10000` (`iter.go:331-338 @
+  jsoniter v1.1.12`, vendored, error `exceeded max depth`), its numbers
+  against the reference's own skip-time overflow rule (the bullet above).
+  Typed values
+  keep serde's 128, which nothing legal reaches: a container in any of those
+  positions is a type error before its depth is looked at.
+  **What upstream counts is not the brackets to the left of the value**, and
+  reading that off its decoders rather than off one measured example is what
+  makes this parity rather than a coincidence at one position. The envelope
+  object counts (`oneFieldStructDecoder` increments,
+  `reflect_struct_decoder.go:574-594`); the `streams` ARRAY does not
+  (`sliceDecoder` never increments, `reflect_slice.go:59-99`); the stream
+  object and everything under it do, because `LogProtoStream` has an
+  `UnmarshalJSON` (`pkg/loghttp/query.go:99 @ v3.7.4`) that jsoniter reaches
+  through `unmarshalerDecoder`/`SkipAndReturnBytes`, whose `iter.Skip()`
+  walks the object with `ReadObjectCB`/`ReadArrayCB`
+  (`iter_skip_strict.go:85-99`). So the deepest ACCEPTED nest is 9,999 under
+  an unknown envelope key, 9,998 under an unknown key inside a stream and
+  9,996 as an entry's fourth element — all six boundaries bisected against
+  the two servers, all six now agreeing. Harness: the `json/ignored-depth-*`
+  cases, three positions × (deepest accepted, first refused, 200,000) plus
+  126/127; hermetically,
+  `loki_push::tests::parse_json_bounds_nesting_depth_at_the_references_ceiling`
+  asserts those literals, and
+  `loki_push::tests::parse_json_a_discarded_value_is_still_syntax_checked_and_strings_are_not_nesting`
+  pins what the byte scan must not confuse for nesting.
+- **Residual 9 — a non-string value in a `stream` label map.** Upstream does
+  not type these: `LabelSet.UnmarshalJSON` runs
+  `jsonparser.ParseString(val)` over the raw bytes of whatever the value is
+  and stores the result (`pkg/loghttp/labels.go:29-37 @ v3.7.4`), so
+  `{"stream":{"a":123}}` is `204` there and stores the label `a="123"`,
+  while `serde` refuses it here with `invalid type: integer 123, expected a
+  string`. Pre-existing and not introduced by any of this row's work — it
+  is the retained path's rule, and the only thing round 12 changed is that
+  the same rule now also applies PAST the raw-pair cap, where an
+  `IgnoredAny` drain used to let a non-string value through (measured
+  `204`/`204` by accident before, `204`/`400` consistently after). Adjacent
+  and the same mechanism: `"values":[null,["ts","x"]]` is `204` upstream,
+  which skips null elements explicitly (`if ty == jsonparser.Null { return
+  }`, `pkg/loghttp/query.go:131-134 @ v3.7.4`), and `400` here. Both belong
+  to a value-typing change, not to this row's cap ordering. Harness:
+  `json/drained-label-map-non-string` and its `-under-cap` control, both
+  recorded divergences.
+- **Residual 10 — the LENGTH of a digits-only number in a value neither side
+  reads.** PulsusDB's rule: a run of digits with at most one dot, under a key
+  the decoder does not read, is accepted **whatever its length**. The
+  reference's rule, stated as its mechanism rather than as the shape that
+  mechanism produces: a digits-only run is **skipped unevaluated only while
+  it fits inside the decoder's current read buffer**; a run that spans the
+  buffer's end leaves that fast path, **is parsed as a float**, and is
+  refused **only if the parse overflows `f64`**. The fast skip scans that
+  buffer and nothing else — `for i := iter.head; i < iter.tail`
+  (`iter_skip_strict.go:26 @ jsoniter v1.1.12`) — over the 512 bytes
+  `jsoniter.NewDecoder` allocates (`config.go:366`, reached from
+  `unmarshal.DecodePushRequest`, `pkg/util/unmarshal/unmarshal.go:17 @
+  v3.7.4`); a token that reaches `tail` returns `false` from `trySkipNumber`
+  (`:55,:58`) and falls through to
+  `ReadFloat64`/`readFloat64SlowPath`/`strconv.ParseFloat`
+  (`iter_skip_strict.go:10-21`, `iter_float.go:299-315`), whose `ErrRange`
+  is then surfaced through the `ReadBigFloat` retry over an already-consumed
+  buffer as `readNumberAsString: invalid number`. **Crossing the boundary is
+  not itself a rejection — it removes the exemption.**
+
+  **Why this is registered and not matched.** Where that buffer boundary
+  falls is not a property of the request. It moves with the token's byte
+  offset in the body and with how the client chunked its writes, so the same
+  bytes get different verdicts from different senders. Measured on
+  `grafana/loki@sha256:87f0a067…` and a PulsusDB built from this branch
+  (issue #374 round 17), one ignored digit run under an unknown envelope
+  key:
+
+  | shape | reference | PulsusDB |
+  |---|---|---|
+  | 400 digits, body written in one piece | `204` | `204` |
+  | 400 digits, **same bytes**, 512-byte chunks | `204` | `204` |
+  | 400 digits, **same bytes**, 256-byte chunks | **`400`** | `204` |
+  | 400 digits, one write, run at offset 111 | `204` | `204` |
+  | 400 digits, one write, run at offset 112 | **`400`** | `204` |
+  | 504 digits at offset 7 | `204` | `204` |
+  | 505 digits at offset 7 | **`400`** | `204` |
+  | 308 nines crossing a boundary | `204` | `204` |
+  | 309 nines crossing a boundary | **`400`** | `204` |
+  | 309 digits, `1` then 308 zeros, crossing | `204` | `204` |
+  | 1,000 digits, any offset, any framing | **`400`** | `204` |
+
+  The last three rows are the mechanism rather than a length threshold:
+  crossing only removes the exemption, so the same 309-digit length is
+  **`400`** when the value overflows `f64` and **`204`** when it does not
+  (measured at three offsets, all crossing). Length alone decides nothing
+  either — 400 digits is either answer depending on framing. A run of 512
+  digits or more cannot fit in a 512-byte window at any offset, and no run of
+  310 digits or more is representable in `f64`, so a 1,000-digit run is the
+  one corner of this that is framing-independent in **both** conditions, and
+  is what the harness pins. That independence is measured rather than argued:
+  `number_route_probe.py`'s `ctl-1000-nines` sends it in all three ignored
+  positions at three offsets in four framings, 36 cells, `400` upstream and
+  `204` here in every one.
+
+  Matching the reference here would mean reproducing the sender's socket
+  behaviour, which is worse for a user than the difference: our acceptance
+  surface would stop being a function of the request. So this is the
+  standing rule applied — copy the reference except where it is wrong — and
+  it is recorded rather than chased.
+
+  **Bounded**: the divergence is exactly the digits-only runs that span the
+  end of the reader's current 512-byte window **and** whose value overflows
+  `f64` — for an all-nines run that means 309 digits or more, while a
+  309-digit run of smaller magnitude is accepted on both sides. The exponent
+  rule agrees on both edges (`1e999`, `1e309`, `1.7976931348623159e308`
+  refused on both; `1e308`, `1.7976931348623157e308`, `1e-999`, `5e-324`
+  accepted on both), and each of the fourteen ignored-number shapes the
+  harness and the hermetic test pin between them was re-measured over 12 cells
+  in round 17 — 4 wire framings × 3 byte offsets, 168 cells in all — and over
+  36 cells each in round 19 — those same 12 in each of the three ignored
+  positions, 504 cells — without moving on either server. Those 504 cells are
+  the exponent group of
+  `crates/pulsus-write/tests/golden/log_label_bounds/number_route_probe.py`,
+  a raw-socket matrix that writes each body in the four framings at the three
+  offsets and exits non-zero on a cell that moves; the figure is that script's
+  output rather than a report of one, and `number_route_probe.txt` beside it
+  records a run of it and of its stale-timestamp mutant. Thirteen of the
+  fourteen take `skipNumber`, and for the eleven of those that carry an `e`
+  that invariance is what `trySkipNumber` leaving the fast path on `e` in every
+  window predicts: the exponent axis cannot depend on the buffer. The other
+  two, `12345678901234567890` and `-0.0`, are short digits-only runs, `204`
+  whether they are skipped or parsed. The fourteenth shape, `0e999`, takes
+  `ReadFloat32` on its first byte, and zero is finite in both widths, so its
+  cells are `204` on either route and none of them could have shown the
+  dispatch in a status.
+  Round 18 re-derived the table above on the same two servers after changing
+  the `f32` route below, rather than restating it: bisecting the offset of a
+  400-nine run in one write gives a last accepted offset of 111 (offset +
+  length + 1 = 512 exactly), `400` at 112; the same bytes are `204` in one
+  write and in 512-byte chunks and `400` in 256- and 128-byte chunks;
+  crossing, 308 nines is `204`, 309 nines is
+  `400`, 309 digits of `1` then zeros is `204`; 1,000 nines is `400` at four
+  offsets. PulsusDB answered `204` to every one of those, unchanged. The
+  111/112 pair is no longer a one-round derivation: it is the pair of controls
+  `number_route_probe.py` sends on every run, in all three ignored positions
+  and all four framings, and they are there to prove the framing and offset
+  knobs reach upstream's decoder at all — without them a run whose chunked
+  writes had coalesced would still have reported 720 agreeing cells (measured,
+  with the pause between chunks removed).
+
+  **One shape was outside this residual and is now CLOSED (found round 17,
+  fixed round 18).** `Skip` never reaches `skipNumber` for a token whose first
+  byte is `0`: it calls `ReadFloat32` directly (`iter_skip.go:83-85 @ jsoniter
+  v1.1.12`), so upstream range-checks that token against **`f32`**, not
+  `f64`. Measured on the two servers over 36 cells per shape (3 ignored
+  positions × 4 wire framings × 3 byte offsets, 216 cells — the `f32` group of
+  `number_route_probe.py`), each shape single-valued:
+  `0.35e39` and `0.34028236e39` are **`400`**, `0.34e39` and `0.34028235e39`
+  — the latter still rounding to `f32::MAX` — are `204`, and the same
+  magnitude written `3.5e38` or `-0.35e39`, neither of which starts with `0`,
+  is `204` because both take the `skipNumber`/`f64` route. Unlike the length
+  axis this is deterministic on the request — the `ReadFloat32` route never
+  enters `trySkipNumber`, so no read buffer is involved — which is why it was
+  matched rather than registered. PulsusDB now dispatches on the same byte
+  (`check_ignored_number`), and all six shapes agree on both sides.
+
+  Harness: the `f32` route is pinned by six agreeing rows —
+  `json/ignored-number-lead0-over`, `-lead0-under`, `-lead0-at-f32-max`,
+  `-lead0-past-f32-max`, and the two controls `-signed-lead0` and `-no-lead0`
+  that make them mean the dispatch rather than the value.
+  `json/ignored-number-int-1000` is the recorded divergence;
+  `json/ignored-number-int` (400 nines) is the control that agrees, and it
+  agrees only because that body puts the run at offset 86, so its terminating
+  byte lands at index 486 against a last-fitting index of 511 — 25 bytes of
+  headroom. A note in `compare.py` says so, because growing that body by 26
+  bytes ahead of the run flips it (measured: +25 is `204`, +26 is `400`).
+  Hermetically,
+  `loki_push::tests::parse_json_a_discarded_number_follows_the_references_overflow_rule`
+  asserts our side of it in all three ignored positions.
+
+  **How this was missed for a round.** Round 14 claimed "66 probes over 22
+  shapes × 3 positions, 0 disagreements". The probes were real and the count
+  was real, but every one of them placed the digit run where it happened to
+  fit the window, so the gate could not see the axis it was being quoted to
+  cover. A 66-probe slice at the same three positions, placed differently,
+  found the disagreements. Same instrument, same count, opposite result:
+  the placement was the variable and it was never varied.
+- **Measured side by side**: every case in the harness is sent
+  byte-identically to `grafana/loki@sha256:87f0a067…` and to a running
+  PulsusDB, over both Loki-push encodings and both OTLP encodings. Statuses
+  agree everywhere except residual 3's second half (in both its spellings)
+  and residuals 4, 5, 6, 7, 9 and 10 — residual 8 was closed in round 14 and
+  its rows are agreements now — which the harness carries as expected
+  divergences so that they stay the ones that were recorded; the case,
+  agreement and divergence counts are on
+  `compare.py`'s generated summary line at the end of the transcript's
+  table, and are deliberately not copied into this row. The
+  transcript and the harness that produced it are checked in at
+  `crates/pulsus-write/tests/golden/log_label_bounds/`; the harness exits
+  non-zero on any verdict that is not its expected one. A case is one body
+  written in one piece, so one thing that directory carries cannot be a case:
+  the claim that the ignored-number verdicts do not depend on the wire
+  framing or the token's byte offset. `number_route_probe.py` beside it is the
+  instrument for that one — a raw-socket writer over 20 shapes × 3 ignored
+  positions × 4 framings × 3 offsets, plus three deliberately framing-aware
+  controls, exiting non-zero on a cell that moves — and
+  `number_route_probe.txt` is its recorded run.
+  An earlier 44-case version of that harness scored 44/44 against an
+  implementation that selected the OTLP subset on the canonicalized name,
+  because every OTLP case it sent used either an exact dotted index name
+  or an obviously arbitrary one — never a raw key whose canonical form
+  disagrees with it about membership, which is where that defect lived.
+  The `otlp/raw/…` and `otlp/canonical/…` pairs are now generated from the
+  reference's own list for that reason; re-running the current cases
+  against that implementation produces 25 unexpected verdicts. **The list
+  itself is read out of the reference too** —
+  `git show b318f282:pkg/loghttp/push/otlp_config.go`, parsed at run time,
+  with a non-zero exit rather than a fallback if it cannot be read —
+  because pairs generated over a hand-copied list are still drawn from our
+  own model of the rule. **And these are statuses:** the four
+  `otlp/index-key-vs-near-miss/*` cases agree on the wire and diverge in
+  what is stored, which is why that half is asserted on stored state
+  instead (see the raw-name paragraph above).
+- **Pinned by** `log_label_limits`'s own unit tests (the four bounds, both
+  edges each, the `service_name` decrement, the empty-value rule and its
+  effect on stored identity, the internal-stream exemption, the
+  check-order cases including count-vs-duplicate and value-vs-duplicate,
+  and the whole ASCII range of the Go quoting transcribed from
+  `strconv.Quote`; plus
+  `every_index_attribute_is_bounded_in_its_raw_spelling_only`, which walks
+  the reference's own 18-name list and asserts both directions rather
+  than sampling), `loki_push::tests::parse_json_*`/`parse_protobuf_*`
+  and `otlp_logs::tests::*` (both receivers reach the rules, empty labels
+  do not consume the decode caps, the OTLP bounds are charged on the
+  raw-name-selected indexed subset while the empty-value drop is not —
+  `every_raw_index_name_bounds_and_its_canonical_spelling_does_not`,
+  `a_raw_attribute_that_only_canonicalizes_into_an_index_name_is_not_bounded`
+  — and a bad stream costs only itself),
+  `ingest/http.rs`'s
+  `loki_over_long_label_value_is_400_with_the_reference_message` /
+  `loki_over_wide_stream_is_400_with_the_reference_message` /
+  `logs_over_long_resource_attribute_value_returns_400_with_status_code_3`
+  / `loki_mixed_batch_admits_the_good_streams_and_still_answers_400` /
+  `logs_mixed_batch_admits_the_good_resources_and_still_answers_400` /
+  `stream_errors_are_grouped_the_way_the_reference_groups_them` (the wire
+  status, body and admission), and the live
+  `crates/pulsus-server/tests/loki_push_live.rs` quintet
+  `over_wide_label_value_is_rejected_and_stores_nothing`,
+  `a_mixed_batch_stores_the_good_streams_and_still_answers_400`,
+  `an_empty_valued_label_does_not_split_the_stream` (`400` at the wire
+  **and** the matching row counts read back out of ClickHouse, with an
+  at-bound control push proving the read-back discriminates),
+  `a_stream_less_push_is_422_on_both_receivers_and_stores_nothing` and
+  `an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label` — the one
+  case the wire cannot show, where both sides answer success and the
+  stored label and fingerprint are read back to show the 2049-byte value
+  on an indexed label. The stream-less `422` is pinned at every tier: the
+  parsers (`parse_json_rejects_a_request_with_no_streams`,
+  `decode_protobuf_rejects_a_request_with_no_streams`,
+  `parse_rejects_a_request_with_no_log_records`), the wire
+  (`loki_push_with_no_streams_is_422_with_the_reference_message`,
+  `loki_protobuf_push_with_no_streams_is_422`,
+  `logs_request_with_no_log_records_is_422_with_the_reference_message`),
+  and — because a status-only rule is easy to over-apply — its accepted
+  neighbours beside it at each tier
+  (`parse_json_entry_less_stream_alone_is_not_a_stream_less_request`,
+  `parse_accepts_a_request_whose_records_are_all_in_one_resource`,
+  `loki_push_with_an_entry_less_stream_is_still_accepted`). Its one
+  exception — residual 6's ordering against the `AnyValue` depth cap — is
+  pinned by `the_depth_cap_outranks_the_stream_less_check`, whose at-cap
+  neighbour is inside the same test, and on the wire by the four
+  `*-over-deep-attr` harness cases.

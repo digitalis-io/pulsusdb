@@ -14,15 +14,15 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
-use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use pulsus_model::{
-    Date, Fingerprint, LabelSet, UnixNano, canonicalize_label_key, retain_non_empty_values,
-    stream_fingerprint, strip_empty_valued_labels,
+    Date, Fingerprint, LabelSet, UnixNano, canonicalize_label_key, stream_fingerprint,
+    strip_empty_valued_labels,
 };
 
 use crate::error::LogsIngestError;
 use crate::protocols::label_name::validate_otlp_attribute_names;
+use crate::protocols::log_label_limits;
 use crate::protocols::loki_push::structured_metadata_json;
 
 /// A `SeverityNumber` outside this range (including the `0`/unset default)
@@ -93,6 +93,22 @@ pub struct ParsedLogs {
     /// The first rejection's error message, surfaced verbatim as the OTLP
     /// `partial_success.error_message`.
     pub rejected_message: Option<String>,
+    /// Stream-local validation failures (issue #374): one message per stream
+    /// whose labels breached a per-stream bound. Those streams are **not** in
+    /// `rows`/`streams`; every other stream in the request is, and the receiver
+    /// admits them and then answers `400` with these messages.
+    ///
+    /// That is the reference's shape, not a PulsusDB choice:
+    /// `PushWithResolver` `continue`s past a stream whose labels fail
+    /// validation, accumulates the error, writes the streams that passed and
+    /// only then returns the `400`
+    /// (`pkg/distributor/distributor.go:645-655, 780-790, 929 @ v3.7.4`). A
+    /// client does not lose the good streams of a mixed batch, which matters
+    /// because a well-behaved log shipper does not retry a `400`.
+    ///
+    /// Distinct from `rejected`/`rejected_message`, which are per-*record*
+    /// drops reported through OTLP partial success with a `2xx`.
+    pub stream_errors: Vec<String>,
 }
 
 /// Decodes a (decompressed) OTLP `/v1/logs` request body. The sole
@@ -132,8 +148,12 @@ pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestEr
 /// `Err` iff a body/attribute `AnyValue` tree nests deeper than
 /// [`otlp_depth::MAX_ANYVALUE_DEPTH`](crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH)
 /// — a whole-request, atomic structural failure (400 / `code = 3`), exactly
-/// like a decode error; malformed per-record timestamps stay per-record
-/// partial-success rejections inside the `Ok`.
+/// like a decode error — or iff the request carries no log records at all
+/// ([`LogsIngestError::MissingStreams`], 422; issue #374). The depth check is
+/// charged first, so a request that is both over-deep and record-less is the
+/// `400`, not the `422` (see the body). Malformed
+/// per-record timestamps stay per-record partial-success rejections inside
+/// the `Ok`.
 pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
     // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
     // maliciously deep body/attribute tree before any value is rendered or a
@@ -143,6 +163,35 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
     // the same class as a decode failure.
     crate::protocols::otlp_depth::ensure_logs_anyvalue_depth(req)?;
 
+    // A request carrying no log records at all is `422`, not an empty success
+    // (issue #374). Upstream's OTLP translation returns an EMPTY push request
+    // for one — `if ld.LogRecordCount() == 0 { return &logproto.PushRequest{},
+    // nil }`, the first statement of `otlpToLokiPushRequest`
+    // (`pkg/loghttp/push/otlp.go:144-146 @ v3.7.4`) — and `PushWithResolver`
+    // then refuses a stream-less push (`pkg/distributor/distributor.go:579-581
+    // @ v3.7.4`). `LogRecordCount()` sums the records over every
+    // `(ResourceLogs, ScopeLogs)` pair, so `{}`, `{"resourceLogs":[]}`, a
+    // resource with no `scopeLogs`, and a scope with an empty `logRecords` are
+    // one case, and all four measure `422` on
+    // `grafana/loki@sha256:87f0a067…`. Charged here: after decode, before any
+    // per-record work, and before the per-stream label bounds — but NOT before
+    // the `AnyValue` depth cap. Both transports charge that cap inside decode
+    // (`otlp_prescan::prescan_logs` for protobuf, `otlp_json::AnyValueSeed`
+    // for JSON) and `ensure_logs_anyvalue_depth` above repeats it, so a
+    // record-less body that ALSO nests an attribute past
+    // `MAX_ANYVALUE_DEPTH` answers `400` here where the reference answers this
+    // `422`. Measured on both transports, and present on the branch point
+    // `5969a94` too — the depth cap is a PulsusDB-only bound the reference has
+    // no equivalent of, so its ordering against this check is ours to state,
+    // not the reference's to dictate. Ledger residual 6 (`ingest-label-bounds`).
+    if req
+        .resource_logs
+        .iter()
+        .all(|rl| rl.scope_logs.iter().all(|sl| sl.log_records.is_empty()))
+    {
+        return Err(LogsIngestError::MissingStreams);
+    }
+
     let mut out = ParsedLogs::default();
     // Dedups stream registration within this request by `(fingerprint,
     // month)` (architect plan amendment) — a fingerprint-only key would
@@ -150,12 +199,69 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
     let mut seen_streams: HashSet<(Fingerprint, Date)> = HashSet::new();
 
     for resource_logs in &req.resource_logs {
+        // Stream labels are the resource's attributes ONLY (scope is
+        // structured metadata, not a stream label; issue #109), so there is
+        // exactly one label set per `ResourceLogs` — built once here rather
+        // than re-derived for every scope, and never per record.
+        let resource_attrs = resource_logs
+            .resource
+            .as_ref()
+            .map(|resource| resource.attributes.as_slice())
+            .unwrap_or(&[]);
+        let (labels, collisions) = build_stream_labels(resource_attrs)?;
+        // `WithoutEmpty` + the four per-stream label bounds (issue #374).
+        // `WithoutEmpty` is applied inside `build_stream_labels` above, before
+        // `from_normalized`, because the reference drops empty values before
+        // hashing on this transport too — its OTLP translation renders a label
+        // literal (`pkg/loghttp/push/otlp.go:244 @ v3.7.4`) which the
+        // distributor re-parses through `syntax.ParseLabels`
+        // (`distributor.go:1370 @ v3.7.4`).
+        //
+        // The four bounds, though, are charged on a SUBSET, selected from the
+        // RAW attribute names: upstream splits a resource's attributes in two
+        // (`otlp.go:180-212 @ v3.7.4`) by calling
+        // `otlpConfig.ActionForResourceAttribute(k)` on the wire key `k` and
+        // only then canonicalizing it with `attributeToLabels`
+        // (`otlp.go:193,610-614 @ v3.7.4`). The 18 names in
+        // `distributor.otlp.default_resource_attributes_as_index_labels`
+        // (`pkg/loghttp/push/otlp_config.go:56-73 @ v3.7.4`) become stream
+        // labels, and every other attribute becomes structured metadata, which
+        // `ValidateLabels` never sees. PulsusDB indexes them all (issue #109),
+        // so charging the bounds on our whole set would refuse ordinary OTLP
+        // payloads the reference accepts: measured against
+        // `grafana/loki@sha256:87f0a067…`, a resource carrying `app` with a
+        // 2049-byte value, or 16 arbitrary attributes, answers `204` there and
+        // stores the attribute as structured metadata. So would selecting on
+        // the CANONICALIZED name: `{service_name: "x"*2049}` is `204` there,
+        // because the raw key `service_name` is not one of the 18 — only
+        // `service.name` is. Selecting on the raw names reproduces its answer
+        // either way, so `attr_pairs` is re-walked here rather than the built
+        // `LabelSet` being filtered.
+        //
+        // The remainder is not left unbounded upstream — it lands under the
+        // structured-metadata limits at `ValidateEntry` (64 kB and 128 entries
+        // per line, `pkg/validation/limits.go:60-61 @ v3.7.4`) — but those are
+        // per-entry limits on data PulsusDB stores as stream labels, so mapping
+        // them belongs with the #109 attribute-placement decision, not here.
+        //
+        // A breach drops this resource's streams and is reported as a `400`
+        // after the rest of the request is written (`distributor.go:645-655,
+        // 780-790, 929`), not as a whole-request `Err` and not as a per-record
+        // partial-success drop. Skipped when the resource carries no records at
+        // all: upstream skips an entry-less stream before validating it
+        // (`pkg/distributor/distributor.go:639-641 @ v3.7.4`).
+        let has_records = resource_logs
+            .scope_logs
+            .iter()
+            .any(|scope_logs| !scope_logs.log_records.is_empty());
+        if has_records
+            && let Err(err) =
+                log_label_limits::validate_otlp_index_labels(attr_pairs(resource_attrs)?)
+        {
+            out.stream_errors.push(err.to_string());
+            continue;
+        }
         for scope_logs in &resource_logs.scope_logs {
-            // Stream labels + fingerprint computed once per ScopeLogs
-            // (resource attributes ONLY — scope is structured metadata, not
-            // a stream label; issue #109), reused across every record in it —
-            // never re-derived per record.
-            let (labels, collisions) = build_stream_labels(resource_logs.resource.as_ref())?;
             out.collisions += collisions as u64;
             let fingerprint = stream_fingerprint(&labels);
             let service = labels.service().to_string();
@@ -264,8 +370,10 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
 /// is a pure function of the resource labels — a stream pushed with vs.
 /// without scope fingerprints identically, exactly as Loki does.
 ///
-/// An EMPTY-VALUED attribute is dropped ([`retain_non_empty_values`], issue
-/// #259): the reference's OTLP path collects the promoted labels into a map
+/// An EMPTY-VALUED attribute is dropped (issue #259 — pair-wise, the
+/// [`pulsus_model::retain_non_empty_values`] rule, applied inside
+/// [`log_label_limits::StreamLabels::from_pairs`] so that issue #374's bounds
+/// are charged on the survivors): the reference's OTLP path collects the promoted labels into a map
 /// and renders it back into a label-set literal
 /// (`pkg/loghttp/push/otlp.go:240-250 @ v3.7.4`) that the distributor
 /// re-parses with `syntax.ParseLabels`/`WithoutEmpty`
@@ -293,11 +401,18 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
 /// `from_normalized` to resolve exactly as it did before #259. By-name would
 /// NOT have been neutral — it would drop both twins and change a case the
 /// reference keeps.
-fn build_stream_labels(resource: Option<&Resource>) -> Result<(LabelSet, usize), LogsIngestError> {
-    let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    let mut pairs = attr_pairs(resource_attrs)?;
-    retain_non_empty_values(&mut pairs);
-    Ok(LabelSet::from_normalized(pairs))
+fn build_stream_labels(resource_attrs: &[KeyValue]) -> Result<(LabelSet, usize), LogsIngestError> {
+    // `StreamLabels::from_pairs` applies `WithoutEmpty` (issue #374) BEFORE
+    // `from_normalized`: an empty-valued resource attribute is neither
+    // validated nor stored, so it cannot change the stream's fingerprint and
+    // cannot win a normalized-key collision. The reference drops it in
+    // `parseStreamLabels`, which this transport reaches too — its OTLP
+    // translation renders a label literal that the distributor re-parses
+    // through `syntax.ParseLabels` (`pkg/loghttp/push/otlp.go:244`,
+    // `pkg/distributor/distributor.go:1370 @ v3.7.4`).
+    Ok(LabelSet::from_normalized(
+        log_label_limits::StreamLabels::from_pairs(attr_pairs(resource_attrs)?).into_pairs(),
+    ))
 }
 
 /// Builds the per-entry structured-metadata JSON String carrying a log
@@ -575,6 +690,7 @@ mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
     use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+    use opentelemetry_proto::tonic::resource::v1::Resource;
 
     /// The `AnyValue` depth guard (finding #54) made `super::parse` fallible.
     /// Every legacy assertion below constructs shallow, in-bounds requests, so
@@ -597,12 +713,7 @@ mod tests {
     /// fallible. Every caller of this shim uses admissible keys; the
     /// dedicated rejection tests call `super::parse` and observe the `Err`.
     fn stream_labels(attributes: Vec<KeyValue>) -> (LabelSet, usize) {
-        build_stream_labels(Some(&Resource {
-            attributes,
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        }))
-        .expect("test resource attribute keys are admissible")
+        build_stream_labels(&attributes).expect("test resource attribute keys are admissible")
     }
 
     fn string_body(s: &str) -> Option<AnyValue> {
@@ -628,10 +739,16 @@ mod tests {
         }
     }
 
+    /// An empty request used to parse to empty output and answer `200`;
+    /// issue #374 made it the reference's `422`. The rule and every shape of
+    /// it are pinned in
+    /// [`parse_rejects_a_request_with_no_log_records`]; this case stays as
+    /// the one that used to assert the opposite, so the change is visible
+    /// where the old contract was written down.
     #[test]
-    fn parse_of_empty_request_returns_empty_output() {
-        let out = parse(&request(vec![]), 1_000);
-        assert_eq!(out, ParsedLogs::default());
+    fn parse_of_empty_request_is_a_stream_less_request() {
+        let err = super::parse(&request(vec![]), 1_000).expect_err("no log records");
+        assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
     }
 
     #[test]
@@ -1959,5 +2076,630 @@ mod tests {
         }]);
         let err = super::parse(&req, 0).expect_err("over-depth resource attribute is rejected");
         assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
+    }
+
+    // -- per-stream label rules (issue #374) -------------------------------
+    //
+    // The OTLP logs path reaches the same validator upstream — its
+    // `/otlp/v1/logs` handler funnels into `Distributor.PushWithResolver` ->
+    // `parseStreamLabels` -> `ValidateLabels` like `/loki/api/v1/push`
+    // (`pkg/distributor/http.go:28-33 @ v3.7.4`) — but not with the same data:
+    // only the 18 attributes in
+    // `distributor.otlp.default_resource_attributes_as_index_labels` become
+    // stream labels there, and the rest become structured metadata
+    // (`pkg/loghttp/push/otlp_config.go:56-73`, `otlp.go:180-212 @ v3.7.4`).
+    // PulsusDB indexes them all (#109), so the bounds are charged on the subset
+    // the reference indexes; these cases pin both halves of that, each measured
+    // against `grafana/loki@sha256:87f0a067…`.
+
+    fn logs_with_resource_attrs(attrs: Vec<KeyValue>) -> ExportLogsServiceRequest {
+        request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: attrs,
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("hello"),
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        }])
+    }
+
+    fn attr(key: &str, value: &str) -> KeyValue {
+        kv(key, Value::StringValue(value.to_string()))
+    }
+
+    fn only_stream_error(out: &ParsedLogs) -> &str {
+        assert!(out.rows.is_empty(), "a rejected stream contributes no rows");
+        assert_eq!(out.stream_errors.len(), 1, "{:?}", out.stream_errors);
+        &out.stream_errors[0]
+    }
+
+    /// The 18 OTel keys the reference indexes, minus `service.name` (which the
+    /// count bound discounts) — enough to build a 15/16 edge.
+    const INDEXED: [&str; 17] = [
+        "service.namespace",
+        "service.instance.id",
+        "deployment.environment",
+        "deployment.environment.name",
+        "cloud.region",
+        "cloud.availability_zone",
+        "k8s.cluster.name",
+        "k8s.namespace.name",
+        "k8s.pod.name",
+        "k8s.container.name",
+        "container.name",
+        "k8s.replicaset.name",
+        "k8s.deployment.name",
+        "k8s.statefulset.name",
+        "k8s.daemonset.name",
+        "k8s.cronjob.name",
+        "k8s.job.name",
+    ];
+
+    fn indexed(n: usize) -> Vec<KeyValue> {
+        INDEXED[..n].iter().map(|k| attr(k, "v")).collect()
+    }
+
+    /// Issue #374: a request carrying no log records converts to an EMPTY
+    /// push request upstream (`ld.LogRecordCount() == 0`,
+    /// `pkg/loghttp/push/otlp.go:144-146 @ v3.7.4`), which the distributor
+    /// then refuses with `422` (`distributor.go:579-581 @ v3.7.4`). All four
+    /// shapes of "no records" measure `422` on
+    /// `grafana/loki@sha256:87f0a067…`, including the one the review found —
+    /// a resource with attributes and an empty `logRecords`.
+    #[test]
+    fn parse_rejects_a_request_with_no_log_records() {
+        let empty_scope = ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![attr("service.name", "probe")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![])],
+            schema_url: String::new(),
+        };
+        let no_scopes = ResourceLogs {
+            scope_logs: vec![],
+            ..empty_scope.clone()
+        };
+        for req in [
+            request(vec![]),
+            request(vec![no_scopes]),
+            request(vec![empty_scope.clone()]),
+            request(vec![empty_scope.clone(), empty_scope]),
+        ] {
+            let err = super::parse(&req, 0).expect_err("no log records");
+            assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                "error at least one valid stream is required for ingestion"
+            );
+        }
+    }
+
+    /// The discriminating neighbour: one record anywhere in the request is
+    /// enough, even in a resource that carries no attributes at all (measured
+    /// `204` upstream — its own `service_name` discovery gives that resource a
+    /// label), and even when a record-less resource sits beside it.
+    #[test]
+    fn parse_accepts_a_request_whose_records_are_all_in_one_resource() {
+        let empty = ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![attr("service.name", "empty")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![])],
+            schema_url: String::new(),
+        };
+        let full = ResourceLogs {
+            resource: None,
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("hello"),
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        };
+        let out = super::parse(&request(vec![empty, full]), 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    /// Issue #374, ledger residual 6: the `AnyValue` depth cap is charged
+    /// BEFORE the stream-less check, so a request that is both record-less
+    /// and over-deep is the depth `400`, not the `422`. The reference has no
+    /// depth cap and answers `422` for this body — measured on both
+    /// transports against `grafana/loki@sha256:87f0a067…`.
+    ///
+    /// This pins `parse`'s OWN order only. On the wire the cap is charged
+    /// earlier still, inside decode, so `parse`'s guard never gets the chance
+    /// — the wire order is pinned by
+    /// `ingest::http::tests::a_record_less_over_deep_request_is_400_not_the_stream_less_422`
+    /// and by the harness's `*-over-deep-attr` cases. Both layers are worth
+    /// pinning: this one keeps a direct library caller of `parse` on the same
+    /// rule the wire has.
+    ///
+    /// The at-cap neighbour below is the discriminator: one level shallower,
+    /// the same record-less shape, and it *does* reach the `422` — so this
+    /// test cannot pass merely because the request is record-less.
+    #[test]
+    fn the_depth_cap_outranks_the_stream_less_check() {
+        let over_deep = |levels| {
+            request(vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "deep".to_string(),
+                        value: Some(nested_body(levels)),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                // No records anywhere: on its own this is `MissingStreams`.
+                scope_logs: vec![simple_scope_logs(vec![])],
+                schema_url: String::new(),
+            }])
+        };
+        let err = super::parse(
+            &over_deep(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1),
+            0,
+        )
+        .expect_err("record-less AND over-deep");
+        assert!(
+            matches!(err, LogsIngestError::OversizeMessage { .. }),
+            "depth cap must win over MissingStreams, got {err:?}"
+        );
+        let err = super::parse(
+            &over_deep(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH),
+            0,
+        )
+        .expect_err("record-less, within the depth cap");
+        assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
+    }
+
+    #[test]
+    fn parse_rejects_an_indexed_attribute_value_over_2048_bytes() {
+        let value = "b".repeat(2049);
+        let req = logs_with_resource_attrs(vec![attr("k8s.pod.name", &value)]);
+        let out = super::parse(&req, 0).unwrap();
+        assert_eq!(
+            only_stream_error(&out),
+            format!("stream '{{k8s_pod_name=\"{value}\"}}' has label value too long: '{value}'")
+        );
+    }
+
+    #[test]
+    fn parse_accepts_an_indexed_attribute_value_at_2048_bytes() {
+        let req = logs_with_resource_attrs(vec![attr("k8s.pod.name", &"b".repeat(2048))]);
+        assert_eq!(super::parse(&req, 0).unwrap().rows.len(), 1);
+    }
+
+    /// The other half, and the one that made the previous implementation
+    /// narrower than the reference: an attribute the reference does not index
+    /// is structured metadata there, so no bound applies to it. Measured on
+    /// `grafana/loki@sha256:87f0a067…`: a resource carrying `app` with a
+    /// 2049-byte value answers `204` and stores it as structured metadata.
+    #[test]
+    fn a_non_indexed_attribute_is_outside_every_bound() {
+        for (key, value) in [
+            ("app".to_string(), "b".repeat(2049)),
+            ("a".repeat(1025), "v".to_string()),
+        ] {
+            let req = logs_with_resource_attrs(vec![attr(&key, &value)]);
+            let out = super::parse(&req, 0).unwrap();
+            assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+            assert_eq!(out.rows.len(), 1);
+        }
+        // ...and 16 arbitrary attributes is a `204` upstream, not a `400`.
+        let attrs: Vec<KeyValue> = (0..16).map(|i| attr(&format!("l{i}"), "v")).collect();
+        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    /// ...but a non-indexed attribute is still STORED as a stream label here
+    /// (issue #109), which is what makes the subset the bound is charged on
+    /// different from the set that is stored.
+    #[test]
+    fn a_non_indexed_attribute_is_still_stored_as_a_stream_label() {
+        let req = logs_with_resource_attrs(vec![attr("app", "checkout")]);
+        let out = super::parse(&req, 0).unwrap();
+        assert_eq!(out.streams[0].labels.get("app"), Some("checkout"));
+    }
+
+    #[test]
+    fn parse_rejects_sixteen_indexed_attributes_and_accepts_fifteen() {
+        assert_eq!(
+            super::parse(&logs_with_resource_attrs(indexed(15)), 0)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        let out = super::parse(&logs_with_resource_attrs(indexed(16)), 0).unwrap();
+        assert!(only_stream_error(&out).ends_with("' has 16 label names; limit 15"));
+        // `service.name` canonicalizes to `service_name`, which is indexed but
+        // not counted (`validator.go:169-174 @ v3.7.4`).
+        let mut with_service = indexed(15);
+        with_service.push(attr("service.name", "checkout"));
+        assert_eq!(
+            super::parse(&logs_with_resource_attrs(with_service), 0)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+    }
+
+    /// Non-indexed attributes do not count towards the 15 either, so 15
+    /// indexed plus any number of others is accepted — the case an ordinary
+    /// OTLP shipper actually sends.
+    #[test]
+    fn non_indexed_attributes_do_not_count_towards_the_label_bound() {
+        let mut attrs = indexed(15);
+        attrs.extend((0..40).map(|i| attr(&format!("extra{i}"), "v")));
+        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert_eq!(out.streams[0].labels.len(), 55);
+    }
+
+    /// `pkg/distributor/distributor.go:639-641 @ v3.7.4` skips an entry-less
+    /// stream before validating it. The over-wide resource needs a
+    /// record-carrying sibling to be observed at all: alone it would make the
+    /// whole request stream-less, which is the `422` above, not this rule.
+    /// Measured on `grafana/loki@sha256:87f0a067…` as `204` (case
+    /// `otlp/record-less-over-wide-resource+good`).
+    #[test]
+    fn a_resource_with_no_records_skips_the_label_bounds() {
+        let req = request(vec![
+            ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![attr("k8s.pod.name", &"b".repeat(4096))],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![simple_scope_logs(vec![])],
+                schema_url: String::new(),
+            },
+            ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![attr("service.name", "good")],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: string_body("hello"),
+                    ..Default::default()
+                }])],
+                schema_url: String::new(),
+            },
+        ]);
+        let out = super::parse(&req, 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert!(out.stream_errors.is_empty());
+    }
+
+    /// Scope attributes are structured metadata, not stream labels (#109), so
+    /// they are outside the bound — matching upstream, whose OTLP translation
+    /// puts them in structured metadata too.
+    #[test]
+    fn scope_attributes_are_not_subject_to_the_stream_label_bounds() {
+        let req = request(vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "s".to_string(),
+                    version: String::new(),
+                    attributes: vec![attr("wide", &"b".repeat(4096))],
+                    dropped_attributes_count: 0,
+                }),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: string_body("hello"),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }]);
+        assert_eq!(super::parse(&req, 0).unwrap().rows.len(), 1);
+    }
+
+    /// `WithoutEmpty` reaches this transport too — the reference's OTLP
+    /// translation renders a label literal that `parseStreamLabels` re-parses
+    /// (`pkg/loghttp/push/otlp.go:244`, `distributor.go:1370 @ v3.7.4`) — so an
+    /// empty-valued resource attribute must not reach the stored label set or
+    /// the fingerprint. Applies to indexed and non-indexed attributes alike,
+    /// since the drop is about storage, not about the bounds.
+    #[test]
+    fn an_empty_valued_resource_attribute_is_absent_from_the_stored_stream() {
+        let with_empty = super::parse(
+            &logs_with_resource_attrs(vec![
+                attr("service.name", "checkout"),
+                attr("ignored", ""),
+                attr("k8s.pod.name", ""),
+            ]),
+            0,
+        )
+        .unwrap();
+        let without = super::parse(
+            &logs_with_resource_attrs(vec![attr("service.name", "checkout")]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(with_empty.streams[0].labels.get("ignored"), None);
+        assert_eq!(with_empty.streams[0].labels.get("k8s_pod_name"), None);
+        assert_eq!(with_empty.streams[0].labels, without.streams[0].labels);
+        assert_eq!(
+            with_empty.streams[0].fingerprint,
+            without.streams[0].fingerprint
+        );
+    }
+
+    /// ...and an empty-valued indexed attribute is neither counted nor
+    /// length-checked, so 15 indexed attributes plus empty-valued ones are
+    /// accepted.
+    #[test]
+    fn empty_valued_indexed_attributes_are_not_counted() {
+        let mut attrs = indexed(15);
+        attrs.push(attr("k8s.job.name", ""));
+        attrs.push(attr("service.name", ""));
+        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert_eq!(out.streams[0].labels.len(), 15);
+    }
+
+    /// `validator.go:164-167 @ v3.7.4` exempts a stream whose *index labels*
+    /// carry `__pattern__`/`__aggregated_metric__`. An OTLP resource attribute
+    /// of that name is not indexed upstream — it is structured metadata — so
+    /// the exemption is unreachable from this transport on both sides, and 16
+    /// indexed attributes are still refused when one is present. Measured on
+    /// `grafana/loki@sha256:87f0a067…`.
+    #[test]
+    fn an_internal_label_from_a_resource_attribute_does_not_exempt_the_stream() {
+        for internal in ["__aggregated_metric__", "__pattern__"] {
+            let mut attrs = indexed(16);
+            attrs.push(attr(internal, "x"));
+            let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+            assert!(
+                only_stream_error(&out).ends_with("' has 16 label names; limit 15"),
+                "{internal}"
+            );
+        }
+    }
+
+    /// The reference writes the streams that passed and answers `400` after
+    /// them (`distributor.go:645-655, 780-790, 929 @ v3.7.4`), so one
+    /// malformed resource must not cost a client the rest of its batch.
+    #[test]
+    fn a_bad_resource_costs_only_itself() {
+        let resource = |value: &str| ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![attr("k8s.pod.name", value)],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("hello"),
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        };
+        let req = request(vec![
+            resource("good"),
+            resource(&"b".repeat(2049)),
+            resource("also_good"),
+        ]);
+        let out = super::parse(&req, 0).unwrap();
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(out.streams.len(), 2);
+        assert_eq!(out.stream_errors.len(), 1);
+        assert!(out.stream_errors[0].contains("has label value too long"));
+    }
+
+    /// The subset is selected on the **raw** attribute name, which is what
+    /// `ActionForResourceAttribute` matches (`otlp.go:193 @ v3.7.4`, exact
+    /// string equality at `otlp_config.go:88-99`) before `attributeToLabels`
+    /// canonicalizes it. `service_name` is not one of the 18 raw names — only
+    /// `service.name` is — so upstream routes it to structured metadata and no
+    /// bound applies. Measured on `grafana/loki@sha256:87f0a067…`: a resource
+    /// carrying `{service_name: "x"*2049}` answers `204` there.
+    #[test]
+    fn a_raw_attribute_that_only_canonicalizes_into_an_index_name_is_not_bounded() {
+        let value = "x".repeat(2049);
+        for spelling in [
+            "service_name",
+            "service-name",
+            "k8s_pod_name",
+            "cloud-region",
+        ] {
+            let req = logs_with_resource_attrs(vec![attr(spelling, &value)]);
+            let out = super::parse(&req, 0).unwrap();
+            assert!(
+                out.stream_errors.is_empty(),
+                "{spelling}: {:?}",
+                out.stream_errors
+            );
+            assert_eq!(out.rows.len(), 1, "{spelling}");
+        }
+    }
+
+    /// The other direction of the same rule, over the reference's whole list
+    /// rather than one sample: every raw index name bounds, and the same name
+    /// with its separators already canonicalized does not.
+    #[test]
+    fn every_raw_index_name_bounds_and_its_canonical_spelling_does_not() {
+        let value = "x".repeat(2049);
+        let mut raw_index = INDEXED.to_vec();
+        raw_index.push("service.name");
+        for raw in raw_index {
+            let out = super::parse(&logs_with_resource_attrs(vec![attr(raw, &value)]), 0).unwrap();
+            assert_eq!(out.stream_errors.len(), 1, "{raw} must be bounded");
+            assert!(
+                out.stream_errors[0].contains("has label value too long"),
+                "{raw}"
+            );
+
+            let canonical = raw.replace('.', "_");
+            let out =
+                super::parse(&logs_with_resource_attrs(vec![attr(&canonical, &value)]), 0).unwrap();
+            assert!(
+                out.stream_errors.is_empty(),
+                "{canonical} must not be bounded: {:?}",
+                out.stream_errors
+            );
+        }
+    }
+
+    /// A near-miss spelling is not counted towards the 15 either, so 15 raw
+    /// index attributes alongside a full set of underscored look-alikes is
+    /// accepted — and all of them are still stored as stream labels (#109).
+    #[test]
+    fn near_miss_spellings_are_stored_but_not_counted() {
+        let mut attrs = indexed(15);
+        attrs.extend(
+            INDEXED
+                .iter()
+                .map(|k| attr(&k.replace('.', "_"), "v"))
+                .collect::<Vec<_>>(),
+        );
+        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        // The 15 raw and the 17 underscored spellings canonicalize onto the
+        // same 17 label names, so the stored set is 17 wide.
+        assert_eq!(out.streams[0].labels.len(), 17);
+    }
+
+    /// The gap the bounds do not cover, pinned on **stored state** rather than
+    /// on the wire verdict (issue #374 round-3 review; adjudicated to #109).
+    ///
+    /// The wire verdict agrees with the reference:
+    /// `{service.name: "ok", service_name: "x"*2049}` is accepted by both,
+    /// because upstream matches the raw dotted name and routes the underscored
+    /// one to structured metadata, which no bound reaches. Storage does not
+    /// agree. We index every resource attribute (#109), both spellings
+    /// canonicalize onto `service_name`, and `from_normalized`'s frozen
+    /// collision rule (#4) keeps the greatest *original* key — `_` (0x5F)
+    /// sorts after `.` (0x2E) — so the **unvalidated** near-miss wins and a
+    /// 2049-byte value is stored under the label the validator passed at two
+    /// bytes. Both the stored value and the stream's identity follow the
+    /// winner, which is why this asserts labels and fingerprint: four rounds
+    /// of oracle status comparison could not see it.
+    #[test]
+    fn an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value() {
+        let wide = "x".repeat(2049);
+        let out = super::parse(
+            &logs_with_resource_attrs(vec![
+                attr("service.name", "ok"),
+                attr("service_name", &wide),
+            ]),
+            0,
+        )
+        .unwrap();
+
+        // Accepted: only the raw `service.name` is charged, and "ok" is in
+        // bounds. This half is parity — the oracle answers 204.
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+
+        // The stored label is one collapsed `service_name`, holding the value
+        // no bound was charged on.
+        let stored = &out.streams[0].labels;
+        assert_eq!(stored.len(), 1, "both spellings collapse onto one label");
+        assert_eq!(stored.get("service_name"), Some(wide.as_str()));
+        assert!(
+            stored.get("service_name").map(str::len)
+                > Some(log_label_limits::MAX_LABEL_VALUE_BYTES),
+            "an indexed, stored label wider than the bound this module introduces"
+        );
+
+        // The identity follows the winner too: this stream is the one a bare
+        // over-wide `service_name` push produces, not the `{service_name="ok"}`
+        // the bound was charged on.
+        let near_miss_alone = super::parse(
+            &logs_with_resource_attrs(vec![attr("service_name", &wide)]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.streams[0].fingerprint, near_miss_alone.streams[0].fingerprint,
+            "the unvalidated value fixes the stream's identity"
+        );
+        let validated = super::parse(
+            &logs_with_resource_attrs(vec![attr("service.name", "ok")]),
+            0,
+        )
+        .unwrap();
+        assert_ne!(
+            out.streams[0].fingerprint, validated.streams[0].fingerprint,
+            "the validated value does not"
+        );
+    }
+
+    /// The same shape reaches the other two bounds, so the gap is not specific
+    /// to the value length: a near-miss spelling carries an over-long label
+    /// *name* into storage, and near-miss spellings that do not collide take
+    /// the stored label count past `MAX_LABEL_NAMES_PER_STREAM`.
+    #[test]
+    fn near_miss_spellings_store_labels_past_the_name_and_count_bounds() {
+        let long_name = format!("k8s.{}", "n".repeat(1025));
+        let out = super::parse(
+            &logs_with_resource_attrs(vec![attr("service.name", "ok"), attr(&long_name, "v")]),
+            0,
+        )
+        .unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        let stored_name = long_name.replace('.', "_");
+        assert!(
+            out.streams[0].labels.get(&stored_name).is_some()
+                && stored_name.len() > log_label_limits::MAX_LABEL_NAME_BYTES,
+            "an indexed, stored label name longer than the bound"
+        );
+
+        // 15 raw index attributes pass the count bound; the 17 underscored
+        // look-alikes are not counted, and 15 of them do not collide with the
+        // 15 raw ones either — the stored set is 17 wide.
+        let mut attrs = indexed(15);
+        attrs.extend(INDEXED.iter().map(|k| attr(&k.replace('.', "_"), "v")));
+        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert!(
+            out.streams[0].labels.len() > log_label_limits::MAX_LABEL_NAMES_PER_STREAM,
+            "stored label count {} is past the bound",
+            out.streams[0].labels.len()
+        );
+    }
+
+    /// One label set per `ResourceLogs`, so a resource with several scopes
+    /// reports its breach once, not once per scope — the reference builds one
+    /// `logproto.Stream` per resource label set too.
+    #[test]
+    fn a_breach_is_reported_once_per_resource_not_once_per_scope() {
+        let record = || LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            body: string_body("hello"),
+            ..Default::default()
+        };
+        let req = request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![attr("k8s.pod.name", &"b".repeat(2049))],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![
+                simple_scope_logs(vec![record()]),
+                simple_scope_logs(vec![record()]),
+                simple_scope_logs(vec![record()]),
+            ],
+            schema_url: String::new(),
+        }]);
+        let out = super::parse(&req, 0).unwrap();
+        assert_eq!(out.stream_errors.len(), 1);
+        assert!(out.rows.is_empty());
     }
 }
