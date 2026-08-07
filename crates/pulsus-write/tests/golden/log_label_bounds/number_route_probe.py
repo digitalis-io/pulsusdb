@@ -148,8 +148,9 @@ EXPONENT = (
     ("underflow", "1e-999", "skipNumber", 204, 204),
     ("denormal-min", "5e-324", "skipNumber", 204, 204),
     # Zero is finite in BOTH widths, which is why these two are 204 whichever
-    # reader takes them -- and why no probe over this group could have shown
-    # the dispatch in a status (issue #374 round 19).
+    # reader takes them -- so nothing in this group's status column is
+    # attributable to the dispatch, which is what round 19 of issue #374 got
+    # wrong.  The F32 group below is where the two readers separate.
     ("zero-exp", "0e999", "ReadFloat32", 204, 204),
     ("zero-exp-neg", "-0e999", "skipNumber", 204, 204),
     # No exponent: a short digits-only run, skipped unevaluated where it fits
@@ -277,45 +278,43 @@ def raw_post(target, body, framing, delay):
             pass
     finally:
         sock.close()
-    # Exactly an HTTP/1.1 status line, field by field.  A peer that answers
-    # something else is not a cell of this matrix and must not be read as one,
-    # and `status-line = HTTP-version SP status-code SP [ reason-phrase ]`
-    # (RFC 9112 s4) has three fields plus the CRLF that delimits it, each of
-    # which can be malformed on its own.  All of them, and what catches each,
-    # measured against a stub responder answering a fixed line:
+    # Enough of the status line to say whether this peer took the push -- NOT
+    # an HTTP parser and not a parse of RFC 9112's grammar.  This is a probe's
+    # preflight gate: it exists so that "am I talking to a server that accepted
+    # this?" is answered before 780 cells are allowed to mean anything, and
+    # nothing but this script reads it.
     #
-    #   nothing, or no CRLF at all  -> `no response from` above (recv b"")
-    #   fewer than two tokens       -> len(parts) < 2       ("", "HTTP/1.1")
-    #   the version                 -> == b"HTTP/1.1"       ("HTTP/1.0 204 x",
-    #                                                        "204 No Content")
-    #   the separator               -> split on ONE b" "    ("HTTP/1.1\t204 x")
-    #   the status, not a number    -> isdigit              ("HTTP/1.1 abc x")
-    #   the status, wrong width     -> len(...) == 3        ("0204", "204000",
-    #                                                        "20", "2040")
-    #   the status, wrong value     -> the CALLER's one     ("200", "100")
-    #                                  expected value: preflight demands 204
-    #                                  and a matrix cell its own pair, so an
-    #                                  interim 1xx or a 200 is refused there
-    #                                  rather than here
-    #   the reason phrase           -> NOT checked: RFC 9112 s4 makes it
-    #                                  arbitrary, so "HTTP/1.1 204" with none
-    #                                  is a valid answer and stays accepted
+    # CHECKED here: the first token is exactly b"HTTP/1.1", and the second is
+    # exactly three ASCII digits -- `bytes.isdigit` is ASCII-only, unlike
+    # `str.isdigit` with its superscripts and other Unicode digits, and `buf`
+    # is never decoded.  Width plus digits is what makes `int()` faithful:
+    # `int(parts[1]) == 204` iff `parts[1] == b"204"`.  The VALUE is then
+    # checked by each caller against its own one expected number, so an
+    # interim 1xx or a 200 is refused by `preflight` or by a cell's expected
+    # pair rather than in here.  A line that never arrives is caught above, by
+    # the `no response from` exit.
     #
-    # There is no ninth row.  Four of the eight are the grammar's own parts
-    # -- the version, the separator, the status code (three rows, one per way
-    # a code can be wrong) and the reason phrase -- and the other two are the
-    # two ways the line fails to arrive at all: nothing on the socket, and a
-    # line too short to hold a code.  Descent stops at `bytes.isdigit`,
-    # which is ASCII-only -- unlike `str.isdigit`, which accepts superscripts
-    # and other Unicode digits; `buf` is bytes and is never decoded.  The
-    # headers and body after the line are not parsed at all, deliberately: a
-    # cell is the status and nothing else.
+    # DELIBERATELY NOT CHECKED, which is why this is not a parse of
+    # `status-line = HTTP-version SP status-code SP [ reason-phrase ]`
+    # (RFC 9112 s4): the SP after the code, which that grammar makes mandatory
+    # even when the phrase is empty -- so `HTTP/1.1 204\r\n` is malformed by
+    # the RFC and is accepted here; the reason-phrase bytes, including ones the
+    # RFC forbids, such as `HTTP/1.1 204 \x00`; and the headers and the body,
+    # which are not looked at at all.  A cell is the status.
     #
-    # Width plus digits is what makes `int()` faithful.  `.isdigit()` alone
-    # accepted `0204` and `00000000204` as 204 (measured: both passed
-    # `preflight`), so the returned int was not the status token.  With
-    # exactly three ASCII digits, `int(parts[1]) == 204` iff
-    # `parts[1] == b"204"`.
+    # Measured, each against a stub responder answering one fixed line:
+    #
+    #   len(parts) < 2      ""; "HTTP/1.1"
+    #   the version token   "204 No Content"; "HTTP/1.0 204 No Content";
+    #                       "HTTP/1.1\t204 x" (the tab leaves the code inside
+    #                       token 0)
+    #   three ASCII digits  "HTTP/1.1  204 x" (double space -> empty token);
+    #                       "HTTP/1.1 20 x"; and the four that `.isdigit()`
+    #                       plus `int()` USED to read as 204 -- "0204",
+    #                       "00000000204", "2040", "204000"
+    #   not a number        "HTTP/1.1 abc x"
+    #   the value           "HTTP/1.1 200 OK", "HTTP/1.1 100 Continue" --
+    #                       refused by preflight's 204, not by this function
     parts = buf.split(b"\r\n", 1)[0].split(b" ")
     if (
         len(parts) < 2
@@ -344,11 +343,12 @@ def preflight(delay):
     are all the same failure: the matrix would be measuring the environment
     rather than the two decoders.  Upstream's `/loki/api/v1/push` writes
     `w.WriteHeader(http.StatusNoContent)` on the success path
-    (`pkg/distributor/http.go:107,157 @ loki v3.7.4`) and PulsusDB's
+    (`pkg/distributor/http.go:108,158 @ loki v3.7.4`) and PulsusDB's
     `ingest_loki_push` answers the same `204`, so a `200` here means the port
     is answering something that is not this endpoint.  `raw_post` returns a
-    number only from a three-digit status token, so `204` here means the peer
-    wrote exactly `204` -- see the field-by-field note there.
+    number only from a three-ASCII-digit status token, so `204` here means the
+    peer wrote those three bytes -- see the note there for what that gate does
+    and does not look at.
 
     The two targets must also be DIFFERENT endpoints.  Every shape in the
     matrix expects the same status from both sides, so one server answering

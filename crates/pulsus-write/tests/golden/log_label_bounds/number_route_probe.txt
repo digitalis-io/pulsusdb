@@ -128,12 +128,15 @@ pair of servers plus a 40-line stub responder:
      b'fine']
      exit 1
 
-     THAT GATE IS A PARSE OF AN UNTRUSTED LINE, so it was re-run field by
-     field after round 21 found it looser than the sentence backing it: a
-     stub answering `HTTP/1.1 0204 malformed` passed both this gate and gate
-     2, because a digits-only test plus `int()` reads `0204` as 204. Every
-     field of `status-line = HTTP-version SP status-code SP [reason-phrase]`
-     (RFC 9112 s4), plus the two ways the line can fail to arrive, measured
+     THAT GATE IS A PARSE OF AN UNTRUSTED LINE, and round 21 found it looser
+     than the sentence backing it: a stub answering `HTTP/1.1 0204 malformed`
+     passed both this gate and gate 2, because a digits-only test plus
+     `int()` reads `0204` as 204. It is a preflight, not an HTTP parser: it
+     checks the `HTTP/1.1` version token, a three-ASCII-digit code, and -- at
+     each caller -- the one expected value. It does NOT check the SP that
+     `status-line = HTTP-version SP status-code SP [reason-phrase]` (RFC 9112
+     s4) makes mandatory after the code even when the phrase is empty, nor the
+     reason-phrase bytes, nor the headers, nor the body. What was measured
      against a stub answering a fixed line on both ports:
 
        peer sends junk with no CRLF, closes  no response from 127.0.0.1:…
@@ -151,18 +154,19 @@ pair of servers plus a 40-line stub responder:
        "HTTP/1.1 00000000204 x"              not an HTTP/1.1 status line
        "HTTP/1.1 200 OK"                     answered 200 …, not 204 (gate 2)
        "HTTP/1.1 100 Continue"               answered 100 …, not 204 (gate 2)
-       "HTTP/1.1 204"                        ACCEPTED -- no reason phrase is
-                                             a valid answer (RFC 9112 s4)
+       "HTTP/1.1 204"                        ACCEPTED -- the SP the RFC
+                                             requires after the code is not
+                                             one of the things checked
+       "HTTP/1.1 204 \x00"                   ACCEPTED -- nor are the
+                                             reason-phrase bytes
        "HTTP/1.1 204 No Content"             ACCEPTED
 
      The four rows starting `0204`, `00000000204`, `2040`, `204000` were the
      ones that passed before; the fix is a width check (exactly three ASCII
      digits) on top of the digit check, which is what makes `int()` faithful
-     -- `int(parts[1]) == 204` iff the token was literally `204`. There is no
-     further field: that list is the whole grammar plus the absence of the
-     line, and the status VALUE is checked by each caller against its own one
-     expected number, which is why a 1xx or a 200 is refused at gate 2 rather
-     than here.
+     -- `int(parts[1]) == 204` iff the token was literally `204`. The status
+     VALUE is checked by each caller against its own one expected number,
+     which is why a 1xx or a 200 is refused at gate 2 rather than here.
 
   4. the two endpoints being the same one -- every shape expects the same
      status from both sides, so one server on both ports would agree with
