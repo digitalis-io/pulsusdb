@@ -75,11 +75,14 @@ Reproduce:
   sed -n '/^RUN B/,/^#### end of generated/p' number_route_probe.txt \
       | sed 1d | diff - b.txt        # empty == run B reproduces
 
-Each of those two runs is SERIAL and takes 3m36s (measured), which is long
-enough to trip a per-command timeout in some harnesses. `--jobs N` puts N
-requests in flight at once and changes nothing else -- stdout is assembled
-from the cell dictionary after every cell is in. Measured on the servers
-below: `--jobs 16` finishes the same matrix in 18s and `diff` against the
+Each of those two runs is SERIAL and takes MINUTES, which is long enough to
+trip a per-command timeout in some harnesses. How many minutes is the host's
+number, not the probe's, so it is reported rather than claimed: A took 3:35.9
+and B 3:50.9 when this span was last reproduced, and the host that recorded
+the span timed A three times at 3:35.8-3:36.0. `--jobs N` puts N requests in
+flight at once and changes nothing else -- stdout is assembled from the cell
+dictionary after every cell is in. Measured on the servers below: `--jobs 16`
+finishes the same matrix in ~18s (18.27s last measured) and `diff` against the
 serial run's stdout is empty. The recipe above stays serial because that is
 what the two runs recorded here were made with.
 
@@ -125,6 +128,42 @@ pair of servers plus a 40-line stub responder:
      b'fine']
      exit 1
 
+     THAT GATE IS A PARSE OF AN UNTRUSTED LINE, so it was re-run field by
+     field after round 21 found it looser than the sentence backing it: a
+     stub answering `HTTP/1.1 0204 malformed` passed both this gate and gate
+     2, because a digits-only test plus `int()` reads `0204` as 204. Every
+     field of `status-line = HTTP-version SP status-code SP [reason-phrase]`
+     (RFC 9112 s4), plus the two ways the line can fail to arrive, measured
+     against a stub answering a fixed line on both ports:
+
+       peer sends junk with no CRLF, closes  no response from 127.0.0.1:…
+       ""                                    not an HTTP/1.1 status line
+       "HTTP/1.1"                            not an HTTP/1.1 status line
+       "204 No Content"                      not an HTTP/1.1 status line
+       "HTTP/1.0 204 No Content"             not an HTTP/1.1 status line
+       "HTTP/1.1\t204 No Content"            not an HTTP/1.1 status line
+       "HTTP/1.1  204 No Content"            not an HTTP/1.1 status line
+       "HTTP/1.1 abc x"                      not an HTTP/1.1 status line
+       "HTTP/1.1 20 x"                       not an HTTP/1.1 status line
+       "HTTP/1.1 2040 x"                     not an HTTP/1.1 status line
+       "HTTP/1.1 204000 x"                   not an HTTP/1.1 status line
+       "HTTP/1.1 0204 malformed"             not an HTTP/1.1 status line
+       "HTTP/1.1 00000000204 x"              not an HTTP/1.1 status line
+       "HTTP/1.1 200 OK"                     answered 200 …, not 204 (gate 2)
+       "HTTP/1.1 100 Continue"               answered 100 …, not 204 (gate 2)
+       "HTTP/1.1 204"                        ACCEPTED -- no reason phrase is
+                                             a valid answer (RFC 9112 s4)
+       "HTTP/1.1 204 No Content"             ACCEPTED
+
+     The four rows starting `0204`, `00000000204`, `2040`, `204000` were the
+     ones that passed before; the fix is a width check (exactly three ASCII
+     digits) on top of the digit check, which is what makes `int()` faithful
+     -- `int(parts[1]) == 204` iff the token was literally `204`. There is no
+     further field: that list is the whole grammar plus the absence of the
+     line, and the status VALUE is checked by each caller against its own one
+     expected number, which is why a 1xx or a 200 is refused at gate 2 rather
+     than here.
+
   4. the two endpoints being the same one -- every shape expects the same
      status from both sides, so one server on both ports would agree with
      itself 720 times
@@ -135,9 +174,13 @@ pair of servers plus a 40-line stub responder:
 
 The gates stop at what a preflight CAN see. A stub answering 204 to
 everything passes all four -- and is then caught by the matrix itself, which
-is the point of writing every cell's expected pair down: measured, that stub
-reports `exponent group … moved=180`, `f32 group … moved=72`, `total 780
-cells, moved=252`, exit 1.
+is the point of writing every cell's expected pair down: measured, with that
+stub on the pulsus port, `exponent group … moved=180`, `f32 group … moved=72`,
+`total 780 cells, moved=252`, exit 1. That 252 is checkable against the
+script and does not depend on the host: it is the seven shapes whose pulsus
+column is 400 (five in EXPONENT, two in F32) at 36 cells each, and none of
+the controls, whose pulsus column is 204 in all 60 cells by the registered
+length divergence.
 
 A manual capture -- NOT run in CI.
 
@@ -387,6 +430,16 @@ three more mutants, all run against these servers
    ctl-400-nines-at-112 and ctl-1000-nines stayed put, which is the other
    half -- coalescing moves only the cells whose verdict depends on framing.
 
+   THE 6 IS THIS RUN'S COUNT, NOT THE CLAIM. Whether a given connection's
+   writes actually coalesce with the pause removed is up to the host's kernel
+   and scheduler, so the moved count varies from run to run: runs here have
+   moved between 1 and 6 of ctl-400-nines-at-111's six chunked cells, and a
+   reviewer on another host measured 2, 1 and 6 across three runs. What does
+   NOT vary, and is what the mutant is for: the run exits 1, both shape groups
+   stay moved=0, ctl-400-nines-at-112 and ctl-1000-nines stay moved=0, and
+   every moved cell is a chunked at-111 cell -- the controls are the only
+   thing that catches a coalesced run.
+
 2. THE SHAPE COMPARATOR BITES. One expected verdict edited in the script
    (`lead0-under` from 204/204 to 400/400) and the matrix re-run unchanged:
 
@@ -405,10 +458,14 @@ three more mutants, all run against these servers
 
      with the group-tag test (shipped):   INSTRUMENT FAILURE printed,
                                           control boundary-400-nines-at-111
-                                          ... moved=6, exit 1
+                                          moved, exit 1
      with the name-prefix test (pre-fix): INSTRUMENT FAILURE lines: 0,
                                           control boundary-400-nines-at-111
-                                          ... moved=1, exit 1
+                                          moved, exit 1
 
    Same failure, same non-zero exit, and the pre-fix run does not say what
-   failed. Both mutations reverted; `cmp` against the pre-mutant copy clean.
+   failed. The moved COUNTS of those two runs differed (6 and 1) and are left
+   out on purpose: they are two runs of a host-timing-dependent mutant, per
+   the note under 1, and the count is not what discriminates the predicates --
+   the INSTRUMENT FAILURE line is, and exit codes alone never showed it. Both
+   mutations reverted; `cmp` against the pre-mutant copy clean.

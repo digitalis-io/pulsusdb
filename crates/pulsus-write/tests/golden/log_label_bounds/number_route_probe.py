@@ -57,10 +57,15 @@ accepted position in one write, which is why 111 passes and 112 does not;
 and a 256-byte first read cuts the same token short, which is why the
 chunked framings differ from the unchunked ones at 111.  A control cell that
 does not answer what that predicts exits 1 with INSTRUMENT FAILURE -- a
-message saying the instrument, not the subject, is what failed.  Measured:
-with the pause between chunks removed the writes coalesce, the 20 shapes
-still report 720 agreeing cells, and the at-111 control's six chunked cells
-are the only thing that catches it.
+message saying the instrument, not the subject, is what failed.  Measured
+with the pause removed (`--delay 0`): the 20 shapes still report 720 agreeing
+cells, and the only cells that move are chunked cells of the at-111 control.
+HOW MANY of its six is a property of the host -- whether the kernel coalesced
+that particular connection's writes -- and runs here have moved between 1 and
+6 of them, so the count is not the claim.  What does not vary is: the run
+exits 1, both shape groups stay at moved=0, at-112 and ctl-1000-nines stay
+put, and every moved cell is a chunked at-111 cell.  The controls are the
+only thing standing between a coalesced run and a green one.
 
 All three controls are the registered length divergence (ledger residual 10),
 so PulsusDB answers 204 to all 60 of their cells -- that is the divergence,
@@ -81,11 +86,14 @@ the probe refuses to run otherwise -- see `preflight`):
     LOKI_PORT=13375 PULSUS_PORT=18375 python3 number_route_probe.py \
         --stale-timestamps
 
-A serial run of the 780 cells takes 3m36s (measured), which is long enough to
-trip a per-command timeout in some harnesses.  `--jobs N` puts N requests in
-flight at once and does nothing else: stdout is assembled from the cell
-dictionary after every cell is in, so it is byte-identical to the serial run
--- measured, `--jobs 16` finishes in 18s and diffs clean against it.
+A serial run of the 780 cells takes MINUTES -- long enough to trip a
+per-command timeout in some harnesses.  (How many is the host's, not the
+probe's: measured here 3:35.9 for the live-timestamp run and 3:50.9 for the
+`--stale-timestamps` one; the recording host measured the first three times
+at 3:35.8-3:36.0.)  `--jobs N` puts N requests in flight at once and does
+nothing else: stdout is assembled from the cell dictionary after every cell
+is in, so it is byte-identical to the serial run -- measured, `--jobs 16`
+finishes in ~18s and diffs clean against it.
 
 Stdout is the whole measurement and nothing else, terminated by
 GENERATED_END; the ports, the chunk pause and the job count go to stderr so
@@ -269,11 +277,52 @@ def raw_post(target, body, framing, delay):
             pass
     finally:
         sock.close()
-    parts = buf.split(b"\r\n", 1)[0].split()
-    # Exactly an HTTP/1.1 status line.  A peer that answers something else is
-    # not a cell of this matrix and must not be read as one -- the same reason
-    # `preflight` below demands one status rather than a range.
-    if len(parts) < 2 or parts[0] != b"HTTP/1.1" or not parts[1].isdigit():
+    # Exactly an HTTP/1.1 status line, field by field.  A peer that answers
+    # something else is not a cell of this matrix and must not be read as one,
+    # and `status-line = HTTP-version SP status-code SP [ reason-phrase ]`
+    # (RFC 9112 s4) has three fields plus the CRLF that delimits it, each of
+    # which can be malformed on its own.  All of them, and what catches each,
+    # measured against a stub responder answering a fixed line:
+    #
+    #   nothing, or no CRLF at all  -> `no response from` above (recv b"")
+    #   fewer than two tokens       -> len(parts) < 2       ("", "HTTP/1.1")
+    #   the version                 -> == b"HTTP/1.1"       ("HTTP/1.0 204 x",
+    #                                                        "204 No Content")
+    #   the separator               -> split on ONE b" "    ("HTTP/1.1\t204 x")
+    #   the status, not a number    -> isdigit              ("HTTP/1.1 abc x")
+    #   the status, wrong width     -> len(...) == 3        ("0204", "204000",
+    #                                                        "20", "2040")
+    #   the status, wrong value     -> the CALLER's one     ("200", "100")
+    #                                  expected value: preflight demands 204
+    #                                  and a matrix cell its own pair, so an
+    #                                  interim 1xx or a 200 is refused there
+    #                                  rather than here
+    #   the reason phrase           -> NOT checked: RFC 9112 s4 makes it
+    #                                  arbitrary, so "HTTP/1.1 204" with none
+    #                                  is a valid answer and stays accepted
+    #
+    # There is no ninth row.  Four of the eight are the grammar's own parts
+    # -- the version, the separator, the status code (three rows, one per way
+    # a code can be wrong) and the reason phrase -- and the other two are the
+    # two ways the line fails to arrive at all: nothing on the socket, and a
+    # line too short to hold a code.  Descent stops at `bytes.isdigit`,
+    # which is ASCII-only -- unlike `str.isdigit`, which accepts superscripts
+    # and other Unicode digits; `buf` is bytes and is never decoded.  The
+    # headers and body after the line are not parsed at all, deliberately: a
+    # cell is the status and nothing else.
+    #
+    # Width plus digits is what makes `int()` faithful.  `.isdigit()` alone
+    # accepted `0204` and `00000000204` as 204 (measured: both passed
+    # `preflight`), so the returned int was not the status token.  With
+    # exactly three ASCII digits, `int(parts[1]) == 204` iff
+    # `parts[1] == b"204"`.
+    parts = buf.split(b"\r\n", 1)[0].split(b" ")
+    if (
+        len(parts) < 2
+        or parts[0] != b"HTTP/1.1"
+        or len(parts[1]) != 3
+        or not parts[1].isdigit()
+    ):
         sys.exit("not an HTTP/1.1 status line from %s:%d: %r" % (target + (parts,)))
     return int(parts[1])
 
@@ -297,7 +346,9 @@ def preflight(delay):
     `w.WriteHeader(http.StatusNoContent)` on the success path
     (`pkg/distributor/http.go:107,157 @ loki v3.7.4`) and PulsusDB's
     `ingest_loki_push` answers the same `204`, so a `200` here means the port
-    is answering something that is not this endpoint.
+    is answering something that is not this endpoint.  `raw_post` returns a
+    number only from a three-digit status token, so `204` here means the peer
+    wrote exactly `204` -- see the field-by-field note there.
 
     The two targets must also be DIFFERENT endpoints.  Every shape in the
     matrix expects the same status from both sides, so one server answering
@@ -373,11 +424,11 @@ def main():
         default=1,
         help="requests in flight at once (default 1, i.e. strictly serial -- "
         "which is what the recorded transcript was made with; the 780 cells "
-        "take 3m36s that way, which is long enough to hit a per-command "
+        "take minutes that way, which is long enough to hit a per-command "
         "timeout). Raising it changes only how long a run takes: stdout is "
         "assembled from the cell dictionary afterwards, so it is "
         "byte-identical either way -- measured, --jobs 16 finishes the same "
-        "matrix in 18s and its stdout diffs clean against the serial run. "
+        "matrix in ~18s and its stdout diffs clean against the serial run. "
         "Every cell is still its own connection with its own chunk pauses, "
         "and the controls still have to bite: if a parallel run reports "
         "INSTRUMENT FAILURE, lower --jobs before believing the shapes.",

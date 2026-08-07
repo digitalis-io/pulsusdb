@@ -3236,17 +3236,29 @@ mod tests {
     /// stream label name over hand-encoded snappy/protobuf (`400`), and an
     /// inadmissible structured-metadata name (`500`).
     ///
-    /// This walks one error of each class THIS handler can produce (decode,
+    /// This walks one error of each class THIS handler can produce — decode,
     /// oversize, backpressure, flush failure, inadmissible name, the
     /// stream-less `422`, and the stream-local label-bound `400` in both its
-    /// forms — nothing written and written-then-refused) so a future error
+    /// forms (nothing written, and written-then-refused) — so a future error
     /// path cannot quietly drop the terminator. The last three are issue
     /// #374's and go through [`loki_stream_errors_response`] rather than
     /// [`loki_error_response`], which is exactly why they are listed: they are
     /// the bodies a per-variant terminator would have missed. The
     /// inadmissible-name case additionally has its exact bytes pinned by
-    /// `loki_inadmissible_structured_metadata_name_is_400_on_both_encodings`,
-    /// since that is the one message whose text is the reference's.
+    /// `loki_inadmissible_structured_metadata_name_is_400_on_both_encodings`
+    /// — that is the one message whose text is the reference's — but a
+    /// separate test cannot make an enumeration complete, so the body is
+    /// carried HERE too rather than counted from over there.
+    ///
+    /// Why that list is all of them. Every error answer in
+    /// [`ingest_loki_push`] leaves through one of exactly three functions:
+    /// [`loki_error_response`] (the capped body read, the decode — which is
+    /// where both the inadmissible name and the stream-less `422` are
+    /// charged — and the flush failure), [`loki_stream_errors_response`], and
+    /// [`loki_backpressure_response`]. The cases below reach all three. The
+    /// two async-mode arms (`X-Pulsus-Async: 1`) answer through the same two
+    /// of those functions as the sync twins listed here, so they cannot carry
+    /// a different terminator; that closes the enumeration.
     #[tokio::test]
     async fn every_loki_push_error_body_is_lf_terminated() {
         let oversize = vec![0u8; decompress::MAX_DECOMPRESSED_BYTES + 1024];
@@ -3279,6 +3291,16 @@ mod tests {
                 "flush failure",
                 Outcome::FlushFails,
                 valid_loki_json_body(),
+                "application/json",
+            ),
+            // Issue #259's: an empty structured-metadata name, the one body
+            // whose exact bytes are the reference's.
+            (
+                "inadmissible structured-metadata name",
+                Outcome::Admit,
+                br#"{"streams":[{"stream":{"a":"b"},
+                    "values":[["1700000000000000000","hello",{"":""}]]}]}"#
+                    .to_vec(),
                 "application/json",
             ),
             // Issue #374's three: the stream-less 422 and the stream-local
