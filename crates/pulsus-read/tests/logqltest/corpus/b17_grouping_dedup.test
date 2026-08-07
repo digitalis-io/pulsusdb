@@ -82,7 +82,7 @@ eval instant at 60s sum by (fp, env, fp) (count_over_time({service_name="svc-gd"
 # dedup both reduce to a present name plus an ABSENT one, which the
 # reference OMITS: it builds each `by` group's label set out of the
 # METRIC's own labels, so a name the series does not carry contributes
-# nothing (`pkg/logql/evaluator.go:466-477 @ v3.7.4`). Label names are
+# nothing (`pkg/logql/evaluator.go:468-477 @ v3.7.4`). Label names are
 # case-sensitive, so `FP` is a second, absent name — d4a and d4b are the
 # same answer by two routes. Both were `{fp="a", FP=""}` / `{fp="b",
 # FP=""}` shaped in PulsusDB until #241 landed.
@@ -107,7 +107,7 @@ eval instant at 60s sum by (nosuch) (count_over_time({service_name="svc-gd"} | l
 
 # d4e (issue #241) — `without` was never affected and is pinned here as
 # the other half of the pair: an absent name in the list is an idempotent
-# no-op delete (`lb.Del(Groups...)`, `evaluator.go:462-465 @ v3.7.4`), so
+# no-op delete (`lb.Del(Groups...)`, `evaluator.go:462-466 @ v3.7.4`), so
 # the answer is the ungrouped label sets.
 eval instant at 60s sum without (nosuch) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
   {env="e1", fp="a", service_name="svc-gd"} 1

@@ -11,7 +11,7 @@
 use super::error::ReadError;
 use super::plan::{self};
 use pulsus_logql::{Grouping, GroupingKind, VectorAggOp};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::agg::{EMPTY_LABEL_SET, LabelSet, VectorAccum, k_of};
 use super::charge::{
@@ -166,19 +166,19 @@ fn charged_group_key<'a>(
 /// set by ranging over the METRIC and keeping the labels whose name is in
 /// the grouping list — `metric.Range(func(l labels.Label) { for _, n :=
 /// range Groups { if l.Name == n { b.Add(l.Name, l.Value); break } } })`
-/// (`pkg/logql/evaluator.go:466-477 @ v3.7.4`) — so the output is a
+/// (`pkg/logql/evaluator.go:468-477 @ v3.7.4`) — so the output is a
 /// SUBSEQUENCE of the input and a grouping name the series does not carry
 /// contributes nothing. The identity agrees, by the same shape:
 /// `HashForLabels` is a merge-join of the sorted names against the sorted
 /// labels and hashes only the intersection
-/// (`vendor/github.com/prometheus/prometheus/model/labels/labels_slicelabels.go:103-121
+/// (`vendor/github.com/prometheus/prometheus/model/labels/labels_slicelabels.go:103-122
 /// @ v3.7.4`). Issue #241: PulsusDB used to materialise the miss as
 /// `name=""`, which answered `{__variant__=""}` where the reference
 /// answers `{}`.
 ///
 /// A label PRESENT with an empty value is a different thing and is KEPT —
 /// `ScratchBuilder.Add`/`Labels` copy what they are given
-/// (`labels_slicelabels.go:485-510 @ v3.7.4`), and the container agrees
+/// (`labels_slicelabels.go:485-493 and :505-510 @ v3.7.4`), and the container agrees
 /// (`sum by (zz)` over a `label_format zz=""` series answers `{zz=""}`).
 /// Selecting from the input has that property for free; an
 /// absent-vs-present-empty test would not distinguish a rule that dropped
@@ -186,7 +186,7 @@ fn charged_group_key<'a>(
 ///
 /// `without` needs no change: it already filters the series' own labels,
 /// so an absent name in the list is simply a no-op, as the reference's
-/// `lb.Del(Groups...)` is (`evaluator.go:462-465 @ v3.7.4`).
+/// `lb.Del(Groups...)` is (`evaluator.go:462-466 @ v3.7.4`).
 pub(in crate::logql) fn group_key(
     labels: &[(String, String)],
     grouping: Option<&Grouping>,
@@ -195,19 +195,25 @@ pub(in crate::logql) fn group_key(
         return Vec::new();
     };
     let mut kv: Vec<(String, String)> = match g.kind {
-        // Built from `labels`, not from `g.labels` — the direction is the
-        // fix. Hashing the (small, plan-time deduplicated) name list and
-        // probing it per label keeps this O(|g| + |labels|); the previous
-        // form hashed `labels` instead, so the allocation count is
-        // unchanged.
-        GroupingKind::By => {
-            let want: HashSet<&str> = g.labels.iter().map(String::as_str).collect();
-            labels
-                .iter()
-                .filter(|(k, _)| want.contains(k.as_str()))
-                .cloned()
-                .collect()
-        }
+        // Built from `labels`, not from `g.labels` — the direction IS the
+        // fix, and this is the reference's own loop: `metric.Range` with
+        // an inner scan of `Groups` and a `break`
+        // (`evaluator.go:468-477 @ v3.7.4`). It allocates NOTHING beyond
+        // the key itself: no membership index is built per call, which
+        // matters because `group_key` runs once per series. An earlier
+        // revision of this fix used a `HashSet` over `g.labels` here,
+        // which made the per-call allocation scale with the GROUPING LIST
+        // instead of the series — inert in any real query (a `by` clause
+        // is a handful of names) but measurable at the query-text cap,
+        // and it surfaced as a phantom 2,788 B on `W_GROUPNAME`'s paired
+        // fixture in `logql_post_agg_witness`. The scan is `|labels| x
+        // |g|` byte comparisons that almost all fail on the first byte;
+        // `group_key_bytes` above has always had the same shape.
+        GroupingKind::By => labels
+            .iter()
+            .filter(|(k, _)| g.labels.iter().any(|n| n == k))
+            .cloned()
+            .collect(),
         GroupingKind::Without => labels
             .iter()
             .filter(|(k, _)| !g.labels.contains(k))
@@ -949,8 +955,8 @@ mod tests {
     /// does not carry contributes NOTHING to the group — it is not in the
     /// key and not in the emitted label set. The reference builds the
     /// group's labels by ranging over the METRIC and keeping the names it
-    /// finds (`pkg/logql/evaluator.go:466-477 @ v3.7.4`), and hashes the
-    /// same intersection (`labels_slicelabels.go:103-121 @ v3.7.4`).
+    /// finds (`pkg/logql/evaluator.go:468-477 @ v3.7.4`), and hashes the
+    /// same intersection (`labels_slicelabels.go:103-122 @ v3.7.4`).
     ///
     /// Captured on `grafana/loki:3.7.4` over a three-stream `fp=a,b,b`
     /// dataset: `sum by (fp, nosuch)` answers `{fp="a"} 1`, `{fp="b"} 2`
@@ -975,7 +981,7 @@ mod tests {
         );
         // `without` was never affected and stays pinned: an absent name in
         // the list is a no-op, as `lb.Del(Groups...)` is
-        // (`evaluator.go:462-465 @ v3.7.4`). Container: `sum without
+        // (`evaluator.go:462-466 @ v3.7.4`). Container: `sum without
         // (nosuch)` returns the three input label sets unchanged.
         let without = Grouping {
             kind: GroupingKind::Without,
@@ -1099,7 +1105,7 @@ mod tests {
     /// The `by` key is a SUBSEQUENCE of the series' labels — it can never
     /// be longer than the label set, whatever the clause. The reference
     /// gets this from building the key out of the metric
-    /// (`evaluator.go:468-476 @ v3.7.4`); here it is the direction of the
+    /// (`evaluator.go:468-477 @ v3.7.4`); here it is the direction of the
     /// filter. A repeated name cannot lengthen it either, which is the
     /// property `plan::dedup_grouping` (issue #288) already guarantees
     /// upstream and this arm no longer depends on.

@@ -122,7 +122,7 @@ eval instant at 60s sum by (env) (label_replace(count_over_time({service_name="s
 # (`label_replace` only sets `dst` where the regex matched). Those two
 # group together under an EMPTY label set, not under `dst=""`: the
 # reference builds a `by` group's labels out of the METRIC's own
-# (`pkg/logql/evaluator.go:466-477 @ v3.7.4`). Re-captured 2026-08-07 on
+# (`pkg/logql/evaluator.go:468-477 @ v3.7.4`). Re-captured 2026-08-07 on
 # `grafana/loki:3.7.4` (digest
 # sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc).
 eval instant at 60s sum by (dst) (label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "v-$1", "src", "source-value-(.*)"))

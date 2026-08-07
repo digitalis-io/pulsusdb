@@ -3619,7 +3619,7 @@ fn variants_absent_series_use_the_variants_selector_and_carry_no_index() {
     // vector aggregation and the synthetic series carries no
     // `__variant__`, so this is a `by` over a MISSING label — which the
     // reference omits from the key rather than materialising as
-    // `__variant__=""` (`pkg/logql/evaluator.go:466-477 @ v3.7.4`).
+    // `__variant__=""` (`pkg/logql/evaluator.go:468-477 @ v3.7.4`).
     // PulsusDB answered `{__variant__=""} 1` here until issue #241; the
     // sub-case was excluded at this site and in `b13_variants.test` and
     // is now pinned at both (`b13` case 16s, re-captured 2026-08-07 on
