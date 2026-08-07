@@ -1946,22 +1946,28 @@ back up here.
   run of digits with at most one dot and skips it unevaluated, but hands
   anything else — an exponent, in practice — to `ParseFloat`, which fails on
   OVERFLOW (`iter_skip_strict.go:10-59`, `iter_float.go:186-204 @ jsoniter
-  v1.1.12`), so an ignored `1e999` is `400` there while an ignored 400-digit
-  integer is `204`. Round 12 matched that by accident, because `serde`
-  evaluated every number it walked; round 14, which reads such a value as
-  raw text instead, applies the rule explicitly rather than inheriting it —
-  the two are told apart by `json/ignored-number-int` against
-  `json/ignored-number-overflow`, and by
+  v1.1.12`), so an ignored `1e999` is `400` there. Round 12 matched that by
+  accident, because `serde` evaluated every number it walked; round 14, which
+  reads such a value as raw text instead, applies the rule explicitly rather
+  than inheriting it — the two are told apart by `json/ignored-number-int`
+  against `json/ignored-number-overflow`, and by
   `loki_push::tests::parse_json_a_discarded_number_follows_the_references_overflow_rule`,
-  whose rows are measured in each of the three positions.
+  whose rows are measured in each of the three positions. That is the
+  EXPONENT axis and it agrees exactly, invariantly under wire framing and
+  byte offset. The LENGTH of a digits-only run does not agree and is not
+  matched: **residual 10**.
 - **Multi-failure bodies** are grouped as `util.GroupedErrors.Error()`
   groups them (`pkg/util/errors.go:105-131 @ v3.7.4`): identical messages
   collapsed with an `N errors like: ` prefix, distinct groups joined with
   `"; "`, a lone failure rendered bare. Group ORDER is a Go map walk
   upstream and therefore deliberately randomized; ours is first-seen.
   There is no byte-reproducible upstream body to match for more than one
-  distinct failure, only the format — 40 sends of one such request returned
-  two orderings, 36 and 4. The transcript sorts the groups for exactly that
+  distinct failure, only the format: 40 sends of one such request return
+  BOTH orderings, and the split between them is a fresh sample every time —
+  five such runs gave 36/4, 39/1, 32/8, 32/8 and 35/5. Only "both orders
+  occur" is a measurement; the ratio is not, and quoting one sample as
+  though it were is what left two of this row's artifacts disagreeing (round
+  15's `[low]`). The transcript sorts the groups for exactly that
   reason, in `compare.py`'s `trim`, so that its stated reproduce recipe
   ("diff empty") holds; the sort is applied to both sides and cannot reach a
   verdict, which is a status.
@@ -2192,12 +2198,83 @@ back up here.
   to a value-typing change, not to this row's cap ordering. Harness:
   `json/drained-label-map-non-string` and its `-under-cap` control, both
   recorded divergences.
+- **Residual 10 — the LENGTH of a digits-only number in a value neither side
+  reads.** PulsusDB's rule: a run of digits with at most one dot, under a key
+  the decoder does not read, is accepted **whatever its length**. The
+  reference's rule: accepted when the run fits inside the decoder's current
+  read buffer, refused when it runs to the buffer's end and then overflows
+  `f64`. Its fast skip scans that buffer and nothing else — `for i :=
+  iter.head; i < iter.tail` (`iter_skip_strict.go:26 @ jsoniter v1.1.12`) —
+  over the 512 bytes `jsoniter.NewDecoder` allocates (`config.go:366`,
+  reached from `unmarshal.DecodePushRequest`,
+  `pkg/util/unmarshal/unmarshal.go:17 @ v3.7.4`); a token that reaches
+  `tail` falls through to `ReadFloat64`/`strconv.ParseFloat`, which is where
+  a long run overflows.
+
+  **Why this is registered and not matched.** Where that buffer boundary
+  falls is not a property of the request. It moves with the token's byte
+  offset in the body and with how the client chunked its writes, so the same
+  bytes get different verdicts from different senders. Measured on
+  `grafana/loki@sha256:87f0a067…` and a PulsusDB built from this branch
+  (issue #374 round 15), one ignored digit run under an unknown envelope
+  key:
+
+  | shape | reference | PulsusDB |
+  |---|---|---|
+  | 400 digits, body written in one piece | `204` | `204` |
+  | 400 digits, **same bytes**, 512-byte chunks | `204` | `204` |
+  | 400 digits, **same bytes**, 256-byte chunks | **`400`** | `204` |
+  | 400 digits, one write, run at offset 111 | `204` | `204` |
+  | 400 digits, one write, run at offset 112 | **`400`** | `204` |
+  | 504 digits at offset 7 | `204` | `204` |
+  | 505 digits at offset 7 | **`400`** | `204` |
+  | 308 digits crossing a boundary | `204` | `204` |
+  | 309 digits crossing a boundary | **`400`** | `204` |
+  | 1,000 digits, any offset, any framing | **`400`** | `204` |
+
+  Both conditions are needed: crossing the boundary only decides anything
+  for a run that then overflows `f64` (308 digits crossing is `204`, 309 is
+  `400`), and length alone decides nothing (400 digits is either answer
+  depending on framing). A run of 512 digits or more cannot fit in a
+  512-byte window at any offset, which is the one corner of this that IS
+  framing-independent, and is what the harness pins.
+
+  Matching the reference here would mean reproducing the sender's socket
+  behaviour, which is worse for a user than the difference: our acceptance
+  surface would stop being a function of the request. So this is the
+  standing rule applied — copy the reference except where it is wrong — and
+  it is recorded rather than chased.
+
+  **Bounded**: the divergence is exactly the digits-only runs longer than
+  308 digits that cross a 512-byte boundary. Every other number shape agrees,
+  including both edges of the exponent rule (`1e999`, `1e309`,
+  `1.7976931348623159e308` refused on both; `1e308`,
+  `1.7976931348623157e308`, `1e-999`, `5e-324` accepted on both), and those
+  verdicts were re-measured under four framings and three offsets without
+  moving — `trySkipNumber` leaves the fast path on `e` in every window, so
+  the exponent axis cannot depend on the buffer.
+
+  Harness: `json/ignored-number-int-1000` is the recorded divergence;
+  `json/ignored-number-int` (400 nines) is the control that agrees, and it
+  agrees only because that body puts the run at offset 82, 29 bytes short of
+  the boundary — a note in `compare.py` says so, because a 30-byte edit
+  elsewhere in that body would flip it. Hermetically,
+  `loki_push::tests::parse_json_a_discarded_number_follows_the_references_overflow_rule`
+  asserts our side of it in all three ignored positions.
+
+  **How this was missed for a round.** Round 14 claimed "66 probes over 22
+  shapes × 3 positions, 0 disagreements". The probes were real and the count
+  was real, but every one of them placed the digit run where it happened to
+  fit the window, so the gate could not see the axis it was being quoted to
+  cover. A 66-probe slice at the same three positions, placed differently,
+  found the disagreements. Same instrument, same count, opposite result:
+  the placement was the variable and it was never varied.
 - **Measured side by side**: every case in the harness is sent
   byte-identically to `grafana/loki@sha256:87f0a067…` and to a running
   PulsusDB, over both Loki-push encodings and both OTLP encodings. Statuses
   agree everywhere except residual 3's second half (in both its spellings)
-  and residuals 4, 5, 6, 7 and 9 — residual 8 was closed in round 14 and its
-  rows are agreements now — which the harness carries as expected
+  and residuals 4, 5, 6, 7, 9 and 10 — residual 8 was closed in round 14 and
+  its rows are agreements now — which the harness carries as expected
   divergences so that they stay the ones that were recorded; the case,
   agreement and divergence counts are on
   `compare.py`'s generated summary line at the end of the transcript's

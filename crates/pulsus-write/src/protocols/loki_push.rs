@@ -2293,16 +2293,36 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 /// `strconv.ParseFloat(str, 64)` (`iter_float.go:186-204`). Go returns
 /// `ErrRange` there only for OVERFLOW, and the `ReadBigFloat` retry that
 /// follows re-reads an already-consumed buffer and reports `readNumberAsString:
-/// invalid number` — so a skipped `1e999` is a `400` upstream while a skipped
-/// 400-digit integer, which never leaves the fast path, is a `204`.
+/// invalid number` — so a skipped `1e999` is a `400` upstream.
 ///
-/// Measured on `grafana/loki@sha256:87f0a067…` under an unknown envelope key
-/// (issue #374 round 14): `1e999`, `1e309`, `-1e309` and
-/// `1.7976931348623159e308` are `400`; `1e308`, `1.7976931348623157e308`,
-/// `1e-999`, `5e-324`, `0e999`, 400 nines and `12345678901234567890` are `204`.
-/// Underflow is accepted on both sides because Go's `floatBits` raises its
-/// overflow flag only upward, and Rust's `f64` parse likewise yields a finite
-/// zero rather than an error.
+/// That EXPONENT rule is what this function implements, and it matches:
+/// measured on `grafana/loki@sha256:87f0a067…` under an unknown envelope key,
+/// `1e999`, `1e309`, `-1e309` and `1.7976931348623159e308` are `400` on both
+/// sides; `1e308`, `1.7976931348623157e308`, `1e-999`, `5e-324`, `0e999` and
+/// `12345678901234567890` are `204` on both. Underflow is accepted on both
+/// because Go's `floatBits` raises its overflow flag only upward, and Rust's
+/// `f64` parse likewise yields a finite zero rather than an error. Each of
+/// those verdicts is invariant under wire chunking and under the token's byte
+/// offset (measured over four framings × three offsets, issue #374 round 15),
+/// because `trySkipNumber` bails to the slow path on `e` in every window.
+///
+/// The LENGTH axis is a REGISTERED DIVERGENCE, not a rule we match. Ours is
+/// the line below: a run of digits with at most one dot is accepted whatever
+/// its length. The reference's fast path is bounded by its READ BUFFER —
+/// `trySkipNumber` scans `for i := iter.head; i < iter.tail`
+/// (`iter_skip_strict.go:26 @ jsoniter v1.1.12`) over the 512 bytes
+/// `jsoniter.NewDecoder` gives it (`config.go:366`, reached from
+/// `unmarshal.DecodePushRequest`, `pkg/util/unmarshal/unmarshal.go:17 @ loki
+/// v3.7.4`) — so it skips the token only when the token AND its terminating
+/// byte are inside the current window, and otherwise evaluates it and
+/// overflows. The verdict therefore turns on where a buffer boundary falls,
+/// which is a function of the token's byte offset in the body and of how the
+/// client chunked its writes, not of the request: the same 400-digit body is
+/// `204` written in one piece or in 512-byte chunks and `400` in 256-byte
+/// chunks, and `204` at offset 111 and `400` at offset 112. A second
+/// implementation cannot match that without reproducing the sender's socket
+/// behaviour. See `docs/benchmarks/logs-differential-ledger.md`, the
+/// `ingest-label-bounds` row, for the measured table.
 fn check_ignored_number<E: serde::de::Error>(token: &str) -> Result<(), E> {
     let magnitude = token.strip_prefix('-').unwrap_or(token);
     if magnitude.bytes().all(|b| b.is_ascii_digit() || b == b'.')
@@ -3951,14 +3971,23 @@ mod tests {
     /// unevaluated, and hands anything else (an exponent, in practice) to
     /// `ParseFloat`, which fails on overflow (`iter_skip_strict.go:10-59`,
     /// `iter_float.go:186-204 @ jsoniter v1.1.12`). So a discarded `1e999` is a
-    /// `400` upstream while a discarded 400-digit integer is a `204`, and
-    /// closing the depth over-rejection without this would have opened an
-    /// acceptance one in its place.
+    /// `400` upstream, and closing the depth over-rejection without this would
+    /// have opened an acceptance one in its place.
     ///
-    /// Every row measured on `grafana/loki@sha256:87f0a067…` under an unknown
-    /// envelope key (issue #374 round 14) — including the pair either side of
+    /// Every EXPONENT row here is measured on `grafana/loki@sha256:87f0a067…`
+    /// under an unknown envelope key — including the pair either side of
     /// `f64::MAX`, which is where "overflow" is actually decided, and the
     /// underflow rows, which are accepted on both sides for the same reason.
+    /// Each was re-measured in round 15 under four wire framings and three
+    /// byte offsets and did not move, which is what makes it a rule rather
+    /// than a sample.
+    ///
+    /// The two digits-only accepted rows — `digits_400` and `digits_1000` —
+    /// are the other side of that, and their LENGTH is where the two
+    /// implementations part company. See [`check_ignored_number`] and the
+    /// `ingest-label-bounds` ledger row: upstream's verdict on those depends
+    /// on where its 512-byte read buffer happens to break, ours does not, and
+    /// this test pins ours.
     #[test]
     fn parse_json_a_discarded_number_follows_the_references_overflow_rule() {
         const WIN: &str = r#"{"stream":{"app":"w"},"values":[["1700000000000000000","final"]]}"#;
@@ -3970,11 +3999,21 @@ mod tests {
             "1e1000000000000000000000",
         ];
         // 400 nines is the row that makes the fast path part of the rule
-        // rather than decoration: it overflows `f64` and upstream stores it,
-        // because a run of digits with no exponent is never evaluated at all.
-        // A decoder that range-checked EVERY number would pass every other row
-        // here and fail this one.
+        // rather than decoration: it overflows `f64` and upstream stores it
+        // (measured, in one write at the offset this body puts it), because a
+        // run of digits with no exponent is never evaluated at all. A decoder
+        // that range-checked EVERY number would pass every other row here and
+        // fail this one.
         let digits_400 = "9".repeat(400);
+        // 1,000 nines is the DIVERGENCE, asserted in the direction we chose.
+        // A run this long cannot fit in upstream's 512-byte read window at any
+        // offset or framing, so upstream evaluates and refuses it every time
+        // (measured `400` under five framings and four offsets, round 15),
+        // while we accept it — deliberately, because upstream's answer at 400
+        // nines flips with the wire chunking and ours cannot. Flipping this
+        // assertion to a rejection would be adopting a framing-dependent
+        // acceptance surface; see the `ingest-label-bounds` ledger row.
+        let digits_1000 = "9".repeat(1000);
         let accepted = [
             "1e308",
             "1.7976931348623157e308",
@@ -3985,6 +4024,7 @@ mod tests {
             "12345678901234567890",
             "1.5e3",
             digits_400.as_str(),
+            digits_1000.as_str(),
             "-0.0",
         ];
         /// One position an ignored value can sit in: its name, and a builder

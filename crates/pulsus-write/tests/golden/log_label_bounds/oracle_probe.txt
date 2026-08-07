@@ -38,8 +38,10 @@ Reproduce (and check that the span still reproduces):
   # `trim` are what make it so -- both applied to both sides, neither able to
   # change a verdict, because verdicts are statuses:
   #   - a multi-failure body groups its failures in Go MAP order, which is
-  #     randomized (40 sends of json/two-distinct-failures returned two
-  #     orderings, 36 and 4), so the groups are sorted;
+  #     randomized: 40 sends of json/two-distinct-failures return BOTH
+  #     orderings, and the split is a fresh sample each time (five such runs
+  #     gave 36/4, 39/1, 32/8, 32/8, 35/5 -- the ratio is not a reproducible
+  #     number and is not quoted as one), so the groups are sorted;
   #   - a jsoniter decode error quotes a window of the request and an offset
   #     into the CURRENT READ BUFFER, which move with how the body was chunked
   #     over the wire (#10 in one run, #9 in the next, same request), so that
@@ -262,6 +264,7 @@ json/ignored-number-at-max                                 204   204     SAME   
 json/ignored-number-past-max                               400   400     SAME     SAME
 json/ignored-number-underflow                              204   204     SAME     SAME
 json/ignored-number-int                                    204   204     SAME     SAME
+json/ignored-number-int-1000                               400   204     DIFF     DIFF
 json/ignored-number-nested                                 400   400     SAME     SAME
 pb/duplicate-distinct                                      400   400     SAME     SAME
 pb/257-nonempty                                            400   400     SAME     SAME
@@ -353,7 +356,7 @@ otlp/index-key-map-value-long-nested-value                 400   400     SAME   
 otlp/index-key-int-value                                   204   200     SAME     SAME
 otlp/index-key-array-value-long                            400   400     SAME     SAME
 
-status agreement: 167/178 (11 recorded divergence(s): ['json/65537-raw-empty-keys', 'json/duplicate-key-65537-raw', 'json/superseded-shared-budget', 'json/drained-label-map-non-string', 'json/drained-label-map-non-string-under-cap', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
+status agreement: 167/179 (12 recorded divergence(s): ['json/65537-raw-empty-keys', 'json/duplicate-key-65537-raw', 'json/superseded-shared-budget', 'json/drained-label-map-non-string', 'json/drained-label-map-non-string-under-cap', 'json/ignored-number-int-1000', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
 unexpected verdicts: []
 
 ====================================================================================================
@@ -622,6 +625,9 @@ bodies
     pulsus 204: 
 --- json/ignored-number-int [SAME]
     loki   204: 
+    pulsus 204: 
+--- json/ignored-number-int-1000 [DIFF]
+    loki   400: loghttp.PushRequest.readNumberAsString: invalid number, error found in #<n> byte of <parser window elided>\n
     pulsus 204: 
 --- json/ignored-number-nested [SAME]
     loki   400: loghttp.PushRequest.readNumberAsString: invalid number, error found in #<n> byte of <parser window elided>\n
@@ -1008,6 +1014,45 @@ json/drained-label-map-non-string, json/drained-label-map-non-string-under-cap
     cap-ordering one, and the same mechanism answers
     `"values":[null,["ts","x"]]` 204 upstream (which skips null elements,
     pkg/loghttp/query.go:131-134) and 400 here.
+
+json/ignored-number-int-1000
+    A 1,000-digit integer under a key neither side reads. Upstream refuses
+    it, we accept it, and the reason it is a divergence we register rather
+    than a rule we match is that upstream's answer to this SHAPE is not a
+    function of the request. jsoniter's fast skip scans the current read
+    buffer only -- `for i := iter.head; i < iter.tail`
+    (iter_skip_strict.go:26 @ v1.1.12) over the 512 bytes
+    `jsoniter.NewDecoder` gives it (config.go:366, reached from
+    unmarshal.DecodePushRequest, pkg/util/unmarshal/unmarshal.go:17 @
+    v3.7.4) -- so a digits-only token is skipped unevaluated when the token
+    AND its terminating byte are inside that window, and is evaluated (and
+    overflows) when it runs to the window's end. Measured on these two
+    servers, round 15:
+
+        400 digits, one write / 512-byte chunks   204 upstream
+        400 digits, 256-byte chunks               400 upstream   same bytes
+        400 digits, one write, run at offset 111  204 upstream
+        400 digits, one write, run at offset 112  400 upstream   one byte over
+        504 digits at offset 7                    204 upstream
+        505 digits at offset 7                    400 upstream
+        308 digits crossing a boundary            204 upstream   fits f64
+        309 digits crossing a boundary            400 upstream   overflows
+
+    Both of the last two conditions are needed: crossing the boundary only
+    matters for a run that then overflows f64. The boundary itself lands
+    where the client's writes and the token's offset put it, so the SAME
+    bytes get different verdicts from different senders. PulsusDB accepts a
+    digits-only run at any length, deterministically, and does not adopt an
+    acceptance surface that depends on socket behaviour.
+    A run of 1,000 digits is the framing-INDEPENDENT corner of this: longer
+    than the whole 512-byte window, so it cannot fit at any offset under any
+    chunking -- 400 upstream in all five framings and all four offsets
+    measured. That is why this row, and not the fragile `json/ignored-number-
+    int` (400 nines, which fits with 29 bytes to spare only because of where
+    this body puts it), is the one pinned as a divergence. The EXPONENT rows
+    of that group are not affected and are not a divergence: they were
+    re-measured under the same framings and offsets and did not move. Ledger
+    residual 10.
 
 nesting depth -- withdrawn as a divergence in round 14
     Round 12 closed the ignored-value depth hole by recursing those values

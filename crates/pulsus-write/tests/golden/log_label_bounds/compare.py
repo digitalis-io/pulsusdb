@@ -586,18 +586,47 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 # digits with at most one dot and skips it unevaluated, and hands anything else
 # -- an exponent, in practice -- to ParseFloat, which fails on OVERFLOW
 # (iter_skip_strict.go:10-59, iter_float.go:186-204 @ jsoniter v1.1.12).  So an
-# ignored 1e999 is 400 there and an ignored 400-digit integer is 204, and a
-# decoder that captured the value as raw text without applying this would agree
-# about depth while quietly accepting what upstream refuses.  The `-int` row is
-# the discriminator: same magnitude, no exponent, never evaluated.
-for _name, _value in (("overflow", "1e999"),
-                      ("at-max", "1.7976931348623157e308"),
-                      ("past-max", "1.7976931348623159e308"),
-                      ("underflow", "1e-999"),
-                      ("int", "9" * 400),
-                      ("nested", "[[[1e999]]]")):
+# ignored 1e999 is 400 there, and a decoder that captured the value as raw text
+# without applying this would agree about depth while quietly accepting what
+# upstream refuses.  Those EXPONENT rows agree, and they agree INVARIANTLY:
+# re-measured in round 15 under four wire framings and three byte offsets, none
+# of them moved, because trySkipNumber bails to the slow path on `e` in every
+# window.
+#
+# The LENGTH of a digits-only run is a different story and a registered
+# divergence.  trySkipNumber scans `for i := iter.head; i < iter.tail`
+# (iter_skip_strict.go:26) over the 512-byte buffer jsoniter.NewDecoder hands
+# it (config.go:366, reached from unmarshal.DecodePushRequest,
+# pkg/util/unmarshal/unmarshal.go:17 @ v3.7.4), so it skips the token only when
+# the token AND its terminating byte are inside the CURRENT window, and
+# otherwise evaluates it and overflows.  Upstream's verdict on such a run
+# therefore turns on where that buffer boundary falls -- a function of the
+# token's byte offset in the body and of how the client chunked its writes, not
+# of the request.  Measured on these two servers (round 15): the same
+# 400-digit body is 204 written in one piece and in 512-byte chunks and 400 in
+# 256-byte chunks; in one write it is 204 with the run at offset 111 and 400 at
+# offset 112.  We accept a digits-only run at any length, deterministically.
+#
+#   -int       400 nines.  Fits, so both sides are 204 -- and it fits only
+#              because this body puts it at offset 82 (82 + 400 + 1 <= 512).
+#              That row has 29 bytes of HEADROOM: growing _win by 30 bytes
+#              would flip it to a divergence, which is itself the thing being
+#              recorded.
+#   -int-1000  1,000 nines.  Longer than the whole window, so no offset and no
+#              chunking can make it fit: 400 upstream under all five framings
+#              and all four offsets measured, 204 here.  The divergence in its
+#              framing-INDEPENDENT form, which is why this is the row pinned
+#              expect="DIFF" and the fragile one is not.
+for _name, _value, _expect in (("overflow", "1e999", "SAME"),
+                               ("at-max", "1.7976931348623157e308", "SAME"),
+                               ("past-max", "1.7976931348623159e308", "SAME"),
+                               ("underflow", "1e-999", "SAME"),
+                               ("int", "9" * 400, "SAME"),
+                               ("int-1000", "9" * 1000, "DIFF"),
+                               ("nested", "[[[1e999]]]", "SAME")):
     case("json/ignored-number-%s" % _name, "json",
-         ('{"streams":[' + _win + '],"junk":' + _value + "}").encode(), "application/json")
+         ('{"streams":[' + _win + '],"junk":' + _value + "}").encode(),
+         "application/json", expect=_expect)
 
 # ---- Loki push, protobuf -------------------------------------------------
 def pb(labels, line="hi"):
@@ -887,9 +916,12 @@ def trim(s, n=100000):
     1. A body reporting several DISTINCT validation failures groups them as
        `N errors like: ...; M errors like: ...`, built from a Go map whose
        iteration order is deliberately randomized -- so the same request comes
-       back with the groups in either order (40 sends of
-       json/two-distinct-failures gave 39 of one order and 1 of the other).
-       Sorted.
+       back with the groups in either order.  What is measured is that BOTH
+       orders occur: five runs of 40 sends of json/two-distinct-failures gave
+       36/4, 39/1, 32/8, 32/8 and 35/5.  The SPLIT is a fresh sample every
+       time and is not a reproducible number -- an earlier round quoted two of
+       those samples as if they were one measurement, which is why the ratio
+       is stated here as a range and never as a figure.  Sorted.
     2. A jsoniter decode error appends `error found in #N byte of ...|<window>
        |..., bigger context ...`, where the window and the offset into it are
        positions in the CURRENT READ BUFFER -- so they move with however the
