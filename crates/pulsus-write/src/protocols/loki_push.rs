@@ -2286,32 +2286,61 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 }
 
 /// The reference's rule for a NUMBER inside a value it skips, which is not
-/// "any JSON number is fine". One mechanism produces all of it bar the
-/// `0`-leading case at the end of this comment: jsoniter's
+/// "any JSON number is fine". The rule begins one level above `skipNumber`, at
+/// the DISPATCH, and that is what the two branches below mirror: `Skip` picks
+/// the reader from the value's FIRST BYTE and from nothing else —
+/// `case '0'` unreads that byte and calls `ReadFloat32`, while
+/// `case '-', '1', …, '9'` calls `skipNumber` (`iter_skip.go:72-96`,
+/// `:83-85`, `:86-87 @ jsoniter v1.1.12`). One byte selects the route, and the
+/// two routes differ in the width the value is range-checked against AND in
+/// whether the unevaluated fast path is reachable at all. It is a byte test,
+/// not a test on the number: `0.35e39` and `-0.35e39` are the same magnitude
+/// and take different routes, because the second one's first byte is `-`.
+///
+/// ROUTE `0` — range-checked against `f32`. `ReadFloat32` →
+/// `readPositiveFloat32` → (on the `e`/`E`, on too many decimal places, or on
+/// reaching the buffer's end) `readFloat32SlowPath` →
+/// `strconv.ParseFloat(str, 32)` (`iter_float.go:70-77`, `:79-157`,
+/// `:188-205`, `:198`). `trySkipNumber` is never called on this route, so
+/// there is no digits-only exemption and no dependence on the read buffer:
+/// `readNumberAsString` loads more (`:159-186`) until the token ends. The
+/// verdict is a function of the request alone — refused iff the value
+/// overflows `f32`. Measured on `grafana/loki@sha256:87f0a067…` over 36 cells
+/// per shape (3 ignored positions × 4 wire framings × 3 byte offsets), each
+/// shape single-valued: `0.35e39` is `400` on both sides while `0.34e39` is
+/// `204` on both, and the same magnitude written `3.5e38` or `-0.35e39` is
+/// `204` on both because neither starts with `0`. The threshold is `f32`'s own
+/// and not a smaller cutoff: `0.34028235e39` is `204` and `0.34028236e39` is
+/// `400`, which is where `ParseFloat(str, 32)` starts rounding past
+/// `f32::MAX`. Rust's `f32` parse yields `inf` at exactly that pair where Go's
+/// returns `ErrRange`, so the check reads the same as the `f64` one below
+/// (issue #374 round 18).
+///
+/// ROUTE `-`/`1`..`9` — `skipNumber`, and range-checked against `f64`.
 /// `trySkipNumber` walks a run of digits with at most one dot and skips it
 /// UNEVALUATED, but it walks the CURRENT READ BUFFER and nothing else — `for i
-/// := iter.head; i < iter.tail` (`iter_skip_strict.go:26 @ jsoniter v1.1.12`)
-/// — and reports "skipped" only on reaching a terminating `,]}`/whitespace
-/// inside that window (`:46-53`). Everything else — a token carrying `e`/`E`,
-/// and a digit run that reaches the window's end — returns `false` and is
-/// PARSED instead: `ReadFloat64` → `readFloat64SlowPath` →
-/// `strconv.ParseFloat(str, 64)` (`iter_skip_strict.go:10-21`,
-/// `iter_float.go:299-315`). So leaving the fast path is not a rejection; it
-/// is an evaluation, and — for a token the capture has already validated as
-/// JSON, which rules out `validateFloat`'s `1.`/`1.e1` — the evaluation
-/// refuses for exactly one reason: OVERFLOW. Go's `ErrRange` then propagates through the `ReadBigFloat` retry
+/// := iter.head; i < iter.tail` (`iter_skip_strict.go:26`) — and reports
+/// "skipped" only on reaching a terminating `,]}`/whitespace inside that
+/// window (`:46-53`). Everything else — a token carrying `e`/`E`, and a digit
+/// run that reaches the window's end — returns `false` and is PARSED instead:
+/// `ReadFloat64` → `readFloat64SlowPath` → `strconv.ParseFloat(str, 64)`
+/// (`iter_skip_strict.go:10-21`, `iter_float.go:299-315`). So leaving the fast
+/// path is not a rejection; it is an evaluation, and — for a token the capture
+/// has already validated as JSON, which rules out `validateFloat`'s
+/// `1.`/`1.e1` — the evaluation refuses for exactly one reason: OVERFLOW. Go's
+/// `ErrRange` then propagates through the `ReadBigFloat` retry
 /// (`iter_skip_strict.go:17-20`), which re-reads an already-consumed buffer
 /// and reports `readNumberAsString: invalid number` (`iter_float.go:159-186`)
 /// — the message a skipped `1e999` comes back with, `400`.
 ///
-/// Two consequences follow, and they are different in kind.
+/// Two consequences follow on that route, and they are different in kind.
 ///
-/// EXPONENT — a matched rule, and what the code below implements. A token
-/// carrying `e`/`E` never takes the fast path in ANY window, so its verdict is
-/// a function of the request alone: refused iff its value overflows `f64`.
-/// Measured on `grafana/loki@sha256:87f0a067…` under an unknown envelope key,
-/// `1e999`, `1e309`, `-1e309` and `1.7976931348623159e308` are `400` on both
-/// sides; `1e308`, `1.7976931348623157e308`, `1e-999`, `5e-324`, `0e999` and
+/// EXPONENT — a matched rule, and what the second branch below implements. A
+/// token carrying `e`/`E` never takes the fast path in ANY window, so its
+/// verdict is a function of the request alone: refused iff its value overflows
+/// `f64`. Measured on the same oracle under an unknown envelope key, `1e999`,
+/// `1e309`, `-1e309` and `1.7976931348623159e308` are `400` on both sides;
+/// `1e308`, `1.7976931348623157e308`, `1e-999`, `5e-324`, `0e999` and
 /// `12345678901234567890` are `204` on both. Underflow is accepted on both
 /// because Go's `floatBits` raises its overflow flag only upward, and Rust's
 /// `f64` parse likewise yields a finite zero rather than an error. Those ten
@@ -2322,8 +2351,8 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 /// (issue #374 round 17), which is what `trySkipNumber` bailing on `e` in
 /// every window predicts.
 ///
-/// LENGTH — a REGISTERED DIVERGENCE, not a rule we match. Ours is the line
-/// below: a run of digits with at most one dot is accepted whatever its
+/// LENGTH — a REGISTERED DIVERGENCE, not a rule we match. Ours is the second
+/// branch below: a run of digits with at most one dot is accepted whatever its
 /// length. Upstream's fast path is bounded by the 512 bytes
 /// `jsoniter.NewDecoder` allocates (`config.go:366`, reached from
 /// `unmarshal.DecodePushRequest`, `pkg/util/unmarshal/unmarshal.go:17 @ loki
@@ -2338,16 +2367,20 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 /// and `204` at offset 111 and `400` at offset 112. A second implementation
 /// cannot match that without reproducing the sender's socket behaviour. See
 /// `docs/benchmarks/logs-differential-ledger.md`, the `ingest-label-bounds`
-/// row, for the measured table.
-///
-/// One shape is outside both and is an OPEN gap, measured in round 17 and not
-/// yet decided: `Skip` never reaches `skipNumber` for a token whose first byte
-/// is `0` — it calls `ReadFloat32` directly (`iter_skip.go:83-85 @ jsoniter
-/// v1.1.12`) — so upstream range-checks that token against `f32`. `0.35e39` is
-/// `400` upstream and `204` here in all three ignored positions, while the same
-/// magnitude written `3.5e38` or `-0.35e39` is `204` on both. Deterministic on
-/// the request, unlike the length axis. Recorded in the ledger row above.
+/// row, for the measured table. The divergence lives on this route only: a
+/// `0`-leading token never reaches `trySkipNumber`, so it has no window
+/// dependence to diverge over.
 fn check_ignored_number<E: serde::de::Error>(token: &str) -> Result<(), E> {
+    // The dispatch, in the same order the reference dispatches: the first byte
+    // decides, so this test comes before the digits-only exemption rather than
+    // inside it — upstream's exemption lives in `skipNumber`, which a
+    // `0`-leading token never reaches.
+    if token.as_bytes().first() == Some(&b'0') {
+        if token.parse::<f32>().is_ok_and(|value| !value.is_finite()) {
+            return Err(serde::de::Error::custom("invalid number"));
+        }
+        return Ok(());
+    }
     let magnitude = token.strip_prefix('-').unwrap_or(token);
     if magnitude.bytes().all(|b| b.is_ascii_digit() || b == b'.')
         && magnitude.bytes().filter(|b| *b == b'.').count() <= 1
@@ -4003,9 +4036,24 @@ mod tests {
     /// under an unknown envelope key — including the pair either side of
     /// `f64::MAX`, which is where "overflow" is actually decided, and the
     /// underflow rows, which are accepted on both sides for the same reason.
-    /// Every one of the fourteen shapes below was re-measured in round 17
-    /// over 12 cells — 4 wire framings × 3 byte offsets, 168 cells in all —
-    /// and none moved, which is what makes this a rule rather than a sample.
+    /// Each of the fourteen `f64`-route shapes below was re-measured over 12
+    /// cells in round 17 — 4 wire framings × 3 byte offsets, 168 cells in all
+    /// — and each of the six rows added in round 18 over 36 cells (those same
+    /// 12, in each of the three positions, 216 cells); none moved, which is
+    /// what makes this a rule rather than a sample.
+    ///
+    /// The six rows added in round 18 are the DISPATCH: upstream picks the
+    /// reader from the value's first byte, so a token starting with `0` is
+    /// range-checked against `f32` and everything else against `f64`
+    /// (`iter_skip.go:83-87 @ jsoniter v1.1.12`; see
+    /// [`check_ignored_number`]). `-0.35e39` and `3.5e38` are the rows that
+    /// tell that dispatch apart from "the value is out of `f32` range": all
+    /// three of `0.35e39`, `-0.35e39` and `3.5e38` are the same magnitude and
+    /// all three are infinite in `f32`, yet only the first is refused. A
+    /// check keyed on the magnitude, or on a leading zero anywhere in the
+    /// mantissa, passes `0.35e39` and fails those two. `0.34028235e39` and
+    /// `0.34028236e39` are the other half: they pin the threshold at `f32`'s
+    /// own rounding boundary rather than at some smaller cutoff.
     ///
     /// The two digits-only accepted rows — `digits_400` and `digits_1000` —
     /// are the other side of that, and their LENGTH is where the two
@@ -4023,6 +4071,12 @@ mod tests {
             "-1e309",
             "1.7976931348623159e308",
             "1e1000000000000000000000",
+            // The `f32` route: first byte `0`, value past `f32::MAX`. The
+            // second one sits just above the rounding boundary at
+            // `f32::MAX + ½ULP` ≈ `3.4028235678e38`, whose accepted side is
+            // `0.34028235e39` below.
+            "0.35e39",
+            "0.34028236e39",
         ];
         // 400 nines is the row that makes the fast path part of the rule
         // rather than decoration: it overflows `f64` and upstream stores it
@@ -4051,6 +4105,14 @@ mod tests {
             "-0e999",
             "12345678901234567890",
             "1.5e3",
+            // The `f32` route's accepted side — including one just under the
+            // rounding boundary, which still rounds to `f32::MAX` — and the
+            // two magnitude-equal controls that take the `f64` route because
+            // their first byte is not `0`.
+            "0.34e39",
+            "0.34028235e39",
+            "-0.35e39",
+            "3.5e38",
             digits_400.as_str(),
             digits_1000.as_str(),
             "-0.0",

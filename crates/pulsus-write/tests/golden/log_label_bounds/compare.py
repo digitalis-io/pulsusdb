@@ -582,10 +582,25 @@ case("json/ignored-depth-126", "json", _at_envelope(126).encode(), "application/
 case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/json")
 
 # ---- and one thing an ignored value is checked for that is NOT depth --------
-# Upstream's skip does not skip every number, and ONE mechanism decides which:
-# `trySkipNumber` walks a run of digits with at most one dot and skips it
+# Upstream's skip does not skip every number.  The rule starts at the DISPATCH:
+# Skip picks the reader from the value's FIRST BYTE and nothing else -- case '0'
+# unreads it and calls ReadFloat32, case '-','1'..'9' calls skipNumber
+# (iter_skip.go:72-96,83-87 @ jsoniter v1.1.12).  One byte, two routes, and they
+# differ in the width the value is range-checked against.
+#
+# ROUTE '0' -- f32.  ReadFloat32 -> readPositiveFloat32 -> readFloat32SlowPath ->
+# strconv.ParseFloat(str, 32) (iter_float.go:70-77,79-157,188-205).
+# trySkipNumber is never reached, so there is no digits-only exemption and no
+# read-buffer dependence: readNumberAsString loads more until the token ends.
+# The verdict is a function of the request alone -- refused iff the value
+# overflows f32.  The -lead0-* and the two control rows below are that route,
+# measured over 36 cells per shape (3 ignored positions x 4 wire framings x 3
+# byte offsets, round 18), each shape single-valued.
+#
+# ROUTE '-','1'..'9' -- f64, via skipNumber.  `trySkipNumber` walks a run of
+# digits with at most one dot and skips it
 # unevaluated, but it walks the CURRENT READ BUFFER only -- `for i := iter.head;
-# i < iter.tail` (iter_skip_strict.go:26 @ jsoniter v1.1.12) over the 512-byte
+# i < iter.tail` (iter_skip_strict.go:26) over the 512-byte
 # buffer jsoniter.NewDecoder hands it (config.go:366, reached from
 # unmarshal.DecodePushRequest, pkg/util/unmarshal/unmarshal.go:17 @ v3.7.4) --
 # and reports "skipped" only on reaching a terminating ,]} or whitespace inside
@@ -627,19 +642,26 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 #              form, which is why this is the row pinned expect="DIFF" and the
 #              fragile one is not.
 #
-# One shape is outside both and is an OPEN gap, measured in round 17 and not
-# yet decided: Skip never reaches skipNumber for a token whose first byte is
-# `0` -- it calls ReadFloat32 directly (iter_skip.go:83-85) -- so upstream
-# range-checks that token against f32.  0.35e39 is 400 upstream and 204 here in
-# all three ignored positions, while 3.5e38 and -0.35e39 are 204 on both.  See
-# the ingest-label-bounds ledger row; no case is pinned for it here.
+# The six -lead0-* / control rows are the f32 route, closed in round 18 (found
+# in round 17 by reading Skip's dispatch, not by probing: 168 cells of exponent
+# probes all went through skipNumber).  The two controls are what make them mean
+# the dispatch rather than the value: 0.35e39, -0.35e39 and 3.5e38 are the same
+# magnitude and all three are inf in f32, yet only the one whose first byte is
+# `0` is refused.  The -at-f32-max / -past-f32-max pair pins the threshold at
+# f32's own rounding boundary rather than at some smaller cutoff.
 for _name, _value, _expect in (("overflow", "1e999", "SAME"),
                                ("at-max", "1.7976931348623157e308", "SAME"),
                                ("past-max", "1.7976931348623159e308", "SAME"),
                                ("underflow", "1e-999", "SAME"),
                                ("int", "9" * 400, "SAME"),
                                ("int-1000", "9" * 1000, "DIFF"),
-                               ("nested", "[[[1e999]]]", "SAME")):
+                               ("nested", "[[[1e999]]]", "SAME"),
+                               ("lead0-over", "0.35e39", "SAME"),
+                               ("lead0-under", "0.34e39", "SAME"),
+                               ("lead0-at-f32-max", "0.34028235e39", "SAME"),
+                               ("lead0-past-f32-max", "0.34028236e39", "SAME"),
+                               ("signed-lead0", "-0.35e39", "SAME"),
+                               ("no-lead0", "3.5e38", "SAME")):
     case("json/ignored-number-%s" % _name, "json",
          ('{"streams":[' + _win + '],"junk":' + _value + "}").encode(),
          "application/json", expect=_expect)

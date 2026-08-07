@@ -139,15 +139,26 @@ rows keep the far-past-everything shape in each position, so a ceiling that
 went missing on one side could not pass as a ceiling that merely differs.
 
 The `json/ignored-number-*` group is there because depth is not the only thing
-upstream's skip still checks. `trySkipNumber` walks a run of digits with at
-most one dot and skips it unevaluated, but hands anything else -- an exponent,
-in practice -- to `ParseFloat`, which fails on OVERFLOW
-(iter_skip_strict.go:10-59, iter_float.go:186-204 @ jsoniter v1.1.12). So an
+upstream's skip still checks, and the rule starts at `Skip`'s DISPATCH: the
+reader is picked from the value's FIRST BYTE, `case '0'` calling ReadFloat32
+and `case '-','1'..'9'` calling skipNumber (iter_skip.go:72-96,83-87 @
+jsoniter v1.1.12). On the skipNumber route `trySkipNumber` walks a run of
+digits with at most one dot and skips it unevaluated, but hands anything else
+-- an exponent, in practice -- to `ParseFloat`, which fails on OVERFLOW
+(iter_skip_strict.go:10-59, iter_float.go:186-204). So an
 ignored `1e999` is 400 there and an ignored 400-digit integer is 204. Reading
 a discarded value as raw text is what makes the depth rows above agree, and on
 its own it would have opened this hole in exchange -- `-int` is the row that
 tells the two apart, and `-at-max`/`-past-max` sit either side of `f64::MAX`,
-which is where "overflow" is actually decided.
+which is where "overflow" is actually decided. The ReadFloat32 route is
+range-checked against f32 instead, a ceiling smaller by 30 orders of
+magnitude, and the six `-lead0-*`/`-signed-lead0`/`-no-lead0` rows are it:
+0.35e39 is 400 on both sides while -0.35e39 and 3.5e38 -- the same magnitude,
+also inf in f32, but not starting with `0` -- are 204 on both, and
+`-at-f32-max`/`-past-f32-max` sit either side of the f32 rounding boundary.
+Those six were added in round 18 and measured over 36 cells each (3 ignored
+positions x 4 wire framings x 3 byte offsets, 216 cells), every shape
+single-valued.
 
 Several cases are large by design: `-streams-stream-count` and
 `drained-streams-non-object` carry 1,000,001 stream objects (3 MB),
@@ -267,6 +278,12 @@ json/ignored-number-underflow                              204   204     SAME   
 json/ignored-number-int                                    204   204     SAME     SAME
 json/ignored-number-int-1000                               400   204     DIFF     DIFF
 json/ignored-number-nested                                 400   400     SAME     SAME
+json/ignored-number-lead0-over                             400   400     SAME     SAME
+json/ignored-number-lead0-under                            204   204     SAME     SAME
+json/ignored-number-lead0-at-f32-max                       204   204     SAME     SAME
+json/ignored-number-lead0-past-f32-max                     400   400     SAME     SAME
+json/ignored-number-signed-lead0                           204   204     SAME     SAME
+json/ignored-number-no-lead0                               204   204     SAME     SAME
 pb/duplicate-distinct                                      400   400     SAME     SAME
 pb/257-nonempty                                            400   400     SAME     SAME
 pb/duplicate-identical                                     400   400     SAME     SAME
@@ -357,7 +374,7 @@ otlp/index-key-map-value-long-nested-value                 400   400     SAME   
 otlp/index-key-int-value                                   204   200     SAME     SAME
 otlp/index-key-array-value-long                            400   400     SAME     SAME
 
-status agreement: 167/179 (12 recorded divergence(s): ['json/65537-raw-empty-keys', 'json/duplicate-key-65537-raw', 'json/superseded-shared-budget', 'json/drained-label-map-non-string', 'json/drained-label-map-non-string-under-cap', 'json/ignored-number-int-1000', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
+status agreement: 173/185 (12 recorded divergence(s): ['json/65537-raw-empty-keys', 'json/duplicate-key-65537-raw', 'json/superseded-shared-budget', 'json/drained-label-map-non-string', 'json/drained-label-map-non-string-under-cap', 'json/ignored-number-int-1000', 'otlp/record-less-over-deep-attr', 'otlp/record-bearing-over-deep-attr', 'otlppb/record-less-over-deep-attr', 'otlppb/record-bearing-over-deep-attr', 'otlp/duplicate-index-key/bad-last', 'otlp/index-key-map-value-long-nested-key'])
 unexpected verdicts: []
 
 ====================================================================================================
@@ -633,6 +650,24 @@ bodies
 --- json/ignored-number-nested [SAME]
     loki   400: loghttp.PushRequest.readNumberAsString: invalid number, error found in #<n> byte of <parser window elided>\n
     pulsus 400: malformed Loki push request: invalid number at line 1 column 98
+--- json/ignored-number-lead0-over [SAME]
+    loki   400: loghttp.PushRequest.strconv.ParseFloat: parsing "0.35e39": value out of range\n
+    pulsus 400: malformed Loki push request: invalid number at line 1 column 94
+--- json/ignored-number-lead0-under [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/ignored-number-lead0-at-f32-max [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/ignored-number-lead0-past-f32-max [SAME]
+    loki   400: loghttp.PushRequest.strconv.ParseFloat: parsing "0.34028236e39": value out of range\n
+    pulsus 400: malformed Loki push request: invalid number at line 1 column 100
+--- json/ignored-number-signed-lead0 [SAME]
+    loki   204: 
+    pulsus 204: 
+--- json/ignored-number-no-lead0 [SAME]
+    loki   204: 
+    pulsus 204: 
 --- pb/duplicate-distinct [SAME]
     loki   400: stream '{foo="bar", foo="barf", service_name="unknown_service"}' has duplicate label name: 'foo'\n
     pulsus 400: stream '{foo="bar", foo="barf"}' has duplicate label name: 'foo'
@@ -1060,16 +1095,26 @@ json/ignored-number-int-1000
     EXPONENT rows of that group are not affected and are not a divergence:
     the fourteen exponent shapes this group and the hermetic test pin between
     them were re-measured over 12 cells each (4 wire framings x 3 byte
-    offsets, 168 cells) and none moved. Ledger residual 10.
+    offsets, 168 cells) in round 17, and re-run over 36 cells each in round 18
+    after the f32 change below; none moved. Ledger residual 10.
 
-    One shape in this group's neighbourhood is neither, and is an OPEN gap
-    found in round 17: `Skip` never reaches skipNumber for a token whose first
-    byte is `0`, it calls ReadFloat32 directly (iter_skip.go:83-85 @ v1.1.12),
-    so upstream range-checks that token against f32. 0.35e39 is 400 upstream
-    and 204 here in all three ignored positions, while the same magnitude
-    written 3.5e38 or -0.35e39 is 204 on both. Deterministic on the request,
-    unlike the length axis above, so it is not part of residual 10 and no case
-    is pinned for it here; see the ledger row.
+    Round 18 re-derived this table's boundary on the same two servers rather
+    than restating it: bisecting the offset of a 400-nine run written in one
+    piece gives a last accepted offset of 111, i.e. offset + length + 1 = 512
+    exactly (the terminating byte has to be visible too), and 400 upstream at
+    112; the same bytes are 204 in one write and in 512-byte chunks and 400 in
+    256- and 128-byte chunks; crossing, 308 nines is 204, 309 nines is 400 and
+    309 digits of `1` then zeros is 204; 1,000 nines is 400 at each of four
+    offsets. PulsusDB answered 204 to every one of those, as before.
+
+    The `0`-leading route is NOT part of this residual and is no longer a gap:
+    it was closed in round 18. `Skip` never reaches skipNumber for a token
+    whose first byte is `0`, it calls ReadFloat32 directly (iter_skip.go:83-85
+    @ v1.1.12), so upstream range-checks that token against f32 -- and because
+    that route never enters `trySkipNumber` it has no read-buffer dependence
+    to diverge over, which is why matching it was possible where matching the
+    length axis is not. Pinned by the six `-lead0-*`/`-signed-lead0`/
+    `-no-lead0` rows above.
 
 nesting depth -- withdrawn as a divergence in round 14
     Round 12 closed the ignored-value depth hole by recursing those values

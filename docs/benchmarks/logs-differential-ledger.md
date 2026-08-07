@@ -1942,11 +1942,19 @@ back up here.
   and on the wire by the `json/drained-*` harness cases.
   **The same applies to a value under a key neither side reads**, and there
   the checks are the reference's SKIP's rather than a type's: nesting depth
-  (residual 8) and out-of-range numbers. Upstream's `trySkipNumber` walks a
-  run of digits with at most one dot and skips it unevaluated; everything
+  (residual 8) and out-of-range numbers. The number rule begins at `Skip`'s
+  DISPATCH, which picks the reader from the value's FIRST BYTE and nothing
+  else: `case '0'` calls `ReadFloat32` and `case '-', '1'..'9'` calls
+  `skipNumber` (`iter_skip.go:72-96`, `:83-87 @ jsoniter v1.1.12`). So a
+  token starting with `0` is range-checked against **`f32`** — `0.35e39` is
+  `400` on both sides, while `-0.35e39` and `3.5e38`, the same magnitude and
+  equally out of `f32` range, are `204` on both because their first byte
+  routes them elsewhere. On that other route, upstream's `trySkipNumber` walks
+  a run of digits with at most one dot and skips it unevaluated; everything
   else — an exponent, in practice — leaves that fast path and is PARSED by
-  `ParseFloat`, which fails on OVERFLOW (`iter_skip_strict.go:10-21,24-59`,
-  `iter_float.go:299-315 @ jsoniter v1.1.12`), so an ignored `1e999` is `400`
+  `ParseFloat`, which fails on OVERFLOW of **`f64`**
+  (`iter_skip_strict.go:10-21,24-59`,
+  `iter_float.go:299-315`), so an ignored `1e999` is `400`
   there. Round 12 matched that by
   accident, because `serde` evaluated every number it walked; round 14, which
   reads such a value as raw text instead, applies the rule explicitly rather
@@ -1955,11 +1963,10 @@ back up here.
   `loki_push::tests::parse_json_a_discarded_number_follows_the_references_overflow_rule`,
   whose rows are measured in each of the three positions. That is the
   EXPONENT axis and it agrees exactly, invariantly under wire framing and
-  byte offset. The LENGTH of a digits-only run does not agree and is not
-  matched: **residual 10**. A token whose first byte is `0` is a third case,
-  found in round 17 and open: `Skip` routes it to `ReadFloat32` without ever
-  reaching `skipNumber` (`iter_skip.go:83-85`), so upstream range-checks it
-  against `f32` — see the end of residual 10.
+  byte offset; the `f32` route, closed in round 18, agrees the same way and
+  for a stronger reason — it never enters the read-buffer-bounded fast path
+  at all. The LENGTH of a digits-only run does not agree and is not
+  matched: **residual 10**.
 - **Multi-failure bodies** are grouped as `util.GroupedErrors.Error()`
   groups them (`pkg/util/errors.go:105-131 @ v3.7.4`): identical messages
   collapsed with an `N errors like: ` prefix, distinct groups joined with
@@ -2271,22 +2278,35 @@ back up here.
   the hermetic test pin between them was re-measured over 12 cells — 4 wire
   framings × 3 byte offsets, 168 cells in all — without moving, which is what
   `trySkipNumber` leaving the fast path on `e` in every window predicts: the
-  exponent axis cannot depend on the buffer.
+  exponent axis cannot depend on the buffer. Round 18 re-derived the table
+  above on the same two servers after changing the `f32` route below, rather
+  than restating it: bisecting the offset of a 400-nine run in one write gives
+  a last accepted offset of 111 (offset + length + 1 = 512 exactly), `400` at
+  112; the same bytes are `204` in one write and in 512-byte chunks and `400`
+  in 256- and 128-byte chunks; crossing, 308 nines is `204`, 309 nines is
+  `400`, 309 digits of `1` then zeros is `204`; 1,000 nines is `400` at four
+  offsets. PulsusDB answered `204` to every one of those, unchanged.
 
-  **One shape is outside this residual and is OPEN (found round 17, not yet
-  decided).** `Skip` never reaches `skipNumber` for a token whose first byte
-  is `0`: it calls `ReadFloat32` directly (`iter_skip.go:83-85 @ jsoniter
+  **One shape was outside this residual and is now CLOSED (found round 17,
+  fixed round 18).** `Skip` never reaches `skipNumber` for a token whose first
+  byte is `0`: it calls `ReadFloat32` directly (`iter_skip.go:83-85 @ jsoniter
   v1.1.12`), so upstream range-checks that token against **`f32`**, not
-  `f64`. Measured on the two servers, in all three ignored positions:
-  `0.35e39` is **`400`** upstream and `204` here, `0.34e39` (just under
-  `f32::MAX`) is `204` on both, and the same magnitude written `3.5e38` or
-  `-0.35e39` — neither of which starts with `0`, so both take the
-  `skipNumber`/`f64` route — is `204` on both. Unlike the length axis this is
-  deterministic on the request, so registering it is not the obvious answer;
-  it is recorded here as found and unadjudicated, with no harness row pinned
-  for it.
+  `f64`. Measured on the two servers over 36 cells per shape (3 ignored
+  positions × 4 wire framings × 3 byte offsets), each shape single-valued:
+  `0.35e39` and `0.34028236e39` are **`400`**, `0.34e39` and `0.34028235e39`
+  — the latter still rounding to `f32::MAX` — are `204`, and the same
+  magnitude written `3.5e38` or `-0.35e39`, neither of which starts with `0`,
+  is `204` because both take the `skipNumber`/`f64` route. Unlike the length
+  axis this is deterministic on the request — the `ReadFloat32` route never
+  enters `trySkipNumber`, so no read buffer is involved — which is why it was
+  matched rather than registered. PulsusDB now dispatches on the same byte
+  (`check_ignored_number`), and all six shapes agree on both sides.
 
-  Harness: `json/ignored-number-int-1000` is the recorded divergence;
+  Harness: the `f32` route is pinned by six agreeing rows —
+  `json/ignored-number-lead0-over`, `-lead0-under`, `-lead0-at-f32-max`,
+  `-lead0-past-f32-max`, and the two controls `-signed-lead0` and `-no-lead0`
+  that make them mean the dispatch rather than the value.
+  `json/ignored-number-int-1000` is the recorded divergence;
   `json/ignored-number-int` (400 nines) is the control that agrees, and it
   agrees only because that body puts the run at offset 86, so its terminating
   byte lands at index 486 against a last-fitting index of 511 — 25 bytes of
