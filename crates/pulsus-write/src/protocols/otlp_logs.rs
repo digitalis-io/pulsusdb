@@ -401,9 +401,7 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
 /// `from_normalized` to resolve exactly as it did before #259. By-name would
 /// NOT have been neutral — it would drop both twins and change a case the
 /// reference keeps.
-fn build_stream_labels(
-    resource_attrs: &[KeyValue],
-) -> Result<(LabelSet, usize), LogsIngestError> {
+fn build_stream_labels(resource_attrs: &[KeyValue]) -> Result<(LabelSet, usize), LogsIngestError> {
     // `StreamLabels::from_pairs` applies `WithoutEmpty` (issue #374) BEFORE
     // `from_normalized`: an empty-valued resource attribute is neither
     // validated nor stored, so it cannot change the stream's fingerprint and

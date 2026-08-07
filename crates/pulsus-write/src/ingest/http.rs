@@ -411,15 +411,13 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
     // in the request failed there is nothing to write, so the sink is not
     // touched at all.
     if !stream_errors.is_empty() && parsed.rows.is_empty() && parsed.streams.is_empty() {
-        return plain_text_response(StatusCode::BAD_REQUEST, group_stream_errors(stream_errors));
+        return loki_stream_errors_response(stream_errors);
     }
 
     if is_async(&headers) {
         return match sink.admit(parsed) {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::ACCEPTED),
-            Ok(()) => {
-                plain_text_response(StatusCode::BAD_REQUEST, group_stream_errors(stream_errors))
-            }
+            Ok(()) => loki_stream_errors_response(stream_errors),
             Err(Backpressure) => loki_backpressure_response(),
         };
     }
@@ -427,13 +425,33 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
     match sink.admit_flush(parsed) {
         Ok(wait) => match wait.await {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::NO_CONTENT),
-            Ok(()) => {
-                plain_text_response(StatusCode::BAD_REQUEST, group_stream_errors(stream_errors))
-            }
+            Ok(()) => loki_stream_errors_response(stream_errors),
             Err(err) => loki_error_response(&err),
         },
         Err(Backpressure) => loki_backpressure_response(),
     }
+}
+
+/// `/loki/api/v1/push`'s stream-local validation `400`: the grouped messages
+/// with [`loki_error_response`]'s LF terminator.
+///
+/// Same reason, same writer. The reference binds ONE error writer for the
+/// whole endpoint — `pushHandler(w, r, push.ParseLokiRequest, push.HTTPError,
+/// …)` (`pkg/distributor/http.go:27-30 @ v3.7.4`) — and a label-bound breach
+/// leaves `PushWithResolver` as an `httpgrpc` error that the same handler
+/// hands to that writer (`http.go:161-171`), i.e. to `http.Error` ->
+/// `fmt.Fprintln` (`pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Measured on
+/// `grafana/loki@sha256:87f0a067…`: a 2049-byte `app` value answers `400`
+/// whose last body byte is `0x0a`.
+///
+/// The OTLP path deliberately does NOT go through here — its body is a
+/// `google.rpc.Status` protobuf written by `push.OTLPError`, which has no
+/// terminator (`pkg/distributor/http.go:32-33 @ v3.7.4`).
+fn loki_stream_errors_response(errors: Vec<String>) -> Response {
+    plain_text_response(
+        StatusCode::BAD_REQUEST,
+        format!("{}\n", group_stream_errors(errors)),
+    )
 }
 
 /// `/loki/api/v1/push`'s whole-request error response: [`classify`]'s status
@@ -2759,7 +2777,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             plain_text_body(res).await,
-            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'")
+            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'\n"),
+            "the reference LF-terminates every error body on this endpoint"
         );
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
@@ -2784,7 +2803,7 @@ mod tests {
         assert!(
             plain_text_body(res)
                 .await
-                .ends_with("' has 16 label names; limit 15")
+                .ends_with("' has 16 label names; limit 15\n")
         );
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
@@ -2893,7 +2912,7 @@ mod tests {
             assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(
                 plain_text_body(res).await,
-                "error at least one valid stream is required for ingestion"
+                "error at least one valid stream is required for ingestion\n"
             );
             assert!(sink.admitted.lock().unwrap().is_empty());
         }
@@ -2914,7 +2933,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             plain_text_body(res).await,
-            "error at least one valid stream is required for ingestion"
+            "error at least one valid stream is required for ingestion\n"
         );
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
@@ -3218,9 +3237,14 @@ mod tests {
     /// inadmissible structured-metadata name (`500`).
     ///
     /// This walks one error of each class THIS handler can produce (decode,
-    /// oversize, backpressure, flush failure, inadmissible name) so a future
-    /// error path cannot quietly drop the terminator. The inadmissible-name
-    /// case additionally has its exact bytes pinned by
+    /// oversize, backpressure, flush failure, inadmissible name, the
+    /// stream-less `422`, and the stream-local label-bound `400` in both its
+    /// forms — nothing written and written-then-refused) so a future error
+    /// path cannot quietly drop the terminator. The last three are issue
+    /// #374's and go through [`loki_stream_errors_response`] rather than
+    /// [`loki_error_response`], which is exactly why they are listed: they are
+    /// the bodies a per-variant terminator would have missed. The
+    /// inadmissible-name case additionally has its exact bytes pinned by
     /// `loki_inadmissible_structured_metadata_name_is_400_on_both_encodings`,
     /// since that is the one message whose text is the reference's.
     #[tokio::test]
@@ -3255,6 +3279,37 @@ mod tests {
                 "flush failure",
                 Outcome::FlushFails,
                 valid_loki_json_body(),
+                "application/json",
+            ),
+            // Issue #374's three: the stream-less 422 and the stream-local
+            // 400, once with nothing to write and once written-then-refused.
+            (
+                "no streams at all",
+                Outcome::Admit,
+                br#"{"streams":[]}"#.to_vec(),
+                "application/json",
+            ),
+            (
+                "every stream breaches a label bound",
+                Outcome::Admit,
+                format!(
+                    r#"{{"streams":[{{"stream":{{"app":"{}"}},"values":[["1700000000000000000","x"]]}}]}}"#,
+                    "b".repeat(2049)
+                )
+                .into_bytes(),
+                "application/json",
+            ),
+            (
+                "one stream breaches, the other is written",
+                Outcome::Admit,
+                format!(
+                    r#"{{"streams":[
+                        {{"stream":{{"app":"good"}},"values":[["1700000000000000000","a"]]}},
+                        {{"stream":{{"app":"{}"}},"values":[["1700000000000000000","b"]]}}
+                    ]}}"#,
+                    "b".repeat(2049)
+                )
+                .into_bytes(),
                 "application/json",
             ),
         ];

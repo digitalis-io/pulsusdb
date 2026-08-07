@@ -75,26 +75,69 @@ Reproduce:
   sed -n '/^RUN B/,/^#### end of generated/p' number_route_probe.txt \
       | sed 1d | diff - b.txt        # empty == run B reproduces
 
+Each of those two runs is SERIAL and takes 3m36s (measured), which is long
+enough to trip a per-command timeout in some harnesses. `--jobs N` puts N
+requests in flight at once and changes nothing else -- stdout is assembled
+from the cell dictionary after every cell is in. Measured on the servers
+below: `--jobs 16` finishes the same matrix in 18s and `diff` against the
+serial run's stdout is empty. The recipe above stays serial because that is
+what the two runs recorded here were made with.
+
 Stdout is the whole measurement and nothing else, ending at the
-GENERATED_END marker; the ports and the chunk pause go to STDERR, so a fresh
-run's stdout diffs clean whatever ports it used. Two consecutive runs of A on
-one pair of servers were diffed against each other before this was recorded,
-and they were identical. THIS PREAMBLE AND THE NOTES AFTER RUN B ARE
-HAND-MAINTAINED: the script neither writes nor checks them.
+GENERATED_END marker; the ports, the chunk pause and the job count go to
+STDERR, so a fresh run's stdout diffs clean whatever ports it used. Two
+consecutive runs of A on one pair of servers were diffed against each other
+before this was recorded, and they were identical. The two ambient channels
+that could have leaked in were POPULATED and the run repeated, rather than
+left at whatever this host had: `TZ` is UNSET here (the host is BST) and
+`LANG` is `C.UTF-8`, so the re-run set `TZ=Asia/Tokyo LC_ALL=en_US.utf8
+LANG=en_US.utf8` -- confirmed inside the process as `JST+0900` -- and the
+`sed`+`diff` recipe against it is empty too. Only 4 locales are installed
+here, so a case-folding locale (`tr_TR`) was not available to try; the probe
+folds no case and formats no date, and the timestamps it does emit are
+integer nanoseconds. THIS
+PREAMBLE AND THE NOTES AFTER RUN B ARE HAND-MAINTAINED: the script neither
+writes nor checks them.
 
-The probe REFUSES to run without both servers -- it pushes one body nothing
-objects to at each of them first and exits non-zero if either is unreachable
-or answers anything but 204, because the matrix would otherwise be measuring
-the environment. Both legs were tripped for real:
+WHAT THE PROBE REFUSES TO RUN AGAINST. Four gates, each demanding ONE value
+rather than a range, because a gate that accepts a range is exactly how a
+matrix gets validated by something that is not the server you think it is
+(issue #374 review round 20). All four were tripped for real, against this
+pair of servers plus a 40-line stub responder:
 
-    $ LOKI_PORT=13375 PULSUS_PORT=18999 python3 number_route_probe.py
-    pulsus at 127.0.0.1:18999 is not reachable: [Errno 111] Connection
-    refused  Start it first; LOKI_PORT / PULSUS_PORT override the ports.
-    exit 1
-    $ LOKI_PORT=13999 PULSUS_PORT=18375 python3 number_route_probe.py
-    loki at 127.0.0.1:13999 is not reachable: [Errno 111] Connection refused
-    ...
-    exit 1
+  1. either endpoint unreachable
+     $ LOKI_PORT=13999 PULSUS_PORT=18380 python3 number_route_probe.py
+     loki at 127.0.0.1:13999 is not reachable: [Errno 111] Connection refused
+       Start it first; LOKI_PORT / PULSUS_PORT override the ports.
+     exit 1
+     ... and the same message naming `pulsus` for PULSUS_PORT=18999.
+
+  2. either endpoint answering anything but 204 to a trivially valid push --
+     including a benign 200, which is what round 20's finding was
+     $ LOKI_PORT=13380 PULSUS_PORT=<stub answering 200> python3 …
+     pulsus at 127.0.0.1:18981 answered 200 to a trivially valid push, not
+     204; the matrix would be measuring the environment
+     exit 1
+
+  3. either endpoint answering something that is not an HTTP/1.1 status line
+     $ … PULSUS_PORT=<stub answering "OK 204 fine"> python3 …
+     not an HTTP/1.1 status line from 127.0.0.1:18981: [b'OK', b'204',
+     b'fine']
+     exit 1
+
+  4. the two endpoints being the same one -- every shape expects the same
+     status from both sides, so one server on both ports would agree with
+     itself 720 times
+     $ LOKI_PORT=13380 PULSUS_PORT=13380 python3 number_route_probe.py
+     loki and pulsus are the same endpoint 127.0.0.1:13380; the matrix would
+     be comparing one server with itself
+     exit 1
+
+The gates stop at what a preflight CAN see. A stub answering 204 to
+everything passes all four -- and is then caught by the matrix itself, which
+is the point of writing every cell's expected pair down: measured, that stub
+reports `exponent group … moved=180`, `f32 group … moved=72`, `total 780
+cells, moved=252`, exit 1.
 
 A manual capture -- NOT run in CI.
 
@@ -124,7 +167,7 @@ lead0-at-f32-max    f32         ReadFloat32  36     204/204
 signed-lead0        f32         skipNumber   36     204/204
 no-lead0            f32         skipNumber   36     204/204
 
-controls (the first two are NOT single-valued -- see the docstring)
+controls (ctl-400-nines-at-111 is NOT single-valued; at-112 is, one byte later -- see the docstring)
   ctl-400-nines-at-111  (400 digits at offset 111)
     envelope-key       off 111 one-write    loki 204  pulsus 204
     envelope-key       off 111 512B-chunks  loki 204  pulsus 204
@@ -223,7 +266,7 @@ lead0-at-f32-max    f32         ReadFloat32  36     400/204
 signed-lead0        f32         skipNumber   36     400/204
 no-lead0            f32         skipNumber   36     400/204
 
-controls (the first two are NOT single-valued -- see the docstring)
+controls (ctl-400-nines-at-111 is NOT single-valued; at-112 is, one byte later -- see the docstring)
   ctl-400-nines-at-111  (400 digits at offset 111)
     envelope-key       off 111 one-write    loki 400  pulsus 204
     envelope-key       off 111 512B-chunks  loki 400  pulsus 204
@@ -316,7 +359,7 @@ both runs. That asymmetry is why the live matrix sends `now`: an earlier pass
 of this probe used the fixed timestamp throughout and reported those shapes
 MOVED, which is the observation this run turns into a repeatable check.
 
-two more mutants, both run against these servers
+three more mutants, all run against these servers
 ------------------------------------------------
 1. THE CONTROLS BITE. `--delay 0` removes the pause between wire chunks, so
    the writes coalesce and the framing never reaches upstream's decoder. The
@@ -352,3 +395,20 @@ two more mutants, both run against these servers
 
    exit 1, all 36 of that shape's cells reported. Reverted by the inverse
    edit; the script is byte-identical to the pre-mutant copy (`cmp`).
+
+3. THE INSTRUMENT-FAILURE LINE IS KEYED ON THE CONTROL GROUP, NOT ON A NAME
+   PREFIX. That line is the only thing that says "the instrument, not the
+   subject, is what failed", and it used to fire on `name.startswith("ctl-")`
+   -- a substring test standing in for "this row is a control". Renaming
+   `ctl-400-nines-at-111` to `boundary-400-nines-at-111` and re-running with
+   `--delay 0` is the discriminating case, and it was run BOTH ways:
+
+     with the group-tag test (shipped):   INSTRUMENT FAILURE printed,
+                                          control boundary-400-nines-at-111
+                                          ... moved=6, exit 1
+     with the name-prefix test (pre-fix): INSTRUMENT FAILURE lines: 0,
+                                          control boundary-400-nines-at-111
+                                          ... moved=1, exit 1
+
+   Same failure, same non-zero exit, and the pre-fix run does not say what
+   failed. Both mutations reverted; `cmp` against the pre-mutant copy clean.

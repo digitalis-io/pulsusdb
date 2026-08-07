@@ -1111,8 +1111,14 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
         // empty upstream too, so the stream ends up with no labels at all.
         // `stream.stream` is a `BTreeMap`, so a repeated JSON key has already
         // collapsed and the duplicate-name bound is vacuous here — which is
-        // also what the reference does with a duplicate JSON key (measured:
+        // also what the reference does with a duplicate JSON key (its JSON
+        // label object is a key-unique last-write-wins map too,
+        // `pkg/loghttp/labels.go:24-40 @ v3.7.4`; measured:
         // `{"foo":"bar","foo":"barf"}` answers `204` on `grafana/loki:3.7.4`).
+        // The empty-value drop this seam needs is `WithoutEmpty` applied
+        // inside `StreamLabels::from_pairs` — pair-wise, issue #259's
+        // `retain_non_empty_values` rule — and it has to run before the bounds
+        // are charged, which is why the two are one call here.
         // Skipped for an entry-less stream, as upstream skips it before
         // validating (`pkg/distributor/distributor.go:639-641 @ v3.7.4`); a
         // breach drops just this stream (`distributor.go:645-655`).
@@ -1296,6 +1302,23 @@ fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
 /// retained pairs as [`LogsIngestError::OversizeMessage`] — all whole-request
 /// 400s. Prometheus value escaping (`\\`, `\"`, `\n`, `\t`, `\r`) is
 /// unescaped; the empty set `{}` yields no pairs.
+///
+/// The strip is **pair-wise**, not by-name: this literal is the one log-ingest
+/// input that can carry the same name twice (the reference's `labels.New`
+/// sorts without de-duplicating,
+/// `vendor/…/model/labels/labels_stringlabels.go:312-318 @ v3.7.4`), and
+/// `WithoutEmpty` removes only the empty occurrence. Measured on
+/// `grafana/loki:3.7.4`: a protobuf push of `{d="", d="keep"}` **and** one of
+/// `{d="keep", d=""}` both store `d="keep"`. The structured-metadata seam uses
+/// the by-name [`strip_empty_valued_labels`] instead, and for the same input
+/// keeps no `d` at all.
+///
+/// Ordering note for the label-count/length/duplicate bounds (issue #374):
+/// they must be charged on the POST-strip pair list. The reference strips in
+/// `ParseLabels` and only then calls `ValidateLabels`
+/// (`pkg/distributor/validator.go:157-199 @ v3.7.4`), which is why
+/// `{d="", d="keep"}` is a 204 above while `{d="one", d="two"}` is a 400
+/// `has duplicate label name` (both measured).
 fn parse_label_pairs(input: &str) -> Result<Vec<(String, String)>, LogsIngestError> {
     // `maxStreamLabelsSize`, charged on the raw literal exactly as
     // `syntax.ParseLabels` charges it (`pkg/logql/syntax/parser.go:280-281 @

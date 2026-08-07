@@ -74,21 +74,29 @@ from Loki must move and no others.  That is the probe's own mutant -- it
 demonstrates that a green run is a measurement and not a rubber stamp, and
 it is why the live-timestamp run uses `now`.
 
-Usage (both servers must already be up; the probe refuses to run otherwise):
+Usage (both servers must already be up, and must be two different servers;
+the probe refuses to run otherwise -- see `preflight`):
 
     LOKI_PORT=13375 PULSUS_PORT=18375 python3 number_route_probe.py
     LOKI_PORT=13375 PULSUS_PORT=18375 python3 number_route_probe.py \
         --stale-timestamps
 
+A serial run of the 780 cells takes 3m36s (measured), which is long enough to
+trip a per-command timeout in some harnesses.  `--jobs N` puts N requests in
+flight at once and does nothing else: stdout is assembled from the cell
+dictionary after every cell is in, so it is byte-identical to the serial run
+-- measured, `--jobs 16` finishes in 18s and diffs clean against it.
+
 Stdout is the whole measurement and nothing else, terminated by
-GENERATED_END; the ports and the chunk pause go to stderr so that a fresh
-run's stdout can be diffed against the recorded one with no post-processing
-whatever ports it used.  See number_route_probe.txt in this directory for a
+GENERATED_END; the ports, the chunk pause and the job count go to stderr so
+that a fresh run's stdout can be diffed against the recorded one with no
+post-processing whatever ports it used.  See number_route_probe.txt in this directory for a
 recorded run of each mode and the diff recipe, and oracle_probe.txt for the
 servers and the container recipe.  A manual capture -- NOT run in CI.
 """
 import argparse
 import errno
+from concurrent import futures
 import os
 import socket
 import sys
@@ -262,18 +270,45 @@ def raw_post(target, body, framing, delay):
     finally:
         sock.close()
     parts = buf.split(b"\r\n", 1)[0].split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        sys.exit("unparseable status line: %r" % parts)
+    # Exactly an HTTP/1.1 status line.  A peer that answers something else is
+    # not a cell of this matrix and must not be read as one -- the same reason
+    # `preflight` below demands one status rather than a range.
+    if len(parts) < 2 or parts[0] != b"HTTP/1.1" or not parts[1].isdigit():
+        sys.exit("not an HTTP/1.1 status line from %s:%d: %r" % (target + (parts,)))
     return int(parts[1])
 
 
-def preflight(delay):
-    """Refuse to run without both servers.
+# The ONE status a Loki-compatible push receiver answers to a valid, synchronous
+# push.  Not a range: the point of the preflight is that a responder which is
+# not the server you think it is cannot validate the matrix, and "anything but
+# an error" is exactly what such a responder is most likely to answer.  Both
+# servers answer this and only this -- see the `preflight` docstring.
+PREFLIGHT_STATUS = 204
 
-    A push nothing objects to has to come back accepted from each of them
-    first: a connection refused, or a server that answers 400 to a trivially
-    valid body, means the matrix below would be measuring the environment.
+
+def preflight(delay):
+    """Refuse to run without both servers, and without them being two.
+
+    A push nothing objects to has to come back `204` from each of them first
+    -- `204` exactly, not "not an error".  A connection refused, a server that
+    answers `400` to a trivially valid body, and a server that answers `200`
+    are all the same failure: the matrix would be measuring the environment
+    rather than the two decoders.  Upstream's `/loki/api/v1/push` writes
+    `w.WriteHeader(http.StatusNoContent)` on the success path
+    (`pkg/distributor/http.go:107,157 @ loki v3.7.4`) and PulsusDB's
+    `ingest_loki_push` answers the same `204`, so a `200` here means the port
+    is answering something that is not this endpoint.
+
+    The two targets must also be DIFFERENT endpoints.  Every shape in the
+    matrix expects the same status from both sides, so one server answering
+    on both ports would agree with itself 720 times; only the controls, whose
+    two columns differ, would notice.
     """
+    if LOKI == PULSUS:
+        sys.exit(
+            "loki and pulsus are the same endpoint %s:%d; the matrix would be "
+            "comparing one server with itself" % LOKI
+        )
     ts = str(int(time.time() * 1e9))
     body = ('{"streams":[{"stream":{"app":"preflight"},"values":[["%s","ok"]]}]}' % ts).encode()
     for label, target in (("loki", LOKI), ("pulsus", PULSUS)):
@@ -284,40 +319,36 @@ def preflight(delay):
                 "  Start it first; LOKI_PORT / PULSUS_PORT override the ports."
             )
             sys.exit("%s at %s:%d is not reachable: %s%s" % (label, target[0], target[1], exc, hint))
-        if status not in (200, 204):
+        if status != PREFLIGHT_STATUS:
             sys.exit(
-                "%s at %s:%d answered %d to a trivially valid push; the matrix "
-                "would be measuring the environment" % (label, target[0], target[1], status)
+                "%s at %s:%d answered %d to a trivially valid push, not %d; the "
+                "matrix would be measuring the environment"
+                % (label, target[0], target[1], status, PREFLIGHT_STATUS)
             )
 
 
-def cells_for(shape, ts, delay):
-    """Every cell of one shape: (position, framing, offset) -> (loki, pulsus)."""
-    name, value, _route, _l, _p = shape
-    out = {}
-    for position in POSITIONS:
-        for offset in OFFSETS:
-            body = build(position, ts, value, offset)
-            for framing in FRAMINGS:
-                out[(position, framing, offset)] = (
-                    raw_post(LOKI, body, framing, delay),
-                    raw_post(PULSUS, body, framing, delay),
-                )
-    return out
+def measure(value, ts, offsets, delay, jobs):
+    """Every cell of one value: (position, framing, offset) -> (loki, pulsus).
 
-
-def control_cells(control, ts, delay):
-    _name, value, offsets, _loki_by_framing, _pulsus = control
-    out = {}
+    Each cell is two independent requests on two fresh sockets, so they can be
+    made concurrently when `jobs > 1`.  The RESULT is a dict keyed by cell, and
+    every caller reads it by key, so `jobs` changes how long a run takes and
+    nothing about what it prints -- see `--jobs` in `main`.
+    """
+    keys, calls = [], []
     for position in POSITIONS:
         for offset in offsets:
             body = build(position, ts, value, offset)
             for framing in FRAMINGS:
-                out[(position, framing, offset)] = (
-                    raw_post(LOKI, body, framing, delay),
-                    raw_post(PULSUS, body, framing, delay),
-                )
-    return out
+                keys.append((position, framing, offset))
+                calls.append((LOKI, body, framing))
+                calls.append((PULSUS, body, framing))
+    if jobs == 1:
+        statuses = [raw_post(*call, delay) for call in calls]
+    else:
+        with futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            statuses = list(pool.map(lambda call: raw_post(*call, delay), calls))
+    return {key: (statuses[2 * i], statuses[2 * i + 1]) for i, key in enumerate(keys)}
 
 
 def framing_name(framing):
@@ -337,6 +368,21 @@ def main():
         "cells Loki accepts move to 400 (the probe's own mutant)",
     )
     ap.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="requests in flight at once (default 1, i.e. strictly serial -- "
+        "which is what the recorded transcript was made with; the 780 cells "
+        "take 3m36s that way, which is long enough to hit a per-command "
+        "timeout). Raising it changes only how long a run takes: stdout is "
+        "assembled from the cell dictionary afterwards, so it is "
+        "byte-identical either way -- measured, --jobs 16 finishes the same "
+        "matrix in 18s and its stdout diffs clean against the serial run. "
+        "Every cell is still its own connection with its own chunk pauses, "
+        "and the controls still have to bite: if a parallel run reports "
+        "INSTRUMENT FAILURE, lower --jobs before believing the shapes.",
+    )
+    ap.add_argument(
         "--delay",
         type=float,
         default=0.005,
@@ -344,6 +390,8 @@ def main():
         "if the controls report that the framing did not reach the decoder",
     )
     args = ap.parse_args()
+    if args.jobs < 1:
+        sys.exit("--jobs must be at least 1")
 
     preflight(args.delay)
     ts = STALE_TS if args.stale_timestamps else str(int(time.time() * 1e9))
@@ -357,12 +405,13 @@ def main():
         "timestamps: %s"
         % ("FIXED 2023 (--stale-timestamps)" if args.stale_timestamps else "now")
     )
-    # The ports and the pause are run parameters, not measurements: they go to
-    # STDERR so that stdout is byte-reproducible across runs and can be diffed
-    # against the recorded transcript with no post-processing.
+    # The ports, the pause and the job count are run parameters, not
+    # measurements: they go to STDERR so that stdout is byte-reproducible
+    # across runs and can be diffed against the recorded transcript with no
+    # post-processing.
     print(
-        "loki %s:%d   pulsus %s:%d   chunk pause %g s"
-        % (LOKI[0], LOKI[1], PULSUS[0], PULSUS[1], args.delay),
+        "loki %s:%d   pulsus %s:%d   chunk pause %g s   jobs %d"
+        % (LOKI[0], LOKI[1], PULSUS[0], PULSUS[1], args.delay, args.jobs),
         file=sys.stderr,
     )
     print()
@@ -376,7 +425,7 @@ def main():
                 # Every accepted cell must be refused instead; a refused one
                 # never reaches the timestamp check and must not move.
                 loki_ok = 400
-            observed = cells_for(shape, ts, args.delay)
+            observed = measure(value, ts, OFFSETS, args.delay, args.jobs)
             bad = {k: v for k, v in observed.items() if v != (loki_ok, pulsus_ok)}
             statuses = sorted({v for v in observed.values()})
             rows.append(
@@ -388,7 +437,7 @@ def main():
     control_rows = []
     for control in CONTROLS:
         name, value, offsets, loki_by_framing, pulsus_ok = control
-        observed = control_cells(control, ts, args.delay)
+        observed = measure(value, ts, offsets, args.delay, args.jobs)
         expected = {
             k: ((400 if args.stale_timestamps else loki_by_framing[k[1]]), pulsus_ok)
             for k in observed
@@ -406,7 +455,15 @@ def main():
         print("%s  %-10s  %-11s  %-5d  %s%s" % (name.ljust(width), group, route, count, rendered, flag))
     print()
 
-    print("controls (the first two are NOT single-valued -- see the docstring)")
+    # Not "the first two are NOT single-valued", which is what this line used
+    # to say and what the runs refute: at-111 has two status pairs, at-112 has
+    # one (400/204 in all four framings). The pair of them is the OFFSET knob
+    # -- same 400 digits, one byte apart, opposite verdicts -- and at-111
+    # alone is the framing knob.
+    print(
+        "controls (ctl-400-nines-at-111 is NOT single-valued; at-112 is, one "
+        "byte later -- see the docstring)"
+    )
     for name, value, offsets, observed, expected, bad in control_rows:
         print(
             "  %s  (%d digits at offset%s %s)"
@@ -429,7 +486,11 @@ def main():
                     )
     print()
 
-    if any(name.startswith("ctl-") for _g, name, _b, _e in moved):
+    # Keyed on the group tag the control loop appends, not on the shape's name:
+    # a shape in EXPONENT or F32 that happened to be called `ctl-…` would
+    # otherwise claim the instrument failed, and a control renamed out of that
+    # prefix would stop claiming it.
+    if any(group == "control" for group, _n, _b, _e in moved):
         print(
             "INSTRUMENT FAILURE: a control moved. The framing or the offset knob "
             "did not reach upstream's decoder, so the invariance the shapes above "

@@ -2303,6 +2303,26 @@ back up here.
   reason, in `compare.py`'s `trim`, so that its stated reproduce recipe
   ("diff empty") holds; the sort is applied to both sides and cannot reach a
   verdict, which is a status.
+- **The `400` body is LF-terminated on the Loki push path**, and only
+  there. The reference binds one error writer per push endpoint —
+  `push.HTTPError` for `/loki/api/v1/push`, `push.OTLPError` for the OTLP
+  one (`pkg/distributor/http.go:27-33 @ v3.7.4`) — and a label-bound breach
+  leaves `PushWithResolver` as an `httpgrpc` error handed to that same
+  writer (`http.go:161-171`), i.e. to `http.Error` -> `fmt.Fprintln`
+  (`pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Measured on the pinned
+  oracle: a 2049-byte label value answers `400` whose last body byte is
+  `0x0a`. Merged in from issue #259, which established the same terminator
+  for this endpoint's decode-failure bodies; the stream-local `400` this
+  row adds is written through the same seam and had to follow. The OTLP
+  body is a `google.rpc.Status` protobuf and carries no terminator. In the
+  transcript below, every case where BOTH sides answer `400` now agrees on
+  it; the six where exactly one side terminates are the six where exactly
+  one side answers `400` at all, i.e. the recorded status divergences.
+  Gated by `ingest/http.rs`'s `every_loki_push_error_body_is_lf_terminated`,
+  which #259 wrote as an enumeration over the endpoint's error classes and
+  which this row extends with its three: the stream-less `422` and the
+  stream-local `400` in both its forms (nothing written, and
+  written-then-refused).
 - **Residual 1 — the rendered label set inside the message.** Every one of
   the four messages interpolates the stream's label set, and the
   reference's copy carries a `service_name` label its own push parser

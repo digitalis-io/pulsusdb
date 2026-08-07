@@ -892,7 +892,7 @@ async fn empty_valued_structured_metadata_is_never_stored() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_155;
+    let port = 31_162;
     let db = "pulsus_loki_push_empty_sm_it";
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
@@ -1079,7 +1079,7 @@ async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_store
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_158;
+    let port = 31_164;
     let db = "pulsus_loki_push_sm_name_it";
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
@@ -1205,7 +1205,7 @@ async fn empty_valued_stream_labels_are_never_stored_and_merge_the_stream() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_156;
+    let port = 31_163;
     let db = "pulsus_loki_push_empty_labels_it";
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
@@ -1657,7 +1657,7 @@ async fn over_wide_label_value_is_rejected_and_stores_nothing() {
         res.body,
         format!(
             "stream '{{app=\"{over}\", service_name=\"{service}-rejected\"}}' \
-             has label value too long: '{over}'"
+             has label value too long: '{over}'\n"
         ),
         "the 400 body is the reference's message"
     );
@@ -1685,7 +1685,7 @@ async fn over_wide_label_value_is_rejected_and_stores_nothing() {
     assert_eq!(res.status, 400, "over-bound value rejected on protobuf too");
     assert!(
         res.body
-            .ends_with(&format!("has label value too long: '{over}'")),
+            .ends_with(&format!("has label value too long: '{over}'\n")),
         "protobuf 400 body: {}",
         res.body
     );
@@ -1770,7 +1770,7 @@ async fn a_mixed_batch_stores_the_good_streams_and_still_answers_400() {
     assert_eq!(res.status, 400, "a mixed batch still answers 400");
     assert!(
         res.body
-            .ends_with(&format!("has label value too long: '{over}'")),
+            .ends_with(&format!("has label value too long: '{over}'\n")),
         "the 400 body is the reference's message for the one bad stream: {}",
         res.body
     );
@@ -2134,12 +2134,22 @@ async fn a_stream_less_push_is_422_on_both_receivers_and_stores_nothing() {
     let base_ns = now_ns();
     let service = "stream-less-374";
     const MISSING: &str = "error at least one valid stream is required for ingestion";
+    // The Loki push endpoint LF-terminates every error body it writes
+    // (`push.HTTPError` -> `http.Error` -> `fmt.Fprintln`,
+    // `pkg/loghttp/push/push.go:606-608 @ v3.7.4`); measured on
+    // `grafana/loki:3.7.4`, this 422's last byte is `0x0a`. The OTLP twin
+    // below carries the same text inside a `google.rpc.Status` and has no
+    // terminator at all.
+    let missing_lf = format!("{MISSING}\n");
 
     // Loki push, both JSON spellings of "no streams".
     for body in [r#"{"streams":[]}"#, "{}"] {
         let res = push(port, "application/json", body.as_bytes());
         assert_eq!(res.status, 422, "{body} -> 422 (body {})", res.body);
-        assert_eq!(res.body, MISSING, "the 422 body is the reference's message");
+        assert_eq!(
+            res.body, missing_lf,
+            "the 422 body is the reference's message, terminator included"
+        );
     }
     // ...and the protobuf transport, where "no streams" is an empty message.
     let res = push(
@@ -2150,7 +2160,7 @@ async fn a_stream_less_push_is_422_on_both_receivers_and_stores_nothing() {
             .expect("snappy compress"),
     );
     assert_eq!(res.status, 422, "empty protobuf push (body {})", res.body);
-    assert_eq!(res.body, MISSING);
+    assert_eq!(res.body, missing_lf);
 
     // OTLP: a resource with attributes but an empty `logRecords` — the shape
     // the review measured — plus the empty request.
@@ -2251,7 +2261,9 @@ async fn a_case_variant_streams_key_is_accepted_and_its_lines_are_stored() {
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
     let base_ns = now_ns();
-    const MISSING: &str = "error at least one valid stream is required for ingestion";
+    // LF-terminated, like every error body this endpoint writes -- see the
+    // stream-less test above.
+    const MISSING: &str = "error at least one valid stream is required for ingestion\n";
     let one = |spelling: &str, service: &str, line: &str| {
         format!(
             r#"{{"{spelling}":[{{"stream":{{"service_name":"{service}"}},"values":[["{base_ns}","{line}"]]}}]}}"#
