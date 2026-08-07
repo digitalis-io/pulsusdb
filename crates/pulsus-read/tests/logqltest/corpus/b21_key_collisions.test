@@ -359,6 +359,50 @@ eval instant at 60s {service_name="kc-jexpr-arr2"} | json a="arr[0]", a="z"
 
 clear
 
+# --- competing INDICES of one array resolve by ascending index, not by
+#     expression order: the reference collects the wanted indices and
+#     then walks the array once (`ArrayEach`), scanning the expressions
+#     only inside a single element -----------------------------------
+load
+  {env="prod", service_name="kc-jexpr-idx"}
+  0s  {"arr":[{"k":"K1"},{"k":"K2"},{"k":"K3"}]}
+
+eval instant at 60s {service_name="kc-jexpr-idx"} | json a="arr[2].k", a="arr[0].k", a="arr[1].k"
+  {env="prod", service_name="kc-jexpr-idx", a="K3"}  0s  {"arr":[{"k":"K1"},{"k":"K2"},{"k":"K3"}]}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-idx2"}
+  0s  {"arr":[10,20]}
+
+eval instant at 60s {service_name="kc-jexpr-idx2"} | json a="arr[1]", a="arr[0]"
+  {env="prod", service_name="kc-jexpr-idx2", a="20"}  0s  {"arr":[10,20]}
+
+clear
+
+# --- …and INSIDE one element the expression list does break the tie ---
+load
+  {env="prod", service_name="kc-jexpr-elord"}
+  0s  {"arr":[{"j":"J","k":"K"}]}
+
+eval instant at 60s {service_name="kc-jexpr-elord"} | json a="arr[0].k", a="arr[0].j"
+  {env="prod", service_name="kc-jexpr-elord", a="J"}  0s  {"arr":[{"j":"J","k":"K"}]}
+
+clear
+
+# --- a repeated key INSIDE an array element resolves to its first
+#     occurrence, like everywhere else (`searchKeys` returns at the
+#     first full match) ------------------------------------------------
+load
+  {env="prod", service_name="kc-jexpr-eldup"}
+  0s  {"arr":[{"k":"K1","k":"K2"}]}
+
+eval instant at 60s {service_name="kc-jexpr-eldup"} | json a="arr[0].k"
+  {env="prod", service_name="kc-jexpr-eldup", a="K1"}  0s  {"arr":[{"k":"K1","k":"K2"}]}
+
+clear
+
 # --- several expressions naming ONE path all fire at that key ---------
 load
   {env="prod", service_name="kc-jexpr-share"}

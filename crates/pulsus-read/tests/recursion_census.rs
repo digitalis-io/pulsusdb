@@ -323,6 +323,26 @@ fn declared_slots(files: &[(String, String)], members: &[String]) -> Vec<Slot> {
     out
 }
 
+/// Recursive types whose depth is bounded by the PARSER that builds them,
+/// not by the query text — so the #272 machinery (opaque `Child`/
+/// `ChildVec` handles, `impl Scc`, an iterative `Drop`) buys them
+/// nothing and check (b) deliberately does not apply.
+///
+/// `WireJson` (issue #334) is the only one. It is built solely by
+/// `serde_json`, whose deserializer refuses a document nested past its
+/// own recursion limit, so no log line can make one deeper than that:
+/// measured at 127 levels parsing, 128 a `JSONParserErr` and 5 000 the
+/// same rather than a stack overflow
+/// (`logql_json_flatten_budget.rs::json_nesting_past_the_parser_limit_is_a_parse_error`).
+/// The four AST members are a different case entirely — their depth is
+/// bounded only by the query-text cap, thousands of levels, which is why
+/// #272 exists.
+///
+/// This is an exemption from (b), NOT from (a): the type still has to
+/// appear in the discovered set below, so a sixth recursive type — or
+/// this one losing its parser bound — still reddens the file.
+const DEPTH_BOUNDED_BY_THEIR_PARSER: &[&str] = &["WireJson"];
+
 #[test]
 fn check_a_and_b_the_slot_census_matches_the_pinned_inventory() {
     let files = sweep();
@@ -335,12 +355,28 @@ fn check_a_and_b_the_slot_census_matches_the_pinned_inventory() {
             "MetricExpr".to_string(),
             "MetricNode".to_string(),
             "VariantsExpr".to_string(),
+            "WireJson".to_string(),
         ],
         "the recursive-type set moved. `CompiledLabelFilter` left it when #272 flattened it \
-         to a post-order `Vec<LfOp>`; anything else joining or leaving is a design change."
+         to a post-order `Vec<LfOp>`; `WireJson` joined it in #334 and is exempt from (b) by \
+         `DEPTH_BOUNDED_BY_THEIR_PARSER`; anything else joining or leaving is a design change."
     );
+    // The exemption cannot name a type the scan did not find, so it
+    // cannot rot into a list of types that no longer exist.
+    for exempt in DEPTH_BOUNDED_BY_THEIR_PARSER {
+        assert!(
+            members.iter().any(|m| m == exempt),
+            "{exempt} is exempted from (b) but is no longer a discovered recursive type — \
+             drop it from DEPTH_BOUNDED_BY_THEIR_PARSER"
+        );
+    }
 
-    let slots = declared_slots(&files, &members);
+    let converted: Vec<String> = members
+        .iter()
+        .filter(|m| !DEPTH_BOUNDED_BY_THEIR_PARSER.contains(&m.as_str()))
+        .cloned()
+        .collect();
+    let slots = declared_slots(&files, &converted);
     // (b) every surviving slot is spelled `Child`/`ChildVec` — no `Box`
     // or `Vec` of an SCC member remains anywhere.
     let unconverted: Vec<&Slot> = slots

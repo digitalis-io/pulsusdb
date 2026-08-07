@@ -4123,23 +4123,16 @@ impl<'v> JsonPathCapture<'v, '_> {
 enum WireJson {
     /// Fields in the order the document listed them, duplicates included.
     Object(Vec<(String, WireJson)>),
-    /// Everything that is not an object, `serde_json`'s own value so its
-    /// pinned rendering (`float_roundtrip` number formatting included) is
-    /// untouched.
-    ///
-    /// **Arrays stay here on purpose.** Nothing derives a label NAME from
-    /// inside one — the flatten skips arrays outright (`parser.go:105-114`
-    /// handles only string/number/boolean/object) and `unpack` takes only
-    /// top-level strings — so the only reader is a targeted `[i]` path,
-    /// which the reference itself resolves with a self-contained
-    /// `searchKeys` on the ELEMENT rather than through the document scan
-    /// (`vendor/github.com/grafana/jsonparser/parser.go:497-540 @ v3.7.4`).
-    /// Giving arrays their own `Vec<WireJson>` variant would put a second
-    /// recursive spelling in this crate and move
-    /// `tests/recursion_census.rs`'s pinned set, which is a #272 design
-    /// decision and not this issue's to make. The cost is named on the
-    /// issue: duplicate keys inside an array ELEMENT resolve to the last
-    /// here and to the first there.
+    /// Elements in order. A targeted `[i]` path may index into an array
+    /// and continue into an object, so the order and the duplicates
+    /// inside one are observable exactly as they are anywhere else —
+    /// `qq="arr[2].k", qq="arr[0].k", qq="arr[1].k"` resolves by ASCENDING
+    /// INDEX, and a repeated key inside an element resolves to its first
+    /// occurrence. Round 2 of this issue left arrays as
+    /// `serde_json::Value` and got both wrong.
+    Array(Vec<WireJson>),
+    /// Any scalar, `serde_json`'s own value so its pinned rendering
+    /// (`float_roundtrip` number formatting included) is untouched.
     Leaf(serde_json::Value),
 }
 
@@ -4190,10 +4183,10 @@ impl<'de> serde::de::Visitor<'de> for WireJsonVisitor {
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<WireJson, A::Error> {
         let mut out = Vec::new();
-        while let Some(v) = seq.next_element::<serde_json::Value>()? {
+        while let Some(v) = seq.next_element::<WireJson>()? {
             out.push(v);
         }
-        Ok(WireJson::Leaf(serde_json::Value::Array(out)))
+        Ok(WireJson::Array(out))
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<WireJson, A::Error> {
@@ -4404,9 +4397,7 @@ impl<'a> TargetWalk<'a> {
             // expression whose next segment indexes THIS array is resolved
             // here, in the order the expressions were written, and is
             // flagged whether or not the element exists.
-            WireJson::Leaf(serde_json::Value::Array(items)) => {
-                self.fire_indexed(items, stack, labels, st, dirty);
-            }
+            WireJson::Array(items) => self.fire_indexed(items, stack, labels, st, dirty),
             WireJson::Leaf(_) => {}
         }
     }
@@ -4432,37 +4423,69 @@ impl<'a> TargetWalk<'a> {
     }
 
     /// Fires every expression that indexes the array at `stack`.
+    ///
+    /// **The outer loop is over ELEMENTS, not over expressions.**
+    /// `EachKey`'s array branch collects the wanted indices, then hands
+    /// the array to `ArrayEach`, which walks it once in order; only
+    /// inside one element does it scan the expressions
+    /// (`vendor/github.com/grafana/jsonparser/parser.go:497-540 @
+    /// v3.7.4`). So competing indices of one array resolve by ASCENDING
+    /// INDEX and the expression list breaks ties only within a single
+    /// element — captured at v3.7.4:
+    /// `qq="arr[2].k", qq="arr[0].k", qq="arr[1].k"` over three elements
+    /// is the THIRD element's value, where writing in expression order
+    /// gives the second's.
     fn fire_indexed(
         &mut self,
-        items: &[serde_json::Value],
+        items: &[WireJson],
         stack: &[&str],
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
         st: &mut ExtractionState<'a, '_>,
         dirty: &mut bool,
     ) {
-        for i in 0..self.extractions.len() {
-            let path = &self.extractions[i].1;
-            if self.flagged[i]
-                || path.len() <= stack.len()
-                || !path_is_fields(&path[..stack.len()], stack)
-            {
-                continue;
+        // `arrIdxFlags` — the set of element indices some expression
+        // wants. An index past the end is still wanted; it simply never
+        // comes up in the walk, and the reference flags those paths at
+        // the end of `ArrayEach` having fired nothing.
+        let wanted: Vec<(usize, usize)> = (0..self.extractions.len())
+            .filter(|&i| !self.flagged[i])
+            .filter_map(|i| {
+                let path = &self.extractions[i].1;
+                if path.len() <= stack.len() || !path_is_fields(&path[..stack.len()], stack) {
+                    return None;
+                }
+                match path[stack.len()] {
+                    JsonPathSeg::Index(idx) => Some((idx, i)),
+                    JsonPathSeg::Field(_) => None,
+                }
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        for (element, item) in items.iter().enumerate() {
+            for &(idx, i) in &wanted {
+                if idx != element {
+                    continue;
+                }
+                self.flagged[i] = true;
+                self.flagged_count += 1;
+                // `searchKeys` on the element, then `if of != -1` — a
+                // miss stays flagged but fires no callback.
+                let path = &self.extractions[i].1;
+                let Some(found) = lookup_wire_path(item, &path[stack.len() + 1..]) else {
+                    continue;
+                };
+                self.fired += 1;
+                self.write(i, wire_json_to_string(found), labels, st, dirty);
             }
-            let JsonPathSeg::Index(idx) = path[stack.len()] else {
-                continue;
-            };
-            self.flagged[i] = true;
-            self.flagged_count += 1;
-            // `searchKeys` on the element, then `if of != -1` — a miss
-            // stays flagged but fires no callback.
-            let Some(found) = items
-                .get(idx)
-                .and_then(|item| lookup_json_path(item, &path[stack.len() + 1..]))
-            else {
-                continue;
-            };
-            self.fired += 1;
-            self.write(i, json_scalar_to_string(found), labels, st, dirty);
+        }
+        // An index past the end resolves to nothing but is still spent.
+        for &(idx, i) in &wanted {
+            if idx >= items.len() && !self.flagged[i] {
+                self.flagged[i] = true;
+                self.flagged_count += 1;
+            }
         }
     }
 
@@ -4496,17 +4519,19 @@ fn path_is_fields(path: &[JsonPathSeg], stack: &[&str]) -> bool {
             .all(|(seg, want)| matches!(seg, JsonPathSeg::Field(name) if name == want))
 }
 
-/// The reference's `searchKeys` inside ONE array element: first matching
-/// field at each step, elements by index.
-fn lookup_json_path<'v>(
-    root: &'v serde_json::Value,
-    path: &[JsonPathSeg],
-) -> Option<&'v serde_json::Value> {
+/// The reference's `searchKeys` inside ONE array element
+/// (`vendor/github.com/grafana/jsonparser/parser.go:203-320 @ v3.7.4`):
+/// it scans left to right and returns at the FIRST full path match, so a
+/// repeated key inside the element resolves to its first occurrence.
+fn lookup_wire_path<'v>(root: &'v WireJson, path: &[JsonPathSeg]) -> Option<&'v WireJson> {
     let mut cur = root;
     for seg in path {
-        cur = match seg {
-            JsonPathSeg::Field(name) => cur.get(name)?,
-            JsonPathSeg::Index(idx) => cur.get(idx)?,
+        cur = match (seg, cur) {
+            (JsonPathSeg::Field(name), WireJson::Object(fields)) => {
+                &fields.iter().find(|(k, _)| k == name)?.1
+            }
+            (JsonPathSeg::Index(idx), WireJson::Array(items)) => items.get(*idx)?,
+            _ => return None,
         };
     }
     Some(cur)
@@ -4521,15 +4546,18 @@ fn lookup_json_path<'v>(
 fn wire_json_to_string(node: &WireJson) -> String {
     match node {
         WireJson::Leaf(v) => json_scalar_to_string(v),
-        object => json_scalar_to_string(&wire_json_to_value(object)),
+        container => json_scalar_to_string(&wire_json_to_value(container)),
     }
 }
 
 /// A `WireJson` node as the `serde_json::Value` it would have been —
-/// needed only by [`wire_json_to_string`]'s object arm.
+/// needed only by [`wire_json_to_string`]'s container arm.
 fn wire_json_to_value(node: &WireJson) -> serde_json::Value {
     match node {
         WireJson::Leaf(v) => v.clone(),
+        WireJson::Array(items) => {
+            serde_json::Value::Array(items.iter().map(wire_json_to_value).collect())
+        }
         WireJson::Object(fields) => serde_json::Value::Object(
             fields
                 .iter()
@@ -4619,7 +4647,7 @@ fn flatten_json<'v>(
         for (k, v) in map {
             if matches!(
                 v,
-                WireJson::Leaf(serde_json::Value::Null | serde_json::Value::Array(_))
+                WireJson::Array(_) | WireJson::Leaf(serde_json::Value::Null)
             ) {
                 continue;
             }
@@ -4710,6 +4738,10 @@ fn flatten_json<'v>(
                     budget,
                     capture.as_deref_mut(),
                 )?,
+                // Unreachable — the loop `continue`s on an array above,
+                // as `parseObject` handles only string/number/boolean/
+                // object (`parser.go:105-114`).
+                WireJson::Array(_) => {}
             }
         }
     }
