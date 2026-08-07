@@ -1,13 +1,21 @@
 //! `/api/v1/*`'s error envelope: `{"status":"error","errorType",...
 //! "error"}` — **exactly** these three fields, no `position` field (issue
-//! #32 architect plan: unlike `logs_api`'s `{..,"position"}`, a PromQL
-//! parse error's position is embedded verbatim inside the `error` message
-//! string, Prometheus-style — `pulsus_promql::PromqlError::Parse`'s
-//! `Display` already carries the vendored parser's own positional text,
-//! see docs/api.md §3's "Errors" section). The five-type taxonomy below is
+//! #32 architect plan: a PromQL parse error's position is embedded
+//! verbatim inside the `error` message string, Prometheus-style —
+//! `pulsus_promql::PromqlError::Parse`'s `Display` already carries the
+//! vendored parser's own positional text, see docs/api.md §3's "Errors"
+//! section). The five-type taxonomy below is
 //! pinned by the plan amendment (task-manager resolution, overruling the
 //! original draft's four-type collapse): `timeout` is distinct from
 //! `unavailable` so Prometheus-compatible clients can branch on it.
+//!
+//! Issue #264 moved the LogQL surface (`logs_api/error.rs`) off its JSON
+//! envelope onto a bare `text/plain` body and left this one alone
+//! deliberately: upstream Prometheus writes every API error as
+//! `application/json` (`respondError`, `web/api/v1/api.go:2200-2230`,
+//! read at `vendor/github.com/prometheus/prometheus/` @ grafana/loki
+//! v3.7.4), so making the two surfaces symmetric would have created a
+//! divergence rather than closing one.
 
 use axum::Json;
 use axum::http::StatusCode;

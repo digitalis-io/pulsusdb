@@ -11,7 +11,7 @@ Conventions:
 
 - Default listener: `0.0.0.0:3100`. All endpoints relative to that root.
 - Timestamps: log APIs use nanoseconds; metrics APIs use RFC3339 or unix seconds; trace APIs accept unix seconds/nanoseconds/RFC3339.
-- Errors: `{"status":"error","errorType":...,"error":...}` envelopes; `429` on ingest backpressure; `400` for malformed queries with parser position where available.
+- Errors: the log query API (§2) returns a bare `text/plain` body carrying the message and nothing else; the metrics (§3) and trace (§4) APIs return `{"status":"error","errorType":...,"error":...}` JSON envelopes. `429` on ingest backpressure; `400` for malformed queries.
 - Compression: requests may be `gzip`, `snappy`, or `zstd` (`Content-Encoding`); responses gzip when accepted.
 - Regular expressions: RE2 in every query language — §9 documents the dialect and the measured differences from Loki/Prometheus/Tempo.
 
@@ -95,7 +95,7 @@ Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":
 - **Range-query window semantics (issue #227):** a metric range query re-evaluates the `[range]` selector at every point of the **start-anchored** grid `{start + k·step ≤ end}`, over the **half-open** window `(t − range, t]` — the reference store's sliding evaluation, not fixed step-aligned buckets. Windows **overlap** when `range > step` (one entry contributes to several points), an **empty window emits no point** (a gap, never a zero), and `rate`/`bytes_rate` divide by the **`[range]`** seconds, so `rate({…}[1m])` and `rate({…}[10m])` differ. Instant queries are unaffected (one window `(time − range, time]`).
 - With `X-Pulsus-Explain: 1`, `data.explain = {"result_type","routing":{"chosen":"rollup"|"raw","reason":"..."}|null,"stages":[{"name","sql","note"|null},...]}` is added alongside `data.stats`.
 
-**Metric binary operations & vector matching (issue #91).** LogQL metric expressions support binary operations between range vectors — arithmetic, comparison (with `bool`), and the `and`/`or`/`unless` set operators — with the full `on(...)`/`ignoring(...)` and `group_left(...)`/`group_right(...)` vector-matching modifiers (semantics oracle-verified against `grafana/loki:3.4.2`). One-to-one matches output the reduced (`on`/`ignoring`) signature; `group_left`/`group_right` pass the many side's labels through whole and copy the include labels from the one side. A cardinality violation is a `400 bad_data` carrying the reference store's exact message (`multiple matches for labels: many-to-one matching must be explicit …` / `… many-to-many matching not allowed: matching labels must be unique on one side`); a bare `group_left`/`group_right` with no preceding `on`/`ignoring` is a parse-time `400`. Matrix (range) binops apply the vector match independently per step. Note: the reference store returns HTTP `500` for these runtime matching errors while PulsusDB returns `400` (the semantically correct bad-request code); the error bodies agree. Streams-path error series carry both `__error__` and its human-readable `__error_details__` companion (issue #99), byte-exact against the reference where feasible; the metric pipeline-error path is unchanged.
+**Metric binary operations & vector matching (issue #91).** LogQL metric expressions support binary operations between range vectors — arithmetic, comparison (with `bool`), and the `and`/`or`/`unless` set operators — with the full `on(...)`/`ignoring(...)` and `group_left(...)`/`group_right(...)` vector-matching modifiers (semantics oracle-verified against `grafana/loki:3.4.2`). One-to-one matches output the reduced (`on`/`ignoring`) signature; `group_left`/`group_right` pass the many side's labels through whole and copy the include labels from the one side. A cardinality violation is a `400` carrying the reference store's exact message (`multiple matches for labels: many-to-one matching must be explicit …` / `… many-to-many matching not allowed: matching labels must be unique on one side`); a bare `group_left`/`group_right` with no preceding `on`/`ignoring` is a parse-time `400`. Matrix (range) binops apply the vector match independently per step. Note: the reference store returns HTTP `500` for these runtime matching errors while PulsusDB returns `400` (the semantically correct bad-request code); the error bodies agree. Streams-path error series carry both `__error__` and its human-readable `__error_details__` companion (issue #99), byte-exact against the reference where feasible; the metric pipeline-error path is unchanged.
 
 ### 2.2 `GET|POST /api/logs/v1/query`
 
@@ -117,26 +117,75 @@ Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values
 
 #### Errors (§2.1-2.3)
 
-`{"status":"error","errorType":"...","error":"...","position":<byte offset>?}` — `position` is present only for LogQL parse errors.
+A LogQL error response is a **bare `text/plain` body** — the message and
+nothing else: no JSON, no keys, no trailing newline. Headers are
+`Content-Type: text/plain; charset=utf-8` and
+`X-Content-Type-Options: nosniff`. The **container** matches the
+reference exactly (the message prose does not always — see the cosmetic
+divergence below): it writes every LogQL HTTP error through one function
+(`pkg/util/server/error.go:46-52` @ grafana/loki v3.7.4: two header sets,
+`WriteHeader(status)`, then `fmt.Fprint(w, err.Error())`). Issue #264
+replaced PulsusDB's earlier `{"status","errorType","error","position"?}`
+envelope with it; a parse error's byte offset now travels inside the
+message, as the reference's line/column does.
 
-| Cause | HTTP | `errorType` |
-|-------|------|-------------|
-| Malformed params, malformed LogQL, empty/contradictory matchers, invalid `step` | `400` | `bad_data` |
-| LogQL query text of **131,072 bytes or more** (`pulsus_logql::MAX_QUERY_BYTES`, an exclusive maximum — the longest accepted query is **131,071 bytes**; the reference's `maxInputSize` at grafana/loki v3.7.4 `pkg/logql/syntax/parser.go:42`, enforced `>=` at `:86`; applies at every LogQL parse, incl. per `match[]` value and `/tail`) | `400` | `bad_data` |
-| Pipeline/plan rejection (bad regex — **including an uncompilable pushed-down line-filter or stream-matcher regex, since #240** — bad parser expression, unwrap-arity, …) | `400` | `bad_data` |
-| Query rejected as too broad (scan-budget or stream-count cap exceeded) | `422` | `query_too_broad` |
-| Metric result over **500 series** (`max_query_series`, the reference's own threshold and `> cap` test, applied to the FINAL result — never to scanned or inner-aggregation groups) | `422` | `query_too_broad` |
-| Metric evaluation over **12,000,000 result point-slots** or over the post-aggregation byte bound **`MAX_POST_AGG_BYTES` (8 GiB)** — both charged BEFORE the allocation they guard, so an over-wide query is a clean refusal rather than an OOM. The byte bound is a registered divergence with no reference equivalent (it evaluates step-ordered and never materialises the inner matrix); its `by(...)` and `group_left/right(include)` amplifier thresholds are in `docs/benchmarks/logs-differential-ledger.md` §"Issue #236" (d)/(e) | `422` | `query_too_broad` |
-| ClickHouse read timed out | `504` | `timeout` |
-| Unclassified ClickHouse/internal failure | `500` | `internal` |
+The status code is the whole machine-readable classification — there is no
+`errorType` field on this surface (the reference has none either).
+
+The metrics API (§3) and trace API (§4) are untouched by #264 and keep
+their JSON envelopes, but for different reasons, and only one of the two
+is parity:
+
+- **§3 (metrics) matches its reference.** Upstream Prometheus writes every
+  API error as `application/json` carrying exactly
+  `{status, errorType, error}` — `respondError`,
+  `web/api/v1/api.go:2200-2230`, read at
+  `vendor/github.com/prometheus/prometheus/` @ grafana/loki v3.7.4. Making
+  §3 plain text to match §2 would have *created* a divergence.
+- **§4 (traces) does not, and is a known open divergence.** Tempo v3.0.2
+  writes its query errors as plain text too — the querier calls
+  `http.Error` directly (`modules/querier/http.go:45,52,94,…`) and the
+  query frontend funnels everything through dskit's
+  `httpgrpc.WriteError` (`modules/frontend/handler.go:156-168`), which is
+  also `http.Error`. PulsusDB's `traces_api` still answers a JSON
+  envelope. That is a second wire-shape change across a second surface —
+  it is **not** fixed here and needs its own issue; #264's owner ruling
+  and its measured sweep both name the LogQL surface.
+
+The three surfaces have never shared an error writer in PulsusDB, so
+changing §2 changed only §2.
+
+**"Plain text" is not one contract.** `POST /loki/api/v1/push` (§8.2)
+also answers plain text, but **LF-terminated** — its reference binds a
+different writer (`http.Error` -> `fmt.Fprintln`, issue #374) from the
+one above (`fmt.Fprint`). The query surface terminates nothing; the push
+surface always terminates. Do not carry a trailing-byte expectation from
+one to the other.
+
+| Cause | HTTP |
+|-------|------|
+| Malformed params, malformed LogQL, empty/contradictory matchers, invalid `step` | `400` |
+| LogQL query text of **131,072 bytes or more** (`pulsus_logql::MAX_QUERY_BYTES`, an exclusive maximum — the longest accepted query is **131,071 bytes**; the reference's `maxInputSize` at grafana/loki v3.7.4 `pkg/logql/syntax/parser.go:42`, enforced `>=` at `:86`; applies at every LogQL parse, incl. per `match[]` value and `/tail`) | `400` |
+| Pipeline/plan rejection (bad regex — **including an uncompilable pushed-down line-filter or stream-matcher regex, since #240** — bad parser expression, unwrap-arity, …) | `400` |
+| Query rejected as too broad (scan-budget or stream-count cap exceeded) | `422` |
+| Metric result over **500 series** (`max_query_series`, the reference's own threshold and `> cap` test, applied to the FINAL result — never to scanned or inner-aggregation groups) | `422` |
+| Metric evaluation over **12,000,000 result point-slots** or over the post-aggregation byte bound **`MAX_POST_AGG_BYTES` (8 GiB)** — both charged BEFORE the allocation they guard, so an over-wide query is a clean refusal rather than an OOM. The byte bound is a registered divergence with no reference equivalent (it evaluates step-ordered and never materialises the inner matrix); its `by(...)` and `group_left/right(include)` amplifier thresholds are in `docs/benchmarks/logs-differential-ledger.md` §"Issue #236" (d)/(e) | `422` |
+| ClickHouse read timed out | `504` |
+| Unclassified ClickHouse/internal failure | `500` |
+
+The `422` rows are a **status** divergence and are unchanged by #264's
+container change: the reference's classifier
+(`pkg/util/server/error.go:54-131` @ grafana/loki v3.7.4) maps every LogQL
+error class it names — parse, pipeline, limit, interval-limit, blocked,
+matchers-only, unsupported-instant-syntax — to `400`, and returns `422`
+for none of them.
 
 LogQL rejection **bodies** carry the bare reason with no PulsusDB prefix
 (issue #240); where a body has a reference counterpart it is byte-identical
 and corpus-gated. PulsusDB does **not** reproduce the reference's
 `parse error : …` / `stage '…' :` envelope wording (accepted cosmetic
 divergence, owner-ruled: status, container and accept/reject decision must
-match; message prose need not). The JSON-vs-`text/plain` response-container
-divergence is tracked in #264; the WebSocket close frame truncates reasons
+match; message prose need not). The WebSocket close frame truncates reasons
 at 123 bytes; the LogQL corpus runner's pushdown blind spot is #278.
 
 **Transport bound on the query-text cap (#279).** The 131,072-byte row
@@ -150,7 +199,7 @@ but accepts no `query` parameter (only `start`/`end`, per the route table
 above), so no query of any length reaches the cap through it. Our HTTP
 stack caps the whole request-target at **65,534 bytes** (`http::Uri`), so
 on any GET a request-target past that is answered `414 URI Too Long` with
-an empty body by hyper, before routing — never the `400 bad_data`
+an empty body by hyper, before routing — never the `400`
 envelope above.
 That ceiling is below the cap, so it also blocks legitimate sub-cap
 queries above roughly 65.5 KB, and it applies to the GET-only routes
@@ -169,7 +218,7 @@ docs/benchmarks/logs-differential-ledger.md
 | `start` | starting timestamp (ns), default now − 1h |
 | `delay_for` | seconds to delay to tolerate late arrivals (default 0; values above `PULSUS_TAIL_MAX_DELAY` — 5s — are clamped) |
 
-Frames: `{"streams":[...],"dropped_entries":[{"labels":{...},"timestamp":"<ns>"}],"dropped_total":<n>}`. Slow consumers get the **oldest** undelivered frames evicted and reported, never unbounded buffering: `dropped_entries` is a bounded representative sample (at most `PULSUS_TAIL_MAX_ENTRIES_PER_FRAME` rows), and `dropped_total` — a PulsusDB **additive** field next to the reference frame shape; clients that don't know it ignore the extra key — carries the *exact* cumulative count dropped since the previous frame (`0` on a normal frame). Exceeding `PULSUS_TAIL_MAX_CONNECTIONS` concurrent tail connections rejects the next one `429 too_many_requests` before the upgrade.
+Frames: `{"streams":[...],"dropped_entries":[{"labels":{...},"timestamp":"<ns>"}],"dropped_total":<n>}`. Slow consumers get the **oldest** undelivered frames evicted and reported, never unbounded buffering: `dropped_entries` is a bounded representative sample (at most `PULSUS_TAIL_MAX_ENTRIES_PER_FRAME` rows), and `dropped_total` — a PulsusDB **additive** field next to the reference frame shape; clients that don't know it ignore the extra key — carries the *exact* cumulative count dropped since the previous frame (`0` on a normal frame). Exceeding `PULSUS_TAIL_MAX_CONNECTIONS` concurrent tail connections rejects the next one `429` before the upgrade.
 
 Delivery: tail polls ClickHouse (there is no push channel) with a deterministic composite keyset cursor — `(timestamp_ns, fingerprint, cityHash64(body))` plus an occurrence count — catching up over a backlog one `PULSUS_TAIL_CATCHUP_SLICE` window per query, so no single query scans unbounded history. Every row from `start` forward is delivered **exactly once**, including timestamp tie groups split across fetch pages and byte-identical duplicate lines inside a scanned window. Sole documented limitation: an entry arriving later than `delay_for` at an already-scanned position — at or below the cursor/watermark, e.g. a late byte-identical duplicate of an already-delivered same-nanosecond line — is genuinely late and is not delivered.
 
@@ -202,7 +251,7 @@ Without `targetLabels`, the aggregation keys on the selector's **own matcher nam
 
 Response `200`: the §2.2 vector envelope evaluated at `end` — `{"status":"success","data":{"resultType":"vector","result":[{"metric":{...},"value":[<end_unix_seconds>,"<bytes>"]},...],"stats":{"series":N}}}`. **Result order is bytes-desc (tie-break: label set asc), truncated to `limit` — NOT label-sorted** (the top-N presentation is the contract; deliberately different from §2.2's label-sorted vectors). `stats` is a PulsusDB-additive key (same clients-ignore-extras precedent as §2.4's `dropped_total`). `bytes` is the sum of line-body bytes (the same basis as §2.5's `bytes`), 5s-bucket-granular at window edges (the same rollup caveat as §2.5/`count_over_time`). With `X-Pulsus-Explain: 1`, `data.explain` (the §2.1 shape) is added — its `volume_read` stage always targets `log_metrics_5s`.
 
-Errors: `400 bad_data` (missing/malformed `query`, metric query, any pipeline stage, invalid `aggregateBy`/`limit`, oversized `targetLabels`, `end < start`), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
+Errors: `400` (missing/malformed `query`, metric query, any pipeline stage, invalid `aggregateBy`/`limit`, oversized `targetLabels`, `end < start`), `422`, and `503`/`504`/`500` per §2.3's table.
 
 #### 2.6.2 `GET|POST /api/logs/v1/detected_labels`
 
@@ -217,7 +266,7 @@ Relevance filter (reference-pinned): labels named `cluster`/`namespace`/`instanc
 
 Response `200`: `{"detectedLabels":[{"label":"…","cardinality":N},…]}`, sorted by label. Documented divergences from the reference, all deliberate: `cardinality` is **exact** (`uniqExact`) rather than a hyperloglog estimate (the registered `detected-cardinality-exact-not-estimated` ledger entry; this endpoint's own bound/memory audit is issue #261); no `sketch` key is emitted (valid under the reference's own `omitempty`); the top-level key is always present (never omitted when empty); deterministic label-sorted order vs Go map order. With `X-Pulsus-Explain: 1`, `explain` (the §2.1 shape) is added as a sibling key — its `detected_labels` stage always targets `log_streams_idx`.
 
-Errors: `400 bad_data` (malformed/piped `query`), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
+Errors: `400` (malformed/piped `query`), `422`, and `503`/`504`/`500` per §2.3's table.
 
 #### 2.6.3 `GET|POST /api/logs/v1/detected_fields`
 
@@ -231,7 +280,7 @@ Per-entry **fields** detected from a bounded sample of matching log entries: str
 | `limit` (legacy alias `field_limit`) | max distinct field **names**, first-seen wins — later names are skipped entirely (default 1000; `0`/non-numeric → `400`; above 5000 → `400`). `limit` is read first, then the alias |
 | `step`, `since` | accepted and **ignored** (documented deviation: the reference validates `step` only as a shared-codec artifact and neither param affects detection) |
 
-Sampling contract (issue #170 plan v2): the sample is up to `line_limit` **post-pipeline matching** entries, newest first. With no in-engine dropping stage (a bare selector, line filters, non-dropping transforms — the dominant drilldown shape) one index-served `LIMIT line_limit` scan is provably that sample (line-filter pushdown carries the exact predicate). A dropping stage (a label filter, or a line filter after `line_format`) engages the §2.1 fetch-until-limit keyset paging under the **same byte scan budget an equivalent `/query_range` would pay** (`reader.logql_scan_budget_bytes`), so matches occurring long after the first `line_limit` raw rows are still found. Pages stream row by row (issue #244): if the budget is spent mid-paging — including **mid-page**; the accumulated prefix is a prefix of the newest-first sampled row sequence and is **not** required to align with a page boundary — the response returns the fields found so far and adds the additive `"pulsus_partial": true` key, **omitted** on complete responses (the §2.1 `stats.pulsus_partial` convention), so complete responses stay byte-identical to the reference shape. A `ScanBudgetBytes` overflow while draining the **first** page is `422 query_too_broad` regardless of how many rows were already delivered — the prefix is discarded with the request (the pre-#244 contract, preserved).
+Sampling contract (issue #170 plan v2): the sample is up to `line_limit` **post-pipeline matching** entries, newest first. With no in-engine dropping stage (a bare selector, line filters, non-dropping transforms — the dominant drilldown shape) one index-served `LIMIT line_limit` scan is provably that sample (line-filter pushdown carries the exact predicate). A dropping stage (a label filter, or a line filter after `line_format`) engages the §2.1 fetch-until-limit keyset paging under the **same byte scan budget an equivalent `/query_range` would pay** (`reader.logql_scan_budget_bytes`), so matches occurring long after the first `line_limit` raw rows are still found. Pages stream row by row (issue #244): if the budget is spent mid-paging — including **mid-page**; the accumulated prefix is a prefix of the newest-first sampled row sequence and is **not** required to align with a page boundary — the response returns the fields found so far and adds the additive `"pulsus_partial": true` key, **omitted** on complete responses (the §2.1 `stats.pulsus_partial` convention), so complete responses stay byte-identical to the reference shape. A `ScanBudgetBytes` overflow while draining the **first** page is `422` regardless of how many rows were already delivered — the prefix is discarded with the request (the pre-#244 contract, preserved).
 
 Retention model (issue #244): everything the accumulator **retains** — distinct value strings and admitted field names — is charged against a server-side per-request byte ceiling (`MAX_DETECTED_FIELD_BYTES`, 64 MiB, the house per-query retained-state magnitude) **before** each retaining allocation. A refused charge **freezes that field's value set and keeps serving** — the type still re-detects and parsers still attribute; the request is never rejected — and the response carries the same additive `"pulsus_partial": true` key (its meaning is therefore "budget-truncated sampling **or** a retention-capped cardinality"). The reference has no analogous bound because it retains no value bytes at all — its per-field state is a p14 HyperLogLog sketch.
 
@@ -248,7 +297,7 @@ Response `200`: `{"fields":[{"label":"…","type":"…","cardinality":N,"parsers
 
 With `X-Pulsus-Explain: 1`, `explain` is added as a sibling key — its `detected_fields_read` stage carries the single stage-3 scan (note `single-scan: no unpushed dropping stage`) or the first keyset page (note `paged: unpushed dropping stage`).
 
-Errors: `400 bad_data` (missing/malformed `query`, metric query, invalid `line_limit`/`limit`), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
+Errors: `400` (missing/malformed `query`, metric query, invalid `line_limit`/`limit`), `422`, and `503`/`504`/`500` per §2.3's table.
 
 #### 2.6.4 `GET /api/logs/v1/patterns`
 
@@ -262,7 +311,7 @@ Detected **log patterns** — the drilldown UI's "group these lines by shape" vi
 
 Response `200`: the Loki-interop envelope `{"status":"success","data":[{"pattern":"<_> ...","samples":[[<unix_seconds>,<count>],...]},...]}`. `samples` are ascending by second, zero-count steps omitted, both elements bare integers (`unix_seconds` is the floor of the bucket ns). **`data` is ordered total-count desc then pattern asc, truncated to the top 1000 — NOT re-sorted client-side** (the top-N presentation is the contract; a PulsusDB determinism pin — upstream order is unspecified). **Count semantics** are exact on the clean ingest path and **best-effort approximate under ingest-failure re-sends**, at parity with §2.2's `log_metrics` (the writer never auto-replays a block that could have committed; a per-request burst of >10 000 distinct templates is an under-count event, folded into the same approximate semantics — see docs/schemas.md §3.1). With `X-Pulsus-Explain: 1`, `data.explain` (the §2.1 shape) is added — its `patterns_read` stage always targets `log_patterns`.
 
-Errors: `400 bad_data` (missing/malformed `query`, metric query, any pipeline stage, non-positive `step`, over-11k grid), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
+Errors: `400` (missing/malformed `query`, metric query, any pipeline stage, non-positive `step`, over-11k grid), `422`, and `503`/`504`/`500` per §2.3's table.
 
 ---
 
@@ -314,7 +363,7 @@ GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 
 #### Errors (§3.1-3.4)
 
-`{"status":"error","errorType":"...","error":"..."}` — exactly these three fields, **no `position` field** (unlike the log API's §2.3 envelope): a PromQL parse error's position is embedded verbatim inside the `error` message string, Prometheus-style, never split out.
+`{"status":"error","errorType":"...","error":"..."}` — exactly these three fields, **no `position` field**: a PromQL parse error's position is embedded verbatim inside the `error` message string, Prometheus-style, never split out. This surface keeps a JSON envelope where the log API (§2.3) has none, because upstream Prometheus writes its errors as `application/json` and Loki writes LogQL's as bare `text/plain` — the two are matched against their own references independently, never made symmetric with each other.
 
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|

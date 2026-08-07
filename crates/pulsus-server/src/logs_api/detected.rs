@@ -5,7 +5,7 @@
 //! - **detected_labels** reads ONLY the stream index (`log_streams_idx`)
 //!   via one server-side aggregation — never `log_samples`. `query=` is
 //!   optional and **matchers only** (`parse_selector`; a pipeline in
-//!   `query` is a 400 parse error with `position`).
+//!   `query` is a 400 parse error).
 //! - **detected_fields** samples <= `line_limit` **post-pipeline
 //!   matching** entries (structured metadata + pipeline extractions +
 //!   json/logfmt auto-detection); `query` is required and accepts the
@@ -84,7 +84,7 @@ async fn detected_labels_impl(
     // `syntax.ParseMatchers`): absent OR empty = the unscoped form
     // (matching the reference's empty-string handling); anything else
     // must parse as a bare selector — a pipeline is a parse error with
-    // `position`, BEFORE any pool work.
+    // BEFORE any pool work.
     let selector: Option<Expr> = match params::get(&pairs, "query") {
         None | Some("") => None,
         Some(q) => {
@@ -221,14 +221,40 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
+    /// `(status, body text)`. Issue #264: every error on this surface is a
+    /// bare `text/plain` body, so tests assert the raw message; success
+    /// bodies are still JSON and those cases parse the returned string.
+    ///
+    /// On any 4xx/5xx this also asserts the reference's error container —
+    /// `Content-Type: text/plain; charset=utf-8` + `X-Content-Type-Options:
+    /// nosniff`, non-empty body (`pkg/util/server/error.go:48-51 @
+    /// v3.7.4`) — so every error case in this module covers the wire
+    /// shape, not just its status code.
+    async fn status_and_body(res: Response) -> (StatusCode, String) {
         let status = res.status();
+        if status.is_client_error() || status.is_server_error() {
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+            );
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+            );
+        }
         let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        if status.is_client_error() || status.is_server_error() {
+            assert!(!text.is_empty(), "an error body is never empty");
+        }
+        (status, text)
     }
 
-    async fn labels_get(query: Option<&str>) -> (StatusCode, serde_json::Value) {
+    async fn labels_get(query: Option<&str>) -> (StatusCode, String) {
         let res = detected_labels(
             State(test_state()),
             HeaderMap::new(),
@@ -238,7 +264,7 @@ mod tests {
         status_and_body(res).await
     }
 
-    async fn fields_get(query: Option<&str>) -> (StatusCode, serde_json::Value) {
+    async fn fields_get(query: Option<&str>) -> (StatusCode, String) {
         let res = detected_fields(
             State(test_state()),
             HeaderMap::new(),
@@ -257,11 +283,9 @@ mod tests {
         format!(r#"query={{app="{}"}}"#, "a".repeat(131_072 - 8))
     }
 
-    fn assert_query_too_long(status: StatusCode, json: &serde_json::Value) {
+    fn assert_query_too_long(status: StatusCode, body: &str) {
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["error"], "input size too long (131072 > 131072)");
-        assert_eq!(json["position"], 0);
+        assert_eq!(body, "input size too long (131072 > 131072)");
     }
 
     // -- detected_labels ---------------------------------------------------
@@ -270,37 +294,34 @@ mod tests {
     /// reaches the 503 pool check (proving validation passed).
     #[tokio::test]
     async fn detected_labels_without_query_is_unscoped_then_503_without_a_pool() {
-        let (status, json) = labels_get(None).await;
+        let (status, _body) = labels_get(None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     /// An empty `query=` is the same unscoped form (the reference's
     /// empty-string handling).
     #[tokio::test]
     async fn detected_labels_empty_query_is_unscoped_then_503_without_a_pool() {
-        let (status, json) = labels_get(Some("query=")).await;
+        let (status, _body) = labels_get(Some("query=")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     #[tokio::test]
-    async fn detected_labels_malformed_query_is_400_bad_data_with_a_position() {
-        let (status, json) = labels_get(Some("query=%7B")).await;
+    async fn detected_labels_malformed_query_is_400_with_the_byte_offset_in_the_message() {
+        let (status, body) = labels_get(Some("query=%7B")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some());
+        assert!(body.contains("at byte"), "{body}");
     }
 
     /// Issue #170: `query` is matchers-only (`parse_selector`) — a
-    /// pipeline in `query` is a 400 parse error with `position`, BEFORE
-    /// any pool work (no pool exists here, yet the error is `bad_data`).
+    /// pipeline in `query` is a 400 parse error BEFORE any pool work
+    /// (no pool exists here, yet the answer is 400, not 503).
     #[tokio::test]
-    async fn detected_labels_pipeline_in_query_is_400_with_a_position_before_the_pool_check() {
-        let (status, json) = labels_get(Some(&format!("{SELECTOR}%20%7C%3D%20%22err%22"))).await;
+    async fn detected_labels_pipeline_in_query_is_400_with_the_byte_offset_in_the_message_before_the_pool_check()
+     {
+        let (status, body) = labels_get(Some(&format!("{SELECTOR}%20%7C%3D%20%22err%22"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some());
+        assert!(body.contains("at byte"), "{body}");
     }
 
     /// Issue #279 (AC4): `/detected_labels` — an over-cap `query=` (the
@@ -309,87 +330,68 @@ mod tests {
     /// the pool check, so the 400 is the cap.
     #[tokio::test]
     async fn detected_labels_rejects_an_over_cap_query_400_before_the_pool_check() {
-        let (status, json) = labels_get(Some(&oversized_query_param())).await;
-        assert_query_too_long(status, &json);
+        let (status, body) = labels_get(Some(&oversized_query_param())).await;
+        assert_query_too_long(status, &body);
 
-        let (status, json) = labels_get(Some(SELECTOR)).await;
+        let (status, _body) = labels_get(Some(SELECTOR)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     /// Issue #279 (AC4): `/detected_fields` — over-cap 400 vs valid 503,
     /// poolless.
     #[tokio::test]
     async fn detected_fields_rejects_an_over_cap_query_400_before_the_pool_check() {
-        let (status, json) = fields_get(Some(&oversized_query_param())).await;
-        assert_query_too_long(status, &json);
+        let (status, body) = fields_get(Some(&oversized_query_param())).await;
+        assert_query_too_long(status, &body);
 
-        let (status, json) = fields_get(Some(SELECTOR)).await;
+        let (status, _body) = fields_get(Some(SELECTOR)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     // -- detected_fields ---------------------------------------------------
 
     #[tokio::test]
-    async fn detected_fields_missing_query_is_400_bad_data() {
-        let (status, json) = fields_get(None).await;
+    async fn detected_fields_missing_query_is_400() {
+        let (status, _body) = fields_get(None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_none());
     }
 
     /// Unlike detected_labels, an EMPTY `query=` is missing here — the
     /// param is required.
     #[tokio::test]
-    async fn detected_fields_empty_query_is_400_bad_data() {
-        let (status, json) = fields_get(Some("query=")).await;
+    async fn detected_fields_empty_query_is_400() {
+        let (status, _body) = fields_get(Some("query=")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn detected_fields_malformed_query_is_400_bad_data_with_a_position() {
-        let (status, json) = fields_get(Some("query=%7B")).await;
+    async fn detected_fields_malformed_query_is_400_with_the_byte_offset_in_the_message() {
+        let (status, body) = fields_get(Some("query=%7B")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some());
+        assert!(body.contains("at byte"), "{body}");
     }
 
     /// Issue #170: a metric query is rejected 400 BEFORE any pool/engine
-    /// work (no pool exists here, yet the error is `bad_data`, not 503).
+    /// work (no pool exists here, yet the answer is 400, not 503).
     #[tokio::test]
-    async fn detected_fields_metric_query_is_400_bad_data_before_the_pool_check() {
-        let (status, json) =
+    async fn detected_fields_metric_query_is_400_before_the_pool_check() {
+        let (status, body) =
             fields_get(Some("query=count_over_time(%7Bapp%3D%22x%22%7D%5B1h%5D)")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("metric queries")
-        );
+        assert!(body.contains("metric queries"), "{body}");
     }
 
     #[tokio::test]
-    async fn detected_fields_line_limit_zero_is_400_bad_data() {
-        let (status, json) = fields_get(Some(&format!("{SELECTOR}&line_limit=0"))).await;
+    async fn detected_fields_line_limit_zero_is_400() {
+        let (status, body) = fields_get(Some(&format!("{SELECTOR}&line_limit=0"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("line_limit")
-        );
+        assert!(body.contains("line_limit"), "{body}");
     }
 
     #[tokio::test]
-    async fn detected_fields_limit_above_the_cap_is_400_bad_data() {
-        let (status, json) = fields_get(Some(&format!("{SELECTOR}&limit=999999"))).await;
+    async fn detected_fields_limit_above_the_cap_is_400() {
+        let (status, _body) = fields_get(Some(&format!("{SELECTOR}&limit=999999"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     /// A full log-selector query WITH a pipeline is shape-valid on
@@ -397,11 +399,10 @@ mod tests {
     /// the 503 pool check (proving validation passed).
     #[tokio::test]
     async fn detected_fields_pipeline_query_passes_validation_then_503_without_a_pool() {
-        let (status, json) = fields_get(Some(&format!(
+        let (status, _body) = fields_get(Some(&format!(
             "{SELECTOR}%20%7C%20json&line_limit=50&field_limit=10"
         )))
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 }

@@ -43,7 +43,7 @@
 //! sixth spawn below sets that budget to `1` byte and seeds two minimal
 //! rows — any real read exceeds 1 byte, tripping ClickHouse's `code 307
 //! TOO_MANY_BYTES` -> `ReadError::QueryTooBroad(ScanBudgetBytes)` -> the
-//! same documented `422 query_too_broad` taxonomy row `StreamCap` would
+//! same documented `422` taxonomy row `StreamCap` would
 //! have produced (this matrix asserts status/envelope only, never internal
 //! correctness — either `TooBroadReason` variant proves the same live
 //! contract). The `StreamCap` trigger specifically stays unit-level-only
@@ -81,7 +81,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
 use manifest::{
-    CaseClass, ExpectedError, Gate, Method, RouteSpec, RouteStatus, Surface, route_manifest,
+    CaseClass, ExpectedError, Gate, Method, PlainTextWriter, RouteSpec, RouteStatus, Surface,
+    route_manifest,
 };
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -119,7 +120,13 @@ struct RawResponse {
 
 impl RawResponse {
     fn content_type(&self) -> Option<&str> {
-        self.headers.get("content-type").map(String::as_str)
+        self.header("content-type")
+    }
+
+    /// `name` must be lowercase — the parser lowercases every key as it
+    /// builds the map.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(String::as_str)
     }
 
     /// `ctx` is the caller's full matrix-cell identifier (round-10
@@ -1039,16 +1046,60 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
                 "{ctx}: message must be non-empty"
             );
         }
-        ExpectedError::PlainText => {
+        ExpectedError::PlainText(writer) => {
             assert_eq!(
                 res.content_type(),
                 Some("text/plain; charset=utf-8"),
-                "{ctx}: remote-write error content-type"
+                "{ctx}: plain-text error content-type"
             );
             assert!(
                 !res.body.is_empty(),
                 "{ctx}: plain-text error body must be non-empty"
             );
+            // Issue #264: the body is the bare message, never a JSON
+            // envelope. Without this the arm would pass on a JSON body
+            // that merely carried the wrong `Content-Type`, and it is the
+            // only thing standing between a re-introduced envelope and a
+            // green matrix on the whole LogQL error surface. It holds for
+            // every plain-text family, not just LogQL's.
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&res.body).is_err(),
+                "{ctx}: a plain-text error body must not parse as JSON, got {:?}",
+                String::from_utf8_lossy(&res.body)
+            );
+            // The trailing byte is per-writer, NOT per-content-type — the
+            // two Loki families disagree about it because the reference's
+            // two writers do. See `manifest::PlainTextWriter`.
+            match writer {
+                PlainTextWriter::LogqlWriteError => {
+                    assert_eq!(
+                        res.header("x-content-type-options"),
+                        Some("nosniff"),
+                        "{ctx}: `WriteError` sets nosniff \
+                         (pkg/util/server/error.go:49 @ v3.7.4)"
+                    );
+                    assert!(
+                        !res.body.ends_with(b"\n"),
+                        "{ctx}: the reference's `fmt.Fprint` writes no trailing newline \
+                         (pkg/util/server/error.go:51 @ v3.7.4), got {:?}",
+                        String::from_utf8_lossy(&res.body)
+                    );
+                }
+                PlainTextWriter::LokiPushHttpError => {
+                    // Issue #374: `http.Error` -> `fmt.Fprintln`
+                    // (pkg/loghttp/push/push.go:606-608 @ v3.7.4). Exactly
+                    // one `\n`, so a doubled terminator fails too.
+                    assert!(
+                        res.body.ends_with(b"\n") && !res.body.ends_with(b"\n\n"),
+                        "{ctx}: this endpoint's writer is `fmt.Fprintln` — the body ends \
+                         in exactly one newline, got {:?}",
+                        String::from_utf8_lossy(&res.body)
+                    );
+                }
+                // Terminator unprobed for these references — see the
+                // variant's doc comment.
+                PlainTextWriter::WriterSideReceiver => {}
+            }
         }
     }
 }
@@ -1433,7 +1484,7 @@ fn ws_attempt(port: u16, target: &str, ctx: &str) -> (RawResponse, Option<TcpStr
 /// `Connection: close` requests cannot perform an upgrade handshake):
 /// bare GET → the empirically-pinned 400 rejection (mounting oracle);
 /// real handshake + valid selector → `101`; handshake + missing/metric
-/// query → the 400 JSON envelope BEFORE any upgrade; `POST` → 405
+/// query → the 400 bare `text/plain` body BEFORE any upgrade; `POST` → 405
 /// `Allow: GET,HEAD`; sibling nonexistent path → empty 404. Streaming
 /// content is `logs_tail_live.rs`'s job; slot exhaustion (429) gets its
 /// own spawn below.
@@ -1460,8 +1511,10 @@ fn assert_tail_route(port: u16, spec: &RouteSpec, spawn: &str) {
     assert!(stream.is_some(), "{ctx}: upgraded stream returned");
     drop(stream); // closing the TCP stream ends the tail connection
 
-    // Handshake with a MISSING query: rejected 400 (JSON envelope)
-    // before any upgrade — the response is plain HTTP, never a 101.
+    // Handshake with a MISSING query: rejected 400 (bare `text/plain`
+    // body, issue #264) before any upgrade — the response is plain HTTP,
+    // never a 101. The reference rejects the same way, through
+    // `serverutil.WriteError` (`pkg/querier/tail/http.go:35 @ v3.7.4`).
     let ctx = format!(
         "[{spawn}] GET {} case=handshake-missing-query-400",
         spec.path
@@ -1471,10 +1524,7 @@ fn assert_tail_route(port: u16, spec: &RouteSpec, spawn: &str) {
     assert_eq!(res.status, 400, "{ctx}: status");
     assert_case_envelope(
         &res,
-        &ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        &ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
         &ctx,
     );
 
@@ -1489,10 +1539,7 @@ fn assert_tail_route(port: u16, spec: &RouteSpec, spawn: &str) {
     assert_eq!(res.status, 400, "{ctx}: status");
     assert_case_envelope(
         &res,
-        &ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        &ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
         &ctx,
     );
 
@@ -2322,12 +2369,12 @@ async fn logql_scan_budget_query_too_broad_live_case() {
         "[spawn=all,scan-budget=1B] GET /api/logs/v1/query_range case=query_too_broad-422: status (body: {:?})",
         String::from_utf8_lossy(&res.body)
     );
+    // Issue #264: the LogQL surface's 422 is a bare `text/plain` body
+    // like every other error on it — the status carries the whole
+    // classification now.
     assert_case_envelope(
         &res,
-        &ExpectedError::Json {
-            error_type: "query_too_broad",
-            has_position: false,
-        },
+        &ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
         "[spawn=all,scan-budget=1B] GET /api/logs/v1/query_range case=query_too_broad-422",
     );
 }
@@ -2335,7 +2382,7 @@ async fn logql_scan_budget_query_too_broad_live_case() {
 // ---------------------------------------------------------------------
 // Issue #74 (M6-11): tail slot exhaustion — with
 // PULSUS_TAIL_MAX_CONNECTIONS=1, one held tail connection makes the next
-// handshake a pre-upgrade `429 too_many_requests`, and releasing the
+// handshake a pre-upgrade `429`, and releasing the
 // slot (closing the first connection) restores a `101`.
 // ---------------------------------------------------------------------
 
@@ -2368,10 +2415,7 @@ async fn tail_slot_exhaustion_returns_429_before_the_upgrade() {
     );
     assert_case_envelope(
         &res,
-        &ExpectedError::Json {
-            error_type: "too_many_requests",
-            has_position: false,
-        },
+        &ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
         &ctx,
     );
 

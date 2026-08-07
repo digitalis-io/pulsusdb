@@ -1588,8 +1588,10 @@ clients only display it).
   wording around parse/pipeline errors. Status must match, the response
   container must match, the accept/reject decision must match; the
   message prose need not. (The JSON-vs-`text/plain` CONTAINER
-  divergence is tracked separately in **#264**; the WebSocket close
-  frame still truncates reasons at 123 bytes.)
+  divergence was tracked separately in **#264** and is now **closed** —
+  every LogQL error is the reference's bare `text/plain` body, so the
+  container matches too and only the prose still differs; the WebSocket
+  close frame still truncates reasons at 123 bytes.)
 - **Rejection-status fix (probed, `pulsus-240-status`):** an
   uncompilable regex in a pushed-down line filter (`{…} |~ "("`) or a
   stream matcher (`{app=~"("}`) was a ClickHouse-side 500 `internal`;
@@ -1671,8 +1673,9 @@ a divergence at a public surface, found while implementing the cap.
   decision all differ. At or below a 65,534-byte request-target the two
   agree; and the cap boundary itself (131,071 accepted / 131,072
   rejected `400` with the same reason text, `input size too long
-  (131072 > 131072)` — the JSON-vs-`text/plain` container divergence is
-  the separate #264) agrees whenever the query arrives by POST instead.
+  (131072 > 131072)`, and — since #264 closed — in the same bare
+  `text/plain` container) agrees whenever the query arrives by POST
+  instead.
 - **Why this is a divergence and not a defect we chose:** the limit is
   imposed by our HTTP stack (`http::Uri` stores its length in a `u16`),
   not by any PulsusDB decision, and it is not reachable through

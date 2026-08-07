@@ -898,8 +898,15 @@ async fn query_instant_returns_a_vector_for_a_metric_query() {
     assert!(body["data"]["stats"]["series"].as_u64().unwrap() >= 1);
 }
 
+/// Issue #264: on the wire, a LogQL error is the reference's bare
+/// `text/plain` body — `Content-Type: text/plain; charset=utf-8` +
+/// `X-Content-Type-Options: nosniff`, the message and nothing else, no
+/// trailing newline (`pkg/util/server/error.go:46-52 @ v3.7.4`; probed
+/// identical on `grafana/loki:3.7.4`). This is the end-to-end leg: the
+/// hermetic tests assert the `Response` this handler builds, this one
+/// asserts what a socket actually receives from a spawned server.
 #[tokio::test]
-async fn malformed_query_returns_a_400_error_envelope_with_a_position() {
+async fn malformed_query_returns_a_400_bare_text_plain_body() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
@@ -911,10 +918,31 @@ async fn malformed_query_returns_a_400_error_envelope_with_a_position() {
     let res = http_get(port, &q("/api/logs/v1/query_range", &[("query", "{")]))
         .expect("query_range reachable");
     assert_eq!(res.status, 400);
-    let body = json(&res);
-    assert_eq!(body["status"], "error");
-    assert_eq!(body["errorType"], "bad_data");
-    assert!(body["position"].is_number());
+    assert_eq!(
+        res.headers.get("content-type").map(String::as_str),
+        Some("text/plain; charset=utf-8"),
+        "body: {}",
+        res.body
+    );
+    assert_eq!(
+        res.headers
+            .get("x-content-type-options")
+            .map(String::as_str),
+        Some("nosniff")
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&res.body).is_err(),
+        "the error body must not be JSON: {}",
+        res.body
+    );
+    assert!(
+        !res.body.ends_with('\n'),
+        "no trailing newline: {:?}",
+        res.body
+    );
+    // The parser's byte offset survives inside the message, exactly as the
+    // reference carries its own `line`/`col` there.
+    assert!(res.body.contains("at byte"), "{}", res.body);
 }
 
 /// e2e memory test (architect plan amendment 1, test 2(b)): seeds a large
@@ -1866,10 +1894,7 @@ async fn nothing_in_a_query_may_span_more_than_five_years() {
         let (status, body) = instant(query);
         assert_eq!(status, want, "{query}: {body}");
         if want == 400 {
-            assert!(
-                body.contains("\"errorType\":\"bad_data\"") && body.contains("too long"),
-                "{query}: {body}"
-            );
+            assert!(body.contains("too long"), "{query}: {body}");
         }
     }
 
@@ -1898,10 +1923,7 @@ async fn nothing_in_a_query_may_span_more_than_five_years() {
     assert_eq!(status, 200, "exactly 5 years is served: {body}");
     let (status, body) = range(base_ns - CAP_NS - 1, base_ns);
     assert_eq!(status, 400, "one nanosecond more is refused: {body}");
-    assert!(
-        body.contains("\"errorType\":\"bad_data\"") && body.contains("query time range of"),
-        "{body}"
-    );
+    assert!(body.contains("query time range of"), "{body}");
 
     // 3b. EVERY route that carries `start`/`end`, not just `query_range`.
     // THREE code paths never reach the planner and are capped by
