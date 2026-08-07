@@ -38,13 +38,27 @@
 //! the table says so rather than being tuned until it agrees.** The
 //! reference validates the variant's own pipeline and ignores it at
 //! evaluation; it runs the common `of (...)` pipeline and does not
-//! validate it. PulsusDB was the mirror image. The variant side is now
-//! CLOSED — `build_variants_node` compiles a variant's own pipeline
-//! purely to validate it, exactly as the reference does — and
-//! [`points_disagree_with_the_reference_only_where_the_table_says_so`]
-//! asserts that direction is EMPTY. The common side stays open and
-//! ledgered — see [`Outcome`] for its mechanism and the measurement
-//! behind it.
+//! validate it. PulsusDB was the mirror image.
+//!
+//! **The variant side is now CLOSED, with the same rejection surface as
+//! the reference but a different decomposition — and the difference
+//! matters enough to state.** The reference validates the whole variant
+//! pipeline in ONE place, `variant.Extractors()` at
+//! `evaluator.go:1417 @ v3.7.4`. PulsusDB splits it: everything before
+//! the first `Stage::Unwrap` is compiled by `build_variants_node` at
+//! plan time, and the rest arrives as `common ++ tail` in
+//! `VariantArena::build`. Both run before any I/O, so a user sees the
+//! same 400 — but "exactly as the reference does" is false of the
+//! mechanism, and reading it that way is what produced a doc claim
+//! withdrawn in round 4 (that plan-time validation covers the tail; it
+//! does not).
+//!
+//! The common side stays open and ledgered — see [`Outcome`] for its
+//! mechanism and the measurement behind it. **What guards the variant
+//! side is named in
+//! [`points_disagree_with_the_reference_only_where_the_table_says_so`]'s
+//! doc comment, and that test is not among the guards** — the direction
+//! is unreachable in this fixture's types rather than asserted empty.
 //!
 //! - [`pulsus_agrees_with_the_captured_reference_verdicts`] — hermetic,
 //!   the whole matrix, PulsusDB's verdict at the layer a user meets it:
@@ -1115,10 +1129,19 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
 /// rather than left to a future reader: `leaves()` must keep yielding the
 /// variants scan plan. Removing `MetricNode::Variants { scan, .. } =>
 /// out.push(scan)` from `plan.rs` reddens this test with a message saying
-/// the arm has become load-bearing. (An earlier revision of this comment
-/// called the whole thing a tripwire for #397 and credited masks that a
-/// third perturbation showed were doing all the work; the arm was dead
-/// code and nothing here would have said so.)
+/// the arm has become load-bearing.
+///
+/// **Why the earlier revision got this wrong, because the lesson
+/// generalises.** At `ad8ff0a` this comment called the whole test a
+/// tripwire for #397 and said dropping the tail was masked by plan-time
+/// validation covering it. That was false against the code it shipped
+/// with — the validation was already prefix-only by then, so it never
+/// saw a tail. What actually hid the tail perturbation was that **no
+/// tail-malformed query existed in the list**: the perturbation was
+/// masked by the ABSENCE OF A CASE, not by another guard. A perturbation
+/// that changes no behaviour because nothing exercises the path reads
+/// exactly like one that is correctly redundant, and only adding the
+/// case tells them apart.
 ///
 /// It is deliberately not a code-sharing refactor: `extended_with` exists
 /// to avoid recompiling the common pipeline's regexes once per tail
@@ -1146,10 +1169,16 @@ fn the_oracle_agrees_with_the_real_variant_arena() {
         // prefix-only validation cannot see it, and the `leaves()` arm
         // compiles only the common pipeline, which is well formed. The
         // ONLY thing that refuses it is the arm under test assembling
-        // `common ++ tail`, exactly as `VariantArena::build` does with
-        // `extended_with`. Neutralising the arm, dropping `common` from
-        // the assembly, or dropping the tail each makes this row
-        // disagree.
+        // `common ++ tail`, as `VariantArena::build` does with
+        // `extended_with`.
+        //
+        // TWO perturbations make this row disagree, and they were run:
+        // neutralising the arm, and dropping the tail from the assembly.
+        // Dropping `common` does **not** — the bad regex is in the tail
+        // and fails with or without the prefix — which is why that third
+        // one is covered by the `planned_leaves_include` assertion below
+        // rather than by this row. (An earlier version of this comment
+        // named all three, contradicting the test's own doc comment.)
         r#"variants(sum_over_time({service_name="m"} | logfmt | unwrap v | lbl=~"(" [5m])) of ({service_name="m"} | logfmt [5m])"#,
     ] {
         let (ours, why) = pulsus_verdict(query);
