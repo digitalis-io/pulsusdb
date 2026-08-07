@@ -1,0 +1,354 @@
+Ignored-number route probe: cell-level transcript (issue #374)
+==============================================================
+
+Oracle: docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc
+        (tag 3.7.4; /loki/api/v1/status/buildinfo reports version 3.7.4,
+        revision b318f282), the image's built-in single-binary config, so
+        every limit is at its flag default.
+Subject: pulsusdb built from this branch, PULSUS_COMPAT_ENDPOINTS=1, against
+        ClickHouse 24.8.14.39.
+
+This is the artifact behind the per-shape cell counts quoted for the
+ignored-number rules -- 504 cells for the exponent group, 216 for the f32
+group. `compare.py` beside this file sends ONE body per case, so it pins one
+cell per shape: one ignored position, one wire framing, one byte offset. The
+claim those shapes carry is stronger than that -- that each shape's verdict
+is a function of the REQUEST, not of where the token sits in the body or of
+how the client chunked its writes -- so it needs an instrument that varies
+the two things it says do not matter. `number_route_probe.py` is that
+instrument, and the counts below are its output rather than a report of one.
+
+    20 shapes x 3 ignored positions x 4 wire framings x 3 byte offsets
+      exponent group  14 shapes x 36 = 504 cells
+      f32 group        6 shapes x 36 = 216 cells
+      controls         3 shapes      =  60 cells
+
+Every cell's expected pair of statuses is written down in the script; a cell
+whose observed pair differs comes back MOVED and the run exits 1.
+
+WHY THE CONTROLS ARE LOAD-BEARING. The 20 shapes are claimed invariant across
+framings and offsets. If the framing loop never reached upstream's decoder --
+if the kernel coalesced the writes, or if the server buffered the whole body
+before parsing -- all four framings would return the same status and the run
+would be green anyway. A green run would then be evidence of nothing. So the
+probe also sends a 400-digit run at the two offsets either side of upstream's
+read-buffer boundary, where the verdict is known to depend on both knobs:
+
+    400 nines at offset 111  204 upstream in one write and in 512-byte
+                             chunks, 400 in 256- and 128-byte chunks
+    400 nines at offset 112  400 upstream in all four framings
+
+`trySkipNumber` walks the CURRENT READ BUFFER only (`for i := iter.head; i <
+iter.tail`, iter_skip_strict.go:26 @ jsoniter v1.1.12) over the 512 bytes
+`jsoniter.NewDecoder` hands it (config.go:366, reached from
+unmarshal.DecodePushRequest, pkg/util/unmarshal/unmarshal.go:17 @ loki
+v3.7.4), and reports "skipped" only on reaching a terminating byte inside
+that window (:46-53) -- so offset + length + 1 = 512 is the last accepted
+position in one write, and a 256-byte first read cuts the same token short.
+Those two also re-derive round 18's 111/112 boundary on every run.
+
+The third control is the registered divergence's headline row, and its claim
+is the opposite one: 1,000 nines is 400 upstream in every cell, because 1,000
+digits is longer than the whole window and cannot fit at any offset under any
+framing, and no 1,000-digit value is representable in f64. That is why
+`json/ignored-number-int-1000` is the row compare.py pins expect="DIFF" and
+the fragile 400-nine one is not; here it is 36 cells rather than the 20 first
+reported in round 17.
+
+All three controls are the registered length divergence (ledger residual 10),
+so PulsusDB answers 204 to all 60 of their cells. That is the divergence,
+recorded cell by cell, not a surprise.
+
+Reproduce:
+  podman run -d --rm --name pulsus-loki-374 -p 13375:3100 \
+      docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc
+  podman run -d --rm --name pulsus-ch-374 -p 19375:8123 \
+      docker.io/clickhouse/clickhouse-server:24.8
+  PULSUS_HOST=127.0.0.1 PULSUS_PORT=18375 CLICKHOUSE_SERVER=localhost \
+      CLICKHOUSE_HTTP_PORT=19375 CLICKHOUSE_DB=pulsus_374_probe \
+      PULSUS_COMPAT_ENDPOINTS=1 ./target/debug/pulsusdb &
+  LOKI_PORT=13375 PULSUS_PORT=18375 python3 number_route_probe.py > a.txt
+  LOKI_PORT=13375 PULSUS_PORT=18375 python3 number_route_probe.py \
+      --stale-timestamps > b.txt
+  sed -n '/^RUN A/,/^#### end of generated/p' number_route_probe.txt \
+      | sed 1d | diff - a.txt        # empty == run A reproduces
+  sed -n '/^RUN B/,/^#### end of generated/p' number_route_probe.txt \
+      | sed 1d | diff - b.txt        # empty == run B reproduces
+
+Stdout is the whole measurement and nothing else, ending at the
+GENERATED_END marker; the ports and the chunk pause go to STDERR, so a fresh
+run's stdout diffs clean whatever ports it used. Two consecutive runs of A on
+one pair of servers were diffed against each other before this was recorded,
+and they were identical. THIS PREAMBLE AND THE NOTES AFTER RUN B ARE
+HAND-MAINTAINED: the script neither writes nor checks them.
+
+The probe REFUSES to run without both servers -- it pushes one body nothing
+objects to at each of them first and exits non-zero if either is unreachable
+or answers anything but 204, because the matrix would otherwise be measuring
+the environment. Both legs were tripped for real:
+
+    $ LOKI_PORT=13375 PULSUS_PORT=18999 python3 number_route_probe.py
+    pulsus at 127.0.0.1:18999 is not reachable: [Errno 111] Connection
+    refused  Start it first; LOKI_PORT / PULSUS_PORT override the ports.
+    exit 1
+    $ LOKI_PORT=13999 PULSUS_PORT=18375 python3 number_route_probe.py
+    loki at 127.0.0.1:13999 is not reachable: [Errno 111] Connection refused
+    ...
+    exit 1
+
+A manual capture -- NOT run in CI.
+
+RUN A -- live timestamps (`python3 number_route_probe.py`), exit 0
+number_route_probe: 20 shapes x 3 positions x 4 framings x 3 offsets
+timestamps: now
+
+shape               group       route        cells  observed (loki,pulsus)
+overflow            exponent    skipNumber   36     400/400
+exp-309             exponent    skipNumber   36     400/400
+exp-309-neg         exponent    skipNumber   36     400/400
+past-f64-max        exponent    skipNumber   36     400/400
+exp-1e22-digits     exponent    skipNumber   36     400/400
+exp-308             exponent    skipNumber   36     204/204
+at-f64-max          exponent    skipNumber   36     204/204
+underflow           exponent    skipNumber   36     204/204
+denormal-min        exponent    skipNumber   36     204/204
+zero-exp            exponent    ReadFloat32  36     204/204
+zero-exp-neg        exponent    skipNumber   36     204/204
+digits-20           exponent    skipNumber   36     204/204
+small               exponent    skipNumber   36     204/204
+neg-zero            exponent    skipNumber   36     204/204
+lead0-over          f32         ReadFloat32  36     400/400
+lead0-past-f32-max  f32         ReadFloat32  36     400/400
+lead0-under         f32         ReadFloat32  36     204/204
+lead0-at-f32-max    f32         ReadFloat32  36     204/204
+signed-lead0        f32         skipNumber   36     204/204
+no-lead0            f32         skipNumber   36     204/204
+
+controls (the first two are NOT single-valued -- see the docstring)
+  ctl-400-nines-at-111  (400 digits at offset 111)
+    envelope-key       off 111 one-write    loki 204  pulsus 204
+    envelope-key       off 111 512B-chunks  loki 204  pulsus 204
+    envelope-key       off 111 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 111 128B-chunks  loki 400  pulsus 204
+    stream-key         off 111 one-write    loki 204  pulsus 204
+    stream-key         off 111 512B-chunks  loki 204  pulsus 204
+    stream-key         off 111 256B-chunks  loki 400  pulsus 204
+    stream-key         off 111 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 111 one-write    loki 204  pulsus 204
+    entry-4th-element  off 111 512B-chunks  loki 204  pulsus 204
+    entry-4th-element  off 111 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 111 128B-chunks  loki 400  pulsus 204
+  ctl-400-nines-at-112  (400 digits at offset 112)
+    envelope-key       off 112 one-write    loki 400  pulsus 204
+    envelope-key       off 112 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 112 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 112 128B-chunks  loki 400  pulsus 204
+    stream-key         off 112 one-write    loki 400  pulsus 204
+    stream-key         off 112 512B-chunks  loki 400  pulsus 204
+    stream-key         off 112 256B-chunks  loki 400  pulsus 204
+    stream-key         off 112 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 112 one-write    loki 400  pulsus 204
+    entry-4th-element  off 112 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 112 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 112 128B-chunks  loki 400  pulsus 204
+  ctl-1000-nines  (1000 digits at offsets 120, 300, 508)
+    envelope-key       off 120 one-write    loki 400  pulsus 204
+    envelope-key       off 120 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 120 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 120 128B-chunks  loki 400  pulsus 204
+    envelope-key       off 300 one-write    loki 400  pulsus 204
+    envelope-key       off 300 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 300 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 300 128B-chunks  loki 400  pulsus 204
+    envelope-key       off 508 one-write    loki 400  pulsus 204
+    envelope-key       off 508 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 508 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 508 128B-chunks  loki 400  pulsus 204
+    stream-key         off 120 one-write    loki 400  pulsus 204
+    stream-key         off 120 512B-chunks  loki 400  pulsus 204
+    stream-key         off 120 256B-chunks  loki 400  pulsus 204
+    stream-key         off 120 128B-chunks  loki 400  pulsus 204
+    stream-key         off 300 one-write    loki 400  pulsus 204
+    stream-key         off 300 512B-chunks  loki 400  pulsus 204
+    stream-key         off 300 256B-chunks  loki 400  pulsus 204
+    stream-key         off 300 128B-chunks  loki 400  pulsus 204
+    stream-key         off 508 one-write    loki 400  pulsus 204
+    stream-key         off 508 512B-chunks  loki 400  pulsus 204
+    stream-key         off 508 256B-chunks  loki 400  pulsus 204
+    stream-key         off 508 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 120 one-write    loki 400  pulsus 204
+    entry-4th-element  off 120 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 120 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 120 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 300 one-write    loki 400  pulsus 204
+    entry-4th-element  off 300 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 300 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 300 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 508 one-write    loki 400  pulsus 204
+    entry-4th-element  off 508 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 508 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 508 128B-chunks  loki 400  pulsus 204
+
+exponent group: 14 shapes x 36 cells = 504 cells, moved=0
+f32 group: 6 shapes x 36 cells = 216 cells, moved=0
+control ctl-400-nines-at-111: 3 positions x 4 framings x 1 offset(s) = 12 cells, moved=0
+control ctl-400-nines-at-112: 3 positions x 4 framings x 1 offset(s) = 12 cells, moved=0
+control ctl-1000-nines: 3 positions x 4 framings x 3 offset(s) = 36 cells, moved=0
+total 780 cells, moved=0
+#### end of generated section ####
+
+RUN B -- `python3 number_route_probe.py --stale-timestamps`, exit 0
+number_route_probe: 20 shapes x 3 positions x 4 framings x 3 offsets
+timestamps: FIXED 2023 (--stale-timestamps)
+
+shape               group       route        cells  observed (loki,pulsus)
+overflow            exponent    skipNumber   36     400/400
+exp-309             exponent    skipNumber   36     400/400
+exp-309-neg         exponent    skipNumber   36     400/400
+past-f64-max        exponent    skipNumber   36     400/400
+exp-1e22-digits     exponent    skipNumber   36     400/400
+exp-308             exponent    skipNumber   36     400/204
+at-f64-max          exponent    skipNumber   36     400/204
+underflow           exponent    skipNumber   36     400/204
+denormal-min        exponent    skipNumber   36     400/204
+zero-exp            exponent    ReadFloat32  36     400/204
+zero-exp-neg        exponent    skipNumber   36     400/204
+digits-20           exponent    skipNumber   36     400/204
+small               exponent    skipNumber   36     400/204
+neg-zero            exponent    skipNumber   36     400/204
+lead0-over          f32         ReadFloat32  36     400/400
+lead0-past-f32-max  f32         ReadFloat32  36     400/400
+lead0-under         f32         ReadFloat32  36     400/204
+lead0-at-f32-max    f32         ReadFloat32  36     400/204
+signed-lead0        f32         skipNumber   36     400/204
+no-lead0            f32         skipNumber   36     400/204
+
+controls (the first two are NOT single-valued -- see the docstring)
+  ctl-400-nines-at-111  (400 digits at offset 111)
+    envelope-key       off 111 one-write    loki 400  pulsus 204
+    envelope-key       off 111 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 111 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 111 128B-chunks  loki 400  pulsus 204
+    stream-key         off 111 one-write    loki 400  pulsus 204
+    stream-key         off 111 512B-chunks  loki 400  pulsus 204
+    stream-key         off 111 256B-chunks  loki 400  pulsus 204
+    stream-key         off 111 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 111 one-write    loki 400  pulsus 204
+    entry-4th-element  off 111 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 111 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 111 128B-chunks  loki 400  pulsus 204
+  ctl-400-nines-at-112  (400 digits at offset 112)
+    envelope-key       off 112 one-write    loki 400  pulsus 204
+    envelope-key       off 112 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 112 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 112 128B-chunks  loki 400  pulsus 204
+    stream-key         off 112 one-write    loki 400  pulsus 204
+    stream-key         off 112 512B-chunks  loki 400  pulsus 204
+    stream-key         off 112 256B-chunks  loki 400  pulsus 204
+    stream-key         off 112 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 112 one-write    loki 400  pulsus 204
+    entry-4th-element  off 112 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 112 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 112 128B-chunks  loki 400  pulsus 204
+  ctl-1000-nines  (1000 digits at offsets 120, 300, 508)
+    envelope-key       off 120 one-write    loki 400  pulsus 204
+    envelope-key       off 120 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 120 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 120 128B-chunks  loki 400  pulsus 204
+    envelope-key       off 300 one-write    loki 400  pulsus 204
+    envelope-key       off 300 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 300 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 300 128B-chunks  loki 400  pulsus 204
+    envelope-key       off 508 one-write    loki 400  pulsus 204
+    envelope-key       off 508 512B-chunks  loki 400  pulsus 204
+    envelope-key       off 508 256B-chunks  loki 400  pulsus 204
+    envelope-key       off 508 128B-chunks  loki 400  pulsus 204
+    stream-key         off 120 one-write    loki 400  pulsus 204
+    stream-key         off 120 512B-chunks  loki 400  pulsus 204
+    stream-key         off 120 256B-chunks  loki 400  pulsus 204
+    stream-key         off 120 128B-chunks  loki 400  pulsus 204
+    stream-key         off 300 one-write    loki 400  pulsus 204
+    stream-key         off 300 512B-chunks  loki 400  pulsus 204
+    stream-key         off 300 256B-chunks  loki 400  pulsus 204
+    stream-key         off 300 128B-chunks  loki 400  pulsus 204
+    stream-key         off 508 one-write    loki 400  pulsus 204
+    stream-key         off 508 512B-chunks  loki 400  pulsus 204
+    stream-key         off 508 256B-chunks  loki 400  pulsus 204
+    stream-key         off 508 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 120 one-write    loki 400  pulsus 204
+    entry-4th-element  off 120 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 120 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 120 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 300 one-write    loki 400  pulsus 204
+    entry-4th-element  off 300 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 300 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 300 128B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 508 one-write    loki 400  pulsus 204
+    entry-4th-element  off 508 512B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 508 256B-chunks  loki 400  pulsus 204
+    entry-4th-element  off 508 128B-chunks  loki 400  pulsus 204
+
+exponent group: 14 shapes x 36 cells = 504 cells, moved=0
+f32 group: 6 shapes x 36 cells = 216 cells, moved=0
+control ctl-400-nines-at-111: 3 positions x 4 framings x 1 offset(s) = 12 cells, moved=0
+control ctl-400-nines-at-112: 3 positions x 4 framings x 1 offset(s) = 12 cells, moved=0
+control ctl-1000-nines: 3 positions x 4 framings x 3 offset(s) = 36 cells, moved=0
+total 780 cells, moved=0
+
+stale-timestamp mutant: every cell must be 400 upstream, which for the 13 shape(s) Loki accepts with `now` (exp-308, at-f64-max, underflow, denormal-min, zero-exp, zero-exp-neg, digits-20, small, neg-zero, lead0-under, lead0-at-f32-max, signed-lead0, no-lead0) and the 1 control(s) with an accepted cell (ctl-400-nines-at-111) is a MOVE
+every one of them moved; the probe's comparator sees a change when there is one to see. PulsusDB has no reject_old_samples equivalent, so its column is unchanged -- which is why the live-timestamp run sends `now`.
+#### end of generated section ####
+
+what run B demonstrates
+-----------------------
+Run B is the probe's own mutant, and it is what makes run A's green a
+measurement rather than an assumption. Upstream's default one-week
+`reject_old_samples` window refuses anything it would otherwise have STORED,
+so re-sending the identical matrix with a fixed 2023 timestamp must turn
+every accepted cell into a 400 -- 13 of the 20 shapes plus the accepted half
+of ctl-400-nines-at-111, listed by name in run B's last paragraph. All 13
+moved. The five exponent shapes and two f32 shapes upstream refuses at DECODE
+never reach the timestamp check and did not move, which is the other half of
+the demonstration: the mutant is selective, not a blanket 400.
+
+PulsusDB has no reject_old_samples equivalent, so its column is identical in
+both runs. That asymmetry is why the live matrix sends `now`: an earlier pass
+of this probe used the fixed timestamp throughout and reported those shapes
+MOVED, which is the observation this run turns into a repeatable check.
+
+two more mutants, both run against these servers
+------------------------------------------------
+1. THE CONTROLS BITE. `--delay 0` removes the pause between wire chunks, so
+   the writes coalesce and the framing never reaches upstream's decoder. The
+   20 shapes stayed green -- exactly the false green the controls exist to
+   catch -- and the controls caught it:
+
+     ctl-400-nines-at-111  (400 digits at offset 111)
+       envelope-key       off 111 one-write    loki 204  pulsus 204
+       envelope-key       off 111 512B-chunks  loki 204  pulsus 204
+       envelope-key       off 111 256B-chunks  loki 204  pulsus 204   <-- MOVED, expected 400/204
+       envelope-key       off 111 128B-chunks  loki 204  pulsus 204   <-- MOVED, expected 400/204
+       [the same two cells in each of the other two positions]
+     INSTRUMENT FAILURE: a control moved. The framing or the offset knob did
+     not reach upstream's decoder, so the invariance the shapes above report
+     is not evidence. Raise --delay and re-run.
+     exponent group: 14 shapes x 36 cells = 504 cells, moved=0
+     f32 group: 6 shapes x 36 cells = 216 cells, moved=0
+     control ctl-400-nines-at-111: ... = 12 cells, moved=6
+     control ctl-400-nines-at-112: ... = 12 cells, moved=0
+     control ctl-1000-nines: ... = 36 cells, moved=0
+     total 780 cells, moved=6
+
+   exit 1. Note the two zero rows above the INSTRUMENT line: without the
+   controls this run would have reported 720 agreeing cells and exit 0.
+   ctl-400-nines-at-112 and ctl-1000-nines stayed put, which is the other
+   half -- coalescing moves only the cells whose verdict depends on framing.
+
+2. THE SHAPE COMPARATOR BITES. One expected verdict edited in the script
+   (`lead0-under` from 204/204 to 400/400) and the matrix re-run unchanged:
+
+     lead0-under         f32         ReadFloat32  36     204/204   <-- MOVED, expected 400/400
+     f32 group: 6 shapes x 36 cells = 216 cells, moved=36
+
+   exit 1, all 36 of that shape's cells reported. Reverted by the inverse
+   edit; the script is byte-identical to the pre-mutant copy (`cmp`).

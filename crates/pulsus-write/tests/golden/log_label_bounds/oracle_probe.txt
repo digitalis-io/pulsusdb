@@ -11,6 +11,12 @@ Evidence for the `ingest-label-bounds` row in
 docs/benchmarks/logs-differential-ledger.md. A manual capture -- NOT run in
 CI.
 
+`number_route_probe.py` / `number_route_probe.txt` beside this file are the
+second half of that evidence, for the one group whose claim a case table
+cannot carry: a case is one body written in one piece, and the ignored-number
+rules are claimed INVARIANT across wire framings and byte offsets. That probe
+varies both, over 780 cells, and exits non-zero on a cell that moves.
+
 `compare.py` in this directory regenerates PART of this file: the case table,
 the summary line and the body dump -- everything from the `case ... expected`
 header line down to the `#### end of generated section ####` marker, which the
@@ -159,7 +165,11 @@ also inf in f32, but not starting with `0`, so they take skipNumber and f64 --
 are 204 on both, and `-at-f32-max`/`-past-f32-max` sit either side of the f32
 rounding boundary. Those six were added in round 18 and measured over 36 cells
 each (3 ignored positions x 4 wire framings x 3 byte offsets, 216 cells), every
-shape single-valued.
+shape single-valued. That matrix is the f32 group of number_route_probe.py in
+this directory, and number_route_probe.txt is a recorded run of it; the six
+cases here pin one of its cells apiece. A case is one body in one write, so
+it cannot measure a claim about framings and offsets -- the probe is what
+does, and its cell counts are its own output.
 
 Several cases are large by design: `-streams-stream-count` and
 `drained-streams-non-object` carry 1,000,001 stream objects (3 MB),
@@ -1089,7 +1099,10 @@ json/ignored-number-int-1000
     A run of 1,000 digits is the framing-INDEPENDENT corner of this: longer
     than the whole 512-byte window, so it cannot fit at any offset under any
     chunking, and no 1,000-digit value is representable in f64 -- 400 upstream
-    over 20 cells measured (5 wire framings x 4 byte offsets). That is why
+    over 20 cells measured in round 17 (5 wire framings x 4 byte offsets), and
+    over 36 more as number_route_probe.py's ctl-1000-nines control (3 ignored
+    positions x 4 framings x 3 offsets), which re-measures it on every run.
+    That is why
     this row, and not the fragile `json/ignored-number-int` (400 nines, whose
     terminating byte lands at index 486 with 25 bytes to spare, only because
     of where this body puts it), is the one pinned as a divergence. The
@@ -1099,7 +1112,10 @@ json/ignored-number-int-1000
     offsets, 168 cells) in round 17, and re-run over 36 cells each in round 19
     -- those same 12 in each of the 3 ignored positions, 504 cells, both
     servers -- after the f32 change below; every shape stayed single-valued and
-    none moved. Thirteen of the fourteen take skipNumber; the fourteenth,
+    none moved. Those 504 cells are the exponent group of
+    number_route_probe.py in this directory: the figure is that script's
+    output, reproducible by running it, and number_route_probe.txt is a
+    recorded run. Thirteen of the fourteen take skipNumber; the fourteenth,
     `0e999`, takes ReadFloat32 on its first byte, and zero is finite in both
     widths, which is why no probe over this set could have shown the dispatch
     in a status. Ledger residual 10.
@@ -1112,6 +1128,15 @@ json/ignored-number-int-1000
     256- and 128-byte chunks; crossing, 308 nines is 204, 309 nines is 400 and
     309 digits of `1` then zeros is 204; 1,000 nines is 400 at each of four
     offsets. PulsusDB answered 204 to every one of those, as before.
+
+    The 111/112 half of that is now re-derived on every run of
+    number_route_probe.py rather than only in round 18: its two controls are
+    a 400-nine run at each of those offsets, in all three ignored positions
+    and all four framings, and they are there to prove the framing and offset
+    knobs reach upstream's decoder at all. Without them the twenty invariant
+    shapes would report agreement even if the chunked writes had coalesced --
+    measured, with the pause between chunks removed: 720 agreeing cells, and
+    the controls the only thing that caught it.
 
     The `0`-leading route is NOT part of this residual and is no longer a gap:
     it was closed in round 18. `Skip` never reaches skipNumber for a token

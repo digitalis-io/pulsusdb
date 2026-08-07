@@ -2306,7 +2306,10 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 /// `readNumberAsString` loads more (`:159-186`) until the token ends. The
 /// verdict is a function of the request alone — refused iff the value
 /// overflows `f32`. Measured on `grafana/loki@sha256:87f0a067…` over 36 cells
-/// per shape (3 ignored positions × 4 wire framings × 3 byte offsets), each
+/// per shape (3 ignored positions × 4 wire framings × 3 byte offsets, 216
+/// cells — the `f32` group of
+/// `crates/pulsus-write/tests/golden/log_label_bounds/number_route_probe.py`,
+/// which is where those cells come from and how to reproduce them), each
 /// shape single-valued: `0.35e39` is `400` on both sides while `0.34e39` is
 /// `204` on both, and the same magnitude written `3.5e38` or `-0.35e39` is
 /// `204` on both because neither starts with `0`. The threshold is `f32`'s own
@@ -2354,7 +2357,12 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 /// framings (one write, 128-, 256- and 512-byte chunks) × 3 byte offsets, 168
 /// cells in all (issue #374 round 17), and again over 36 cells each — those
 /// same 12 in each of the three ignored positions, 504 cells — after the `f32`
-/// route was closed (round 19). None moved on either server, which is what
+/// route was closed (round 19). Those 504 are the exponent group of
+/// `crates/pulsus-write/tests/golden/log_label_bounds/number_route_probe.py`,
+/// a raw-socket matrix that writes the body in the four framings at the three
+/// offsets and exits non-zero on a cell that moves; the figure is its output
+/// rather than a report of one, and `number_route_probe.txt` beside it is a
+/// recorded run. None moved on either server, which is what
 /// `trySkipNumber` bailing on `e` in every window predicts for the eleven on
 /// this route that carry one (the two digits-only ones are `204` skipped or
 /// parsed), and what never reaching `trySkipNumber` predicts for `0e999`.
@@ -4051,7 +4059,11 @@ mod tests {
     /// round 19 (those same 12 in each of the three positions, 504 cells);
     /// each of the six rows added in round 18 was measured over 36 cells when
     /// it was added (216 cells). None moved, which is what makes this a rule
-    /// rather than a sample.
+    /// rather than a sample. Both matrices are
+    /// `tests/golden/log_label_bounds/number_route_probe.py`, which is the
+    /// artifact those two figures come from and how to re-run them: this test
+    /// pins OUR side of each shape hermetically, that probe measures both
+    /// sides over all 36 cells of it.
     ///
     /// The six rows added in round 18 are the DISPATCH: upstream picks the
     /// reader from the value's first byte, so a token starting with `0` is
@@ -4101,7 +4113,8 @@ mod tests {
         // A run this long cannot fit in upstream's 512-byte read window at any
         // offset or framing, and every 1,000-digit value overflows `f64`, so
         // upstream parses and refuses it every time — 20 cells, 5 wire
-        // framings × 4 byte offsets, all `400` (round 17) — while we accept
+        // framings × 4 byte offsets, all `400` (round 17), and 36 more as
+        // `number_route_probe.py`'s `ctl-1000-nines` — while we accept
         // it, deliberately, because upstream's answer at 400 nines flips with
         // the wire chunking and ours cannot. Flipping this assertion to a
         // rejection would be adopting a framing-dependent acceptance surface;

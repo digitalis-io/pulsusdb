@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Ignored-number route probe: the cell-level measurement behind the
+504-cell / 216-cell figures quoted for issue #374.
+
+`compare.py` beside this file sends ONE body per case through
+`http.client`, so it pins one cell per shape: one ignored position, one wire
+framing, one byte offset.  The claims made about those shapes are stronger
+than that -- that each shape's verdict is a function of the REQUEST and not
+of where the token sits in the body or of how the client chunked its writes.
+This script is the instrument that measures the claim it is quoted for, and
+the cell counts in the artifacts are its output rather than a report of it.
+
+    20 shapes x 3 ignored positions x 4 wire framings x 3 byte offsets
+
+  * exponent group -- the 14 shapes `compare.py`'s number cases and
+    `loki_push::tests::parse_json_a_discarded_number_follows_the_references_overflow_rule`
+    pin between them:  14 x 36 = 504 cells.
+  * f32 group -- the 6 `-lead0-*` / control shapes:  6 x 36 = 216 cells.
+  * three CONTROLS on the digits-only axis, below:  60 cells.
+
+Every cell's expected pair of statuses is written down here; a cell whose
+observed pair differs is reported MOVED and the run exits 1.  Nothing about
+a run is inferred from another run: a shape claimed single-valued that is
+not comes back as a table of the cells that disagreed.
+
+Why the controls are load-bearing.  The 20 shapes are claimed INVARIANT
+across framings and offsets, so if the framing loop never reached the
+decoder -- if the kernel coalesced the writes, or if the server buffered the
+whole body before parsing -- all four framings would return the same status
+and the run would still be green.  A green run would then be evidence of
+nothing.  So the probe also sends a 400-digit run at the two offsets either
+side of upstream's read-buffer boundary:
+
+    400 nines at offset 111 -- one write and 512-byte chunks are 204
+                              upstream, 256- and 128-byte chunks are 400
+    400 nines at offset 112 -- 400 upstream in all four framings
+
+The third control is the registered divergence's headline row and its claim
+is the opposite one:
+
+    1,000 nines, all 3 offsets -- 400 upstream in every cell
+
+1,000 digits is longer than the whole 512-byte window, so no offset and no
+framing can make it fit, and no 1,000-digit value is representable in f64.
+That is why `json/ignored-number-int-1000` is the row `compare.py` pins
+expect="DIFF" and the fragile 400-nine one is not -- and this control is the
+measurement behind that "framing-independent", over 36 cells rather than the
+20 first reported in round 17.
+
+`trySkipNumber` walks the CURRENT READ BUFFER only (`for i := iter.head; i <
+iter.tail`, `iter_skip_strict.go:26 @ jsoniter v1.1.12`) over the 512 bytes
+`jsoniter.NewDecoder` hands it (`config.go:366`, reached from
+`unmarshal.DecodePushRequest`, `pkg/util/unmarshal/unmarshal.go:17 @ loki
+v3.7.4`), and reports "skipped" only on reaching a terminating byte inside
+that window (`:46-53`).  offset + length + 1 = 512 is therefore the last
+accepted position in one write, which is why 111 passes and 112 does not;
+and a 256-byte first read cuts the same token short, which is why the
+chunked framings differ from the unchunked ones at 111.  A control cell that
+does not answer what that predicts exits 1 with INSTRUMENT FAILURE -- a
+message saying the instrument, not the subject, is what failed.  Measured:
+with the pause between chunks removed the writes coalesce, the 20 shapes
+still report 720 agreeing cells, and the at-111 control's six chunked cells
+are the only thing that catches it.
+
+All three controls are the registered length divergence (ledger residual 10),
+so PulsusDB answers 204 to all 60 of their cells -- that is the divergence,
+recorded cell by cell, not a surprise.
+
+Timestamps.  Every body carries `now`.  `--stale-timestamps` re-runs the
+whole matrix with a fixed 2023 timestamp instead and asserts the OPPOSITE
+result: upstream's default one-week `reject_old_samples` window turns every
+cell it would have accepted into a 400, so exactly the cells expected 204
+from Loki must move and no others.  That is the probe's own mutant -- it
+demonstrates that a green run is a measurement and not a rubber stamp, and
+it is why the live-timestamp run uses `now`.
+
+Usage (both servers must already be up; the probe refuses to run otherwise):
+
+    LOKI_PORT=13375 PULSUS_PORT=18375 python3 number_route_probe.py
+    LOKI_PORT=13375 PULSUS_PORT=18375 python3 number_route_probe.py \
+        --stale-timestamps
+
+Stdout is the whole measurement and nothing else, terminated by
+GENERATED_END; the ports and the chunk pause go to stderr so that a fresh
+run's stdout can be diffed against the recorded one with no post-processing
+whatever ports it used.  See number_route_probe.txt in this directory for a
+recorded run of each mode and the diff recipe, and oracle_probe.txt for the
+servers and the container recipe.  A manual capture -- NOT run in CI.
+"""
+import argparse
+import errno
+import os
+import socket
+import sys
+import time
+
+LOKI = ("127.0.0.1", int(os.environ.get("LOKI_PORT", "13174")))
+PULSUS = ("127.0.0.1", int(os.environ.get("PULSUS_PORT", "18374")))
+PATH = "/loki/api/v1/push"
+CTYPE = "application/json"
+
+# 2023-11-14, more than a week old under any plausible run date: the same
+# constant `compare.py` uses for bodies both sides refuse at decode.
+STALE_TS = "1700000000000000000"
+
+# Wire framings.  `None` writes the body in one `sendall`; an integer writes
+# it in chunks of that many bytes, with a pause between them so that the
+# server's read returns the chunk rather than the whole body.
+FRAMINGS = (None, 512, 256, 128)
+# Byte offset of the value's FIRST byte within the request body.  120 and 300
+# sit inside upstream's first 512-byte read; at 508 even the shortest shape
+# here (`-0.0`, 4 bytes) has its terminating byte at index 512 or beyond, so
+# the token runs to the end of that window.
+OFFSETS = (120, 300, 508)
+POSITIONS = ("envelope-key", "stream-key", "entry-4th-element")
+
+# (name, literal, route, loki, pulsus) -- the expected pair for all 36 cells.
+#
+# `route` is which reader `Skip` dispatches to on the value's FIRST BYTE:
+# `case '0'` unreads it and calls `ReadFloat32`, `case '-','1'..'9'` calls
+# `skipNumber` (`iter_skip.go:72-96,83-87 @ jsoniter v1.1.12`).  It is
+# recorded per shape because it is the rule being measured, not a label: the
+# two routes range-check against different widths.
+EXPONENT = (
+    ("overflow", "1e999", "skipNumber", 400, 400),
+    ("exp-309", "1e309", "skipNumber", 400, 400),
+    ("exp-309-neg", "-1e309", "skipNumber", 400, 400),
+    ("past-f64-max", "1.7976931348623159e308", "skipNumber", 400, 400),
+    ("exp-1e22-digits", "1e1000000000000000000000", "skipNumber", 400, 400),
+    ("exp-308", "1e308", "skipNumber", 204, 204),
+    ("at-f64-max", "1.7976931348623157e308", "skipNumber", 204, 204),
+    ("underflow", "1e-999", "skipNumber", 204, 204),
+    ("denormal-min", "5e-324", "skipNumber", 204, 204),
+    # Zero is finite in BOTH widths, which is why these two are 204 whichever
+    # reader takes them -- and why no probe over this group could have shown
+    # the dispatch in a status (issue #374 round 19).
+    ("zero-exp", "0e999", "ReadFloat32", 204, 204),
+    ("zero-exp-neg", "-0e999", "skipNumber", 204, 204),
+    # No exponent: a short digits-only run, skipped unevaluated where it fits
+    # the window and parsed to a finite value where it does not, so 204 either
+    # way.  The LENGTH of such a run is the divergence -- see the controls.
+    ("digits-20", "12345678901234567890", "skipNumber", 204, 204),
+    ("small", "1.5e3", "skipNumber", 204, 204),
+    ("neg-zero", "-0.0", "skipNumber", 204, 204),
+)
+
+# The dispatch itself: same magnitude, different first byte, different width.
+F32 = (
+    ("lead0-over", "0.35e39", "ReadFloat32", 400, 400),
+    ("lead0-past-f32-max", "0.34028236e39", "ReadFloat32", 400, 400),
+    ("lead0-under", "0.34e39", "ReadFloat32", 204, 204),
+    ("lead0-at-f32-max", "0.34028235e39", "ReadFloat32", 204, 204),
+    ("signed-lead0", "-0.35e39", "skipNumber", 204, 204),
+    ("no-lead0", "3.5e38", "skipNumber", 204, 204),
+)
+
+# (name, literal, offsets, {framing: loki}, pulsus).  The first two exist to
+# prove the framing and offset knobs reach upstream's decoder -- see the module
+# docstring.  The third is the registered divergence's headline row, whose
+# claim is the OPPOSITE one: 1,000 digits is longer than the whole 512-byte
+# window, so it cannot fit at any offset under any framing, and no 1,000-digit
+# value is representable in f64.  It is single-valued at 400 upstream for that
+# reason and not by luck, which is why `json/ignored-number-int-1000` is the
+# row pinned expect="DIFF" in compare.py and the fragile 400-nine one is not.
+CONTROLS = (
+    ("ctl-400-nines-at-111", "9" * 400, (111,), {None: 204, 512: 204, 256: 400, 128: 400}, 204),
+    ("ctl-400-nines-at-112", "9" * 400, (112,), {None: 400, 512: 400, 256: 400, 128: 400}, 204),
+    ("ctl-1000-nines", "9" * 1000, OFFSETS, {None: 400, 512: 400, 256: 400, 128: 400}, 204),
+)
+
+
+def body_parts(position, ts):
+    """(before-pad, after-pad, tail) for one ignored position.
+
+    The three positions are the ones the reference counts separately and the
+    ones the hermetic test carries: an unknown key on the envelope, an unknown
+    key inside a stream object, and an entry's fourth element.  Padding goes
+    in an unknown envelope key so that the same knob works in all three.
+    """
+    win = '{"stream":{"app":"w"},"values":[["%s","FINAL"]]}' % ts
+    if position == "envelope-key":
+        return '{"pad":"', '","streams":[%s],"junk":' % win, "}"
+    if position == "stream-key":
+        return (
+            '{"pad":"',
+            '","streams":[{"stream":{"app":"a"},"values":[["%s","FINAL"]],"junk":' % ts,
+            "}]}",
+        )
+    if position == "entry-4th-element":
+        return (
+            '{"pad":"',
+            '","streams":[{"stream":{"app":"a"},"values":[["%s","x",{},' % ts,
+            "]]}]}",
+        )
+    sys.exit("unknown position %r" % position)
+
+
+def build(position, ts, value, offset):
+    """A body whose `value` starts at exactly `offset` bytes in.
+
+    The offset is structural, not searched for: the pad is sized so that the
+    prefix is `offset` bytes long, and a target below the position's own
+    minimum is fatal rather than silently rounded up to it.
+    """
+    head, mid, tail = body_parts(position, ts)
+    pad = offset - (len(head) + len(mid))
+    if pad < 0:
+        sys.exit(
+            "offset %d is unreachable in position %s: its shortest prefix is "
+            "%d bytes" % (offset, position, len(head) + len(mid))
+        )
+    body = head + "a" * pad + mid + value + tail
+    assert len(head) + pad + len(mid) == offset
+    return body.encode()
+
+
+def raw_post(target, body, framing, delay):
+    """One push over a RAW SOCKET, with the body written in `framing`-byte
+    chunks (or in one write when `framing` is None).
+
+    `http.client` writes the body in one `sendall` and offers no way to say
+    otherwise, which is why this is here.  The head is written on its own and
+    followed by the same pause, so that the server's request-line reader does
+    not pull the first body bytes into its own buffer along with the head --
+    if it did, the first body read would return whatever it had left over
+    rather than a chunk, and the framing would not be the one asked for.
+    """
+    head = (
+        "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: %s\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n"
+        % (PATH, target[0], target[1], CTYPE, len(body))
+    ).encode()
+    sock = socket.create_connection(target, timeout=30)
+    try:
+        try:
+            sock.sendall(head)
+            if framing is None:
+                sock.sendall(body)
+            else:
+                time.sleep(delay)
+                for i in range(0, len(body), framing):
+                    sock.sendall(body[i : i + framing])
+                    if i + framing < len(body):
+                        time.sleep(delay)
+        except (BrokenPipeError, ConnectionResetError):
+            # A server that has already decided (a decode error part way
+            # through the body) may close before the last chunk lands.  Its
+            # answer is still on the socket, and that answer is the cell.
+            pass
+        buf = b""
+        while b"\r\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                sys.exit("no response from %s:%d" % target)
+            buf += chunk
+        # Drain, so the peer sees an orderly close rather than a reset.
+        try:
+            while sock.recv(65536):
+                pass
+        except OSError:
+            pass
+    finally:
+        sock.close()
+    parts = buf.split(b"\r\n", 1)[0].split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        sys.exit("unparseable status line: %r" % parts)
+    return int(parts[1])
+
+
+def preflight(delay):
+    """Refuse to run without both servers.
+
+    A push nothing objects to has to come back accepted from each of them
+    first: a connection refused, or a server that answers 400 to a trivially
+    valid body, means the matrix below would be measuring the environment.
+    """
+    ts = str(int(time.time() * 1e9))
+    body = ('{"streams":[{"stream":{"app":"preflight"},"values":[["%s","ok"]]}]}' % ts).encode()
+    for label, target in (("loki", LOKI), ("pulsus", PULSUS)):
+        try:
+            status = raw_post(target, body, None, delay)
+        except OSError as exc:
+            hint = "" if exc.errno != errno.ECONNREFUSED else (
+                "  Start it first; LOKI_PORT / PULSUS_PORT override the ports."
+            )
+            sys.exit("%s at %s:%d is not reachable: %s%s" % (label, target[0], target[1], exc, hint))
+        if status not in (200, 204):
+            sys.exit(
+                "%s at %s:%d answered %d to a trivially valid push; the matrix "
+                "would be measuring the environment" % (label, target[0], target[1], status)
+            )
+
+
+def cells_for(shape, ts, delay):
+    """Every cell of one shape: (position, framing, offset) -> (loki, pulsus)."""
+    name, value, _route, _l, _p = shape
+    out = {}
+    for position in POSITIONS:
+        for offset in OFFSETS:
+            body = build(position, ts, value, offset)
+            for framing in FRAMINGS:
+                out[(position, framing, offset)] = (
+                    raw_post(LOKI, body, framing, delay),
+                    raw_post(PULSUS, body, framing, delay),
+                )
+    return out
+
+
+def control_cells(control, ts, delay):
+    _name, value, offsets, _loki_by_framing, _pulsus = control
+    out = {}
+    for position in POSITIONS:
+        for offset in offsets:
+            body = build(position, ts, value, offset)
+            for framing in FRAMINGS:
+                out[(position, framing, offset)] = (
+                    raw_post(LOKI, body, framing, delay),
+                    raw_post(PULSUS, body, framing, delay),
+                )
+    return out
+
+
+def framing_name(framing):
+    return "one-write" if framing is None else "%dB-chunks" % framing
+
+
+# Last stdout line of every run, whatever its verdict.
+GENERATED_END = "#### end of generated section ####"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument(
+        "--stale-timestamps",
+        action="store_true",
+        help="re-run with a fixed 2023 timestamp and require that exactly the "
+        "cells Loki accepts move to 400 (the probe's own mutant)",
+    )
+    ap.add_argument(
+        "--delay",
+        type=float,
+        default=0.005,
+        help="seconds to pause between wire chunks (default 0.005); raise it "
+        "if the controls report that the framing did not reach the decoder",
+    )
+    args = ap.parse_args()
+
+    preflight(args.delay)
+    ts = STALE_TS if args.stale_timestamps else str(int(time.time() * 1e9))
+
+    groups = (("exponent", EXPONENT), ("f32", F32))
+    print(
+        "number_route_probe: %d shapes x %d positions x %d framings x %d offsets"
+        % (len(EXPONENT) + len(F32), len(POSITIONS), len(FRAMINGS), len(OFFSETS))
+    )
+    print(
+        "timestamps: %s"
+        % ("FIXED 2023 (--stale-timestamps)" if args.stale_timestamps else "now")
+    )
+    # The ports and the pause are run parameters, not measurements: they go to
+    # STDERR so that stdout is byte-reproducible across runs and can be diffed
+    # against the recorded transcript with no post-processing.
+    print(
+        "loki %s:%d   pulsus %s:%d   chunk pause %g s"
+        % (LOKI[0], LOKI[1], PULSUS[0], PULSUS[1], args.delay),
+        file=sys.stderr,
+    )
+    print()
+
+    moved = []
+    rows = []
+    for group, shapes in groups:
+        for shape in shapes:
+            name, value, route, loki_ok, pulsus_ok = shape
+            if args.stale_timestamps:
+                # Every accepted cell must be refused instead; a refused one
+                # never reaches the timestamp check and must not move.
+                loki_ok = 400
+            observed = cells_for(shape, ts, args.delay)
+            bad = {k: v for k, v in observed.items() if v != (loki_ok, pulsus_ok)}
+            statuses = sorted({v for v in observed.values()})
+            rows.append(
+                (group, name, value, route, len(observed), statuses, bad, (loki_ok, pulsus_ok))
+            )
+            if bad:
+                moved.append((group, name, bad, (loki_ok, pulsus_ok)))
+
+    control_rows = []
+    for control in CONTROLS:
+        name, value, offsets, loki_by_framing, pulsus_ok = control
+        observed = control_cells(control, ts, args.delay)
+        expected = {
+            k: ((400 if args.stale_timestamps else loki_by_framing[k[1]]), pulsus_ok)
+            for k in observed
+        }
+        bad = {k: v for k, v in observed.items() if v != expected[k]}
+        control_rows.append((name, value, offsets, observed, expected, bad))
+        if bad:
+            moved.append(("control", name, bad, None))
+
+    width = max(len(r[1]) for r in rows)
+    print("%s  %-10s  %-11s  cells  observed (loki,pulsus)" % ("shape".ljust(width), "group", "route"))
+    for group, name, value, route, count, statuses, bad, expect in rows:
+        rendered = " ".join("%d/%d" % s for s in statuses)
+        flag = "   <-- MOVED, expected %d/%d" % expect if bad else ""
+        print("%s  %-10s  %-11s  %-5d  %s%s" % (name.ljust(width), group, route, count, rendered, flag))
+    print()
+
+    print("controls (the first two are NOT single-valued -- see the docstring)")
+    for name, value, offsets, observed, expected, bad in control_rows:
+        print(
+            "  %s  (%d digits at offset%s %s)"
+            % (
+                name,
+                len(value),
+                "" if len(offsets) == 1 else "s",
+                ", ".join(str(o) for o in offsets),
+            )
+        )
+        for position in POSITIONS:
+            for offset in offsets:
+                for framing in FRAMINGS:
+                    key = (position, framing, offset)
+                    got, want = observed[key], expected[key]
+                    flag = "   <-- MOVED, expected %d/%d" % want if got != want else ""
+                    print(
+                        "    %-18s off %-3d %-11s  loki %d  pulsus %d%s"
+                        % (position, offset, framing_name(framing), got[0], got[1], flag)
+                    )
+    print()
+
+    if any(name.startswith("ctl-") for _g, name, _b, _e in moved):
+        print(
+            "INSTRUMENT FAILURE: a control moved. The framing or the offset knob "
+            "did not reach upstream's decoder, so the invariance the shapes above "
+            "report is not evidence. Raise --delay and re-run."
+        )
+
+    for group, shapes in groups:
+        cells = len(shapes) * len(POSITIONS) * len(FRAMINGS) * len(OFFSETS)
+        group_moved = sum(len(b) for g, _n, b, _e in moved if g == group)
+        print(
+            "%s group: %d shapes x %d cells = %d cells, moved=%d"
+            % (group, len(shapes), len(POSITIONS) * len(FRAMINGS) * len(OFFSETS), cells, group_moved)
+        )
+    for name, _v, offsets, observed, _e, bad in control_rows:
+        print(
+            "control %s: %d positions x %d framings x %d offset(s) = %d cells, "
+            "moved=%d"
+            % (name, len(POSITIONS), len(FRAMINGS), len(offsets), len(observed), len(bad))
+        )
+    ctl_cells = sum(len(r[3]) for r in control_rows)
+    total = sum(len(s) for _g, s in groups) * len(POSITIONS) * len(FRAMINGS) * len(OFFSETS) + ctl_cells
+    print("total %d cells, moved=%d" % (total, sum(len(b) for _g, _n, b, _e in moved)))
+
+    mutant_failed = False
+    if args.stale_timestamps:
+        # The mutant's own assertion: the shapes that MUST move are exactly
+        # the ones the live-timestamp table records Loki accepting, and the
+        # comparison above already expects them at 400, so a correct mutant
+        # run reports moved=0 while its `observed` column differs from the
+        # live one.  What is checked here is the change itself.
+        should = [n for _g, s in groups for (n, _v, _r, l, _p) in s if l == 204]
+        should_ctl = [
+            n for (n, _v, _o, by_framing, _p) in CONTROLS if 204 in by_framing.values()
+        ]
+        not_refused = [r[1] for r in rows if any(o[0] != 400 for o in r[5])]
+        mutant_failed = bool(not_refused)
+        print()
+        print(
+            "stale-timestamp mutant: every cell must be 400 upstream, which for "
+            "the %d shape(s) Loki accepts with `now` (%s) and the %d control(s) "
+            "with an accepted cell (%s) is a MOVE"
+            % (len(should), ", ".join(should), len(should_ctl), ", ".join(should_ctl))
+        )
+        if mutant_failed:
+            print("still accepted upstream under the stale timestamp: %s" % ", ".join(not_refused))
+            print(
+                "The mutant did not bite, so a green run of this probe is not "
+                "evidence that its comparator can see a change."
+            )
+        else:
+            print(
+                "every one of them moved; the probe's comparator sees a change "
+                "when there is one to see. PulsusDB has no reject_old_samples "
+                "equivalent, so its column is unchanged -- which is why the "
+                "live-timestamp run sends `now`."
+            )
+
+    # Closes the span this script generates, the way `compare.py`'s
+    # GENERATED_END closes its own: everything from the first line to here is
+    # stdout verbatim, so the recorded transcript can be checked with one
+    # `sed`+`diff`.  The recipe is in number_route_probe.txt's preamble.
+    print(GENERATED_END)
+    return 1 if (moved or mutant_failed) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

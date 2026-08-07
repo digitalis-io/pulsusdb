@@ -16,6 +16,15 @@ rather than redirecting over the whole file.
 Needs a Loki source checkout containing the pinned revision, because the
 eighteen index-label names are read out of it rather than transcribed here
 (LOKI_SRC, default /home/hayato/git/loki). Exits non-zero if it cannot.
+
+One case is one BODY, sent in one write through http.client. Where a claim
+is about how a verdict behaves across wire framings and byte offsets -- the
+ignored-number group, whose whole point is that its verdict does not depend
+on either -- that claim needs an instrument that varies them, and one case
+cannot be it. number_route_probe.py beside this file is that instrument: a
+raw-socket writer over 20 shapes x 3 ignored positions x 4 framings x 3
+offsets, with three controls on the digits-only axis. The number cases
+below pin one cell of it apiece.
 """
 import http.client
 import json
@@ -596,8 +605,10 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 # overflows f32.  The four -lead0-* rows below are that route; their two
 # controls (-signed-lead0, -no-lead0) are the OTHER route by one byte, which is
 # what makes them controls.  All six were measured over 36 cells per shape
-# (3 ignored positions x 4 wire framings x 3 byte offsets, round 18), each
-# shape single-valued.
+# (3 ignored positions x 4 wire framings x 3 byte offsets, 216 cells, round
+# 18), each shape single-valued.  That matrix is number_route_probe.py in this
+# directory -- these cases pin one cell of it apiece, and the probe is what
+# measures the invariance the sentence above claims.
 #
 # ROUTE '-','1'..'9' -- f64, via skipNumber.  `trySkipNumber` walks a run of
 # digits with at most one dot and skips it
@@ -619,7 +630,10 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 # group and the hermetic test pin between them were re-measured in round 17
 # over 12 cells each (4 wire framings x 3 byte offsets, 168 cells) and in round
 # 19 over 36 each (those same 12 in each of the 3 ignored positions, 504
-# cells); none moved, on either server.  Thirteen of the fourteen are on this
+# cells); none moved, on either server.  Those 504 cells are
+# number_route_probe.py's exponent group -- run it to reproduce the figure
+# rather than take it, and see number_route_probe.txt for a recorded run.
+# Thirteen of the fourteen are on this
 # route -- `0e999` is the one whose first byte sends it to ReadFloat32 -- and
 # two of the thirteen (`12345678901234567890`, `-0.0`) carry no exponent at
 # all: they are short digits-only runs, skipped unevaluated wherever they fit
@@ -647,9 +661,11 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 #   -int-1000  1,000 nines.  Longer than the whole window, so no offset and no
 #              chunking can make it fit, and every 1,000-digit value overflows
 #              f64: 400 upstream over 20 cells (5 wire framings x 4 byte
-#              offsets), 204 here.  The divergence in its framing-INDEPENDENT
-#              form, which is why this is the row pinned expect="DIFF" and the
-#              fragile one is not.
+#              offsets, round 17) and over 36 more as number_route_probe.py's
+#              ctl-1000-nines (3 ignored positions x 4 framings x 3 offsets),
+#              204 here in all of them.  The divergence in its
+#              framing-INDEPENDENT form, which is why this is the row pinned
+#              expect="DIFF" and the fragile one is not.
 #
 # The six -lead0-* / control rows pin the f32 route, closed in round 18 (found
 # in round 17 by reading Skip's dispatch, not by probing: of the 168

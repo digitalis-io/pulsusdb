@@ -2260,7 +2260,10 @@ back up here.
   digits or more cannot fit in a 512-byte window at any offset, and no run of
   310 digits or more is representable in `f64`, so a 1,000-digit run is the
   one corner of this that is framing-independent in **both** conditions, and
-  is what the harness pins.
+  is what the harness pins. That independence is measured rather than argued:
+  `number_route_probe.py`'s `ctl-1000-nines` sends it in all three ignored
+  positions at three offsets in four framings, 36 cells, `400` upstream and
+  `204` here in every one.
 
   Matching the reference here would mean reproducing the sender's socket
   behaviour, which is worse for a user than the difference: our acceptance
@@ -2278,7 +2281,13 @@ back up here.
   harness and the hermetic test pin between them was re-measured over 12 cells
   in round 17 — 4 wire framings × 3 byte offsets, 168 cells in all — and over
   36 cells each in round 19 — those same 12 in each of the three ignored
-  positions, 504 cells — without moving on either server. Thirteen of the
+  positions, 504 cells — without moving on either server. Those 504 cells are
+  the exponent group of
+  `crates/pulsus-write/tests/golden/log_label_bounds/number_route_probe.py`,
+  a raw-socket matrix that writes each body in the four framings at the three
+  offsets and exits non-zero on a cell that moves; the figure is that script's
+  output rather than a report of one, and `number_route_probe.txt` beside it
+  records a run of it and of its stale-timestamp mutant. Thirteen of the
   fourteen take `skipNumber`, and for the eleven of those that carry an `e`
   that invariance is what `trySkipNumber` leaving the fast path on `e` in every
   window predicts: the exponent axis cannot depend on the buffer. The other
@@ -2294,14 +2303,21 @@ back up here.
   write and in 512-byte chunks and `400` in 256- and 128-byte chunks;
   crossing, 308 nines is `204`, 309 nines is
   `400`, 309 digits of `1` then zeros is `204`; 1,000 nines is `400` at four
-  offsets. PulsusDB answered `204` to every one of those, unchanged.
+  offsets. PulsusDB answered `204` to every one of those, unchanged. The
+  111/112 pair is no longer a one-round derivation: it is the pair of controls
+  `number_route_probe.py` sends on every run, in all three ignored positions
+  and all four framings, and they are there to prove the framing and offset
+  knobs reach upstream's decoder at all — without them a run whose chunked
+  writes had coalesced would still have reported 720 agreeing cells (measured,
+  with the pause between chunks removed).
 
   **One shape was outside this residual and is now CLOSED (found round 17,
   fixed round 18).** `Skip` never reaches `skipNumber` for a token whose first
   byte is `0`: it calls `ReadFloat32` directly (`iter_skip.go:83-85 @ jsoniter
   v1.1.12`), so upstream range-checks that token against **`f32`**, not
   `f64`. Measured on the two servers over 36 cells per shape (3 ignored
-  positions × 4 wire framings × 3 byte offsets), each shape single-valued:
+  positions × 4 wire framings × 3 byte offsets, 216 cells — the `f32` group of
+  `number_route_probe.py`), each shape single-valued:
   `0.35e39` and `0.34028236e39` are **`400`**, `0.34e39` and `0.34028235e39`
   — the latter still rounding to `f32::MAX` — are `204`, and the same
   magnitude written `3.5e38` or `-0.35e39`, neither of which starts with `0`,
@@ -2344,7 +2360,14 @@ back up here.
   table, and are deliberately not copied into this row. The
   transcript and the harness that produced it are checked in at
   `crates/pulsus-write/tests/golden/log_label_bounds/`; the harness exits
-  non-zero on any verdict that is not its expected one.
+  non-zero on any verdict that is not its expected one. A case is one body
+  written in one piece, so one thing that directory carries cannot be a case:
+  the claim that the ignored-number verdicts do not depend on the wire
+  framing or the token's byte offset. `number_route_probe.py` beside it is the
+  instrument for that one — a raw-socket writer over 20 shapes × 3 ignored
+  positions × 4 framings × 3 offsets, plus three deliberately framing-aware
+  controls, exiting non-zero on a cell that moves — and
+  `number_route_probe.txt` is its recorded run.
   An earlier 44-case version of that harness scored 44/44 against an
   implementation that selected the OTLP subset on the canonicalized name,
   because every OTLP case it sent used either an exact dotted index name
