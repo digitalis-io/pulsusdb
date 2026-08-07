@@ -41,8 +41,12 @@
 //!   labels and is kept.
 //! - `pattern` `<name>` captures between literal delimiters, `<_>`
 //!   discards; a non-matching line adds no labels and is kept.
-//! - An extracted label colliding with an existing one lands under
-//!   `<name>_extracted`.
+//! - An extracted label colliding with the ORIGINAL stream labels or a
+//!   live structured-metadata entry lands under `<name>_extracted`; one
+//!   colliding with a name already EXTRACTED on this line is dropped
+//!   entirely, so the first extraction of a name wins (issue #334 —
+//!   [`ExtractionState`] carries the reference's three separate rules,
+//!   and names the parsers that do not follow the last one).
 //! - String label filters match against the empty string when the label
 //!   is missing; numeric label filters drop lines missing the label and
 //!   keep (with `__error__="LabelFilterErr"`) lines whose value fails
@@ -1552,6 +1556,17 @@ impl CompiledPipeline {
             details: Cow::Borrowed(sm.details.as_str()),
             dirty: sm.has_ordinary,
         };
+        // The reference's per-line builder categories (issue #334). The
+        // merged `base` is stream labels first, then the row's ordinary
+        // structured metadata — see `StructuredMetadataCtx::stream_label_count`.
+        let stream_len = sm.stream_label_count.unwrap_or(base.len()).min(base.len());
+        let (stream_base, sm_base) = base.split_at(stream_len);
+        let mut st = ExtractionState {
+            stream: stream_base,
+            sm: sm_base,
+            parsed_over_sm: Vec::new(),
+            removed_parsed: Vec::new(),
+        };
 
         for stage in &self.stages {
             match stage {
@@ -1576,6 +1591,7 @@ impl CompiledPipeline {
                     &line,
                     extractions,
                     labels,
+                    &mut st,
                     &mut errs,
                     &json_key_budget,
                     json_paths.as_deref_mut(),
@@ -1592,19 +1608,25 @@ impl CompiledPipeline {
                     match &line {
                         Cow::Borrowed(text) => run_logfmt(
                             text,
-                            *strict,
-                            *keep_empty,
+                            LogfmtFlags {
+                                strict: *strict,
+                                keep_empty: *keep_empty,
+                            },
                             extractions,
                             labels,
+                            &mut st,
                             &mut errs,
                             |c| c,
                         ),
                         Cow::Owned(text) => run_logfmt(
                             text,
-                            *strict,
-                            *keep_empty,
+                            LogfmtFlags {
+                                strict: *strict,
+                                keep_empty: *keep_empty,
+                            },
                             extractions,
                             labels,
+                            &mut st,
                             &mut errs,
                             |c| Cow::Owned(c.into_owned()),
                         ),
@@ -1619,8 +1641,10 @@ impl CompiledPipeline {
                                     if let Some(m) = caps.name(name) {
                                         add_extracted(
                                             labels,
+                                            &mut st,
                                             Cow::Borrowed(name),
                                             Cow::Borrowed(m.as_str()),
+                                            OnAlreadyExtracted::Skip,
                                             &mut errs.dirty,
                                         );
                                     }
@@ -1633,8 +1657,10 @@ impl CompiledPipeline {
                                     if let Some(m) = caps.name(name) {
                                         add_extracted(
                                             labels,
+                                            &mut st,
                                             Cow::Borrowed(name),
                                             Cow::Owned(m.as_str().to_string()),
+                                            OnAlreadyExtracted::Skip,
                                             &mut errs.dirty,
                                         );
                                     }
@@ -1655,8 +1681,10 @@ impl CompiledPipeline {
                                 walk_pattern(text, tokens, &mut |name, value| {
                                     add_extracted(
                                         labels,
+                                        &mut st,
                                         Cow::Borrowed(name),
                                         Cow::Borrowed(value),
+                                        OnAlreadyExtracted::Skip,
                                         &mut errs.dirty,
                                     );
                                 });
@@ -1667,8 +1695,10 @@ impl CompiledPipeline {
                                 walk_pattern(text, tokens, &mut |name, value| {
                                     add_extracted(
                                         labels,
+                                        &mut st,
                                         Cow::Borrowed(name),
                                         Cow::Owned(value.to_string()),
+                                        OnAlreadyExtracted::Skip,
                                         &mut errs.dirty,
                                     );
                                 });
@@ -1867,8 +1897,16 @@ impl CompiledPipeline {
                                 // every reachable input (#226). A resolved
                                 // rename runs `Set`+`Del` and therefore dirties
                                 // the builder (`fmt.go:416-418`).
+                                // The `Set` is a `Set(ParsedLabel, …)`
+                                // (`fmt.go:417`), so `dst` counts as
+                                // extracted for every later parser, and the
+                                // `Del` of `src` leaves whatever `src`
+                                // already recorded standing (issue #334).
+                                let src_extracted = st.is_extracted(labels, src);
                                 if let Some(value) = remove_label(labels, src) {
-                                    set_label(labels, Cow::Borrowed(dst), value);
+                                    st.note_removed(src_extracted, Cow::Borrowed(src.as_str()));
+                                    let dst = st.note_parsed_set(Cow::Borrowed(dst.as_str()));
+                                    set_label(labels, dst, value);
                                     errs.dirty = true;
                                 }
                             }
@@ -1878,6 +1916,14 @@ impl CompiledPipeline {
                                 // live-probed); resolved ⇒ dirty, unresolved ⇒
                                 // complete no-op (issue #238).
                                 if remove_label(labels, name).is_some() {
+                                    // The `Set` ran before the `Del`
+                                    // (`fmt.go:417-418`), so the name is
+                                    // extracted for the rest of the line even
+                                    // though no label survives — issue #334,
+                                    // container cell `| json | label_format
+                                    // a=a | json` over `{"a":1}` emits
+                                    // NOTHING.
+                                    st.note_removed(true, Cow::Borrowed(name.as_str()));
                                     errs.dirty = true;
                                 }
                             }
@@ -1984,9 +2030,12 @@ impl CompiledPipeline {
                                 };
                                 match rendered {
                                     Ok(rendered) => {
-                                        set_label(labels, Cow::Borrowed(dst), rendered.into_cow());
-                                        // Every template assignment is a
-                                        // `Set` (`fmt.go:431`) — dirty.
+                                        // A `Set(ParsedLabel, …)`
+                                        // (`fmt.go:431`), so `dst` is
+                                        // extracted for every later parser
+                                        // (issue #334) — and dirty.
+                                        let dst = st.note_parsed_set(Cow::Borrowed(dst.as_str()));
+                                        set_label(labels, dst, rendered.into_cow());
                                         errs.dirty = true;
                                     }
                                     Err(e) if e.budget_breach => {
@@ -2054,7 +2103,7 @@ impl CompiledPipeline {
                     // (owned) when present. The immutable borrow of `line`
                     // ends when `run_unpack` returns, so reassigning `line`
                     // afterward is sound.
-                    if let Some(entry) = run_unpack(line.as_ref(), labels, &mut errs) {
+                    if let Some(entry) = run_unpack(line.as_ref(), labels, &mut st, &mut errs) {
                         line = Cow::Owned(entry);
                     }
                 }
@@ -2105,7 +2154,15 @@ impl CompiledPipeline {
                             // the label is absent — and only a PRESENT label
                             // dirties, `drop_labels.go:59-61`).
                             None => {
+                                // `Del` does not un-record what a parsed
+                                // `Set` extracted (`labels.go:322-331` never
+                                // touches `parserKeyHints`), so a dropped
+                                // parsed name still blocks a later parser —
+                                // issue #334, container cell `| json | drop a
+                                // | json` over `{"a":1}` emits NOTHING.
+                                let was = st.is_extracted(labels, &elem.label);
                                 if remove_label(labels, &elem.label).is_some() {
+                                    st.note_removed(was, Cow::Borrowed(elem.label.as_str()));
                                     errs.dirty = true;
                                 }
                             }
@@ -2120,7 +2177,9 @@ impl CompiledPipeline {
                                 let matched =
                                     m.matches(get_label(labels, &elem.label).unwrap_or(""));
                                 if matched {
+                                    let was = st.is_extracted(labels, &elem.label);
                                     remove_label(labels, &elem.label);
+                                    st.note_removed(was, Cow::Borrowed(elem.label.as_str()));
                                     errs.dirty = true;
                                 }
                             }
@@ -2136,6 +2195,30 @@ impl CompiledPipeline {
                     // out-of-band slots are untouched; the builder dirties
                     // iff at least one label was actually removed.
                     let before = labels.len();
+                    // Same `Del` rule as `drop` (issue #334): a name this
+                    // stage removes stays extracted if a parsed `Set` put it
+                    // there. Collected first, because the retain borrows
+                    // `labels` while `is_extracted` reads it.
+                    let dropped: Vec<Cow<'a, str>> = labels
+                        .iter()
+                        .filter(|(k, v)| {
+                            !(k == ERROR_LABEL
+                                || k == ERROR_DETAILS_LABEL
+                                || k == PRESERVE_ERROR_LABEL
+                                || elems.iter().any(|elem| {
+                                    elem.label == k.as_ref()
+                                        && match &elem.matcher {
+                                            None => true,
+                                            Some(m) => m.matches(v),
+                                        }
+                                }))
+                        })
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for name in dropped {
+                        let was = st.is_extracted(labels, &name);
+                        st.note_removed(was, name);
+                    }
                     labels.retain(|(k, v)| {
                         k == ERROR_LABEL
                             || k == ERROR_DETAILS_LABEL
@@ -3126,6 +3209,38 @@ fn get_label<'v>(labels: &'v [(Cow<'_, str>, Cow<'_, str>)], name: &str) -> Opti
         .map(|(_, v)| v.as_ref())
 }
 
+/// Where `name` sits in the label vector, if anywhere. The parsers look a
+/// key up ONCE and then pass this around (see
+/// [`ExtractionState::is_extracted_at`]).
+fn label_position(labels: &[(Cow<'_, str>, Cow<'_, str>)], name: &str) -> Option<usize> {
+    labels.iter().position(|(k, _)| k == name)
+}
+
+fn contains_label(labels: &[(Cow<'_, str>, Cow<'_, str>)], name: &str) -> bool {
+    label_position(labels, name).is_some()
+}
+
+/// `set_label_at` for a caller that has already located the slot: writes
+/// into `at` when it is `Some`, appends otherwise, and returns the
+/// position either way.
+fn put_label_at<'a>(
+    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    at: Option<usize>,
+    name: Cow<'a, str>,
+    value: Cow<'a, str>,
+) -> usize {
+    match at {
+        Some(idx) => {
+            labels[idx].1 = value;
+            idx
+        }
+        None => {
+            labels.push((name, value));
+            labels.len() - 1
+        }
+    }
+}
+
 fn set_label<'a>(
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     name: Cow<'a, str>,
@@ -3160,19 +3275,177 @@ fn remove_label<'a>(
     Some(labels.remove(idx).1)
 }
 
-/// Adds a parser-extracted label, renaming to `<key>_extracted` when the
-/// key already exists (pinned collision semantics; a second collision
-/// overwrites the `_extracted` slot). Allocation-lean: an already-valid
-/// key passes through as-is (borrowed where the caller borrowed it) —
-/// sanitization and the collision rename are the only allocating paths.
-/// Every call is a `Set` on the reference's builder, so it marks the
-/// builder `dirty` (`labels.go:216-222`; issue #238) — a parser that
-/// writes nothing (e.g. a failed `json` parse) never reaches here and
-/// therefore does not dirty.
+/// The reference's per-line builder state that a FLAT label vector cannot
+/// represent (issue #334) — which names the stream ORIGINALLY carried,
+/// which structured-metadata names are still live, and which names a
+/// `Set(ParsedLabel, …)` has already recorded as extracted.
+///
+/// Three reference facts, each read from a DIFFERENT place, and they do
+/// not agree with one another (all `@ v3.7.4`):
+///
+/// - `BaseHas(key)` (`pkg/logql/log/labels.go:278-280`) asks `b.base`,
+///   the stream's labels as the builder was created. `Del` never touches
+///   it, so `| drop x | json` over `{"x":1}` STILL renames to
+///   `x_extracted`.
+/// - `HasInCategory(key, StructuredMetadataLabel)`
+///   (`pkg/logql/log/labels.go:273-275`) asks the LIVE category, which
+///   `Del` does empty — so `| drop m | json` over `{"m":1}` does NOT
+///   rename.
+/// - `ParserHint.Extracted(key)` (`pkg/logql/log/parser_hints.go:68-71`)
+///   is a per-line set that every `Set(ParsedLabel, …)` records
+///   (`labels.go:378-385`) and nothing ever un-records, cleared once per
+///   line by `streamPipeline.Process` → `builder.Reset()`
+///   (`pkg/logql/log/pipeline.go:222` → `labels.go:195-203`). Every
+///   IMPLICIT parser consults it AFTER the rename and SKIPS on a hit, so
+///   the FIRST extraction of a name wins and later ones vanish — across
+///   stages, and even after the label itself was dropped.
+///
+/// **How the two derived sets below stand in for the reference's two
+/// explicit ones.** A name is a LIVE structured-metadata entry iff the
+/// row contributed it AND it is still in the label vector AND no parsed
+/// `Set` has taken it over — those are exactly the two ways an entry
+/// leaves `b.add[StructuredMetadataLabel]` (`Del`, `labels.go:322-331`;
+/// and `Set(ParsedLabel, …)`'s `deleteWithCategory`, `labels.go:347-349`).
+/// A name is EXTRACTED iff it is in the label vector and is neither an
+/// original stream label nor a live structured-metadata entry — i.e. the
+/// only thing that could have put it there is a parsed `Set` — OR a
+/// `Del` removed it after a parsed `Set` had put it there. Both
+/// correction lists stay EMPTY unless a stage actually removes or
+/// overwrites something, so the common pipeline allocates nothing for
+/// this state.
+struct ExtractionState<'a, 'r> {
+    /// The reference's `b.base` — the stream's own labels, immutable for
+    /// the row.
+    stream: &'r [(String, String)],
+    /// The ordinary structured-metadata names the row contributed, under
+    /// the post-rename names
+    /// [`super::labels::merge_labels_with_structured_metadata`] gave them
+    /// — which is the shape the reference's own category holds them in.
+    sm: &'r [(String, String)],
+    /// Names in [`Self::sm`] that a parsed `Set` has taken over, so the
+    /// vector entry under that name is no longer the structured-metadata
+    /// one (the reference's `deleteWithCategory(StructuredMetadataLabel,
+    /// n)` inside `Set`).
+    parsed_over_sm: Vec<Cow<'a, str>>,
+    /// Names a `Del` removed AFTER a parsed `Set` had recorded them —
+    /// still extracted for the rest of the line, though no longer in the
+    /// vector (`Del` does not touch `ParserHint.extracted`).
+    removed_parsed: Vec<Cow<'a, str>>,
+}
+
+/// What a parser does when its resolved key is already extracted.
+///
+/// The EXPRESSION parsers (`| json a="p"`, `| logfmt a="p"`) never
+/// consult `ParserHint.Extracted` for their own identifiers:
+/// `JSONExpressionParser.Process` has no such check at all
+/// (`pkg/logql/log/parser.go:671-731 @ v3.7.4`) and
+/// `LogfmtExpressionParser` bypasses it through `alwaysExtract`
+/// (`parser.go:552-585`), so two expressions naming the same label just
+/// `Set` twice and the LAST one wins — container-captured at v3.7.4,
+/// `| json a="p", a="q"` over `{"p":1,"q":2}` yields `a="2"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnAlreadyExtracted {
+    /// Implicit parsers (`json` full flatten, `logfmt`, `regexp`,
+    /// `pattern`, `unpack`): the first extraction of a name wins.
+    Skip,
+    /// Expression parsers: `Set` regardless, last write wins.
+    Overwrite,
+}
+
+impl<'a> ExtractionState<'a, '_> {
+    fn stream_has(&self, key: &str) -> bool {
+        self.stream.iter().any(|(k, _)| k == key)
+    }
+
+    fn sm_has(&self, key: &str) -> bool {
+        self.sm.iter().any(|(k, _)| k == key)
+    }
+
+    /// `HasInCategory(key, StructuredMetadataLabel)`, given whether `key`
+    /// is currently in the label vector.
+    fn live_sm_at(&self, key: &str, present: bool) -> bool {
+        self.sm_has(key) && present && !self.parsed_over_sm.iter().any(|k| k == key)
+    }
+
+    /// `BaseHas(key) || HasInCategory(key, StructuredMetadataLabel)` — the
+    /// predicate every parser applies before deciding to rename.
+    fn collides_at(&self, key: &str, present: bool) -> bool {
+        self.stream_has(key) || self.live_sm_at(key, present)
+    }
+
+    /// `ParserHint.Extracted(key)`, given whether `key` is currently in
+    /// the label vector.
+    ///
+    /// **Every hot caller passes a presence it has ALREADY looked up.**
+    /// The vector scan is the whole cost of these predicates on a wide
+    /// line — a `| json` over W keys already costs W scans of a W-long
+    /// vector, and the quadratic term is multiplied by however many
+    /// times ONE leaf looks its key up. So resolving the key, testing it
+    /// and writing it share a single lookup on the unrenamed path; a
+    /// rename pays a second, and only fires for a name the stream or the
+    /// metadata supplies.
+    fn is_extracted_at(&self, key: &str, present: bool) -> bool {
+        (present && !self.collides_at(key, present)) || self.removed_parsed.iter().any(|k| k == key)
+    }
+
+    /// [`Self::collides_at`] for a caller that has not looked the key up.
+    fn collides(&self, labels: &[(Cow<'a, str>, Cow<'a, str>)], key: &str) -> bool {
+        // `sm_has` is a handful of entries and short-circuits, so the
+        // vector scan only happens for a name the metadata supplies.
+        self.stream_has(key)
+            || (self.sm_has(key) && self.live_sm_at(key, contains_label(labels, key)))
+    }
+
+    /// [`Self::is_extracted_at`] for a caller that has not looked the key up.
+    fn is_extracted(&self, labels: &[(Cow<'a, str>, Cow<'a, str>)], key: &str) -> bool {
+        self.is_extracted_at(key, contains_label(labels, key))
+    }
+
+    /// Book-keeping for one `Set(ParsedLabel, key, …)`, returning the key
+    /// so the caller can go on to `Set` it: only a key the structured
+    /// metadata ALSO supplies needs recording, and only to say the vector
+    /// entry under that name is no longer the metadata one. Takes the key
+    /// by value because the recording path keeps a copy that has to live
+    /// as long as the row, which a borrow of the caller's local cannot.
+    fn note_parsed_set(&mut self, key: Cow<'a, str>) -> Cow<'a, str> {
+        if self.sm_has(&key) && !self.parsed_over_sm.contains(&key) {
+            self.parsed_over_sm.push(key.clone());
+        }
+        key
+    }
+
+    /// Book-keeping for one `Del(name)`: a name that WAS extracted stays
+    /// extracted, so it has to survive leaving the vector.
+    fn note_removed(&mut self, was_extracted: bool, name: Cow<'a, str>) {
+        if was_extracted && !self.removed_parsed.contains(&name) {
+            self.removed_parsed.push(name);
+        }
+    }
+}
+
+/// Adds a parser-extracted label the way the reference's parsers do
+/// (issue #334): sanitize, rename to `<key>_extracted` iff the ORIGINAL
+/// stream or a LIVE structured-metadata entry holds the name, then — for
+/// an implicit parser — drop the extraction entirely if that resolved
+/// name was already extracted on this line, and otherwise `Set` it
+/// (an upsert, so an expression parser's repeat wins the slot).
+///
+/// Allocation-lean: an already-valid key that does not collide passes
+/// through as-is (borrowed where the caller borrowed it) — sanitization
+/// and the collision rename are the only allocating paths, and the
+/// book-keeping allocates only for a key the structured metadata also
+/// supplies.
+///
+/// A `Set` marks the builder `dirty` (`labels.go:216-222`; issue #238); a
+/// SKIPPED extraction never reaches `Set` and therefore does not dirty,
+/// and a parser that writes nothing (e.g. a failed `json` parse) never
+/// reaches here at all.
 fn add_extracted<'a>(
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    st: &mut ExtractionState<'a, '_>,
     key: Cow<'a, str>,
     value: Cow<'a, str>,
+    mode: OnAlreadyExtracted,
     dirty: &mut bool,
 ) {
     let sanitized: Cow<'a, str> = if key_needs_sanitizing(&key) {
@@ -3180,12 +3453,23 @@ fn add_extracted<'a>(
     } else {
         key
     };
-    *dirty = true;
-    if get_label(labels, &sanitized).is_some() {
-        set_label(labels, Cow::Owned(format!("{sanitized}_extracted")), value);
+    // ONE lookup on the common (unrenamed) path — see
+    // `ExtractionState::is_extracted_at`. A rename costs a second one,
+    // and only fires for a name the stream or the metadata supplies.
+    let at = label_position(labels, &sanitized);
+    let (resolved, at) = if st.collides_at(&sanitized, at.is_some()) {
+        let renamed: Cow<'a, str> = Cow::Owned(format!("{sanitized}{DUPLICATE_SUFFIX}"));
+        let at = label_position(labels, &renamed);
+        (renamed, at)
     } else {
-        labels.push((sanitized, value));
+        (sanitized, at)
+    };
+    if mode == OnAlreadyExtracted::Skip && st.is_extracted_at(&resolved, at.is_some()) {
+        return;
     }
+    *dirty = true;
+    let resolved = st.note_parsed_set(resolved);
+    put_label_at(labels, at, resolved, value);
 }
 
 fn key_needs_sanitizing(key: &str) -> bool {
@@ -3789,10 +4073,109 @@ impl<'v> JsonPathCapture<'v, '_> {
     }
 }
 
+/// A JSON value that keeps an object's fields in WIRE ORDER and keeps
+/// every one of a repeated key's occurrences (issue #334).
+///
+/// `serde_json::Value` can do neither: without the `preserve_order`
+/// feature its object is a `BTreeMap`, so fields arrive SORTED and a
+/// repeated key silently keeps only the last occurrence. That was
+/// invisible while a colliding key produced a second `<key>_extracted`
+/// label, and becomes observable the moment the FIRST extraction of a
+/// name wins — `{"a.b":2,"a-b":1}` is `a_b="2"` at the container and
+/// `a_b="1"` under a sorted walk, and `{"a":1,"a":2}` is `a="1"` at the
+/// container and unreachable under a de-duplicating one. The reference
+/// walks the raw bytes with `jsonparser.ObjectEach`
+/// (`pkg/logql/log/parser.go:82 @ v3.7.4`), which is document order with
+/// every occurrence delivered — captured at v3.7.4 for both orders and
+/// for `{"a":{"b":1},"a":{"c":2}}`, which yields BOTH `a_b` and `a_c`.
+///
+/// Only OBJECTS need the new representation: arrays are skipped by the
+/// flatten and ignored by `unpack`, and scalars are leaves, so everything
+/// that is not an object stays a `serde_json::Value` and keeps its
+/// pinned rendering (`float_roundtrip` number formatting included).
+#[derive(Debug)]
+enum WireJson {
+    /// Fields in the order the document listed them, duplicates included.
+    Object(Vec<(String, WireJson)>),
+    /// Any non-object value, rendered by `serde_json` exactly as before.
+    Leaf(serde_json::Value),
+}
+
+struct WireJsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for WireJsonVisitor {
+    type Value = WireJson;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<WireJson, E> {
+        Ok(WireJson::Leaf(serde_json::Value::Bool(v)))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<WireJson, E> {
+        Ok(WireJson::Leaf(serde_json::Value::from(v)))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<WireJson, E> {
+        Ok(WireJson::Leaf(serde_json::Value::from(v)))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<WireJson, E> {
+        Ok(WireJson::Leaf(serde_json::Value::from(v)))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<WireJson, E> {
+        Ok(WireJson::Leaf(serde_json::Value::String(v.to_owned())))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<WireJson, E> {
+        Ok(WireJson::Leaf(serde_json::Value::String(v)))
+    }
+
+    fn visit_none<E>(self) -> Result<WireJson, E> {
+        Ok(WireJson::Leaf(serde_json::Value::Null))
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<WireJson, D::Error> {
+        d.deserialize_any(self)
+    }
+
+    fn visit_unit<E>(self) -> Result<WireJson, E> {
+        Ok(WireJson::Leaf(serde_json::Value::Null))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<WireJson, A::Error> {
+        // Arrays are never walked for label names, so their elements go
+        // back to `serde_json::Value` — ordering inside one is not
+        // observable.
+        let mut out = Vec::new();
+        while let Some(v) = seq.next_element::<serde_json::Value>()? {
+            out.push(v);
+        }
+        Ok(WireJson::Leaf(serde_json::Value::Array(out)))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<WireJson, A::Error> {
+        // `push`, never `insert`: document order, duplicates kept.
+        let mut out = Vec::new();
+        while let Some(entry) = map.next_entry::<String, WireJson>()? {
+            out.push(entry);
+        }
+        Ok(WireJson::Object(out))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for WireJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(WireJsonVisitor)
+    }
+}
+
 /// Owned key/value output by design: extracted values live inside the
-/// per-line `serde_json::Value`, which drops at the end of this stage —
-/// the parse itself dominates the cost (bounded to pushdown-surviving
-/// rows).
+/// per-line parsed value, which drops at the end of this stage — the
+/// parse itself dominates the cost (bounded to pushdown-surviving rows).
 ///
 /// `budget` is the ROW's ([`MAX_JSON_FLATTEN_KEY_BYTES`]); only the
 /// full-flatten arm spends from it, since only that arm derives label
@@ -3809,6 +4192,7 @@ fn run_json<'a>(
     line: &str,
     extractions: &'a [(String, Vec<JsonPathSeg>)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    st: &mut ExtractionState<'a, '_>,
     errs: &mut ErrorSlots<'a>,
     budget: &JsonKeyBudget,
     paths: Option<&mut JsonPaths>,
@@ -3817,21 +4201,26 @@ fn run_json<'a>(
     if let Some(p) = paths.as_deref_mut() {
         p.clear();
     }
-    let parsed: serde_json::Value = match serde_json::from_str(line) {
-        Ok(v @ serde_json::Value::Object(_)) => v,
-        // A non-object top level (or a parse failure) is the malformed
-        // class: line kept, error tagged in the out-of-band slots
-        // (UNGUARDED — the reference's parser error write has no `HasErr`
-        // check, `parser.go:437-444`), detail recorded on both paths. No
-        // label is written, so a failed parse does NOT dirty the builder
-        // (issue #238 — the details-visibility gate depends on this).
-        _ => {
-            errs.set_err(Cow::Borrowed("JSONParserErr"));
-            errs.set_details(Cow::Borrowed(JSON_ERROR_DETAILS));
-            return Ok(());
-        }
+    // A non-object top level (or a parse failure) is the malformed class:
+    // line kept, error tagged in the out-of-band slots (UNGUARDED — the
+    // reference's parser error write has no `HasErr` check,
+    // `parser.go:437-444`), detail recorded on both paths. No label is
+    // written, so a failed parse does NOT dirty the builder (issue #238 —
+    // the details-visibility gate depends on this).
+    let malformed = |errs: &mut ErrorSlots<'a>| {
+        errs.set_err(Cow::Borrowed("JSONParserErr"));
+        errs.set_details(Cow::Borrowed(JSON_ERROR_DETAILS));
     };
     if extractions.is_empty() {
+        // The full flatten derives label NAMES from the document, so it
+        // needs the wire-order, duplicate-preserving shape (issue #334).
+        let parsed: WireJson = match serde_json::from_str(line) {
+            Ok(v @ WireJson::Object(_)) => v,
+            _ => {
+                malformed(errs);
+                return Ok(());
+            }
+        };
         let mut capture = paths.map(|out| JsonPathCapture {
             stack: Vec::new(),
             charged_stack: 0,
@@ -3841,20 +4230,34 @@ fn run_json<'a>(
             "",
             Depth::Root,
             &parsed,
-            labels,
-            &mut errs.dirty,
+            &mut FlattenSink {
+                labels,
+                st,
+                dirty: &mut errs.dirty,
+            },
             budget,
             capture.as_mut(),
         )?;
     } else {
+        // The expression form names its own labels, so field order is not
+        // observable; it keeps `serde_json::Value` and its path lookup.
+        let parsed: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v @ serde_json::Value::Object(_)) => v,
+            _ => {
+                malformed(errs);
+                return Ok(());
+            }
+        };
         for (label, path) in extractions {
             let value = lookup_json_path(&parsed, path)
                 .map(json_scalar_to_string)
                 .unwrap_or_default();
             add_extracted(
                 labels,
+                st,
                 Cow::Borrowed(label.as_str()),
                 Cow::Owned(value),
+                OnAlreadyExtracted::Overwrite,
                 &mut errs.dirty,
             );
         }
@@ -3879,14 +4282,15 @@ fn run_json<'a>(
 /// drops the field).
 ///
 /// **Collision renames are path-aware too** (fix round 2). A leaf whose
-/// built key already exists in the label set is renamed with
-/// `_extracted`, and WHERE the suffix lands depends on depth, because
-/// the reference has two code paths: a top-level field appends it to
-/// the SANITIZED key (`parser.go:152-153`), while a nested field
-/// appends it to the RAW final path part and rebuilds the sanitized
-/// path (`parser.go:183-187`), so trimming and rune-mapping run over
-/// the suffixed part. The orders differ observably: for base label
-/// `x`, `{"x":{"":1}}` is `x__extracted` (the part trimmed empty, but
+/// built key is taken by the original stream labels or a live
+/// structured-metadata entry is renamed with `_extracted`, and WHERE the
+/// suffix lands depends on depth, because the reference has two code
+/// paths: a top-level field appends it to the SANITIZED key
+/// (`parser.go:152-153`), while a nested field appends it to the RAW
+/// final path part and rebuilds the sanitized path
+/// (`parser.go:183-187`), so trimming and rune-mapping run over the
+/// suffixed part. The orders differ observably: for base label `x`,
+/// `{"x":{"":1}}` is `x__extracted` (the part trimmed empty, but
 /// suffixed it survives as `_extracted` plus its separator), and for
 /// base `x_y`, `{"x":{" y ":1}}` is `x_y__extracted` (the trailing
 /// space, trimmed in the unsuffixed build, now sanitizes to `_`) —
@@ -3895,13 +4299,16 @@ fn run_json<'a>(
 /// HERE, leaf by leaf during the walk ([`insert_flattened`], replacing
 /// the earlier flatten-then-`add_extracted` two-phase): the rename
 /// needs `(prefix, raw part, depth)`, which only the walk knows, and
-/// the collision check must see leaves already inserted by THIS walk
-/// (`{"a-b":1,"a.b":2}` suffixes the second — the recorded #334
-/// divergence, byte-for-byte unchanged by this restructure). A breach
+/// the first-wins check must see leaves already inserted by THIS walk
+/// (`{"a-b":1,"a.b":2}` DROPS the second — issue #334). A breach
 /// mid-walk can leave earlier leaves in `labels`; every caller
 /// propagates [`RowBudgetExceeded`] into the whole query's 422, so a
 /// partial set is never observed. `add_extracted` itself is untouched
 /// and stays there for the other parsers.
+///
+/// **The walk order is the DOCUMENT's** ([`WireJson`]) — which key of a
+/// colliding pair survives depends on it, so a sorted or de-duplicating
+/// walk answers differently in both directions.
 ///
 /// Every key string this builds — the leaf label names and the
 /// intermediate object prefixes alike — is charged to `budget` BEFORE it
@@ -3926,18 +4333,20 @@ fn run_json<'a>(
 /// precondition rather than the arithmetic —
 /// `tests/logql_json_key_alloc_gate.rs` measures the requests and fails
 /// on that shape.
-fn flatten_json<'a, 'v>(
+fn flatten_json<'v>(
     prefix: &str,
     depth: Depth,
-    value: &'v serde_json::Value,
-    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    dirty: &mut bool,
+    value: &'v WireJson,
+    sink: &mut FlattenSink<'_, '_, '_>,
     budget: &JsonKeyBudget,
     mut capture: Option<&mut JsonPathCapture<'v, '_>>,
 ) -> Result<(), RowBudgetExceeded> {
-    if let serde_json::Value::Object(map) = value {
+    if let WireJson::Object(map) = value {
         for (k, v) in map {
-            if matches!(v, serde_json::Value::Null | serde_json::Value::Array(_)) {
+            if matches!(
+                v,
+                WireJson::Leaf(serde_json::Value::Null | serde_json::Value::Array(_))
+            ) {
                 continue;
             }
             // `bytes.TrimSpace` per part. Rust's `str::trim` and Go's
@@ -3950,7 +4359,7 @@ fn flatten_json<'a, 'v>(
                 // contributes neither characters NOR a separator.
                 match v {
                     // Transparent: the child is named by the prefix alone.
-                    serde_json::Value::Object(_) => {
+                    WireJson::Object(_) => {
                         // The reference pushes the raw key onto
                         // `prefixBuffer` BEFORE testing whether it
                         // sanitizes to anything (`nextKeyPrefix`), so an
@@ -3963,8 +4372,7 @@ fn flatten_json<'a, 'v>(
                             prefix,
                             Depth::Nested,
                             v,
-                            labels,
-                            dirty,
+                            sink,
                             budget,
                             capture.as_deref_mut(),
                         );
@@ -3980,11 +4388,10 @@ fn flatten_json<'a, 'v>(
                     // (empty-trimming) part, so it stops vanishing
                     // (container cell: base `x`, `{"x":{"":1}}` →
                     // `x__extracted`).
-                    scalar if !prefix.is_empty() => {
+                    WireJson::Leaf(scalar) if !prefix.is_empty() => {
                         budget.charge_key(prefix.len())?;
                         insert_flattened(
-                            labels,
-                            dirty,
+                            sink,
                             prefix.to_string(),
                             prefix,
                             k,
@@ -4008,27 +4415,19 @@ fn flatten_json<'a, 'v>(
                 "the charged length must be the built length"
             );
             match v {
-                serde_json::Value::Object(_) => {
+                WireJson::Object(_) => {
                     if let Some(c) = capture.as_deref_mut() {
                         c.push(k, budget)?;
                     }
-                    let res = flatten_json(
-                        &key,
-                        Depth::Nested,
-                        v,
-                        labels,
-                        dirty,
-                        budget,
-                        capture.as_deref_mut(),
-                    );
+                    let res =
+                        flatten_json(&key, Depth::Nested, v, sink, budget, capture.as_deref_mut());
                     if let Some(c) = capture.as_deref_mut() {
                         c.pop();
                     }
                     res?;
                 }
-                scalar => insert_flattened(
-                    labels,
-                    dirty,
+                WireJson::Leaf(scalar) => insert_flattened(
+                    sink,
                     key,
                     prefix,
                     k,
@@ -4057,19 +4456,33 @@ enum Depth {
     Nested,
 }
 
+/// Everything one `| json` full flatten WRITES to, as a single value:
+/// the label vector, the per-line extraction state ([`ExtractionState`])
+/// and the builder's dirty bit. Bundled because the walk threads all
+/// three through every level of recursion and every leaf.
+struct FlattenSink<'a, 'r, 'l> {
+    labels: &'l mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    st: &'l mut ExtractionState<'a, 'r>,
+    dirty: &'l mut bool,
+}
+
 /// The reference's `_extracted` collision suffix (`parser.go:25`).
 const DUPLICATE_SUFFIX: &str = "_extracted";
 
 /// Inserts one flattened leaf, applying the reference's depth-aware
 /// collision rename (see [`flatten_json`]'s doc for the two orders and
-/// the container cells pinning them). The collision check runs against
-/// the EVOLVING label set — base labels, structured metadata (merged
-/// upstream under their post-rename names, which is where the
-/// reference's `BaseHas || HasInCategory(StructuredMetadataLabel)`
-/// check reads them too) and every label set earlier in the pipeline,
-/// including this walk's own earlier leaves. Like `add_extracted`, a
-/// rename that lands on a name already present OVERWRITES that slot,
-/// and every leaf marks the builder dirty (`labels.go:216-222`).
+/// the container cells pinning them) and then its first-wins skip
+/// (issue #334).
+///
+/// The rename fires only for a name the ORIGINAL stream carried or that
+/// a LIVE structured-metadata entry holds — [`ExtractionState`] for why
+/// those two are read from different places. A name already extracted on
+/// this line (by an earlier leaf of THIS walk, by an earlier stage, or
+/// before a `drop` removed it) makes the leaf vanish entirely: the
+/// reference `return`s before `Set` (`pkg/logql/log/parser.go:156-158`
+/// at depth 0, `:190-194` deeper @ v3.7.4), so the leaf writes no label,
+/// records no path and — since it never reaches `Set` — does not dirty
+/// the builder (`labels.go:216-222`).
 ///
 /// The renamed key is a fresh exactly-reserved allocation charged
 /// before it is built — the unsuffixed `key` it replaces was already
@@ -4084,48 +4497,55 @@ const DUPLICATE_SUFFIX: &str = "_extracted";
 /// off the raw part, which is why the path recorded here is always the
 /// UNSUFFIXED `raw_part`.
 #[allow(clippy::too_many_arguments)]
-fn insert_flattened<'a, 'v>(
-    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
-    dirty: &mut bool,
+fn insert_flattened<'v>(
+    sink: &mut FlattenSink<'_, '_, '_>,
     key: String,
     prefix: &str,
     raw_part: &'v str,
     depth: Depth,
     value: String,
     budget: &JsonKeyBudget,
-    mut capture: Option<&mut JsonPathCapture<'v, '_>>,
+    capture: Option<&mut JsonPathCapture<'v, '_>>,
 ) -> Result<(), RowBudgetExceeded> {
-    *dirty = true;
-    if get_label(labels, &key).is_none() {
-        labels.push((Cow::Owned(key), Cow::Owned(value)));
-        if let Some(c) = capture.as_deref_mut() {
-            let idx = labels.len() - 1;
-            c.out.record(idx, &c.stack, raw_part, budget)?;
+    let FlattenSink { labels, st, dirty } = sink;
+    let at = label_position(labels, &key);
+    let renamed = st.collides_at(&key, at.is_some());
+    let resolved = if renamed {
+        match depth {
+            // Top level: suffix the SANITIZED key (`parser.go:152-153`).
+            Depth::Root => {
+                let len = key.len() + DUPLICATE_SUFFIX.len();
+                budget.charge_key(len)?;
+                let mut s = String::with_capacity(len);
+                s.push_str(&key);
+                s.push_str(DUPLICATE_SUFFIX);
+                s
+            }
+            // Nested: suffix the RAW final part and rebuild the sanitized
+            // path (`parser.go:183-187`).
+            Depth::Nested => {
+                let len = suffixed_part_len(prefix, raw_part);
+                budget.charge_key(len)?;
+                let mut s = String::with_capacity(len);
+                push_suffixed_part(&mut s, prefix, raw_part);
+                debug_assert_eq!(s.len(), len, "the charged length must be the built length");
+                s
+            }
         }
+    } else {
+        key
+    };
+    let at = if renamed {
+        label_position(labels, &resolved)
+    } else {
+        at
+    };
+    if st.is_extracted_at(&resolved, at.is_some()) {
         return Ok(());
     }
-    let renamed = match depth {
-        // Top level: suffix the SANITIZED key (`parser.go:152-153`).
-        Depth::Root => {
-            let len = key.len() + DUPLICATE_SUFFIX.len();
-            budget.charge_key(len)?;
-            let mut s = String::with_capacity(len);
-            s.push_str(&key);
-            s.push_str(DUPLICATE_SUFFIX);
-            s
-        }
-        // Nested: suffix the RAW final part and rebuild the sanitized
-        // path (`parser.go:183-187`).
-        Depth::Nested => {
-            let len = suffixed_part_len(prefix, raw_part);
-            budget.charge_key(len)?;
-            let mut s = String::with_capacity(len);
-            push_suffixed_part(&mut s, prefix, raw_part);
-            debug_assert_eq!(s.len(), len, "the charged length must be the built length");
-            s
-        }
-    };
-    let idx = set_label_at(labels, Cow::Owned(renamed), Cow::Owned(value));
+    **dirty = true;
+    let resolved = st.note_parsed_set(Cow::Owned(resolved));
+    let idx = put_label_at(labels, at, resolved, Cow::Owned(value));
     if let Some(c) = capture {
         c.out.record(idx, &c.stack, raw_part, budget)?;
     }
@@ -4272,20 +4692,49 @@ fn json_scalar_to_string(v: &serde_json::Value) -> String {
 // unpack
 // ---------------------------------------------------------------------
 
+/// The packed-entry key `| unpack` promotes back to the log line
+/// (`logqlmodel.PackedEntryKey`, `pkg/logqlmodel/logqlmodel.go @ v3.7.4`).
+const PACKED_ENTRY_KEY: &str = "_entry";
+
 /// `| unpack` (issue #200): parse the line as a packed JSON object,
 /// promoting a string `_entry` field back to the line (returned owned) and
-/// other string fields to labels via the shared `<key>_extracted`
-/// collision rule; non-string fields are skipped. A non-object line or a
-/// parse failure keeps the line and tags `__error__="JSONParserErr"` with
-/// the representative detail — the same malformed class `json` reports.
-/// Returns `Some(new_line)` only when a string `_entry` field was present.
+/// other string fields to labels; non-string fields are skipped. A
+/// non-object line or a parse failure keeps the line and tags
+/// `__error__="JSONParserErr"` with the representative detail — the same
+/// malformed class `json` reports. Returns `Some(new_line)` only when a
+/// string `_entry` field was present.
+///
+/// **TWO PHASES, and the split is observable** (issue #334). The
+/// reference resolves each field's key and BUFFERS the pair
+/// (`UnpackParser.unpack`, `pkg/logql/log/parser.go:797-828 @ v3.7.4`),
+/// then `Set`s the whole buffer only `if isPacked` — only when a string
+/// `_entry` field was seen (`parser.go:832-838`). Two consequences the
+/// streaming shape cannot reproduce, both container-captured at v3.7.4:
+///
+/// - an object WITHOUT `_entry` contributes no labels at all
+///   (`{"a":"1","a":"2"}` under `| unpack` yields none);
+/// - within one stage a repeated key is LAST-wins, not first-wins,
+///   because `RecordExtracted` happens at the flush and so no earlier
+///   field of the same stage is ever "already extracted"
+///   (`{"a":"1","a":"2","_entry":"x"}` yields `a="2"`, and with a stream
+///   label `a` it yields `a_extracted="2"`) — the opposite of every other
+///   parser.
+///
+/// The collision and already-extracted tests read the RAW key, before
+/// sanitization, and the SANITIZED form of the (possibly suffixed) key is
+/// what gets buffered — the reference's own order (`parser.go:807-820`:
+/// `BaseHas(key)`/`Extracted(key)` on the interned raw key,
+/// `sanitizeLabelKey(key, true)` only at the buffer push). Container cell:
+/// a stream label `a_b` with a packed field `a-b` OVERWRITES it, no
+/// `_extracted`, because `BaseHas("a-b")` is false.
 fn run_unpack<'a>(
     line: &str,
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    st: &mut ExtractionState<'a, '_>,
     errs: &mut ErrorSlots<'a>,
 ) -> Option<String> {
-    let map = match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(serde_json::Value::Object(map)) => map,
+    let fields = match serde_json::from_str::<WireJson>(line) {
+        Ok(WireJson::Object(fields)) => fields,
         // Slot write, no label, no dirty — see `run_json` (issue #238).
         _ => {
             errs.set_err(Cow::Borrowed("JSONParserErr"));
@@ -4294,15 +4743,40 @@ fn run_unpack<'a>(
         }
     };
     let mut new_line = None;
-    for (k, v) in map {
+    // The reference's `lbsBuffer`. `Vec::new()` allocates nothing until a
+    // field lands in it, so an unpacked line with no promotable field
+    // stays allocation-free.
+    let mut buffered: Vec<(String, String)> = Vec::new();
+    for (k, v) in fields {
         // Only string fields participate; other JSON value types are skipped.
-        if let serde_json::Value::String(s) = v {
-            if k == "_entry" {
-                new_line = Some(s);
-            } else {
-                add_extracted(labels, Cow::Owned(k), Cow::Owned(s), &mut errs.dirty);
-            }
+        let WireJson::Leaf(serde_json::Value::String(s)) = v else {
+            continue;
+        };
+        if k == PACKED_ENTRY_KEY {
+            new_line = Some(s);
+            continue;
         }
+        let resolved = if st.collides(labels, &k) {
+            format!("{k}{DUPLICATE_SUFFIX}")
+        } else {
+            k
+        };
+        if st.is_extracted(labels, &resolved) {
+            continue;
+        }
+        let name = if key_needs_sanitizing(&resolved) {
+            sanitize_label_key(&resolved)
+        } else {
+            resolved
+        };
+        buffered.push((name, s));
+    }
+    // `isPacked` — no promoted entry, no flush, so nothing was extracted.
+    new_line.as_ref()?;
+    for (name, value) in buffered {
+        errs.dirty = true;
+        let name = st.note_parsed_set(Cow::Owned(name));
+        set_label(labels, name, Cow::Owned(value));
     }
     new_line
 }
@@ -4310,6 +4784,16 @@ fn run_unpack<'a>(
 // ---------------------------------------------------------------------
 // logfmt
 // ---------------------------------------------------------------------
+
+/// `| logfmt`'s two switches, carried as one value rather than as a pair
+/// of bare `bool` parameters.
+#[derive(Debug, Clone, Copy)]
+struct LogfmtFlags {
+    /// `--strict`: stop at the first decoder error and tag it.
+    strict: bool,
+    /// `--keep-empty`: keep a pair whose value is empty.
+    keep_empty: bool,
+}
 
 /// Applies the logfmt stage in a single streaming pass (issue #200): each
 /// decoded pair is dropped when its value is empty unless `keep_empty`,
@@ -4321,19 +4805,27 @@ fn run_unpack<'a>(
 /// emitted before it (matching the reference's default best-effort logfmt).
 fn run_logfmt<'a, 't>(
     text: &'t str,
-    strict: bool,
-    keep_empty: bool,
+    flags: LogfmtFlags,
     extractions: &'a [(String, String)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    st: &mut ExtractionState<'a, '_>,
     errs: &mut ErrorSlots<'a>,
     to_cow: impl Fn(Cow<'t, str>) -> Cow<'a, str>,
 ) {
+    let LogfmtFlags { strict, keep_empty } = flags;
     let result = if extractions.is_empty() {
         walk_logfmt(text, &mut |k, v| {
             if !keep_empty && v.is_empty() {
                 return;
             }
-            add_extracted(labels, to_cow(Cow::Borrowed(k)), to_cow(v), &mut errs.dirty);
+            add_extracted(
+                labels,
+                st,
+                to_cow(Cow::Borrowed(k)),
+                to_cow(v),
+                OnAlreadyExtracted::Skip,
+                &mut errs.dirty,
+            );
         })
     } else {
         // Targeted extraction: resolve each requested source key to its
@@ -4357,8 +4849,10 @@ fn run_logfmt<'a, 't>(
             }
             add_extracted(
                 labels,
+                st,
                 Cow::Borrowed(label.as_str()),
                 value,
+                OnAlreadyExtracted::Overwrite,
                 &mut errs.dirty,
             );
         }
@@ -5676,11 +6170,20 @@ mod tests {
     // JSONParserErr detail.
     // -----------------------------------------------------------------
 
+    /// `stream_label_count: None` — these rows are handed a pre-merged
+    /// base with no recorded split, so every base entry counts as a stream
+    /// label. That is exactly right for what they test (the reserved-name
+    /// routing of issue #238) and is only distinguishable from the real
+    /// split by a `drop` of an ORDINARY structured-metadata name followed
+    /// by a re-parse, which no row here does; the category split itself is
+    /// covered end to end, through the real merge, by
+    /// `tests/logql_json_key_sanitization.rs` (`c13`–`c15`, `c18`).
     fn sm(err: &str, details: &str, has_ordinary: bool) -> StructuredMetadataCtx {
         StructuredMetadataCtx {
             err: err.to_string(),
             details: details.to_string(),
             has_ordinary,
+            stream_label_count: None,
         }
     }
 
@@ -6756,5 +7259,110 @@ mod tests {
         let f = program(r#"{x="y"} | logfmt | b = "x" or (c = "q" or n > 1)"#);
         assert_eq!(f.ops.len(), 5);
         assert_eq!(f.or_jumps, vec![5, 4, NO_JUMP, NO_JUMP, NO_JUMP]);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #334 — the parsed-key collision rules that need the
+    // stream/structured-metadata split. Every expected set below is a
+    // literal capture from grafana/loki:3.7.4 (buildinfo revision
+    // b318f282), taken by pushing the row and reading `query_range`
+    // back; the non-metadata cells live in
+    // `tests/logqltest/corpus/b21_key_collisions.test`, which the live
+    // replay leg re-checks against the same image.
+    // -----------------------------------------------------------------
+
+    /// Runs `query` over `body` with a stream label set and a row's
+    /// ORDINARY structured metadata, merged the way the read path merges
+    /// them and with the split recorded, so the reference's two
+    /// different collision reads are both reachable. Returns the sorted
+    /// emitted label set.
+    fn run_split_labels(
+        query: &str,
+        body: &str,
+        stream: &[(&str, &str)],
+        sm: &[(&str, &str)],
+    ) -> Vec<(String, String)> {
+        let mut base: Vec<(String, String)> = stream
+            .iter()
+            .chain(sm.iter())
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        // No case here has a stream/metadata name collision, so the
+        // concatenation is what the merge would build.
+        base.dedup_by(|a, b| a.0 == b.0);
+        let ctx = StructuredMetadataCtx {
+            err: String::new(),
+            details: String::new(),
+            has_ordinary: !sm.is_empty(),
+            stream_label_count: Some(stream.len()),
+        };
+        let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+        let mut labels = Vec::new();
+        compiled
+            .run_into_with_sm(body, &base, 0, &ctx, &mut labels)
+            .expect("no budget breach")
+            .expect("no query here drops its line");
+        let mut got: Vec<(String, String)> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        got.sort();
+        got
+    }
+
+    /// A LIVE structured-metadata name forces the rename, and the repeat
+    /// then resolves to the same suffixed name and loses to the first —
+    /// the rename runs BEFORE the already-extracted test
+    /// (`parser.go:150-158 @ v3.7.4`).
+    #[test]
+    fn a_live_structured_metadata_collision_renames_then_keeps_the_first() {
+        assert_eq!(
+            run_split_labels(r#"{x="y"} | json"#, r#"{"m":1,"m":2}"#, &[], &[("m", "MV")]),
+            vec![
+                ("m".to_string(), "MV".to_string()),
+                ("m_extracted".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    /// Dropping a structured-metadata name empties the LIVE category, so
+    /// the rename stops firing and the leaf lands under the bare name —
+    /// while a stream label dropped the same way keeps renaming, because
+    /// `BaseHas` reads a set `Del` cannot touch.
+    #[test]
+    fn dropping_metadata_frees_the_name_dropping_a_stream_label_does_not() {
+        assert_eq!(
+            run_split_labels(
+                r#"{x="y"} | drop m | json"#,
+                r#"{"m":1}"#,
+                &[],
+                &[("m", "MV")]
+            ),
+            vec![("m".to_string(), "1".to_string())]
+        );
+        assert_eq!(
+            run_split_labels(
+                r#"{x="y"} | drop m | json"#,
+                r#"{"m":1}"#,
+                &[("m", "SV")],
+                &[]
+            ),
+            vec![("m_extracted".to_string(), "1".to_string())]
+        );
+    }
+
+    /// …and the name the freed leaf took is then EXTRACTED, so a second
+    /// parser finds it taken and adds nothing.
+    #[test]
+    fn a_name_freed_by_dropping_metadata_is_extracted_once_a_parser_takes_it() {
+        assert_eq!(
+            run_split_labels(
+                r#"{x="y"} | drop m | json | json"#,
+                r#"{"m":1}"#,
+                &[],
+                &[("m", "MV")]
+            ),
+            vec![("m".to_string(), "1".to_string())]
+        );
     }
 }

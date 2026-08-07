@@ -409,9 +409,29 @@ fn unpack_promotes_entry_to_the_line_and_string_fields_to_labels() {
     assert_eq!(line, "the real log line");
 }
 
+/// No `_entry` field, no labels AT ALL. The reference resolves each
+/// field into `lbsBuffer` and `Set`s the buffer only `if isPacked`
+/// (`UnpackParser.unpack` and its caller, `pkg/logql/log/parser.go:789-838
+/// @ v3.7.4`), and only a string `_entry` sets `isPacked`. Captured at
+/// v3.7.4 for issue #334; before that fix PulsusDB promoted the fields
+/// anyway.
 #[test]
-fn unpack_without_an_entry_field_keeps_the_line_and_promotes_labels() {
+fn unpack_without_an_entry_field_promotes_nothing() {
     let (got, line) = run(r#"{a="b"} | unpack"#, r#"{"level":"warn","svc":"api"}"#).unwrap();
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+    assert_eq!(line, r#"{"level":"warn","svc":"api"}"#);
+}
+
+/// The SAME object with `_entry` promotes both fields — so the test
+/// above is about the flush gate, not about those fields being
+/// unreachable. Captured at v3.7.4.
+#[test]
+fn unpack_with_an_entry_field_promotes_the_same_fields() {
+    let (got, line) = run(
+        r#"{a="b"} | unpack"#,
+        r#"{"level":"warn","svc":"api","_entry":"real line"}"#,
+    )
+    .unwrap();
     assert_eq!(
         got,
         labels(&[
@@ -421,7 +441,7 @@ fn unpack_without_an_entry_field_keeps_the_line_and_promotes_labels() {
             ("svc", "api"),
         ])
     );
-    assert_eq!(line, r#"{"level":"warn","svc":"api"}"#);
+    assert_eq!(line, "real line");
 }
 
 #[test]
@@ -442,9 +462,16 @@ fn unpack_malformed_line_is_kept_with_the_json_error_label() {
     assert_eq!(line, "not a json object");
 }
 
+/// `_entry` is present so the buffer flushes (see above); a packed field
+/// colliding with a stream label lands under `_extracted`. Captured at
+/// v3.7.4.
 #[test]
 fn unpack_collision_with_a_stream_label_lands_under_the_extracted_suffix() {
-    let (got, _) = run(r#"{a="b"} | unpack"#, r#"{"app":"other","x":"1"}"#).unwrap();
+    let (got, _) = run(
+        r#"{a="b"} | unpack"#,
+        r#"{"app":"other","x":"1","_entry":"real line"}"#,
+    )
+    .unwrap();
     assert_eq!(
         got,
         labels(&[
@@ -453,6 +480,23 @@ fn unpack_collision_with_a_stream_label_lands_under_the_extracted_suffix() {
             ("env", "prod"),
             ("x", "1"),
         ])
+    );
+}
+
+/// A repeated packed key is LAST-wins, the opposite of every other
+/// parser, because `RecordExtracted` only happens at the flush — so no
+/// earlier field of the same stage is ever "already extracted"
+/// (`parser.go:812-837 @ v3.7.4`). Captured at v3.7.4 (issue #334).
+#[test]
+fn unpack_repeats_a_key_last_write_wins_unlike_every_other_parser() {
+    let (got, _) = run(
+        r#"{a="b"} | unpack"#,
+        r#"{"x":"1","x":"2","_entry":"real line"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("x", "2")])
     );
 }
 

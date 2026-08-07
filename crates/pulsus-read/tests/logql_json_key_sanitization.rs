@@ -108,11 +108,11 @@
 //! | depth  | category | state   | probe        | outcome            |
 //! |--------|----------|---------|--------------|--------------------|
 //! | 0      | base     | live    | `c16` (+more)| parity             |
-//! | 0      | base     | dropped | `d00`        | DIVERGENT (#334)   |
+//! | 0      | base     | dropped | `d00`        | parity (since #334)|
 //! | 0      | sm       | live    | `c13`        | parity             |
 //! | 0      | sm       | dropped | `c15`        | parity             |
 //! | nested | base     | live    | `c10` (+more)| parity             |
-//! | nested | base     | dropped | `d01`        | DIVERGENT (#334)   |
+//! | nested | base     | dropped | `d01`        | parity (since #334)|
 //! | nested | sm       | live    | `c14`        | parity             |
 //! | nested | sm       | dropped | `c18`        | parity             |
 //!
@@ -132,36 +132,30 @@
 //! depth is a property of the JSON leaf, so sm × {0, nested} is fully
 //! covered by `c13`–`c15`/`c18`.
 //!
-//! **The four DIVERGENT cells (`d00`–`d03`), recorded rather than
-//! claimed, all the SAME missing mechanism** — the reference's
-//! category-aware builder state, which is exactly what #334's
-//! parsed-vs-parsed first-wins fix needs, so all four are filed there
-//! and deliberately NOT fixed here:
+//! **`d00`–`d03` were the four DIVERGENT cells** this file recorded for
+//! issue #334, all of them the same missing mechanism — the reference's
+//! category-aware builder state. #334 built it, so all four are now
+//! ordinary collision rows, asserted against the SAME committed capture
+//! by `collision_renames_reproduce_the_reference_capture` (the artifact
+//! never changed: it already held the reference's answers, and it was
+//! our side that moved). What each cell now agrees on:
 //!
 //! - `d00`/`d01` — `drop <base-label>` then a recolliding key: the
-//!   reference still renames (its `BaseHas` reads the ORIGINAL stream
-//!   labels) at both depths, while PulsusDB's collision check reads the
-//!   evolving label set, so the dropped name no longer collides and the
-//!   leaf lands unrenamed. The `drop <sm-label>` mirrors (`c15`/`c18`)
-//!   MATCH by the same token: the reference's structured-metadata check
-//!   reads the LIVE category, which the drop emptied.
-//! - `d02`/`d03` — parsed-vs-parsed collisions: the reference keeps the
-//!   FIRST extraction (`ParserHints.Extracted`), PulsusDB renames the
-//!   second (`add_extracted`'s `_extracted` suffix, shared by every
-//!   parser and predating this issue).
-//!
-//! Each divergent probe's REFERENCE behaviour is captured in the
-//! artifact like every other row, and our side is computed like every
-//! other row; what the table records is the divergence's SHAPE — the
-//! relation between the two derived values (see [`DivergenceShape`]) —
-//! never expected label names, so the divergence can neither silently
-//! widen, nor drift into a different divergence, nor silently
-//! disappear.
+//!   reference renames at both depths because its `BaseHas` reads the
+//!   ORIGINAL stream labels, which `Del` never edits. The
+//!   `drop <sm-label>` mirrors (`c15`/`c18`) do NOT rename, and by the
+//!   same token: `HasInCategory(…, StructuredMetadataLabel)` reads the
+//!   LIVE category, which the drop emptied.
+//! - `d02`/`d03` — parsed-versus-parsed collisions: the FIRST extraction
+//!   of a name wins and the later one is dropped entirely
+//!   (`ParserHint.Extracted`), at depth 0 and across the nested/flat
+//!   boundary.
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use pulsus_read::logql::StructuredMetadataCtx;
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -289,64 +283,25 @@ const COLLISION_PROBES: &[SourceProbe] = &[
     //    pre-fix join built the same `x_m`) and neither side sees a
     //    collision, so 19d02fb emitted the same labels ------------------
     probe("c18", "| drop x_m | json", &[], &[("x_m", "sv")], r#"{"x":{"m":1}}"#, "same"),
-];
-
-/// HOW a recorded #334 divergence differs from the reference — the
-/// SHAPE of the difference, never the label names themselves. Both
-/// sides of every divergent cell are derived like any other row (the
-/// reference side from the raw capture, ours computed), and the shape
-/// pins the exact relation between the two derived values, so the
-/// divergence can neither widen nor drift into a DIFFERENT divergence
-/// without failing.
-enum DivergenceShape {
-    /// `drop <base-label>` then a recolliding key: the reference still
-    /// renames (its `BaseHas` reads the ORIGINAL stream labels), we do
-    /// not — one label each side, same value, and the reference's name
-    /// is ours with `_extracted` appended.
-    ReferenceStillRenamesDroppedBase,
-    /// Parsed-vs-parsed: the reference keeps the FIRST extraction
-    /// only; we keep it too AND emit the second under a rename — ours
-    /// is exactly the reference's one label plus one more whose name
-    /// is the reference's with `_extracted` appended and whose value
-    /// completes the line's scalar-leaf multiset (the second leaf's
-    /// value, derived — see [`line_leaf_values`]).
-    PulsusRenamesSecondExtraction,
-}
-
-/// A probe whose divergence from the reference is RECORDED (#334).
-/// Deliberately no expected labels here: only the probe (an input) and
-/// the divergence's shape (a relation checked between the two derived
-/// sides).
-struct DivergentProbe {
-    probe: SourceProbe,
-    shape: DivergenceShape,
-}
-
-/// `was` is `same` throughout: none of these cells changed in this
-/// issue (no trimming is involved and the collision paths taken are the
-/// pre-existing ones), which is exactly why they are #334's, not ours.
-#[rustfmt::skip]
-const DIVERGENT_PROBES: &[DivergentProbe] = &[
-    // -- depth 0 × base × dropped ---------------------------------------
-    DivergentProbe {
-        probe: probe("d00", "| drop x | json", &[("x", "s")], &[], r#"{"x":1}"#, "same"),
-        shape: DivergenceShape::ReferenceStillRenamesDroppedBase,
-    },
-    // -- nested × base × dropped (fix round 3) --------------------------
-    DivergentProbe {
-        probe: probe("d01", "| drop x_y | json", &[("x_y", "s")], &[], r#"{"x":{"y":1}}"#, "same"),
-        shape: DivergenceShape::ReferenceStillRenamesDroppedBase,
-    },
-    // -- parsed-vs-parsed, depth 0 --------------------------------------
-    DivergentProbe {
-        probe: probe("d02", "| json", &[], &[], r#"{"a-b":1,"a.b":2}"#, "same"),
-        shape: DivergenceShape::PulsusRenamesSecondExtraction,
-    },
-    // -- parsed-vs-parsed, nested-vs-flat -------------------------------
-    DivergentProbe {
-        probe: probe("d03", "| json", &[], &[], r#"{"x":{"y":1},"x_y":2}"#, "same"),
-        shape: DivergenceShape::PulsusRenamesSecondExtraction,
-    },
+    // -- issue #334's four cells, PARITY since that fix ------------------
+    //    They were recorded here as divergences (`d00`-`d03`) with their
+    //    reference answers captured like every other row; the fix made
+    //    them agree, and the SAME committed capture now asserts it. Ids
+    //    and artifact positions are unchanged, so the capture needs no
+    //    regeneration. `was` stays `same` — none of the four changed in
+    //    #287, which is why they were filed against #334 rather than
+    //    fixed there.
+    //
+    //    depth 0 / nested × base × DROPPED: `BaseHas` reads the ORIGINAL
+    //    stream labels, so a dropped stream label still forces the
+    //    rename (`labels.go:278-280 @ v3.7.4`).
+    probe("d00", "| drop x | json", &[("x", "s")], &[], r#"{"x":1}"#, "same"),
+    probe("d01", "| drop x_y | json", &[("x_y", "s")], &[], r#"{"x":{"y":1}}"#, "same"),
+    //    parsed-versus-parsed at both depths: the FIRST extraction of a
+    //    name wins and the second vanishes
+    //    (`ParserHint.Extracted`/`parser.go:156-158`, `:190-194`).
+    probe("d02", "| json", &[], &[], r#"{"a-b":1,"a.b":2}"#, "same"),
+    probe("d03", "| json", &[], &[], r#"{"x":{"y":1},"x_y":2}"#, "same"),
 ];
 
 /// Every probe, in artifact order.
@@ -354,7 +309,6 @@ fn all_probes() -> Vec<&'static SourceProbe> {
     CONSTRUCTION_PROBES
         .iter()
         .chain(COLLISION_PROBES.iter())
-        .chain(DIVERGENT_PROBES.iter().map(|d| &d.probe))
         .collect()
 }
 
@@ -532,12 +486,26 @@ fn emitted(p: &SourceProbe) -> Vec<(String, String)> {
         .chain(p.sm.iter())
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    // The merged base is stream labels then ordinary structured metadata,
+    // and the pipeline is TOLD where the split is — the reference reads
+    // the two categories from different places, so a probe that hides the
+    // split cannot reach its LIVE-category rule (issue #334; `c15`/`c18`
+    // are exactly that cell). No probe's base and sm collide, so this
+    // concatenation is what the real merge would produce.
+    let sm_ctx = StructuredMetadataCtx {
+        err: String::new(),
+        details: String::new(),
+        has_ordinary: !p.sm.is_empty(),
+        stream_label_count: Some(p.base.len()),
+    };
     let query = format!(r#"{{app="a"}} {}"#, p.pipeline);
-    let mut pairs: Vec<(String, String)> = compiled(&query)
-        .run(p.line, &base, 0)
+    let compiled = compiled(&query);
+    let mut labels = Vec::new();
+    compiled
+        .run_into_with_sm(p.line, &base, 0, &sm_ctx, &mut labels)
         .expect("well inside the key budget")
-        .expect("no probe pipeline drops its line")
-        .labels
+        .expect("no probe pipeline drops its line");
+    let mut pairs: Vec<(String, String)> = labels
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
@@ -550,28 +518,6 @@ fn emitted(p: &SourceProbe) -> Vec<(String, String)> {
         );
     }
     pairs
-}
-
-/// The scalar leaf values of a probe's JSON line, rendered as the json
-/// parser renders label values, sorted. Used to pin BOTH extractions'
-/// values in the parsed-vs-parsed divergence cells; the extractor has
-/// already asserted the capture echoes this exact line, so this is a
-/// derivation from capture-attested input, not an expectation literal.
-fn line_leaf_values(sp: &SourceProbe) -> Vec<String> {
-    fn walk(v: &Value, out: &mut Vec<String>) {
-        match v {
-            Value::Object(m) => m.values().for_each(|x| walk(x, out)),
-            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
-            Value::String(s) => out.push(s.clone()),
-            other => out.push(other.to_string()),
-        }
-    }
-    let parsed: Value = serde_json::from_str(sp.line)
-        .unwrap_or_else(|e| panic!("{}: probe line is not valid JSON: {e}", sp.id));
-    let mut out = Vec::new();
-    walk(&parsed, &mut out);
-    out.sort();
-    out
 }
 
 fn owned(labels: Labels) -> Vec<(String, String)> {
@@ -660,88 +606,6 @@ fn collision_renames_reproduce_the_reference_capture() {
             sp.base,
             sp.sm
         );
-    }
-}
-
-/// The four recorded #334 divergences hold their exact recorded shape:
-/// the artifact derives the reference side, we emit the pulsus side,
-/// the two DIFFER, and they differ in precisely the relation each
-/// probe's [`DivergenceShape`] records — so the divergence can neither
-/// silently widen, nor drift into a different divergence, nor silently
-/// disappear (a fix would flip this test, on purpose).
-#[test]
-fn divergent_cells_hold_their_recorded_shape_against_the_capture() {
-    let art = load_artifact();
-    let by_id = artifact_by_id(&art);
-    for d in DIVERGENT_PROBES {
-        let sp = &d.probe;
-        let ap = by_id[sp.id];
-        let reference = reference_labels(sp, ap);
-        let ours = emitted(sp);
-        assert_ne!(
-            ours, reference,
-            "{}: the recorded divergence disappeared — close it in #334, not silently",
-            sp.id
-        );
-        match d.shape {
-            DivergenceShape::ReferenceStillRenamesDroppedBase => {
-                assert_eq!(reference.len(), 1, "{}: reference label count", sp.id);
-                assert_eq!(ours.len(), 1, "{}: our label count", sp.id);
-                let (our_key, our_value) = &ours[0];
-                assert_eq!(
-                    reference[0].0,
-                    format!("{our_key}_extracted"),
-                    "{}: the reference's one label must be ours renamed with _extracted",
-                    sp.id
-                );
-                assert_eq!(
-                    &reference[0].1, our_value,
-                    "{}: both sides carry the leaf's value",
-                    sp.id
-                );
-            }
-            DivergenceShape::PulsusRenamesSecondExtraction => {
-                assert_eq!(
-                    reference.len(),
-                    1,
-                    "{}: reference keeps the first extraction only",
-                    sp.id
-                );
-                assert_eq!(ours.len(), 2, "{}: we emit both extractions", sp.id);
-                assert!(
-                    ours.contains(&reference[0]),
-                    "{}: the first extraction must agree with the reference",
-                    sp.id
-                );
-                let extra = ours
-                    .iter()
-                    .find(|pair| *pair != &reference[0])
-                    .expect("two labels, one equal to the reference's");
-                assert_eq!(
-                    extra.0,
-                    format!("{}_extracted", reference[0].0),
-                    "{}: the second extraction must land under the reference key renamed \
-                     with _extracted",
-                    sp.id
-                );
-                // Pin the renamed label's VALUE, derived: the probe's
-                // line — which the extractor has already asserted the
-                // capture echoes byte for byte — has exactly two scalar
-                // leaves, and the reference kept the first, so ours
-                // plus the reference's must be exactly that leaf
-                // multiset. A duplicate of the first value, or any
-                // third value, fails here.
-                let mut both = vec![reference[0].1.clone(), extra.1.clone()];
-                both.sort();
-                assert_eq!(
-                    both,
-                    line_leaf_values(sp),
-                    "{}: the two extractions must carry the line's two leaf values — the \
-                     renamed label carries the SECOND extraction's value",
-                    sp.id
-                );
-            }
-        }
     }
 }
 

@@ -138,6 +138,13 @@ pub use exec::{
     read_query_settings, run_pipeline_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
+/// The structured-metadata context [`pipeline::CompiledPipeline::run_into_with_sm`]
+/// takes. Re-exported (issue #334) because that entrypoint is `pub` while
+/// its module is not, so the parameter type had no nameable path outside
+/// the crate — and the stream/structured-metadata split it now carries is
+/// what the `| json` collision matrix has to drive to reach the reference's
+/// LIVE-category rule.
+pub use labels::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
 pub use params::{
     DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec, TimeBounds,
     ValidatedDuration, validate_duration_ns,

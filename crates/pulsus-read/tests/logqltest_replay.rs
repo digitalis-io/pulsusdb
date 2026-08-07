@@ -645,18 +645,26 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// file — a numeric conversion failing to the LEFT of a leaf that reads
 /// the error state — and every row of it is a streams query at a single
 /// instant, so all the figures move together.
-const TOTAL_DIRECTIVES: usize = 1_289;
+///
+/// Issue #334 adds `b21_key_collisions.test`, captured against the same
+/// pinned image with no config delta: every row is a streams query at a
+/// single instant over a relative-offset load set, so all the figures
+/// move together again.
+const TOTAL_DIRECTIVES: usize = 1_312;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_024;
+const PROVENANCE_PERMITS: usize = 1_047;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
 /// [`UNREACHABLE_BY_REASON`] — it is not a shortfall to be quietly
 /// absorbed into a single figure.
-const REACHABLE: usize = 101;
+///
+/// Every `b21_key_collisions.test` row (issue #334) is reachable: a
+/// streams query at a single instant over a relative-offset load set.
+const REACHABLE: usize = 124;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \
 not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergence=18";
