@@ -645,12 +645,19 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// file — a numeric conversion failing to the LEFT of a leaf that reads
 /// the error state — and every row of it is a streams query at a single
 /// instant, so all the figures move together.
-const TOTAL_DIRECTIVES: usize = 1_289;
+///
+/// Issue #241 adopts the formerly-EXCLUDED `by`-over-a-missing-label
+/// sub-cases and the general shapes they instance, across the variants,
+/// `label_replace` and grouping-dedup files. The TOTAL moves by all of
+/// them; [`PROVENANCE_PERMITS`] and the `config-delta file` exclusion by
+/// the share that lands outside a config-delta file. [`REACHABLE`] does
+/// NOT move — they are all metric queries.
+const TOTAL_DIRECTIVES: usize = 1_300;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_024;
+const PROVENANCE_PERMITS: usize = 1_028;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -658,7 +665,7 @@ const PROVENANCE_PERMITS: usize = 1_024;
 /// absorbed into a single figure.
 const REACHABLE: usize = 101;
 
-const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=121, not a capture claim (derived)=29, \
+const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=128, not a capture claim (derived)=29, \
 not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergence=18";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
@@ -667,7 +674,7 @@ not a capture claim (ported)=29, our-error-text (eval_fail)=68, pinned-divergenc
 /// the ENUMERATED gap rather than the coverage. Both are levers the
 /// module docs already name.
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \
-metric query (slice: streams only)=235, range/matrix eval (slice: instant only)=10";
+metric query (slice: streams only)=239, range/matrix eval (slice: instant only)=10";
 // corpus-counts: end (replay-coverage-constants)
 
 /// How far back the first slot sits. Bounded above by

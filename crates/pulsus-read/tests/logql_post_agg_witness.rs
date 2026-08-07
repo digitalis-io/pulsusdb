@@ -1918,10 +1918,6 @@ fn axis_pairs(m: &StageInput, _: &[VectorAggSpec]) -> u64 {
 fn axis_stage_series(m: &StageInput, aggs: &[VectorAggSpec]) -> u64 {
     m.series() * aggs.len() as u64
 }
-fn axis_group_names(m: &StageInput, aggs: &[VectorAggSpec]) -> u64 {
-    m.series() * group_name_bytes(aggs)
-}
-
 fn nested(spec: VectorAggSpec, len: usize) -> Vec<VectorAggSpec> {
     (0..len).map(|_| spec.clone()).collect()
 }
@@ -2053,76 +2049,16 @@ fn chain_ladders() -> Vec<ChainLadder> {
                 .collect(),
             axis: axis_stage_series,
         },
-        // W_GROUPNAME — `by(id, <q-1 absent names>)`. §5.4 named an
-        // ALL-absent clause as the maximising shape; measurement refutes
-        // it: with every name absent all series collapse to ONE group, so
-        // exactly one key is RETAINED and the other N-1 are built and
-        // dropped (peak flat at 8 KiB from q = 4 to q = 16). Keeping one
-        // PRESENT distinguishing name retains one q-pair key per output
-        // group, which is what the term `W_GROUPNAME * N * A` models. The
-        // RULE §5.4 states — "the shape that maximises that axis's rate"
-        // — is what is followed here.
-        ChainLadder {
-            name: "W_GROUPNAME",
-            term: ChainTerm::GroupName,
-            op: VectorAggOp::Sum,
-            key: inst(GroupShape::ByPresent, KShape::NotParameterised),
-            rungs: [4u64, 16, 64, 256]
-                .into_iter()
-                .map(|names| {
-                    (
-                        Fixture {
-                            series: 256,
-                            // `pairs` is reused as the by-name count for
-                            // this ladder only; the fixture data is fixed.
-                            pairs: names,
-                            ..CHAIN_BASE
-                        },
-                        1,
-                    )
-                })
-                .collect(),
-            axis: axis_group_names,
-        },
+        // There is NO `W_GROUPNAME` ladder — see the declared exception in
+        // `every_model_term_is_derived_or_a_declared_exception`.
     ]
-}
-
-/// `by(<q names, none of them in the data>)`.
-fn absent_by_names(q: u64) -> Grouping {
-    Grouping {
-        kind: GroupingKind::By,
-        labels: (0..q).map(|i| format!("a{i:03}")).collect(),
-    }
-}
-
-/// `by(id, <q-1 absent names>)` — one PRESENT distinguishing name, so the
-/// grouping retains one `q`-pair key per output group instead of
-/// collapsing every series into one group.
-fn by_names_with_one_present(q: u64) -> Grouping {
-    let mut labels = vec!["id00".to_string()];
-    labels.extend((1..q).map(|i| format!("a{i:03}")));
-    Grouping {
-        kind: GroupingKind::By,
-        labels,
-    }
 }
 
 fn run_chain_ladder(l: &ChainLadder, skew: Skew) -> LadderRun {
     let mut points = Vec::new();
     for (fx, len) in &l.rungs {
         let fx = Fixture { skew, ..*fx };
-        let (result, aggs) = if l.term == ChainTerm::GroupName {
-            // This ladder varies the BY-NAME COUNT, not the data.
-            let data = Fixture {
-                pairs: CHAIN_BASE.pairs,
-                ..fx
-            };
-            let items = build_vector(&data, false);
-            (
-                QueryResult::Vector(items),
-                vec![(l.op, Some(by_names_with_one_present(fx.pairs)), None)],
-            )
-        } else {
+        let (result, aggs) = {
             let spec = (
                 l.op,
                 grouping_for(l.key.group),
@@ -2413,7 +2349,39 @@ fn every_model_term_is_derived_or_a_declared_exception() {
     // the minimal input by `the_flat_approx_topk_term_bounds_a_minimal_input`.
     // `B_MANY`: plan v14 §6.4's declared exception, discriminated by the
     // 2x2 difference-of-differences.
-    let chain_exceptions = [ChainTerm::StageSeries, ChainTerm::ApproxTopk];
+    //
+    // `W_GROUPNAME`: **UNDERIVED, and deliberately so — the term is
+    // retained SLACK, not a measured rate (issue #241).** Its ladder
+    // varied the by-NAME count over fixed data with one present name and
+    // `q-1` absent ones, and what it measured was `group_key`'s old
+    // materialisation of an absent `by` name as `name=""`: peak scaled
+    // with the clause's byte total because every name in the clause
+    // became an owned pair in every retained key. #241 made the `by` key
+    // a selection FROM the series' own labels, so an absent name now
+    // allocates nothing and the axis is flat by construction — measured
+    // 93,680 B at q = 4, 16 and 64 and 94,208 B at q = 256, where the
+    // ladder's own linearity check then divides into a zero baseline
+    // rate. There is no fixture that revives it: making the `q` names
+    // PRESENT prices label pairs, which is `W_PAIR`/`W_LABEL_BYTE` under
+    // another letter, not an independent axis. The ladder and its fixture
+    // are therefore DELETED rather than kept as a zero, which would be a
+    // false entry in the model rather than a cautious one.
+    //
+    // The COEFFICIENT and the reserve are untouched by that (adjudicated,
+    // #241): `Ledger::acquire` still charges `W_GROUPNAME x series x
+    // group_name_bytes`, and `group_name_bytes` still counts every name
+    // off the QUERY TEXT — which names the data carries is unknowable
+    // before the stage runs. So `MAX_POST_AGG_BYTES` now reserves for
+    // pairs that are no longer allocated. That is conservative and
+    // harmless; whether to reclaim it is #245's decision with its own
+    // review, and the slack is recorded there. The suppression half of
+    // this test below still holds the term to `shipped > 0`, so it cannot
+    // silently drop out of the model.
+    let chain_exceptions = [
+        ChainTerm::StageSeries,
+        ChainTerm::ApproxTopk,
+        ChainTerm::GroupName,
+    ];
     let ladder_terms: Vec<ChainTerm> = chain_ladders().iter().map(|l| l.term).collect();
     for t in ALL_CHAIN_TERMS {
         assert!(
@@ -2519,8 +2487,8 @@ struct ChainPair {
     op: VectorAggOp,
     shape: Shape,
     group: GroupShape,
-    lo: (Fixture, usize, u64),
-    hi: (Fixture, usize, u64),
+    lo: (Fixture, usize),
+    hi: (Fixture, usize),
 }
 
 fn chain_pairs() -> Vec<ChainPair> {
@@ -2529,17 +2497,22 @@ fn chain_pairs() -> Vec<ChainPair> {
         ..CHAIN_BASE
     };
     vec![
-        // The `by(...)` list only; names absent from the data; the data
-        // is byte-identical and `aggs.len()` is held equal.
-        ChainPair {
-            name: "W_GROUPNAME",
-            term: ChainTerm::GroupName,
-            op: VectorAggOp::Sum,
-            shape: Shape::Instant,
-            group: GroupShape::ByAbsent,
-            lo: (base, 1, 1),
-            hi: (base, 1, 256),
-        },
+        // There is NO `W_GROUPNAME` pair, for the same reason its ladder
+        // is gone (issue #241). Its `lo`/`hi` were `by(<1 absent name>)`
+        // and `by(<256 absent names>)` over byte-identical data; now that
+        // the `by` key is SELECTED from the series' own labels, that pair
+        // causes exactly zero incremental peak bytes — measured
+        // `d_measured = 0` against `d_without = 0`, which makes the
+        // NECESSITY assertion below FAIL rather than pass vacuously.
+        //
+        // It was briefly kept, and passed, against an interim `group_key`
+        // that built a per-call `HashSet` over the grouping list: it was
+        // measuring THAT — 2,788 B between the two rungs — and not the
+        // retained key pairs it names. Deleting the phantom allocation
+        // (the reference has no such index either) left the pair with
+        // nothing to demonstrate. Recorded because "it still reddens when
+        // I break the coefficient" was true of it and was not enough.
+        //
         // Points per series; series and labels fixed.
         ChainPair {
             name: "W_POINT",
@@ -2554,7 +2527,6 @@ fn chain_pairs() -> Vec<ChainPair> {
                     ..base
                 },
                 1,
-                0,
             ),
             hi: (
                 Fixture {
@@ -2563,7 +2535,6 @@ fn chain_pairs() -> Vec<ChainPair> {
                     ..base
                 },
                 1,
-                0,
             ),
         },
         // Series, with points-per-series and per-series label width
@@ -2587,7 +2558,6 @@ fn chain_pairs() -> Vec<ChainPair> {
                     ..base
                 },
                 1,
-                0,
             ),
             hi: (
                 Fixture {
@@ -2597,7 +2567,6 @@ fn chain_pairs() -> Vec<ChainPair> {
                     ..base
                 },
                 1,
-                0,
             ),
         },
         // Label VALUE width; pairs and series fixed. A CHAIN fixture, so
@@ -2615,7 +2584,6 @@ fn chain_pairs() -> Vec<ChainPair> {
                     ..base
                 },
                 1,
-                0,
             ),
             hi: (
                 Fixture {
@@ -2624,7 +2592,6 @@ fn chain_pairs() -> Vec<ChainPair> {
                     ..base
                 },
                 1,
-                0,
             ),
         },
         // Pairs per series, per-pair width scaled down so `label_bytes`
@@ -2643,7 +2610,6 @@ fn chain_pairs() -> Vec<ChainPair> {
                     ..base
                 },
                 1,
-                0,
             ),
             hi: (
                 Fixture {
@@ -2653,7 +2619,6 @@ fn chain_pairs() -> Vec<ChainPair> {
                     ..base
                 },
                 1,
-                0,
             ),
         },
     ]
@@ -2661,14 +2626,10 @@ fn chain_pairs() -> Vec<ChainPair> {
 
 fn build_chain_pair_side(
     p: &ChainPair,
-    side: &(Fixture, usize, u64),
+    side: &(Fixture, usize),
 ) -> (QueryResult, Vec<VectorAggSpec>) {
-    let (fx, len, names) = side;
-    let grouping = if p.term == ChainTerm::GroupName {
-        Some(absent_by_names(*names))
-    } else {
-        grouping_for(p.group)
-    };
+    let (fx, len) = side;
+    let grouping = grouping_for(p.group);
     let param = if matches!(p.op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
         Some(fx.series as f64)
     } else {

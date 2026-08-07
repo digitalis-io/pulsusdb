@@ -1125,10 +1125,17 @@ not "fix" us toward the panic.
   post-aggregation byte bound at all: it evaluates step-ordered and never
   materialises the inner matrix, so a wide `by(...)` clause costs it one
   step's worth of keys. *PulsusDB:* materialises the stage, so
-  `group_key`'s `By` arm builds one owned pair per `by` NAME per output
-  group; the funnel charges that as `W_GROUPNAME x series x
+  `group_key`'s `By` arm builds one owned pair per `by` name PRESENT on
+  the group's series (since issue #241 an ABSENT name contributes
+  nothing — the key is selected from the series' own labels,
+  reference-exact); the funnel charges that as `W_GROUPNAME x series x
   group_name_bytes` against `MAX_POST_AGG_BYTES` (8 GiB) and refuses
-  above it with `MetricPostAggBytes` (HTTP 422). **Threshold, as a
+  above it with `MetricPostAggBytes` (HTTP 422). `group_name_bytes` is
+  read off the QUERY TEXT and so counts every name, absent ones included
+  — which names the data carries is unknowable before the stage runs —
+  so since #241 the charge OVER-estimates what is allocated, and the
+  thresholds below, being properties of the charge, are unmoved by that
+  fix. **Threshold, as a
   number a reader can compare their query against: `A_MIN = 597` total
   `by`-clause bytes** — with `A_NAME_MIN = 2` (a one-character name plus
   its separator) that is **at least 299 one-character `by` names** —
