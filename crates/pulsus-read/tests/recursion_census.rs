@@ -330,12 +330,25 @@ fn declared_slots(files: &[(String, String)], members: &[String]) -> Vec<Slot> {
 /// `ChildVec` handles, `impl Scc`, an iterative `Drop`) buys them
 /// nothing and check (b) deliberately does not apply.
 ///
-/// `WireJson` (issue #334) is the only one. It is built solely by
-/// `serde_json`, whose deserializer refuses a document nested past its
-/// own recursion limit, so no log line can make one deeper than that:
-/// measured at 127 levels parsing, 128 a `JSONParserErr` and 5 000 the
-/// same rather than a stack overflow
-/// (`logql_json_flatten_budget.rs::json_nesting_past_the_parser_limit_is_a_parse_error`).
+/// `WireJson` (issue #334) is the only one, and the bound covers EVERY
+/// path to it rather than the intended one. Its three variants have no
+/// programmatic constructor: `Object` is produced only by `visit_map`,
+/// `Array` only by `visit_seq` and `Leaf` only by the scalar visitors
+/// (`visit_bool`/`i64`/`u64`/`f64`/`str`/`string`/`none`/`unit`), all
+/// inside `WireJsonVisitor` in `pipeline.rs`, and the only way in is
+/// `serde_json::from_str` — three call sites, all on a log line. So
+/// every value of this type came through the deserializer, which refuses
+/// a document nested past its own recursion limit, and no log line can
+/// make one deeper than that.
+///
+/// That also says WHERE the depth can be, which is why the check below
+/// is sufficient rather than merely present: since `Leaf` is built only
+/// by the scalar visitors it cannot itself hold nesting, so depth lives
+/// entirely in `Object` and `Array` — and the check exercises both.
+/// (Before issue #334's third round `visit_seq` produced a
+/// `Leaf(Value::Array(_))`, which could hold nesting the check never
+/// reached.)
+///
 /// The four AST members are a different case entirely — their depth is
 /// bounded only by the query-text cap, thousands of levels, which is why
 /// #272 exists.
@@ -367,17 +380,28 @@ const DEPTH_BOUNDED_BY_THEIR_PARSER: &[&str] = &["WireJson"];
 ///   stack, which is the property #272's machinery exists to provide and
 ///   this type gets from the parser instead.
 ///
+/// Each of those over BOTH depth-bearing variants — nested objects and
+/// nested arrays — because either can carry the depth (see
+/// [`DEPTH_BOUNDED_BY_THEIR_PARSER`]). The two arms share one constant
+/// because the limit counts TOTAL descents and does not care which kind
+/// they are: the array arm spends one level on the object that has to
+/// wrap it, and flips one array shallower for exactly that reason.
+///
 /// Driven through `| json`, because `WireJson` is private to
 /// `pipeline.rs`: the observable is the ordinary malformed-line class —
 /// line kept, `__error__="JSONParserErr"`, nothing extracted — and a
 /// budget breach would be a different return, which the `expect` below
-/// separates.
+/// separates. An ACCEPTED deep array yields no labels at all rather than
+/// the error pair, since the flatten skips arrays, so the two outcomes
+/// stay distinguishable on that arm too.
 #[test]
 fn the_depth_bound_the_exemption_rests_on_is_enforced_by_the_parser() {
-    /// One level under `serde_json`'s limit at the pinned version.
+    /// The deepest TOTAL nesting `serde_json` accepts at the pinned
+    /// version, counting object and array descents alike.
     const DEEPEST_ACCEPTED: usize = 127;
 
-    fn nested(depth: usize) -> String {
+    /// `depth` nested objects around a scalar: `{"a":{"a":…1…}}`.
+    fn nested_objects(depth: usize) -> String {
         let mut s = String::with_capacity(depth * 6 + 8);
         for _ in 0..depth {
             s.push_str("{\"a\":");
@@ -386,6 +410,23 @@ fn the_depth_bound_the_exemption_rests_on_is_enforced_by_the_parser() {
         for _ in 0..depth {
             s.push('}');
         }
+        s
+    }
+
+    /// One object — the line has to be one for `| json` to parse it at
+    /// all — wrapping `depth` nested arrays: `{"a":[[…1…]]}`. Total
+    /// depth is therefore `depth + 1`.
+    fn nested_arrays(depth: usize) -> String {
+        let mut s = String::with_capacity(depth * 2 + 16);
+        s.push_str("{\"a\":");
+        for _ in 0..depth {
+            s.push('[');
+        }
+        s.push('1');
+        for _ in 0..depth {
+            s.push(']');
+        }
+        s.push('}');
         s
     }
     let expr = pulsus_logql::parse(r#"{app="a"} | json"#).expect("parse");
@@ -404,31 +445,58 @@ fn the_depth_bound_the_exemption_rests_on_is_enforced_by_the_parser() {
             .collect()
     };
 
+    let refused = vec!["__error__".to_string(), "__error_details__".to_string()];
+
+    // --- depth carried by `WireJson::Object` -------------------------
     // `DEEPEST_ACCEPTED` nested `{"a": …}` flatten to one leaf `a_a_…_a`.
     let leaf: String = std::iter::repeat_n("a", DEEPEST_ACCEPTED)
         .collect::<Vec<_>>()
         .join("_");
     assert_eq!(
-        names(&nested(DEEPEST_ACCEPTED)),
+        names(&nested_objects(DEEPEST_ACCEPTED)),
         vec![leaf],
-        "the parser stopped accepting {DEEPEST_ACCEPTED} levels — the limit MOVED DOWN, and \
-         `DEPTH_BOUNDED_BY_THEIR_PARSER` now names a different bound than it claims"
+        "the parser stopped accepting {DEEPEST_ACCEPTED} object levels — the limit MOVED \
+         DOWN, and `DEPTH_BOUNDED_BY_THEIR_PARSER` now names a different bound than it claims"
     );
-    let refused = vec!["__error__".to_string(), "__error_details__".to_string()];
     assert_eq!(
-        names(&nested(DEEPEST_ACCEPTED + 1)),
+        names(&nested_objects(DEEPEST_ACCEPTED + 1)),
         refused,
-        "the parser accepted {} levels — the limit MOVED UP, so the bound the exemption \
-         rests on is no longer the one measured for it",
+        "the parser accepted {} object levels — the limit MOVED UP, so the bound the \
+         exemption rests on is no longer the one measured for it",
         DEEPEST_ACCEPTED + 1
     );
-    // Far past any plausible limit: if the cap were removed rather than
-    // moved, this recurses instead of returning and takes the stack with
-    // it. Reaching the assertion at all is half the result.
+
+    // --- depth carried by `WireJson::Array` --------------------------
+    // The wrapping object spends one level, so the flip is one array
+    // shallower — which is the evidence that the limit counts TOTAL
+    // descents rather than objects only.
+    assert!(
+        names(&nested_arrays(DEEPEST_ACCEPTED - 1)).is_empty(),
+        "the parser stopped accepting {} array levels inside an object — the limit MOVED \
+         DOWN, or it stopped counting arrays",
+        DEEPEST_ACCEPTED - 1
+    );
     assert_eq!(
-        names(&nested(50_000)),
+        names(&nested_arrays(DEEPEST_ACCEPTED)),
         refused,
-        "50 000 levels must be REFUSED by the parser, not recursed through"
+        "the parser accepted {DEEPEST_ACCEPTED} array levels inside an object — total depth \
+         {}, so the limit MOVED UP or it counts arrays differently from objects",
+        DEEPEST_ACCEPTED + 1
+    );
+
+    // --- far past any plausible limit, both variants ------------------
+    // If the cap were REMOVED rather than moved, these recurse instead of
+    // returning and take the stack with them. Reaching the assertions at
+    // all is half the result.
+    assert_eq!(
+        names(&nested_objects(50_000)),
+        refused,
+        "50 000 object levels must be REFUSED by the parser, not recursed through"
+    );
+    assert_eq!(
+        names(&nested_arrays(50_000)),
+        refused,
+        "50 000 array levels must be REFUSED by the parser, not recursed through"
     );
 }
 
