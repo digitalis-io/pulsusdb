@@ -5815,6 +5815,7 @@ mod tests {
             err: "boom".to_string(),
             details: String::new(),
             has_ordinary: false,
+            stream_label_count: None,
         };
         let mut labels = Vec::new();
         compiled
@@ -5825,6 +5826,7 @@ mod tests {
             err: String::new(),
             details: "bdet".to_string(),
             has_ordinary: false,
+            stream_label_count: None,
         };
         let mut labels = Vec::new();
         compiled

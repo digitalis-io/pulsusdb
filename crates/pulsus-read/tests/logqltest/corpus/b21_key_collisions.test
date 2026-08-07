@@ -1,0 +1,479 @@
+# b21_key_collisions.test — issue #334: what happens when two extractions
+# want the same label name.
+#
+# Every expected label set below is a byte-exact capture from
+# grafana/loki:3.7.4 (container `pulsus-334-loki`, buildinfo
+# version 3.7.4 / revision b318f282, booted on `ci/logql/config.yaml`;
+# `detected_level` stripped per PROVENANCE.md). Instant-eval only.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
+#
+# THE RULE, read from the reference rather than inferred from these rows
+# (grafana/loki @ v3.7.4, b318f2829f0ae2094ab3a1e90780450e9e4b03be). Every
+# implicit parser — `json`'s full flatten, `logfmt`, `regexp`, `pattern`,
+# `unpack` — runs the same three steps, at
+# `pkg/logql/log/parser.go:139-166` (json depth 0), `:171-208` (json
+# nested), `:340-356` (regexp), `:415-433` (logfmt), `:485-495` (pattern),
+# `:812-827` (unpack):
+#
+#   1. sanitize the key;
+#   2. rename it to `<key>_extracted` iff `lbs.BaseHas(key) ||
+#      lbs.HasInCategory(key, StructuredMetadataLabel)`;
+#   3. `continue` — extract NOTHING — iff
+#      `parserHints.Extracted(<resolved key>)`, else
+#      `lbs.Set(ParsedLabel, …)`, which records the resolved key as
+#      extracted (`labels.go:378-385`).
+#
+# Step 3 is the first-wins rule: the FIRST extraction of a name on a line
+# wins and every later one vanishes, across stages and even after the
+# label itself was dropped, because nothing ever un-records a name
+# (`ParserHint.Reset` runs once per LINE, `pipeline.go:222`).
+#
+# Step 2 reads TWO different places and they disagree under `drop`:
+# `BaseHas` reads `b.base`, the stream's own labels, which no stage edits
+# (`labels.go:278-280`), while `HasInCategory` reads the LIVE
+# structured-metadata category, which `Del` empties (`labels.go:273-275`).
+# The structured-metadata half needs per-entry metadata and so lives in
+# `tests/logql_json_key_sanitization.rs` (`c13`-`c15`, `c18`), not here.
+#
+# `label_format` also `Set(ParsedLabel, …)`s (`fmt.go:417`, `:431`), so its
+# destination blocks a later parser exactly like a parsed key does.
+#
+# THE EXPRESSION FORMS differ in step 3 ONLY: `| json a="p"` and
+# `| logfmt a="p"` never consult `Extracted` for their own identifiers
+# (`parser.go:671-731` has no such check; `parser.go:552-585` bypasses it
+# through `alwaysExtract`), so a repeat overwrites rather than vanishing.
+# Steps 1 and 2 are the same, and so is the thing that decides WHICH
+# repeat survives: every parser here reads the document once, in order,
+# and writes as it reads. For `| json <id>="<path>"` the reference does
+# that with a single `jsonparser.EachKey` scan (`parser.go:692`), so the
+# surviving write is the one the LINE reaches last, not the one written
+# last in the query — and each path fires at most once, so a repeated
+# document key resolves to its FIRST occurrence.
+#
+# `| unpack` is the second exception, in the other direction: it BUFFERS
+# every resolved pair and `Set`s the buffer only when the object carried a
+# string `_entry` (`parser.go:789-838`), so within one stage a repeat is
+# LAST-wins too, and an object without `_entry` extracts nothing at all.
+
+# =====================================================================
+# order: "first" is WIRE order, both directions
+# =====================================================================
+
+# --- two keys that sanitize alike: the first in the DOCUMENT wins -----
+load
+  {env="prod", service_name="kc-wire-a"}
+  0s  {"a-b":1,"a.b":2}
+
+eval instant at 60s {service_name="kc-wire-a"} | json
+  {env="prod", service_name="kc-wire-a", a_b="1"}  0s  {"a-b":1,"a.b":2}
+
+clear
+
+# --- the SAME two keys, swapped: the answer swaps with them. Sorted-key
+#     iteration would answer "1" for both rows; this pair is what makes
+#     the order claim falsifiable ---------------------------------------
+load
+  {env="prod", service_name="kc-wire-b"}
+  0s  {"a.b":2,"a-b":1}
+
+eval instant at 60s {service_name="kc-wire-b"} | json
+  {env="prod", service_name="kc-wire-b", a_b="2"}  0s  {"a.b":2,"a-b":1}
+
+clear
+
+# --- a flat key against a nested path that builds the same name -------
+load
+  {env="prod", service_name="kc-flatfirst"}
+  0s  {"x_y":2,"x":{"y":1}}
+
+eval instant at 60s {service_name="kc-flatfirst"} | json
+  {env="prod", service_name="kc-flatfirst", x_y="2"}  0s  {"x_y":2,"x":{"y":1}}
+
+clear
+
+# --- the same pair, swapped -------------------------------------------
+load
+  {env="prod", service_name="kc-nestfirst"}
+  0s  {"x":{"y":1},"x_y":2}
+
+eval instant at 60s {service_name="kc-nestfirst"} | json
+  {env="prod", service_name="kc-nestfirst", x_y="1"}  0s  {"x":{"y":1},"x_y":2}
+
+clear
+
+# =====================================================================
+# a key REPEATED in the line
+# =====================================================================
+
+# --- json: both occurrences are visited, the first wins ---------------
+load
+  {env="prod", service_name="kc-dup"}
+  0s  {"a":1,"a":2}
+
+eval instant at 60s {service_name="kc-dup"} | json
+  {env="prod", service_name="kc-dup", a="1"}  0s  {"a":1,"a":2}
+
+clear
+
+# --- the repeat is visited, not collapsed: two objects under one key
+#     contribute BOTH their leaves ------------------------------------
+load
+  {env="prod", service_name="kc-nestdup"}
+  0s  {"a":{"b":1},"a":{"c":2}}
+
+eval instant at 60s {service_name="kc-nestdup"} | json
+  {env="prod", service_name="kc-nestdup", a_b="1", a_c="2"}  0s  {"a":{"b":1},"a":{"c":2}}
+
+clear
+
+# --- the rename runs FIRST, so both occurrences resolve to the same
+#     suffixed name and the first still wins ---------------------------
+load
+  {env="prod", a="S", service_name="kc-dupbase"}
+  0s  {"a":1,"a":2}
+
+eval instant at 60s {service_name="kc-dupbase"} | json
+  {env="prod", a="S", service_name="kc-dupbase", a_extracted="1"}  0s  {"a":1,"a":2}
+
+clear
+
+# --- logfmt repeats the same way --------------------------------------
+load
+  {env="prod", service_name="kc-lf"}
+  0s  a=1 a=2
+
+eval instant at 60s {service_name="kc-lf"} | logfmt
+  {env="prod", service_name="kc-lf", a="1"}  0s  a=1 a=2
+
+clear
+
+load
+  {env="prod", a="S", service_name="kc-lfbase"}
+  0s  a=1 a=2
+
+eval instant at 60s {service_name="kc-lfbase"} | logfmt
+  {env="prod", a="S", service_name="kc-lfbase", a_extracted="1"}  0s  a=1 a=2
+
+clear
+
+# =====================================================================
+# across STAGES
+# =====================================================================
+
+# --- the second parser extracts nothing -------------------------------
+load
+  {env="prod", service_name="kc-2json"}
+  0s  {"a":1}
+
+eval instant at 60s {service_name="kc-2json"} | json | json
+  {env="prod", service_name="kc-2json", a="1"}  0s  {"a":1}
+
+clear
+
+# --- a different parser is no different -------------------------------
+load
+  {env="prod", service_name="kc-jre"}
+  0s  {"a":1}
+
+eval instant at 60s {service_name="kc-jre"} | json | regexp "^(?P<a>.)"
+  {env="prod", service_name="kc-jre", a="1"}  0s  {"a":1}
+
+clear
+
+load
+  {env="prod", service_name="kc-jpat"}
+  0s  {"a":1}
+
+eval instant at 60s {service_name="kc-jpat"} | json | pattern "<a>"
+  {env="prod", service_name="kc-jpat", a="1"}  0s  {"a":1}
+
+clear
+
+# --- `label_format`'s destination is a parsed Set, so it blocks the
+#     parser that follows -------------------------------------------
+load
+  {env="prod", service_name="kc-lfmt"}
+  0s  {"foo":1}
+
+eval instant at 60s {service_name="kc-lfmt"} | label_format foo="X" | json
+  {env="prod", service_name="kc-lfmt", foo="X"}  0s  {"foo":1}
+
+clear
+
+# =====================================================================
+# after the label is GONE
+# =====================================================================
+
+# --- dropped, then re-parsed: the name is still taken, so the whole
+#     extraction disappears -------------------------------------------
+load
+  {env="prod", service_name="kc-dropp"}
+  0s  {"a":1}
+
+eval instant at 60s {service_name="kc-dropp"} | json | drop a | json
+  {env="prod", service_name="kc-dropp"}  0s  {"a":1}
+
+clear
+
+# --- `keep` removes the same way (and takes the stream labels with it) -
+load
+  {env="prod", service_name="kc-keep"}
+  0s  {"a":1,"b":2}
+
+eval instant at 60s {service_name="kc-keep"} | json | keep b | json
+  {b="2"}  0s  {"a":1,"b":2}
+
+clear
+
+# --- `label_format a=a` is a Set THEN a Del, so it records `a` and
+#     leaves no label: the second parser finds the name taken ----------
+load
+  {env="prod", service_name="kc-lfself"}
+  0s  {"a":1}
+
+eval instant at 60s {service_name="kc-lfself"} | json | label_format a=a | json
+  {env="prod", service_name="kc-lfself"}  0s  {"a":1}
+
+clear
+
+# --- a dropped STREAM label is the other case: `BaseHas` never sees the
+#     drop, so the rename still fires ---------------------------------
+load
+  {env="prod", x="s", service_name="kc-dropbase"}
+  0s  {"x":1}
+
+eval instant at 60s {service_name="kc-dropbase"} | drop x | json
+  {env="prod", service_name="kc-dropbase", x_extracted="1"}  0s  {"x":1}
+
+clear
+
+# --- same at depth, where the suffix lands on the raw final part ------
+load
+  {env="prod", x_y="s", service_name="kc-dropnest"}
+  0s  {"x":{"y":1}}
+
+eval instant at 60s {service_name="kc-dropnest"} | drop x_y | json
+  {env="prod", service_name="kc-dropnest", x_y_extracted="1"}  0s  {"x":{"y":1}}
+
+clear
+
+# =====================================================================
+# the two exceptions
+# =====================================================================
+
+# --- expression form: two expressions naming one label. The winner is
+#     the LAST one the DOCUMENT reaches, not the last one written: the
+#     reference resolves the whole stage with one `jsonparser.EachKey`
+#     scan of the line (`parser.go:692`), which fires a callback as it
+#     passes each requested path. This row and the next differ only in
+#     the line's key order, and the answer follows it ------------------
+load
+  {env="prod", service_name="kc-jexpr"}
+  0s  {"p":1,"q":2}
+
+eval instant at 60s {service_name="kc-jexpr"} | json a="p", a="q"
+  {env="prod", service_name="kc-jexpr", a="2"}  0s  {"p":1,"q":2}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-rev"}
+  0s  {"q":2,"p":1}
+
+eval instant at 60s {service_name="kc-jexpr-rev"} | json a="p", a="q"
+  {env="prod", service_name="kc-jexpr-rev", a="1"}  0s  {"q":2,"p":1}
+
+clear
+
+# --- three paths, document order reversed against the expression list -
+load
+  {env="prod", service_name="kc-jexpr3"}
+  0s  {"r":3,"q":2,"p":1}
+
+eval instant at 60s {service_name="kc-jexpr3"} | json a="p", a="q", a="r"
+  {env="prod", service_name="kc-jexpr3", a="1"}  0s  {"r":3,"q":2,"p":1}
+
+clear
+
+# --- a nested path against a flat one: the walk reaches `z` before it
+#     reaches `x.y` here, and after it in the next row ------------------
+load
+  {env="prod", service_name="kc-jexpr-nest"}
+  0s  {"z":9,"x":{"y":1}}
+
+eval instant at 60s {service_name="kc-jexpr-nest"} | json a="x.y", a="z"
+  {env="prod", service_name="kc-jexpr-nest", a="1"}  0s  {"z":9,"x":{"y":1}}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-nest2"}
+  0s  {"x":{"y":1},"z":9}
+
+eval instant at 60s {service_name="kc-jexpr-nest2"} | json a="x.y", a="z"
+  {env="prod", service_name="kc-jexpr-nest2", a="9"}  0s  {"x":{"y":1},"z":9}
+
+clear
+
+# --- a repeated DOCUMENT key resolves to its FIRST occurrence — each
+#     expression fires at most once (`pathFlags[pi]`) — the opposite of
+#     the last-wins above, and at both depths ---------------------------
+load
+  {env="prod", service_name="kc-jexpr-dup"}
+  0s  {"p":1,"p":2}
+
+eval instant at 60s {service_name="kc-jexpr-dup"} | json a="p"
+  {env="prod", service_name="kc-jexpr-dup", a="1"}  0s  {"p":1,"p":2}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-dupn"}
+  0s  {"x":{"y":1},"x":{"y":2}}
+
+eval instant at 60s {service_name="kc-jexpr-dupn"} | json a="x.y"
+  {env="prod", service_name="kc-jexpr-dupn", a="1"}  0s  {"x":{"y":1},"x":{"y":2}}
+
+clear
+
+# --- an array index against a flat key: the array branch is part of the
+#     same single scan, so it takes its turn in document order too ------
+load
+  {env="prod", service_name="kc-jexpr-arr"}
+  0s  {"z":9,"arr":[7]}
+
+eval instant at 60s {service_name="kc-jexpr-arr"} | json a="arr[0]", a="z"
+  {env="prod", service_name="kc-jexpr-arr", a="7"}  0s  {"z":9,"arr":[7]}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-arr2"}
+  0s  {"arr":[7],"z":9}
+
+eval instant at 60s {service_name="kc-jexpr-arr2"} | json a="arr[0]", a="z"
+  {env="prod", service_name="kc-jexpr-arr2", a="9"}  0s  {"arr":[7],"z":9}
+
+clear
+
+# --- competing INDICES of one array resolve by ascending index, not by
+#     expression order: the reference collects the wanted indices and
+#     then walks the array once (`ArrayEach`), scanning the expressions
+#     only inside a single element -----------------------------------
+load
+  {env="prod", service_name="kc-jexpr-idx"}
+  0s  {"arr":[{"k":"K1"},{"k":"K2"},{"k":"K3"}]}
+
+eval instant at 60s {service_name="kc-jexpr-idx"} | json a="arr[2].k", a="arr[0].k", a="arr[1].k"
+  {env="prod", service_name="kc-jexpr-idx", a="K3"}  0s  {"arr":[{"k":"K1"},{"k":"K2"},{"k":"K3"}]}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-idx2"}
+  0s  {"arr":[10,20]}
+
+eval instant at 60s {service_name="kc-jexpr-idx2"} | json a="arr[1]", a="arr[0]"
+  {env="prod", service_name="kc-jexpr-idx2", a="20"}  0s  {"arr":[10,20]}
+
+clear
+
+# --- …and INSIDE one element the expression list does break the tie ---
+load
+  {env="prod", service_name="kc-jexpr-elord"}
+  0s  {"arr":[{"j":"J","k":"K"}]}
+
+eval instant at 60s {service_name="kc-jexpr-elord"} | json a="arr[0].k", a="arr[0].j"
+  {env="prod", service_name="kc-jexpr-elord", a="J"}  0s  {"arr":[{"j":"J","k":"K"}]}
+
+clear
+
+# --- a repeated key INSIDE an array element resolves to its first
+#     occurrence, like everywhere else (`searchKeys` returns at the
+#     first full match) ------------------------------------------------
+load
+  {env="prod", service_name="kc-jexpr-eldup"}
+  0s  {"arr":[{"k":"K1","k":"K2"}]}
+
+eval instant at 60s {service_name="kc-jexpr-eldup"} | json a="arr[0].k"
+  {env="prod", service_name="kc-jexpr-eldup", a="K1"}  0s  {"arr":[{"k":"K1","k":"K2"}]}
+
+clear
+
+# --- several expressions naming ONE path all fire at that key ---------
+load
+  {env="prod", service_name="kc-jexpr-share"}
+  0s  {"p":1}
+
+eval instant at 60s {service_name="kc-jexpr-share"} | json a="p", b="p"
+  {env="prod", service_name="kc-jexpr-share", a="1", b="1"}  0s  {"p":1}
+
+clear
+
+# --- the missing-path fill never overwrites a label that is already
+#     there, so a hit beside a miss keeps the hit ----------------------
+load
+  {env="prod", service_name="kc-jexpr-miss"}
+  0s  {"p":1}
+
+eval instant at 60s {service_name="kc-jexpr-miss"} | json a="p", a="nosuch"
+  {env="prod", service_name="kc-jexpr-miss", a="1"}  0s  {"p":1}
+
+clear
+
+# --- …and the label it looks for is the RAW identifier, so a stream
+#     label of that name suppresses the fill and is left alone ---------
+load
+  {env="prod", a="S", service_name="kc-jexpr-missb"}
+  0s  {"p":1}
+
+eval instant at 60s {service_name="kc-jexpr-missb"} | json a="nosuch"
+  {env="prod", a="S", service_name="kc-jexpr-missb"}  0s  {"p":1}
+
+clear
+
+# --- unpack: a repeat is LAST-wins, because the buffer is flushed after
+#     the whole object was walked ------------------------------------
+load
+  {env="prod", service_name="kc-unpdup"}
+  0s  {"a":"1","a":"2","_entry":"hi"}
+
+eval instant at 60s {service_name="kc-unpdup"} | unpack
+  {env="prod", service_name="kc-unpdup", a="2"}  0s  hi
+
+clear
+
+# --- and last-wins survives the rename --------------------------------
+load
+  {env="prod", a="S", service_name="kc-unpbase"}
+  0s  {"a":"1","a":"2","_entry":"hi"}
+
+eval instant at 60s {service_name="kc-unpbase"} | unpack
+  {env="prod", a="S", service_name="kc-unpbase", a_extracted="2"}  0s  hi
+
+clear
+
+# --- no `_entry`, no flush: nothing is extracted at all ---------------
+load
+  {env="prod", service_name="kc-unpnoe"}
+  0s  {"a":"1","a":"2"}
+
+eval instant at 60s {service_name="kc-unpnoe"} | unpack
+  {env="prod", service_name="kc-unpnoe"}  0s  {"a":"1","a":"2"}
+
+clear
+
+# --- unpack tests the RAW key, before sanitizing: `a-b` does not match
+#     the stream label `a_b`, so no rename fires and the buffered
+#     (sanitized) `a_b` overwrites the stream label ---------------------
+load
+  {env="prod", a_b="S", service_name="kc-unpraw"}
+  0s  {"a-b":"1","_entry":"x"}
+
+eval instant at 60s {service_name="kc-unpraw"} | unpack
+  {env="prod", a_b="1", service_name="kc-unpraw"}  0s  x
+
+clear

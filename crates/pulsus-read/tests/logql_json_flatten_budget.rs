@@ -489,8 +489,17 @@ fn the_metric_path_charges_the_same_key_budget() {
 // ---------------------------------------------------------------------
 
 /// The emitted pairs of an ordinary nested line are exactly what they
-/// were before the budget existed — same names, same order, same
-/// `null`/array skipping.
+/// were before the budget existed — same names, same `null`/array
+/// skipping.
+///
+/// The ORDER is the DOCUMENT's, not the sorted one it used to be
+/// (issue #334). The flatten walks the object in wire order now, as the
+/// reference's `jsonparser.ObjectEach` does, because once the FIRST
+/// extraction of a name wins the walk order decides which of two
+/// colliding keys survives. The emitted vector is unsorted by contract
+/// — renderers and grouping keys sort it — so this is an internal order
+/// only; it is still asserted positionally, so a silent re-sort fails
+/// here.
 #[test]
 fn ordinary_lines_flatten_exactly_as_before() {
     let compiled = compiled(r#"{app="a"} | json"#);
@@ -510,9 +519,9 @@ fn ordinary_lines_flatten_exactly_as_before() {
     assert_eq!(
         pairs,
         vec![
-            ("http_path".to_string(), "/x".to_string()),
-            ("http_status".to_string(), "200".to_string()),
             ("level".to_string(), "info".to_string()),
+            ("http_status".to_string(), "200".to_string()),
+            ("http_path".to_string(), "/x".to_string()),
             ("ok".to_string(), "true".to_string()),
         ]
     );

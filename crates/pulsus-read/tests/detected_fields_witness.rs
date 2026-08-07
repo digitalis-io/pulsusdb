@@ -1365,7 +1365,7 @@ const EXPECTED_CENSUS: [(FrameKey, &str); 15] = [
     (("detected_probe.rs", None, "auto_parse_observe"),
      ".as_refx2 .clearx1 .enumeratex1 .getx1 .intox1 .iterx1 .observe_pairx1 Errx1 Okx1 auto_parse_intox1 defaultx1 recycle_label_scratchx1"),
     (("labels.rs", None, "merge_labels_with_structured_metadata"),
-     ".anyx1 .clearx4 .clonedx1 .drainx1 .extendx1 .findx1 .is_emptyx1 .iterx2 .iter_mutx1 .lenx1 .pushx1 .push_strx1 parse_flat_labels_intox1"),
+     ".anyx1 .clearx4 .clonedx1 .drainx1 .extendx1 .findx1 .is_emptyx1 .iterx2 .iter_mutx1 .lenx1 .pushx1 .push_strx1 Somex1 parse_flat_labels_intox1"),
     (("labels.rs", None, "parse_flat_labels_into"),
      ".charsx1 .nextx3 .peekx3 .peekablex1 .pushx1 Somex1 parse_json_stringx2 skip_wsx3"),
     (("detected_probe.rs", None, "recycle_label_scratch"),

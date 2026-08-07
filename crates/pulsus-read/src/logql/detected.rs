@@ -815,15 +815,49 @@ mod tests {
     /// The `_extracted` collision rename re-points the path at the RENAMED
     /// label and records the UNSUFFIXED raw part — the reference trims the
     /// suffix back off in `buildJSONPathFromPrefixBuffer` (`parser.go:243
-    /// @ v3.7.4`). (Which of the two keys is renamed is the registered
-    /// #334 divergence and is not what this pins.)
+    /// @ v3.7.4`).
+    ///
+    /// Driven through a compiled `| json` over a STREAM label rather than
+    /// through [`auto_parse_paths`], because since issue #334 a
+    /// parsed-versus-parsed collision no longer renames at all — the first
+    /// extraction wins and the second is dropped, so `{"a-b":1,"a.b":2}`
+    /// is `a_b="1"` alone and never reaches the rename. `auto_parse` runs
+    /// with an EMPTY base, so a base collision is unreachable from it.
     #[test]
     fn json_path_follows_the_extracted_collision_rename() {
-        let (_, pairs) = auto_parse_paths(r#"{"a-b":1,"a.b":2}"#);
-        assert_eq!(path_of(&pairs, "a_b"), Some(vec!["a-b".to_string()]));
+        let expr = pulsus_logql::parse(r#"{app="x"} | json"#).expect("parse");
+        let pulsus_logql::Expr::Log(log) = expr else {
+            panic!("log query");
+        };
+        let compiled = CompiledPipeline::compile(&log.pipeline).expect("compile");
+        let base = owned(&[("a_b", "s")]);
+        let mut out = Vec::new();
+        let mut paths = JsonPaths::default();
+        compiled
+            .run_into_reporting_err_with_json_paths(
+                r#"{"a-b":1}"#,
+                &base,
+                0,
+                &mut out,
+                Some(&mut paths),
+            )
+            .expect("no budget breach");
+        let pairs: Vec<CapturedPair> = out
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                (
+                    k.to_string(),
+                    v.to_string(),
+                    paths.get(i).map(<[String]>::to_vec),
+                )
+            })
+            .collect();
+        assert_eq!(path_of(&pairs, "a_b"), None, "{pairs:?}");
         assert_eq!(
             path_of(&pairs, "a_b_extracted"),
-            Some(vec!["a.b".to_string()])
+            Some(vec!["a-b".to_string()]),
+            "{pairs:?}"
         );
     }
 

@@ -223,6 +223,27 @@ pub struct StructuredMetadataCtx {
     /// source of an empty-valued ordinary entry here is a stored
     /// `log_samples.structured_metadata` JSON.
     pub has_ordinary: bool,
+    /// How many LEADING entries of the merged base slice are STREAM labels
+    /// (issue #334). `None` — the `Default` — means "no structured metadata
+    /// was merged", i.e. every base entry is a stream label.
+    ///
+    /// The parser collision rule needs the two categories apart, because the
+    /// reference reads them from DIFFERENT places: `BaseHas` reads
+    /// `b.base`, the labels the stream carried when the builder was created
+    /// and which no stage can edit, while `HasInCategory(…,
+    /// StructuredMetadataLabel)` reads the LIVE category
+    /// (`pkg/logql/log/labels.go:266-274 @ v3.7.4`). A `drop` of a stream
+    /// label therefore keeps forcing the `_extracted` rename while a `drop`
+    /// of a structured-metadata label stops.
+    ///
+    /// An index rather than a name list because
+    /// [`merge_labels_with_structured_metadata`] only ever OVERWRITES inside
+    /// the seeded stream region or PUSHES past it, so the stream labels stay
+    /// exactly the leading `base_len` entries — and the double-collision case
+    /// (an SM value winning an existing `<key>_extracted` stream slot) lands
+    /// on the stream side, which is where the reference's `BaseHas` finds it
+    /// too.
+    pub stream_label_count: Option<usize>,
 }
 
 /// The shared no-structured-metadata context. NOT a `const`: `String` has a
@@ -232,6 +253,7 @@ pub static EMPTY_STRUCTURED_METADATA: StructuredMetadataCtx = StructuredMetadata
     err: String::new(),
     details: String::new(),
     has_ordinary: false,
+    stream_label_count: None,
 };
 
 impl StructuredMetadataCtx {
@@ -312,6 +334,10 @@ pub(in crate::logql) fn merge_labels_with_structured_metadata(
     merge_buf.clear();
     merge_buf.extend(base.iter().cloned());
     let base_len = merge_buf.len();
+    // The stream/structured-metadata split the parser collision rule reads
+    // (issue #334): everything below `base_len` is a stream label for the
+    // rest of the row, whatever the SM merge writes into it.
+    sm_ctx.stream_label_count = Some(base_len);
     sm_buf.clear();
     parse_flat_labels_into(structured_metadata, sm_buf);
     // `base_len` is small (a stream's label count), so these scans are bounded
