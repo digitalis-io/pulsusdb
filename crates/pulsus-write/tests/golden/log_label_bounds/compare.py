@@ -613,8 +613,8 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 #              would flip it to a divergence, which is itself the thing being
 #              recorded.
 #   -int-1000  1,000 nines.  Longer than the whole window, so no offset and no
-#              chunking can make it fit: 400 upstream under all five framings
-#              and all four offsets measured, 204 here.  The divergence in its
+#              chunking can make it fit: 400 upstream in all eight probes
+#              (five wire framings, four byte offsets), 204 here.  The divergence in its
 #              framing-INDEPENDENT form, which is why this is the row pinned
 #              expect="DIFF" and the fragile one is not.
 for _name, _value, _expect in (("overflow", "1e999", "SAME"),

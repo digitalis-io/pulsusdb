@@ -2303,7 +2303,8 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 /// because Go's `floatBits` raises its overflow flag only upward, and Rust's
 /// `f64` parse likewise yields a finite zero rather than an error. Each of
 /// those verdicts is invariant under wire chunking and under the token's byte
-/// offset (measured over four framings × three offsets, issue #374 round 15),
+/// offset (six probes per shape: four wire framings, and three byte offsets
+/// in one write — issue #374 round 15),
 /// because `trySkipNumber` bails to the slow path on `e` in every window.
 ///
 /// The LENGTH axis is a REGISTERED DIVERGENCE, not a rule we match. Ours is
@@ -4008,7 +4009,8 @@ mod tests {
         // 1,000 nines is the DIVERGENCE, asserted in the direction we chose.
         // A run this long cannot fit in upstream's 512-byte read window at any
         // offset or framing, so upstream evaluates and refuses it every time
-        // (measured `400` under five framings and four offsets, round 15),
+        // (eight probes: five wire framings, and four byte offsets in one
+        // write, all `400`, round 15),
         // while we accept it — deliberately, because upstream's answer at 400
         // nines flips with the wire chunking and ours cannot. Flipping this
         // assertion to a rejection would be adopting a framing-dependent

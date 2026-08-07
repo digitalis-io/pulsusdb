@@ -2250,8 +2250,8 @@ back up here.
   including both edges of the exponent rule (`1e999`, `1e309`,
   `1.7976931348623159e308` refused on both; `1e308`,
   `1.7976931348623157e308`, `1e-999`, `5e-324` accepted on both), and those
-  verdicts were re-measured under four framings and three offsets without
-  moving — `trySkipNumber` leaves the fast path on `e` in every window, so
+  verdicts were re-measured six ways each — four wire framings, three byte
+  offsets — without moving — `trySkipNumber` leaves the fast path on `e` in every window, so
   the exponent axis cannot depend on the buffer.
 
   Harness: `json/ignored-number-int-1000` is the recorded divergence;

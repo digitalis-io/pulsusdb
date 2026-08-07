@@ -1046,10 +1046,11 @@ json/ignored-number-int-1000
     acceptance surface that depends on socket behaviour.
     A run of 1,000 digits is the framing-INDEPENDENT corner of this: longer
     than the whole 512-byte window, so it cannot fit at any offset under any
-    chunking -- 400 upstream in all five framings and all four offsets
-    measured. That is why this row, and not the fragile `json/ignored-number-
-    int` (400 nines, which fits with 29 bytes to spare only because of where
-    this body puts it), is the one pinned as a divergence. The EXPONENT rows
+    chunking -- 400 upstream in all eight probes measured (five wire
+    framings, four byte offsets). That is why this row, and not the fragile
+    `json/ignored-number-int` (400 nines, which fits with 29 bytes to spare
+    only because of where this body puts it), is the one pinned as a
+    divergence. The EXPONENT rows
     of that group are not affected and are not a divergence: they were
     re-measured under the same framings and offsets and did not move. Ledger
     residual 10.
