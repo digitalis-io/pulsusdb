@@ -32,9 +32,9 @@
 //! they pre-date #264, and it neither changed nor covers them
 //! (docs/api.md §2.3).
 //!
-//! The container is pinned by test, not by this comment: every case in
-//! `tests` below goes through `rendered`, which asserts both headers and a
-//! single `Content-Type`, and the live wire leg is `api_conformance`'s
+//! The container is pinned by test, not by this comment:
+//! `tests::assert_reference_container` asserts both headers and rejects a
+//! duplicated `Content-Type`, and the live wire leg is `api_conformance`'s
 //! `PlainTextWriter::LogqlWriteError` arm.
 //!
 //! The container does not vary by status code, which is what lets the
@@ -244,13 +244,15 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
 mod tests {
     use super::*;
 
-    /// Renders an `ApiError` and returns `(status, body)`, asserting the
-    /// reference's two headers on the way through
-    /// (`pkg/util/server/error.go:48-49 @ v3.7.4`) so EVERY case below
-    /// covers the container, not just the one dedicated header test.
-    async fn rendered(err: ApiError) -> (StatusCode, String) {
-        let res = err.into_response();
-        let status = res.status();
+    /// Asserts the reference's error container on a rendered response:
+    /// both headers (`pkg/util/server/error.go:48-49 @ v3.7.4`), and that
+    /// `Content-Type` appears exactly once.
+    ///
+    /// The count matters because `plain_text_error` sets `Content-Type`
+    /// explicitly on top of a `String` body, which sets it too.
+    /// `HeaderMap::get` returns the first of a duplicated pair and hides
+    /// the second, and so would the conformance suite's header `HashMap`.
+    fn assert_reference_container(res: &Response) {
         assert_eq!(
             res.headers()
                 .get(header::CONTENT_TYPE)
@@ -263,15 +265,19 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("nosniff"),
         );
-        // `plain_text_error` sets `Content-Type` explicitly on top of a
-        // `String` body, which sets it too. `HeaderMap::get` would return
-        // the first of a duplicated pair and hide the second, and so
-        // would the conformance suite's header HashMap — count instead.
         assert_eq!(
             res.headers().get_all(header::CONTENT_TYPE).iter().count(),
             1,
             "exactly one Content-Type, never a duplicated pair",
         );
+    }
+
+    /// Renders an `ApiError` and returns `(status, body)`, checking the
+    /// container via [`assert_reference_container`] on the way through.
+    async fn rendered(err: ApiError) -> (StatusCode, String) {
+        let res = err.into_response();
+        let status = res.status();
+        assert_reference_container(&res);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .expect("read body");
@@ -286,12 +292,17 @@ mod tests {
     /// `pkg/util/server/error.go:51 @ v3.7.4` writes no terminator).
     /// Asserted on the raw bytes, not on a trimmed string, so a stray
     /// newline fails.
+    ///
+    /// Cannot use [`rendered`], which decodes the body to a `String`; it
+    /// calls [`assert_reference_container`] directly instead, so this test
+    /// covers the headers too rather than being the one hole in them.
     #[tokio::test]
     async fn an_error_is_the_bare_message_with_no_json_and_no_trailing_newline() {
         let res = ApiError::Read(ReadError::PipelineInvalid {
             reason: "bad regex: unclosed group".to_string(),
         })
         .into_response();
+        assert_reference_container(&res);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .expect("read body");

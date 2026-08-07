@@ -1069,11 +1069,10 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
             );
             // `nosniff` is what the two Loki writers AGREE on — Go's
             // `http.Error` sets it and so does `WriteError`
-            // (pkg/util/server/error.go:49 @ v3.7.4), and both were
-            // measured setting it on grafana/loki:3.7.4. Asserting it only
-            // for the query family is what let our own push responder omit
-            // it unnoticed, so it is keyed off `sets_nosniff` and not off
-            // the terminator distinction below.
+            // (pkg/util/server/error.go:49 @ v3.7.4). Asserting it only for
+            // the query family is what let our own push responder omit it
+            // unnoticed, so it is keyed off `sets_nosniff` and not off the
+            // terminator distinction below.
             if writer.sets_nosniff() {
                 assert_eq!(
                     res.header("x-content-type-options"),

@@ -901,8 +901,8 @@ async fn query_instant_returns_a_vector_for_a_metric_query() {
 /// Issue #264: on the wire, a LogQL error is the reference's bare
 /// `text/plain` body — `Content-Type: text/plain; charset=utf-8` +
 /// `X-Content-Type-Options: nosniff`, the message and nothing else, no
-/// trailing newline (`pkg/util/server/error.go:46-52 @ v3.7.4`; probed
-/// identical on `grafana/loki:3.7.4`). This is the end-to-end leg: the
+/// trailing newline (`pkg/util/server/error.go:46-52 @ v3.7.4`). This
+/// is the end-to-end leg: the
 /// hermetic tests assert the `Response` this handler builds, this one
 /// asserts what a socket actually receives from a spawned server.
 #[tokio::test]

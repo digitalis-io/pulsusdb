@@ -440,9 +440,9 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
 /// …)` (`pkg/distributor/http.go:27-30 @ v3.7.4`) — and a label-bound breach
 /// leaves `PushWithResolver` as an `httpgrpc` error that the same handler
 /// hands to that writer (`http.go:161-171`), i.e. to `http.Error` ->
-/// `fmt.Fprintln` (`pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Measured on
-/// `grafana/loki@sha256:87f0a067…`: a 2049-byte `app` value answers `400`
-/// whose last body byte is `0x0a`.
+/// `fmt.Fprintln` (`pkg/loghttp/push/push.go:606-608 @ v3.7.4`). The
+/// terminator is pinned by
+/// `tests::loki_over_long_label_value_is_400_with_the_reference_message`.
 ///
 /// The OTLP path deliberately does NOT go through here — its body is a
 /// `google.rpc.Status` protobuf written by `push.OTLPError`, which has no
