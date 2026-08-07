@@ -41,10 +41,17 @@
 # `label_format` also `Set(ParsedLabel, …)`s (`fmt.go:417`, `:431`), so its
 # destination blocks a later parser exactly like a parsed key does.
 #
-# THE EXPRESSION FORMS are the exception: `| json a="p"` and
+# THE EXPRESSION FORMS differ in step 3 ONLY: `| json a="p"` and
 # `| logfmt a="p"` never consult `Extracted` for their own identifiers
 # (`parser.go:671-731` has no such check; `parser.go:552-585` bypasses it
-# through `alwaysExtract`), so a repeat is LAST-wins.
+# through `alwaysExtract`), so a repeat overwrites rather than vanishing.
+# Steps 1 and 2 are the same, and so is the thing that decides WHICH
+# repeat survives: every parser here reads the document once, in order,
+# and writes as it reads. For `| json <id>="<path>"` the reference does
+# that with a single `jsonparser.EachKey` scan (`parser.go:692`), so the
+# surviving write is the one the LINE reaches last, not the one written
+# last in the query — and each path fires at most once, so a repeated
+# document key resolves to its FIRST occurrence.
 #
 # `| unpack` is the second exception, in the other direction: it BUFFERS
 # every resolved pair and `Set`s the buffer only when the object carried a
@@ -257,13 +264,130 @@ clear
 # the two exceptions
 # =====================================================================
 
-# --- expression form: two expressions naming one label, last wins -----
+# --- expression form: two expressions naming one label. The winner is
+#     the LAST one the DOCUMENT reaches, not the last one written: the
+#     reference resolves the whole stage with one `jsonparser.EachKey`
+#     scan of the line (`parser.go:692`), which fires a callback as it
+#     passes each requested path. This row and the next differ only in
+#     the line's key order, and the answer follows it ------------------
 load
   {env="prod", service_name="kc-jexpr"}
   0s  {"p":1,"q":2}
 
 eval instant at 60s {service_name="kc-jexpr"} | json a="p", a="q"
   {env="prod", service_name="kc-jexpr", a="2"}  0s  {"p":1,"q":2}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-rev"}
+  0s  {"q":2,"p":1}
+
+eval instant at 60s {service_name="kc-jexpr-rev"} | json a="p", a="q"
+  {env="prod", service_name="kc-jexpr-rev", a="1"}  0s  {"q":2,"p":1}
+
+clear
+
+# --- three paths, document order reversed against the expression list -
+load
+  {env="prod", service_name="kc-jexpr3"}
+  0s  {"r":3,"q":2,"p":1}
+
+eval instant at 60s {service_name="kc-jexpr3"} | json a="p", a="q", a="r"
+  {env="prod", service_name="kc-jexpr3", a="1"}  0s  {"r":3,"q":2,"p":1}
+
+clear
+
+# --- a nested path against a flat one: the walk reaches `z` before it
+#     reaches `x.y` here, and after it in the next row ------------------
+load
+  {env="prod", service_name="kc-jexpr-nest"}
+  0s  {"z":9,"x":{"y":1}}
+
+eval instant at 60s {service_name="kc-jexpr-nest"} | json a="x.y", a="z"
+  {env="prod", service_name="kc-jexpr-nest", a="1"}  0s  {"z":9,"x":{"y":1}}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-nest2"}
+  0s  {"x":{"y":1},"z":9}
+
+eval instant at 60s {service_name="kc-jexpr-nest2"} | json a="x.y", a="z"
+  {env="prod", service_name="kc-jexpr-nest2", a="9"}  0s  {"x":{"y":1},"z":9}
+
+clear
+
+# --- a repeated DOCUMENT key resolves to its FIRST occurrence — each
+#     expression fires at most once (`pathFlags[pi]`) — the opposite of
+#     the last-wins above, and at both depths ---------------------------
+load
+  {env="prod", service_name="kc-jexpr-dup"}
+  0s  {"p":1,"p":2}
+
+eval instant at 60s {service_name="kc-jexpr-dup"} | json a="p"
+  {env="prod", service_name="kc-jexpr-dup", a="1"}  0s  {"p":1,"p":2}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-dupn"}
+  0s  {"x":{"y":1},"x":{"y":2}}
+
+eval instant at 60s {service_name="kc-jexpr-dupn"} | json a="x.y"
+  {env="prod", service_name="kc-jexpr-dupn", a="1"}  0s  {"x":{"y":1},"x":{"y":2}}
+
+clear
+
+# --- an array index against a flat key: the array branch is part of the
+#     same single scan, so it takes its turn in document order too ------
+load
+  {env="prod", service_name="kc-jexpr-arr"}
+  0s  {"z":9,"arr":[7]}
+
+eval instant at 60s {service_name="kc-jexpr-arr"} | json a="arr[0]", a="z"
+  {env="prod", service_name="kc-jexpr-arr", a="7"}  0s  {"z":9,"arr":[7]}
+
+clear
+
+load
+  {env="prod", service_name="kc-jexpr-arr2"}
+  0s  {"arr":[7],"z":9}
+
+eval instant at 60s {service_name="kc-jexpr-arr2"} | json a="arr[0]", a="z"
+  {env="prod", service_name="kc-jexpr-arr2", a="9"}  0s  {"arr":[7],"z":9}
+
+clear
+
+# --- several expressions naming ONE path all fire at that key ---------
+load
+  {env="prod", service_name="kc-jexpr-share"}
+  0s  {"p":1}
+
+eval instant at 60s {service_name="kc-jexpr-share"} | json a="p", b="p"
+  {env="prod", service_name="kc-jexpr-share", a="1", b="1"}  0s  {"p":1}
+
+clear
+
+# --- the missing-path fill never overwrites a label that is already
+#     there, so a hit beside a miss keeps the hit ----------------------
+load
+  {env="prod", service_name="kc-jexpr-miss"}
+  0s  {"p":1}
+
+eval instant at 60s {service_name="kc-jexpr-miss"} | json a="p", a="nosuch"
+  {env="prod", service_name="kc-jexpr-miss", a="1"}  0s  {"p":1}
+
+clear
+
+# --- …and the label it looks for is the RAW identifier, so a stream
+#     label of that name suppresses the fill and is left alone ---------
+load
+  {env="prod", a="S", service_name="kc-jexpr-missb"}
+  0s  {"p":1}
+
+eval instant at 60s {service_name="kc-jexpr-missb"} | json a="nosuch"
+  {env="prod", a="S", service_name="kc-jexpr-missb"}  0s  {"p":1}
 
 clear
 

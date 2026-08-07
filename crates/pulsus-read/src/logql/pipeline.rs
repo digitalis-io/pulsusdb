@@ -3335,14 +3335,20 @@ struct ExtractionState<'a, 'r> {
 
 /// What a parser does when its resolved key is already extracted.
 ///
-/// The EXPRESSION parsers (`| json a="p"`, `| logfmt a="p"`) never
-/// consult `ParserHint.Extracted` for their own identifiers:
-/// `JSONExpressionParser.Process` has no such check at all
-/// (`pkg/logql/log/parser.go:671-731 @ v3.7.4`) and
+/// **Every parser here reads the same document in the same order and
+/// writes in the order it reads.** That is the shared rule, and it is
+/// what a first version of this got wrong by treating the expression
+/// forms as a special case: they consult `ParserHint.Extracted` for
+/// their own identifiers where the implicit parsers do — no such check
+/// exists in `JSONExpressionParser.Process`
+/// (`pkg/logql/log/parser.go:671-731 @ v3.7.4`), and
 /// `LogfmtExpressionParser` bypasses it through `alwaysExtract`
-/// (`parser.go:552-585`), so two expressions naming the same label just
-/// `Set` twice and the LAST one wins — container-captured at v3.7.4,
-/// `| json a="p", a="q"` over `{"p":1,"q":2}` yields `a="2"`.
+/// (`parser.go:552-585`) — so a repeat overwrites instead of vanishing.
+/// It does NOT make the WRITE ORDER a different question: the
+/// last-writer is still whichever the DOCUMENT reaches last, which is
+/// why `| json a="p", a="q"` is `a="2"` over `{"p":1,"q":2}` and `a="1"`
+/// over `{"q":2,"p":1}` (both captured at v3.7.4). See
+/// [`run_json_targets`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnAlreadyExtracted {
     /// Implicit parsers (`json` full flatten, `logfmt`, `regexp`,
@@ -4089,15 +4095,51 @@ impl<'v> JsonPathCapture<'v, '_> {
 /// every occurrence delivered — captured at v3.7.4 for both orders and
 /// for `{"a":{"b":1},"a":{"c":2}}`, which yields BOTH `a_b` and `a_c`.
 ///
-/// Only OBJECTS need the new representation: arrays are skipped by the
-/// flatten and ignored by `unpack`, and scalars are leaves, so everything
-/// that is not an object stays a `serde_json::Value` and keeps its
-/// pinned rendering (`float_roundtrip` number formatting included).
+/// The TARGETED form needs it too (issue #334 review round 1): the
+/// reference resolves `| json a="p", a="q"` with `jsonparser.EachKey`
+/// (`parser.go:692 @ v3.7.4`), which walks the DOCUMENT and fires a
+/// callback per matched path as it passes it, so the winner is decided
+/// by document order and not by the order the expressions were written
+/// — `{"q":2,"p":1}` gives `a="1"` at the container. See
+/// [`run_json_targets`].
+///
+/// Scalars stay `serde_json::Value` so their pinned rendering
+/// (`float_roundtrip` number formatting included) is untouched, and an
+/// object reached by a targeted path is converted back
+/// ([`wire_json_to_value`]) so ITS rendering is untouched too.
+///
+/// **Depth is bounded by the parser, not by this type.** `serde_json`'s
+/// deserializer refuses a document nested past its own recursion limit,
+/// so no line can build a `WireJson` deeper than that and neither its
+/// `Drop` nor the walks over it can run away: measured on this build,
+/// nesting of 127 parses, 128 is a `JSONParserErr`, and 5 000 answers the
+/// same way rather than overflowing the stack
+/// (`json_nesting_past_the_parser_limit_is_a_parse_error`). That is the
+/// bound `serde_json::Value` already carried here before this type
+/// existed, and it is why `| json` keeps an ordinary recursive tree
+/// instead of #272's iterative-dismantle machinery, which exists for the
+/// query AST — bounded only by the query-text cap.
 #[derive(Debug)]
 enum WireJson {
     /// Fields in the order the document listed them, duplicates included.
     Object(Vec<(String, WireJson)>),
-    /// Any non-object value, rendered by `serde_json` exactly as before.
+    /// Everything that is not an object, `serde_json`'s own value so its
+    /// pinned rendering (`float_roundtrip` number formatting included) is
+    /// untouched.
+    ///
+    /// **Arrays stay here on purpose.** Nothing derives a label NAME from
+    /// inside one — the flatten skips arrays outright (`parser.go:105-114`
+    /// handles only string/number/boolean/object) and `unpack` takes only
+    /// top-level strings — so the only reader is a targeted `[i]` path,
+    /// which the reference itself resolves with a self-contained
+    /// `searchKeys` on the ELEMENT rather than through the document scan
+    /// (`vendor/github.com/grafana/jsonparser/parser.go:497-540 @ v3.7.4`).
+    /// Giving arrays their own `Vec<WireJson>` variant would put a second
+    /// recursive spelling in this crate and move
+    /// `tests/recursion_census.rs`'s pinned set, which is a #272 design
+    /// decision and not this issue's to make. The cost is named on the
+    /// issue: duplicate keys inside an array ELEMENT resolve to the last
+    /// here and to the first there.
     Leaf(serde_json::Value),
 }
 
@@ -4147,9 +4189,6 @@ impl<'de> serde::de::Visitor<'de> for WireJsonVisitor {
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<WireJson, A::Error> {
-        // Arrays are never walked for label names, so their elements go
-        // back to `serde_json::Value` — ordering inside one is not
-        // observable.
         let mut out = Vec::new();
         while let Some(v) = seq.next_element::<serde_json::Value>()? {
             out.push(v);
@@ -4239,30 +4278,265 @@ fn run_json<'a>(
             capture.as_mut(),
         )?;
     } else {
-        // The expression form names its own labels, so field order is not
-        // observable; it keeps `serde_json::Value` and its path lookup.
-        let parsed: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v @ serde_json::Value::Object(_)) => v,
+        // The targeted form needs the same shape (issue #334 review round
+        // 1): its winner is decided by DOCUMENT order, not by the order
+        // the expressions were written, and a repeated document key
+        // resolves to its FIRST occurrence.
+        let parsed: WireJson = match serde_json::from_str(line) {
+            Ok(v @ WireJson::Object(_)) => v,
             _ => {
                 malformed(errs);
                 return Ok(());
             }
         };
-        for (label, path) in extractions {
-            let value = lookup_json_path(&parsed, path)
-                .map(json_scalar_to_string)
-                .unwrap_or_default();
-            add_extracted(
-                labels,
-                st,
-                Cow::Borrowed(label.as_str()),
-                Cow::Owned(value),
-                OnAlreadyExtracted::Overwrite,
-                &mut errs.dirty,
-            );
-        }
+        run_json_targets(&parsed, extractions, labels, st, &mut errs.dirty);
     }
     Ok(())
+}
+
+/// `| json <id>="<path>", …` — the reference's `JSONExpressionParser`
+/// (`pkg/logql/log/parser.go:671-731 @ v3.7.4`), whose whole behaviour is
+/// `jsonparser.EachKey`'s (`vendor/github.com/grafana/jsonparser/parser.go:383-495`).
+///
+/// **It is a DOCUMENT walk, not a loop over the expressions**, and that is
+/// the one thing about it worth stating, because writing it the obvious
+/// way — resolve each requested path, write in expression order — gets
+/// four separate cells wrong. `EachKey` scans the line once and fires the
+/// callback the moment it passes a value whose path was asked for, so:
+///
+/// - **document order decides the winner.** `| json a="p", a="q"` is
+///   `a="2"` over `{"p":1,"q":2}` and `a="1"` over `{"q":2,"p":1}` — the
+///   expression list is identical, only the line moved. Captured at
+///   v3.7.4, both directions, and at three paths.
+/// - **each path fires AT MOST ONCE** (`pathFlags[pi]`, `parser.go:466`),
+///   so a repeated document key resolves to its FIRST occurrence:
+///   `| json a="p"` over `{"p":1,"p":2}` is `a="1"`, and the same holds
+///   one level down.
+/// - **several expressions naming ONE path all fire**, at that key, in
+///   the order they were written (the inner `for pi, p := range paths`),
+///   so `| json a="p", b="p"` sets both.
+/// - **the missing-path fill is guarded and does not rename.** Only when
+///   FEWER callbacks fired than there are expressions does the reference
+///   walk the identifiers and `Set(ParsedLabel, id, "")` for each one the
+///   label set does not already hold (`parser.go:714-720`) — reading and
+///   writing the RAW identifier, with no `_extracted` rename. So
+///   `| json a="p", a="nosuch"` over `{"p":1}` keeps `a="1"` rather than
+///   blanking it, and `| json a="nosuch"` against a stream label `a`
+///   leaves that label alone. Both captured.
+///
+/// Unlike the implicit parsers this never consults
+/// `ParserHint.Extracted`, so [`OnAlreadyExtracted::Overwrite`]: each
+/// fired write is a plain `Set`, renamed on a stream/metadata collision
+/// like any other parsed label.
+fn run_json_targets<'a>(
+    root: &WireJson,
+    extractions: &'a [(String, Vec<JsonPathSeg>)],
+    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    st: &mut ExtractionState<'a, '_>,
+    dirty: &mut bool,
+) {
+    let mut walk = TargetWalk {
+        extractions,
+        flagged: vec![false; extractions.len()],
+        flagged_count: 0,
+        fired: 0,
+    };
+    let mut stack: Vec<&str> = Vec::with_capacity(4);
+    walk.visit(root, &mut stack, labels, st, dirty);
+    // `matches < len(j.ids)` (`parser.go:714`): the fill runs only when
+    // some expression produced no write at all.
+    if walk.fired < extractions.len() {
+        for (id, _) in extractions {
+            if get_label(labels, id).is_none() {
+                *dirty = true;
+                let id = st.note_parsed_set(Cow::Borrowed(id.as_str()));
+                set_label(labels, id, Cow::Borrowed(""));
+            }
+        }
+    }
+}
+
+/// The per-line state of one targeted `| json` stage's document walk —
+/// `EachKey`'s `pathFlags`/`pathsMatched` plus the callback count the
+/// missing-path fill is gated on.
+struct TargetWalk<'a> {
+    extractions: &'a [(String, Vec<JsonPathSeg>)],
+    /// `pathFlags` — an expression that has already resolved is inert for
+    /// the rest of the line, which is what makes a repeated document key
+    /// resolve to its FIRST occurrence.
+    flagged: Vec<bool>,
+    /// `pathsMatched` — when every expression is flagged the reference
+    /// returns from the scan; nothing later could match.
+    flagged_count: usize,
+    /// The reference's `matches`: callbacks that actually FIRED. Lower
+    /// than `flagged_count` when a path selected an array element that
+    /// turned out not to exist (`EachKey` flags it either way).
+    fired: usize,
+}
+
+impl<'a> TargetWalk<'a> {
+    /// Walks `node`, whose position in the document is `stack`, firing
+    /// every expression whose path resolves there.
+    fn visit<'v>(
+        &mut self,
+        node: &'v WireJson,
+        stack: &mut Vec<&'v str>,
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        st: &mut ExtractionState<'a, '_>,
+        dirty: &mut bool,
+    ) {
+        if self.flagged_count == self.extractions.len() {
+            return;
+        }
+        match node {
+            WireJson::Object(fields) => {
+                for (key, value) in fields {
+                    stack.push(key);
+                    self.fire_exact(stack, value, labels, st, dirty);
+                    self.visit(value, stack, labels, st, dirty);
+                    stack.pop();
+                    if self.flagged_count == self.extractions.len() {
+                        return;
+                    }
+                }
+            }
+            // `EachKey`'s `case '['` branch: every not-yet-flagged
+            // expression whose next segment indexes THIS array is resolved
+            // here, in the order the expressions were written, and is
+            // flagged whether or not the element exists.
+            WireJson::Leaf(serde_json::Value::Array(items)) => {
+                self.fire_indexed(items, stack, labels, st, dirty);
+            }
+            WireJson::Leaf(_) => {}
+        }
+    }
+
+    /// Fires every expression whose path is EXACTLY `stack`.
+    fn fire_exact(
+        &mut self,
+        stack: &[&str],
+        value: &WireJson,
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        st: &mut ExtractionState<'a, '_>,
+        dirty: &mut bool,
+    ) {
+        for i in 0..self.extractions.len() {
+            if self.flagged[i] || !path_is_fields(&self.extractions[i].1, stack) {
+                continue;
+            }
+            self.flagged[i] = true;
+            self.flagged_count += 1;
+            self.fired += 1;
+            self.write(i, wire_json_to_string(value), labels, st, dirty);
+        }
+    }
+
+    /// Fires every expression that indexes the array at `stack`.
+    fn fire_indexed(
+        &mut self,
+        items: &[serde_json::Value],
+        stack: &[&str],
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        st: &mut ExtractionState<'a, '_>,
+        dirty: &mut bool,
+    ) {
+        for i in 0..self.extractions.len() {
+            let path = &self.extractions[i].1;
+            if self.flagged[i]
+                || path.len() <= stack.len()
+                || !path_is_fields(&path[..stack.len()], stack)
+            {
+                continue;
+            }
+            let JsonPathSeg::Index(idx) = path[stack.len()] else {
+                continue;
+            };
+            self.flagged[i] = true;
+            self.flagged_count += 1;
+            // `searchKeys` on the element, then `if of != -1` — a miss
+            // stays flagged but fires no callback.
+            let Some(found) = items
+                .get(idx)
+                .and_then(|item| lookup_json_path(item, &path[stack.len() + 1..]))
+            else {
+                continue;
+            };
+            self.fired += 1;
+            self.write(i, json_scalar_to_string(found), labels, st, dirty);
+        }
+    }
+
+    fn write(
+        &mut self,
+        i: usize,
+        value: String,
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        st: &mut ExtractionState<'a, '_>,
+        dirty: &mut bool,
+    ) {
+        add_extracted(
+            labels,
+            st,
+            Cow::Borrowed(self.extractions[i].0.as_str()),
+            Cow::Owned(value),
+            OnAlreadyExtracted::Overwrite,
+            dirty,
+        );
+    }
+}
+
+/// Whether `path` is exactly the field chain `stack` — the reference's
+/// `len(p) == level && equalStr(key, p[level-1]) && sameTree(...)`. An
+/// `[i]` segment never satisfies it; those are the array branch's.
+fn path_is_fields(path: &[JsonPathSeg], stack: &[&str]) -> bool {
+    path.len() == stack.len()
+        && path
+            .iter()
+            .zip(stack)
+            .all(|(seg, want)| matches!(seg, JsonPathSeg::Field(name) if name == want))
+}
+
+/// The reference's `searchKeys` inside ONE array element: first matching
+/// field at each step, elements by index.
+fn lookup_json_path<'v>(
+    root: &'v serde_json::Value,
+    path: &[JsonPathSeg],
+) -> Option<&'v serde_json::Value> {
+    let mut cur = root;
+    for seg in path {
+        cur = match seg {
+            JsonPathSeg::Field(name) => cur.get(name)?,
+            JsonPathSeg::Index(idx) => cur.get(idx)?,
+        };
+    }
+    Some(cur)
+}
+
+/// One targeted extraction's value as a label value. A scalar renders
+/// exactly as it always has; an OBJECT is rebuilt as a
+/// `serde_json::Value` first, so its rendering is unchanged too — see the
+/// follow-up noted on the issue, where the reference writes the value's
+/// RAW BYTES and so keeps both the document's key order and its
+/// whitespace.
+fn wire_json_to_string(node: &WireJson) -> String {
+    match node {
+        WireJson::Leaf(v) => json_scalar_to_string(v),
+        object => json_scalar_to_string(&wire_json_to_value(object)),
+    }
+}
+
+/// A `WireJson` node as the `serde_json::Value` it would have been —
+/// needed only by [`wire_json_to_string`]'s object arm.
+fn wire_json_to_value(node: &WireJson) -> serde_json::Value {
+    match node {
+        WireJson::Leaf(v) => v.clone(),
+        WireJson::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), wire_json_to_value(v)))
+                .collect(),
+        ),
+    }
 }
 
 /// Full-flatten: nested objects join with `_`; scalars stringify; arrays
@@ -4660,20 +4934,6 @@ fn push_suffixed_part(out: &mut String, prefix: &str, raw_part: &str) {
         }
     }
     out.push_str(DUPLICATE_SUFFIX);
-}
-
-fn lookup_json_path<'v>(
-    root: &'v serde_json::Value,
-    path: &[JsonPathSeg],
-) -> Option<&'v serde_json::Value> {
-    let mut cur = root;
-    for seg in path {
-        cur = match seg {
-            JsonPathSeg::Field(name) => cur.get(name)?,
-            JsonPathSeg::Index(idx) => cur.get(idx)?,
-        };
-    }
-    Some(cur)
 }
 
 /// Scalars stringify without quotes; a targeted extraction that lands on

@@ -485,6 +485,55 @@ fn the_metric_path_charges_the_same_key_budget() {
 }
 
 // ---------------------------------------------------------------------
+// The parser's own nesting bound (issue #334)
+// ---------------------------------------------------------------------
+
+/// `WireJson`'s depth is bounded by `serde_json`'s deserializer, not by
+/// anything this crate does: a document nested past its recursion limit
+/// is refused, so no line can build a tree deep enough for the walks over
+/// it — or its `Drop` — to run away. Measured rather than assumed, and it
+/// is what lets `| json` keep an ordinary recursive tree instead of the
+/// #272 iterative-dismantle machinery the query AST needs.
+///
+/// A breach is the ordinary malformed-line class: line kept,
+/// `__error__="JSONParserErr"`, no extracted label.
+#[test]
+fn json_nesting_past_the_parser_limit_is_a_parse_error() {
+    fn nested(depth: usize) -> String {
+        let mut s = String::with_capacity(depth * 6 + 8);
+        for _ in 0..depth {
+            s.push_str("{\"a\":");
+        }
+        s.push('1');
+        for _ in 0..depth {
+            s.push('}');
+        }
+        s
+    }
+    let compiled = compiled(r#"{app="a"} | json"#);
+    let names = |line: &str| -> Vec<String> {
+        compiled
+            .run(line, &[], 0)
+            .expect("a nesting breach is a parse error, never a budget breach")
+            .expect("the line is kept")
+            .labels
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .collect()
+    };
+    // 127 nested `{"a": …}` flatten to one leaf named `a_a_…_a`.
+    let deepest_ok: String = std::iter::repeat_n("a", 127).collect::<Vec<_>>().join("_");
+    assert_eq!(names(&nested(127)), vec![deepest_ok], "127 levels parse");
+    for depth in [128usize, 200, 5_000] {
+        assert_eq!(
+            names(&nested(depth)),
+            vec!["__error__".to_string(), "__error_details__".to_string()],
+            "{depth} levels must be refused by the parser, not overflow the stack"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
 // Below the budget, nothing changed
 // ---------------------------------------------------------------------
 
