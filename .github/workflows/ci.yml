@@ -582,6 +582,24 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_nested_ip_matrix
 
+      # Issue #247: the `| logfmt <id>="<expr>"` extraction-expression
+      # accept/reject matrix — every position the extraction can occupy x
+      # the expression shapes that discriminate the reference's own
+      # sub-grammar (pkg/logql/log/logfmt/ @ v3.7.4), plus the extraction
+      # -list shapes, plus a per-route surface axis. Put to this same
+      # container and compared against the verdicts committed in the
+      # test. The window ends at `now`, which is load-bearing: a
+      # sub-grammar rejection is a 200 there once the window's end is
+      # older than query_ingesters_within, so a stale window would score
+      # the reference as accepting all of it. Status only, no pushes. The
+      # hermetic half (PulsusDB's own verdict at parse -> plan -> compile,
+      # and the pre-#247 rule replayed over the same matrix) runs in the
+      # `ci` job with the gate off.
+      - name: LogQL differential leg (logfmt expression matrix, issue #247)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_logfmt_expr_matrix
+
       # Issue #339: the keyword case-folding table. Its verdicts were
       # CAPTURED from this same container (which keywords fold, which
       # token classes are case-sensitive); this leg replays them so the

@@ -1981,10 +1981,20 @@ absence of a corpus row for an oversight.
   | `{app=` | `400` | `400` |
   | `count_over_time({app="x"}[5m]) +` | `400` | `400` |
   | `{app="checkout"} \| unwrap foo \| __error__=` \`x\` | `400` | `400` |
+  | `{app="checkout"} \| logfmt a="b.c"` | `400` | `200` |
+  | `{app="checkout"} \| logfmt a="b",` | `400` | `400` |
 
   A syntax error is refused in both windows; an error the parser accepts
   and the pipeline builder rejects is refused only while the ingester is
   in the query's path.
+
+  The last two rows (issue #247, measured 2026-08-07 on the same pinned
+  image) are the same construct split across both classes, so they show
+  the boundary rather than merely instancing one side of it. A malformed
+  extraction EXPRESSION is refused by the logfmt sub-grammar at
+  `Stage()`, which is pipeline-build — window-dependent. A dangling comma
+  in the extraction LIST is a `syntax.y` production error refused by
+  `ParseExpr` — window-independent. Both are `400` in every window here.
 
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:

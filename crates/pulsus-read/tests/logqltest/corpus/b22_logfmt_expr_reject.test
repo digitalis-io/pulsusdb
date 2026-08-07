@@ -1,0 +1,189 @@
+# b22 — the `| logfmt <id>="<expr>"` extraction EXPRESSION: which shapes
+# are refused, and what a surviving one resolves to (issue #247).
+#
+# Reference of record: grafana/loki:3.7.4, digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc.
+# Container identity READ FROM THE RUNNING PROCESS, not from this header:
+# /loki/api/v1/status/buildinfo answered {"version":"3.7.4",
+# "revision":"b318f282","branch":"release-3.7.x"} — the same b318f282 the
+# pinned digest and the Go checkout at v3.7.4 resolve to. Captured
+# 2026-08-07 over a window ENDING AT NOW, which is load-bearing: a
+# layer-2 rejection is a 200 on the reference once the window's end is
+# older than `query_ingesters_within` (measured on this container: the
+# same query is 400 over a recent window and 200 over one ending 4 h
+# back; ledgered as `malformed-query-refused-in-every-window`, #380).
+#
+# THE RULE, read off the reference's source and then measured. A logfmt
+# extraction expression has a grammar of its OWN — a lexer
+# (pkg/logql/log/logfmt/lexer.go @ v3.7.4), a yacc grammar whose
+# `expressions` rule carries three productions (logfmtexpr.y:26-39, the
+# whole grammar) and a driver (logfmt/parser.go:11-19) —
+# run per expression by NewLogfmtExpressionParser
+# (pkg/logql/log/parser.go:506-529) at Stage() time, whose error becomes a
+# ParseError and therefore a 400 (syntax/ast.go:227,
+# util/server/error.go:110-117). It admits:
+#
+#   a KEY          [A-Za-z_][A-Za-z0-9_]*          lexer.go:67-73
+#   a STRING       "…" to the next " or ] or EOF   lexer.go:100-121
+#                  (escapes NOT honoured; delimiters dropped)
+#   and the sequence KEY? STRING*  — no `expressions key` production,
+#                                    so a KEY may only come first
+#                                                  logfmtexpr.y:29-33
+#
+# Anything else ends the scan. When something was already shifted the
+# lexer's `unexpected char <c>` stands; when nothing was, the yacc error
+# overwrites it and the user is told `unexpected $end` instead — the two
+# classes say WHICH character was at fault, so both are pinned below.
+#
+# WHAT A SURVIVING EXPRESSION RESOLVES TO. The source key is the PARSED
+# PATH, not the raw string: `a="\"b\""` and `a="b"` are the same query.
+# A path of more than one element, or one empty/whitespace-bearing
+# element, is unmatchable on both sides — the reference joins with
+# fmt.Sprintf("%v", paths...) (parser.go:546) and compares against a
+# sanitized key, we join with a space and our logfmt walker can emit
+# neither an empty key nor one containing whitespace. The `--keep-empty`
+# rows below are what make that miss visible as an empty label rather
+# than an absent one; every one of them was captured with its value.
+#
+# The `eval_fail` rows pin the rejections. Their HTTP 400 and the
+# reference's own body were captured in the same run (e.g. `parse error :
+# stage '| logfmt a="b.c"' : cannot parse expression [b.c]: unexpected
+# char .`); the `msg:` gate is a fragment of PulsusDB's own Display, which
+# the owner's 2026-07-26 ruling on this issue relaxes to
+# wording-independent.
+#
+# NOT PINNED HERE, deliberately. A targeted MISS emits `a=""` on the
+# reference with or without `--keep-empty` and emits nothing here, and
+# the reference sanitizes the LINE key before comparing while we do not —
+# both are issue #393, so every row below either uses `--keep-empty` or
+# hits, and the load line carries no key that would exercise the
+# sanitizer.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
+
+load
+  {service_name="lfx"}
+  0s  b=1 a-b=2 x=3
+
+# --- what a surviving expression resolves to --------------------------
+
+# The control: a bare KEY resolves to itself.
+eval instant at 60s {service_name="lfx"} | logfmt a="b"
+  {a="1", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# THE ADOPTED RULE: the source key is the parsed path, so a quoted
+# single-element path is the same query as the bare key above.
+eval instant at 60s {service_name="lfx"} | logfmt a="\"b\""
+  {a="1", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# Several extractions, each resolving independently.
+eval instant at 60s {service_name="lfx"} | logfmt a="x", b="b"
+  {a="3", b="1", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# --- accepted, and unmatchable by construction ------------------------
+
+# A single element holding a space: our walker never emits such a key.
+eval instant at 60s {service_name="lfx"} | logfmt --keep-empty a="\"b c\""
+  {a="", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# A KEY followed by a STRING is a TWO-element path, joined with a space.
+eval instant at 60s {service_name="lfx"} | logfmt --keep-empty a="b \"x\""
+  {a="", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# Two STRINGs, likewise.
+eval instant at 60s {service_name="lfx"} | logfmt --keep-empty a="\"b\" \"c\""
+  {a="", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# An EMPTY path element: our walker never emits an empty key either.
+eval instant at 60s {service_name="lfx"} | logfmt --keep-empty a="\"\""
+  {a="", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# An unterminated STRING runs to end of input and is ACCEPTED — the
+# closing delimiter is optional (lexer.go:109-120).
+eval instant at 60s {service_name="lfx"} | logfmt --keep-empty a="\"unterminated"
+  {a="", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# A well-formed KEY that simply is not on the line.
+eval instant at 60s {service_name="lfx"} | logfmt --keep-empty a="_"
+  {a="", service_name="lfx"}  0s  b=1 a-b=2 x=3
+
+# --- refused: no token at all (logfmtexpr.y:26-27) --------------------
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a=""
+  msg: unexpected $end
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a=" "
+  msg: unexpected $end
+
+# --- refused: a bad character AFTER something was shifted -------------
+# The lexer's message stands, and it names the character.
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="b.c"
+  msg: unexpected char .
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="b-c"
+  msg: unexpected char -
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="b]"
+  msg: unexpected char ]
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="b[0]"
+  msg: unexpected char [
+
+# The raw-string form of the same expression: the sub-grammar sees the
+# same bytes, so it gets the same answer.
+eval_fail instant at 60s {service_name="lfx"} | logfmt a=`b.c`
+  msg: unexpected char .
+
+# --- refused: a bad FIRST character -----------------------------------
+# Nothing was shifted, so the syntax error overwrites the lexer's — a
+# DIFFERENT message from the class above, and that distinction is what
+# tells a user whether the first character or a later one was at fault.
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="0b"
+  msg: unexpected $end
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="é"
+  msg: unexpected $end
+
+# --- refused: a KEY that is not the first token (no `expressions key`) -
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="b c"
+  msg: unexpected KEY
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="\"b\" c"
+  msg: unexpected KEY
+
+# A `]` ENDS the string, so this is STRING("a") then KEY("b") — refused
+# by the same rule, not by the bracket.
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="\"a]b\""
+  msg: unexpected KEY
+
+# --- refused inside a metric query ------------------------------------
+# Every entry point compiles its pipeline before any I/O, so no position
+# is exempt.
+
+eval_fail instant at 60s count_over_time({service_name="lfx"} | logfmt a="b.c" [5m])
+  msg: unexpected char .
+
+eval_fail instant at 60s sum by (a) (count_over_time({service_name="lfx"} | logfmt a="b.c" [5m]))
+  msg: unexpected char .
+
+# --- refused by the LIST rule, one layer earlier ----------------------
+# A comma must be followed by another entry (syntax.y:318-321). This one
+# is a `ParseExpr` error on the reference, so unlike every row above it
+# is refused in EVERY window — and it governs `| json` too, since the
+# reference shares the production.
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="b",
+  msg: identifier
+
+eval_fail instant at 60s {service_name="lfx"} | logfmt a="b", | json
+  msg: identifier
+
+eval_fail instant at 60s {service_name="lfx"} | json a="b",
+  msg: identifier
+
+clear
