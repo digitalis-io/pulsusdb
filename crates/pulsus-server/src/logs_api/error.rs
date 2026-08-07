@@ -4,7 +4,8 @@
 //!
 //! Issue #264 replaced the previous `{"status","errorType","error",
 //! "position"?}` JSON envelope with the reference's shape. Loki writes
-//! every LogQL HTTP error through one function,
+//! every LogQL error its HANDLERS produce — the scope of this module, i.e.
+//! every [`ApiError`] variant below — through one function,
 //! `pkg/util/server/error.go:46-52 @ v3.7.4`:
 //!
 //! ```go
@@ -24,6 +25,15 @@
 //! `pkg/lokifrontend/frontend/transport/handler.go:141`, and `/tail`'s
 //! pre-upgrade rejections through `pkg/querier/tail/http.go:35,42` — all
 //! @ v3.7.4.
+//!
+//! **What that does NOT cover: the routing layer.** Rejections made above
+//! the handlers are not `WriteError`'s in the reference either, and they
+//! do not match. Measured on `grafana/loki:3.7.4` (2026-08-07): an
+//! unrouted path is `404 page not found\n` — LF-terminated plain text via
+//! Go's `http.NotFound` — where ours is an empty axum `404`; a wrong
+//! method is an empty `405` with no `Allow` there and an empty `405` with
+//! `Allow` here. Both pre-date #264 and are unchanged by it; documented in
+//! docs/api.md §2.3.
 //!
 //! Measured to agree, on `grafana/loki:3.7.4`
 //! (`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
@@ -50,9 +60,11 @@
 //! `fmt.Fprint` body regardless of it, so the container provably cannot
 //! vary by status code.
 //!
-//! Only this surface changed; the three PulsusDB surfaces have never
-//! shared a writer, and the two left alone were each checked rather than
-//! assumed (issue #264 determination 2):
+//! Only this surface changed. The three query surfaces have three
+//! independent `IntoResponse` impls — this one, `prom_api::error` and
+//! `traces_api::error` — so nothing here reaches the other two; and the
+//! two left alone were each checked rather than assumed (issue #264
+//! determination 2):
 //!
 //! - `prom_api` keeps its JSON envelope and is CORRECT to. Upstream
 //!   Prometheus writes every API error as `application/json` carrying
@@ -69,13 +81,21 @@
 //!   ruling and its measured sweep both name the LogQL surface. Recorded
 //!   in docs/api.md §2.3 as an open divergence.
 //!
-//! Note also that plain text alone is not the whole contract: the
-//! reference's own two writers disagree on the trailing byte. This one
-//! (`fmt.Fprint`) writes none; `/loki/api/v1/push`'s (`http.Error` ->
-//! `fmt.Fprintln`, issue #374) writes an LF. `pulsus-write`'s ingest
-//! responders are therefore NOT reachable from here, and
-//! `tests/support/manifest.rs`'s `PlainTextWriter` keeps the two rules
-//! apart in the conformance matrix.
+//! Note also that plain text alone is not the whole contract. The
+//! reference's two Loki writers agree on BOTH headers — Go's `http.Error`
+//! sets `Content-Type` and `nosniff` exactly as `WriteError` does — and
+//! disagree only on the trailing byte: this one (`fmt.Fprint`) writes
+//! none, `/loki/api/v1/push`'s (`fmt.Fprintln`, issue #374) writes an LF.
+//! `tests/support/manifest.rs`'s `PlainTextWriter` splits on that one
+//! property and asserts the shared headers for both.
+//!
+//! The writers themselves are separate: `pulsus-write`'s ingest module has
+//! nine response builders and none of them is reachable from `logs_api` —
+//! the crates do not call into each other's responders at all. Two of
+//! those nine ARE shared across references, though (`rw_error_response`
+//! and `rw_backpressure_response` serve both `/api/v1/write` and
+//! `/api/v2/spans`), which is a live divergence recorded on
+//! `rw_error_response` — not a claim of separation anywhere but here.
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};

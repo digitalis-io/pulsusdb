@@ -117,17 +117,27 @@ Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values
 
 #### Errors (§2.1-2.3)
 
-A LogQL error response is a **bare `text/plain` body** — the message and
-nothing else: no JSON, no keys, no trailing newline. Headers are
-`Content-Type: text/plain; charset=utf-8` and
-`X-Content-Type-Options: nosniff`. The **container** matches the
-reference exactly (the message prose does not always — see the cosmetic
-divergence below): it writes every LogQL HTTP error through one function
+Every error a §2 **handler** writes — every row of the table below — is a
+**bare `text/plain` body**: the message and nothing else, no JSON, no
+keys, no trailing newline, under `Content-Type: text/plain; charset=utf-8`
+and `X-Content-Type-Options: nosniff`. That **container** matches the
+reference (the message prose does not always — see the cosmetic
+divergence below), which writes all of these through one function
 (`pkg/util/server/error.go:46-52` @ grafana/loki v3.7.4: two header sets,
 `WriteHeader(status)`, then `fmt.Fprint(w, err.Error())`). Issue #264
 replaced PulsusDB's earlier `{"status","errorType","error","position"?}`
 envelope with it; a parse error's byte offset now travels inside the
 message, as the reference's line/column does.
+
+**Scope of that claim: handler-written errors only.** Rejections made
+*above* the handlers by the routing layer are not `WriteError`'s in the
+reference either, and they do not match. Measured on `grafana/loki:3.7.4`
+(2026-08-07): an unrouted path is `404` with the LF-terminated plain-text
+body `404 page not found\n` there and an **empty** axum `404` here; a
+wrong method is an empty `405` with **no** `Allow` header there and an
+empty `405` **with** `Allow` here. Both are pre-existing routing-layer
+divergences, unchanged by #264 and not owned by it. PulsusDB's server-wide
+`TimeoutLayer` `408` is likewise above the handlers.
 
 The status code is the whole machine-readable classification — there is no
 `errorType` field on this surface (the reference has none either).

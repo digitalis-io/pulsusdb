@@ -1067,37 +1067,40 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
                 "{ctx}: a plain-text error body must not parse as JSON, got {:?}",
                 String::from_utf8_lossy(&res.body)
             );
-            // The trailing byte is per-writer, NOT per-content-type — the
-            // two Loki families disagree about it because the reference's
-            // two writers do. See `manifest::PlainTextWriter`.
+            // `nosniff` is what the two Loki writers AGREE on — Go's
+            // `http.Error` sets it and so does `WriteError`
+            // (pkg/util/server/error.go:49 @ v3.7.4), and both were
+            // measured setting it on grafana/loki:3.7.4. Asserting it only
+            // for the query family is what let our own push responder omit
+            // it unnoticed, so it is keyed off `sets_nosniff` and not off
+            // the terminator distinction below.
+            if writer.sets_nosniff() {
+                assert_eq!(
+                    res.header("x-content-type-options"),
+                    Some("nosniff"),
+                    "{ctx}: this writer's reference sets nosniff"
+                );
+            }
+            // The trailing byte, and ONLY the trailing byte, is per-writer:
+            // `fmt.Fprint` vs `fmt.Fprintln`. See `manifest::PlainTextWriter`.
             match writer {
-                PlainTextWriter::LogqlWriteError => {
-                    assert_eq!(
-                        res.header("x-content-type-options"),
-                        Some("nosniff"),
-                        "{ctx}: `WriteError` sets nosniff \
-                         (pkg/util/server/error.go:49 @ v3.7.4)"
-                    );
-                    assert!(
-                        !res.body.ends_with(b"\n"),
-                        "{ctx}: the reference's `fmt.Fprint` writes no trailing newline \
-                         (pkg/util/server/error.go:51 @ v3.7.4), got {:?}",
-                        String::from_utf8_lossy(&res.body)
-                    );
-                }
-                PlainTextWriter::LokiPushHttpError => {
-                    // Issue #374: `http.Error` -> `fmt.Fprintln`
-                    // (pkg/loghttp/push/push.go:606-608 @ v3.7.4). Exactly
-                    // one `\n`, so a doubled terminator fails too.
-                    assert!(
-                        res.body.ends_with(b"\n") && !res.body.ends_with(b"\n\n"),
-                        "{ctx}: this endpoint's writer is `fmt.Fprintln` — the body ends \
-                         in exactly one newline, got {:?}",
-                        String::from_utf8_lossy(&res.body)
-                    );
-                }
-                // Terminator unprobed for these references — see the
-                // variant's doc comment.
+                PlainTextWriter::LogqlWriteError => assert!(
+                    !res.body.ends_with(b"\n"),
+                    "{ctx}: the reference's `fmt.Fprint` writes no trailing newline \
+                     (pkg/util/server/error.go:51 @ v3.7.4), got {:?}",
+                    String::from_utf8_lossy(&res.body)
+                ),
+                // Issue #374: `http.Error` -> `fmt.Fprintln`
+                // (pkg/loghttp/push/push.go:606-608 @ v3.7.4). Exactly one
+                // `\n`, so a doubled terminator fails too.
+                PlainTextWriter::LokiPushHttpError => assert!(
+                    res.body.ends_with(b"\n") && !res.body.ends_with(b"\n\n"),
+                    "{ctx}: this endpoint's writer is `fmt.Fprintln` — the body ends \
+                     in exactly one newline, got {:?}",
+                    String::from_utf8_lossy(&res.body)
+                ),
+                // Two references, one responder, and they disagree on the
+                // terminator — see the variant's doc comment.
                 PlainTextWriter::WriterSideReceiver => {}
             }
         }

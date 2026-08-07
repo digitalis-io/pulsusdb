@@ -339,40 +339,77 @@ pub enum ExpectedError {
     /// The ingest handlers' hand-rolled `google.rpc.Status { code, message }`
     /// protobuf error body (OTLP `/v1/logs`, `/v1/metrics`, `/v1/traces`).
     Otlp { code: i32 },
-    /// A `text/plain; charset=utf-8` error body, non-empty and not JSON.
-    /// The payload names WHICH writer produced it, because the families
-    /// that share this content type do **not** share a trailing byte —
-    /// see [`PlainTextWriter`].
+    /// A `text/plain; charset=utf-8` error body, non-empty and not JSON —
+    /// asserted for every variant. The payload names WHICH writer produced
+    /// it, which decides the two REFERENCE-derived rules on top of that
+    /// (`nosniff`, and the trailing byte) — see [`PlainTextWriter`].
     PlainText(PlainTextWriter),
 }
 
 /// Which plain-text error writer a route's error body comes from.
 ///
-/// PulsusDB has three, because the references have three, and conflating
-/// them is a live bug the hermetic suites cannot see: `/loki/api/v1/push`
-/// LF-terminates every error body it writes (issue #374) while the LogQL
-/// query surface terminates none of them (issue #264). One `PlainText`
-/// variant asserting either rule would be wrong for the other family.
+/// **The split is on the terminator, and ONLY on the terminator.** Loki's
+/// two writers — `WriteError` for the query surface (issue #264) and
+/// `push.HTTPError` for `/loki/api/v1/push` (issue #374) — are both built
+/// on Go's `http.Error` container: they set the SAME `Content-Type` and
+/// the SAME `X-Content-Type-Options: nosniff`, and differ only in that one
+/// ends with `fmt.Fprint` (no terminator) and the other with
+/// `fmt.Fprintln` (one `\n`). Measured 2026-08-07 on
+/// `grafana/loki:3.7.4`, four push errors and eighteen query errors.
+///
+/// That distinction is easy to get backwards, and getting it backwards is
+/// how a real divergence hides: an earlier revision of this enum asserted
+/// `nosniff` for the query family only, which made our push responder's
+/// MISSING `nosniff` look like a property the families legitimately
+/// disagreed about. They do not. Anything the writers share is asserted
+/// for every variant that has a reference for it — see
+/// [`PlainTextWriter::sets_nosniff`].
 #[derive(Debug, Clone, Copy)]
 pub enum PlainTextWriter {
     /// The LogQL query surface (§2), since issue #264 — Loki's
     /// `WriteError` (`pkg/util/server/error.go:46-52 @ v3.7.4`): two
     /// headers, then `fmt.Fprint(w, err.Error())`. Asserted: `nosniff`
-    /// present and **no** trailing newline (`fmt.Fprint` writes no
-    /// terminator).
+    /// present and **no** trailing newline.
     LogqlWriteError,
     /// `/loki/api/v1/push` (§8.2), issue #374 — the reference binds ONE
     /// error writer for that endpoint, `push.HTTPError` -> `http.Error`
     /// -> `fmt.Fprintln` (`pkg/distributor/http.go:27-30` and
-    /// `pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Asserted: **exactly
-    /// one** trailing `\n`.
+    /// `pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Asserted: `nosniff`
+    /// present (Go's `http.Error` sets it, exactly as `WriteError` does)
+    /// and **exactly one** trailing `\n`.
     LokiPushHttpError,
     /// `/api/v1/write` (Prometheus remote write) and `/api/v2/spans`
-    /// (OpenZipkin). Their references are neither of the above and their
-    /// terminators have not been probed, so the trailing byte is left
-    /// unasserted here — content type and non-emptiness only, exactly the
-    /// strength this matrix had before #264 split the variant.
+    /// (OpenZipkin) — which share ONE PulsusDB responder,
+    /// `pulsus_write::ingest::http::rw_error_response`, while answering to
+    /// two references that were probed on 2026-08-07 and agree on nothing
+    /// it emits: Prometheus v3.13.0 sends `text/plain; charset=utf-8` +
+    /// `nosniff` + a trailing `\n`; OpenZipkin 3 sends `text/*`, no
+    /// `nosniff`, and a terminator that varies case by case.
+    ///
+    /// So NEITHER reference-derived rule can be asserted for this variant:
+    /// it gets only the checks every variant gets (PulsusDB's own exact
+    /// content type, non-empty, non-JSON). That is a genuine gap, not a
+    /// resolved one — it closes when the responder is split, which is out
+    /// of issue #264's scope and filed for adjudication (see
+    /// `rw_error_response`'s doc for the measured table).
     WriterSideReceiver,
+}
+
+impl PlainTextWriter {
+    /// Whether this writer's reference sets
+    /// `X-Content-Type-Options: nosniff`.
+    ///
+    /// Deliberately NOT keyed off the same distinction as the trailing
+    /// byte: both Loki writers set it (Go's `http.Error` and Loki's
+    /// `WriteError` both do), so both assert it. Only
+    /// [`PlainTextWriter::WriterSideReceiver`] cannot, because the two
+    /// references sharing that responder disagree — see its doc.
+    pub fn sets_nosniff(self) -> bool {
+        match self {
+            PlainTextWriter::LogqlWriteError | PlainTextWriter::LokiPushHttpError => true,
+            PlainTextWriter::WriterSideReceiver => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
