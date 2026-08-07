@@ -1800,7 +1800,16 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// added the error-ordering block to the same file, captured in the same
 /// way from the same image: a numeric conversion failing to the LEFT of a
 /// leaf that reads the error state, plus the chained-short-circuit rows.
-const CAPTURED: usize = 1_208;
+///
+/// Issue #241 adopted the formerly-EXCLUDED `by`-over-a-missing-label
+/// sub-cases held open in the variants, `label_replace` and
+/// grouping-dedup files, and pinned the general shape they are instances
+/// of alongside them: the raw-stream-label forms, the
+/// present-name-plus-absent-name and all-absent `by` forms, and the
+/// `without` forms that the divergence never touched. Re-captured against
+/// the pinned v3.7.4 container in the same run, so they carry each file's
+/// `captured` default.
+const CAPTURED: usize = 1_219;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1809,5 +1818,5 @@ const CAPTURED: usize = 1_208;
 const DERIVED: usize = 31;
 const DIVERGENCE: usize = 18;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_289;
+const TOTAL: usize = 1_300;
 // corpus-counts: end (provenance-corpus-constants)
