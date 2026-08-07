@@ -593,9 +593,11 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 # trySkipNumber is never reached, so there is no digits-only exemption and no
 # read-buffer dependence: readNumberAsString loads more until the token ends.
 # The verdict is a function of the request alone -- refused iff the value
-# overflows f32.  The -lead0-* and the two control rows below are that route,
-# measured over 36 cells per shape (3 ignored positions x 4 wire framings x 3
-# byte offsets, round 18), each shape single-valued.
+# overflows f32.  The four -lead0-* rows below are that route; their two
+# controls (-signed-lead0, -no-lead0) are the OTHER route by one byte, which is
+# what makes them controls.  All six were measured over 36 cells per shape
+# (3 ignored positions x 4 wire framings x 3 byte offsets, round 18), each
+# shape single-valued.
 #
 # ROUTE '-','1'..'9' -- f64, via skipNumber.  `trySkipNumber` walks a run of
 # digits with at most one dot and skips it
@@ -613,9 +615,16 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 # so its verdict is a function of the request -- refused iff it overflows f64.
 # A decoder that captured the value as raw text without applying this would
 # agree about depth while quietly accepting what upstream refuses.  Those rows
-# agree, and they agree INVARIANTLY: the fourteen exponent shapes this group
-# and the hermetic test pin between them were re-measured in round 17 over 12
-# cells each (4 wire framings x 3 byte offsets, 168 cells) and none moved.
+# agree, and they agree INVARIANTLY: the fourteen ignored-number shapes this
+# group and the hermetic test pin between them were re-measured in round 17
+# over 12 cells each (4 wire framings x 3 byte offsets, 168 cells) and in round
+# 19 over 36 each (those same 12 in each of the 3 ignored positions, 504
+# cells); none moved, on either server.  Thirteen of the fourteen are on this
+# route -- `0e999` is the one whose first byte sends it to ReadFloat32 -- and
+# two of the thirteen (`12345678901234567890`, `-0.0`) carry no exponent at
+# all: they are short digits-only runs, skipped unevaluated wherever they fit
+# the window and parsed to a finite value where they do not, so they are 204
+# either way.
 #
 # The LENGTH of a digits-only run is the other consequence, and a registered
 # divergence.  A run that spans the buffer boundary is parsed rather than
@@ -642,12 +651,15 @@ case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/
 #              form, which is why this is the row pinned expect="DIFF" and the
 #              fragile one is not.
 #
-# The six -lead0-* / control rows are the f32 route, closed in round 18 (found
-# in round 17 by reading Skip's dispatch, not by probing: 168 cells of exponent
-# probes all went through skipNumber).  The two controls are what make them mean
-# the dispatch rather than the value: 0.35e39, -0.35e39 and 3.5e38 are the same
-# magnitude and all three are inf in f32, yet only the one whose first byte is
-# `0` is refused.  The -at-f32-max / -past-f32-max pair pins the threshold at
+# The six -lead0-* / control rows pin the f32 route, closed in round 18 (found
+# in round 17 by reading Skip's dispatch, not by probing: of the 168
+# ignored-number cells probed then, 156 took skipNumber and the twelve of
+# `0e999` did take ReadFloat32 -- but zero is finite in both widths, so those
+# twelve are 204 on either route and no probe in that set could see the
+# dispatch in a status).  The two controls are what make them mean the dispatch
+# rather than the value: 0.35e39, -0.35e39 and 3.5e38 are the same magnitude
+# and all three are inf in f32, yet only the one whose first byte is `0` is
+# refused.  The -at-f32-max / -past-f32-max pair pins the threshold at
 # f32's own rounding boundary rather than at some smaller cutoff.
 for _name, _value, _expect in (("overflow", "1e999", "SAME"),
                                ("at-max", "1.7976931348623157e308", "SAME"),

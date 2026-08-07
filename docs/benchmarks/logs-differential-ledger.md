@@ -2274,16 +2274,25 @@ back up here.
   309-digit run of smaller magnitude is accepted on both sides. The exponent
   rule agrees on both edges (`1e999`, `1e309`, `1.7976931348623159e308`
   refused on both; `1e308`, `1.7976931348623157e308`, `1e-999`, `5e-324`
-  accepted on both), and each of the fourteen exponent shapes the harness and
-  the hermetic test pin between them was re-measured over 12 cells — 4 wire
-  framings × 3 byte offsets, 168 cells in all — without moving, which is what
-  `trySkipNumber` leaving the fast path on `e` in every window predicts: the
-  exponent axis cannot depend on the buffer. Round 18 re-derived the table
-  above on the same two servers after changing the `f32` route below, rather
-  than restating it: bisecting the offset of a 400-nine run in one write gives
-  a last accepted offset of 111 (offset + length + 1 = 512 exactly), `400` at
-  112; the same bytes are `204` in one write and in 512-byte chunks and `400`
-  in 256- and 128-byte chunks; crossing, 308 nines is `204`, 309 nines is
+  accepted on both), and each of the fourteen ignored-number shapes the
+  harness and the hermetic test pin between them was re-measured over 12 cells
+  in round 17 — 4 wire framings × 3 byte offsets, 168 cells in all — and over
+  36 cells each in round 19 — those same 12 in each of the three ignored
+  positions, 504 cells — without moving on either server. Thirteen of the
+  fourteen take `skipNumber`, and for the eleven of those that carry an `e`
+  that invariance is what `trySkipNumber` leaving the fast path on `e` in every
+  window predicts: the exponent axis cannot depend on the buffer. The other
+  two, `12345678901234567890` and `-0.0`, are short digits-only runs, `204`
+  whether they are skipped or parsed. The fourteenth shape, `0e999`, takes
+  `ReadFloat32` on its first byte, and zero is finite in both widths, so its
+  cells are `204` on either route and none of them could have shown the
+  dispatch in a status.
+  Round 18 re-derived the table above on the same two servers after changing
+  the `f32` route below, rather than restating it: bisecting the offset of a
+  400-nine run in one write gives a last accepted offset of 111 (offset +
+  length + 1 = 512 exactly), `400` at 112; the same bytes are `204` in one
+  write and in 512-byte chunks and `400` in 256- and 128-byte chunks;
+  crossing, 308 nines is `204`, 309 nines is
   `400`, 309 digits of `1` then zeros is `204`; 1,000 nines is `400` at four
   offsets. PulsusDB answered `204` to every one of those, unchanged.
 

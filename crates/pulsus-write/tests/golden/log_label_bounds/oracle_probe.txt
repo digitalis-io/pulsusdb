@@ -152,13 +152,14 @@ its own it would have opened this hole in exchange -- `-int` is the row that
 tells the two apart, and `-at-max`/`-past-max` sit either side of `f64::MAX`,
 which is where "overflow" is actually decided. The ReadFloat32 route is
 range-checked against f32 instead, a ceiling smaller by 30 orders of
-magnitude, and the six `-lead0-*`/`-signed-lead0`/`-no-lead0` rows are it:
+magnitude, and the six `-lead0-*`/`-signed-lead0`/`-no-lead0` rows are what
+pins it -- four of them on that route and the two controls one byte off it:
 0.35e39 is 400 on both sides while -0.35e39 and 3.5e38 -- the same magnitude,
-also inf in f32, but not starting with `0` -- are 204 on both, and
-`-at-f32-max`/`-past-f32-max` sit either side of the f32 rounding boundary.
-Those six were added in round 18 and measured over 36 cells each (3 ignored
-positions x 4 wire framings x 3 byte offsets, 216 cells), every shape
-single-valued.
+also inf in f32, but not starting with `0`, so they take skipNumber and f64 --
+are 204 on both, and `-at-f32-max`/`-past-f32-max` sit either side of the f32
+rounding boundary. Those six were added in round 18 and measured over 36 cells
+each (3 ignored positions x 4 wire framings x 3 byte offsets, 216 cells), every
+shape single-valued.
 
 Several cases are large by design: `-streams-stream-count` and
 `drained-streams-non-object` carry 1,000,001 stream objects (3 MB),
@@ -1093,10 +1094,15 @@ json/ignored-number-int-1000
     terminating byte lands at index 486 with 25 bytes to spare, only because
     of where this body puts it), is the one pinned as a divergence. The
     EXPONENT rows of that group are not affected and are not a divergence:
-    the fourteen exponent shapes this group and the hermetic test pin between
-    them were re-measured over 12 cells each (4 wire framings x 3 byte
-    offsets, 168 cells) in round 17, and re-run over 36 cells each in round 18
-    after the f32 change below; none moved. Ledger residual 10.
+    the fourteen ignored-number shapes this group and the hermetic test pin
+    between them were re-measured over 12 cells each (4 wire framings x 3 byte
+    offsets, 168 cells) in round 17, and re-run over 36 cells each in round 19
+    -- those same 12 in each of the 3 ignored positions, 504 cells, both
+    servers -- after the f32 change below; every shape stayed single-valued and
+    none moved. Thirteen of the fourteen take skipNumber; the fourteenth,
+    `0e999`, takes ReadFloat32 on its first byte, and zero is finite in both
+    widths, which is why no probe over this set could have shown the dispatch
+    in a status. Ledger residual 10.
 
     Round 18 re-derived this table's boundary on the same two servers rather
     than restating it: bisecting the offset of a 400-nine run written in one

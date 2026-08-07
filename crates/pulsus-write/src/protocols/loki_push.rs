@@ -2340,16 +2340,24 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 /// verdict is a function of the request alone: refused iff its value overflows
 /// `f64`. Measured on the same oracle under an unknown envelope key, `1e999`,
 /// `1e309`, `-1e309` and `1.7976931348623159e308` are `400` on both sides;
-/// `1e308`, `1.7976931348623157e308`, `1e-999`, `5e-324`, `0e999` and
-/// `12345678901234567890` are `204` on both. Underflow is accepted on both
-/// because Go's `floatBits` raises its overflow flag only upward, and Rust's
-/// `f64` parse likewise yields a finite zero rather than an error. Those ten
-/// shapes, plus the four more the hermetic test carries
-/// (`1e1000000000000000000000`, `-0e999`, `1.5e3`, `-0.0`), were each
-/// re-measured over 12 cells — 4 wire framings (one write, 128-, 256- and
-/// 512-byte chunks) × 3 byte offsets, 168 cells in all — and none moved
-/// (issue #374 round 17), which is what `trySkipNumber` bailing on `e` in
-/// every window predicts.
+/// `1e308`, `1.7976931348623157e308`, `1e-999`, `5e-324` and
+/// `12345678901234567890` are `204` on both (the last of those carries no
+/// exponent — it is a short digits-only run, taking the fast path wherever it
+/// fits the window and parsing to a finite value where it does not, so it is
+/// `204` either way). Underflow is accepted on both because Go's `floatBits`
+/// raises its overflow flag only upward, and Rust's `f64` parse likewise
+/// yields a finite zero rather than an error. Those nine shapes, the four more
+/// the hermetic test carries (`1e1000000000000000000000`, `-0e999`, `1.5e3`,
+/// and the likewise digits-only `-0.0`), and the one shape it carries on the
+/// OTHER route — `0e999`, whose first byte is `0`, `204` on both because zero
+/// is finite in `f32` too — were each re-measured over 12 cells, 4 wire
+/// framings (one write, 128-, 256- and 512-byte chunks) × 3 byte offsets, 168
+/// cells in all (issue #374 round 17), and again over 36 cells each — those
+/// same 12 in each of the three ignored positions, 504 cells — after the `f32`
+/// route was closed (round 19). None moved on either server, which is what
+/// `trySkipNumber` bailing on `e` in every window predicts for the eleven on
+/// this route that carry one (the two digits-only ones are `204` skipped or
+/// parsed), and what never reaching `trySkipNumber` predicts for `0e999`.
 ///
 /// LENGTH — a REGISTERED DIVERGENCE, not a rule we match. Ours is the second
 /// branch below: a run of digits with at most one dot is accepted whatever its
@@ -4036,11 +4044,14 @@ mod tests {
     /// under an unknown envelope key — including the pair either side of
     /// `f64::MAX`, which is where "overflow" is actually decided, and the
     /// underflow rows, which are accepted on both sides for the same reason.
-    /// Each of the fourteen `f64`-route shapes below was re-measured over 12
-    /// cells in round 17 — 4 wire framings × 3 byte offsets, 168 cells in all
-    /// — and each of the six rows added in round 18 over 36 cells (those same
-    /// 12, in each of the three positions, 216 cells); none moved, which is
-    /// what makes this a rule rather than a sample.
+    /// Each of the fourteen shapes carried over from round 17 — thirteen of
+    /// them on the `f64`/`skipNumber` route and `0e999`, whose first byte is
+    /// `0`, on the `f32` one — was re-measured over 12 cells then (4 wire
+    /// framings × 3 byte offsets, 168 cells in all) and over 36 cells each in
+    /// round 19 (those same 12 in each of the three positions, 504 cells);
+    /// each of the six rows added in round 18 was measured over 36 cells when
+    /// it was added (216 cells). None moved, which is what makes this a rule
+    /// rather than a sample.
     ///
     /// The six rows added in round 18 are the DISPATCH: upstream picks the
     /// reader from the value's first byte, so a token starting with `0` is
