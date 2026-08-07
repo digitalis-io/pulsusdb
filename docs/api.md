@@ -130,14 +130,10 @@ envelope with it; a parse error's byte offset now travels inside the
 message, as the reference's line/column does.
 
 **Scope of that claim: handler-written errors only.** Rejections made
-*above* the handlers by the routing layer are not `WriteError`'s in the
-reference either, and they do not match. Measured on `grafana/loki:3.7.4`
-(2026-08-07): an unrouted path is `404` with the LF-terminated plain-text
-body `404 page not found\n` there and an **empty** axum `404` here; a
-wrong method is an empty `405` with **no** `Allow` header there and an
-empty `405` **with** `Allow` here. Both are pre-existing routing-layer
-divergences, unchanged by #264 and not owned by it. PulsusDB's server-wide
-`TimeoutLayer` `408` is likewise above the handlers.
+*above* the handlers — the router's own `404`/`405`, and the server-wide
+`TimeoutLayer`'s `408` — are not written by this container. They diverge
+from the reference, they are pre-existing, and #264 neither changed nor
+covers them.
 
 The status code is the whole machine-readable classification — there is no
 `errorType` field on this surface (the reference has none either).

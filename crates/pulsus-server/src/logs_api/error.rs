@@ -27,13 +27,10 @@
 //! @ v3.7.4.
 //!
 //! **What that does NOT cover: the routing layer.** Rejections made above
-//! the handlers are not `WriteError`'s in the reference either, and they
-//! do not match. Measured on `grafana/loki:3.7.4` (2026-08-07): an
-//! unrouted path is `404 page not found\n` — LF-terminated plain text via
-//! Go's `http.NotFound` — where ours is an empty axum `404`; a wrong
-//! method is an empty `405` with no `Allow` there and an empty `405` with
-//! `Allow` here. Both pre-date #264 and are unchanged by it; documented in
-//! docs/api.md §2.3.
+//! the handlers — axum's own 404/405, and the server-wide `TimeoutLayer`'s
+//! 408 — are not written by this module. They diverge from the reference,
+//! they pre-date #264, and it neither changed nor covers them
+//! (docs/api.md §2.3).
 //!
 //! Measured to agree, on `grafana/loki:3.7.4`
 //! (`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,

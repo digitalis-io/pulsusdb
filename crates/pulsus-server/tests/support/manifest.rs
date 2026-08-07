@@ -381,17 +381,13 @@ pub enum PlainTextWriter {
     /// `/api/v1/write` (Prometheus remote write) and `/api/v2/spans`
     /// (OpenZipkin) — which share ONE PulsusDB responder,
     /// `pulsus_write::ingest::http::rw_error_response`, while answering to
-    /// two references that were probed on 2026-08-07 and agree on nothing
-    /// it emits: Prometheus v3.13.0 sends `text/plain; charset=utf-8` +
-    /// `nosniff` + a trailing `\n`; OpenZipkin 3 sends `text/*`, no
-    /// `nosniff`, and a terminator that varies case by case.
+    /// two references that do not agree with each other. **Issue #385 owns
+    /// that question and carries the measurements.**
     ///
     /// So NEITHER reference-derived rule can be asserted for this variant:
     /// it gets only the checks every variant gets (PulsusDB's own exact
     /// content type, non-empty, non-JSON). That is a genuine gap, not a
-    /// resolved one — it closes when the responder is split, which is out
-    /// of issue #264's scope and filed for adjudication (see
-    /// `rw_error_response`'s doc for the measured table).
+    /// resolved one — it closes with #385.
     WriterSideReceiver,
 }
 

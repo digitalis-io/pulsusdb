@@ -471,11 +471,9 @@ fn loki_stream_errors_response(errors: Vec<String>) -> Response {
 /// `0x0a`.
 ///
 /// Deliberately NOT [`plain_text_response`]: that one is shared by
-/// `/api/v1/write` and `/api/v2/spans`, whose references do **not** agree
-/// with this one — measured the same day, Prometheus v3.13.0's
-/// remote-write errors carry `nosniff` and an LF while OpenZipkin 3's
-/// carry `Content-Type: text/*`, no `nosniff`, and no consistent
-/// terminator. Adding `nosniff` there would fix one and break the other.
+/// `/api/v1/write` and `/api/v2/spans`, whose references are different and
+/// do not agree with each other, so setting `nosniff` there could not be
+/// right for both. Issue #385 owns that; see [`rw_error_response`].
 fn loki_plain_text_response(status: StatusCode, message: String) -> Response {
     let mut response = plain_text_response(status, message);
     response
@@ -500,10 +498,9 @@ fn loki_plain_text_response(status: StatusCode, message: String) -> Response {
 /// `\n` too.
 ///
 /// Deliberately NOT shared with [`rw_error_response`]: `/api/v1/write` and
-/// `/api/v2/spans` answer to Prometheus and OpenZipkin, not to this one,
-/// and measurement says those two do not even agree with each other — see
-/// [`rw_error_response`]. The OTLP receiver has no terminator at all — its
-/// body is a `google.rpc.Status` protobuf, where the message is a
+/// `/api/v2/spans` answer to other references, and to each other's
+/// detriment — issue #385. The OTLP receiver has no terminator at all —
+/// its body is a `google.rpc.Status` protobuf, where the message is a
 /// length-delimited field (see [`LogsIngestError::InvalidLabelName`]).
 fn loki_error_response(err: &LogsIngestError) -> Response {
     let (status, _code) = classify(err);
@@ -950,26 +947,16 @@ fn rw_success_response(status: StatusCode) -> Response {
 /// status with a plain-text body — never [`status_response`]'s
 /// `google.rpc.Status` protobuf (architect plan edge case 3).
 ///
-/// **KNOWN DIVERGENCE, two references behind one writer.** This function
-/// and [`rw_backpressure_response`] are called from BOTH
-/// [`ingest_remote_write`] (`/api/v1/write`, reference: Prometheus) and
-/// [`ingest_zipkin`] (`/api/v2/spans`, reference: OpenZipkin). Probed
-/// 2026-08-07, and the two references agree on nothing this writer emits:
+/// **KNOWN DIVERGENCE — see issue #385, which owns it.** This function and
+/// [`rw_backpressure_response`] are called from BOTH
+/// [`ingest_remote_write`] (`/api/v1/write`) and [`ingest_zipkin`]
+/// (`/api/v2/spans`), whose references are different and do not agree with
+/// each other, so one writer cannot match both. #385 carries the
+/// measurements and the decision; do not restate them here.
 ///
-/// | property | `prom/prometheus:v3.13.0` | `openzipkin/zipkin:3` | here |
-/// |---|---|---|---|
-/// | `Content-Type` | `text/plain; charset=utf-8` | `text/*` | `text/plain; charset=utf-8` |
-/// | `X-Content-Type-Options` | `nosniff` | absent | absent |
-/// | trailing byte | always `\n` | inconsistent (`\n` on a decode failure, none on a bad span field) | never |
-///
-/// So PulsusDB currently matches Prometheus on content type only, and
-/// OpenZipkin on nothing. Splitting the writer is deliberately NOT done
-/// here: `/api/v2/spans` is outside issue #264, and the Zipkin half needs
-/// its own decision about how far to chase a reference whose own
-/// terminator is not a rule. Filed for adjudication; until then this
-/// comment is the record, and `tests/support/manifest.rs`'s
-/// `PlainTextWriter::WriterSideReceiver` asserts only what both sides do
-/// share (a `text/…` content type and a non-empty, non-JSON body).
+/// Splitting the writer is out of scope for issue #264. Until #385 lands,
+/// `tests/support/manifest.rs`'s `PlainTextWriter::WriterSideReceiver`
+/// asserts no reference-derived rule for either route.
 fn rw_error_response(err: &LogsIngestError) -> Response {
     let (status, _code) = classify(err);
     plain_text_response(status, err.to_string())
