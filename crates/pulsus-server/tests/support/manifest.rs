@@ -670,8 +670,12 @@ fn logs_detected_fields_line_limit_zero(req: &mut Req) {
     req.query = format!("query={}&line_limit=0", enc(r#"{service_name="checkout"}"#));
 }
 
-fn logs_detected_fields_limit_over_cap(req: &mut Req) {
-    req.query = format!("query={}&limit=999999", enc(r#"{service_name="checkout"}"#));
+/// Issue #253: the field-name `limit` has no ceiling, so a large value is
+/// a `200` on both stores now (this case runs against a live pool). The
+/// reject that survives is `limit=0` — the reference answers
+/// `400 limit must be a positive value` (measured, `grafana/loki:3.7.4`).
+fn logs_detected_fields_field_limit_zero(req: &mut Req) {
+    req.query = format!("query={}&limit=0", enc(r#"{service_name="checkout"}"#));
 }
 
 const LOGS_DETECTED_LABELS_CASES: &[CaseClass] = &[
@@ -721,8 +725,8 @@ const LOGS_DETECTED_FIELDS_CASES: &[CaseClass] = &[
         expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
-        name: "limit_over_cap",
-        build: logs_detected_fields_limit_over_cap,
+        name: "field_limit_zero",
+        build: logs_detected_fields_field_limit_zero,
         expect_status: 400,
         expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },

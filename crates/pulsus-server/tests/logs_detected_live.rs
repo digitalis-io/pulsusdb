@@ -297,6 +297,56 @@ fn fields_of(json: &serde_json::Value) -> Vec<DetectedField> {
 
 const CHECKOUT_SELECTOR: &str = "query=%7Bservice_name%3D%22checkout%22%7D";
 
+/// Issue #253 AC 5, run against the end-to-end test's already-seeded
+/// `CHECKOUT_SELECTOR` fixture rather than as a standalone `#[tokio::test]`
+/// so it costs one server spawn and one seed less on the `schema-it` leg
+/// (the plan's own CI-budget note: "one added request against the existing
+/// fixture").
+///
+/// Each request here was a `400` before #253 and answers `200` on
+/// `grafana/loki:3.7.4` (measured 2026-08-07): the fields are exactly the
+/// unlimited default's, the `limit` is echoed as given, and the
+/// `/loki/api/v1/` alias stays byte-identical to the native prefix.
+fn detected_fields_accepts_a_field_limit_far_above_the_entry_cap(port: u16, start: i64, end: i64) {
+    let query = |prefix: &str, qs: &str| {
+        format!("{prefix}/detected_fields?{CHECKOUT_SELECTOR}{qs}&start={start}&end={end}")
+    };
+    let native = |qs: &str| query("/api/logs/v1", qs);
+    let alias = |qs: &str| query("/loki/api/v1", qs);
+    let res = http_get(port, &native(""), false);
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    let json: serde_json::Value = serde_json::from_str(&res.body).expect("default JSON");
+    let default_fields = fields_of(&json);
+
+    for (qs, echoed) in [
+        ("&limit=5001", 5001_u64),
+        ("&limit=4294967295", 4_294_967_295),
+        // Present-but-empty is ABSENT (#253), so the legacy alias
+        // supplies the value; this whole request was a 400 before.
+        ("&limit=&field_limit=5001", 5001),
+    ] {
+        let res = http_get(port, &native(qs), false);
+        assert_eq!(res.status, 200, "{qs}: body: {}", res.body);
+        let json: serde_json::Value = serde_json::from_str(&res.body).expect("uncapped JSON");
+        assert_eq!(
+            fields_of(&json),
+            default_fields,
+            "{qs} must return the unlimited default's fields: {json}"
+        );
+        assert_eq!(
+            json["limit"].as_u64(),
+            Some(echoed),
+            "{qs}: the limit is echoed as given"
+        );
+        let aliased = http_get(port, &alias(qs), false);
+        assert_eq!(aliased.status, 200, "{qs}: alias body: {}", aliased.body);
+        assert_eq!(
+            aliased.body, res.body,
+            "{qs}: uncapped detected_fields alias byte-identity"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn detected_labels_and_fields_end_to_end() {
     if !should_run() {
@@ -550,6 +600,9 @@ async fn detected_labels_and_fields_end_to_end() {
         vec!["method".to_string(), "trace_id".to_string()],
         "the first 2 distinct field names win: {json}"
     );
+
+    // -- Issue #253: the field-name axis has NO ceiling ------------------
+    detected_fields_accepts_a_field_limit_far_above_the_entry_cap(port, start, end);
 
     // -- `line_limit` (sample size): only the newest entry sampled -------
     // The newest checkout row is the one neither parser accepts, so a

@@ -213,6 +213,93 @@ Out of this ledger's scope by design:
   guards fixture-referenced entries only); it is registered here so the
   divergence has a ledger identity before any future fixture case lands.
 
+### detected-fields-limit-saturates-not-wraps (issue #253)
+
+- **Construct:** `/detected_fields`' `limit` (legacy alias `field_limit`)
+  and `line_limit`, for values above `u32::MAX`. Scoped to those two
+  parameters on that one endpoint; nothing else in the API converts a
+  parsed limit through an unchecked narrowing cast. The entry id names
+  the **field** axis's mechanism, which is what #253 changed; `line_limit`
+  is recorded here because it is the same reference cast, but our side of
+  it rejects rather than saturating — see the next bullet.
+- **Direction: the reference wraps; PulsusDB never does — but the two
+  parameters avoid it by different mechanisms, and the entry axis does
+  NOT saturate.** The reference's limit helpers parse an `int`, check
+  `l <= 0`, and then `return uint32(l)` with no range check —
+  `detectedFieldsLimit` (`grafana/loki` v3.7.4 =
+  `b318f2829f0ae2094ab3a1e90780450e9e4b03be`,
+  `pkg/loghttp/params.go:49-64`) and `lineLimit` (`:38-46`) both. So a
+  larger limit can return *fewer* entries or fields. On our side
+  (`crates/pulsus-server/src/logs_api/params.rs`):
+  - **field-name `limit` / `field_limit` — saturates.**
+    `parse_field_limit` ends `u32::try_from(n).unwrap_or(u32::MAX)`, so
+    anything above `u32::MAX` runs at `u32::MAX`. There is no ceiling on
+    this axis, so a value is always produced.
+  - **`line_limit` — rejects.** `parse_line_limit` compares the parsed
+    `i64` against `MAX_LIMIT` and returns `LimitTooLarge` *before* any
+    `u32` conversion; the `as u32` on its success path is reached only on
+    `0 < n <= 5000`. Nothing is clamped or saturated at any magnitude —
+    the outcomes are a value in `1..=5000` or a 400. It avoids the wrap
+    by refusing, not by pinning to a maximum.
+- **Measured** (2026-08-07, `grafana/loki:3.7.4` single-binary, default
+  `limits_config` plus `allow_structured_metadata: true` /
+  `discover_log_levels: false` / `split_queries_by_interval: 0`; one
+  stream of 30 JSON entries carrying 41 distinct field names):
+
+  | `limit` | reference status | reference `fields` | reference `"limit"` echo | PulsusDB effective `field_limit` |
+  |---|---|---|---|---|
+  | `4294967295` | 200 | 41 | `4294967295` | `u32::MAX` |
+  | `4294967296` | 200 | **0** | **key absent** | `u32::MAX` |
+  | `4294967297` | 200 | **1** | `1` | `u32::MAX` |
+  | `9223372036854775807` | 200 | 41 | `4294967295` | `u32::MAX` |
+  | `9223372036854775808` | 400 `strconv.Atoi: … value out of range` | — | — | 400 |
+
+  The reference columns are the container's answers on that fixture; the
+  PulsusDB column is the parsed limit the request runs with, which is
+  also what the response echoes, and is asserted by the gate below rather
+  than transcribed from a run.
+
+  On the entry axis the same cast shows up as an accept-surface
+  difference rather than a value one: `line_limit=4294967295` is a 400
+  there (`max entries limit per query exceeded … (4294967295 > 5000)`),
+  `line_limit=4294967296` a 400 (wrapped to 0, so `limit must be a
+  positive value`), but `line_limit=4294967396` is a **200** — it wrapped
+  back into the legal range. That it is really *served* at the wrapped
+  value, rather than merely accepted, was measured discriminatingly on
+  the same fixture using a per-entry-varying field's `cardinality`:
+  `line_limit=4294967297` reports cardinality 1, exactly like
+  `line_limit=1`, and `line_limit=4294967326` reports 30, exactly like
+  `line_limit=30`. PulsusDB answers 400 to every one of them, by the
+  rejection described above — not by saturating first and then failing a
+  ceiling, which is not what that function does.
+- **Why we decline to mirror it** (owner ruling on #253, 2026-08-07):
+  "a request for more than four billion fields returning *zero* fields is
+  not a value worth matching, it is an unchecked cast wrapping … someone
+  who asks for more and receives nothing has been given a wrong answer,
+  not a different one." This is the parity mandate's "except where they
+  are wrong" case. The **accept surface** on the field axis is identical
+  over the whole `i64` domain either way — only the field *count*
+  differs, and only on `[2^32, i64::MAX]`. No new refusal is introduced
+  anywhere by #253.
+- **Not a ceiling.** #253 removed PulsusDB's 5000 cap on the field-name
+  axis outright and put nothing in its place: the reference imposes no
+  maximum there and, per the measurement recorded on issue #253 over a
+  50 000-field sample, does not degrade either (`limit` from 50 000 to
+  4 294 967 295 returned an identical body in an identical time). On that
+  axis, saturation is the last representable value of the `u32` the
+  parameter already had, not a policy limit. (`line_limit`'s 5000 IS a
+  limit, but a reference-matching one — see the entry-axis bullets above;
+  #253 did not touch it.)
+- **Fixture status:** as the entries above — no
+  `test/fixtures/logs/differential.json` case, so
+  `informational_cases_are_recorded_in_the_committed_ledger` does not
+  apply; registered here for identity.
+- **Gated by:** `crates/pulsus-server/src/logs_api/params.rs`'s
+  `parse_field_limit_saturates_where_the_reference_wraps` (the field
+  axis, all four rows above) and
+  `parse_line_limit_matches_the_reference_atoi_surface` (the entry axis,
+  including the wrap-back-into-range spellings).
+
 ### detected-fields-array-order-pinned (issues #244, #258)
 
 - **Construct:** the ORDER of the `fields` array in a

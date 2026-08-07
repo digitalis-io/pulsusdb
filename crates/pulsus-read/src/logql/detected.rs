@@ -441,11 +441,20 @@ impl FieldAccumulator {
     /// docs/benchmarks/logs-differential-ledger.md; the same treatment
     /// `label-replace-collision-tie-order` and `approx_topk` get.
     ///
-    /// Allocates the response `Vec<DetectedFieldOut>` — RESPONSE-scoped, at
-    /// most `field_limit` (<= 5000) entries, once per request. Outside every
-    /// per-row window; the budget covers what is RETAINED during
-    /// accumulation, and this vector is the accumulation's output, not part
-    /// of it.
+    /// Allocates the response `Vec<DetectedFieldOut>` — RESPONSE-scoped,
+    /// once per request, outside every per-row window; the budget covers
+    /// what is RETAINED during accumulation, and this vector is the
+    /// accumulation's output, not part of it.
+    ///
+    /// Its length is bounded by `field_limit` AND, independently, by what
+    /// [`RetentionBudget`] admitted: every field name here was charged
+    /// against [`MAX_DETECTED_FIELD_BYTES`] before it was inserted, so the
+    /// count cannot exceed what that ceiling paid for however large
+    /// `field_limit` is. `field_limit` carries no ceiling of its own since
+    /// issue #253 — no number belongs in this sentence, and none is given;
+    /// `detected_fields_witness.rs`'s
+    /// `field_count_is_bounded_by_the_retention_budget_not_by_the_parameter`
+    /// derives the bound instead, at `field_limit = u32::MAX`.
     pub(super) fn finish(self) -> (Vec<DetectedFieldOut>, bool) {
         let capped = self.budget.capped();
         let mut out: Vec<DetectedFieldOut> = self
