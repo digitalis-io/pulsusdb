@@ -34,15 +34,15 @@
 # frontend defect is fixed upstream and the capture procedure records
 # which config produced the value.
 #
-# EXCLUDED sub-cases (`by (FP, fp)`, `by (fp, fp, nosuch)`): after
-# dedup these reduce to an ABSENT `by` name, which the reference OMITS
-# (captured: `{fp="a"} 1`, `{fp="b"} 2` for both) while PulsusDB's
-# `group_key` materialises it as `name=""` — the pre-existing
-# engine-wide divergence **owned by #241** (its `group_key` rewrite is
-# deep in review; the #241 adjudication forbids fixing it from another
-# issue). OBLIGATION: when #241 lands, ADD both shapes here with the
-# captured expectations above — ready-made acceptance tests, exactly
-# like the excluded sub-cases in b13/b16.
+# FORMERLY-EXCLUDED sub-cases, now ADOPTED (issue #241, d4a-d4f): after
+# dedup `by (FP, fp)` and `by (fp, fp, nosuch)` reduce to an ABSENT `by`
+# name, which the reference OMITS while PulsusDB's `group_key` used to
+# materialise as `name=""`. That divergence is fixed and the two shapes
+# are pinned below, together with the general shape they are instances of
+# (a present name plus an absent one, an all-absent clause, and the
+# `without` half — which was never affected). Re-captured 2026-08-07 on
+# `grafana/loki:3.7.4` (digest sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc),
+# same anchoring discipline as the rest of the file.
 #
 # provenance: captured
 # (file default; see logqltest/PROVENANCE.md §provenance markers.
@@ -77,6 +77,48 @@ eval instant at 60s sum by (fp, env, fp) (count_over_time({service_name="svc-gd"
   {env="e1", fp="a"} 1
   {env="e2", fp="b"} 1
   {env="e3", fp="b"} 1
+
+# d4a/d4b (issue #241, adopted from this file's EXCLUDED list) — after
+# dedup both reduce to a present name plus an ABSENT one, which the
+# reference OMITS: it builds each `by` group's label set out of the
+# METRIC's own labels, so a name the series does not carry contributes
+# nothing (`pkg/logql/evaluator.go:466-477 @ v3.7.4`). Label names are
+# case-sensitive, so `FP` is a second, absent name — d4a and d4b are the
+# same answer by two routes. Both were `{fp="a", FP=""}` / `{fp="b",
+# FP=""}` shaped in PulsusDB until #241 landed.
+eval instant at 60s sum by (FP, fp) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 1
+  {fp="b"} 2
+
+eval instant at 60s sum by (fp, fp, nosuch) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 1
+  {fp="b"} 2
+
+# d4c (issue #241) — the general shape without a duplicate: one present
+# name plus one absent name. Captured identical to d1.
+eval instant at 60s sum by (fp, nosuch) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a"} 1
+  {fp="b"} 2
+
+# d4d (issue #241) — an ALL-absent `by` clause is not `{nosuch=""}`: every
+# series lands in the SAME group and that group's label set is empty.
+eval instant at 60s sum by (nosuch) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {} 3
+
+# d4e (issue #241) — `without` was never affected and is pinned here as
+# the other half of the pair: an absent name in the list is an idempotent
+# no-op delete (`lb.Del(Groups...)`, `evaluator.go:462-465 @ v3.7.4`), so
+# the answer is the ungrouped label sets.
+eval instant at 60s sum without (nosuch) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {env="e1", fp="a", service_name="svc-gd"} 1
+  {env="e2", fp="b", service_name="svc-gd"} 1
+  {env="e3", fp="b", service_name="svc-gd"} 1
+
+# d4f (issue #241) — and combined with a name that IS present, the absent
+# one changes nothing.
+eval instant at 60s sum without (env, nosuch) (count_over_time({service_name="svc-gd"} | logfmt [5m]))
+  {fp="a", service_name="svc-gd"} 1
+  {fp="b", service_name="svc-gd"} 2
 
 # d5/d6 — `without` repeats are idempotent deletes, alone and combined
 # with a distinct name.

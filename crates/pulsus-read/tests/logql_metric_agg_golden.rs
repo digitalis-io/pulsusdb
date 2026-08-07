@@ -3615,17 +3615,23 @@ fn variants_absent_series_use_the_variants_selector_and_carry_no_index() {
         "absent series must drop at range: {items:?}"
     );
     // Under a bare `sum` the reference groups the index-less series to
-    // `{}` (captured). PulsusDB's `group_key` `by`-grouping currently
-    // materializes a MISSING grouped label as `name=""`
-    // (`unwrap_or_default`) — a PRE-EXISTING engine semantic affecting
-    // EVERY `by` over a missing label, nothing variants-specific.
-    // OWNED BY #241, which captured the same divergence independently by
-    // a different route and carries the root-cause fix (omit missing
-    // labels from the `by` key, reference-exact). OBLIGATION: when #241
-    // lands, re-capture and pin the `sum(absent_over_time(...))`
-    // sub-case here and in `b13_variants.test` — it is a ready-made
-    // acceptance test for that fix (expected `{} 1`). Until then the
-    // sub-case stays excluded at both sites.
+    // `{}` (captured). `variants` injects `by (__variant__)` into the
+    // vector aggregation and the synthetic series carries no
+    // `__variant__`, so this is a `by` over a MISSING label — which the
+    // reference omits from the key rather than materialising as
+    // `__variant__=""` (`pkg/logql/evaluator.go:466-477 @ v3.7.4`).
+    // PulsusDB answered `{__variant__=""} 1` here until issue #241; the
+    // sub-case was excluded at this site and in `b13_variants.test` and
+    // is now pinned at both (`b13` case 16s, re-captured 2026-08-07 on
+    // `grafana/loki:3.7.4`).
+    let query = r#"variants(sum(absent_over_time({service_name="checkout", tier="x"}[5m]))) of ({service_name="checkout"}[5m])"#;
+    let node = metric_node_of(query, &instant_params(60 * NS));
+    let out = sorted_vector(eval_node(&node, &[], &meta_one()).unwrap());
+    assert_eq!(
+        out,
+        vec![(lbl(&[]), 1.0)],
+        "an absent `by` name must be omitted from the group, not materialised empty"
+    );
 }
 
 /// B16 — `append_variant_label` OVERRIDES a common-pipeline

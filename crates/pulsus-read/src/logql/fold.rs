@@ -11,7 +11,7 @@
 use super::error::ReadError;
 use super::plan::{self};
 use pulsus_logql::{Grouping, GroupingKind, VectorAggOp};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::agg::{EMPTY_LABEL_SET, LabelSet, VectorAccum, k_of};
 use super::charge::{
@@ -32,6 +32,13 @@ use super::window::clamp_bucket;
 /// [`label_set_bytes`] evaluated on a `LabelSet` that has not been built.
 /// `group_key_bytes_matches_group_key` pins the two together, so the
 /// sizing cannot drift from the thing it sizes.
+///
+/// The `By` arm walks `g.labels` where `group_key` walks `labels`; the two
+/// count the same pairs because the SOLE `VectorAggSpec` producer
+/// deduplicates the grouping list (`plan::dedup_grouping`, issue #288), so
+/// a present name is met once on either side. Should a repeated name ever
+/// reach here, this arm counts it twice and `group_key` once — an
+/// OVER-charge, which is the safe direction for a charge-before-allocate.
 fn group_key_bytes(labels: &[(String, String)], grouping: Option<&Grouping>) -> u64 {
     let Some(g) = grouping else {
         // `group_key` returns `Vec::new()`, which allocates nothing.
@@ -42,13 +49,17 @@ fn group_key_bytes(labels: &[(String, String)], grouping: Option<&Grouping>) -> 
     match g.kind {
         GroupingKind::By => {
             for name in &g.labels {
-                let value_len = labels
-                    .iter()
-                    .find(|(k, _)| k == name)
-                    .map_or(0, |(_, v)| v.len());
+                // An ABSENT name allocates nothing — `group_key` selects
+                // from the series' labels (issue #241). Sizing it anyway
+                // would price a key the fold never builds, and the
+                // tightness half of `group_key_bytes_matches_group_key`
+                // fails on exactly that.
+                let Some((_, value)) = labels.iter().find(|(k, _)| k == name) else {
+                    continue;
+                };
                 bytes = bytes
                     .saturating_add(alloc_block_bytes(name.len() as u64))
-                    .saturating_add(alloc_block_bytes(value_len as u64));
+                    .saturating_add(alloc_block_bytes(value.len() as u64));
                 pairs += 1;
             }
         }
@@ -147,6 +158,35 @@ fn charged_group_key<'a>(
     Ok((key, charge))
 }
 
+/// The group's identity AND its emitted label set, both as the reference
+/// builds them.
+///
+/// **`by` selects FROM the series' own labels; it never invents one.**
+/// The reference's `VectorAggEvaluator.Next` builds a `by` group's label
+/// set by ranging over the METRIC and keeping the labels whose name is in
+/// the grouping list — `metric.Range(func(l labels.Label) { for _, n :=
+/// range Groups { if l.Name == n { b.Add(l.Name, l.Value); break } } })`
+/// (`pkg/logql/evaluator.go:466-477 @ v3.7.4`) — so the output is a
+/// SUBSEQUENCE of the input and a grouping name the series does not carry
+/// contributes nothing. The identity agrees, by the same shape:
+/// `HashForLabels` is a merge-join of the sorted names against the sorted
+/// labels and hashes only the intersection
+/// (`vendor/github.com/prometheus/prometheus/model/labels/labels_slicelabels.go:103-121
+/// @ v3.7.4`). Issue #241: PulsusDB used to materialise the miss as
+/// `name=""`, which answered `{__variant__=""}` where the reference
+/// answers `{}`.
+///
+/// A label PRESENT with an empty value is a different thing and is KEPT —
+/// `ScratchBuilder.Add`/`Labels` copy what they are given
+/// (`labels_slicelabels.go:485-510 @ v3.7.4`), and the container agrees
+/// (`sum by (zz)` over a `label_format zz=""` series answers `{zz=""}`).
+/// Selecting from the input has that property for free; an
+/// absent-vs-present-empty test would not distinguish a rule that dropped
+/// both.
+///
+/// `without` needs no change: it already filters the series' own labels,
+/// so an absent name in the list is simply a no-op, as the reference's
+/// `lb.Del(Groups...)` is (`evaluator.go:462-465 @ v3.7.4`).
 pub(in crate::logql) fn group_key(
     labels: &[(String, String)],
     grouping: Option<&Grouping>,
@@ -155,21 +195,17 @@ pub(in crate::logql) fn group_key(
         return Vec::new();
     };
     let mut kv: Vec<(String, String)> = match g.kind {
+        // Built from `labels`, not from `g.labels` — the direction is the
+        // fix. Hashing the (small, plan-time deduplicated) name list and
+        // probing it per label keeps this O(|g| + |labels|); the previous
+        // form hashed `labels` instead, so the allocation count is
+        // unchanged.
         GroupingKind::By => {
-            let map: HashMap<&str, &str> = labels
+            let want: HashSet<&str> = g.labels.iter().map(String::as_str).collect();
+            labels
                 .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            g.labels
-                .iter()
-                .map(|name| {
-                    (
-                        name.clone(),
-                        map.get(name.as_str())
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    )
-                })
+                .filter(|(k, _)| want.contains(k.as_str()))
+                .cloned()
                 .collect()
         }
         GroupingKind::Without => labels
@@ -909,6 +945,178 @@ mod tests {
         }
     }
 
+    /// **Issue #241, the discriminating case.** A `by` name the series
+    /// does not carry contributes NOTHING to the group — it is not in the
+    /// key and not in the emitted label set. The reference builds the
+    /// group's labels by ranging over the METRIC and keeping the names it
+    /// finds (`pkg/logql/evaluator.go:466-477 @ v3.7.4`), and hashes the
+    /// same intersection (`labels_slicelabels.go:103-121 @ v3.7.4`).
+    ///
+    /// Captured on `grafana/loki:3.7.4` over a three-stream `fp=a,b,b`
+    /// dataset: `sum by (fp, nosuch)` answers `{fp="a"} 1`, `{fp="b"} 2`
+    /// and `sum by (nosuch)` answers `{} 3`. Before the fix each of these
+    /// carried a `nosuch=""` pair.
+    #[test]
+    fn by_omits_a_grouping_name_the_series_does_not_carry() {
+        let labels = fold_labels(&[("env", "e1"), ("fp", "a")]);
+        let by = |names: &[&str]| Grouping {
+            kind: GroupingKind::By,
+            labels: names.iter().map(|n| n.to_string()).collect(),
+        };
+        assert_eq!(
+            group_key(&labels, Some(&by(&["fp", "nosuch"]))),
+            fold_labels(&[("fp", "a")]),
+            "an absent `by` name must not be materialised as `nosuch=\"\"`"
+        );
+        assert_eq!(
+            group_key(&labels, Some(&by(&["nosuch"]))),
+            fold_labels(&[]),
+            "a `by` clause of only absent names groups to `{{}}`"
+        );
+        // `without` was never affected and stays pinned: an absent name in
+        // the list is a no-op, as `lb.Del(Groups...)` is
+        // (`evaluator.go:462-465 @ v3.7.4`). Container: `sum without
+        // (nosuch)` returns the three input label sets unchanged.
+        let without = Grouping {
+            kind: GroupingKind::Without,
+            labels: vec!["nosuch".to_string()],
+        };
+        assert_eq!(group_key(&labels, Some(&without)), labels);
+    }
+
+    /// A label PRESENT with an empty value is NOT the same as an absent
+    /// one, and this is the direction the fix moves series identity:
+    /// before it, both produced the key `[(zz, "")]` and MERGED; after it
+    /// they are two groups, which is what the container does (`sum by
+    /// (zz)` over a `| label_format zz="{{…}}"` dataset answers
+    /// `{zz=""} 1` and `{zz="v"} 2` — the empty-valued group keeps its
+    /// label).
+    ///
+    /// The change can therefore only SPLIT a group, never merge two: the
+    /// post-fix key is the pre-fix key with the empty-valued absent pairs
+    /// removed, and two series share a post-fix key only if they agree on
+    /// every present grouping label AND carry the same subset of the
+    /// grouping names — which makes their pre-fix keys equal too. The
+    /// `{}`/`{zz=""}` pair below is a witness for the split direction;
+    /// `no_two_group_keys_merge` is the general statement.
+    #[test]
+    fn by_keeps_a_grouping_label_present_with_an_empty_value() {
+        let by_zz = Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["zz".to_string()],
+        };
+        let present_empty = fold_labels(&[("fp", "a"), ("zz", "")]);
+        let absent = fold_labels(&[("fp", "a")]);
+        assert_eq!(
+            group_key(&present_empty, Some(&by_zz)),
+            fold_labels(&[("zz", "")])
+        );
+        assert_eq!(group_key(&absent, Some(&by_zz)), fold_labels(&[]));
+        assert_ne!(
+            group_key(&present_empty, Some(&by_zz)),
+            group_key(&absent, Some(&by_zz)),
+            "present-empty and absent are two groups, not one"
+        );
+    }
+
+    /// The refinement statement, over a matrix rather than a witness: for
+    /// every pair of label sets and every `by` clause, equal post-fix keys
+    /// imply the pre-fix keys were equal too. So no query that used to
+    /// answer with `n` groups now answers with fewer, and no value that
+    /// was summed over one set of series is now summed over a larger one.
+    #[test]
+    fn no_two_group_keys_merge_that_were_distinct_before() {
+        /// The pre-fix `By` arm, kept here as the thing being compared
+        /// against — `name.clone()` with `unwrap_or_default()` for the
+        /// value.
+        fn legacy_group_key(labels: &[(String, String)], g: &Grouping) -> LabelSet {
+            let map: HashMap<&str, &str> = labels
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let mut kv: Vec<(String, String)> = g
+                .labels
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        map.get(name.as_str())
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect();
+            kv.sort();
+            kv
+        }
+
+        let sets = [
+            fold_labels(&[]),
+            fold_labels(&[("a", "1")]),
+            fold_labels(&[("a", "")]),
+            fold_labels(&[("b", "2")]),
+            fold_labels(&[("a", "1"), ("b", "2")]),
+            fold_labels(&[("a", "1"), ("b", "")]),
+            fold_labels(&[("a", ""), ("b", "")]),
+            fold_labels(&[("a", "1"), ("b", "2"), ("c", "3")]),
+        ];
+        let clauses = [
+            vec!["a"],
+            vec!["b"],
+            vec!["a", "b"],
+            vec!["a", "nosuch"],
+            vec!["nosuch"],
+            vec!["a", "b", "c"],
+        ];
+        let mut split = 0usize;
+        for names in &clauses {
+            let g = Grouping {
+                kind: GroupingKind::By,
+                labels: names.iter().map(|n| n.to_string()).collect(),
+            };
+            for x in &sets {
+                for y in &sets {
+                    let (nx, ny) = (group_key(x, Some(&g)), group_key(y, Some(&g)));
+                    let (ox, oy) = (legacy_group_key(x, &g), legacy_group_key(y, &g));
+                    if nx == ny {
+                        assert_eq!(
+                            ox, oy,
+                            "{names:?}: {x:?} and {y:?} MERGED — they were distinct groups \
+                             before and share a key now"
+                        );
+                    } else if ox == oy {
+                        split += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            split > 0,
+            "the matrix must contain a pair the fix SPLITS, or it discriminates nothing"
+        );
+    }
+
+    /// The `by` key is a SUBSEQUENCE of the series' labels — it can never
+    /// be longer than the label set, whatever the clause. The reference
+    /// gets this from building the key out of the metric
+    /// (`evaluator.go:468-476 @ v3.7.4`); here it is the direction of the
+    /// filter. A repeated name cannot lengthen it either, which is the
+    /// property `plan::dedup_grouping` (issue #288) already guarantees
+    /// upstream and this arm no longer depends on.
+    #[test]
+    fn the_by_key_is_a_subsequence_of_the_series_labels() {
+        let labels = fold_labels(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        let g = Grouping {
+            kind: GroupingKind::By,
+            labels: std::iter::repeat_n("a".to_string(), 1024)
+                .chain(["b".to_string(), "nosuch".to_string()])
+                .collect(),
+        };
+        let key = group_key(&labels, Some(&g));
+        assert_eq!(key, fold_labels(&[("a", "1"), ("b", "2")]));
+        assert!(key.len() <= labels.len());
+    }
+
     /// `group_key_bytes` sizes exactly what `group_key` allocates. If the
     /// two drift the charge stops meaning anything, so they are pinned
     /// against each other over both grouping kinds, absent names, empty
@@ -973,12 +1181,15 @@ mod tests {
             step: 10,
             kmax: 4,
         };
-        // A `by(...)` clause whose names come from the QUERY TEXT — the
-        // bytes that were unbounded before this charge existed.
-        // One PRESENT distinguishing name, so distinct series land in
-        // distinct groups; the other 64 are absent from the data and
-        // exist only in the query text — which is the mass this charge
-        // exists to bound.
+        // A `by(...)` clause with one PRESENT distinguishing name, so
+        // distinct series land in distinct groups. The other 64 names are
+        // absent from the data: since issue #241 they cost NOTHING (the
+        // key is selected from the series' labels), so what this gate
+        // measures is the per-RETAINED-GROUP key charge, not query-text
+        // mass. The wide clause is kept because the charge must still be
+        // sized correctly in its presence — `group_key_bytes` skipping
+        // absent names is exactly what makes `key_bytes` here equal what
+        // the fold goes on to allocate.
         let wide = Grouping {
             kind: GroupingKind::By,
             labels: std::iter::once("id".to_string())

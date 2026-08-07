@@ -111,21 +111,46 @@ eval instant at 60s label_replace(count_over_time({service_name="svc-lr"} | logf
 
 # c8 — composes under a vector aggregation; the by-label is rewritten
 # first, so grouping sees the replaced values.
-#
-# EXCLUDED sub-case (`sum by (dst) (label_replace(…))`, where two series
-# lack dst): the container groups them into `{}` (captured: `{} 2`,
-# `{dst="v-10"} 1`, `{dst="v-7"} 1`) while PulsusDB's `group_key`
-# materialises the MISSING by-label as `dst=""` — the pre-existing
-# engine-wide `by`-over-a-missing-label divergence **owned by #241**
-# (its `group_key` rewrite is deep in review; the #241 adjudication
-# forbids fixing it from another issue). OBLIGATION: when #241 lands,
-# ADD that sub-case here with the captured expectation above — it is a
-# ready-made acceptance test, exactly like the excluded
-# `sum(absent_over_time(...))` sub-cases in b13.
 eval instant at 60s sum by (env) (label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "env", "e-$1", "src", "source-value-(.*)"))
   {env="dev"} 1
   {env="e-10"} 1
   {env="e-7"} 1
+  {env="stage"} 1
+
+# c8b (issue #241, adopted from this file's formerly-EXCLUDED list) — the
+# same composition where the by-label is MISSING on two of the four series
+# (`label_replace` only sets `dst` where the regex matched). Those two
+# group together under an EMPTY label set, not under `dst=""`: the
+# reference builds a `by` group's labels out of the METRIC's own
+# (`pkg/logql/evaluator.go:466-477 @ v3.7.4`). Re-captured 2026-08-07 on
+# `grafana/loki:3.7.4` (digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc).
+eval instant at 60s sum by (dst) (label_replace(count_over_time({service_name="svc-lr"} | logfmt [5m]), "dst", "v-$1", "src", "source-value-(.*)"))
+  {} 2
+  {dst="v-10"} 1
+  {dst="v-7"} 1
+
+# c8c (issue #241) — the same rule without `label_replace` in the way:
+# `dst` is a stream label only one of the four series carries, `src` one
+# that three carry. This is the plainest form of the shape and needs no
+# rewrite to reach it.
+eval instant at 60s sum by (dst) (count_over_time({service_name="svc-lr"} | logfmt [5m]))
+  {} 3
+  {dst="old"} 1
+
+eval instant at 60s sum by (src) (count_over_time({service_name="svc-lr"} | logfmt [5m]))
+  {} 1
+  {src="other"} 1
+  {src="source-value-10"} 1
+  {src="source-value-7"} 1
+
+# c8d (issue #241) — a present and an absent name together: the present
+# one groups, the absent one contributes nothing, so three of the four
+# answers are ONE-pair label sets rather than `{dst="", env=…}`.
+eval instant at 60s sum by (dst, env) (count_over_time({service_name="svc-lr"} | logfmt [5m]))
+  {dst="old", env="x"} 1
+  {env="dev"} 1
+  {env="prod"} 1
   {env="stage"} 1
 
 # c9 — nests inside itself; the outer sees the inner's output labels.

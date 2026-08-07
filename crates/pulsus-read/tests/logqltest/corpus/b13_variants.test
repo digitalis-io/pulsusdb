@@ -22,18 +22,15 @@
 #     pins index-wins, gated hermetically);
 #   - no `offset`, no range-aggregation grouping, no case above the
 #     series cap (workspace-wide pre-existing gaps / the #236 cap class);
-#   - the `sum(absent_over_time(...))` sub-case: the capture gives `{}`
-#     (the injected `by (__variant__)` grouping over the index-less
-#     synthetic series); PulsusDB's `group_key` `by`-grouping currently
-#     materializes a MISSING grouped label as `name=""` — a PRE-EXISTING
-#     engine semantic affecting EVERY `by` over a missing label, nothing
-#     variants-specific. **Owned by #241**, which captured the same
-#     divergence independently by a different route and carries the
-#     root-cause fix (omit missing labels from the `by` key,
-#     reference-exact). OBLIGATION: when #241 lands, RE-CAPTURE this
-#     sub-case from the pinned container and add it here — it is a
-#     ready-made acceptance test for that fix (expected `{} 1` over the
-#     case-16 gap dataset below). The absent instant/range cases below
+#   - (LIFTED, issue #241 — the sub-case is now case 16s below.) The
+#     `sum(absent_over_time(...))` sub-case was excluded because the
+#     capture gives `{}` — the injected `by (__variant__)` grouping over
+#     the index-less synthetic series — while PulsusDB's `group_key`
+#     materialized a MISSING grouped label as `name=""`. That was a
+#     PRE-EXISTING engine semantic affecting EVERY `by` over a missing
+#     label, nothing variants-specific; #241 fixed it at the root (the
+#     `by` key is selected from the series' own labels) and the case is
+#     re-captured and pinned. The absent instant/range cases below
 #     ARE pinned: the adjudicated capture correction (2026-07-26
 #     session; the reference attaches `__variant__` per EXTRACTED
 #     SAMPLE, so a synthetic absent series never carries it — index-less
@@ -320,3 +317,15 @@ eval instant at 3600s variants(absent_over_time({service_name="svcy", tier="x"}[
 # case 16r — the same query at range: the index-less synthetic series is
 # dropped by the instant/range asymmetry (captured: empty matrix).
 eval range from 3600s to 3660s step 60s variants(absent_over_time({service_name="svcy", tier="x"}[5m])) of ({service_name="svcy"}[5m])
+
+# case 16s (issue #241, adopted from this file's formerly-EXCLUDED list)
+# — the same absent variant under a `sum`. `variants` injects
+# `by (__variant__)` into the vector aggregation, the synthetic absent
+# series carries no `__variant__` (case 16), and an absent `by` name is
+# OMITTED rather than materialised: the answer is `{}`, not
+# `{__variant__=""}`. That is the user-visible form of the divergence
+# #241 fixed. Re-captured 2026-08-07 on `grafana/loki:3.7.4` (digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc,
+# the same image this file's other captures name), `ci/logql/config.yaml`.
+eval instant at 3600s variants(sum(absent_over_time({service_name="svcy", tier="x"}[5m]))) of ({service_name="svcy"}[5m])
+  {} 1
