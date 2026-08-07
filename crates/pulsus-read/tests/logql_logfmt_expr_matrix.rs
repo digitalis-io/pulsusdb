@@ -2,6 +2,33 @@
 //! extraction expression, measured as a matrix and checked in so it can
 //! be re-run.
 //!
+//! # Read the tests, not the prose
+//!
+//! **This file's comments have been a recurring source of stale
+//! descriptions, and you should treat the tests as authoritative.** Five
+//! separate wrong glosses were found and fixed during review of this
+//! issue, each in a comment nobody had touched since the change that
+//! invalidated it:
+//!
+//! 1. credit given to a test that asserted something unreachable and so
+//!    could never fail;
+//! 2. a claim that a `variants(...)` query was measured through neither
+//!    of its two pipeline positions, when one of them was reached;
+//! 3. a stale-window figure carried over instead of re-measured;
+//! 4. an inline note naming three perturbations as biting when only two
+//!    do, contradicting a doc comment in the same file;
+//! 5. this one — three places saying an expression's verdict does not
+//!    depend on its position, true of the original twelve-position table
+//!    and false since `variants_common_side` joined it.
+//!
+//! The severity fell each time — the last few UNDERSOLD what the tests
+//! check rather than overselling it — but the class did not stop, and one
+//! per round is not convergence. So: where a comment here and a test here
+//! disagree, the test is right. Every non-obvious claim in this file
+//! that could be made breakable has been: the enumerations are computed
+//! from the tables, the compile-site list is derived from the source, and
+//! the perturbations named in comments were each run.
+//!
 //! **What this file is.** The reference validates a logfmt extraction in
 //! TWO layers, and refuses at both. The extraction-**list** shape is a
 //! `syntax.y` grammar error, refused by `ParseExpr` in every window
@@ -76,9 +103,9 @@
 //!   rather than counted.
 //! - [`live_matrix_against_the_reference`] — gated on
 //!   `PULSUSDB_LOGQL_DIFF_URL`, re-measures all of it against the pinned
-//!   container, and checks the compression this table uses (an
-//!   expression's verdict does not depend on WHERE the `| logfmt` sits)
-//!   rather than assuming it.
+//!   container point by point, so the way the table DERIVES a verdict —
+//!   from the expression's layer and the position's outcome together —
+//!   is measured rather than assumed.
 //! - [`live_surface_axis_agrees`] — the same two probes put to every
 //!   route, so "the rule is only observable where a pipeline runs" is
 //!   measured rather than argued.
@@ -413,11 +440,16 @@ const EXPRESSIONS: &[Expression] = &[
 /// plan through `run_metric_node` → `run_metric_inner`), `plan.rs`'s
 /// variant validation and `variants.rs:509`. They do NOT drive
 /// `exec.rs:2290` (`detected_fields`) or `:2576` (`tail`) — see the
-/// module docs' "uncovered call sites". The table holds an expression's
-/// verdict CONSTANT across positions rather than recording one per
-/// position, which
-/// [`live_matrix_against_the_reference`] puts to the container point by
-/// point.
+/// module docs' "uncovered call sites".
+///
+/// **A position carries an [`Outcome`], so the table is position-AWARE.**
+/// PulsusDB's verdict for a given expression is the same at every
+/// position; the REFERENCE's is not — it refuses a malformed expression
+/// at thirteen positions and accepts it at `variants_common_side`. That
+/// is checked by
+/// [`the_reference_verdict_depends_on_position_and_ours_does_not`] and
+/// put to the container point by point by
+/// [`live_matrix_against_the_reference`].
 struct Position {
     name: &'static str,
     template: &'static str,
@@ -876,6 +908,63 @@ fn collect_variant_pipelines(node: &MetricNode, out: &mut Vec<Vec<pulsus_logql::
             }
         }
     });
+}
+
+/// **The table is POSITION-AWARE, and which way round matters.** Three
+/// comments in this file used to say an expression's verdict does not
+/// depend on where the `| logfmt` sits. That was true of the original
+/// twelve-position table and false from the moment `variants_common_side`
+/// joined it — so it is a check now rather than a sentence.
+///
+/// Measured here: for every sub-grammar expression the REFERENCE refuses
+/// it at thirteen positions and ACCEPTS it at `variants_common_side`
+/// (where the build error is swallowed behind `SelectSamples`), while
+/// PulsusDB refuses it at all fourteen. That difference is exactly the
+/// INTRODUCED bucket
+/// [`the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression`]
+/// enumerates, seen from the other end.
+#[test]
+fn the_reference_verdict_depends_on_position_and_ours_does_not() {
+    let mut checked = 0usize;
+    for e in EXPRESSIONS.iter().filter(|e| e.layer == Layer::SubGrammar) {
+        let at = |pos: &'static Position| Point {
+            label: String::new(),
+            query: String::new(),
+            layer: e.layer,
+            outcome: pos.outcome,
+            refuses_at: pos.refuses_at,
+        };
+        let mut theirs: Vec<(&str, Verdict)> = Vec::new();
+        let mut ours: Vec<(&str, Verdict)> = Vec::new();
+        for pos in POSITIONS {
+            let p = at(pos);
+            theirs.push((pos.name, p.reference()));
+            ours.push((pos.name, p.pulsus()));
+        }
+        // OURS is position-independent: a malformed expression is a 400
+        // wherever it sits, because every position compiles the pipeline
+        // that carries it before any I/O.
+        assert!(
+            ours.iter().all(|(_, v)| *v == Verdict::Reject),
+            "{}: PulsusDB's verdict is not constant across positions: {ours:?}",
+            e.name
+        );
+        // THEIRS is not.
+        let accepting: Vec<&str> = theirs
+            .iter()
+            .filter(|(_, v)| *v == Verdict::Accept)
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(
+            accepting,
+            vec!["variants_common_side"],
+            "{}: the reference's verdict varies by position in a way this table no longer \
+             describes — the accepting positions are {accepting:?}",
+            e.name
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no sub-grammar expression was checked");
 }
 
 /// **The two expression columns agree.** `decoded` is what the
@@ -1537,12 +1626,14 @@ fn reference_verdict(base: &str, query: &str) -> (Verdict, String) {
 }
 
 /// **Re-measures the committed verdicts against the pinned container**,
-/// and checks the compression they are stored in.
+/// and checks the derivation they are stored as.
 ///
-/// The table records ONE layer per expression for a matrix of position ×
-/// expression. That is a claim — that an expression's verdict does not
-/// depend on where the `| logfmt` sits — and this leg puts every point
-/// individually, so the claim is measured rather than assumed.
+/// The table records one layer per expression and one [`Outcome`] per
+/// position, and [`Point::reference`] combines them. That is a claim
+/// about every cell of a position × expression matrix, and this leg puts
+/// every cell individually — including the seventeen where the reference
+/// ACCEPTS an expression it refuses everywhere else — so the derivation
+/// is measured rather than assumed.
 #[test]
 fn live_matrix_against_the_reference() {
     let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
