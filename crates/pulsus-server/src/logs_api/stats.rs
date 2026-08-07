@@ -118,40 +118,64 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
+    /// `(status, body text)`. Issue #264: every error on this surface is a
+    /// bare `text/plain` body, so tests assert the raw message; success
+    /// bodies are still JSON and those cases parse the returned string.
+    ///
+    /// On any 4xx/5xx this also asserts the reference's error container —
+    /// `Content-Type: text/plain; charset=utf-8` + `X-Content-Type-Options:
+    /// nosniff`, non-empty body (`pkg/util/server/error.go:48-51 @
+    /// v3.7.4`) — so every error case in this module covers the wire
+    /// shape, not just its status code.
+    async fn status_and_body(res: Response) -> (StatusCode, String) {
         let status = res.status();
+        if status.is_client_error() || status.is_server_error() {
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+            );
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+            );
+        }
         let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        if status.is_client_error() || status.is_server_error() {
+            assert!(!text.is_empty(), "an error body is never empty");
+        }
+        (status, text)
     }
 
     #[tokio::test]
-    async fn stats_missing_query_param_is_400_bad_data() {
+    async fn stats_missing_query_param_is_400() {
         let res = stats(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn stats_malformed_logql_is_400_bad_data_with_a_position() {
+    async fn stats_malformed_logql_is_400_with_the_byte_offset_in_the_message() {
         let res = stats(
             State(test_state()),
             HeaderMap::new(),
             RawQuery(Some("query=%7B".to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some());
+        assert!(body.contains("at byte"), "{body}");
     }
 
     /// Issue #74: a metric query on the stats surface is rejected 400
     /// BEFORE any pool/engine work (no pool exists here, yet the error
-    /// is `bad_data`, not the 503 the pool check would produce).
+    /// is 400, not the 503 the pool check would produce).
     #[tokio::test]
-    async fn stats_metric_query_is_400_bad_data_before_the_pool_check() {
+    async fn stats_metric_query_is_400_before_the_pool_check() {
         let res = stats(
             State(test_state()),
             HeaderMap::new(),
@@ -160,36 +184,24 @@ mod tests {
             )),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("metric queries")
-        );
+        assert!(body.contains("metric queries"), "{body}");
     }
 
     /// Issue #74: a pipeline stage beyond a line filter (here `| logfmt`)
     /// is rejected 400 — nothing else has a pushdown aggregation shape.
     #[tokio::test]
-    async fn stats_parser_pipeline_is_400_bad_data() {
+    async fn stats_parser_pipeline_is_400() {
         let res = stats(
             State(test_state()),
             HeaderMap::new(),
             RawQuery(Some("query=%7Bapp%3D%22x%22%7D%20%7C%20logfmt".to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("line filters only")
-        );
+        assert!(body.contains("line filters only"), "{body}");
     }
 
     /// A selector-plus-line-filter query is shape-valid; with no pool it
@@ -204,9 +216,8 @@ mod tests {
             )),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     /// Issue #279 (AC4): `/stats` — a valid selector of exactly 131,072
@@ -225,10 +236,8 @@ mod tests {
             ))),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["error"], "input size too long (131072 > 131072)");
-        assert_eq!(json["position"], 0);
+        assert_eq!(body, "input size too long (131072 > 131072)");
     }
 }

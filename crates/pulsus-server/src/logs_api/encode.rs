@@ -704,29 +704,22 @@ pub(crate) fn query_response(
         // well-formed error response rather than a panic, mirroring
         // `prom_api::encode`'s own handling of the LogQL-only
         // `QueryResult::Streams` variant.
-        QueryResult::String(_) => (
+        // Issue #264: rendered through the same plain-text writer as every
+        // other logs-surface error, so the surface never speaks two error
+        // containers.
+        QueryResult::String(_) => super::error::plain_text_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({
-                "status": "error",
-                "errorType": "internal",
-                "error": "unexpected string result from a logs query",
-            })),
-        )
-            .into_response(),
+            "unexpected string result from a logs query".to_string(),
+        ),
         // Unreachable: `QueryResult::VectorHist`/`MatrixHist` (M7-A5b-i)
         // are PromQL metrics-only variants (native-histogram results) —
         // LogQL never fetches `metric_hist_samples` and so never produces
         // one. Mirrors the `String` arm's well-formed-error-over-panic
         // precedent.
-        QueryResult::VectorHist(_) | QueryResult::MatrixHist(_) => (
+        QueryResult::VectorHist(_) | QueryResult::MatrixHist(_) => super::error::plain_text_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({
-                "status": "error",
-                "errorType": "internal",
-                "error": "unexpected histogram result from a logs query",
-            })),
-        )
-            .into_response(),
+            "unexpected histogram result from a logs query".to_string(),
+        ),
     }
 }
 

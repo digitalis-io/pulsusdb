@@ -462,11 +462,37 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
+    /// `(status, body text)`. Issue #264: every error on this surface is a
+    /// bare `text/plain` body, so tests assert the raw message; success
+    /// bodies are still JSON and those cases parse the returned string.
+    ///
+    /// On any 4xx/5xx this also asserts the reference's error container —
+    /// `Content-Type: text/plain; charset=utf-8` + `X-Content-Type-Options:
+    /// nosniff`, non-empty body (`pkg/util/server/error.go:48-51 @
+    /// v3.7.4`) — so every error case in this module covers the wire
+    /// shape, not just its status code.
+    async fn status_and_body(res: Response) -> (StatusCode, String) {
         let status = res.status();
+        if status.is_client_error() || status.is_server_error() {
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+            );
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+            );
+        }
         let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        if status.is_client_error() || status.is_server_error() {
+            assert!(!text.is_empty(), "an error body is never empty");
+        }
+        (status, text)
     }
 
     #[tokio::test]
@@ -477,9 +503,8 @@ mod tests {
             RawQuery(Some(r#"query={app="x"}"#.to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     /// Issue #279: a syntactically valid selector of exactly 131,072
@@ -491,14 +516,12 @@ mod tests {
         format!(r#"{{app="{}"}}"#, "a".repeat(131_072 - 8))
     }
 
-    /// Issue #279: the over-cap rejection envelope — 400 `bad_data`, the
-    /// reference's verbatim message (its own `len > cap` rendering of a
-    /// `>=` comparison), `position` 0.
-    fn assert_query_too_long(status: StatusCode, json: &serde_json::Value) {
+    /// Issue #279: the over-cap rejection — 400 carrying the reference's
+    /// verbatim message (its own `len > cap` rendering of a `>=`
+    /// comparison) and nothing else (#264: no envelope, no `position`).
+    fn assert_query_too_long(status: StatusCode, body: &str) {
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["error"], "input size too long (131072 > 131072)");
-        assert_eq!(json["position"], 0);
+        assert_eq!(body, "input size too long (131072 > 131072)");
     }
 
     /// Issue #279 (AC4): `/query_range` rejects an over-cap query 400
@@ -513,8 +536,8 @@ mod tests {
             RawQuery(Some(format!("query={}", oversized_query()))),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
-        assert_query_too_long(status, &json);
+        let (status, body) = status_and_body(res).await;
+        assert_query_too_long(status, &body);
         // The valid-query half lives in
         // `query_range_without_a_pool_is_503_unavailable` above.
     }
@@ -528,8 +551,8 @@ mod tests {
             RawQuery(Some(format!("query={}", oversized_query()))),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
-        assert_query_too_long(status, &json);
+        let (status, body) = status_and_body(res).await;
+        assert_query_too_long(status, &body);
 
         let res = query(
             State(test_state()),
@@ -537,9 +560,8 @@ mod tests {
             RawQuery(Some(r#"query={app="x"}"#.to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     /// Issue #279 (AC4): `/series` — an over-cap `match[]` value is 400
@@ -553,8 +575,8 @@ mod tests {
             RawQuery(Some(format!("match[]={}", oversized_query()))),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
-        assert_query_too_long(status, &json);
+        let (status, body) = status_and_body(res).await;
+        assert_query_too_long(status, &body);
 
         let res = series_get(
             State(test_state()),
@@ -562,9 +584,8 @@ mod tests {
             RawQuery(Some(r#"match[]={app="x"}"#.to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     /// Issue #221: an over-cap **leafless** `vector(n)` range query is guarded
@@ -576,7 +597,7 @@ mod tests {
     /// exact function `run_metric_node` calls for a `VectorLit`) through the
     /// handler's `ReadError` → response conversion (the same
     /// `From<ReadError> for ApiError` + `IntoResponse` path `query_range` uses
-    /// via `?`), asserting it surfaces end-to-end as **422 query_too_broad**
+    /// via `?`), asserting it surfaces end-to-end as **422**
     /// with the 11000-bucket-cap message — identical to any other over-cap
     /// LogQL range query.
     ///
@@ -591,7 +612,7 @@ mod tests {
     /// `end_ns`/`step_ns`), so it is the exact error an over-cap
     /// `query_range` would carry.
     #[tokio::test]
-    async fn over_cap_leafless_vector_range_maps_to_422_query_too_broad() {
+    async fn over_cap_leafless_vector_range_maps_to_422() {
         const S: i64 = 1_000_000_000; // 1s
         // 11_001 step INTERVALS over `[0, 11001s]` at a 1s step > the 11000
         // cap (issue #227 review round 7, finding 1: exactly 11_000
@@ -606,17 +627,16 @@ mod tests {
         };
         let err = pulsus_read::logql::materialize_vector_lit(0.0, &window)
             .expect_err("an over-cap vector(n) range query must reject");
-        let (status, json) = status_and_body(ApiError::Read(err).into_response()).await;
+        let (status, body) = status_and_body(ApiError::Read(err).into_response()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json["errorType"], "query_too_broad");
         assert!(
-            json["error"].as_str().unwrap_or_default().contains("11000"),
-            "over-cap message must name the 11000-bucket cap: {json:?}"
+            body.contains("11000"),
+            "over-cap message must name the 11000-bucket cap: {body}"
         );
     }
 
     /// Issue #221 (AC 9/10): `QueryTooBroad(VariantSubStates)` maps to the
-    /// same 422 `query_too_broad` surface as every other too-broad LogQL
+    /// same 422 surface as every other too-broad LogQL
     /// query, via the real `ReadError` → `ApiError` → response path
     /// `query_range` uses.
     ///
@@ -632,22 +652,18 @@ mod tests {
     /// unreachability verdict are pinned in
     /// `plan::tests::variants_past_the_derived_backstop_reject_at_plan_time`.
     #[tokio::test]
-    async fn variants_past_the_sub_state_backstop_maps_to_422_query_too_broad() {
+    async fn variants_past_the_sub_state_backstop_maps_to_422() {
         let err = pulsus_read::logql::ReadError::QueryTooBroad(
             pulsus_read::logql::TooBroadReason::VariantSubStates {
                 count: 10_001,
                 cap: 10_000,
             },
         );
-        let (status, json) = status_and_body(ApiError::Read(err).into_response()).await;
+        let (status, body) = status_and_body(ApiError::Read(err).into_response()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json["errorType"], "query_too_broad");
         assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("10001 variants, exceeding the 10000-variant cap"),
-            "the message names the derived cap: {json:?}"
+            body.contains("10001 variants, exceeding the 10000-variant cap"),
+            "the message names the derived cap: {body}"
         );
     }
 
@@ -665,11 +681,10 @@ mod tests {
             RawQuery(Some(q.to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
         assert_eq!(
-            json["error"],
+            body,
             "exceeded maximum resolution of 11,000 points per time series. Try increasing the \
              value of the step parameter"
         );
@@ -691,12 +706,12 @@ mod tests {
             RawQuery(Some(q.to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
             "an exactly-at-the-limit request must pass the resolution guard \
-             (got {json:?})"
+             (got {body})"
         );
     }
 
@@ -729,12 +744,12 @@ mod tests {
             pulsus_logql::MAX_QUERY_SPAN_NS
         );
         let res = query_range(State(test_state()), HeaderMap::new(), RawQuery(Some(q))).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
             "the widest admissible request must pass the resolution \
-             guard (got {json:?})"
+             guard (got {body})"
         );
     }
 
@@ -755,12 +770,12 @@ mod tests {
             RawQuery(Some(q.to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
             "a 100-year step the reference serves must pass request parsing \
-             (got {json:?})"
+             (got {body})"
         );
     }
 
@@ -832,38 +847,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_range_missing_query_param_is_400_bad_data() {
+    async fn query_range_missing_query_param_is_400() {
         let res = query_range(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn query_range_malformed_logql_is_400_bad_data_with_a_position() {
+    async fn query_range_malformed_logql_is_400_with_the_byte_offset_in_the_message() {
         let res = query_range(
             State(test_state()),
             HeaderMap::new(),
             RawQuery(Some("query=%7B".to_string())), // "{" — unterminated selector
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some());
+        assert!(body.contains("at byte"), "{body}");
     }
 
     #[tokio::test]
-    async fn query_range_limit_above_the_cap_is_400_bad_data() {
+    async fn query_range_limit_above_the_cap_is_400() {
         let res = query_range(
             State(test_state()),
             HeaderMap::new(),
             RawQuery(Some(r#"query={app="x"}&limit=5001"#.to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
@@ -871,9 +883,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         let res = query_range_post(State(test_state()), headers, Bytes::from_static(b"{}")).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
@@ -885,22 +896,20 @@ mod tests {
         );
         let body = Bytes::from_static(b"query=%7Bapp%3D%22x%22%7D");
         let res = query_range_post(State(test_state()), headers, body).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     #[tokio::test]
-    async fn query_post_missing_query_param_is_400_bad_data() {
+    async fn query_post_missing_query_param_is_400() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
         let res = query_post(State(test_state()), headers, Bytes::from_static(b"")).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
@@ -912,17 +921,15 @@ mod tests {
         );
         let body = Bytes::from_static(b"query=%7Bapp%3D%22x%22%7D");
         let res = query_post(State(test_state()), headers, body).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     #[tokio::test]
-    async fn series_without_any_match_param_is_400_bad_data() {
+    async fn series_without_any_match_param_is_400() {
         let res = series_get(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
@@ -930,9 +937,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         let res = series_post(State(test_state()), headers, Bytes::from_static(b"{}")).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
@@ -944,9 +950,8 @@ mod tests {
         );
         let body = Bytes::from_static(b"match%5B%5D=%7Bapp%3D%22x%22%7D");
         let res = series_post(State(test_state()), headers, body).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     #[tokio::test]
@@ -958,16 +963,14 @@ mod tests {
             RawQuery(None),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     #[tokio::test]
-    async fn query_instant_missing_query_param_is_400_bad_data() {
+    async fn query_instant_missing_query_param_is_400() {
         let res = query(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 }

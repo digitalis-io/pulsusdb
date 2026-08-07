@@ -479,8 +479,10 @@ query text built as `count_over_time({app="a…a"}[1m])` padded to the exact
 byte length (and, corroborating, the bare-selector shape `{app="a…a"}`).
 The 400 body is exactly 51 bytes with **no trailing newline** (`od -c`
 verified), and the headers were `Content-Type: text/plain; charset=utf-8`
-+ `X-Content-Type-Options: nosniff` — PulsusDB's JSON envelope container
-divergence is #264's, not this row's.
++ `X-Content-Type-Options: nosniff`. PulsusDB served that body inside a
+JSON envelope at the time of this capture; issue #264 has since switched
+the LogQL surface to the same bare `text/plain` container, so the headers
+and body recorded here are now PulsusDB's too.
 
 ```pulsus-279-cap
 | id | query-bytes | shape | surface | reference-status | body |

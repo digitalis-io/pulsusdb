@@ -99,7 +99,7 @@ fn mount_detected_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
 ///
 /// **ORDER IS LOAD-BEARING.** #279's 131,072-byte query-text cap lives
 /// INSIDE `parse` (`pulsus-logql`'s `limits.rs`, reached from
-/// `parser.rs`) and answers 400 `bad_data` with the reference's verbatim
+/// `parser.rs`) and answers 400 with the reference's verbatim
 /// message. Admission therefore runs only on input `parse` has ACCEPTED,
 /// so its 422 can never pre-empt that 400.
 ///
@@ -284,7 +284,7 @@ mod tests {
 
     /// Issue #272 AC 6 clause 3d — the ordering at the wire.
     ///
-    /// `parse_logql` parses BEFORE it admits, so #279's 400 `bad_data`
+    /// `parse_logql` parses BEFORE it admits, so #279's 400
     /// wins and our 422 can never pre-empt the reference's answer. The
     /// guard is the MODEL relation, independent of `admit_logql_walk`
     /// (clause 3a owns the implementation half), so the two clauses catch
@@ -307,11 +307,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("error envelope is JSON");
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["error"], "input size too long (524288 > 131072)");
-        assert_eq!(json["position"], 0);
+        // Issue #264: the bare `text/plain` body, byte-exact.
+        assert_eq!(body, b"input size too long (524288 > 131072)");
     }
 
     #[tokio::test]
@@ -334,11 +331,7 @@ mod tests {
             alias_body, native_body,
             "alias and native over-cap rejection bodies must be byte-identical"
         );
-        let json: serde_json::Value =
-            serde_json::from_slice(&alias_body).expect("error envelope is JSON");
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["error"], "input size too long (131072 > 131072)");
-        assert_eq!(json["position"], 0);
+        assert_eq!(alias_body, b"input size too long (131072 > 131072)");
 
         // Irregular suffix (`/index/stats`), GET-only: the routed halves
         // prove both bindings reach the same parse seam (byte-identical

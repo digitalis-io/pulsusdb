@@ -128,18 +128,44 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
+    /// `(status, body text)`. Issue #264: every error on this surface is a
+    /// bare `text/plain` body, so tests assert the raw message; success
+    /// bodies are still JSON and those cases parse the returned string.
+    ///
+    /// On any 4xx/5xx this also asserts the reference's error container —
+    /// `Content-Type: text/plain; charset=utf-8` + `X-Content-Type-Options:
+    /// nosniff`, non-empty body (`pkg/util/server/error.go:48-51 @
+    /// v3.7.4`) — so every error case in this module covers the wire
+    /// shape, not just its status code.
+    async fn status_and_body(res: Response) -> (StatusCode, String) {
         let status = res.status();
+        if status.is_client_error() || status.is_server_error() {
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+            );
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+            );
+        }
         let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        if status.is_client_error() || status.is_server_error() {
+            assert!(!text.is_empty(), "an error body is never empty");
+        }
+        (status, text)
     }
 
-    async fn get(query: Option<&str>) -> (StatusCode, serde_json::Value) {
+    async fn get(query: Option<&str>) -> (StatusCode, String) {
         get_with(test_state(), query).await
     }
 
-    async fn get_with(state: AppState, query: Option<&str>) -> (StatusCode, serde_json::Value) {
+    async fn get_with(state: AppState, query: Option<&str>) -> (StatusCode, String) {
         let res = patterns(
             State(state),
             HeaderMap::new(),
@@ -152,89 +178,66 @@ mod tests {
     const SELECTOR: &str = "query=%7Bservice_name%3D%22checkout%22%7D";
 
     #[tokio::test]
-    async fn patterns_missing_query_param_is_400_bad_data() {
-        let (status, json) = get(None).await;
+    async fn patterns_missing_query_param_is_400() {
+        let (status, _body) = get(None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn patterns_malformed_logql_is_400_bad_data_with_a_position() {
-        let (status, json) = get(Some("query=%7B")).await;
+    async fn patterns_malformed_logql_is_400_with_the_byte_offset_in_the_message() {
+        let (status, body) = get(Some("query=%7B")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some());
+        assert!(body.contains("at byte"), "{body}");
     }
 
     /// A metric query on the patterns surface is rejected 400 BEFORE any
-    /// pool/engine work (no pool exists here, yet it is `bad_data`, not the
+    /// pool/engine work (no pool exists here, yet it is 400, not the
     /// 503 the pool check would produce).
     #[tokio::test]
-    async fn patterns_metric_query_is_400_bad_data_before_the_pool_check() {
-        let (status, json) = get(Some("query=count_over_time(%7Bapp%3D%22x%22%7D%5B1h%5D)")).await;
+    async fn patterns_metric_query_is_400_before_the_pool_check() {
+        let (status, body) = get(Some("query=count_over_time(%7Bapp%3D%22x%22%7D%5B1h%5D)")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("metric queries")
-        );
+        assert!(body.contains("metric queries"), "{body}");
     }
 
     /// Unlike `/stats`, even a LINE FILTER is rejected — the stored templates
     /// are body-content-blind and patterns has no raw fallback.
     #[tokio::test]
-    async fn patterns_line_filter_pipeline_is_400_bad_data() {
-        let (status, json) = get(Some("query=%7Bapp%3D%22x%22%7D%20%7C%3D%20%22err%22")).await;
+    async fn patterns_line_filter_pipeline_is_400() {
+        let (status, body) = get(Some("query=%7Bapp%3D%22x%22%7D%20%7C%3D%20%22err%22")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("bare stream selector")
-        );
+        assert!(body.contains("bare stream selector"), "{body}");
     }
 
     #[tokio::test]
-    async fn patterns_parser_pipeline_is_400_bad_data() {
-        let (status, json) = get(Some("query=%7Bapp%3D%22x%22%7D%20%7C%20logfmt")).await;
+    async fn patterns_parser_pipeline_is_400() {
+        let (status, _body) = get(Some("query=%7Bapp%3D%22x%22%7D%20%7C%20logfmt")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn patterns_non_positive_step_is_400_bad_data() {
-        let (status, json) = get(Some(&format!("{SELECTOR}&step=0"))).await;
+    async fn patterns_non_positive_step_is_400() {
+        let (status, _body) = get(Some(&format!("{SELECTOR}&step=0"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     /// An over-11k bucket grid is rejected 400 in pure param parsing (no pool
-    /// exists, yet it is `bad_data`, not 503).
+    /// exists, yet it is 400, not 503).
     #[tokio::test]
-    async fn patterns_over_11k_grid_is_400_bad_data_before_the_pool_check() {
+    async fn patterns_over_11k_grid_is_400_before_the_pool_check() {
         // 11_001 × 10s window at a 10s step ⇒ 11_001 buckets > 11_000.
         let end = 11_001i64 * 10_000_000_000;
-        let (status, json) = get(Some(&format!("{SELECTOR}&start=0&end={end}&step=10"))).await;
+        let (status, body) = get(Some(&format!("{SELECTOR}&start=0&end={end}&step=10"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("bucket grid too large")
-        );
+        assert!(body.contains("bucket grid too large"), "{body}");
     }
 
     /// A bare selector (with in-cap params) is shape-valid; with no pool it
     /// reaches the 503 pool check (proving validation passed).
     #[tokio::test]
     async fn patterns_valid_selector_passes_validation_then_503_without_a_pool() {
-        let (status, json) = get(Some(&format!("{SELECTOR}&step=30"))).await;
+        let (status, _body) = get(Some(&format!("{SELECTOR}&step=30"))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     /// Issue #279 (AC4): `/patterns` — a valid selector of exactly
@@ -244,15 +247,13 @@ mod tests {
     /// parse precedes the pool check, so the 400 is the cap.
     #[tokio::test]
     async fn patterns_rejects_an_over_cap_query_400_before_the_pool_check() {
-        let (status, json) = get(Some(&format!(
+        let (status, body) = get(Some(&format!(
             r#"query={{app="{}"}}"#,
             "a".repeat(131_072 - 8)
         )))
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["error"], "input size too long (131072 > 131072)");
-        assert_eq!(json["position"], 0);
+        assert_eq!(body, "input size too long (131072 > 131072)");
     }
 
     /// AC 5b (M7-C3, issue #171 review finding 2): with the kill-switch OFF,
@@ -263,8 +264,9 @@ mod tests {
     async fn patterns_kill_switch_off_returns_empty_success_without_the_pool() {
         let mut config = Config::default();
         config.writer.log_patterns = false;
-        let (status, json) = get_with(state_with_config(config), Some(SELECTOR)).await;
+        let (status, body) = get_with(state_with_config(config), Some(SELECTOR)).await;
         assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).expect("success body is JSON");
         assert_eq!(json["status"], "success");
         assert_eq!(json["data"], serde_json::json!([]));
     }

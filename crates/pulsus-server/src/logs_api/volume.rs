@@ -125,14 +125,40 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
+    /// `(status, body text)`. Issue #264: every error on this surface is a
+    /// bare `text/plain` body, so tests assert the raw message; success
+    /// bodies are still JSON and those cases parse the returned string.
+    ///
+    /// On any 4xx/5xx this also asserts the reference's error container —
+    /// `Content-Type: text/plain; charset=utf-8` + `X-Content-Type-Options:
+    /// nosniff`, non-empty body (`pkg/util/server/error.go:48-51 @
+    /// v3.7.4`) — so every error case in this module covers the wire
+    /// shape, not just its status code.
+    async fn status_and_body(res: Response) -> (StatusCode, String) {
         let status = res.status();
+        if status.is_client_error() || status.is_server_error() {
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+            );
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+            );
+        }
         let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        if status.is_client_error() || status.is_server_error() {
+            assert!(!text.is_empty(), "an error body is never empty");
+        }
+        (status, text)
     }
 
-    async fn get(query: Option<&str>) -> (StatusCode, serde_json::Value) {
+    async fn get(query: Option<&str>) -> (StatusCode, String) {
         let res = volume(
             State(test_state()),
             HeaderMap::new(),
@@ -145,137 +171,96 @@ mod tests {
     const SELECTOR: &str = "query=%7Bservice_name%3D%22checkout%22%7D";
 
     #[tokio::test]
-    async fn volume_missing_query_param_is_400_bad_data() {
-        let (status, json) = get(None).await;
+    async fn volume_missing_query_param_is_400() {
+        let (status, _body) = get(None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn volume_malformed_logql_is_400_bad_data_with_a_position() {
-        let (status, json) = get(Some("query=%7B")).await;
+    async fn volume_malformed_logql_is_400_with_the_byte_offset_in_the_message() {
+        let (status, body) = get(Some("query=%7B")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some());
+        assert!(body.contains("at byte"), "{body}");
     }
 
     /// Issue #169: a metric query on the volume surface is rejected 400
     /// BEFORE any pool/engine work (no pool exists here, yet the error is
-    /// `bad_data`, not the 503 the pool check would produce).
+    /// 400, not the 503 the pool check would produce).
     #[tokio::test]
-    async fn volume_metric_query_is_400_bad_data_before_the_pool_check() {
-        let (status, json) = get(Some("query=count_over_time(%7Bapp%3D%22x%22%7D%5B1h%5D)")).await;
+    async fn volume_metric_query_is_400_before_the_pool_check() {
+        let (status, body) = get(Some("query=count_over_time(%7Bapp%3D%22x%22%7D%5B1h%5D)")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("metric queries")
-        );
+        assert!(body.contains("metric queries"), "{body}");
     }
 
     /// Issue #169: unlike `/stats`, even a LINE FILTER is rejected — the
     /// rollup is body-content-blind and volume has no raw fallback.
     #[tokio::test]
-    async fn volume_line_filter_pipeline_is_400_bad_data() {
-        let (status, json) = get(Some("query=%7Bapp%3D%22x%22%7D%20%7C%3D%20%22err%22")).await;
+    async fn volume_line_filter_pipeline_is_400() {
+        let (status, body) = get(Some("query=%7Bapp%3D%22x%22%7D%20%7C%3D%20%22err%22")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("bare stream selector")
-        );
+        assert!(body.contains("bare stream selector"), "{body}");
     }
 
     #[tokio::test]
-    async fn volume_parser_pipeline_is_400_bad_data() {
-        let (status, json) = get(Some("query=%7Bapp%3D%22x%22%7D%20%7C%20logfmt")).await;
+    async fn volume_parser_pipeline_is_400() {
+        let (status, _body) = get(Some("query=%7Bapp%3D%22x%22%7D%20%7C%20logfmt")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn volume_invalid_aggregate_by_is_400_bad_data() {
-        let (status, json) = get(Some(&format!("{SELECTOR}&aggregateBy=both"))).await;
+    async fn volume_invalid_aggregate_by_is_400() {
+        let (status, body) = get(Some(&format!("{SELECTOR}&aggregateBy=both"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("aggregateBy")
-        );
+        assert!(body.contains("aggregateBy"), "{body}");
     }
 
     #[tokio::test]
-    async fn volume_limit_above_the_cap_is_400_bad_data() {
-        let (status, json) = get(Some(&format!("{SELECTOR}&limit=5001"))).await;
+    async fn volume_limit_above_the_cap_is_400() {
+        let (status, _body) = get(Some(&format!("{SELECTOR}&limit=5001"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn volume_end_before_start_is_400_bad_data() {
-        let (status, json) = get(Some(&format!("{SELECTOR}&start=200&end=100"))).await;
+    async fn volume_end_before_start_is_400() {
+        let (status, body) = get(Some(&format!("{SELECTOR}&start=200&end=100"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("precedes")
-        );
+        assert!(body.contains("precedes"), "{body}");
     }
 
     /// Issue #169 plan v2 (b)(ii): oversized `targetLabels` (count) is
     /// rejected 400 while NO pool exists — mechanical proof the rejection
     /// precedes injection/engine/SQL work.
     #[tokio::test]
-    async fn volume_too_many_target_labels_is_400_bad_data_before_the_pool_check() {
+    async fn volume_too_many_target_labels_is_400_before_the_pool_check() {
         let over_cap = (0..33)
             .map(|i| format!("l{i}"))
             .collect::<Vec<_>>()
             .join(",");
-        let (status, json) = get(Some(&format!("{SELECTOR}&targetLabels={over_cap}"))).await;
+        let (status, body) = get(Some(&format!("{SELECTOR}&targetLabels={over_cap}"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("too many 'targetLabels'")
-        );
+        assert!(body.contains("too many 'targetLabels'"), "{body}");
     }
 
     /// Issue #169 plan v2 (b)(ii): the per-entry length cap, same
     /// pool-less pre-injection proof.
     #[tokio::test]
-    async fn volume_overlong_target_label_is_400_bad_data_before_the_pool_check() {
+    async fn volume_overlong_target_label_is_400_before_the_pool_check() {
         let long = "x".repeat(257);
-        let (status, json) = get(Some(&format!("{SELECTOR}&targetLabels={long}"))).await;
+        let (status, body) = get(Some(&format!("{SELECTOR}&targetLabels={long}"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("exceeds the maximum")
-        );
+        assert!(body.contains("exceeds the maximum"), "{body}");
     }
 
     /// A bare selector (with in-cap params) is shape-valid; with no pool
     /// it reaches the 503 pool check (proving validation passed).
     #[tokio::test]
     async fn volume_valid_selector_passes_validation_then_503_without_a_pool() {
-        let (status, json) = get(Some(&format!(
+        let (status, _body) = get(Some(&format!(
             "{SELECTOR}&limit=0&aggregateBy=labels&targetLabels=env,team"
         )))
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
     }
 
     /// Issue #279 (AC4): `/volume` — a valid selector of exactly 131,072
@@ -285,14 +270,12 @@ mod tests {
     /// the pool check, so the 400 is the cap.
     #[tokio::test]
     async fn volume_rejects_an_over_cap_query_400_before_the_pool_check() {
-        let (status, json) = get(Some(&format!(
+        let (status, body) = get(Some(&format!(
             r#"query={{app="{}"}}"#,
             "a".repeat(131_072 - 8)
         )))
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["error"], "input size too long (131072 > 131072)");
-        assert_eq!(json["position"], 0);
+        assert_eq!(body, "input size too long (131072 > 131072)");
     }
 }
