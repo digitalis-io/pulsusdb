@@ -4111,14 +4111,17 @@ impl<'v> JsonPathCapture<'v, '_> {
 /// **Depth is bounded by the parser, not by this type.** `serde_json`'s
 /// deserializer refuses a document nested past its own recursion limit,
 /// so no line can build a `WireJson` deeper than that and neither its
-/// `Drop` nor the walks over it can run away: measured on this build,
-/// nesting of 127 parses, 128 is a `JSONParserErr`, and 5 000 answers the
-/// same way rather than overflowing the stack
-/// (`json_nesting_past_the_parser_limit_is_a_parse_error`). That is the
-/// bound `serde_json::Value` already carried here before this type
-/// existed, and it is why `| json` keeps an ordinary recursive tree
-/// instead of #272's iterative-dismantle machinery, which exists for the
-/// query AST — bounded only by the query-text cap.
+/// `Drop` nor the walks over it can run away. That is the bound
+/// `serde_json::Value` already carried here before this type existed,
+/// and it is why `| json` keeps an ordinary recursive tree instead of
+/// #272's iterative-dismantle machinery, which exists for the query AST
+/// — bounded only by the query-text cap.
+///
+/// The bound is a DEPENDENCY's, not ours, so it is not left as a
+/// measurement in a comment: `tests/recursion_census.rs` carries the
+/// exemption that rests on it and, beside it,
+/// `the_depth_bound_the_exemption_rests_on_is_enforced_by_the_parser`,
+/// which fails if the limit moves in either direction or disappears.
 #[derive(Debug)]
 enum WireJson {
     /// Fields in the order the document listed them, duplicates included.

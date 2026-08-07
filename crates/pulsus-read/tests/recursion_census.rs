@@ -53,6 +53,8 @@
 
 use std::collections::BTreeSet;
 
+use pulsus_read::logql::pipeline::CompiledPipeline;
+
 /// The two source trees this census sweeps. Read from disk at test time
 /// rather than `include_str!`-ed one by one, so a NEW file in either is
 /// swept automatically instead of being silently outside the scan.
@@ -341,7 +343,94 @@ fn declared_slots(files: &[(String, String)], members: &[String]) -> Vec<Slot> {
 /// This is an exemption from (b), NOT from (a): the type still has to
 /// appear in the discovered set below, so a sixth recursive type — or
 /// this one losing its parser bound — still reddens the file.
+///
+/// The bound itself is pinned by
+/// [`the_depth_bound_the_exemption_rests_on_is_enforced_by_the_parser`],
+/// which lives in THIS file rather than beside the parser: an exemption
+/// and the precondition that justifies it are worth nothing apart, and
+/// deleting one next to the other is a visible act.
 const DEPTH_BOUNDED_BY_THEIR_PARSER: &[&str] = &["WireJson"];
+
+/// **The exemption's precondition, as a breakable check rather than a
+/// measurement in a comment** (issue #334, adjudicated).
+///
+/// [`DEPTH_BOUNDED_BY_THEIR_PARSER`] is safe only while the depth of the
+/// types it names is capped by the parser that builds them — and that cap
+/// **is not ours**. It is `serde_json`'s deserializer recursion limit, a
+/// number a `cargo update` can raise and a parser swap can remove
+/// outright. Either would make the exemption false while every check
+/// above stayed green, so the bound is asserted from BOTH sides here:
+///
+/// * one level under the limit PARSES, so a bump that LOWERS it fails;
+/// * one level over it is refused, so a bump that RAISES it fails;
+/// * far over it is refused the same way rather than overflowing the
+///   stack, which is the property #272's machinery exists to provide and
+///   this type gets from the parser instead.
+///
+/// Driven through `| json`, because `WireJson` is private to
+/// `pipeline.rs`: the observable is the ordinary malformed-line class —
+/// line kept, `__error__="JSONParserErr"`, nothing extracted — and a
+/// budget breach would be a different return, which the `expect` below
+/// separates.
+#[test]
+fn the_depth_bound_the_exemption_rests_on_is_enforced_by_the_parser() {
+    /// One level under `serde_json`'s limit at the pinned version.
+    const DEEPEST_ACCEPTED: usize = 127;
+
+    fn nested(depth: usize) -> String {
+        let mut s = String::with_capacity(depth * 6 + 8);
+        for _ in 0..depth {
+            s.push_str("{\"a\":");
+        }
+        s.push('1');
+        for _ in 0..depth {
+            s.push('}');
+        }
+        s
+    }
+    let expr = pulsus_logql::parse(r#"{app="a"} | json"#).expect("parse");
+    let pulsus_logql::Expr::Log(log) = expr else {
+        panic!("expected a log query")
+    };
+    let compiled = CompiledPipeline::compile(&log.pipeline).expect("compile");
+    let names = |line: &str| -> Vec<String> {
+        compiled
+            .run(line, &[], 0)
+            .expect("a nesting breach is a PARSE error, never a budget breach")
+            .expect("the line is kept")
+            .labels
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .collect()
+    };
+
+    // `DEEPEST_ACCEPTED` nested `{"a": …}` flatten to one leaf `a_a_…_a`.
+    let leaf: String = std::iter::repeat_n("a", DEEPEST_ACCEPTED)
+        .collect::<Vec<_>>()
+        .join("_");
+    assert_eq!(
+        names(&nested(DEEPEST_ACCEPTED)),
+        vec![leaf],
+        "the parser stopped accepting {DEEPEST_ACCEPTED} levels — the limit MOVED DOWN, and \
+         `DEPTH_BOUNDED_BY_THEIR_PARSER` now names a different bound than it claims"
+    );
+    let refused = vec!["__error__".to_string(), "__error_details__".to_string()];
+    assert_eq!(
+        names(&nested(DEEPEST_ACCEPTED + 1)),
+        refused,
+        "the parser accepted {} levels — the limit MOVED UP, so the bound the exemption \
+         rests on is no longer the one measured for it",
+        DEEPEST_ACCEPTED + 1
+    );
+    // Far past any plausible limit: if the cap were removed rather than
+    // moved, this recurses instead of returning and takes the stack with
+    // it. Reaching the assertion at all is half the result.
+    assert_eq!(
+        names(&nested(50_000)),
+        refused,
+        "50 000 levels must be REFUSED by the parser, not recursed through"
+    );
+}
 
 #[test]
 fn check_a_and_b_the_slot_census_matches_the_pinned_inventory() {
