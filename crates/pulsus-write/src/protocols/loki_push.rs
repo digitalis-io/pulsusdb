@@ -2286,44 +2286,67 @@ fn check_ignored_value<E: serde::de::Error>(raw: &str, open_containers: u32) -> 
 }
 
 /// The reference's rule for a NUMBER inside a value it skips, which is not
-/// "any JSON number is fine": jsoniter's `trySkipNumber` walks over a run of
-/// digits with at most one dot and skips it unevaluated, but anything else —
-/// an exponent, in practice — makes it hand the token to `ReadFloat64`
-/// (`iter_skip_strict.go:10-21,23-59 @ jsoniter v1.1.12`), whose slow path is
-/// `strconv.ParseFloat(str, 64)` (`iter_float.go:186-204`). Go returns
-/// `ErrRange` there only for OVERFLOW, and the `ReadBigFloat` retry that
-/// follows re-reads an already-consumed buffer and reports `readNumberAsString:
-/// invalid number` — so a skipped `1e999` is a `400` upstream.
+/// "any JSON number is fine". One mechanism produces all of it bar the
+/// `0`-leading case at the end of this comment: jsoniter's
+/// `trySkipNumber` walks a run of digits with at most one dot and skips it
+/// UNEVALUATED, but it walks the CURRENT READ BUFFER and nothing else — `for i
+/// := iter.head; i < iter.tail` (`iter_skip_strict.go:26 @ jsoniter v1.1.12`)
+/// — and reports "skipped" only on reaching a terminating `,]}`/whitespace
+/// inside that window (`:46-53`). Everything else — a token carrying `e`/`E`,
+/// and a digit run that reaches the window's end — returns `false` and is
+/// PARSED instead: `ReadFloat64` → `readFloat64SlowPath` →
+/// `strconv.ParseFloat(str, 64)` (`iter_skip_strict.go:10-21`,
+/// `iter_float.go:299-315`). So leaving the fast path is not a rejection; it
+/// is an evaluation, and — for a token the capture has already validated as
+/// JSON, which rules out `validateFloat`'s `1.`/`1.e1` — the evaluation
+/// refuses for exactly one reason: OVERFLOW. Go's `ErrRange` then propagates through the `ReadBigFloat` retry
+/// (`iter_skip_strict.go:17-20`), which re-reads an already-consumed buffer
+/// and reports `readNumberAsString: invalid number` (`iter_float.go:159-186`)
+/// — the message a skipped `1e999` comes back with, `400`.
 ///
-/// That EXPONENT rule is what this function implements, and it matches:
-/// measured on `grafana/loki@sha256:87f0a067…` under an unknown envelope key,
+/// Two consequences follow, and they are different in kind.
+///
+/// EXPONENT — a matched rule, and what the code below implements. A token
+/// carrying `e`/`E` never takes the fast path in ANY window, so its verdict is
+/// a function of the request alone: refused iff its value overflows `f64`.
+/// Measured on `grafana/loki@sha256:87f0a067…` under an unknown envelope key,
 /// `1e999`, `1e309`, `-1e309` and `1.7976931348623159e308` are `400` on both
 /// sides; `1e308`, `1.7976931348623157e308`, `1e-999`, `5e-324`, `0e999` and
 /// `12345678901234567890` are `204` on both. Underflow is accepted on both
 /// because Go's `floatBits` raises its overflow flag only upward, and Rust's
-/// `f64` parse likewise yields a finite zero rather than an error. Each of
-/// those verdicts is invariant under wire chunking and under the token's byte
-/// offset (six probes per shape: four wire framings, and three byte offsets
-/// in one write — issue #374 round 15),
-/// because `trySkipNumber` bails to the slow path on `e` in every window.
+/// `f64` parse likewise yields a finite zero rather than an error. Those ten
+/// shapes, plus the four more the hermetic test carries
+/// (`1e1000000000000000000000`, `-0e999`, `1.5e3`, `-0.0`), were each
+/// re-measured over 12 cells — 4 wire framings (one write, 128-, 256- and
+/// 512-byte chunks) × 3 byte offsets, 168 cells in all — and none moved
+/// (issue #374 round 17), which is what `trySkipNumber` bailing on `e` in
+/// every window predicts.
 ///
-/// The LENGTH axis is a REGISTERED DIVERGENCE, not a rule we match. Ours is
-/// the line below: a run of digits with at most one dot is accepted whatever
-/// its length. The reference's fast path is bounded by its READ BUFFER —
-/// `trySkipNumber` scans `for i := iter.head; i < iter.tail`
-/// (`iter_skip_strict.go:26 @ jsoniter v1.1.12`) over the 512 bytes
-/// `jsoniter.NewDecoder` gives it (`config.go:366`, reached from
+/// LENGTH — a REGISTERED DIVERGENCE, not a rule we match. Ours is the line
+/// below: a run of digits with at most one dot is accepted whatever its
+/// length. Upstream's fast path is bounded by the 512 bytes
+/// `jsoniter.NewDecoder` allocates (`config.go:366`, reached from
 /// `unmarshal.DecodePushRequest`, `pkg/util/unmarshal/unmarshal.go:17 @ loki
-/// v3.7.4`) — so it skips the token only when the token AND its terminating
-/// byte are inside the current window, and otherwise evaluates it and
-/// overflows. The verdict therefore turns on where a buffer boundary falls,
-/// which is a function of the token's byte offset in the body and of how the
-/// client chunked its writes, not of the request: the same 400-digit body is
-/// `204` written in one piece or in 512-byte chunks and `400` in 256-byte
-/// chunks, and `204` at offset 111 and `400` at offset 112. A second
-/// implementation cannot match that without reproducing the sender's socket
-/// behaviour. See `docs/benchmarks/logs-differential-ledger.md`, the
-/// `ingest-label-bounds` row, for the measured table.
+/// v3.7.4`), so a run that spans that boundary is parsed — and then refused
+/// ONLY if it overflows. Crossing removes the exemption; it does not reject.
+/// That is why 308 nines crossing is `204` and 309 nines is `400`, and why a
+/// 309-digit run of `1` followed by 308 zeros — same length, finite value — is
+/// `204` crossing at each of three offsets. Where the boundary falls is a
+/// function of the token's byte offset in the body and of how the client
+/// chunked its writes, not of the request: the same 400-digit body is `204`
+/// written in one piece or in 512-byte chunks and `400` in 256-byte chunks,
+/// and `204` at offset 111 and `400` at offset 112. A second implementation
+/// cannot match that without reproducing the sender's socket behaviour. See
+/// `docs/benchmarks/logs-differential-ledger.md`, the `ingest-label-bounds`
+/// row, for the measured table.
+///
+/// One shape is outside both and is an OPEN gap, measured in round 17 and not
+/// yet decided: `Skip` never reaches `skipNumber` for a token whose first byte
+/// is `0` — it calls `ReadFloat32` directly (`iter_skip.go:83-85 @ jsoniter
+/// v1.1.12`) — so upstream range-checks that token against `f32`. `0.35e39` is
+/// `400` upstream and `204` here in all three ignored positions, while the same
+/// magnitude written `3.5e38` or `-0.35e39` is `204` on both. Deterministic on
+/// the request, unlike the length axis. Recorded in the ledger row above.
 fn check_ignored_number<E: serde::de::Error>(token: &str) -> Result<(), E> {
     let magnitude = token.strip_prefix('-').unwrap_or(token);
     if magnitude.bytes().all(|b| b.is_ascii_digit() || b == b'.')
@@ -3969,26 +3992,28 @@ mod tests {
     /// Capturing the value as raw text rather than deserializing it means
     /// nothing evaluates the numbers in it — and the reference DOES evaluate
     /// some of them: `trySkipNumber` skips a run of digits with at most one dot
-    /// unevaluated, and hands anything else (an exponent, in practice) to
-    /// `ParseFloat`, which fails on overflow (`iter_skip_strict.go:10-59`,
-    /// `iter_float.go:186-204 @ jsoniter v1.1.12`). So a discarded `1e999` is a
-    /// `400` upstream, and closing the depth over-rejection without this would
-    /// have opened an acceptance one in its place.
+    /// unevaluated, and everything else (an exponent, in practice) leaves that
+    /// fast path and is parsed by `ParseFloat`, which fails on overflow
+    /// (`iter_skip_strict.go:10-21,24-59`, `iter_float.go:299-315 @ jsoniter
+    /// v1.1.12`). So a discarded `1e999` is a `400` upstream, and closing the
+    /// depth over-rejection without this would have opened an acceptance one
+    /// in its place.
     ///
     /// Every EXPONENT row here is measured on `grafana/loki@sha256:87f0a067…`
     /// under an unknown envelope key — including the pair either side of
     /// `f64::MAX`, which is where "overflow" is actually decided, and the
     /// underflow rows, which are accepted on both sides for the same reason.
-    /// Each was re-measured in round 15 under four wire framings and three
-    /// byte offsets and did not move, which is what makes it a rule rather
-    /// than a sample.
+    /// Every one of the fourteen shapes below was re-measured in round 17
+    /// over 12 cells — 4 wire framings × 3 byte offsets, 168 cells in all —
+    /// and none moved, which is what makes this a rule rather than a sample.
     ///
     /// The two digits-only accepted rows — `digits_400` and `digits_1000` —
     /// are the other side of that, and their LENGTH is where the two
     /// implementations part company. See [`check_ignored_number`] and the
-    /// `ingest-label-bounds` ledger row: upstream's verdict on those depends
-    /// on where its 512-byte read buffer happens to break, ours does not, and
-    /// this test pins ours.
+    /// `ingest-label-bounds` ledger row: a run that spans upstream's 512-byte
+    /// read buffer is parsed rather than skipped, and refused only if it then
+    /// overflows, so upstream's verdict on those depends on where its buffer
+    /// happens to break. Ours does not, and this test pins ours.
     #[test]
     fn parse_json_a_discarded_number_follows_the_references_overflow_rule() {
         const WIN: &str = r#"{"stream":{"app":"w"},"values":[["1700000000000000000","final"]]}"#;
@@ -4002,19 +4027,20 @@ mod tests {
         // 400 nines is the row that makes the fast path part of the rule
         // rather than decoration: it overflows `f64` and upstream stores it
         // (measured, in one write at the offset this body puts it), because a
-        // run of digits with no exponent is never evaluated at all. A decoder
+        // run of digits with no exponent that fits the current read buffer is
+        // never evaluated at all — see [`check_ignored_number`]. A decoder
         // that range-checked EVERY number would pass every other row here and
         // fail this one.
         let digits_400 = "9".repeat(400);
         // 1,000 nines is the DIVERGENCE, asserted in the direction we chose.
         // A run this long cannot fit in upstream's 512-byte read window at any
-        // offset or framing, so upstream evaluates and refuses it every time
-        // (eight probes: five wire framings, and four byte offsets in one
-        // write, all `400`, round 15),
-        // while we accept it — deliberately, because upstream's answer at 400
-        // nines flips with the wire chunking and ours cannot. Flipping this
-        // assertion to a rejection would be adopting a framing-dependent
-        // acceptance surface; see the `ingest-label-bounds` ledger row.
+        // offset or framing, and every 1,000-digit value overflows `f64`, so
+        // upstream parses and refuses it every time — 20 cells, 5 wire
+        // framings × 4 byte offsets, all `400` (round 17) — while we accept
+        // it, deliberately, because upstream's answer at 400 nines flips with
+        // the wire chunking and ours cannot. Flipping this assertion to a
+        // rejection would be adopting a framing-dependent acceptance surface;
+        // see the `ingest-label-bounds` ledger row.
         let digits_1000 = "9".repeat(1000);
         let accepted = [
             "1e308",

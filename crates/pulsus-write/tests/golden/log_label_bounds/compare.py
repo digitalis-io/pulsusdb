@@ -582,41 +582,57 @@ case("json/ignored-depth-126", "json", _at_envelope(126).encode(), "application/
 case("json/ignored-depth-127", "json", _at_envelope(127).encode(), "application/json")
 
 # ---- and one thing an ignored value is checked for that is NOT depth --------
-# Upstream's skip does not skip every number: `trySkipNumber` walks a run of
-# digits with at most one dot and skips it unevaluated, and hands anything else
-# -- an exponent, in practice -- to ParseFloat, which fails on OVERFLOW
-# (iter_skip_strict.go:10-59, iter_float.go:186-204 @ jsoniter v1.1.12).  So an
-# ignored 1e999 is 400 there, and a decoder that captured the value as raw text
-# without applying this would agree about depth while quietly accepting what
-# upstream refuses.  Those EXPONENT rows agree, and they agree INVARIANTLY:
-# re-measured in round 15 under four wire framings and three byte offsets, none
-# of them moved, because trySkipNumber bails to the slow path on `e` in every
-# window.
+# Upstream's skip does not skip every number, and ONE mechanism decides which:
+# `trySkipNumber` walks a run of digits with at most one dot and skips it
+# unevaluated, but it walks the CURRENT READ BUFFER only -- `for i := iter.head;
+# i < iter.tail` (iter_skip_strict.go:26 @ jsoniter v1.1.12) over the 512-byte
+# buffer jsoniter.NewDecoder hands it (config.go:366, reached from
+# unmarshal.DecodePushRequest, pkg/util/unmarshal/unmarshal.go:17 @ v3.7.4) --
+# and reports "skipped" only on reaching a terminating ,]} or whitespace inside
+# that window (:46-53).  Everything else leaves the fast path and is PARSED:
+# ReadFloat64 -> strconv.ParseFloat(str, 64) (iter_skip_strict.go:10-21,
+# iter_float.go:299-315), which refuses for one reason only, OVERFLOW.  Leaving
+# the fast path is therefore not a rejection, it is an evaluation.
 #
-# The LENGTH of a digits-only run is a different story and a registered
-# divergence.  trySkipNumber scans `for i := iter.head; i < iter.tail`
-# (iter_skip_strict.go:26) over the 512-byte buffer jsoniter.NewDecoder hands
-# it (config.go:366, reached from unmarshal.DecodePushRequest,
-# pkg/util/unmarshal/unmarshal.go:17 @ v3.7.4), so it skips the token only when
-# the token AND its terminating byte are inside the CURRENT window, and
-# otherwise evaluates it and overflows.  Upstream's verdict on such a run
-# therefore turns on where that buffer boundary falls -- a function of the
-# token's byte offset in the body and of how the client chunked its writes, not
-# of the request.  Measured on these two servers (round 15): the same
-# 400-digit body is 204 written in one piece and in 512-byte chunks and 400 in
-# 256-byte chunks; in one write it is 204 with the run at offset 111 and 400 at
-# offset 112.  We accept a digits-only run at any length, deterministically.
+# EXPONENT rows: a token carrying `e` never takes the fast path in any window,
+# so its verdict is a function of the request -- refused iff it overflows f64.
+# A decoder that captured the value as raw text without applying this would
+# agree about depth while quietly accepting what upstream refuses.  Those rows
+# agree, and they agree INVARIANTLY: the fourteen exponent shapes this group
+# and the hermetic test pin between them were re-measured in round 17 over 12
+# cells each (4 wire framings x 3 byte offsets, 168 cells) and none moved.
+#
+# The LENGTH of a digits-only run is the other consequence, and a registered
+# divergence.  A run that spans the buffer boundary is parsed rather than
+# skipped, and is then refused only if it overflows: 308 nines crossing is 204
+# and 309 nines is 400, while a 309-digit run of `1` and 308 zeros -- same
+# length, finite value -- is 204 crossing at three offsets.  Where the boundary
+# falls is a function of the token's byte offset in the body and of how the
+# client chunked its writes, not of the request.  Measured on these two servers
+# (round 17): the same 400-digit body is 204 written in one piece and in
+# 512-byte chunks and 400 in 256-byte chunks; in one write it is 204 with the
+# run at offset 111 and 400 at offset 112.  We accept a digits-only run at any
+# length, deterministically.
 #
 #   -int       400 nines.  Fits, so both sides are 204 -- and it fits only
-#              because this body puts it at offset 82 (82 + 400 + 1 <= 512).
-#              That row has 29 bytes of HEADROOM: growing _win by 30 bytes
-#              would flip it to a divergence, which is itself the thing being
-#              recorded.
+#              because this body puts it at offset 86, with its terminating
+#              byte at index 486 and the last index that fits at 511.  That row
+#              has 25 bytes of HEADROOM: growing _win by 26 bytes moves the
+#              terminator to 512 and flips it to a divergence (measured: +25 is
+#              204, +26 is 400), which is itself the thing being recorded.
 #   -int-1000  1,000 nines.  Longer than the whole window, so no offset and no
-#              chunking can make it fit: 400 upstream in all eight probes
-#              (five wire framings, four byte offsets), 204 here.  The divergence in its
-#              framing-INDEPENDENT form, which is why this is the row pinned
-#              expect="DIFF" and the fragile one is not.
+#              chunking can make it fit, and every 1,000-digit value overflows
+#              f64: 400 upstream over 20 cells (5 wire framings x 4 byte
+#              offsets), 204 here.  The divergence in its framing-INDEPENDENT
+#              form, which is why this is the row pinned expect="DIFF" and the
+#              fragile one is not.
+#
+# One shape is outside both and is an OPEN gap, measured in round 17 and not
+# yet decided: Skip never reaches skipNumber for a token whose first byte is
+# `0` -- it calls ReadFloat32 directly (iter_skip.go:83-85) -- so upstream
+# range-checks that token against f32.  0.35e39 is 400 upstream and 204 here in
+# all three ignored positions, while 3.5e38 and -0.35e39 are 204 on both.  See
+# the ingest-label-bounds ledger row; no case is pinned for it here.
 for _name, _value, _expect in (("overflow", "1e999", "SAME"),
                                ("at-max", "1.7976931348623157e308", "SAME"),
                                ("past-max", "1.7976931348623159e308", "SAME"),
@@ -916,12 +932,14 @@ def trim(s, n=100000):
     1. A body reporting several DISTINCT validation failures groups them as
        `N errors like: ...; M errors like: ...`, built from a Go map whose
        iteration order is deliberately randomized -- so the same request comes
-       back with the groups in either order.  What is measured is that BOTH
-       orders occur: five runs of 40 sends of json/two-distinct-failures gave
-       36/4, 39/1, 32/8, 32/8 and 35/5.  The SPLIT is a fresh sample every
-       time and is not a reproducible number -- an earlier round quoted two of
-       those samples as if they were one measurement, which is why the ratio
-       is stated here as a range and never as a figure.  Sorted.
+       back with the groups in either order.  The only measurement here is
+       that BOTH orders occur: repeated batches of 40 sends of
+       json/two-distinct-failures return one order for most of the batch and
+       the other for a minority of it, and a batch that shows only one order
+       has been observed too.  No split is quoted, because a split is a fresh
+       sample every time and not a reproducible figure -- earlier rounds
+       quoted samples as though they were measurements and left the artifacts
+       disagreeing about which sample was the number.  Sorted.
     2. A jsoniter decode error appends `error found in #N byte of ...|<window>
        |..., bigger context ...`, where the window and the offset into it are
        positions in the CURRENT READ BUFFER -- so they move with however the
