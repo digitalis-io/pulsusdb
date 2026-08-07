@@ -2244,6 +2244,8 @@ mod tests {
             ("detected_probe.rs", include_str!("detected_probe.rs")),
             ("fold.rs", include_str!("fold.rs")),
             ("labels.rs", include_str!("labels.rs")),
+            // Issue #247: the `| logfmt <id>="<expr>"` sub-grammar.
+            ("logfmt_expr.rs", include_str!("logfmt_expr.rs")),
             ("post_agg.rs", include_str!("post_agg.rs")),
             ("variants.rs", include_str!("variants.rs")),
             ("walkbound.rs", include_str!("walkbound.rs")),

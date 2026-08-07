@@ -88,6 +88,7 @@ use pulsus_logql::{
 
 use super::ip::{IpMatcher, line_has_ip_in};
 use super::labels::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
+use super::logfmt_expr;
 use super::template::{self, Part as TmplPart, Template, TemplateEnv, TemplateKind};
 // Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
 // Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go
@@ -2394,14 +2395,29 @@ fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
             strict,
             keep_empty,
             extractions,
-        } => Ok(CompiledStage::Logfmt {
-            strict: *strict,
-            keep_empty: *keep_empty,
-            extractions: extractions
-                .iter()
-                .map(|e| (e.label.clone(), e.expression.clone()))
-                .collect(),
-        }),
+        } => {
+            // Issue #247: an extraction EXPRESSION has its own grammar in
+            // the reference (`pkg/logql/log/logfmt/ @ v3.7.4`), refused at
+            // `Stage()` and surfaced as a 400 — so it is refused here, at
+            // the pipeline compile every entry point runs before any I/O.
+            // A bare `| logfmt` has no extractions, so the loop body never
+            // runs and `detected.rs`'s `LOGFMT_PARSER` still cannot fail.
+            let mut compiled = Vec::with_capacity(extractions.len());
+            for e in extractions {
+                let key = logfmt_expr::parse_logfmt_expr(&e.expression).map_err(|msg| {
+                    PipelineError::BadParserExpr(format!(
+                        "logfmt expression {:?}: {msg}",
+                        e.expression
+                    ))
+                })?;
+                compiled.push((e.label.clone(), key));
+            }
+            Ok(CompiledStage::Logfmt {
+                strict: *strict,
+                keep_empty: *keep_empty,
+                extractions: compiled,
+            })
+        }
         ParserStage::Regexp(pattern) => {
             let re = compile_regex(pattern)?;
             if re.capture_names().flatten().next().is_none() {
@@ -5341,6 +5357,112 @@ fn walk_pattern<'n, 't>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Issue #247, the unmatchable-key invariant.** The logfmt
+    /// extraction sub-grammar expresses "this path matches nothing" as a
+    /// source key `walk_logfmt` can never emit — the empty string, or one
+    /// containing ASCII whitespace (a multi-element path joins with a
+    /// space). That is only sound if the walker really cannot emit such
+    /// a key, so it is asserted here over hostile lines rather than
+    /// argued in a comment.
+    ///
+    /// **Both halves were broken and watched to fail.** Deleting the
+    /// `is_ascii_whitespace()` break in the key scan reddens this with
+    /// `"a b=1" emitted key "a b"`. The empty half has TWO redundant
+    /// enforcers — the leading-`=` `UnexpectedEquals` guard and the
+    /// `if !key.is_empty()` gate on the `sink` call — and deleting either
+    /// alone leaves this green; deleting both reddens it with `"=1"
+    /// emitted an EMPTY key`. Deleting the `b'"' || b < 0x20` invalid-key
+    /// guard does NOT redden it, and that is correct: a key holding a
+    /// quote or a control byte is neither empty nor whitespace-bearing,
+    /// so it is outside what this invariant claims.
+    #[test]
+    fn walk_logfmt_never_emits_an_empty_or_whitespace_bearing_key() {
+        let lines = [
+            "=1",
+            "\"\"=1",
+            "a=",
+            "\"a\"=1",
+            "a b=1",
+            "a=1 =2",
+            "   ",
+            "",
+            "\t\n \t",
+            "a=\"unterminated",
+            "a\u{1}b=1",
+            "a=1\u{7}b=2",
+            "a=\"x y\" b=2",
+            "a==1",
+            "=",
+            "b=1 a-b=2 x=3 b.c=4",
+            "a.b=1 a/b=2 a:b=3 a,b=4 a[0]=5",
+            "é=1 日本=2",
+            "a=1 a=2 a=3",
+        ];
+        let mut seen = 0usize;
+        for line in lines {
+            // The walk's Err is irrelevant here: the sink fires for every
+            // pair decoded BEFORE any error, and those are exactly the
+            // keys a targeted extraction compares against.
+            let _ = walk_logfmt(line, &mut |k, _v| {
+                seen += 1;
+                assert!(!k.is_empty(), "{line:?} emitted an EMPTY key");
+                assert!(
+                    !k.bytes().any(|b| b.is_ascii_whitespace()),
+                    "{line:?} emitted key {k:?}, which contains ASCII whitespace"
+                );
+            });
+        }
+        assert!(seen >= 20, "the hostile lines emitted only {seen} keys");
+    }
+
+    /// **Issue #247, the same invariant end to end.** The three shapes
+    /// whose resolved source key is unmatchable — a quoted path holding a
+    /// space, a two-element path, and an empty path — extract nothing
+    /// from a line that carries every one of their pieces. Measured on
+    /// the pinned v3.7.4 container over this same line: all three give
+    /// `a=""` there too (a miss on both sides; the reference joins with
+    /// `fmt.Sprintf("%v", paths...)`, `pkg/logql/log/parser.go:546 @
+    /// v3.7.4`, and compares against a sanitized key).
+    #[test]
+    fn an_unmatchable_resolved_key_extracts_nothing() {
+        const LINE: &str = "b=1 a-b=2 x=3";
+        for query in [
+            r#"{s="m"} | logfmt --keep-empty a="\"b c\"""#,
+            r#"{s="m"} | logfmt --keep-empty a="b \"x\"""#,
+            r#"{s="m"} | logfmt --keep-empty a="\"\"""#,
+        ] {
+            let compiled = CompiledPipeline::compile(&stages_of(query))
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let mut out = Vec::new();
+            compiled
+                .run_into(LINE, &[], 0, &mut out)
+                .expect("within budget");
+            let a = out
+                .iter()
+                .find(|(k, _)| k == "a")
+                .map(|(_, v)| v.to_string());
+            assert_eq!(
+                a,
+                Some(String::new()),
+                "{query} must extract nothing (the `--keep-empty` flag is what makes the miss \
+                 visible as an empty label rather than an absent one)"
+            );
+        }
+        // The control: a matchable key over the same line does extract.
+        let compiled =
+            CompiledPipeline::compile(&stages_of(r#"{s="m"} | logfmt a="b""#)).expect("compiles");
+        let mut out = Vec::new();
+        compiled
+            .run_into(LINE, &[], 0, &mut out)
+            .expect("within budget");
+        assert_eq!(
+            out.iter()
+                .find(|(k, _)| k == "a")
+                .map(|(_, v)| v.to_string()),
+            Some("1".to_string())
+        );
+    }
 
     /// Issue #240 AC6: the `bad_regex` seam reports the USER's pattern —
     /// a label-filter regex failure (`| a=~"("`) carries the compile

@@ -87,6 +87,10 @@ pub mod explain;
 pub(crate) mod fold;
 mod ip;
 pub(crate) mod labels;
+/// Issue #247: the `| logfmt <id>="<expr>"` extraction-expression
+/// sub-grammar — a module of its own rather than more of [`pipeline`],
+/// which is already over the file-size limit.
+mod logfmt_expr;
 pub mod params;
 pub mod pipeline;
 pub mod plan;

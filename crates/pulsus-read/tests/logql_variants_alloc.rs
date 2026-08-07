@@ -1523,7 +1523,30 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // both new arms — the substitution writes two `i64` literals into
         // the `Copy` `ClientWindow` that was being built anyway; no
         // allocation on either path, so no per-variant band term.
-        branches: 28,
+        //
+        // Issue #247 round 2: 28 -> 29, and `compile` joins the callee
+        // set. A variant's own pipeline is dead syntax at evaluation but
+        // the reference VALIDATES it — `newVariantsEvaluator` builds the
+        // variant's extractor purely to count it
+        // (`pkg/logql/evaluator.go:1417`, `:1422 @ v3.7.4`) — so
+        // `CompiledPipeline::compile(common_stages(pipeline))?` runs here
+        // and its result is discarded. The new branch is that `?`.
+        //
+        // W-MEM disposition of the new callee: **BAND** — a compile
+        // allocates per stage, once PER VARIANT, so it is a real
+        // per-variant term and not a NIL. It is bounded to the DISCARDED
+        // PREFIX (`common_stages`, everything before the first
+        // `Stage::Unwrap`) precisely so it does not double the tail:
+        // `VariantArena::build` already compiles `common ++ tail` before
+        // any I/O, so compiling the whole variant pipeline here would
+        // charge the tail's stages twice per variant. With the prefix
+        // only, the G1c per-variant slope stays INSIDE the committed
+        // `EXEC_*` band unchanged — measured, not assumed: compiling the
+        // whole pipeline instead pushed G1c (F_rich) to 882 against the
+        // band [547, 587], and the prefix-only form passes it. The band
+        // constants are therefore untouched by this issue. Inventory row
+        // P-l.
+        branches: 29,
         callees: &[
             ".any",
             ".as_nanos",
@@ -1557,6 +1580,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             "Unwrap",
             "charge_fanout_bytes",
             "common_stages",
+            // Issue #247 round 2: the discarded-prefix validation, BAND.
+            "compile",
             "format!",
             "format_args!",
             "matches!",

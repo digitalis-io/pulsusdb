@@ -731,9 +731,29 @@ fn parse_pipe_stage(cursor: &mut Cursor<'_>) -> Result<Stage, LogQlError> {
 /// `json`/`logfmt` extraction list: zero or more `label` /
 /// `label="expression"` entries, comma-separated. A bare identifier is
 /// shorthand for `label="label"`.
+///
+/// **A comma must be followed by another entry (issue #247).**
+/// `labelExtractionExpressionList: labelExtractionExpression |
+/// labelExtractionExpressionList COMMA labelExtractionExpression`
+/// (`pkg/logql/syntax/syntax.y:318-321 @ v3.7.4`) — there is no
+/// trailing-comma production. So the loop below is `loop` +
+/// `expect_ident`, the shape [`parse_drop_keep_list`] and
+/// [`parse_label_format_list`] already use, and a dangling comma dies in
+/// `expect_ident` rather than silently ending the list. Measured on the
+/// pinned container: `| logfmt a="b",`, `| logfmt a="b", | json` and
+/// `| json a="b",` are all 400 (`unexpected $end, expecting IDENTIFIER`
+/// for the first and third), as are `| label_format a=b,` and
+/// `| drop a,` — the same rejection the two loops above already give.
+/// The early return keeps a bare
+/// `| json` / `| logfmt` (and `| logfmt --strict`) an empty list, which
+/// is what the `LOGFMT`/`JSON` productions without a list express
+/// (`syntax.y:264-267`, `:270`).
 fn parse_extraction_list(cursor: &mut Cursor<'_>) -> Result<Vec<LabelExtraction>, LogQlError> {
     let mut out = Vec::new();
-    while matches!(cursor.peek().kind, TokenKind::Ident(_)) {
+    if !matches!(cursor.peek().kind, TokenKind::Ident(_)) {
+        return Ok(out);
+    }
+    loop {
         let (label, _) = cursor.expect_ident()?;
         let expression = if matches!(cursor.peek().kind, TokenKind::Eq)
             && matches!(cursor.peek2().kind, TokenKind::String(_))
