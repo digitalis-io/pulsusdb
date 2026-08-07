@@ -354,8 +354,7 @@ pub enum ExpectedError {
 /// on Go's `http.Error` container: they set the SAME `Content-Type` and
 /// the SAME `X-Content-Type-Options: nosniff`, and differ only in that one
 /// ends with `fmt.Fprint` (no terminator) and the other with
-/// `fmt.Fprintln` (one `\n`). Measured 2026-08-07 on
-/// `grafana/loki:3.7.4`, four push errors and eighteen query errors.
+/// `fmt.Fprintln` (one `\n`).
 ///
 /// That distinction is easy to get backwards, and getting it backwards is
 /// how a real divergence hides: an earlier revision of this enum asserted

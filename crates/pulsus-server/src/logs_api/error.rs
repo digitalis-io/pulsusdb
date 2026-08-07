@@ -32,30 +32,19 @@
 //! they pre-date #264, and it neither changed nor covers them
 //! (docs/api.md §2.3).
 //!
-//! Measured to agree, on `grafana/loki:3.7.4`
-//! (`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
-//! 2026-08-07): a parse error (`query={`) on each of `/query`,
-//! `/query_range`, `/series`, `/label/{n}/values`, `/index/stats`,
-//! `/index/volume`, `/patterns`, `/detected_labels`, `/detected_fields`
-//! and `/tail`; plus, on `/query_range`, the param class (missing
-//! `query`; unparseable `step`; out-of-range `end`), the
-//! pipeline-validation class (`|~ "("`) and the limit class (a
-//! 131,081-byte POST-form query). All 18 answered `400` with
-//! `Content-Type: text/plain; charset=utf-8` and
-//! `X-Content-Type-Options: nosniff`, and **no** response's last byte was
-//! `0x0a` (`}`, `d`, `n`, `` ` ``, `e`, `)`); the limit case was
-//! `od -c`-checked whole, 51 bytes ending `…(131081 > 131072)`.
+//! The container is pinned by test, not by this comment: every case in
+//! `tests` below goes through `rendered`, which asserts both headers and a
+//! single `Content-Type`, and the live wire leg is `api_conformance`'s
+//! `PlainTextWriter::LogqlWriteError` arm.
 //!
-//! The `422`, `500` and `504` rows of the table below are NOT
-//! container-probed. Every input tried above was classified `400` by
-//! `ClientHTTPStatusAndError`, and this suite made no attempt to drive
-//! the reference into a genuine `5xx` (it has such paths — see the
-//! docs/api.md §2.1 note on its `500` for a vector-matching cardinality
-//! violation). The source settles those rows instead, and more strongly
-//! than a probe of any one of them could: `WriteError` takes the status
-//! as a *value* and then writes the same two headers and the same
-//! `fmt.Fprint` body regardless of it, so the container provably cannot
-//! vary by status code.
+//! The container does not vary by status code, which is what lets the
+//! `422`/`500`/`504` rows of the table below rest on the same rule:
+//! `WriteError` takes the status as a *value* and then writes the same two
+//! headers and the same `fmt.Fprint` body regardless of it. That is a
+//! property of the source, and a stronger one than probing statuses
+//! individually would give — the reference classifies client-caused
+//! failures as `400` (`ClientHTTPStatusAndError`), so its `5xx` paths are
+//! not reachable by sending a bad request at all.
 //!
 //! Only this surface changed. The three query surfaces have three
 //! independent `IntoResponse` impls — this one, `prom_api::error` and
@@ -294,10 +283,9 @@ mod tests {
 
     /// Issue #264: the exact wire container. The body is the message and
     /// nothing else — no JSON, no trailing newline (`fmt.Fprint` in
-    /// `pkg/util/server/error.go:51 @ v3.7.4` writes no terminator, and
-    /// none of the 18 `grafana/loki:3.7.4` `400`s in this module's header
-    /// probe ended in `0x0a`). Asserted on the raw bytes, not on a
-    /// trimmed string, so a stray newline fails.
+    /// `pkg/util/server/error.go:51 @ v3.7.4` writes no terminator).
+    /// Asserted on the raw bytes, not on a trimmed string, so a stray
+    /// newline fails.
     #[tokio::test]
     async fn an_error_is_the_bare_message_with_no_json_and_no_trailing_newline() {
         let res = ApiError::Read(ReadError::PipelineInvalid {

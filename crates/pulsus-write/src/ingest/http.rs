@@ -463,12 +463,12 @@ fn loki_stream_errors_response(errors: Vec<String>) -> Response {
 /// `fmt.Fprintln`. So the reference's two Loki writers — this one and the
 /// query surface's `WriteError` (`pkg/util/server/error.go:46-52 @
 /// v3.7.4`, issue #264) — **agree on the headers** and differ only in the
-/// terminator. Measured on `grafana/loki:3.7.4`
-/// (`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
-/// 2026-08-07): corrupt snappy, malformed JSON, an inadmissible
-/// structured-metadata name and the stream-less `422` all answered
-/// `Content-Type: text/plain; charset=utf-8` + `nosniff`, last byte
-/// `0x0a`.
+/// terminator.
+///
+/// Pinned by test, not by this comment: `tests::
+/// every_loki_push_error_carries_content_type_and_nosniff` covers all
+/// three responders that reach here, and the live wire leg is
+/// `api_conformance`'s `PlainTextWriter::LokiPushHttpError` arm.
 ///
 /// Deliberately NOT [`plain_text_response`]: that one is shared by
 /// `/api/v1/write` and `/api/v2/spans`, whose references are different and
@@ -2809,11 +2809,8 @@ mod tests {
     /// The two Loki writers differ only in the terminator; they agree on
     /// the headers (`push.HTTPError` -> `http.Error`,
     /// `pkg/loghttp/push/push.go:606-608 @ v3.7.4`, vs `WriteError`,
-    /// `pkg/util/server/error.go:46-52 @ v3.7.4`). Measured on
-    /// `grafana/loki:3.7.4` 2026-08-07: corrupt snappy, malformed JSON, an
-    /// empty structured-metadata name and the stream-less `422` all carry
-    /// `nosniff`. Covers all three responders — whole-request
-    /// ([`loki_error_response`]), stream-local
+    /// `pkg/util/server/error.go:46-52 @ v3.7.4`). Covers all three
+    /// responders — whole-request ([`loki_error_response`]), stream-local
     /// ([`loki_stream_errors_response`]) and backpressure
     /// ([`loki_backpressure_response`]) — because they are three call
     /// sites and a fix to one is not a fix to the others.
