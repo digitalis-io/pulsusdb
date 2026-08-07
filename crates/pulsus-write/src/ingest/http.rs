@@ -440,22 +440,51 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
 /// …)` (`pkg/distributor/http.go:27-30 @ v3.7.4`) — and a label-bound breach
 /// leaves `PushWithResolver` as an `httpgrpc` error that the same handler
 /// hands to that writer (`http.go:161-171`), i.e. to `http.Error` ->
-/// `fmt.Fprintln` (`pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Measured on
-/// `grafana/loki@sha256:87f0a067…`: a 2049-byte `app` value answers `400`
-/// whose last body byte is `0x0a`.
+/// `fmt.Fprintln` (`pkg/loghttp/push/push.go:606-608 @ v3.7.4`). The
+/// terminator is pinned by
+/// `tests::loki_over_long_label_value_is_400_with_the_reference_message`.
 ///
 /// The OTLP path deliberately does NOT go through here — its body is a
 /// `google.rpc.Status` protobuf written by `push.OTLPError`, which has no
 /// terminator (`pkg/distributor/http.go:32-33 @ v3.7.4`).
 fn loki_stream_errors_response(errors: Vec<String>) -> Response {
-    plain_text_response(
+    loki_plain_text_response(
         StatusCode::BAD_REQUEST,
         format!("{}\n", group_stream_errors(errors)),
     )
 }
 
+/// The `/loki/api/v1/push` error container: `text/plain; charset=utf-8`
+/// **and** `X-Content-Type-Options: nosniff`.
+///
+/// Both headers come from the same place the LF does. `push.HTTPError` is
+/// `http.Error(w, errorStr, code)` (`pkg/loghttp/push/push.go:606-608 @
+/// v3.7.4`), and Go's `http.Error` sets *both* headers before
+/// `fmt.Fprintln`. So the reference's two Loki writers — this one and the
+/// query surface's `WriteError` (`pkg/util/server/error.go:46-52 @
+/// v3.7.4`, issue #264) — **agree on the headers** and differ only in the
+/// terminator.
+///
+/// Pinned by test, not by this comment: `tests::
+/// every_loki_push_error_carries_content_type_and_nosniff` covers all
+/// three responders that reach here, and the live wire leg is
+/// `api_conformance`'s `PlainTextWriter::LokiPushHttpError` arm.
+///
+/// Deliberately NOT [`plain_text_response`]: that one is shared by
+/// `/api/v1/write` and `/api/v2/spans`, whose references are different and
+/// do not agree with each other, so setting `nosniff` there could not be
+/// right for both. Issue #385 owns that; see [`rw_error_response`].
+fn loki_plain_text_response(status: StatusCode, message: String) -> Response {
+    let mut response = plain_text_response(status, message);
+    response
+        .headers_mut()
+        .insert(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF);
+    response
+}
+
 /// `/loki/api/v1/push`'s whole-request error response: [`classify`]'s status
-/// with a plain-text, **LF-terminated** body.
+/// with an LF-terminated body in [`loki_plain_text_response`]'s container
+/// (`text/plain; charset=utf-8` + `nosniff`).
 ///
 /// The terminator is the reference's, not a stylistic choice. Its push
 /// receiver binds one error writer for the whole endpoint —
@@ -469,20 +498,20 @@ fn loki_stream_errors_response(errors: Vec<String>) -> Response {
 /// `\n` too.
 ///
 /// Deliberately NOT shared with [`rw_error_response`]: `/api/v1/write` and
-/// `/api/v2/spans` answer to Prometheus and OpenZipkin, not to this one.
-/// The OTLP receiver has no terminator at all — its body is a
-/// `google.rpc.Status` protobuf, where the message is a length-delimited
-/// field (see [`LogsIngestError::InvalidLabelName`]).
+/// `/api/v2/spans` answer to other references, and to each other's
+/// detriment — issue #385. The OTLP receiver has no terminator at all —
+/// its body is a `google.rpc.Status` protobuf, where the message is a
+/// length-delimited field (see [`LogsIngestError::InvalidLabelName`]).
 fn loki_error_response(err: &LogsIngestError) -> Response {
     let (status, _code) = classify(err);
-    plain_text_response(status, format!("{err}\n"))
+    loki_plain_text_response(status, format!("{err}\n"))
 }
 
 /// `/loki/api/v1/push`'s sink-backpressure response — [`loki_error_response`]'s
 /// terminator applies here too, since the reference writes its rate-limit
 /// rejection through the very same `HTTPError`.
 fn loki_backpressure_response() -> Response {
-    plain_text_response(
+    loki_plain_text_response(
         StatusCode::TOO_MANY_REQUESTS,
         "sink is applying backpressure: buffers are full\n".to_string(),
     )
@@ -899,6 +928,12 @@ fn protobuf_response(status: StatusCode, body: Vec<u8>) -> Response {
 
 const PLAIN_TEXT_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("text/plain; charset=utf-8");
 
+/// `X-Content-Type-Options: nosniff` — set by Go's `http.Error`, and so by
+/// every reference writer built on it. Used by
+/// [`loki_plain_text_response`] only; see its doc for why the other
+/// plain-text receivers do not share it.
+const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
+
 /// `/api/v1/write`'s empty-body success/accepted response (architect plan:
 /// remote-write has no partial-success envelope, so `rejected` never
 /// appears here — only via the writer's `rejected_total` metric/log).
@@ -911,6 +946,17 @@ fn rw_success_response(status: StatusCode) -> Response {
 /// `/api/v1/write`'s whole-request error response: `err`'s [`classify`]d
 /// status with a plain-text body — never [`status_response`]'s
 /// `google.rpc.Status` protobuf (architect plan edge case 3).
+///
+/// **KNOWN DIVERGENCE — see issue #385, which owns it.** This function and
+/// [`rw_backpressure_response`] are called from BOTH
+/// [`ingest_remote_write`] (`/api/v1/write`) and [`ingest_zipkin`]
+/// (`/api/v2/spans`), whose references are different and do not agree with
+/// each other, so one writer cannot match both. #385 carries the
+/// measurements and the decision; do not restate them here.
+///
+/// Splitting the writer is out of scope for issue #264. Until #385 lands,
+/// `tests/support/manifest.rs`'s `PlainTextWriter::WriterSideReceiver`
+/// asserts no reference-derived rule for either route.
 fn rw_error_response(err: &LogsIngestError) -> Response {
     let (status, _code) = classify(err);
     plain_text_response(status, err.to_string())
@@ -2754,6 +2800,84 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(!plain_text_body(res).await.is_empty());
         assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// Issue #264 review finding 1: `/loki/api/v1/push` sets BOTH headers
+    /// Go's `http.Error` sets — `Content-Type: text/plain; charset=utf-8`
+    /// **and** `X-Content-Type-Options: nosniff` — not just the first.
+    ///
+    /// The two Loki writers differ only in the terminator; they agree on
+    /// the headers (`push.HTTPError` -> `http.Error`,
+    /// `pkg/loghttp/push/push.go:606-608 @ v3.7.4`, vs `WriteError`,
+    /// `pkg/util/server/error.go:46-52 @ v3.7.4`). Covers all three
+    /// responders — whole-request ([`loki_error_response`]), stream-local
+    /// ([`loki_stream_errors_response`]) and backpressure
+    /// ([`loki_backpressure_response`]) — because they are three call
+    /// sites and a fix to one is not a fix to the others.
+    #[tokio::test]
+    async fn every_loki_push_error_carries_content_type_and_nosniff() {
+        fn container_of(res: &Response) -> (Option<String>, Option<String>) {
+            let h = res.headers();
+            let get = |n: &str| {
+                h.get(n)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_ascii_lowercase)
+            };
+            (get("content-type"), get("x-content-type-options"))
+        }
+
+        // Whole-request: an undecodable body.
+        let sink = MockSink::new(Outcome::Admit);
+        let whole = call_loki(
+            &sink,
+            b"\xff\xff\xff not snappy".to_vec(),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(whole.status(), StatusCode::BAD_REQUEST);
+
+        // Stream-local: an over-long label value on the only stream.
+        let value = "b".repeat(2049);
+        let sink2 = MockSink::new(Outcome::Admit);
+        let stream_local = call_loki(
+            &sink2,
+            format!(
+                r#"{{"streams":[{{"stream":{{"app":"{value}"}},"values":[["1700000000000000000","x"]]}}]}}"#
+            )
+            .into_bytes(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(stream_local.status(), StatusCode::BAD_REQUEST);
+
+        // Backpressure.
+        let sink3 = MockSink::new(Outcome::Backpressure);
+        let backpressure = call_loki(
+            &sink3,
+            br#"{"streams":[{"stream":{"a":"b"},"values":[["1700000000000000000","x"]]}]}"#
+                .to_vec(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(backpressure.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        for (label, res) in [
+            ("whole-request", whole),
+            ("stream-local", stream_local),
+            ("backpressure", backpressure),
+        ] {
+            let (ct, nosniff) = container_of(&res);
+            assert_eq!(
+                ct.as_deref(),
+                Some("text/plain; charset=utf-8"),
+                "{label}: content-type"
+            );
+            assert_eq!(
+                nosniff.as_deref(),
+                Some("nosniff"),
+                "{label}: the reference's http.Error sets X-Content-Type-Options"
+            );
+        }
     }
 
     /// Issue #374 at the wire, Loki-push transport: an over-long label value

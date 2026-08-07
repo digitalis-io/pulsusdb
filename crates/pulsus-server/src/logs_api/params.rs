@@ -41,9 +41,10 @@ const DEFAULT_LOOKBACK_NS: i64 = 3_600_000_000_000;
 const DERIVED_STEP_TARGET_POINTS: i64 = 250;
 const ONE_SECOND_NS: u64 = 1_000_000_000;
 
-/// Errors from parsing `/api/logs/v1` request parameters — mapped to `400
-/// bad_data` by `error::ApiError` (the one exception, `UnsupportedContentType`,
-/// still maps to `400`, just for a POST-specific reason).
+/// Errors from parsing `/api/logs/v1` request parameters — mapped to
+/// `400` by `error::ApiError` (the one exception,
+/// `UnsupportedContentType`, still maps to `400`, just for a
+/// POST-specific reason).
 #[derive(Debug, Error)]
 pub(crate) enum ParamError {
     #[error("missing required parameter 'query'")]

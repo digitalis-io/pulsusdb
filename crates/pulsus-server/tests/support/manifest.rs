@@ -1,9 +1,12 @@
 //! The single source of truth for issue #36's exhaustive API conformance
 //! matrix: every mounted route, its HTTP method matrix, its mode/flag
 //! gate, its documented-vs-planned status, and a representative set of
-//! invalid-param cases with the exact `(status, errorType)` (or, for the
-//! non-JSON ingest families, the exact protobuf/plain-text error shape)
-//! the architect plan pins.
+//! invalid-param cases with the exact error shape the architect plan pins
+//! — the `(status, errorType)` JSON envelope on `prom_api`/`traces_api`,
+//! and `text/plain` on the LogQL surface (issue #264) and the ingest
+//! families. "Plain text" is not one contract: see [`PlainTextWriter`],
+//! which keeps the LogQL surface's un-terminated body apart from
+//! `/loki/api/v1/push`'s LF-terminated one.
 //!
 //! Shared by both test binaries via `#[path = "support/manifest.rs"] mod
 //! manifest;` (a `tests/` subdirectory, so cargo never builds this file as
@@ -82,8 +85,11 @@ pub enum Surface {
     /// empty-body shape); `api_conformance.rs` dispatches on the concrete
     /// path, not just this variant.
     Ingest,
-    /// `/api/logs/v1/*` and its `/loki/api/v1/*` alias — LogQL JSON query
-    /// envelope (`{"status","errorType","error","position"?}`).
+    /// `/api/logs/v1/*` and its `/loki/api/v1/*` alias — a JSON success
+    /// envelope (`{"status","data",...}`), but a BARE `text/plain` error
+    /// body: the message and nothing else, matching the reference's
+    /// `WriteError` (`pkg/util/server/error.go:46-52 @ v3.7.4`, issue
+    /// #264).
     LogsQuery,
     /// `GET /api/logs/v1/tail` and its `/loki/api/v1/tail` alias (issue
     /// #74) — a WebSocket route. The generic matrix cannot drive it (a
@@ -96,25 +102,25 @@ pub enum Surface {
     /// `WebSocketUpgrade` rejection ("Connection header did not include
     /// 'upgrade'") — an unmounted path returns the EMPTY 404 instead.
     /// `success_status` carries that pinned 400. Param/shape errors are
-    /// the LogsQuery JSON envelope, asserted with real upgrade headers
-    /// in `assert_tail_route`; slot exhaustion is `429
-    /// too_many_requests` (its own dedicated spawn).
+    /// the LogsQuery bare `text/plain` body, asserted with real upgrade
+    /// headers in `assert_tail_route`; slot exhaustion is `429` (its own
+    /// dedicated spawn).
     LogsTail,
     /// `GET /api/logs/v1/stats` and its `/loki/api/v1/index/stats` alias
     /// (issue #74, docs/api.md §2.5) — success is the bare
     /// `{"streams","chunks","entries","bytes"}` object (no status/data
     /// envelope); against this suite's empty databases every field is 0
-    /// — the mounting oracle. Errors are the LogsQuery JSON envelope
-    /// (`position` present exactly on LogQL parse errors).
+    /// — the mounting oracle. Errors are the LogsQuery bare `text/plain`
+    /// body.
     LogsStats,
     /// `GET|POST /api/logs/v1/detected_labels` and its
     /// `/loki/api/v1/detected_labels` alias (issue #170, docs/api.md
     /// §2.6) — success is the bare `{"detectedLabels":[...]}` object (the
     /// reference wire shape, no status/data envelope); against this
     /// suite's empty databases the exact body is `{"detectedLabels":[]}`
-    /// — the mounting oracle. Errors are the LogsQuery JSON envelope
-    /// (`position` present exactly on LogQL parse errors — including a
-    /// pipeline in `query`, which the matchers-only parse rejects).
+    /// — the mounting oracle. Errors are the LogsQuery bare `text/plain`
+    /// body (including for a pipeline in `query`, which the matchers-only
+    /// parse rejects).
     LogsDetectedLabels,
     /// `GET|POST /api/logs/v1/detected_fields` and its
     /// `/loki/api/v1/detected_fields` alias (issue #170, docs/api.md
@@ -126,8 +132,7 @@ pub enum Surface {
     /// NOT the mounting oracle — `{}` identifies no handler — so
     /// `api_conformance::assert_detected_fields_handler_identity` proves
     /// mounting from the `X-Pulsus-Explain` fingerprint instead. Errors
-    /// are the LogsQuery JSON envelope (`position` present exactly on
-    /// LogQL parse errors).
+    /// are the LogsQuery bare `text/plain` body.
     LogsDetectedFields,
     /// `/api/v1/*` — the Prometheus HTTP API JSON query envelope
     /// (`{"status","errorType","error"}`, no `position`).
@@ -317,14 +322,16 @@ impl Req {
 
 /// The exact error shape a [`CaseClass`] expects — one variant per
 /// response family (plan v3/v4 deltas: OTLP `google.rpc.Status` protobuf,
-/// remote-write plain text, and the two JSON query envelopes are never
+/// remote-write plain text, and the JSON query envelope are never
 /// conflated).
 #[derive(Debug, Clone, Copy)]
 pub enum ExpectedError {
-    /// `logs_api`/`prom_api`'s `{"status":"error","errorType",...}`
+    /// `prom_api`/`traces_api`'s `{"status":"error","errorType",...}`
     /// envelope. `has_position` pins whether `position` is present (only
-    /// ever true for `logs_api` LogQL parse errors — `prom_api`'s envelope
-    /// never carries the field at all).
+    /// ever true for `traces_api` TraceQL parse errors — `prom_api`'s
+    /// envelope never carries the field at all). Issue #264 moved the
+    /// whole LogQL surface off this variant onto
+    /// [`ExpectedError::PlainText`].
     Json {
         error_type: &'static str,
         has_position: bool,
@@ -332,9 +339,72 @@ pub enum ExpectedError {
     /// The ingest handlers' hand-rolled `google.rpc.Status { code, message }`
     /// protobuf error body (OTLP `/v1/logs`, `/v1/metrics`, `/v1/traces`).
     Otlp { code: i32 },
-    /// `/api/v1/write`'s plain-text error body (`text/plain; charset=utf-8`,
-    /// non-empty).
-    PlainText,
+    /// A `text/plain; charset=utf-8` error body, non-empty and not JSON —
+    /// asserted for every variant. The payload names WHICH writer produced
+    /// it, which decides the two REFERENCE-derived rules on top of that
+    /// (`nosniff`, and the trailing byte) — see [`PlainTextWriter`].
+    PlainText(PlainTextWriter),
+}
+
+/// Which plain-text error writer a route's error body comes from.
+///
+/// **The split is on the terminator, and ONLY on the terminator.** Loki's
+/// two writers — `WriteError` for the query surface (issue #264) and
+/// `push.HTTPError` for `/loki/api/v1/push` (issue #374) — are both built
+/// on Go's `http.Error` container: they set the SAME `Content-Type` and
+/// the SAME `X-Content-Type-Options: nosniff`, and differ only in that one
+/// ends with `fmt.Fprint` (no terminator) and the other with
+/// `fmt.Fprintln` (one `\n`).
+///
+/// That distinction is easy to get backwards, and getting it backwards is
+/// how a real divergence hides: an earlier revision of this enum asserted
+/// `nosniff` for the query family only, which made our push responder's
+/// MISSING `nosniff` look like a property the families legitimately
+/// disagreed about. They do not. Anything the writers share is asserted
+/// for every variant that has a reference for it — see
+/// [`PlainTextWriter::sets_nosniff`].
+#[derive(Debug, Clone, Copy)]
+pub enum PlainTextWriter {
+    /// The LogQL query surface (§2), since issue #264 — Loki's
+    /// `WriteError` (`pkg/util/server/error.go:46-52 @ v3.7.4`): two
+    /// headers, then `fmt.Fprint(w, err.Error())`. Asserted: `nosniff`
+    /// present and **no** trailing newline.
+    LogqlWriteError,
+    /// `/loki/api/v1/push` (§8.2), issue #374 — the reference binds ONE
+    /// error writer for that endpoint, `push.HTTPError` -> `http.Error`
+    /// -> `fmt.Fprintln` (`pkg/distributor/http.go:27-30` and
+    /// `pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Asserted: `nosniff`
+    /// present (Go's `http.Error` sets it, exactly as `WriteError` does)
+    /// and **exactly one** trailing `\n`.
+    LokiPushHttpError,
+    /// `/api/v1/write` (Prometheus remote write) and `/api/v2/spans`
+    /// (OpenZipkin) — which share ONE PulsusDB responder,
+    /// `pulsus_write::ingest::http::rw_error_response`, while answering to
+    /// two references that do not agree with each other. **Issue #385 owns
+    /// that question and carries the measurements.**
+    ///
+    /// So NEITHER reference-derived rule can be asserted for this variant:
+    /// it gets only the checks every variant gets (PulsusDB's own exact
+    /// content type, non-empty, non-JSON). That is a genuine gap, not a
+    /// resolved one — it closes with #385.
+    WriterSideReceiver,
+}
+
+impl PlainTextWriter {
+    /// Whether this writer's reference sets
+    /// `X-Content-Type-Options: nosniff`.
+    ///
+    /// Deliberately NOT keyed off the same distinction as the trailing
+    /// byte: both Loki writers set it (Go's `http.Error` and Loki's
+    /// `WriteError` both do), so both assert it. Only
+    /// [`PlainTextWriter::WriterSideReceiver`] cannot, because the two
+    /// references sharing that responder disagree — see its doc.
+    pub fn sets_nosniff(self) -> bool {
+        match self {
+            PlainTextWriter::LogqlWriteError | PlainTextWriter::LokiPushHttpError => true,
+            PlainTextWriter::WriterSideReceiver => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -393,37 +463,25 @@ const LOGS_QUERY_LIKE_CASES: &[CaseClass] = &[
         name: "missing_query",
         build: logs_missing_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "malformed_logql",
         build: logs_malformed_logql,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "limit_over_cap",
         build: logs_limit_over_cap,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "wrong_content_type",
         build: logs_wrong_content_type,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
 ];
 
@@ -431,10 +489,7 @@ const LOGS_LABELS_CASES: &[CaseClass] = &[CaseClass {
     name: "wrong_content_type",
     build: logs_wrong_content_type,
     expect_status: 400,
-    expect: ExpectedError::Json {
-        error_type: "bad_data",
-        has_position: false,
-    },
+    expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
 }];
 
 // -- logs stats (issue #74, docs/api.md §2.5) ---------------------------
@@ -458,37 +513,25 @@ const LOGS_STATS_CASES: &[CaseClass] = &[
         name: "missing_query",
         build: logs_missing_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "malformed_logql",
         build: logs_malformed_logql,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "metric_query_rejected",
         build: logs_stats_metric_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "parser_pipeline_rejected",
         build: logs_stats_parser_pipeline,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
 ];
 
@@ -530,64 +573,43 @@ const LOGS_VOLUME_CASES: &[CaseClass] = &[
         name: "missing_query",
         build: logs_missing_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "malformed_logql",
         build: logs_malformed_logql,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "metric_query_rejected",
         build: logs_stats_metric_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "pipeline_rejected",
         build: logs_volume_pipeline,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "invalid_aggregate_by",
         build: logs_volume_invalid_aggregate_by,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "limit_too_large",
         build: logs_volume_limit_too_large,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "target_labels_too_many",
         build: logs_volume_too_many_target_labels,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
 ];
 
@@ -608,46 +630,31 @@ const LOGS_PATTERNS_CASES: &[CaseClass] = &[
         name: "missing_query",
         build: logs_missing_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "malformed_logql",
         build: logs_malformed_logql,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "metric_query_rejected",
         build: logs_stats_metric_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "pipeline_rejected",
         build: logs_patterns_pipeline,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "bad_step",
         build: logs_patterns_bad_step,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
 ];
 
@@ -672,28 +679,19 @@ const LOGS_DETECTED_LABELS_CASES: &[CaseClass] = &[
         name: "malformed_logql",
         build: logs_malformed_logql,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "pipeline_in_query_rejected",
         build: logs_detected_labels_pipeline_in_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "wrong_content_type",
         build: logs_wrong_content_type,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
 ];
 
@@ -702,55 +700,37 @@ const LOGS_DETECTED_FIELDS_CASES: &[CaseClass] = &[
         name: "missing_query",
         build: logs_missing_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "malformed_logql",
         build: logs_malformed_logql,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "metric_query_rejected",
         build: logs_stats_metric_query,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "line_limit_zero",
         build: logs_detected_fields_line_limit_zero,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "limit_over_cap",
         build: logs_detected_fields_limit_over_cap,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "wrong_content_type",
         build: logs_wrong_content_type,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
 ];
 
@@ -759,19 +739,13 @@ const LOGS_SERIES_CASES: &[CaseClass] = &[
         name: "missing_match",
         build: logs_series_missing_match,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
         name: "wrong_content_type",
         build: logs_wrong_content_type,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
 ];
 
@@ -1397,7 +1371,7 @@ const REMOTE_WRITE_CASES: &[CaseClass] = &[CaseClass {
     name: "bad_snappy",
     build: rw_bad_snappy,
     expect_status: 400,
-    expect: ExpectedError::PlainText,
+    expect: ExpectedError::PlainText(PlainTextWriter::WriterSideReceiver),
 }];
 
 // -- Loki push (issue #77, docs/api.md §8.2) ----------------------------
@@ -1435,13 +1409,13 @@ const LOKI_PUSH_CASES: &[CaseClass] = &[
         name: "bad_snappy",
         build: loki_bad_snappy,
         expect_status: 400,
-        expect: ExpectedError::PlainText,
+        expect: ExpectedError::PlainText(PlainTextWriter::LokiPushHttpError),
     },
     CaseClass {
         name: "unsupported_content_type",
         build: loki_unsupported_content_type,
         expect_status: 400,
-        expect: ExpectedError::PlainText,
+        expect: ExpectedError::PlainText(PlainTextWriter::LokiPushHttpError),
     },
 ];
 
@@ -1477,13 +1451,13 @@ const ZIPKIN_CASES: &[CaseClass] = &[
         name: "malformed_json",
         build: zipkin_malformed_json,
         expect_status: 400,
-        expect: ExpectedError::PlainText,
+        expect: ExpectedError::PlainText(PlainTextWriter::WriterSideReceiver),
     },
     CaseClass {
         name: "unsupported_content_encoding",
         build: zipkin_unsupported_content_encoding,
         expect_status: 400,
-        expect: ExpectedError::PlainText,
+        expect: ExpectedError::PlainText(PlainTextWriter::WriterSideReceiver),
     },
 ];
 

@@ -1,11 +1,90 @@
-//! `/api/logs/v1`'s error envelope: `{"status":"error","errorType",...
-//! "error","position"?}` (docs/api.md "Errors"), and the status-code
-//! mapping table pinned by the issue #13 architect plan.
+//! `/api/logs/v1`'s error body: a BARE `text/plain` message (docs/api.md
+//! §2.3 "Errors"), and the status-code mapping table pinned by the issue
+//! #13 architect plan.
+//!
+//! Issue #264 replaced the previous `{"status","errorType","error",
+//! "position"?}` JSON envelope with the reference's shape. Loki writes
+//! every LogQL error its HANDLERS produce — the scope of this module, i.e.
+//! every [`ApiError`] variant below — through one function,
+//! `pkg/util/server/error.go:46-52 @ v3.7.4`:
+//!
+//! ```go
+//! func WriteError(err error, w http.ResponseWriter) {
+//!     status, cerr := ClientHTTPStatusAndError(err)
+//!     w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+//!     w.Header().Set("X-Content-Type-Options", "nosniff")
+//!     w.WriteHeader(status)
+//!     fmt.Fprint(w, cerr.Error())
+//! }
+//! ```
+//!
+//! `fmt.Fprint` adds no terminator, so there is **no trailing newline**.
+//! Every LogQL route reaches it: the query/series/label/stats/volume/
+//! patterns/detected family through
+//! `pkg/querier/queryrange/serialize.go:67,73,81,89` and
+//! `pkg/lokifrontend/frontend/transport/handler.go:141`, and `/tail`'s
+//! pre-upgrade rejections through `pkg/querier/tail/http.go:35,42` — all
+//! @ v3.7.4.
+//!
+//! **What that does NOT cover: the routing layer.** Rejections made above
+//! the handlers — axum's own 404/405, and the server-wide `TimeoutLayer`'s
+//! 408 — are not written by this module. They diverge from the reference,
+//! they pre-date #264, and it neither changed nor covers them
+//! (docs/api.md §2.3).
+//!
+//! The container is pinned by test, not by this comment:
+//! `tests::assert_reference_container` asserts both headers and rejects a
+//! duplicated `Content-Type`, and the live wire leg is `api_conformance`'s
+//! `PlainTextWriter::LogqlWriteError` arm.
+//!
+//! The container does not vary by status code, which is what lets the
+//! `422`/`500`/`504` rows of the table below rest on the same rule:
+//! `WriteError` takes the status as a *value* and then writes the same two
+//! headers and the same `fmt.Fprint` body regardless of it. That is a
+//! property of the source, and a stronger one than probing statuses
+//! individually would give — the reference classifies client-caused
+//! failures as `400` (`ClientHTTPStatusAndError`), so its `5xx` paths are
+//! not reachable by sending a bad request at all.
+//!
+//! Only this surface changed. The three query surfaces have three
+//! independent `IntoResponse` impls — this one, `prom_api::error` and
+//! `traces_api::error` — so nothing here reaches the other two; and the
+//! two left alone were each checked rather than assumed (issue #264
+//! determination 2):
+//!
+//! - `prom_api` keeps its JSON envelope and is CORRECT to. Upstream
+//!   Prometheus writes every API error as `application/json` carrying
+//!   `{status, errorType, error}` — `respondError`,
+//!   `web/api/v1/api.go:2200-2230`, read at
+//!   `vendor/github.com/prometheus/prometheus/` @ grafana/loki v3.7.4.
+//! - `traces_api` keeps its JSON envelope and is KNOWN DIVERGENT.
+//!   Tempo v3.0.2 writes trace query errors as plain text: the querier
+//!   calls `http.Error` directly (`modules/querier/http.go:45,52,94,…`)
+//!   and the query frontend routes everything through dskit's
+//!   `httpgrpc.WriteError` (`modules/frontend/handler.go:156-168`), which
+//!   is `http.Error` as well. Changing it is a second wire-shape change
+//!   across a second surface and is deliberately NOT done here — #264's
+//!   ruling and its measured sweep both name the LogQL surface. Recorded
+//!   in docs/api.md §2.3 as an open divergence.
+//!
+//! Note also that plain text alone is not the whole contract. The
+//! reference's two Loki writers agree on BOTH headers — Go's `http.Error`
+//! sets `Content-Type` and `nosniff` exactly as `WriteError` does — and
+//! disagree only on the trailing byte: this one (`fmt.Fprint`) writes
+//! none, `/loki/api/v1/push`'s (`fmt.Fprintln`, issue #374) writes an LF.
+//! `tests/support/manifest.rs`'s `PlainTextWriter` splits on that one
+//! property and asserts the shared headers for both.
+//!
+//! The writers themselves are separate: `pulsus-write`'s ingest module has
+//! nine response builders and none of them is reachable from `logs_api` —
+//! the crates do not call into each other's responders at all. Two of
+//! those nine ARE shared across references, though (`rw_error_response`
+//! and `rw_backpressure_response` serve both `/api/v1/write` and
+//! `/api/v2/spans`), which is a live divergence recorded on
+//! `rw_error_response` — not a claim of separation anywhere but here.
 
-use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
 
 use pulsus_clickhouse::ChError;
 use pulsus_logql::LogQlError;
@@ -14,7 +93,7 @@ use pulsus_read::ReadError;
 use super::params::ParamError;
 
 /// Every failure mode a `/api/logs/v1` handler can return, converted to the
-/// documented error envelope by [`IntoResponse`].
+/// bare plain-text error body by [`IntoResponse`].
 #[derive(Debug)]
 pub(crate) enum ApiError {
     Param(ParamError),
@@ -50,72 +129,65 @@ impl From<ReadError> for ApiError {
     }
 }
 
-#[derive(Serialize)]
-struct ErrorEnvelope {
-    status: &'static str,
-    #[serde(rename = "errorType")]
-    error_type: &'static str,
-    error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    position: Option<usize>,
+/// Writes the reference's error response: the message verbatim, no
+/// trailing newline, `text/plain; charset=utf-8` + `nosniff`
+/// (`pkg/util/server/error.go:46-52 @ v3.7.4` — quoted in this module's
+/// header). The `Content-Type` is set explicitly rather than left to
+/// `String`'s own `IntoResponse` so the two headers are pinned in one
+/// place and read as a unit against the reference.
+pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        message,
+    )
+        .into_response()
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, error_type, message, position) = match &self {
-            ApiError::Param(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
-            ApiError::LogQl(e) => (
-                StatusCode::BAD_REQUEST,
-                "bad_data",
-                e.to_string(),
-                Some(e.span().start),
-            ),
+        let (status, message) = match &self {
+            ApiError::Param(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            ApiError::LogQl(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ApiError::Read(e) => read_error_parts(e),
             ApiError::PoolUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
                 "clickhouse pool not yet established".to_string(),
-                None,
             ),
             ApiError::TailBusy => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "too_many_requests",
                 "tail connection limit reached (reader.tail_max_connections)".to_string(),
-                None,
             ),
         };
-        let body = ErrorEnvelope {
-            status: "error",
-            error_type,
-            error: message,
-            position,
-        };
-        (status, Json(body)).into_response()
+        plain_text_error(status, message)
     }
 }
 
-/// The `ReadError` branch of the architect plan's status-code table:
+/// The `ReadError` branch of the architect plan's status-code table.
+/// Issue #264 dropped the `errorType` column with the JSON envelope — the
+/// status code is the whole machine-readable classification now, exactly
+/// as in the reference, whose `ClientHTTPStatusAndError`
+/// (`pkg/util/server/error.go:54-131 @ v3.7.4`) also returns only
+/// `(status, error)`.
 ///
-/// | source | HTTP | errorType |
-/// |---|---|---|
-/// | `Parse`/`EmptyMatcherSet`/`ContradictoryMatchers`/`InvalidStep` | 400 | `bad_data` |
-/// | `QueryTooBroad` | 422 | `query_too_broad` |
-/// | `Clickhouse(Timeout)` | 504 | `timeout` |
-/// | `Clickhouse(_)` | 500 | `internal` |
-fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<usize>) {
+/// | source | HTTP |
+/// |---|---|
+/// | `Parse`/`EmptyMatcherSet`/`ContradictoryMatchers`/`InvalidStep` | 400 |
+/// | `QueryTooBroad` | 422 |
+/// | `Clickhouse(Timeout)` | 504 |
+/// | `Clickhouse(_)` | 500 |
+fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
     match e {
-        ReadError::Parse(inner) => (
-            StatusCode::BAD_REQUEST,
-            "bad_data",
-            e.to_string(),
-            Some(inner.span().start),
-        ),
+        ReadError::Parse(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         // Issue M6-09 plan v3 delta 6: pipeline-validation failures (bad
         // regex / invalid template (#230) / bad parser expression /
         // `unwrap` outside a range aggregation) and the M6-10
         // metric-pipeline deferral are both client-caused query-shape
-        // rejections — 400 `bad_data`, alongside the other planner
-        // validation variants.
+        // rejections — 400, alongside the other planner validation
+        // variants.
         // `MetricPipelineError` (issue M6-10 adjudication #1: a metric
         // line retained a nonempty `__error__` after the full pipeline)
         // is likewise 400 — the status the oracle returns for the same
@@ -131,7 +203,7 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
         | ReadError::PipelineInvalid { .. }
         | ReadError::MetricPipelineError { .. }
         | ReadError::PipelineUnsupportedInMetric { .. } => {
-            (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None)
+            (StatusCode::BAD_REQUEST, e.to_string())
         }
         // Issue #85: `NamelessSelectorUnresolvable` is a PromQL-only
         // variant (the LogQL engine never produces it), matched here for
@@ -144,41 +216,27 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
         // `prom_api::error::read_error_parts`.
         ReadError::QueryTooBroad(_)
         | ReadError::NamelessSelectorUnresolvable { .. }
-        | ReadError::HistogramResultUnsupported => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "query_too_broad",
-            e.to_string(),
-            None,
-        ),
+        | ReadError::HistogramResultUnsupported => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        }
         // M7-A5a: a histogram-decode failure is a metrics-only data-
-        // integrity defect (unreachable from LogQL), 500 `internal`.
-        ReadError::HistogramDecode(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            e.to_string(),
-            None,
-        ),
+        // integrity defect (unreachable from LogQL), 500.
+        ReadError::HistogramDecode(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         ReadError::Clickhouse(ch) => match ch {
-            ChError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string(), None),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                e.to_string(),
-                None,
-            ),
+            ChError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, e.to_string()),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         },
         // Issue #31: every `pulsus_promql::PromqlError` variant (parse,
         // unsupported construct, bad vector matching, histogram_quantile
         // bucket error) is a client-caused failure — mapped uniformly to
-        // 400 `bad_data`, no position (unlike `LogQlError`'s span-tracked
+        // 400 (unlike `LogQlError`'s span-tracked
         // parser, `PromqlError::Parse` carries only the vendored parser's
         // message text). `pulsus-server` does not yet wire `MetricsEngine`
         // into a route (that is #32), so this arm is unreachable from any
         // request today; #32 may split it into a finer-grained mapping
-        // (e.g. `Unsupported` -> a distinct `errorType`) if the PromQL API
-        // surface needs one — this keeps `ReadError` matches exhaustive
-        // and correct in the meantime.
-        ReadError::Promql(_) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
+        // if the PromQL API surface needs one — this keeps `ReadError`
+        // matches exhaustive and correct in the meantime.
+        ReadError::Promql(_) => (StatusCode::BAD_REQUEST, e.to_string()),
     }
 }
 
@@ -186,66 +244,127 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
 mod tests {
     use super::*;
 
-    async fn envelope(err: ApiError) -> (StatusCode, serde_json::Value) {
+    /// Asserts the reference's error container on a rendered response:
+    /// both headers (`pkg/util/server/error.go:48-49 @ v3.7.4`), and that
+    /// `Content-Type` appears exactly once.
+    ///
+    /// The count matters because `plain_text_error` sets `Content-Type`
+    /// explicitly on top of a `String` body, which sets it too.
+    /// `HeaderMap::get` returns the first of a duplicated pair and hides
+    /// the second, and so would the conformance suite's header `HashMap`.
+    fn assert_reference_container(res: &Response) {
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+        );
+        assert_eq!(
+            res.headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+        );
+        assert_eq!(
+            res.headers().get_all(header::CONTENT_TYPE).iter().count(),
+            1,
+            "exactly one Content-Type, never a duplicated pair",
+        );
+    }
+
+    /// Renders an `ApiError` and returns `(status, body)`, checking the
+    /// container via [`assert_reference_container`] on the way through.
+    async fn rendered(err: ApiError) -> (StatusCode, String) {
         let res = err.into_response();
         let status = res.status();
+        assert_reference_container(&res);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .expect("read body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
-        (status, json)
+        (
+            status,
+            String::from_utf8(body.to_vec()).expect("utf-8 body"),
+        )
+    }
+
+    /// Issue #264: the exact wire container. The body is the message and
+    /// nothing else — no JSON, no trailing newline (`fmt.Fprint` in
+    /// `pkg/util/server/error.go:51 @ v3.7.4` writes no terminator).
+    /// Asserted on the raw bytes, not on a trimmed string, so a stray
+    /// newline fails.
+    ///
+    /// Cannot use [`rendered`], which decodes the body to a `String`; it
+    /// calls [`assert_reference_container`] directly instead, so this test
+    /// covers the headers too rather than being the one hole in them.
+    #[tokio::test]
+    async fn an_error_is_the_bare_message_with_no_json_and_no_trailing_newline() {
+        let res = ApiError::Read(ReadError::PipelineInvalid {
+            reason: "bad regex: unclosed group".to_string(),
+        })
+        .into_response();
+        assert_reference_container(&res);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(body.as_ref(), b"bad regex: unclosed group");
+        assert!(!body.ends_with(b"\n"), "body must not end with a newline");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).is_err(),
+            "the body must not be JSON at all"
+        );
     }
 
     #[tokio::test]
-    async fn param_error_maps_to_400_bad_data() {
-        let (status, json) = envelope(ApiError::Param(ParamError::MissingQuery)).await;
+    async fn param_error_maps_to_400() {
+        let (status, body) = rendered(ApiError::Param(ParamError::MissingQuery)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["status"], "error");
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_none());
+        assert_eq!(body, ParamError::MissingQuery.to_string());
     }
 
+    /// Issue #264: a LogQL parse error carried a `position` byte offset in
+    /// the old JSON envelope. The reference has no such field — its body
+    /// is `err.Error()` and nothing more — so the span survives only
+    /// inside the message text where the reference itself puts it.
     #[tokio::test]
-    async fn logql_error_maps_to_400_bad_data_with_a_position() {
+    async fn logql_error_maps_to_400_with_no_position_field() {
         let err = LogQlError::EmptySelector {
             span: pulsus_logql::Span { start: 4, end: 6 },
         };
-        let (status, json) = envelope(ApiError::LogQl(err)).await;
+        let expected = err.to_string();
+        let (status, body) = rendered(ApiError::LogQl(err)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["position"], 4);
+        assert_eq!(body, expected);
+        assert!(!body.contains("position"), "{body}");
     }
 
     #[tokio::test]
-    async fn read_error_empty_matcher_set_maps_to_400_bad_data() {
-        let (status, json) = envelope(ApiError::Read(ReadError::EmptyMatcherSet)).await;
+    async fn read_error_empty_matcher_set_maps_to_400() {
+        let (status, body) = rendered(ApiError::Read(ReadError::EmptyMatcherSet)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(body, ReadError::EmptyMatcherSet.to_string());
     }
 
     #[tokio::test]
-    async fn read_error_invalid_step_maps_to_400_bad_data() {
-        let (status, json) = envelope(ApiError::Read(ReadError::InvalidStep)).await;
+    async fn read_error_invalid_step_maps_to_400() {
+        let (status, body) = rendered(ApiError::Read(ReadError::InvalidStep)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(body, ReadError::InvalidStep.to_string());
     }
 
     /// Issue M6-09 plan v3 delta 6: both pipeline rejection classes map
-    /// to 400 `bad_data` (matching the
-    /// `read_error_empty_matcher_set_maps_to_400_bad_data` idiom).
+    /// to 400 (matching the `read_error_empty_matcher_set_maps_to_400`
+    /// idiom).
     /// Issue #240: the body is the BARE reason, asserted byte-exactly on
-    /// the WHOLE `error` field — the old `contains(…)` assert pinned the
+    /// the WHOLE body — the old `contains(…)` assert pinned the
     /// removed PulsusDB-only prefix and is deleted, not weakened.
     #[tokio::test]
-    async fn read_error_pipeline_invalid_maps_to_400_bad_data() {
+    async fn read_error_pipeline_invalid_maps_to_400() {
         let err = ReadError::PipelineInvalid {
             reason: "bad regex: unclosed group".to_string(),
         };
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let (status, body) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_none());
-        assert_eq!(json["error"], "bad regex: unclosed group");
+        assert_eq!(body, "bad regex: unclosed group");
     }
 
     /// Issue #240 (AC2's once-only leg): a reason that itself begins
@@ -256,9 +375,8 @@ mod tests {
         let err = ReadError::PipelineInvalid {
             reason: reason.to_string(),
         };
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let (status, body) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        let body = json["error"].as_str().expect("error body");
         assert_eq!(body, reason);
         assert_eq!(body.matches("parse error ").count(), 1);
     }
@@ -267,30 +385,27 @@ mod tests {
     /// `__error__` maps to 400 (the oracle's status for the same
     /// failure, live-probed) with the oracle's message shape intact.
     #[tokio::test]
-    async fn read_error_metric_pipeline_error_maps_to_400_bad_data() {
+    async fn read_error_metric_pipeline_error_maps_to_400() {
         let err = ReadError::MetricPipelineError {
             error_type: "SampleExtractionErr".to_string(),
             series: r#"{__error__="SampleExtractionErr", app="x"}"#.to_string(),
         };
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let (status, body) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        let msg = json["error"].as_str().unwrap_or_default();
         assert!(
-            msg.starts_with("pipeline error: 'SampleExtractionErr' for series:"),
-            "{msg}"
+            body.starts_with("pipeline error: 'SampleExtractionErr' for series:"),
+            "{body}"
         );
     }
 
     #[tokio::test]
-    async fn read_error_pipeline_unsupported_in_metric_maps_to_400_bad_data() {
+    async fn read_error_pipeline_unsupported_in_metric_maps_to_400() {
         let err = ReadError::PipelineUnsupportedInMetric {
             construct: "json".to_string(),
         };
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let (status, body) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json["error"].as_str().unwrap_or_default().contains("json"));
+        assert!(body.contains("json"), "{body}");
     }
 
     #[tokio::test]
@@ -299,75 +414,66 @@ mod tests {
             count: 1,
             cap: 1,
         });
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let expected = err.to_string();
+        let (status, body) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json["errorType"], "query_too_broad");
+        assert_eq!(body, expected);
     }
 
     /// Issue #35: the query-text guard's reason rides the existing
     /// `QueryTooBroad(_)` wildcard arm — no mapper change was needed, and
     /// this test proves it.
     #[tokio::test]
-    async fn read_error_query_text_bytes_maps_to_422_query_too_broad() {
+    async fn read_error_query_text_bytes_maps_to_422() {
         let err = ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::QueryTextBytes {
             rendered_bytes: 9_000_000,
             cap: 8_388_608,
         });
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let (status, _) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json["errorType"], "query_too_broad");
     }
 
     /// Issue #272: the walk-admission reason rides the same
     /// `QueryTooBroad(_)` wildcard — no mapper arm changes, and this
     /// proves it.
     #[tokio::test]
-    async fn read_error_walk_transient_bytes_maps_to_422_query_too_broad() {
+    async fn read_error_walk_transient_bytes_maps_to_422() {
         let err =
             ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::WalkTransientBytes {
                 estimate: 900_000_000,
                 cap: 80_000_000,
             });
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let (status, _) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json["errorType"], "query_too_broad");
     }
 
     #[tokio::test]
     async fn read_error_clickhouse_timeout_maps_to_504() {
         let err = ReadError::Clickhouse(ChError::Timeout("deadline".to_string()));
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let (status, _) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(json["errorType"], "timeout");
     }
 
     #[tokio::test]
-    async fn read_error_clickhouse_other_maps_to_500_internal() {
+    async fn read_error_clickhouse_other_maps_to_500() {
         let err = ReadError::Clickhouse(ChError::Decode("bad row".to_string()));
-        let (status, json) = envelope(ApiError::Read(err)).await;
+        let (status, _) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(json["errorType"], "internal");
     }
 
     #[tokio::test]
     async fn pool_unavailable_maps_to_503() {
-        let (status, json) = envelope(ApiError::PoolUnavailable).await;
+        let (status, body) = rendered(ApiError::PoolUnavailable).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
-    /// Issue #74: tail slot exhaustion is `429 too_many_requests`,
-    /// naming the knob, in the standard JSON envelope.
+    /// Issue #74: tail slot exhaustion is `429`, naming the knob, in the
+    /// plain-text body (#264).
     #[tokio::test]
-    async fn tail_busy_maps_to_429_too_many_requests() {
-        let (status, json) = envelope(ApiError::TailBusy).await;
+    async fn tail_busy_maps_to_429() {
+        let (status, body) = rendered(ApiError::TailBusy).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(json["errorType"], "too_many_requests");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("tail_max_connections")
-        );
+        assert!(body.contains("tail_max_connections"), "{body}");
     }
 }
