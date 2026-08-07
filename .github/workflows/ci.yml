@@ -569,6 +569,19 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-logql --test logql_differential
 
+      # Issue #248: the nested-`ip()` accept/reject matrix — every
+      # position an `ip()` label filter can occupy x both operators x
+      # well-formed and malformed patterns, put to this container and
+      # compared against the verdicts committed in the test. Status only,
+      # no pushes: the disposition is decided before a line is read. The
+      # hermetic half (PulsusDB's own verdict at parse -> plan -> compile,
+      # and the pre-#248 rule replayed over the same matrix) runs in the
+      # `ci` job with the gate off.
+      - name: LogQL differential leg (nested ip() matrix, issue #248)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_nested_ip_matrix
+
       # Issue #339: the keyword case-folding table. Its verdicts were
       # CAPTURED from this same container (which keywords fold, which
       # token classes are case-sensitive); this leg replays them so the
@@ -595,18 +608,29 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_json_key_sanitization
 
+      # corpus-counts: none (ci-replay-leg)
       # Issue #352 step 3: the LogQL corpus replay. Takes each reachable
       # corpus case's `load` to this same reference and compares its
       # answer against the committed expectation, so a capture that goes
       # STALE is caught rather than trusted forever. NIGHTLY/dispatch
       # only: drift is a property of time passing, not of the commit
-      # under test, and the leg needs ~80 sequential pushes.
+      # under test, and the leg makes a sequential push per reachable
+      # row.
       #
       # It verifies VALUES; it does not verify provenance markers — it
-      # reads them to decide which rows it may compare. 77 of the 993
+      # reads them to decide which rows it may compare. Only some of the
       # rows the markers permit are physically reachable; the gap is
-      # enumerated by reason in the test, dominated by 678 template rows
-      # pinned to an absolute date the reference will not serve.
+      # enumerated by reason in the test, dominated by the template rows
+      # pinned to an absolute date the reference will not serve. The
+      # figures live on REACHABLE / PROVENANCE_PERMITS in
+      # logqltest_replay.rs, which assert them against the corpus, and
+      # are deliberately not restated here: a hand-copied count beside a
+      # machine-checked figure drifts (issue #248 found a stale copy in
+      # round after round — this comment, the test's own module doc, and
+      # PROVENANCE.md). The `corpus-counts: none` marker above makes that
+      # rule enforceable rather than advisory; see
+      # `check_f_marked_regions_state_no_corpus_count`.
+      # corpus-counts: end (ci-replay-leg)
       - name: LogQL corpus replay leg (issue #352, nightly)
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
@@ -680,6 +704,19 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test trace_ingest_roundtrip
+
+      # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
+      # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
+      # MetricWriter (sync) -> ClickHouse, read back as
+      # reinterpretAsUInt64(value). The literals are chosen so serde_json's
+      # default parser and str::parse disagree by 1 ULP, so this step fails if
+      # the workspace `float_roundtrip` feature is ever dropped.
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: OTLP/JSON metrics ingest stores nearest-representable f64 bits
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test metric_ingest_float_roundtrip
 
       # Issue #75: the Zipkin v2 JSON ingest round-trip — ingest_zipkin ->
       # zipkin::to_otlp -> otlp_traces::parse -> TraceWriter (sync) ->

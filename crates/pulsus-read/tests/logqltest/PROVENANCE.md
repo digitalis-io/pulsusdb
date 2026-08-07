@@ -7,7 +7,9 @@ time. Every expected value is **bit-exact** (`f64::to_bits`, no tolerance —
 the #218 lesson): a one-ULP perturbation reddens the runner
 (`a_perturbed_expected_value_reddens_the_runner`).
 
-## Replay coverage: three numbers, never one (issue #352 step 3)
+## Replay coverage: separate figures, never one (issue #352 step 3)
+
+<!-- corpus-counts: none (provenance-replay-coverage) -->
 
 The live replay leg (`logqltest_replay.rs`) is built. It takes each
 reachable case's `load` to the digest-pinned reference and compares the
@@ -18,36 +20,79 @@ caught rather than trusted forever.
 marker only to decide which rows it may compare. That statement above the
 marker table still holds and is now load-bearing in code.
 
-| figure | means | today |
+| figure | means | where the number lives |
 |---|---|---|
-| `captured` | directives claiming container capture | 1172 |
-| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | 993 |
-| `REACHABLE` | rows a live replay can PHYSICALLY compare | 77 |
+| `captured` | directives claiming container capture | `CAPTURED`, `logqltest_provenance.rs` |
+| `PROVENANCE_PERMITS` | rows the markers ALLOW a replay to compare | `logqltest_replay.rs` |
+| `REACHABLE` | rows a live replay can PHYSICALLY compare | `logqltest_replay.rs` |
+
+### Counts live on the constants, and nowhere else
+
+Each of those constants is asserted against a figure recomputed from the
+corpus, so it cannot go stale silently. A copy in prose cannot be, and
+issue #248 shipped a stale copy in round after round — the table's old
+`today` column, then the sentence that explained why the column went,
+then a delta restated in the gap enumeration below and again on
+`CAPTURED`'s own doc comment. Each was corrected as a number; the class
+outlived every correction.
+
+**So the rule is mechanical, and the region you are reading is inside
+it.** Between a `corpus-counts: none` marker and its `corpus-counts: end`,
+prose may carry **no digit and no number word at all** — not a count
+spelled out (`nine`, `twenty-one`, `zero`), not a per-issue delta, and
+not an ordinary English `one` or `two` either. The rule used to be
+"no number word in front of a counting noun", and reviewers kept finding
+the next word it did not know; the ban is now flat, which removes the
+counting-noun list entirely. **What the ban COVERS is stated exactly, and
+it is not everything:** digits, the standard spelling of every cardinal
+below `10^21` (complete — the check derives it from a speller), and a
+hand-written list of variant spellings (`nought`, `naught`, `aught`,
+`nil`, `zilch`). It is **not** closed against archaic or dialect forms,
+nor against words that name an exact quantity but are ordinary function
+words — `ought`, `none`, `both`, `a` are deliberately left out, because a
+guard that reddens on `we ought to` gets switched off. Saying "closed"
+here was wrong already and review found `nought` the next round.
+Name the reason, point at the constant.
+`check_f_marked_regions_state_no_corpus_count`
+(`logqltest_provenance.rs`) fails on any, and when a figure really moves,
+the recomputing assertion prints its new value.
+
+**Each marker names its region**, as `corpus-counts: none (<id>)` with the
+same id repeated on its `corpus-counts: end`, and every id is listed in
+that check's `NO_COUNT_REQUIRED`. So the check fails BY NAME when a region
+is deleted, renamed, un-named, duplicated or emptied — the earlier version
+listed file names instead, and this file carries regions in separate
+sections, so deleting the earlier pair left the file in the set and the
+check stayed green. Adding a region means adding its id to that list; the
+marker line's own tail is scanned like any other prose.
 
 `PROVENANCE_PERMITS` was called `REPLAYABLE` until the live leg existed,
 and that name was wrong: most of those rows can never be reached. The
-same conflation this issue opened with, one level further in. The gap is
-enumerated by reason, not absorbed:
+same conflation this issue opened with, a level further in. The gap is
+enumerated by reason, not absorbed; the per-reason breakdown is
+`UNREACHABLE_BY_REASON`, recomputed and asserted beside the reasons:
 
-- **absolute-timestamp (template corpus) — 678.** `t1`-`t6` samples carry
-  a fixed 2026-07-27 timestamp. They cannot be time-shifted (the expected
-  value is a function of the timestamp — `t5_time.test` is 258 rows of
-  exactly that) and cannot be pushed as-is (outside the reference's ~3h
-  ingestion window). **This is the single largest lever on reachability,
-  and it is blocked by the CORPUS, not the harness:** unblocking it means
+- **absolute-timestamp (template corpus).** The `t1`-`t6` samples carry a
+  fixed 2026-07-27 timestamp. They cannot be time-shifted (the expected
+  value is a function of the timestamp — `t5_time.test` is rows of
+  exactly that and nothing else) and cannot be pushed as-is (outside the
+  reference's ingestion window, `INGESTION_WINDOW`). **This is the single
+  largest lever on reachability — asserted, not asserted-in-prose:
+  `the_template_corpus_is_the_largest_unreachable_bucket` — and it is
+  blocked by the CORPUS, not the harness:** unblocking it means
   re-capturing those files against RELATIVE time, which is corpus work
   with its own capture procedure and review.
-- **metric query — 228.** The first slice replays log (streams) queries
-  only. Issue #344 added 37 (`b18_range_agg_grouping.test`'s executed
-  grouped range aggregations, including the two cross-stream tie rows its
-  instant `first`/`last` delivery-order fix unblocked).
-- **range/matrix — 10.** Needs the step grid replayed too. Issue #344
-  added 8 (the same file's sliding-path rows, which include the
-  cross-stream `StableHash` tie).
+- **metric query.** The first slice replays log (streams) queries only,
+  so `b18_range_agg_grouping.test`'s executed grouped range aggregations
+  (issue #344) and `b20_nested_ip.test`'s post-`unwrap` and
+  `count_over_time` rows (issue #248) land here rather than in the
+  coverage.
+- **range/matrix.** Needs the step grid replayed too — `b18`'s
+  sliding-path rows, which include the cross-stream `StableHash` tie.
 
-### Two properties of the reference that shaped the leg, both measured
+### The properties of the reference that shaped the leg, each measured
 
-**It serves only the last ~3 hours.** A push older than that returns
+**It serves only the last few hours.** A push older than that returns
 `204` and is then invisible — a success that answers nothing, which reads
 exactly like a replay finding a mismatch. The measured table is in
 `INGESTION_WINDOW`, and `slots_fit_inside_the_measured_ingestion_window`
@@ -55,21 +100,24 @@ asserts the slice's slots stay inside it arithmetically.
 
 **It injects `detected_level`** when `discover_log_levels` is on, which it
 is in `ci/logql/config.yaml`. The corpus was captured with it off, so the
-label is stripped before comparison — the leg's ONE normalisation, named
+label is stripped before comparison — the leg's ONLY normalisation, named
 at the constant. The better fix is `discover_log_levels: false` in that
-config, which would also unblock the 121 config-delta rows in
-`b12_error_pair_model` and `b14_detected_fields`; it is deliberately not
+config, which would also unblock the config-delta files that need exactly
+that setting (`b12_error_pair_model`, `b14_detected_fields`; their share
+of the exclusion is in `EXCLUDED_BY_PROVENANCE`); it is deliberately not
 done from inside this leg, because that config is shared with the syntax
 and json-key legs. **Follow-up, with both legs re-verified.**
 
 ### The container must be fresh
 
-Two runs push the same corpus labels at overlapping absolute times, so
-the reference sees one stream and merges the entries; no query window can
+A repeat run pushes the same corpus labels at overlapping absolute times,
+so the reference sees a single stream and merges the entries; no window can
 separate them. The leg checks for a prior run and fails with instructions
 rather than reporting the stale lines as corpus mismatches. CI always
 starts a fresh container, which is why an unchecked assumption here would
 have held in CI and misled every local run.
+
+<!-- corpus-counts: end (provenance-replay-coverage) -->
 
 ## Pinned reference
 
@@ -287,13 +335,25 @@ not the pure value path).
 
 ## Issue #230 — template-engine corpus (`t1…t6_*.test`)
 
+<!-- corpus-counts: none (provenance-template-corpus) -->
+
 The `t*` files pin the `line_format`/`label_format` template engine —
-688 directives: 678 `eval` (t1 60 + t2 228 + t3 34 + t4 29 + t5 258 +
-t6 69) plus 10 `eval_fail` reject-parity cases (all in t1) — every
-value AND execution-error string captured verbatim from
-`grafana/loki:3.7.4`, never hand-authored. (Re-derive with
-`grep -c '^eval ' / '^eval_fail'` per file; an earlier "676 cases"
-claim mixed the two directive kinds without saying so.) **Toolchain of record:**
+`eval` rows across the whole set, plus the `eval_fail` reject-parity
+cases, which are all in `t1` — every value AND execution-error string
+captured verbatim from `grafana/loki:3.7.4`, never hand-authored. (Count
+them with `grep -ac '^eval ' / '^eval_fail'` per file rather than reading
+a figure here: this paragraph used to carry the inventory, and an even
+earlier version of it mixed both directive kinds into a single number
+without saying so. The `-a` is load-bearing — `t5_time.test` trips GNU
+grep's binary heuristic, and without it the command prints NOTHING for
+that file, which reads exactly like an empty corpus. `docs/features.md`
+and the logs differential ledger do quote this corpus's size, and
+`check_f_quoted_template_corpus_counts_match_the_corpus` recomputes it
+from the files rather than trusting either.)
+
+<!-- corpus-counts: end (provenance-template-corpus) -->
+
+**Toolchain of record:**
 the pinned image's binary is built with **go1.26.5** (`go version -m`
 on the extracted binary) — semantics citations against an older local
 Go tree are advisory only; on any disagreement the container capture
@@ -429,6 +489,45 @@ divergence is #264's, not this row's.
 | C3 | 131071 | bare selector | /loki/api/v1/query | 400 | log queries are not supported as an instant query type, ... (parser ACCEPTED the text; the rejection is the instant-log-query type check downstream of parse) |
 | C4 | 131072 | bare selector | /loki/api/v1/query | 400 | parse error : input size too long (131072 > 131072) |
 ```
+
+## Issue #248 — nested `ip()` corpus (`b20_nested_ip.test`)
+
+- **Image:** `grafana/loki:3.7.4`, digest
+  `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`.
+  Identity read from the RUNNING process (`/loki/api/v1/status/buildinfo`
+  → `{"version":"3.7.4","revision":"b318f282",...}`), not from a header.
+  Captured 2026-08-05 in one run. Every row was re-run against a freshly
+  started container on 2026-08-06 and re-produced its committed value; the
+  seven METRIC rows were re-run separately on a clean container, because
+  the live replay leg is streams-only and so does not cover them.
+- **Config:** `ci/logql/config.yaml` plus `discover_log_levels: false`, the
+  §230 step-2 delta — without it the distributor injects a
+  `detected_level` stream label the hermetic store does not reproduce.
+  The file's header therefore does NOT declare a config requirement and it
+  is NOT in `CONFIG_DELTA_FILES`: the delta changes only that injected
+  label, which the live replay leg strips before comparing, so a replay
+  against the CI oracle (which has level discovery on) stays conclusive.
+  Contrast `b12`/`b14`, where the injected level changes the answer.
+- **Streams captured through `query_range`** (v3.7.4 rejects instant log
+  queries), metric rows through `query`; the `.test` replays both as
+  `eval instant`, per §230 step 3.
+- **What is captured:** the accept/reject disposition AND every value, in
+  the same run — including the reference's own 400 bodies
+  (`parse error : stage '| addr=ip("nope")' : ip: invalid pattern:
+  "nope"`). As elsewhere, an `eval_fail` row's `msg:` gate gates
+  PulsusDB's own Display, not that body.
+- **The rule is read from the source, not inferred from the captures**:
+  `NewIPLabelFilter` cannot fail (`pkg/logql/log/ip.go:94-103 @ v3.7.4`)
+  and `PatternError()` has exactly one caller,
+  `LabelFilterExpr.Stage()` (`pkg/logql/syntax/ast.go:801-809 @ v3.7.4`).
+  The post-`unwrap` rows exist because the source says
+  `ReduceAndLabelFilter` bypasses that call
+  (`pkg/logql/syntax/extractor.go:76,187 @ v3.7.4`) — a case no amount of
+  probing the nesting forms would have suggested looking for. The file
+  covers both sites because the grammar has only two: `git grep -n
+  labelFilter v3.7.4 -- pkg/logql/syntax/syntax.y` returns nine lines —
+  the `%type` declaration (58), the production itself (302, 307-311), and
+  two uses, 221 (a pipeline stage) and 160 (a post-`unwrap` filter).
 
 ## Issue #244 — `/detected_fields` corpus (`b14_detected_fields.test`)
 

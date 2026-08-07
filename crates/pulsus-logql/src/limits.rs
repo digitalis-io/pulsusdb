@@ -40,16 +40,55 @@ pub const MAX_QUERY_BYTES: usize = 131_072;
 /// told plainly rather than silently handed a different answer.
 ///
 /// **A DELIBERATE DIVERGENCE — the only limit here that is ours rather
-/// than the reference's.** grafana/loki v3.7.4 accepts an offset and a
-/// range anywhere in the `i64` nanosecond domain, and bounds no query
-/// span at all — measured on the digest-pinned oracle:
-/// `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) is a 200 there, as
-/// is `offset -9223372036854775808ns` (`i64::MIN`), and `[2562047h]` (a
-/// 292-year window) is a 200. Retention is days to months and nobody
+/// than the reference's.** Retention is days to months and nobody
 /// queries five years of logs, so this refuses nothing a real deployment
 /// does while removing the whole class of absurd-input arithmetic that
 /// issue #343 chased down four successive layers. Ledgered as
 /// `five-year-span-cap` in docs/benchmarks/logs-differential-ledger.md.
+///
+/// **How much of it is a divergence, re-measured** (issue #248 round 5,
+/// digest-pinned v3.7.4 oracle). This comment used to say the reference
+/// "bounds no query span at all"; it does bound one.
+/// `max_query_length` defaults to `721h`
+/// (`pkg/validation/limits.go:371` @ v3.7.4) over the window
+/// `[start - ([range] + offset), end - offset]`
+/// (`pkg/querier/queryrange/shard_resolver.go:94-104` @ v3.7.4), so on a
+/// range query BOTH the request span and the `[range]` selector are
+/// bounded there far tighter than here — `[720h]` over a `1h` request
+/// span is already a `400 the query time range exceeds the limit`. The
+/// offset cancels in that subtraction and stays unbounded across the
+/// band its own lexer admits — `i64` nanoseconds: `offset
+/// 2562047h47m16s854ms775us807ns` (`i64::MAX`) is a 200 there, and so is
+/// every other value in THAT band SAVE ONE. The exception is
+/// `i64::MIN`, and its `200` is conditional in a way this comment used
+/// to leave out. A frontend that has not already answered the
+/// neighbouring value REFUSES it — `400 this data is no longer
+/// available`, Go's negation overflowing inside the shard resolver and
+/// inverting the window — and with `cache_index_stats_results: false`
+/// that `400` is the verdict in every probe order. At the shipped
+/// default (true) it is what a cold frontend answers; only a warm
+/// index-stats entry written by `i64::MIN + 1` — one nanosecond away,
+/// and indistinguishable in the millisecond-resolution request the shard
+/// resolver issues — turns a later `i64::MIN` into a 200. So it is an
+/// overflow artefact at a single point rather than a magnitude bound
+/// (`i64::MIN + 1` is a 200 in any order, in both configurations), but
+/// it is a REFUSAL wherever no neighbouring probe has cached it away.
+/// Rounds 6 and 7 of issue #248 settled that; the ledger row carries the
+/// order-dependent probe table. So past 43,800 h this cap diverges at
+/// every offset magnitude THE REFERENCE'S LEXER ADMITS — that `i64`
+/// nanosecond band, bar the negative endpoint just described, where a
+/// cold reference refuses too. Outside the band it does not diverge at
+/// all, which the sentence this replaces missed by quantifying over
+/// magnitude alone: `offset 9223372036854775808ns` is 292 years, far
+/// past this cap, and is a reference `400` at the lexer — reject
+/// parity. The three out-of-band literals this crate pins are
+/// enumerated, and the branch that refuses each named, in `parser.rs`'s
+/// `both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`
+/// (issue #248 round 8). It also diverges on an INSTANT query's
+/// `[range]` (which the reference admits and then splits into per-hour
+/// subqueries that do not answer in practice); on a range query it
+/// fires only where the reference, at its shipped default, refuses
+/// first.
 ///
 /// Same status as [`MAX_QUERY_BYTES`] — `400 bad_data` — and the two
 /// literal forms are enforced at the same layer it is, the parser, so no

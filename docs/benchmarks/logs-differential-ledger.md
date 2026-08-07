@@ -763,13 +763,119 @@ not "fix" us toward the panic.
 
 ### `five-year-span-cap` (issue #343, owner mandate — a deliberate limit, not a defect)
 
-- **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
-  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`): both
-  LogQL duration literals are accepted across the whole `i64` nanosecond
-  domain — `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) and
-  `offset -9223372036854775808ns` (`i64::MIN`) are 200s, as is
-  `[2562047h]`, a 292-year window — and the query's own `start`-to-`end`
-  span is not bounded at all.
+- **Reference behaviour, RE-MEASURED** on the digest-pinned v3.7.4 oracle
+  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`,
+  `ci/logql/config.yaml`, 2026-08-06). **This bullet used to say that the
+  reference accepts both duration literals across the whole `i64`
+  nanosecond domain and bounds no query span at all. Two thirds of that
+  is wrong**, and it was wrong when written: issue #380 re-measured
+  `max_query_length` while establishing something else, and the
+  contradiction with this row (and with `docs/features.md`) went
+  unnoticed until issue #248's last round. The measurements:
+
+  | probe | verdict |
+  |---|---|
+  | request span `720h`, `721h` | `200` |
+  | request span `721h1s` | `400 the query time range exceeds the limit (query length: 721h0m1s, limit: 30d1h)` |
+  | request span `43800h` (our cap) | `400`, same message |
+  | `count_over_time({app="x"}[720h])` over a `1h` request span | `400 … (query length: 721h1m0s, limit: 30d1h)` |
+  | `count_over_time({app="x"}[2562047h])` over a `1h` request span | `400 … (query length: 2562047h47m16.854775807s, …)` |
+  | `count_over_time({app="x"}[43800h])` as an INSTANT query | never answers: the connection is closed with no HTTP status line at all (38 s and 60 s on two runs). `split_instant_metric_queries_by_interval` defaults to `1h` (`pkg/validation/limits.go:434 @ v3.7.4`) and is reduced only for a SHORTER range vector (`pkg/querier/queryrange/splitters.go:206-215`), so this decomposes into 43,800 subqueries |
+  | `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`), instant and range | `200` |
+  | `offset -9223372036854775807ns` (`i64::MIN + 1`) | `200`, in any order |
+  | `offset -9223372036854775808ns` (`i64::MIN`) on a frontend that has not seen the neighbouring value | `400 this data is no longer available, it is past now - max_query_lookback (0s)`, instant and range alike |
+  | the same, after `i64::MIN + 1` has been probed on that frontend | `200` |
+  | `offset ±43800h` | `200` |
+
+  **The `i64::MIN` row depends on probe ORDER, and that is the whole of
+  the disagreement it caused** (issue #248 round 6: one round measured
+  only the `400`, review measured only the `200`, and both reproduce on
+  demand). `cache_index_stats_results` defaults to `true`
+  (`pkg/querier/queryrange/roundtrip.go:66 @ v3.7.4`) and the two offsets
+  differ by one nanosecond — indistinguishable in the
+  millisecond-resolution index-stats request the shard resolver issues,
+  so whichever runs FIRST decides. Reproducible in either direction on a
+  freshly booted container:
+
+  | container | probe order | verdicts |
+  |---|---|---|
+  | `ci/logql/config.yaml` as shipped | `i64::MIN`, `i64::MIN + 1`, `i64::MIN` | `400`, `200`, `200` |
+  | the same plus `query_range.cache_index_stats_results: false` | `i64::MIN + 1`, `i64::MIN`, `i64::MIN + 1`, `i64::MIN` | `200`, `400`, `200`, `400` |
+
+  With the stats cache off, the `400` is the reference's verdict at that
+  value in every order; with it on, a warm entry hides it.
+
+  **The rules behind them, from the source.** `max_query_length` defaults
+  to `721h` (`pkg/validation/limits.go:371 @ v3.7.4`) and is enforced at
+  `pkg/querier/queryrange/limits.go:194-201` and
+  `pkg/querier/limits/validation.go:88-91` with the message at
+  `pkg/util/validation/validate.go:5`; there is no dedicated `[range]`
+  cap in the shipped config, `max_query_range` defaulting to `0s`
+  (`limits.go:374-375`, consulted only when nonzero,
+  `pkg/logql/engine.go:388-395`). The length is measured over the
+  range-selector-adjusted window `[start - ([range] + offset),
+  end - offset]` (`pkg/querier/queryrange/shard_resolver.go:94-104`), so
+  the `[range]` literal COUNTS against `max_query_length` on a range
+  query while the offset CANCELS.
+
+  **The `i64::MIN` `400`, traced end to end** (round 6 — round 5 named
+  the right overflow but the wrong caller, and left the caching out).
+  The query-frontend's AST mapper decides whether the request is
+  shardable from `maxRangeVectorAndOffsetDuration`
+  (`pkg/querier/queryrange/split_by_interval.go:262-278 @ v3.7.4`),
+  which takes `r.Offset` only when `r.Offset > maxOffset` — a NEGATIVE
+  offset therefore contributes `0`, the schema lookup at
+  `querysharding.go:167` sees the UNSHIFTED window, finds a valid TSDB
+  period and proceeds. The shard resolver then computes the real window
+  as `diff := Interval + Offset; from = start.Add(-diff);
+  through = end.Add(-Offset)`
+  (`pkg/querier/queryrange/shard_resolver.go:94-104`). At `Offset =
+  i64::MIN` Go's `-Offset` overflows to `i64::MIN` itself, so `through`
+  moves 292 years BACK, while `-diff` does not overflow (`Interval`
+  pulls the sum off the rail) and `from` moves 292 years FORWARD. That
+  inverted window reaches `IndexStats` (`pkg/querier/querier.go:535`),
+  whose `ValidateQueryTimeRangeLimits` takes the `through.Before(from)`
+  branch (`pkg/querier/limits/validation.go:92-94`, message at
+  `pkg/util/validation/validate.go:7`) and returns `400`; the container
+  logs it as `middleware=QueryShard.astMapperware msg="failed mapping
+  AST"`. At `i64::MIN + 1` both endpoints move forward together and the
+  window stays ordered — a one-value artefact, not a bound.
+- **What is left of the divergence, stated exactly.** On the request span
+  and on a RANGE query's `[range]`, the reference's default config
+  already refuses far more than our cap does (`721h` against our
+  `43,800h`), so there our cap can only fire where it also rejects. The
+  divergence is real for the `offset` magnitude WITHIN THE BAND THE
+  REFERENCE'S LEXER ADMITS — `i64` nanoseconds (a `200` there at every
+  value but `i64::MIN`, and a `200` even at `i64::MIN` once the stats
+  cache is warm; a `400` here past 5 years) — and for an INSTANT
+  query's `[range]`, which the reference admits and then decomposes into
+  per-hour subqueries that do not answer in practice.
+- **Past that band there is nothing to diverge from** (issue #248 round
+  8; the qualifier in the bullet above is that round's — it used to
+  quantify over magnitude alone, which counted these rows as
+  divergences). A magnitude too large for a Go `time.Duration` never
+  becomes a DURATION token, so the reference refuses it at the lexer.
+  Re-measured on the same oracle in round 8, in
+  `count_over_time({app="x"}[5m] offset <lit>)` (which is where the
+  column comes from): `9223372036854775808ns` and
+  `18446744073709551615ns` are `400 parse error at line 1, col 38:
+  syntax error: unexpected NUMBER, expecting DURATION`, and
+  `-9223372036854775809ns` is the same with `unexpected -, expecting
+  DURATION`. The neighbouring endpoints bracket them —
+  `9223372036854775807ns` and `2562047h47m16s854ms775us807ns` (both
+  `i64::MAX`) are `200`s, and one nanosecond more,
+  `2562047h47m16s854ms775us808ns`, is the NUMBER refusal again.
+  PulsusDB refuses those three out-of-band literals too (`offset too
+  long`), so they are reject parity — a different message, the same
+  `400 bad_data` class.
+  WHICH branch refuses each is not observable from the wire (the lexer
+  discards `parseDuration`'s error), and it is two branches over the
+  three rows — none of them one of `model.ParseDuration`'s, whose unit
+  map has no `ns`, so an `ns` literal leaves it at the unit lookup. The
+  source-level account, with the two discriminating probes that separate
+  Go's `leadingInt` overflow from its trailing positive-only range
+  check, is at `crates/pulsus-logql/src/parser.rs`'s
+  `both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`.
 - **PulsusDB behaviour (the delta): NOTHING IN A LogQL QUERY MAY SPAN MORE
   THAN 5 YEARS** — `MAX_QUERY_SPAN_NS` = 157,680,000,000,000,000 ns =
   43,800 h = 5 × 365 d. One rule, three places, all against that one
@@ -1698,6 +1804,220 @@ absence of a corpus row for an oversight.
   stream, then query `avg_over_time`, `avg_over_time … by (env)`,
   `avg_over_time … without ()`, `stdvar_over_time` and
   `stdvar_over_time … by (env)` at an instant covering them.
+
+### inadmissible-label-name-status (issue #259)
+
+- **Status: REGISTERED EXCEPTION — a deliberate divergence we decline to
+  mirror.** Adjudicated on issue #259; this row is the ledger half the
+  adjudication asked for, alongside the docs/api.md §8.2 note.
+- **Construct:** the response STATUS for a structured-metadata name (or an
+  OTLP attribute key) the reference refuses outright — an empty name, or one
+  that sanitizes to nothing but underscores
+  (`otlptranslator.LabelNamer.Build`,
+  `vendor/github.com/prometheus/otlptranslator/label_namer.go:66-90 @
+  v3.7.4`).
+- **Reference behaviour, measured on `grafana/loki:3.7.4`:** it disagrees
+  with ITSELF. `POST /loki/api/v1/push` answers **500** (both encodings),
+  `POST /otlp/v1/logs` answers **400**, for the identical condition.
+- **Why the 500 is accidental rather than designed.** The push error escapes
+  the distributor's validation closure as a bare `errors.New` carrying no
+  gRPC status (`pkg/distributor/distributor.go:703-706 @ v3.7.4`), so
+  `httpgrpc.HTTPResponseFromError` fails and `pushHandler` falls into its
+  status-less `else` branch (`pkg/distributor/http.go:170-180`) — while
+  every sibling failure in that same loop is client-classified `400` through
+  `validationErrors`. Provenance agrees: the `if err != nil { return err }`
+  arrived in Loki commit `09d831ea85`, *"chore: upgrade Prometheus to
+  208187eaa19b (#18756)"*, a mechanical bump adding the minimum needed to
+  compile once `Build` grew an `error` return. Before it, the same input
+  produced no error at all.
+- **PulsusDB behaviour:** **400 on both transports.** The input is entirely
+  client-controlled and no retry can succeed, while `5xx` is precisely the
+  class log agents retry — a 500 makes a well-behaved agent retry an
+  unfixable body forever and books it against server-error SLOs. It is also
+  what the reference itself answers on one of its own two transports.
+- **What IS byte-identical.** The push response body, terminator included:
+  the reference writes every push error through `push.HTTPError` ->
+  `http.Error` -> `fmt.Fprintln` (`pkg/loghttp/push/push.go:606-608 @
+  v3.7.4`), so its body is `label name is empty\n` — the same 20 bytes
+  PulsusDB writes. On OTLP the reference wraps the same text in
+  `symbolizer lookup: ` (`pkg/loghttp/push/otlp.go:613 @ v3.7.4`) and
+  PulsusDB reproduces that prefix, so the `google.rpc.Status` MESSAGE is
+  byte-identical.
+- **Related, pre-existing, not owned here:** the enclosing
+  `google.rpc.Status` differs in one field — the reference deliberately
+  omits `code` (`grpcstatus.New(0, errorStr)`, `push.go:571-582 @ v3.7.4`,
+  "Status 0 because we omit the Status.code field") while every PulsusDB
+  OTLP receiver sets `code = 3` for a 400-class failure, a receiver-wide
+  contract from issue #8 that predates this issue and applies to all four
+  signals.
+- **Fixture status:** no `test/fixtures/logs/differential.json` case (the
+  differential corpus carries no inadmissible name, and its oracle is still
+  `grafana/loki:3.4.2`, which predates `Build` returning an error at all).
+  Gated hermetically by `ingest/http.rs`'s
+  `loki_inadmissible_structured_metadata_name_is_400_on_both_encodings`,
+  `otlp_inadmissible_attribute_key_returns_400_with_status_code_3` and
+  `every_loki_push_error_body_is_lf_terminated`, and live by
+  `loki_push_live.rs`'s
+  `inadmissible_structured_metadata_names_are_refused_and_nothing_is_stored`.
+
+### inadmissible-label-name-echo-escaping (issue #259)
+
+- **Status: REGISTERED EXCEPTION — a USER-VISIBLE runtime-rendering
+  difference we do not chase.** Verdict, status and sentence all match; only
+  the echoed name's escaping differs. A client CAN reach it: see the
+  reachability note below, which corrects an earlier version of this row
+  that argued the difference was unreachable.
+- **Construct:** the `%q`-quoted name inside
+  `normalization for label name %q resulted in invalid name %q`.
+- **Reference behaviour:** Go's `fmt` `%q` (`strconv.Quote`), whose
+  printability table is Go's own.
+- **PulsusDB behaviour:** Rust's `{:?}` (`char::escape_debug`), whose
+  printability table is Rust's own.
+- **The exact, bounded difference.** Comparing the two renderings over all
+  1 112 064 codepoints: they agree on every assigned, printable,
+  non-combining character. Every disagreement is a control character
+  (`"\x01"` vs `"\u{1}"`, `"\x00"` vs `"\0"`), a format/separator
+  character (`"\u00a0"` vs `"\u{a0}"`), an unassigned or private-use
+  codepoint, or a `Grapheme_Extend` mark (Go prints U+0301 raw, Rust
+  escapes it). The only exceptions carrying a letter/number/punctuation/
+  symbol category at all are U+FF9E and U+FF9F, themselves
+  `Grapheme_Extend`. On the 80-name matrix the whole rule was replayed
+  over, accept/reject agrees **80/80** and the message agrees **71/80**.
+- **Reachability — a client CAN hit this, and sees different bytes.** A lone
+  combining mark is exactly the sort of name this rule refuses, so it is a
+  reachable input rather than a theoretical one. Measured on
+  `grafana/loki:3.7.4` (`b318f282`), pushing structured metadata keyed
+  `U+0301` on both push encodings and as an OTLP attribute:
+
+  | side | response body |
+  |---|---|
+  | reference | `normalization for label name "<CC 81>" resulted in invalid name "_"` — the raw two UTF-8 bytes inside the quotes |
+  | PulsusDB | `normalization for label name "\u{301}" resulted in invalid name "_"` — eight ASCII bytes |
+
+  What is bounded is the CLASS of characters that differ, never the
+  reachability. An earlier version of this row said the difference was one
+  "no consumer can act on"; that was wrong, and this row says so instead of
+  re-deriving a narrower bound.
+- **Why we do not mirror it:** the two tables track different Unicode
+  versions and move with each runtime's releases, so byte agreement here is
+  not a stable property either side can hold — Go's `%q` printability is
+  `strconv.IsPrint`'s generated table (categories L/M/N/P/S plus ASCII
+  space), Rust's `{:?}` additionally escapes `Grapheme_Extend`, and neither
+  is reachable from the other's standard library. Reproducing Go's would
+  mean vendoring a Unicode category table and pinning it to the Go release
+  that built the image. The impact is bounded to the echoed name: the name
+  is refused either way, with the same condition and the same sentence, and
+  no PulsusDB response status changes.
+- **Fixture status:** pinned by `label_name.rs`'s
+  `the_escape_syntax_for_an_unprintable_name_is_our_runtimes_not_the_references`,
+  which carries the reference's measured rendering beside ours for every
+  member of the known set.
+
+### `malformed-query-refused-in-every-window` (issue #380, owner ruling 2026-08-06 — deliberate, the reference is wrong here)
+
+- **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
+  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`,
+  `ci/logql/config.yaml`). The same malformed query,
+  `{app="checkout"} | addr = ip("nope")`, over different windows:
+
+  | window | status |
+  |---|---|
+  | 1 h ending now | `400` `parse error : stage '\| addr=ip("nope")' : ip: invalid pattern: "nope"` |
+  | 1 h ending 2 h ago | `400` |
+  | 1 h ending 3 h ago | `200`, empty |
+  | 1 h ending ten years ago | `200`, empty |
+  | `start=0&end=1` | `200`, empty |
+  | 1 h starting a day from now | `400` |
+
+- **The boundary is `query_ingesters_within` (3 h by default), NOT
+  `max_query_lookback`.** The lookback middleware
+  (`pkg/querier/queryrange/limits.go:167-181 @ v3.7.4`) was the first
+  explanation offered for this — on issue #380, and in a comment on
+  `logql_nested_ip_matrix.rs` — and it is wrong: the pinned container
+  reports `max_query_lookback: 0s` on `/config`, which is the shipped
+  default (`pkg/validation/limits.go:379 @ v3.7.4`), so that branch never
+  runs. Bisecting the window by hour puts the transition exactly at 3 h,
+  the default `query_ingesters_within`.
+
+- **The rule, from the source.** When a query's END precedes
+  `now - query_ingesters_within`, the ingester is not consulted at all
+  and only the store is —
+  `BuildQueryIntervalsWithLookback` returns a nil ingester interval
+  (`pkg/querier/intervals.go:32-38 @ v3.7.4`, via
+  `isWithinIngesterMaxLookbackPeriod`, `pkg/querier/querier.go:277-287`).
+  The store's `SelectLogs` then returns `iter.NoopEntryIterator` as soon
+  as no chunk matches (`pkg/storage/store.go:491 @ v3.7.4`) — **before**
+  `expr.Pipeline()` at `:497`. The same 3 h boundary was measured
+  independently on issue #352, from the other side: pushes older than it
+  succeed and then answer nothing (`logqltest_replay.rs`'s
+  `INGESTION_WINDOW` table). The malformed `ip()` pattern is raised
+  when the pipeline is BUILT (`log.NewIPLabelFilter` records the error
+  and leaves the matcher nil, `pkg/logql/log/ip.go:94-103`;
+  `PatternError()`'s only caller is `LabelFilterExpr.Stage()`,
+  `pkg/logql/syntax/ast.go:801-809`), so it is never raised and the query
+  answers 200-empty.
+
+- **The class is pipeline-BUILD errors, not parse errors** — measured,
+  and it corrects issue #380's body, which said this applies to "every
+  parse-time-invalid construct". Each query below over a 1 h window
+  ending now vs a 1 h window ending 4 h ago:
+
+  | query | recent | 4 h old |
+  |---|---|---|
+  | `{app="checkout"} \| addr = ip("nope")` | `400` | `200` |
+  | `{app="checkout"} \| line_format "{{"` | `400` | `200` |
+  | `{app="checkout"} \| json \| label_format a=b,a=c` | `400` | `200` |
+  | `{app="checkout"} \|\|\|` | `400` | `400` |
+  | `{app=` | `400` | `400` |
+  | `count_over_time({app="x"}[5m]) +` | `400` | `400` |
+  | `{app="checkout"} \| unwrap foo \| __error__=` \`x\` | `400` | `400` |
+
+  A syntax error is refused in both windows; an error the parser accepts
+  and the pipeline builder rejects is refused only while the ingester is
+  in the query's path.
+
+- **PulsusDB behaviour (the delta): a malformed query is a `400` in every
+  window.** Nothing about our rejection depends on the dates asked for:
+  `plan()` and `CompiledPipeline::compile` both run before any I/O
+  (`logql/exec.rs:612`, `:906`, `:2290`, `:2576`, propagated with `?` and
+  surfaced by `logs_api/error.rs` as a 400), so an invalid pipeline
+  cannot reach a "no chunks, return empty" path in the first place.
+
+- **Why we do not copy it** (owner ruling, 2026-08-06). Answering `200`
+  with no results for a query that has a typo in it is wrong: the user
+  reads an empty result as "no logs matched", not "your query is
+  broken", and the same query gets both answers depending on which dates
+  they picked. `{app="checkout"} | addr = ip("nope")` is malformed
+  whatever window you ask for.
+
+- **Reachability — the five-year span cap does not narrow this** (issue
+  #380 option 3, measured). The divergence needs a window whose END is
+  more than `query_ingesters_within` in the past; it puts no lower bound
+  on the SPAN, and the natural cases are tiny (1 h ending 4 h ago, 1 h
+  ten years ago, `start=0&end=1` — all far under 5 years), so
+  `five-year-span-cap` fires on none of them. In the other direction, a
+  span big enough to trip our cap is already refused by the reference on
+  its own `max_query_length` (default 721 h = `30d1h`): measured,
+  `start=0` to ten-years-ago is a `400 the query time range exceeds the
+  limit (query length: 408519h40m31s, limit: 30d1h)` there. So the SPAN
+  half of that cap only ever fires where the reference also rejects (its
+  `offset` half does not — see `five-year-span-cap`), and the divergence
+  surface is exactly what this entry describes.
+
+- Gated by `b20_nested_ip.test`'s
+  `# provenance: divergence(malformed-query-refused-in-every-window)`
+  row, which pins that the lone malformed `ip()` filter is refused by the
+  value evaluator with no window in the picture at all.
+
+- **Re-derivation.** `podman run -d -p 13380:3100 -v
+  ci/logql/config.yaml:/etc/loki/local-config.yaml:ro
+  grafana/loki@sha256:87f0a067…`, wait for `/ready`, then `curl -sS -G
+  --data-urlencode 'query={app="checkout"} | addr = ip("nope")'
+  --data-urlencode start=… --data-urlencode end=…
+  http://localhost:13380/loki/api/v1/query_range` with the windows in the
+  first table. `curl -s http://localhost:13380/config | grep
+  max_query_lookback` shows the `0s` that rules out the lookback
+  middleware.
 
 ## Issue #374 — the per-stream label rules at log ingest
 

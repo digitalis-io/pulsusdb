@@ -392,15 +392,15 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
-        // Reuses the signal-neutral empty-`204`/plain-text response family
-        // (the `rw_*` helpers) — Loki and remote-write share that exact
-        // response shape.
-        Err(err) => return rw_error_response(&err),
+        // Reuses the signal-neutral empty-`204` success shape (the `rw_*`
+        // helpers) — Loki and remote-write share that exactly — but its own
+        // LF-terminated error body; see [`loki_error_response`].
+        Err(err) => return loki_error_response(&err),
     };
 
     let mut parsed = match decode_loki_push(&headers, &body, now_ns) {
         Ok(parsed) => parsed,
-        Err(err) => return rw_error_response(&err),
+        Err(err) => return loki_error_response(&err),
     };
     // Stream-local label-bound failures (issue #374): the streams that passed
     // are still admitted, and the `400` is answered after they are — see
@@ -420,7 +420,7 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
             Ok(()) => {
                 plain_text_response(StatusCode::BAD_REQUEST, group_stream_errors(stream_errors))
             }
-            Err(Backpressure) => rw_backpressure_response(),
+            Err(Backpressure) => loki_backpressure_response(),
         };
     }
 
@@ -430,10 +430,44 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
             Ok(()) => {
                 plain_text_response(StatusCode::BAD_REQUEST, group_stream_errors(stream_errors))
             }
-            Err(err) => rw_error_response(&err),
+            Err(err) => loki_error_response(&err),
         },
-        Err(Backpressure) => rw_backpressure_response(),
+        Err(Backpressure) => loki_backpressure_response(),
     }
+}
+
+/// `/loki/api/v1/push`'s whole-request error response: [`classify`]'s status
+/// with a plain-text, **LF-terminated** body.
+///
+/// The terminator is the reference's, not a stylistic choice. Its push
+/// receiver binds one error writer for the whole endpoint —
+/// `pushHandler(w, r, push.ParseLokiRequest, push.HTTPError, …)`
+/// (`pkg/distributor/http.go:27-30 @ v3.7.4`) — and `HTTPError` is
+/// `http.Error(w, errorStr, code)` (`pkg/loghttp/push/push.go:606-608 @
+/// v3.7.4`), whose last act is `fmt.Fprintln(w, error)`: every error body
+/// this endpoint writes therefore ends in `\n`. Measured on
+/// `grafana/loki:3.7.4`, an inadmissible structured-metadata name returns
+/// the 20 bytes `label name is empty\n`, and a malformed JSON body ends in
+/// `\n` too.
+///
+/// Deliberately NOT shared with [`rw_error_response`]: `/api/v1/write` and
+/// `/api/v2/spans` answer to Prometheus and OpenZipkin, not to this one.
+/// The OTLP receiver has no terminator at all — its body is a
+/// `google.rpc.Status` protobuf, where the message is a length-delimited
+/// field (see [`LogsIngestError::InvalidLabelName`]).
+fn loki_error_response(err: &LogsIngestError) -> Response {
+    let (status, _code) = classify(err);
+    plain_text_response(status, format!("{err}\n"))
+}
+
+/// `/loki/api/v1/push`'s sink-backpressure response — [`loki_error_response`]'s
+/// terminator applies here too, since the reference writes its rate-limit
+/// rejection through the very same `HTTPError`.
+fn loki_backpressure_response() -> Response {
+    plain_text_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "sink is applying backpressure: buffers are full\n".to_string(),
+    )
 }
 
 /// Renders accumulated stream-local validation failures the way the reference
@@ -736,6 +770,11 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::OversizeBody { .. }
         | LogsIngestError::OversizeMessage { .. }
         | LogsIngestError::LokiDecode(_)
+        // 400 on BOTH transports, which is what the reference answers on its
+        // OTLP receiver and a deliberate divergence from the `500` its
+        // Loki-push receiver answers for the identical input (issue #259) —
+        // the rationale, with the reference line numbers, is on the variant.
+        | LogsIngestError::InvalidLabelName(_)
         | LogsIngestError::ZipkinDecode(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
@@ -1264,6 +1303,93 @@ mod tests {
             status.message,
             format!("stream '{{k8s_pod_name=\"{value}\"}}' has label value too long: '{value}'")
         );
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// Issue #259, OTLP half: an inadmissible resource-attribute key is a
+    /// `400` / `code = 3` here, which is what `grafana/loki:3.7.4` answers
+    /// for the same body on `/otlp/v1/logs` (measured: `400`, body
+    /// `\x12&symbolizer lookup: label name is empty`). The message string
+    /// asserted below is byte-identical to those measured bytes; `code = 3`
+    /// is ours — the reference leaves the field unset (`push.go:571-582 @
+    /// v3.7.4`), a receiver-wide PulsusDB contract predating this issue.
+    /// Nothing reaches the sink.
+    #[tokio::test]
+    async fn otlp_inadmissible_attribute_key_returns_400_with_status_code_3() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
+                    attributes: vec![opentelemetry_proto::tonic::common::v1::KeyValue {
+                        key: String::new(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue("v".to_string())),
+                        }),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("hello".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), request.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert_eq!(status.message, "symbolizer lookup: label name is empty");
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    /// Issue #259 re-review: the same at a log RECORD's attributes, whose
+    /// values issue #109's placement discards — so before this check the
+    /// identical body was a `200` here and a `400` on `grafana/loki:3.7.4`
+    /// (measured at the wire, body
+    /// `\x12&symbolizer lookup: label name is empty`). Nothing reaches the
+    /// sink: it is the whole-request class, exactly as for a resource key.
+    #[tokio::test]
+    async fn otlp_inadmissible_record_attribute_key_returns_400_with_status_code_3() {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("hello".to_string())),
+                        }),
+                        attributes: vec![opentelemetry_proto::tonic::common::v1::KeyValue {
+                            key: String::new(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("v".to_string())),
+                            }),
+                            key_strindex: 0,
+                        }],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), request.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert_eq!(status.message, "symbolizer lookup: label name is empty");
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
 
@@ -2441,7 +2567,9 @@ mod tests {
     // (PulsusDB). Reuses `MockSink` (the `LogSink` double) and the
     // remote-write `snappy_compress`/`plain_text_body` helpers.
 
-    use crate::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
+    use crate::protocols::loki_push::{
+        EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter, Timestamp,
+    };
 
     fn valid_loki_protobuf_body() -> Vec<u8> {
         let req = PushRequest {
@@ -2988,6 +3116,70 @@ mod tests {
         );
     }
 
+    /// Issue #259, at the WIRE rather than at `parse`: an inadmissible
+    /// structured-metadata name is a `400` whose body is byte-identical to
+    /// the reference's — trailing `\n` included, since its push receiver
+    /// writes every error through `http.Error` (`fmt.Fprintln`). Asserted as
+    /// exact bytes, not `.trim()`ed, because the terminator is the point.
+    ///
+    /// This is a DELIBERATE, measured divergence in the status only.
+    /// `grafana/loki:3.7.4` answers `500 label name is empty` on this very
+    /// body (hand-encoded snappy/protobuf and JSON alike) because the error
+    /// escapes its validation closure carrying no gRPC status
+    /// (`pkg/distributor/distributor.go:703-706 @ v3.7.4` ->
+    /// `pkg/distributor/http.go:170-180`, the status-less `else` branch),
+    /// while answering `400 symbolizer lookup: label name is empty` for the
+    /// identical condition on its own OTLP receiver
+    /// (`pkg/loghttp/push/otlp.go:611-614`). We answer `400` on both: the
+    /// input is client-controlled and no retry can succeed, and `5xx` is the
+    /// class log agents retry. See `LogsIngestError::InvalidLabelName` and
+    /// docs/api.md §8.2.
+    #[tokio::test]
+    async fn loki_inadmissible_structured_metadata_name_is_400_on_both_encodings() {
+        for (body, content_type) in [
+            (
+                snappy_compress(
+                    &PushRequest {
+                        streams: vec![StreamAdapter {
+                            labels: r#"{a="b"}"#.to_string(),
+                            entries: vec![EntryAdapter {
+                                timestamp: Some(Timestamp {
+                                    seconds: 1_700_000_000,
+                                    nanos: 0,
+                                }),
+                                line: "hello".to_string(),
+                                structured_metadata: vec![LabelPairAdapter {
+                                    name: String::new(),
+                                    value: String::new(),
+                                }],
+                            }],
+                        }],
+                    }
+                    .encode_to_vec(),
+                ),
+                "application/x-protobuf",
+            ),
+            (
+                br#"{"streams":[{"stream":{"a":"b"},
+                    "values":[["1700000000000000000","hello",{"":""}]]}]}"#
+                    .to_vec(),
+                "application/json",
+            ),
+        ] {
+            let sink = MockSink::new(Outcome::Admit);
+            let res = call_loki(&sink, body, &[("content-type", content_type)]).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{content_type}");
+            let body = plain_text_body(res).await;
+            assert_eq!(body, "label name is empty\n", "{content_type}");
+            assert_eq!(
+                body.as_bytes(),
+                b"label name is empty\n",
+                "{content_type}: the 20 bytes measured on grafana/loki:3.7.4"
+            );
+            assert!(sink.admitted.lock().unwrap().is_empty(), "{content_type}");
+        }
+    }
+
     #[tokio::test]
     async fn loki_structured_metadata_is_accepted_and_dropped_204() {
         // A JSON `values` entry with a trailing structured-metadata object:
@@ -3014,6 +3206,79 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(!plain_text_body(res).await.is_empty());
+    }
+
+    /// The LF terminator belongs to the ENDPOINT, not to one error variant:
+    /// the reference binds a single `push.HTTPError` writer for the whole
+    /// push receiver (`pkg/distributor/http.go:27-30 @ v3.7.4`), so every
+    /// error body it writes ends in `\n`. Measured on `grafana/loki:3.7.4`
+    /// across four unrelated error classes, all LF-terminated: a truncated
+    /// JSON body (`400`), a body with no valid stream (`422`), a duplicate
+    /// stream label name over hand-encoded snappy/protobuf (`400`), and an
+    /// inadmissible structured-metadata name (`500`).
+    ///
+    /// This walks one error of each class THIS handler can produce (decode,
+    /// oversize, backpressure, flush failure, inadmissible name) so a future
+    /// error path cannot quietly drop the terminator. The inadmissible-name
+    /// case additionally has its exact bytes pinned by
+    /// `loki_inadmissible_structured_metadata_name_is_400_on_both_encodings`,
+    /// since that is the one message whose text is the reference's.
+    #[tokio::test]
+    async fn every_loki_push_error_body_is_lf_terminated() {
+        let oversize = vec![0u8; decompress::MAX_DECOMPRESSED_BYTES + 1024];
+        let cases: Vec<(&str, Outcome, Vec<u8>, &str)> = vec![
+            (
+                "malformed json",
+                Outcome::Admit,
+                b"{".to_vec(),
+                "application/json",
+            ),
+            (
+                "json body under protobuf",
+                Outcome::Admit,
+                valid_loki_json_body(),
+                "application/x-protobuf",
+            ),
+            (
+                "over the 64 MiB cap",
+                Outcome::Admit,
+                oversize,
+                "application/json",
+            ),
+            (
+                "sink backpressure",
+                Outcome::Backpressure,
+                valid_loki_json_body(),
+                "application/json",
+            ),
+            (
+                "flush failure",
+                Outcome::FlushFails,
+                valid_loki_json_body(),
+                "application/json",
+            ),
+        ];
+        for (case, outcome, body, content_type) in cases {
+            let sink = MockSink::new(outcome);
+            let res = call_loki(&sink, body, &[("content-type", content_type)]).await;
+            assert!(
+                res.status().is_client_error() || res.status().is_server_error(),
+                "{case}"
+            );
+            let text = plain_text_body(res).await;
+            assert!(
+                text.ends_with('\n'),
+                "{case}: body {text:?} must end with LF"
+            );
+            assert!(
+                !text.trim_end_matches('\n').is_empty(),
+                "{case}: body must carry a message, not just the terminator"
+            );
+            assert!(
+                !text.trim_end_matches('\n').contains('\n'),
+                "{case}: exactly one LF, at the end"
+            );
+        }
     }
 
     #[tokio::test]
