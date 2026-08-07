@@ -36,9 +36,16 @@ schema_config:
         prefix: index_
         period: 24h
 
-# Generous query limits so a syntactically valid query answers (empty)
-# instead of being rejected on a range/length cap — the leg must distinguish
-# a syntax rejection (400) from an accepted-but-empty query (2xx).
+# The query length/range limits are left at their SHIPPED DEFAULTS, and
+# this block raises none of them: `/config` on the running container
+# reports `max_query_length: 30d1h`, `max_query_range: 0s`,
+# `max_query_lookback: 0s`, `query_ingesters_within: 3h` (issue #248 —
+# this comment used to describe the limits as "generous", which read as
+# if they had been raised here). The legs stay well inside them (the
+# differential leg queries a 1h window), so a syntactically valid query
+# answers 2xx-empty rather than tripping a length cap, and the leg can
+# read a 400 as a syntax rejection. What the block DOES do is enable
+# features the legs would otherwise be unable to probe:
 # `shard_aggregations` (issue #221): without it EVERY approx_topk query is a
 # 500 `approx_topk is not enabled` — inconclusive for the leg, never a
 # syntax verdict.

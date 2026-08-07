@@ -107,6 +107,15 @@ pub const ERROR_LABEL: &str = "__error__";
 /// so the emitted sorted `labels_json` stays canonical with no plumbing.
 pub const ERROR_DETAILS_LABEL: &str = "__error_details__";
 
+/// The reference's `errLabelFilter` (`pkg/logql/log/error.go:8`): the
+/// per-line error class a numeric-family label filter sets when the label
+/// value will not convert (`label_filter.go:184`, `:204`, `:252`, `:272`,
+/// `:315`, `:335` — each guarded on `!lbs.HasErr()`, so the FIRST error
+/// wins). Named because the value is READ back inside the same filter:
+/// the reference's `SetErr` is immediate, so a later `__error__ = "…"`
+/// leaf in the same `| <label filter>` sees it (issue #248 round 2).
+pub const LABEL_FILTER_ERROR: &str = "LabelFilterErr";
+
 /// The reference's `errTemplateFormat` (`pkg/logql/log/error.go:9`): the
 /// per-line error class a FAILING template execution sets — the query
 /// succeeds, the line keeps flowing (issue #230; `fmt.go:252-256`,
@@ -448,15 +457,79 @@ enum LfOp {
     /// `name != ip("…")`. The label value is parsed as an IP and tested for
     /// membership in the compiled range. Unlike the numeric `Compare` filter,
     /// this NEVER errors: a missing label or an unparseable value is simply a
-    /// non-match (reference v3.7.3-verified — no `__error__`/`__error_details__`
-    /// is ever set). `=` drops the non-match; `!=` keeps it.
+    /// non-match — no `__error__`/`__error_details__` is ever set.
+    /// `=` drops the non-match; `!=` keeps it.
+    ///
+    /// **Two divergences from the reference live in that last sentence, both
+    /// pre-dating and untouched by issue #248, both in `filterTy`
+    /// (`pkg/logql/log/ip.go:123-145 @ v3.7.4`) rather than in where the
+    /// filter may sit.** They are reported on #248 for a follow-up, not fixed
+    /// here, and are container-measured on `grafana/loki:3.7.4`:
+    ///
+    /// 1. A **missing label** is `false` for `!=` too in the reference —
+    ///    `lbs.Get` failing returns before the `=`/`!=` switch (`ip.go:128-132`),
+    ///    so the line is DROPPED. PulsusDB keeps it.
+    /// 2. The reference **scans** the label value for an embedded address
+    ///    (`ipFilter.filter`, `ip.go:183-226` — the same routine the `ip()`
+    ///    LINE filter uses, and the one our [`super::ip::line_has_ip_in`]
+    ///    mirrors), so `addr="10.1.2.3:8080"` and `addr="client 10.1.2.3 ok"`
+    ///    both match `ip("10.0.0.0/8")`. PulsusDB parses the WHOLE value and
+    ///    misses both.
+    ///
+    /// The matcher is always well formed: a MALFORMED `ip()` pattern that the
+    /// reference does not reject compiles to [`LfOp::IpMalformed`] instead.
     Ip {
         name: String,
         matcher: IpMatcher,
         negated: bool,
     },
+    /// A `name = ip("…")` / `name != ip("…")` filter whose PATTERN is
+    /// malformed, in a position where the reference never surfaces the
+    /// pattern error (issue #248 — see [`LabelFilterSite`]).
+    ///
+    /// The reference's `NewIPLabelFilter` cannot fail: it stores the parse
+    /// error on the node and leaves the matcher nil
+    /// (`pkg/logql/log/ip.go:94-103 @ v3.7.4`), so the filter stays in the
+    /// program and runs. It then evaluates to `true` on an entry carrying a
+    /// pipeline error and `false` otherwise — for `=` AND `!=` alike, and
+    /// whatever the label holds, because the `HasErr` and nil-matcher checks
+    /// both precede the `=`/`!=` switch (`ip.go:123-145 @ v3.7.4`).
+    ///
+    /// It therefore carries no name, no matcher and no negation: none of
+    /// those inputs can change its verdict.
+    IpMalformed,
     And,
     Or,
+}
+
+/// Where a `| <label filter>` expression sits in the pipeline, which is the
+/// whole of what decides whether a malformed `ip()` pattern is REPORTED or
+/// silently deferred (issue #248).
+///
+/// **Two variants because the reference's grammar has exactly two sites.**
+/// `git grep -n labelFilter v3.7.4 -- pkg/logql/syntax/syntax.y` returns
+/// nine lines: its `%type` declaration (58), its own production
+/// (302, 307-311), and exactly two USES elsewhere — line 221
+/// (`PIPE labelFilter`, a pipeline stage) and line 160
+/// (`unwrapExpr PIPE labelFilter`, a post-`unwrap` filter). `| drop` and
+/// `| keep` take `namedMatchers` (371-373), not a `labelFilter`, so no
+/// third site can carry an `ip()` pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelFilterSite {
+    /// A `| <label filter>` PIPELINE stage. The reference builds its stage
+    /// through `LabelFilterExpr.Stage()`
+    /// (`pkg/logql/syntax/ast.go:801-809 @ v3.7.4`), which type-switches on
+    /// the stage's WHOLE filterer and returns `ip.PatternError()` only when
+    /// that filterer IS the `ip()` filter — the one place in the reference a
+    /// deferred pattern error is ever surfaced.
+    PipelineStage,
+    /// A post-`unwrap` filter. The reference reduces `Unwrap.PostFilters`
+    /// with `log.ReduceAndLabelFilter`
+    /// (`pkg/logql/syntax/extractor.go:76,187 @ v3.7.4`), which builds the
+    /// filterer directly and never calls `Stage()` — so a malformed pattern
+    /// is accepted here in EVERY position, a lone filter included
+    /// (container-measured on `grafana/loki:3.7.4`).
+    PostUnwrap,
 }
 
 /// The inline verdict-stack width.
@@ -468,8 +541,7 @@ enum LfOp {
 /// `max_stack == 2` regardless of width; the worst case is full RIGHT
 /// nesting, whose verdict stack is one deeper than the parse depth, and
 /// `pulsus-logql`'s `LABEL_FILTER_MAX_DEPTH` bounds that at 91. 96
-/// leaves headroom and costs 96 bytes of stack (`Option<bool>` is one
-/// byte).
+/// leaves headroom and costs 96 bytes of stack (`bool` is one byte).
 ///
 /// `max_stack_never_spills_for_any_parser_admissible_filter` measures
 /// the deepest filter the parser accepts and asserts it fits, so raising
@@ -497,9 +569,43 @@ struct CompiledLabelFilter {
     /// Precomputed replacement for the former `filter_contains_compare`
     /// walk. Not rendered by `Debug` — the bytes must not move.
     has_compare: bool,
+    /// The `or` SHORT-CIRCUIT table (issue #248 round 2). `or_jumps[i]`
+    /// is the op index evaluation resumes at when op `i` yields `true`,
+    /// or [`NO_JUMP`]; **EMPTY when the program contains no `Or`**, which
+    /// is every single-leaf and every `and`-only filter, so the common
+    /// shapes pay neither the allocation nor a per-op lookup miss.
+    ///
+    /// It exists because the reference's `or` really does skip its right
+    /// operand — `BinaryLabelFilter.Process` returns at
+    /// `if !b.And && lok` (`pkg/logql/log/label_filter.go:90-98 @
+    /// v3.7.4`) — and a skipped operand is a numeric filter that never
+    /// gets to call `SetErr`. Measured on `grafana/loki:3.7.4` with
+    /// `n=bad n2=5`: `| logfmt | n2 > 1 or n > 1` returns the line
+    /// WITHOUT `__error__`, while `| logfmt | n > 1 or n2 > 1` returns it
+    /// WITH. Nothing else about a leaf is observable, so skipping and
+    /// suppressing would agree everywhere else; the error is the whole
+    /// reason the table is here.
+    ///
+    /// Not rendered by `Debug` (it is derived from `ops`, and the bytes
+    /// must not move), but compared by
+    /// [`CompiledPipeline::label_filter_programs_eq`].
+    or_jumps: Vec<u32>,
 }
 
+/// The [`CompiledLabelFilter::or_jumps`] sentinel: this op does not
+/// short-circuit.
+const NO_JUMP: u32 = u32::MAX;
+
 impl CompiledLabelFilter {
+    /// Where evaluation resumes when op `i` yields `true`, if op `i` is
+    /// the LEFT operand of an `or`.
+    fn or_jump(&self, i: usize) -> Option<usize> {
+        match self.or_jumps.get(i) {
+            Some(&t) if t != NO_JUMP => Some(t as usize),
+            _ => None,
+        }
+    }
+
     /// The index of each internal node's two operands, recovered from
     /// post-order in one linear pass, plus the root index. Used only by
     /// `Debug`, which is not a hot path.
@@ -535,7 +641,10 @@ impl fmt::Debug for CompiledLabelFilter {
         let mut stack: Vec<(usize, u8, usize)> = vec![(root, 0, 0)];
         while let Some((i, step, level)) = stack.pop() {
             match &self.ops[i] {
-                leaf @ (LfOp::Match { .. } | LfOp::Compare { .. } | LfOp::Ip { .. }) => {
+                leaf @ (LfOp::Match { .. }
+                | LfOp::Compare { .. }
+                | LfOp::Ip { .. }
+                | LfOp::IpMalformed) => {
                     walk::dbg_own(f, leaf, alt, level)?;
                 }
                 LfOp::And | LfOp::Or => {
@@ -910,7 +1019,16 @@ fn compile_stage(
             Ok(Some(compile_parser(p)?))
         }
         Stage::LabelFilter(expr) => {
-            let filter = compile_label_filter(expr)?;
+            // Issue #248: the parser admits label filters after `| unwrap`
+            // only, so a label-filter stage reached with the unwrap already
+            // compiled IS one of the reference's `Unwrap.PostFilters` — the
+            // one position where it never surfaces an `ip()` pattern error.
+            let site = if st.has_unwrap {
+                LabelFilterSite::PostUnwrap
+            } else {
+                LabelFilterSite::PipelineStage
+            };
+            let filter = compile_label_filter(expr, site)?;
             // A numeric comparison can add `__error__` on a
             // conversion failure — that changes the label set, so
             // it must route through the fan-out path (correctness
@@ -1077,8 +1195,8 @@ impl CompiledPipeline {
     }
 
     /// Structural equality of two compiled pipelines' LABEL-FILTER
-    /// programs — **including the two fields `Debug` does not render**,
-    /// `max_stack` and `has_compare`.
+    /// programs — **including the three fields `Debug` does not render**,
+    /// `max_stack`, `has_compare` and `or_jumps`.
     ///
     /// Test-support, and narrowly scoped: it exists because #272's
     /// widest-chain stack gate must prove a `Clone` carried the whole
@@ -1146,10 +1264,16 @@ impl CompiledPipeline {
                         negated: bg,
                     },
                 ) => an == bn && am == bm && ag == bg,
-                (LfOp::And, LfOp::And) | (LfOp::Or, LfOp::Or) => true,
+                // A malformed-pattern leaf is a CONSTANT (issue #248): two of
+                // them behave identically whatever label or operator they were
+                // written with, so they compare equal.
+                (LfOp::IpMalformed, LfOp::IpMalformed)
+                | (LfOp::And, LfOp::And)
+                | (LfOp::Or, LfOp::Or) => true,
                 (LfOp::Match { .. }, _)
                 | (LfOp::Compare { .. }, _)
                 | (LfOp::Ip { .. }, _)
+                | (LfOp::IpMalformed, _)
                 | (LfOp::And, _)
                 | (LfOp::Or, _) => false,
             }
@@ -1159,6 +1283,7 @@ impl CompiledPipeline {
             && a.iter().zip(b.iter()).all(|(x, y)| {
                 x.max_stack == y.max_stack
                     && x.has_compare == y.has_compare
+                    && x.or_jumps == y.or_jumps
                     && x.ops.len() == y.ops.len()
                     && x.ops.iter().zip(y.ops.iter()).all(|(p, q)| op_eq(p, q))
             })
@@ -1552,34 +1677,33 @@ impl CompiledPipeline {
                     }
                 }
                 CompiledStage::LabelFilter(filter) => {
-                    // Both paths capture the first offending `(kind, raw)`
-                    // for the detail string: streams and metric now each
-                    // carry `__error_details__` (issue #104). `failed` only
-                    // borrows the raw value — an `And`/`Or` sibling can
-                    // still absorb this into a definite `Some`, masking the
-                    // error entirely, so masked lines never allocate.
+                    // `failed` is the error the reference's `SetErr` has
+                    // ALREADY written by the time the filter finishes — the
+                    // evaluator sets it at the failing leaf and every later
+                    // leaf reads it (issue #248 round 2). It borrows the
+                    // offending raw value; only the owned detail `String` is
+                    // deferred to here, and only on the KEPT path, because a
+                    // dropped line discards the reference's builder and with
+                    // it the error. Both paths carry `__error_details__`:
+                    // streams (issue #99) and metric (issue #104).
                     let mut failed: Option<(UnitKind, &str)> = None;
-                    match eval_label_filter(filter, labels, &errs, &mut failed) {
-                        Some(true) => {}
-                        Some(false) => return Ok((MetricRun::Dropped, errs.has_err())),
-                        // Conversion failure: keep the line, tag the error
-                        // class in the out-of-band slots (pinned semantics,
-                        // oracle-verified; a later `__error__=""` filter
-                        // drops it) — but ONLY when no earlier error is set:
-                        // the reference guards every numeric-family write on
-                        // `!lbs.HasErr()` (`label_filter.go:184`, `:204`,
-                        // `:252`, `:272`, `:315`, `:335` — "first error
-                        // wins", live-probed). When the guard blocks, the
-                        // detail `String` is never built (alloc budget).
-                        None => {
-                            if !errs.has_err() {
-                                let details = failed
-                                    .map(|(kind, value)| label_filter_error_details(kind, value));
-                                errs.set_err(Cow::Borrowed("LabelFilterErr"));
-                                if let Some(details) = details {
-                                    errs.set_details(Cow::Owned(details));
-                                }
-                            }
+                    if !eval_label_filter(filter, labels, &errs, &mut failed) {
+                        return Ok((MetricRun::Dropped, errs.has_err()));
+                    }
+                    // Keep the line and tag the error class in the
+                    // out-of-band slots (a later `__error__=""` filter drops
+                    // it) — but ONLY when no earlier error is set: the
+                    // reference guards every numeric-family write on
+                    // `!lbs.HasErr()` (`label_filter.go:184`, `:204`, `:252`,
+                    // `:272`, `:315`, `:335` — "first error wins",
+                    // live-probed). When the guard blocks, the detail
+                    // `String` is never built (alloc budget).
+                    if failed.is_some() && !errs.has_err() {
+                        let details =
+                            failed.map(|(kind, value)| label_filter_error_details(kind, value));
+                        errs.set_err(Cow::Borrowed(LABEL_FILTER_ERROR));
+                        if let Some(details) = details {
+                            errs.set_details(Cow::Owned(details));
                         }
                     }
                 }
@@ -2319,7 +2443,10 @@ fn compile_pattern(pattern: &str) -> Result<Vec<PatternTok>, PipelineError> {
 /// the exact node count; the FIRST error still wins in source order,
 /// because post-order visits the leaves left to right and `?` returns on
 /// the first failing one.
-fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, PipelineError> {
+fn compile_label_filter(
+    expr: &LabelFilterExpr,
+    site: LabelFilterSite,
+) -> Result<CompiledLabelFilter, PipelineError> {
     // A single-leaf filter — `| x="1"`, by far the common shape — needs
     // no traversal at all, so it costs exactly ONE allocation (the `ops`
     // vector), matching the pre-#272 profile of zero `Box`es plus this
@@ -2332,6 +2459,18 @@ fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, P
     } else {
         walk::postorder_into::<pulsus_logql::LabelFilterScc>(expr, &mut nodes);
     }
+    // Issue #248 — the ONE condition under which a malformed `ip()` pattern
+    // is reported, and the exact analogue of `LabelFilterExpr.Stage()`
+    // (`pkg/logql/syntax/ast.go:801-809 @ v3.7.4`): the stage's whole
+    // filterer must BE the `ip()` filter. `leaf_only` says the expression is
+    // a single node, so inside the `Ip` arm below it says that node is this
+    // one. Parentheses are transparent in both grammars
+    // (`syntax.y:307 @ v3.7.4` yields the inner filter, and our parser
+    // returns it unwrapped), so `| (a=ip("x"))` reports like `| a=ip("x")`.
+    // Anywhere else — nested under `and`/`or`/`,`, or any post-`unwrap`
+    // position — the error is dropped and the filter runs as
+    // [`LfOp::IpMalformed`].
+    let report_pattern_error = leaf_only && matches!(site, LabelFilterSite::PipelineStage);
     let mut ops: Vec<LfOp> = Vec::with_capacity(nodes.len());
     let mut has_compare = false;
     let mut live: u32 = 0;
@@ -2362,15 +2501,19 @@ fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, P
                 value,
                 negated,
             } => {
-                let matcher = IpMatcher::parse(value)
-                    .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?;
                 // The IP label filter never mutates the label set (it
                 // cannot error), so it does not force the label-mutating
                 // fan-out path — `has_compare` stays as it was.
-                LfOp::Ip {
-                    name: name.clone(),
-                    matcher,
-                    negated: *negated,
+                match IpMatcher::parse(value) {
+                    Ok(matcher) => LfOp::Ip {
+                        name: name.clone(),
+                        matcher,
+                        negated: *negated,
+                    },
+                    Err(e) if report_pattern_error => {
+                        return Err(PipelineError::BadIpFilter(e.to_string()));
+                    }
+                    Err(_) => LfOp::IpMalformed,
                 }
             }
             LabelFilterExpr::And(..) => LfOp::And,
@@ -2383,11 +2526,63 @@ fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, P
         max_stack = max_stack.max(live);
         ops.push(op);
     }
+    let or_jumps = build_or_jumps(&ops);
     Ok(CompiledLabelFilter {
         ops,
         max_stack,
         has_compare,
+        or_jumps,
     })
+}
+
+/// The `or` short-circuit table for a post-order program — see
+/// [`CompiledLabelFilter::or_jumps`].
+///
+/// Two linear passes, both allocation-free when the program has no `Or`
+/// (the single-leaf and `and`-only shapes).
+///
+/// Pass 1 recovers each internal node's operands from post-order the same
+/// way [`CompiledLabelFilter::tree_shape`] does, and for every `Or` marks
+/// its LEFT operand with the index just past that `Or`.
+///
+/// Pass 2 CHAINS, and it is the half that is easy to get wrong: an `Or`
+/// that is itself the left operand of an enclosing `Or` must hand its own
+/// destination down. `a or b or c` parses left-deep, so its program is
+/// `[a, b, Or1, c, Or2]`; the reference evaluates `Left = (a or b)`,
+/// short-circuits inside it on `a`, returns `true` to `Or2`, which
+/// short-circuits again — `c` is never evaluated at all. Marking `a` with
+/// `Or1 + 1 = 3` would land on `c` and evaluate it. Parents always sit at
+/// a HIGHER index than their children in post-order, so one descending
+/// pass resolves every chain: when `i`'s provisional target is
+/// `parent + 1` and `parent` has itself been resolved, `i` inherits it.
+fn build_or_jumps(ops: &[LfOp]) -> Vec<u32> {
+    if !ops.iter().any(|o| matches!(o, LfOp::Or)) {
+        return Vec::new();
+    }
+    let mut jumps = vec![NO_JUMP; ops.len()];
+    let mut pending: Vec<usize> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if matches!(op, LfOp::And | LfOp::Or) {
+            // Same `unwrap_or(0)` convention as `tree_shape`: a
+            // post-order program built by `compile_label_filter` always
+            // has both operands on the stack.
+            pending.pop();
+            let l = pending.pop().unwrap_or(0);
+            if matches!(op, LfOp::Or) {
+                jumps[l] = (i + 1) as u32;
+            }
+        }
+        pending.push(i);
+    }
+    for i in (0..ops.len()).rev() {
+        if jumps[i] != NO_JUMP {
+            let parent_or = jumps[i] as usize - 1;
+            if jumps[parent_or] != NO_JUMP {
+                jumps[i] = jumps[parent_or];
+            }
+        }
+    }
+    jumps
 }
 
 /// Classifies a numeric RHS literal (plan edge case 4: `5xz` is a named
@@ -3061,55 +3256,88 @@ fn frozen_slot<'m>(name: &str, err: Option<&'m str>, details: Option<&'m str>) -
     }
 }
 
-/// Three-valued label-filter evaluation: `Some(true)` keep, `Some(false)`
-/// drop, `None` = a numeric conversion failed somewhere the outcome
-/// depends on (→ keep + `__error__`). Kleene semantics: a definite
-/// `false` under `and` / definite `true` under `or` absorbs an error.
+/// Two-valued label-filter evaluation — `true` keep, `false` drop —
+/// with the error state carried LEFT TO RIGHT through the program, the
+/// way the reference carries it on its `LabelsBuilder`.
 ///
-/// `failed` borrows the offending raw label value rather than owning it:
-/// an `And`/`Or` sibling can still absorb the `None` into a definite
-/// `Some(false)`/`Some(true)` (masked, no label ever set), so the owned
-/// detail `String` is deferred to the caller's `None` arm — the only
-/// place a label is actually written.
-/// Issue #272: a LINEAR SCAN over the flat post-order program.
+/// **Issue #248 round 2: this used to be three-valued, and that was the
+/// defect.** A numeric conversion failure returned `None`, the Kleene
+/// tables propagated it, and the caller committed `__error__` only on a
+/// surviving `None`. The reference has no third value: a failing
+/// numeric-family filter calls `SetErr` right there and returns **true**
+/// (`pkg/logql/log/label_filter.go:182-188` bytes, `:250-256` duration,
+/// `:313-319` numeric @ v3.7.4). Deferring the commit made the error
+/// INVISIBLE to every later leaf that reads it in the same filter —
+/// `ip()`, a malformed `ip()`, and `__error__` itself — and dropped
+/// lines the reference keeps. Measured on `grafana/loki:3.7.4` over a
+/// line `n=bad n2=5 addr=1.2.3.4 b=y`:
 ///
-/// **Contract 3 is preserved exactly**: post-order visits the leaves in
-/// SOURCE order and evaluates BOTH operands of every `And`/`Or`
-/// unconditionally, so `failed` still records the LEFTMOST conversion
-/// failure and the Kleene tables below are transcribed unchanged. No
-/// Sethi-Ullman reordering, no associativity normalisation, no rank
-/// side-table.
+/// | `| logfmt |` filter | reference | pre-fix PulsusDB |
+/// |---|---|---|---|
+/// | `n > 1 and addr=ip("nope")` | kept, `__error__` | dropped |
+/// | `n > 1 and addr=ip("10.0.0.0/8")` | kept, `__error__` | dropped |
+/// | `n > 1 and __error__ = "LabelFilterErr"` | kept, `__error__` | dropped |
+/// | `n > 1 or n2 > 1` | kept, `__error__` | kept, NO error |
 ///
-/// **Per-row cost.** Strictly less than the tree walk it replaces: a
-/// contiguous `Vec<LfOp>` instead of `Box`-pointer chasing plus a call
-/// frame per node, and an on-stack `[Option<bool>; LF_INLINE_STACK]`
-/// verdict array instead of any allocation. A left-deep chain — what the
-/// parser builds for `a or b or c …` — has `max_stack == 2` regardless
-/// of width, so width never spills to the heap.
+/// `failed` therefore no longer means "maybe an error": it IS the error,
+/// recorded the instant it happens, and `has_err` below reads it. What
+/// stays deferred is only the owned detail `String`, which the caller
+/// builds on the KEPT path — the reference's own error is unobservable
+/// on a dropped line (the builder is discarded), so a dropped line still
+/// allocates nothing.
+///
+/// **`or` short-circuits, `and` does not** — `BinaryLabelFilter.Process`
+/// returns early only at `if !b.And && lok` (`label_filter.go:90-98`).
+/// That asymmetry is load-bearing precisely because of the error: the
+/// skipped operand never gets to `SetErr`. See
+/// [`CompiledLabelFilter::or_jumps`].
+///
+/// Issue #272: a LINEAR SCAN over the flat post-order program, which
+/// visits the leaves in SOURCE order — the order the reference's
+/// left-to-right recursion visits them in — so `failed` records the
+/// leftmost EVALUATED conversion failure, which is what
+/// `if !lbs.HasErr()` makes first-wins.
+///
+/// **Per-row cost.** A contiguous `Vec<LfOp>` instead of `Box`-pointer
+/// chasing plus a call frame per node, and an on-stack
+/// `[bool; LF_INLINE_STACK]` verdict array instead of any allocation. A
+/// left-deep chain — what the parser builds for `a or b or c …` — has
+/// `max_stack == 2` regardless of width, so width never spills to the
+/// heap. The short-circuit strictly REMOVES work.
 fn eval_label_filter<'v>(
     filter: &CompiledLabelFilter,
     labels: &'v [(Cow<'_, str>, Cow<'_, str>)],
     errs: &ErrorSlots<'_>,
     failed: &mut Option<(UnitKind, &'v str)>,
-) -> Option<bool> {
-    let mut inline = [None; LF_INLINE_STACK];
+) -> bool {
+    let mut inline = [false; LF_INLINE_STACK];
     // Unreachable for any parser-produced filter (see
     // `LF_INLINE_STACK`); retained for programmatically constructed
     // trees, which the corpus runner and `extended_with` can both carry.
     // `max_stack <= ops.len() <= N`, itself bounded by admission.
-    let mut spill: Vec<Option<bool>> = if filter.max_stack as usize > LF_INLINE_STACK {
-        vec![None; filter.max_stack as usize]
+    let mut spill: Vec<bool> = if filter.max_stack as usize > LF_INLINE_STACK {
+        vec![false; filter.max_stack as usize]
     } else {
         Vec::new()
     };
-    let vals: &mut [Option<bool>] = if spill.is_empty() {
+    let vals: &mut [bool] = if spill.is_empty() {
         &mut inline
     } else {
         &mut spill
     };
+    // `lbs.HasErr()` as the reference reports it at the START of this
+    // stage. An error already set by an earlier stage BLOCKS this
+    // filter's own `SetErr` (`if !lbs.HasErr()`, first-wins) and is what
+    // the error-reading leaves see even before this filter fails.
+    let pre_err = errs.has_err();
     let mut top = 0usize;
-    for op in &filter.ops {
-        let v = match op {
+    let mut i = 0usize;
+    while i < filter.ops.len() {
+        // `lbs.HasErr()` AS OF THIS OP — the whole point of the round-2
+        // fix. Recomputed per op because a `Compare` to its left may have
+        // set it since the last read.
+        let has_err = pre_err || failed.is_some();
+        let v = match &filter.ops[i] {
             LfOp::Match {
                 name,
                 op,
@@ -3124,58 +3352,61 @@ fn eval_label_filter<'v>(
                 // matcher semantics otherwise: a missing label matches as the
                 // empty string — which an unset slot also reads as.
                 let v = if name == ERROR_LABEL {
-                    errs.err_str()
+                    // `GetErr()` reads the slot the reference has ALREADY
+                    // written, including one written by a `Compare` to the
+                    // left of this leaf in this same filter — measured:
+                    // `| logfmt | n > 1 and __error__ = "LabelFilterErr"`
+                    // returns the line with `n=bad`.
+                    if pre_err {
+                        errs.err_str()
+                    } else if failed.is_some() {
+                        LABEL_FILTER_ERROR
+                    } else {
+                        ""
+                    }
                 } else {
                     get_label(labels, name).unwrap_or("")
                 };
-                Some(match op {
+                match op {
                     MatchOp::Eq => v == value,
                     MatchOp::Neq => v != value,
                     MatchOp::Re => re.as_ref().is_some_and(|re| re.is_match(v)),
                     MatchOp::Nre => !re.as_ref().is_some_and(|re| re.is_match(v)),
-                })
+                }
             }
             LfOp::Compare {
                 name,
                 op,
                 kind,
                 threshold,
-            } => {
-                // A missing label never satisfies a numeric comparison
-                // (dropped, no error); an unconvertible value is the error
-                // class.
-                // Issue #272: the leaf arms used to be a recursive call, so
-                // an early `return` exited only that leaf. In the linear scan
-                // it would exit the whole program, so each is now the arm's
-                // VALUE.
-                let Some(raw) = get_label(labels, name) else {
-                    vals[top] = Some(false);
-                    top += 1;
-                    continue;
-                };
-                let Some(v) = convert_label_value(*kind, raw) else {
-                    // Record the leftmost conversion failure as a borrow —
-                    // no allocation here. A sibling `And`/`Or` combinator may
-                    // still absorb this `None` into a definite outcome (the
-                    // line is masked and no label is ever set), so the owned
-                    // detail string is built by the caller, only once, only
-                    // on the surviving `None` outcome.
-                    if failed.is_none() {
-                        *failed = Some((*kind, raw));
+            } => match get_label(labels, name) {
+                // A missing label never satisfies a numeric comparison —
+                // `lbs.Get` failing returns `false` with NO error
+                // (`label_filter.go:176-180`, `:244-248`, `:307-311`).
+                None => false,
+                Some(raw) => match convert_label_value(*kind, raw) {
+                    None => {
+                        // The reference SETS the error here and returns
+                        // TRUE. We record the same first-wins choice as a
+                        // BORROW of the offending value — no allocation on
+                        // this path, and none at all if the line is later
+                        // dropped, which is exactly when the reference's
+                        // own error becomes unobservable.
+                        if failed.is_none() {
+                            *failed = Some((*kind, raw));
+                        }
+                        true
                     }
-                    vals[top] = None;
-                    top += 1;
-                    continue;
-                };
-                Some(match op {
-                    CompareOp::Eq => v == *threshold,
-                    CompareOp::Neq => v != *threshold,
-                    CompareOp::Gt => v > *threshold,
-                    CompareOp::Gte => v >= *threshold,
-                    CompareOp::Lt => v < *threshold,
-                    CompareOp::Lte => v <= *threshold,
-                })
-            }
+                    Some(v) => match op {
+                        CompareOp::Eq => v == *threshold,
+                        CompareOp::Neq => v != *threshold,
+                        CompareOp::Gt => v > *threshold,
+                        CompareOp::Gte => v >= *threshold,
+                        CompareOp::Lt => v < *threshold,
+                        CompareOp::Lte => v <= *threshold,
+                    },
+                },
+            },
             LfOp::Ip {
                 name,
                 matcher,
@@ -3187,47 +3418,60 @@ fn eval_label_filter<'v>(
                 // live-probed: `| json | addr = ip(...)` and `!= ip(...)` both
                 // keep the errored line; after `drop __error__` both drop it,
                 // and a stream label `__error__` does NOT trip it).
-                if errs.has_err() {
-                    vals[top] = Some(true);
-                    top += 1;
-                    continue;
+                if has_err {
+                    true
+                } else {
+                    // Reference v3.7.3 semantics (differential-authoritative): parse the
+                    // label value as an IP and test range membership. A missing label OR
+                    // an unparseable value is `match = false` — NEVER an error, so no
+                    // `__error__`/`__error_details__` is set (this is the key divergence
+                    // from the numeric label filter, which DOES error on bad values).
+                    // `=` returns the line iff matched; `!=` iff not matched.
+                    let matched = get_label(labels, name)
+                        .and_then(|raw| raw.parse::<IpAddr>().ok())
+                        .is_some_and(|ip| matcher.contains(&ip));
+                    if *negated { !matched } else { matched }
                 }
-                // Reference v3.7.3 semantics (differential-authoritative): parse the
-                // label value as an IP and test range membership. A missing label OR
-                // an unparseable value is `match = false` — NEVER an error, so no
-                // `__error__`/`__error_details__` is set (this is the key divergence
-                // from the numeric label filter, which DOES error on bad values).
-                // `=` returns the line iff matched; `!=` iff not matched.
-                let matched = get_label(labels, name)
-                    .and_then(|raw| raw.parse::<IpAddr>().ok())
-                    .is_some_and(|ip| matcher.contains(&ip));
-                Some(if *negated { !matched } else { matched })
             }
+            // Issue #248: a malformed pattern the reference did not reject.
+            // `ip.go:123-145 @ v3.7.4` checks `HasErr` first (pass), then the
+            // label, then `f.ip == nil` — all BEFORE the `=`/`!=` switch, so
+            // the verdict is `true` on an errored entry and `false` on every
+            // other, for both operators. Container-measured on
+            // `grafana/loki:3.7.4`: `| logfmt | addr != ip("nope") or b="y"`
+            // returns only the `b="y"` line, so `!=` does NOT negate to true;
+            // and `| logfmt | n > 1 and addr=ip("nope")` over `n=bad` returns
+            // the line, which is why `has_err` and not `pre_err`.
+            LfOp::IpMalformed => has_err,
             LfOp::And => {
                 // Post-order leaves [.., lhs, rhs] on the tail; BOTH were
-                // evaluated, in source order, before this op runs.
+                // evaluated, in source order, before this op runs — `and`
+                // never short-circuits in the reference either.
                 let rhs = vals[top - 1];
                 let lhs = vals[top - 2];
                 top -= 2;
-                match (lhs, rhs) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                }
+                lhs && rhs
             }
             LfOp::Or => {
+                // Reached only when the left operand was FALSE: a true one
+                // jumped past this op (see `or_jumps`).
                 let rhs = vals[top - 1];
                 let lhs = vals[top - 2];
                 top -= 2;
-                match (lhs, rhs) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                }
+                lhs || rhs
             }
         };
         vals[top] = v;
         top += 1;
+        if v && let Some(target) = filter.or_jump(i) {
+            // The skipped region is exactly this `or`'s right operand plus
+            // the `Or` op(s) it feeds, which together consume one verdict
+            // and push one — so leaving the left operand's `true` in place
+            // keeps the stack exactly as the skipped ops would have.
+            i = target;
+            continue;
+        }
+        i += 1;
     }
     match top {
         1 => vals[0],
@@ -5015,10 +5259,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Issues #99 + #104: a compound `and`/`or` label filter can absorb a
-    // sibling's conversion failure into a definite outcome (masking) —
-    // `eval_label_filter`'s `failed` capture must never allocate on that
-    // path, and a genuinely-surviving error must stay byte-exact.
+    // Issues #99 + #104: a compound `and`/`or` label filter can leave a
+    // sibling's conversion failure unobservable — either because the
+    // line is DROPPED (the reference's error goes down with the
+    // discarded builder) or because `or` short-circuited past the leaf
+    // that would have failed. `eval_label_filter` must never allocate
+    // the detail string on those paths, and a genuinely-surviving error
+    // must stay byte-exact.
     // -----------------------------------------------------------------
 
     /// Issue #272 finding 3: the zero-allocation-per-row claim must hold
@@ -5085,8 +5332,10 @@ mod tests {
         ))
         .unwrap();
         let base = vec![("a".to_string(), "b".to_string())];
-        // `level = "warn"` is definite-false; `and` absorbs the sibling's
-        // conversion failure on `took=bad` without ever setting a label.
+        // `level = "warn"` is false. `and` does not short-circuit, so
+        // `took > 250ms` still runs and still fails on `took=bad` — but
+        // `false && true` drops the line, and the reference's error goes
+        // down with the discarded builder, so no label is ever written.
         assert!(
             compiled
                 .run("level=info took=bad", &base, 0)
@@ -5102,8 +5351,9 @@ mod tests {
         ))
         .unwrap();
         let base = vec![("a".to_string(), "b".to_string())];
-        // `level = "info"` is definite-true; `or` absorbs the sibling's
-        // conversion failure on `took=bad` without ever setting a label.
+        // `level = "info"` is true, and `or` SHORT-CIRCUITS
+        // (`label_filter.go:92-94`), so `took > 250ms` never runs on
+        // `took=bad` and no error is ever set.
         let out = compiled
             .run("level=info took=bad", &base, 0)
             .expect("no budget breach")
@@ -5134,11 +5384,11 @@ mod tests {
     fn a_genuine_compound_error_still_emits_byte_exact_error_labels() {
         let base = vec![("a".to_string(), "b".to_string())];
         for query in [
-            // `or`: both sides fail to produce a definite `true`
-            // (`level = "warn"` is false, `took > 250ms` errors) → `None`.
+            // `or`: `level = "warn"` is false, so no short-circuit —
+            // `took > 250ms` runs, sets the error and returns true.
             r#"{a="b"} | logfmt | level = "warn" or took > 250ms"#,
-            // `and`: both sides fail to produce a definite `false`
-            // (`level = "info"` is true, `took > 250ms` errors) → `None`.
+            // `and`: never short-circuits — `took > 250ms` runs, sets the
+            // error and returns true, and `true && true` keeps the line.
             r#"{a="b"} | logfmt | level = "info" and took > 250ms"#,
         ] {
             let compiled = CompiledPipeline::compile(&stages_of(query)).unwrap();
@@ -6110,5 +6360,401 @@ mod tests {
         expected.push((ERROR_DETAILS_LABEL.to_string(), DET.to_string()));
         expected.sort();
         assert_eq!(with_sm, expected);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #248: a MALFORMED `ip()` label-filter pattern is rejected in
+    // exactly one position and silently deferred everywhere else.
+    //
+    // Rule read off the reference: `NewIPLabelFilter` cannot fail — it
+    // stores the error and leaves the matcher nil
+    // (`pkg/logql/log/ip.go:94-103 @ v3.7.4`) — and the ONLY caller of
+    // `PatternError()` is `LabelFilterExpr.Stage()`
+    // (`pkg/logql/syntax/ast.go:801-809 @ v3.7.4`; `git grep -n PatternError
+    // pkg/` at v3.7.4 returns its declaration at `ip.go:117-121` and that one
+    // call site), which type-switches on the stage's whole filterer.
+    // Post-`unwrap` filters never reach it:
+    // they are reduced with `log.ReduceAndLabelFilter`
+    // (`pkg/logql/syntax/extractor.go:76,187 @ v3.7.4`).
+    //
+    // Every accept/reject and every verdict below was also measured on
+    // `grafana/loki:3.7.4` (digest
+    // `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+    // `discover_log_levels: false`); the corpus file
+    // `tests/logqltest/corpus/b20_nested_ip.test` carries the captures.
+    // -----------------------------------------------------------------
+
+    /// The one reported position: the malformed filter IS the whole
+    /// `| <label filter>` stage. Parentheses are transparent in both
+    /// grammars (`syntax.y:307 @ v3.7.4`), so the wrapped form reports too.
+    #[test]
+    fn a_lone_malformed_ip_pipeline_stage_is_rejected() {
+        for query in [
+            r#"{x="y"} | logfmt | addr = ip("nope")"#,
+            r#"{x="y"} | logfmt | (addr = ip("nope"))"#,
+            r#"{x="y"} | logfmt | addr != ip("nope")"#,
+            r#"{x="y"} | logfmt | addr = ip("")"#,
+            r#"{x="y"} | logfmt | addr = ip("10.0.0.0/99")"#,
+            // A second stage is still a stage of its own.
+            r#"{x="y"} | logfmt | b="x" | addr = ip("nope")"#,
+        ] {
+            let err = CompiledPipeline::compile(&stages_of(query))
+                .expect_err(query)
+                .to_string();
+            assert!(err.contains("ip()"), "{query}: {err}");
+        }
+    }
+
+    /// Nested under any of the reference's four `labelFilter` combinators
+    /// (`and`, `,`, `or`, and parenthesised nesting) the pattern error is
+    /// never surfaced — the reference answers 200.
+    #[test]
+    fn a_malformed_ip_nested_under_and_or_comma_compiles() {
+        for query in [
+            r#"{x="y"} | logfmt | addr = ip("nope") and b="x""#,
+            r#"{x="y"} | logfmt | b="x" and addr = ip("nope")"#,
+            r#"{x="y"} | logfmt | addr = ip("nope"), b="x""#,
+            r#"{x="y"} | logfmt | addr = ip("nope") or b="x""#,
+            r#"{x="y"} | logfmt | b="x" or addr = ip("nope")"#,
+            r#"{x="y"} | logfmt | addr != ip("nope") and b="x""#,
+            r#"{x="y"} | logfmt | (addr = ip("nope") and b="x")"#,
+            r#"{x="y"} | logfmt | (addr = ip("nope") or b="zzz") or b="x""#,
+            // The nested form does not poison a LATER lone stage's report,
+            // and a later lone stage does not un-defer the nested one.
+            r#"{x="y"} | logfmt | addr = ip("nope") or b="x" | b="x""#,
+        ] {
+            CompiledPipeline::compile(&stages_of(query)).expect(query);
+        }
+    }
+
+    /// Post-`unwrap` filters are reduced, never staged, so EVERY position
+    /// is accepted there — a lone malformed filter included (measured: the
+    /// reference answers 200 for `… | unwrap val | addr = ip("nope")` and
+    /// 400 for the same filter placed before the `unwrap`).
+    #[test]
+    fn a_malformed_ip_after_unwrap_compiles_in_every_position() {
+        for query in [
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | addr = ip("nope") [5m])"#,
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | (addr = ip("nope")) [5m])"#,
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | addr != ip("nope") [5m])"#,
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | addr = ip("nope") and b="x" [5m])"#,
+            r#"sum_over_time({x="y"} | logfmt | unwrap val | b="x" | addr = ip("nope") [5m])"#,
+        ] {
+            CompiledPipeline::compile(&stages_of(query)).expect(query);
+        }
+        // The same filter one stage earlier — before the `unwrap` — is a
+        // pipeline stage again, and reports.
+        let query = r#"sum_over_time({x="y"} | logfmt | addr = ip("nope") | unwrap val [5m])"#;
+        CompiledPipeline::compile(&stages_of(query)).expect_err(query);
+    }
+
+    /// The verdict on a clean entry is `false` for `=` AND `!=` alike —
+    /// `ip.go`'s nil-matcher check precedes the operator switch, so `!=`
+    /// does not negate to `true`. Discriminating measurement: the
+    /// reference returns only the `b="y"` line for the `!=` query.
+    #[test]
+    fn a_malformed_nested_ip_is_false_for_both_operators() {
+        let kept = |query: &str, body: &str| {
+            run_sm_labels(
+                query,
+                body,
+                &[("service_name", "ipnest")],
+                &EMPTY_STRUCTURED_METADATA,
+            )
+            .is_some()
+        };
+        let eq_or = r#"{x="y"} | logfmt | addr = ip("nope") or b="x""#;
+        assert!(kept(eq_or, "addr=10.1.2.3 b=x"), "the `or` arm holds");
+        assert!(!kept(eq_or, "addr=10.1.2.3 b=y"), "both arms false");
+
+        let ne_or = r#"{x="y"} | logfmt | addr != ip("nope") or b="y""#;
+        assert!(
+            !kept(ne_or, "addr=10.1.2.3 b=x"),
+            "`!=` must NOT negate the malformed leaf to true"
+        );
+        assert!(kept(ne_or, "addr=192.168.1.1 b=y"), "the `or` arm holds");
+
+        let eq_and = r#"{x="y"} | logfmt | addr = ip("nope") and b="x""#;
+        assert!(!kept(eq_and, "addr=10.1.2.3 b=x"), "the `and` is false");
+    }
+
+    /// On an ERRORED entry the malformed leaf passes unconditionally, the
+    /// same short-circuit a well-formed `ip()` takes (`ip.go:124-127`
+    /// checks `HasErr` before the nil-matcher check).
+    #[test]
+    fn a_malformed_nested_ip_passes_an_errored_entry() {
+        let kept = |query: &str, body: &str| {
+            run_sm_labels(
+                query,
+                body,
+                &[("service_name", "ipjson")],
+                &EMPTY_STRUCTURED_METADATA,
+            )
+        };
+        for query in [
+            r#"{x="y"} | json | addr = ip("nope") or b="zzz""#,
+            r#"{x="y"} | json | addr != ip("nope") or b="zzz""#,
+        ] {
+            let got = kept(query, "not json at all").unwrap_or_else(|| panic!("{query}"));
+            assert!(
+                got.iter().any(|(k, _)| k == ERROR_LABEL),
+                "{query}: {got:?}"
+            );
+        }
+        // A CLEAN entry takes the `false` branch, so the `and` drops it.
+        assert_eq!(
+            kept(
+                r#"{x="y"} | json | addr = ip("nope") and b="zzz""#,
+                r#"{"addr":"10.1.2.3","b":"x"}"#
+            ),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #248 round 2: the error state a numeric conversion sets is
+    // visible to every leaf to its RIGHT in the same `| <label filter>`,
+    // and `or` short-circuits so a leaf to the right of a true operand
+    // never sets one. All expectations below were measured on the same
+    // pinned `grafana/loki:3.7.4`; the corpus block
+    // `b20_nested_ip.test` §"the error set to the LEFT of the leaf that
+    // reads it" carries them as captures.
+    // -----------------------------------------------------------------
+
+    /// `run` over `{x="y"}` with the line `body`, returning the final
+    /// label set, or `None` when the pipeline dropped the line.
+    fn filtered_labels(query: &str, body: &str) -> Option<Vec<(String, String)>> {
+        let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+        let base = vec![("x".to_string(), "y".to_string())];
+        Some(
+            compiled
+                .run(body, &base, 0)
+                .expect("no budget breach")?
+                .labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    fn error_of(labels: &[(String, String)]) -> Option<&str> {
+        labels
+            .iter()
+            .find(|(k, _)| k == ERROR_LABEL)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// A failed numeric conversion sets `__error__` where it happens, so
+    /// an `ip()` leaf — malformed or well formed — and an `__error__`
+    /// matcher to its RIGHT all see it. The entry kept is the one whose
+    /// `addr` was never tested: `192.168.1.1` is NOT in `10.0.0.0/8`.
+    #[test]
+    fn an_error_set_left_of_a_leaf_that_reads_it_is_visible_to_that_leaf() {
+        for query in [
+            r#"{x="y"} | logfmt | n > 1 and addr = ip("nope")"#,
+            r#"{x="y"} | logfmt | n > 1, addr = ip("nope")"#,
+            r#"{x="y"} | logfmt | n > 1 and addr != ip("nope")"#,
+            r#"{x="y"} | logfmt | n > 1 and addr = ip("10.0.0.0/8")"#,
+            r#"{x="y"} | logfmt | n > 1 and addr != ip("10.0.0.0/8")"#,
+            r#"{x="y"} | logfmt | n > 1 and __error__ = "LabelFilterErr""#,
+            // The duration and bytes families set the same error.
+            r#"{x="y"} | logfmt | d > 1s and addr = ip("nope")"#,
+        ] {
+            let labels = filtered_labels(query, "n=bad d=bad addr=192.168.1.1 b=x")
+                .unwrap_or_else(|| panic!("{query}: the errored entry must survive"));
+            assert_eq!(error_of(&labels), Some(LABEL_FILTER_ERROR), "{query}");
+        }
+        // The MIRROR IMAGE: with the operands swapped the `ip()` leaf runs
+        // before the error exists, is false, and the `and` drops the line.
+        assert_eq!(
+            filtered_labels(
+                r#"{x="y"} | logfmt | addr = ip("nope") and n > 1"#,
+                "n=bad addr=192.168.1.1 b=x"
+            ),
+            None
+        );
+        // And a CLEAN entry never takes the error branch at all: n=5 > 1
+        // holds, so the malformed leaf decides, and it is false.
+        assert_eq!(
+            filtered_labels(
+                r#"{x="y"} | logfmt | n > 1 and addr = ip("nope")"#,
+                "n=5 addr=10.1.2.3 b=y"
+            ),
+            None
+        );
+    }
+
+    /// The same on the METRIC path, which runs the identical stage but
+    /// through `run_metric_into`.
+    #[test]
+    fn an_error_set_left_of_an_ip_leaf_is_visible_to_it_on_the_metric_path() {
+        let query = r#"count_over_time({x="y"} | logfmt | n > 1 and addr = ip("nope") [5m])"#;
+        let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+        let base = vec![("x".to_string(), "y".to_string())];
+        let mut labels = Vec::new();
+        let MetricRun::Kept { .. } = compiled
+            .run_metric_into("n=bad addr=192.168.1.1 b=x", &base, 0, None, &mut labels)
+            .expect("no budget breach")
+        else {
+            panic!("the errored entry must survive the malformed ip() leaf");
+        };
+        assert!(
+            labels
+                .iter()
+                .any(|(k, v)| k == ERROR_LABEL && v == LABEL_FILTER_ERROR),
+            "{labels:?}"
+        );
+    }
+
+    /// `or` short-circuits (`label_filter.go:92-94`) and `and` does not,
+    /// so the SAME two operands in the two orders return the same entry
+    /// with and without `__error__`. This is the pair the reference was
+    /// measured on.
+    #[test]
+    fn an_or_with_a_true_left_operand_never_evaluates_the_right_one() {
+        let line = "n=bad b=x";
+        let short_circuited = filtered_labels(r#"{x="y"} | logfmt | b = "x" or n > 1"#, line)
+            .expect("the `or` holds on its left operand");
+        assert_eq!(
+            error_of(&short_circuited),
+            None,
+            "the right operand never ran, so nothing set an error: {short_circuited:?}"
+        );
+        let evaluated = filtered_labels(r#"{x="y"} | logfmt | n > 1 or b = "x""#, line)
+            .expect("the failed conversion returns true, which the `or` carries");
+        assert_eq!(error_of(&evaluated), Some(LABEL_FILTER_ERROR));
+    }
+
+    /// The short-circuit CHAINS. `a or b or c` parses left-deep, so `a`
+    /// being true must skip `b`, `c` AND both `Or` ops — a jump that
+    /// stopped one level up would land on `c` and evaluate it.
+    #[test]
+    fn an_or_short_circuit_chains_through_a_left_deep_chain() {
+        let labels = filtered_labels(
+            r#"{x="y"} | logfmt | b = "x" or c = "zzz" or n > 1"#,
+            "n=bad b=x c=q",
+        )
+        .expect("the leftmost operand holds");
+        assert_eq!(
+            error_of(&labels),
+            None,
+            "`n > 1` sits two `or`s to the right of a true operand: {labels:?}"
+        );
+        // Four wide, to show the chain is not two-deep by accident.
+        let labels = filtered_labels(
+            r#"{x="y"} | logfmt | b = "x" or c = "zzz" or c = "qqq" or n > 1"#,
+            "n=bad b=x c=q",
+        )
+        .expect("the leftmost operand holds");
+        assert_eq!(error_of(&labels), None, "{labels:?}");
+    }
+
+    /// A RIGHT-nested `or` short-circuits within its own subtree without
+    /// inheriting the enclosing one's destination — the case the chaining
+    /// pass must NOT apply.
+    #[test]
+    fn a_right_nested_or_short_circuits_only_past_its_own_operand() {
+        let labels = filtered_labels(
+            r#"{x="y"} | logfmt | b = "zzz" or (c = "q" or n > 1)"#,
+            "n=bad b=x c=q",
+        )
+        .expect("the inner `or`'s left operand holds");
+        assert_eq!(
+            error_of(&labels),
+            None,
+            "the inner `or` skipped `n > 1`: {labels:?}"
+        );
+        // The enclosing `or` still combines correctly when the inner one
+        // is false throughout: `n > 1` runs, errors, and returns true.
+        let labels = filtered_labels(
+            r#"{x="y"} | logfmt | b = "zzz" or (c = "zzz" or n > 1)"#,
+            "n=bad b=x c=q",
+        )
+        .expect("the failed conversion returns true");
+        assert_eq!(error_of(&labels), Some(LABEL_FILTER_ERROR));
+    }
+
+    /// An `and` NEVER short-circuits, so its right operand runs even when
+    /// the left is false — and the verdict stack survives a mixed tree.
+    #[test]
+    fn an_and_between_two_or_chains_keeps_the_verdict_stack_balanced() {
+        // (true-by-short-circuit) and (false or true) -> kept.
+        let labels = filtered_labels(
+            r#"{x="y"} | logfmt | (b = "x" or n > 1) and (c = "zzz" or c = "q")"#,
+            "n=bad b=x c=q",
+        )
+        .expect("both sides of the `and` hold");
+        assert_eq!(error_of(&labels), None, "{labels:?}");
+        // The same shape with the right side false drops the line.
+        assert_eq!(
+            filtered_labels(
+                r#"{x="y"} | logfmt | (b = "x" or n > 1) and (c = "zzz" or c = "yyy")"#,
+                "n=bad b=x c=q"
+            ),
+            None
+        );
+    }
+
+    /// The FIRST error wins across a whole filter, and it is the first in
+    /// EVALUATION order — the reference's `if !lbs.HasErr()` guard on a
+    /// left-to-right walk. `n` fails before `d` does, so the detail is
+    /// the float message.
+    #[test]
+    fn the_first_conversion_failure_in_evaluation_order_owns_the_detail() {
+        let labels = filtered_labels(r#"{x="y"} | logfmt | n > 1 and d > 1s"#, "n=bad d=bad")
+            .expect("both operands return true");
+        assert_eq!(error_of(&labels), Some(LABEL_FILTER_ERROR));
+        assert_eq!(
+            labels
+                .iter()
+                .find(|(k, _)| k == ERROR_DETAILS_LABEL)
+                .map(|(_, v)| v.as_str()),
+            Some("strconv.ParseFloat: parsing \"bad\": invalid syntax"),
+            "{labels:?}"
+        );
+        let labels = filtered_labels(r#"{x="y"} | logfmt | d > 1s and n > 1"#, "n=bad d=bad")
+            .expect("both operands return true");
+        assert_eq!(
+            labels
+                .iter()
+                .find(|(k, _)| k == ERROR_DETAILS_LABEL)
+                .map(|(_, v)| v.as_str()),
+            Some("time: invalid duration \"bad\""),
+            "{labels:?}"
+        );
+    }
+
+    /// `or_jumps` is EMPTY unless the program contains an `Or` — the
+    /// common shapes must not pay an allocation for a table of sentinels.
+    #[test]
+    fn or_jumps_is_allocated_only_for_programs_that_contain_an_or() {
+        let program = |query: &str| {
+            let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+            compiled
+                .stages
+                .iter()
+                .find_map(|s| match s {
+                    CompiledStage::LabelFilter(f) => Some(f.clone()),
+                    _ => None,
+                })
+                .expect("a label-filter stage")
+        };
+        for query in [
+            r#"{x="y"} | logfmt | b = "x""#,
+            r#"{x="y"} | logfmt | b = "x" and n > 1"#,
+            r#"{x="y"} | logfmt | b = "x" and (n > 1 and c = "q")"#,
+        ] {
+            assert!(program(query).or_jumps.is_empty(), "{query}");
+        }
+        // `a or b or c` -> [a, b, Or, c, Or]: `a` chains past BOTH ops to
+        // the end, and the inner `Or` (index 2) jumps past the outer one.
+        let f = program(r#"{x="y"} | logfmt | b = "x" or c = "q" or n > 1"#);
+        assert_eq!(f.ops.len(), 5);
+        assert_eq!(f.or_jumps, vec![5, NO_JUMP, 5, NO_JUMP, NO_JUMP]);
+        // `a or (b or c)` -> [a, b, c, Or, Or]: the inner `Or` is a RIGHT
+        // operand, so its left child jumps only past the inner op.
+        let f = program(r#"{x="y"} | logfmt | b = "x" or (c = "q" or n > 1)"#);
+        assert_eq!(f.ops.len(), 5);
+        assert_eq!(f.or_jumps, vec![5, 4, NO_JUMP, NO_JUMP, NO_JUMP]);
     }
 }

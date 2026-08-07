@@ -1278,26 +1278,140 @@ fn parse_log_range(cursor: &mut Cursor<'_>) -> Result<LogRange, LogQlError> {
 ///   layer down, where a saturating shift relocated the evaluation
 ///   window, and nothing downstream can detect an already-altered offset.
 ///
-///   **The cap is OURS; the reference has none here.** MEASURED on the
-///   digest-pinned v3.7.4 oracle (`grafana/loki@sha256:87f0a067…`,
-///   `/status/buildinfo` reporting `3.7.4` / `b318f282`), the reference
-///   accepts the whole `i64` nanosecond domain, asymmetrically:
+///   **The cap is OURS; the reference caps no offset magnitude here.**
+///   MEASURED on the digest-pinned v3.7.4 oracle
+///   (`grafana/loki@sha256:87f0a067…`, `/loki/api/v1/status/buildinfo`
+///   reporting `3.7.4` / `b318f282` — that is the only path the
+///   reference serves it on, registered twice at that one path:
+///   `pkg/loki/loki.go:601 @ v3.7.4` on the internal server, guarded by
+///   `if t.Cfg.InternalServer.Enable`, and `:603` unconditionally on the
+///   public one; bare `/status/buildinfo` and `/api/v1/status/buildinfo`
+///   are both a measured `404`), the reference's LEXER admits the whole `i64`
+///   nanosecond domain, asymmetrically. The LEXER, said deliberately:
+///   HTTP acceptance stops one value short of that band, and the
+///   endpoint it drops is the next paragraph's subject, so this sentence
+///   is not a wire-acceptance claim (issue #248 round 9; the same
+///   sentence had already been narrowed the same way at three other
+///   sites — `limits.rs`'s `MAX_QUERY_SPAN_NS`, `docs/features.md`'s
+///   LogQL parity paragraph, and the `five-year-span-cap` ledger row —
+///   and this was the fourth.
+///
+///   **FOUR SITES ARE AUDITED. THE SET IS NOT PROVEN CLOSED**, and a
+///   fifth unqualified claim may exist in wording none of the sweeps
+///   below matches. Rounds 9 and 10 wrote "those four are the whole
+///   set"; the sweeps do not carry a universal, so the claim is
+///   withdrawn (issue #248 round 11). They are written out verbatim
+///   here, counts as of `3e04428`, so the next reader re-runs them
+///   instead of trusting a number.
+///   Sweep 1, the keyword: `git grep -lI five-year-span-cap` → 5 files,
+///   whose fifth, `pulsus_read`'s `QuerySpanTooLong`, quantifies over no
+///   band at all. CIRCULAR on its own — a file could describe the band
+///   and never name the row.
+///   Sweep 2, band markers, keyword-free:
+///   `git grep -nI -iE 'offset' | grep -E 'i64|2562047|9223372036854775|43800|43801'`
+///   → 88 lines in 27 files AT `3e04428`; the 23 not also in sweep 1 are
+///   `pub offset_ns: i64`-class type declarations, PromQL/OTLP/template
+///   arithmetic, and `b19_offset.test`'s
+///   `offset-domain-edge-exact-arithmetic` block, read by hand.
+///   Sweep 3, unbounded-acceptance phrases within ±12 lines of a line
+///   matching `offset`, keyword-free. The matcher is INLINED into the
+///   command, never held in a shell variable, so what is printed is what
+///   runs in a shell that has never seen this file. An earlier revision
+///   spelled the matcher out in prose and passed it as `"$PH"` without
+///   showing the assignment: run as printed, `$PH` expands to the empty
+///   regex, which every line matches, and the loop selects every file it
+///   scans instead of 13 — 229 files, both at `42806d2` and over the tree
+///   carrying this sentence, since the scanned set is `git grep -lI -i
+///   offset` and this file was already in it (issue #248 round 12,
+///   reproduced with `env -u PH`).
+///   `for f in $(git grep -lI -i offset); do grep -i -C12 -E offset "$f" |
+///   grep -qiE 'unbounded|uncapped|no cap|imposes no|admits|accepts (any|the|every)' &&
+///   echo "$f"; done | sort -u`
+///   → 13 files, the 9 not also in sweep 1 read by hand and carrying
+///   no claim about the reference's offset band: a TraceQL cap, a
+///   parser-vendoring note, `admits_instant`, a local named `uncapped`,
+///   and three copies of "the only unbounded quantity left is where the
+///   REQUEST sits", which is the other ledger row.
+///
+///   Three ways those sweeps fall short of closure, each reproducible.
+///   NEITHER keyword-free sweep contains sweep 1's set: both MISS
+///   `crates/pulsus-read/src/logql/error.rs`, so each drops a KNOWN
+///   member. Round 10 charged that failure against a line-scoped variant
+///   of sweep 3 only and offered sweep 3 as the repair; sweep 3 has it
+///   too, and had it silently: round 10 gave sweep 2's residue as 22 of
+///   27, which subtracts all five keyword files from it. Only four are
+///   in it, so the residue is 23. Compute the intersection; do not
+///   subtract an assumed containment.
+///   Sweep 3's count is a function of its matcher — widening it by
+///   `whole i64|entire|no limit` takes 13 → 20 — so no single number
+///   from it means anything without the list beside it. And sweep 2
+///   COUNTS ITS OWN DESCRIPTION: the line spelling out its markers,
+///   above, matches it, so its total moves whenever this paragraph is
+///   edited. That is the entire 87-vs-88 disagreement between rounds 10
+///   and 11: 87 at `b3bd6c3`, 88 at `3e04428` — the one added line being
+///   this sweep's own text — and neither round quoted the SHA it counted
+///   at, which is why two correct measurements read as a contradiction.
+///   Writing this paragraph out costs two more self-matches and saves
+///   one, so over the tree carrying this sentence the same command
+///   returns 89. Quote the SHA with the number or do not quote the
+///   number.)
 ///   `offset 2562047h47m16s854ms775us807ns` (`i64::MAX`) → 200, one ns
 ///   more → 400 `syntax error: unexpected NUMBER, expecting DURATION`;
-///   `offset -9223372036854775808ns` (`i64::MIN`) → 200, one ns more
-///   negative → 400 `syntax error: unexpected -, expecting DURATION`.
+///   `offset -9223372036854775808ns` (`i64::MIN`) is the lexer's floor,
+///   one ns more negative → 400 `syntax error: unexpected -, expecting
+///   DURATION`.
 ///
-///   That asymmetry is not an accident of its own: the magnitude is lexed
-///   by `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`), which
-///   tries `model.ParseDuration` first — vendored
-///   `prometheus/common/model/time.go:249-255`, rejecting `dur > 1<<63-1`
-///   as `duration out of range` — and falls back to Go's
-///   `time.ParseDuration`, whose floor is `-1<<63`. A leading `-` fails
-///   the Prometheus parser outright (it demands a leading digit), so the
-///   negative form always lands on the stdlib fallback and reaches
-///   `i64::MIN`. Recorded because our cap sits far inside it: the whole
-///   `i64` band is reference-accepted and PulsusDB-refused, ledgered as
-///   `five-year-span-cap`.
+///   Those are LEXER verdicts. On the WIRE the whole negative `i64` band
+///   is a `200` SAVE `i64::MIN` itself, which a frontend that has not
+///   already answered its neighbour REFUSES (issue #248 rounds 5 to 7; round 5
+///   reported that `400` as unconditional, round 6's wording made the
+///   `200` unconditional instead, and it is neither). The refusal is
+///   `400 this data is no longer available, it is past now -
+///   max_query_lookback (0s)`:
+///   the value parses, and what refuses it is Go's `-offset` overflowing
+///   at that one value inside the shard resolver's `through =
+///   end.Add(-Offset)` while `from = start.Add(-(Interval + Offset))`
+///   moves the other way, inverting the window
+///   (`pkg/querier/queryrange/shard_resolver.go:94-104`,
+///   rejected at `pkg/querier/limits/validation.go:92-94` @ v3.7.4).
+///   Only a warm cache turns it into a `200`:
+///   `cache_index_stats_results` (default true,
+///   `pkg/querier/queryrange/roundtrip.go:66`) answers it from the
+///   `i64::MIN + 1` entry — the two are one nanosecond apart and the
+///   index-stats request is in milliseconds. Set that option to `false`
+///   and the `400` stands in every probe order. It is an artefact of one
+///   value rather than a bound — `i64::MIN + 1` is a `200` in any order,
+///   with the cache on or off — but the accepted band this paragraph
+///   describes therefore stops one value short of the domain. The
+///   order-dependent probe table is in the `five-year-span-cap` ledger
+///   row.
+///
+///   That asymmetry is not an accident of its own, and it is ONE
+///   function's doing. The magnitude is lexed by `parseDuration` (v3.7.4
+///   `pkg/logql/syntax/lex.go:326`), which tries the vendored
+///   `model.ParseDuration` and falls back to Go's `time.ParseDuration`.
+///   Both endpoints above are spelled in units `model` does not have —
+///   its map is `ms`/`s`/`m`/`h`/`d`/`w`/`y`, no `us` and no `ns`
+///   (`vendor/github.com/prometheus/common/model/time.go:189-200` @
+///   v3.7.4) — and a leading `-` fails its leading-digit check (`:219`)
+///   besides, so neither endpoint reaches `model`'s overflow branches at
+///   all; the stdlib decides both. There the total accumulates in a
+///   `uint64` the loop lets reach `1<<63` (`src/time/format.go:1707` at
+///   go1.25.5, `:1717` at the go1.26.5 the reference is actually built
+///   with), and a negative returns at `if neg {
+///   return -Duration(d) }` (`:1711` / `:1721`) BEFORE the positive-only
+///   `d > 1<<63-1` (`:1714` / `:1724`) — the two toolchains' arithmetic
+///   is identical and the line numbers are the whole of the difference,
+///   compared in
+///   [`tests::both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`].
+///   Hence a ceiling of `i64::MAX` and a floor
+///   of `i64::MIN`, one check on each side. Recorded because our cap
+///   sits far inside it: the `i64` band, its negative endpoint aside, is
+///   reference-accepted and PulsusDB-refused, ledgered as
+///   `five-year-span-cap`. PAST that band the reference refuses too (the
+///   three rows in
+///   [`tests::both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp`]),
+///   so there is no divergence out there to record.
 ///
 /// The keyword goes through [`is_kw`] like every other keyword in this
 /// file (issue #339's rule): the reference's lexer folds keywords, so
@@ -1343,10 +1457,12 @@ fn parse_offset(cursor: &mut Cursor<'_>) -> Result<Option<i64>, LogQlError> {
 /// never a clamped value: someone asking for a stupid number is told
 /// plainly rather than silently handed a different answer.
 ///
-/// **A deliberate divergence.** The reference bounds neither literal
-/// below the `i64` domain and bounds no query span at all; retention is
-/// days to months, so this refuses nothing a real deployment does.
-/// Ledgered as `five-year-span-cap`.
+/// **A deliberate divergence**, and a narrower one than this comment
+/// used to claim: the reference DOES bound a query's span, through
+/// `max_query_length` (default `721h`), over a window that includes the
+/// `[range]` selector but not the offset. Retention is days to months,
+/// so this refuses nothing a real deployment does. The re-measurement
+/// and the source lines are on the `five-year-span-cap` ledger row.
 fn check_span(
     what: &'static str,
     nanos: u64,
@@ -1612,12 +1728,132 @@ mod tests {
     /// one layer above the code it fixed, and undetectable from below. The
     /// cap subsumes it: nothing past 43,800 h reaches a conversion at all.
     ///
-    /// Every rejected case here is a reference **200** (measured on the
-    /// digest-pinned v3.7.4 oracle `grafana/loki@sha256:87f0a067…`,
-    /// buildinfo `3.7.4` / `b318f282`: it accepts the whole `i64`
-    /// nanosecond domain for both literals, e.g. `offset 2562047h` and
-    /// `[2562047h]`). That is the ledgered `five-year-span-cap`
-    /// divergence, and this test is what pins it.
+    /// The offsets rejected here that the reference's own lexer ACCEPTS
+    /// are reference **200**s — measured on the digest-pinned v3.7.4
+    /// oracle `grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` /
+    /// `b318f282`: `offset ±43801h` and
+    /// `offset 2562047h47m16s854ms775us807ns` are all 200s, instant and
+    /// range alike, because the offset cancels out of the window
+    /// `max_query_length` is measured over. That is the ledgered
+    /// `five-year-span-cap` divergence and this test is what pins it.
+    ///
+    /// The three out-of-`i64` literals in the refusal list below are NOT
+    /// that. All three are measured reference `400`s at the LEXER on the
+    /// same oracle: `9223372036854775808ns` and `18446744073709551615ns`
+    /// both give `parse error at line 1, col 38: syntax error: unexpected
+    /// NUMBER, expecting DURATION`, and `-9223372036854775809ns` gives
+    /// `unexpected -, expecting DURATION`. Those rows are reject PARITY,
+    /// not divergence — the paragraph above used to cover them with an
+    /// "every".
+    ///
+    /// **Which branch refuses each — TWO branches over the three rows,
+    /// not one and not three.**
+    /// `parseDuration` (v3.7.4 `pkg/logql/syntax/lex.go:326`) tries the
+    /// vendored `model.ParseDuration` and falls back to Go's
+    /// `time.ParseDuration`. NEITHER of `model`'s two overflow checks is
+    /// what fires here, which this comment used to say it was: its unit
+    /// map is `ms`/`s`/`m`/`h`/`d`/`w`/`y` with no `ns` at all
+    /// (`vendor/github.com/prometheus/common/model/time.go:189-200` @
+    /// v3.7.4, prometheus/common v0.67.5), so a pure-`ns` literal stops
+    /// at the unit lookup with `unknown unit "ns"` (`:240-242`) and
+    /// never reaches `v > 1<<63/unit.mult` or `dur > 1<<63-1`
+    /// (`:249-255`); the `-` form stops one check earlier still, at the
+    /// leading-digit test (`:219`). All three are therefore decided by
+    /// the stdlib, and the first row's branch is not the other two's.
+    /// Line numbers below are `go1.25.5 src/time/format.go`'s; the
+    /// TOOLCHAIN THE REFERENCE ITSELF USES IS go1.26.5, and that is now
+    /// the version compared rather than assumed (issue #248 round 9 —
+    /// an earlier wording generalised from go1.23 and go1.25.5, neither
+    /// of which the reference builds with). Loki v3.7.4 declares
+    /// `go 1.26.5` (`go.mod:3`, `cmd/loki/Dockerfile:1
+    /// ARG GO_VERSION=1.26.5`) and the digest-pinned image's own binary
+    /// agrees: `go version -m` on `/usr/bin/loki` extracted from
+    /// `grafana/loki@sha256:87f0a067…` prints `go1.26.5` and
+    /// `mod github.com/grafana/loki/v3 v3.0.0-20260722033256-b318f2829f0a`
+    /// (the build-info endpoint cannot answer this. Measured on the
+    /// pinned digest: `GET /loki/api/v1/status/buildinfo` → `200`
+    /// `{"version":"3.7.4","revision":"b318f282",…,"goVersion":""}`.
+    /// That path is the endpoint — the only one it is served on,
+    /// registered at that one path twice: `pkg/loki/loki.go:601 @ v3.7.4`
+    /// on the internal server, behind `if t.Cfg.InternalServer.Enable`,
+    /// and `:603` unconditionally on the public one; bare
+    /// `/status/buildinfo` and `/api/v1/status/buildinfo` are both `404`,
+    /// which is what this comment named until issue #248 round 10.
+    ///
+    /// **Empty in the RELEASE build, which is the build we pin — not
+    /// unpopulatable in principle.** The release `ldflags` set
+    /// Branch/Version/Revision/BuildUser/BuildDate and NOT `GoVersion`
+    /// (`Makefile:46-50` @ v3.7.4), and `versionHandler` reads the
+    /// package var `build.GoVersion` directly
+    /// (`pkg/loki/version_handler.go:12-20`,
+    /// `pkg/util/build/build.go:14-21` @ v3.7.4) rather than
+    /// `build.GetVersion()`, the accessor whose `init()` fills the field
+    /// from `runtime.Version()` (`build.go:23-30`) — so nothing in a
+    /// release build ever assigns it. That is a fact about the shipped
+    /// binary, not about the tree: `-X …/pkg/util/build.GoVersion=…` at
+    /// link time, or a plain assignment, populates it, and the
+    /// reference's own `version_handler_test.go:20 @ v3.7.4` sets
+    /// `build.GoVersion = "42"` and requires the handler to echo it
+    /// (`:36` in the expected literal opened at `:30`, `assert.JSONEq`
+    /// at `:40`) —
+    /// RUN, not merely read: `go test ./pkg/loki/ -run
+    /// '^TestVersionHandler$'` on the v3.7.4 checkout passes, under the
+    /// go1.26.5 the module declares. Round 10 wrote "structurally so,
+    /// not by accident of this image", which claims no build of the tree
+    /// can populate it; a missing ldflag cannot show that, and that
+    /// passing test refutes it. What the ldflag DOES establish is the
+    /// only thing this comment needs — the release binary we pin
+    /// reports it empty (issue #248 round 11)).
+    /// Against go1.26.5's `src/time/format.go`:
+    /// `leadingInt` is byte-identical to go1.25.5's and at the SAME
+    /// lines (`:1554-1572`, ceiling `:1566`), `unitMap` is
+    /// byte-identical (moved to `:1615`), and `ParseDuration` differs at
+    /// ten lines, ALL of them error construction —
+    /// `errors.New("time: … " + quote(orig))` became
+    /// `&parseDurationError{…}`, whose `Error()` renders the identical
+    /// string (`:1606-1613`). No arithmetic, no control flow: the three
+    /// branches cited below sit unchanged at `:1717` / `:1721` /
+    /// `:1724`, i.e. go1.25.5's `:1707` / `:1711` / `:1714` shifted by
+    /// the ten lines that type occupies. Measured as well as read: nine
+    /// literals — the three refusals and two discriminators below,
+    /// `-9223372036854775808ns`, both `i64::MAX` spellings
+    /// (`9223372036854775807ns` and
+    /// `2562047h47m16s854ms775us807ns`) and the one-nanosecond-over
+    /// `2562047h47m16s854ms775us808ns` — through `time.ParseDuration`
+    /// under BOTH toolchains give byte-identical verdicts and error
+    /// texts. So the branch does not turn on the toolchain, and that is
+    /// now checked at the one toolchain that matters:
+    ///
+    /// - `9223372036854775808ns` is `1<<63` EXACTLY. `leadingInt`
+    ///   admits it — its ceiling is `1<<63` itself (`:1566`) — and the
+    ///   in-loop `d > 1<<63` (`:1707`) does not fire either. What
+    ///   refuses it is the trailing POSITIVE-ONLY `d > 1<<63-1`
+    ///   (`:1714`), which is also why the identical magnitude spelled
+    ///   `-9223372036854775808ns` parses: `if neg { return -Duration(d) }`
+    ///   (`:1711`) returns before that check.
+    /// - `18446744073709551615ns` (`1<<64 - 1`) never reaches a unit at
+    ///   all: `leadingInt` overflows on the digits at `x > 1<<63`
+    ///   (`:1566`).
+    /// - `-9223372036854775809ns` is that SAME `leadingInt` overflow, on
+    ///   the magnitude, after `model` refused the leading `-`. So these
+    ///   two share a branch and the first row does not.
+    ///
+    /// Which branch it is cannot be read off the wire — the lexer
+    /// discards `parseDuration`'s error and emits NUMBER (or, for the
+    /// `-` form, the `-` rune), so all of them surface as the one syntax
+    /// error. Established by running the vendored file and the stdlib
+    /// over these literals plus two discriminators that separate
+    /// `leadingInt` from the unit lookup: `9223372036854775808x` gives
+    /// `unknown unit "x"` (so `leadingInt` passed) while
+    /// `18446744073709551615x` gives `invalid duration` (so it did not).
+    ///
+    /// The `[range]` half is NOT symmetric with it, which this comment
+    /// used to imply by saying "both literals": on a range query the
+    /// selector counts against `max_query_length` (`[720h]` over a `1h`
+    /// request span is already a 400 there), and on an instant query the
+    /// reference admits it and then decomposes it into per-hour
+    /// subqueries that do not answer. Issue #248 round 5 re-measured
+    /// both; the ledger row carries the table.
     #[test]
     fn both_duration_literals_cap_at_five_years_and_refuse_rather_than_clamp() {
         const CAP: i64 = MAX_QUERY_SPAN_NS;

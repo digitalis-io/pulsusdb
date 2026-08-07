@@ -719,8 +719,14 @@ pub enum ReadError {
     /// input error, a clean 400 `bad_data`, never a clamped window. It is
     /// what closes the remaining absurd-input hole: a `start` in 1677 with
     /// an ordinary `offset 1h` still walks off the representable
-    /// timestamp domain. A deliberate divergence (the reference bounds no
-    /// query span at all), ledgered as `five-year-span-cap`.
+    /// timestamp domain. A deliberate divergence, ledgered as
+    /// `five-year-span-cap` — though on THIS axis the reference is the
+    /// stricter of the two: its `max_query_length` defaults to `721h`,
+    /// well inside our 5 years, so at that default this rejection only
+    /// ever fires where the reference rejects first (the limit is
+    /// per-tenant configurable there, and `0` disables it). The ledger row carries the
+    /// re-measurement; the divergence that remains is the `offset`
+    /// magnitude, capped in the parser.
     #[error("query time range of {value} ns is outside the supported range (0 to {max} ns)")]
     QuerySpanTooLong { value: i128, max: i64 },
 

@@ -205,15 +205,19 @@ fn per_row_allocation_bounds_hold() {
          (the captured value + the detail string), not a per-row growth series"
     );
 
-    // --- Issues #99 + #104: a compound `and`/`or` label filter can
-    // --- absorb a sibling's conversion failure into a definite outcome
-    // --- (masking). `eval_label_filter`'s `failed` capture must borrow,
-    // --- never allocate, the offending value — the owned detail string
-    // --- is built only in the caller's surviving `None` arm.
+    // --- Issues #99 + #104: a compound `and`/`or` label filter can leave
+    // --- a sibling's conversion failure unobservable — the line is
+    // --- dropped, or `or` short-circuited past the failing leaf.
+    // --- `eval_label_filter`'s `failed` capture must borrow, never
+    // --- allocate, the offending value; the owned detail string is built
+    // --- only by the caller, only on the KEPT path (issue #248 round 2:
+    // --- the evaluator now commits the error at the leaf, but the
+    // --- STRING it would need stays deferred for exactly this reason).
     //
-    // Masked AND: `level = "warn"` is definite-false over every body
-    // (`level=info`), so `and` absorbs the sibling's duration-conversion
-    // failure into `Some(false)` — dropped, ZERO allocations per row.
+    // Unobservable AND: `level = "warn"` is false over every body
+    // (`level=info`). `and` does not short-circuit, so `took > 250ms`
+    // still runs and still fails, but `false && true` drops the line and
+    // the detail is never built — ZERO allocations per row.
     let masked_and_total = count_run_into(
         r#"{a="b"} | logfmt | level = "warn" and took > 250ms"#,
         &bad_dur_bodies,
@@ -221,15 +225,14 @@ fn per_row_allocation_bounds_hold() {
     );
     assert!(
         masked_and_total <= ZERO_RESIDUE,
-        "masked-and: {masked_and_total} allocations over {ROWS} rows — the compound label \
-         filter must not allocate the sibling's absorbed conversion failure"
+        "unobservable-and: {masked_and_total} allocations over {ROWS} rows — the compound \
+         label filter must not allocate a detail string for a line it drops"
     );
 
-    // Masked OR: `level = "info"` is definite-true over every body, so
-    // `or` absorbs the sibling's duration-conversion failure into
-    // `Some(true)` — kept, and must cost no more than a clean keep with
-    // no error at all (differential: masked bodies vs bodies whose
-    // duration converts cleanly, so no error is ever captured).
+    // Short-circuited OR: `level = "info"` is true over every body, so
+    // `or` returns before `took > 250ms` runs at all — kept, and must
+    // cost no more than a clean keep with no error (differential:
+    // failing bodies vs bodies whose duration converts cleanly).
     let good_dur_bodies: Vec<String> = (0..64)
         .map(|i| format!("level=info took={}ms", 300 + i))
         .collect();
@@ -245,8 +248,8 @@ fn per_row_allocation_bounds_hold() {
     );
     assert!(
         masked_or_total <= clean_or_total + ZERO_RESIDUE,
-        "masked-or: {masked_or_total} allocations over {ROWS} rows vs {clean_or_total} for a \
-         clean keep — the absorbed conversion failure must not cost more than a normal keep"
+        "short-circuited-or: {masked_or_total} allocations over {ROWS} rows vs \
+         {clean_or_total} for a clean keep — a skipped operand must not cost anything"
     );
 
     // --- Assembly paths (`run_pipeline_rows` end to end). Output
