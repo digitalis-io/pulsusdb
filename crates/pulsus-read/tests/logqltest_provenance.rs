@@ -1822,7 +1822,7 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// same file-level `captured` default. As elsewhere, an `eval_fail`'s
 /// `msg:` gate is PulsusDB's own wording while the REJECTION it pins was
 /// captured.
-const CAPTURED: usize = 1_283;
+const CAPTURED: usize = 1_284;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1831,5 +1831,5 @@ const CAPTURED: usize = 1_283;
 const DERIVED: usize = 31;
 const DIVERGENCE: usize = 18;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_364;
+const TOTAL: usize = 1_365;
 // corpus-counts: end (provenance-corpus-constants)

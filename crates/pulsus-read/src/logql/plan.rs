@@ -28,7 +28,7 @@ use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_s
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
-use super::pipeline::{PipelineError, RangeGrouping};
+use super::pipeline::{CompiledPipeline, PipelineError, RangeGrouping};
 use super::sql::ScanLowerBound;
 use super::window::{ClientWindow, GridWindow};
 
@@ -2603,6 +2603,42 @@ fn build_variants_node(
             }
             _ => None,
         };
+        // **Issue #247: a variant's own pipeline is VALIDATED even though
+        // nothing consumes it.** Everything before the first `unwrap` is
+        // dead syntax at evaluation — [`variant_tail`] discards it, and
+        // so does the reference (`variantRangeAggExprExtractor` passes
+        // `nil` stages, `pkg/logql/syntax/extractor.go:186`, `:225 @
+        // v3.7.4`). But the reference still BUILDS it:
+        // `newVariantsEvaluator` calls `variant.Extractors()`
+        // (`pkg/logql/evaluator.go:1417 @ v3.7.4`) and then uses only the
+        // LENGTH of the result (`for range extractors`, `:1422`), so a
+        // malformed stage in a variant is a 400 there even though the
+        // stage never runs. Measured on the pinned container, and NOT
+        // data-dependent — 400 with and without matching rows, and with
+        // the malformed side on either selector:
+        //
+        //   variants(count_over_time({s} | logfmt a="b.c" [5m])) of (…)   400
+        //   variants(count_over_time({s} | line_format "{{" [5m])) of (…) 400
+        //   variants(count_over_time({s} | addr=ip("nope") [5m])) of (…)  400
+        //
+        // So compile it here and throw the result away, which is exactly
+        // what the reference does.
+        //
+        // Only the DISCARDED PREFIX, not the whole variant pipeline: the
+        // complement is [`variant_tail`], which `VariantArena::build`
+        // already compiles as `common ++ tail` before any I/O
+        // (`exec.rs`'s `run_variants` — "the arena compiles before any
+        // I/O (a bad regex is a 400, never a wasted scan)"). Compiling
+        // the whole pipeline here would validate the tail a second time
+        // and allocate for it, which the per-variant allocation band in
+        // `logql_variants_alloc.rs` measures. `common_stages` is exactly
+        // that complement — everything before the first `Stage::Unwrap`.
+        //
+        // The whole surface is pinned by
+        // `tests/logql_logfmt_expr_matrix.rs`'s `variants_variant_side`
+        // position; `variant_pipelines_are_validated_though_nothing_runs_them`
+        // below is the unit-level guard.
+        CompiledPipeline::compile(common_stages(pipeline))?;
         let tail = variant_tail(pipeline);
         let value = if has_unwrap {
             ClientValue::Unwrap
@@ -4668,6 +4704,49 @@ mod tests {
         };
         let expr = parse(query).expect("parse");
         plan(&expr, &params, &test_ctx())
+    }
+
+    /// **Issue #247 round 2: a variant's own pipeline is validated even
+    /// though nothing runs it.** Everything before a variant's first
+    /// `unwrap` is discarded by [`variant_tail`], so until this the
+    /// planner had nothing left to refuse and every malformed stage in a
+    /// variant was accepted. The reference refuses them — it builds the
+    /// variant's extractor purely to count it
+    /// (`pkg/logql/evaluator.go:1417`, `:1422 @ v3.7.4`) — and the first
+    /// three classes below were measured as 400 on the pinned container.
+    ///
+    /// Deleting the `CompiledPipeline::compile(pipeline)?` line in
+    /// `build_variants_node` reddens this on the first case.
+    #[test]
+    fn variant_pipelines_are_validated_though_nothing_runs_them() {
+        for query in [
+            // the logfmt extraction sub-grammar (this issue)
+            r#"variants(count_over_time({a="b"} | logfmt v="x.y" [5m])) of ({a="b"}[5m])"#,
+            // a malformed `line_format` template
+            r#"variants(count_over_time({a="b"} | line_format "{{" [5m])) of ({a="b"}[5m])"#,
+            // a malformed `ip()` pattern, in the one position #248
+            // established the reference reports it
+            r#"variants(count_over_time({a="b"} | logfmt | addr=ip("nope") [5m])) of ({a="b"}[5m])"#,
+            // an uncompilable regex in a variant parser stage
+            r#"variants(count_over_time({a="b"} | regexp "(" [5m])) of ({a="b"}[5m])"#,
+        ] {
+            let err = plan_of(query, range_spec()).expect_err(query).to_string();
+            assert!(
+                !err.is_empty(),
+                "{query} must be refused with a reason, not silently"
+            );
+        }
+        // The CONTROL: a well-formed variant pipeline still plans, so the
+        // rule refuses malformed STAGES rather than variants that carry a
+        // pipeline at all.
+        for query in [
+            r#"variants(count_over_time({a="b"} | logfmt v="x" [5m])) of ({a="b"}[5m])"#,
+            r#"variants(count_over_time({a="b"} | logfmt | addr=ip("10.0.0.0/8") [5m])) of ({a="b"}[5m])"#,
+            r#"variants(sum_over_time({a="b"} | logfmt | unwrap v [5m])) of ({a="b"}[5m])"#,
+            r#"variants(count_over_time({a="b"}[5m])) of ({a="b"}[5m])"#,
+        ] {
+            plan_of(query, range_spec()).unwrap_or_else(|e| panic!("{query}: {e}"));
+        }
     }
 
     #[test]

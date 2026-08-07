@@ -2003,7 +2003,7 @@ absence of a corpus row for an oversight.
   | query | reference | PulsusDB |
   |---|---|---|
   | `variants(count_over_time({app="x"} [5m])) of ({app="x"} \| logfmt a="b.c" [5m])` | `200`, empty | `400` |
-  | `variants(count_over_time({app="x"} \| logfmt a="b.c" [5m])) of ({app="x"} [5m])` | `400` | `200` |
+  | `variants(count_over_time({app="x"} \| logfmt a="b.c" [5m])) of ({app="x"} [5m])` | `400` | `400` (closed) |
 
   The first row is **not** the reference serving the query. Read from the
   container's own log during that request, the ingester answers `rpc
@@ -2017,15 +2017,21 @@ absence of a corpus row for an oversight.
   reference hides it regardless of the window, and the owner's ruling
   below applies unchanged.
 
-  The second row points the other way and is **not** closed: the
-  reference builds each variant's extractor (`evaluator.go:1417 @
-  v3.7.4`) purely to count it (`for range extractors`, `:1422`) while the
-  real extraction passes `nil` variant stages (`extractor.go:186`,
-  `:225`), so it validates syntax it then ignores; PulsusDB drops the
-  variant's own pre-`unwrap` pipeline at plan time (issue #221, matching
-  those same evaluation semantics) and so has nothing left to refuse.
-  Both rows are pinned point by point in
-  `crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs`.
+  The second row is **closed** (issue #247 round 2) and is kept here to
+  show the contrast. The reference builds each variant's extractor
+  (`evaluator.go:1417 @ v3.7.4`) purely to count it (`for range
+  extractors`, `:1422`) while the real extraction passes `nil` variant
+  stages (`extractor.go:186`, `:225`) — it validates syntax it then
+  ignores. PulsusDB now does the same: `build_variants_node` compiles a
+  variant's own pipeline and discards the result, so `| logfmt a="b.c"`,
+  `| line_format "{{"`, a malformed `ip()` pattern and an uncompilable
+  regex in a variant are all refused here as they are there. Unlike every
+  other row in this entry that rejection is **window-independent on both
+  sides**, because the reference raises it in the querier's
+  `newVariantsEvaluator` rather than behind the store's stale-window
+  short circuit — measured: no variant-side point moves when the window
+  is aged past `query_ingesters_within`. Both rows are pinned point by
+  point in `crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs`.
 
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:

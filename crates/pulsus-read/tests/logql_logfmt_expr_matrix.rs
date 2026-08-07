@@ -20,28 +20,40 @@
 //! be.** What has to be exhaustive is the set of places PulsusDB compiles
 //! a pipeline, since that is where the rule could be skipped. The first
 //! version of this file enumerated twelve query POSITIONS instead — "where
-//! can a `| logfmt` sit" — and missed `variants.rs:509` entirely, so a
-//! `variants(...)` query was measured through neither of its two pipeline
-//! positions. The enumeration is therefore derived from the code that
-//! CALLS the compiler, by
+//! can a `| logfmt` sit" — and so held no `variants(...)` query at all.
+//! That missed **one** of the construct's two pipeline positions, the
+//! variant side. The common side was reachable even then: the round-one
+//! helper walked `MetricNode::leaves()`, which yields the `scan` plan
+//! whose client pipeline IS the common one, and replaying that helper
+//! shows it returning a compile-layer rejection for a malformed common
+//! pipeline. (An earlier revision of this sentence said "neither", which
+//! is false and was checked by reconstructing the helper.) The
+//! enumeration is therefore derived from the code that CALLS the
+//! compiler, by
 //! [`the_compile_sites_are_enumerated_from_the_callers_of_the_compiler`],
 //! which reddens on a new call site until someone decides whether this
 //! matrix must cover it.
 //!
-//! **`variants(...)` disagrees with the reference in BOTH directions, and
+//! **`variants(...)` disagreed with the reference in BOTH directions, and
 //! the table says so rather than being tuned until it agrees.** The
 //! reference validates the variant's own pipeline and ignores it at
 //! evaluation; it runs the common `of (...)` pipeline and does not
-//! validate it. PulsusDB is the mirror image. Neither divergence is
-//! closed here — see [`Outcome`] for the mechanism and the measurement
-//! behind each, and
-//! [`points_disagree_with_the_reference_only_where_the_table_says_so`],
-//! which pins the exception set so it cannot quietly grow.
+//! validate it. PulsusDB was the mirror image. The variant side is now
+//! CLOSED — `build_variants_node` compiles a variant's own pipeline
+//! purely to validate it, exactly as the reference does — and
+//! [`points_disagree_with_the_reference_only_where_the_table_says_so`]
+//! asserts that direction is EMPTY. The common side stays open and
+//! ledgered — see [`Outcome`] for its mechanism and the measurement
+//! behind it.
 //!
 //! - [`pulsus_agrees_with_the_captured_reference_verdicts`] — hermetic,
-//!   the whole matrix, PulsusDB's verdict at the layer a user meets it
-//!   (parse → plan → the pipeline compile `exec` runs before any I/O:
-//!   `exec.rs:612`, `:906`, `:2290`, `:2576`).
+//!   the whole matrix, PulsusDB's verdict at the layer a user meets it:
+//!   parse → plan → the pipeline compile that runs before any I/O. Every
+//!   position is a `query_range`-shaped query, so the sites it actually
+//!   drives are `exec.rs:612` (streams), `:906` (metric, incl. every
+//!   binary leaf), `plan.rs`'s variant validation and `variants.rs:509`
+//!   — NOT `exec.rs:2290`/`:2576`, which are `/detected_fields` and
+//!   `/tail` and are covered as described under "unmeasured routes".
 //! - [`the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression`]
 //!   — hermetic, the discrimination check: the rule PulsusDB shipped at
 //!   `7980344` (the `| logfmt` compile arm cloned the expression string
@@ -67,11 +79,24 @@
 //! v3.7.4`) before `expr.Pipeline()` at `:500`. Ledgered as
 //! `malformed-query-refused-in-every-window` (#380). This was checked by
 //! breaking it: with the window moved 4 h back,
-//! [`live_matrix_against_the_reference`] fails on 222 of its 431 points —
-//! the sub-grammar rejections — while the layer-1 list-shape rejections
-//! stay 400, because `ParseExpr` runs in every window. A leg captured
-//! against a stale window would therefore have recorded the whole
-//! sub-grammar as accepted and passed for ever.
+//! [`live_matrix_against_the_reference`] fails on **205 of its 431**
+//! points. That figure is measured by patching the window and running the
+//! literal test, never scaled from an earlier one: this sentence said 222
+//! for one revision, which was the same measurement taken while the leg
+//! still compared against the wrong verdict, and 222 − 17 = 205 is
+//! exactly the arithmetic that makes a rescaled number look plausible.
+//!
+//! **The 205 are not "the sub-grammar rejections", and the exception is
+//! the interesting part.** They are the 17 sub-grammar expressions at
+//! each of the twelve pipeline-compile positions, plus
+//! `shape/raw_string_expression`. The list-shape rejections stay 400
+//! because `ParseExpr` runs in every window — and so do all 17
+//! `variants_variant_side` points, which the reference raises in
+//! `newVariantsEvaluator` in the QUERIER (`evaluator.go:1417 @ v3.7.4`)
+//! rather than behind the store's stale-window short circuit. Measured:
+//! no `variants_*` point appears among the 205. A leg captured against a
+//! stale window would still have recorded most of the sub-grammar as
+//! accepted and passed for ever.
 //!
 //! **Excluded by name.**
 //! - **Non-ASCII identifiers — #392.** `| logfmt éx="b"`, `| json
@@ -99,9 +124,15 @@
 //! **Unmeasured routes, named with the reason.** `/patterns` is a 404 on
 //! the pinned container (its pattern ingester is off in
 //! `ci/logql/config.yaml`), so it cannot report a syntax verdict.
-//! `/tail` is a WebSocket and this harness speaks HTTP only; its
-//! PulsusDB counterpart compiles the same pipeline at `exec.rs:2576`,
-//! which the hermetic half already covers.
+//! `/tail` is a WebSocket and this harness speaks HTTP only. Its
+//! PulsusDB counterpart (`tail_setup`, `exec.rs:2576`) calls the same
+//! `CompiledPipeline::compile` on the same `StreamsPlan::pipeline` that
+//! `exec.rs:612` does, so the RULE is covered by the streams positions —
+//! but that call SITE is not driven by anything in this file, and saying
+//! "the hermetic half already covers it" would be a claim about the site
+//! rather than the rule. `/detected_fields` (`exec.rs:2290`) is likewise
+//! not driven here; it is measured live by
+//! [`live_surface_axis_agrees`]'s route table.
 
 use std::process::Command;
 
@@ -109,6 +140,7 @@ use pulsus_logql::parse;
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::plan::{MetricNode, MetricNodeScc, Plan};
 use pulsus_read::logql::{Direction, PlanCtx, QueryParams, QuerySpec, plan};
+use pulsus_read::logql::{MAX_VARIANT_FANOUT_STATE_BYTES, VariantArena};
 
 /// What a user sees: the query is served, or it is a 400.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +404,7 @@ struct Position {
     name: &'static str,
     template: &'static str,
     outcome: Outcome,
+    refuses_at: Refusal,
 }
 
 /// Whether PulsusDB's verdict at a position matches the reference's, and
@@ -382,33 +415,40 @@ struct Position {
 enum Outcome {
     /// PulsusDB's verdict equals the reference's.
     Agrees,
-    /// **Open, routed.** The reference refuses a malformed expression in
-    /// a variant's own log range; PulsusDB accepts it. The reference
-    /// builds the variant's extractor at `evaluator.go:1417 @ v3.7.4`
-    /// (`extractors, err := variant.Extractors()`) and then uses only its
-    /// LENGTH (`for range extractors`, `:1422`), because the real
-    /// extraction passes `nil` variant stages (`extractor.go:186`,
-    /// `:225`, "No stages here - common pipeline will be applied
-    /// separately"). So it validates syntax it then ignores. PulsusDB
-    /// drops the variant's pre-`unwrap` pipeline at plan time
-    /// (`plan.rs`'s `variant_tail`, issue #221 — matching the same
-    /// evaluation semantics), so nothing is left to refuse. Closing it
-    /// means compiling dead syntax purely to validate it, which is a
-    /// change to #221's variants machinery and NOT this issue's.
-    VariantSideNotValidated,
-    /// **Ledgered divergence, deliberate.** The reference answers
-    /// **200 with an empty result** for a malformed COMMON `of (...)`
-    /// pipeline; PulsusDB answers 400. This is not "the reference serves
-    /// it": measured on the pinned container, the ingester returns
-    /// `rpc error: code = Code(400) desc = error extracting common
-    /// pipeline: parse error : stage '| logfmt a="b.c"' : cannot parse
-    /// expression [b.c]: unexpected char .` (read from the container's
-    /// own log during the request), and the querier swallows it, handing
-    /// the user an empty 200 with no indication the query was broken.
-    /// That is exactly the class the owner ruled on for
-    /// `malformed-query-refused-in-every-window`: "the user reads an
-    /// empty result as 'no logs matched', not 'your query is broken'".
+    /// **Ledgered divergence, deliberate — the only one left.** The
+    /// reference answers **200 with an empty result** for a malformed
+    /// COMMON `of (...)` pipeline; PulsusDB answers 400. This is not "the
+    /// reference serves it": measured on the pinned container, the
+    /// ingester returns `rpc error: code = Code(400) desc = error
+    /// extracting common pipeline: parse error : stage '| logfmt
+    /// a="b.c"' : cannot parse expression [b.c]: unexpected char .` (read
+    /// from the container's own log during the request) and the querier
+    /// swallows it, handing the user an empty 200 with no indication the
+    /// query was broken. The control is the same query with a well-formed
+    /// expression, which returns a series. That is the class the owner
+    /// ruled on for `malformed-query-refused-in-every-window`: "the user
+    /// reads an empty result as 'no logs matched', not 'your query is
+    /// broken'". Upheld on review; ledgered, not closed.
     CommonSideRefusedHere,
+}
+
+/// Which of PulsusDB's two pre-I/O layers refuses a malformed extraction
+/// EXPRESSION at a position. Both run before any ClickHouse call and both
+/// surface as a 400, but they are different code and the fixture says
+/// which, so "we reject" cannot pass for the wrong reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// `CompiledPipeline::compile` on a pipeline the plan carries — the
+    /// ordinary case (`exec.rs:612`, `:906`, `:2290`, `:2576`;
+    /// `variants.rs:509` for a variants common pipeline).
+    PipelineCompile,
+    /// Inside `plan()` itself: `build_variants_node` compiles a variant's
+    /// OWN pipeline purely to validate it (issue #247 round 2), because
+    /// nothing downstream ever will — `variant_tail` has already
+    /// discarded it. Mirrors the reference, which builds the variant's
+    /// extractor at `evaluator.go:1417 @ v3.7.4` and keeps only its
+    /// length.
+    PlanTime,
 }
 
 const POSITIONS: &[Position] = &[
@@ -416,61 +456,73 @@ const POSITIONS: &[Position] = &[
         name: "streams",
         template: r#"{service_name="m"} | logfmt a="{Q}""#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "streams_second_stage",
         template: r#"{service_name="m"} | logfmt | logfmt a="{Q}""#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "streams_after_flag",
         template: r#"{service_name="m"} | logfmt --strict a="{Q}""#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "streams_second_extraction",
         template: r#"{service_name="m"} | logfmt ok="x", a="{Q}""#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "streams_after_line_filter",
         template: r#"{service_name="m"} |= "x" | logfmt a="{Q}""#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "count_over_time",
         template: r#"count_over_time({service_name="m"} | logfmt a="{Q}" [5m])"#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "sum_by",
         template: r#"sum by (a) (count_over_time({service_name="m"} | logfmt a="{Q}" [5m]))"#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "unwrap",
         template: r#"sum_over_time({service_name="m"} | logfmt a="{Q}" | unwrap x [5m])"#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "topk",
         template: r#"topk(3, count_over_time({service_name="m"} | logfmt a="{Q}" [5m]))"#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "label_replace",
         template: r#"label_replace(count_over_time({service_name="m"} | logfmt a="{Q}" [5m]), "d", "$1", "a", "(.*)")"#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "binary_lhs",
         template: r#"count_over_time({service_name="m"} | logfmt a="{Q}" [5m]) + count_over_time({service_name="m"} [5m])"#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     Position {
         name: "binary_rhs",
         template: r#"count_over_time({service_name="m"} [5m]) + count_over_time({service_name="m"} | logfmt a="{Q}" [5m])"#,
         outcome: Outcome::Agrees,
+        refuses_at: Refusal::PipelineCompile,
     },
     // --- `variants(...) of (...)`: the FIFTH compile site
     //     (`variants.rs:509`), missed by the first version of this
@@ -480,12 +532,14 @@ const POSITIONS: &[Position] = &[
     Position {
         name: "variants_variant_side",
         template: r#"variants(count_over_time({service_name="m"} | logfmt a="{Q}" [5m])) of ({service_name="m"} [5m])"#,
-        outcome: Outcome::VariantSideNotValidated,
+        outcome: Outcome::Agrees,
+        refuses_at: Refusal::PlanTime,
     },
     Position {
         name: "variants_common_side",
         template: r#"variants(count_over_time({service_name="m"} [5m])) of ({service_name="m"} | logfmt a="{Q}" [5m])"#,
         outcome: Outcome::CommonSideRefusedHere,
+        refuses_at: Refusal::PipelineCompile,
     },
 ];
 
@@ -645,6 +699,7 @@ struct Point {
     query: String,
     layer: Layer,
     outcome: Outcome,
+    refuses_at: Refusal,
 }
 
 impl Point {
@@ -659,7 +714,7 @@ impl Point {
                 Layer::Grammar | Layer::DanglingComma => Verdict::Reject,
                 Layer::SubGrammar | Layer::Accepted => Verdict::Accept,
             },
-            Outcome::Agrees | Outcome::VariantSideNotValidated => self.layer.reference(),
+            Outcome::Agrees => self.layer.reference(),
         }
     }
 
@@ -668,14 +723,6 @@ impl Point {
     /// pins the disagreeing set exactly.
     fn pulsus(&self) -> Verdict {
         match self.outcome {
-            // The variant's own pre-`unwrap` pipeline is dropped at plan
-            // time (`variant_tail`, #221), so no sub-grammar rejection
-            // survives to the compile. A LogQL grammar error still does:
-            // it is a parser rejection, position-independent.
-            Outcome::VariantSideNotValidated => match self.layer {
-                Layer::Grammar | Layer::DanglingComma => Verdict::Reject,
-                Layer::SubGrammar | Layer::Accepted => Verdict::Accept,
-            },
             Outcome::Agrees | Outcome::CommonSideRefusedHere => self.layer.reference(),
         }
     }
@@ -690,6 +737,7 @@ fn matrix() -> Vec<Point> {
                 query: position.template.replace("{Q}", e.quoted),
                 layer: e.layer,
                 outcome: position.outcome,
+                refuses_at: position.refuses_at,
             });
         }
     }
@@ -699,6 +747,8 @@ fn matrix() -> Vec<Point> {
             query: s.query.to_string(),
             layer: s.layer,
             outcome: Outcome::Agrees,
+            // Unused: a shape's layer is never `SubGrammar`.
+            refuses_at: Refusal::PipelineCompile,
         });
     }
     out
@@ -889,13 +939,20 @@ fn pulsus_agrees_with_the_captured_reference_verdicts() {
         // pipeline would never reach the compile at all. So each
         // rejection's reason must name the layer the fixture says.
         match p.layer {
-            Layer::SubGrammar => assert!(
-                why.starts_with("compile:"),
-                "{} {}: the sub-grammar must refuse at the PIPELINE COMPILE (the layer `exec` \
-                 reaches before any I/O), but the rejection came from {why:?}",
-                p.label,
-                p.query
-            ),
+            Layer::SubGrammar => {
+                let want = match p.refuses_at {
+                    Refusal::PipelineCompile => "compile:",
+                    Refusal::PlanTime => "plan:",
+                };
+                assert!(
+                    why.starts_with(want),
+                    "{} {}: the fixture says this sub-grammar rejection surfaces at {:?} \
+                     ({want:?}), but it came from {why:?}",
+                    p.label,
+                    p.query,
+                    p.refuses_at
+                );
+            }
             Layer::Grammar | Layer::DanglingComma => assert!(
                 why.starts_with("parse:"),
                 "{} {}: a list-shape rejection must come from the PARSER, but it came from \
@@ -932,24 +989,31 @@ fn pulsus_agrees_with_the_captured_reference_verdicts() {
             "no matrix point exercises {layer:?}"
         );
     }
-    for outcome in [
-        Outcome::Agrees,
-        Outcome::VariantSideNotValidated,
-        Outcome::CommonSideRefusedHere,
-    ] {
+    for outcome in [Outcome::Agrees, Outcome::CommonSideRefusedHere] {
         assert!(
             points.iter().any(|p| p.outcome == outcome),
             "no matrix point exercises {outcome:?}"
         );
     }
+    for refusal in [Refusal::PipelineCompile, Refusal::PlanTime] {
+        assert!(
+            points
+                .iter()
+                .any(|p| p.layer == Layer::SubGrammar && p.refuses_at == refusal),
+            "no sub-grammar point refuses at {refusal:?}"
+        );
+    }
 }
 
-/// **The exception set is pinned, and it is exactly the two `variants`
-/// positions.** Without this, a future change could add a divergence by
-/// giving a position a non-`Agrees` outcome and everything would still
-/// be green. Every disagreement is enumerated by name and its direction
-/// asserted, because the two point OPPOSITE ways and conflating them is
-/// how a regression would hide.
+/// **The exception set is pinned, and it is exactly ONE position.**
+/// Without this, a future change could add a divergence by giving a
+/// position a non-`Agrees` outcome and everything would still be green.
+/// Every disagreement is enumerated by name and its direction asserted.
+///
+/// The other direction — the reference refuses and we accept — must now
+/// be EMPTY. `variants_variant_side` was that bucket until #247 round 2
+/// made `build_variants_node` validate a variant's own pipeline, and an
+/// empty assertion is what stops it coming back.
 #[test]
 fn points_disagree_with_the_reference_only_where_the_table_says_so() {
     let points = matrix();
@@ -961,9 +1025,9 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
         }
         // A disagreement may ONLY come from a position whose outcome
         // declares one, and only for a sub-grammar expression — an
-        // `Accepted` expression agrees even at the two variants
-        // positions, which is why the outcome is a property of the
-        // position and the check is on the disagreeing points.
+        // `Accepted` expression agrees even at the variants positions,
+        // which is why the outcome is a property of the position and the
+        // check is on the disagreeing points.
         assert_eq!(
             p.layer,
             Layer::SubGrammar,
@@ -971,10 +1035,7 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
             p.label
         );
         match (p.pulsus(), p.reference()) {
-            (Verdict::Accept, Verdict::Reject) => {
-                assert_eq!(p.outcome, Outcome::VariantSideNotValidated, "{}", p.label);
-                we_accept_they_refuse.push(p.label.as_str());
-            }
+            (Verdict::Accept, Verdict::Reject) => we_accept_they_refuse.push(p.label.as_str()),
             (Verdict::Reject, Verdict::Accept) => {
                 assert_eq!(p.outcome, Outcome::CommonSideRefusedHere, "{}", p.label);
                 we_refuse_they_accept.push(p.label.as_str());
@@ -982,17 +1043,19 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
             other => panic!("{}: impossible verdict pair {other:?}", p.label),
         }
     }
-    // Both sets are exactly the sub-grammar expressions at their
-    // position — computed from the table, not restated as a literal.
+    assert!(
+        we_accept_they_refuse.is_empty(),
+        "PulsusDB accepts {} queries the reference refuses. That is the higher-priority \
+         direction and #247 closed the whole of it, so a new one is a regression rather than \
+         a divergence to record: {we_accept_they_refuse:?}",
+        we_accept_they_refuse.len()
+    );
+    // The remaining divergence is exactly the sub-grammar expressions at
+    // the one position that carries it — computed from the table.
     let sub_grammar = EXPRESSIONS
         .iter()
         .filter(|e| e.layer == Layer::SubGrammar)
         .count();
-    assert_eq!(
-        we_accept_they_refuse.len(),
-        sub_grammar,
-        "the variant-side gap must be exactly the sub-grammar expressions: {we_accept_they_refuse:?}"
-    );
     assert_eq!(
         we_refuse_they_accept.len(),
         sub_grammar,
@@ -1000,51 +1063,167 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
          {we_refuse_they_accept:?}"
     );
     eprintln!(
-        "OPEN, routed — the reference refuses, we accept ({} points, all \
-         `variants_variant_side`): {}\nLEDGERED divergence — the reference answers 200-empty, we \
-         answer 400 ({} points, all `variants_common_side`): {}",
-        we_accept_they_refuse.len(),
-        we_accept_they_refuse.join(", "),
+        "LEDGERED divergence — the reference answers 200-empty, we answer 400 ({} points, all \
+         `variants_common_side`): {}\nOPEN in the other direction: none.",
         we_refuse_they_accept.len(),
         we_refuse_they_accept.join(", "),
     );
+}
+
+/// **The oracle's variants arm, and an honest account of how weak this
+/// tie is.** [`pulsus_verdict`]'s variants arm is a hand-written
+/// reproduction of `VariantArena::build` (`variants.rs:507-540`): it
+/// compiles the common pipeline, then `common ++ tail` per variant. The
+/// real code does the second half with `extended_with` instead, so there
+/// is no shared code keeping them honest. This test asks the REAL
+/// `VariantArena::build` for a verdict on each planned query and asserts
+/// it matches the oracle's.
+///
+/// **It does not currently discriminate, and that was checked rather
+/// than assumed.** Two perturbations of the oracle's arm were tried and
+/// NEITHER reddens anything in this file:
+///
+/// - dropping `common` from `common ++ tail` — masked, because the
+///   `Plan::MetricBinary` arm already compiles the scan plan's client
+///   pipeline through `MetricNode::leaves()`, and for a variants node
+///   that IS the common pipeline;
+/// - dropping the tail — masked, because `build_variants_node` now
+///   compiles each variant's whole own pipeline (tail included) at plan
+///   time for #247, so a malformed tail is refused before any arena is
+///   built.
+///
+/// So the arm is redundant with two other paths today, and this test is a
+/// TRIPWIRE for when that stops being true rather than a check that
+/// currently proves the two agree. It is not a code-sharing refactor on
+/// purpose: `extended_with` exists to avoid recompiling the common
+/// pipeline's regexes once per tail (`pipeline.rs:1155-1162`), so making
+/// the oracle call it would couple this fixture to a performance
+/// mechanism instead of to the rule.
+///
+/// **Carried to #397.** When a variant gets a live pipeline of its own,
+/// both masks come off — the arm becomes load-bearing, and whoever does
+/// that work must make this test discriminate (or delete the arm in
+/// favour of the real one) rather than trusting it as it stands. Tails
+/// are already non-empty for `unwrap` variants (measured: `sum_over_time(…
+/// | unwrap v | v > 1 …)` plans a two-stage tail), so the assembly this
+/// arm performs is real code, not a placeholder.
+#[test]
+fn the_oracle_agrees_with_the_real_variant_arena() {
+    for query in [
+        // accepted, no tail
+        r#"variants(count_over_time({service_name="m"} [5m])) of ({service_name="m"} [5m])"#,
+        // accepted, with an unwrap tail (the shape whose tail is non-empty)
+        r#"variants(sum_over_time({service_name="m"} | logfmt | unwrap v [5m])) of ({service_name="m"} | logfmt [5m])"#,
+        // accepted, common pipeline carrying an extraction
+        r#"variants(count_over_time({service_name="m"} [5m])) of ({service_name="m"} | logfmt a="b" [5m])"#,
+        // refused: the common pipeline's extraction expression
+        r#"variants(count_over_time({service_name="m"} [5m])) of ({service_name="m"} | logfmt a="b.c" [5m])"#,
+        // two variants, one with a tail
+        r#"variants(count_over_time({service_name="m"} [5m]), sum_over_time({service_name="m"} | logfmt | unwrap v [5m])) of ({service_name="m"} | logfmt [5m])"#,
+    ] {
+        let (ours, why) = pulsus_verdict(query);
+        // The engine's own answer, from the code the oracle mirrors.
+        let expr = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let planned = match plan(&expr, &params(), &ctx()) {
+            Ok(p) => p,
+            Err(_) => {
+                // The plan already refused it, so there is no arena to
+                // build and both sides agree by construction.
+                assert_eq!(ours, Verdict::Reject, "{query}: {why}");
+                continue;
+            }
+        };
+        let Plan::MetricBinary(node) = &planned else {
+            panic!("{query}: a variants query must plan to a node tree");
+        };
+        let mut engine = Verdict::Accept;
+        pulsus_logql::walk::preorder::<MetricNodeScc>(node, |n| {
+            if let MetricNode::Variants { scan, variants, .. } = n {
+                let common: Vec<pulsus_logql::Stage> = scan
+                    .client
+                    .as_ref()
+                    .map(|c| c.pipeline.clone())
+                    .unwrap_or_default();
+                if VariantArena::build(&common, variants, MAX_VARIANT_FANOUT_STATE_BYTES, 0)
+                    .is_err()
+                {
+                    engine = Verdict::Reject;
+                }
+            }
+        });
+        assert_eq!(
+            ours, engine,
+            "{query}: the matrix oracle says {ours:?} ({why}) but `VariantArena::build` says \
+             {engine:?}. The oracle's variants arm has drifted from the code it mirrors — see \
+             this test's doc comment and issue #397."
+        );
+    }
 }
 
 /// **The compile sites are enumerated from the code that CALLS the
 /// compiler, not from a reading of the plan types.** Twelve query
 /// positions were enumerated carefully for #247 and still missed
 /// `variants.rs:509`, because that enumeration started from "where can a
-/// `| logfmt` sit" instead of "who compiles a pipeline". This scans the
-/// production region of every `src/logql/*.rs` for
-/// `CompiledPipeline::compile` and requires each site to be named here,
-/// so a NEW compile site reddens this test until someone decides whether
-/// the matrix must cover it.
+/// `| logfmt` sit" instead of "who compiles a pipeline".
+///
+/// **There are TWO ways into the compiler, and both are scanned.**
+/// `CompiledPipeline::compile` is the obvious one. The other is
+/// `CompiledPipeline::extended_with` (`pipeline.rs:1163`), which appends
+/// stages to an already-compiled pipeline through the same
+/// `compile_stage` the `compile` loop uses (`pipeline.rs:1180`'s
+/// `from_parts` is their shared assembly point) — so it compiles user
+/// stages without ever mentioning `compile`. That is precisely the path
+/// `VariantArena::build` takes for a variant's unwrap tail, i.e. the
+/// path whose omission caused this round: a census scanning only for
+/// `compile(` would have reported this file complete while blind to it.
+/// `variants.rs`'s own `variants_exec_census` pins `extended_with` at
+/// exactly one call site; this one pins WHERE both entry points are,
+/// across the whole module.
 #[test]
 fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
-    /// `(file, count, why it is or is not a matrix position)`.
-    const SITES: &[(&str, usize, &str)] = &[
+    /// `(file, compile calls, extended_with calls, why it is or is not a
+    /// matrix position)`.
+    const SITES: &[(&str, usize, usize, &str)] = &[
         (
             "detected.rs",
             2,
+            0,
             "the two process-wide bare `LazyLock` parsers — no user input reaches them, and \
              their extraction lists are empty by construction",
         ),
         (
             "exec.rs",
             4,
+            0,
             "streams :612, metric :906 (incl. every binary leaf), detected_fields :2290, tail \
-             :2576 — the twelve `POSITIONS` cover these",
+             :2576. `POSITIONS` reaches the first TWO of these and no more: every position is \
+             a `query_range`-shaped log or metric query, so none of them runs \
+             `detected_fields` or `tail`. `/detected_fields` is covered instead by \
+             `live_surface_axis_agrees`'s route table, and `/tail` is named in this file's \
+             module docs as unmeasured (WebSocket) with the reason",
+        ),
+        (
+            "plan.rs",
+            1,
+            0,
+            "`build_variants_node` compiles a variant's OWN pipeline purely to validate it \
+             (issue #247 round 2, mirroring `evaluator.go:1417 @ v3.7.4`) — the \
+             `variants_variant_side` position covers it, and `Refusal::PlanTime` records that \
+             it refuses here rather than at a pipeline compile",
         ),
         (
             "variants.rs",
             1,
-            "`VariantArena::build` :509 compiles `common` and each `common ++ tail` — the \
-             `variants_variant_side` / `variants_common_side` positions cover it",
+            1,
+            "`VariantArena::build` :509 compiles the COMMON pipeline and :536 extends it with \
+             each variant's unwrap tail — the `variants_common_side` position covers the \
+             common half; the tails carry no extraction expression of their own because \
+             `variant_tail` starts at the `unwrap`",
         ),
     ];
 
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
-    let mut found: Vec<(String, usize)> = Vec::new();
+    let mut found: Vec<(String, usize, usize)> = Vec::new();
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
         .map(|e| e.expect("dir entry").path())
@@ -1059,27 +1238,45 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
             Some(i) => &src[..i],
             None => src.as_str(),
         };
-        let n = production.matches("CompiledPipeline::compile(").count();
-        if n > 0 {
+        // COMMENT TEXT STRIPPED, the `variants_exec_census` precedent:
+        // these files document their own compile sites heavily, and a
+        // census that counted its own prose would move whenever someone
+        // edited a doc comment.
+        let production: String = production
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let production = production.as_str();
+        let compiles = production.matches("CompiledPipeline::compile(").count();
+        // `extended_with` is scanned on the method name alone, because the
+        // receiver is a local (`pipelines[0]`) and naming the type would
+        // miss it — which is the whole failure this arm exists for. The
+        // DEFINITION lives in `pipeline.rs` and is excluded by matching
+        // the call form `.extended_with(`.
+        let extends = production.matches(".extended_with(").count();
+        if compiles > 0 || extends > 0 {
             found.push((
                 path.file_name()
                     .expect("file name")
                     .to_string_lossy()
                     .into_owned(),
-                n,
+                compiles,
+                extends,
             ));
         }
     }
-    let named: Vec<(String, usize)> = SITES
+    let named: Vec<(String, usize, usize)> = SITES
         .iter()
-        .map(|(f, n, _)| ((*f).to_string(), *n))
+        .map(|(f, c, e, _)| ((*f).to_string(), *c, *e))
         .collect();
     assert_eq!(
         found, named,
-        "the set of pipeline-compile call sites in `src/logql` has changed. Every site is a \
+        "the set of pipeline-COMPILER call sites in `src/logql` has changed. Every site is a \
          place the logfmt sub-grammar can be skipped, so add it to `SITES` **and** decide \
-         whether `POSITIONS` must cover it — this is the check that would have caught \
-         `variants.rs:509` before review."
+         whether `POSITIONS` must cover it. Both entry points count: `compile(` and \
+         `.extended_with(`, the latter because it reaches `compile_stage` without naming \
+         `compile` — that is how `variants.rs` was missed."
     );
 }
 
@@ -1093,9 +1290,10 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
 ///
 /// - **CLOSED** — the pre-#247 tree disagreed with the reference and we
 ///   now agree. This is what the issue is for.
-/// - **STILL OPEN** — both trees disagree with the reference. The
-///   `variants_variant_side` points: the reference validates the
-///   variant's own pipeline and we never compile it (see [`Outcome`]).
+/// - **STILL OPEN** — both trees disagree with the reference. Asserted
+///   EMPTY. It held the `variants_variant_side` points until round 2
+///   made `build_variants_node` validate a variant's own pipeline; the
+///   assertion is what stops that bucket refilling.
 /// - **INTRODUCED** — the pre-#247 tree AGREED with the reference and we
 ///   now do not. The `variants_common_side` points, where the reference
 ///   answers 200-empty and we answer 400. Recorded here rather than
@@ -1160,14 +1358,15 @@ fn the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression() {
         .iter()
         .filter(|e| e.layer == Layer::SubGrammar)
         .count();
-    assert_eq!(still_open.len(), sub_grammar, "STILL OPEN: {still_open:?}");
-    assert_eq!(introduced.len(), sub_grammar, "INTRODUCED: {introduced:?}");
+    // STILL OPEN must be EMPTY: #247 closes every point where the
+    // reference refuses and the pre-#247 tree did not, including the
+    // `variants_variant_side` ones that round 2 added.
     assert!(
-        still_open
-            .iter()
-            .all(|l| l.starts_with("variants_variant_side/")),
-        "a still-open point outside the variant side: {still_open:?}"
+        still_open.is_empty(),
+        "#247 leaves {} point(s) where the reference refuses and we do not: {still_open:?}",
+        still_open.len()
     );
+    assert_eq!(introduced.len(), sub_grammar, "INTRODUCED: {introduced:?}");
     assert!(
         introduced
             .iter()
