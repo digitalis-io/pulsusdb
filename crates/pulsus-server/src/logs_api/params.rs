@@ -296,33 +296,40 @@ pub(crate) const DEFAULT_FIELD_LIMIT: u32 = 1000;
 /// reference's `parseInt(value, def)` returns `def` for `""`
 /// (`pkg/loghttp/params.go:154-159 @ v3.7.4 b318f282`) and Go's
 /// `r.Form.Get` cannot tell an absent key from an empty one, so empty
-/// **is** absent there. Outside `strconv.Atoi`'s accepted set → 400 (see
-/// [`parse_field_limit`] — the same `i64` parse, established by
-/// measurement). `n <= 0` → 400. `n > MAX_LIMIT` → 400, never clamped.
+/// **is** absent there. Outside `i64::from_str` → 400 — that is exactly
+/// `strconv.Atoi`'s accepted set, established by measurement in
+/// [`parse_field_limit`]. `n <= 0` → 400. `n > MAX_LIMIT` → 400.
 ///
-/// The 5000 ceiling here is **parity, not a house cap**: the reference
-/// answers `line_limit=5001` with `400 max entries limit per query
-/// exceeded, limit > max_entries_limit_per_query (5001 > 5000)` from
+/// **This function never converts an out-of-range value; it refuses it.**
+/// `n` is compared against [`MAX_LIMIT`] as an `i64` and the `as u32`
+/// below is reached only on `0 < n <= 5000`. So there is no clamp, no
+/// saturation and no cast to wrap on this axis, at any magnitude — the
+/// only outcomes are a value in `1..=5000` or a 400.
+///
+/// The 5000 is **parity, not a house cap**: the reference answers
+/// `line_limit=5001` with a 400 reading `max entries limit per query
+/// exceeded, limit > max_entries_limit_per_query (5001 > 5000)`, from
 /// `validateMaxEntriesLimits` (`pkg/querier/queryrange/limits.go:767-780`,
 /// called at `pkg/querier/queryrange/detected_fields.go:189`) against
 /// `validation.max-entries-limit`, default 5000
 /// (`pkg/validation/limits.go:355`). Container-measured against
-/// `grafana/loki:3.7.4`, 2026-08-07; only the message text differs, which
-/// the owner ruling on #253 puts below the parity bar.
+/// `grafana/loki:3.7.4`, 2026-08-07. At that boundary only the 400's
+/// message text differs, which the owner ruling on #253 puts below the
+/// parity bar.
 ///
 /// The two statuses agree over the whole of `[1, 2^32)`, which follows
-/// from the source rather than from the probe: `uint32(l)` is the identity
-/// there, so `1..=5000` passes `validateMaxEntriesLimits` on both sides and
-/// `5001..` fails it on both. Above `2^32` that cast
-/// (`pkg/loghttp/params.go:38-46`) is no longer the identity and the
-/// reference accepts what it should reject — measured discriminatingly on a
-/// 30-entry fixture, `line_limit=4294967297` returns the same
-/// per-field cardinality 1 as `line_limit=1` and `line_limit=4294967326`
-/// the same 30 as `line_limit=30`, i.e. it really does serve the wrapped
-/// value. We saturate instead and therefore still reject; that is the
-/// `detected-fields-limit-saturates-not-wraps` ledger row, which covers
-/// both parameters. Pinned by
-/// `parse_line_limit_matches_the_reference_atoi_surface`.
+/// from the two implementations rather than from the probe: we compare `n`
+/// to 5000 directly, while the reference feeds `uint32(l)` — the identity
+/// on that range — to a check against the same 5000. Above `2^32` its cast
+/// (`pkg/loghttp/params.go:38-46`) stops being the identity and it accepts
+/// what it should reject: measured discriminatingly on a 30-entry fixture,
+/// `line_limit=4294967297` returns the same per-field cardinality 1 as
+/// `line_limit=1`, and `line_limit=4294967326` the same 30 as
+/// `line_limit=30` — it really does serve the wrapped value. We have no
+/// such cast, so we go on rejecting; that asymmetry is recorded in the
+/// `detected-fields-limit-saturates-not-wraps` ledger row, which names
+/// both parameters and the different way each of ours avoids the wrap.
+/// Pinned by `parse_line_limit_matches_the_reference_atoi_surface`.
 pub(crate) fn parse_line_limit(raw: Option<&str>) -> Result<u32, ParamError> {
     let Some(text) = raw.filter(|s| !s.is_empty()) else {
         return Ok(DEFAULT_LINE_LIMIT);
@@ -350,7 +357,7 @@ pub(crate) fn parse_line_limit(raw: Option<&str>) -> Result<u32, ParamError> {
 /// an **empty** value on either counting as absent exactly as the
 /// reference's `detectedFieldsLimit` does (`pkg/loghttp/params.go:49-64 @
 /// v3.7.4 b318f282`); absent → [`DEFAULT_FIELD_LIMIT`]; outside
-/// `strconv.Atoi`'s accepted set → 400; `n <= 0` → 400.
+/// `i64::from_str` → 400; `n <= 0` → 400.
 ///
 /// The accepted set is `i64::from_str` — the same grammar as `Atoi` on a
 /// 64-bit platform (optional `+`/`-`, then ASCII digits only, value within
@@ -1031,8 +1038,9 @@ mod tests {
         // (wrapped to 0), `4294967396` -> 200. That the wrapped value is
         // what it actually SAMPLES was measured on a per-entry-varying
         // field's cardinality: `4294967297` -> 1, like `line_limit=1`;
-        // `4294967326` -> 30, like `line_limit=30`. We saturate at
-        // `u32::MAX` and therefore still reject — the
+        // `4294967326` -> 30, like `line_limit=30`. `parse_line_limit`
+        // performs no such cast — it compares the `i64` to MAX_LIMIT and
+        // REJECTS, at every magnitude — so these stay 400 here. The
         // `detected-fields-limit-saturates-not-wraps` ledger row.
         for raw in ["4294967296", "4294967396", "8589934692"] {
             assert!(
@@ -1041,6 +1049,43 @@ mod tests {
                     ParamError::LimitTooLarge { max: 5000, .. }
                 ),
                 "{raw:?}"
+            );
+        }
+    }
+
+    /// The entry axis REFUSES an out-of-range value; it does not saturate
+    /// and then fail a ceiling. The two are indistinguishable by status,
+    /// so this pins the observable that separates them: the reported
+    /// `limit` is the value as parsed, never `u32::MAX`. A
+    /// saturate-then-check implementation would report `4294967295` for
+    /// every one of these.
+    ///
+    /// Also states the range invariant the doc comment claims — every
+    /// accepted `line_limit`, including the absent/empty default, lands in
+    /// `1..=MAX_LIMIT` — which holds because the `as u32` in
+    /// [`parse_line_limit`] is reachable only under `0 < n <= MAX_LIMIT`.
+    #[test]
+    fn parse_line_limit_refuses_out_of_range_rather_than_saturating() {
+        for (raw, want) in [
+            ("5001", 5001_u64),
+            ("4294967295", 4_294_967_295),
+            ("4294967296", 4_294_967_296),
+            ("9223372036854775807", 9_223_372_036_854_775_807),
+        ] {
+            match parse_line_limit(Some(raw)).unwrap_err() {
+                ParamError::LimitTooLarge { limit, max } => {
+                    assert_eq!(limit, want, "{raw:?} must be reported as parsed");
+                    assert_eq!(max, MAX_LIMIT, "{raw:?}");
+                }
+                other => panic!("{raw:?} must be LimitTooLarge, got {other:?}"),
+            }
+        }
+
+        for raw in [None, Some(""), Some("1"), Some("100"), Some("5000")] {
+            let got = parse_line_limit(raw).expect("accepted");
+            assert!(
+                (1..=MAX_LIMIT).contains(&got),
+                "{raw:?} produced {got}, outside 1..={MAX_LIMIT}"
             );
         }
     }
