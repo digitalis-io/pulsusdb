@@ -12,18 +12,31 @@
 //! surfaced as a 400. At `7980344` PulsusDB had no sub-grammar at all,
 //! and its extraction list — faithful otherwise — ended silently at a
 //! trailing comma instead of refusing it. This is the measurement of
-//! both, as a fixture: twelve query positions × the expression shapes
-//! that discriminate the sub-grammar, plus the list shapes, with the
-//! reference's verdict for each.
+//! both, as a fixture: every query position × the expression shapes that
+//! discriminate the sub-grammar, plus the list shapes, with the
+//! reference's verdict AND PulsusDB's for each.
 //!
 //! **The positions are not an enumeration of LogQL, and do not need to
-//! be.** What has to be exhaustive is the set of PulsusDB entry points
-//! that run a pipeline, since that is where the rule could be skipped;
-//! [`POSITIONS`]' doc comment names every one and cites it (`exec.rs:612`,
-//! `:906`, `:2290`, `:2576`). The table then holds an expression's
-//! verdict CONSTANT across all twelve rather than recording one per
-//! position — a claim [`live_matrix_against_the_reference`] puts to the
-//! container point by point rather than assuming.
+//! be.** What has to be exhaustive is the set of places PulsusDB compiles
+//! a pipeline, since that is where the rule could be skipped. The first
+//! version of this file enumerated twelve query POSITIONS instead — "where
+//! can a `| logfmt` sit" — and missed `variants.rs:509` entirely, so a
+//! `variants(...)` query was measured through neither of its two pipeline
+//! positions. The enumeration is therefore derived from the code that
+//! CALLS the compiler, by
+//! [`the_compile_sites_are_enumerated_from_the_callers_of_the_compiler`],
+//! which reddens on a new call site until someone decides whether this
+//! matrix must cover it.
+//!
+//! **`variants(...)` disagrees with the reference in BOTH directions, and
+//! the table says so rather than being tuned until it agrees.** The
+//! reference validates the variant's own pipeline and ignores it at
+//! evaluation; it runs the common `of (...)` pipeline and does not
+//! validate it. PulsusDB is the mirror image. Neither divergence is
+//! closed here — see [`Outcome`] for the mechanism and the measurement
+//! behind each, and
+//! [`points_disagree_with_the_reference_only_where_the_table_says_so`],
+//! which pins the exception set so it cannot quietly grow.
 //!
 //! - [`pulsus_agrees_with_the_captured_reference_verdicts`] — hermetic,
 //!   the whole matrix, PulsusDB's verdict at the layer a user meets it
@@ -54,11 +67,11 @@
 //! v3.7.4`) before `expr.Pipeline()` at `:500`. Ledgered as
 //! `malformed-query-refused-in-every-window` (#380). This was checked by
 //! breaking it: with the window moved 4 h back,
-//! [`live_matrix_against_the_reference`] fails on 205 of its 373 points —
-//! exactly the sub-grammar rejections — while the layer-1 list-shape
-//! rejections stay 400, because `ParseExpr` runs in every window. A leg
-//! captured against a stale window would therefore have recorded the
-//! whole sub-grammar as accepted and passed for ever.
+//! [`live_matrix_against_the_reference`] fails on 222 of its 431 points —
+//! the sub-grammar rejections — while the layer-1 list-shape rejections
+//! stay 400, because `ParseExpr` runs in every window. A leg captured
+//! against a stale window would therefore have recorded the whole
+//! sub-grammar as accepted and passed for ever.
 //!
 //! **Excluded by name.**
 //! - **Non-ASCII identifiers — #392.** `| logfmt éx="b"`, `| json
@@ -94,7 +107,7 @@ use std::process::Command;
 
 use pulsus_logql::parse;
 use pulsus_read::logql::pipeline::CompiledPipeline;
-use pulsus_read::logql::plan::Plan;
+use pulsus_read::logql::plan::{MetricNode, MetricNodeScc, Plan};
 use pulsus_read::logql::{Direction, PlanCtx, QueryParams, QuerySpec, plan};
 
 /// What a user sees: the query is served, or it is a 400.
@@ -358,56 +371,121 @@ const EXPRESSIONS: &[Expression] = &[
 struct Position {
     name: &'static str,
     template: &'static str,
+    outcome: Outcome,
+}
+
+/// Whether PulsusDB's verdict at a position matches the reference's, and
+/// when it does not, WHICH divergence it is. Recorded per position so a
+/// disagreement is stated by the fixture rather than hidden by a table
+/// that can only express agreement (issue #247, review round 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// PulsusDB's verdict equals the reference's.
+    Agrees,
+    /// **Open, routed.** The reference refuses a malformed expression in
+    /// a variant's own log range; PulsusDB accepts it. The reference
+    /// builds the variant's extractor at `evaluator.go:1417 @ v3.7.4`
+    /// (`extractors, err := variant.Extractors()`) and then uses only its
+    /// LENGTH (`for range extractors`, `:1422`), because the real
+    /// extraction passes `nil` variant stages (`extractor.go:186`,
+    /// `:225`, "No stages here - common pipeline will be applied
+    /// separately"). So it validates syntax it then ignores. PulsusDB
+    /// drops the variant's pre-`unwrap` pipeline at plan time
+    /// (`plan.rs`'s `variant_tail`, issue #221 — matching the same
+    /// evaluation semantics), so nothing is left to refuse. Closing it
+    /// means compiling dead syntax purely to validate it, which is a
+    /// change to #221's variants machinery and NOT this issue's.
+    VariantSideNotValidated,
+    /// **Ledgered divergence, deliberate.** The reference answers
+    /// **200 with an empty result** for a malformed COMMON `of (...)`
+    /// pipeline; PulsusDB answers 400. This is not "the reference serves
+    /// it": measured on the pinned container, the ingester returns
+    /// `rpc error: code = Code(400) desc = error extracting common
+    /// pipeline: parse error : stage '| logfmt a="b.c"' : cannot parse
+    /// expression [b.c]: unexpected char .` (read from the container's
+    /// own log during the request), and the querier swallows it, handing
+    /// the user an empty 200 with no indication the query was broken.
+    /// That is exactly the class the owner ruled on for
+    /// `malformed-query-refused-in-every-window`: "the user reads an
+    /// empty result as 'no logs matched', not 'your query is broken'".
+    CommonSideRefusedHere,
 }
 
 const POSITIONS: &[Position] = &[
     Position {
         name: "streams",
         template: r#"{service_name="m"} | logfmt a="{Q}""#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "streams_second_stage",
         template: r#"{service_name="m"} | logfmt | logfmt a="{Q}""#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "streams_after_flag",
         template: r#"{service_name="m"} | logfmt --strict a="{Q}""#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "streams_second_extraction",
         template: r#"{service_name="m"} | logfmt ok="x", a="{Q}""#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "streams_after_line_filter",
         template: r#"{service_name="m"} |= "x" | logfmt a="{Q}""#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "count_over_time",
         template: r#"count_over_time({service_name="m"} | logfmt a="{Q}" [5m])"#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "sum_by",
         template: r#"sum by (a) (count_over_time({service_name="m"} | logfmt a="{Q}" [5m]))"#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "unwrap",
         template: r#"sum_over_time({service_name="m"} | logfmt a="{Q}" | unwrap x [5m])"#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "topk",
         template: r#"topk(3, count_over_time({service_name="m"} | logfmt a="{Q}" [5m]))"#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "label_replace",
         template: r#"label_replace(count_over_time({service_name="m"} | logfmt a="{Q}" [5m]), "d", "$1", "a", "(.*)")"#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "binary_lhs",
         template: r#"count_over_time({service_name="m"} | logfmt a="{Q}" [5m]) + count_over_time({service_name="m"} [5m])"#,
+        outcome: Outcome::Agrees,
     },
     Position {
         name: "binary_rhs",
         template: r#"count_over_time({service_name="m"} [5m]) + count_over_time({service_name="m"} | logfmt a="{Q}" [5m])"#,
+        outcome: Outcome::Agrees,
+    },
+    // --- `variants(...) of (...)`: the FIFTH compile site
+    //     (`variants.rs:509`), missed by the first version of this
+    //     matrix. It has TWO pipeline positions and the reference gives
+    //     them OPPOSITE verdicts, so both are here and neither agrees
+    //     with us. See [`Outcome`] for the mechanism behind each.
+    Position {
+        name: "variants_variant_side",
+        template: r#"variants(count_over_time({service_name="m"} | logfmt a="{Q}" [5m])) of ({service_name="m"} [5m])"#,
+        outcome: Outcome::VariantSideNotValidated,
+    },
+    Position {
+        name: "variants_common_side",
+        template: r#"variants(count_over_time({service_name="m"} [5m])) of ({service_name="m"} | logfmt a="{Q}" [5m])"#,
+        outcome: Outcome::CommonSideRefusedHere,
     },
 ];
 
@@ -566,6 +644,41 @@ struct Point {
     label: String,
     query: String,
     layer: Layer,
+    outcome: Outcome,
+}
+
+impl Point {
+    /// What the pinned container answers, from the captured table.
+    fn reference(&self) -> Verdict {
+        match self.outcome {
+            // The common `of (...)` pipeline's build error happens behind
+            // `SelectSamples` and is swallowed, so the user gets a 200
+            // with an empty result. A LogQL GRAMMAR error is still a 400,
+            // because `ParseExpr` runs before any of that.
+            Outcome::CommonSideRefusedHere => match self.layer {
+                Layer::Grammar | Layer::DanglingComma => Verdict::Reject,
+                Layer::SubGrammar | Layer::Accepted => Verdict::Accept,
+            },
+            Outcome::Agrees | Outcome::VariantSideNotValidated => self.layer.reference(),
+        }
+    }
+
+    /// What PulsusDB answers, recorded rather than assumed equal to the
+    /// reference — [`points_disagree_with_the_reference_only_where_the_table_says_so`]
+    /// pins the disagreeing set exactly.
+    fn pulsus(&self) -> Verdict {
+        match self.outcome {
+            // The variant's own pre-`unwrap` pipeline is dropped at plan
+            // time (`variant_tail`, #221), so no sub-grammar rejection
+            // survives to the compile. A LogQL grammar error still does:
+            // it is a parser rejection, position-independent.
+            Outcome::VariantSideNotValidated => match self.layer {
+                Layer::Grammar | Layer::DanglingComma => Verdict::Reject,
+                Layer::SubGrammar | Layer::Accepted => Verdict::Accept,
+            },
+            Outcome::Agrees | Outcome::CommonSideRefusedHere => self.layer.reference(),
+        }
+    }
 }
 
 fn matrix() -> Vec<Point> {
@@ -576,6 +689,7 @@ fn matrix() -> Vec<Point> {
                 label: format!("{}/{}", position.name, e.name),
                 query: position.template.replace("{Q}", e.quoted),
                 layer: e.layer,
+                outcome: position.outcome,
             });
         }
     }
@@ -584,6 +698,7 @@ fn matrix() -> Vec<Point> {
             label: format!("shape/{}", s.name),
             query: s.query.to_string(),
             layer: s.layer,
+            outcome: Outcome::Agrees,
         });
     }
     out
@@ -623,8 +738,22 @@ fn params() -> QueryParams {
 /// parser alone would be a weaker layer and would report the whole
 /// sub-grammar as accepted, which is exactly the gap this issue closed.
 ///
-/// Every pipeline a plan carries is compiled, including each leaf of a
-/// binary plan (`MetricNode::leaves`), because `run_metric_inner` does.
+/// **This mirrors the compile SITES, one by one — it does not claim to
+/// walk "every pipeline a plan carries".** An earlier version of this
+/// comment did claim that, and it was false: `MetricNode::leaves()`
+/// (`plan.rs:457`) pushes only `scan` for `MetricNode::Variants` and
+/// never the variant specs, so a `variants(...)` query was measured
+/// through one of its two pipeline positions and not the other. The
+/// authority for this function is
+/// [`the_compile_sites_are_enumerated_from_the_callers_of_the_compiler`],
+/// which derives the site list from the source rather than from a
+/// reading of the plan types.
+///
+/// The variants arm reproduces `VariantArena::build`
+/// (`variants.rs:507-512`) rather than approximating it: the common
+/// pipeline is compiled alone, and each variant's tail is compiled as
+/// `common ++ tail`, because `VariantSpec::client`'s own doc says
+/// "nothing may compile `client.pipeline` on its own".
 fn pulsus_verdict(query: &str) -> (Verdict, String) {
     let expr = match parse(query) {
         Ok(e) => e,
@@ -634,22 +763,49 @@ fn pulsus_verdict(query: &str) -> (Verdict, String) {
         Ok(p) => p,
         Err(e) => return (Verdict::Reject, format!("plan: {e}")),
     };
-    let pipelines: Vec<&[pulsus_logql::Stage]> = match &planned {
-        Plan::Streams(sp) => vec![&sp.pipeline],
-        Plan::Metric(mp) => mp.client.iter().map(|c| c.pipeline.as_slice()).collect(),
-        Plan::MetricBinary(node) => node
-            .leaves()
-            .into_iter()
-            .filter_map(|leaf| leaf.client.as_ref())
-            .map(|c| c.pipeline.as_slice())
-            .collect(),
-    };
-    for stages in pipelines {
+    let mut pipelines: Vec<Vec<pulsus_logql::Stage>> = Vec::new();
+    match &planned {
+        // `exec.rs:612` (streams), `:2290` (detected_fields), `:2576` (tail).
+        Plan::Streams(sp) => pipelines.push(sp.pipeline.clone()),
+        // `exec.rs:906` (`run_metric_inner`).
+        Plan::Metric(mp) => pipelines.extend(mp.client.iter().map(|c| c.pipeline.clone())),
+        Plan::MetricBinary(node) => {
+            // `exec.rs:906` again, per binary leaf.
+            for leaf in node.leaves() {
+                pipelines.extend(leaf.client.iter().map(|c| c.pipeline.clone()));
+            }
+            // `variants.rs:509` — the fifth site, and the one the twelve
+            // -position enumeration missed. `leaves()` already yielded the
+            // scan above; add each variant's `common ++ tail`.
+            collect_variant_pipelines(node, &mut pipelines);
+        }
+    }
+    for stages in &pipelines {
         if let Err(e) = CompiledPipeline::compile(stages) {
             return (Verdict::Reject, format!("compile: {e}"));
         }
     }
     (Verdict::Accept, String::new())
+}
+
+/// Every `common ++ tail` a `MetricNode::Variants` would have
+/// `VariantArena::build` compile. Walks the whole node tree, because a
+/// variants node can sit under a binary op or an aggregation.
+fn collect_variant_pipelines(node: &MetricNode, out: &mut Vec<Vec<pulsus_logql::Stage>>) {
+    pulsus_logql::walk::preorder::<MetricNodeScc>(node, |n| {
+        if let MetricNode::Variants { scan, variants, .. } = n {
+            let common: Vec<pulsus_logql::Stage> = scan
+                .client
+                .as_ref()
+                .map(|c| c.pipeline.clone())
+                .unwrap_or_default();
+            for spec in variants {
+                let mut full = common.clone();
+                full.extend(spec.client().pipeline.iter().cloned());
+                out.push(full);
+            }
+        }
+    });
 }
 
 /// **The two expression columns agree.** `decoded` is what the
@@ -686,7 +842,11 @@ fn the_fixtures_two_expression_columns_agree() {
     }
 }
 
-/// **The matrix agrees with the reference, point for point.**
+/// **PulsusDB's verdict is what the table records, point for point** —
+/// which is the reference's verdict everywhere except the two `variants`
+/// positions, whose divergences the table states explicitly. See
+/// [`points_disagree_with_the_reference_only_where_the_table_says_so`],
+/// which pins that exception set so it cannot quietly grow.
 #[test]
 fn pulsus_agrees_with_the_captured_reference_verdicts() {
     let points = matrix();
@@ -700,19 +860,25 @@ fn pulsus_agrees_with_the_captured_reference_verdicts() {
     let (mut accepts, mut rejects) = (0usize, 0usize);
     for p in &points {
         let (ours, why) = pulsus_verdict(&p.query);
-        match p.layer.reference() {
+        match p.reference() {
             Verdict::Accept => accepts += 1,
             Verdict::Reject => rejects += 1,
         }
-        if ours != p.layer.reference() {
+        if ours != p.pulsus() {
             disagree.push(format!(
-                "{} {}\n    reference={:?} pulsus={:?} {}",
+                "{} {}\n    table says pulsus={:?} (reference={:?}), measured {:?} {}",
                 p.label,
                 p.query,
-                p.layer.reference(),
+                p.pulsus(),
+                p.reference(),
                 ours,
                 why
             ));
+            continue;
+        }
+        // A point we are recorded as ACCEPTING carries no rejection
+        // reason to check the layer of.
+        if p.pulsus() == Verdict::Accept {
             continue;
         }
         // **The LAYER is checked, not assumed.** Agreeing on the verdict
@@ -742,7 +908,7 @@ fn pulsus_agrees_with_the_captured_reference_verdicts() {
     }
     assert!(
         disagree.is_empty(),
-        "{} of {} matrix points disagree with the captured reference verdicts:\n{}",
+        "{} of {} matrix points disagree with the committed PulsusDB verdicts:\n{}",
         disagree.len(),
         points.len(),
         disagree.join("\n")
@@ -753,8 +919,8 @@ fn pulsus_agrees_with_the_captured_reference_verdicts() {
         accepts > 0 && rejects > 0,
         "the matrix must contain both dispositions ({accepts} accept, {rejects} reject)"
     );
-    // And every layer must be exercised, or a whole rule could vanish
-    // from the fixture without a test noticing.
+    // And every layer AND every outcome must be exercised, or a whole
+    // rule could vanish from the fixture without a test noticing.
     for layer in [
         Layer::Grammar,
         Layer::DanglingComma,
@@ -766,72 +932,258 @@ fn pulsus_agrees_with_the_captured_reference_verdicts() {
             "no matrix point exercises {layer:?}"
         );
     }
+    for outcome in [
+        Outcome::Agrees,
+        Outcome::VariantSideNotValidated,
+        Outcome::CommonSideRefusedHere,
+    ] {
+        assert!(
+            points.iter().any(|p| p.outcome == outcome),
+            "no matrix point exercises {outcome:?}"
+        );
+    }
 }
 
-/// **The fixture discriminates.** The rule PulsusDB shipped at `7980344`
-/// replayed over the same matrix, with every disagreement enumerated.
+/// **The exception set is pinned, and it is exactly the two `variants`
+/// positions.** Without this, a future change could add a divergence by
+/// giving a position a non-`Agrees` outcome and everything would still
+/// be green. Every disagreement is enumerated by name and its direction
+/// asserted, because the two point OPPOSITE ways and conflating them is
+/// how a regression would hide.
+#[test]
+fn points_disagree_with_the_reference_only_where_the_table_says_so() {
+    let points = matrix();
+    let mut we_accept_they_refuse = Vec::new();
+    let mut we_refuse_they_accept = Vec::new();
+    for p in &points {
+        if p.pulsus() == p.reference() {
+            continue;
+        }
+        // A disagreement may ONLY come from a position whose outcome
+        // declares one, and only for a sub-grammar expression — an
+        // `Accepted` expression agrees even at the two variants
+        // positions, which is why the outcome is a property of the
+        // position and the check is on the disagreeing points.
+        assert_eq!(
+            p.layer,
+            Layer::SubGrammar,
+            "{}: only a sub-grammar expression may disagree",
+            p.label
+        );
+        match (p.pulsus(), p.reference()) {
+            (Verdict::Accept, Verdict::Reject) => {
+                assert_eq!(p.outcome, Outcome::VariantSideNotValidated, "{}", p.label);
+                we_accept_they_refuse.push(p.label.as_str());
+            }
+            (Verdict::Reject, Verdict::Accept) => {
+                assert_eq!(p.outcome, Outcome::CommonSideRefusedHere, "{}", p.label);
+                we_refuse_they_accept.push(p.label.as_str());
+            }
+            other => panic!("{}: impossible verdict pair {other:?}", p.label),
+        }
+    }
+    // Both sets are exactly the sub-grammar expressions at their
+    // position — computed from the table, not restated as a literal.
+    let sub_grammar = EXPRESSIONS
+        .iter()
+        .filter(|e| e.layer == Layer::SubGrammar)
+        .count();
+    assert_eq!(
+        we_accept_they_refuse.len(),
+        sub_grammar,
+        "the variant-side gap must be exactly the sub-grammar expressions: {we_accept_they_refuse:?}"
+    );
+    assert_eq!(
+        we_refuse_they_accept.len(),
+        sub_grammar,
+        "the common-side divergence must be exactly the sub-grammar expressions: \
+         {we_refuse_they_accept:?}"
+    );
+    eprintln!(
+        "OPEN, routed — the reference refuses, we accept ({} points, all \
+         `variants_variant_side`): {}\nLEDGERED divergence — the reference answers 200-empty, we \
+         answer 400 ({} points, all `variants_common_side`): {}",
+        we_accept_they_refuse.len(),
+        we_accept_they_refuse.join(", "),
+        we_refuse_they_accept.len(),
+        we_refuse_they_accept.join(", "),
+    );
+}
+
+/// **The compile sites are enumerated from the code that CALLS the
+/// compiler, not from a reading of the plan types.** Twelve query
+/// positions were enumerated carefully for #247 and still missed
+/// `variants.rs:509`, because that enumeration started from "where can a
+/// `| logfmt` sit" instead of "who compiles a pipeline". This scans the
+/// production region of every `src/logql/*.rs` for
+/// `CompiledPipeline::compile` and requires each site to be named here,
+/// so a NEW compile site reddens this test until someone decides whether
+/// the matrix must cover it.
+#[test]
+fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
+    /// `(file, count, why it is or is not a matrix position)`.
+    const SITES: &[(&str, usize, &str)] = &[
+        (
+            "detected.rs",
+            2,
+            "the two process-wide bare `LazyLock` parsers — no user input reaches them, and \
+             their extraction lists are empty by construction",
+        ),
+        (
+            "exec.rs",
+            4,
+            "streams :612, metric :906 (incl. every binary leaf), detected_fields :2290, tail \
+             :2576 — the twelve `POSITIONS` cover these",
+        ),
+        (
+            "variants.rs",
+            1,
+            "`VariantArena::build` :509 compiles `common` and each `common ++ tail` — the \
+             `variants_variant_side` / `variants_common_side` positions cover it",
+        ),
+    ];
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
+    let mut found: Vec<(String, usize)> = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    files.sort();
+    for path in &files {
+        let src = std::fs::read_to_string(path).expect("source");
+        // Everything above the file's `#[cfg(test)]` marker, the same
+        // split `charge.rs`'s censuses use.
+        let production = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src.as_str(),
+        };
+        let n = production.matches("CompiledPipeline::compile(").count();
+        if n > 0 {
+            found.push((
+                path.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned(),
+                n,
+            ));
+        }
+    }
+    let named: Vec<(String, usize)> = SITES
+        .iter()
+        .map(|(f, n, _)| ((*f).to_string(), *n))
+        .collect();
+    assert_eq!(
+        found, named,
+        "the set of pipeline-compile call sites in `src/logql` has changed. Every site is a \
+         place the logfmt sub-grammar can be skipped, so add it to `SITES` **and** decide \
+         whether `POSITIONS` must cover it — this is the check that would have caught \
+         `variants.rs:509` before review."
+    );
+}
+
+/// **The fixture discriminates, and it accounts for the whole effect of
+/// this change** — not only for what it closes.
 ///
-/// Every one of them is the same direction — PulsusDB accepts a query the
-/// reference refuses — and the disagreeing set is exactly the points the
-/// two new rules refuse, computed from the table rather than restated as
-/// a literal. The `Layer::Grammar` points are the control: they were
-/// already 400 on both sides at `7980344`, so they pin the rule and
-/// discriminate NOTHING for this fix.
+/// Each point is classified by comparing three verdicts: the rule
+/// PulsusDB shipped at `7980344`, the rule it ships now, and the
+/// reference's. That gives four disjoint buckets, and the test asserts
+/// they partition the matrix, so no point can fall out of the accounting:
+///
+/// - **CLOSED** — the pre-#247 tree disagreed with the reference and we
+///   now agree. This is what the issue is for.
+/// - **STILL OPEN** — both trees disagree with the reference. The
+///   `variants_variant_side` points: the reference validates the
+///   variant's own pipeline and we never compile it (see [`Outcome`]).
+/// - **INTRODUCED** — the pre-#247 tree AGREED with the reference and we
+///   now do not. The `variants_common_side` points, where the reference
+///   answers 200-empty and we answer 400. Recorded here rather than
+///   buried, because a change that fixes N points and breaks M must
+///   report M.
+/// - **UNMOVED** — the two trees give the same verdict. Split into the
+///   points already refused at `7980344` (which pin a rule and
+///   discriminate nothing) and the accept-side controls (which show the
+///   new rule does not over-refuse).
 #[test]
 fn the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression() {
     let points = matrix();
-    let mut mismatches = Vec::new();
+    let (mut closed, mut still_open, mut introduced) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut already_rejecting, mut controls) = (Vec::new(), 0usize);
     for p in &points {
-        if p.layer.pre_247() != p.layer.reference() {
-            assert_eq!(
-                (p.layer.pre_247(), p.layer.reference()),
-                (Verdict::Accept, Verdict::Reject),
-                "a pre-#247 mismatch in the other direction would be a different bug: {} {}",
-                p.label,
-                p.query
-            );
-            mismatches.push(p);
+        let (before, now, theirs) = (p.layer.pre_247(), p.pulsus(), p.reference());
+        match (before == theirs, now == theirs) {
+            (false, true) => {
+                assert_eq!(
+                    (before, theirs),
+                    (Verdict::Accept, Verdict::Reject),
+                    "a closed point in the other direction would be a different bug: {} {}",
+                    p.label,
+                    p.query
+                );
+                closed.push(p.label.as_str());
+            }
+            (false, false) => still_open.push(p.label.as_str()),
+            (true, false) => introduced.push(p.label.as_str()),
+            (true, true) => {
+                if theirs == Verdict::Reject {
+                    already_rejecting.push(p.label.as_str());
+                } else {
+                    controls += 1;
+                }
+            }
         }
     }
-    let expected: usize = points
+    assert_eq!(
+        closed.len() + still_open.len() + introduced.len() + already_rejecting.len() + controls,
+        points.len(),
+        "the four buckets must partition the matrix"
+    );
+    // CLOSED is exactly the sub-grammar and dangling-comma points at
+    // every position whose outcome is `Agrees` — computed from the
+    // table, never restated as a literal.
+    let expected_closed = points
         .iter()
-        .filter(|p| matches!(p.layer, Layer::SubGrammar | Layer::DanglingComma))
+        .filter(|p| {
+            matches!(p.layer, Layer::SubGrammar | Layer::DanglingComma)
+                && p.outcome == Outcome::Agrees
+        })
         .count();
     assert_eq!(
-        mismatches.len(),
-        expected,
-        "the pre-#247 rule must disagree at every sub-grammar and dangling-comma point, and \
-         nowhere else"
+        closed.len(),
+        expected_closed,
+        "#247 must close every sub-grammar and dangling-comma point at an agreeing position"
+    );
+    // And the two exception buckets are exactly their positions'
+    // sub-grammar points, both asserted rather than described.
+    let sub_grammar = EXPRESSIONS
+        .iter()
+        .filter(|e| e.layer == Layer::SubGrammar)
+        .count();
+    assert_eq!(still_open.len(), sub_grammar, "STILL OPEN: {still_open:?}");
+    assert_eq!(introduced.len(), sub_grammar, "INTRODUCED: {introduced:?}");
+    assert!(
+        still_open
+            .iter()
+            .all(|l| l.starts_with("variants_variant_side/")),
+        "a still-open point outside the variant side: {still_open:?}"
     );
     assert!(
-        mismatches
+        introduced
             .iter()
-            .all(|p| matches!(p.layer, Layer::SubGrammar | Layer::DanglingComma)),
-        "a mismatch outside the two rules this issue adds"
-    );
-    // NAMED, not counted — and split, because the two kinds of
-    // non-discriminating point mean different things. A `Grammar` point
-    // was already 400 on both trees: it pins a rule and proves nothing
-    // about this fix. An `Accepted` point is a CONTROL: it shows the new
-    // rule does not over-refuse.
-    let already_rejecting: Vec<&str> = points
-        .iter()
-        .filter(|p| p.layer == Layer::Grammar)
-        .map(|p| p.label.as_str())
-        .collect();
-    let controls = points.iter().filter(|p| p.layer == Layer::Accepted).count();
-    assert_eq!(
-        already_rejecting.len() + controls + mismatches.len(),
-        points.len(),
-        "every point must be a discriminator, a control, or an already-rejecting pin"
+            .all(|l| l.starts_with("variants_common_side/")),
+        "an introduced divergence outside the common side: {introduced:?}"
     );
     eprintln!(
-        "pre-#247 rule: {} of {} points disagree with the reference, all 'PulsusDB accepts, \
-         reference refuses'.\n{} points pin a rule but DISCRIMINATE NOTHING (400 on both trees \
-         at 7980344): {}\n{} points are accept-side controls (200 on both), which is what shows \
-         the new rule does not over-refuse.",
-        mismatches.len(),
+        "of {} matrix points: {} CLOSED by #247; {} STILL OPEN ({}); {} INTRODUCED ({}); {} \
+         already refused on both trees at 7980344, which pin a rule and DISCRIMINATE NOTHING \
+         ({}); {} accept-side controls.",
         points.len(),
+        closed.len(),
+        still_open.len(),
+        still_open.join(", "),
+        introduced.len(),
+        introduced.join(", "),
         already_rejecting.len(),
         already_rejecting.join(", "),
         controls,
@@ -915,12 +1267,12 @@ fn live_matrix_against_the_reference() {
     let mut disagree = Vec::new();
     for p in &points {
         let (theirs, body) = reference_verdict(&base, &p.query);
-        if theirs != p.layer.reference() {
+        if theirs != p.reference() {
             disagree.push(format!(
                 "{} {}\n    committed={:?} container={:?} {}",
                 p.label,
                 p.query,
-                p.layer.reference(),
+                p.reference(),
                 theirs,
                 body.chars().take(160).collect::<String>()
             ));

@@ -1996,12 +1996,44 @@ absence of a corpus row for an oversight.
   in the extraction LIST is a `syntax.y` production error refused by
   `ParseExpr` — window-independent. Both are `400` in every window here.
 
+- **The window is not the only way the reference hides one of these — a
+  `variants(...)` common pipeline hides it in EVERY window** (issue #247,
+  measured 2026-08-07 on the same pinned image, window ending now):
+
+  | query | reference | PulsusDB |
+  |---|---|---|
+  | `variants(count_over_time({app="x"} [5m])) of ({app="x"} \| logfmt a="b.c" [5m])` | `200`, empty | `400` |
+  | `variants(count_over_time({app="x"} \| logfmt a="b.c" [5m])) of ({app="x"} [5m])` | `400` | `200` |
+
+  The first row is **not** the reference serving the query. Read from the
+  container's own log during that request, the ingester answers `rpc
+  error: code = Code(400) desc = error extracting common pipeline: parse
+  error : stage '| logfmt a="b.c"' : cannot parse expression [b.c]:
+  unexpected char .` — the build fails exactly as it does everywhere
+  else, and the querier swallows it, handing the user an empty `200` with
+  nothing to say the query was broken. The control is the same query with
+  a well-formed expression, which returns a series. So this is the same
+  divergence class as the rest of this entry, in a stronger form: the
+  reference hides it regardless of the window, and the owner's ruling
+  below applies unchanged.
+
+  The second row points the other way and is **not** closed: the
+  reference builds each variant's extractor (`evaluator.go:1417 @
+  v3.7.4`) purely to count it (`for range extractors`, `:1422`) while the
+  real extraction passes `nil` variant stages (`extractor.go:186`,
+  `:225`), so it validates syntax it then ignores; PulsusDB drops the
+  variant's own pre-`unwrap` pipeline at plan time (issue #221, matching
+  those same evaluation semantics) and so has nothing left to refuse.
+  Both rows are pinned point by point in
+  `crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs`.
+
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
-  (`logql/exec.rs:612`, `:906`, `:2290`, `:2576`, propagated with `?` and
-  surfaced by `logs_api/error.rs` as a 400), so an invalid pipeline
-  cannot reach a "no chunks, return empty" path in the first place.
+  (`logql/exec.rs:612`, `:906`, `:2290`, `:2576`, `logql/variants.rs:509`,
+  propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
+  invalid pipeline cannot reach a "no chunks, return empty" path in the
+  first place.
 
 - **Why we do not copy it** (owner ruling, 2026-08-06). Answering `200`
   with no results for a query that has a typo in it is wrong: the user
