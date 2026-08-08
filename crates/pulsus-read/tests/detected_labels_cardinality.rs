@@ -291,6 +291,8 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
         ["first divergence ", "at n = 5328"],
         ["first divergence ", "is n = 5328"],
         ["far inside ", "the agreeing range"],
+        // Round two: sufficient conditions written as necessary ones.
+        ["only while ", "all three"],
     ]
     .iter()
     .map(|halves| halves.concat())
@@ -317,7 +319,7 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
     // that every banned phrase contains at least one of them, which is
     // what makes skipping a file that contains none provably safe rather
     // than probably safe.
-    const PREFILTER: &[&str] = &["5327", "5328", "distinct-value", "agreeing"];
+    const PREFILTER: &[&str] = &["5327", "5328", "distinct-value", "agreeing", "all three"];
     for phrase in &banned {
         assert!(
             PREFILTER.iter().any(|t| phrase.contains(t)),
@@ -351,9 +353,11 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
         for banned in &banned {
             assert!(
                 !norm.contains(banned),
-                "{rel} states the retracted universal agreement threshold: {banned:?}. \
-                 The threshold is a property of the VALUE STRINGS; say which family \
-                 a number was measured on, or do not give a number (issue #261)."
+                "{rel} states a retracted over-claim about when the reference's \
+                 estimate is exact: {banned:?}. Two shapes were retracted under \
+                 #261 — a threshold stated without the value family it was \
+                 measured on, and sufficient conditions written as necessary \
+                 ones. Name the family, or state the condition as sufficient."
             );
         }
     }
@@ -380,6 +384,12 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
         "the ledger must keep saying what the threshold depends on"
     );
     assert!(
+        ledger.contains("sufficient conditions, not necessary ones"),
+        "the ledger must keep the conditions labelled SUFFICIENT: a dense sketch \
+         still answers exactly N at plenty of N, so writing them as necessary \
+         conditions is the same false-universal shape one layer in (issue #261)"
+    );
+    assert!(
         ledger.contains("4533"),
         "the ledger must keep the svc-{{i}} counterexample cardinality 4533, which is \
          BELOW the number the retracted claim named"
@@ -404,13 +414,23 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
 /// the caller's doc comment for why this file needs its own rule.
 fn check_frozen_244_header(path: &std::path::Path, banned: &[String]) {
     let text = std::fs::read_to_string(path).expect("the frozen #244 artifact must exist");
-    for (i, line) in text.lines().enumerate() {
+    let lines: Vec<&str> = text.lines().collect();
+    // The LEADING contiguous comment block — the same span `header()`
+    // reads, and the only place the wording is scoped by the family
+    // sentence. The two halves of this rule must be checked against the
+    // same text: an earlier revision asked only "does the line start with
+    // `#`", which a comment appended AFTER the data rows satisfies while
+    // sitting permanently outside the scope check. That gap left the
+    // round-one evasion open (issue #261 review, round two).
+    let header_len = lines.iter().take_while(|l| l.starts_with('#')).count();
+    for (i, line) in lines.iter().enumerate() {
         let norm = normalize(line);
         for phrase in banned {
             if norm.contains(phrase) {
                 assert!(
-                    line.starts_with('#'),
-                    "{}:{}: a data row states the retracted threshold: {phrase:?}",
+                    i < header_len,
+                    "{}:{}: the retracted threshold appears outside the leading header \
+                     block, where the family-scoping sentence cannot reach it: {phrase:?}",
                     path.display(),
                     i + 1
                 );

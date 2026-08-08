@@ -203,12 +203,19 @@ Out of this ledger's scope by design:
   `N <= 1`. A single value has nothing to collide with, one insert can
   never trip the sparse-to-dense check, and one is below the linear
   counter's exactness ceiling — so agreement at `N <= 1` holds for every
-  value set there is. It is also useless, and it is the ONLY such `N`:
-  from `N = 2` upward a collision is possible, so no larger bound holds
-  for all value sets and none is claimed here.
-  Above that floor the estimate equals the exact count only while **all
-  three** of the following hold. The first two depend on the value
-  strings; the third does not:
+  value set there is. It is also useless, and it is the ONLY such `N` —
+  a fact with a witness rather than a hope: `{"svc-787", "svc-4532"}` is
+  a TWO-value set whose sparse keys collide (both 36184712, the pair
+  identified below), and the reference answers **1** for it. So no bound
+  at or above `N = 2` holds for every value set, and none is claimed
+  here.
+
+  **Above that floor the following are SUFFICIENT conditions, not
+  necessary ones.** The estimate equals the exact count **whenever** all
+  three hold — the first two depend on the value strings, the third does
+  not — and it frequently equals it when they do not. What changes above
+  the floor is not that agreement stops; it is that agreement stops
+  being guaranteed:
   1. **no sparse-key collision yet.** In sparse mode each value is
      encoded into a 25-bit key derived from `metro.Hash64(v, 1337)`
      (`vendor/.../utils.go:44`, `sparse.go:18-25`); the first pair of
@@ -230,6 +237,14 @@ Out of this ledger's scope by design:
      8191 an exactly-offsetting number of collisions could still land on
      `N` by coincidence, so it is not a bound above which agreement is
      impossible.
+
+  **Agreement outside those conditions is routine, and is coincidence.**
+  Driving the vendored library directly: `instance-{i}` at `N` = 7966,
+  7989, 8012 and 8015; `10.42.0.{i}` at 7760, 7762, 7767 and 7768; and
+  `v{i}` at 7780, 7782, 7794 and 7797 each report exactly `N` with the
+  sketch **already dense** — condition 2 broken, answer still right.
+  Read nothing above the floor as a rule in either direction: not "they
+  agree below X", and not "they disagree above X" either.
   Measured first divergences, fresh sketch per `N`, one family per row —
   **each is that family's threshold and nothing else's**: `v{i}` **5328**
   (the #244 capture, a sparse-key collision),
