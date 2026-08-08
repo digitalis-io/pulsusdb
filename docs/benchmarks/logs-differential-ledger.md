@@ -2315,28 +2315,58 @@ often than they agree about it.
   | `engine_dir_b_invalid_utf8_escape` | `"\xff"` | 9 | the VERDICT half of something worse, and see the note under this table. Go's `strconv.Unquote` gives the reference one 0xFF byte, which its parser refuses as invalid UTF-8 wherever the pattern reaches it — these nine positions. **Our lexer does not produce that byte, and does not produce U+00FF either**: `scan_double_quoted` drops the backslash on an unknown escape (`crates/pulsus-logql/src/lexer.rs:322-331`, `Some(other) => value.push(other)`), so the pattern becomes the three ASCII characters `xff` and compiles. The positions absent from the nine are the `NewFastRegexMatcher` sites, which never parse a plain literal at all (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) |
   | `variants_variant_side_skips_the_line_filter` | the 14 patterns both sides reject | 1 | found by this matrix. The reference refuses a malformed line filter inside a `variants(...)` variant; we serve it — but only while the filter is PUSHABLE. `compile_stage` returns `Ok(None)` for a pushable line filter (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`, so the discarded variant prefix `VariantSpec::try_new` compiles (`plan.rs:2641`) never sees the regex, and a discarded prefix renders no SQL either. Put the same filter after a `line_format` and the pushdown is cleared, the filter is compiled, and both sides refuse it — that is the `variants_variant_after_line_format` position, which agrees at every pattern and is what bounds this row. `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused on both sides too |
 
-- **A VALUE divergence this matrix structurally cannot see, and the limit
-  that hid it** (issue #246 review round 2). `engine_dir_b_invalid_utf8_escape`
-  is only the verdict half. The real defect is that
-  `crates/pulsus-logql/src/lexer.rs:322-331`'s `scan_double_quoted`
-  handles an **unknown escape by dropping the backslash and keeping the
-  character** (`Some(other) => value.push(other)`), so `"\xff"` becomes
-  the three ASCII characters `xff` — not the 0xFF byte Go's unquoting
-  produces, and not U+00FF either, which is what this entry claimed for a
-  round. At the five `NewFastRegexMatcher` positions both systems answer
-  `200`, the reference matching lines that contain byte 0xFF and PulsusDB
-  matching lines that contain `xff`. **A user's pattern silently becomes a
-  different pattern.** Owned by **#400** as a value divergence, not an
-  accept-surface one; the class is not limited to `\x`, since any escape
-  Go defines and this lexer does not takes the same path.
+- **The LogQL string ESCAPE is one root cause with TWO divergences, and
+  only one of them is in this matrix at all** (issue #246 review rounds 2
+  and 3). `scan_double_quoted`
+  (`crates/pulsus-logql/src/lexer.rs:322-331`) knows `\n`, `\t` and `\r`
+  and handles everything else with `Some(other) => value.push(other)` —
+  dropping the backslash and keeping the character. Go's string grammar
+  knows a great deal more and rejects what it does not know. Measured on
+  the pinned oracle and through this tree's parser, 2026-08-08:
 
-  **Why it survived a review round is the limit worth recording**: this
-  matrix scores VERDICTS. Both sides accept at all 16 positions, so no
-  cell moves, no test moves, and no amount of adding patterns or positions
-  would have caught it. The matrix's module docs now say so under "What
-  this matrix cannot see", and the decoded value itself is asserted by
+  | spelling | reference | PulsusDB | half |
+  |---|---|---|---|
+  | `{app=~"\xff"}` | `200`, a matcher for byte `0xFF` | `200`, a matcher for `xff` | value |
+  | `{app=~"\101"}` | `200`, a matcher for `A` (Go octal) | `200`, a matcher for `101` | value |
+  | `{app=~"\d+"}` | `400 parse error at line 1, col 7: invalid char escape` | `200`, a matcher for `d+` | reject |
+  | `{app=~"\0"}` | `400 … invalid char escape` | `200`, a matcher for `0` | reject |
+  | `{app="x"} \|~ "\d+"` | `400 … col 14` | `200`, filter `d+` | reject |
+  | `{app="x"} \| regexp "(?P<c>\d+)"` | `400 … col 20` | `200` | reject |
+
+  **The value half** — an escape Go DEFINES and we do not — is what
+  `engine_dir_b_invalid_utf8_escape` records the verdicts of. Its real
+  damage is that at the five `NewFastRegexMatcher` positions both systems
+  answer `200` and match different lines: **a user's pattern silently
+  becomes a different pattern.** (This entry claimed for one round that
+  our lexer produced U+00FF. It does not produce that, nor the reference's
+  0xFF byte.)
+
+  **The reject half** — an escape Go does NOT define — is an ordinary
+  accept-surface divergence: a `400` there at the LEXER, before any regex
+  parser, and therefore at every construct rather than at particular
+  positions (the column numbers above are the only thing that moves), and
+  a `200` here. **It is in none of the 792 points and none of the nine
+  classes**, because every pattern in the matrix is a regex body that is
+  LogQL-quoted on the way in and so carries no undefined string escape.
+  Nothing here covers it, and this entry does not claim to.
+
+  Both halves are owned by **#400**; the reject half is an accept-surface
+  divergence and belongs there beside the value one. The PromQL side of
+  the same escape family was examined once before, on
+  `docs/decisions/0002-promql-parser-selection.md:110`.
+
+  **Why the value half survived a review round is the limit worth
+  recording**: this matrix scores VERDICTS. Both sides accept at all 16
+  positions, so no cell moves, no test moves, and no amount of adding
+  patterns or positions would have caught it. The matrix's module docs now
+  say so under "What this matrix cannot see", and the decoded value itself
+  is asserted by
   `the_parsed_pattern_value_is_committed_where_the_escape_changes_it` —
   the one check in the file with a value in it rather than a disposition.
+  Demonstrated rather than asserted: with a real `\xHH`-decoding arm added
+  to the lexer, that one test fails and the other twelve — every verdict
+  test, both live legs and the divergence enumeration — stay green while
+  the compiled pattern has genuinely changed.
 
 - **Status parity, in contrast, holds everywhere.** Every rejection above
   is `400` on both sides — ours through `PipelineError::BadRegex` →

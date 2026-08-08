@@ -123,6 +123,18 @@
 //! pattern hoping to pin a meaning, this file is the wrong place: it will
 //! report agreement.**
 //!
+//! **And the escape family this matrix touches is only half of one.** An
+//! escape Go's string grammar DEFINES and this lexer does not (`\xff`,
+//! `\101`) is the value half above, and `invalid_utf8` is its one probe
+//! here. An escape Go does **not** define (`\d`, `\w`, `\0`, `\q`) is an
+//! ordinary accept-surface divergence — measured, `{app=~"\d+"}` is
+//! `400 parse error at line 1, col 7: invalid char escape` on the
+//! reference and parses to the pattern `d+` here — and **it is in none of
+//! this file's points and none of its divergence classes**, because every
+//! other pattern is a regex body that [`logql_quote`] escapes on the way
+//! in, so no point carries an undefined string escape at all. Both halves
+//! are #400's; do not widen this file to cover the reject half.
+//!
 //! **If this file has to be split**, the seam is the template axis:
 //! [`TEMPLATE_AXIS`] and its two tests have a different verdict TYPE from
 //! everything else here (a `200` carrying `__error__`, never a status)
