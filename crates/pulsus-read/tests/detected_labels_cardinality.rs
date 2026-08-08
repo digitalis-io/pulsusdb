@@ -208,30 +208,69 @@ fn detected_labels_divergence_rows_hold_and_the_ledger_names_them() {
     }
 }
 
-/// Normalizes prose for phrase matching: lowercase, markdown emphasis
-/// and code ticks removed, `≤`/dashes folded, whitespace (including line
-/// wraps) collapsed. Without the wrap-collapsing, a banned sentence
-/// re-enters simply by falling across two lines.
-fn normalize(text: &str) -> String {
-    let lowered = text
-        .to_lowercase()
-        .replace('≤', "<=")
-        .replace(['—', '–'], "-");
-    let mut out = String::with_capacity(lowered.len());
-    let mut last_space = false;
-    for ch in lowered.chars() {
+/// Lowercases, folds `≤` and dashes, and drops the markup characters
+/// that could sit inside a phrase — WITHOUT collapsing whitespace.
+///
+/// [`normalize`] is exactly this plus the collapse, and the two must stay
+/// in that relationship: it is what makes the pre-filter sound. A token
+/// containing no whitespace survives into this output if and only if it
+/// survives into `normalize`'s, so a file with no raw hit for such a
+/// token cannot contain the phrase however it is wrapped.
+fn flatten(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
         match ch {
             '`' | '*' | '_' | '"' => {}
-            c if c.is_whitespace() => {
-                if !last_space {
+            '≤' => out.push_str("<="),
+            '—' | '–' => out.push('-'),
+            c if c.is_uppercase() => out.extend(c.to_lowercase()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// [`flatten`] plus whitespace collapse — the form phrases are matched
+/// against. The collapse is why a banned sentence cannot return by
+/// falling across two lines; every caller must therefore normalize the
+/// whole SPAN it is checking, never line by line (issue #261 review,
+/// round three: the per-line variant let a phrase through by wrapping).
+fn normalize(text: &str) -> String {
+    collapse(&flatten(text))
+}
+
+/// The whitespace-collapsing half of [`normalize`], split out so a caller
+/// that has already paid for [`flatten`] does not pay for it twice.
+///
+/// It also drops each line's LEADING comment marker before joining. That
+/// is not cosmetic: in a `#`-commented file the continuation line of a
+/// wrapped sentence carries a `#` that lands INSIDE the phrase —
+/// `only while # all three` — so collapsing whitespace alone does not
+/// rejoin it, and the wrap-collapse this whole gate rests on silently
+/// stops working. It was found in the one file with its own rule (issue
+/// #261 review, round three) but the hole was never confined to it: the
+/// main sweep reads `.test`, `.tsv`, YAML and Rust sources, and a phrase
+/// wrapped across two `#` or `//` lines in any of them would have walked
+/// through the same way.
+fn collapse(flat: &str) -> String {
+    let mut out = String::with_capacity(flat.len());
+    for line in flat.lines() {
+        // One leading run of comment punctuation, after any indent.
+        // Deliberately NOT `-`: a markdown bullet introduces a new
+        // sentence rather than continuing one, and eating it would join
+        // unrelated prose.
+        let body = line.trim_start().trim_start_matches(['#', '/', ';', '>']);
+        for ch in body.chars() {
+            if ch.is_whitespace() {
+                if !out.ends_with(' ') {
                     out.push(' ');
-                    last_space = true;
                 }
+            } else {
+                out.push(ch);
             }
-            c => {
-                out.push(c);
-                last_space = false;
-            }
+        }
+        if !out.ends_with(' ') {
+            out.push(' ');
         }
     }
     out
@@ -242,7 +281,10 @@ fn normalize(text: &str) -> String {
 /// still be there.
 ///
 /// **Domain: every git-TRACKED file, with exactly one file under a
-/// different rule and none skipped.** Not a hand-listed set — a hand
+/// different rule and none skipped.** "None skipped" is enforced, not
+/// asserted in prose: a tracked path the filesystem will not open is
+/// collected and the collection is asserted empty, so the domain in this
+/// sentence is the domain the code walks. Not a hand-listed set — a hand
 /// list cannot see the copy nobody remembered, and the claim was in four
 /// separate files before #261, each found by grep rather than by
 /// recollection. Line wraps are collapsed first, so the sentence cannot
@@ -285,18 +327,34 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
     // which lets the sweep below include its OWN definition site rather
     // than carve out an exemption for it. The one exemption in this test
     // is the frozen #244 artifact, and it has a reason.
-    let banned: Vec<String> = [
-        ["for every ", "distinct-value count"],
-        ["for every ", "n <= 5327"],
-        ["first divergence ", "at n = 5328"],
-        ["first divergence ", "is n = 5328"],
-        ["far inside ", "the agreeing range"],
+    // Each entry is (phrase, required pre-filter tokens). The phrase is
+    // assembled from halves so the literal never appears in any file,
+    // which lets the sweep read its OWN definition site instead of
+    // exempting it. The tokens are what makes skipping a file sound: a
+    // file is only inspected when ALL of some phrase's tokens appear in
+    // it, and both properties that argument needs — every token is
+    // whitespace-free, every token is inside its phrase — are asserted
+    // below rather than asserted in a comment.
+    let banned: Vec<(String, &[&str])> = vec![
+        (
+            ["for every ", "distinct-value count"].concat(),
+            &["distinct-value"][..],
+        ),
+        (["for every ", "n <= 5327"].concat(), &["5327"][..]),
+        (["first divergence ", "at n = 5328"].concat(), &["5328"][..]),
+        (["first divergence ", "is n = 5328"].concat(), &["5328"][..]),
+        (
+            ["far inside ", "the agreeing range"].concat(),
+            &["agreeing"][..],
+        ),
         // Round two: sufficient conditions written as necessary ones.
-        ["only while ", "all three"],
-    ]
-    .iter()
-    .map(|halves| halves.concat())
-    .collect();
+        // Two tokens, because its rarest single word (`only`) is in
+        // almost every file and would make the pre-filter do nothing.
+        (
+            ["only while ", "all three"].concat(),
+            &["only", "three"][..],
+        ),
+    ];
     // Every TRACKED file, from git rather than from a directory walk: a
     // walk would also read a developer's untracked scratch files, and a
     // gate that fails on those is a gate people learn to ignore. A
@@ -319,17 +377,34 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
     // that every banned phrase contains at least one of them, which is
     // what makes skipping a file that contains none provably safe rather
     // than probably safe.
-    const PREFILTER: &[&str] = &["5327", "5328", "distinct-value", "agreeing", "all three"];
-    for phrase in &banned {
+    // The soundness argument has two halves and BOTH are checked, because
+    // an earlier revision's comment claimed unsplittability while its
+    // assertion only checked containment — a gate proving something
+    // weaker than the sentence above it (issue #261 review, round three).
+    for (phrase, tokens) in &banned {
         assert!(
-            PREFILTER.iter().any(|t| phrase.contains(t)),
-            "banned phrase {phrase:?} has no PREFILTER token, so the sweep would \
-             skip files containing it"
+            !tokens.is_empty(),
+            "banned phrase {phrase:?} has no pre-filter token, so every file would \
+             be skipped for it"
         );
+        for token in *tokens {
+            assert!(
+                !token.chars().any(char::is_whitespace),
+                "pre-filter token {token:?} contains whitespace, so a line wrap inside \
+                 it would give zero hits and the file would be skipped — which is \
+                 exactly how `all three` let a wrapped claim through"
+            );
+            assert!(
+                phrase.contains(token),
+                "pre-filter token {token:?} is not inside its phrase {phrase:?}, so \
+                 skipping on it proves nothing"
+            );
+        }
     }
     let mut scanned = 0usize;
     let mut inspected = 0usize;
     let mut saw_frozen = false;
+    let mut unreadable: Vec<String> = Vec::new();
     for rel in String::from_utf8_lossy(&listing.stdout).split('\0') {
         if rel.is_empty() {
             continue;
@@ -341,16 +416,27 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
         }
         let path = repo.join(rel);
         let Ok(bytes) = std::fs::read(&path) else {
-            continue; // a listed-but-absent path (submodule, sparse checkout)
+            // A path git lists that the filesystem will not open
+            // (submodule, sparse checkout). Counted, never silently
+            // dropped: the domain sentence above says none is skipped, so
+            // this is asserted at zero below rather than tolerated.
+            unreadable.push(rel.to_string());
+            continue;
         };
         scanned += 1;
-        let raw = String::from_utf8_lossy(&bytes).to_lowercase();
-        if !PREFILTER.iter().any(|t| raw.contains(t)) {
+        // `flatten`, not the raw bytes: markup INSIDE a token (`dis*tinct*`)
+        // would otherwise hide it from the pre-filter while `normalize`
+        // still saw the phrase. Same strip set, one collapse apart.
+        let flat = flatten(&String::from_utf8_lossy(&bytes));
+        if !banned
+            .iter()
+            .any(|(_, tokens)| tokens.iter().all(|t| flat.contains(t)))
+        {
             continue;
         }
-        let norm = normalize(&raw);
+        let norm = collapse(&flat);
         inspected += 1;
-        for banned in &banned {
+        for (banned, _) in &banned {
             assert!(
                 !norm.contains(banned),
                 "{rel} states a retracted over-claim about when the reference's \
@@ -370,6 +456,11 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
         inspected > 0,
         "the pre-filter matched nothing at all, which would make the ban vacuous — \
          the ledger alone should have carried a matching token"
+    );
+    assert!(
+        unreadable.is_empty(),
+        "git lists these tracked paths but they could not be read, so they went \
+         unswept: {unreadable:?}"
     );
     assert!(
         saw_frozen,
@@ -412,35 +503,36 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
 /// `#` comment line, and only while the header still names the value
 /// family that phrase was measured on. Coverage, not an exemption — see
 /// the caller's doc comment for why this file needs its own rule.
-fn check_frozen_244_header(path: &std::path::Path, banned: &[String]) {
+fn check_frozen_244_header(path: &std::path::Path, banned: &[(String, &[&str])]) {
     let text = std::fs::read_to_string(path).expect("the frozen #244 artifact must exist");
     let lines: Vec<&str> = text.lines().collect();
     // The LEADING contiguous comment block — the same span `header()`
     // reads, and the only place the wording is scoped by the family
-    // sentence. The two halves of this rule must be checked against the
-    // same text: an earlier revision asked only "does the line start with
-    // `#`", which a comment appended AFTER the data rows satisfies while
-    // sitting permanently outside the scope check. That gap left the
-    // round-one evasion open (issue #261 review, round two).
+    // sentence.
     let header_len = lines.iter().take_while(|l| l.starts_with('#')).count();
-    for (i, line) in lines.iter().enumerate() {
-        let norm = normalize(line);
-        for phrase in banned {
-            if norm.contains(phrase) {
-                assert!(
-                    i < header_len,
-                    "{}:{}: the retracted threshold appears outside the leading header \
-                     block, where the family-scoping sentence cannot reach it: {phrase:?}",
-                    path.display(),
-                    i + 1
-                );
-            }
-        }
-    }
-    let head = header(&text);
-    if banned.iter().any(|p| normalize(&head).contains(p)) {
+    // Both spans are normalized WHOLE, never line by line. Two earlier
+    // revisions of this function were evaded through that gap: first by
+    // appending a `#` comment after the data rows (inside a `starts_with`
+    // check, outside the scope check), then by splitting a phrase across
+    // two `#` lines, which a per-line normalize cannot see and the
+    // main sweep — which normalizes whole files — always could. This is
+    // the only file the main sweep does not cover, so it is the only
+    // place that gap was reachable (issue #261 review, rounds two/three).
+    let header_span = normalize(&lines[..header_len].join("\n"));
+    let body_span = normalize(&lines[header_len..].join("\n"));
+    for (phrase, _) in banned {
         assert!(
-            head.contains("\"v0\"") && head.contains("\"v{n-1}\""),
+            !body_span.contains(phrase),
+            "{}: the retracted claim {phrase:?} appears at or after line {} — outside \
+             the leading header block, where the family-scoping sentence cannot reach \
+             it (issue #261).",
+            path.display(),
+            header_len + 1
+        );
+    }
+    if banned.iter().any(|(p, _)| header_span.contains(p)) {
+        assert!(
+            header_span.contains("v0") && header_span.contains("v{n-1}"),
             "{}: the header states a threshold without naming the value family it \
              was measured on. That scoping sentence is the ONLY thing that makes \
              the wording true, and the AC-19 gate skips `#` lines, so this is the \
@@ -558,10 +650,17 @@ fn the_detected_labels_aggregate_is_still_an_exact_count() {
             rendered.contains("uniqExact(val) AS cardinality"),
             "the exact aggregate is the contract: {rendered}"
         );
-        // Every ClickHouse approximate distinct-count entry point, not
-        // just the one a refactor would most likely reach for.
+        // A deny list of approximate distinct-count entry points. It is
+        // NOT exhaustive and must not be described as such — `uniqIf`
+        // and any future spelling are absent. What actually carries this
+        // test is the POSITIVE assertion above: an estimator swap has to
+        // remove `uniqExact(val) AS cardinality` to take effect, and
+        // that fires first whatever the replacement is called. The list
+        // is belt-and-braces, and it makes the failure message name the
+        // offending function.
         for estimator in [
             "uniq(",
+            "uniqIf",
             "uniqCombined",
             "uniqCombined64",
             "uniqHLL12",
