@@ -12,13 +12,23 @@ docs/benchmarks/logs-differential-ledger.md. A manual capture -- NOT run in
 CI.
 
 The generated span was RE-CAPTURED under issue #379, which implements
-`service_name` discovery: 86 body lines moved, every one of them a `pulsus`
-body gaining the synthesized label, and no `loki` line, status, case or
-verdict moved at all (`compare.py` still exits 0). Byte-identical bodies rose
-from 95 of 184 cases to 115. That is the retirement of `ingest-label-bounds`'
-Residual 1 shown at the wire; the residual's other half -- that
-`MissingLabelsErrorMsg` was unreachable -- was false and is corrected in the
-ledger.
+`service_name` discovery. What moved: `pulsus` body lines, each gaining the
+synthesized label. What did not: any `loki` line, any status, any case, any
+verdict -- `compare.py` still exits 0, and the case and agreement counts are
+its own generated summary line at the end of the table below.
+
+No count is restated here. An earlier revision of this paragraph did restate
+them and got all three wrong, by recounting the body dump with a pattern that
+dropped the one case whose name contains a space
+(`otlp/near-miss/service name/value-2049`) -- a hand-written copy of a number
+the file already generates, sitting a few hundred lines above the generated
+one, and disagreeing with it. To see what this capture changed, diff the file
+against its previous committed revision; to see where the two servers still
+differ, read the body dump.
+
+That capture is the retirement of `ingest-label-bounds`' Residual 1 shown at
+the wire; the residual's other half -- that `MissingLabelsErrorMsg` was
+unreachable -- was false and is corrected in the ledger.
 
 `number_route_probe.py` / `number_route_probe.txt` beside this file are the
 second half of that evidence, for the one group whose claim a case table
