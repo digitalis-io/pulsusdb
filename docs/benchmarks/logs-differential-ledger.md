@@ -2351,10 +2351,13 @@ often than they agree about it.
   regex body that `logql_quote` escapes on the way in, so it cannot carry
   a string escape at all. `Pattern::literal` deliberately exempts one body
   variant, `Body::LogqlSource`, and `invalid_utf8` (`\xff`) IS that
-  variant — the exemption is the whole point of it. That single unquoted
-  point is still not in this half, because `\x` is an escape Go DEFINES;
-  it is the value half's probe. Nothing here covers the reject half, and
-  this entry does not claim to.
+  variant — the exemption is the whole point of it. So the coverage
+  argument splits 43 patterns × 18 positions = 774 points (quoted, cannot
+  carry a string escape) plus **one pattern at 18 points** (`invalid_utf8`,
+  unquoted), and 774 + 18 = 792. Those 18 are still not in this half,
+  because all of them carry the same `\x`, which is an escape Go DEFINES;
+  they are the value half's probe. Nothing here covers the reject half,
+  and this entry does not claim to.
 
   Both halves are owned by **#400**; the reject half is an accept-surface
   divergence and belongs there beside the value one. The PromQL side of
