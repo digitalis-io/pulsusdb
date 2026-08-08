@@ -131,9 +131,14 @@
 //! `400 parse error at line 1, col 7: invalid char escape` on the
 //! reference and parses to the pattern `d+` here — and **it is in none of
 //! this file's points and none of its divergence classes**, because every
-//! other pattern is a regex body that [`logql_quote`] escapes on the way
-//! in, so no point carries an undefined string escape at all. Both halves
-//! are #400's; do not widen this file to cover the reject half.
+//! **other** pattern is a regex body that [`logql_quote`] escapes on the
+//! way in, so it cannot carry a string escape at all. The exception is
+//! `invalid_utf8`, which [`Pattern::literal`] passes through unescaped by
+//! design — and it is not in this half either, because `\x` is an escape
+//! Go DEFINES. **Both clauses are load-bearing**: the two prose copies of
+//! this sentence dropped the "other" and became false, which is exactly
+//! what made the exemption invisible. Both halves are #400's; do not
+//! widen this file to cover the reject half.
 //!
 //! **If this file has to be split**, the seam is the template axis:
 //! [`TEMPLATE_AXIS`] and its two tests have a different verdict TYPE from

@@ -2346,9 +2346,15 @@ often than they agree about it.
   parser, and therefore at every construct rather than at particular
   positions (the column numbers above are the only thing that moves), and
   a `200` here. **It is in none of the 792 points and none of the nine
-  classes**, because every pattern in the matrix is a regex body that is
-  LogQL-quoted on the way in and so carries no undefined string escape.
-  Nothing here covers it, and this entry does not claim to.
+  classes**, and the reason is worth stating exactly, because a looser
+  version of it was wrong: every **other** pattern in the matrix is a
+  regex body that `logql_quote` escapes on the way in, so it cannot carry
+  a string escape at all. `Pattern::literal` deliberately exempts one body
+  variant, `Body::LogqlSource`, and `invalid_utf8` (`\xff`) IS that
+  variant — the exemption is the whole point of it. That single unquoted
+  point is still not in this half, because `\x` is an escape Go DEFINES;
+  it is the value half's probe. Nothing here covers the reject half, and
+  this entry does not claim to.
 
   Both halves are owned by **#400**; the reject half is an accept-surface
   divergence and belongs there beside the value one. The PromQL side of
