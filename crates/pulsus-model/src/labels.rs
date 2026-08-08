@@ -126,14 +126,24 @@ pub fn retain_non_empty_values(pairs: &mut Vec<(String, String)>) {
 ///    is dropped, an `add` entry **replaces** the FIRST base entry of the
 ///    same name, remaining `add` entries are inserted in sorted position.
 /// 7. Consequence of 5 and 6, spelled out because it is the corner every
-///    prose DESCRIPTION of this function has got wrong: **`del` drops BASE
-///    entries only, so a `Set` outranks it.** An empty value deletes every
-///    pair stored under its name *that the builder did not `Set`* — a rename
-///    or a U+FFFD rewrite re-adds the name, in either wire order, because
-///    `add` is emitted whether or not `del` holds that name. Measured on
-///    `grafana/loki:3.7.4` (`b318f282`): `{a_b="", a_b="p\u{FFFD}"}` stores
-///    `a_b="p "` and so does the reverse order, while the U+FFFD-free control
-///    `{a_b="", a_b="p"}` stores nothing. Rows `g01`-`g05` of
+///    prose DESCRIPTION of this function has got wrong. **This sentence is
+///    the one the docs copy** — `docs/api.md` §8.2 row 6 and
+///    `docs/schemas.md` §3.1 must contain it byte for byte between the same
+///    markers, which `tests/copied_rule.rs` asserts; edit it here and the
+///    test names every file that has fallen behind.
+///
+///    <!-- copied-rule:del-vs-set:start -->
+///    **`del` drops BASE entries only, so a `Set` outranks it.** An empty
+///    value deletes every pair stored under its name that the builder did
+///    not `Set`, and a rename or a U+FFFD rewrite re-adds the name in either
+///    wire order, because `add` is emitted whether or not `del` holds that
+///    name.
+///    <!-- copied-rule:del-vs-set:end -->
+///
+///    Measured on `grafana/loki:3.7.4` (`b318f282`): `{a_b="",
+///    a_b="p\u{FFFD}"}` stores `a_b="p "` and so does the reverse order,
+///    while the U+FFFD-free control `{a_b="", a_b="p"}` stores nothing. Rows
+///    `g01`-`g07` of
 ///    `the_builder_emits_a_set_name_even_when_reset_deleted_it`.
 ///
 /// So the tie-break is two-tier, not positional: **a pair that was `Set`
@@ -822,13 +832,19 @@ mod tests {
     /// `3.7.4` / `b318f282`, `ci/logql/config.yaml`), pushed as JSON
     /// structured metadata with duplicate object keys emitted as text and
     /// read back with `X-Loki-Response-Encoding-Flags: categorize-labels`.
-    /// `g02`/`g04` are the U+FFFD-free controls: without the `Set` the delete
-    /// stands, which is what makes the other three discriminating rather than
-    /// vacuous. `g03`/`g04` are the pair list the OTLP scope path builds for
-    /// an empty-valued `scope_name` attribute beside a real scope name — the
-    /// case `otlp_logs`'s
+    /// `g02`, `g04` and `g07` are the U+FFFD-free controls: without the `Set`
+    /// the delete stands, which is what makes the other four discriminating
+    /// rather than vacuous.
+    ///
+    /// The rows come in BOTH wire orders (`g01`/`g05`, `g03`/`g06`) because
+    /// `Reset` walks the whole base before the loop runs, so `del` holds the
+    /// name wherever the empty pair sits — order-independence is a property
+    /// of the mechanism, not of the examples. Only `g03`/`g04`'s order is
+    /// reachable through the OTLP scope path, which always appends identity
+    /// after the attributes; `otlp_logs`'s
     /// `a_u_fffd_bearing_scope_name_survives_an_empty_valued_attribute_of_the_same_name`
-    /// asserts end to end.
+    /// asserts that one end to end. `g06`'s order reaches the builder on the
+    /// push transports, where the entry's pairs arrive in wire order.
     #[test]
     fn the_builder_emits_a_set_name_even_when_reset_deleted_it() {
         for (id, source, expected) in [
@@ -849,6 +865,12 @@ mod tests {
                 &[("a_b", "p\u{FFFD}"), ("a_b", "")],
                 &[("a_b", "p ")],
             ),
+            (
+                "g06",
+                &[("scope_name", "N\u{FFFD}"), ("scope_name", "")],
+                &[("scope_name", "N ")],
+            ),
+            ("g07", &[("scope_name", "N"), ("scope_name", "")], &[]),
         ] {
             assert_eq!(resolved(source), pairs(expected), "{id}: from {source:?}");
         }
