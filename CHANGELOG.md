@@ -12,6 +12,21 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
 
 ### Added
 
+- `service_name` discovery at log ingest, on both receivers (issue #379).
+  A stream pushed without a `service_name` label now gains one, as Loki
+  3.7.4 gives it one: on `/loki/api/v1/push` the first of thirteen
+  configured names present with a non-empty value, scanned in the
+  reference's list order, and `unknown_service` when none is; on
+  `/otlp/v1/logs` the reference's separate, wire-ordered rule over the
+  resource attributes it indexes. The discovered value also populates the
+  physical `service` column that `log_samples`' ordering key leads on,
+  which was `''` for every such stream before. Stream identities therefore
+  change for every stream stored without an explicit `service_name`, and
+  `{service_name="…"}` becomes a usable selector for them. Ships with the
+  reference's empty-label rejection (`400 error at least one label pair is
+  required per stream`), which its OTLP discovery rule makes reachable.
+  See `docs/api.md` §8.2 and
+  `docs/benchmarks/logs-differential-ledger.md`.
 - Helm chart (`deploy/charts/pulsusdb/`) for deploying PulsusDB to
   Kubernetes: single all-mode or split writer/reader topologies, an
   optional bundled single-node or sharded ClickHouse (with a Keeper

@@ -56,6 +56,7 @@ use crate::protocols::label_name::validate_label_names;
 use crate::protocols::log_label_limits;
 use crate::protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow};
 use crate::protocols::otlp_prescan::MAX_DECODED_BYTES;
+use crate::protocols::service_name::push_service_name;
 
 /// `logproto.PushRequest`: `streams` at tag 1.
 ///
@@ -959,8 +960,16 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
     let mut out = ParsedLogs::default();
     let mut seen_streams: HashSet<(Fingerprint, Date)> = HashSet::new();
     for stream in &req.streams {
-        let stream_labels =
+        let mut stream_labels =
             log_label_limits::StreamLabels::from_pairs(parse_label_pairs(&stream.labels)?);
+        // `discover_service_name` (issue #379), between the strip and the
+        // bounds, which is where `ParseLokiRequest` has it
+        // (`pkg/loghttp/push/push.go:442-456 @ v3.7.4`). The owned copy is the
+        // one allocation this costs a stream: the resolver borrows the pairs
+        // it scans and the set is about to be mutated.
+        if let Some(discovered) = push_service_name(stream_labels.pairs()).map(str::to_owned) {
+            stream_labels.set_service_name(&discovered);
+        }
         // A stream with no entries is skipped before validation upstream
         // (`pkg/distributor/distributor.go:639-641 @ v3.7.4`), so an
         // entry-less stream with over-wide labels is accepted there and here.
@@ -1122,13 +1131,20 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
         // Skipped for an entry-less stream, as upstream skips it before
         // validating (`pkg/distributor/distributor.go:639-641 @ v3.7.4`); a
         // breach drops just this stream (`distributor.go:645-655`).
-        let stream_labels = log_label_limits::StreamLabels::from_pairs(
+        let mut stream_labels = log_label_limits::StreamLabels::from_pairs(
             stream
                 .stream
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<Vec<_>>(),
         );
+        // `discover_service_name` (issue #379) — the same call, in the same
+        // position, as `parse_protobuf`'s: the reference runs it once in
+        // `ParseLokiRequest`, after both encodings have become one
+        // `logproto.PushRequest` (`pkg/loghttp/push/push.go:442-456 @ v3.7.4`).
+        if let Some(discovered) = push_service_name(stream_labels.pairs()).map(str::to_owned) {
+            stream_labels.set_service_name(&discovered);
+        }
         if !stream.values.is_empty()
             && let Err(err) = stream_labels.validate()
         {
@@ -3293,11 +3309,14 @@ mod tests {
         let out = parse_json(body.as_bytes(), 0).unwrap();
         assert_eq!(out.rows.len(), 1);
         // Last-write-wins, exactly as the reference's map assignment is.
+        // `service_name` is discovered from `app` (issue #379): `app` is the
+        // second name in the discovery list and `dup` is in none of them.
         assert_eq!(
             out.streams[0].labels.iter().collect::<Vec<_>>(),
             [
                 ("app", "x"),
                 ("dup", format!("v{MAX_LABELS_PER_STREAM}").as_str()),
+                ("service_name", "x"),
             ]
         );
     }
@@ -4382,7 +4401,14 @@ mod tests {
         let body = json_body_with_labels(&format!("{{{}}}", ok.join(",")));
         let out = parse_json(body.as_bytes(), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
-        assert_eq!(out.streams[0].labels.len(), 15);
+        // 15 pushed plus the discovered `service_name` (issue #379): none of
+        // the 15 is a discovery name, so the value is `unknown_service`, and
+        // it does not count towards the 15.
+        assert_eq!(out.streams[0].labels.len(), 16);
+        assert_eq!(
+            out.streams[0].labels.get("service_name"),
+            Some("unknown_service")
+        );
     }
 
     /// `validator.go:164-167 @ v3.7.4`: a stream carrying `__aggregated_metric__`
@@ -4438,9 +4464,13 @@ mod tests {
             }],
         };
         let out = parse_protobuf(&req, 0).unwrap();
+        // The rendered set is the POST-synthesis one (issue #379): the
+        // reference discovers `service_name` before it validates, so its own
+        // message carries the label too.
         assert_eq!(
             only_stream_error(&out),
-            "stream '{foo=\"bar\", foo=\"barf\"}' has duplicate label name: 'foo'"
+            "stream '{foo=\"bar\", foo=\"barf\", service_name=\"unknown_service\"}' \
+             has duplicate label name: 'foo'"
         );
     }
 
@@ -4460,6 +4490,12 @@ mod tests {
         assert_eq!(out.streams[0].labels.get("foo"), Some("bar"));
     }
 
+    /// AC5 (issue #379): the over-long value is copied VERBATIM into
+    /// `service_name` before the bounds run, so the `400` body carries it
+    /// twice inside the rendered set and a third time as the offending value.
+    /// Measured on `grafana/loki@sha256:87f0a067…` (3.7.4, stock config):
+    /// `stream '{app="b…", service_name="b…"}' has label value too long:
+    /// 'b…'`. Truncating or synthesizing after validation changes these bytes.
     #[test]
     fn parse_protobuf_rejects_a_label_value_over_2048_bytes() {
         let value = "b".repeat(2049);
@@ -4470,9 +4506,44 @@ mod tests {
             }],
         };
         let out = parse_protobuf(&req, 0).unwrap();
+        let message = only_stream_error(&out);
+        assert_eq!(
+            message,
+            format!(
+                "stream '{{app=\"{value}\", service_name=\"{value}\"}}' \
+                 has label value too long: '{value}'"
+            )
+        );
+        assert_eq!(
+            message.matches(value.as_str()).count(),
+            3,
+            "the discovered value is copied, not truncated"
+        );
+    }
+
+    /// AC5's other half: synthesis precedes the COUNT bound, so the label the
+    /// reference synthesized is inside the message it renders. Byte-equal to
+    /// the measured container body (`grafana/loki@sha256:87f0a067…`, stock
+    /// config, 16 arbitrary labels).
+    #[test]
+    fn the_discovered_label_is_inside_the_bound_message() {
+        let inner = (0..16)
+            .map(|i| format!(r#"l{i:02}="v""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: format!("{{{inner}}}"),
+                entries: vec![entry(1_700_000_000, 0, "a")],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
         assert_eq!(
             only_stream_error(&out),
-            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'")
+            "entry for stream '{l00=\"v\", l01=\"v\", l02=\"v\", l03=\"v\", l04=\"v\", \
+             l05=\"v\", l06=\"v\", l07=\"v\", l08=\"v\", l09=\"v\", l10=\"v\", l11=\"v\", \
+             l12=\"v\", l13=\"v\", l14=\"v\", l15=\"v\", service_name=\"unknown_service\"}' \
+             has 16 label names; limit 15"
         );
     }
 
@@ -5251,46 +5322,65 @@ mod tests {
         assert_eq!(out.rows[0].structured_metadata, "");
     }
 
-    /// A stream whose labels are ALL empty-valued strips down to the empty
-    /// label set, and PulsusDB stores it.
+    /// AC8 (issue #379): a stream whose labels are ALL empty-valued strips
+    /// down to nothing and is then given `service_name="unknown_service"`, so
+    /// it is stored under the same identity as a literal `{}` push — which is
+    /// what the reference does with both.
     ///
-    /// **This is a divergence, and which one depends on how the reference is
-    /// configured** — an earlier revision of this comment claimed
-    /// unconditionally that it answers 400, which is wrong under its own
-    /// defaults. Its push path normally never reaches the empty-label check:
     /// `ParseLokiRequest` runs `syntax.ParseLabels` (the strip) and then, for
     /// any stream carrying no `service_name`, sets one from
-    /// `discover_service_name` — falling back to the literal `unknown_service`
-    /// when no configured name is present (`pkg/loghttp/push/push.go:425-452 @
-    /// v3.7.4`). That list defaults to thirteen names, i.e. non-empty
-    /// (`pkg/validation/limits.go:329-341 @ v3.7.4`), so the label set is no
-    /// longer empty by the time `ValidateLabels` tests `ls.IsEmpty()` ->
-    /// `MissingLabelsErrorMsg` (`pkg/distributor/validator.go:156-162 @
-    /// v3.7.4`). Measured on two `grafana/loki:3.7.4` containers differing
-    /// only in that setting:
+    /// `discover_service_name`, falling back to the literal `unknown_service`
+    /// when no configured name is present
+    /// (`pkg/loghttp/push/push.go:442-456 @ v3.7.4`); the list defaults to
+    /// thirteen names, i.e. non-empty
+    /// (`pkg/validation/limits.go:329-343 @ v3.7.4`), so the set is no longer
+    /// empty by the time `ValidateLabels` tests `ls.IsEmpty()`
+    /// (`pkg/distributor/validator.go:158-162 @ v3.7.4`). Measured on stock
+    /// `grafana/loki@sha256:87f0a067…`: `{}` and `{"onlyempty":""}` are both
+    /// `204` and land in ONE `{service_name="unknown_service"}` stream. This
+    /// test asserts the same two bodies produce one shared fingerprint here.
     ///
-    /// | pushed | stock config | `discover_service_name: []` |
-    /// |---|---|---|
-    /// | `{}` | 204, stored as `{service_name="unknown_service"}` | 400 `error at least one label pair is required per stream` |
-    /// | `{"onlyempty":""}` | 204, stored in that SAME stream | 400, same text |
-    ///
-    /// PulsusDB answers neither: 204, storing the empty label set. It
-    /// implements neither half — no `discover_service_name` equivalent at all
-    /// (pre-existing and not specific to this input: a push of `{"keep":"v"}`
-    /// likewise stores without the synthesized `service_name`), and no
-    /// `ValidateLabels`, which is #374's. Measured at our own wire with the
-    /// same two bodies: both 204, both landing in one `log_streams` row whose
-    /// `labels` is `{}`. Issue #259 changes only which inputs reach that row —
-    /// the literal `{}` push already did.
+    /// An earlier revision of this test recorded the divergence instead: we
+    /// stored the empty label set, because neither half was implemented. Both
+    /// halves are implemented now — synthesis here, and the empty-label
+    /// rejection in [`log_label_limits`], which this input consequently never
+    /// reaches on the push path.
     #[test]
-    fn a_stream_whose_labels_are_all_empty_valued_becomes_the_empty_label_set() {
-        let (labels, _) = parse_label_set(r#"{e=""}"#).unwrap();
-        assert!(labels.is_empty());
-        assert_eq!(labels.service(), "");
+    fn a_stream_whose_labels_are_all_empty_valued_is_the_unknown_service_stream() {
+        let json = |labels: &str| {
+            let body = format!(
+                r#"{{"streams":[{{"stream":{labels},"values":[["1700000000000000000","x"]]}}]}}"#
+            );
+            let out = parse_json(body.as_bytes(), 0).unwrap();
+            assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+            out
+        };
 
-        // Identical outcome to the literal empty set we already accepted.
-        let (already_empty, _) = parse_label_set("{}").unwrap();
-        assert_eq!(labels, already_empty);
+        let all_empty = json(r#"{"onlyempty":""}"#);
+        assert_eq!(
+            all_empty.streams[0].labels.to_canonical_json(),
+            r#"{"service_name":"unknown_service"}"#
+        );
+        // ...and the physical `service` column carries it, not `""`.
+        assert_eq!(all_empty.rows[0].service, "unknown_service");
+
+        let literal_empty = json("{}");
+        assert_eq!(
+            literal_empty.streams[0].fingerprint, all_empty.streams[0].fingerprint,
+            "both bodies are the one stream the reference stores them in"
+        );
+
+        // The empty-label rejection is therefore unreachable from THIS
+        // transport, which is the half of the reachability claim that was
+        // right: a label whose name breaks a bound but whose value is empty
+        // still answers `204` here, because synthesis refills the set before
+        // it is validated. Measured on stock `grafana/loki@sha256:87f0a067…`:
+        // `{"z"*2000: ""}` -> `204`.
+        let over_long_name_but_empty = json(&format!(r#"{{"{}":""}}"#, "z".repeat(2000)));
+        assert_eq!(
+            over_long_name_but_empty.streams[0].fingerprint,
+            all_empty.streams[0].fingerprint
+        );
     }
 
     #[test]
