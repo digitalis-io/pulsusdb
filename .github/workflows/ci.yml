@@ -600,6 +600,28 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_logfmt_expr_matrix
 
+      # Issue #246: the regex accept/reject surface — every LogQL
+      # construct that carries a user regex x the pattern classes where
+      # Go's regexp and the Rust regex crate disagree, plus the two
+      # positions that MASK the whole set (a `| regexp` without a named
+      # capture, and a selector with no positive matcher: both sides
+      # refuse those for reasons that have nothing to do with the regex),
+      # plus the template-function axis, whose reference half needs one
+      # pushed line. Put to this same container and compared against the
+      # verdicts committed in the test. The window ends at `now`, and here
+      # that is load-bearing for one more reason than the logfmt leg's:
+      # the reference raises a LINE FILTER's regex error at pipeline
+      # BUILD, so over a stale window it answers 200 and this leg would
+      # score it as accepting every malformed pattern. The hermetic half
+      # (PulsusDB's own verdict at parse -> plan -> compile, the
+      # divergence enumeration, the Go error-code census, the compile-site
+      # enumeration and the template axis) runs in the `ci` job with the
+      # gate off.
+      - name: LogQL differential leg (regex accept matrix, issue #246)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_regex_accept_matrix
+
       # Issue #339: the keyword case-folding table. Its verdicts were
       # CAPTURED from this same container (which keywords fold, which
       # token classes are case-sensitive); this leg replays them so the

@@ -2308,7 +2308,23 @@ impl CompiledPipeline {
 /// user's own pattern fails to compile, its error is the message;
 /// otherwise the observed (anchored) error is used unchanged, so a
 /// size-limit-class failure of the wrapped form is never misreported.
-/// Issue #246 replaces this body and nowhere else.
+///
+/// **This body is NOT going to be replaced with Go's wording, and the
+/// instruction that used to stand here saying it would is withdrawn**
+/// (issue #246, owner rulings 2026-07-26 and 2026-08-08). What is in
+/// scope is the STATUS and the accept/reject decision — both `400` here
+/// and there, pinned point for point by
+/// `tests/logql_regex_accept_matrix.rs`. The prose is not, for two
+/// measured reasons: nothing branches on it (the reference's own four
+/// non-vendor occurrences of `error parsing regexp` are all in its
+/// `_test.go` files), and byte parity is unreachable without porting
+/// Go's parser — its `Error.Expr` is the offending SUB-TOKEN rather than
+/// the pattern (`vendor/github.com/grafana/regexp/syntax/parse.go:16-22
+/// @ v3.7.4`), and that port was refused on #331. The wording difference
+/// is ledgered under `logql-error-envelope`; where the two sides
+/// disagree about the DECISION rather than the words, the classes are
+/// enumerated in `logql-regex-accept-surface-divergence` and owned by
+/// #400.
 ///
 /// NOTE: `label_replace` (issue #276) is the ONE deliberate exception —
 /// LIVE, not dormant: the reference genuinely reports the WRAPPED
