@@ -601,58 +601,66 @@ fn check_frozen_244_header(path: &std::path::Path, banned: &[(String, &[&str])])
         );
     }
     if banned.iter().any(|(p, _)| header_span.contains(p)) {
-        // A UNIQUENESS check, and the comment must not claim more than
-        // that. What it proves: the header names exactly ONE value
-        // family, and it is the one the wording is true for. What it
-        // does NOT prove: that the naming governs the threshold
-        // sentence. Those are different claims, and every round of
-        // review here found another way for two present strings to be
-        // unrelated — which is the tell that "this sentence is scoped by
-        // that one" is a RELATIONAL claim and a presence test can never
-        // settle it (issue #261 review, round five).
+        // Pins the whole scoping DECLARATION, not just the family name
+        // inside it.
         //
-        // Uniqueness is bought because it kills the realistic failure:
-        // a re-capture on another family that leaves the old name behind
-        // in an aside, so the retracted sentence ends up attached to a
-        // family it is FALSE for (`pod-` diverges at 7708, not 5328).
-        // Two range forms now fail. Deliberately still open: moving the
-        // one range form into an unrelated line. Stopping here is a
-        // judgement about stakes — this gates a comment in a frozen,
-        // non-executing artifact, and the exactness contract itself is
-        // carried by the live gates — not a claim that the hole is shut.
-        const SCOPE_ANCHOR: &str = "\"v0\"..\"v{n-1}\"";
+        // Why not just the name: coverage turned out to be a property of
+        // SPELLING, not of intent. A uniqueness test on the quoted range
+        // `"v0".."v{n-1}"` only sees a re-capture that writes the new
+        // family the same way — and that is not this repo's notation.
+        // Measured in this tree: the ledger names families in the `{i}`
+        // form 16 times (`v{i}`, `svc-{i}`, `pod-{i}`, `instance-{i}`,
+        // `10.42.0.{i}`); the sibling artifact this issue added names
+        // them bare (`pod-`, `svc-`) in a `family` column and as "three
+        // families" in prose; and a quoted range form appears in only 4
+        // tracked files (`git grep -lE '"[^"]+"\.\."[^"]+"'`). So a
+        // maintainer re-capturing on `pod-` writes `the `pod-{i}`
+        // family` or `family: pod-`, leaves the stale quoted range in a
+        // superseded-capture aside, and a uniqueness check sees nothing
+        // wrong while the header now asserts the retracted threshold
+        // about a family that diverges at 7708. Both of those were
+        // green before this assertion existed (issue #261 review, round
+        // six).
+        //
+        // WHAT THIS PROVES, exactly: that one sentence is present,
+        // verbatim, in the leading header block. It does NOT prove that
+        // sentence governs the threshold sentence two lines below it —
+        // no presence test can, and a sentence-relation parser is out of
+        // proportion to a comment in a frozen, non-executing artifact
+        // whose exactness contract is carried by the live gates.
+        //
+        // SO, IF YOU ARE EDITING THIS HEADER: this gate will tell you
+        // the declaration changed. It will not tell you the threshold
+        // sentence has become false. Re-read that sentence against the
+        // family this declaration names, or delete it.
+        const SCOPE_DECLARATION: &str = "inserted per row: \"v0\"..\"v{n-1}\", fresh sketch per n";
         // Read through the SAME span pipeline as the phrase check, only
         // with quotes preserved, so strengthening one reader cannot
         // silently weaken the other the way it did in round four. It is
         // tolerant of the wraps that actually occur: markdown reflow
-        // breaks at spaces, and the anchor has none. A break placed
-        // INSIDE the anchor fails closed (zero ranges), which is the
-        // direction to fail in.
+        // breaks at spaces, and this is checked after collapse.
         let anchor_span = collapse(&flatten_with(&lines[..header_len].join("\n"), Quotes::Keep));
+        assert!(
+            anchor_span.contains(SCOPE_DECLARATION),
+            "{}: the header carries the retracted threshold wording but no longer \
+             carries the declaration that scopes it, verbatim: {SCOPE_DECLARATION:?}. \
+             Any re-capture rewrites that sentence — and the threshold wording is \
+             true ONLY for that family, so it must be re-read or deleted at the same \
+             time (issue #261).",
+            path.display()
+        );
+        // Kept as a second, fail-closed constraint: a stale quoted range
+        // left behind in an aside is still a second family named in the
+        // same header.
         let ranges = value_family_ranges(&anchor_span);
         assert_eq!(
             ranges.len(),
             1,
-            "{}: the header must name exactly ONE value family range and it must be \
-             {SCOPE_ANCHOR}; found {n} ({ranges:?}). {why} (issue #261).",
+            "{}: the header names {n} value family ranges ({ranges:?}); exactly one \
+             is allowed, so a superseded capture's name cannot linger beside the \
+             live one (issue #261).",
             path.display(),
-            n = ranges.len(),
-            why = if ranges.is_empty() {
-                "None means the threshold sentence names no family at all, which is \
-                 the state that made the original claim false"
-            } else {
-                "More than one means the sentence can no longer be read against a \
-                 single family — and if the capture was redone on another one, it is \
-                 now false for that family"
-            }
-        );
-        assert_eq!(
-            ranges[0],
-            SCOPE_ANCHOR,
-            "{}: the header's value family range is {:?}, but the retracted threshold \
-             wording is only true for {SCOPE_ANCHOR} (issue #261).",
-            path.display(),
-            ranges[0]
+            n = ranges.len()
         );
     }
 }
