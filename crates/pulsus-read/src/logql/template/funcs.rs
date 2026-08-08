@@ -1801,9 +1801,23 @@ fn compile_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex::Regex, 
         .build()
         .map_err(|e| {
             // The reference emits Go's `error parsing regexp: …` wording;
-            // rust-regex words its diagnostics differently. The accept/
-            // reject boundary matches (both are RE2-class engines); the
-            // wording difference is ledgered (owner error-wording ruling).
+            // rust-regex words its diagnostics differently. The wording
+            // difference is ledgered (owner error-wording ruling).
+            //
+            // **The accept/reject boundary does NOT match**, and this
+            // comment said it did until issue #246 measured it. Both
+            // engines are RE2-CLASS, which is not the same as agreeing:
+            // driven through `{{ regexReplaceAll <p> .app "z" }}` on the
+            // pinned v3.7.4 container and here, 18 of 20 probes disagree,
+            // and two of them answer with a different STRING rather than
+            // a different verdict — `a**` renders `zxz` from the input
+            // `x` (the Rust crate reads it as `(a*)*` and replaces at
+            // every position) and `\p{Alphabetic}` renders `z`. Those are
+            // wrong answers, not boundary differences. The measurement is
+            // `pulsus-read/tests/logql_regex_accept_matrix.rs`'s
+            // `the_template_regex_boundary_does_not_match_the_reference`
+            // and its gated companion; the classes are ledgered under
+            // `logql-regex-accept-surface-divergence` and owned by #400.
             format!("error parsing regexp: {e}")
         })
 }

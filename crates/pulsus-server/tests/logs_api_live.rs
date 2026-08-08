@@ -2396,6 +2396,163 @@ async fn a_grouped_range_aggregation_merges_two_streams_raw_samples_end_to_end()
     );
 }
 
+/// **Issue #246: PulsusDB's own SURFACE axis for a malformed regex.**
+///
+/// `crates/pulsus-read/tests/logql_regex_accept_matrix.rs` measures which
+/// PATTERNS are refused, at the `parse → plan → compile` layer. It cannot
+/// see which ROUTES ask that layer at all — a handler that never parses
+/// `query` answers `200` no matter what the pattern is. So this test puts
+/// one malformed selector regex and one well-formed control to every
+/// mounted `/api/logs/v1` route and compares against the per-route status
+/// committed below.
+///
+/// The reference column was CAPTURED, not assumed: the same two queries
+/// were put to the digest-pinned v3.7.4 oracle's ten `/loki/api/v1`
+/// counterparts on 2026-08-08, and the malformed one is **`400` on all
+/// ten**, `/labels` and `/label/{n}/values` included.
+///
+/// **Two routes answer `200` here, and that is recorded rather than
+/// accepted**: `/labels` and `/label/{n}/values` do not read `query` at
+/// all — `labels_impl` and `label_values_impl` in
+/// `crates/pulsus-server/src/logs_api/handlers.rs` parse only the time
+/// bounds, and docs/api.md §2.3 documents their parameter list without
+/// `query`. That is a route-level gap and NOT a regex one: those two
+/// routes would serve `{app=~"a.*b"}` and `{app=~"("}` identically
+/// because they serve every selector identically. Owned by **#400** with
+/// the rest of this surface's divergences; nothing here fixes it.
+#[tokio::test]
+async fn a_malformed_selector_regex_is_refused_on_every_mounted_logs_route() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_regex_surface";
+    let port = 31_125;
+    let (_guard, _client, base_ns) = setup(db, port).await;
+    let start = (base_ns - 3_600_000_000_000).to_string();
+    let end = (base_ns + 3_600_000_000_000).to_string();
+
+    /// `(route, the parameter carrying the selector, extra params,
+    /// status for a MALFORMED regex, status for the well-formed control,
+    /// why the malformed status is what it is)`.
+    ///
+    /// `bad` is the whole point; `ok` is the control that proves the
+    /// route is reachable and that a `400` came from the regex rather
+    /// than from the route being wrong.
+    type Route = (
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        u16,
+        u16,
+        &'static str,
+    );
+    const ROUTES: &[Route] = &[
+        (
+            "query_range",
+            "query",
+            &[("step", "60s")],
+            400,
+            200,
+            "parses and plans",
+        ),
+        (
+            "query",
+            "query",
+            &[],
+            400,
+            200,
+            "parses and plans. Note the CONTROL diverges here for an unrelated, documented \
+             reason: PulsusDB serves an instant LOG query (docs/api.md §2.2, `vector` or \
+             `streams`) where the reference refuses one on type grounds (`log queries are not \
+             supported as an instant query type`, measured 2026-08-08). That difference is not \
+             this issue's and is not changed by it — it is named so the 200 below is not read as \
+             a regex verdict",
+        ),
+        ("series", "match[]", &[], 400, 200, "parses the matcher set"),
+        (
+            "labels",
+            "query",
+            &[],
+            200,
+            200,
+            "GAP: the handler reads only the time bounds, so `query` is never parsed. The \
+             reference answers 400. Route-level, not regex-level",
+        ),
+        (
+            "label/env/values",
+            "query",
+            &[],
+            200,
+            200,
+            "GAP: same as `labels` — `label_values_impl` reads only the bounds",
+        ),
+        ("stats", "query", &[], 400, 200, "parses the selector"),
+        ("volume", "query", &[], 400, 200, "parses the selector"),
+        (
+            "detected_labels",
+            "query",
+            &[],
+            400,
+            200,
+            "parses the selector",
+        ),
+        (
+            "detected_fields",
+            "query",
+            &[],
+            400,
+            200,
+            "parses the selector",
+        ),
+        (
+            "patterns",
+            "query",
+            &[("step", "60s")],
+            400,
+            200,
+            "parses the selector",
+        ),
+    ];
+
+    let mut probed = 0usize;
+    let mut gaps = Vec::new();
+    for (route, param, extra, bad_status, ok_status, why) in ROUTES {
+        for (pattern, want) in [
+            (r#"{env=~"("}"#, *bad_status),
+            (r#"{env=~"p.*d"}"#, *ok_status),
+        ] {
+            let mut params: Vec<(&str, &str)> = vec![
+                (param, pattern),
+                ("start", start.as_str()),
+                ("end", end.as_str()),
+            ];
+            params.extend(extra.iter().copied());
+            let res = http_get(port, &q(&format!("/api/logs/v1/{route}"), &params))
+                .unwrap_or_else(|| panic!("{route} reachable"));
+            assert_eq!(
+                res.status, want,
+                "/api/logs/v1/{route} with {pattern}: {why}\nbody: {}",
+                res.body
+            );
+            probed += 1;
+        }
+        if *bad_status != 400 {
+            gaps.push(*route);
+        }
+    }
+    assert_eq!(probed, ROUTES.len() * 2, "every route, both patterns");
+    // The gap set is committed, so a route that quietly starts or stops
+    // parsing `query` reddens instead of drifting.
+    assert_eq!(
+        gaps,
+        vec!["labels", "label/env/values"],
+        "the set of routes that ignore `query` has changed — the reference refuses the malformed \
+         regex on all ten, so a new member is a new divergence and a lost one is a fix that \
+         needs its row removed"
+    );
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {

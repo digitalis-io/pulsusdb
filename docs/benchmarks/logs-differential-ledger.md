@@ -1396,10 +1396,40 @@ clients only display it).
   `regexReplaceAllLiteral`/`count`: the reference embeds Go's
   `error parsing regexp: missing closing ): …` wording in
   `__error_details__`; PulsusDB embeds rust-regex's diagnostic behind
-  the same `error parsing regexp: ` prefix. Accept/reject boundaries
-  match (both RE2-class engines); the error CLASS
+  the same `error parsing regexp: ` prefix. The error CLASS
   (`TemplateFormatErr`) and position prefix are byte-exact. Kept out
   of the corpus; hermetically gated instead.
+
+  **Correction (issue #246, measured 2026-08-08).** This bullet used to
+  claim the two engines agree about which patterns they accept, on the
+  ground that both are RE2-class. They do not agree, and being RE2-class
+  is not the same as agreeing. Driven through
+  `{{ regexReplaceAll <pattern> .app `z` }}` over a line whose `app` is
+  `x` — the pattern passed as a Go template RAW string, because a
+  double-quoted template literal makes Go's own scanner refuse `\Q`,
+  `\p` and `\u{` before the regex engine sees them — **18 of 20 probes
+  disagree** on the pinned `grafana/loki@sha256:87f0a067…` v3.7.4 oracle
+  vs this tree. Nine render there and raise `TemplateFormatErr` here
+  (`a{bbb}c`, `\Qa*\E`, `\101`, `(?ss:ab)`, `(?)a`, `a{,5}`, `a{}`,
+  `a(?i){2}`, `(?P<n>a)(?P<n>b)`); nine raise `TemplateFormatErr` there
+  and render here (`\p{Alphabetic}`, `a{1001}`, `a**`, `[[:foo:]]`,
+  `\U0001F600`, `\u{263A}`, `(?x)a`, `(?R)a`, `[a--b]`). The two
+  agreements are `a.*b` and `(`.
+
+  **Two of those are wrong ANSWERS, not lenient accepts**: `a**` renders
+  **`zxz`** from the input `x`, because the Rust crate reads it as
+  `(a*)*` and replaces at every position, and `\p{Alphabetic}` renders
+  **`z`**, because that property exists in the crate's UCD tables and
+  not in RE2's fixed set, so it matches `x`. The reference answers
+  neither — it raises `TemplateFormatErr` for both.
+
+  The divergence classes are the same ones the query-side surface has;
+  they are enumerated in `logql-regex-accept-surface-divergence` below
+  and owned by **#400**. The witness is
+  `crates/pulsus-read/tests/logql_regex_accept_matrix.rs`
+  (`the_template_regex_boundary_does_not_match_the_reference`, hermetic,
+  plus `live_template_axis_against_the_reference`, which re-measures the
+  reference half by pushing one line and reading `__error__` back).
 - Everything else — including `divf`'s `decimal division by 0`,
   slice-bounds panics, `unixToTime`'s `%!w(<nil>)` quirk, goodFunc
   signature rejects and coercion errors — proved byte-exact in the
@@ -1685,7 +1715,25 @@ clients only display it).
   divergence was tracked separately in **#264** and is now **closed** —
   every LogQL error is the reference's bare `text/plain` body, so the
   container matches too and only the prose still differs; the WebSocket
-  close frame still truncates reasons at 123 bytes.)
+  close frame still truncates reasons at 123 bytes.) **This covers the
+  inner regex-compiler text too** (issue #246, owner ruling 2026-08-08 —
+  no translation table): where the reference embeds Go's
+  `error parsing regexp: <code>: `<expr>`` PulsusDB embeds the Rust
+  crate's diagnostic, and byte parity there is unreachable for two
+  STRUCTURAL reasons, not for want of effort. First, Go's `Error.Expr`
+  is the offending **sub-token** rather than the pattern
+  (`vendor/github.com/grafana/regexp/syntax/parse.go:16-22 @ v3.7.4`
+  builds the message from `Code` plus `Expr`) — measured, `{app=~"[z-a]"}`
+  answers ``invalid character class range: `z-a` `` and `{app=~"a**"}`
+  answers ``invalid nested repetition operator: `**` `` — so reproducing
+  it means reproducing that parser's cursor, i.e. the port refused on
+  #331. Second, `label_replace` quotes the **anchored** form where every
+  other call site quotes the bare one, so even the quoted-expression rule
+  is per-site. Nothing branches on the text: Loki v3.7.4's own four
+  non-vendor occurrences of `error parsing regexp` are all in its
+  `_test.go` files. The STATUS is `400` on both sides at every point of
+  the surface, pinned by
+  `crates/pulsus-read/tests/logql_regex_accept_matrix.rs`.
 - **Rejection-status fix (probed, `pulsus-240-status`):** an
   uncompilable regex in a pushed-down line filter (`{…} |~ "("`) or a
   stream matcher (`{app=~"("}`) was a ClickHouse-side 500 `internal`;
@@ -2070,10 +2118,36 @@ absence of a corpus row for an oversight.
   | `{app="checkout"} \| unwrap foo \| __error__=` \`x\` | `400` | `400` |
   | `{app="checkout"} \| logfmt a="b.c"` | `400` | `200` |
   | `{app="checkout"} \| logfmt a="b",` | `400` | `400` |
+  | `{app="x"} \|~ "("` | `400` | `200` |
+  | `{app="x"} \| line_format "{{.x}}" \|~ "("` | `400` | `200` |
+  | `count_over_time({app="x"} \|~ "(" [5m])` | `400` | `200` |
+  | `{app=~"("}` | `400` | `400` |
+  | `{app="x"} \| regexp "(?P<c>()"` | `400` | `400` |
+  | `{app="x"} \| drop a=~"("` | `400` | `400` |
+  | `{app="x"} \| logfmt \| a=~"("` | `400` | `400` |
+  | `label_replace(rate({app="x"}[5m]),"d","$1","s","(")` | `400` | `400` |
 
   A syntax error is refused in both windows; an error the parser accepts
   and the pipeline builder rejects is refused only while the ingester is
   in the query's path.
+
+  The last eight rows (issue #246, measured 2026-08-08 on the same pinned
+  image, 30-day-old window for the stale column) are a MALFORMED REGEX
+  put to every LogQL construct that carries one, and they split the same
+  way. Only the line filter is window-dependent, because it is the one
+  regex construct the reference raises at pipeline BUILD
+  (`pkg/logql/log/filter.go:646 @ v3.7.4`, `parseRegexpFilter` reached
+  from `newRegexpFilter` at `:363`); every other construct compiles its
+  pattern at PARSE — the stream selector and the label filter through
+  `mustNewMatcher` (`pkg/logql/syntax/ast.go:1102-1108`), `| regexp`
+  through `newLabelParserExpr` (`ast.go:729-741`), and `label_replace`
+  through `mustNewLabelReplaceExpr` (`ast.go:2225-2233`) — so it is
+  `400` in every window. **A live leg that used a stale window would
+  therefore score the reference as accepting an entire half of the regex
+  accept surface**, which is why
+  `crates/pulsus-read/tests/logql_regex_accept_matrix.rs`'s
+  `live_matrix_against_the_reference` ends its window at `now` and
+  asserts both dispositions of this split rather than describing them.
 
   The last two rows (issue #247, measured 2026-08-07 on the same pinned
   image) are the same construct split across both classes, so they show
@@ -2112,13 +2186,42 @@ absence of a corpus row for an oversight.
   ignores. PulsusDB now does the same: `build_variants_node` compiles a
   variant's own pipeline and discards the result, so `| logfmt a="b.c"`,
   `| line_format "{{"`, a malformed `ip()` pattern and an uncompilable
-  regex in a variant are all refused here as they are there. Unlike every
+  regex **in a `| regexp`, `| drop`, `| keep` or label-filter stage** of a
+  variant are all refused here as they are there. Unlike every
   other row in this entry that rejection is **window-independent on both
   sides**, because the reference raises it in the querier's
   `newVariantsEvaluator` rather than behind the store's stale-window
   short circuit — measured: no variant-side point moves when the window
   is aged past `query_ingesters_within`. Both rows are pinned point by
   point in `crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs`.
+
+  **Correction (issue #246, measured 2026-08-08).** That sentence said
+  "an uncompilable regex in a variant" without qualification, and one
+  construct escapes it: a variant's own **PUSHABLE line filter**.
+  Measured on the same pinned image and through this tree's
+  `parse → plan → compile` chain:
+
+  | query | reference | PulsusDB |
+  |---|---|---|
+  | `variants(count_over_time({app="x"} \|~ "(" [5m])) of ({app="x"}[5m])` | `400` | **`200`** |
+  | `variants(count_over_time({app="x"} \| line_format "{{.x}}" \|~ "(" [5m])) of ({app="x"}[5m])` | `400` | `400` |
+  | the same with `\| regexp "("`, `\| drop a=~"("`, `\| logfmt a="b.c"` or `\| line_format "{{"` | `400` | `400` |
+
+  **The escape is the PUSHDOWN, not the construct**, which the first
+  version of this correction got wrong by writing "line filter" flat.
+  `VariantSpec::try_new` (`plan.rs:2641`) does compile the variant's
+  discarded prefix, but `compile_stage` returns `Ok(None)` for a pushable
+  line filter (`pipeline.rs:986-996`) before it reaches `compile_regex` at
+  `:1013`; a pushable filter's regex is validated on the SQL-rendering
+  path instead (`logql/escape.rs`'s `_checked` renderers), and a discarded
+  prefix renders no SQL. Put the filter after a `line_format` and
+  `seen_line_format` clears the pushdown, so the filter IS compiled and
+  the second row agrees. This is the one place in this entry where the
+  divergence runs the OTHER way (we serve what the reference refuses), so
+  the owner ruling below does not cover it; it is enumerated as
+  `variants_variant_side_skips_the_line_filter` in
+  `logql-regex-accept-surface-divergence`, bounded there by the
+  `variants_variant_after_line_format` position, and owned by **#400**.
 
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
@@ -2163,6 +2266,168 @@ absence of a corpus row for an oversight.
   first table. `curl -s http://localhost:13380/config | grep
   max_query_lookback` shows the `0s` that rules out the lookback
   middleware.
+
+## Issue #246 — the LogQL regex accept surface
+
+### `logql-regex-accept-surface-divergence` (issue #246, measured; every class OWNED by #400 unless noted)
+
+**Not a wording entry.** Issue #246 was filed to reproduce Go's `regexp`
+error prose byte for byte and was scoped out of that by the owner (rulings
+2026-07-26 and 2026-08-08): the prose difference is covered by
+`logql-error-envelope`, and no translation table exists or is owed. What
+this entry records is what the scouting run found while measuring the
+prose question — the two engines disagree about the **decision** far more
+often than they agree about it.
+
+- **Measurement conditions.** 16 query positions × 44 patterns = 704
+  points, plus 2 masked positions × 44 = 88, so 792 probed in all. Reference: the digest-pinned
+  `grafana/loki@sha256:87f0a067…` v3.7.4 oracle
+  (`/loki/api/v1/status/buildinfo` = `{"version":"3.7.4","revision":"b318f282"}`)
+  with `ci/logql/config.yaml`, probed at `/loki/api/v1/query_range` over a
+  5-minute window **ending at `now`** — load-bearing, see
+  `malformed-query-refused-in-every-window`. PulsusDB: `parse → plan →
+  CompiledPipeline::compile`, the compile `exec` runs before any I/O.
+  **308 of the 704 unmasked points disagree**, in the classes below. Every
+  figure here is recomputed by
+  `crates/pulsus-read/tests/logql_regex_accept_matrix.rs` rather than
+  restated: the class enumeration is asserted equal to the matrix's own
+  derived disagreement set, and no class may be redundant.
+
+- **Direction A — PulsusDB rejects, the reference serves.** A query that
+  works there fails here.
+
+  | class | patterns | positions | note |
+  |---|---|---|---|
+  | `engine_dir_a_perl_and_flag_forms` | `\Qa*\E`, `\101`, `a(?i){2}`, `(?ss:ab)`, `(?)a` | 15 | the `re2_pattern_to_rust` rewrite does not change them, so `label_replace` is affected too |
+  | `engine_dir_a_brace_forms` | `a{bbb}c`, `a{,5}`, `a{}` | 14 | `label_replace` excluded — its rewrite escapes the braces. That is #331's deferred partial fix, live at one site out of fourteen |
+  | `engine_dir_a_duplicate_capture_name` | `(?P<n>a)(?P<n>b)` | 14 | **not one of the eighteen classes #400 was filed with** — found by this matrix. The reference's vendored parser has no duplicate-name check (`git grep -n duplicate vendor/github.com/grafana/regexp/ @ v3.7.4` finds only an unrelated comment); the Rust crate refuses it. `regexp_named` excluded: the reference refuses it there for its own reason, `duplicate extracted label name 'n'` (`pkg/logql/log/parser.go:309-311 @ v3.7.4`) |
+  | `engine_dir_a_nesting_limit` | 999 nested groups | 7 | a LIMIT, not a construct. The reference's `maxHeight` is 1000 (`vendor/github.com/grafana/regexp/syntax/parse.go:93 @ v3.7.4`) and every site that wraps the pattern in `^(?:…)$` spends part of it, so this rejects on both sides at the anchored positions and only diverges at the unanchored ones |
+  | `variants_common_side_hides_the_build_error` | the 14 patterns both sides reject | 1 | **owned by #380**, not #400: the reference swallows a `variants(...)` common-pipeline build error in every window. Deliberate, and the direction the owner ruled for |
+
+- **Direction B — PulsusDB serves, the reference rejects. Several of these
+  answer with a DIFFERENT PATTERN, which is a wrong answer and not
+  leniency.**
+
+  | class | patterns | positions | note |
+  |---|---|---|---|
+  | `engine_dir_b_read_as_a_different_pattern` | `\U0001F600`, `(?R)a`, `(?x)a`, `a**`, `[[:foo:]]`, `\p{Alphabetic}`, `a{1001}` | 15 | `(?R)` is read as the Rust crate's CRLF flag and matches everything; `[[:foo:]]` as a nested class matching `:`/`f`/`o`; `a**` as `(a*)*`. In a `line_format` template `a**` renders **`zxz`** from the input `x` and `\p{Alphabetic}` renders **`z`** — see `template-error-wording-residuals` |
+  | `engine_dir_b_class_forms` | `[a--b]`, `\u{263A}` | 14 | `label_replace` excluded — its rewrite makes the Rust crate agree with the reference, so that one position is the only LogQL site where these are refused |
+  | `engine_dir_b_invalid_utf8_escape` | `"\xff"` | 9 | the VERDICT half of something worse, and see the note under this table. Go's `strconv.Unquote` gives the reference one 0xFF byte, which its parser refuses as invalid UTF-8 wherever the pattern reaches it — these nine positions. **Our lexer does not produce that byte, and does not produce U+00FF either**: `scan_double_quoted` drops the backslash on an unknown escape (`crates/pulsus-logql/src/lexer.rs:322-331`, `Some(other) => value.push(other)`), so the pattern becomes the three ASCII characters `xff` and compiles. The positions absent from the nine are the `NewFastRegexMatcher` sites, which never parse a plain literal at all (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) |
+  | `variants_variant_side_skips_the_line_filter` | the 14 patterns both sides reject | 1 | found by this matrix. The reference refuses a malformed line filter inside a `variants(...)` variant; we serve it — but only while the filter is PUSHABLE. `compile_stage` returns `Ok(None)` for a pushable line filter (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`, so the discarded variant prefix `VariantSpec::try_new` compiles (`plan.rs:2641`) never sees the regex, and a discarded prefix renders no SQL either. Put the same filter after a `line_format` and the pushdown is cleared, the filter is compiled, and both sides refuse it — that is the `variants_variant_after_line_format` position, which agrees at every pattern and is what bounds this row. `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused on both sides too |
+
+- **The LogQL string ESCAPE is one root cause with TWO divergences, and
+  only one of them is in this matrix at all** (issue #246 review rounds 2
+  and 3). `scan_double_quoted`
+  (`crates/pulsus-logql/src/lexer.rs:322-331`) knows `\n`, `\t` and `\r`
+  and handles everything else with `Some(other) => value.push(other)` —
+  dropping the backslash and keeping the character. Go's string grammar
+  knows a great deal more and rejects what it does not know. Measured on
+  the pinned oracle and through this tree's parser, 2026-08-08:
+
+  | spelling | reference | PulsusDB | half |
+  |---|---|---|---|
+  | `{app=~"\xff"}` | `200`, a matcher for byte `0xFF` | `200`, a matcher for `xff` | value |
+  | `{app=~"\101"}` | `200`, a matcher for `A` (Go octal) | `200`, a matcher for `101` | value |
+  | `{app=~"\d+"}` | `400 parse error at line 1, col 7: invalid char escape` | `200`, a matcher for `d+` | reject |
+  | `{app=~"\0"}` | `400 … invalid char escape` | `200`, a matcher for `0` | reject |
+  | `{app="x"} \|~ "\d+"` | `400 … col 14` | `200`, filter `d+` | reject |
+  | `{app="x"} \| regexp "(?P<c>\d+)"` | `400 … col 20` | `200` | reject |
+
+  **The value half** — an escape Go DEFINES and we do not — is what
+  `engine_dir_b_invalid_utf8_escape` records the verdicts of. Its real
+  damage is that at the five `NewFastRegexMatcher` positions both systems
+  answer `200` and match different lines: **a user's pattern silently
+  becomes a different pattern.** (This entry claimed for one round that
+  our lexer produced U+00FF. It does not produce that, nor the reference's
+  0xFF byte.)
+
+  **The reject half** — an escape Go does NOT define — is an ordinary
+  accept-surface divergence: a `400` there at the LEXER, before any regex
+  parser, and therefore at every construct rather than at particular
+  positions (the column numbers above are the only thing that moves), and
+  a `200` here. **It is in none of the 792 points and none of the nine
+  classes**, and the reason is worth stating exactly, because a looser
+  version of it was wrong: every **other** pattern in the matrix is a
+  regex body that `logql_quote` escapes on the way in, so it cannot carry
+  a string escape at all. `Pattern::literal` deliberately exempts one body
+  variant, `Body::LogqlSource`, and `invalid_utf8` (`\xff`) IS that
+  variant — the exemption is the whole point of it. That single unquoted
+  point is still not in this half, because `\x` is an escape Go DEFINES;
+  it is the value half's probe. Nothing here covers the reject half, and
+  this entry does not claim to.
+
+  Both halves are owned by **#400**; the reject half is an accept-surface
+  divergence and belongs there beside the value one. The PromQL side of
+  the same escape family was examined once before, on
+  `docs/decisions/0002-promql-parser-selection.md:110`.
+
+  **Why the value half survived a review round is the limit worth
+  recording**: this matrix scores VERDICTS. Both sides accept at all 16
+  positions, so no cell moves, no test moves, and no amount of adding
+  patterns or positions would have caught it. The matrix's module docs now
+  say so under "What this matrix cannot see", and the decoded value itself
+  is asserted by
+  `the_parsed_pattern_value_is_committed_where_the_escape_changes_it` —
+  the one check in the file with a value in it rather than a disposition.
+  Demonstrated rather than asserted: with a real `\xHH`-decoding arm added
+  to the lexer, that one test fails and the other twelve — every verdict
+  test, both live legs and the divergence enumeration — stay green while
+  the compiled pattern has genuinely changed.
+
+- **Status parity, in contrast, holds everywhere.** Every rejection above
+  is `400` on both sides — ours through `PipelineError::BadRegex` →
+  `ReadError::PipelineInvalid` → `StatusCode::BAD_REQUEST` — at all 792
+  probed points. That is the half this issue shipped as a pin.
+
+- **The three ways to measure this and learn nothing**, each hit during
+  the scouting run and each now built into the fixture: probing `| regexp`
+  **without** a named capture (both sides refuse it for that reason alone
+  — 0 of 44 disagree); probing the negated selector as `{app!~"P"}` (both
+  sides refuse a selector with no positive matcher — 0 of 44 disagree);
+  and putting the live leg to a window older than `query_ingesters_within`
+  (the reference's line filter is a build error, so it answers `200` there
+  — the leg would score the whole of Direction B as agreement).
+
+- **The pattern set is enumerated from the reference's TAXONOMY, and two
+  unreachability claims in the first version of it were false in the same
+  way.** Of the 16 `ErrorCode` constants the vendored parser declares
+  (`vendor/github.com/grafana/regexp/syntax/parse.go:28-48 @ v3.7.4` — 16,
+  not the 17 the plan stated), 14 are now raised by a named pattern, each
+  tied to the container's own captured error body. Only `ErrInternalError`
+  and `ErrInvalidCharClass` are excused, and their argument is a grep over
+  the reference's source (declared, never raised anywhere in the package)
+  rather than a probe.
+
+  The two that were wrongly excused, recorded because the shape recurs:
+  `ErrInvalidUTF8` was excused on a probe that sent a **raw** `%FF` byte in
+  the `query=` parameter, which the LogQL scanner refuses first
+  (`pkg/logql/syntax/query_scanner.go:264 @ v3.7.4`) — while the string
+  **escape** `"\xff"` reaches the parser normally and `{app="x"} |~ "\xff"`
+  is a `400 … invalid UTF-8`. `ErrLarge` was excused on a probe of a
+  *nested* repeat, which the repeat-product cap pre-empts
+  (`repeatIsValid(re, 1000)`, `parse.go:434-437`) — while 4,000 copies of
+  `a{999}`, 24,000 characters, reaches `maxSize`, which is
+  `128<<20 / instSize` with `instSize = 40` = **3,355,443** instructions
+  (33,554,432 is `maxRunes`, the other limit, and the figure the first
+  version quoted for this one). **An unreachability claim is a claim about
+  every route into a rule, so the probe's domain has to be the claim's
+  domain.** The census now fails if a pattern is credited with a code whose
+  captured body does not begin with that code's message, and the live leg
+  fails if any excused code is ever observed on the wire.
+
+- **What is NOT here.** No fix. Both root fixes — porting Go's
+  `regexp/syntax`, and embedding RE2 — were rejected by the owner on #331,
+  and the partial fix (applying `re2_pattern_to_rust` at the LogQL
+  in-process sites, which would close the brace and class-form classes and
+  nothing else) was deferred there. #400 owns the decision.
+
+- **Fixture status:** `crates/pulsus-read/tests/logql_regex_accept_matrix.rs`
+  — hermetic halves plus `live_matrix_against_the_reference` and
+  `live_template_axis_against_the_reference`, both gated on
+  `PULSUSDB_LOGQL_DIFF_URL` and wired into CI's `schema-it` job against
+  the already-running `pulsus-logql-diff` container. The per-route surface
+  axis is `crates/pulsus-server/tests/logs_api_live.rs`'s
+  `a_malformed_selector_regex_is_refused_on_every_mounted_logs_route`.
 
 ## Issue #374 — the per-stream label rules at log ingest
 
