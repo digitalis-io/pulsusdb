@@ -9,11 +9,15 @@
 //!
 //! The canonical sentence lives in `pulsus_model::resolve_structured_metadata`'s
 //! doc comment, primitive 7, between the markers below. Every file in
-//! [`COPIES`] must contain it **byte for byte** after doc-comment prefixes are
-//! stripped and whitespace is collapsed — the two normalizations a Markdown
-//! renderer applies anyway, so the rendered text is identical, not merely
-//! similar. Nothing else is normalized: a changed word, a moved emphasis span,
-//! a dropped comma or an em dash swapped for a comma all fail, which is
+//! [`COPIES`] must contain it **byte for byte** after whitespace runs are
+//! collapsed — and, on the RUST SOURCE side only, after each line's
+//! doc-comment marker is stripped. Both are normalizations a Markdown renderer
+//! applies to that input anyway, so the rendered text is identical rather than
+//! merely similar. The asymmetry is deliberate: `///` is syntax in the source
+//! and literal rendered text in a `.md` file, so stripping it from both sides
+//! would let a document that gained a stray `///` prefix compare equal.
+//! Nothing else is normalized — a changed word, a moved emphasis span, a
+//! dropped comma or an em dash swapped for a comma all fail, which is
 //! precisely the class of difference that got through by eye.
 //!
 //! To change the rule: edit it in `labels.rs` and run this test, which names
@@ -52,22 +56,39 @@ fn read(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"))
 }
 
-/// Strips Rust doc-comment prefixes and collapses every whitespace run to one
-/// space — what a Markdown renderer does to inline text either way. Applied to
-/// the source and to the docs alike, so neither side gets a normalization the
-/// other does not.
-fn normalize(text: &str) -> String {
-    let stripped: String = text
+/// Which side of the comparison a text came from — and therefore whether
+/// `///`/`//!` at the start of a line is syntax to strip or literal text to
+/// keep.
+///
+/// It is only syntax in the Rust source. In a Markdown document those three
+/// characters render as themselves, so stripping them there would let a doc
+/// that gained a stray `///` prefix compare equal to the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    RustSource,
+    MarkdownDoc,
+}
+
+/// Collapses every whitespace run to one space, and — for
+/// [`Kind::RustSource`] ONLY — strips the leading doc-comment marker from each
+/// line. Both are what a Markdown renderer does to the corresponding input, so
+/// two texts that survive this comparison render identically rather than
+/// merely similarly.
+fn normalize(text: &str, kind: Kind) -> String {
+    let joined: String = text
         .lines()
-        .map(|line| {
-            let line = line.trim_start();
-            line.strip_prefix("///")
-                .or_else(|| line.strip_prefix("//!"))
-                .unwrap_or(line)
+        .map(|line| match kind {
+            Kind::RustSource => {
+                let line = line.trim_start();
+                line.strip_prefix("///")
+                    .or_else(|| line.strip_prefix("//!"))
+                    .unwrap_or(line)
+            }
+            Kind::MarkdownDoc => line,
         })
         .collect::<Vec<_>>()
         .join(" ");
-    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+    joined.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The text BETWEEN the markers, trimmed, from an already-normalized
@@ -101,7 +122,7 @@ fn extract(normalized: &str, what: &str) -> String {
 
 #[test]
 fn every_document_copies_the_del_vs_set_rule_verbatim() {
-    let canonical = extract(&normalize(&read(SOURCE)), SOURCE);
+    let canonical = extract(&normalize(&read(SOURCE), Kind::RustSource), SOURCE);
     // Non-vacuity: a marker pair that had lost its contents would otherwise
     // let every file "match" an empty rule.
     assert!(
@@ -116,7 +137,7 @@ fn every_document_copies_the_del_vs_set_rule_verbatim() {
 
     let mut stale = Vec::new();
     for copy in COPIES {
-        let found = extract(&normalize(&read(copy)), copy);
+        let found = extract(&normalize(&read(copy), Kind::MarkdownDoc), copy);
         if found != canonical {
             stale.push(format!(
                 "{copy}\n  has:      {found}\n  expected: {canonical}"
@@ -139,34 +160,45 @@ fn every_document_copies_the_del_vs_set_rule_verbatim() {
 /// qualifier to the whole clause, `— a rename` -> `, and a rename`, and a
 /// dropped comma. A normalization that swallowed any of them would let the
 /// same defect back in.
+///
+/// Each mutation is applied in two steps that fail SEPARATELY, because a
+/// `replacen` whose needle has vanished silently no-ops and a no-op mutation
+/// equals the body — which would trip the "survives normalization" assertion
+/// for entirely the wrong reason. So: the needle must be present (or this
+/// test is checking nothing), the replacement must change the raw text, and
+/// only then must the difference survive [`normalize`].
 #[test]
 fn the_comparison_rejects_the_differences_that_got_through_by_eye() {
-    let canonical = extract(&normalize(&read(SOURCE)), SOURCE);
+    let canonical = extract(&normalize(&read(SOURCE), Kind::RustSource), SOURCE);
     let body = canonical.as_str();
 
     let mutations = [
-        ("case", body.replacen("An empty value", "an empty value", 1)),
+        ("case", "An empty value", "an empty value"),
         (
             "emphasis moved",
-            body.replacen(
-                "that the builder did not `Set`",
-                "*that the builder did not `Set`*",
-                1,
-            ),
+            "that the builder did not `Set`",
+            "*that the builder did not `Set`*",
         ),
-        (
-            "em dash for comma",
-            body.replacen(", and a rename", " — a rename", 1),
-        ),
+        ("em dash for comma", ", and a rename", " — a rename"),
         (
             "comma dropped",
-            body.replacen("name in either wire order,", "name in either wire order", 1),
+            "name in either wire order,",
+            "name in either wire order",
         ),
     ];
-    for (label, mutated) in mutations {
+    for (label, needle, replacement) in mutations {
+        assert!(
+            body.contains(needle),
+            "{label}: the mutation's needle {needle:?} is no longer in the canonical sentence, so              this row asserts nothing — re-derive it from the sentence as it now reads"
+        );
+        let mutated = body.replacen(needle, replacement, 1);
         assert_ne!(
-            normalize(&mutated),
-            normalize(body),
+            mutated, body,
+            "{label}: the mutation did not change the raw text"
+        );
+        assert_ne!(
+            normalize(&mutated, Kind::RustSource),
+            normalize(body, Kind::RustSource),
             "{label}: this difference survives normalization, so the test would not catch it"
         );
     }
@@ -175,8 +207,8 @@ fn the_comparison_rejects_the_differences_that_got_through_by_eye() {
     // a doc-comment prefix and a re-wrap must not count as a difference.
     let rewrapped = format!("///   {}", body.replace(' ', "\n///       "));
     assert_eq!(
-        normalize(&rewrapped),
-        normalize(body),
+        normalize(&rewrapped, Kind::RustSource),
+        normalize(body, Kind::RustSource),
         "re-wrapping a doc comment must not read as a changed rule"
     );
 }

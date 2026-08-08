@@ -839,12 +839,22 @@ mod tests {
     /// The rows come in BOTH wire orders (`g01`/`g05`, `g03`/`g06`) because
     /// `Reset` walks the whole base before the loop runs, so `del` holds the
     /// name wherever the empty pair sits — order-independence is a property
-    /// of the mechanism, not of the examples. Only `g03`/`g04`'s order is
-    /// reachable through the OTLP scope path, which always appends identity
-    /// after the attributes; `otlp_logs`'s
-    /// `a_u_fffd_bearing_scope_name_survives_an_empty_valued_attribute_of_the_same_name`
-    /// asserts that one end to end. `g06`'s order reaches the builder on the
-    /// push transports, where the entry's pairs arrive in wire order.
+    /// of the mechanism, not of the examples.
+    ///
+    /// **Both orders are reachable on both transports.** An earlier revision
+    /// of this comment claimed `g06`'s order could not occur on the OTLP
+    /// scope path, arguing that identity is appended after the attributes.
+    /// That argument is about the identity FIELD and says nothing about two
+    /// ATTRIBUTES canonicalizing onto one name with the scope's own
+    /// name/version empty, which is `g06`'s pair list exactly — measured
+    /// through the reference's own OTLP receiver and asserted against ours by
+    /// `otlp_logs`'s
+    /// `two_attributes_canonicalizing_onto_one_name_reach_the_reverse_order_here_too`,
+    /// with `a_u_fffd_bearing_scope_name_survives_an_empty_valued_attribute_of_the_same_name`
+    /// covering the identity route. The claim is recorded rather than deleted
+    /// because the defect was the SHAPE of the argument: an absence justified
+    /// by a reachability story about our own code, instead of by enumerating
+    /// what can reach the seam.
     #[test]
     fn the_builder_emits_a_set_name_even_when_reset_deleted_it() {
         for (id, source, expected) in [

@@ -1358,6 +1358,53 @@ mod tests {
         assert_eq!(attribute, r#"{"a_b":"p "}"#);
     }
 
+    /// The REVERSE pair order — the `Set` first, the empty pair second — is
+    /// reachable here too, and this test exists because an earlier revision
+    /// claimed it was not. "Identity is appended after the attributes" rules
+    /// out reaching that order **through the identity field**; it says
+    /// nothing about reaching it through TWO ATTRIBUTES that canonicalize
+    /// onto one name, with the scope's own name and version empty so nothing
+    /// is appended after them at all.
+    ///
+    /// Measured on `grafana/loki:3.7.4` (`b318f282`) through the reference's
+    /// OWN OTLP receiver (`POST /otlp/v1/logs`, read back with
+    /// `categorize-labels`), not inferred from the push transport: a scope
+    /// with empty name/version and attributes `scope.name="N\u{FFFD}"` then
+    /// `scope_name=""` stores `scope_name="N "` (beside the reference's own
+    /// `severity_number` entry, which PulsusDB does not add), the U+FFFD-free
+    /// control `scope.name="N"` + `scope_name=""` stores neither, and the
+    /// opposite attribute order stores `scope_name="N "` as well.
+    ///
+    /// Row `g06` of `pulsus_model`'s
+    /// `the_builder_emits_a_set_name_even_when_reset_deleted_it` is this pair
+    /// list; here it is driven through the real `parse`.
+    #[test]
+    fn two_attributes_canonicalizing_onto_one_name_reach_the_reverse_order_here_too() {
+        for (first, second, expected, note) in [
+            (
+                kv("scope.name", Value::StringValue("N\u{FFFD}".to_string())),
+                kv("scope_name", Value::StringValue(String::new())),
+                r#"{"scope_name":"N "}"#,
+                "the U+FFFD `Set` outranks the later empty pair's delete",
+            ),
+            (
+                kv("scope_name", Value::StringValue(String::new())),
+                kv("scope.name", Value::StringValue("N\u{FFFD}".to_string())),
+                r#"{"scope_name":"N "}"#,
+                "…and in the other attribute order",
+            ),
+            (
+                kv("scope.name", Value::StringValue("N".to_string())),
+                kv("scope_name", Value::StringValue(String::new())),
+                "",
+                "the discriminating control: without the U+FFFD the delete stands",
+            ),
+        ] {
+            let stored = scope_sm(Some(scope("", "", vec![first, second])));
+            assert_eq!(stored, expected, "{note}");
+        }
+    }
+
     #[test]
     fn empty_valued_resource_attribute_leaves_the_stream_label_set() {
         // Stream labels get a strip too (issue #259), the PAIR-WISE one: the
