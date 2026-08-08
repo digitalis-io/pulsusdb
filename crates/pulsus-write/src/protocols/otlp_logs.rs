@@ -1310,6 +1310,54 @@ mod tests {
         assert_eq!(identity_wins, r#"{"scope_name":"N","scope_version":"1.0"}"#);
     }
 
+    /// …but "an empty-valued attribute takes the identity field with it" holds
+    /// only while that identity field is never `Set`. `Reset` seeds the
+    /// builder's `del` from the BASE scan, a U+FFFD value is a `Set` into
+    /// `add`, and `Labels()` emits `add` whether or not `del` holds the name
+    /// (`labels_common.go:163-200`, `labels_stringlabels.go:483-521 @
+    /// v3.7.4`) — so a scope NAME carrying U+FFFD survives the same
+    /// `scope_name=""` attribute that deletes a plain one, rewritten to a
+    /// space.
+    ///
+    /// Measured on `grafana/loki:3.7.4` (`b318f282`) as the pair list this
+    /// path builds: `{scope_name="", scope_name="N\u{FFFD}"}` stores
+    /// `scope_name="N "` there, and the U+FFFD-free control
+    /// `{scope_name="", scope_name="N"}` stores nothing. The rule is
+    /// `pulsus_model`'s
+    /// `the_builder_emits_a_set_name_even_when_reset_deleted_it`; this is the
+    /// OTLP end of it, and the failure mode for the docs/schemas.md §3.1
+    /// sentence that states it.
+    #[test]
+    fn a_u_fffd_bearing_scope_name_survives_an_empty_valued_attribute_of_the_same_name() {
+        let survives = scope_sm(Some(scope(
+            "N\u{FFFD}",
+            "1.0",
+            vec![kv("scope_name", Value::StringValue(String::new()))],
+        )));
+        assert_eq!(survives, r#"{"scope_name":"N ","scope_version":"1.0"}"#);
+
+        // The discriminating control: identical but for the U+FFFD, and the
+        // delete then stands (what the test above asserts).
+        let deleted = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv("scope_name", Value::StringValue(String::new()))],
+        )));
+        assert_eq!(deleted, r#"{"scope_version":"1.0"}"#);
+
+        // The same interaction on an ordinary attribute rather than an
+        // identity field, so the rule is not read as special-casing identity.
+        let attribute = scope_sm(Some(scope(
+            "",
+            "",
+            vec![
+                kv("a.b", Value::StringValue(String::new())),
+                kv("a_b", Value::StringValue("p\u{FFFD}".to_string())),
+            ],
+        )));
+        assert_eq!(attribute, r#"{"a_b":"p "}"#);
+    }
+
     #[test]
     fn empty_valued_resource_attribute_leaves_the_stream_label_set() {
         // Stream labels get a strip too (issue #259), the PAIR-WISE one: the

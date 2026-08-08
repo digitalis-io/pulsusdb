@@ -125,6 +125,16 @@ pub fn retain_non_empty_values(pairs: &mut Vec<(String, String)>) {
 ///    `labels_stringlabels.go:483-521`): a base entry whose name is in `del`
 ///    is dropped, an `add` entry **replaces** the FIRST base entry of the
 ///    same name, remaining `add` entries are inserted in sorted position.
+/// 7. Consequence of 5 and 6, spelled out because it is the corner every
+///    prose DESCRIPTION of this function has got wrong: **`del` drops BASE
+///    entries only, so a `Set` outranks it.** An empty value deletes every
+///    pair stored under its name *that the builder did not `Set`* — a rename
+///    or a U+FFFD rewrite re-adds the name, in either wire order, because
+///    `add` is emitted whether or not `del` holds that name. Measured on
+///    `grafana/loki:3.7.4` (`b318f282`): `{a_b="", a_b="p\u{FFFD}"}` stores
+///    `a_b="p "` and so does the reverse order, while the U+FFFD-free control
+///    `{a_b="", a_b="p"}` stores nothing. Rows `g01`-`g05` of
+///    `the_builder_emits_a_set_name_even_when_reset_deleted_it`.
 ///
 /// So the tie-break is two-tier, not positional: **a pair that was `Set`
 /// (renamed, or carrying U+FFFD) beats a pair that was not, wherever either
@@ -796,6 +806,49 @@ mod tests {
             ),
             ("e09", &[("a", ""), ("a", "keep")], &[]),
             ("e10", &[("a", "keep"), ("a", "")], &[]),
+        ] {
+            assert_eq!(resolved(source), pairs(expected), "{id}: from {source:?}");
+        }
+    }
+
+    /// **`del` drops base entries only, so a `Set` outranks it** — primitive
+    /// 7 of [`resolve_structured_metadata`]'s docs, and the corner that makes
+    /// "an empty value removes every pair stored under that name" false as
+    /// stated. `Reset` seeds `del` from the base scan, a U+FFFD rewrite
+    /// writes into `add`, and `Labels()` emits `add` whether or not `del`
+    /// holds the name — so the rewritten pair survives, in either wire order.
+    ///
+    /// Every row measured this session on `grafana/loki:3.7.4` (`buildinfo`
+    /// `3.7.4` / `b318f282`, `ci/logql/config.yaml`), pushed as JSON
+    /// structured metadata with duplicate object keys emitted as text and
+    /// read back with `X-Loki-Response-Encoding-Flags: categorize-labels`.
+    /// `g02`/`g04` are the U+FFFD-free controls: without the `Set` the delete
+    /// stands, which is what makes the other three discriminating rather than
+    /// vacuous. `g03`/`g04` are the pair list the OTLP scope path builds for
+    /// an empty-valued `scope_name` attribute beside a real scope name — the
+    /// case `otlp_logs`'s
+    /// `a_u_fffd_bearing_scope_name_survives_an_empty_valued_attribute_of_the_same_name`
+    /// asserts end to end.
+    #[test]
+    fn the_builder_emits_a_set_name_even_when_reset_deleted_it() {
+        for (id, source, expected) in [
+            (
+                "g01",
+                &[("a_b", ""), ("a_b", "p\u{FFFD}")][..],
+                &[("a_b", "p ")][..],
+            ),
+            ("g02", &[("a_b", ""), ("a_b", "p")], &[]),
+            (
+                "g03",
+                &[("scope_name", ""), ("scope_name", "N\u{FFFD}")],
+                &[("scope_name", "N ")],
+            ),
+            ("g04", &[("scope_name", ""), ("scope_name", "N")], &[]),
+            (
+                "g05",
+                &[("a_b", "p\u{FFFD}"), ("a_b", "")],
+                &[("a_b", "p ")],
+            ),
         ] {
             assert_eq!(resolved(source), pairs(expected), "{id}: from {source:?}");
         }
