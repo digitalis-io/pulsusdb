@@ -171,23 +171,110 @@ Out of this ledger's scope by design:
 
 ### detected-cardinality-exact-not-estimated (issues #244, #261)
 
-- **Construct:** `/detected_fields`' per-field `cardinality` (and, when
-  issue #261 lands its sibling audit, `/detected_labels`' — cross-reference
-  #261). Informational note, not a gate downgrade.
-- **Direction:** **PulsusDB reports the EXACT distinct-value count** over
-  the sampled entries; the reference reports a **p14 HyperLogLog
-  estimate** (`grafana/loki` v3.7.4 =
-  `b318f2829f0ae2094ab3a1e90780450e9e4b03be`,
-  `pkg/querier/queryrange/detected_fields.go` `parsedFields.sketch`,
-  vendored `github.com/axiomhq/hyperloglog` `New()` = precision 14,
-  sparse). The estimate equals the exact count for every `N <= 5327`;
-  the first divergence is `N = 5328` (sparse-key collision
-  `"v2888"`/`"v5327"`), captured with the pre-committed larger points in
+- **Construct:** two endpoints' `cardinality`, one estimator.
+  `/detected_fields`' per-field `cardinality`, and — landed by issue #261,
+  no longer a forward reference — `/detected_labels`' per-key
+  `cardinality`, `uniqExact(val) AS cardinality` in
+  `crates/pulsus-read/src/logql/sql.rs:163-178`. On the reference both come
+  from the same sketch type: `newParsedFields` and `newParsedLabels` each
+  build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:942` @ `grafana/loki`
+  v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and
+  `countLabelsAndCardinality` (`querier.go:757`) reports the raw
+  `v.Estimate()` (`querier.go:799`). Informational note, not a gate
+  downgrade.
+- **Direction:** **PulsusDB reports the EXACT distinct-value count**; the
+  reference reports a **p14 HyperLogLog estimate** — `New()` = `New14()` =
+  `newSketchNoError(14, true)`, precision 14 with the sparse
+  representation enabled (`vendor/github.com/axiomhq/hyperloglog/hyperloglog.go:27`,
+  `:30`; module `github.com/axiomhq/hyperloglog v0.2.6`), the value taken
+  raw from `Estimate()` with no post-processing
+  (`hyperloglog.go:161-172`).
+- **The agreement threshold is a property of the VALUE STRINGS, not of
+  `N`.** An earlier revision of this entry named a single number, 5327,
+  as the largest distinct-value count at which the two are guaranteed to
+  agree, without saying which values it had been measured on. **That
+  claim was false as stated**: it was measured on one value family
+  (`v{i}`) and written as if it held for all of them. The family
+  `svc-{i}` diverges at **`N = 4533`**, below 5327 — confirmed
+  end-to-end against the container.
+
+  **The correction must not repeat the mistake, so state the floor
+  exactly.** There IS a universal `N` below which the two always agree:
+  `N <= 1`. A single value has nothing to collide with, one insert can
+  never trip the sparse-to-dense check, and one is below the linear
+  counter's exactness ceiling — so agreement at `N <= 1` holds for every
+  value set there is. It is also useless, and it is the ONLY such `N` —
+  a fact with a witness rather than a hope: `{"svc-787", "svc-4532"}` is
+  a TWO-value set whose sparse keys collide (both 36184712, the pair
+  identified below), and the reference answers **1** for it. So no bound
+  at or above `N = 2` holds for every value set, and none is claimed
+  here.
+
+  **Above that floor the following are SUFFICIENT conditions, not
+  necessary ones.** The estimate equals the exact count **whenever** all
+  three hold — the first two depend on the value strings, the third does
+  not — and it frequently equals it when they do not. What changes above
+  the floor is not that agreement stops; it is that agreement stops
+  being guaranteed:
+  1. **no sparse-key collision yet.** In sparse mode each value is
+     encoded into a 25-bit key derived from `metro.Hash64(v, 1337)`
+     (`vendor/.../utils.go:44`, `sparse.go:18-25`); the first pair of
+     values sharing a key makes the count low by one. Which pair that
+     is, and at what `N` it arrives, is a property of the strings.
+  2. **the sketch is still sparse.** `maybeToNormal` flips to the dense
+     estimator once the varint sparse list's **byte** length exceeds `m`
+     (`hyperloglog.go:76-83`, `compressed.go:108-110`), after which the
+     answer is an estimate by construction.
+  3. **the sparse-key count is below 8192.** Sparse mode returns
+     `uint64(linearCount(2^25, 2^25 - count))` (`hyperloglog.go:161-165`,
+     `utils.go:31-34`, `mp = 1<<25` at `hyperloglog.go:11-14`), and that
+     value truncates back to `count` for every `count < 8192`, first
+     missing at `count = 8192`, where it returns 8193. Re-derived here
+     from those lines rather than inferred from the captures. This is the
+     one part of the picture that is a property of the ESTIMATOR alone,
+     and it is exactly why the instrument hazard recorded in PROVENANCE
+     lands on 8192. Note it bounds the sparse-key count, not `N`: above
+     8191 an exactly-offsetting number of collisions could still land on
+     `N` by coincidence, so it is not a bound above which agreement is
+     impossible.
+
+  **Agreement outside those conditions is routine, and is coincidence.**
+  Driving the vendored library directly: `instance-{i}` at `N` = 7966,
+  7989, 8012 and 8015; `10.42.0.{i}` at 7760, 7762, 7767 and 7768; and
+  `v{i}` at 7780, 7782, 7794 and 7797 each report exactly `N` with the
+  sketch **already dense** — condition 2 broken, answer still right.
+  Read nothing above the floor as a rule in either direction: not "they
+  agree below X", and not "they disagree above X" either.
+  Measured first divergences, fresh sketch per `N`, one family per row —
+  **each is that family's threshold and nothing else's**: `v{i}` **5328**
+  (the #244 capture, a sparse-key collision),
+  `svc-{i}` **4533** (collision, still sparse), `pod-{i}` **7708**
+  (no collision first — this family reaches the dense flip intact),
+  `instance-{i}` **7708**, `10.42.0.{i}` **7708**. At that shared
+  `N = 7708` the three families answer **7640**, **7720** and **7700**:
+  one `N`, three reference answers. `pod-` and `svc-` were read back
+  from the container end-to-end; `instance-` and `10.42.0.` are
+  library-only, and the artifact's `observed_by` column records which is
+  which per point.
+
+  **The mechanism is observed per family, not fitted to the numbers.**
+  Re-deriving each family's sparse keys directly —
+  `encodeHash(metro.Hash64(v, 1337), 14, 25)` — at its own divergence
+  point: `v{i}` at 5328 has exactly ONE collision, `"v2888"`/`"v5327"`
+  on key 52686402; `svc-{i}` at 4533 has exactly ONE,
+  `"svc-787"`/`"svc-4532"` on key 36184712; and `pod-{i}`,
+  `instance-{i}` and `10.42.0.{i}` at 7708 have **zero** collisions —
+  7708 distinct keys each — so their divergence is the sparse-to-dense
+  flip alone, with no collision involved. Two families diverge by
+  mechanism 1, three by mechanism 2, at counts that share no pattern. The `v{i}` points are captured in
   `crates/pulsus-read/tests/golden/detected_cardinality/reference_divergence.tsv`
-  and pinned by `detected_fields_witness.rs`'s AC 19 gate (our side is
-  recomputed through the production accumulator; the reference column is
-  the recorded estimate).
-- **Reachability — NOT ESTABLISHED.** The divergence is real and is
+  (pinned by `detected_fields_witness.rs`'s AC 19 gate); the
+  `/detected_labels` points are in
+  `crates/pulsus-read/tests/golden/detected_labels_cardinality/reference_divergence.tsv`,
+  pinned by `crates/pulsus-read/tests/detected_labels_cardinality.rs`,
+  which also asserts that this entry stays family-scoped and that the
+  retracted sentence does not return.
+- **Reachability — `/detected_fields`: NOT ESTABLISHED.** The divergence is real and is
   registered here at the ESTIMATOR level; the largest per-field
   cardinality reachable through the HTTP endpoint is **not established,
   and no bound is claimed**. An earlier revision of this entry asserted
@@ -204,12 +291,81 @@ Out of this ledger's scope by design:
   stores; a second wrong bound in this entry would be worse than an
   acknowledged gap, so none is given. What IS established: every
   `crates/pulsus-read/tests/logqltest/corpus/b14_detected_fields.test`
-  case captures a cardinality `<= 100`, far inside the agreeing range,
-  so every corpus case is pure hard-gated parity rather than a
-  divergence.
-- **Fixture status:** `/detected_fields` has no case in
-  `test/fixtures/logs/differential.json`, so this entry is not referenced
-  from the fixture (`informational_cases_are_recorded_in_the_committed_ledger`
+  case captures a cardinality `<= 100`, and each of those is the
+  container's own answer replayed against ours, so every corpus case is
+  pure hard-gated parity rather than a divergence. (That last clause
+  previously appealed to a universal agreeing range; #261 replaced it
+  with the reason that does not need one — the values were captured from
+  the container. The rest of this bullet is unchanged from #244 and
+  still stands.)
+- **Reachability — `/detected_labels`: ROUTINE.** Unlike the
+  `/detected_fields` bullet above, this one does not need a bound
+  argued: on `/detected_labels` the count is not over a sampled window
+  at all. `N` is the number of distinct values a stream-label key has
+  across the whole month partition(s) the request's window touches,
+  narrowed only by the optional `query=`'s `fingerprint IN` filter
+  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:163-178`);
+  **no request parameter bounds it** — `line_limit` and `limit` do not
+  exist on this endpoint, and `start`/`end` select partitions rather
+  than rows (the within-month granularity gap is issue #399). The
+  count therefore accumulates over a whole month rather than over the
+  requested window: no measurement here bounds a real deployment, but a
+  namespace whose pods churn passes a few thousand distinct `pod` values
+  in a month as a matter of course, so the thresholds above sit inside
+  ordinary operation rather than at an extreme.
+- **Cost — reference-faithfulness is the MOST expensive option,
+  measured.**
+  `clickhouse/clickhouse-server:24.8`, one node, `system.query_log`,
+  3 reps, 2026-08-08. Corpus A: 3,000,000 rows in ONE month partition of
+  the `log_streams_idx` shape = 1,000,000 distinct `pod` values + 50
+  `namespace` + 500 `service`. The query is the production text of
+  `sql::detected_labels`; `uniq` is the same text with the aggregate
+  swapped (**not** reference-compatible — a different estimator
+  entirely); "ship distinct `(key,val)`" is the only route that could
+  reproduce the reference's own sketch, since ClickHouse has no
+  `axiomhq/hyperloglog`-compatible estimator and the values would have
+  to be hashed coordinator-side.
+
+  | variant | duration ms (3 reps) | `memory_usage` | `result_rows` | `result_bytes` |
+  |---|---|---|---|---|
+  | `uniqExact` (what ships) | 120 / 99 / 128 | 125.92 / 129.34 / 123.50 MiB | 3 | 8.77 KiB |
+  | `uniq` (approximate, not the reference's) | 69 / 55 / 50 | 8.16 / 8.09 / 8.88 MiB | 3 | 2.94 KiB |
+  | ship distinct `(key,val)` (the faithful route) | 134 / 112 / 124 | 221.23 / 210.62 / 218.42 MiB | 1,000,550 | 25.28 MiB |
+
+  Corpus B: 10,000,000 distinct `pod` values, one partition, one row per
+  fingerprint. `uniqExact` 1714 / 1801 / 1730 ms at 896.17 / 897.93 /
+  893.79 MiB; `uniq` 144 / 209 / 181 ms at 12.56 / 12.12 / 12.65 MiB.
+
+  So exactness costs roughly 2× the time and 15× the ClickHouse-side
+  memory of a cheap estimator at 1 M distinct values, and about 12× and
+  70× at 10 M — while **reference-faithfulness costs more than either**,
+  adding five orders of magnitude to the coordinator fan-in on a path
+  whose design point (docs/api.md §2.6.2) is "one row per distinct key
+  crosses the network, never one per value". Matching the reference here
+  would be both less accurate and more expensive, which is why this
+  entry records a divergence rather than a TODO. The fan-in property
+  itself is gated, scale-invariantly, by
+  `detected_labels_fan_in_is_one_row_per_key_at_any_cardinality`
+  (`crates/pulsus-read/tests/query_log_gates.rs`).
+- **Memory characteristic — a refusal on this path is a 500, not a 422,
+  and that is issue #398's to fix, not this entry's.** LogQL reads set
+  `max_bytes_to_read` but no `max_memory_usage`
+  (`read_query_settings`, `crates/pulsus-read/src/logql/exec.rs:3225`),
+  so a
+  ClickHouse code 241 falls through `map_read_error` (`exec.rs:3255`) to
+  `ReadError::Clickhouse` and surfaces as **500**, where the
+  `QueryTooBroad` family answers 422. It is deliberately NOT fixed under
+  #261, because it is not this endpoint's exposure: on the identical
+  corpus B above, the SHARED stage-1 stream resolution
+  (`sql::stage1`, which `/query_range`, `/series`, `/detected_fields`
+  and `/detected_labels` all run) used **3.19 / 3.03 / 2.91 GiB**
+  against this endpoint's aggregate at 0.87–0.88 GiB — 3.3-3.6× more. A cap
+  scoped to `/detected_labels` would sit on the cheaper half and leave
+  the expensive half uncapped. One mechanism, one issue: **#398**.
+- **Fixture status:** neither `/detected_fields` nor `/detected_labels`
+  has a case in `test/fixtures/logs/differential.json`, so this entry is
+  not referenced from the fixture
+  (`informational_cases_are_recorded_in_the_committed_ledger`
   guards fixture-referenced entries only); it is registered here so the
   divergence has a ledger identity before any future fixture case lands.
 

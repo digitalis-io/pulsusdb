@@ -1,0 +1,39 @@
+# Issue #261 — the `/detected_labels` half of the registered cardinality
+# divergence: PulsusDB reports the EXACT distinct-value count
+# (`uniqExact(val)`, crates/pulsus-read/src/logql/sql.rs:163-178); the
+# reference reports a p14 HyperLogLog estimate
+# (`newParsedLabels` -> `hyperloglog.New()`, pkg/querier/querier.go:942-947
+# @ grafana/loki v3.7.4 = b318f2829f0ae2094ab3a1e90780450e9e4b03be).
+#
+# THE AGREEMENT THRESHOLD IS A PROPERTY OF THE VALUE STRINGS, NOT OF N.
+# Three families measured at the SAME n = 7708 give three different
+# reference answers below, and a fourth family diverges at 4533. No row
+# here may be read as a bound on any other family.
+#
+# Capture conditions (2026-08-08):
+#  - container: docker.io/grafana/loki:3.7.4, digest
+#    sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc,
+#    single binary, filesystem store, tsdb/v13; limits_config overrides
+#    max_global_streams_per_user: 0, max_streams_per_user: 0,
+#    discover_log_levels: false, split_queries_by_interval: 0.
+#    ONE stream per distinct value, ONE entry each, all at the same
+#    timestamp; scoped by a per-fixture `app` label. Request
+#    `GET /loki/api/v1/detected_labels?query={app="<fixture>"}&start&end`
+#    over a 2 h window. 3 reps per fixture, identical answers.
+#  - library: the vendored github.com/axiomhq/hyperloglog v0.2.6 copied out
+#    of that same Loki checkout, driven as the querier drives it
+#    (`New()`, `Insert([]byte(v))`, `Estimate()`), FRESH SKETCH PER N.
+#    Validated first against the already-committed #244 artifact
+#    (golden/detected_cardinality/reference_divergence.tsv), which it
+#    reproduces exactly. Insertion order (numeric vs lexicographic) does
+#    not move any value in this file.
+#
+# LAST-AGREEING WITNESSES (container, same conditions) — deliberately NOT
+# rows, because a row that agrees discriminates nothing:
+#    pod-  n = 7707 -> 7707       svc-  n = 4532 -> 4532
+#
+# columns: family <TAB> n_distinct <TAB> reference_value <TAB> pulsus_exact <TAB> observed_by <TAB> ledger_id <TAB> note
+svc-	4533	4532	4533	container	detected-cardinality-exact-not-estimated	first sparse-key collision for this family — BELOW the v{i} family's 5328, which is why no universal threshold exists
+pod-	7708	7640	7708	container	detected-cardinality-exact-not-estimated	this family's sparse list flips to dense here (MarshalBinary mode byte); sparse through 7707
+instance-	7708	7720	7708	library	detected-cardinality-exact-not-estimated	same n as the pod- row, estimate high instead of low — the value strings decide
+10.42.0.	7708	7700	7708	library	detected-cardinality-exact-not-estimated	same n again, a third estimate — three families, one n, three answers
