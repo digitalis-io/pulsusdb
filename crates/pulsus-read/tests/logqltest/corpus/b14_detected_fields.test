@@ -2,10 +2,12 @@
 # against the pinned `grafana/loki:3.7.4` container (2026-07-29, config =
 # ci/logql/config.yaml + `limits_config.discover_log_levels: false`; capture
 # procedure and full transcripts in ../PROVENANCE.md). Every case's captured
-# cardinality is <= 100, where the reference's p14 HLL estimate equals the
-# exact count (first divergence at N = 5328 — see
-# tests/golden/detected_cardinality/reference_divergence.tsv), so these are
-# pure hard-gated parity, not divergences.
+# cardinality is <= 100 and is the container's OWN answer, so these are pure
+# hard-gated parity, not divergences. (The earlier wording justified that
+# with a single universal cardinality threshold; that number was ONE value
+# family's and not a universal one — issue #261. The agreement threshold is
+# a property of the value strings: see the
+# detected-cardinality-exact-not-estimated ledger entry.)
 #
 # Authoring rules (PROVENANCE.md §244): A0 loaded streams == query scope;
 # A1 one stream per section unless order-insensitive; A2 distinct

@@ -673,9 +673,13 @@ C5 {app="c5"} (defaults)      -> [{"cardinality":2,"label":"v","parsers":["json"
 C6 {app="c6"} (defaults)      -> [{"cardinality":1,"label":"k","parsers":["json"],"type":"string"}] limit=1000
 ```
 
-Every captured cardinality is <= 100, where the reference's p14 estimate
-equals the exact count (first divergence N = 5328) — pure hard-gated
-parity, not divergences.
+Every captured cardinality is <= 100 and every one of them is the
+container's own answer, replayed against ours — so these rows are pure
+hard-gated parity, not divergences, by capture rather than by argument.
+(An earlier wording justified them with "first divergence N = 5328",
+which is the `v{i}` family's threshold and not a universal one — see the
+`detected-cardinality-exact-not-estimated` ledger entry, corrected by
+issue #261.)
 
 ### Sketch-estimate capture procedure and transcript (2026-07-29)
 
@@ -700,6 +704,78 @@ verified byte-clean afterwards (`git status --porcelain` empty). Per
 
 All five pre-committed additional points disagree, so all are kept
 (the keep-iff-disagrees rule); the `5328` row is mandatory.
+
+**Read the `n <= 5327` sentence in that TSV's header inside its own
+context.** It is scoped by the sentence before it — the values are
+`"v0"`…`"v{n-1}"` — and for that family it is correct (re-verified
+2026-08-08 by scanning `n = 1…5400` fresh-sketch-per-`n`: the first
+`Estimate() != n` is `n = 5328`). It is **not** a statement about other
+value families, and the copies of it that had lost that scope are
+corrected by issue #261 — see the next section.
+
+### `/detected_labels` sketch capture (issue #261, 2026-08-08)
+
+`crates/pulsus-read/tests/golden/detected_labels_cardinality/reference_divergence.tsv`.
+Two instruments, in this order — the library is validated against an
+**already-committed artifact** before it is used to explain anything new:
+
+1. **Library.** The vendored `github.com/axiomhq/hyperloglog` v0.2.6 was
+   copied out of the reference checkout at
+   `b318f2829f0ae2094ab3a1e90780450e9e4b03be` (with its two vendored
+   dependencies, `dgryski/go-metro` and `kamstrup/intmap`, and a
+   hand-written `vendor/modules.txt` reproducing that checkout's
+   version lines) into a throwaway module **outside** the checkout, so
+   the reference tree was never written to (`git -C <loki> status
+   --porcelain` empty before and after). Driven exactly as
+   `newParsedLabels` drives it — `New()`, `Insert([]byte(v))`,
+   `Estimate()` — fresh sketch per `n`. It reproduces the committed
+   `#244` transcript above **exactly** (5327→5327, 5328→5327,
+   7708→7719, 8192→8230, 10000→10049, 20000→20155, 50000→49894);
+   only then was it used for anything else.
+2. **Container.** `docker.io/grafana/loki:3.7.4`, digest
+   `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+   single binary on the filesystem store (tsdb/v13), `limits_config`
+   overriding `max_global_streams_per_user: 0`,
+   `max_streams_per_user: 0`, `discover_log_levels: false`,
+   `split_queries_by_interval: 0`. Each fixture is ONE stream per
+   distinct value, ONE entry each, all at one timestamp, tagged with a
+   per-fixture `app` label; read back with
+   `GET /loki/api/v1/detected_labels?query={app="<fixture>"}&start=<t-1h>&end=<t+1h>`.
+   Three reps per fixture, identical answers each time.
+
+Columns: `family`, `n`, the reference's `cardinality`, the instrument,
+the note. **This block is parsed**, not just read:
+`crates/pulsus-read/tests/detected_labels_cardinality.rs` requires every
+disagreeing row here to appear in the TSV with the same numbers and the
+same instrument, and every agreeing row to appear in the TSV's header as
+a last-agreeing witness and NOT as a row.
+
+```pulsus-261-detected-labels-capture
+pod-	7707	7707	container	last agreeing witness; the sketch is still sparse
+pod-	7708	7640	container	this family's sparse -> dense flip
+svc-	4532	4532	container	last agreeing witness
+svc-	4533	4532	container	sparse-key collision, BELOW the v{i} family's 5328
+instance-	7708	7720	library	the same n as the pod- row, a different answer
+10.42.0.	7708	7700	library	the same n again, a third answer
+```
+
+**Two instrument hazards, both hit while measuring:**
+
+- **`Estimate()` mutates the sketch.** In sparse mode it calls
+  `mergeSparse()`, which drains `tmpSet` and therefore delays the
+  `maybeToNormal()` check (`hyperloglog.go:76-83`, `:161-165`). Scanning
+  incrementally — one sketch, `Estimate()` after every insert — reports
+  `pod-`'s first divergence at **8192** (→ 8193), where the correct
+  fresh-sketch-per-`n` answer is **7708** (→ 7640). Only
+  fresh-sketch-per-`n` is valid; any future re-capture must do the same.
+- **Insertion order is not fixed by the reference.** The ingester
+  returns each label's values from a Go map (`ingester.go:1710-1717`),
+  so the querier inserts them in an unspecified order. Checked
+  explicitly: inserting each family's values in lexicographic order
+  instead of numeric changes none of the values above, and the three
+  container reps agreed. So the captured numbers are not order
+  artifacts — but a future capture at a different `n` should re-check
+  rather than assume.
 
 ## Provenance markers (issue #352)
 
