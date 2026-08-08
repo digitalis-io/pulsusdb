@@ -48,7 +48,7 @@ use std::collections::HashSet;
 
 use prost::Message;
 use pulsus_model::{
-    Date, Fingerprint, LabelSet, UnixNano, stream_fingerprint, strip_empty_valued_labels,
+    Date, Fingerprint, LabelSet, UnixNano, resolve_structured_metadata, stream_fingerprint,
 };
 
 use crate::error::LogsIngestError;
@@ -729,22 +729,26 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 /// through this one seam so the stored `log_samples.structured_metadata`
 /// String is byte-identical across transports by construction.
 ///
-/// - Every EMPTY-VALUED pair is stripped first, BY NAME — and by the
-///   NORMALIZED name, so an empty pair suppresses whatever shares the key it
-///   will be stored under ([`strip_empty_valued_labels`]). The reference's
-///   distributor runs the whole entry's structured metadata through
-///   Prometheus' `labels.Builder`, renaming each pair into it *before* the
-///   empty-value delete takes effect, and a rename re-adds a name a delete
-///   had taken (`pkg/distributor/distributor.go:698-722 @ v3.7.4`; issue
-///   #259). Measured: `{"a.b":"", "a_b":"keep"}` stores nothing at all, while
-///   `{"a.b":"keep", "a_b":""}` stores `a_b="keep"`. This is the one seam
-///   every structured-metadata producer funnels through, so the strip applies
-///   to the Loki-push transports and the OTLP-logs scope path alike, exactly
-///   as the reference's single distributor seam does for its own two
-///   transports (`PushHandler` / `OTLPPushHandler` both reach
-///   `pushHandler` -> `Push`, `pkg/distributor/http.go:27-34 @ v3.7.4`).
-///   By-name is the correct primitive HERE and the wrong one for stream
-///   labels, which the reference strips pair-wise; see `parse_label_set`.
+/// - The pair list is first resolved by [`resolve_structured_metadata`], which
+///   IS the reference's builder: Loki's distributor runs the whole entry's
+///   structured metadata through Prometheus' `labels.Builder`
+///   (`pkg/distributor/distributor.go:697-722 @ v3.7.4`), whose `Reset`
+///   seeding, `Del`, `Set` (rename and U+FFFD) and `Labels()` merge together
+///   decide both which pairs survive an empty value (issue #259) and which of
+///   several pairs sharing a stored name wins (issue #381). It is one rule,
+///   not two: a pair that was `Set` — renamed, or carrying U+FFFD — beats a
+///   pair that was not wherever either sits in wire order, among `Set` pairs
+///   the last wins, and an empty value is a `Del`. Measured, `{"a.b":"x",
+///   "a_b":"keep"}` stores `a_b="x"` in BOTH wire orders (which plain
+///   last-write-wins cannot explain), and `{"a.b":"", "a_b":"keep"}` stores
+///   nothing at all. This is the one seam every structured-metadata producer
+///   funnels through, so the rule applies to the Loki-push transports and the
+///   OTLP-logs scope path alike, exactly as the reference's single distributor
+///   seam does for its own two transports (`PushHandler` / `OTLPPushHandler`
+///   both reach `pushHandler` -> `Push`, `pkg/distributor/http.go:27-34 @
+///   v3.7.4`). The builder is the correct primitive HERE and the wrong one for
+///   stream labels, which the reference strips pair-wise; see
+///   `parse_label_set`.
 /// - The **empty** set yields `""` (an empty string, NOT `"{}"`) so the read
 ///   path's `structured_metadata.is_empty()` fast-path branch stays on the
 ///   zero-structured-metadata path for entries that carry none — the common
@@ -757,39 +761,30 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 ///   JSON string is byte-identical in shape to a stream-labels JSON string.
 ///   The normalization collision count is intentionally discarded: SM is
 ///   per-entry and never contributes to the stream-label collision metric.
-///   **Which of two colliding NON-empty pairs wins is a separate, pre-existing
-///   divergence, flagged not fixed:** `from_normalized`'s frozen greatest-key/
-///   greatest-value rule (issue #4) elects a different pair from the
-///   reference's plain last-`Set`-wins — measured on `grafana/loki:3.7.4`,
-///   `{"a.b":"x", "a_b":"keep"}` stores `a_b="x"` there and `a_b="keep"` here.
-///   It is independent of the empty-value rule above (it needs no empty pair
-///   to appear, and the strip's fast path does not run for such an input);
-///   closing it means pre-resolving last-write-wins here, as the OTLP path
-///   already does for its own seam.
+///   `from_normalized`'s own collision rule (the frozen greatest-original-key
+///   one, issue #4) is **unreachable from here**: the resolution above hands
+///   it unique canonicalize fixed points, which is what the OTLP path has
+///   always done for its own seam. That frozen rule still governs stream
+///   labels, where it is the identity a stream is stored under.
 ///
 /// This core carries **no** cardinality cap — the Loki-push cap check lives in
 /// [`canonical_structured_metadata`] (charge-before-allocate, before this is
 /// reached), and the OTLP path is intentionally uncapped (matching OTLP
-/// `parse`'s existing unbounded-label, infallible behaviour). The OTLP path
-/// pre-resolves its own last-write-wins collisions (Loki's rule) *before*
-/// calling this, so `from_normalized` here only ever sees already-unique
-/// sanitized keys and its own collision path is not exercised there.
+/// `parse`'s existing unbounded-label, infallible behaviour).
 pub(crate) fn structured_metadata_json(
     pairs: impl IntoIterator<Item = (String, String)>,
 ) -> String {
-    // Materialized because the empty-value strip deletes by NORMALIZED NAME
-    // and therefore needs a second look at the pair list
-    // (`strip_empty_valued_labels`, which canonicalizes each name itself). The
+    // Materialized because the builder decides by NORMALIZED NAME over the
+    // whole entry and therefore needs a second look at the pair list. The
     // per-entry cardinality/byte caps are charged on borrowed data by
     // `canonical_structured_metadata` BEFORE this is reached, so the `Vec` is
     // bounded, and `LabelSet::from_normalized` allocates a `BTreeMap` of
     // `BTreeSet`s from it immediately afterwards either way.
-    let mut pairs: Vec<(String, String)> = pairs.into_iter().collect();
-    strip_empty_valued_labels(&mut pairs);
-    if pairs.is_empty() {
+    let resolved = resolve_structured_metadata(pairs.into_iter().collect());
+    if resolved.is_empty() {
         return String::new();
     }
-    let (labels, _collisions) = LabelSet::from_normalized(pairs);
+    let (labels, _collisions) = LabelSet::from_normalized(resolved);
     labels.to_canonical_json()
 }
 
@@ -1325,9 +1320,10 @@ fn parse_label_set(input: &str) -> Result<(LabelSet, usize), LogsIngestError> {
 /// `vendor/…/model/labels/labels_stringlabels.go:312-318 @ v3.7.4`), and
 /// `WithoutEmpty` removes only the empty occurrence. Measured on
 /// `grafana/loki:3.7.4`: a protobuf push of `{d="", d="keep"}` **and** one of
-/// `{d="keep", d=""}` both store `d="keep"`. The structured-metadata seam uses
-/// the by-name [`strip_empty_valued_labels`] instead, and for the same input
-/// keeps no `d` at all.
+/// `{d="keep", d=""}` both store `d="keep"`. The structured-metadata seam runs
+/// the reference's `labels.Builder` instead
+/// ([`resolve_structured_metadata`]), and for the same input keeps no `d` at
+/// all.
 ///
 /// Ordering note for the label-count/length/duplicate bounds (issue #374):
 /// they must be charged on the POST-strip pair list. The reference strips in
@@ -5100,6 +5096,105 @@ mod tests {
             let out = parse_json(body.as_bytes(), 0).unwrap();
             assert_eq!(out.rows[0].structured_metadata, expected, "sm: {sm}");
         }
+    }
+
+    /// The issue #381 collision rows, shared by the two tests below so the
+    /// cross-encoding claim and the identity claim are made over the SAME
+    /// inputs. Reference answers for these rows are not written here: they
+    /// are derived from the committed container capture by
+    /// `tests/structured_metadata_collisions.rs`.
+    #[rustfmt::skip]
+    const COLLISION_ROWS: &[&[(&str, &str)]] = &[
+        &[("a.b", "x"), ("a_b", "keep")],
+        &[("a_b", "keep"), ("a.b", "x")],
+        &[("a.b", "1"), ("a-b", "2")],
+        &[("a-b", "2"), ("a.b", "1")],
+        &[("a_b", "1"), ("a_b", "2")],
+        &[("a_b", "2"), ("a_b", "1")],
+        &[("a_b", "1"), ("a_b", "2"), ("a.b", "9")],
+        &[("a.b", "1"), ("a_b", "2"), ("a.b", "3")],
+        &[("a.b", "1"), ("a_b", "2"), ("a-b", "3")],
+        &[("a-b", "3"), ("a_b", "2"), ("a.b", "1")],
+        &[("a.b", "1"), ("a.b", "2")],
+        &[("a_b", ""), ("a.b", "x"), ("a-b", "y")],
+        &[("a.b", "x"), ("a_b", "keep"), ("z", "1")],
+        &[("a.b", "9"), ("a_b", "1"), ("a_b", "2")],
+        &[("a.b", "x"), ("a_b", "p\u{FFFD}")],
+        &[("a_b", "p\u{FFFD}"), ("a.b", "x")],
+        &[("a_b", "p\u{FFFD}q")],
+        &[("a_b", "1"), ("a_b", "p\u{FFFD}")],
+    ];
+
+    /// The two push encodings resolve a metadata collision identically —
+    /// asserted against each other, over every row of [`COLLISION_ROWS`].
+    ///
+    /// They must, and for the reason the reference's must: both decoders hand
+    /// the distributor the same ordered, duplicate-preserving list — protobuf
+    /// as `EntryAdapter`'s repeated field, JSON because the object's keys are
+    /// appended to a slice rather than inserted into a map
+    /// (`pkg/loghttp/query.go:181-196 @ v3.7.4`, and `BoundedStructuredMetadata`
+    /// here). Measured: rows 1, 3, 5, 6 and 7 were pushed to
+    /// `grafana/loki:3.7.4` on a hand-encoded snappy-protobuf body as well as
+    /// the JSON one and the container answered cell for cell the same.
+    ///
+    /// The JSON body is assembled as TEXT because a repeated name is half of
+    /// what is under test and a `serde_json::Map` would collapse it.
+    #[test]
+    fn both_push_encodings_resolve_a_metadata_collision_identically() {
+        for row in COLLISION_ROWS {
+            let protobuf = parse_protobuf(
+                &sm_request(row.iter().map(|(n, v)| label_pair(n, v)).collect()),
+                0,
+            )
+            .unwrap();
+            let object: Vec<String> = row
+                .iter()
+                .map(|(n, v)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(n).unwrap(),
+                        serde_json::to_string(v).unwrap()
+                    )
+                })
+                .collect();
+            let body = format!(
+                r#"{{"streams":[{{"stream":{{"service_name":"checkout"}},
+                "values":[["1700000000000000000","hello",{{{}}}]]}}]}}"#,
+                object.join(",")
+            );
+            let json = parse_json(body.as_bytes(), 0).unwrap();
+            assert_eq!(
+                protobuf.rows[0].structured_metadata, json.rows[0].structured_metadata,
+                "the two encodings disagree on {row:?}"
+            );
+            assert!(
+                !protobuf.rows[0].structured_metadata.is_empty(),
+                "{row:?} stores nothing — the comparison is vacuous"
+            );
+        }
+    }
+
+    /// Structured metadata is a per-ENTRY column and never enters a stream's
+    /// identity: the same stream pushed with a colliding metadata pair and
+    /// with none at all fingerprints identically. This is what makes issue
+    /// #381 safe to fix at the metadata seam while `LabelSet::from_normalized`'s
+    /// frozen collision rule (issue #4) keeps governing stream labels.
+    #[test]
+    fn resolving_a_metadata_collision_does_not_move_the_stream_fingerprint() {
+        let with_sm = parse_protobuf(
+            &sm_request(vec![label_pair("a.b", "x"), label_pair("a_b", "keep")]),
+            0,
+        )
+        .unwrap();
+        let without = parse_protobuf(&sm_request(Vec::new()), 0).unwrap();
+        assert_eq!(
+            with_sm.streams[0].fingerprint, without.streams[0].fingerprint,
+            "structured metadata moved the stream fingerprint"
+        );
+        assert_eq!(with_sm.streams[0].labels, without.streams[0].labels);
+        // Non-vacuity: the metadata really was stored, and really did resolve.
+        assert_eq!(with_sm.rows[0].structured_metadata, r#"{"a_b":"x"}"#);
+        assert_eq!(without.rows[0].structured_metadata, "");
     }
 
     /// Builds a one-entry protobuf push carrying exactly `sm`.

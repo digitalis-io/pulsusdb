@@ -648,6 +648,20 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_json_key_sanitization
 
+      # Issue #381: the structured-metadata collision capture drift leg.
+      # Re-pushes every probe of pulsus-write/tests/fixtures/
+      # structured_metadata_collisions/capture.json to this job's reference
+      # container and asserts the fresh answers match the committed capture,
+      # so the artifact the parity assertions DERIVE their expectations from
+      # provably stays a capture. Like the #287 leg above it compares VALUES,
+      # not just HTTP status; the hermetic legs of the same file run in the
+      # `ci` job with the gate off. One push of 18 one-entry streams and one
+      # query_range each.
+      - name: Structured-metadata collision capture drift leg (issue #381)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-write --test structured_metadata_collisions
+
       # corpus-counts: none (ci-replay-leg)
       # Issue #352 step 3: the LogQL corpus replay. Takes each reachable
       # corpus case's `load` to this same reference and compares its

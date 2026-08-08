@@ -62,10 +62,10 @@ pub struct LabelSet {
 /// the promoted resource attributes back into exactly such a literal
 /// (`pkg/loghttp/push/otlp.go:240-250 @ v3.7.4`).
 ///
-/// Use this — NOT [`strip_empty_valued_labels`] — wherever a STREAM LABEL set
-/// is built. The two differ only when the same name appears twice, which the
-/// reference resolves differently at its two seams; see
-/// [`strip_empty_valued_labels`] for the discriminating measurement.
+/// Use this — NOT [`resolve_structured_metadata`] — wherever a STREAM LABEL
+/// set is built. The two differ whenever a name repeats or renames onto
+/// another, which the reference resolves differently at its two seams; see
+/// [`resolve_structured_metadata`] for the discriminating measurements.
 ///
 /// Only an exactly-empty value is dropped. A whitespace-only value is kept
 /// verbatim and nothing is trimmed — measured on `grafana/loki:3.7.4` at both
@@ -85,131 +85,266 @@ pub fn retain_non_empty_values(pairs: &mut Vec<(String, String)>) {
     pairs.retain(|(_, value)| !value.is_empty());
 }
 
-/// Drops every pair an empty-valued pair suppresses — the same "empty means
-/// absent" rule in its BY-NAME form, where the name that decides is the
-/// **canonicalized** one ([`canonicalize_label_key`]), not the raw one.
-///
-/// This is what Prometheus' `labels.Builder` does, and Loki's distributor runs
-/// every entry's **structured metadata** through one
-/// (`pkg/distributor/distributor.go:698-722 @ v3.7.4`). Three of its
-/// primitives combine into the rule this function reproduces:
-///
-/// 1. `NewBuilder` calls `Reset`, which records the RAW name of every
-///    empty-valued base label in `del`, and `Labels()` omits every base label
-///    carrying a name in `del`
-///    (`vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:471-521`
-///    — the file actually compiled: it is `//go:build !slicelabels &&
-///    !dedupelabels`, and Loki builds with `-tags netgo` alone,
-///    `Makefile:54-64 @ v3.7.4`).
-/// 2. The distributor's loop **renames first**: for a name whose normalized
-///    form differs it runs `Del(raw)` then `Set(normalized, value)`
-///    (`distributor.go:702-712`), and `Set(n, "")` is defined as `Del(n)`
-///    (`labels_common.go:187-192`). So an empty-valued pair deletes its
-///    NORMALIZED name too — and takes any same-normalized twin with it.
-/// 3. `Del` removes the name from `add` as well, while `Set` does not remove
-///    it from `del`, and `Labels()` emits `add` regardless of `del`
-///    (`labels_stringlabels.go:483-521`). So a renamed non-empty pair
-///    *resurrects* a name an empty twin had deleted — unless a later renamed
-///    empty pair deletes it again. The rule is therefore order-dependent, and
-///    this function reproduces that too.
+/// Resolves one log entry's **structured metadata** the way the reference
+/// resolves it: Prometheus' `labels.Builder`, driven by Loki's distributor
+/// over the entry's pairs (`pkg/distributor/distributor.go:697-722 @ v3.7.4`
+/// over
+/// `vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:454-521`
+/// and `labels_common.go:163-200`). Input is the entry's pairs in WIRE order
+/// under their RAW names; output is pairs whose names are
+/// [`canonicalize_label_key`] fixed points and unique, so the caller's
+/// [`LabelSet::from_normalized`] never reaches its own collision branch.
 ///
 /// Use this — NOT [`retain_non_empty_values`] — wherever a STRUCTURED
-/// METADATA set is built.
+/// METADATA set is built. Order is not part of the contract: the sole
+/// consumer sorts, so the slow path's ascending order is a by-product of the
+/// merge and the fast path returns wire order untouched.
 ///
-/// **`normalized` here is PulsusDB's [`canonicalize_label_key`], the name the
-/// pair is actually STORED under, not the reference's `LabelNamer.Build`.**
-/// The rule is then statable against our own data — *an empty-valued entry
-/// suppresses every entry stored under the same label name* — and the two
-/// agree wherever the two renamings agree. Where they do not (`a..b` and
-/// `a__b` normalize to `a_b` there and to `a__b` here; `9bad` gains a `key_`
-/// prefix there), the suppression groups differently: measured on
-/// `grafana/loki:3.7.4`, `{a..b="", a_b="keep"}` stores nothing there and
-/// `a_b="keep"` here. That residual is entailed by the label-RENAMING
-/// divergence registered in docs/api.md §8.2 (issue #259) and disappears with
-/// it; it is not a second rule. See `protocols::label_name`'s
-/// `sanitize_differs_from_our_storage_canonicalization`.
+/// # The builder, primitive by primitive
 ///
-/// The discriminating cases, all measured against `grafana/loki:3.7.4`
-/// (`b318f282`, `allow_structured_metadata: true`, `discover_log_levels:
-/// false`, `discover_service_name: []`), pushed as structured metadata on the
-/// snappy-protobuf and JSON encodings alike (both agree):
+/// 1. `base` is the entry's pairs as `labels.Labels`: sorted by name with
+///    **duplicates preserved** (`logproto.FromLabelAdaptersToLabels`,
+///    `pkg/logproto/compat.go:59-86`, over `ScratchBuilder.Add`/`Sort`/
+///    `Labels`, `labels_stringlabels.go:614-645` — `Add`'s own doc says a
+///    repeated name yields a duplicate label).
+/// 2. `NewBuilder` calls `Reset`, which records the RAW name of every
+///    empty-valued base label in `del` (`distributor.go:700` ->
+///    `labels_stringlabels.go:471-480` — the file actually compiled: it is
+///    `//go:build !slicelabels && !dedupelabels`, and Loki builds with
+///    `-tags netgo` alone, `Makefile:54-64 @ v3.7.4`).
+/// 3. The loop **renames**: iff the normalized name differs from the raw one
+///    it runs `Del(raw)` then `Set(normalized, value)`
+///    (`distributor.go:707-710`).
+/// 4. The loop **also** `Set`s when the value contains `utf8.RuneError`, with
+///    every U+FFFD mapped to a space (`distributor.go:714-715`,
+///    `removeInvalidUtf` at `:75-80`). Both branches can fire for one pair;
+///    the second overwrites the first, as in Go.
+/// 5. `Set(n, "")` is `Del(n)`; `Del` also removes `n` from `add`; `Set` does
+///    not remove `n` from `del` (`labels_common.go:163-200`).
+/// 6. `Labels()` merges (`distributor.go:722` ->
+///    `labels_stringlabels.go:483-521`): a base entry whose name is in `del`
+///    is dropped, an `add` entry **replaces** the FIRST base entry of the
+///    same name, remaining `add` entries are inserted in sorted position.
+/// 7. Consequence of 5 and 6, spelled out because it is the corner every
+///    prose DESCRIPTION of this function has got wrong. **This sentence is
+///    the one the docs copy** — `docs/api.md` §8.2 row 6 and
+///    `docs/schemas.md` §3.1 must contain it byte for byte between the same
+///    markers, which `tests/copied_rule.rs` asserts; edit it here and the
+///    test names every file that has fallen behind.
 ///
-/// | pushed, in this order | stored |
-/// |---|---|
-/// | `a=""`, `a="keep"` | nothing |
-/// | `a.b=""`, `a_b="keep"` | nothing — the empty pair renames ONTO the twin |
-/// | `a_b="keep"`, `a.b=""` | nothing — same, order-independent |
-/// | `a.b="keep"`, `a_b=""` | `a_b="keep"` — the rename resurrects the deleted name |
-/// | `a_b=""`, `a.b="keep"` | `a_b="keep"` — same, order-independent |
-/// | `a.b=""`, `a.b="keep"` | `a_b="keep"` — the second pair's rename resurrects |
-/// | `a.b="keep"`, `a.b=""` | nothing — the SECOND rename deletes what the first added |
-/// | `a.b=""`, `c="v"` | `c="v"` |
+///    <!-- copied-rule:del-vs-set:start -->
+///    **`del` drops BASE entries only, so a `Set` outranks it.** An empty
+///    value deletes every pair stored under its name that the builder did
+///    not `Set`, and a rename or a U+FFFD rewrite re-adds the name in either
+///    wire order, because `add` is emitted whether or not `del` holds that
+///    name.
+///    <!-- copied-rule:del-vs-set:end -->
 ///
-/// The same set pushed as STREAM labels keeps the non-empty twin in every
-/// row: that seam strips the empty **pair** only ([`retain_non_empty_values`]).
+///    Measured on `grafana/loki:3.7.4` (`b318f282`): `{a_b="",
+///    a_b="p\u{FFFD}"}` stores `a_b="p "` and so does the reverse order,
+///    while the U+FFFD-free control `{a_b="", a_b="p"}` stores nothing. Rows
+///    `g01`-`g07` of
+///    `the_builder_emits_a_set_name_even_when_reset_deleted_it`.
 ///
-/// (Stream labels measured on the Loki-push protobuf transport: of the two
-/// push encodings its label literal is the only one that carries a duplicate
-/// name as far as the strip, because the JSON one decodes its label object
-/// into a map first — both here and on the reference,
-/// `pkg/loghttp/labels.go:24-40 @ v3.7.4`. The OTLP receiver's attribute list
-/// can repeat a key too, and resolves it differently again; that seam is
-/// documented at `otlp_logs::build_stream_labels`. Structured metadata keeps
-/// duplicates on BOTH push encodings: protobuf as a repeated field, JSON
-/// because the reference appends each object key to a slice,
-/// `pkg/loghttp/query.go:182-203 @ v3.7.4`, exactly as we do.)
+/// So the tie-break is two-tier, not positional: **a pair that was `Set`
+/// (renamed, or carrying U+FFFD) beats a pair that was not, wherever either
+/// sits in wire order; among pairs `Set` onto one name the last wins; among
+/// pairs never `Set` the reference keeps them all as duplicate labels.** That
+/// is neither [`LabelSet::from_normalized`]'s greatest-original-key rule nor
+/// plain last-write-wins over the wire list, and it is what makes both orders
+/// of `{a.b="x", a_b="keep"}` store `a_b="x"` (issue #381).
 ///
-/// Only an exactly-empty value is dropped; a whitespace-only value is kept
-/// verbatim (`{"a":" "}` round-trips as `a=" "`) and nothing is trimmed.
+/// Duplicate names, which the reference's `Labels()` can emit and our
+/// key-unique `log_samples.structured_metadata` column cannot hold, collapse
+/// **keeping the last**: the reference marshals its duplicates into a JSON
+/// object (`pkg/loghttp/entry.go:233-244`), so a JSON consumer observes the
+/// last one. That choice reproduces every measured duplicate row below.
+///
+/// # One function, because it is one builder
+///
+/// The empty-value rule of issue #259 is not a second rule folded in for
+/// adjacency: `Reset` + `Del` and `Set` are primitives of the same builder,
+/// and the model above derives all ten of that issue's measured rows —
+/// asserted, unchanged, by
+/// `loki_push::a_normalized_metadata_name_collision_with_one_empty_follows_the_references_builder`
+/// and its JSON twin.
+///
+/// # Measured
+///
+/// Every row below was pushed as structured metadata to
+/// `grafana/loki:3.7.4` (`buildinfo` `revision: b318f282`) and read back with
+/// `X-Loki-Response-Encoding-Flags: categorize-labels`. The `stored` column
+/// is the container's answer; each is asserted here by
+/// the unit test `structured_metadata_resolution_is_the_references_builder`,
+/// and
+/// against a committed capture of the raw response bodies by
+/// `pulsus-write/tests/structured_metadata_collisions.rs`.
+///
+/// | id | pushed, in this order | stored |
+/// |---|---|---|
+/// | c01 | `a.b=x`, `a_b=keep` | `a_b=x` — the renamed pair replaces the base twin |
+/// | c02 | `a_b=keep`, `a.b=x` | `a_b=x` — same, wire order does not decide |
+/// | c03 | `a.b=1`, `a-b=2` | `a_b=2` — both renamed, last `Set` wins |
+/// | c04 | `a-b=2`, `a.b=1` | `a_b=1` — …in either order |
+/// | c05 | `a_b=1`, `a_b=2` | `a_b=2` — neither `Set`: two base duplicates, last observed |
+/// | c06 | `a_b=2`, `a_b=1` | `a_b=1` — …in either order |
+/// | c07 | `a_b=1`, `a_b=2`, `a.b=9` | `a_b=2` — the `Set` replaces the FIRST duplicate only |
+/// | c08 | `a.b=1`, `a_b=2`, `a.b=3` | `a_b=3` |
+/// | c09 | `a.b=1`, `a_b=2`, `a-b=3` | `a_b=3` |
+/// | c10 | `a-b=3`, `a_b=2`, `a.b=1` | `a_b=1` |
+/// | c11 | `a.b=1`, `a.b=2` | `a_b=2` |
+/// | c16 | `a_b=""`, `a.b=x`, `a-b=y` | `a_b=y` — `Reset` deletes the base name, both renames re-add |
+/// | c17 | `a.b=x`, `a_b=keep`, `z=1` | `a_b=x`, `z=1` |
+/// | c18 | `a.b=9`, `a_b=1`, `a_b=2` | `a_b=2` |
+/// | f01 | `a.b=x`, `a_b=p\u{FFFD}` | `a_b="p "` — the U+FFFD `Set` outranks the rename |
+/// | f02 | `a_b=p\u{FFFD}`, `a.b=x` | `a_b=x` — …and loses to a LATER `Set` |
+/// | f03 | `a_b=p\u{FFFD}q` | `a_b="p q"` — a lone value rewrite, no collision |
+/// | f04 | `a_b=1`, `a_b=p\u{FFFD}` | *the push is a 204 whose read is a 500* |
+///
+/// f04 is where `Labels()` emits TWO `a_b` entries — `"p "` from `add`, then
+/// the untouched base duplicate — and the reference's own read path then
+/// fails: `failed to parse series labels to categorize labels: 1:6: parse
+/// error: invalid UTF-8 rune`. There is no consumer-observable reference
+/// value, so ours is a choice (keep-last, `a_b="p\u{FFFD}"`), recorded as a
+/// residual in docs/benchmarks/logs-differential-ledger.md.
+///
+/// # Residuals
+///
+/// - **`normalized` here is [`canonicalize_label_key`], not the reference's
+///   `LabelNamer.Build`.** The rule is then statable against our own data —
+///   the name a pair is actually STORED under — and the two agree wherever the
+///   two renamings agree. Where they do not (`a..b` and `a__b` normalize to
+///   `a_b` there and to `a__b` here; `9bad` gains a `key_` prefix there) the
+///   collision GROUPS differ: measured, `{a..b="", a_b="keep"}` stores nothing
+///   there and `a_b="keep"` here. That is the label-RENAMING divergence
+///   already registered in docs/api.md §8.2 (issue #259), not a second rule;
+///   see `protocols::label_name`'s
+///   `sanitize_differs_from_our_storage_canonicalization`.
+/// - **Go's sort is unstable.** `base` is ordered by `slices.SortFunc`
+///   (`ScratchBuilder.Sort`, `labels_stringlabels.go:627-629`), which is
+///   insertion sort up to 12 elements and pdqsort above, so when one canonical
+///   name is repeated AND a rename lands on it the reference's own answer is
+///   unspecified past 12 pairs in the entry. This function sorts stably; the
+///   measured boundary is in the ledger.
+///
+/// Only an exactly-empty value is dropped; a whitespace-only value is a value
+/// (`{"a":" "}` round-trips as `a=" "`) and nothing is trimmed.
 ///
 /// A caller that has already canonicalized its keys (the OTLP scope path)
-/// passes canonicalize fixed points, for which no pair is "renamed" and the
-/// rule degenerates to the plain by-name delete it was before.
-pub fn strip_empty_valued_labels(pairs: &mut Vec<(String, String)>) {
-    // Fast path: the overwhelmingly common case has no empty value at all, so
-    // it costs one borrowed scan and allocates nothing. Sound because with no
-    // empty value `del` stays empty and every renamed pair is re-added under
-    // its normalized name — which is where the downstream
-    // `LabelSet::from_normalized` puts it anyway.
-    if !pairs.iter().any(|(_, value)| value.is_empty()) {
-        return;
+/// passes fixed points, for which no pair is renamed, `add` carries only the
+/// U+FFFD rewrites, and the builder degenerates to a by-name delete plus
+/// keep-last — which is the reference's own shape there, because its OTLP
+/// translation runs `LabelNamer.Build` over every attribute key before the
+/// distributor sees it (`pkg/loghttp/push/otlp.go:602-614 @ v3.7.4`).
+pub fn resolve_structured_metadata(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    // Identity fast path, borrowed and allocation-light: the overwhelmingly
+    // common entry (`trace_id`, `span_id`, …) has non-empty values, no
+    // U+FFFD, canonical names and no repeat. `del` and `add` are then both
+    // empty, so `Labels()` returns `base` — the same pairs, modulo an order
+    // the caller re-derives anyway. A name is a `canonicalize_label_key`
+    // fixed point exactly when every char is in its allow-list
+    // (`canonical.rs:26-36`), which costs no allocation to test.
+    let is_identity = {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        pairs.iter().all(|(name, value)| {
+            !value.is_empty()
+                && !value.contains('\u{FFFD}')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && seen.insert(name.as_str())
+        })
+    };
+    if is_identity {
+        return pairs;
     }
-    // The builder's `del`, seeded by `Reset` with the RAW name of every
-    // empty-valued pair. Names are cloned only on this rare path, and the
-    // count is bounded by the caller's per-entry cap.
+
+    let canon: Vec<String> = pairs
+        .iter()
+        .map(|(name, _)| canonicalize_label_key(name))
+        .collect();
+    // `Reset`: the RAW name of every empty-valued base label.
     let mut deleted: BTreeSet<String> = pairs
         .iter()
         .filter(|(_, value)| value.is_empty())
         .map(|(name, _)| name.clone())
         .collect();
-    // The builder's `add`, as indices into `pairs`: a renamed non-empty pair
-    // survives even when its normalized name is in `del`. Keeping every such
-    // pair (rather than only the last, as `Set` does) leaves the winner among
-    // colliding non-empty pairs to `LabelSet::from_normalized`'s frozen rule,
-    // exactly as it is decided when no empty value is present at all.
-    let mut added: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (index, (name, value)) in pairs.iter().enumerate() {
-        let normalized = canonicalize_label_key(name);
-        if normalized == *name {
-            continue;
+    // `add`. Go keeps an unordered slice and sorts it just before the merge;
+    // a `BTreeMap` has the same `Set`/`Del` semantics (unique names, last
+    // write overwrites) and hands the merge its sorted iteration for free.
+    let mut added: BTreeMap<String, String> = BTreeMap::new();
+    for (index, (raw, value)) in pairs.iter().enumerate() {
+        let normalized = &canon[index];
+        if normalized != raw {
+            // `Del(raw)`. Its `add` half is provably a no-op here — every
+            // `add` key is a fixed point and `raw` is not, or it would equal
+            // `normalized` — but the delete half is what lets a rename
+            // suppress its own base entry.
+            added.remove(raw);
+            deleted.insert(raw.clone());
+            set(&mut added, &mut deleted, normalized, value.clone());
         }
-        deleted.insert(name.clone());
-        if value.is_empty() {
-            // `Set(normalized, "")` == `Del(normalized)`, which also drops
-            // whatever an earlier renamed pair had added under that name.
-            added.remove(&normalized);
-            deleted.insert(normalized);
-        } else {
-            added.entry(normalized).or_default().push(index);
+        if value.contains('\u{FFFD}') {
+            set(
+                &mut added,
+                &mut deleted,
+                normalized,
+                value.replace('\u{FFFD}', " "),
+            );
         }
     }
-    let resurrected: BTreeSet<usize> = added.into_values().flatten().collect();
-    let original = std::mem::take(pairs);
-    pairs.reserve(original.len());
-    for (index, pair) in original.into_iter().enumerate() {
-        if resurrected.contains(&index) || !deleted.contains(&pair.0) {
-            pairs.push(pair);
+
+    // `Labels()`: merge the sorted base with the sorted `add`. The sort is
+    // stable, so equal names keep wire order (Go's is not — see the residual
+    // in this function's docs).
+    let mut order: Vec<usize> = (0..pairs.len()).collect();
+    order.sort_by(|&a, &b| pairs[a].0.cmp(&pairs[b].0));
+    let mut merged: Vec<(String, String)> = Vec::with_capacity(pairs.len() + added.len());
+    let mut adds = added.into_iter().peekable();
+    for index in order {
+        let name = &pairs[index].0;
+        if deleted.contains(name) {
+            continue;
         }
+        while adds.peek().is_some_and(|(n, _)| n < name) {
+            merged.push(adds.next().expect("peeked"));
+        }
+        if adds.peek().is_some_and(|(n, _)| n == name) {
+            // This base entry is REPLACED — and only this one, so a second
+            // base entry of the same name survives as a duplicate (row c07).
+            merged.push(adds.next().expect("peeked"));
+            continue;
+        }
+        merged.push(pairs[index].clone());
+    }
+    merged.extend(adds);
+
+    // The reference can emit duplicate names; our column is key-unique, and a
+    // JSON consumer of the reference's object observes the last. `merged` is
+    // sorted, so the duplicates are adjacent: one linear pass, keeping the
+    // last of each run.
+    merged.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            std::mem::swap(later, earlier);
+            true
+        } else {
+            false
+        }
+    });
+    merged
+}
+
+/// The builder's `Set`, whose empty-value case is `Del`
+/// (`labels_common.go:187-192 @ v3.7.4`).
+fn set(
+    added: &mut BTreeMap<String, String>,
+    deleted: &mut BTreeSet<String>,
+    name: &str,
+    value: String,
+) {
+    if value.is_empty() {
+        added.remove(name);
+        deleted.insert(name.to_string());
+    } else {
+        added.insert(name.to_string(), value);
     }
 }
 
@@ -527,17 +662,26 @@ mod tests {
         );
     }
 
-    // -- empty-value strips (issue #259) -----------------------------------
+    // -- the structured-metadata builder (issues #259, #381) ---------------
+
+    /// The pair list `resolve_structured_metadata` returns, sorted, so a row's
+    /// expectation reads as the set the caller will store.
+    fn resolved(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut out = resolve_structured_metadata(pairs(items));
+        out.sort();
+        out
+    }
 
     #[test]
-    fn both_strips_remove_only_exactly_empty_values() {
+    fn both_rules_remove_only_exactly_empty_values() {
         // Neither trims: a whitespace-only value is a value.
         let source = pairs(&[("a", ""), ("b", "v"), ("c", " "), ("d", "\t"), ("e", "0")]);
         let expected = pairs(&[("b", "v"), ("c", " "), ("d", "\t"), ("e", "0")]);
 
-        let mut by_name = source.clone();
-        strip_empty_valued_labels(&mut by_name);
-        assert_eq!(by_name, expected);
+        assert_eq!(
+            resolved(&[("a", ""), ("b", "v"), ("c", " "), ("d", "\t"), ("e", "0")]),
+            expected
+        );
 
         let mut pair_wise = source;
         retain_non_empty_values(&mut pair_wise);
@@ -554,16 +698,18 @@ mod tests {
     /// pushed both ways round: as structured metadata (either transport) no
     /// `a` survives; as protobuf stream labels `a="keep"` survives.
     #[test]
-    fn by_name_strip_takes_the_non_empty_twin_where_pair_wise_keeps_it() {
+    fn the_builder_takes_the_non_empty_twin_where_the_pair_wise_strip_keeps_it() {
         for source in [
-            pairs(&[("a", ""), ("a", "keep"), ("z", "v")]),
-            pairs(&[("a", "keep"), ("a", ""), ("z", "v")]),
+            [("a", ""), ("a", "keep"), ("z", "v")],
+            [("a", "keep"), ("a", ""), ("z", "v")],
         ] {
-            let mut by_name = source.clone();
-            strip_empty_valued_labels(&mut by_name);
-            assert_eq!(by_name, pairs(&[("z", "v")]), "by-name, from {source:?}");
+            assert_eq!(
+                resolved(&source),
+                pairs(&[("z", "v")]),
+                "builder, from {source:?}"
+            );
 
-            let mut pair_wise = source.clone();
+            let mut pair_wise = pairs(&source);
             retain_non_empty_values(&mut pair_wise);
             assert_eq!(
                 pair_wise,
@@ -573,63 +719,224 @@ mod tests {
         }
     }
 
-    /// The by-name delete runs on the NORMALIZED name, so an empty-valued
-    /// pair whose key canonicalizes onto another pair's key takes that pair
-    /// with it — and a renamed non-empty pair resurrects a name an empty twin
-    /// deleted, because the reference's `Set` adds where `Del` only deletes.
+    /// **The reference's builder, row by row.** Every case in
+    /// [`resolve_structured_metadata`]'s doc table, with the expectation
+    /// equal to the container's answer.
     ///
-    /// Every row measured on `grafana/loki:3.7.4` (`b318f282`), pushed as
-    /// structured metadata on the snappy-protobuf encoding and, where the
-    /// shape survives a JSON object, on the JSON one too — both agree. The
-    /// expectation below is the pair list AFTER the strip; the stored key
-    /// follows from `LabelSet::from_normalized` (`a.b` -> `a_b`).
+    /// Measured this session on `grafana/loki:3.7.4` (`buildinfo` reports
+    /// `version 3.7.4`, `revision b318f282`), each row pushed as JSON
+    /// structured metadata to `/loki/api/v1/push` — duplicate object keys
+    /// emitted by hand, which the reference keeps as raw pairs
+    /// (`pkg/loghttp/query.go:181-196 @ v3.7.4`) — and read back through
+    /// `/loki/api/v1/query_range` with
+    /// `X-Loki-Response-Encoding-Flags: categorize-labels`. The raw response
+    /// bodies are committed at
+    /// `pulsus-write/tests/fixtures/structured_metadata_collisions/capture.json`,
+    /// which `structured_metadata_collisions.rs` re-derives these answers
+    /// from and re-captures in CI; the rows below are the same measurement in
+    /// the form this function's own callers see.
+    ///
+    /// The `#259` rows are the same builder and live in the same table for
+    /// that reason (`e01`-`e10`): `Reset`, `Del` and `Set` are primitives of
+    /// one function, not two rules that happen to be adjacent.
     #[test]
-    fn the_by_name_strip_deletes_after_normalization_and_a_rename_resurrects() {
-        for (source, expected, note) in [
+    fn structured_metadata_resolution_is_the_references_builder() {
+        for (id, source, expected) in [
+            // -- issue #381: which pair wins ------------------------------
             (
-                pairs(&[("a.b", ""), ("a_b", "keep")]),
-                Vec::new(),
-                "the empty pair renames ONTO the twin and deletes it",
+                "c01",
+                &[("a.b", "x"), ("a_b", "keep")][..],
+                &[("a_b", "x")][..],
+            ),
+            ("c02", &[("a_b", "keep"), ("a.b", "x")], &[("a_b", "x")]),
+            ("c03", &[("a.b", "1"), ("a-b", "2")], &[("a_b", "2")]),
+            ("c04", &[("a-b", "2"), ("a.b", "1")], &[("a_b", "1")]),
+            ("c05", &[("a_b", "1"), ("a_b", "2")], &[("a_b", "2")]),
+            ("c06", &[("a_b", "2"), ("a_b", "1")], &[("a_b", "1")]),
+            (
+                "c07",
+                &[("a_b", "1"), ("a_b", "2"), ("a.b", "9")],
+                &[("a_b", "2")],
             ),
             (
-                pairs(&[("a_b", "keep"), ("a.b", "")]),
-                Vec::new(),
-                "…in either order",
+                "c08",
+                &[("a.b", "1"), ("a_b", "2"), ("a.b", "3")],
+                &[("a_b", "3")],
             ),
             (
-                pairs(&[("a.b", "keep"), ("a_b", "")]),
-                pairs(&[("a.b", "keep")]),
-                "the rename re-adds `a_b`, which outranks the delete",
+                "c09",
+                &[("a.b", "1"), ("a_b", "2"), ("a-b", "3")],
+                &[("a_b", "3")],
             ),
             (
-                pairs(&[("a_b", ""), ("a.b", "keep")]),
-                pairs(&[("a.b", "keep")]),
-                "…in either order",
+                "c10",
+                &[("a-b", "3"), ("a_b", "2"), ("a.b", "1")],
+                &[("a_b", "1")],
+            ),
+            ("c11", &[("a.b", "1"), ("a.b", "2")], &[("a_b", "2")]),
+            (
+                "c16",
+                &[("a_b", ""), ("a.b", "x"), ("a-b", "y")],
+                &[("a_b", "y")],
             ),
             (
-                pairs(&[("a.b", ""), ("a.b", "keep")]),
-                pairs(&[("a.b", "keep")]),
-                "the second pair's rename resurrects what the first deleted",
+                "c17",
+                &[("a.b", "x"), ("a_b", "keep"), ("z", "1")],
+                &[("a_b", "x"), ("z", "1")],
             ),
             (
-                pairs(&[("a.b", "keep"), ("a.b", "")]),
-                Vec::new(),
-                "…and the reverse order deletes what the first added",
+                "c18",
+                &[("a.b", "9"), ("a_b", "1"), ("a_b", "2")],
+                &[("a_b", "2")],
+            ),
+            // -- issue #381: the U+FFFD `Set`, which decides f01/f02 ------
+            (
+                "f01",
+                &[("a.b", "x"), ("a_b", "p\u{FFFD}")],
+                &[("a_b", "p ")],
             ),
             (
-                pairs(&[("a.b", ""), ("c", "v")]),
-                pairs(&[("c", "v")]),
-                "an unrelated pair is untouched",
+                "f02",
+                &[("a_b", "p\u{FFFD}"), ("a.b", "x")],
+                &[("a_b", "x")],
             ),
+            ("f03", &[("a_b", "p\u{FFFD}q")], &[("a_b", "p q")]),
+            // -- issue #259: the same builder's `Reset`/`Del` half ---------
+            ("e01", &[("a.b", ""), ("a_b", "keep")], &[]),
+            ("e02", &[("a_b", "keep"), ("a.b", "")], &[]),
+            ("e03", &[("a.b", "keep"), ("a_b", "")], &[("a_b", "keep")]),
+            ("e04", &[("a_b", ""), ("a.b", "keep")], &[("a_b", "keep")]),
+            ("e05", &[("a.b", ""), ("a.b", "keep")], &[("a_b", "keep")]),
+            ("e06", &[("a.b", "keep"), ("a.b", "")], &[]),
+            ("e07", &[("a.b", ""), ("c", "v")], &[("c", "v")]),
             (
-                pairs(&[("a.b", "x"), ("a_b", ""), ("a_b", "keep")]),
-                pairs(&[("a.b", "x")]),
-                "the delete covers every base pair carrying the name",
+                "e08",
+                &[("a.b", "x"), ("a_b", ""), ("a_b", "keep")],
+                &[("a_b", "x")],
             ),
+            ("e09", &[("a", ""), ("a", "keep")], &[]),
+            ("e10", &[("a", "keep"), ("a", "")], &[]),
         ] {
-            let mut stripped = source.clone();
-            strip_empty_valued_labels(&mut stripped);
-            assert_eq!(stripped, expected, "{note}, from {source:?}");
+            assert_eq!(resolved(source), pairs(expected), "{id}: from {source:?}");
+        }
+    }
+
+    /// **`del` drops base entries only, so a `Set` outranks it** — primitive
+    /// 7 of [`resolve_structured_metadata`]'s docs, and the corner that makes
+    /// "an empty value removes every pair stored under that name" false as
+    /// stated. `Reset` seeds `del` from the base scan, a U+FFFD rewrite
+    /// writes into `add`, and `Labels()` emits `add` whether or not `del`
+    /// holds the name — so the rewritten pair survives, in either wire order.
+    ///
+    /// Every row measured this session on `grafana/loki:3.7.4` (`buildinfo`
+    /// `3.7.4` / `b318f282`, `ci/logql/config.yaml`), pushed as JSON
+    /// structured metadata with duplicate object keys emitted as text and
+    /// read back with `X-Loki-Response-Encoding-Flags: categorize-labels`.
+    /// `g02`, `g04` and `g07` are the U+FFFD-free controls: without the `Set`
+    /// the delete stands, which is what makes the other four discriminating
+    /// rather than vacuous.
+    ///
+    /// The rows come in BOTH wire orders (`g01`/`g05`, `g03`/`g06`) because
+    /// `Reset` walks the whole base before the loop runs, so `del` holds the
+    /// name wherever the empty pair sits — order-independence is a property
+    /// of the mechanism, not of the examples.
+    ///
+    /// **Both orders are reachable on both transports.** An earlier revision
+    /// of this comment claimed `g06`'s order could not occur on the OTLP
+    /// scope path, arguing that identity is appended after the attributes.
+    /// That argument is about the identity FIELD and says nothing about two
+    /// ATTRIBUTES canonicalizing onto one name with the scope's own
+    /// name/version empty, which is `g06`'s pair list exactly — measured
+    /// through the reference's own OTLP receiver and asserted against ours by
+    /// `otlp_logs`'s
+    /// `two_attributes_canonicalizing_onto_one_name_reach_the_reverse_order_here_too`,
+    /// with `a_u_fffd_bearing_scope_name_survives_an_empty_valued_attribute_of_the_same_name`
+    /// covering the identity route. The claim is recorded rather than deleted
+    /// because the defect was the SHAPE of the argument: an absence justified
+    /// by a reachability story about our own code, instead of by enumerating
+    /// what can reach the seam.
+    #[test]
+    fn the_builder_emits_a_set_name_even_when_reset_deleted_it() {
+        for (id, source, expected) in [
+            (
+                "g01",
+                &[("a_b", ""), ("a_b", "p\u{FFFD}")][..],
+                &[("a_b", "p ")][..],
+            ),
+            ("g02", &[("a_b", ""), ("a_b", "p")], &[]),
+            (
+                "g03",
+                &[("scope_name", ""), ("scope_name", "N\u{FFFD}")],
+                &[("scope_name", "N ")],
+            ),
+            ("g04", &[("scope_name", ""), ("scope_name", "N")], &[]),
+            (
+                "g05",
+                &[("a_b", "p\u{FFFD}"), ("a_b", "")],
+                &[("a_b", "p ")],
+            ),
+            (
+                "g06",
+                &[("scope_name", "N\u{FFFD}"), ("scope_name", "")],
+                &[("scope_name", "N ")],
+            ),
+            ("g07", &[("scope_name", "N"), ("scope_name", "")], &[]),
+        ] {
+            assert_eq!(resolved(source), pairs(expected), "{id}: from {source:?}");
+        }
+    }
+
+    /// Residual B of issue #381: `{a_b:"1", a_b:"p\u{FFFD}"}` is a push the
+    /// reference accepts (204) and then cannot read back — its `Labels()`
+    /// emits TWO `a_b` entries, the `add` rewrite `"p "` and the untouched
+    /// base duplicate, and its own read path answers HTTP 500 `failed to
+    /// parse series labels to categorize labels: 1:6: parse error: invalid
+    /// UTF-8 rune` (measured, with and without the categorize header).
+    ///
+    /// There is no consumer-observable reference value, so this is OUR
+    /// choice, asserted as such: the duplicate collapse keeps the last, which
+    /// is the untouched base pair. Recorded in
+    /// docs/benchmarks/logs-differential-ledger.md.
+    #[test]
+    fn a_duplicate_the_reference_cannot_serve_collapses_to_the_last_pair() {
+        assert_eq!(
+            resolved(&[("a_b", "1"), ("a_b", "p\u{FFFD}")]),
+            pairs(&[("a_b", "p\u{FFFD}")])
+        );
+    }
+
+    /// Residual A of issue #381, pinned on OUR side so the divergence has a
+    /// stated boundary rather than a vague one. `base` is ordered by Go's
+    /// `slices.SortFunc` (`ScratchBuilder.Sort`,
+    /// `labels_stringlabels.go:627-629 @ v3.7.4`), which is insertion sort up
+    /// to 12 elements and pdqsort above, so with one canonical name repeated
+    /// AND a rename landing on it the reference's own answer stops being a
+    /// function of wire order once the entry carries 13 pairs.
+    ///
+    /// Measured on `grafana/loki:3.7.4` (`b318f282`) with `k` copies of `a_b`
+    /// followed by `a.b="REN"`: the container returns the LAST wire copy for
+    /// k=3,5,8,11 (12 pairs or fewer) and `a_b="2"` for k=12,13,15,20 (13
+    /// pairs or more). With no rename present it returns the last wire copy
+    /// at k=13,20,40.
+    ///
+    /// This function sorts stably, so it returns the last wire copy at every
+    /// k — asserted here at both sides of the boundary. It therefore agrees
+    /// with the reference on every shape except "repeated canonical name + a
+    /// rename onto it + at least 13 pairs", where the reference's own answer
+    /// is unspecified. Recorded in
+    /// docs/benchmarks/logs-differential-ledger.md.
+    #[test]
+    fn the_stable_sort_returns_the_last_wire_copy_on_both_sides_of_the_boundary() {
+        for k in [11usize, 12] {
+            let mut input: Vec<(String, String)> = (1..=k)
+                .map(|i| ("a_b".to_string(), i.to_string()))
+                .collect();
+            input.push(("a.b".to_string(), "REN".to_string()));
+            assert_eq!(
+                resolve_structured_metadata(input),
+                pairs(&[("a_b", &k.to_string())]),
+                "k={k}: the last wire copy must win whatever the entry's width"
+            );
         }
     }
 
@@ -637,22 +944,20 @@ mod tests {
     /// docs/api.md §8.2, pinned so it stays visible: the reference groups
     /// `a..b`, `a__b` and `a_b` under one name (`LabelNamer.Build` collapses
     /// consecutive invalid runes) while PulsusDB stores them as three, so the
-    /// suppression groups differently. Measured on `grafana/loki:3.7.4`:
+    /// collision groups differently. Measured on `grafana/loki:3.7.4`:
     /// `{a..b="", a_b="keep"}` and `{a__b="", a_b="keep"}` both store NOTHING
     /// there, and `{9bad="", key_9bad="keep"}` likewise (`9bad` gains a
     /// `key_` prefix there). This is one divergence, not two: fixing the
     /// renaming fixes these rows with no change to the rule above.
     #[test]
-    fn the_normalized_delete_groups_by_our_renaming_not_the_references() {
+    fn the_builder_groups_by_our_renaming_not_the_references() {
         for source in [
-            pairs(&[("a..b", ""), ("a_b", "keep")]),
-            pairs(&[("a__b", ""), ("a_b", "keep")]),
-            pairs(&[("9bad", ""), ("key_9bad", "keep")]),
+            [("a..b", ""), ("a_b", "keep")],
+            [("a__b", ""), ("a_b", "keep")],
+            [("9bad", ""), ("key_9bad", "keep")],
         ] {
-            let mut stripped = source.clone();
-            strip_empty_valued_labels(&mut stripped);
             assert_eq!(
-                stripped.len(),
+                resolve_structured_metadata(pairs(&source)).len(),
                 1,
                 "the non-empty twin survives here and does not on the reference: {source:?}"
             );
@@ -660,23 +965,154 @@ mod tests {
     }
 
     #[test]
-    fn both_strips_preserve_order_and_are_noops_without_empties() {
-        for strip in [
-            strip_empty_valued_labels as fn(&mut Vec<(String, String)>),
-            retain_non_empty_values,
-        ] {
-            let mut p = pairs(&[("z", "1"), ("a", "2"), ("m", "3")]);
-            let before = p.clone();
-            strip(&mut p);
-            assert_eq!(p, before, "input order is preserved, nothing removed");
+    fn the_builder_is_a_noop_without_empties_renames_or_repeats() {
+        let p = pairs(&[("z", "1"), ("a", "2"), ("m", "3")]);
+        assert_eq!(
+            resolve_structured_metadata(p.clone()),
+            p,
+            "the identity fast path returns the input untouched, wire order included"
+        );
+        assert!(resolve_structured_metadata(pairs(&[("a", ""), ("b", "")])).is_empty());
+        assert!(resolve_structured_metadata(Vec::new()).is_empty());
+    }
 
-            let mut all_empty = pairs(&[("a", ""), ("b", "")]);
-            strip(&mut all_empty);
-            assert!(all_empty.is_empty());
-
-            let mut none: Vec<(String, String)> = Vec::new();
-            strip(&mut none);
-            assert!(none.is_empty());
+    /// A naive, independently written transcription of `labels.Builder` as
+    /// the distributor drives it (`pkg/distributor/distributor.go:697-722 @
+    /// v3.7.4`) — `base` as a sorted list of pairs, `del` and `add` as plain
+    /// `Vec`s with linear scans, and `Labels()` as the literal merge — with
+    /// **no** fast path and no `BTreeMap`. Used only by
+    /// [`the_fast_path_is_the_builders_identity_case`].
+    fn naive_builder(input: &[(String, String)]) -> Vec<(String, String)> {
+        // `Labels()` merges over a name-sorted base with duplicates kept.
+        let mut base: Vec<(String, String)> = input.to_vec();
+        base.sort_by(|a, b| a.0.cmp(&b.0));
+        // `Reset`.
+        let mut del: Vec<String> = base
+            .iter()
+            .filter(|(_, v)| v.is_empty())
+            .map(|(n, _)| n.clone())
+            .collect();
+        let mut add: Vec<(String, String)> = Vec::new();
+        fn set(add: &mut Vec<(String, String)>, del: &mut Vec<String>, n: &str, v: String) {
+            if v.is_empty() {
+                add.retain(|(an, _)| an != n);
+                del.push(n.to_string());
+            } else if let Some(slot) = add.iter_mut().find(|(an, _)| an == n) {
+                slot.1 = v;
+            } else {
+                add.push((n.to_string(), v));
+            }
         }
+        for (raw, value) in input {
+            let normalized = canonicalize_label_key(raw);
+            if normalized != *raw {
+                add.retain(|(an, _)| an != raw);
+                del.push(raw.clone());
+                set(&mut add, &mut del, &normalized, value.clone());
+            }
+            if value.contains('\u{FFFD}') {
+                set(
+                    &mut add,
+                    &mut del,
+                    &normalized,
+                    value.replace('\u{FFFD}', " "),
+                );
+            }
+        }
+        add.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut a = 0usize;
+        for (name, value) in &base {
+            if del.iter().any(|d| d == name) {
+                continue;
+            }
+            while a < add.len() && add[a].0 < *name {
+                out.push(add[a].clone());
+                a += 1;
+            }
+            if a < add.len() && add[a].0 == *name {
+                out.push(add[a].clone());
+                a += 1;
+                continue;
+            }
+            out.push((name.clone(), value.clone()));
+        }
+        while a < add.len() {
+            out.push(add[a].clone());
+            a += 1;
+        }
+        // Duplicate names collapse keeping the LAST, as a JSON consumer of
+        // the reference's duplicate-keyed object observes.
+        let mut collapsed: Vec<(String, String)> = Vec::new();
+        for pair in out {
+            if let Some(slot) = collapsed.iter_mut().find(|(n, _)| *n == pair.0) {
+                slot.1 = pair.1;
+            } else {
+                collapsed.push(pair);
+            }
+        }
+        collapsed
+    }
+
+    /// The fast path is the builder's identity case, and the optimized merge
+    /// is the naive one — over the exhaustive enumeration of every sequence
+    /// of length 1..=3 drawn from four names x four values. The names cover a
+    /// canonical fixed point, two distinct raw names renaming onto it and an
+    /// unrelated key; the values cover two distinct non-empty ones, the empty
+    /// one and a U+FFFD carrier, so every branch of both implementations is
+    /// crossed with every other.
+    ///
+    /// Order is not part of the contract (the sole consumer sorts), so both
+    /// sides are compared sorted.
+    #[test]
+    fn the_fast_path_is_the_builders_identity_case() {
+        const NAMES: [&str; 4] = ["a_b", "a.b", "a-b", "c"];
+        const VALUES: [&str; 4] = ["1", "2", "", "p\u{FFFD}"];
+        let alphabet: Vec<(String, String)> = NAMES
+            .iter()
+            .flat_map(|n| VALUES.iter().map(move |v| (n.to_string(), v.to_string())))
+            .collect();
+        assert_eq!(alphabet.len(), 16);
+
+        let mut cases = 0usize;
+        let mut took_fast_path = 0usize;
+        let mut sequences: Vec<Vec<(String, String)>> = vec![Vec::new()];
+        for _ in 0..3 {
+            sequences = sequences
+                .iter()
+                .flat_map(|prefix| {
+                    alphabet.iter().map(move |pair| {
+                        let mut next = prefix.clone();
+                        next.push(pair.clone());
+                        next
+                    })
+                })
+                .collect();
+            for input in &sequences {
+                cases += 1;
+                let mut ours = resolve_structured_metadata(input.clone());
+                if ours == *input {
+                    took_fast_path += 1;
+                }
+                ours.sort();
+                let mut theirs = naive_builder(input);
+                theirs.sort();
+                assert_eq!(ours, theirs, "from {input:?}");
+            }
+        }
+        // Asserted as a literal so a silent shrink of the enumeration fails:
+        // 16 + 16^2 + 16^3.
+        assert_eq!(cases, 4368, "the enumeration has shrunk");
+        // Non-vacuity, and exact: only the fast path can return the input
+        // itself. Every other branch shortens the list (an empty value or a
+        // repeat) or rewrites a name or value, so `ours == *input` holds for
+        // exactly the fast-path members — the sequences of DISTINCT canonical
+        // names (`a_b`, `c`) over the two non-empty non-U+FFFD values. Length
+        // 1: 2 names x 2 values = 4. Length 2: 2 orders x 2 x 2 values = 8.
+        // Length 3: no third distinct canonical name, so none.
+        assert_eq!(
+            took_fast_path, 12,
+            "the fast path was taken by a different set of cases than the enumeration implies"
+        );
     }
 }

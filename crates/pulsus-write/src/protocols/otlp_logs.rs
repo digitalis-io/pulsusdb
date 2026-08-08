@@ -17,7 +17,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
 use prost::Message;
 use pulsus_model::{
     Date, Fingerprint, LabelSet, SERVICE_NAME_LABEL, UnixNano, canonicalize_label_key,
-    stream_fingerprint, strip_empty_valued_labels,
+    stream_fingerprint,
 };
 
 use crate::error::LogsIngestError;
@@ -401,8 +401,9 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
 /// while `deployment.environment=" "` yields a distinct one.
 ///
 /// The pair-wise primitive is the right one at a stream-label seam; the
-/// structured-metadata seam below uses the by-name
-/// [`strip_empty_valued_labels`] instead. For a LITERALLY duplicated
+/// structured-metadata seam below runs the reference's `labels.Builder`
+/// ([`pulsus_model::resolve_structured_metadata`]) instead. For a LITERALLY
+/// duplicated
 /// attribute key the reference is order-dependent — it maps the promoted
 /// attributes last-write-wins before stripping (`otlp.go:193`), measured as
 /// `cloud.region=""` then `="eu"` -> `eu` kept, and `="eu"` then `=""` ->
@@ -484,12 +485,25 @@ fn build_stream_labels(
 ///   (`4fa045d3`) returns `keep`, `sm_keep`, **and** `team=""`, `sm_empty=""`;
 ///   `grafana/loki:3.7.4` (`b318f282`) returns only `keep` and `sm_keep`.
 ///
-/// The resolution is done explicitly HERE, before the [`structured_metadata_json`]
-/// seam, because `from_normalized` mis-resolves (a)/(b). Keys are sanitized with
-/// the same [`canonicalize_label_key`] primitive `from_normalized` uses, so the
-/// post-resolution pairs are unique canonicalize fixed points — the seam then
-/// re-canonicalizes idempotently, finds no collision, and only sorts +
-/// JSON-encodes (byte-identical to the Loki-push SM representation).
+/// All three rules are now the [`structured_metadata_json`] seam's own —
+/// `pulsus_model::resolve_structured_metadata`, the reference's
+/// `labels.Builder`, over keys this path has ALREADY renamed exactly as the
+/// reference's `attributeToLabels` renames them (issue #381). This function
+/// therefore only builds the ordered list and hands it over; it re-spells no
+/// rule of its own.
+///
+/// That is a unification, not a carve-out. The reference's OTLP translation
+/// runs `LabelNamer.Build` over every attribute key BEFORE the distributor
+/// sees it (`pkg/loghttp/push/otlp.go:602-614 @ v3.7.4`, reached for scope
+/// attributes from `:300-317`), so at the builder no OTLP pair is ever
+/// renamed, `add` stays empty but for the U+FFFD rewrites, and the builder
+/// degenerates to exactly the by-name delete + keep-last this function used to
+/// spell inline. [`canonicalize_label_key`] is the same primitive
+/// `LabelSet::from_normalized` uses, so the keys handed over are its fixed
+/// points and the seam only sorts + JSON-encodes them (byte-identical to the
+/// Loki-push representation). The surviving asymmetry — push hands the builder
+/// RAW names, this path hands it renamed ones — is the reference's own
+/// asymmetry, at the same place.
 fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, LogsIngestError> {
     let Some(scope) = scope_logs.scope.as_ref() else {
         return Ok(String::new());
@@ -508,43 +522,25 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, Log
     if !scope.version.is_empty() {
         ordered.push(("scope_version".to_string(), scope.version.clone()));
     }
-    // Rule (c): the by-name strip runs over the WHOLE ordered list — every
-    // attribute AND both identity fields — and BEFORE the last-write-wins pass
-    // (issue #259). Both halves of that placement are load-bearing, each pinned
-    // by a measurement against `grafana/loki:3.7.4`:
+    // Rules (a), (b) and (c) are all the seam's builder now, over this ONE
+    // ordered list — every attribute AND both identity fields. Two halves of
+    // that scope are load-bearing and each is pinned by a measurement against
+    // `grafana/loki:3.7.4` and by a test below:
     //
-    // - Before last-write-wins, because the reference deletes by NAME over the
-    //   unresolved set: two attributes sanitizing to one key with either empty
-    //   (`a.b=""` + `a_b="v"`) lose the key entirely, in both wire orders.
-    //   Resolving first would elect the non-empty `"v"` and keep it. This seam
-    //   is order-INdependent where the push seam is not, and for the reason
-    //   the reference itself is: its OTLP translation has already run
-    //   `LabelNamer.Build` over every attribute key
-    //   (`pkg/loghttp/push/otlp.go:603-614 @ v3.7.4`) before the distributor's
-    //   builder sees them, so no pair is renamed there and the resurrect
-    //   asymmetry documented at `strip_empty_valued_labels` cannot fire. The
-    //   keys handed over here are `canonicalize_label_key` fixed points for
-    //   exactly the same reason.
-    // - Over the identity fields too, because an empty-valued attribute NAMED
-    //   `scope_name` takes the real `scope_name` with it: a body with scope
-    //   name `N`, version `1.0` and attribute `scope_name=""` comes back
-    //   carrying `scope_version="1.0"` and no `scope_name` at all. Stripping
-    //   before the identity append would leave `scope_name="N"` standing.
-    //
-    // Rule (a) (identity outranks a colliding attribute) still holds for
-    // NON-empty values: nothing is stripped, and the append order decides.
-    strip_empty_valued_labels(&mut ordered);
-    // Last-write-wins per sanitized key (Loki's rule). Cardinality is tiny;
-    // a linear replace-in-place over insertion order needs no new dependency.
-    let mut resolved: Vec<(String, String)> = Vec::with_capacity(ordered.len());
-    for (key, value) in ordered {
-        if let Some(slot) = resolved.iter_mut().find(|(k, _)| *k == key) {
-            slot.1 = value;
-        } else {
-            resolved.push((key, value));
-        }
-    }
-    Ok(structured_metadata_json(resolved))
+    // - The empty-value delete is by NAME and runs over the unresolved set, so
+    //   two attributes sanitizing to one key with either empty (`a.b=""` +
+    //   `a_b="v"`) lose the key entirely, in both wire orders
+    //   (`empty_valued_scope_attribute_drops_its_sanitized_twin_in_either_order`).
+    //   That is `Reset`'s seeding, not a rule of this function.
+    // - The identity fields go through the builder too, because an
+    //   empty-valued attribute NAMED `scope_name` takes the real `scope_name`
+    //   with it: a body with scope name `N`, version `1.0` and attribute
+    //   `scope_name=""` comes back carrying `scope_version="1.0"` and no
+    //   `scope_name` at all (`an_empty_valued_attribute_named_after_an_identity_field_deletes_it_too`).
+    //   Appending them AFTER the attributes is what keeps rule (a) true for
+    //   non-empty values: nothing is deleted, and among pairs the builder
+    //   treats alike the last wins.
+    Ok(structured_metadata_json(ordered))
 }
 
 /// Renders a `KeyValue` list to `(key, value)` label pairs, using the same
@@ -1369,6 +1365,101 @@ mod tests {
             vec![kv("scope_name", Value::StringValue("attr".to_string()))],
         )));
         assert_eq!(identity_wins, r#"{"scope_name":"N","scope_version":"1.0"}"#);
+    }
+
+    /// …but "an empty-valued attribute takes the identity field with it" holds
+    /// only while that identity field is never `Set`. `Reset` seeds the
+    /// builder's `del` from the BASE scan, a U+FFFD value is a `Set` into
+    /// `add`, and `Labels()` emits `add` whether or not `del` holds the name
+    /// (`labels_common.go:163-200`, `labels_stringlabels.go:483-521 @
+    /// v3.7.4`) — so a scope NAME carrying U+FFFD survives the same
+    /// `scope_name=""` attribute that deletes a plain one, rewritten to a
+    /// space.
+    ///
+    /// Measured on `grafana/loki:3.7.4` (`b318f282`) as the pair list this
+    /// path builds: `{scope_name="", scope_name="N\u{FFFD}"}` stores
+    /// `scope_name="N "` there, and the U+FFFD-free control
+    /// `{scope_name="", scope_name="N"}` stores nothing. The rule is
+    /// `pulsus_model`'s
+    /// `the_builder_emits_a_set_name_even_when_reset_deleted_it`; this is the
+    /// OTLP end of it, and the failure mode for the docs/schemas.md §3.1
+    /// sentence that states it.
+    #[test]
+    fn a_u_fffd_bearing_scope_name_survives_an_empty_valued_attribute_of_the_same_name() {
+        let survives = scope_sm(Some(scope(
+            "N\u{FFFD}",
+            "1.0",
+            vec![kv("scope_name", Value::StringValue(String::new()))],
+        )));
+        assert_eq!(survives, r#"{"scope_name":"N ","scope_version":"1.0"}"#);
+
+        // The discriminating control: identical but for the U+FFFD, and the
+        // delete then stands (what the test above asserts).
+        let deleted = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv("scope_name", Value::StringValue(String::new()))],
+        )));
+        assert_eq!(deleted, r#"{"scope_version":"1.0"}"#);
+
+        // The same interaction on an ordinary attribute rather than an
+        // identity field, so the rule is not read as special-casing identity.
+        let attribute = scope_sm(Some(scope(
+            "",
+            "",
+            vec![
+                kv("a.b", Value::StringValue(String::new())),
+                kv("a_b", Value::StringValue("p\u{FFFD}".to_string())),
+            ],
+        )));
+        assert_eq!(attribute, r#"{"a_b":"p "}"#);
+    }
+
+    /// The REVERSE pair order — the `Set` first, the empty pair second — is
+    /// reachable here too, and this test exists because an earlier revision
+    /// claimed it was not. "Identity is appended after the attributes" rules
+    /// out reaching that order **through the identity field**; it says
+    /// nothing about reaching it through TWO ATTRIBUTES that canonicalize
+    /// onto one name, with the scope's own name and version empty so nothing
+    /// is appended after them at all.
+    ///
+    /// Measured on `grafana/loki:3.7.4` (`b318f282`) through the reference's
+    /// OWN OTLP receiver (`POST /otlp/v1/logs`, read back with
+    /// `categorize-labels`), not inferred from the push transport: a scope
+    /// with empty name/version and attributes `scope.name="N\u{FFFD}"` then
+    /// `scope_name=""` stores `scope_name="N "` (beside the reference's own
+    /// `severity_number` entry, which PulsusDB does not add), the U+FFFD-free
+    /// control `scope.name="N"` + `scope_name=""` stores neither, and the
+    /// opposite attribute order stores `scope_name="N "` as well.
+    ///
+    /// Row `g06` of `pulsus_model`'s
+    /// `the_builder_emits_a_set_name_even_when_reset_deleted_it` is this pair
+    /// list; here it is driven through the real `parse`.
+    #[test]
+    fn two_attributes_canonicalizing_onto_one_name_reach_the_reverse_order_here_too() {
+        for (first, second, expected, note) in [
+            (
+                kv("scope.name", Value::StringValue("N\u{FFFD}".to_string())),
+                kv("scope_name", Value::StringValue(String::new())),
+                r#"{"scope_name":"N "}"#,
+                "the U+FFFD `Set` outranks the later empty pair's delete",
+            ),
+            (
+                kv("scope_name", Value::StringValue(String::new())),
+                kv("scope.name", Value::StringValue("N\u{FFFD}".to_string())),
+                r#"{"scope_name":"N "}"#,
+                "…and in the other attribute order",
+            ),
+            (
+                kv("scope.name", Value::StringValue("N".to_string())),
+                kv("scope_name", Value::StringValue(String::new())),
+                "",
+                "the discriminating control: without the U+FFFD the delete stands",
+            ),
+        ] {
+            let stored = scope_sm(Some(scope("", "", vec![first, second])));
+            assert_eq!(stored, expected, "{note}");
+        }
     }
 
     #[test]
@@ -2749,6 +2840,93 @@ mod tests {
             r#"{"service_name":"unknown_service"}"#,
             "a near-miss alone leaves the slot at its fallback"
         );
+    }
+
+    /// **The #379 and #381 seams do not see each other** (merge check). Two
+    /// resolvers now run over one `ResourceLogs`: `service_name` discovery and
+    /// the stream-label build read the RESOURCE attributes, while the
+    /// structured-metadata builder reads the SCOPE attributes. They are
+    /// separate lists on the wire, so neither can observe the other's output —
+    /// asserted here rather than argued, because both landed in this file in
+    /// the same week and a shared list would be invisible until it changed a
+    /// stored value.
+    ///
+    /// The discriminating case is the second one: a SCOPE attribute named
+    /// `service.name` canonicalizes onto the label `service_name`, so if the
+    /// two seams shared a list it would either capture the stream's identity
+    /// or be captured by it. It does neither — it is stored as structured
+    /// metadata and the stream keeps the synthesized `unknown_service`.
+    #[test]
+    fn the_service_name_slot_and_the_scope_metadata_builder_read_different_lists() {
+        // (1) A resource attribute reaches the stream labels and NOT the
+        // scope's structured metadata.
+        let mut request = logs_with_resource_attrs(vec![
+            attr("service.name", "checkout"),
+            attr("k8s.container.name", "c"),
+        ]);
+        request.resource_logs[0].scope_logs[0].scope = Some(scope(
+            "",
+            "",
+            vec![kv("team", Value::StringValue("pay".to_string()))],
+        ));
+        let out = super::parse(&request, 0).unwrap();
+        assert_eq!(out.rows[0].structured_metadata, r#"{"team":"pay"}"#);
+        assert_eq!(out.streams[0].service, "checkout");
+        assert_eq!(
+            out.streams[0].labels.get("k8s_container_name"),
+            Some("c"),
+            "labels: {:?}",
+            out.streams[0].labels
+        );
+
+        // (2) …and a SCOPE attribute canonicalizing onto `service_name`
+        // reaches the structured metadata and NOT the stream's identity, which
+        // keeps the synthesized fallback.
+        let mut request = logs_with_resource_attrs(vec![attr("zzz", "v")]);
+        request.resource_logs[0].scope_logs[0].scope = Some(scope(
+            "",
+            "",
+            vec![kv(
+                "service.name",
+                Value::StringValue("from-scope".to_string()),
+            )],
+        ));
+        let out = super::parse(&request, 0).unwrap();
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            r#"{"service_name":"from-scope"}"#
+        );
+        assert_eq!(
+            out.streams[0].service,
+            crate::protocols::service_name::UNKNOWN_SERVICE,
+            "a scope attribute must not reach the stream's identity"
+        );
+    }
+
+    /// **An entry whose structured metadata resolves to NOTHING must not trip
+    /// the stream-level empty-label rejection #379 made reachable** (merge
+    /// check). The two "empty" rules live at different seams — the builder
+    /// deletes per ENTRY, `MissingLabelsErrorMsg` fires on the STREAM's label
+    /// set — and only the second is a rejection.
+    #[test]
+    fn structured_metadata_resolving_to_nothing_does_not_empty_the_stream() {
+        let mut request = logs_with_resource_attrs(vec![attr("service.name", "checkout")]);
+        request.resource_logs[0].scope_logs[0].scope = Some(scope(
+            "",
+            "",
+            vec![
+                kv("a.b", Value::StringValue(String::new())),
+                kv("a_b", Value::StringValue("keep".to_string())),
+            ],
+        ));
+        let out = super::parse(&request, 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert_eq!(out.rows.len(), 1, "the entry is still stored");
+        assert_eq!(
+            out.rows[0].structured_metadata, "",
+            "the builder deletes both pairs, which is not a stream-level emptiness"
+        );
+        assert_eq!(out.streams[0].service, "checkout");
     }
 
     /// AC7 (issue #379): `container.name=""` is an index attribute AND a

@@ -211,9 +211,10 @@ pub struct StructuredMetadataCtx {
     /// read-path stand-in for a write-path strip, added by #238 when PulsusDB
     /// still stored empty-valued structured metadata.
     ///
-    /// PulsusDB's ingest now performs that strip (#259 —
-    /// `pulsus_model::strip_empty_valued_labels` at every structured-metadata
-    /// seam), so no row this build writes can carry an empty-valued ordinary
+    /// PulsusDB's ingest now performs that delete (#259 —
+    /// `pulsus_model::resolve_structured_metadata`, which runs the same
+    /// builder at every structured-metadata seam), so no row this build
+    /// writes can carry an empty-valued ordinary
     /// SM pair, and for those rows the test is unreachable. It is kept, not
     /// removed: a row written by an OLDER build would otherwise start
     /// rendering `__error_details__` where the reference renders nothing, and

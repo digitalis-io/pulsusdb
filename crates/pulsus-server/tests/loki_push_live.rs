@@ -1059,6 +1059,99 @@ async fn empty_valued_structured_metadata_is_never_stored() {
     }
 }
 
+/// Issue #381: the collision resolution reaches STORAGE, not just the
+/// parser — the value ClickHouse holds in `log_samples.structured_metadata`
+/// is the one the reference stores.
+///
+/// Four rows, chosen so no two are decided by the same half of the builder:
+/// `c01` a rename replacing a base twin, `c03` two renames onto one name,
+/// `c06` two base duplicates and no rename at all, `c16` an empty value whose
+/// `Reset` delete is then re-added by two renames. The expected values are
+/// the pinned reference's, captured raw at
+/// `pulsus-write/tests/fixtures/structured_metadata_collisions/capture.json`
+/// and asserted against the parser by that suite; this test asserts the same
+/// four survive the writer, the wire and ClickHouse unchanged. Each row is
+/// pushed on BOTH encodings, because the storage claim is per transport.
+///
+/// Before this fix these four stored `keep`, `1`, `2` and `x` respectively —
+/// the frozen greatest-original-key resolution.
+#[tokio::test(flavor = "multi_thread")]
+async fn colliding_structured_metadata_is_stored_as_the_reference_resolves_it() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_166;
+    let db = "pulsus_loki_push_sm_collision_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "sm-collision";
+
+    /// One capture row: its id, the pairs pushed in wire order, and the
+    /// value the pinned reference stores for them.
+    struct CollisionRow {
+        id: &'static str,
+        sm: &'static [(&'static str, &'static str)],
+        expected: &'static str,
+    }
+    let rows = &[
+        CollisionRow {
+            id: "c01",
+            sm: &[("a.b", "x"), ("a_b", "keep")],
+            expected: r#"{"a_b":"x"}"#,
+        },
+        CollisionRow {
+            id: "c03",
+            sm: &[("a.b", "1"), ("a-b", "2")],
+            expected: r#"{"a_b":"2"}"#,
+        },
+        CollisionRow {
+            id: "c06",
+            sm: &[("a_b", "2"), ("a_b", "1")],
+            expected: r#"{"a_b":"1"}"#,
+        },
+        CollisionRow {
+            id: "c16",
+            sm: &[("a_b", ""), ("a.b", "x"), ("a-b", "y")],
+            expected: r#"{"a_b":"y"}"#,
+        },
+    ];
+
+    let mut expected_by_body: Vec<(String, &str)> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let (id, sm) = (row.id, row.sm);
+        let offset = index as i64 * 2;
+        let json_line = format!("collision {id} over json");
+        let res = push(
+            port,
+            "application/json",
+            json_body_with_sm(service, base_ns + offset, &json_line, sm).as_bytes(),
+        );
+        assert_eq!(res.status, 204, "{id} json push (body {})", res.body);
+        expected_by_body.push((json_line, row.expected));
+
+        let proto_line = format!("collision {id} over protobuf");
+        let res = push(
+            port,
+            "application/x-protobuf",
+            &protobuf_body_with_sm(service, base_ns + offset + 1, &proto_line, sm),
+        );
+        assert_eq!(res.status, 204, "{id} protobuf push (body {})", res.body);
+        expected_by_body.push((proto_line, row.expected));
+    }
+
+    let client = ch_client(db).await;
+    let stored = stored_samples_by_body(&client, db, service, expected_by_body.len()).await;
+    for (body, expected) in &expected_by_body {
+        assert_eq!(
+            stored[body].structured_metadata, *expected,
+            "stored metadata for {body:?}"
+        );
+    }
+}
+
 /// Issue #259: an inadmissible structured-metadata NAME is refused at the
 /// wire on both push encodings, and nothing is stored for it.
 ///

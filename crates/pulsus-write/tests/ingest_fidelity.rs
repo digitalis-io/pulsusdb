@@ -433,12 +433,30 @@ fn sql_escape(s: &str) -> String {
 /// takes the real one with it (issue #259 — Loki 3.7.4's distributor runs an
 /// entry's structured metadata through Prometheus' `labels.Builder`, which
 /// deletes empty-valued base labels; spelled out inline here rather than
-/// calling `pulsus_model::strip_empty_valued_labels`, so Path B stays
+/// calling `pulsus_model::resolve_structured_metadata`, so Path B stays
 /// independent of the code Path A exercises) — then resolves what is left by
 /// last-write-wins, and serializes through the
 /// same `LabelSet::from_normalized` + `to_canonical_json` seam — which, over
 /// already-unique keys, only sorts + JSON-encodes. Empty set -> `""`.
+///
+/// It deliberately does NOT implement the builder's U+FFFD value rewrite
+/// (`distributor.go:714-715 @ v3.7.4`, issue #381), which Path A now performs.
+/// The two agree only because no fixture carries a U+FFFD in a scope value —
+/// asserted here rather than assumed, so a fixture that gains one fails loudly
+/// instead of scoring Path A's rewrite as a mismatch.
 fn path_b_scope_structured_metadata(f: &Fixture) -> String {
+    for text in f
+        .file
+        .scope_attributes
+        .iter()
+        .flat_map(|(key, value)| [key, value])
+        .chain([&f.file.scope_name, &f.file.scope_version])
+    {
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "a scope field carries U+FFFD, which Path B does not rewrite: {text:?}"
+        );
+    }
     let mut ordered: Vec<(String, String)> = f
         .file
         .scope_attributes
