@@ -33,7 +33,28 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
   artifact to `oci://ghcr.io/digitalis-io/charts/pulsusdb` on `helm-v*`
   tags, gated on an already-exists preflight guard and a digest-verified
   `helm pull` round trip.
-- `CHANGELOG.md` (this file).
+- Local-only Grafana demo stack (`make grafana-up`/`grafana-down`/
+  `grafana-logs`): a `deploy/e2e/compose.grafana.yaml` overlay on the
+  existing single-node e2e fixture adding Tempo-compat and native
+  Prometheus Grafana datasources against pulsusdb (alongside the existing
+  Loki-compat one), a vendored copy of the `firehose` synthetic
+  logs/metrics/traces generator (`deploy/e2e/firehose/`, real-time
+  `SPEEDUP=1` against a laptop-sized 5-host fleet), a dedicated
+  otel-collector config (`deploy/e2e/otel-config.grafana.yaml`, kept
+  separate from the CI-shared `otel-config.single.yaml`), and a
+  provisioned dashboard (`deploy/e2e/grafana/provisioning/dashboards/`)
+  covering log rate/stream, host/region metrics, and a Tempo traces
+  panel. Not wired into CI or the `pulsus-e2e` harness.
+- `deploy/e2e/compose.tier.yaml`, part of the same `make grafana-up`
+  stack: a three-tier (frontend/middletier/backend) HTTP checkout
+  service vendored from `terraform-google-monitoring`'s
+  `traffic-gen/loaders/otel-tier` (`deploy/e2e/otel-tier/`), each hop
+  propagating W3C `traceparent` so a single trace spans all three real
+  HTTP calls, with realistic nested spans, injected slow "db-query"
+  spans (~20%), and hard backend failures (~14%) — richer, multi-hop
+  traces than firehose's single-service ones, for Tempo-view
+  exploration. A `curlimages/curl` loop drives traffic (otel-tier ships
+  no load generator of its own).
 - Helm chart: a `pulsusdb.validateAuth` render-time guard rejects
   partial/ambiguous `pulsusdb.auth` combinations (one-sided `user`,
   one-sided password source, or `password`+`existingSecret` together);
