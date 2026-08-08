@@ -97,6 +97,32 @@
 //!   [`live_reference_error_codes_are_exactly_the_covered_set`] — the
 //!   census, and the half that makes it bite.
 //!
+//! # What this matrix cannot see
+//!
+//! **It scores VERDICTS.** Every position, every pattern, every committed
+//! cell, the whole live leg and every divergence class answer one
+//! question: is the query served, or is it a 400. That means a pattern
+//! both sides ACCEPT while reading it as two different patterns — a wrong
+//! answer, and the worse kind of divergence — moves no cell here and
+//! reddens nothing.
+//!
+//! This is not a hypothetical limit. `engine_dir_b_invalid_utf8_escape`
+//! shipped with a false mechanism ("our lexer decodes `\xff` to U+00FF")
+//! and survived a review round, because no check in this file could
+//! contradict it. What our lexer actually does is drop the backslash
+//! (`pulsus-logql/src/lexer.rs:322-331`), so the pattern becomes the three
+//! ASCII characters `xff` while the reference sees one 0xFF byte — and at
+//! the five positions where BOTH sides serve it, the two engines match
+//! different lines with every cell agreeing.
+//!
+//! [`the_parsed_pattern_value_is_committed_where_the_escape_changes_it`]
+//! is the one check here with a value in it, and it covers exactly the
+//! patterns whose LogQL escape is the construct under test. Anything
+//! broader — what a pattern MATCHES, rather than whether it compiles —
+//! belongs to the value-differential suites, not here. **If you add a
+//! pattern hoping to pin a meaning, this file is the wrong place: it will
+//! report agreement.**
+//!
 //! **If this file has to be split**, the seam is the template axis:
 //! [`TEMPLATE_AXIS`] and its two tests have a different verdict TYPE from
 //! everything else here (a `200` carrying `__error__`, never a status)
@@ -588,9 +614,24 @@ const PATTERNS: &[Pattern] = &[
     // plain literal to a string matcher and never parses it at all
     // (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72
     // @ v3.7.4` — `optimizeAlternatingLiterals` returns before
-    // `syntax.Parse`), so those positions serve it. PulsusDB serves it
-    // everywhere: our lexer decodes `\xff` to U+00FF, a valid `char`,
-    // so the crate compiles a pattern the reference could not even parse.
+    // `syntax.Parse`), so those positions serve it. Whether that is a
+    // property of the POSITION or of the literal was measured rather than
+    // assumed: `{app=~"a\xffb.*"}` is a 400 at the selector and
+    // `{app=~"\xff|\xfe"}` is a 200, so it is the literal short-circuit.
+    //
+    // **PulsusDB serves it everywhere, and NOT because it reads the same
+    // pattern.** `scan_double_quoted` (`pulsus-logql/src/lexer.rs:322-331`)
+    // handles an unknown escape with `Some(other) => value.push(other)` —
+    // it drops the backslash and keeps the `x` — so the pattern the
+    // planner receives is the three ASCII characters `xff`, pinned by
+    // [`the_parsed_pattern_value_is_committed_where_the_escape_changes_it`].
+    // The reference sees one 0xFF byte. So the user's pattern silently
+    // becomes a DIFFERENT pattern matching different lines: at the five
+    // positions where both sides serve it, the reference matches lines
+    // containing byte 0xFF and we match lines containing `xff`. That is a
+    // wrong answer, not a lenient accept, and this matrix scores verdicts
+    // and cannot see it — see the module docs' "What this matrix cannot
+    // see".
     Pattern {
         id: "invalid_utf8",
         body: Body::LogqlSource(r"\xff"),
@@ -1128,13 +1169,18 @@ const DIVERGENCES: &[Divergence] = &[
             "variants_variant_after_line_format",
         ],
         owner: "#400",
-        why: "a value difference as much as a verdict one: `\"\\xff\"` is one 0xFF byte in the \
-              reference's pattern, which its parser refuses as invalid UTF-8 wherever the \
-              pattern actually reaches a parser; our lexer decodes the same escape to U+00FF, a \
-              valid `char`, so the crate compiles a pattern that means something the reference \
-              could not express. The positions absent from this list are the \
-              `NewFastRegexMatcher` sites, which never parse a plain literal at all — so they \
-              agree by serving it too, for a different reason.",
+        why: "the verdict half of something worse. `\"\\xff\"` is one 0xFF byte in the \
+              reference's pattern, refused as invalid UTF-8 wherever the pattern actually \
+              reaches a parser — these nine positions. Our lexer does NOT decode it to that \
+              byte, nor to U+00FF: `scan_double_quoted` drops the backslash on an unknown \
+              escape (`pulsus-logql/src/lexer.rs:322-331`), so the pattern becomes the three \
+              ASCII characters `xff` and compiles. The positions absent from this list are the \
+              `NewFastRegexMatcher` sites, which never parse a plain literal at all — they \
+              serve it on both sides, and THAT is where the real damage is: the reference \
+              matches lines containing byte 0xFF, we match lines containing `xff`, and no cell \
+              of this matrix moves. A wrong answer, recorded on #400 as a value divergence; \
+              `the_parsed_pattern_value_is_committed_where_the_escape_changes_it` is the only \
+              check here that can see it.",
     },
     Divergence {
         id: "variants_common_side_hides_the_build_error",
@@ -1930,6 +1976,90 @@ fn the_enumeration_is_self_consistent_and_says_why_each_entry_exists() {
                 d.id
             );
         }
+    }
+}
+
+/// **The one thing in this file that is not a verdict: what the planner
+/// actually receives when the LogQL string escape changes the pattern.**
+///
+/// Every other check here scores accept-versus-reject, so a pattern that
+/// both sides SERVE while meaning different things is invisible to all of
+/// them. That is not hypothetical — `engine_dir_b_invalid_utf8_escape`
+/// carried a false mechanism for a whole review round ("our lexer decodes
+/// `\xff` to U+00FF") and nothing in the matrix could contradict it,
+/// because no cell moves either way.
+///
+/// So: for every [`Body::LogqlSource`] pattern — the ones whose escape is
+/// the construct under test — the decoded value the planner sees is
+/// committed here and asserted through the real parser, together with
+/// what it does and does not match. A new `LogqlSource` pattern without
+/// an entry fails rather than being scored on its verdict alone.
+#[test]
+fn the_parsed_pattern_value_is_committed_where_the_escape_changes_it() {
+    /// `(pattern id, the value our parser hands the planner, what the
+    /// REFERENCE's parser sees instead)`.
+    const DECODED: &[(&str, &str, &str)] = &[(
+        "invalid_utf8",
+        // `scan_double_quoted` (`pulsus-logql/src/lexer.rs:322-331`)
+        // handles an unknown escape with `Some(other) => value.push(other)`
+        // — the backslash is dropped and the `x` kept.
+        "xff",
+        // Go's `strconv.Unquote` decodes `\xff` to the single byte 0xFF,
+        // which is why the reference's parser raises `ErrInvalidUTF8`
+        // wherever the pattern reaches it at all.
+        "one 0xFF byte",
+    )];
+
+    for pattern in PATTERNS {
+        let Body::LogqlSource(source) = pattern.body else {
+            continue;
+        };
+        let entry = DECODED.iter().find(|(id, _, _)| *id == pattern.id);
+        let Some((_, decoded, reference_sees)) = entry else {
+            panic!(
+                "`{}` is a LogqlSource pattern with no committed decoded value — its escape is \
+                 the construct under test, and a verdict alone cannot show what it became",
+                pattern.id
+            );
+        };
+        assert!(!reference_sees.is_empty());
+
+        // Through the real parser, at a position whose pattern slot is the
+        // whole matcher value, so the decoded text is readable directly.
+        let query = format!(r#"{{app=~"{source}"}}"#);
+        let expr = parse(&query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let pulsus_logql::Expr::Log(log) = expr else {
+            panic!("{query}: expected a log query")
+        };
+        let value = &log.selector.matchers[0].value;
+        assert_eq!(
+            value, decoded,
+            "`{}`: the planner receives {value:?}, not the committed {decoded:?}. If the lexer \
+             changed, re-record the value AND the divergence's mechanism — the sentence in \
+             `engine_dir_b_invalid_utf8_escape` describes exactly this string.",
+            pattern.id
+        );
+
+        // And what that value MEANS, because "the pattern became `xff`"
+        // is only a defect if `xff` matches something else.
+        let compiled = regex::Regex::new(value).expect("the decoded pattern compiles");
+        assert!(
+            compiled.is_match("xff"),
+            "`{}`: the decoded pattern must match its own literal text",
+            pattern.id
+        );
+        assert!(
+            !compiled.is_match("\u{00FF}"),
+            "`{}`: the decoded pattern must NOT match U+00FF — a previous version of this \
+             file's mechanism claimed the escape produced that character",
+            pattern.id
+        );
+        // The reference's byte, as the transport would deliver it.
+        assert!(
+            !compiled.is_match(&String::from_utf8_lossy(&[0xFFu8])),
+            "`{}`: the decoded pattern must not match the reference's 0xFF byte either",
+            pattern.id
+        );
     }
 }
 

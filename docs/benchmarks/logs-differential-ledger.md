@@ -2312,8 +2312,31 @@ often than they agree about it.
   |---|---|---|---|
   | `engine_dir_b_read_as_a_different_pattern` | `\U0001F600`, `(?R)a`, `(?x)a`, `a**`, `[[:foo:]]`, `\p{Alphabetic}`, `a{1001}` | 15 | `(?R)` is read as the Rust crate's CRLF flag and matches everything; `[[:foo:]]` as a nested class matching `:`/`f`/`o`; `a**` as `(a*)*`. In a `line_format` template `a**` renders **`zxz`** from the input `x` and `\p{Alphabetic}` renders **`z`** — see `template-error-wording-residuals` |
   | `engine_dir_b_class_forms` | `[a--b]`, `\u{263A}` | 14 | `label_replace` excluded — its rewrite makes the Rust crate agree with the reference, so that one position is the only LogQL site where these are refused |
-  | `engine_dir_b_invalid_utf8_escape` | `"\xff"` | 9 | a VALUE difference as much as a verdict one: the escape decodes to one 0xFF byte in the reference's pattern, which its parser refuses as invalid UTF-8; our lexer decodes it to U+00FF, a valid `char`, so we compile a pattern the reference could not express. The nine positions are the ones where the pattern actually reaches a parser; the selector, both label filters and `drop`/`keep` serve it on BOTH sides, because `NewFastRegexMatcher` short-circuits a plain literal before `syntax.Parse` (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) |
+  | `engine_dir_b_invalid_utf8_escape` | `"\xff"` | 9 | the VERDICT half of something worse, and see the note under this table. Go's `strconv.Unquote` gives the reference one 0xFF byte, which its parser refuses as invalid UTF-8 wherever the pattern reaches it — these nine positions. **Our lexer does not produce that byte, and does not produce U+00FF either**: `scan_double_quoted` drops the backslash on an unknown escape (`crates/pulsus-logql/src/lexer.rs:322-331`, `Some(other) => value.push(other)`), so the pattern becomes the three ASCII characters `xff` and compiles. The positions absent from the nine are the `NewFastRegexMatcher` sites, which never parse a plain literal at all (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) |
   | `variants_variant_side_skips_the_line_filter` | the 14 patterns both sides reject | 1 | found by this matrix. The reference refuses a malformed line filter inside a `variants(...)` variant; we serve it — but only while the filter is PUSHABLE. `compile_stage` returns `Ok(None)` for a pushable line filter (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`, so the discarded variant prefix `VariantSpec::try_new` compiles (`plan.rs:2641`) never sees the regex, and a discarded prefix renders no SQL either. Put the same filter after a `line_format` and the pushdown is cleared, the filter is compiled, and both sides refuse it — that is the `variants_variant_after_line_format` position, which agrees at every pattern and is what bounds this row. `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused on both sides too |
+
+- **A VALUE divergence this matrix structurally cannot see, and the limit
+  that hid it** (issue #246 review round 2). `engine_dir_b_invalid_utf8_escape`
+  is only the verdict half. The real defect is that
+  `crates/pulsus-logql/src/lexer.rs:322-331`'s `scan_double_quoted`
+  handles an **unknown escape by dropping the backslash and keeping the
+  character** (`Some(other) => value.push(other)`), so `"\xff"` becomes
+  the three ASCII characters `xff` — not the 0xFF byte Go's unquoting
+  produces, and not U+00FF either, which is what this entry claimed for a
+  round. At the five `NewFastRegexMatcher` positions both systems answer
+  `200`, the reference matching lines that contain byte 0xFF and PulsusDB
+  matching lines that contain `xff`. **A user's pattern silently becomes a
+  different pattern.** Owned by **#400** as a value divergence, not an
+  accept-surface one; the class is not limited to `\x`, since any escape
+  Go defines and this lexer does not takes the same path.
+
+  **Why it survived a review round is the limit worth recording**: this
+  matrix scores VERDICTS. Both sides accept at all 16 positions, so no
+  cell moves, no test moves, and no amount of adding patterns or positions
+  would have caught it. The matrix's module docs now say so under "What
+  this matrix cannot see", and the decoded value itself is asserted by
+  `the_parsed_pattern_value_is_committed_where_the_escape_changes_it` —
+  the one check in the file with a value in it rather than a disposition.
 
 - **Status parity, in contrast, holds everywhere.** Every rejection above
   is `400` on both sides — ours through `PipelineError::BadRegex` →
