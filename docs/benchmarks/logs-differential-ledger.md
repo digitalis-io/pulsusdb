@@ -196,10 +196,19 @@ Out of this ledger's scope by design:
   claim was false as stated**: it was measured on one value family
   (`v{i}`) and written as if it held for all of them. The family
   `svc-{i}` diverges at **`N = 4533`**, below 5327 — confirmed
-  end-to-end against the container. There is no universal `N` below
-  which the two agree, and none is claimed here.
-  The estimate can only equal the exact count while **both** of the
-  following hold, and both depend on the value strings:
+  end-to-end against the container.
+
+  **The correction must not repeat the mistake, so state the floor
+  exactly.** There IS a universal `N` below which the two always agree:
+  `N <= 1`. A single value has nothing to collide with, one insert can
+  never trip the sparse-to-dense check, and one is below the linear
+  counter's exactness ceiling — so agreement at `N <= 1` holds for every
+  value set there is. It is also useless, and it is the ONLY such `N`:
+  from `N = 2` upward a collision is possible, so no larger bound holds
+  for all value sets and none is claimed here.
+  Above that floor the estimate equals the exact count only while **all
+  three** of the following hold. The first two depend on the value
+  strings; the third does not:
   1. **no sparse-key collision yet.** In sparse mode each value is
      encoded into a 25-bit key derived from `metro.Hash64(v, 1337)`
      (`vendor/.../utils.go:44`, `sparse.go:18-25`); the first pair of
@@ -209,6 +218,18 @@ Out of this ledger's scope by design:
      estimator once the varint sparse list's **byte** length exceeds `m`
      (`hyperloglog.go:76-83`, `compressed.go:108-110`), after which the
      answer is an estimate by construction.
+  3. **the sparse-key count is below 8192.** Sparse mode returns
+     `uint64(linearCount(2^25, 2^25 - count))` (`hyperloglog.go:161-165`,
+     `utils.go:31-34`, `mp = 1<<25` at `hyperloglog.go:11-14`), and that
+     value truncates back to `count` for every `count < 8192`, first
+     missing at `count = 8192`, where it returns 8193. Re-derived here
+     from those lines rather than inferred from the captures. This is the
+     one part of the picture that is a property of the ESTIMATOR alone,
+     and it is exactly why the instrument hazard recorded in PROVENANCE
+     lands on 8192. Note it bounds the sparse-key count, not `N`: above
+     8191 an exactly-offsetting number of collisions could still land on
+     `N` by coincidence, so it is not a bound above which agreement is
+     impossible.
   Measured first divergences, fresh sketch per `N`, one family per row —
   **each is that family's threshold and nothing else's**: `v{i}` **5328**
   (the #244 capture, a sparse-key collision),
@@ -219,9 +240,18 @@ Out of this ledger's scope by design:
   one `N`, three reference answers. `pod-` and `svc-` were read back
   from the container end-to-end; `instance-` and `10.42.0.` are
   library-only, and the artifact's `observed_by` column records which is
-  which per point. The `v{i}` collision pair is re-derived rather than
-  quoted: `encodeHash(metro.Hash64(v, 1337), 14, 25)` maps both
-  `"v2888"` and `"v5327"` to sparse key 52686402. The `v{i}` points are captured in
+  which per point.
+
+  **The mechanism is observed per family, not fitted to the numbers.**
+  Re-deriving each family's sparse keys directly —
+  `encodeHash(metro.Hash64(v, 1337), 14, 25)` — at its own divergence
+  point: `v{i}` at 5328 has exactly ONE collision, `"v2888"`/`"v5327"`
+  on key 52686402; `svc-{i}` at 4533 has exactly ONE,
+  `"svc-787"`/`"svc-4532"` on key 36184712; and `pod-{i}`,
+  `instance-{i}` and `10.42.0.{i}` at 7708 have **zero** collisions —
+  7708 distinct keys each — so their divergence is the sparse-to-dense
+  flip alone, with no collision involved. Two families diverge by
+  mechanism 1, three by mechanism 2, at counts that share no pattern. The `v{i}` points are captured in
   `crates/pulsus-read/tests/golden/detected_cardinality/reference_divergence.tsv`
   (pinned by `detected_fields_witness.rs`'s AC 19 gate); the
   `/detected_labels` points are in

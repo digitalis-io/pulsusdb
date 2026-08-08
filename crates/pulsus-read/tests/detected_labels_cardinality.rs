@@ -160,12 +160,31 @@ fn detected_labels_divergence_rows_hold_and_the_ledger_names_them() {
          it is the counterexample to the retracted universal threshold"
     );
 
-    // (h) one N, more than one reference answer.
+    // (h) The ledger asserts "one `N`, three reference answers". That
+    // sentence is a figure describing THIS artifact, so it is recomputed
+    // here and matched against the prose instead of being trusted: the
+    // widest disagreement in the file is counted, and the ledger must
+    // spell out that same number. Deleting a row therefore cannot leave
+    // the sentence standing — the count drops and the words no longer
+    // match.
+    let widest = by_n.values().map(HashSet::len).max().unwrap_or(0);
     assert!(
-        by_n.values().any(|answers| answers.len() > 1),
-        "(h) the artifact must keep at least one `n_distinct` at which two \
-         families give DIFFERENT reference answers; without it the file can be \
-         re-read as a table of thresholds indexed by N"
+        widest >= 3,
+        "(h) the artifact must keep at least one `n_distinct` at which THREE \
+         families give three different reference answers (widest is {widest}); \
+         two would still read as a table of thresholds indexed by N, and the \
+         ledger's own sentence claims three"
+    );
+    let spelled = ["zero", "one", "two", "three", "four", "five", "six"]
+        .get(widest)
+        .copied()
+        .unwrap_or_else(|| panic!("(h) extend the number words past {widest}"));
+    let ledger_norm = normalize(&ledger);
+    assert!(
+        ledger_norm.contains(&format!("one n, {spelled} reference answers")),
+        "(h) the ledger must state the widest disagreement this artifact \
+         actually carries — {widest} answers at one N, i.e. \
+         \"one `N`, {spelled} reference answers\""
     );
 
     // (i) capture conditions and the agreeing witnesses.
@@ -222,29 +241,39 @@ fn normalize(text: &str) -> String {
 /// or to the public API surface, and the statement that replaced it must
 /// still be there.
 ///
-/// **What this gate reaches, and where it stops.** It sweeps EVERY
-/// git-TRACKED file in the repository — not a hand-listed set, because a
-/// hand-listed set cannot see the fifth copy nobody remembered; the
-/// claim lived in four separate files before #261 and each was found by
-/// grep, not by recollection. Line wraps are collapsed first, so the
-/// retracted sentence cannot come back by being re-flowed or
-/// re-emphasised. What it CANNOT do is recognise a NEW sentence
-/// asserting some other number as a universal threshold; no textual
-/// rule can. That case is covered instead by the positive half below:
-/// the ledger has to keep saying what the threshold actually depends
-/// on, and docs/api.md has to keep saying that no such distinct-value
-/// count exists, so a rewrite that quietly reintroduces a bound has to
-/// delete a sentence this test requires. That is where the instrument
-/// stops.
+/// **Domain: every git-TRACKED file, with exactly one file under a
+/// different rule and none skipped.** Not a hand-listed set — a hand
+/// list cannot see the copy nobody remembered, and the claim was in four
+/// separate files before #261, each found by grep rather than by
+/// recollection. Line wraps are collapsed first, so the sentence cannot
+/// return by being re-flowed or re-emphasised.
 ///
-/// `crates/pulsus-read/tests/golden/detected_cardinality/reference_divergence.tsv`
-/// is deliberately NOT in the file list. Its header carries the same
-/// wording, scoped by the sentence immediately before it (`"v0"`…
-/// `"v{n-1}"`), and for that family it is true — re-verified 2026-08-08
-/// by scanning n = 1…5400 with a fresh sketch per n against the vendored
-/// v0.2.6 library, whose first `Estimate() != n` is n = 5328. It is also
-/// a frozen #244 artifact. Excluding it is a decision with a reason, not
-/// an oversight.
+/// `golden/detected_cardinality/reference_divergence.tsv` is the one
+/// exception, and it is a STRICTER rule rather than a pass: the phrase
+/// may appear there only inside a `#` comment line, and only while the
+/// header also names the value family it was measured on (`"v0"` …
+/// `"v{n-1}"`). That file is a frozen #244 artifact whose wording is
+/// true for its own family — re-verified 2026-08-08 by scanning
+/// n = 1…5400 fresh-sketch-per-n against the vendored v0.2.6 library,
+/// first `Estimate() != n` at n = 5328. It needs its own rule because
+/// the AC-19 gate that otherwise freezes it
+/// (`detected_fields_witness.rs`) `continue`s on `#` lines, so nothing
+/// else in the tree reads that header at all.
+///
+/// **Where this instrument stops — three limits, stated because a gate
+/// that looks complete is worse than one whose edges are known.**
+///
+/// 1. It bans the enumerated FORMS. A universal claim worded differently
+///    — a new number, a new phrasing — is not detectable by any textual
+///    rule, and this one does not pretend otherwise.
+/// 2. The pre-filter is sound only for those forms. Every banned phrase
+///    is asserted to contain a pre-filter token, so skipping a file that
+///    holds none is safe for THIS ban list and only for it.
+/// 3. **The positive assertions below only prevent DELETION.** They do
+///    not stop a contradictory sentence being ADDED alongside them: a
+///    reviewer added a universal claim without removing anything and
+///    this test stayed green. Reviewing a diff that adds prose here is
+///    still a human job.
 #[test]
 fn the_universal_agreement_threshold_claim_stays_retracted() {
     // The `v{i}`-scoped #244 capture, excluded with its reason in this
@@ -298,9 +327,15 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
     }
     let mut scanned = 0usize;
     let mut inspected = 0usize;
+    let mut saw_frozen = false;
     for rel in String::from_utf8_lossy(&listing.stdout).split('\0') {
-        if rel.is_empty() || rel.ends_with(FROZEN_244_ARTIFACT) {
-            continue; // the one deliberate exclusion, reasoned above
+        if rel.is_empty() {
+            continue;
+        }
+        if rel.ends_with(FROZEN_244_ARTIFACT) {
+            saw_frozen = true;
+            check_frozen_244_header(&repo.join(rel), &banned);
+            continue;
         }
         let path = repo.join(rel);
         let Ok(bytes) = std::fs::read(&path) else {
@@ -332,6 +367,11 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
         "the pre-filter matched nothing at all, which would make the ban vacuous — \
          the ledger alone should have carried a matching token"
     );
+    assert!(
+        saw_frozen,
+        "the frozen #244 artifact was not seen in the tracked listing, so its \
+         header went unchecked — the exception must be exercised, not assumed"
+    );
 
     // The positive half — the sentences that must survive.
     let ledger = normalize(&repo_file("docs/benchmarks/logs-differential-ledger.md"));
@@ -344,18 +384,50 @@ fn the_universal_agreement_threshold_claim_stays_retracted() {
         "the ledger must keep the svc-{{i}} counterexample cardinality 4533, which is \
          BELOW the number the retracted claim named"
     );
-    assert!(
-        ledger.contains("one n, three reference answers"),
-        "the ledger must keep the one-N-three-answers observation, which is what makes \
-         a threshold indexed by N impossible to write"
-    );
+    // The one-N-three-answers sentence is NOT asserted here: it is a
+    // figure describing the artifact, so it is recomputed from the
+    // artifact and matched against this prose by check (h) of
+    // `detected_labels_divergence_rows_hold_and_the_ledger_names_them`.
+    // One owner per number.
     let api = normalize(&repo_file("docs/api.md"));
     assert!(
-        api.contains(
-            "there is no distinct-value count below which the two are guaranteed to agree"
-        ),
-        "docs/api.md §2.6.3 must keep the negative statement that replaced the bound"
+        api.contains("from two values upward there is no useful bound"),
+        "docs/api.md §2.6.3 must keep the statement that replaced the bound — and it \
+         must keep saying `no USEFUL bound` rather than `no bound`, because a \
+         single value cannot collide and so always agrees"
     );
+}
+
+/// The frozen #244 artifact's rule: a banned phrase may appear only in a
+/// `#` comment line, and only while the header still names the value
+/// family that phrase was measured on. Coverage, not an exemption — see
+/// the caller's doc comment for why this file needs its own rule.
+fn check_frozen_244_header(path: &std::path::Path, banned: &[String]) {
+    let text = std::fs::read_to_string(path).expect("the frozen #244 artifact must exist");
+    for (i, line) in text.lines().enumerate() {
+        let norm = normalize(line);
+        for phrase in banned {
+            if norm.contains(phrase) {
+                assert!(
+                    line.starts_with('#'),
+                    "{}:{}: a data row states the retracted threshold: {phrase:?}",
+                    path.display(),
+                    i + 1
+                );
+            }
+        }
+    }
+    let head = header(&text);
+    if banned.iter().any(|p| normalize(&head).contains(p)) {
+        assert!(
+            head.contains("\"v0\"") && head.contains("\"v{n-1}\""),
+            "{}: the header states a threshold without naming the value family it \
+             was measured on. That scoping sentence is the ONLY thing that makes \
+             the wording true, and the AC-19 gate skips `#` lines, so this is the \
+             only check that reads it (issue #261).",
+            path.display()
+        );
+    }
 }
 
 /// `docs/api.md` §2.6.2 must not list the absent `sketch` key as a

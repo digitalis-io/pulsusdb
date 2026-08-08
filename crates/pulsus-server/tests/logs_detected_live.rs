@@ -840,19 +840,28 @@ async fn detected_fields_budget_truncation_signals_pulsus_partial() {
 /// not have failed before the change any more than after it. #261
 /// changed documentation, not behaviour.
 ///
-/// **What it does and does not catch, measured rather than assumed.**
+/// **What it catches, what it does not, and why the split is deliberate
+/// (issue #261 AC 8, restated to what the two gates actually do).**
 /// Swapping `uniqExact(val)` in `sql::detected_labels` for
 /// `uniqCombined`, `uniqCombined64` or `uniqHLL12` reddens this
 /// assertion at both fixtures, and `uniqTheta` at the `pod-` one
 /// (measured on `clickhouse/clickhouse-server:24.8`, 2026-08-08: at
 /// 7708 distinct values those four answer 7696 / 7696 / 7733 / 7665, and
-/// at 4533 they answer 4534 / 4534 / 4552 / 4533). A swap to plain
-/// `uniq` is **invisible here**: ClickHouse's `uniq` is still exact at
-/// both of these cardinalities, so it returns 7708 and 4533 too. That
-/// one is caught only by the SQL-text gate
-/// `the_detected_labels_aggregate_is_still_an_exact_count`
+/// at 4533 they answer 4534 / 4534 / 4552 / 4533).
+///
+/// A swap to plain `uniq` is **invisible here, permanently**, and the
+/// fixture sizes must NOT be changed to chase it. ClickHouse's `uniq` is
+/// exact through 65536 distinct values and first diverges at 65537
+/// (measured same day: 65536 → 65536, 65537 → 65359). Discriminating it
+/// live would therefore need a fixture 8.5× this one's rows, and 65537
+/// is not a point where the REFERENCE's estimate diverges — which is the
+/// entire reason 7708 and 4533 were chosen. Buying that one break would
+/// cost CI time and sever this case from the two numbers it exists to
+/// pin. So it is not bought: `uniq(` is banned by literal in the SQL-text
+/// gate `the_detected_labels_aggregate_is_still_an_exact_count`
 /// (`crates/pulsus-read/tests/detected_labels_cardinality.rs`), which is
-/// why that weaker-looking gate exists. Neither gate is redundant.
+/// why that weaker-looking gate exists. Neither gate is redundant, and
+/// between them every estimator ClickHouse offers is covered.
 ///
 /// Seeding is ONE bulk statement per fixture over `numbers()`, fanned out
 /// into `log_streams_idx` by the shipped `log_streams_idx_mv`

@@ -15,8 +15,8 @@
 //!   `HasErr()` analog), evaluated via the SAME [`CompiledPipeline`]
 //!   parser stages the query path runs;
 //! - [`FieldAccumulator`]'s first-seen field cap, exact cardinality
-//!   (documented improvement over the reference's hyperloglog sketch —
-//!   registered as `detected-cardinality-exact-not-estimated` in
+//!   (a REGISTERED divergence from the reference's hyperloglog sketch —
+//!   `detected-cardinality-exact-not-estimated` in
 //!   docs/benchmarks/logs-differential-ledger.md), per-observation type
 //!   re-detection (last observation wins, matching the reference's
 //!   per-entry re-detect), encounter-order deduped parser attribution,
@@ -52,8 +52,11 @@ pub struct DetectedFieldOut {
     /// One of the pinned closed set: `string` | `int` | `float` |
     /// `boolean` | `duration` | `bytes`.
     pub field_type: &'static str,
-    /// Exact distinct-value count over the sampled entries (the reference
-    /// reports a hyperloglog estimate — documented improvement).
+    /// Exact distinct-value count over the sampled entries. The reference
+    /// reports a p14 hyperloglog estimate instead; the difference is the
+    /// registered `detected-cardinality-exact-not-estimated` divergence
+    /// (docs/benchmarks/logs-differential-ledger.md), not an unrecorded
+    /// improvement.
     pub cardinality: u64,
     /// `"json"`/`"logfmt"` in encounter order, deduped; empty for fields
     /// observed only without parser attribution (structured metadata /

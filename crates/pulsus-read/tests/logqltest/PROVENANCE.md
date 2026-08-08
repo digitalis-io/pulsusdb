@@ -768,6 +768,14 @@ instance-	7708	7720	library	the same n as the pod- row, a different answer
   `pod-`'s first divergence at **8192** (→ 8193), where the correct
   fresh-sketch-per-`n` answer is **7708** (→ 7640). Only
   fresh-sketch-per-`n` is valid; any future re-capture must do the same.
+  **8192 is not a coincidence and is worth knowing on its own:** sparse
+  mode returns `uint64(linearCount(2^25, 2^25 - count))`
+  (`hyperloglog.go:161-165`, `utils.go:31-34`), which truncates back to
+  `count` for every `count < 8192` and first misses at `count = 8192`,
+  where it returns 8193. Re-derived from those lines directly. An
+  incremental scan keeps the sketch sparse for longer (that is the
+  hazard), so what it actually finds is the linear counter's own ceiling
+  rather than the family's divergence point.
 - **Insertion order is not fixed by the reference.** The ingester
   returns each label's values from a Go map (`ingester.go:1710-1717`),
   so the querier inserts them in an unspecified order. Checked
