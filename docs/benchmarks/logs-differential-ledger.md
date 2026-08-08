@@ -2992,24 +2992,33 @@ back up here.
   which this row extends with its three: the stream-less `422` and the
   stream-local `400` in both its forms (nothing written, and
   written-then-refused).
-- **Residual 1 — the rendered label set inside the message.** Every one of
-  the four messages interpolates the stream's label set, and the
-  reference's copy carries a `service_name` label its own push parser
-  injected (`discover_service_name`, `pkg/loghttp/push/push.go:441-453 @
-  v3.7.4`, on by default — e.g. `service_name="unknown_service"`, or the
-  value of an `app` label). PulsusDB does not implement service-name
-  discovery, so its rendered set omits that label. This is a pre-existing
-  difference in what we store, not something #374 introduced, and it
-  never changes a status: the reference decrements its own injected label
-  out of the count, so the counts agree exactly (17 user labels reports
-  `has 17 label names` on both). The same injection is why the
-  reference's `MissingLabelsErrorMsg` is unreachable there and not
-  implemented here, and why a stream whose labels are all empty-valued is
-  stored as `{service_name="unknown_service"}` upstream and with no
-  labels here.
+- **Residual 1 — CLOSED by issue #379; kept for the record because the
+  reasoning it carried was wrong and load-bearing.** It read: every one of
+  the four messages interpolates the stream's label set, the reference's
+  copy carries a `service_name` its own push parser injected, PulsusDB does
+  not implement service-name discovery, so our rendered set omits it. That
+  half was true and is now fixed — PulsusDB synthesizes `service_name` on
+  both receivers, before validation, so the rendered set is the reference's
+  (`crates/pulsus-write/src/protocols/service_name.rs`, issue #379), and the
+  bodies agree in the transcript below.
+
+  The half that was false: "the same injection is why the reference's
+  `MissingLabelsErrorMsg` is unreachable there and not implemented here."
+  It is unreachable from `/loki/api/v1/push`, where synthesis always refills
+  the set. It is **reachable from `/otlp/v1/logs`**, whose discovery
+  algorithm has no non-empty guard: a resource whose only index attribute is
+  `container.name=""` writes `service_name=""`, suppresses the
+  `unknown_service` fallback (`pkg/loghttp/push/otlp.go:198-220 @ v3.7.4`),
+  strips to nothing, and answers `400 error at least one label pair is
+  required per stream` — measured on `grafana/loki@sha256:87f0a067…`, stock
+  config. That sentence was used to justify not implementing the check, so
+  the check was missing for as long as the sentence stood. It is implemented
+  now, as the first check in `StreamLabels::validate`, matching
+  `pkg/distributor/validator.go:158-167 @ v3.7.4`.
+
   Loki error bodies additionally carry the trailing newline Go's
   `http.Error` appends, which none of our Loki plain-text error bodies
-  have — also pre-existing, and not specific to these four.
+  have — pre-existing, not specific to these four, and unchanged.
 - **Residual 2 — non-ASCII escaping in the rendered label set.**
   Prometheus' `Labels.String` (`model/labels/labels_common.go:57-80`,
   vendored at `v3.7.4`) renders every label value through Go's
@@ -3442,3 +3451,92 @@ back up here.
   pinned by `the_depth_cap_outranks_the_stream_less_check`, whose at-cap
   neighbour is inside the same test, and on the wire by the four
   `*-over-deep-attr` harness cases.
+
+## Issue #379 — `service_name` discovery at log ingest
+
+### `ingest-service-name-discovery` (issue #379 — parity ADOPTED; one residual, owned by #109)
+
+PulsusDB previously stored every stream exactly as pushed, where the
+reference synthesizes a `service_name` label for every stream that does not
+carry one. The label set differed on **every** push that omitted it, so
+stream identities differed and a query filtering or grouping on
+`service_name` returned nothing here where it returned data there. Issue
+#379 adopts the reference's rules — both of them, because the reference has
+two.
+
+- **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle
+  (`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`, stock
+  config), read back through `/loki/api/v1/series`:
+
+  | pushed / resource attributes | stored stream |
+  |---|---|
+  | push `{name="nn379", app="aa379"}` | `{app="aa379", name="nn379", service_name="aa379"}` |
+  | push `{workload="ww379", job="jj379"}` | `{job=…, service_name="ww379", workload=…}` |
+  | push `{component="cc379", container="kk379"}` | `{component=…, container=…, service_name="kk379"}` |
+  | push `{service_name="", app="aa2-379"}` | `{app=…, service_name="aa2-379"}` |
+  | push `{__pattern__="1", app="pp379"}` | `{__pattern__="1", app="pp379"}` — no synthesis |
+  | push `{}`, `{"onlyempty":""}`, `{"z"*2000:""}` | `204`, all one `{service_name="unknown_service"}` stream |
+  | OTLP `k8s.job.name=j379` | `{k8s_job_name=…, service_name="j379"}` |
+  | OTLP `k8s.pod.name=p-379` | `{k8s_pod_name=…, service_name="unknown_service"}` |
+  | OTLP `container.name=c4-379, service.name=""` | `{container_name="c4-379"}` — **no `service_name` at all** |
+  | OTLP `service.name="ok379", service_name=<2049 B>` | `{service_name="ok379"}` |
+  | OTLP `container.name=""` | `400 error at least one label pair is required per stream` |
+
+  The push rule scans the thirteen `DiscoverServiceName` defaults
+  (`pkg/validation/limits.go:329-343 @ v3.7.4`) in LIST order over every
+  stream label, skipping empty values, after the strip and before validation
+  (`pkg/loghttp/push/push.go:442-456 @ v3.7.4`). The OTLP rule scans the
+  resource attributes in WIRE order, only over the eighteen it promotes to
+  index labels, with no non-empty guard, and lets a `service.name` attribute
+  overwrite the slot wherever it appears (`pkg/loghttp/push/otlp.go:174-220 @
+  v3.7.4`). They disagree observably —
+  `{k8s.container.name, container.name}` resolves by arrival order on OTLP
+  and always to `container_name` on push — so PulsusDB implements two
+  functions, not one.
+
+- **What PulsusDB now does: both rules, in the same positions** —
+  `crates/pulsus-write/src/protocols/service_name.rs`, called from
+  `loki_push::parse_json`, `loki_push::parse_protobuf` and
+  `otlp_logs::parse`. The discovered value also populates the physical
+  `log_streams.service` / `log_samples.service` column, which
+  `log_samples`' `ORDER BY (service, fingerprint, timestamp_ns)` leads on;
+  before this change that column was `''` for every stream pushed without an
+  explicit `service_name`, so the leading primary-key column was a constant.
+  The list is not configurable, exactly as the four label bounds of
+  `ingest-label-bounds` are not.
+
+- **Residual — the extra stream label, owned by #109 and NOT new.** On the
+  OTLP path PulsusDB stores every resource attribute as a stream label while
+  the reference indexes eighteen and routes the rest to structured metadata.
+  So a resource carrying `app=x` stores `{app="x", service_name="unknown_service"}`
+  here and `{service_name="unknown_service"}` there: the `service_name` now
+  agrees and the extra label does not. Two consequences of making the slot
+  authoritative, both of the same #109 mechanism: an attribute whose raw name
+  merely canonicalizes onto `service_name` (`service_name`, `service-name`,
+  `service name`) is now stored **nowhere** here, where the reference keeps it
+  as structured metadata; and that attribute no longer wins the
+  `from_normalized` collision (issue #4) it used to win, so
+  `{service.name: "ok", service_name: <2049 B>}` stores the validated `"ok"`
+  on both sides. The seventeen other index names still resolve that collision
+  the old way — `{k8s.pod.name: "ok", k8s_pod_name: <2049 B>}` stores the
+  unvalidated value here — which is `ingest-label-bounds`' *What these bounds
+  do not cover*, unchanged. Issue #109 owns the placement rule and therefore
+  owns all of this.
+
+- **Pinned by** `service_name`'s own unit tests (the thirteen defaults and
+  their order, list order vs wire order asserted side by side so unifying the
+  two resolvers fails a test, the skip cases, the OTLP slot's overwrite order
+  including the empty-value cases, and the three-of-eighteen intersection
+  enumerated from the reference's own two lists), by
+  `the_discovered_label_is_inside_the_bound_message` and
+  `parse_protobuf_rejects_a_label_value_over_2048_bytes` in `loki_push.rs`
+  (synthesis precedes validation, proved through byte-equal `400` bodies), by
+  `an_empty_stream_label_set_is_the_reference_message` and
+  `the_empty_check_precedes_the_internal_stream_exemption` in
+  `log_label_limits.rs`, by `an_empty_index_attribute_value_empties_the_stream`
+  and `a_resource_with_no_index_attributes_still_validates` in `otlp_logs.rs`
+  (both directions of the empty-label check), and live by
+  `the_discovered_service_name_reaches_the_service_column_on_both_receivers`
+  and `an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label` in
+  `crates/pulsus-server/tests/loki_push_live.rs`, which read the `service`
+  column, the stored labels JSON and the fingerprints back out of ClickHouse.

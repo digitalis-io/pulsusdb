@@ -1363,9 +1363,18 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let status = decode_status_body(res).await;
         assert_eq!(status.code, 3);
+        // The rendered set carries the synthesized `service_name` (issue
+        // #379), because the reference validates its `streamLabels` map after
+        // writing the slot into it. Measured on stock
+        // `grafana/loki@sha256:87f0a067…` at `/otlp/v1/logs`: `400 stream
+        // '{k8s_pod_name="b…", service_name="unknown_service"}' has label
+        // value too long: 'b…'`.
         assert_eq!(
             status.message,
-            format!("stream '{{k8s_pod_name=\"{value}\"}}' has label value too long: '{value}'")
+            format!(
+                "stream '{{k8s_pod_name=\"{value}\", service_name=\"unknown_service\"}}' \
+                 has label value too long: '{value}'"
+            )
         );
         assert!(sink.admitted.lock().unwrap().is_empty());
     }
@@ -2882,8 +2891,10 @@ mod tests {
 
     /// Issue #374 at the wire, Loki-push transport: an over-long label value
     /// is a `400` whose plain-text body is the reference's message verbatim
-    /// (measured on `grafana/loki:3.7.4`, which answers
-    /// `400 stream '{app="bbb…"}' has label value too long: 'bbb…'`), and the
+    /// (measured on stock `grafana/loki@sha256:87f0a067…`, which answers
+    /// `400 stream '{app="bbb…", service_name="bbb…"}' has label value too
+    /// long: 'bbb…'` — the over-long value is copied verbatim into the
+    /// discovered `service_name` before the bounds run, issue #379), and the
     /// sink is never admitted to.
     #[tokio::test]
     async fn loki_over_long_label_value_is_400_with_the_reference_message() {
@@ -2901,7 +2912,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             plain_text_body(res).await,
-            format!("stream '{{app=\"{value}\"}}' has label value too long: '{value}'\n"),
+            format!(
+                "stream '{{app=\"{value}\", service_name=\"{value}\"}}' \
+                 has label value too long: '{value}'\n"
+            ),
             "the reference LF-terminates every error body on this endpoint"
         );
         assert!(sink.admitted.lock().unwrap().is_empty());

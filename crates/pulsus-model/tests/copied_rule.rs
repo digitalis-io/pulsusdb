@@ -189,7 +189,9 @@ fn the_comparison_rejects_the_differences_that_got_through_by_eye() {
     for (label, needle, replacement) in mutations {
         assert!(
             body.contains(needle),
-            "{label}: the mutation's needle {needle:?} is no longer in the canonical sentence, so              this row asserts nothing — re-derive it from the sentence as it now reads"
+            "{label}: the mutation's needle {needle:?} is no longer in the canonical \
+             sentence, so this row asserts nothing — re-derive it from the sentence as \
+             it now reads"
         );
         let mutated = body.replacen(needle, replacement, 1);
         assert_ne!(
