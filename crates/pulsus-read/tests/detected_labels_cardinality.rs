@@ -217,15 +217,55 @@ fn detected_labels_divergence_rows_hold_and_the_ledger_names_them() {
 /// survives into `normalize`'s, so a file with no raw hit for such a
 /// token cannot contain the phrase however it is wrapped.
 fn flatten(text: &str) -> String {
+    flatten_with(text, Quotes::Strip)
+}
+
+/// Whether [`flatten_with`] keeps `"`. Phrase matching strips it —
+/// emphasis must not hide a banned sentence — while the frozen artifact's
+/// scope anchor needs it, because the quotes are what stop
+/// `"v0".."v{n-1}"` arising from unrelated prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quotes {
+    Strip,
+    Keep,
+}
+
+fn flatten_with(text: &str, quotes: Quotes) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
+            '"' if quotes == Quotes::Keep => out.push('"'),
             '`' | '*' | '_' | '"' => {}
             '≤' => out.push_str("<="),
             '—' | '–' => out.push('-'),
             c if c.is_uppercase() => out.extend(c.to_lowercase()),
             c => out.push(c),
         }
+    }
+    out
+}
+
+/// Every value-family range form `"<a>".."<b>"` in `text`, in order.
+///
+/// Hand-scanned rather than pattern-matched: the shape is four literal
+/// characters between two quoted tokens, and this test adds no dependency
+/// to find them.
+fn value_family_ranges(text: &str) -> Vec<String> {
+    const SEP: &str = "\"..\"";
+    let mut out = Vec::new();
+    for (i, _) in text.match_indices(SEP) {
+        let Some(open) = text[..i].rfind('"') else {
+            continue;
+        };
+        let rest = i + SEP.len();
+        let Some(close) = text[rest..].find('"') else {
+            continue;
+        };
+        out.push(format!(
+            "\"{}\"..\"{}\"",
+            &text[open + 1..i],
+            &text[rest..rest + close]
+        ));
     }
     out
 }
@@ -264,6 +304,21 @@ fn collapse(flat: &str) -> String {
         // which STARTS a sentence instead of continuing one, so eating it
         // would join unrelated prose. Hence the `--` test below rather
         // than adding `-` to the character class.
+        //
+        // Because the indent is trimmed first, this covers the 126
+        // tracked files with an indented-or-not `--` line, not the 105
+        // with one in column zero. Say which set is meant.
+        //
+        // Known residuals, recorded with their DIRECTION rather than
+        // fixed, since both need contrived input and one is merely
+        // noisy:
+        //  - `trim_start_matches('-')` eats the whole run, not just the
+        //    `--` introducer, so a `---` rule or YAML front matter
+        //    between two halves of a phrase joins them. Fails CLOSED: a
+        //    spurious failure, and `---` is common enough to meet.
+        //  - `-->` closing an HTML comment mid-phrase is stripped and
+        //    the halves join. Fails OPEN, but needs a comment ended
+        //    mid-sentence and then continued.
         //
         // Two neighbours read text slightly differently and are left
         // alone on purpose, because both fail CLOSED: `header_len`
@@ -546,31 +601,58 @@ fn check_frozen_244_header(path: &std::path::Path, banned: &[(String, &[&str])])
         );
     }
     if banned.iter().any(|(p, _)| header_span.contains(p)) {
-        // Deliberately checked against the RAW header, not `header_span`,
-        // and the two texts differ for a reason worth stating — reading
-        // one claim against two texts is what broke this function twice.
-        // The phrase check needs `flatten` + collapse to see a wrapped
-        // sentence. The anchor check must NOT use them: `flatten` strips
-        // quotes, and the quotes are the entire reason this anchor cannot
-        // arise incidentally. Testing the flattened text let
-        // `library v0.2.6, see v{n-1} notes` satisfy a scoping
-        // requirement it does not meet — a fail-OPEN regression (issue
-        // #261 review, round four). The anchor is the contiguous range
-        // form, so neither half can be borrowed from unrelated prose.
+        // A UNIQUENESS check, and the comment must not claim more than
+        // that. What it proves: the header names exactly ONE value
+        // family, and it is the one the wording is true for. What it
+        // does NOT prove: that the naming governs the threshold
+        // sentence. Those are different claims, and every round of
+        // review here found another way for two present strings to be
+        // unrelated — which is the tell that "this sentence is scoped by
+        // that one" is a RELATIONAL claim and a presence test can never
+        // settle it (issue #261 review, round five).
+        //
+        // Uniqueness is bought because it kills the realistic failure:
+        // a re-capture on another family that leaves the old name behind
+        // in an aside, so the retracted sentence ends up attached to a
+        // family it is FALSE for (`pod-` diverges at 7708, not 5328).
+        // Two range forms now fail. Deliberately still open: moving the
+        // one range form into an unrelated line. Stopping here is a
+        // judgement about stakes — this gates a comment in a frozen,
+        // non-executing artifact, and the exactness contract itself is
+        // carried by the live gates — not a claim that the hole is shut.
         const SCOPE_ANCHOR: &str = "\"v0\"..\"v{n-1}\"";
-        let raw_header: String = lines[..header_len]
-            .iter()
-            .map(|l| l.trim_start_matches('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            raw_header.contains(SCOPE_ANCHOR),
-            "{}: the header states a threshold without naming the value family it \
-             was measured on — it must carry the literal range {SCOPE_ANCHOR}. That \
-             scoping is the ONLY thing that makes the wording true, and the AC-19 \
-             gate skips `#` lines, so this is the only check that reads it \
-             (issue #261).",
-            path.display()
+        // Read through the SAME span pipeline as the phrase check, only
+        // with quotes preserved, so strengthening one reader cannot
+        // silently weaken the other the way it did in round four. It is
+        // tolerant of the wraps that actually occur: markdown reflow
+        // breaks at spaces, and the anchor has none. A break placed
+        // INSIDE the anchor fails closed (zero ranges), which is the
+        // direction to fail in.
+        let anchor_span = collapse(&flatten_with(&lines[..header_len].join("\n"), Quotes::Keep));
+        let ranges = value_family_ranges(&anchor_span);
+        assert_eq!(
+            ranges.len(),
+            1,
+            "{}: the header must name exactly ONE value family range and it must be \
+             {SCOPE_ANCHOR}; found {n} ({ranges:?}). {why} (issue #261).",
+            path.display(),
+            n = ranges.len(),
+            why = if ranges.is_empty() {
+                "None means the threshold sentence names no family at all, which is \
+                 the state that made the original claim false"
+            } else {
+                "More than one means the sentence can no longer be read against a \
+                 single family — and if the capture was redone on another one, it is \
+                 now false for that family"
+            }
+        );
+        assert_eq!(
+            ranges[0],
+            SCOPE_ANCHOR,
+            "{}: the header's value family range is {:?}, but the retracted threshold \
+             wording is only true for {SCOPE_ANCHOR} (issue #261).",
+            path.display(),
+            ranges[0]
         );
     }
 }
