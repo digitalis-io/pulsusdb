@@ -149,8 +149,12 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 
 /// Detected-labels aggregation over the stream index (issue #170,
 /// docs/api.md §2.6): one output row per distinct key within `months`,
-/// with `uniqExact(val)` as the exact cardinality (documented improvement
-/// over the reference's hyperloglog estimate) and `non_id_values` counting
+/// with `uniqExact(val)` as the exact cardinality (a REGISTERED
+/// divergence, not an unrecorded improvement: the reference reports a p14
+/// hyperloglog estimate — `detected-cardinality-exact-not-estimated` in
+/// docs/benchmarks/logs-differential-ledger.md, which carries the
+/// per-family measurements and the cost that decided it) and
+/// `non_id_values` counting
 /// values that are neither a float (`toFloat64OrNull`) nor a UUID
 /// ([`UUID_RE`]) — the server-side half of the reference's
 /// `containsAllIDTypes` relevance filter (the keep rule — static label OR

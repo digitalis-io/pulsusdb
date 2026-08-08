@@ -18,7 +18,10 @@
 //!   AFTER the first `line_limit` raw rows ARE found (window-exhausted,
 //!   complete — no `pulsus_partial` key), and a budget-truncated spawn
 //!   returns 200 with `"pulsus_partial":true`;
-//! - the `/loki/api/v1/*` aliases are byte-identical to native.
+//! - the `/loki/api/v1/*` aliases are byte-identical to native;
+//! - issue #261: at the two value counts where the reference's p14
+//!   HyperLogLog estimate stops matching the truth, `detected_labels`
+//!   answers the EXACT count — the number the reference does not give.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
@@ -29,7 +32,8 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Ports 31155-31156, distinct from every other live suite.
+//! Ports 31155-31156 and 31165, distinct from every other live suite.
+//! (31157, the next number up, already belongs to `loki_push_live.rs`.)
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -808,6 +812,139 @@ async fn detected_fields_budget_truncation_signals_pulsus_partial() {
          partial key (issue #258): {json}"
     );
     assert_eq!(res.body, r#"{"pulsus_partial":true}"#);
+
+    drop_db(db).await;
+}
+
+/// Issue #261 — the exactness claim, gated at the layer the user
+/// observes. At the two distinct-value counts where the reference's p14
+/// HyperLogLog estimate stops equalling the truth, the HTTP body carries
+/// the EXACT count:
+///
+/// | fixture | true N | this endpoint | `grafana/loki:3.7.4` |
+/// |---|---|---|---|
+/// | `pod-{0..7707}` | 7708 | **7708** | 7640 |
+/// | `svc-{0..4532}` | 4533 | **4533** | 4532 |
+///
+/// Both reference numbers were measured end-to-end against the container
+/// on 2026-08-08 (three reps each) and are recorded in
+/// `crates/pulsus-read/tests/golden/detected_labels_cardinality/reference_divergence.tsv`
+/// with their capture conditions. The two families diverge at different
+/// counts because the agreement threshold is a property of the value
+/// strings, not of N — see the `detected-cardinality-exact-not-estimated`
+/// ledger entry.
+///
+/// **This case pins the rule; it does not discriminate the #261 change.**
+/// #261 edited no `src/`, so the engine this case drives IS the pre-#261
+/// engine: it already answered the exact count, and this assertion could
+/// not have failed before the change any more than after it. #261
+/// changed documentation, not behaviour.
+///
+/// **What it catches, what it does not, and why the split is deliberate
+/// (issue #261 AC 8, restated to what the two gates actually do).**
+/// Swapping `uniqExact(val)` in `sql::detected_labels` for
+/// `uniqCombined`, `uniqCombined64` or `uniqHLL12` reddens this
+/// assertion at both fixtures, and `uniqTheta` at the `pod-` one
+/// (measured on `clickhouse/clickhouse-server:24.8`, 2026-08-08: at
+/// 7708 distinct values those four answer 7696 / 7696 / 7733 / 7665, and
+/// at 4533 they answer 4534 / 4534 / 4552 / 4533).
+///
+/// A swap to plain `uniq` is **invisible here, permanently**, and the
+/// fixture sizes must NOT be changed to chase it. ClickHouse's `uniq` is
+/// exact through 65536 distinct values and first diverges at 65537
+/// (measured same day: 65536 → 65536, 65537 → 65359). Discriminating it
+/// live would therefore need a fixture 8.5× this one's rows, and 65537
+/// is not a point where the REFERENCE's estimate diverges — which is the
+/// entire reason 7708 and 4533 were chosen. Buying that one break would
+/// cost CI time and sever this case from the two numbers it exists to
+/// pin. So it is not bought: `uniq(` is banned by literal in the SQL-text
+/// gate `the_detected_labels_aggregate_is_still_an_exact_count`
+/// (`crates/pulsus-read/tests/detected_labels_cardinality.rs`), which is
+/// why that weaker-looking gate exists. Neither gate is redundant, and
+/// between them every estimator ClickHouse offers is covered.
+///
+/// Seeding is ONE bulk statement per fixture over `numbers()`, fanned out
+/// into `log_streams_idx` by the shipped `log_streams_idx_mv`
+/// (`crates/pulsus-schema/src/catalog.rs`). `pod` is a static detected
+/// label (the reference's `cluster`/`namespace`/`instance`/`pod` set), so
+/// the relevance filter admits it unconditionally; `svc` is admitted
+/// because its values are neither floats nor UUIDs.
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_labels_cardinality_is_exact_at_the_reference_divergence_points() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_165;
+    let db = "pulsus_detected_it_cardinality";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
+    let client = data_client(db).await;
+
+    let now = now_ns();
+    // (service_name, label key, value prefix, distinct value count,
+    //  fingerprint base) — the two measured divergence points.
+    let fixtures = [
+        ("card", "pod", "pod-", 7708u64, 0u64),
+        ("svcfix", "svc", "svc-", 4533, 10_000_000),
+    ];
+    for (service, key, prefix, n, fp_base) in fixtures {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) SELECT \
+                     toStartOfMonth(fromUnixTimestamp64Nano(toInt64({now}))), \
+                     {fp_base} + number, '{service}', \
+                     concat('{{\"{key}\":\"{prefix}', toString(number), \
+                     '\",\"service_name\":\"{service}\"}}'), 0 FROM numbers({n})"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+    }
+
+    let start = now - 3 * 24 * 3_600_000_000_000;
+    let end = now + 60_000_000_000;
+    for (service, key, _prefix, n, _fp_base) in fixtures {
+        // `query=` scopes the aggregation to this fixture's streams, so
+        // each response carries exactly its own key plus `service_name`.
+        let query = format!("query=%7Bservice_name%3D%22{service}%22%7D");
+        let path = format!("/api/logs/v1/detected_labels?{query}&start={start}&end={end}");
+        let res = http_get(port, &path, false);
+        assert_eq!(res.status, 200, "body: {}", res.body);
+        let json: serde_json::Value = serde_json::from_str(&res.body).expect("detected_labels");
+        // Label-ascending is the documented order (§2.6.2), and
+        // `service_name` sorts AFTER `pod` but BEFORE `svc` — build the
+        // expectation rather than hard-coding one fixture's order.
+        let mut expected = vec![(key, n), ("service_name", 1)];
+        expected.sort_by_key(|(label, _)| *label);
+        let expected: Vec<serde_json::Value> = expected
+            .into_iter()
+            .map(|(label, cardinality)| {
+                serde_json::json!({"label": label, "cardinality": cardinality})
+            })
+            .collect();
+        assert_eq!(
+            json["detectedLabels"],
+            serde_json::Value::Array(expected),
+            "the EXACT count is the contract at a reference divergence point \
+             ({key}: {n} distinct values): {json}"
+        );
+
+        let aliased = http_get(
+            port,
+            &format!("/loki/api/v1/detected_labels?{query}&start={start}&end={end}"),
+            false,
+        );
+        assert_eq!(aliased.status, 200, "alias body: {}", aliased.body);
+        assert_eq!(
+            aliased.body, res.body,
+            "the /loki/api/v1 alias must be byte-identical to native"
+        );
+    }
 
     drop_db(db).await;
 }
