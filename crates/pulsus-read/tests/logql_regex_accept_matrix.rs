@@ -93,6 +93,16 @@
 //!   a ledger row both claimed matched the reference. It does not: 18 of
 //!   20 probes disagree, and two of them answer with a different STRING
 //!   rather than merely a different verdict.
+//! * [`every_go_regexp_error_code_is_accounted_for`] and
+//!   [`live_reference_error_codes_are_exactly_the_covered_set`] — the
+//!   census, and the half that makes it bite.
+//!
+//! **If this file has to be split**, the seam is the template axis:
+//! [`TEMPLATE_AXIS`] and its two tests have a different verdict TYPE from
+//! everything else here (a `200` carrying `__error__`, never a status)
+//! and share only [`logql_quote`]. Nothing else divides cleanly — the
+//! positions, the patterns, the exceptions and the divergence
+//! enumeration are one measurement.
 
 use std::process::Command;
 
@@ -139,12 +149,28 @@ struct Position {
     pulsus: Rule,
 }
 
-/// A pattern body. `nest_999` is generated rather than written out.
+/// A pattern body. The generated forms are generated rather than written
+/// out; [`Body::LogqlSource`] is the one form that is NOT a regex.
 enum Body {
     Literal(&'static str),
     /// `n` nested groups around a literal `a` — a LIMIT probe, not a
     /// construct, and its verdict depends on the anchoring wrapper.
     NestedGroups(usize),
+    /// `s` repeated `n` times — the other LIMIT probe.
+    Repeated(&'static str, usize),
+    /// **The text goes into the LogQL string literal verbatim, unescaped.**
+    /// Every other body is a REGEX that gets LogQL-quoted on the way in;
+    /// this one is the literal's own SOURCE, because the construct under
+    /// test is what the string escape decodes to. `\xff` here is four
+    /// ASCII characters in the query — which the query scanner accepts —
+    /// that Go's unquoting turns into one 0xFF byte inside the pattern.
+    ///
+    /// Getting this wrong is how the first version of this file recorded
+    /// `ErrInvalidUTF8` as unreachable: it probed a RAW `%FF` byte in the
+    /// `query=` parameter, which `query_scanner.go:264 @ v3.7.4` refuses
+    /// before the regex parser is reached. That measurement was true and
+    /// its domain was one route into the rule, not the rule.
+    LogqlSource(&'static str),
 }
 
 /// One pattern. `reference` and `pulsus` are CAPTURED columns, not
@@ -315,15 +341,31 @@ const POSITIONS: &[Position] = &[
     Position {
         id: "variants_variant_side",
         template: r#"variants(count_over_time({app="x"} |~ "{P}" [5m])) of ({app="x"}[5m])"#,
-        why: "a `variants(...)` VARIANT's own pipeline. The reference builds it purely to \
-              count the extractors (`pkg/logql/evaluator.go:1417,1422 @ v3.7.4`) and so \
-              refuses a malformed stage there; PulsusDB validates the variant's discarded \
-              prefix in `VariantSpec::try_new` — but through `CompiledPipeline::compile`, \
-              which does not compile a LINE FILTER's regex (that validation lives on the \
-              SQL-rendering path, and a discarded prefix renders no SQL). Hence \
-              `AcceptsEverything` here, and a divergence row.",
+        why: "a `variants(...)` VARIANT's own pipeline, with a PUSHABLE line filter. The \
+              reference builds it purely to count the extractors \
+              (`pkg/logql/evaluator.go:1417,1422 @ v3.7.4`) and so refuses a malformed stage \
+              there. PulsusDB validates the variant's discarded prefix in `VariantSpec::try_new` \
+              (`plan.rs:2641`) — but through `CompiledPipeline::compile`, whose `compile_stage` \
+              returns `Ok(None)` for a PUSHABLE line filter (`pipeline.rs:986-996`) before it \
+              reaches `compile_regex` at `:1013`; the regex of a pushable filter is validated on \
+              the SQL-rendering path instead, and a discarded prefix renders no SQL. Hence \
+              `AcceptsEverything` here, and a divergence row. The escape is the PUSHDOWN, not \
+              the construct — `variants_variant_after_line_format` is the same filter with \
+              pushdown cleared, and it agrees.",
         reference: Rule::PerPattern,
         pulsus: Rule::AcceptsEverything,
+    },
+    Position {
+        id: "variants_variant_after_line_format",
+        template: r#"variants(count_over_time({app="x"} | line_format "{{.x}}" |~ "{P}" [5m])) of ({app="x"}[5m])"#,
+        why: "the SAME variant position with the line filter after a `line_format`, which \
+              clears `seen_line_format`'s pushdown so `compile_stage` compiles the filter in \
+              process. It agrees with the reference at every pattern, which is what bounds the \
+              row above: the gap is pushable line filters, not line filters. Without this \
+              position nothing in the matrix would contradict the wider wording, and the first \
+              version of this file stated it that way.",
+        reference: Rule::PerPattern,
+        pulsus: Rule::PerPattern,
     },
     Position {
         id: "variants_common_side",
@@ -503,8 +545,12 @@ const PATTERNS: &[Pattern] = &[
         Verdict::Reject,
         Verdict::Reject,
     ),
-    // The `ErrLarge` probe: the repeat PRODUCT cap fires first, which is
-    // why `ErrLarge` is recorded unreachable rather than covered.
+    // A NESTED repeat does not reach `ErrLarge`: the repeat-PRODUCT cap
+    // fires first (`repeatIsValid(re, 1000)`, parse.go:434-437), so this
+    // is `ErrInvalidRepeatSize`. Kept because the first version of this
+    // file used it to argue `ErrLarge` was unreachable — a true
+    // measurement over one route, and `too_large` below is the route it
+    // did not try.
     p(
         "repeat_product",
         "((a{100}){100}){100}",
@@ -519,6 +565,39 @@ const PATTERNS: &[Pattern] = &[
         Verdict::Reject,
         Verdict::Reject,
     ),
+    // `ErrLarge`, REACHED. 4,000 copies of `a{999}` — 24,000 characters,
+    // well inside the 131,072-byte query-text cap. Each repeat is under
+    // the 1,000 product cap, so `repeatIsValid` passes and `checkSize`'s
+    // `maxSize` is what fires: `128<<20 / instSize` with `instSize = 40`
+    // is **3,355,443** instructions (33,554,432 is `maxRunes`, the OTHER
+    // limit, and the figure the first version of this file quoted for
+    // this one). Both sides reject; ours through the Rust crate's own
+    // 10 MiB compiled-size limit, which is not the same budget and is
+    // recorded as agreement on the verdict only.
+    Pattern {
+        id: "too_large",
+        body: Body::Repeated("a{999}", 4_000),
+        go_code: Some("ErrLarge"),
+        reference: Verdict::Reject,
+        pulsus: Verdict::Reject,
+    },
+    // `ErrInvalidUTF8`, REACHED — through the string ESCAPE, not a raw
+    // byte. See [`Body::LogqlSource`]. The reference rejects it only
+    // where the pattern reaches a parser: every `NewFastRegexMatcher`
+    // site (the selector, label filters, `drop`/`keep`) short-circuits a
+    // plain literal to a string matcher and never parses it at all
+    // (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72
+    // @ v3.7.4` — `optimizeAlternatingLiterals` returns before
+    // `syntax.Parse`), so those positions serve it. PulsusDB serves it
+    // everywhere: our lexer decodes `\xff` to U+00FF, a valid `char`,
+    // so the crate compiles a pattern the reference could not even parse.
+    Pattern {
+        id: "invalid_utf8",
+        body: Body::LogqlSource(r"\xff"),
+        go_code: Some("ErrInvalidUTF8"),
+        reference: Verdict::Accept,
+        pulsus: Verdict::Accept,
+    },
     // --- Direction A: PulsusDB rejects, the reference serves.
     p(
         "dup_capture_name",
@@ -699,6 +778,69 @@ const EXCEPTIONS: &[Exception] = &[
         Verdict::Accept,
         "unanchored",
     ),
+    ex_ref(
+        "variants_variant_after_line_format",
+        "nest_999",
+        Verdict::Accept,
+        "unanchored",
+    ),
+    // `invalid_utf8` is the mirror image: the reference REJECTS it only
+    // where the pattern reaches a parser. Every `NewFastRegexMatcher`
+    // site short-circuits a plain literal before `syntax.Parse`
+    // (regexp.go:56-72 @ v3.7.4), so the selector, both label filters and
+    // `drop`/`keep` serve it — those are the base column — and the line
+    // filter, `| regexp`, `label_replace` and the variant positions,
+    // which call the parser directly, refuse it.
+    ex_ref(
+        "line_re",
+        "invalid_utf8",
+        Verdict::Reject,
+        "the line filter calls `syntax.Parse` directly (`log/filter.go:646 @ v3.7.4`)",
+    ),
+    ex_ref("line_nre", "invalid_utf8", Verdict::Reject, "as `line_re`"),
+    ex_ref(
+        "line_after_line_format",
+        "invalid_utf8",
+        Verdict::Reject,
+        "as `line_re`",
+    ),
+    ex_ref(
+        "regexp_named",
+        "invalid_utf8",
+        Verdict::Reject,
+        "`NewRegexpParser` calls `regexp.Compile` directly (`log/parser.go:295 @ v3.7.4`)",
+    ),
+    ex_ref(
+        "metric_line",
+        "invalid_utf8",
+        Verdict::Reject,
+        "as `line_re`",
+    ),
+    ex_ref(
+        "metric_binary",
+        "invalid_utf8",
+        Verdict::Reject,
+        "as `line_re`",
+    ),
+    ex_ref(
+        "label_replace",
+        "invalid_utf8",
+        Verdict::Reject,
+        "`mustNewLabelReplaceExpr` compiles `^(?:…)$` directly (`syntax/ast.go:2225-2233 @ \
+         v3.7.4`), and the body quotes that WRAPPED form",
+    ),
+    ex_ref(
+        "variants_variant_side",
+        "invalid_utf8",
+        Verdict::Reject,
+        "as `line_re`",
+    ),
+    ex_ref(
+        "variants_variant_after_line_format",
+        "invalid_utf8",
+        Verdict::Reject,
+        "as `line_re`",
+    ),
     Exception {
         position: "regexp_named",
         pattern: "dup_capture_name",
@@ -806,6 +948,7 @@ const BOTH_REJECT: &[&str] = &[
     "adjacent_repeats",
     "repeat_product",
     "class_escape_range",
+    "too_large",
 ];
 
 const DIVERGENCES: &[Divergence] = &[
@@ -833,6 +976,7 @@ const DIVERGENCES: &[Divergence] = &[
             "metric_line",
             "metric_binary",
             "label_replace",
+            "variants_variant_after_line_format",
             "variants_common_side",
         ],
         owner: "#400",
@@ -857,6 +1001,7 @@ const DIVERGENCES: &[Divergence] = &[
             "keep",
             "metric_line",
             "metric_binary",
+            "variants_variant_after_line_format",
             "variants_common_side",
         ],
         owner: "#400",
@@ -880,6 +1025,7 @@ const DIVERGENCES: &[Divergence] = &[
             "metric_line",
             "metric_binary",
             "label_replace",
+            "variants_variant_after_line_format",
             "variants_common_side",
         ],
         owner: "#400",
@@ -898,6 +1044,7 @@ const DIVERGENCES: &[Divergence] = &[
             "line_after_line_format",
             "metric_line",
             "metric_binary",
+            "variants_variant_after_line_format",
             "variants_common_side",
         ],
         owner: "#400",
@@ -931,6 +1078,7 @@ const DIVERGENCES: &[Divergence] = &[
             "metric_line",
             "metric_binary",
             "label_replace",
+            "variants_variant_after_line_format",
             "variants_variant_side",
         ],
         owner: "#400",
@@ -957,11 +1105,36 @@ const DIVERGENCES: &[Divergence] = &[
             "keep",
             "metric_line",
             "metric_binary",
+            "variants_variant_after_line_format",
             "variants_variant_side",
         ],
         owner: "#400",
         why: "`label_replace` is absent because its rewrite makes the Rust crate agree with the \
               reference — the same one-site partial fix as the brace forms.",
+    },
+    Divergence {
+        id: "engine_dir_b_invalid_utf8_escape",
+        pulsus: Verdict::Accept,
+        patterns: &["invalid_utf8"],
+        positions: &[
+            "line_re",
+            "line_nre",
+            "line_after_line_format",
+            "regexp_named",
+            "metric_line",
+            "metric_binary",
+            "label_replace",
+            "variants_variant_side",
+            "variants_variant_after_line_format",
+        ],
+        owner: "#400",
+        why: "a value difference as much as a verdict one: `\"\\xff\"` is one 0xFF byte in the \
+              reference's pattern, which its parser refuses as invalid UTF-8 wherever the \
+              pattern actually reaches a parser; our lexer decodes the same escape to U+00FF, a \
+              valid `char`, so the crate compiles a pattern that means something the reference \
+              could not express. The positions absent from this list are the \
+              `NewFastRegexMatcher` sites, which never parse a plain literal at all — so they \
+              agree by serving it too, for a different reason.",
     },
     Divergence {
         id: "variants_common_side_hides_the_build_error",
@@ -983,11 +1156,15 @@ const DIVERGENCES: &[Divergence] = &[
         owner: "#400",
         why: "found by this matrix, and the direction that matters: the reference REFUSES a \
               malformed line filter in a variant (`stage '|~ \"(\"'`) and PulsusDB serves it. \
-              `VariantSpec::try_new` does compile the variant's discarded prefix, but \
-              `CompiledPipeline::compile` does not compile a line filter's regex — that \
-              validation lives on the SQL-rendering path (`escape.rs`), and a discarded prefix \
-              renders no SQL. Measured: `| regexp`, `| drop`, `| logfmt` and `| line_format` \
-              in the same position ARE refused; only the line filter is not.",
+              `VariantSpec::try_new` (`plan.rs:2641`) does compile the variant's discarded \
+              prefix, but `compile_stage` returns `Ok(None)` for a PUSHABLE line filter \
+              (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`; a pushable \
+              filter's regex is validated on the SQL-rendering path instead, and a discarded \
+              prefix renders no SQL. **The escape is the pushdown, not the construct**: the \
+              same filter after a `line_format` clears the pushdown and IS refused — that is \
+              the `variants_variant_after_line_format` position, which agrees at every pattern. \
+              `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused \
+              on both sides too.",
     },
 ];
 
@@ -997,38 +1174,64 @@ const DIVERGENCES: &[Divergence] = &[
 
 /// Every `ErrorCode` constant of
 /// `vendor/github.com/grafana/regexp/syntax/parse.go:28-48 @ v3.7.4`,
-/// written out literally and in source order. That vendored fork is the
-/// authority rather than the local Go toolchain: all five reference call
-/// sites import `github.com/grafana/regexp` (`pkg/logql/log/parser.go:18`
-/// and `pkg/logql/log/filter.go:9-10 @ v3.7.4`).
-const GO_ERROR_CODES: &[&str] = &[
-    "ErrInternalError",
-    "ErrInvalidCharClass",
-    "ErrInvalidCharRange",
-    "ErrInvalidEscape",
-    "ErrInvalidNamedCapture",
-    "ErrInvalidPerlOp",
-    "ErrInvalidRepeatOp",
-    "ErrInvalidRepeatSize",
-    "ErrInvalidUTF8",
-    "ErrMissingBracket",
-    "ErrMissingParen",
-    "ErrMissingRepeatArgument",
-    "ErrTrailingBackslash",
-    "ErrUnexpectedParen",
-    "ErrNestingDepth",
-    "ErrLarge",
+/// with its message text, written out literally and in source order.
+/// That vendored fork is the authority rather than the local Go
+/// toolchain: all five reference call sites import
+/// `github.com/grafana/regexp` (`pkg/logql/log/parser.go:18` and
+/// `pkg/logql/log/filter.go:9-10 @ v3.7.4`).
+///
+/// The message is here, not just the constant name, so that a code's
+/// coverage can be checked against the CONTAINER's own error body rather
+/// than against this file's opinion of which pattern raises what — see
+/// [`CAPTURED_REFERENCE_ERRORS`] and
+/// [`live_reference_error_codes_are_exactly_the_covered_set`].
+const GO_ERROR_CODES: &[(&str, &str)] = &[
+    ("ErrInternalError", "regexp/syntax: internal error"),
+    ("ErrInvalidCharClass", "invalid character class"),
+    ("ErrInvalidCharRange", "invalid character class range"),
+    ("ErrInvalidEscape", "invalid escape sequence"),
+    ("ErrInvalidNamedCapture", "invalid named capture"),
+    ("ErrInvalidPerlOp", "invalid or unsupported Perl syntax"),
+    ("ErrInvalidRepeatOp", "invalid nested repetition operator"),
+    ("ErrInvalidRepeatSize", "invalid repeat count"),
+    ("ErrInvalidUTF8", "invalid UTF-8"),
+    ("ErrMissingBracket", "missing closing ]"),
+    ("ErrMissingParen", "missing closing )"),
+    (
+        "ErrMissingRepeatArgument",
+        "missing argument to repetition operator",
+    ),
+    (
+        "ErrTrailingBackslash",
+        "trailing backslash at end of expression",
+    ),
+    ("ErrUnexpectedParen", "unexpected )"),
+    ("ErrNestingDepth", "expression nests too deeply"),
+    ("ErrLarge", "expression too large"),
 ];
 
-/// A code with no covering pattern, and why it cannot have one. Recorded
-/// rather than omitted: the census fails if a code has neither.
+/// A code with no covering pattern, and why it cannot have one.
+///
+/// **An unreachability claim is a claim about EVERY route into the rule,
+/// so the argument has to cover the rule and not one probe.** The first
+/// version of this table had four rows and two of them were wrong in
+/// exactly that way: `ErrInvalidUTF8` was excused on a probe that sent a
+/// raw `%FF` byte (refused by the query scanner first) when the escape
+/// `"\xff"` reaches the parser fine, and `ErrLarge` was excused on a
+/// probe of a NESTED repeat (pre-empted by the repeat-product cap) when
+/// 4,000 copies of `a{999}` reach `maxSize` fine. Both are now covered
+/// patterns. The two that remain are not probe-based at all — they are
+/// a grep over the reference's own source, which is a statement about
+/// every route by construction, and
+/// [`live_reference_error_codes_are_exactly_the_covered_set`] fails if
+/// either is ever observed on the wire.
 const UNREACHABLE_CODES: &[(&str, &str)] = &[
     (
         "ErrInternalError",
         "declared and never raised. `git grep -n ErrInternalError \
          vendor/github.com/grafana/regexp/ @ v3.7.4` finds exactly one hit, the declaration at \
          parse.go:30; `parse`'s recover (parse.go:889-900) maps only ErrLarge and \
-         ErrNestingDepth. No input reaches it.",
+         ErrNestingDepth. Not a probe result: there is no raise site to reach.",
     ),
     (
         "ErrInvalidCharClass",
@@ -1037,23 +1240,120 @@ const UNREACHABLE_CODES: &[(&str, &str)] = &[
          instead — measured, `[[:foo:]]` answers ``invalid character class range: \
          `[:foo:]` `` on the container, which is the `bad_posix_class` row.",
     ),
+];
+
+/// The reference's OWN error body for each pattern that raises a code,
+/// captured from the pinned container: the position it was captured at,
+/// and the body text from the code onward (truncated).
+///
+/// This is what makes the census bite. Without it
+/// [`every_go_regexp_error_code_is_accounted_for`] only checks that this
+/// file agrees with itself — which is how two false unreachability rows
+/// sat here passing. The live leg puts each of these back to the
+/// container at its named position and requires the fragment to appear,
+/// so a pattern credited with a code has to actually raise it.
+///
+/// The expression Go quotes is the offending **sub-token**, not the
+/// pattern — visible here in `[z-a]` → `` `z-a` `` and `a{100}{100}{100}`
+/// → `` `{100}{100}` `` — and `label_replace`/`nest_999` show the other
+/// half of the same rule, a site that quotes the ANCHORED form. Those two
+/// facts are the reason byte-parity of the message is unreachable without
+/// porting the parser, so they are pinned here rather than asserted in
+/// prose.
+///
+/// `invalid_utf8` carries no quoted expression because the expression is
+/// a raw 0xFF byte, which is not representable in a Rust `&str` and which
+/// the transport renders lossily.
+const CAPTURED_REFERENCE_ERRORS: &[(&str, &str, &str)] = &[
+    ("missing_paren", "sel_re", "missing closing ): `(`"),
+    ("missing_bracket", "sel_re", "missing closing ]: `[a`"),
     (
-        "ErrInvalidUTF8",
-        "raised at parse.go:2106,2116, but unreachable through LogQL: the query SCANNER refuses \
-         the byte first. Measured on the pinned container — `query={app=~\"%FF\"}` answers 400 \
-         `parse error at line 1, col 7: invalid UTF-8 encoding` \
-         (`pkg/logql/syntax/query_scanner.go:264 @ v3.7.4`), and the same for `a%FFb` and for a \
-         `| regexp` pattern. No byte sequence reaches the regex parser.",
+        "missing_repeat_arg",
+        "sel_re",
+        "missing argument to repetition operator: `*`",
     ),
     (
-        "ErrLarge",
-        "raised at parse.go:163 (`numRunes > maxRunes`) and :207 (`calcSize > maxSize`), both \
-         33,554,432 — but the repeat-PRODUCT cap fires first: `repeatIsValid(re, 1000)` at \
-         parse.go:434-437. Measured, the `repeat_product` row: `((a{100}){100}){100}` answers \
-         ``invalid repeat count: `{100}` ``, not `expression too large`. Reaching ErrLarge needs \
-         a pattern of ~33M runes, which is not a query anyone sends and not one this matrix \
-         will carry.",
+        "trailing_backslash",
+        "sel_re",
+        "trailing backslash at end of expression: ``",
     ),
+    ("unexpected_paren", "sel_re", "unexpected ): `a)b`"),
+    (
+        "bad_char_range",
+        "sel_re",
+        "invalid character class range: `z-a`",
+    ),
+    ("bad_escape", "sel_re", r"invalid escape sequence: `\q`"),
+    (
+        "bad_named_capture",
+        "sel_re",
+        "invalid named capture: `(?P<>`",
+    ),
+    (
+        "lookahead",
+        "sel_re",
+        "invalid or unsupported Perl syntax: `(?!`",
+    ),
+    (
+        "repeat_size_inverted",
+        "sel_re",
+        "invalid repeat count: `{2,1}`",
+    ),
+    (
+        "adjacent_repeats",
+        "sel_re",
+        "invalid nested repetition operator: `{100}{100}`",
+    ),
+    ("repeat_product", "sel_re", "invalid repeat count: `{100}`"),
+    (
+        "class_escape_range",
+        "sel_re",
+        r"invalid escape sequence: `\d`",
+    ),
+    (
+        "too_large",
+        "sel_re",
+        "expression too large: `a{999}a{999}a{999}",
+    ),
+    ("invalid_utf8", "line_re", "invalid UTF-8: `"),
+    (
+        "nest_999",
+        "sel_re",
+        "expression nests too deeply: `^(?s:(((((",
+    ),
+    ("big_u_escape", "sel_re", r"invalid escape sequence: `\U`"),
+    (
+        "perl_R",
+        "sel_re",
+        "invalid or unsupported Perl syntax: `(?R`",
+    ),
+    (
+        "flag_x",
+        "sel_re",
+        "invalid or unsupported Perl syntax: `(?x`",
+    ),
+    (
+        "nested_star",
+        "sel_re",
+        "invalid nested repetition operator: `**`",
+    ),
+    (
+        "bad_posix_class",
+        "sel_re",
+        "invalid character class range: `[:foo:]`",
+    ),
+    (
+        "unicode_prop_long",
+        "sel_re",
+        r"invalid character class range: `\p{Alphabetic}`",
+    ),
+    ("repeat_1001", "sel_re", "invalid repeat count: `{1001}`"),
+    (
+        "class_double_dash",
+        "sel_re",
+        "invalid character class range: `a--`",
+    ),
+    ("brace_unicode", "sel_re", r"invalid escape sequence: `\u`"),
 ];
 
 // ---------------------------------------------------------------------
@@ -1213,10 +1513,27 @@ const fn tp(
 // ---------------------------------------------------------------------
 
 impl Pattern {
-    fn body(&self) -> String {
+    /// The text as it appears INSIDE the LogQL string literal. For every
+    /// regex body that is the LogQL-quoted regex; for
+    /// [`Body::LogqlSource`] it is the body verbatim, because there the
+    /// escape IS the construct under test.
+    fn literal(&self) -> String {
+        match self.body {
+            Body::Literal(s) => logql_quote(s),
+            Body::NestedGroups(n) => logql_quote(&format!("{}a{}", "(".repeat(n), ")".repeat(n))),
+            Body::Repeated(s, n) => logql_quote(&s.repeat(n)),
+            Body::LogqlSource(s) => s.to_string(),
+        }
+    }
+
+    /// The body as written, for identity checks only — never for building
+    /// a query, which must go through [`Pattern::literal`].
+    fn describe_body(&self) -> String {
         match self.body {
             Body::Literal(s) => s.to_string(),
             Body::NestedGroups(n) => format!("{}a{}", "(".repeat(n), ")".repeat(n)),
+            Body::Repeated(s, n) => s.repeat(n),
+            Body::LogqlSource(s) => s.to_string(),
         }
     }
 }
@@ -1281,9 +1598,7 @@ fn matrix(positions: &'static [Position]) -> Vec<Point> {
             out.push(Point {
                 position,
                 pattern,
-                query: position
-                    .template
-                    .replace("{P}", &logql_quote(&pattern.body())),
+                query: position.template.replace("{P}", &pattern.literal()),
             });
         }
     }
@@ -1437,18 +1752,18 @@ fn the_divergence_set_is_exactly_the_committed_enumeration() {
     // describes.
     assert_eq!(
         POSITIONS.len() * PATTERNS.len(),
-        630,
-        "the ledger says 630 unmasked points"
+        704,
+        "the ledger says 704 unmasked points"
     );
     assert_eq!(
         measured.len(),
-        278,
-        "the ledger says 278 of the 630 unmasked points disagree"
+        308,
+        "the ledger says 308 of the 704 unmasked points disagree"
     );
     assert_eq!(
         POSITIONS.len() * PATTERNS.len() + MASKED.len() * PATTERNS.len(),
-        714,
-        "the ledger says 714 probed points, masked positions included"
+        792,
+        "the ledger says 792 probed points, masked positions included"
     );
 
     let claimed = |skip: Option<usize>| -> Vec<(String, String)> {
@@ -1590,7 +1905,7 @@ fn the_enumeration_is_self_consistent_and_says_why_each_entry_exists() {
             "duplicate pattern `{}`",
             pattern.id
         );
-        let body = pattern.body();
+        let body = pattern.describe_body();
         assert!(
             !bodies.contains(&body),
             "`{}` repeats another pattern's body, so it adds no point",
@@ -1694,14 +2009,33 @@ fn the_masked_positions_pin_nothing_and_this_is_measured() {
     }
 }
 
+fn message_of(code: &str) -> &'static str {
+    GO_ERROR_CODES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, m)| *m)
+        .unwrap_or_else(|| panic!("`{code}` is not one of the reference's codes"))
+}
+
 /// **The pattern set is enumerated from the REFERENCE's taxonomy, not
-/// from ours.** Every `ErrorCode` the reference's vendored parser
-/// declares is either covered by a named pattern whose `go_code` matches,
-/// or carries a stated unreachability reason. A code with neither fails.
+/// from ours, and each code's coverage is tied to a CAPTURED reference
+/// error rather than to this file's opinion.**
+///
+/// An earlier version checked only that the table agreed with itself and
+/// that each unreachability reason was long enough. That is why two false
+/// reasons sat here passing: `ErrInvalidUTF8` and `ErrLarge` were both
+/// excused on a probe whose domain was one route into the rule, and no
+/// assertion here could see the difference. Now every covered code has to
+/// name a pattern AND a captured body fragment that begins with that
+/// code's message, and
+/// [`live_reference_error_codes_are_exactly_the_covered_set`] puts every
+/// fragment back to the container and checks that no excused code ever
+/// appears on the wire.
 #[test]
 fn every_go_regexp_error_code_is_accounted_for() {
     let mut uncovered = Vec::new();
-    for code in GO_ERROR_CODES {
+    for (code, message) in GO_ERROR_CODES {
+        assert!(!message.is_empty(), "`{code}` has no message text");
         let covered = PATTERNS.iter().any(|p| p.go_code == Some(*code));
         let excused = UNREACHABLE_CODES.iter().any(|(c, _)| c == code);
         assert!(
@@ -1718,33 +2052,77 @@ fn every_go_regexp_error_code_is_accounted_for() {
          unreachability reason: {uncovered:?}"
     );
     for (code, why) in UNREACHABLE_CODES {
-        assert!(
-            GO_ERROR_CODES.contains(code),
-            "`{code}` is not one of the reference's codes"
-        );
+        message_of(code);
         assert!(
             why.len() > 80,
             "`{code}`'s unreachability reason is too thin to check"
         );
+        // No captured body may carry an excused code: if one does, the
+        // code is reachable and the row is a false claim.
+        // `{message}: ` and not `{message}`, because one code's message
+        // is a PREFIX of another's ("invalid character class" of
+        // "invalid character class range") and Go always emits the
+        // delimiter (`parse.go:21 @ v3.7.4`).
+        let message = format!("{}: ", message_of(code));
+        for (pattern, _, fragment) in CAPTURED_REFERENCE_ERRORS {
+            assert!(
+                !fragment.starts_with(&message),
+                "`{code}` is recorded unreachable but `{pattern}`'s captured reference error \
+                 begins with its message — the reason is false, not the capture"
+            );
+        }
     }
-    // Every `go_code` a pattern claims must be a real code, and every
-    // pattern claiming one must be a pattern the reference REJECTS —
-    // otherwise the census would credit a code to a pattern that never
-    // raises it.
+    // Every `go_code` a pattern claims must be a real code, the pattern
+    // must be one the reference REJECTS somewhere, and it must carry a
+    // captured body that actually begins with that code's message.
     for pattern in PATTERNS {
         let Some(code) = pattern.go_code else {
+            assert!(
+                !CAPTURED_REFERENCE_ERRORS
+                    .iter()
+                    .any(|(p, _, _)| p == &pattern.id),
+                "`{}` has a captured reference error but claims no code",
+                pattern.id
+            );
             continue;
         };
-        assert!(
-            GO_ERROR_CODES.contains(&code),
-            "`{}` claims `{code}`, which is not one of the reference's codes",
+        let message = format!("{}: ", message_of(code));
+        let captured: Vec<_> = CAPTURED_REFERENCE_ERRORS
+            .iter()
+            .filter(|(p, _, _)| p == &pattern.id)
+            .collect();
+        assert_eq!(
+            captured.len(),
+            1,
+            "`{}` claims `{code}` and must have exactly one captured reference error",
             pattern.id
         );
-        assert_eq!(
-            pattern.reference,
-            Verdict::Reject,
-            "`{}` claims `{code}` but the reference column says it is accepted",
+        let (_, position, fragment) = captured[0];
+        assert!(
+            fragment.starts_with(&message),
+            "`{}`'s captured error {fragment:?} does not begin with `{code}`'s message \
+             {message:?} — the pattern is credited with a code it does not raise",
             pattern.id
+        );
+        let position = POSITIONS
+            .iter()
+            .find(|p| p.id == *position)
+            .unwrap_or_else(|| panic!("`{}` captures at an unknown position", pattern.id));
+        assert_eq!(
+            committed(position, pattern, Side::Reference),
+            Verdict::Reject,
+            "`{}` captures its error at `{}`, where the committed reference verdict is Accept",
+            pattern.id,
+            position.id
+        );
+    }
+    // `invalid_utf8` and `too_large` are the two the first version of
+    // this table excused; if either loses its code the old claim is back.
+    for id in ["invalid_utf8", "too_large"] {
+        let pattern = PATTERNS.iter().find(|p| p.id == id).expect("present");
+        assert!(
+            pattern.go_code.is_some(),
+            "`{id}` exists to cover a code the first version of this file called unreachable"
         );
     }
 }
@@ -2185,6 +2563,100 @@ fn live_matrix_against_the_reference() {
     eprintln!(
         "re-measured {} points against the reference; the committed column holds",
         points.len()
+    );
+}
+
+/// **The error-code census, put back to the container.**
+///
+/// This is the half that makes [`every_go_regexp_error_code_is_accounted_for`]
+/// more than a self-consistency check. Two things:
+///
+/// 1. every captured fragment must still appear in the container's body
+///    at the position it was captured from, so a pattern credited with a
+///    code has to keep raising it;
+/// 2. the SET of codes observed across the whole matrix must contain no
+///    code this file calls unreachable. That is the assertion that would
+///    have caught the first version's two false unreachability rows the
+///    moment a pattern reaching them entered the set — and it is why
+///    `ErrInvalidUTF8` and `ErrLarge` are covered rows now rather than
+///    excuses.
+#[test]
+fn live_reference_error_codes_are_exactly_the_covered_set() {
+    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+        eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live error-code census");
+        return;
+    };
+
+    // (1) Each captured fragment, at its captured position.
+    let mut wrong = Vec::new();
+    for (pattern_id, position_id, fragment) in CAPTURED_REFERENCE_ERRORS {
+        let position = POSITIONS
+            .iter()
+            .find(|p| p.id == *position_id)
+            .expect("known position");
+        let pattern = PATTERNS
+            .iter()
+            .find(|p| p.id == *pattern_id)
+            .expect("known pattern");
+        let query = position.template.replace("{P}", &pattern.literal());
+        let (verdict, body) = reference_verdict(&base, &query);
+        if verdict != Verdict::Reject || !body.contains(fragment) {
+            wrong.push(format!(
+                "{position_id}/{pattern_id}: expected a 400 containing {fragment:?}, got \
+                 {verdict:?} {}",
+                body.chars().take(160).collect::<String>()
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} captured reference errors no longer hold — re-capture, do not relax the \
+         fragment:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+
+    // (2) No excused code may appear anywhere in the matrix's reference
+    //     bodies. Scanning every point, not just the captured ones.
+    let mut points = matrix(POSITIONS);
+    points.extend(matrix(MASKED));
+    let mut observed: Vec<&str> = Vec::new();
+    for pt in &points {
+        let (verdict, body) = reference_verdict(&base, &pt.query);
+        if verdict != Verdict::Reject {
+            continue;
+        }
+        for (code, message) in GO_ERROR_CODES {
+            if body.contains(&format!("error parsing regexp: {message}: "))
+                && !observed.contains(code)
+            {
+                observed.push(code);
+            }
+        }
+    }
+    for (code, why) in UNREACHABLE_CODES {
+        assert!(
+            !observed.contains(code),
+            "`{code}` is recorded unreachable — \"{why}\" — but the container raised it inside \
+             this matrix. The reason is false; cover the code with a pattern instead of \
+             excusing it."
+        );
+    }
+    let mut covered: Vec<&str> = PATTERNS.iter().filter_map(|p| p.go_code).collect();
+    covered.sort_unstable();
+    covered.dedup();
+    let mut observed_sorted = observed.clone();
+    observed_sorted.sort_unstable();
+    assert_eq!(
+        observed_sorted, covered,
+        "the codes the container actually raised across this matrix are not the codes the \
+         patterns claim to cover"
+    );
+    eprintln!(
+        "observed {} distinct reference error codes across {} points; {} excused, none observed",
+        observed.len(),
+        points.len(),
+        UNREACHABLE_CODES.len()
     );
 }
 
