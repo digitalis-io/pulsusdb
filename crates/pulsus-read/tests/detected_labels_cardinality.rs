@@ -256,10 +256,25 @@ fn collapse(flat: &str) -> String {
     let mut out = String::with_capacity(flat.len());
     for line in flat.lines() {
         // One leading run of comment punctuation, after any indent.
-        // Deliberately NOT `-`: a markdown bullet introduces a new
-        // sentence rather than continuing one, and eating it would join
-        // unrelated prose.
-        let body = line.trim_start().trim_start_matches(['#', '/', ';', '>']);
+        //
+        // `--` is included and a lone `-` is not, and the difference is
+        // real rather than fussy: `--` at the start of a line is only
+        // ever a SQL comment — this tree tracks 70 `.sql` files and the
+        // `golden/traces_*` corpora — whereas `- ` is a markdown bullet,
+        // which STARTS a sentence instead of continuing one, so eating it
+        // would join unrelated prose. Hence the `--` test below rather
+        // than adding `-` to the character class.
+        //
+        // Two neighbours read text slightly differently and are left
+        // alone on purpose, because both fail CLOSED: `header_len`
+        // requires a `#` in column zero where this accepts an indented
+        // one, and `header()` matches raw substrings for the
+        // capture-condition pins. Unifying them would buy nothing and
+        // risk the fail-open direction that has already cost a round.
+        let mut body = line.trim_start().trim_start_matches(['#', '/', ';', '>']);
+        if body.starts_with("--") {
+            body = body.trim_start_matches('-');
+        }
         for ch in body.chars() {
             if ch.is_whitespace() {
                 if !out.ends_with(' ') {
@@ -531,12 +546,30 @@ fn check_frozen_244_header(path: &std::path::Path, banned: &[(String, &[&str])])
         );
     }
     if banned.iter().any(|(p, _)| header_span.contains(p)) {
+        // Deliberately checked against the RAW header, not `header_span`,
+        // and the two texts differ for a reason worth stating — reading
+        // one claim against two texts is what broke this function twice.
+        // The phrase check needs `flatten` + collapse to see a wrapped
+        // sentence. The anchor check must NOT use them: `flatten` strips
+        // quotes, and the quotes are the entire reason this anchor cannot
+        // arise incidentally. Testing the flattened text let
+        // `library v0.2.6, see v{n-1} notes` satisfy a scoping
+        // requirement it does not meet — a fail-OPEN regression (issue
+        // #261 review, round four). The anchor is the contiguous range
+        // form, so neither half can be borrowed from unrelated prose.
+        const SCOPE_ANCHOR: &str = "\"v0\"..\"v{n-1}\"";
+        let raw_header: String = lines[..header_len]
+            .iter()
+            .map(|l| l.trim_start_matches('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            header_span.contains("v0") && header_span.contains("v{n-1}"),
+            raw_header.contains(SCOPE_ANCHOR),
             "{}: the header states a threshold without naming the value family it \
-             was measured on. That scoping sentence is the ONLY thing that makes \
-             the wording true, and the AC-19 gate skips `#` lines, so this is the \
-             only check that reads it (issue #261).",
+             was measured on — it must carry the literal range {SCOPE_ANCHOR}. That \
+             scoping is the ONLY thing that makes the wording true, and the AC-19 \
+             gate skips `#` lines, so this is the only check that reads it \
+             (issue #261).",
             path.display()
         );
     }
