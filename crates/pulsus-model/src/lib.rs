@@ -24,7 +24,7 @@ pub use histogram::{
     CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMA_MAX, EXPONENTIAL_SCHEMA_MIN, HistogramColumns,
     HistogramError, NativeHistogram, SampleValue, Span, ValueType,
 };
-pub use labels::{LabelError, LabelSet, retain_non_empty_values, strip_empty_valued_labels};
+pub use labels::{LabelError, LabelSet, resolve_structured_metadata, retain_non_empty_values};
 pub use matcher::{LabelMatcher, MatchOp};
 pub use sample::{LogSample, MetricSample, STALE_NAN_BITS, Series};
 pub use time::{

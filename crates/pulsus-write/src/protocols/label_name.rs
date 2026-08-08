@@ -53,7 +53,7 @@ const SYMBOLIZER_LOOKUP_PREFIX: &str = "symbolizer lookup: ";
 ///    other three — the pair-wise value strip
 ///    ([`pulsus_model::retain_non_empty_values`]), the by-name value delete
 ///    and its delete-after-normalization half (both
-///    [`pulsus_model::strip_empty_valued_labels`]).
+///    [`pulsus_model::resolve_structured_metadata`]).
 /// 2. the sanitized name consists only of `_` ->
 ///    `normalization for label name %q resulted in invalid name %q`. A
 ///    whitespace-only name lands HERE, not in (1): `" "` sanitizes to `"_"`.

@@ -2214,6 +2214,106 @@ absence of a corpus row for an oversight.
   which carries the reference's measured rendering beside ours for every
   member of the known set.
 
+### structured-metadata-collision-resolution (issue #381)
+
+- **Status: PARITY, with three named residuals.** The construct itself is
+  fixed, not exempted: PulsusDB now runs the reference's own builder at the
+  one shared structured-metadata seam, and reproduces its answer on every
+  measured row. What remains are the three residuals below, two of which are
+  cases where the reference has no stable answer of its own.
+- **Construct:** which of several structured-metadata pairs sharing a stored
+  label name is the one stored, and what a value containing `utf8.RuneError`
+  (U+FFFD) stores as.
+- **The rule, from source.** Loki's distributor runs an entry's structured
+  metadata through Prometheus' `labels.Builder`
+  (`pkg/distributor/distributor.go:697-722 @ v3.7.4` over
+  `vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:454-521`
+  and `labels_common.go:163-200`): `base` is the entry's pairs sorted by name
+  with duplicates preserved, `Reset` seeds `del` with the raw name of every
+  empty-valued pair, the loop `Del`s + `Set`s a pair whose name renames and
+  `Set`s a pair whose value carries U+FFFD (`removeInvalidUtf`, `:75-80`),
+  and `Labels()` lets an `add` entry REPLACE the first base entry of the same
+  name. So a pair that was `Set` beats a pair that was not, wherever either
+  sits in wire order; among `Set` pairs the last wins; among pairs never
+  `Set` the reference keeps them all as duplicate labels and a JSON consumer
+  observes the last. **It is not last-write-wins**, which cannot explain why
+  both wire orders of `{a.b="x", a_b="keep"}` store `a_b="x"`.
+- **Measured** on `grafana/loki:3.7.4` (`buildinfo` `3.7.4` / `b318f282`,
+  `ci/logql/config.yaml`), pushed as JSON structured metadata with duplicate
+  object keys emitted verbatim and read back with
+  `X-Loki-Response-Encoding-Flags: categorize-labels`. The raw response
+  bodies are committed at
+  `crates/pulsus-write/tests/fixtures/structured_metadata_collisions/capture.json`
+  and are the source every hermetic expectation is derived from; the drift
+  leg re-captures them in CI (`schema-it`, "Structured-metadata collision
+  capture drift leg"). Of the 17 rows the reference can serve, **12 differed
+  from PulsusDB at `b872855`** and 5 already agreed (`c04`, `c05`, `c07`,
+  `c11`, `c18` — the frozen greatest-original-key rule happens to elect the
+  same pair there, so they pin the rule without discriminating the fix).
+- **Residual A — the reference's own answer is unspecified past 12 pairs.**
+  `base` is ordered by Go's `slices.SortFunc` (`ScratchBuilder.Sort`,
+  `labels_stringlabels.go:627-629 @ v3.7.4`), insertion sort up to 12
+  elements and pdqsort above, so a repeated canonical name PLUS a rename
+  landing on it resolves by an unstable permutation. Measured with `k` copies
+  of `a_b` followed by `a.b="REN"`: the container returns the last wire copy
+  at k=3 (`3`), k=5 (`5`), k=8 (`8`) and k=11 (`11`), and returns `a_b="2"`
+  at k=12, 13, 15 and 20 — the boundary is 13 pairs in the entry. With no
+  rename present it returns the last wire copy at k=13, 20 and 40. PulsusDB
+  sorts stably and returns the last wire copy at every k, so the two agree
+  everywhere except "repeated canonical name + a rename onto it + at least 13
+  pairs". Not chased: the reference has no answer there to match. Pinned on
+  our side by `labels.rs`'s
+  `the_stable_sort_returns_the_last_wire_copy_on_both_sides_of_the_boundary`.
+- **Residual B — a row the reference accepts and cannot serve.**
+  `{a_b="1", a_b="p\ufffd"}` is a **204** push whose read is a **500**:
+  `failed to parse series labels to categorize labels: 1:6: parse error:
+  invalid UTF-8 rune`, with and without the categorize header. Its `Labels()`
+  emits two `a_b` entries — the `add` rewrite `"p "` and the untouched base
+  duplicate — and its own read path then refuses the series. There is no
+  consumer-observable reference value, so PulsusDB's is a choice: the
+  duplicate collapse keeps the last, `a_b="p\ufffd"`, and the entry is
+  readable. Pinned by `labels.rs`'s
+  `a_duplicate_the_reference_cannot_serve_collapses_to_the_last_pair` and by
+  `structured_metadata_collisions.rs`'s
+  `the_row_the_reference_cannot_serve_is_stored_by_us_as_the_last_pair`,
+  which asserts the captured 500 alongside our stored value.
+- **Residual C — inherited, unchanged.** The builder groups by PulsusDB's
+  `canonicalize_label_key` rather than the reference's `LabelNamer.Build`, so
+  wherever the two renamings differ the collision GROUPS differ (`a..b` and
+  `a__b` are `a_b` there and `a__b` here; `9bad` gains a `key_` prefix
+  there). That is the renaming divergence already registered under issue #259
+  / docs/api.md §8.2, not a second rule, and it disappears when that one
+  does.
+- **In scope deliberately: the U+FFFD branch is a value change.** It is not
+  separable from the collision rule — the branch is a `Set`, and `Set` is
+  what decides the tier, so omitting it resolves `{a.b="x", a_b="p\ufffd"}`
+  and its reverse to the wrong pair. It comes with a rewrite that is
+  user-visible on its own, with no collision needed:
+  `{a_b="p\ufffdq"}` now stores `a_b="p q"` where it stored `a_b="p\ufffdq"`
+  before. Rule 6 of the docs/api.md §8.2 table.
+- **Not in scope, and named rather than omitted:** stream-label collisions of
+  any kind. Structured metadata is a per-entry column and never enters
+  `stream_fingerprint`, so no stored stream identity moves here;
+  `LabelSet::from_normalized`'s frozen greatest-original-key rule (issue #4)
+  is untouched and still governs stream labels, including residual 4 of
+  `ingest-label-bounds` (a repeated OTLP index attribute) and the
+  `{service.name, service_name}` near-miss, which belong to issues #4/#109.
+- **Fixture status:** capture-backed parity in
+  `crates/pulsus-write/tests/structured_metadata_collisions.rs`
+  (`the_stored_string_reproduces_the_reference_capture`,
+  `the_table_discriminates_the_pre_fix_resolution`), the rule itself in
+  `pulsus-model/src/labels.rs`
+  (`structured_metadata_resolution_is_the_references_builder`, and
+  `the_fast_path_is_the_builders_identity_case` over an exhaustive 4 368-case
+  enumeration against an independent transcription of the builder),
+  cross-encoding agreement in `loki_push.rs`
+  (`both_push_encodings_resolve_a_metadata_collision_identically`),
+  cross-transport agreement in
+  `crates/pulsus-write/tests/cross_transport_parity.rs`
+  (`both_log_receivers_resolve_structured_metadata_with_one_rule`), and
+  storage in `loki_push_live.rs`
+  (`colliding_structured_metadata_is_stored_as_the_reference_resolves_it`).
+
 ### `malformed-query-refused-in-every-window` (issue #380, owner ruling 2026-08-06 — deliberate, the reference is wrong here)
 
 - **Reference behaviour, measured** on the digest-pinned v3.7.4 oracle

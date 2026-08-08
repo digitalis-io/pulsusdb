@@ -298,3 +298,152 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         .clone();
     assert_eq!(otlp_summary_type, rw_metadata_type_string(5, "a_summary"));
 }
+
+// ---------------------------------------------------------------------
+// Logs: the structured-metadata seam (issue #381).
+// ---------------------------------------------------------------------
+
+/// The same collision rows the two receivers' own suites use, in wire order.
+#[rustfmt::skip]
+const SM_COLLISION_ROWS: &[&[(&str, &str)]] = &[
+    &[("a.b", "x"), ("a_b", "keep")],
+    &[("a_b", "keep"), ("a.b", "x")],
+    &[("a.b", "1"), ("a-b", "2")],
+    &[("a-b", "2"), ("a.b", "1")],
+    &[("a_b", "1"), ("a_b", "2")],
+    &[("a_b", "2"), ("a_b", "1")],
+    &[("a_b", "1"), ("a_b", "2"), ("a.b", "9")],
+    &[("a.b", "1"), ("a_b", "2"), ("a.b", "3")],
+    &[("a.b", "1"), ("a_b", "2"), ("a-b", "3")],
+    &[("a-b", "3"), ("a_b", "2"), ("a.b", "1")],
+    &[("a.b", "1"), ("a.b", "2")],
+    &[("a_b", ""), ("a.b", "x"), ("a-b", "y")],
+    &[("a.b", "x"), ("a_b", "keep"), ("z", "1")],
+    &[("a.b", "9"), ("a_b", "1"), ("a_b", "2")],
+    &[("a.b", "x"), ("a_b", "p\u{FFFD}")],
+    &[("a_b", "p\u{FFFD}"), ("a.b", "x")],
+    &[("a_b", "p\u{FFFD}q")],
+    &[("a_b", "1"), ("a_b", "p\u{FFFD}")],
+];
+
+/// A Loki-push JSON body carrying exactly `sm` as one entry's structured
+/// metadata. Assembled as TEXT: a repeated name is half of what is under
+/// test and a `serde_json::Map` would collapse it.
+fn loki_push_stored(sm: &[(&str, &str)]) -> String {
+    let object: Vec<String> = sm
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}:{}",
+                serde_json::to_string(k).expect("string"),
+                serde_json::to_string(v).expect("string")
+            )
+        })
+        .collect();
+    let body = format!(
+        r#"{{"streams":[{{"stream":{{"service_name":"checkout"}},"values":[["1700000000000000000","hello",{{{}}}]]}}]}}"#,
+        object.join(",")
+    );
+    let out = pulsus_write::parse_loki_json(body.as_bytes(), 0).expect("admissible push body");
+    out.rows[0].structured_metadata.clone()
+}
+
+/// An OTLP body carrying exactly `sm` as one scope's attributes — scope name
+/// and version left empty so nothing else is appended.
+fn otlp_scope_stored(sm: &[(&str, &str)]) -> String {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    let req = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv(
+                    "service.name",
+                    Value::StringValue("checkout".to_string()),
+                )],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: String::new(),
+                    version: String::new(),
+                    attributes: sm
+                        .iter()
+                        .map(|(k, v)| kv(k, Value::StringValue(v.to_string())))
+                        .collect(),
+                    dropped_attributes_count: 0,
+                }),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: Some(AnyValue {
+                        value: Some(Value::StringValue("hello".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let out = pulsus_write::parse(&req, 0).expect("admissible OTLP body");
+    out.rows[0].structured_metadata.clone()
+}
+
+/// The two log receivers run the SAME structured-metadata rule, stated as an
+/// equation rather than an exception (issue #381):
+///
+/// > `OTLP(raw keys) == Loki-push(canonicalized keys)`
+///
+/// Both call `pulsus_model::resolve_structured_metadata` through the one
+/// shared seam. What differs is only what each hands it: the push transport
+/// hands it RAW names, the OTLP one hands it names its translation has
+/// already renamed. That is the reference's own asymmetry, at the same place
+/// — its OTLP translation runs `LabelNamer.Build` over every attribute key
+/// before the distributor's builder sees it
+/// (`pkg/loghttp/push/otlp.go:602-614 @ v3.7.4`, reached for scope attributes
+/// from `:300-317`), whereas the push path hands the builder the wire names.
+///
+/// So no row is exempted: every row is checked, and the rows whose names are
+/// already canonicalize fixed points — where the renaming is the identity and
+/// the equation collapses to plain equality — are checked a second time and
+/// counted, because those are the rows that were CROSS-TRANSPORT DIVERGENT
+/// before this fix. Measured at `b872855`: `[a_b="2", a_b="1"]` stored
+/// `a_b="1"` through the OTLP scope path and `a_b="2"` through the push one.
+#[test]
+fn both_log_receivers_resolve_structured_metadata_with_one_rule() {
+    let mut identical = 0usize;
+    for row in SM_COLLISION_ROWS {
+        let canonicalized: Vec<(String, String)> = row
+            .iter()
+            .map(|(k, v)| (pulsus_model::canonicalize_label_key(k), (*v).to_string()))
+            .collect();
+        let as_refs: Vec<(&str, &str)> = canonicalized
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            otlp_scope_stored(row),
+            loki_push_stored(&as_refs),
+            "the OTLP scope path is not the push path over renamed keys: {row:?}"
+        );
+        if as_refs == *row {
+            identical += 1;
+            assert_eq!(
+                otlp_scope_stored(row),
+                loki_push_stored(row),
+                "already-canonical keys must resolve identically on both transports: {row:?}"
+            );
+        }
+    }
+    // Non-vacuity, and exact: the rows whose every name is already a fixed
+    // point are `[a_b,a_b]` twice, `[a_b]` once and `[a_b,a_b]` with a
+    // U+FFFD — four of the eighteen.
+    assert_eq!(
+        identical, 4,
+        "the set of already-canonical rows has moved; the equation is being checked over a \
+         different subset than the comment claims"
+    );
+}
