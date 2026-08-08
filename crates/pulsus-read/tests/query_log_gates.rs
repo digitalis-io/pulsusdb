@@ -980,3 +980,201 @@ async fn fetch_until_limit_first_page_over_budget_stays_query_too_broad() {
         "first-page budget overflow must be QueryTooBroad, got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #261 — the property that makes exactness affordable on
+// `/detected_labels`: the aggregation's coordinator fan-in is ONE row per
+// distinct KEY and is independent of how many distinct VALUES those keys
+// have. It is what separates our aggregate from the only
+// reference-faithful alternative (ship every distinct `(key, val)` out of
+// ClickHouse to hash coordinator-side), whose fan-in is one row per
+// value.
+// ---------------------------------------------------------------------
+
+/// Tier-1, scale-invariant (docs/schemas.md §9): runs the PRODUCTION
+/// `sql::detected_labels` text over the same three keys at two very
+/// different value cardinalities and asserts, from `system.query_log`,
+/// that `result_rows` equals the number of distinct KEYS at each — and
+/// is therefore the same number at both. Ratios and identities only;
+/// never a wall-time or byte threshold, so the gate survives any corpus
+/// resize. The absolute duration and memory of this aggregate ARE
+/// scale-dependent (measured under #261: ~0.9 GiB at 10 M distinct
+/// values on a single node) and belong to #25, not here.
+///
+/// **Which assertion carries the weight.** The per-case
+/// `result_rows == DISTINCT_KEYS` is the one that fails: replacing the
+/// aggregate with the reference-faithful `GROUP BY key, val` shape (the
+/// only route that could reproduce the reference's own sketch) makes it
+/// fire at both cardinalities, and so does an accidental change to the
+/// seeded key set. The cross-cardinality equality below is then a
+/// restatement rather than an independent check — it is kept because it
+/// is the sentence a reader wants ("the fan-in does not grow with value
+/// cardinality"), not because it catches a case the per-case identity
+/// misses.
+#[tokio::test]
+async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_qlg_detected_labels_fanin";
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+    run_init(&admin, &test_ctx(db)).await.expect("run_init");
+    let client = data_client(db).await;
+
+    // The two months are separate partitions, so the same three keys can
+    // carry 100 and 7,708 distinct `pod` values without either scan
+    // seeing the other's rows. 7,708 is the `pod-{i}` family's measured
+    // reference-divergence point (issue #261), i.e. a cardinality the
+    // reference could not report exactly.
+    const LOW: u64 = 100;
+    const HIGH: u64 = 7_708;
+    let cases = [("'2026-06-01'", LOW), ("'2026-07-01'", HIGH)];
+    for (month, n) in cases {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) \
+                     SELECT toDate({month}), 'pod', concat('pod-', toString(number)), number \
+                     FROM numbers({n})"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed pod values");
+        // Two more keys, at a cardinality that does NOT scale with `n` —
+        // the key set is identical in both cases, which is what makes the
+        // two `result_rows` comparable.
+        for (key, distinct) in [("namespace", 3u64), ("service_name", 5)] {
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) \
+                         SELECT toDate({month}), '{key}', \
+                         concat('{key}-', toString(number % {distinct})), number \
+                         FROM numbers({n})"
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("seed low-cardinality keys");
+        }
+    }
+    const DISTINCT_KEYS: u64 = 3;
+
+    let mut fan_in = Vec::new();
+    for (i, (month, n)) in cases.iter().enumerate() {
+        let sql =
+            sql::detected_labels(&format!("{db}.log_streams_idx"), &[month.to_string()], None);
+        let query_id = format!("qlg-detected-labels-fanin-{i}");
+        // The UUID predicate carries literal `?`s, which the clickhouse
+        // crate would read as bind placeholders — production doubles them
+        // at the execution boundary (`exec::escape_query_placeholders`),
+        // and a test issuing the raw text must do the same.
+        let (returned, evidence) =
+            run_detected_labels(&client, &sql.replace('?', "??"), &query_id).await;
+        assert_eq!(
+            returned, DISTINCT_KEYS,
+            "the aggregate must stream one row per distinct key at n = {n}"
+        );
+        assert_eq!(
+            evidence.result_rows, returned,
+            "the server's own view of the result size must match what the client \
+             decoded at n = {n}"
+        );
+        assert_eq!(
+            evidence.result_rows, DISTINCT_KEYS,
+            "coordinator fan-in at n = {n} must be one row per distinct KEY, not \
+             one per distinct value (issue #261)"
+        );
+        assert!(
+            evidence.read_rows >= *n,
+            "sanity: the scan at n = {n} must actually have read the seeded rows \
+             (read {})",
+            evidence.read_rows
+        );
+        fan_in.push(evidence.result_rows);
+    }
+
+    assert_eq!(
+        fan_in[0], fan_in[1],
+        "the coordinator fan-in must NOT depend on value cardinality: {} rows at \
+         {LOW} distinct pod values vs {} rows at {HIGH} — the endpoint's whole \
+         design point (docs/api.md §2.6.2) is one row per distinct key, never one \
+         per value (issue #261)",
+        fan_in[0], fan_in[1]
+    );
+    assert_eq!(
+        fan_in[1], DISTINCT_KEYS,
+        "and that constant is the number of distinct KEYS, not a coincidence"
+    );
+}
+
+/// The `/detected_labels` aggregate's three-column output shape.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DetectedLabelsRow {
+    key: String,
+    cardinality: u64,
+    non_id_values: u64,
+}
+
+/// `result_rows` — the coordinator fan-in — is not a column of the
+/// suite-wide [`QueryLogRow`], and this scenario is the only one that
+/// needs it; it gets its own row shape rather than widening the shared
+/// one, so no other gate's evidence query changes.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct FanInRow {
+    result_rows: u64,
+    read_rows: u64,
+}
+
+/// Runs `sql` under `query_id`, drains every returned row (the
+/// `QueryFinish` row only lands once the query has fully completed),
+/// flushes logs and reads back `(rows returned, evidence)`. The stream is
+/// scoped to this function so its pooled connection lease is released
+/// before the `system.query_log` read.
+async fn run_detected_labels(client: &ChClient, sql: &str, query_id: &str) -> (u64, FanInRow) {
+    let settings = QuerySettings::new().set("query_id", query_id);
+    let mut returned = 0u64;
+    {
+        let mut stream = client
+            .query_stream::<DetectedLabelsRow>(sql, &settings)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+        while let Some(row) = stream.next().await {
+            row.expect("decode detected_labels row");
+            returned += 1;
+        }
+    }
+
+    client
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    let log_sql = format!(
+        "SELECT result_rows, read_rows FROM system.query_log \
+         WHERE query_id = '{query_id}' AND type = 'QueryFinish' \
+         ORDER BY event_time_microseconds DESC LIMIT 1"
+    );
+    let mut log_stream = client
+        .query_stream::<FanInRow>(&log_sql, &QuerySettings::new())
+        .await
+        .expect("query system.query_log");
+    let evidence = log_stream
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("no query_log row for query_id {query_id}"))
+        .expect("decode query_log row");
+    (returned, evidence)
+}

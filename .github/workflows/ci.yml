@@ -697,7 +697,9 @@ jobs:
 
       # Issue #16, docs/schemas.md §9's two-tier model, Tier 1: the
       # scale-invariant system.query_log ratio gate for the logs read path
-      # (CI-scale corpus). Reuses this job's ClickHouse 24.8 container.
+      # (CI-scale corpus). Includes issue #261's /detected_labels fan-in
+      # identity: the aggregation returns one row per distinct KEY at any
+      # value cardinality. Reuses this job's ClickHouse 24.8 container.
       - name: LogQL query_log ratio gate (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1207,8 +1209,12 @@ jobs:
       # budget-truncated pulsus_partial spawn, /loki alias byte-identity,
       # and the reference wire shapes fixed in #254/#258 (per-field
       # jsonPath, `parsers: null` when unattributed, and the bare `{}`
-      # zero-field body). Ports 31155-31156. Reuses this job's ClickHouse
-      # 24.8 container.
+      # zero-field body). Issue #261 adds the exactness case: at the two
+      # value counts where the reference's p14 HLL estimate stops matching
+      # the truth (7708 and 4533 distinct values, measured against
+      # grafana/loki:3.7.4), the response body carries the EXACT count.
+      # Ports 31155-31156 and 31165. Reuses this job's ClickHouse 24.8
+      # container.
       - name: Live logs detected labels/fields suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
