@@ -16,14 +16,15 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
 use prost::Message;
 use pulsus_model::{
-    Date, Fingerprint, LabelSet, UnixNano, canonicalize_label_key, stream_fingerprint,
-    strip_empty_valued_labels,
+    Date, Fingerprint, LabelSet, SERVICE_NAME_LABEL, UnixNano, canonicalize_label_key,
+    stream_fingerprint, strip_empty_valued_labels,
 };
 
 use crate::error::LogsIngestError;
 use crate::protocols::label_name::validate_otlp_attribute_names;
 use crate::protocols::log_label_limits;
 use crate::protocols::loki_push::structured_metadata_json;
+use crate::protocols::service_name;
 
 /// A `SeverityNumber` outside this range (including the `0`/unset default)
 /// resolves to severity `0` (architect plan: `severity = severity_number`
@@ -208,7 +209,15 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
             .as_ref()
             .map(|resource| resource.attributes.as_slice())
             .unwrap_or(&[]);
-        let (labels, collisions) = build_stream_labels(resource_attrs)?;
+        // `service_name` discovery (issue #379), resolved ONCE per resource
+        // from the RAW attributes in wire order and then used both for the
+        // validated subset and for the stored set, so the two cannot
+        // disagree. This is the reference's OTLP algorithm, which is not its
+        // push algorithm — see [`service_name`]'s module doc for the measured
+        // table of inputs on which the two answer differently.
+        let raw_attributes = attr_pairs(resource_attrs)?;
+        let service_name = service_name::otlp_service_name(&raw_attributes);
+        let (labels, collisions) = build_stream_labels(&raw_attributes, &service_name);
         // `WithoutEmpty` + the four per-stream label bounds (issue #374).
         // `WithoutEmpty` is applied inside `build_stream_labels` above, before
         // `from_normalized`, because the reference drops empty values before
@@ -255,8 +264,10 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
             .iter()
             .any(|scope_logs| !scope_logs.log_records.is_empty());
         if has_records
-            && let Err(err) =
-                log_label_limits::validate_otlp_index_labels(attr_pairs(resource_attrs)?)
+            && let Err(err) = log_label_limits::validate_otlp_index_labels(
+                raw_attributes.iter().cloned(),
+                &service_name,
+            )
         {
             out.stream_errors.push(err.to_string());
             continue;
@@ -401,7 +412,10 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
 /// `from_normalized` to resolve exactly as it did before #259. By-name would
 /// NOT have been neutral — it would drop both twins and change a case the
 /// reference keeps.
-fn build_stream_labels(resource_attrs: &[KeyValue]) -> Result<(LabelSet, usize), LogsIngestError> {
+fn build_stream_labels(
+    raw_attributes: &[(String, String)],
+    service_name: &str,
+) -> (LabelSet, usize) {
     // `StreamLabels::from_pairs` applies `WithoutEmpty` (issue #374) BEFORE
     // `from_normalized`: an empty-valued resource attribute is neither
     // validated nor stored, so it cannot change the stream's fingerprint and
@@ -410,9 +424,30 @@ fn build_stream_labels(resource_attrs: &[KeyValue]) -> Result<(LabelSet, usize),
     // translation renders a label literal that the distributor re-parses
     // through `syntax.ParseLabels` (`pkg/loghttp/push/otlp.go:244`,
     // `pkg/distributor/distributor.go:1370 @ v3.7.4`).
-    Ok(LabelSet::from_normalized(
-        log_label_limits::StreamLabels::from_pairs(attr_pairs(resource_attrs)?).into_pairs(),
-    ))
+    //
+    // `service_name` is the resolved slot (issue #379) and it is
+    // AUTHORITATIVE: every raw attribute that canonicalizes onto that name is
+    // dropped first, then the slot is appended. Upstream that name is written
+    // by a plain map assignment (`otlp.go:193,201,219 @ v3.7.4`) which no
+    // other attribute can reach — a raw `service_name` or `service-name`
+    // attribute is not an index attribute there, so it becomes structured
+    // metadata and never touches the stream label. `from_normalized`'s frozen
+    // greatest-key/greatest-value rule (issue #4) is therefore never asked to
+    // decide `service_name` on this path; it still decides every other
+    // collision, unchanged.
+    //
+    // What this costs, stated plainly: PulsusDB stores a `service_name`
+    // near-miss attribute nowhere, where the reference stores it as structured
+    // metadata. That is the #109 attribute-placement difference showing
+    // through, and it is ledgered under this issue's residual rather than
+    // fixed here.
+    let mut pairs: Vec<(String, String)> = raw_attributes
+        .iter()
+        .filter(|(key, _)| canonicalize_label_key(key) != SERVICE_NAME_LABEL)
+        .cloned()
+        .collect();
+    pairs.push((SERVICE_NAME_LABEL.to_string(), service_name.to_string()));
+    LabelSet::from_normalized(log_label_limits::StreamLabels::from_pairs(pairs).into_pairs())
 }
 
 /// Builds the per-entry structured-metadata JSON String carrying a log
@@ -709,11 +744,15 @@ mod tests {
         }
     }
 
-    /// The attribute-key check (issue #259) made `build_stream_labels`
-    /// fallible. Every caller of this shim uses admissible keys; the
-    /// dedicated rejection tests call `super::parse` and observe the `Err`.
+    /// The attribute-key check (issue #259) made `attr_pairs` fallible. Every
+    /// caller of this shim uses admissible keys; the dedicated rejection tests
+    /// call `super::parse` and observe the `Err`. The `service_name` slot is
+    /// resolved exactly as [`super::parse`] resolves it (issue #379), so a
+    /// label set built here is the one the receiver would store.
     fn stream_labels(attributes: Vec<KeyValue>) -> (LabelSet, usize) {
-        build_stream_labels(&attributes).expect("test resource attribute keys are admissible")
+        let raw = attr_pairs(&attributes).expect("test resource attribute keys are admissible");
+        let slot = service_name::otlp_service_name(&raw);
+        build_stream_labels(&raw, &slot)
     }
 
     fn string_body(s: &str) -> Option<AnyValue> {
@@ -781,8 +820,16 @@ mod tests {
         assert_eq!(out.streams[0].labels.service(), "checkout");
     }
 
+    /// A resource with no attributes at all stores
+    /// `service_name="unknown_service"` and puts that value in the physical
+    /// `service` column (issue #379). This test asserted the opposite until
+    /// discovery was implemented: its previous name,
+    /// `parse_service_is_empty_string_when_absent_not_unknown_service`,
+    /// named the divergence. Measured on stock `grafana/loki@sha256:87f0a067…`
+    /// via `/loki/api/v1/series`: an attribute-less resource stores
+    /// `{service_name="unknown_service"}`.
     #[test]
-    fn parse_service_is_empty_string_when_absent_not_unknown_service() {
+    fn parse_service_is_unknown_service_when_absent() {
         let record = LogRecord {
             time_unix_nano: 1_700_000_000_000_000_000,
             body: string_body("no resource"),
@@ -796,7 +843,12 @@ mod tests {
             }]),
             0,
         );
-        assert_eq!(out.rows[0].service, "");
+        assert_eq!(out.rows[0].service, "unknown_service");
+        assert_eq!(out.streams[0].service, "unknown_service");
+        assert_eq!(
+            out.streams[0].labels.to_canonical_json(),
+            r#"{"service_name":"unknown_service"}"#
+        );
     }
 
     /// Helper: builds a single-record request from a `ScopeLogs` and reads
@@ -1038,9 +1090,13 @@ mod tests {
             out.rows[0].structured_metadata,
             r#"{"http_method":"GET","na_ve":"yes","scope_name":"N"}"#
         );
+        // `k8s.pod.name` is an index attribute but is not one of the thirteen
+        // discovery names, so the slot falls back (issue #379) — measured on
+        // stock `grafana/loki@sha256:87f0a067…`: `{k8s_pod_name="p-379",
+        // service_name="unknown_service"}`.
         assert_eq!(
             out.streams[0].labels.to_canonical_json(),
-            r#"{"k8s_pod_name":"pod-1"}"#
+            r#"{"k8s_pod_name":"pod-1","service_name":"unknown_service"}"#
         );
     }
 
@@ -1377,7 +1433,13 @@ mod tests {
             ],
         ] {
             let (labels, _) = stream_labels(attrs);
-            assert_eq!(labels.to_canonical_json(), r#"{"region":"eu"}"#);
+            // `region` is neither indexed nor a discovery name, so the slot
+            // falls back (issue #379); the duplicate rule under test is
+            // unchanged by it.
+            assert_eq!(
+                labels.to_canonical_json(),
+                r#"{"region":"eu","service_name":"unknown_service"}"#
+            );
         }
     }
 
@@ -2266,9 +2328,17 @@ mod tests {
         let value = "b".repeat(2049);
         let req = logs_with_resource_attrs(vec![attr("k8s.pod.name", &value)]);
         let out = super::parse(&req, 0).unwrap();
+        // The rendered set is the POST-synthesis one, on this transport too:
+        // the reference validates the `streamLabels` map after writing the
+        // `service_name` slot into it (`otlp.go:174-244` ->
+        // `distributor.go:1370 @ v3.7.4`). Measured on stock
+        // `grafana/loki@sha256:87f0a067…`, byte for byte.
         assert_eq!(
             only_stream_error(&out),
-            format!("stream '{{k8s_pod_name=\"{value}\"}}' has label value too long: '{value}'")
+            format!(
+                "stream '{{k8s_pod_name=\"{value}\", service_name=\"unknown_service\"}}' \
+                 has label value too long: '{value}'"
+            )
         );
     }
 
@@ -2344,7 +2414,9 @@ mod tests {
         attrs.extend((0..40).map(|i| attr(&format!("extra{i}"), "v")));
         let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
-        assert_eq!(out.streams[0].labels.len(), 55);
+        // 15 indexed + 40 others + the discovered `service_name` (issue #379,
+        // from `container.name` — one of the 15 indexed here).
+        assert_eq!(out.streams[0].labels.len(), 56);
     }
 
     /// `pkg/distributor/distributor.go:639-641 @ v3.7.4` skips an entry-less
@@ -2572,28 +2644,72 @@ mod tests {
         let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         // The 15 raw and the 17 underscored spellings canonicalize onto the
-        // same 17 label names, so the stored set is 17 wide.
-        assert_eq!(out.streams[0].labels.len(), 17);
+        // same 17 label names, plus the discovered `service_name` (issue
+        // #379, from `container.name`), so the stored set is 18 wide.
+        assert_eq!(out.streams[0].labels.len(), 18);
+        assert_eq!(out.streams[0].labels.get("service_name"), Some("v"));
     }
 
     /// The gap the bounds do not cover, pinned on **stored state** rather than
-    /// on the wire verdict (issue #374 round-3 review; adjudicated to #109).
+    /// on the wire verdict (issue #374 round-3 review; adjudicated to #109) —
+    /// and, since issue #379, the one name it no longer reaches.
     ///
-    /// The wire verdict agrees with the reference:
-    /// `{service.name: "ok", service_name: "x"*2049}` is accepted by both,
-    /// because upstream matches the raw dotted name and routes the underscored
-    /// one to structured metadata, which no bound reaches. Storage does not
-    /// agree. We index every resource attribute (#109), both spellings
-    /// canonicalize onto `service_name`, and `from_normalized`'s frozen
-    /// collision rule (#4) keeps the greatest *original* key — `_` (0x5F)
-    /// sorts after `.` (0x2E) — so the **unvalidated** near-miss wins and a
-    /// 2049-byte value is stored under the label the validator passed at two
-    /// bytes. Both the stored value and the stream's identity follow the
-    /// winner, which is why this asserts labels and fingerprint: four rounds
-    /// of oracle status comparison could not see it.
+    /// The wire verdict agrees with the reference: an index attribute
+    /// alongside its underscored near-miss is accepted by both, because
+    /// upstream matches the raw dotted name and routes the underscored one to
+    /// structured metadata, which no bound reaches.
+    ///
+    /// Storage still disagrees for seventeen of the eighteen: we index every
+    /// resource attribute (#109), both spellings canonicalize onto one label,
+    /// and `from_normalized`'s frozen collision rule (#4) keeps the greatest
+    /// *original* key — `_` (0x5F) sorts after `.` (0x2E) — so the
+    /// **unvalidated** near-miss wins and a 2049-byte value is stored under a
+    /// label the validator passed at two bytes.
+    ///
+    /// `service_name` is the exception: its slot is resolved from the raw
+    /// attributes and written last, exactly as the reference's map assignment
+    /// is, so the near-miss cannot win it. Measured on stock
+    /// `grafana/loki@sha256:87f0a067…` via `/loki/api/v1/series`:
+    /// `{service.name: "ok379", service_name: <2049 B>}` stores
+    /// `{service_name="ok379"}` there, and now here.
+    ///
+    /// Both halves are asserted side by side so neither can drift into the
+    /// other: unifying them would fail one assertion or the other.
     #[test]
     fn an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value() {
         let wide = "x".repeat(2049);
+
+        // -- the surviving gap: `k8s.pod.name`, which the slot does not
+        // govern. The near-miss value is stored and fixes the identity.
+        let out = super::parse(
+            &logs_with_resource_attrs(vec![
+                attr("k8s.pod.name", "ok"),
+                attr("k8s_pod_name", &wide),
+            ]),
+            0,
+        )
+        .unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        let stored = &out.streams[0].labels;
+        assert_eq!(stored.get("k8s_pod_name"), Some(wide.as_str()));
+        assert!(
+            stored.get("k8s_pod_name").map(str::len)
+                > Some(log_label_limits::MAX_LABEL_VALUE_BYTES),
+            "an indexed, stored label wider than the bound this module introduces"
+        );
+        let near_miss_alone = super::parse(
+            &logs_with_resource_attrs(vec![attr("k8s_pod_name", &wide)]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out.streams[0].fingerprint, near_miss_alone.streams[0].fingerprint,
+            "the unvalidated value fixes the stream's identity"
+        );
+
+        // -- the closed case: `service_name`. The slot wins, so the stored
+        // value is the one the bound was charged on and the identity follows
+        // the VALIDATED attribute instead.
         let out = super::parse(
             &logs_with_resource_attrs(vec![
                 attr("service.name", "ok"),
@@ -2602,42 +2718,107 @@ mod tests {
             0,
         )
         .unwrap();
-
-        // Accepted: only the raw `service.name` is charged, and "ok" is in
-        // bounds. This half is parity — the oracle answers 204.
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
-
-        // The stored label is one collapsed `service_name`, holding the value
-        // no bound was charged on.
         let stored = &out.streams[0].labels;
-        assert_eq!(stored.len(), 1, "both spellings collapse onto one label");
-        assert_eq!(stored.get("service_name"), Some(wide.as_str()));
-        assert!(
-            stored.get("service_name").map(str::len)
-                > Some(log_label_limits::MAX_LABEL_VALUE_BYTES),
-            "an indexed, stored label wider than the bound this module introduces"
-        );
+        assert_eq!(stored.len(), 1, "the near-miss is not stored at all");
+        assert_eq!(stored.get("service_name"), Some("ok"));
 
-        // The identity follows the winner too: this stream is the one a bare
-        // over-wide `service_name` push produces, not the `{service_name="ok"}`
-        // the bound was charged on.
-        let near_miss_alone = super::parse(
-            &logs_with_resource_attrs(vec![attr("service_name", &wide)]),
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            out.streams[0].fingerprint, near_miss_alone.streams[0].fingerprint,
-            "the unvalidated value fixes the stream's identity"
-        );
         let validated = super::parse(
             &logs_with_resource_attrs(vec![attr("service.name", "ok")]),
             0,
         )
         .unwrap();
-        assert_ne!(
+        assert_eq!(
             out.streams[0].fingerprint, validated.streams[0].fingerprint,
-            "the validated value does not"
+            "the validated value fixes the identity now"
+        );
+        // ...and NOT the stream a bare over-wide `service_name` produces,
+        // which is the assertion that discriminates: were `from_normalized`
+        // still deciding this name, these two would be one stream.
+        let near_miss_alone = super::parse(
+            &logs_with_resource_attrs(vec![attr("service_name", &wide)]),
+            0,
+        )
+        .unwrap();
+        assert_ne!(
+            out.streams[0].fingerprint, near_miss_alone.streams[0].fingerprint,
+            "the unvalidated near-miss no longer decides `service_name`"
+        );
+        assert_eq!(
+            near_miss_alone.streams[0].labels.to_canonical_json(),
+            r#"{"service_name":"unknown_service"}"#,
+            "a near-miss alone leaves the slot at its fallback"
+        );
+    }
+
+    /// AC7 (issue #379): `container.name=""` is an index attribute AND a
+    /// discovery name, so it writes `service_name=""` with no non-empty guard
+    /// and suppresses the `unknown_service` fallback; both labels then strip
+    /// away and the stream is refused as empty. Measured on stock
+    /// `grafana/loki@sha256:87f0a067…`: `400 error at least one label pair is
+    /// required per stream`.
+    #[test]
+    fn an_empty_index_attribute_value_empties_the_stream() {
+        let out = super::parse(
+            &logs_with_resource_attrs(vec![attr("container.name", "")]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            only_stream_error(&out),
+            "error at least one label pair is required per stream"
+        );
+        assert!(out.rows.is_empty(), "nothing is stored");
+    }
+
+    /// AC7's other direction, and the one that catches the likely defect: a
+    /// resource with NO index attributes at all still validates, because the
+    /// subset the bounds are charged on carries the synthesized slot. Charging
+    /// them on the index attributes alone would newly refuse this, where the
+    /// reference answers `204` (measured: `{zzz: "v"}` stores
+    /// `{service_name="unknown_service"}` there, with `zzz` as structured
+    /// metadata).
+    #[test]
+    fn a_resource_with_no_index_attributes_still_validates() {
+        let out = super::parse(&logs_with_resource_attrs(vec![attr("zzz", "v")]), 0).unwrap();
+        assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+        assert_eq!(
+            out.streams[0].labels.to_canonical_json(),
+            r#"{"service_name":"unknown_service","zzz":"v"}"#
+        );
+        assert_eq!(out.rows[0].service, "unknown_service");
+    }
+
+    /// The measured OTLP rows that are only visible in STORED state: wire
+    /// order decides the slot, and an empty `service.name` after a discovery
+    /// hit leaves a stream with no `service_name` at all — which is not a
+    /// rejection, because `container_name` survives the strip.
+    #[test]
+    fn the_stored_otlp_stream_follows_the_slot_including_when_it_is_empty() {
+        let stored = |attrs: Vec<KeyValue>| {
+            let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+            assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
+            out.streams[0].labels.to_canonical_json()
+        };
+        assert_eq!(
+            stored(vec![attr("container.name", "c4"), attr("service.name", "")]),
+            r#"{"container_name":"c4"}"#,
+            "measured: the reference stores this stream with no `service_name`"
+        );
+        assert_eq!(
+            stored(vec![
+                attr("k8s.container.name", "kc"),
+                attr("container.name", "c")
+            ]),
+            r#"{"container_name":"c","k8s_container_name":"kc","service_name":"kc"}"#
+        );
+        assert_eq!(
+            stored(vec![
+                attr("container.name", "c2"),
+                attr("k8s.container.name", "kc2")
+            ]),
+            r#"{"container_name":"c2","k8s_container_name":"kc2","service_name":"c2"}"#,
+            "wire order decides, so the same two names answer differently"
         );
     }
 

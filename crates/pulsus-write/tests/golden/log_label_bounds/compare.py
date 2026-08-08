@@ -920,7 +920,11 @@ case("otlp/duplicate-index-key/bad-first", "otlp",
 # structured metadata while we store it as an index label, and our collision
 # rule (#4: greatest ORIGINAL key, and `_` 0x5F sorts after `.` 0x2E) hands the
 # label to the UNVALIDATED near-miss -- so a 2049-byte value is stored under a
-# name the bound passed at two bytes.  Statuses cannot see that; the stored
+# name the bound passed at two bytes.  That is still true of the k8s.pod.name
+# pair; it is NOT true of the service_name pair since issue #379, where the
+# slot is resolved from the raw attributes and written last as the reference
+# writes it, so the validated value is what is stored.  Statuses cannot see
+# either way; the stored
 # labels and the fingerprint are asserted in
 # otlp_logs.rs::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value
 # and, out of live ClickHouse, in loki_push_live.rs::

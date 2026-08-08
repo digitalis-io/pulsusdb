@@ -79,21 +79,42 @@
 //! `service_name` is not counted: `ValidateLabels` decrements the label count
 //! when it is present (`validator.go:169-174 @ v3.7.4`), because the
 //! reference's own push parser injects one when a stream has none
-//! (`pkg/loghttp/push/push.go:441-453 @ v3.7.4`, on by default). PulsusDB does
-//! not inject it, but the decrement still applies to a *client-supplied*
-//! `service_name`, so without it we would reject a 16-label stream the
-//! reference accepts. Measured: 15 arbitrary labels + `service_name` -> `204`;
-//! 16 arbitrary labels + `service_name` -> `400 … has 16 label names`. The
-//! effective rule either way is "at most 15 labels other than `service_name`".
+//! (`pkg/loghttp/push/push.go:441-456 @ v3.7.4`, on by default). PulsusDB
+//! injects it too ([`super::service_name`], issue #379), and the decrement
+//! applies equally to a *client-supplied* `service_name`, so a stream carrying
+//! 15 real labels plus one is accepted on both sides. Measured: 15 arbitrary
+//! labels + `service_name` -> `204`; 16 arbitrary labels + `service_name` ->
+//! `400 … has 16 label names`. The effective rule either way is "at most 15
+//! labels other than `service_name`", and because synthesis runs *before*
+//! validation the label set rendered into all four messages is the one
+//! carrying the synthesized label.
 //!
-//! That same unconditional injection is why `MissingLabelsErrorMsg` ("error at
-//! least one label pair is required per stream", `validator.go:159-163`) is not
-//! implemented here: with the reference's default `discover_service_name` a
-//! non-internal stream always carries at least `service_name`, so the check is
-//! unreachable upstream. A stream whose labels are *all* empty-valued is
-//! stored by PulsusDB with no labels and by the reference as
-//! `{service_name="unknown_service"}` — the pre-existing `service_name`
-//! injection divergence, ledgered separately, not a new one.
+//! # The empty-label check is first, and it is reachable
+//!
+//! `MissingLabelsErrorMsg` ("error at least one label pair is required per
+//! stream", `pkg/validation/validate.go:25 @ v3.7.4`) is the first check in
+//! [`StreamLabels::validate`], ahead of the internal-stream early return,
+//! which is where `validator.go:158-167 @ v3.7.4` has it.
+//!
+//! An earlier revision of this comment claimed the check was "unreachable
+//! upstream" and used that claim to justify not implementing it. The claim is
+//! false, and it was load-bearing (issue #379). It holds for
+//! `/loki/api/v1/push`: under the stock discovery list every non-internal push
+//! stream gains a non-empty `service_name`, so the set is never empty by the
+//! time it is validated. It fails for `/otlp/v1/logs`, where the discovery
+//! algorithm is a different one: `container.name` is an index attribute AND a
+//! discovery name, a `container.name=""` attribute therefore writes
+//! `service_name=""` — the OTLP path has no non-empty guard — and sets
+//! `hasServiceName`, which suppresses the `unknown_service` fallback
+//! (`pkg/loghttp/push/otlp.go:193-220 @ v3.7.4`). Both labels then strip away
+//! and nothing is left. Measured on stock `grafana/loki:3.7.4` (revision
+//! `b318f282`): `400 error at least one label pair is required per stream`.
+//! Pinned by `an_empty_stream_label_set_is_the_reference_message` here, by
+//! `an_empty_index_attribute_value_empties_the_stream` in `otlp_logs.rs`, and
+//! — in the direction that matters more — by
+//! `a_resource_with_no_index_attributes_still_validates`, since charging this
+//! check on a subset that does not include the synthesized slot would refuse
+//! `{zzz="v"}`, which the reference accepts.
 //!
 //! Duplicate names only reach check 4 on a transport that can carry them.
 //! The reference's JSON push body and its OTLP translation both build the set
@@ -118,14 +139,24 @@
 //! [`MAX_LABEL_NAMES_PER_STREAM`]. Two paths reach it:
 //!
 //! - an attribute whose raw name is not one of the eighteen —
-//!   `{app: "x"*2049}` stores a 2049-byte `app` label;
+//!   `{app: "x"*2049}` stores a 2049-byte `app` label, and enough such
+//!   attributes store a set wider than fifteen;
 //! - an attribute whose raw name merely *canonicalizes onto* one of the
-//!   eighteen — `{service.name: "ok", service_name: "x"*2049}`. Only
-//!   `service.name` is validated; both collapse onto `service_name` in
+//!   eighteen — `{k8s.pod.name: "ok", k8s_pod_name: "x"*2049}`. Only
+//!   `k8s.pod.name` is validated; both collapse onto `k8s_pod_name` in
 //!   storage, and `from_normalized`'s frozen collision rule (issue #4) keeps
 //!   the greatest *original* key, where `_` (0x5F) sorts after `.` (0x2E). The
 //!   unvalidated near-miss therefore always wins, and the stored value of a
 //!   validated label is one no bound was ever charged on.
+//!
+//! **`service_name` is the one name the second path no longer reaches**
+//! (issue #379). That slot is resolved by
+//! [`super::service_name::otlp_service_name`] from the raw attributes and
+//! written last, exactly as the reference's `streamLabels[LabelServiceName] =
+//! …` map assignment is, so `from_normalized` is never asked to decide it and
+//! `{service.name: "ok", service_name: "x"*2049}` now stores `"ok"` — the
+//! value the bound was charged on — on both the value and the fingerprint.
+//! The seventeen other indexed names are unchanged.
 //!
 //! This is not a divergence note. Both examples are accepted by the reference
 //! too — it routes those attributes to structured metadata, which is unbounded
@@ -143,7 +174,8 @@
 //! The Loki-push transports have no such gap: every pair in the pushed literal
 //! is a stream label and every one of them is validated. Pinned by
 //! `an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value` in
-//! `otlp_logs.rs` (stored labels and fingerprint) and by
+//! `otlp_logs.rs` (stored labels and fingerprint, for a name the slot does not
+//! govern, alongside the `service_name` case it now does) and by
 //! `an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label` in
 //! `crates/pulsus-server/tests/loki_push_live.rs` (read back out of
 //! ClickHouse).
@@ -212,7 +244,14 @@ pub const PATTERN_LABEL: &str = "__pattern__";
 /// The inner `Vec` is private and there is deliberately no `Default`, no
 /// `From` and no second constructor, so "[`Self::from_pairs`] is the only way
 /// to obtain a stream's pairs" is enforced by the compiler rather than by
-/// convention.
+/// convention. [`Self::set_service_name`] is the one mutator, and it exists
+/// because the reference's own ordering forces it: `service_name` synthesis
+/// sits *between* the strip and the bounds (`pkg/loghttp/push/push.go:425-456`
+/// -> `pkg/distributor/distributor.go:1370-1387 @ v3.7.4`), so the set that is
+/// validated is the set after synthesis. Doing it before `from_pairs` instead
+/// would charge the bounds on a set the reference had already stripped, and
+/// doing it after `validate` would render a different literal into the four
+/// bound messages than the reference renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamLabels(Vec<(String, String)>);
 
@@ -240,6 +279,38 @@ impl StreamLabels {
         &self.0
     }
 
+    /// Inserts or replaces `service_name`, restoring the name sort — the
+    /// reference's `lb.Set(LabelServiceName, serviceName).Labels()`
+    /// (`pkg/loghttp/push/push.go:451-452 @ v3.7.4`) and, on the OTLP path,
+    /// its `streamLabels[LabelServiceName] = …` map assignment
+    /// (`pkg/loghttp/push/otlp.go:201,219 @ v3.7.4`). A plain overwrite in
+    /// both cases: whatever the slot held loses.
+    ///
+    /// An EMPTY `value` is dropped rather than stored, because both reference
+    /// paths render the set back into a label literal that
+    /// `parseStreamLabels` re-parses through `WithoutEmpty`
+    /// (`push.go:456`, `otlp.go:244` -> `distributor.go:1370 @ v3.7.4`). That
+    /// is only reachable from OTLP, where the slot can legitimately be `""`.
+    ///
+    /// Any pre-existing `service_name` pairs are removed first, so the
+    /// duplicate-name bound cannot be tripped by synthesis itself; on the push
+    /// path this is a no-op, since a set already carrying the label is one the
+    /// resolver declines to touch.
+    pub fn set_service_name(&mut self, value: &str) {
+        self.0.retain(|(name, _)| name != SERVICE_NAME_LABEL);
+        if value.is_empty() {
+            return;
+        }
+        // The pairs are name-sorted, so the insertion point is the first name
+        // that is not less than `service_name` — an O(log n) probe rather than
+        // a re-sort of the whole set.
+        let at = self
+            .0
+            .partition_point(|(name, _)| name.as_str() < SERVICE_NAME_LABEL);
+        self.0
+            .insert(at, (SERVICE_NAME_LABEL.to_string(), value.to_string()));
+    }
+
     /// Consumes into the pairs a `LabelSet` is built from — the same value
     /// [`Self::validate`] inspected.
     pub fn into_pairs(self) -> Vec<(String, String)> {
@@ -254,7 +325,8 @@ impl StreamLabels {
             .any(|(name, _)| name == AGGREGATED_METRIC_LABEL || name == PATTERN_LABEL)
     }
 
-    /// Applies the four bounds in the reference's order.
+    /// Applies the empty-set check and then the four bounds, in the
+    /// reference's order.
     ///
     /// Call this only for a stream that carries at least one entry: the
     /// reference skips an entry-less stream before validating it
@@ -263,6 +335,19 @@ impl StreamLabels {
     /// Errors are [`LabelLimitError`] — the reference's message verbatim,
     /// which the receiver accumulates and answers `400` with.
     pub fn validate(&self) -> Result<(), LabelLimitError> {
+        // `validator.go:158-162 @ v3.7.4` — ahead of the internal-stream early
+        // return, which is where the reference has it. The ORDER is not
+        // observable on either side (both predicates read the post-strip set,
+        // and an empty set carries no internal label), so it is copied rather
+        // than claimed: `an_internal_label_cannot_survive_into_the_empty_check`
+        // asserts the mutual exclusivity instead. See the module doc for why
+        // the check is reachable at all.
+        if self.0.is_empty() {
+            return Err(LabelLimitError(
+                "error at least one label pair is required per stream".to_string(),
+            ));
+        }
+
         if self.is_internal() {
             return Ok(());
         }
@@ -375,10 +460,31 @@ const OTLP_INDEX_ATTRIBUTES: [&str; 18] = [
     "service.namespace",
 ];
 
+/// True for a raw OTel resource attribute key the reference promotes to a
+/// stream label ([`OTLP_INDEX_ATTRIBUTES`]) — a binary search into the sorted
+/// table. The selection is on the RAW key, before canonicalization, exactly as
+/// `otlpConfig.ActionForResourceAttribute(k)` is
+/// (`pkg/loghttp/push/otlp.go:180-193 @ v3.7.4`).
+///
+/// Exposed because [`super::service_name::otlp_service_name`] scans the same
+/// subset: the reference's discovery loop is nested inside the `IndexLabel`
+/// branch (`otlp.go:192-207 @ v3.7.4`), so an attribute that is not indexed
+/// cannot be discovered. One list, two readers.
+pub fn is_otlp_index_attribute(key: &str) -> bool {
+    OTLP_INDEX_ATTRIBUTES.binary_search(&key).is_ok()
+}
+
+/// The eighteen raw names themselves, for tests that must enumerate them
+/// rather than test membership.
+pub fn otlp_index_attributes() -> &'static [&'static str] {
+    &OTLP_INDEX_ATTRIBUTES
+}
+
 /// Validates an OTLP resource's labels, charging the four bounds on the subset
 /// the reference indexes as stream labels — selected from the **raw** attribute
 /// names ([`OTLP_INDEX_ATTRIBUTES`]) and canonicalized afterwards, which is the
-/// order `otlp.go:180-212 @ v3.7.4` does it in.
+/// order `otlp.go:180-212 @ v3.7.4` does it in — plus the resolved
+/// `service_name` slot, which is part of that same map upstream.
 ///
 /// PulsusDB stores every resource attribute as a stream label (issue #109);
 /// the reference stores only those 18 that way and routes the rest to
@@ -399,30 +505,43 @@ const OTLP_INDEX_ATTRIBUTES: [&str; 18] = [
 /// **Only within the subset.** Storage collapses the *whole* attribute list
 /// (issue #109), so a non-indexed attribute canonicalizing onto an indexed name
 /// can win that collapse and be stored under a name this function validated a
-/// different value for — `{service.name: "ok", service_name: "x"*2049}` stores
-/// 2049 bytes under `service_name`. See the module doc's *What these bounds do
-/// not cover*; the fix belongs to issue #109.
+/// different value for — `{k8s.pod.name: "ok", k8s_pod_name: "x"*2049}` stores
+/// 2049 bytes under `k8s_pod_name`. See the module doc's *What these bounds do
+/// not cover*; the fix belongs to issue #109. `service_name` is the exception,
+/// since `service_name` is the parameter below rather than a collapse winner.
 ///
 /// Two raw index attributes that collide on one canonical name (only reachable
 /// from a repeated wire key, since the 18 raw names canonicalize to 18 distinct
 /// labels) resolve by `from_normalized`'s frozen rule (issue #4) rather than by
 /// upstream's last-write-wins; that is the pre-existing collision divergence,
 /// not a bound of its own — see docs/benchmarks/logs-differential-ledger.md.
-pub fn validate_otlp_index_labels<I>(raw_attributes: I) -> Result<(), LabelLimitError>
+///
+/// `service_name` is [`super::service_name::otlp_service_name`]'s answer for
+/// this resource, applied last. The reference validates the POST-synthesis
+/// `streamLabels` map (`otlp.go:174-244` -> `distributor.go:1370 @ v3.7.4`),
+/// which is why it is a parameter and not something this function could
+/// derive: a resource with no index attributes at all still validates a
+/// one-label set here, `{service_name="unknown_service"}`, and would otherwise
+/// be refused as empty where the reference answers `204`.
+pub fn validate_otlp_index_labels<I>(
+    raw_attributes: I,
+    service_name: &str,
+) -> Result<(), LabelLimitError>
 where
     I: IntoIterator<Item = (String, String)>,
 {
     let indexed: Vec<(String, String)> = raw_attributes
         .into_iter()
-        .filter(|(key, _)| OTLP_INDEX_ATTRIBUTES.binary_search(&key.as_str()).is_ok())
+        .filter(|(key, _)| is_otlp_index_attribute(key))
         .collect();
     let (labels, _collisions) = pulsus_model::LabelSet::from_normalized(indexed);
-    StreamLabels::from_pairs(
+    let mut stream_labels = StreamLabels::from_pairs(
         labels
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string())),
-    )
-    .validate()
+    );
+    stream_labels.set_service_name(service_name);
+    stream_labels.validate()
 }
 
 /// `model.LegacyValidation.IsValidLabelName`
@@ -501,6 +620,40 @@ mod tests {
         check(pairs).unwrap_err().to_string()
     }
 
+    /// The one mutator (issue #379): insert, replace, and drop-when-empty,
+    /// each preserving the name sort the duplicate bound depends on.
+    #[test]
+    fn set_service_name_inserts_replaces_and_drops_in_sort_order() {
+        let mut set = labels(&[("zzz", "1"), ("app", "2")]);
+        set.set_service_name("checkout");
+        assert_eq!(
+            set.pairs(),
+            [
+                ("app".to_string(), "2".to_string()),
+                ("service_name".to_string(), "checkout".to_string()),
+                ("zzz".to_string(), "1".to_string()),
+            ],
+            "inserted at its sorted position, between `app` and `zzz`"
+        );
+
+        // A plain overwrite, as the reference's map assignment is.
+        set.set_service_name("other");
+        assert_eq!(set.pairs()[1].1, "other");
+        assert_eq!(set.pairs().len(), 3, "replaced, not appended");
+
+        // An empty slot is dropped, because the reference re-parses the
+        // rendered literal through `WithoutEmpty`.
+        set.set_service_name("");
+        assert_eq!(set.pairs().len(), 2);
+        assert!(set.pairs().iter().all(|(n, _)| n != SERVICE_NAME_LABEL));
+
+        // Setting on a set that is nothing else leaves a valid one-label
+        // stream, which is what a bare OTLP resource stores.
+        let mut only = labels(&[]);
+        only.set_service_name(super::super::service_name::UNKNOWN_SERVICE);
+        assert!(only.validate().is_ok());
+    }
+
     #[test]
     fn fifteen_labels_are_accepted() {
         let names: Vec<String> = (0..15).map(|i| format!("l{i}")).collect();
@@ -552,10 +705,21 @@ mod tests {
 
     /// An empty-valued label is not length-checked either — measured:
     /// `{"z"*2000: ""}` answers `204` upstream.
+    ///
+    /// Asserted alongside a non-empty sibling because the strip is what makes
+    /// the over-long name unreachable, and a set that strips to NOTHING is
+    /// refused by the empty-set check instead (issue #379) — which would pass
+    /// this test for the wrong reason.
     #[test]
     fn empty_valued_label_escapes_the_name_length_bound() {
         let name = "z".repeat(2000);
-        assert!(check(&[(name.as_str(), "")]).is_ok());
+        assert!(check(&[(name.as_str(), ""), ("app", "v")]).is_ok());
+        // The name bound is genuinely what is being escaped: the same name
+        // with a value is refused.
+        assert!(
+            err(&[(name.as_str(), "v"), ("app", "v")]).contains("has label name too long"),
+            "the bound must still fire for a non-empty value"
+        );
     }
 
     /// The drop is not a validation-only filter: the pairs handed on for
@@ -739,9 +903,58 @@ mod tests {
         );
     }
 
+    /// AC7 (issue #379). This inverts an earlier expectation named
+    /// `an_empty_label_set_is_accepted`, which encoded the false claim that
+    /// `MissingLabelsErrorMsg` could not be reached from any receiver.
+    /// Measured on
+    /// `grafana/loki@sha256:87f0a067…` (3.7.4, stock config): an OTLP resource
+    /// carrying `container.name=""` answers exactly this body.
     #[test]
-    fn an_empty_label_set_is_accepted() {
-        assert!(check(&[]).is_ok());
+    fn an_empty_stream_label_set_is_the_reference_message() {
+        assert_eq!(
+            err(&[]),
+            "error at least one label pair is required per stream"
+        );
+        // Reachable through the strip, not only from a literally empty set.
+        assert_eq!(
+            err(&[("only", ""), ("empty", "")]),
+            "error at least one label pair is required per stream"
+        );
+    }
+
+    /// The check is placed ahead of the internal-stream early return because
+    /// `validator.go:158-167 @ v3.7.4` places it there, but **the ordering is
+    /// not observable and this test does not claim it is**: both predicates
+    /// read the set AFTER `WithoutEmpty`, and a set that is empty cannot carry
+    /// an internal label, so the two branches are mutually exclusive on both
+    /// sides. That mutual exclusivity is the assertable part, and it is what
+    /// is asserted here — moving the check below the early return leaves every
+    /// test in this file green, deliberately.
+    ///
+    /// What the check must not do is swallow the exemption, so the exemption
+    /// is re-asserted beside it.
+    #[test]
+    fn an_internal_label_cannot_survive_into_the_empty_check() {
+        for internal in [AGGREGATED_METRIC_LABEL, PATTERN_LABEL] {
+            // Empty-valued: stripped away, so the set is empty AND not
+            // internal — this input reaches the empty check either way.
+            let stripped = labels(&[(internal, "")]);
+            assert!(stripped.pairs().is_empty(), "{internal}");
+            assert!(!stripped.is_internal(), "{internal}");
+            assert_eq!(
+                stripped.validate().unwrap_err().to_string(),
+                "error at least one label pair is required per stream",
+                "{internal}"
+            );
+
+            // Non-empty: internal, non-empty, and still exempt from all four
+            // bounds.
+            let mut pairs: Vec<(&str, &str)> = vec![(internal, "1")];
+            let names: Vec<String> = (0..16).map(|i| format!("l{i}")).collect();
+            pairs.extend(names.iter().map(|n| (n.as_str(), "v")));
+            assert!(labels(&pairs).is_internal(), "{internal}");
+            assert!(check(&pairs).is_ok(), "{internal}");
+        }
     }
 
     #[test]
@@ -810,12 +1023,16 @@ mod tests {
     }
     // -- the OTLP index-label subset --------------------------------------
 
+    /// Mirrors the receiver: the slot is resolved from the same raw
+    /// attributes the subset is selected from ([`super::otlp_logs::parse`]),
+    /// so a case that passes here passes for the reason it passes at the wire.
     fn otlp(attrs: &[(&str, &str)]) -> Result<(), LabelLimitError> {
-        validate_otlp_index_labels(
-            attrs
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
-        )
+        let raw: Vec<(String, String)> = attrs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let slot = crate::protocols::service_name::otlp_service_name(&raw);
+        validate_otlp_index_labels(raw, &slot)
     }
 
     /// `binary_search` is only a correct membership test on a sorted slice, so

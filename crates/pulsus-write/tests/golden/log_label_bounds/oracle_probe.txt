@@ -11,6 +11,15 @@ Evidence for the `ingest-label-bounds` row in
 docs/benchmarks/logs-differential-ledger.md. A manual capture -- NOT run in
 CI.
 
+The generated span was RE-CAPTURED under issue #379, which implements
+`service_name` discovery: 86 body lines moved, every one of them a `pulsus`
+body gaining the synthesized label, and no `loki` line, status, case or
+verdict moved at all (`compare.py` still exits 0). Byte-identical bodies rose
+from 95 of 184 cases to 115. That is the retirement of `ingest-label-bounds`'
+Residual 1 shown at the wire; the residual's other half -- that
+`MissingLabelsErrorMsg` was unreachable -- was false and is corrected in the
+ledger.
+
 `number_route_probe.py` / `number_route_probe.txt` beside this file are the
 second half of that evidence, for the one group whose claim a case table
 cannot carry: a case is one body written in one piece, and the ignored-number
@@ -82,8 +91,14 @@ These are statuses, and a status cannot see what was STORED. The four
 upstream keeps the near-miss spelling as structured metadata while we index
 it, both spellings canonicalize onto one label name, and our collision rule
 keeps the near-miss -- so a 2049-byte value lands on a stream label the
-bound passed at two bytes. That half is asserted on stored state instead,
-by `otlp_logs::tests::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value`
+bound passed at two bytes. That holds for the two `k8s.pod.name` rows. It
+STOPPED holding for the two `service_name` rows under issue #379: that slot
+is now resolved from the raw attributes and written last, exactly as the
+reference's map assignment is, so the validated value is stored on both
+sides and the near-miss reaches no stream label here at all (it reaches
+structured metadata upstream -- the #109 placement difference, unchanged).
+Both halves are asserted on stored state, side by side, by
+`otlp_logs::tests::an_index_attribute_and_its_near_miss_collide_on_the_unvalidated_value`
 and, out of live ClickHouse, by
 `loki_push_live::an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label`.
 
@@ -396,7 +411,7 @@ bodies
     pulsus 204: 
 --- json/16-labels [SAME]
     loki   400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
-    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v"}' has 16 label names; limit 15\n
+    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
 --- json/15+service_name [SAME]
     loki   204: 
     pulsus 204: 
@@ -411,31 +426,31 @@ bodies
     pulsus 204: 
 --- json/name-1025 [SAME]
     loki   400: stream '{<ax1025>="v", service_name="unknown_service"}' has label name too long: '<ax1025>'\n
-    pulsus 400: stream '{<ax1025>="v"}' has label name too long: '<ax1025>'\n
+    pulsus 400: stream '{<ax1025>="v", service_name="unknown_service"}' has label name too long: '<ax1025>'\n
 --- json/value-2048 [SAME]
     loki   204: 
     pulsus 204: 
 --- json/value-2049 [SAME]
     loki   400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
-    pulsus 400: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'\n
+    pulsus 400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
 --- json/empty-valued-2000B-name [SAME]
     loki   204: 
     pulsus 204: 
 --- json/count-outranks-length [SAME]
     loki   400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service", <zx2000>="<cx3000>"}' has 17 label names; limit 15\n
-    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", <zx2000>="<cx3000>"}' has 17 label names; limit 15\n
+    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service", <zx2000>="<cx3000>"}' has 17 label names; limit 15\n
 --- json/name-outranks-value-same-label [SAME]
     loki   400: stream '{service_name="unknown_service", <zx2000>="<cx3000>"}' has label name too long: '<zx2000>'\n
-    pulsus 400: stream '{<zx2000>="<cx3000>"}' has label name too long: '<zx2000>'\n
+    pulsus 400: stream '{service_name="unknown_service", <zx2000>="<cx3000>"}' has label name too long: '<zx2000>'\n
 --- json/sorted-order-picks-the-label [SAME]
     loki   400: stream '{aaa="<cx3000>", service_name="unknown_service", <zx2000>="v"}' has label value too long: '<cx3000>'\n
-    pulsus 400: stream '{aaa="<cx3000>", <zx2000>="v"}' has label value too long: '<cx3000>'\n
+    pulsus 400: stream '{aaa="<cx3000>", service_name="unknown_service", <zx2000>="v"}' has label value too long: '<cx3000>'\n
 --- json/duplicate-key-collapses [SAME]
     loki   204: 
     pulsus 204: 
 --- json/16-nonempty+241-empty [SAME]
     loki   400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
-    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v"}' has 16 label names; limit 15\n
+    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
 --- json/15-nonempty+250-empty [SAME]
     loki   204: 
     pulsus 204: 
@@ -453,13 +468,13 @@ bodies
     pulsus 204: 
 --- json/mixed-good-and-bad [SAME]
     loki   400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
-    pulsus 400: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'\n
+    pulsus 400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
 --- json/two-distinct-failures [SAME]
     loki   400: 1 errors like: stream '{<ax1025>="v", service_name="unknown_service"}' has label name too long: '<ax1025>'; 1 errors like: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
-    pulsus 400: 1 errors like: stream '{<ax1025>="v"}' has label name too long: '<ax1025>'; 1 errors like: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'\n
+    pulsus 400: 1 errors like: stream '{<ax1025>="v", service_name="unknown_service"}' has label name too long: '<ax1025>'; 1 errors like: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
 --- json/control-bytes-in-sibling-label [SAME]
     loki   400: stream '{app="<bx2049>", ctl="x\vy\fz\b", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
-    pulsus 400: stream '{app="<bx2049>", ctl="x\vy\fz\b"}' has label value too long: '<bx2049>'\n
+    pulsus 400: stream '{app="<bx2049>", ctl="x\vy\fz\b", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
 --- json/entry-less-stream-over-wide [SAME]
     loki   204: 
     pulsus 204: 
@@ -525,7 +540,7 @@ bodies
     pulsus 204: 
 --- json/case-variant-value-2049 [SAME]
     loki   400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
-    pulsus 400: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'\n
+    pulsus 400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
 --- json/superseded-streams-entries [SAME]
     loki   204: 
     pulsus 204: 
@@ -681,28 +696,28 @@ bodies
     pulsus 204: 
 --- pb/duplicate-distinct [SAME]
     loki   400: stream '{foo="bar", foo="barf", service_name="unknown_service"}' has duplicate label name: 'foo'\n
-    pulsus 400: stream '{foo="bar", foo="barf"}' has duplicate label name: 'foo'\n
+    pulsus 400: stream '{foo="bar", foo="barf", service_name="unknown_service"}' has duplicate label name: 'foo'\n
 --- pb/257-nonempty [SAME]
     loki   400: entry for stream '{n0="v", n1="v", n10="v", n100="v", n101="v", n102="v", n103="v", n104="v", n105="v", n106="v", n107="v", n108="v", n109="v", n11="v", n110="v", n111="v", n112="v", n113="v", n114="v", n115="v", n116="v", n117="v", n118="v", n119="v", n12="v", n120="v", n121="v", n122="v", n123="v", n124="v", n125="v", n126="v", n127="v", n128="v", n129="v", n13="v", n130="v", n131="v", n132="v", n133="v", n134="v", n135="v", n136="v", n137="v", n138="v", n139="v", n14="v", n140="v", n141="v", n142="v", n143="v", n144="v", n145="v", n146="v", n147="v", n148="v", n149="v", n15="v", n150="v", n151="v", n152="v", n153="v", n154="v", n155="v", n156="v", n157="v", n158="v", n159="v", n16="v", n160="v", n161="v", n162="v", n163="v", n164="v", n165="v", n166="v", n167="v", n168="v", n169="v", n17="v", n170="v", n171="v", n172="v", n173="v", n174="v", n175="v", n176="v", n177="v", n178="v", n179="v", n18="v", n180="v", n181="v", n182="v", n183="v", n184="v", n185="v", n186="v", n187="v", n188="v", n189="v", n19="v", n190="v", n191="v", n192="v", n193="v", n194="v", n195="v", n196="v", n197="v", n198="v", n199="v", n2="v", n20="v", n200="v", n201="v", n202="v", n203="v", n204="v", n205="v", n206="v", n207="v", n208="v", n209="v", n21="v", n210="v", n211="v", n212="v", n213="v", n214="v", n215="v", n216="v", n217="v", n218="v", n219="v", n22="v", n220="v", n221="v", n222="v", n223="v", n224="v", n225="v", n226="v", n227="v", n228="v", n229="v", n23="v", n230="v", n231="v", n232="v", n233="v", n234="v", n235="v", n236="v", n237="v", n238="v", n239="v", n24="v", n240="v", n241="v", n242="v", n243="v", n244="v", n245="v", n246="v", n247="v", n248="v", n249="v", n25="v", n250="v", n251="v", n252="v", n253="v", n254="v", n255="v", n256="v", n26="v", n27="v", n28="v", n29="v", n3="v", n30="v", n31="v", n32="v", n33="v", n34="v", n35="v", n36="v", n37="v", n38="v", n39="v", n4="v", n40="v", n41="v", n42="v", n43="v", n44="v", n45="v", n46="v", n47="v", n48="v", n49="v", n5="v", n50="v", n51="v", n52="v", n53="v", n54="v", n55="v", n56="v", n57="v", n58="v", n59="v", n6="v", n60="v", n61="v", n62="v", n63="v", n64="v", n65="v", n66="v", n67="v", n68="v", n69="v", n7="v", n70="v", n71="v", n72="v", n73="v", n74="v", n75="v", n76="v", n77="v", n78="v", n79="v", n8="v", n80="v", n81="v", n82="v", n83="v", n84="v", n85="v", n86="v", n87="v", n88="v", n89="v", n9="v", n90="v", n91="v", n92="v", n93="v", n94="v", n95="v", n96="v", n97="v", n98="v", n99="v", service_name="unknown_service"}' has 257 label names; limit 15\n
     pulsus 400: labels count 257 exceeds the documented limit of 256\n
 --- pb/duplicate-identical [SAME]
     loki   400: stream '{foo="bar", foo="bar", service_name="unknown_service"}' has duplicate label name: 'foo'\n
-    pulsus 400: stream '{foo="bar", foo="bar"}' has duplicate label name: 'foo'\n
+    pulsus 400: stream '{foo="bar", foo="bar", service_name="unknown_service"}' has duplicate label name: 'foo'\n
 --- pb/value-2049 [SAME]
     loki   400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
-    pulsus 400: stream '{app="<bx2049>"}' has label value too long: '<bx2049>'\n
+    pulsus 400: stream '{app="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'\n
 --- pb/16-labels [SAME]
     loki   400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
-    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v"}' has 16 label names; limit 15\n
+    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
 --- pb/count-outranks-duplicate [SAME]
     loki   400: entry for stream '{l0="v", l0="again", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 17 label names; limit 15\n
-    pulsus 400: entry for stream '{l0="v", l0="again", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v"}' has 17 label names; limit 15\n
+    pulsus 400: entry for stream '{l0="v", l0="again", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 17 label names; limit 15\n
 --- pb/value-outranks-later-duplicate [SAME]
     loki   400: stream '{aaa="<cx3000>", service_name="unknown_service", zzz="1", zzz="2"}' has label value too long: '<cx3000>'\n
-    pulsus 400: stream '{aaa="<cx3000>", zzz="1", zzz="2"}' has label value too long: '<cx3000>'\n
+    pulsus 400: stream '{aaa="<cx3000>", service_name="unknown_service", zzz="1", zzz="2"}' has label value too long: '<cx3000>'\n
 --- pb/earlier-duplicate-outranks-value [SAME]
     loki   400: stream '{aaa="1", aaa="2", service_name="unknown_service", zzz="<cx3000>"}' has duplicate label name: 'aaa'\n
-    pulsus 400: stream '{aaa="1", aaa="2", zzz="<cx3000>"}' has duplicate label name: 'aaa'\n
+    pulsus 400: stream '{aaa="1", aaa="2", service_name="unknown_service", zzz="<cx3000>"}' has duplicate label name: 'aaa'\n
 --- pb/repeat-with-empty-copy-is-not-duplicate [SAME]
     loki   204: 
     pulsus 204: 
@@ -711,10 +726,10 @@ bodies
     pulsus 204: 
 --- pb/distinct-duplicate-is-still-a-duplicate [SAME]
     loki   400: stream '{d="one", d="two", service_name="unknown_service"}' has duplicate label name: 'd'\n
-    pulsus 400: stream '{d="one", d="two"}' has duplicate label name: 'd'\n
+    pulsus 400: stream '{d="one", d="two", service_name="unknown_service"}' has duplicate label name: 'd'\n
 --- pb/16-nonempty+241-empty [SAME]
     loki   400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
-    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v"}' has 16 label names; limit 15\n
+    pulsus 400: entry for stream '{l0="v", l1="v", l10="v", l11="v", l12="v", l13="v", l14="v", l15="v", l2="v", l3="v", l4="v", l5="v", l6="v", l7="v", l8="v", l9="v", service_name="unknown_service"}' has 16 label names; limit 15\n
 --- pb/no-streams [SAME]
     loki   422: error at least one valid stream is required for ingestion\n
     pulsus 422: error at least one valid stream is required for ingestion\n
@@ -723,13 +738,13 @@ bodies
     pulsus 204: 
 --- otlp/indexed-value-2049 [SAME]
     loki   400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_pod_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/indexed-value-2048 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/16-indexed [SAME]
     loki   400: �entry for stream '{cloud_availability_zone="v", cloud_region="v", container_name="v", deployment_environment="v", deployment_environment_name="v", k8s_cluster_name="v", k8s_container_name="v", k8s_cronjob_name="v", k8s_daemonset_name="v", k8s_deployment_name="v", k8s_namespace_name="v", k8s_pod_name="v", k8s_replicaset_name="v", k8s_statefulset_name="v", service_instance_id="v", service_name="v", service_namespace="v"}' has 16 label names; limit 15
-    pulsus 400: �entry for stream '{cloud_availability_zone="v", cloud_region="v", container_name="v", deployment_environment="v", deployment_environment_name="v", k8s_cluster_name="v", k8s_container_name="v", k8s_cronjob_name="v", k8s_daemonset_name="v", k8s_deployment_name="v", k8s_namespace_name="v", k8s_pod_name="v", k8s_replicaset_name="v", k8s_statefulset_name="v", service_instance_id="v", service_namespace="v"}' has 16 label names; limit 15
+    pulsus 400: �entry for stream '{cloud_availability_zone="v", cloud_region="v", container_name="v", deployment_environment="v", deployment_environment_name="v", k8s_cluster_name="v", k8s_container_name="v", k8s_cronjob_name="v", k8s_daemonset_name="v", k8s_deployment_name="v", k8s_namespace_name="v", k8s_pod_name="v", k8s_replicaset_name="v", k8s_statefulset_name="v", service_instance_id="v", service_name="v", service_namespace="v"}' has 16 label names; limit 15
 --- otlp/15-indexed [SAME]
     loki   204: 
     pulsus 200: 
@@ -753,10 +768,10 @@ bodies
     pulsus 200: 
 --- otlp/16-indexed+__pattern__ [SAME]
     loki   400: �entry for stream '{cloud_availability_zone="v", cloud_region="v", container_name="v", deployment_environment="v", deployment_environment_name="v", k8s_cluster_name="v", k8s_container_name="v", k8s_cronjob_name="v", k8s_daemonset_name="v", k8s_deployment_name="v", k8s_namespace_name="v", k8s_pod_name="v", k8s_replicaset_name="v", k8s_statefulset_name="v", service_instance_id="v", service_name="v", service_namespace="v"}' has 16 label names; limit 15
-    pulsus 400: �entry for stream '{cloud_availability_zone="v", cloud_region="v", container_name="v", deployment_environment="v", deployment_environment_name="v", k8s_cluster_name="v", k8s_container_name="v", k8s_cronjob_name="v", k8s_daemonset_name="v", k8s_deployment_name="v", k8s_namespace_name="v", k8s_pod_name="v", k8s_replicaset_name="v", k8s_statefulset_name="v", service_instance_id="v", service_namespace="v"}' has 16 label names; limit 15
+    pulsus 400: �entry for stream '{cloud_availability_zone="v", cloud_region="v", container_name="v", deployment_environment="v", deployment_environment_name="v", k8s_cluster_name="v", k8s_container_name="v", k8s_cronjob_name="v", k8s_daemonset_name="v", k8s_deployment_name="v", k8s_namespace_name="v", k8s_pod_name="v", k8s_replicaset_name="v", k8s_statefulset_name="v", service_instance_id="v", service_name="v", service_namespace="v"}' has 16 label names; limit 15
 --- otlp/mixed-good-and-bad-indexed [SAME]
     loki   400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_pod_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/no-resource-logs [SAME]
     loki   422: 9error at least one valid stream is required for ingestion
     pulsus 422: 9error at least one valid stream is required for ingestion
@@ -798,103 +813,103 @@ bodies
     pulsus 200: 
 --- otlp/raw/service.namespace/value-2049 [SAME]
     loki   400: � stream '{service_name="unknown_service", service_namespace="<bx2049>"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{service_namespace="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{service_name="unknown_service", service_namespace="<bx2049>"}' has label value too long: '<bx2049>'
 --- otlp/canonical/service_namespace/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/service.instance.id/value-2049 [SAME]
     loki   400: � stream '{service_instance_id="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{service_instance_id="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{service_instance_id="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/service_instance_id/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/deployment.environment/value-2049 [SAME]
     loki   400: � stream '{deployment_environment="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{deployment_environment="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{deployment_environment="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/deployment_environment/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/deployment.environment.name/value-2049 [SAME]
     loki   400: � stream '{deployment_environment_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{deployment_environment_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{deployment_environment_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/deployment_environment_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/cloud.region/value-2049 [SAME]
     loki   400: � stream '{cloud_region="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{cloud_region="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{cloud_region="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/cloud_region/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/cloud.availability_zone/value-2049 [SAME]
     loki   400: � stream '{cloud_availability_zone="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{cloud_availability_zone="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{cloud_availability_zone="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/cloud_availability_zone/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.cluster.name/value-2049 [SAME]
     loki   400: � stream '{k8s_cluster_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_cluster_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_cluster_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_cluster_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.namespace.name/value-2049 [SAME]
     loki   400: � stream '{k8s_namespace_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_namespace_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_namespace_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_namespace_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.pod.name/value-2049 [SAME]
     loki   400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_pod_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_pod_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.container.name/value-2049 [SAME]
     loki   400: �0stream '{k8s_container_name="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_container_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: �0stream '{k8s_container_name="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_container_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/container.name/value-2049 [SAME]
     loki   400: �0stream '{container_name="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{container_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: �0stream '{container_name="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'
 --- otlp/canonical/container_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.replicaset.name/value-2049 [SAME]
     loki   400: � stream '{k8s_replicaset_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_replicaset_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_replicaset_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_replicaset_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.deployment.name/value-2049 [SAME]
     loki   400: � stream '{k8s_deployment_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_deployment_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_deployment_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_deployment_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.statefulset.name/value-2049 [SAME]
     loki   400: � stream '{k8s_statefulset_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_statefulset_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_statefulset_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_statefulset_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.daemonset.name/value-2049 [SAME]
     loki   400: � stream '{k8s_daemonset_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_daemonset_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_daemonset_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_daemonset_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.cronjob.name/value-2049 [SAME]
     loki   400: � stream '{k8s_cronjob_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_cronjob_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_cronjob_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_cronjob_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
 --- otlp/raw/k8s.job.name/value-2049 [SAME]
     loki   400: �0stream '{k8s_job_name="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_job_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: �0stream '{k8s_job_name="<bx2049>", service_name="<bx2049>"}' has label value too long: '<bx2049>'
 --- otlp/canonical/k8s_job_name/value-2049 [SAME]
     loki   204: 
     pulsus 200: 
@@ -927,7 +942,7 @@ bodies
     pulsus 200: 
 --- otlp/index-key-vs-near-miss/bad-on-index [SAME]
     loki   400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
-    pulsus 400: � stream '{k8s_pod_name="<bx2049>"}' has label value too long: '<bx2049>'
+    pulsus 400: � stream '{k8s_pod_name="<bx2049>", service_name="unknown_service"}' has label value too long: '<bx2049>'
 --- otlp/index-key-vs-near-miss/service_name-bad-on-near-miss [SAME]
     loki   204: 
     pulsus 200: 
@@ -945,7 +960,7 @@ bodies
     pulsus 200: 
 --- otlp/index-key-array-value-long [SAME]
     loki   400: � stream '{k8s_pod_name="[\"<bx2049>\"]", service_name="unknown_service"}' has label value too long: '["<bx2049>"]'
-    pulsus 400: � stream '{k8s_pod_name="[\"<bx2049>\"]"}' has label value too long: '["<bx2049>"]'
+    pulsus 400: � stream '{k8s_pod_name="[\"<bx2049>\"]", service_name="unknown_service"}' has label value too long: '["<bx2049>"]'
 #### end of generated section ####
 
 ====================================================================

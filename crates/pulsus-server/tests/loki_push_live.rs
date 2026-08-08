@@ -1598,9 +1598,9 @@ async fn pushed_stream_appears_in_tail() {
 // `pkg/distributor/distributor.go:1380 @ v3.7.4`. Statuses and message text
 // were captured side by side against the pinned `grafana/loki:3.7.4`
 // container (revision `b318f282`) — 12 JSON cases and 6 protobuf cases, all
-// agreeing on status; the text agrees except for the `service_name` label
-// the reference's own `discover_service_name` injects and PulsusDB does not
-// (a pre-existing difference, no status effect).
+// agreeing on status. The text agrees outright since issue #379: PulsusDB
+// synthesizes the same `service_name` label before validating, so the label
+// set rendered into each message is the reference's own.
 //
 // The response status alone is not the claim being proven here. Before this
 // change the same push answered `204` AND stored the row, so the test reads
@@ -1931,20 +1931,28 @@ async fn wait_for_count(db: &str, sql: &str, want: u64) -> u64 {
     }
 }
 
-/// Issue #374: the bounds this branch introduces do not cover every label it
-/// stores, and this is the case that shows it **at the storage tier**, which
-/// is the only tier that can see it.
+/// Issue #374: the bounds this branch introduces do not cover every label
+/// they store, and issue #379 closed that hole for exactly one name. This is
+/// the case that shows both at the **storage tier**, which is the only tier
+/// that can see either.
 ///
-/// `{service.name: "ok", service_name: <2049 B>}` is accepted by the pinned
-/// oracle (`204`) and by PulsusDB (`200`) — the rejection surface #374 exists
-/// to match does agree, because upstream matches the raw dotted spelling only
-/// (`otlp.go:193`, `otlp_config.go:88-99 @ v3.7.4`) and routes the underscored
-/// one to structured metadata, which no bound reaches. Storage does not agree:
-/// we index every resource attribute (#109), both spellings canonicalize onto
-/// `service_name`, and `from_normalized`'s frozen rule (#4) keeps the greatest
-/// original key — `_` (0x5F) after `.` (0x2E) — so the **unvalidated** value
-/// is the one written, and it is 2049 bytes wide under a label the validator
-/// passed at two. The stream's identity follows it too.
+/// `{k8s.pod.name: "ok", k8s_pod_name: <2049 B>}` is accepted by the pinned
+/// oracle (`204`) and by PulsusDB (`200`) — upstream matches the raw dotted
+/// spelling only (`otlp.go:193`, `otlp_config.go:88-99 @ v3.7.4`) and routes
+/// the underscored one to structured metadata, which no bound reaches.
+/// Storage does not agree: we index every resource attribute (#109), both
+/// spellings canonicalize onto `k8s_pod_name`, and `from_normalized`'s frozen
+/// rule (#4) keeps the greatest original key — `_` (0x5F) after `.` (0x2E) —
+/// so the **unvalidated** value is written under a label the validator passed
+/// at two bytes, and the stream's identity follows it.
+///
+/// The same shape spelled `service.name`/`service_name` no longer behaves that
+/// way (issue #379): that slot is resolved from the raw attributes and written
+/// last, exactly as the reference's map assignment is, so the validated value
+/// wins and the near-miss is not stored at all. Measured on stock
+/// `grafana/loki@sha256:87f0a067…` via `/loki/api/v1/series`:
+/// `{service.name: "ok379", service_name: <2049 B>}` stores
+/// `{service_name="ok379"}`.
 ///
 /// Four rounds of status-only oracle comparison could not see any of this.
 /// The hermetic twin is
@@ -1965,30 +1973,50 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
     let wide = "x".repeat(2049);
     let probe = "otlp-near-miss-374";
 
-    // All three resources carry the same marker attribute, so one query sees
+    // All five resources carry the same marker attribute, so one query sees
     // exactly these streams and the fingerprints are directly comparable.
-    let marker = ("k8s.pod.name", probe.to_string());
+    // `container.name` is the marker rather than `k8s.pod.name`, because the
+    // near-miss half of this test now needs `k8s_pod_name` free — and it is a
+    // discovery name, so it also fixes `service_name` for every resource here
+    // EXCEPT the two that carry `service.name` themselves.
+    let marker = ("container.name", probe.to_string());
     let body = otlp_json_body(
         &[
-            // (a) the validated index name AND its unvalidated near-miss.
+            // (a) the validated index name AND its unvalidated near-miss, on
+            // a name the `service_name` slot does not govern.
             (
                 vec![
                     marker.clone(),
-                    ("service.name", "ok".to_string()),
-                    ("service_name", wide.clone()),
+                    ("k8s.pod.name", "ok".to_string()),
+                    ("k8s_pod_name", wide.clone()),
                 ],
                 "otlp near miss both",
             ),
             // (b) the near-miss alone: the same stored label set as (a).
             (
-                vec![marker.clone(), ("service_name", wide.clone())],
+                vec![marker.clone(), ("k8s_pod_name", wide.clone())],
                 "otlp near miss alone",
             ),
             // (c) the control — only the validated index name, so the value
             // the bound was charged on is the one stored.
             (
-                vec![marker.clone(), ("service.name", "ok".to_string())],
+                vec![marker.clone(), ("k8s.pod.name", "ok".to_string())],
                 "otlp near miss control",
+            ),
+            // (d) the closed case (issue #379): the same shape on
+            // `service_name`, where the slot decides instead.
+            (
+                vec![
+                    marker.clone(),
+                    ("service.name", "svcok".to_string()),
+                    ("service_name", wide.clone()),
+                ],
+                "otlp service name both",
+            ),
+            // (e) its control: the validated spelling alone.
+            (
+                vec![marker.clone(), ("service.name", "svcok".to_string())],
+                "otlp service name control",
             ),
         ],
         base_ns,
@@ -2001,19 +2029,20 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
     );
 
     let of_probe =
-        format!("FROM log_streams WHERE JSONExtractString(labels, 'k8s_pod_name') = '{probe}'");
+        format!("FROM log_streams WHERE JSONExtractString(labels, 'container_name') = '{probe}'");
 
-    // Two streams, not three: (a) and (b) share one fingerprint because the
-    // near-miss won the collapse in both, and (c) is a different stream.
+    // Three streams: (a) and (b) share one fingerprint because the near-miss
+    // won the collapse in both; (c) is a second; (d) and (e) share a third,
+    // because the SLOT decided `service_name` in both.
     assert_eq!(
         wait_for_count(
             db,
             &format!("SELECT count(DISTINCT fingerprint) AS c {of_probe}"),
-            2
+            3
         )
         .await,
-        2,
-        "(a) and (b) must be one stream and (c) another"
+        3,
+        "(a)+(b), (c), and (d)+(e) are three streams"
     );
 
     // The stored label is the 2049-byte value no bound was charged on...
@@ -2022,7 +2051,7 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
             db,
             &format!(
                 "SELECT count() AS c {of_probe} \
-                 AND JSONExtractString(labels, 'service_name') = '{wide}'"
+                 AND JSONExtractString(labels, 'k8s_pod_name') = '{wide}'"
             ),
         )
         .await,
@@ -2031,11 +2060,11 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
     );
     // ...and it is (a)'s stream, not merely (b)'s. This is the assertion that
     // distinguishes the rule: were the collapse to keep the VALIDATED
-    // `service.name` value, (a) would land in the `ok` stream instead and
+    // `k8s.pod.name` value, (a) would land in the `ok` stream instead and
     // every count above would look exactly the same.
     let wide_stream = format!(
         "fingerprint IN (SELECT fingerprint FROM log_streams \
-         WHERE JSONExtractString(labels, 'service_name') = '{wide}')"
+         WHERE JSONExtractString(labels, 'k8s_pod_name') = '{wide}')"
     );
     assert_eq!(
         ch_count(
@@ -2047,7 +2076,7 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
         )
         .await,
         2,
-        "the record pushed WITH the validated `service.name` must be stored \
+        "the record pushed WITH the validated `k8s.pod.name` must be stored \
          under the over-wide label too"
     );
     assert_eq!(
@@ -2056,8 +2085,8 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
             &format!(
                 "SELECT count() AS c FROM log_samples WHERE fingerprint IN \
                  (SELECT fingerprint FROM log_streams \
-                  WHERE JSONExtractString(labels, 'k8s_pod_name') = '{probe}' \
-                  AND JSONExtractString(labels, 'service_name') = 'ok') \
+                  WHERE JSONExtractString(labels, 'container_name') = '{probe}' \
+                  AND JSONExtractString(labels, 'k8s_pod_name') = 'ok') \
                  AND body != 'otlp near miss control'"
             ),
         )
@@ -2071,7 +2100,7 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
             db,
             &format!(
                 "SELECT count() AS c {of_probe} \
-                 AND length(JSONExtractString(labels, 'service_name')) > 2048"
+                 AND length(JSONExtractString(labels, 'k8s_pod_name')) > 2048"
             ),
         )
         .await,
@@ -2085,24 +2114,226 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
             db,
             &format!(
                 "SELECT count() AS c {of_probe} \
-                 AND JSONExtractString(labels, 'service_name') = 'ok'"
+                 AND JSONExtractString(labels, 'k8s_pod_name') = 'ok'"
             ),
         )
         .await,
         1,
         "the control stream stores the validated value"
     );
-    // And all three lines landed: nothing here was refused.
+
+    // Issue #379, the inverted half: NO stored stream carries the over-wide
+    // value under `service_name`, and (d) landed in (e)'s stream — the
+    // validated one — which is the assertion that discriminates the slot rule
+    // from `from_normalized`'s.
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c {of_probe} \
+                 AND length(JSONExtractString(labels, 'service_name')) > 2048"
+            ),
+        )
+        .await,
+        0,
+        "the `service_name` slot is not decided by the unvalidated near-miss"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_samples WHERE fingerprint IN \
+                 (SELECT fingerprint FROM log_streams \
+                  WHERE JSONExtractString(labels, 'container_name') = '{probe}' \
+                  AND JSONExtractString(labels, 'service_name') = 'svcok') \
+                 AND body IN ('otlp service name both', 'otlp service name control')"
+            ),
+        )
+        .await,
+        2,
+        "(d) and (e) are one stream, under the VALIDATED `service.name` value"
+    );
+    // And all five lines landed: nothing here was refused.
     assert_eq!(
         wait_for_count(
             db,
             "SELECT count() AS c FROM log_samples WHERE body IN \
-             ('otlp near miss both', 'otlp near miss alone', 'otlp near miss control')",
-            3,
+             ('otlp near miss both', 'otlp near miss alone', 'otlp near miss control', \
+              'otlp service name both', 'otlp service name control')",
+            5,
         )
         .await,
-        3,
-        "all three records are accepted and stored"
+        5,
+        "all five records are accepted and stored"
+    );
+}
+
+/// Issue #379 AC6: the discovered `service_name` reaches the PHYSICAL
+/// `service` column on both receivers, on both push encodings, and the label
+/// it was discovered from is queryable by LogQL.
+///
+/// This is the assertion behind the read-path claim. `log_samples` is
+/// `ORDER BY (service, fingerprint, timestamp_ns)`
+/// (`crates/pulsus-schema/src/catalog.rs`), and every logs read renders
+/// `PREWHERE service = …` from the values hydrated in stage 2
+/// (`crates/pulsus-read/src/logql/sql.rs`). Before discovery, a push carrying
+/// no explicit `service_name` — and an OTLP resource carrying no
+/// `service.name` — stored `service = ''`, so the leading primary-key column
+/// was a constant and pruned nothing. Without this test, "the PREWHERE now
+/// prunes" would be an unbacked sentence.
+///
+/// Measured on stock `grafana/loki@sha256:87f0a067…` via
+/// `/loki/api/v1/series`: `{app="aa379", name="nn379"}` stores
+/// `{app=…, name=…, service_name="aa379"}`, and an OTLP resource carrying
+/// `container.name` stores `service_name` equal to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_discovered_service_name_reaches_the_service_column_on_both_receivers() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_160;
+    let db = "pulsus_loki_push_service_discovery_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let discovered = "checkout-379";
+    let otlp_discovered = "otlp-379";
+
+    // JSON push: `app` is a discovery name, `name` is a later one, so the
+    // stored `service_name` is `app`'s value — list order, not wire order.
+    let json_line = "discovery json line";
+    let res = push(
+        port,
+        "application/json",
+        format!(
+            r#"{{"streams":[{{"stream":{{"name":"nn-379","app":"{discovered}"}},"values":[["{base_ns}","{json_line}"]]}}]}}"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(res.status, 204, "json push (body: {})", res.body);
+
+    // Protobuf push: the same stream shape through the other encoding, with
+    // the two labels in the reverse wire order — the discovered value is the
+    // same, because the DISCOVERY LIST decides on this transport, not the
+    // wire.
+    let pb_line = "discovery protobuf line";
+    let pb_ns = base_ns + 1;
+    let req = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: format!(r#"{{app="{discovered}", name="nn-379"}}"#),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: pb_ns / 1_000_000_000,
+                    nanos: (pb_ns % 1_000_000_000) as i32,
+                }),
+                line: pb_line.to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        }],
+    };
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &snap::raw::Encoder::new()
+            .compress_vec(&req.encode_to_vec())
+            .expect("snappy compress"),
+    );
+    assert_eq!(res.status, 204, "protobuf push (body: {})", res.body);
+
+    // OTLP: `container.name` is both an index attribute and a discovery name.
+    let otlp_line = "discovery otlp line";
+    let res = otlp_push(
+        port,
+        &otlp_json_body(
+            &[(
+                vec![("container.name", otlp_discovered.to_string())],
+                otlp_line,
+            )],
+            base_ns + 2,
+        ),
+    );
+    assert_eq!(res.status, 200, "otlp push (body: {})", res.body);
+
+    // Both push encodings land in ONE stream (same labels, same identity),
+    // and its physical `service` column carries the discovered value.
+    assert_eq!(
+        wait_for_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_samples WHERE service = '{discovered}' \
+                 AND body IN ('{json_line}', '{pb_line}')"
+            ),
+            2,
+        )
+        .await,
+        2,
+        "log_samples.service must carry the discovered value on both encodings"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count(DISTINCT fingerprint) AS c FROM log_streams \
+                 WHERE service = '{discovered}' \
+                 AND JSONExtractString(labels, 'service_name') = '{discovered}' \
+                 AND JSONExtractString(labels, 'app') = '{discovered}' \
+                 AND JSONExtractString(labels, 'name') = 'nn-379'"
+            ),
+        )
+        .await,
+        1,
+        "log_streams.service and the stored labels JSON both carry it, in one stream"
+    );
+
+    // The OTLP resource likewise, through its own (different) algorithm.
+    assert_eq!(
+        wait_for_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_samples WHERE service = '{otlp_discovered}' \
+                 AND body = '{otlp_line}'"
+            ),
+            1,
+        )
+        .await,
+        1,
+        "log_samples.service must carry the OTLP-discovered value"
+    );
+    assert_eq!(
+        ch_count(
+            db,
+            &format!(
+                "SELECT count() AS c FROM log_streams WHERE service = '{otlp_discovered}' \
+                 AND JSONExtractString(labels, 'service_name') = '{otlp_discovered}' \
+                 AND JSONExtractString(labels, 'container_name') = '{otlp_discovered}'"
+            ),
+        )
+        .await,
+        1,
+        "log_streams.service and the stored labels JSON both carry it"
+    );
+
+    // And the synthesized label is a real selector: a LogQL query the client
+    // never had labels for now returns the pushed lines.
+    let lines = wait_for_line(port, discovered, base_ns, json_line);
+    assert!(
+        lines.contains(&pb_line.to_string()),
+        "{{service_name=\"{discovered}\"}} must return both encodings' lines: {lines:?}"
+    );
+    let labels = labels_of_stream_carrying(port, "/api/logs/v1", discovered, base_ns, json_line);
+    assert_eq!(
+        labels,
+        [
+            ("app", discovered),
+            ("name", "nn-379"),
+            ("service_name", discovered)
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect::<std::collections::BTreeMap<String, String>>(),
+        "the queried stream carries the discovered label alongside the pushed ones"
     );
 }
 
