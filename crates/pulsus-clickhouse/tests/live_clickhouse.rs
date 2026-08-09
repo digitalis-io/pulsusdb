@@ -140,6 +140,87 @@ async fn insert_block_then_query_stream_round_trips_rows() {
     assert!(got[1].fingerprint > (1u64 << 63));
 }
 
+/// Issue #382: a server exception raised after the query has already
+/// written output must still classify by its numeric code, so a scan
+/// budget stays a 422 `query_too_broad` and never becomes a 500.
+///
+/// The query and settings are the exact shape measured to produce the
+/// defect: a compressible projection with the default response buffering,
+/// so ClickHouse writes the `RowBinaryWithNamesAndTypes` column header,
+/// then trips `max_result_bytes` and emits the exception into the same
+/// (compressed) response. `randomPrintableASCII` padding does NOT
+/// reproduce it — an incompressible payload takes the crate's streaming
+/// extractor instead, which re-anchors the message at `Code:`
+/// (`extract_exception_old`, `response.rs:368-377` @ clickhouse 0.15.1)
+/// and so hides the defect.
+///
+/// **What this gate proves depends on the server it runs against**, and
+/// that is deliberate rather than papered over:
+///
+/// - On **26.3.17.110** it is the regression gate. The server keeps the
+///   already-written output, the crate returns the whole body
+///   (`collect_bad_response`, `response.rs:127-163`), the message is
+///   `\u{1}\u{1}v\u{6}StringCode: 396. …`, and the pre-#382
+///   `strip_prefix("Code: ")` read fails it with `code: 0`.
+/// - On **24.8.14.39** — the version this suite's CI step runs — it is a
+///   pin only: that server discards its not-yet-flushed output buffer
+///   when it turns the response into an error, so the message begins at
+///   `Code:` and the pre-#382 read passes too. Named as a pin, not
+///   counted as a gate. The hermetic discriminating cases live in
+///   `pulsus_clickhouse::error`'s
+///   `a_code_that_arrives_after_output_has_been_written_parses`, on the
+///   verbatim 26.3 bodies.
+///
+/// Read-only against `numbers()`, so this suite's existing CI step (which
+/// runs against the bare image's `default` database) needs no new fixture
+/// and no new step.
+#[tokio::test]
+async fn a_result_limit_tripped_after_output_has_been_written_carries_its_code() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct OneCol {
+        v: String,
+    }
+
+    let mut stream = client
+        .query_stream::<OneCol>(
+            "SELECT toString(number) AS v FROM numbers(100000000)",
+            &QuerySettings::new()
+                .set("max_result_bytes", 1_000_000u64)
+                .set("result_overflow_mode", "throw"),
+        )
+        .await
+        .expect("query_stream");
+
+    use futures::StreamExt;
+    let mut failure = None;
+    while let Some(item) = stream.next().await {
+        if let Err(e) = item {
+            failure = Some(e);
+            break;
+        }
+    }
+
+    let err = failure.expect("the result-byte limit must trip");
+    match err {
+        ChError::Server { code, message } => {
+            assert_eq!(
+                code, 396,
+                "TOO_MANY_ROWS_OR_BYTES must classify by code, not fall back to 0 \
+                 (message: {message:?})"
+            );
+            assert!(
+                message.contains("TOO_MANY_ROWS_OR_BYTES"),
+                "the body must be the result-limit exception, not some other \
+                 failure that happens to carry a code: {message:?}"
+            );
+        }
+        other => panic!("expected ChError::Server, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn query_stream_lease_is_released_on_drop_before_exhaustion() {
     skip_unless_live!();

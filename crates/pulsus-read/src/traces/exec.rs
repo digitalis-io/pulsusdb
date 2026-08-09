@@ -2698,6 +2698,49 @@ mod tests {
         }
     }
 
+    /// Issue #382, the user-visible defect: the three tests above hand
+    /// `map_trace_read_error` a `ChError::Server` they built themselves, so
+    /// none of them can see how the code is READ off the wire — and that is
+    /// where the defect was. These bodies are the verbatim messages the
+    /// `clickhouse` crate handed this client when ClickHouse 26.3.17.110
+    /// raised the limit AFTER it had already written output (`SELECT
+    /// toString(number) AS v FROM numbers(100000000)` with
+    /// `max_result_bytes=1000000, result_overflow_mode=throw` for 396 and
+    /// `max_bytes_to_read=1100000` for 307); the leading
+    /// `RowBinaryWithNamesAndTypes` column header is what defeated the old
+    /// `strip_prefix("Code: ")` read, leaving code `0` and a 500 `internal`
+    /// where the client should have been told 422 `query_too_broad`.
+    ///
+    /// 307 is here because 396 is not the only affected arm — every code in
+    /// this mapper reaches it through the same single parse.
+    #[test]
+    fn a_limit_raised_after_output_was_written_still_maps_to_its_byte_budget() {
+        let body_396 = "\u{1}\u{1}v\u{6}StringCode: 396. DB::Exception: Limit for result \
+                        exceeded, max bytes: 976.56 KiB, current bytes: 1.64 MiB. \
+                        (TOO_MANY_ROWS_OR_BYTES) (version 26.3.17.110 (official build))";
+        let body_307 = "\u{1}\u{1}v\u{6}StringCode: 307. DB::Exception: Limit for rows or bytes \
+                        to read exceeded, max bytes: 1.05 MiB, current bytes: 1.50 MiB: While \
+                        executing NumbersRange. (TOO_MANY_BYTES) (version 26.3.17.110 (official \
+                        build))";
+        for (body, expected) in [
+            (body_396, TRACE_MAX_RESULT_BYTES),
+            (body_307, TRACE_READ_BYTES_BUDGET),
+        ] {
+            assert_eq!(
+                body.strip_prefix("Code: "),
+                None,
+                "the defect's precondition: the code is not at byte 0"
+            );
+            let e = ChError::from(clickhouse::error::Error::BadResponse(body.to_string()));
+            match map_trace_read_error(e, &cfg()) {
+                ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes {
+                    budget_bytes, ..
+                }) => assert_eq!(budget_bytes, expected),
+                other => panic!("expected ScanBudgetBytes, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn code_191_maps_to_the_metrics_set_budget_on_the_metrics_path_only() {
         let e = || ChError::Server {

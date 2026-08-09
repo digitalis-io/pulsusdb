@@ -3542,6 +3542,37 @@ mod tests {
         }
     }
 
+    /// Issue #382. `code_307_maps_to_scan_budget_bytes` above hands the
+    /// mapper a `ChError::Server` it built itself, so it cannot see how the
+    /// code is READ off the wire — and that is where the defect was. This
+    /// one starts from the `BadResponse` the `clickhouse` crate actually
+    /// hands us when the server raised 307 AFTER it had already written
+    /// output: the body is the verbatim message measured through
+    /// `pulsus-clickhouse`'s client against ClickHouse 26.3.17.110
+    /// (`SELECT toString(number) AS v FROM numbers(100000000)` with
+    /// `max_bytes_to_read=1100000`), whose `RowBinaryWithNamesAndTypes`
+    /// column header precedes the exception. Before #382 the code read as
+    /// `0` and the user got a 500 `internal` instead of the 422
+    /// `query_too_broad` that tells them to narrow the query.
+    #[test]
+    fn a_307_raised_after_output_was_written_still_maps_to_scan_budget_bytes() {
+        let body = "\u{1}\u{1}v\u{6}StringCode: 307. DB::Exception: Limit for rows or bytes to \
+                    read exceeded, max bytes: 1.05 MiB, current bytes: 1.50 MiB: While executing \
+                    NumbersRange. (TOO_MANY_BYTES) (version 26.3.17.110 (official build))";
+        assert_eq!(
+            body.strip_prefix("Code: "),
+            None,
+            "the defect's precondition: the code is not at byte 0"
+        );
+        let e = ChError::from(clickhouse::error::Error::BadResponse(body.to_string()));
+        match map_read_error(e, 1024) {
+            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, 1024);
+            }
+            other => panic!("expected QueryTooBroad(ScanBudgetBytes), got {other:?}"),
+        }
+    }
+
     #[test]
     fn code_158_is_not_mapped_to_query_too_broad() {
         let e = ChError::Server {
