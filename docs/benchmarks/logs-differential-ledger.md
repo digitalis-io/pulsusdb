@@ -169,6 +169,138 @@ Out of this ledger's scope by design:
 
 ## Entries
 
+### detected-labels-window-scoped-to-rollup-bucket (issue #399)
+
+- **Construct:** the time bound on the four log **discovery** endpoints —
+  `/detected_labels`, `/labels`, `/label/{name}/values`, `/series`. All
+  four scan `log_streams_idx`, which carries no time column at all
+  (`month Date, key, val, fingerprint` —
+  `crates/pulsus-schema/src/catalog.rs:224-238`), so before #399 the only
+  bound any of them applied was the calendar `month`. A one-hour request
+  was answered from the whole month containing it. Informational note,
+  not a gate downgrade.
+- **Direction:** **PulsusDB is now strictly TIGHTER than the reference on
+  three of the four, and matches its intent on the fourth.** The bound is
+  a semi-join against the log rollup — `fingerprint IN (SELECT DISTINCT
+  fingerprint FROM log_metrics_<res> WHERE bucket_ns >= <floor(start)> AND
+  bucket_ns <= <end>)` — whose lower edge is the rollup bucket
+  **containing** `start`, because the MV stores `bucket_ns =
+  intDiv(timestamp_ns, res) * res`. So ours over-includes by at most one
+  rollup resolution (5s at the default `PULSUS_LOG_ROLLUP_RESOLUTION`) at
+  each edge, and can never drop a stream with a line in the window.
+
+- **The reference is not uniform across the four, and that asymmetry is
+  the reason all four moved together here rather than one at a time.**
+  Read at `grafana/loki` v3.7.4 =
+  `b318f2829f0ae2094ab3a1e90780450e9e4b03be`:
+  - `TSDBIndex.LabelNames` and `TSDBIndex.LabelValues` **ignore
+    `from`/`through` entirely** — the parameters are literally `_, _
+    model.Time` in both signatures
+    (`pkg/storage/stores/shipper/indexshipper/tsdb/single_file_index.go:304`,
+    `:312`). What bounds them is which index FILES overlap the window,
+    selected by `forMatchingIndices`
+    (`multi_file_index.go:115-132`, `:247-289`), i.e. the index period —
+    24h in the probe below.
+  - `TSDBIndex.Series` **is** window-bounded, and finely: it passes
+    `from`/`through` down to `i.reader.Series(...)` and drops any series
+    whose `chks` came back empty (`single_file_index.go:282-302`), i.e.
+    chunk-granular.
+- **Measured, not inferred** (`grafana/loki:3.7.4`, tsdb/v13, filesystem
+  store, index period 24h; `/flush` + restart so the ingester is empty and
+  exactly one index file exists; three streams with single lines at T−6h,
+  T−1h and T−5m):
+  - `/detected_labels` over `[T−2h, T−1h]` returned a label whose only
+    line sat ~5h outside that window; over the **previous day** it
+    returned `[]` — so the bound is real but index-file-granular.
+  - `[T−7h, T−5h]` (store-only, outside `query_ingesters_within`=3h,
+    containing only the T−6h stream): `/labels` returned all three
+    streams' keys and `/label/job/values` both values, while `/series`
+    returned **exactly the one stream**.
+- **What PulsusDB answers on the same fixture shape:** all four return
+  only what the window contains, bucket-granular. The endpoint where the
+  reference is closest to us is `/series`; the three others are where we
+  are tighter.
+
+- **Two bounded consequences, both accepted:**
+  1. **Bucket quantization at a month boundary.** With `start` within one
+     bucket of a month start, the floored lower bound can name a bucket in
+     the previous month, whose index rows the outer `month` predicate then
+     still excludes. Bounded by one rollup resolution and strictly
+     narrower than the whole-month error it replaces. `months_overlapping`
+     is deliberately NOT widened.
+  2. **Rollup-table rename exposure.** `PULSUS_LOG_ROLLUP_RESOLUTION`
+     names the table (`catalog.rs` id 9, `MigrationScope::ConfigName`), so
+     after a resolution change the old table is orphaned and pre-change
+     activity is invisible to these endpoints. This is the exposure
+     `/stats` and `/volume` already carry (`sql::log_stats_rollup`,
+     `sql::log_volume_rollup` read only the configured name) —
+     pre-existing and consistent, not newly introduced by #399. No
+     multi-table fallback is built.
+
+#### Cost
+
+The correctness fix is not free, and the number is recorded here rather
+than as a ratio so the deferred activity-index decision (routed to **#25**
+by the issue #399 rulings) re-opens on arithmetic instead of projection.
+
+**Architect's fixture, the measurement the ruling deferred against**
+(2,000 streams each emitting into every 5s bucket for a full day =
+34,560,000 rollup rows/day, 206.58 MiB on disk/day; 6,009
+`log_streams_idx` rows across 3 keys; request window 10 minutes;
+ClickHouse 24.8.14.39, single node, `system.query_log`, mean of 3):
+
+| query | read rows | read bytes | ms |
+|---|---|---|---|
+| pre-#399 (wrong) aggregation — index only | 6,009 | 134.29 KiB | 11 |
+| fixed aggregation, **unscoped** | 29,086,663 | 287.45 MiB | 70 |
+| the activity subquery alone, **unscoped** | 29,080,654 | 287.27 MiB | 50 |
+| the activity subquery alone, **scoped to 5 fingerprints** | 73,728 | 1.13 MiB | 2 |
+| the activity subquery, unscoped, corpus **doubled** to two days (69,120,006 rows) | 29,080,654 | 287.27 MiB | 59 |
+
+**Independently reproduced during implementation** on the same shape
+(2,000 streams × 17,280 5s buckets = 34,560,000 rows/day, 80.88 MiB on
+disk/day across 12 parts; 6,000 `log_streams_idx` rows across 3 keys;
+10-minute window; ClickHouse 24.8.14.39; three runs each, range shown):
+
+| query | read rows | read bytes | ms |
+|---|---|---|---|
+| pre-#399 (wrong) aggregation — index only | 6,000 | 134.15 KiB | 14–21 |
+| fixed aggregation, **unscoped** | 25,808,136 | 261.96 MiB | 244–477 |
+| the activity subquery alone, **unscoped** | 25,802,136 | 261.78 MiB | 231–529 |
+| the activity subquery alone, **scoped to 5 fingerprints** | 65,536 | 1.00 MiB | 6–18 |
+| the activity subquery, unscoped, corpus **doubled** to two days (69,120,000 rows) | 25,802,136 | 261.78 MiB | 75–90 |
+
+Both runs agree on the four things that decide the deferral:
+
+1. **The unscoped path costs hundreds of MiB per request on a
+   2,000-hot-stream day** — a ~4,300× read amplification in rows over the
+   pre-#399 wrong answer. Well inside the 50 GiB
+   `logql_scan_budget_bytes` default; not free, and not called free.
+2. **Cost scales with the window's DAYS, not with retention.** Doubling
+   the corpus left the read byte-identical (25,802,136 rows / 261.78 MiB
+   in the reproduction), because `bucket_ns` is the partition key's only
+   input column: measured `EXPLAIN indexes = 1` shows `MinMax … Parts:
+   1/8, Granules: 3258/8440`, then `PrimaryKey … Granules: 3150/3258`.
+   The absolute law is `rows read ≈ active_streams × (86400/res) ×
+   days_touched`, and it falls proportionally with a coarser
+   `PULSUS_LOG_ROLLUP_RESOLUTION`.
+3. **Pushing a stage-1 fingerprint list INTO the subquery is worth ~394×**
+   (65,536 vs 25,802,136 rows; the architect measured ~395× on the same
+   shape). That is what makes `/series` — always scoped by `match[]` — and
+   `detected_labels?query=` cheap.
+4. **The expensive cases are exactly the three unscoped ones.** `/labels`
+   and `/label/{name}/values` accept no `query=` narrowing in our
+   implementation (deferred M1 scope, `sql.rs`) while the reference's do
+   (`pkg/querier/querier.go:706-737` passes `matchers` to both store
+   calls), so those two sit **permanently** on the unscoped path;
+   unscoped `detected_labels` joins them. A day-granular activity index
+   would take that scan from ~26M rows to ~2,000. Deferred per the issue
+   #399 rulings; re-open against these tables, not against a projection.
+
+`DISTINCT` on the `(fingerprint, bucket_ns)` PK prefix is a streaming
+distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
+`IN` set is O(active streams), not O(streams × buckets).
+
 ### detected-cardinality-exact-not-estimated (issues #244, #261)
 
 - **Construct:** two endpoints' `cardinality`, one estimator.

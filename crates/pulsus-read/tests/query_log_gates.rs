@@ -537,6 +537,7 @@ fn engine_config(db: &str, scan_budget_bytes: u64) -> EngineConfig {
         scan_budget_bytes,
         max_streams: 100_000,
         pipeline_scan_factor: 10,
+        distributed: false,
     }
 }
 
@@ -1034,8 +1035,45 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
     // reference could not report exactly.
     const LOW: u64 = 100;
     const HIGH: u64 = 7_708;
+    // Issue #399: the aggregation is now bounded by the requested window
+    // as well as the month, via a semi-join over the log rollup. This
+    // fixture seeds `log_streams_idx` directly (never `log_samples`, so
+    // the rollup MV never fires), so it must seed the activity rows too —
+    // otherwise every case returns zero rows and the fan-in identity
+    // below becomes vacuously true. The window per case is the month
+    // itself, keeping the #261 property exactly as it was measured.
+    let month_window = |month: &str| -> (i64, i64) {
+        // `'YYYY-MM-01'` (quoted) → the month's [start, start + 28d] in ns.
+        let date = month.trim_matches('\'');
+        let y: i64 = date[0..4].parse().expect("year");
+        let m: i64 = date[5..7].parse().expect("month");
+        // Days from the Unix epoch to `y-m-01`, civil-calendar algorithm
+        // (Howard Hinnant's `days_from_civil`) — no chrono dependency in
+        // this suite.
+        let yy = if m <= 2 { y - 1 } else { y };
+        let era = yy.div_euclid(400);
+        let yoe = yy - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        let start = days * 86_400 * 1_000_000_000;
+        (start, start + 28 * 86_400 * 1_000_000_000)
+    };
     let cases = [("'2026-06-01'", LOW), ("'2026-07-01'", HIGH)];
     for (month, n) in cases {
+        let (start_ns, _) = month_window(month);
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_metrics_5s (fingerprint, bucket_ns, count, bytes) \
+                     SELECT number, {start_ns} + 5000000000, 1, 10 FROM numbers({n})"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed rollup activity");
         client
             .execute(
                 &format!(
@@ -1071,8 +1109,15 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
 
     let mut fan_in = Vec::new();
     for (i, (month, n)) in cases.iter().enumerate() {
-        let sql =
-            sql::detected_labels(&format!("{db}.log_streams_idx"), &[month.to_string()], None);
+        let (start_ns, end_ns) = month_window(month);
+        let sql = sql::detected_labels(
+            &format!("{db}.log_streams_idx"),
+            &[month.to_string()],
+            None,
+            &format!("{db}.log_metrics_5s"),
+            sql::TimeWindow { start_ns, end_ns },
+            5_000_000_000,
+        );
         let query_id = format!("qlg-detected-labels-fanin-{i}");
         // The UUID predicate carries literal `?`s, which the clickhouse
         // crate would read as bind placeholders — production doubles them

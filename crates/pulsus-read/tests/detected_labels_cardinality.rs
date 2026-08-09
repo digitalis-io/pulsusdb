@@ -768,6 +768,12 @@ fn the_detected_labels_aggregate_is_still_an_exact_count() {
             "log_streams_idx",
             &["'2026-08-01'".to_string()],
             fingerprints,
+            "log_metrics_5s",
+            sql::TimeWindow {
+                start_ns: 1_754_000_000_000_000_000,
+                end_ns: 1_754_003_600_000_000_000,
+            },
+            5_000_000_000,
         );
         assert!(
             rendered.contains("uniqExact(val) AS cardinality"),
