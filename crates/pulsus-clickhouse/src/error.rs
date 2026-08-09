@@ -417,9 +417,19 @@ mod tests {
     ///   http://localhost:8123/
     /// ```
     ///
-    /// **2. Same expression in a `WHERE`** — the rows are filtered out, so
-    /// nothing is ever written. HTTP 500 with `X-ClickHouse-Exception-Code:
-    /// 153`, 490-byte body, code at byte 0.
+    /// **2. Same expression in a `WHERE`** — the output never leaves
+    /// ClickHouse's response buffer. HTTP 500 with
+    /// `X-ClickHouse-Exception-Code: 153`, 490-byte body, parsed code 153 at
+    /// byte 0.
+    ///
+    /// Not because the predicate filters the rows away, which is the
+    /// plausible-sounding reason and the wrong one: `match()` here matches
+    /// **every** row, since the pattern's `|.*` alternative does
+    /// (`SELECT count() FROM numbers(1000) WHERE match(…)` returns 1000). It
+    /// is `notEquals(intDiv(1, number - 400000), 0)` that admits exactly one
+    /// row below the trip — `number = 399999`, where `intDiv(1, -1) = -1`;
+    /// every smaller `number` gives `0`. One row is ~7 bytes, so the response
+    /// stays buffered and the server can still discard it and set a status.
     ///
     /// ```text
     /// curl --data-binary "SELECT toString(number) AS v FROM numbers(100000000)
@@ -429,8 +439,9 @@ mod tests {
     /// ```
     ///
     /// **3. SELECT list but tripping at row 2,000** — the output never leaves
-    /// ClickHouse's response buffer. HTTP 500 with the header, 486-byte body,
-    /// code at byte 0.
+    /// ClickHouse's response buffer either, this time because 2,000 rows is
+    /// far below it. HTTP 500 with the header, 486-byte body, parsed code 153
+    /// at byte 0.
     ///
     /// ```text
     /// curl --data-binary "SELECT concat(toString(number), toString(and(
