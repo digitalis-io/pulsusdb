@@ -145,8 +145,12 @@ fn json_targeted_extraction_follows_paths_and_missing_paths_render_empty() {
     );
 }
 
+/// Renamed by issue #389 part B: the answer is the document's own bytes,
+/// which for THIS line happens to look like compact JSON because the
+/// line has no inner whitespace and no duplicate key. The name used to
+/// assert the rendering we have now removed.
 #[test]
-fn json_extraction_landing_on_an_object_renders_compact_json() {
+fn json_extraction_landing_on_an_object_hands_back_its_bytes() {
     let (got, _) = run(
         r#"{a="b"} | json hdr="req.hdr""#,
         r#"{"req":{"hdr":{"a":"1"}}}"#,
@@ -159,6 +163,265 @@ fn json_extraction_landing_on_an_object_renders_compact_json() {
             ("env", "prod"),
             ("hdr", r#"{"a":"1"}"#),
         ])
+    );
+}
+
+// --- issue #389 part A: the scan stops at the end of the first value ---
+//
+// `serde_json::from_str` demands end-of-input after the value; the
+// reference's scanner simply stops (`jsonparser.ObjectEach` returns the
+// moment it reaches the closing brace,
+// `vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160 @
+// v3.7.4`). ONE call, THREE entrypoints — `| json`, `| json a="…"` and
+// `| unpack` — so each gets its own case.
+
+#[test]
+fn json_flatten_ignores_bytes_after_the_first_value() {
+    for (line, want) in [
+        (r#"{"a":1}trailing"#, vec![("a", "1")]),
+        // Only the FIRST value is read: `b` is never seen.
+        (r#"{"a":1}{"b":2}"#, vec![("a", "1")]),
+        (r#"{"a":1,"o":{"x":2}}junk"#, vec![("a", "1"), ("o_x", "2")]),
+        // Rules out a "truncate at the last/first `}`" hack: the brace
+        // here is INSIDE a string.
+        (r#"{"a":"}x"}trailing"#, vec![("a", "}x")]),
+    ] {
+        let (got, kept) = run(r#"{a="b"} | json"#, line).unwrap();
+        let mut want: Vec<(&str, &str)> = want;
+        want.extend([("app", "checkout"), ("env", "prod")]);
+        assert_eq!(got, labels(&want), "line {line:?}");
+        assert_eq!(kept, line, "parsers never rewrite the line");
+    }
+}
+
+#[test]
+fn json_expression_ignores_bytes_after_the_first_value() {
+    for line in [
+        r#"{"a":1}trailing"#,
+        r#"{"a":1}{"b":2}"#,
+        // The first occurrence wins, and the second value is not read.
+        r#"{"a":1,"a":2}zz"#,
+    ] {
+        let (got, _) = run(r#"{a="b"} | json a="a""#, line).unwrap();
+        assert_eq!(
+            got,
+            labels(&[("app", "checkout"), ("env", "prod"), ("a", "1")]),
+            "line {line:?}"
+        );
+    }
+}
+
+#[test]
+fn unpack_ignores_bytes_after_the_first_value() {
+    let (got, line) = run(
+        r#"{a="b"} | unpack"#,
+        r#"{"_entry":"hi","lbl":"v"}trailing"#,
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("lbl", "v")])
+    );
+    assert_eq!(line, "hi");
+}
+
+/// `JSONExpressionParser.Process` gates on `len(line) == 0` and then on
+/// `isValidJSONStart(line)` — ONE raw byte, whitespace NOT skipped
+/// (`pkg/logql/log/parser.go:664-670,726-732 @ v3.7.4`). Everything past
+/// that gate is a non-validating scan whose misses are the missing-path
+/// fill, so a line that does not parse still answers `a=""` with no
+/// error. We used to route this arm through the flatten arm's
+/// "must parse to an object" test, which is wrong in both directions.
+#[test]
+fn json_expression_gates_on_the_first_byte_only() {
+    // `addErrLabel(errJSON, nil, lbs)`: the error, and NO details.
+    for line in [r#" {"a":1}"#, "\t{\"a\":1}", r#"x{"a":1}"#] {
+        let (got, _) = run(r#"{a="b"} | json a="a""#, line).unwrap();
+        assert_eq!(
+            got,
+            labels(&[
+                ("app", "checkout"),
+                ("env", "prod"),
+                ("__error__", "JSONParserErr"),
+            ]),
+            "line {line:?}"
+        );
+    }
+    // An empty line writes NOTHING — not the fill, not an error.
+    let (got, _) = run(r#"{a="b"} | json a="a""#, "").unwrap();
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+    // Past the gate, a miss is the fill: `a=""` and no error.
+    for line in [r#"[1,2]junk"#, r#""hello"trailing"#, "{garbage", r#"{"a"}"#] {
+        let (got, _) = run(r#"{a="b"} | json a="a""#, line).unwrap();
+        assert_eq!(
+            got,
+            labels(&[("app", "checkout"), ("env", "prod"), ("a", "")]),
+            "line {line:?}"
+        );
+    }
+}
+
+/// `UnpackParser.Process`'s own gate (`parser.go:753-762 @ v3.7.4`): an
+/// empty line returns silently, and the object test is `line[0] != '{'`.
+#[test]
+fn unpack_gates_on_the_first_byte_only() {
+    let (got, line) = run(r#"{a="b"} | unpack"#, "").unwrap();
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+    assert_eq!(line, "");
+
+    let (got, line) = run(r#"{a="b"} | unpack"#, r#" {"a":"1"}"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("__error__", "JSONParserErr"),
+            (
+                "__error_details__",
+                "Value looks like object, but can't find closing '}' symbol",
+            ),
+        ])
+    );
+    assert_eq!(line, r#" {"a":"1"}"#);
+}
+
+// --- issue #389 part B: a container extraction hands back the bytes ---
+
+/// `case jsonparser.Object: lbs.Set(ParsedLabel, key, string(data))`
+/// (`pkg/logql/log/parser.go:700-706 @ v3.7.4`) — the value's own slice
+/// out of the line. Key order, inner whitespace, duplicate keys and the
+/// spelling of an escape all survive; we used to re-render a parsed
+/// value and lose every one of them.
+#[test]
+fn json_extraction_hands_back_the_document_bytes() {
+    for (line, want) in [
+        (r#"{"o":{"b":1,  "a":2},"k":3}"#, r#"{"b":1,  "a":2}"#),
+        ("{\"o\":{\"a\":\t1,\n\"b\":2}}", "{\"a\":\t1,\n\"b\":2}"),
+        (r#"{ "a" : 1 , "o" : { "z" : 1 } }"#, r#"{ "z" : 1 }"#),
+        (r#"{"o":{"a":1,"a":2},"k":3}"#, r#"{"a":1,"a":2}"#),
+        (r#"{"o":{"k":"a\u0041b"},"k":3}"#, r#"{"k":"a\u0041b"}"#),
+        (r#"{"o":{"k":"\u00e9"},"k":3}"#, r#"{"k":"\u00e9"}"#),
+        (r#"{"o":{"p":"a\/b"}}"#, r#"{"p":"a\/b"}"#),
+    ] {
+        let (got, _) = run(r#"{a="b"} | json o="o""#, line).unwrap();
+        assert_eq!(
+            got,
+            labels(&[("app", "checkout"), ("env", "prod"), ("o", want)]),
+            "line {line:?}"
+        );
+    }
+}
+
+/// An ARRAY does not take the object arm: it falls to
+/// `default: unescapeJSONString(data)` (`parser.go:700-706 @ v3.7.4`),
+/// which is `jsonparser.Unescape` over the whole span
+/// (`vendor/github.com/grafana/jsonparser/escape.go:130-171`) followed by
+/// U+FFFD → space (`parser.go:44-49,278-281`). So the span's whitespace
+/// survives while its escapes do not.
+#[test]
+fn json_extraction_of_an_array_unescapes_the_span() {
+    for (line, want) in [
+        (r#"{"o":[3,  1,2],"k":3}"#, r#"[3,  1,2]"#),
+        ("{\"o\":[1,\n2],\"k\":3}", "[1,\n2]"),
+        (r#"{"o":["a\"b",  "c"],"k":3}"#, r#"["a"b",  "c"]"#),
+        (r#"{"o":["a\u0041b"],"k":3}"#, r#"["aAb"]"#),
+        ("{\"o\":[\"x\u{FFFD}y\"]}", "[\"x y\"]"),
+    ] {
+        let (got, _) = run(r#"{a="b"} | json o="o""#, line).unwrap();
+        assert_eq!(
+            got,
+            labels(&[("app", "checkout"), ("env", "prod"), ("o", want)]),
+            "line {line:?}"
+        );
+    }
+}
+
+/// **The discriminator.** Two rows that a plausible-but-wrong fix passes
+/// the rest of this file with.
+///
+/// Turning on `serde_json`'s `preserve_order` feature (or any other
+/// order-preserving RE-SERIALISE) makes the key order right —
+/// `{"b":1,"a":2}` — and still collapses the two spaces to one comma and
+/// still unescapes `A` to `A`. Only handing back the bytes passes
+/// both rows. The third row rules out the other cheap fix, for part A:
+/// any "truncate at a brace" or brace-counting-outside-strings hack
+/// answers something other than `}x`.
+#[test]
+fn a_key_order_fix_alone_does_not_pass() {
+    let (got, _) = run(r#"{a="b"} | json o="o""#, r#"{"o":{"b":1,  "a":2}}"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("o", r#"{"b":1,  "a":2}"#),
+        ])
+    );
+
+    let (got, _) = run(r#"{a="b"} | json o="o""#, r#"{"o":{"k":"a\u0041b"}}"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("o", r#"{"k":"a\u0041b"}"#),
+        ])
+    );
+
+    let (got, _) = run(r#"{a="b"} | json a="a""#, r#"{"a":"}x"}trailing"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("a", "}x"),])
+    );
+}
+
+/// The span search and [the walk] must resolve a duplicated key the same
+/// way, and the rule is "the first occurrence whose REMAINING path
+/// resolves", not a naive first-occurrence descent. Container-captured
+/// at v3.7.4; a naive descent gets the `o[0]` column wrong on both lines.
+#[test]
+fn json_extraction_backtracks_over_a_duplicated_key_like_the_walk() {
+    for (line, expr, want) in [
+        (r#"{"o":{"z":1},"o":[[7],  8]}"#, "o", r#"{"z":1}"#),
+        (r#"{"o":{"z":1},"o":[[7],  8]}"#, "o.z", "1"),
+        (r#"{"o":{"z":1},"o":[[7],  8]}"#, "o[0]", "[7]"),
+        (r#"{"o":[1],"o":{"z":{"w":  9}}}"#, "o", "[1]"),
+        (r#"{"o":[1],"o":{"z":{"w":  9}}}"#, "o.z", r#"{"w":  9}"#),
+        (r#"{"o":[1],"o":{"z":{"w":  9}}}"#, "o[0]", "1"),
+    ] {
+        let (got, _) = run(&format!(r#"{{a="b"}} | json x="{expr}""#), line).unwrap();
+        assert_eq!(
+            got,
+            labels(&[("app", "checkout"), ("env", "prod"), ("x", want)]),
+            "line {line:?} expr {expr:?}"
+        );
+    }
+}
+
+/// Nothing on this path may recurse: a path is bounded only by the
+/// query-text cap and a document by nothing at all. The nested line is
+/// past `serde_json`'s own recursion limit, so the parse fails and the
+/// missing-path fill answers — without touching the stack, which is the
+/// point. The flat line resolves a container span across 50 000 sibling
+/// fields.
+#[test]
+fn json_expression_resolves_a_span_without_recursing() {
+    let deep = format!("{}1{}", "[".repeat(50_000), "]".repeat(50_000));
+    let (got, _) = run(r#"{a="b"} | json a="a""#, &format!(r#"{{"a":{deep}}}"#)).unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("a", "")])
+    );
+
+    let mut flat = String::from("{");
+    for i in 0..50_000 {
+        flat.push_str(&format!("\"f{i}\":{i},"));
+    }
+    flat.push_str(r#""o":{"z":  1}}"#);
+    let (got, _) = run(r#"{a="b"} | json o="o""#, &flat).unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("o", r#"{"z":  1}"#)])
     );
 }
 

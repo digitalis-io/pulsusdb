@@ -4240,6 +4240,31 @@ impl<'de> serde::Deserialize<'de> for WireJson {
     }
 }
 
+/// The FIRST JSON value in `line`, with whatever follows it ignored —
+/// issue #389 part A.
+///
+/// `serde_json::from_str` is `Deserializer::from_str` plus `end()`, and
+/// that `end()` is the whole difference: it demands end-of-input after
+/// the value, so `{"a":1}trailing` is a parse error here where the
+/// reference answers `a="1"`. The reference's scanner simply stops.
+/// `jsonparser.ObjectEach` returns `nil` the moment it reaches the
+/// object's closing `}` and never looks further
+/// (`vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160
+/// @ v3.7.4`), and `EachKey`'s dispatch has no default case, so a byte it
+/// does not recognise is skipped rather than refused (`:568-577`).
+/// Dropping `end()` reproduces that for a line whose trailing bytes come
+/// AFTER a complete value; a line malformed INSIDE the value is still
+/// refused here and is not (the residual ledgered as
+/// `json-nonvalidating-scan-residual`).
+///
+/// The recursion bound is unchanged: this is the same deserializer with
+/// the same limit, reached by a different spelling — see [`WireJson`] and
+/// `tests/recursion_census.rs`.
+fn parse_wire_json_prefix(line: &str) -> Result<WireJson, serde_json::Error> {
+    let mut de = serde_json::Deserializer::from_str(line);
+    serde::Deserialize::deserialize(&mut de)
+}
+
 /// Owned key/value output by design: extracted values live inside the
 /// per-line parsed value, which drops at the end of this stage — the
 /// parse itself dominates the cost (bounded to pushdown-surviving rows).
@@ -4281,7 +4306,7 @@ fn run_json<'a>(
     if extractions.is_empty() {
         // The full flatten derives label NAMES from the document, so it
         // needs the wire-order, duplicate-preserving shape (issue #334).
-        let parsed: WireJson = match serde_json::from_str(line) {
+        let parsed: WireJson = match parse_wire_json_prefix(line) {
             Ok(v @ WireJson::Object(_)) => v,
             _ => {
                 malformed(errs);
@@ -4306,18 +4331,43 @@ fn run_json<'a>(
             capture.as_mut(),
         )?;
     } else {
-        // The targeted form needs the same shape (issue #334 review round
-        // 1): its winner is decided by DOCUMENT order, not by the order
-        // the expressions were written, and a repeated document key
-        // resolves to its FIRST occurrence.
-        let parsed: WireJson = match serde_json::from_str(line) {
-            Ok(v @ WireJson::Object(_)) => v,
-            _ => {
-                malformed(errs);
-                return Ok(());
-            }
-        };
-        run_json_targets(&parsed, extractions, labels, st, &mut errs.dirty);
+        // THE TARGETED FORM HAS ITS OWN VALIDITY GATE, and it is not the
+        // flatten arm's (issue #389 part A). `JSONExpressionParser.Process`
+        // (`pkg/logql/log/parser.go:664-670,726-732 @ v3.7.4`) tests
+        // exactly two things before scanning, and neither is "does the
+        // line parse":
+        //
+        // - an EMPTY line returns with no label written at all — not the
+        //   missing-path fill, not an error;
+        // - `isValidJSONStart` looks at ONE RAW BYTE, `line[0]`, and
+        //   whitespace is NOT skipped, so ` {"a":1}` is refused where
+        //   `{"a":1}trailing` is admitted.
+        //
+        // Everything past that gate is the non-validating scan, whose
+        // misses are the missing-path fill: `{garbage`, `[1,2]junk` and
+        // `"hello"trailing` all answer `a=""` with NO error. Routing this
+        // arm through the flatten arm's "must parse to an object" test got
+        // all eight of those rows wrong in both directions.
+        if line.is_empty() {
+            return Ok(());
+        }
+        // `addErrLabel(errJSON, nil, lbs)` — a NIL error, so `SetErr` runs
+        // and `SetErrorDetails` does not (`parser.go:734-742`). The detail
+        // slot stays as the previous stage left it.
+        if !matches!(line.as_bytes()[0], b'"' | b'{' | b'[') {
+            errs.set_err(Cow::Borrowed("JSONParserErr"));
+            return Ok(());
+        }
+        // The targeted form needs the wire-order, duplicate-preserving
+        // shape (issue #334 review round 1): its winner is decided by
+        // DOCUMENT order, not by the order the expressions were written,
+        // and a repeated document key resolves to its FIRST occurrence.
+        //
+        // A parse failure past the first-byte gate is NOT an error here:
+        // the reference's scan finds nothing and the fill writes `""`, so
+        // an empty document reproduces it exactly.
+        let parsed = parse_wire_json_prefix(line).unwrap_or(WireJson::Object(Vec::new()));
+        run_json_targets(line, &parsed, extractions, labels, st, &mut errs.dirty);
     }
     Ok(())
 }
@@ -4357,6 +4407,7 @@ fn run_json<'a>(
 /// fired write is a plain `Set`, renamed on a stream/metadata collision
 /// like any other parsed label.
 fn run_json_targets<'a>(
+    line: &str,
     root: &WireJson,
     extractions: &'a [(String, Vec<JsonPathSeg>)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
@@ -4364,6 +4415,7 @@ fn run_json_targets<'a>(
     dirty: &mut bool,
 ) {
     let mut walk = TargetWalk {
+        line,
         extractions,
         flagged: vec![false; extractions.len()],
         flagged_count: 0,
@@ -4387,7 +4439,16 @@ fn run_json_targets<'a>(
 /// The per-line state of one targeted `| json` stage's document walk —
 /// `EachKey`'s `pathFlags`/`pathsMatched` plus the callback count the
 /// missing-path fill is gated on.
-struct TargetWalk<'a> {
+struct TargetWalk<'a, 'l> {
+    /// The RAW line the walked tree was parsed from — issue #389 part B.
+    /// A fired extraction that lands on an object or an array hands back
+    /// the document's own bytes, so the span has to be resolvable, and it
+    /// is resolved LAZILY (only when such an extraction fires) rather
+    /// than carried inside every [`WireJson`] node: measured, the eager
+    /// shape costs +48% / +103% / +545% on flat / nested / 100-deep
+    /// lines, on every `| json` row, for a value only a container
+    /// extraction ever reads.
+    line: &'l str,
     extractions: &'a [(String, Vec<JsonPathSeg>)],
     /// `pathFlags` — an expression that has already resolved is inert for
     /// the rest of the line, which is what makes a repeated document key
@@ -4402,7 +4463,7 @@ struct TargetWalk<'a> {
     fired: usize,
 }
 
-impl<'a> TargetWalk<'a> {
+impl<'a> TargetWalk<'a, '_> {
     /// Walks `node`, whose position in the document is `stack`, firing
     /// every expression whose path resolves there.
     fn visit<'v>(
@@ -4453,7 +4514,22 @@ impl<'a> TargetWalk<'a> {
             self.flagged[i] = true;
             self.flagged_count += 1;
             self.fired += 1;
-            self.write(i, wire_json_to_string(value), labels, st, dirty);
+            let v = self.target_value(i, value);
+            self.write(i, v, labels, st, dirty);
+        }
+    }
+
+    /// One fired extraction's label value — `readValue`'s arms as the
+    /// expression parser reaches them (`pkg/logql/log/parser.go:700-706 @
+    /// v3.7.4`).
+    ///
+    /// A scalar renders exactly as it always has. A CONTAINER is the
+    /// document's own bytes ([`container_value`]), which is why the walk
+    /// carries the raw line at all.
+    fn target_value(&self, i: usize, node: &WireJson) -> String {
+        match node {
+            WireJson::Leaf(v) => json_scalar_to_string(v),
+            container => container_value(self.line, &self.extractions[i].1, container),
         }
     }
 
@@ -4512,7 +4588,8 @@ impl<'a> TargetWalk<'a> {
                     continue;
                 };
                 self.fired += 1;
-                self.write(i, wire_json_to_string(found), labels, st, dirty);
+                let v = self.target_value(i, found);
+                self.write(i, v, labels, st, dirty);
             }
         }
         // An index past the end resolves to nothing but is still spent.
@@ -4572,12 +4649,14 @@ fn lookup_wire_path<'v>(root: &'v WireJson, path: &[JsonPathSeg]) -> Option<&'v 
     Some(cur)
 }
 
-/// One targeted extraction's value as a label value. A scalar renders
-/// exactly as it always has; an OBJECT is rebuilt as a
-/// `serde_json::Value` first, so its rendering is unchanged too — see the
-/// follow-up noted on the issue, where the reference writes the value's
-/// RAW BYTES and so keeps both the document's key order and its
-/// whitespace.
+/// A targeted extraction's value, re-rendered from the parsed tree.
+///
+/// **This is no longer how a container extraction answers** (issue #389
+/// part B): the reference writes the value's RAW BYTES, so key order and
+/// whitespace survive, and [`container_value`] does that. This is only
+/// its fallback for the case where the span search cannot find the node
+/// the walk found — which the `debug_assert` in `container_value` says
+/// cannot happen, and which must still not panic in release.
 fn wire_json_to_string(node: &WireJson) -> String {
     match node {
         WireJson::Leaf(v) => json_scalar_to_string(v),
@@ -4586,7 +4665,8 @@ fn wire_json_to_string(node: &WireJson) -> String {
 }
 
 /// A `WireJson` node as the `serde_json::Value` it would have been —
-/// needed only by [`wire_json_to_string`]'s container arm.
+/// needed only by [`wire_json_to_string`] and by [`container_value`]'s
+/// debug-build agreement check.
 fn wire_json_to_value(node: &WireJson) -> serde_json::Value {
     match node {
         WireJson::Leaf(v) => v.clone(),
@@ -4599,6 +4679,565 @@ fn wire_json_to_value(node: &WireJson) -> serde_json::Value {
                 .map(|(k, v)| (k.clone(), wire_json_to_value(v)))
                 .collect(),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// issue #389 part B — a targeted extraction that lands on a container
+// hands back the DOCUMENT'S OWN BYTES
+// ---------------------------------------------------------------------
+
+/// `readValue`'s container arms as the expression parser reaches them
+/// (`pkg/logql/log/parser.go:700-706 @ v3.7.4`):
+///
+/// ```text
+/// case jsonparser.Object: lbs.Set(ParsedLabel, key, string(data))
+/// default:                lbs.Set(ParsedLabel, key, unescapeJSONString(data))
+/// ```
+///
+/// `data` is `data[offset:endOffset]` out of the line
+/// (`vendor/github.com/grafana/jsonparser/parser.go:878-940 @ v3.7.4`),
+/// so an OBJECT is copied VERBATIM — keys in document order, duplicates
+/// kept, inner whitespace and escape spellings intact — and an ARRAY
+/// falls to `default`, which is the same span with
+/// [`unescape_json_text`] run over it. Container-captured at v3.7.4:
+/// `{"o":{"b":1,  "a":2}}` answers `{"b":1,  "a":2}` there and answered
+/// `{"a":2,"b":1}` here; `{"o":["a\"b",  "c"]}` answers `["a"b",  "c"]`.
+///
+/// **The span is resolved LAZILY, only for a container that actually
+/// fired.** Carrying it inside every [`WireJson`] node is the tidy
+/// answer and it is O(n·d) — measured at +48% / +103% / +545% on flat /
+/// nested / 100-deep lines, on every `| json` row, for a value only this
+/// arm reads. Here the cost is paid once per fired container extraction.
+///
+/// The span search and [`TargetWalk`] are two mechanisms that have to
+/// agree on WHICH node the path selects, so every debug build asserts
+/// they do. `serde_json::Value` equality is the right relation: it
+/// ignores key order, whitespace and escape spelling — precisely the
+/// things this function exists to preserve — and still catches a wrong
+/// node. A search miss falls back to the old rendering rather than
+/// panicking in release.
+fn container_value(line: &str, path: &[JsonPathSeg], node: &WireJson) -> String {
+    let Some(span) = raw_span_for_path(line, path) else {
+        debug_assert!(
+            false,
+            "the walk fired on a container the span search cannot reach: {path:?} in {line:?}"
+        );
+        return wire_json_to_string(node);
+    };
+    debug_assert!(
+        span_is_node(span, node),
+        "the raw span and the walked node are different documents: {span:?}"
+    );
+    match node {
+        WireJson::Object(_) => span.to_owned(),
+        WireJson::Array(_) => unescape_json_text(span),
+        // Unreachable: `TargetWalk::target_value` routes leaves to
+        // `json_scalar_to_string`. Rendering the node is still the right
+        // answer if it ever arrives — the span of a leaf carries its
+        // quotes, which a label value must not.
+        WireJson::Leaf(_) => wire_json_to_string(node),
+    }
+}
+
+/// Whether `span` and `node` are the same JSON document — the agreement
+/// between the two mechanisms [`container_value`] rests on, asserted in
+/// every debug build so the whole hermetic suite checks it.
+///
+/// It compares in LOCKSTEP rather than by building a value out of each
+/// side, and that is deliberate on two counts. It allocates nothing on
+/// the paths this arm takes, so `tests/logql_pipeline_alloc.rs` still
+/// measures the arm rather than its own invariant check — a
+/// `serde_json::Value` on both sides costs more per key than the
+/// re-rendering this issue REMOVED, which would have made that gate
+/// unable to see the improvement at all. And an in-order walk is
+/// STRICTLY STRONGER than `Value` equality here: both sides keep
+/// document order and duplicate keys, so `{"a":1,"a":2}` is compared as
+/// itself instead of collapsing to its last write on both sides.
+/// Whitespace and escape SPELLING are still out of scope for it, as
+/// they must be — those are what the span preserves and the node
+/// cannot.
+fn span_is_node(span: &str, node: &WireJson) -> bool {
+    let mut de = serde_json::Deserializer::from_str(span);
+    matches!(
+        serde::de::DeserializeSeed::deserialize(SameAs(node), &mut de),
+        Ok(true)
+    )
+}
+
+/// [`span_is_node`]'s seed: it is its own visitor, and each container
+/// arm recurses with the matching child node. Depth is the NODE's, which
+/// `serde_json` already bounded when it built it.
+struct SameAs<'n>(&'n WireJson);
+
+impl<'de> serde::de::DeserializeSeed<'de> for SameAs<'_> {
+    type Value = bool;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for SameAs<'_> {
+    type Value = bool;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the JSON value the walk resolved to")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<bool, E> {
+        Ok(matches!(self.0, WireJson::Leaf(serde_json::Value::Bool(b)) if *b == v))
+    }
+
+    // The number arms read the leaf's own accessor rather than building a
+    // `Value` to compare against: both sides decode the SAME bytes with
+    // the same deserializer, so they take the same arm of `Number`, and
+    // reading it back costs nothing.
+    fn visit_i64<E>(self, v: i64) -> Result<bool, E> {
+        Ok(matches!(self.0, WireJson::Leaf(serde_json::Value::Number(n)) if n.as_i64() == Some(v)))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<bool, E> {
+        Ok(matches!(self.0, WireJson::Leaf(serde_json::Value::Number(n)) if n.as_u64() == Some(v)))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<bool, E> {
+        // `to_bits`, not `==`: a float is compared for IDENTITY here, and
+        // `-0.0 == 0.0` would let a wrong node through.
+        Ok(matches!(
+            self.0,
+            WireJson::Leaf(serde_json::Value::Number(n))
+                if n.as_f64().map(f64::to_bits) == Some(v.to_bits())
+        ))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<bool, E> {
+        Ok(matches!(self.0, WireJson::Leaf(serde_json::Value::String(s)) if s == v))
+    }
+
+    fn visit_none<E>(self) -> Result<bool, E> {
+        Ok(matches!(self.0, WireJson::Leaf(serde_json::Value::Null)))
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(self)
+    }
+
+    fn visit_unit<E>(self) -> Result<bool, E> {
+        Ok(matches!(self.0, WireJson::Leaf(serde_json::Value::Null)))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+        let WireJson::Array(items) = self.0 else {
+            drain_seq(seq)?;
+            return Ok(false);
+        };
+        let mut agree = true;
+        for item in items {
+            match seq.next_element_seed(SameAs(item))? {
+                Some(true) => {}
+                // A shorter document, or a child that disagrees.
+                _ => {
+                    agree = false;
+                    break;
+                }
+            }
+        }
+        // A longer document disagrees too, and the rest must be consumed
+        // either way: `deserialize_any` checks for the closing bracket
+        // once the visitor returns.
+        let extra = drain_seq(seq)?;
+        Ok(agree && extra == 0)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+        let WireJson::Object(fields) = self.0 else {
+            drain_map(map)?;
+            return Ok(false);
+        };
+        let mut agree = true;
+        for (key, value) in fields {
+            match map.next_key_seed(KeyIs(key))? {
+                Some(true) => {
+                    if !map.next_value_seed(SameAs(value))? {
+                        agree = false;
+                        break;
+                    }
+                }
+                Some(false) => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    agree = false;
+                    break;
+                }
+                None => {
+                    agree = false;
+                    break;
+                }
+            }
+        }
+        let extra = drain_map(map)?;
+        Ok(agree && extra == 0)
+    }
+}
+
+/// Consumes the rest of a sequence, returning how many elements were
+/// left. Every visitor that stops early owes `serde_json` this.
+fn drain_seq<'de, A: serde::de::SeqAccess<'de>>(mut seq: A) -> Result<usize, A::Error> {
+    let mut n = 0;
+    while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// [`drain_seq`] for a map.
+fn drain_map<'de, A: serde::de::MapAccess<'de>>(mut map: A) -> Result<usize, A::Error> {
+    let mut n = 0;
+    while map
+        .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+        .is_some()
+    {
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// The raw span of the value `path` selects in `line`, resolved the way
+/// [`TargetWalk`] resolves it.
+///
+/// The walk is a PRE-ORDER document walk that fires at the first node
+/// whose root path is `path`, so the resolution rule is "the first
+/// occurrence at each level whose REMAINING path resolves", not a naive
+/// first-occurrence descent. Container-captured at v3.7.4, and the two
+/// rows a naive descent gets wrong:
+///
+/// | line | `a="o"` | `a="o.z"` | `a="o[0]"` |
+/// |---|---|---|---|
+/// | `{"o":{"z":1},"o":[[7],  8]}` | `{"z":1}` | `1` | `[7]` |
+/// | `{"o":[1],"o":{"z":{"w":  9}}}` | `[1]` | `{"w":  9}` | `1` |
+///
+/// A pre-order walk enumerates the candidates for one path in
+/// lexicographic order of their per-level occurrence numbers, because an
+/// object field's whole subtree is visited before its next sibling — so
+/// a depth-first search that tries occurrence 0, 1, 2 … at each level
+/// and backtracks reaches the same node first.
+///
+/// **The `[i]` segment ends the backtracking**, because the walk's array
+/// branch does. `EachKey`'s array case resolves the REST of the path
+/// inside the chosen element with `searchKeys`, a straight first-match
+/// scan, and flags the expression whether or not that succeeds
+/// (`vendor/github.com/grafana/jsonparser/parser.go:497-540 @ v3.7.4`;
+/// mirrored here by [`lookup_wire_path`]) — so once an array is reached
+/// at the path's field prefix, nothing later in the document can win.
+///
+/// **Iterative on purpose.** The frame stack is a `Vec`: a path is
+/// bounded only by the query-text cap (`| json a="a.a.a…"`) and a
+/// document by nothing, and `serde_json`'s own value-skipping is
+/// iterative too, so no input can drive this into the stack.
+fn raw_span_for_path<'l>(line: &'l str, path: &[JsonPathSeg]) -> Option<&'l str> {
+    if path.is_empty() {
+        return None;
+    }
+    // Every segment before the first `[i]` is a field — that is what
+    // makes `head` the boundary between the two halves.
+    let head = path
+        .iter()
+        .position(|s| matches!(s, JsonPathSeg::Index(_)))
+        .unwrap_or(path.len());
+    // `frames[d]` is the span the first `d` segments resolved to, paired
+    // with the occurrence of segment `d` to try inside it.
+    let mut frames: Vec<(&'l str, usize)> = Vec::with_capacity(head + 1);
+    frames.push((line, 0));
+    loop {
+        let (span, occ) = *frames.last()?;
+        let d = frames.len() - 1;
+        if d < head {
+            let JsonPathSeg::Field(name) = &path[d] else {
+                return None;
+            };
+            if let Some(child) = field_nth(span, name, occ) {
+                frames.push((child, 0));
+                continue;
+            }
+        } else if head == path.len() {
+            // An all-field path: the walk fires at the first node in
+            // document order whose root path is `path`, and this is it.
+            return Some(span);
+        } else {
+            let JsonPathSeg::Index(idx) = path[head] else {
+                return None;
+            };
+            // The array branch runs only on an ARRAY node; the walk
+            // passes straight over a non-array occurrence and keeps
+            // looking, so that is a backtrack and not a miss. A
+            // `RawValue` span never carries leading whitespace (measured
+            // against serde_json 1.0.150), and this arm's root span is
+            // the line, which `isValidJSONStart` has already gated.
+            if span.as_bytes().first() == Some(&b'[') {
+                return element_at(span, idx).and_then(|e| lookup_raw_path(e, &path[head + 1..]));
+            }
+        }
+        // This frame is spent: back up a level and try the next
+        // occurrence of the segment that produced it.
+        frames.pop();
+        frames.last_mut()?.1 += 1;
+    }
+}
+
+/// [`lookup_wire_path`] over raw spans — the straight first-match scan
+/// the reference runs INSIDE a chosen array element, with no
+/// backtracking and a miss at any segment ending it.
+fn lookup_raw_path<'l>(root: &'l str, path: &[JsonPathSeg]) -> Option<&'l str> {
+    let mut cur = root;
+    for seg in path {
+        cur = match seg {
+            JsonPathSeg::Field(name) => field_nth(cur, name, 0)?,
+            JsonPathSeg::Index(idx) => element_at(cur, *idx)?,
+        };
+    }
+    Some(cur)
+}
+
+/// The raw span of the value under the `skip`-th (0-based) occurrence of
+/// `key` in the object `raw`, in document order. `None` when `raw` is
+/// not an object, is malformed, or holds fewer than `skip + 1`
+/// occurrences.
+///
+/// Costs one scan of the object and NO allocation for the value: the
+/// value is captured as a `&RawValue` borrowed out of `raw` and every
+/// other value is skipped with `IgnoredAny`, which `serde_json` resolves
+/// iteratively. The whole object is drained because `deserialize_map`
+/// checks for the closing brace after the visitor returns.
+fn field_nth<'l>(raw: &'l str, key: &str, skip: usize) -> Option<&'l str> {
+    use serde::Deserializer as _;
+
+    struct FieldNth<'k> {
+        key: &'k str,
+        skip: usize,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for FieldNth<'_> {
+        type Value = Option<&'de serde_json::value::RawValue>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            mut self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = None;
+            while let Some(hit) = map.next_key_seed(KeyIs(self.key))? {
+                if hit && out.is_none() {
+                    if self.skip == 0 {
+                        out = Some(map.next_value::<&serde_json::value::RawValue>()?);
+                        continue;
+                    }
+                    self.skip -= 1;
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(out)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(raw);
+    let found = (&mut de).deserialize_map(FieldNth { key, skip }).ok()?;
+    found.map(serde_json::value::RawValue::get)
+}
+
+/// An object-key seed that answers "is this key the one we want?"
+/// without materialising it: an unescaped key arrives borrowed and an
+/// escaped one through `serde_json`'s reused scratch buffer, and both
+/// route to the same comparison.
+struct KeyIs<'k>(&'k str);
+
+impl<'de> serde::de::DeserializeSeed<'de> for KeyIs<'_> {
+    type Value = bool;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        struct V<'k>(&'k str);
+        impl<'de> serde::de::Visitor<'de> for V<'_> {
+            type Value = bool;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object key")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<bool, E> {
+                Ok(v == self.0)
+            }
+        }
+        d.deserialize_str(V(self.0))
+    }
+}
+
+/// The raw span of element `idx` of the array `raw`. `None` when `raw`
+/// is not an array, is malformed, or is shorter than `idx + 1`.
+fn element_at(raw: &str, idx: usize) -> Option<&str> {
+    use serde::Deserializer as _;
+
+    struct ElementAt(usize);
+
+    impl<'de> serde::de::Visitor<'de> for ElementAt {
+        type Value = Option<&'de serde_json::value::RawValue>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a JSON array")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = None;
+            let mut i = 0usize;
+            loop {
+                if i == self.0 {
+                    match seq.next_element::<&serde_json::value::RawValue>()? {
+                        Some(v) => out = Some(v),
+                        None => break,
+                    }
+                } else if seq.next_element::<serde::de::IgnoredAny>()?.is_none() {
+                    break;
+                }
+                i += 1;
+            }
+            Ok(out)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(raw);
+    let found = (&mut de).deserialize_seq(ElementAt(idx)).ok()?;
+    found.map(serde_json::value::RawValue::get)
+}
+
+/// `unescapeJSONString` over a whole value span
+/// (`pkg/logql/log/parser.go:269-283 @ v3.7.4`): `jsonparser.Unescape`
+/// (`vendor/github.com/grafana/jsonparser/escape.go:130-171`) and then,
+/// only if the result carries one, every U+FFFD mapped to a SPACE
+/// (`parser.go:44-49,278-281` — "the rune error replacement is rejected
+/// by Prometheus hence replacing them with space").
+///
+/// `Unescape` returns its input untouched when it holds no backslash, so
+/// a span with no escape is copied verbatim. Otherwise every `\`
+/// sequence in the span is decoded — including ones inside the array's
+/// structure, which is why `["a\"b",  "c"]` comes back as `["a"b",  "c"]`
+/// with its two spaces intact.
+///
+/// An INVALID escape makes `Unescape` fail and `unescapeJSONString`
+/// return the empty string. It is unreachable here — the span comes out
+/// of a document `serde_json` has already accepted, and `serde_json`
+/// refuses a bad escape and a lone surrogate — but the arm is the
+/// reference's, not a panic.
+fn unescape_json_text(span: &str) -> String {
+    let Some(first) = span.find('\\') else {
+        return map_rune_error(span);
+    };
+    let mut out = String::with_capacity(span.len());
+    out.push_str(&span[..first]);
+    let bytes = span.as_bytes();
+    let mut i = first;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // `unescapeToUTF8` (`escape.go:96-121`).
+            let Some((consumed, ch)) = unescape_one(bytes, i) else {
+                return String::new();
+            };
+            out.push(ch);
+            i += consumed;
+            continue;
+        }
+        // "Copy everything up until the next backslash."
+        let rest = &span[i..];
+        match rest.find('\\') {
+            Some(n) => {
+                out.push_str(&rest[..n]);
+                i += n;
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    if out.contains(char::REPLACEMENT_CHARACTER) {
+        out = out.replace(char::REPLACEMENT_CHARACTER, " ");
+    }
+    out
+}
+
+/// `strings.Map(removeInvalidUtf, res)` on a span `Unescape` returned
+/// unchanged — allocating the copy the caller needs either way.
+fn map_rune_error(span: &str) -> String {
+    if span.contains(char::REPLACEMENT_CHARACTER) {
+        span.replace(char::REPLACEMENT_CHARACTER, " ")
+    } else {
+        span.to_owned()
+    }
+}
+
+/// One escape sequence at `bytes[at]`, as `(bytes consumed, the rune it
+/// decodes to)` — `unescapeToUTF8`'s table plus `decodeUnicodeEscape`
+/// (`escape.go:64-121 @ v3.7.4`). `None` is the reference's `(-1, -1)`.
+fn unescape_one(bytes: &[u8], at: usize) -> Option<(usize, char)> {
+    let e = *bytes.get(at + 1)?;
+    let simple = match e {
+        b'"' => '"',
+        b'\\' => '\\',
+        b'/' => '/',
+        b'b' => '\u{8}',
+        b'f' => '\u{c}',
+        b'n' => '\n',
+        b'r' => '\r',
+        b't' => '\t',
+        b'u' => return decode_unicode_escape(bytes, at),
+        _ => return None,
+    };
+    Some((2, simple))
+}
+
+/// `decodeUnicodeEscape` (`escape.go:64-79 @ v3.7.4`). A code unit
+/// outside the surrogate range is the rune; one inside it MUST be
+/// followed by a second `\uXXXX` whose value is at least `0xDC00`, and
+/// the pair combines. Note that the reference reads the second escape's
+/// four hex digits WITHOUT checking that a `\u` precedes them, and that
+/// `utf8.EncodeRune` writes U+FFFD for a rune the combination puts out
+/// of range — both reproduced, and both unreachable through
+/// `serde_json`, which refuses such a document outright.
+fn decode_unicode_escape(bytes: &[u8], at: usize) -> Option<(usize, char)> {
+    let r = decode_single_unicode_escape(bytes, at)?;
+    if !(0xD800..=0xDFFF).contains(&r) {
+        return Some((6, char::from_u32(r).unwrap_or(char::REPLACEMENT_CHARACTER)));
+    }
+    let low = decode_single_unicode_escape(bytes, at + 6)?;
+    if low < 0xDC00 {
+        return None;
+    }
+    let combined = 0x10000 + ((r - 0xD800) << 10) + (low - 0xDC00);
+    Some((
+        12,
+        char::from_u32(combined).unwrap_or(char::REPLACEMENT_CHARACTER),
+    ))
+}
+
+/// `decodeSingleUnicodeEscape` (`escape.go:37-53 @ v3.7.4`): the four hex
+/// digits at `at + 2`, with the `\u` prefix ASSUMED and not checked.
+fn decode_single_unicode_escape(bytes: &[u8], at: usize) -> Option<u32> {
+    let hex = bytes.get(at + 2..at + 6)?;
+    let mut out = 0u32;
+    for b in hex {
+        out = (out << 4) | hex_val(*b)?;
+    }
+    Some(out)
+}
+
+/// `h2I` (`escape.go:24-34 @ v3.7.4`).
+fn hex_val(b: u8) -> Option<u32> {
+    match b {
+        b'0'..=b'9' => Some(u32::from(b - b'0')),
+        b'A'..=b'F' => Some(u32::from(b - b'A' + 10)),
+        b'a'..=b'f' => Some(u32::from(b - b'a' + 10)),
+        _ => None,
     }
 }
 
@@ -5060,7 +5699,20 @@ fn run_unpack<'a>(
     st: &mut ExtractionState<'a, '_>,
     errs: &mut ErrorSlots<'a>,
 ) -> Option<String> {
-    let fields = match serde_json::from_str::<WireJson>(line) {
+    // `UnpackParser.Process`'s OWN gate (`parser.go:753-762 @ v3.7.4`),
+    // not the flatten arm's (issue #389 part A): an empty line returns
+    // before anything at all is written, and the object test is ONE RAW
+    // BYTE — whitespace is not skipped, so ` {"a":"1"}` is refused where
+    // `{"_entry":"hi"}trailing` is admitted.
+    if line.is_empty() {
+        return None;
+    }
+    if line.as_bytes()[0] != b'{' {
+        errs.set_err(Cow::Borrowed("JSONParserErr"));
+        errs.set_details(Cow::Borrowed(JSON_ERROR_DETAILS));
+        return None;
+    }
+    let fields = match parse_wire_json_prefix(line) {
         Ok(WireJson::Object(fields)) => fields,
         // Slot write, no label, no dirty — see `run_json` (issue #238).
         _ => {

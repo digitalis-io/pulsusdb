@@ -1822,14 +1822,29 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// same file-level `captured` default. As elsewhere, an `eval_fail`'s
 /// `msg:` gate is PulsusDB's own wording while the REJECTION it pins was
 /// captured.
-const CAPTURED: usize = 1_284;
+///
+/// Issue #389 added `b23_json_raw_read.test` — how a JSON value is read
+/// OUT of a log line: the rows where bytes follow a complete value at
+/// every entrypoint that reads the line (`| json`, `| json <id>="<path>"`
+/// and `| unpack`), the targeted form's own first-byte gate and its
+/// missing-path fill, the object and array arms that hand back the
+/// document's own bytes, and the duplicated-key rows the span search has
+/// to backtrack through. Captured against the pinned v3.7.4 container in
+/// a single run, same file-level `captured` default. The rows where the
+/// reference's non-validating scan reads past a line that is malformed
+/// in the MIDDLE carry their own `divergence` marker instead and move
+/// `DIVERGENCE`, not this constant.
+const CAPTURED: usize = 1_314;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
 /// boundary fix added the domain-edge rows (each off-axis row with its
 /// on-axis control), same file default.
 const DERIVED: usize = 31;
-const DIVERGENCE: usize = 18;
+/// Issue #389's residual rows — the mid-line-malformed class, and its
+/// bound where both sides answer the empty string — all name
+/// `json-nonvalidating-scan-residual`.
+const DIVERGENCE: usize = 23;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_365;
+const TOTAL: usize = 1_400;
 // corpus-counts: end (provenance-corpus-constants)
