@@ -57,23 +57,29 @@
 //!   `{status, errorType, error}` — `respondError`,
 //!   `web/api/v1/api.go:2200-2230`, read at
 //!   `vendor/github.com/prometheus/prometheus/` @ grafana/loki v3.7.4.
-//! - `traces_api` keeps its JSON envelope and is KNOWN DIVERGENT.
-//!   Tempo v3.0.2 writes trace query errors as plain text: the querier
-//!   calls `http.Error` directly (`modules/querier/http.go:45,52,94,…`)
-//!   and the query frontend routes everything through dskit's
-//!   `httpgrpc.WriteError` (`modules/frontend/handler.go:156-168`), which
-//!   is `http.Error` as well. Changing it is a second wire-shape change
-//!   across a second surface and is deliberately NOT done here — #264's
-//!   ruling and its measured sweep both name the LogQL surface. Recorded
-//!   in docs/api.md §2.3 as an open divergence.
+//! - `traces_api` also writes plain text since issue #384, but NOT this
+//!   container, and the difference is one header. Tempo's user-facing
+//!   `/api/*` query routes are served by its query FRONTEND
+//!   (`cmd/tempo/app/modules.go:500-512 @ tempo v3.0.2`), whose 4xx
+//!   rejections are `*http.Response` values with a nil `Header` map,
+//!   copied out verbatim by `modules/frontend/handler.go:113-116` — so no
+//!   `X-Content-Type-Options` and no terminator. (The `http.Error` sites
+//!   in `modules/querier/http.go` DO set `nosniff` and DO append an LF,
+//!   but they are registered only under `/querier/…`,
+//!   `modules.go:438-459` + `pkg/api/http.go:67` — an internal path.) So
+//!   `traces_api::error::plain_text_error` is a SEPARATE function that
+//!   omits `nosniff`; do not merge the two.
 //!
-//! Note also that plain text alone is not the whole contract. The
-//! reference's two Loki writers agree on BOTH headers — Go's `http.Error`
-//! sets `Content-Type` and `nosniff` exactly as `WriteError` does — and
-//! disagree only on the trailing byte: this one (`fmt.Fprint`) writes
-//! none, `/loki/api/v1/push`'s (`fmt.Fprintln`, issue #374) writes an LF.
-//! `tests/support/manifest.rs`'s `PlainTextWriter` splits on that one
-//! property and asserts the shared headers for both.
+//! Note also that plain text alone is not the whole contract, and the
+//! three writers do not split on one axis. Loki's two — this one and
+//! `/loki/api/v1/push`'s (issue #374) — agree on BOTH headers (Go's
+//! `http.Error` sets `Content-Type` and `nosniff` exactly as `WriteError`
+//! does) and disagree only on the trailing byte: `fmt.Fprint` writes
+//! none, `fmt.Fprintln` writes an LF. Tempo's frontend agrees with THIS
+//! one on the terminator (neither writes one) and differs on `nosniff`.
+//! `tests/support/manifest.rs`'s `PlainTextWriter` therefore carries two
+//! independent per-writer rules, and its `NosniffRule` is three-valued so
+//! "absent by rule" cannot be spelled the same way as "no rule".
 //!
 //! The writers themselves are separate: `pulsus-write`'s ingest module has
 //! nine response builders and none of them is reachable from `logs_api` —

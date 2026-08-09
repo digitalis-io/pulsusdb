@@ -80,6 +80,9 @@ const TAG_NAMES_MAX: usize = 10_000;
 
 struct RawResponse {
     status: u16,
+    /// Kept (rather than dropped after dechunking) so error cases can
+    /// assert the issue #384 container, `nosniff`'s ABSENCE included.
+    headers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -94,6 +97,41 @@ impl RawResponse {
     }
 }
 
+/// Issue #384: every §4 error is Tempo's frontend container over the real
+/// wire — `text/plain; charset=utf-8`, **no** `X-Content-Type-Options`, no
+/// trailing newline, and not JSON — carrying the message and nothing else.
+/// Returns the body so the caller can assert the message with a LITERAL
+/// needle (the #237 Rule D shape: a derived needle in a substring search
+/// over a wire body is exactly what that guard forbids).
+///
+/// `nosniff`'s absence is the property that separates this container from
+/// `logs_api`'s (`pkg/util/server/error.go:49 @ loki v3.7.4` sets it;
+/// Tempo's frontend sets no headers at all,
+/// `modules/frontend/handler.go:113-116 @ tempo v3.0.2`). Reusing the
+/// LogQL responder would pass every other assertion here.
+fn assert_error_body(res: &RawResponse, status: u16, ctx: &str) -> String {
+    let body = String::from_utf8_lossy(&res.body).into_owned();
+    assert_eq!(res.status, status, "{ctx}: status (body: {body:?})");
+    assert_eq!(
+        res.headers.get("content-type").map(String::as_str),
+        Some("text/plain; charset=utf-8"),
+        "{ctx}: error content type"
+    );
+    assert_eq!(
+        res.headers.get("x-content-type-options"),
+        None,
+        "{ctx}: Tempo's frontend emits no nosniff"
+    );
+    assert!(
+        !res.body.ends_with(b"\n"),
+        "{ctx}: no trailing newline, got {body:?}"
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&res.body).is_err(),
+        "{ctx}: the body must not parse as JSON, got {body:?}"
+    );
+    body
+}
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -176,7 +214,11 @@ fn request(
         raw_body.to_vec()
     };
 
-    Some(RawResponse { status, body })
+    Some(RawResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn get(port: u16, path: &str, ctx: &str) -> RawResponse {
@@ -540,10 +582,8 @@ async fn tag_discovery_against_real_clickhouse() {
     // -- scope=bogus is an explicit 400, never widened. ------------------
     let ctx = "tags scope=bogus";
     let res = get(port, &format!("{NAMES_URL}?scope=bogus"), ctx);
-    assert_eq!(res.status, 400, "{ctx}");
-    let json = res.json(ctx);
-    assert_eq!(json["status"], "error", "{ctx}");
-    assert_eq!(json["errorType"], "bad_data", "{ctx}: body {json}");
+    let body = assert_error_body(&res, 400, ctx);
+    assert!(body.contains("bogus"), "{ctx}: {body:?}");
 
     // -- Values: typed inference live (string/int/duration/bool). --------
     let ctx = "values resource.service.name";

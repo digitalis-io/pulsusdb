@@ -2,8 +2,8 @@
 //! docs/api.md §4.1). Thin handlers (`handlers.rs`): parse the hex trace
 //! id (`params.rs`) → point-read via `TraceEngine` (`pulsus-read`) →
 //! decode/dedup/merge/encode the OTLP `TracesData` (`assemble.rs`) →
-//! negotiate the representation (`negotiate.rs`) → envelope errors
-//! (`error.rs`). All SQL/execution stays in `pulsus-read` — this module
+//! negotiate the representation (`negotiate.rs`) → render errors as the
+//! reference's bare `text/plain` body (`error.rs`, issue #384). All SQL/execution stays in `pulsus-read` — this module
 //! only ever talks to it through `TraceEngine`'s public methods; all OTLP
 //! shaping stays here so `pulsus-read` stays OTLP-agnostic (task-manager
 //! adjudication on issue #55).

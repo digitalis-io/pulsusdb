@@ -77,8 +77,7 @@ async fn search_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use axum::body::to_bytes;
-
+    use super::super::error::testutil::error_body;
     use super::*;
     use crate::app::BuildInfo;
     use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
@@ -108,16 +107,14 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
-        let status = res.status();
-        let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
-    }
-
-    async fn run(query: &str) -> (StatusCode, serde_json::Value) {
+    /// Every case below is an ERROR response, so it goes through
+    /// `error::testutil::error_body` — which asserts Tempo's container
+    /// (`text/plain; charset=utf-8`, exactly once, NO `nosniff`) on the
+    /// way through. That is how this module is not a hole in the
+    /// container check (issue #384).
+    async fn run(query: &str) -> (StatusCode, String) {
         let res = search(State(test_state()), RawQuery(Some(query.to_string()))).await;
-        status_and_body(res).await
+        error_body(res).await
     }
 
     // Param/parse failures resolve BEFORE the pool is consulted, so the
@@ -125,58 +122,50 @@ mod tests {
     // stops at 503 (no pool), proving parse precedes execution.
 
     #[tokio::test]
-    async fn malformed_q_is_400_bad_data_with_a_position() {
-        let (status, json) = run("q=%7B&start=1&end=2").await;
+    async fn malformed_q_is_400_naming_its_byte_offset() {
+        let (status, body) = run("q=%7B&start=1&end=2").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some(), "body {json}");
+        assert!(body.contains("byte 1"), "body {body}");
     }
 
     #[tokio::test]
-    async fn bad_start_is_400_bad_data() {
-        let (status, json) = run("q=%7B%7D&start=abc&end=2").await;
+    async fn bad_start_is_400() {
+        let (status, body) = run("q=%7B%7D&start=abc&end=2").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_none());
+        assert!(!body.contains("byte "), "body {body}");
     }
 
     #[tokio::test]
-    async fn q_plus_legacy_is_400_bad_data() {
-        let (status, json) = run("q=%7B%7D&tags=a%3Db&start=1&end=2").await;
+    async fn q_plus_legacy_is_400() {
+        let (status, _) = run("q=%7B%7D&tags=a%3Db&start=1&end=2").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn malformed_tags_logfmt_is_400_bad_data() {
-        let (status, json) = run("tags=barekey&start=1&end=2").await;
+    async fn malformed_tags_logfmt_is_400() {
+        let (status, _) = run("tags=barekey&start=1&end=2").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn a_planner_type_mismatch_is_400_bad_data() {
+    async fn a_planner_type_mismatch_is_400() {
         // `name > "x"` parses but the planner rejects ordering on strings.
-        let (status, json) = run("q=%7B%20name%20%3E%20%22x%22%20%7D&start=1&end=2").await;
+        let (status, _) = run("q=%7B%20name%20%3E%20%22x%22%20%7D&start=1&end=2").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
     }
 
     #[tokio::test]
-    async fn a_metrics_stage_on_search_is_400_bad_data_without_a_position() {
+    async fn a_metrics_stage_on_search_is_400_without_a_byte_offset() {
         // Issue #59 error-shape shift: `q={}|rate()` used to be a
         // positioned NotYetSupported parse error; it now PARSES and
-        // fails in plan_search — still 400 bad_data, but with no
-        // `position` (a plan error, not a parse error).
-        let (status, json) = run("q=%7B%7D%20%7C%20rate()&start=1&end=2").await;
+        // fails in plan_search — still 400, but with no byte offset (a
+        // plan error, not a parse error).
+        let (status, body) = run("q=%7B%7D%20%7C%20rate()&start=1&end=2").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
-        assert!(json.get("position").is_none(), "body {json}");
+        assert!(!body.contains("byte "), "body {body}");
         assert!(
-            json["error"]
-                .as_str()
-                .is_some_and(|m| m.contains("metrics")),
-            "message must point at the metrics surface, got {json}"
+            body.contains("metrics"),
+            "message must point at the metrics surface, got {body}"
         );
     }
 
@@ -186,22 +175,19 @@ mod tests {
     /// pipeline even though its request parser never reads it as TraceQL
     /// (`async_query_validator_middleware.go:49-55` vs
     /// `pkg/api/http.go:180`). PulsusDB served this `200` before; it is a
-    /// `400` now, with the same envelope a malformed `q` produces.
+    /// `400` now, with the same body a malformed `q` produces.
     ///
     /// Reachable over the wire, unlike the issue #284 length cap: a
     /// malformed expression is short, so `http::Uri`'s 65,534-byte
     /// request-target limit (#296) never intercepts it.
     #[tokio::test]
-    async fn a_malformed_query_parameter_is_400_bad_data_with_a_position() {
-        let (status, json) = run("query=%7B&start=1&end=2").await;
+    async fn a_malformed_query_parameter_is_400_naming_its_byte_offset() {
+        let (status, body) = run("query=%7B&start=1&end=2").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert_eq!(json["position"], 1, "body {json}");
+        assert!(body.contains("byte 1"), "body {body}");
         assert!(
-            json["error"]
-                .as_str()
-                .is_some_and(|m| m.starts_with("invalid TraceQL query: ")),
-            "the reference's wrapping, got {json}"
+            body.starts_with("invalid TraceQL query: "),
+            "the reference's wrapping, got {body}"
         );
     }
 
@@ -214,10 +200,10 @@ mod tests {
     /// which asserts `q` is `None`.
     #[tokio::test]
     async fn a_parseable_query_parameter_is_admitted_and_the_search_still_runs() {
-        let (status, json) =
+        let (status, body) =
             run("query=%7B%20resource.service.name%20%3D%20%22checkout%22%20%7D&start=1&end=2")
                 .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {json}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
     }
 
     /// Issue #328 (AC 4, replacing the #326 divergence pin
@@ -225,48 +211,45 @@ mod tests {
     /// the `traceql.Validate` half is now reproduced route-independently,
     /// so ONE expression that parses but fails semantic validation —
     /// `{ span.a =~ "[" }`, an unterminated character class, the
-    /// reference's own middleware-test shape — is a `400 bad_data` with
+    /// reference's own middleware-test shape — is a `400` with
     /// the reference's `invalid TraceQL query: ` wrapping on BOTH
     /// parameters. The 503 backend-reachability coverage this replaces
     /// survives in `a_parseable_query_parameter_is_admitted_and_the_search_still_runs`
-    /// and `a_well_formed_request_without_a_pool_is_503_unavailable`.
+    /// and `a_well_formed_request_without_a_pool_is_503`.
     #[tokio::test]
     async fn a_semantically_invalid_expression_is_rejected_on_both_parameters() {
         // `{ span.a =~ "[" }` — an unterminated character class.
         const EXPR: &str = "%7B%20span.a%20%3D~%20%22%5B%22%20%7D";
 
         for param in ["q", "query"] {
-            let (status, json) = run(&format!("{param}={EXPR}&start=1&end=2")).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{param}: body {json}");
-            assert_eq!(json["errorType"], "bad_data", "{param}: body {json}");
-            let message = json["error"].as_str().unwrap_or_default();
+            let (status, body) = run(&format!("{param}={EXPR}&start=1&end=2")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{param}: body {body}");
             assert!(
-                message.starts_with("invalid TraceQL query: "),
-                "{param}: the reference's wrapping, got {json}"
+                body.starts_with("invalid TraceQL query: "),
+                "{param}: the reference's wrapping, got {body}"
             );
             // The D6 superset: the deleted #326 pin's q-side assertion.
             assert!(
-                message.contains("invalid regex"),
-                "{param}: the semantic validator's regex rejection, got {json}"
+                body.contains("invalid regex"),
+                "{param}: the semantic validator's regex rejection, got {body}"
             );
-            // A semantic rejection carries no position (the reference's
-            // Validate errors name no offset).
-            assert!(json.get("position").is_none(), "{param}: body {json}");
+            // A semantic rejection names no byte offset (the reference's
+            // Validate errors name none either).
+            assert!(!body.contains("byte "), "{param}: body {body}");
         }
     }
 
     #[tokio::test]
-    async fn a_well_formed_request_without_a_pool_is_503_unavailable() {
-        let (status, json) = run("q=%7B%7D&start=1&end=2").await;
+    async fn a_well_formed_request_without_a_pool_is_503() {
+        let (status, body) = run("q=%7B%7D&start=1&end=2").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[tokio::test]
     async fn a_missing_query_string_entirely_is_400_for_the_missing_range() {
         let res = search(State(test_state()), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 }

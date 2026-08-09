@@ -107,6 +107,7 @@ pub(crate) async fn echo() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::testutil::error_body;
     use super::*;
 
     use axum::body::to_bytes;
@@ -139,67 +140,61 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
-        let status = res.status();
-        let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
-    }
-
     // The reshaping handlers share the native parse-before-pool ordering:
     // a param failure resolves 400 without ClickHouse; a well-formed
     // request against the no-pool test state stops at 503.
 
     #[tokio::test]
-    async fn a_well_formed_v1_tags_request_without_a_pool_is_503_unavailable() {
+    async fn a_well_formed_v1_tags_request_without_a_pool_is_503() {
         let res = tags_v1(State(test_state()), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        // `error_body` asserts Tempo's container on the way through, so
+        // the §8.1 aliases are not a hole in the #384 check.
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[tokio::test]
-    async fn a_well_formed_v1_values_request_without_a_pool_is_503_unavailable() {
+    async fn a_well_formed_v1_values_request_without_a_pool_is_503() {
         let res = tag_values_v1(State(test_state()), Path("service.name".to_string())).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[tokio::test]
-    async fn a_well_formed_v2_tags_request_without_a_pool_is_503_unavailable() {
+    async fn a_well_formed_v2_tags_request_without_a_pool_is_503() {
         let res = tags_v2(State(test_state()), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[tokio::test]
-    async fn a_well_formed_v2_values_request_without_a_pool_is_503_unavailable() {
+    async fn a_well_formed_v2_values_request_without_a_pool_is_503() {
         let res = tag_values_v2(State(test_state()), Path("service.name".to_string())).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[tokio::test]
-    async fn a_bogus_scope_on_the_v1_tags_alias_is_400_bad_data_before_the_pool() {
+    async fn a_bogus_scope_on_the_v1_tags_alias_is_400_before_the_pool() {
         let res = tags_v1(
             State(test_state()),
             RawQuery(Some("scope=bogus".to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
+        assert!(body.contains("bogus"), "body {body}");
     }
 
     #[tokio::test]
-    async fn an_empty_tag_key_on_the_v2_values_alias_is_400_bad_data_before_the_pool() {
+    async fn an_empty_tag_key_on_the_v2_values_alias_is_400_before_the_pool() {
         let res = tag_values_v2(State(test_state()), Path("resource.".to_string())).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
