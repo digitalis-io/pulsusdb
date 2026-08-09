@@ -108,9 +108,9 @@ async fn trace_by_id_impl(
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::testutil::error_body;
     use super::*;
 
-    use axum::body::to_bytes;
     use pulsus_config::Config;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -140,15 +140,8 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
-        let status = res.status();
-        let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
-    }
-
     #[tokio::test]
-    async fn trace_by_id_without_a_pool_is_503_unavailable() {
+    async fn trace_by_id_without_a_pool_is_503() {
         let res = trace_by_id(
             State(test_state()),
             Path("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
@@ -159,13 +152,15 @@ mod tests {
             res.headers().get(header::VARY).map(|v| v.as_bytes()),
             Some(b"accept".as_slice())
         );
-        let (status, json) = status_and_body(res).await;
+        // `error_body` asserts Tempo's container on the way through, so
+        // the fetch route is not a hole in the #384 check.
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[tokio::test]
-    async fn trace_by_id_json_without_a_pool_is_503_unavailable() {
+    async fn trace_by_id_json_without_a_pool_is_503() {
         let res = trace_by_id_json(
             State(test_state()),
             Path("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
@@ -173,8 +168,8 @@ mod tests {
         )
         .await;
         assert!(res.headers().get(header::VARY).is_none());
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 }

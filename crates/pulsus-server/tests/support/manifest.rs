@@ -2,11 +2,11 @@
 //! matrix: every mounted route, its HTTP method matrix, its mode/flag
 //! gate, its documented-vs-planned status, and a representative set of
 //! invalid-param cases with the exact error shape the architect plan pins
-//! — the `(status, errorType)` JSON envelope on `prom_api`/`traces_api`,
-//! and `text/plain` on the LogQL surface (issue #264) and the ingest
-//! families. "Plain text" is not one contract: see [`PlainTextWriter`],
-//! which keeps the LogQL surface's un-terminated body apart from
-//! `/loki/api/v1/push`'s LF-terminated one.
+//! — the `(status, errorType)` JSON envelope on `prom_api`, and
+//! `text/plain` on the LogQL surface (issue #264), the traces surface
+//! (issue #384) and the ingest families. "Plain text" is not one
+//! contract: see [`PlainTextWriter`], whose writers differ on two
+//! INDEPENDENT axes (the trailing byte, and `nosniff`).
 //!
 //! Shared by both test binaries via `#[path = "support/manifest.rs"] mod
 //! manifest;` (a `tests/` subdirectory, so cargo never builds this file as
@@ -135,15 +135,25 @@ pub enum Surface {
     /// are the LogsQuery bare `text/plain` body.
     LogsDetectedFields,
     /// `/api/v1/*` — the Prometheus HTTP API JSON query envelope
-    /// (`{"status","errorType","error"}`, no `position`).
+    /// (`{"status","errorType","error"}`, no `position`). The one query
+    /// surface that keeps a JSON error envelope, because upstream
+    /// Prometheus writes one — see [`ExpectedError::Json`].
     PromApi,
     /// `/api/traces/v1/trace/{traceId}[/json]` (issue #55) — success is an
     /// OTLP `TracesData` body (JSON or protobuf by `Accept`); errors are
-    /// always the JSON envelope (`{"status","errorType","error"}`, no
-    /// `position`). Against the conformance suite's empty databases the
-    /// "success" of a well-formed request is the mounted-but-absent `404
-    /// not_found` envelope — which doubles as the mounting oracle (an
-    /// unmounted path returns axum's *empty* 404 instead). Asserted by the
+    /// always the bare `text/plain` body of
+    /// [`PlainTextWriter::TempoFrontendResponse`] (issue #384), whatever
+    /// the `Accept`. Against the conformance suite's empty databases the
+    /// "success" of a well-formed request is the mounted-but-absent `404`
+    /// `trace not found` — which doubles as the mounting oracle (an
+    /// unmounted path returns axum's *empty* 404 instead). That body being
+    /// NON-EMPTY is a named residual divergence: Tempo answers an absent
+    /// trace with no body and no `Content-Type` at all, and matching it
+    /// would leave this surface with no live mounting oracle
+    /// (`route_inventory` is a hermetic SOURCE scan and proves nothing
+    /// about a running spawn). See docs/api.md §4.1 and
+    /// `traces-absent-trace-404-body` in
+    /// docs/benchmarks/traces-differential-ledger.md. Asserted by the
     /// dedicated `assert_traces_fetch_route` (the generic matrix's
     /// sibling-404 suffix trick would mutate the trailing `{traceId}` param
     /// into a 400, not an unrouted 404).
@@ -153,8 +163,10 @@ pub enum Surface {
     /// (`{"traces":[...],"metrics":{"partial","limit","returned"}}`), not
     /// the `{"status","data"}` query envelope; against this suite's empty
     /// databases a well-formed request returns the empty envelope 200,
-    /// which doubles as the mounting oracle. Errors are the JSON envelope
-    /// with `position` present exactly on TraceQL parse errors.
+    /// which doubles as the mounting oracle. Errors are the bare
+    /// `text/plain` body of [`PlainTextWriter::TempoFrontendResponse`]
+    /// (issue #384); a TraceQL parse error's byte offset travels inside
+    /// the message.
     TracesSearch,
     /// `GET /api/traces/v1/metrics/{query_range,query}` (issue #59/#182,
     /// docs/api.md §4.4) — success is the **Tempo-native** `{series,
@@ -164,9 +176,10 @@ pub enum Surface {
     /// `query_range` → 200 with an empty `series` list; `query` → 200 with
     /// exactly one `__name__`-labelled series whose single sample omits its
     /// zero `value` (protojson default-omission; a `uniqExact` with no
-    /// `GROUP BY` always returns one row). Errors are the JSON envelope
-    /// with `position` present exactly on TraceQL parse errors; the
-    /// static point-cap rejection is a 422 `query_too_broad` (the
+    /// `GROUP BY` always returns one row). Errors are the bare
+    /// `text/plain` body of [`PlainTextWriter::TempoFrontendResponse`]
+    /// (issue #384); a TraceQL parse error's byte offset travels inside
+    /// the message, and the static point-cap rejection is a 422 (the
     /// adjudicated bounded-response contract).
     TracesMetrics,
     /// `GET /api/traces/v1/service_graph` (issue #173, M7-E1, docs/api.md
@@ -175,10 +188,12 @@ pub enum Surface {
     /// envelope: `Surface::TracesMetrics` is not reused). Against this
     /// suite's empty databases a well-formed request returns exactly
     /// `{"edges":[],"truncated":false}` with 200 — the mounting oracle (an
-    /// unmounted path would 404 instead). Errors are the JSON envelope
-    /// (`{"status","errorType","error"}`), never with `position`. This is a
-    /// PulsusDB-native surface with no Tempo-compat alias (the interop
-    /// reference has no service-graph HTTP endpoint).
+    /// unmounted path would 404 instead). Errors are the bare `text/plain`
+    /// body of [`PlainTextWriter::TempoFrontendResponse`] (issue #384),
+    /// never carrying a byte offset. This is a PulsusDB-native surface
+    /// with no Tempo-compat alias (the interop reference has no
+    /// service-graph HTTP endpoint) — it takes the §4 container because it
+    /// is a §4 route, written by the same responder.
     TracesGraph,
     /// `GET /api/traces/v1/tags` and `/api/traces/v1/tag/{tag}/values`
     /// (issue #58, docs/api.md §4.3) — success is the documented native
@@ -191,7 +206,9 @@ pub enum Surface {
     /// Unlike `TracesFetch`, the middle `{tag}` param with a trailing
     /// static `/values` is compatible with the generic matrix (the
     /// sibling-404 suffix yields a genuinely unrouted path). Errors are
-    /// the JSON envelope, never with `position`.
+    /// the bare `text/plain` body of
+    /// [`PlainTextWriter::TempoFrontendResponse`] (issue #384), never
+    /// carrying a byte offset.
     TracesTags,
     /// The T9 v2 Tempo tag-discovery aliases `/api/v2/search/tags` and
     /// `/api/v2/search/tag/{tag}/values` (issue #61, docs/api.md §8.1) —
@@ -201,8 +218,9 @@ pub enum Surface {
     /// well-formed request returns the empty envelope 200
     /// (`{"scopes":[]}` / `{"tagValues":[]}`) with NO `truncated` key —
     /// the mounting oracle. Errors are native-identical (shared param
-    /// parsing), never with `position`. The seeded non-empty wire-shape
-    /// proof lives in `traces_tags_live.rs`.
+    /// parsing and the same #384 responder), never carrying a byte
+    /// offset. The seeded non-empty wire-shape proof lives in
+    /// `traces_tags_live.rs`.
     TracesTagsV2,
     /// The T9 v1 Tempo tag-discovery aliases `/api/search/tags` and
     /// `/api/search/tag/{tag}/values` (issue #61, docs/api.md §8.1) —
@@ -210,8 +228,9 @@ pub enum Surface {
     /// `{"tagValues":[<bare strings>]}` (scope, value types, and
     /// `truncated` all projected away server-side). Empty-DB mounting
     /// oracle: the flat empty envelope 200, with neither a `scopes` nor
-    /// a `truncated` key. Errors native-identical, never with
-    /// `position`. Seeded proof in `traces_tags_live.rs`.
+    /// a `truncated` key. Errors native-identical (the same #384
+    /// responder), never carrying a byte offset. Seeded proof in
+    /// `traces_tags_live.rs`.
     TracesTagsV1,
     /// `GET /api/echo` (issue #61) — Tempo's constant liveness echo:
     /// `200` with the exact body `echo` (`text/plain; charset=utf-8`,
@@ -326,16 +345,18 @@ impl Req {
 /// conflated).
 #[derive(Debug, Clone, Copy)]
 pub enum ExpectedError {
-    /// `prom_api`/`traces_api`'s `{"status":"error","errorType",...}`
-    /// envelope. `has_position` pins whether `position` is present (only
-    /// ever true for `traces_api` TraceQL parse errors — `prom_api`'s
-    /// envelope never carries the field at all). Issue #264 moved the
-    /// whole LogQL surface off this variant onto
-    /// [`ExpectedError::PlainText`].
-    Json {
-        error_type: &'static str,
-        has_position: bool,
-    },
+    /// `prom_api`'s `{"status":"error","errorType","error"}` envelope, and
+    /// ONLY `prom_api`'s: upstream Prometheus writes its API errors as
+    /// `application/json` (`respondError`, `web/api/v1/api.go:2200-2230`
+    /// vendored @ grafana/loki v3.7.4), so this surface keeps a JSON
+    /// envelope where the other two have none. Issue #264 moved the LogQL
+    /// surface off this variant and issue #384 moved the traces surface
+    /// off it, both onto [`ExpectedError::PlainText`].
+    ///
+    /// There is no `has_position` knob: this envelope has exactly three
+    /// fields and `position` is never one of them. `api_conformance`
+    /// asserts its ABSENCE unconditionally, on every case.
+    Json { error_type: &'static str },
     /// The ingest handlers' hand-rolled `google.rpc.Status { code, message }`
     /// protobuf error body (OTLP `/v1/logs`, `/v1/metrics`, `/v1/traces`).
     Otlp { code: i32 },
@@ -348,35 +369,63 @@ pub enum ExpectedError {
 
 /// Which plain-text error writer a route's error body comes from.
 ///
-/// **The split is on the terminator, and ONLY on the terminator.** Loki's
-/// two writers — `WriteError` for the query surface (issue #264) and
-/// `push.HTTPError` for `/loki/api/v1/push` (issue #374) — are both built
-/// on Go's `http.Error` container: they set the SAME `Content-Type` and
-/// the SAME `X-Content-Type-Options: nosniff`, and differ only in that one
-/// ends with `fmt.Fprint` (no terminator) and the other with
-/// `fmt.Fprintln` (one `\n`).
+/// **The writers differ on TWO independent axes**, and reading them as one
+/// axis is how a real divergence hides.
 ///
-/// That distinction is easy to get backwards, and getting it backwards is
-/// how a real divergence hides: an earlier revision of this enum asserted
-/// `nosniff` for the query family only, which made our push responder's
-/// MISSING `nosniff` look like a property the families legitimately
-/// disagreed about. They do not. Anything the writers share is asserted
-/// for every variant that has a reference for it — see
-/// [`PlainTextWriter::sets_nosniff`].
+/// - Loki's two — `WriteError` for the LogQL query surface (issue #264)
+///   and `push.HTTPError` for `/loki/api/v1/push` (issue #374) — are both
+///   built on Go's `http.Error` container: same `Content-Type`, same
+///   `X-Content-Type-Options: nosniff`, differing only in that one ends
+///   with `fmt.Fprint` (no terminator) and the other with `fmt.Fprintln`
+///   (one `\n`). An earlier revision of this enum asserted `nosniff` for
+///   the query family only, which made our push responder's MISSING
+///   `nosniff` look like a property the families legitimately disagreed
+///   about. They do not.
+/// - Tempo's user-facing query frontend (issue #384) agrees with
+///   `WriteError` on the content type AND on the terminator, and differs
+///   on `nosniff`: it sets **no headers at all**. So the terminator, which
+///   separates the two Loki writers, does NOT separate Tempo's from
+///   Loki's — and `nosniff`, which the two Loki writers share, is exactly
+///   what separates them. Sharing one expectation across the LogQL and
+///   traces surfaces would make us emit a header Tempo never emits, and
+///   every hermetic check would stay green.
+///
+/// Anything a writer's reference decides is asserted — presence AND
+/// absence. See [`PlainTextWriter::nosniff_rule`].
 #[derive(Debug, Clone, Copy)]
 pub enum PlainTextWriter {
     /// The LogQL query surface (§2), since issue #264 — Loki's
-    /// `WriteError` (`pkg/util/server/error.go:46-52 @ v3.7.4`): two
+    /// `WriteError` (`pkg/util/server/error.go:46-52 @ loki v3.7.4`): two
     /// headers, then `fmt.Fprint(w, err.Error())`. Asserted: `nosniff`
-    /// present and **no** trailing newline.
+    /// PRESENT and **no** trailing newline.
     LogqlWriteError,
     /// `/loki/api/v1/push` (§8.2), issue #374 — the reference binds ONE
     /// error writer for that endpoint, `push.HTTPError` -> `http.Error`
     /// -> `fmt.Fprintln` (`pkg/distributor/http.go:27-30` and
-    /// `pkg/loghttp/push/push.go:606-608 @ v3.7.4`). Asserted: `nosniff`
-    /// present (Go's `http.Error` sets it, exactly as `WriteError` does)
-    /// and **exactly one** trailing `\n`.
+    /// `pkg/loghttp/push/push.go:606-608 @ loki v3.7.4`). Asserted:
+    /// `nosniff` PRESENT (Go's `http.Error` sets it, exactly as
+    /// `WriteError` does) and **exactly one** trailing `\n`.
     LokiPushHttpError,
+    /// The traces query surface (§4) and its §8.1 aliases, since issue
+    /// #384 — Tempo's query FRONTEND, which serves every user-facing
+    /// `/api/*` query route (`cmd/tempo/app/modules.go:500-512 @ tempo
+    /// v3.0.2`). Its 4xx rejections are `*http.Response` values with a nil
+    /// `Header` map (`httpInvalidRequest`,
+    /// `modules/frontend/metrics_query_range_handler.go:266-272`), copied
+    /// out verbatim by `modules/frontend/handler.go:113-116` — so Go
+    /// sniffs the content type and nothing sets a header or appends a
+    /// terminator. Asserted: `nosniff` ABSENT and **no** trailing newline.
+    ///
+    /// NOT [`PlainTextWriter::LogqlWriteError`]: the two agree on every
+    /// property this enum asserts EXCEPT `nosniff`, which is why the
+    /// traces cases may not borrow that variant.
+    ///
+    /// (Tempo's `http.Error` sites in `modules/querier/http.go` do set
+    /// `nosniff` and do append an LF, but they are registered only under
+    /// `path.Join(api.PathPrefixQuerier, …)` — `modules.go:438-459`,
+    /// `pkg/api/http.go:67` — an internal path, not this surface's
+    /// reference.)
+    TempoFrontendResponse,
     /// `/api/v1/write` (Prometheus remote write) and `/api/v2/spans`
     /// (OpenZipkin) — which share ONE PulsusDB responder,
     /// `pulsus_write::ingest::http::rw_error_response`, while answering to
@@ -390,19 +439,44 @@ pub enum PlainTextWriter {
     WriterSideReceiver,
 }
 
+/// What a writer's reference says about `X-Content-Type-Options`.
+///
+/// **Three-valued on purpose.** [`NosniffRule::Absent`] is a rule the
+/// reference gives us and must be asserted; [`NosniffRule::Unasserted`] is
+/// the ABSENCE of a rule, where two references sharing one responder
+/// disagree and issue #385 owns the question. Collapsing the two — which
+/// is what a `sets_nosniff() -> bool` does, since `false` has to stand for
+/// both — is the conflation that produced issue #264's round-one finding:
+/// an assertion dropped on a property the writers actually shared, which
+/// hid a genuinely missing header. Adding Tempo's frontend, whose rule IS
+/// absence, under that same spelling would have reintroduced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NosniffRule {
+    /// The reference sets the header; assert it is present.
+    Present,
+    /// The reference sets no header; assert it is absent.
+    Absent,
+    /// No reference-derived rule exists for this writer; assert nothing.
+    Unasserted,
+}
+
 impl PlainTextWriter {
-    /// Whether this writer's reference sets
+    /// What this writer's reference decides about
     /// `X-Content-Type-Options: nosniff`.
     ///
     /// Deliberately NOT keyed off the same distinction as the trailing
-    /// byte: both Loki writers set it (Go's `http.Error` and Loki's
-    /// `WriteError` both do), so both assert it. Only
-    /// [`PlainTextWriter::WriterSideReceiver`] cannot, because the two
-    /// references sharing that responder disagree — see its doc.
-    pub fn sets_nosniff(self) -> bool {
+    /// byte — see [`PlainTextWriter`]'s doc for the two axes.
+    pub fn nosniff_rule(self) -> NosniffRule {
         match self {
-            PlainTextWriter::LogqlWriteError | PlainTextWriter::LokiPushHttpError => true,
-            PlainTextWriter::WriterSideReceiver => false,
+            // Go's `http.Error` and Loki's `WriteError` both set it.
+            PlainTextWriter::LogqlWriteError | PlainTextWriter::LokiPushHttpError => {
+                NosniffRule::Present
+            }
+            // Tempo's frontend sets no headers at all.
+            PlainTextWriter::TempoFrontendResponse => NosniffRule::Absent,
+            // Two references, one responder, and they disagree — #385.
+            // Do NOT opportunistically promote this to `Absent`.
+            PlainTextWriter::WriterSideReceiver => NosniffRule::Unasserted,
         }
     }
 }
@@ -814,7 +888,6 @@ const PROM_QUERY_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
     CaseClass {
@@ -823,7 +896,6 @@ const PROM_QUERY_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
     CaseClass {
@@ -832,7 +904,6 @@ const PROM_QUERY_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
 ];
@@ -844,7 +915,6 @@ const PROM_QUERY_RANGE_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
     CaseClass {
@@ -853,7 +923,6 @@ const PROM_QUERY_RANGE_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
     CaseClass {
@@ -862,7 +931,6 @@ const PROM_QUERY_RANGE_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
     CaseClass {
@@ -871,7 +939,6 @@ const PROM_QUERY_RANGE_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
 ];
@@ -883,7 +950,6 @@ const PROM_LABELS_CASES: &[CaseClass] = &[
         expect_status: 422,
         expect: ExpectedError::Json {
             error_type: "execution",
-            has_position: false,
         },
     },
     CaseClass {
@@ -892,7 +958,6 @@ const PROM_LABELS_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
 ];
@@ -904,7 +969,6 @@ const PROM_SERIES_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
     CaseClass {
@@ -913,7 +977,6 @@ const PROM_SERIES_CASES: &[CaseClass] = &[
         expect_status: 422,
         expect: ExpectedError::Json {
             error_type: "execution",
-            has_position: false,
         },
     },
     CaseClass {
@@ -922,7 +985,6 @@ const PROM_SERIES_CASES: &[CaseClass] = &[
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
-            has_position: false,
         },
     },
 ];
@@ -1088,10 +1150,7 @@ const TRACE_FETCH_CASES: &[CaseClass] = &[CaseClass {
     name: "malformed_hex",
     build: traces_malformed_hex,
     expect_status: 400,
-    expect: ExpectedError::Json {
-        error_type: "bad_data",
-        has_position: false,
-    },
+    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
 }];
 
 // -- traces search (issue #57, docs/api.md §4.2) -----------------------
@@ -1133,57 +1192,37 @@ const TRACES_SEARCH_CASES: &[CaseClass] = &[
         name: "malformed_q",
         build: traces_search_malformed_q,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "bad_start",
         build: traces_search_bad_start,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "bad_limit",
         build: traces_search_bad_limit,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "bad_spss",
         build: traces_search_bad_spss,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "malformed_tags_logfmt",
         build: traces_search_malformed_tags,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            // Strict logfmt errors carry a byte offset into the decoded
-            // `tags` value (code review round 1).
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "q_plus_legacy_conflict",
         build: traces_search_q_plus_legacy,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
 ];
 
@@ -1231,46 +1270,31 @@ const TRACES_METRICS_CASES: &[CaseClass] = &[
         name: "malformed_q",
         build: traces_metrics_malformed_q,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: true,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "missing_range",
         build: traces_metrics_missing_range,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "bad_step",
         build: traces_metrics_bad_step,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "missing_metric_stage",
         build: traces_metrics_missing_stage,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "point_cap_static_422",
         build: traces_metrics_point_cap,
         expect_status: 422,
-        expect: ExpectedError::Json {
-            error_type: "query_too_broad",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
 ];
 
@@ -1300,28 +1324,19 @@ const TRACES_GRAPH_CASES: &[CaseClass] = &[
         name: "missing_window",
         build: traces_graph_missing_window,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "inverted_range",
         build: traces_graph_inverted_range,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
         name: "since_plus_absolute_conflict",
         build: traces_graph_since_plus_absolute,
         expect_status: 400,
-        expect: ExpectedError::Json {
-            error_type: "bad_data",
-            has_position: false,
-        },
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
 ];
 
@@ -1344,10 +1359,7 @@ const TRACES_TAGS_CASES: &[CaseClass] = &[CaseClass {
     name: "unsupported_scope",
     build: traces_tags_bogus_scope,
     expect_status: 400,
-    expect: ExpectedError::Json {
-        error_type: "bad_data",
-        has_position: false,
-    },
+    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
 }];
 
 fn traces_tag_values_empty_key(req: &mut Req) {
@@ -1361,10 +1373,7 @@ const TRACES_TAG_VALUES_CASES: &[CaseClass] = &[CaseClass {
     name: "empty_key",
     build: traces_tag_values_empty_key,
     expect_status: 400,
-    expect: ExpectedError::Json {
-        error_type: "bad_data",
-        has_position: false,
-    },
+    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
 }];
 
 fn rw_bad_snappy(req: &mut Req) {

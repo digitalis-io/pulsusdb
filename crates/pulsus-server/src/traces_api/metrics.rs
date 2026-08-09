@@ -99,9 +99,9 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
 
 #[cfg(test)]
 mod tests {
-    use axum::body::to_bytes;
     use axum::http::StatusCode;
 
+    use super::super::error::testutil::error_body;
     use super::*;
     use crate::app::BuildInfo;
     use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
@@ -131,21 +131,18 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
-        let status = res.status();
-        let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
-    }
-
-    async fn run_range(query: &str) -> (StatusCode, serde_json::Value) {
+    /// Every case below is an ERROR response, so it goes through
+    /// `error::testutil::error_body`, which asserts Tempo's container
+    /// (`text/plain; charset=utf-8`, exactly once, NO `nosniff`) on the
+    /// way through — this module is not a hole in that check (#384).
+    async fn run_range(query: &str) -> (StatusCode, String) {
         let res = metrics_query_range(State(test_state()), RawQuery(Some(query.to_string()))).await;
-        status_and_body(res).await
+        error_body(res).await
     }
 
-    async fn run_instant(query: &str) -> (StatusCode, serde_json::Value) {
+    async fn run_instant(query: &str) -> (StatusCode, String) {
         let res = metrics_query(State(test_state()), RawQuery(Some(query.to_string()))).await;
-        status_and_body(res).await
+        error_body(res).await
     }
 
     // Param/parse/plan failures resolve BEFORE the pool is consulted, so
@@ -155,39 +152,34 @@ mod tests {
     const RATE_Q: &str = "q=%7B%7D%20%7C%20rate()";
 
     #[tokio::test]
-    async fn a_malformed_traceql_expression_is_400_bad_data_with_a_position() {
-        let (status, json) = run_range("q=%7B&start=1700000000&end=1700003600").await;
+    async fn a_malformed_traceql_expression_is_400_naming_its_byte_offset() {
+        let (status, body) = run_range("q=%7B&start=1700000000&end=1700003600").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_some(), "body {json}");
+        assert!(body.contains("byte 1"), "body {body}");
     }
 
     #[tokio::test]
-    async fn a_missing_range_is_400_bad_data() {
-        let (status, json) = run_range(RATE_Q).await;
+    async fn a_missing_range_is_400() {
+        let (status, body) = run_range(RATE_Q).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_none());
+        assert!(!body.contains("byte "), "body {body}");
     }
 
     #[tokio::test]
-    async fn a_bad_step_is_400_bad_data_on_both_forms() {
+    async fn a_bad_step_is_400_on_both_forms() {
         let query = format!("{RATE_Q}&start=1700000000&end=1700003600&step=500ms");
-        let (status, json) = run_range(&query).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
-        let (status, json) = run_instant(&query).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
+        let (status, body) = run_range(&query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        let (status, body) = run_instant(&query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
     }
 
     #[tokio::test]
-    async fn a_search_only_pipeline_on_metrics_is_400_bad_data() {
+    async fn a_search_only_pipeline_on_metrics_is_400() {
         // `{} | count() > 2` parses but the metrics planner rejects it.
-        let (status, json) =
+        let (status, body) =
             run_range("q=%7B%7D%20%7C%20count()%20%3E%202&start=1700000000&end=1700003600").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
     }
 
     /// Issue #328 (AC 7): `topk(0)` parses and the metrics PLANNER used
@@ -197,59 +189,53 @@ mod tests {
     #[tokio::test]
     async fn a_non_positive_topk_limit_is_400_with_the_validate_wrapping() {
         let q = "q=%7B%7D%20%7C%20rate()%20%7C%20topk(0)&start=1700000000&end=1700003600";
-        for (form, (status, json)) in [
+        for (form, (status, body)) in [
             ("range", run_range(q).await),
             ("instant", run_instant(q).await),
         ] {
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{form}: body {json}");
-            assert_eq!(json["errorType"], "bad_data", "{form}: body {json}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{form}: body {body}");
             assert!(
-                json["error"]
-                    .as_str()
-                    .is_some_and(|m| m.starts_with("invalid TraceQL query: ")
-                        && m.contains("limit must be greater than 0")),
-                "{form}: body {json}"
+                body.starts_with("invalid TraceQL query: ")
+                    && body.contains("limit must be greater than 0"),
+                "{form}: body {body}"
             );
-            assert!(json.get("position").is_none(), "{form}: body {json}");
+            assert!(!body.contains("byte "), "{form}: body {body}");
         }
     }
 
     #[tokio::test]
-    async fn a_missing_metric_stage_is_400_bad_data() {
-        let (status, json) = run_range("q=%7B%7D&start=1700000000&end=1700003600").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
+    async fn a_missing_metric_stage_is_400() {
+        let (status, body) = run_range("q=%7B%7D&start=1700000000&end=1700003600").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
     }
 
     #[tokio::test]
-    async fn a_cross_spanset_metrics_query_is_400_bad_data() {
+    async fn a_cross_spanset_metrics_query_is_400() {
         let q = "q=%7B%7D%20%26%26%20%7B%7D%20%7C%20rate()&start=1700000000&end=1700003600";
-        let (status, json) = run_range(q).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
+        let (status, body) = run_range(q).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
     }
 
     #[tokio::test]
-    async fn exceeding_the_point_cap_is_a_static_422_query_too_broad() {
+    async fn exceeding_the_point_cap_is_a_static_422() {
         // 1,000,000 seconds at step=1 → 1M buckets >> MAX_METRICS_POINTS,
         // rejected at plan time — no pool needed, so this no-pool state
         // proves the rejection is pre-execution.
-        let (status, json) =
+        let (status, body) =
             run_range(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json["errorType"], "query_too_broad", "body {json}");
-        assert!(json.get("position").is_none());
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {body}");
+        assert!(!body.contains("byte "), "body {body}");
     }
 
     #[tokio::test]
     async fn a_well_formed_request_without_a_pool_is_503_on_both_forms() {
         let query = format!("{RATE_Q}&start=1700000000&end=1700003600&step=60");
-        let (status, json) = run_range(&query).await;
+        let (status, body) = run_range(&query).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
-        let (status, json) = run_instant(&query).await;
+        assert_eq!(body, "clickhouse pool not yet established");
+        let (status, body) = run_instant(&query).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[tokio::test]
@@ -259,10 +245,10 @@ mod tests {
         // in either form reaches the pool gate (503 here), never a 400.
         let query =
             format!("{RATE_Q}&start=1700000000000000000&end=2023-11-14T23%3A13%3A20Z&step=60");
-        let (status, json) = run_range(&query).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {json}");
-        let (status, json) = run_instant(&query).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {json}");
+        let (status, body) = run_range(&query).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
+        let (status, body) = run_instant(&query).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
     }
 
     #[tokio::test]
@@ -272,16 +258,14 @@ mod tests {
         // round 1's overflow class, proven end to end through the
         // handler).
         let query = format!("{RATE_Q}&start={}&end={}&step=1", i64::MIN, i64::MAX);
-        let (status, json) = run_range(&query).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {json}");
-        assert_eq!(json["errorType"], "query_too_broad", "body {json}");
+        let (status, body) = run_range(&query).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {body}");
     }
 
     #[tokio::test]
     async fn a_missing_query_string_entirely_is_400() {
         let res = metrics_query_range(State(test_state()), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 }

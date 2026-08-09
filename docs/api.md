@@ -11,7 +11,7 @@ Conventions:
 
 - Default listener: `0.0.0.0:3100`. All endpoints relative to that root.
 - Timestamps: log APIs use nanoseconds; metrics APIs use RFC3339 or unix seconds; trace APIs accept unix seconds/nanoseconds/RFC3339.
-- Errors: the log query API (§2) returns a bare `text/plain` body carrying the message and nothing else; the metrics (§3) and trace (§4) APIs return `{"status":"error","errorType":...,"error":...}` JSON envelopes. `429` on ingest backpressure; `400` for malformed queries.
+- Errors: the log query API (§2) and the trace query API (§4) return a bare `text/plain` body carrying the message and nothing else — but not the same container: §2 also sets `X-Content-Type-Options: nosniff` and §4 does not, because their references differ (see §2.3 and §4). The metrics API (§3) returns a `{"status":"error","errorType":...,"error":...}` JSON envelope, because upstream Prometheus does. `429` on ingest backpressure; `400` for malformed queries.
 - Compression: requests may be `gzip`, `snappy`, or `zstd` (`Content-Encoding`); responses gzip when accepted.
 - Regular expressions: RE2 in every query language — §9 documents the dialect and the measured differences from Loki/Prometheus/Tempo.
 
@@ -138,25 +138,26 @@ covers them.
 The status code is the whole machine-readable classification — there is no
 `errorType` field on this surface (the reference has none either).
 
-The metrics API (§3) and trace API (§4) are untouched by #264 and keep
-their JSON envelopes, but for different reasons, and only one of the two
-is parity:
+The other two query surfaces were checked against their own references
+rather than made symmetric with this one, and they landed differently:
 
-- **§3 (metrics) matches its reference.** Upstream Prometheus writes every
-  API error as `application/json` carrying exactly
-  `{status, errorType, error}` — `respondError`,
+- **§3 (metrics) keeps a JSON envelope, and matches its reference.**
+  Upstream Prometheus writes every API error as `application/json`
+  carrying exactly `{status, errorType, error}` — `respondError`,
   `web/api/v1/api.go:2200-2230`, read at
   `vendor/github.com/prometheus/prometheus/` @ grafana/loki v3.7.4. Making
   §3 plain text to match §2 would have *created* a divergence.
-- **§4 (traces) does not, and is a known open divergence.** Tempo v3.0.2
-  writes its query errors as plain text too — the querier calls
-  `http.Error` directly (`modules/querier/http.go:45,52,94,…`) and the
-  query frontend funnels everything through dskit's
-  `httpgrpc.WriteError` (`modules/frontend/handler.go:156-168`), which is
-  also `http.Error`. PulsusDB's `traces_api` still answers a JSON
-  envelope. That is a second wire-shape change across a second surface —
-  it is **not** fixed here and needs its own issue; #264's owner ruling
-  and its measured sweep both name the LogQL surface.
+- **§4 (traces) writes plain text too, since issue #384 — but not this
+  container.** Tempo's user-facing `/api/*` query routes are served by its
+  query frontend (`cmd/tempo/app/modules.go:500-512` @ tempo v3.0.2),
+  whose 4xx rejections are `*http.Response` values with a nil `Header`
+  map, copied out verbatim by `modules/frontend/handler.go:113-116`. So
+  §4 sets **no** `X-Content-Type-Options`, where this section's writer
+  does. The trailing byte, which is what separates §2's writer from
+  `/loki/api/v1/push`'s, is the same on both (neither writes one) — so
+  the two surfaces agree on the terminator and disagree on the header,
+  and neither expectation may be reused for the other. See §4's own
+  errors note.
 
 The three surfaces have never shared an error writer in PulsusDB, so
 changing §2 changed only §2.
@@ -373,7 +374,7 @@ GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 
 #### Errors (§3.1-3.4)
 
-`{"status":"error","errorType":"...","error":"..."}` — exactly these three fields, **no `position` field**: a PromQL parse error's position is embedded verbatim inside the `error` message string, Prometheus-style, never split out. This surface keeps a JSON envelope where the log API (§2.3) has none, because upstream Prometheus writes its errors as `application/json` and Loki writes LogQL's as bare `text/plain` — the two are matched against their own references independently, never made symmetric with each other.
+`{"status":"error","errorType":"...","error":"..."}` — exactly these three fields, **no `position` field**: a PromQL parse error's position is embedded verbatim inside the `error` message string, Prometheus-style, never split out. This is the **only** query surface that keeps a JSON envelope: the log API (§2.3) and the trace API (§4) both write a bare `text/plain` body. Upstream Prometheus writes its errors as `application/json`, Loki writes LogQL's as bare `text/plain`, and Tempo writes its query frontend's as bare `text/plain` too — three surfaces, two shapes, each matched against its own reference independently and never made symmetric with the others.
 
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|
@@ -398,6 +399,50 @@ One boundary remains, and it is storage's, not the cache's: ClickHouse compiles 
 
 ## 4. Traces query API
 
+#### Errors (§4.1-§4.5)
+
+Every error a §4 **handler** writes — every row of every table below — is
+a **bare `text/plain` body**: the message and nothing else, no JSON, no
+keys, no trailing newline, under `Content-Type: text/plain; charset=utf-8`
+and **no** `X-Content-Type-Options`. Issue #384 replaced PulsusDB's
+earlier `{"status","errorType","error","position"?}` envelope with it; a
+parse error's byte offset now travels inside the message, as the
+reference's `line, col` does.
+
+That container is the reference's, and *which* reference writer matters.
+Tempo has two and they disagree:
+
+- **The query frontend** serves every user-facing `/api/*` query route
+  (`cmd/tempo/app/modules.go:500-512` @ grafana/tempo v3.0.2, each
+  `base.Wrap(queryFrontend.…Handler)`). Its 4xx rejections are
+  `*http.Response` values built with a **nil `Header` map**
+  (`httpInvalidRequest`,
+  `modules/frontend/metrics_query_range_handler.go:266-272`;
+  `extractTenant`, `modules/frontend/util.go:15-25`; the same literal
+  recurs across the search, tag, trace-by-ID and metrics handler files),
+  which `handler.ServeHTTP` copies out verbatim
+  (`modules/frontend/handler.go:113-116`: `copyHeader`,
+  `WriteHeader`, `io.Copy`). Nothing sets a header, so Go sniffs the
+  content type and no `nosniff` is emitted; nothing appends a terminator.
+- **The querier's own handlers** call `http.Error`, which *does* set both
+  headers and *does* append a newline — but they are registered only
+  under `path.Join(api.PathPrefixQuerier, …)`
+  (`cmd/tempo/app/modules.go:438-459`, `PathPrefixQuerier = "/querier"`
+  at `pkg/api/http.go:67`), an internal path no client meets.
+
+**This is not §2's container**, and the difference is exactly one header:
+§2's writer (Loki's `WriteError`, `pkg/util/server/error.go:46-52` @
+grafana/loki v3.7.4) sets `X-Content-Type-Options: nosniff` and this one
+does not. The two agree on the content type and on the absent terminator.
+The status code is the whole machine-readable classification on this
+surface — there is no `errorType` field (the reference has none either).
+
+**Scope of that claim: handler-written errors only.** Rejections made
+*above* the handlers — the router's own `404`/`405`, and the server-wide
+`TimeoutLayer`'s `408` — are not written by this container. They diverge
+from the reference, they are pre-existing, and #384 neither changed nor
+covers them (the same boundary #264 drew for §2).
+
 ### 4.1 Trace fetch
 
 ```
@@ -405,21 +450,23 @@ GET /api/traces/v1/trace/{traceId}         → OTLP-shaped trace (protobuf or JS
 GET /api/traces/v1/trace/{traceId}/json    → force JSON
 ```
 
-`traceId` is hex (16 or 32 chars, left-padded). `404` with an error envelope when absent.
+`traceId` is hex (16 or 32 chars, left-padded). `404` with the plain-text body `trace not found` when absent.
 
-**Content negotiation.** The default representation is OTLP-canonical JSON (protojson: hex trace/span ids, camelCase fields, 64-bit integers as strings) with `Content-Type: application/json`; no `Accept` header means JSON. `Accept: application/protobuf` (or its request-side alias `application/x-protobuf`) selects the protobuf `TracesData` encoding, returned as `Content-Type: application/protobuf` — deliberately asymmetric with OTLP *ingest*, which uses `application/x-protobuf` per the OTLP/HTTP spec; the query response follows the Tempo/Grafana client convention instead, and never emits `x-protobuf`. Quality values are honored per RFC 9110 (`;q=` weights, exact `type/subtype` > `type/*` > `*/*` specificity, `q=0` excludes; an equal-quality tie resolves to JSON). An `Accept` header under which neither served representation is acceptable (e.g. `text/plain`, or every matching range at `q=0`) is rejected with `406 not_acceptable`. The `/json` suffix forces JSON unconditionally — it never consults `Accept` and never returns `406`. Every response from the negotiating route (success or error) carries `Vary: accept` per RFC 9110 §12.5.5; the `/json` route serves one representation and never adds `accept` to `Vary` (the global compression layer independently appends `accept-encoding` where applicable).
+**Content negotiation.** The default representation is OTLP-canonical JSON (protojson: hex trace/span ids, camelCase fields, 64-bit integers as strings) with `Content-Type: application/json`; no `Accept` header means JSON. `Accept: application/protobuf` (or its request-side alias `application/x-protobuf`) selects the protobuf `TracesData` encoding, returned as `Content-Type: application/protobuf` — deliberately asymmetric with OTLP *ingest*, which uses `application/x-protobuf` per the OTLP/HTTP spec; the query response follows the Tempo/Grafana client convention instead, and never emits `x-protobuf`. Quality values are honored per RFC 9110 (`;q=` weights, exact `type/subtype` > `type/*` > `*/*` specificity, `q=0` excludes; an equal-quality tie resolves to JSON). An `Accept` header under which neither served representation is acceptable (e.g. `text/plain`, or every matching range at `q=0`) is rejected with `406`. The `/json` suffix forces JSON unconditionally — it never consults `Accept` and never returns `406`. Every response from the negotiating route (success or error) carries `Vary: accept` per RFC 9110 §12.5.5; the `/json` route serves one representation and never adds `accept` to `Vary` (the global compression layer independently appends `accept-encoding` where applicable).
 
 **Response shape.** One `TracesData` assembling every stored span of the trace; at-least-once ingest duplicates are deduplicated by span id at read time. Spans are returned in a canonical order — ascending `(startTimeUnixNano, spanId)` — so responses are byte-deterministic regardless of storage read order.
 
-**Errors** are always the JSON envelope (`{"status":"error","errorType":...,"error":...}`), regardless of `Accept`:
+**Errors** are always the §4 plain-text body, regardless of `Accept` — an error never re-encodes as protobuf:
 
-| Cause | HTTP | `errorType` |
-|-------|------|-------------|
-| Malformed `traceId` (not 16/32 hex chars) | `400` | `bad_data` |
-| Trace absent | `404` | `not_found` |
-| No acceptable representation under `Accept` | `406` | `not_acceptable` |
-| ClickHouse read timed out | `504` | `timeout` |
-| Unclassified ClickHouse/internal failure (incl. undecodable or unsupported stored payloads) | `500` | `internal` |
+| Cause | HTTP |
+|-------|------|
+| Malformed `traceId` (not 16/32 hex chars) | `400` |
+| Trace absent | `404` |
+| No acceptable representation under `Accept` | `406` |
+| ClickHouse read timed out | `504` |
+| Unclassified ClickHouse/internal failure (incl. undecodable or unsupported stored payloads) | `500` |
+
+**Named residual — the absent-trace `404` body.** Tempo answers an absent trace with an **empty** `404` carrying no `Content-Type` at all; PulsusDB answers `trace not found` as `text/plain`. This is deliberate and is the one §4 error where our body differs from the reference's: `api_conformance`'s fetch-surface mounting oracle distinguishes *mounted-but-absent* from *unmounted* precisely by the body being non-empty (axum's unrouted `404` is empty), and `route_inventory` cannot stand in for it — that guard is a hermetic scan of the router **source**, with no server and no request, so it proves the route is registered in the tree, never that a running spawn in a given mode serves it. Ledgered as `traces-absent-trace-404-body` in `docs/benchmarks/traces-differential-ledger.md`. The `406` row is likewise PulsusDB-native (Tempo ignores an unacceptable `Accept` rather than rejecting) — an RFC 9110 behaviour #384 did not change, only re-containered.
 
 ### 4.2 `GET /api/traces/v1/search`
 
@@ -430,9 +477,9 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 | `start`, `end` | unix s / ns / RFC3339 (§1's trace-API forms; integers with magnitude ≥ 10^12 are nanoseconds, smaller ones seconds); **both required**, `end > start` |
 | `limit`, `spss` | result cap (default 20) and spans-per-spanset cap (default 3); positive integers |
 
-**`q` vs legacy params:** mutually exclusive — supplying `q` together with any of `tags`/`minDuration`/`maxDuration` is a `400 bad_data`, never silent precedence. Supplying neither is a valid time-range-only search (`{}`).
+**`q` vs legacy params:** mutually exclusive — supplying `q` together with any of `tags`/`minDuration`/`maxDuration` is a `400`, never silent precedence. Supplying neither is a valid time-range-only search (`{}`).
 
-**Legacy compilation:** `tags` is logfmt — space-separated `key=value` pairs; a value may be double-quoted to contain spaces/`=`, and inside quotes `\"` and `\\` are the only escapes. Each pair compiles to an **unscoped** `.key="value"` conjunct; `minDuration`/`maxDuration` compile to `duration >= <lit>` / `duration <= <lit>`; all conjuncts join with `&&` in one `{ … }` and the result goes through the ordinary TraceQL parser (one validation path). The grammar is enforced strictly: a bare key with no `=`, an empty key, an unterminated quote, an `=` or `"` inside an **unquoted** value (quote the value instead), a quoted value not followed by whitespace/end-of-input, or any escape other than `\"`/`\\` is a `400 bad_data` carrying `position` — the byte offset into the decoded `tags` value.
+**Legacy compilation:** `tags` is logfmt — space-separated `key=value` pairs; a value may be double-quoted to contain spaces/`=`, and inside quotes `\"` and `\\` are the only escapes. Each pair compiles to an **unscoped** `.key="value"` conjunct; `minDuration`/`maxDuration` compile to `duration >= <lit>` / `duration <= <lit>`; all conjuncts join with `&&` in one `{ … }` and the result goes through the ordinary TraceQL parser (one validation path). The grammar is enforced strictly: a bare key with no `=`, an empty key, an unterminated quote, an `=` or `"` inside an **unquoted** value (quote the value instead), a quoted value not followed by whitespace/end-of-input, or any escape other than `\"`/`\\` is a `400` whose message names the byte offset into the decoded `tags` value.
 
 **Duration literals** (in `q`, e.g. `duration > 2s`): an **unsigned** decimal number (integer or fraction — `2`, `1.5`, `.5`) **immediately** followed by exactly **one** unit from `{ns, us, µs, ms, s, m, h}`. No sign; no compound literals (`1h30m` is rejected). A fractional literal is valid only if it resolves to an exact whole number of nanoseconds (`0.5s` = 500000000ns is valid; `0.1ns` is a positioned parse error) — no rounding, no truncation.
 
@@ -450,7 +497,7 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 
 Response: `{"traces":[...],"metrics":{"partial":<bool>,"limit":<n>,"returned":<n>}}`. Each trace carries `traceID`, `rootServiceName`, `rootTraceName`, `startTimeUnixNano` (string nanoseconds; root metadata comes from the **whole** trace, so a root that predates `start` is still reported correctly), `durationMs` (the root span's duration), and `spanSets`: for a plain query a **single** entry of `{"matched":<total matched spans>,"spans":[...]}` where each span summary carries `spanID`, `name`, `startTimeUnixNano`, `durationMs`, plus an `attributes` list (`{"key","value":{"stringValue"}}`) for `select()`-projected fields.
 
-**`by()`/`coalesce()` grouped spanSets (issue #193).** A `| by(<keys>)` stage reshapes a trace's response into **one `spanSets` entry per distinct group key-tuple** (in first-appearance order), each carrying a group `attributes` list — the group-key attribute is named with Tempo's **`by(<key-expr>)`** form (`by(name)`, `by(resource.service.name)`, …) and carries the value **rendered by its TraceQL type** (verified live against Tempo v3.0.2): a string/attribute → `{"stringValue"}`; a numeric attribute → `{"doubleValue":<f>}`; a numeric intrinsic (`nestedSetParent`/`Left`/`Right`, `span:childCount`) → `{"intValue":"<n>"}`; `status`/`kind` → their lowercase **keyword** `{"stringValue"}` (`"ok"`/`"error"`/`"unset"`, `"server"`/`"client"`/…); a `duration`/`traceDuration` → Go's `time.Duration.String()` form as `{"stringValue"}` (`"1.5s"`, `"500µs"`); a span lacking the key groups under a null value — alongside that group's own `matched` total and its `spss`-capped `spans`. `spss` is applied **per group** (on the full pre-`spss` matched set), so a group never under-reports its membership. A `| coalesce()` stage **merges the current spanSets back into the single flat spanSet** (no per-spanSet `attributes`); the two stages apply in **pipeline order**, so `by()|coalesce()` collapses to flat while `coalesce()|by()` stays grouped. Float group keys are value-normalised — `-0.0` folds into `+0.0` and every NaN into one group — matching the reference. **Every by-key that resolves to a per-span scalar is grouped** — the physical columns (`name`/`resource.service.name`/`duration`/`status`/`kind`), the nested-set intrinsics (`nestedSetParent`/`Left`/`Right`), the trace-level intrinsics (`traceDuration`/`rootName`/`rootServiceName`/`span:childCount`/`span:id`/`span:parentID`/`trace:id`/`statusMessage`/`instrumentation:name`/`instrumentation:version`), and attributes — never a silent flat fallback. The only excluded by-keys are the **span-event / span-link intrinsics** (`event:name`/`event:timeSinceStart`/`link:spanID`/`link:traceID`): a span carries a *collection* of events/links, so there is no single scalar group value, and grouping by one is a clean **`400 bad_data`** (never a flat 200). A plain (non-`by()`, or `by()`-then-`coalesce()`) response is byte-identical to the single-spanSet shape above.
+**`by()`/`coalesce()` grouped spanSets (issue #193).** A `| by(<keys>)` stage reshapes a trace's response into **one `spanSets` entry per distinct group key-tuple** (in first-appearance order), each carrying a group `attributes` list — the group-key attribute is named with Tempo's **`by(<key-expr>)`** form (`by(name)`, `by(resource.service.name)`, …) and carries the value **rendered by its TraceQL type** (verified live against Tempo v3.0.2): a string/attribute → `{"stringValue"}`; a numeric attribute → `{"doubleValue":<f>}`; a numeric intrinsic (`nestedSetParent`/`Left`/`Right`, `span:childCount`) → `{"intValue":"<n>"}`; `status`/`kind` → their lowercase **keyword** `{"stringValue"}` (`"ok"`/`"error"`/`"unset"`, `"server"`/`"client"`/…); a `duration`/`traceDuration` → Go's `time.Duration.String()` form as `{"stringValue"}` (`"1.5s"`, `"500µs"`); a span lacking the key groups under a null value — alongside that group's own `matched` total and its `spss`-capped `spans`. `spss` is applied **per group** (on the full pre-`spss` matched set), so a group never under-reports its membership. A `| coalesce()` stage **merges the current spanSets back into the single flat spanSet** (no per-spanSet `attributes`); the two stages apply in **pipeline order**, so `by()|coalesce()` collapses to flat while `coalesce()|by()` stays grouped. Float group keys are value-normalised — `-0.0` folds into `+0.0` and every NaN into one group — matching the reference. **Every by-key that resolves to a per-span scalar is grouped** — the physical columns (`name`/`resource.service.name`/`duration`/`status`/`kind`), the nested-set intrinsics (`nestedSetParent`/`Left`/`Right`), the trace-level intrinsics (`traceDuration`/`rootName`/`rootServiceName`/`span:childCount`/`span:id`/`span:parentID`/`trace:id`/`statusMessage`/`instrumentation:name`/`instrumentation:version`), and attributes — never a silent flat fallback. The only excluded by-keys are the **span-event / span-link intrinsics** (`event:name`/`event:timeSinceStart`/`link:spanID`/`link:traceID`): a span carries a *collection* of events/links, so there is no single scalar group value, and grouping by one is a clean **`400`** (never a flat 200). A plain (non-`by()`, or `by()`-then-`coalesce()`) response is byte-identical to the single-spanSet shape above.
 
 **Response string truncation (issue #57 re-audit, owner-approved).** `rootServiceName`, `name` (span/root), and any `select()`-projected attribute `stringValue` are truncated at a hard **8192-byte** ceiling: strings at or under the cap are returned byte-identical; a longer string is cut to its first **2048 UTF-8 code points** instead (2048–8192 bytes, depending on code-point width — a UTF-8 code point is at most 4 bytes, so the 2048-code-point fallback itself never exceeds the 8192-byte ceiling). This bounds the search path's transient result-block memory at the source (docs/schemas.md §7) and is invisible for realistic telemetry (span/service names and projected attribute values are almost always well under 8 KiB); it is a documented, visible change only on pathological rows.
 
@@ -458,16 +505,16 @@ Response: `{"traces":[...],"metrics":{"partial":<bool>,"limit":<n>,"returned":<n
 
 **Partial results:** the response returns at most `limit` traces (the top-K under the ordering contract above). Candidate generation and consumption are capped **separately** from `limit`, both at `PULSUS_TRACEQL_MAX_CANDIDATES`: each candidate generator is a top-K-by-recency read of that depth, and the merged candidate stream is evaluated up to that many candidates — so the engine may evaluate up to `PULSUS_TRACEQL_MAX_CANDIDATES` candidates even for a small `limit` (stopping earlier only when no unseen candidate can still enter the top `limit`). `metrics.partial` is `true` whenever any internal bound engaged before natural exhaustion — a candidate generator hit its `PULSUS_TRACEQL_MAX_CANDIDATES` depth, the candidate consumption ceiling was reached with candidates still unconsumed, or a single trace exceeded the 10,000 hydrated-spans-per-trace cap (that trace is evaluated on its truncated span set, never silently reported complete). `metrics.limit` echoes the request's `limit`; `metrics.returned` is the returned trace count.
 
-**Errors** use the §4.1 JSON envelope; a TraceQL parse error carries `position` (byte offset into the rejected expression — `q`, or the `query` parameter validated below), and a `tags` logfmt error carries `position` (byte offset into the decoded `tags` value):
+**Errors** use the §4 plain-text body; a TraceQL parse error names its byte offset into the rejected expression (`q`, or the `query` parameter validated below) **inside the message**, and so does a `tags` logfmt error (byte offset into the decoded `tags` value) — there is no separate `position` field to read:
 
-| Cause | HTTP | `errorType` |
-|-------|------|-------------|
-| Malformed `q` / params / `tags` logfmt / `q`+legacy conflict / unsupported operator-type combination | `400` | `bad_data` |
-| TraceQL expression text of **more than 131,072 bytes** (`traces_api::querytext::MAX_QUERY_EXPRESSION_BYTES`, an **inclusive** maximum — exactly 131,072 bytes is accepted, 131,073 is the shortest rejected; grafana/tempo v3.0.2's `max_query_expression_size_bytes`, defaulted `128 * 1024` at `modules/frontend/config.go:141` and enforced `>` at `modules/frontend/pipeline/async_query_validator_middleware.go:45`). Scoped exactly as the reference scopes it — the `q`/`query` **parameter** on search and TraceQL metrics only (the reference's validator is wired at `modules/frontend/frontend.go:159` search, `:215` query_range, `:229` query_instant, and reads `q` then `query` on all three); NOT the legacy `tags`/`minDuration`/`maxDuration` params (whose compiled expression the reference never measures), not tag discovery, not trace-by-ID. On **search**, `query` carries the cap but is NOT an alias for `q`: the reference's search request parser reads `q` alone (`pkg/api/http.go:180`), folding a lone `query` into its legacy tag map, so `query` never becomes the searched expression here either. One deliberate divergence: the reference's selection is last-write-wins, so an over-cap `q` accompanied by an under-cap `query` escapes its cap and is then executed unbounded — PulsusDB caps both parameters and rejects that shape. Note the boundary is the opposite of LogQL's, whose reference compares `>=` on the same number. Not reachable over the wire today: these routes are `GET`-only and `http::Uri` caps a request target at 65,534 bytes (the #296 transport band) | `400` | `bad_data` |
-| A `query` parameter on **search** that does not parse as TraceQL, e.g. `?query=%7B&start=…&end=…`. The reference's query-frontend validator parses the parameter it selected (`traceql.ParseNoOptimizations` at `modules/frontend/pipeline/async_query_validator_middleware.go:49`, wrapped as `invalid TraceQL query: …` at `:54`) **after** the size check at `:45` and regardless of pipeline, so on search it rejects text its own request parser never reads as an expression. PulsusDB reproduces that: the rejection is `400 bad_data` with the reference's `invalid TraceQL query: ` prefix and a `position` byte offset, and `query` still does not become the searched expression. Unlike the size cap this IS reachable over the wire — a malformed expression is short. The validator's second half is reproduced too (#328): `traceql.Validate` (`:51`) is ported as the route-independent `pulsus_traceql::validate`, so an expression that parses but fails the semantic checks (operand types, per-type operator sets, regex literals via the shared RE2 verdict, intrinsic `= nil`, quantile bounds, `by(...)` arity, `topk`/`bottomk` limits, `compare()` exclusivity) is a `400 bad_data` with the same `invalid TraceQL query: ` wrapping and NO `position` (the reference's Validate errors name no offset), on `q`, on the shadow `query`, and on the metrics parameter alike. The narrowed residual is #336's: the regex verdict's `Unknown` classes — enumerated from `pulsus-re2`'s own return sites and measured per class: lookarounds (`(?=` and friends, the commonest member), out-of-table `\p{…}` properties, `\u`/`\U` escapes, a trailing backslash, non-portable `(?…` heads, repetition beyond 1000 or applied to a repetition, over-budget compilations — are accepted on the validation-only shadow parameter where the reference rejects (storage-bound paths still reject at execution) — ledgered with the full class table as `traceql-validate-re2-unknown-residual`, alongside `traceql-validate-nil-spelling-conflation` for the `!(x != nil)` spelling | `400` | `bad_data` |
-| Scan or memory budget exceeded (`PULSUS_TRACEQL_SCAN_BUDGET_ROWS` rows read, read/result byte ceilings, the engine's 256 MiB retention budget, or the phase-1 candidate-generator's `PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES` memory ceiling) — too broad to bound, never silently slow or quietly incomplete | `422` | `query_too_broad` |
-| ClickHouse read timed out | `504` | `timeout` |
-| Unclassified failure | `500` | `internal` |
+| Cause | HTTP |
+|-------|------|
+| Malformed `q` / params / `tags` logfmt / `q`+legacy conflict / unsupported operator-type combination | `400` |
+| TraceQL expression text of **more than 131,072 bytes** (`traces_api::querytext::MAX_QUERY_EXPRESSION_BYTES`, an **inclusive** maximum — exactly 131,072 bytes is accepted, 131,073 is the shortest rejected; grafana/tempo v3.0.2's `max_query_expression_size_bytes`, defaulted `128 * 1024` at `modules/frontend/config.go:141` and enforced `>` at `modules/frontend/pipeline/async_query_validator_middleware.go:45`). Scoped exactly as the reference scopes it — the `q`/`query` **parameter** on search and TraceQL metrics only (the reference's validator is wired at `modules/frontend/frontend.go:159` search, `:215` query_range, `:229` query_instant, and reads `q` then `query` on all three); NOT the legacy `tags`/`minDuration`/`maxDuration` params (whose compiled expression the reference never measures), not tag discovery, not trace-by-ID. On **search**, `query` carries the cap but is NOT an alias for `q`: the reference's search request parser reads `q` alone (`pkg/api/http.go:180`), folding a lone `query` into its legacy tag map, so `query` never becomes the searched expression here either. One deliberate divergence: the reference's selection is last-write-wins, so an over-cap `q` accompanied by an under-cap `query` escapes its cap and is then executed unbounded — PulsusDB caps both parameters and rejects that shape. Note the boundary is the opposite of LogQL's, whose reference compares `>=` on the same number. Not reachable over the wire today: these routes are `GET`-only and `http::Uri` caps a request target at 65,534 bytes (the #296 transport band) | `400` |
+| A `query` parameter on **search** that does not parse as TraceQL, e.g. `?query=%7B&start=…&end=…`. The reference's query-frontend validator parses the parameter it selected (`traceql.ParseNoOptimizations` at `modules/frontend/pipeline/async_query_validator_middleware.go:49`, wrapped as `invalid TraceQL query: …` at `:54`) **after** the size check at `:45` and regardless of pipeline, so on search it rejects text its own request parser never reads as an expression. PulsusDB reproduces that: the rejection is `400` with the reference's `invalid TraceQL query: ` prefix and a byte offset inside the message, and `query` still does not become the searched expression. Unlike the size cap this IS reachable over the wire — a malformed expression is short. The validator's second half is reproduced too (#328): `traceql.Validate` (`:51`) is ported as the route-independent `pulsus_traceql::validate`, so an expression that parses but fails the semantic checks (operand types, per-type operator sets, regex literals via the shared RE2 verdict, intrinsic `= nil`, quantile bounds, `by(...)` arity, `topk`/`bottomk` limits, `compare()` exclusivity) is a `400` with the same `invalid TraceQL query: ` wrapping and NO byte offset (the reference's Validate errors name none either), on `q`, on the shadow `query`, and on the metrics parameter alike. The narrowed residual is #336's: the regex verdict's `Unknown` classes — enumerated from `pulsus-re2`'s own return sites and measured per class: lookarounds (`(?=` and friends, the commonest member), out-of-table `\p{…}` properties, `\u`/`\U` escapes, a trailing backslash, non-portable `(?…` heads, repetition beyond 1000 or applied to a repetition, over-budget compilations — are accepted on the validation-only shadow parameter where the reference rejects (storage-bound paths still reject at execution) — ledgered with the full class table as `traceql-validate-re2-unknown-residual`, alongside `traceql-validate-nil-spelling-conflation` for the `!(x != nil)` spelling | `400` |
+| Scan or memory budget exceeded (`PULSUS_TRACEQL_SCAN_BUDGET_ROWS` rows read, read/result byte ceilings, the engine's 256 MiB retention budget, or the phase-1 candidate-generator's `PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES` memory ceiling) — too broad to bound, never silently slow or quietly incomplete | `422` |
+| ClickHouse read timed out | `504` |
+| Unclassified failure | `500` |
 
 ### 4.3 Tags
 
@@ -480,7 +527,7 @@ Served exclusively from `trace_tag_catalog` (bounded, deduplicated) — never by
 
 | Param | Notes |
 |-------|-------|
-| `scope` | `resource` or `span`; omitted = both scopes. Anything else (incl. `intrinsic`/`none`) is a `400 bad_data`, never silently widened |
+| `scope` | `resource` or `span`; omitted = both scopes. Anything else (incl. `intrinsic`/`none`) is a `400`, never silently widened |
 | `{tag}` | `resource.<key>` / `span.<key>` scope the lookup; a leading-`.` or bare key is unscoped (values from both scopes) |
 | `start`, `end` | accepted for client compatibility and **ignored**: the catalog has no timestamp column, so tag discovery is time-less. Catalog entries can therefore **outlive** the 7-day span retention (the source `trace_attrs_idx` is TTL'd; `trace_tag_catalog` has no TTL) |
 | `q` | accepted and **ignored** (best-effort narrowing, Tempo semantics): when `q` cannot be evaluated against the catalog, results may be a **superset** of what a narrowing query would return |
@@ -496,15 +543,15 @@ Tag names are ordered `(scope, key)` ascending; values are ordered ascending. Re
 
 **Typed values are best-effort inference** from the stored string (the catalog stores values type-lessly): exact `true`/`false` → `bool`; a valid §4.2 duration literal (by the normative parser — `.5s` yes, `0.1ns`/`1h30m`/`1d` no) → `duration`; optional-sign integers → `int`; `f64`-parseable → `float`; else `string`. Known limit: a numeric- or duration-*looking* string attribute infers as numeric/duration.
 
-**Scan bound.** A `scope`-confined `/tags` read and a scoped `/tag/{tag}/values` read prune to a `(scope)`/`(scope, key)` primary-key prefix; an unscoped `/tags` read or a bare-key (`{tag}` with no `resource.`/`span.` prefix) `/tag/{tag}/values` read cannot prune on `scope` and is a full catalog scan. That scan carries the same Layer-1 read-row budget the §4.2 search path uses (`PULSUS_TRACEQL_SCAN_BUDGET_ROWS`, `read_overflow_mode='throw'`): on a catalog large enough that the scan would exceed it, the request is rejected with `422 query_too_broad` rather than served as a slow unbounded scan. The `TAG_NAMES_MAX`/`TAG_VALUES_MAX` response caps above bound only a *successful* request's returned rows, not the rows a scan reads.
+**Scan bound.** A `scope`-confined `/tags` read and a scoped `/tag/{tag}/values` read prune to a `(scope)`/`(scope, key)` primary-key prefix; an unscoped `/tags` read or a bare-key (`{tag}` with no `resource.`/`span.` prefix) `/tag/{tag}/values` read cannot prune on `scope` and is a full catalog scan. That scan carries the same Layer-1 read-row budget the §4.2 search path uses (`PULSUS_TRACEQL_SCAN_BUDGET_ROWS`, `read_overflow_mode='throw'`): on a catalog large enough that the scan would exceed it, the request is rejected with `422` rather than served as a slow unbounded scan. The `TAG_NAMES_MAX`/`TAG_VALUES_MAX` response caps above bound only a *successful* request's returned rows, not the rows a scan reads.
 
-| Cause | HTTP | `errorType` |
-|-------|------|-------------|
-| `scope` outside `{resource, span}` (incl. `intrinsic`/`none`) | `400` | `bad_data` |
-| Empty `{tag}` key | `400` | `bad_data` |
-| Discovery scan exceeded the reader row budget (unscoped `/tags`, or a bare-key `/values` on a high-cardinality key) | `422` | `query_too_broad` |
-| ClickHouse read timed out | `504` | `timeout` |
-| Unclassified failure | `500` | `internal` |
+| Cause | HTTP |
+|-------|------|
+| `scope` outside `{resource, span}` (incl. `intrinsic`/`none`) | `400` |
+| Empty `{tag}` key | `400` |
+| Discovery scan exceeded the reader row budget (unscoped `/tags`, or a bare-key `/values` on a high-cardinality key) | `422` |
+| ClickHouse read timed out | `504` |
+| Unclassified failure | `500` |
 
 ### 4.4 TraceQL metrics
 
@@ -534,11 +581,11 @@ GET /api/traces/v1/metrics/query
 
 Labels are OTLP protojson `AnyValue` (camelCase `stringValue`/`doubleValue`); `timestampMs` is a JSON **string** int64; a sample `value` is **omitted when zero** (protojson default omission); `exemplars` is present only under `with(exemplars=…)` and carries the trace reference as a `trace:id` label (not a top-level `traceId`). The instant `query` form carries one sample per series stamped at the snapped right edge `E`.
 
-**`by()` series cap (shared by metrics and search).** A grouped query runs a same-predicate distinct-by-key probe (`GROUP BY <by-keys> LIMIT cap+1`) before the main query; more than `reader.traceql_max_series` (default 1000) distinct series is a static **`422 query_too_broad`**, never a silent subset. Ungrouped queries skip the probe. **One shared cap, one shared error:** the same `reader.traceql_max_series` cap and the same pre-flight probe bound BOTH the metric `by(...)` clause (`… | rate() by(resource.service.name)`) and the search-side spanset `| by(...)` stage (`{…} | by(resource.service.name)`); the search probe fires when the `by()` key is `resource.service.name` over a single `{…}` filter. For **every other** search-side `by()` form (other keys, multi-key, composite spansets) the same `reader.traceql_max_series` cap is enforced by an **in-engine distinct-group backstop** — the regroup counts distinct group key-tuples across the evaluated candidate set at grouping-production time (before any `coalesce()` collapse and before result-limit eviction) and returns the identical static `422 query_too_broad` on breach — so `by()|coalesce()` and fan-out concentrated in limit-evicted traces cannot bypass the cap. Search-side `by()` regroups the response into per-group spanSet arrays and `coalesce()` collapses them (issue #193; response shape above); grouping adds **no** new Phase-1/Phase-2 scan (it is a client-side post-pass over already-hydrated spans, group values riding the existing index-served attribute batch).
+**`by()` series cap (shared by metrics and search).** A grouped query runs a same-predicate distinct-by-key probe (`GROUP BY <by-keys> LIMIT cap+1`) before the main query; more than `reader.traceql_max_series` (default 1000) distinct series is a static **`422`**, never a silent subset. Ungrouped queries skip the probe. **One shared cap, one shared error:** the same `reader.traceql_max_series` cap and the same pre-flight probe bound BOTH the metric `by(...)` clause (`… | rate() by(resource.service.name)`) and the search-side spanset `| by(...)` stage (`{…} | by(resource.service.name)`); the search probe fires when the `by()` key is `resource.service.name` over a single `{…}` filter. For **every other** search-side `by()` form (other keys, multi-key, composite spansets) the same `reader.traceql_max_series` cap is enforced by an **in-engine distinct-group backstop** — the regroup counts distinct group key-tuples across the evaluated candidate set at grouping-production time (before any `coalesce()` collapse and before result-limit eviction) and returns the identical static `422` on breach — so `by()|coalesce()` and fan-out concentrated in limit-evicted traces cannot bypass the cap. Search-side `by()` regroups the response into per-group spanSet arrays and `coalesce()` collapses them (issue #193; response shape above); grouping adds **no** new Phase-1/Phase-2 scan (it is a client-side post-pass over already-hydrated spans, group values riding the existing index-served attribute batch).
 
 **Bucketing (normative):** buckets are epoch-aligned, **left-closed** intervals `[b, b + step)`. The evaluated window is snapped outward: `S = ⌊start/step⌋·step`, `E = ⌈end/step⌉·step` — an unaligned request over-includes by at most one step on each edge, and every bucket divides by the full step. Empty buckets are omitted (no gap-filling). The instant `query` form evaluates one bucket over the whole snapped window `[S, E)` — `rate` divides by `E − S` seconds — and stamps its single sample at `E`; on an empty window it returns no series (count/rate) or a single zero sample (aggregations).
 
-**Step derivation and the point cap (committed contract):** when `step` is omitted, `step_s = max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)` with `DEFAULT_METRICS_POINTS` = 100. The snapped bucket count `(E − S) / step_s` is capped at `MAX_METRICS_POINTS` = 11000: a range resolving more buckets is rejected **statically before execution** with `422 query_too_broad` — deliberately 422 (the bounded-response family), not Prometheus's 400, and never a silent truncation. Attribute-filter semi-joins carry throwing IN-set limits with the same 422 semantics (docs/schemas.md §4.2).
+**Step derivation and the point cap (committed contract):** when `step` is omitted, `step_s = max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)` with `DEFAULT_METRICS_POINTS` = 100. The snapped bucket count `(E − S) / step_s` is capped at `MAX_METRICS_POINTS` = 11000: a range resolving more buckets is rejected **statically before execution** with `422` — deliberately 422 (the bounded-response family), not Prometheus's 400, and never a silent truncation. Attribute-filter semi-joins carry throwing IN-set limits with the same 422 semantics (docs/schemas.md §4.2).
 
 
 #### 4.4.1 `histogram_over_time` matches Tempo; its percentile and series order deliberately do not
@@ -623,12 +670,12 @@ bucket label — `sortResponse` compares `AnyValue.String()`, which is Go's
 `%g`, not the JSON text of the response and not the value. Measured, for
 spans at 1 µs, 16 µs, 1 ms and 1 s:
 
-| position | reference | PulsusDB |
-|---|---|---|
-| 1 | `0.001048576` (1 ms) | `1.024e-6` (1 µs) |
-| 2 | `0.000001024` (1 µs) | `1.6384e-5` (16 µs) |
-| 3 | `1.073741824` (1 s) | `0.001048576` (1 ms) |
-| 4 | `0.000016384` (16 µs) | `1.073741824` (1 s) |
+| position | reference |
+|---|---|
+| 1 | `0.001048576` (1 ms) |
+| 2 | `0.000001024` (1 µs) |
+| 3 | `1.073741824` (1 s) |
+| 4 | `0.000016384` (16 µs) |
 
 Each column is that store's own JSON text: the two agree on every bucket
 except `2^10 .. 2^13 ns`, where we write `1.024e-6` and the reference
@@ -682,7 +729,7 @@ There is no `q` expression and no `step`: the read is a fixed `(client, server, 
 
 **Window boundary (normative):** an edge is reported iff **both** its halves' own timestamps fall in `[start, end)` — a call whose client and server spans straddle the window edge (or a daily partition boundary) is attributed only when both contributing rows are in-window. Results are **merge-invariant**: identical before and after a background merge or `OPTIMIZE ... FINAL` (docs/schemas.md §4.2), and unchanged under byte-identical re-ingest.
 
-**Errors:** a missing/invalid/inverted window, or `since` supplied together with `start`/`end`, is `400 bad_data`. A window too broad to bound within the reader scan budget is `422 query_too_broad` (the same bounded-response family as §4.2/§4.4). Errors are always the JSON envelope, never with `position`.
+**Errors:** a missing/invalid/inverted window, or `since` supplied together with `start`/`end`, is `400`. A window too broad to bound within the reader scan budget is `422` (the same bounded-response family as §4.2/§4.4). Errors are the §4 plain-text body, never carrying a byte offset.
 
 ---
 
