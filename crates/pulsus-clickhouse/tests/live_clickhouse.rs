@@ -154,22 +154,33 @@ async fn insert_block_then_query_stream_round_trips_rows() {
 /// (`extract_exception_old`, `response.rs:368-377` @ clickhouse 0.15.1)
 /// and so hides the defect.
 ///
-/// **What this gate proves depends on the server it runs against**, and
-/// that is deliberate rather than papered over:
+/// **This is the end-to-end gate on the ADR 0007 vendored patch**
+/// (`vendor/clickhouse/PATCHES.md`), which is what makes the code readable
+/// at all on this path: it puts the `X-ClickHouse-Exception-Code` value at
+/// byte 0 of the `BadResponse` message. Revert that patch and this test
+/// fails with `code: 0` on 26.3 — nothing else in the suite covers the
+/// vendored change.
+///
+/// **What it proves depends on the server it runs against**, and that is
+/// deliberate rather than papered over:
 ///
 /// - On **26.3.17.110** it is the regression gate. The server keeps the
 ///   already-written output, the crate returns the whole body
-///   (`collect_bad_response`, `response.rs:127-163`), the message is
-///   `\u{1}\u{1}v\u{6}StringCode: 396. …`, and the pre-#382
-///   `strip_prefix("Code: ")` read fails it with `code: 0`.
+///   (`collect_bad_response`, `response.rs:127-163`), and without the
+///   patch the message is `\u{1}\u{1}v\u{6}StringCode: 396. …`, whose code
+///   sits past byte 0 where nothing can be trusted.
 /// - On **24.8.14.39** — the version this suite's CI step runs — it is a
 ///   pin only: that server discards its not-yet-flushed output buffer
 ///   when it turns the response into an error, so the message begins at
 ///   `Code:` and the pre-#382 read passes too. Named as a pin, not
 ///   counted as a gate. The hermetic discriminating cases live in
 ///   `pulsus_clickhouse::error`'s
-///   `a_code_that_arrives_after_output_has_been_written_parses`, on the
-///   verbatim 26.3 bodies.
+///   `the_code_the_patch_puts_at_byte_zero_is_what_gets_read`.
+///
+/// Neither leg says anything about 24.8's **streaming** path, which stays
+/// forgeable by a tenant literal echoed into the exception description and
+/// is issue #412, closing with #376. Pinned hermetically by
+/// `on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412`.
 ///
 /// Read-only against `numbers()`, so this suite's existing CI step (which
 /// runs against the bare image's `default` database) needs no new fixture
