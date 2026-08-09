@@ -158,8 +158,9 @@ async fn insert_block_then_query_stream_round_trips_rows() {
 /// (`vendor/clickhouse/PATCHES.md`), which is what makes the code readable
 /// at all on this path: it puts the `X-ClickHouse-Exception-Code` value at
 /// byte 0 of the `BadResponse` message. Revert that patch and this test
-/// fails with `code: 0` on 26.3 — nothing else in the suite covers the
-/// vendored change.
+/// fails with `code: 0` on 26.3. It is not the only gate on the vendored
+/// change — `pulsus-read`'s `traces_search_explain` catches the same revert
+/// on 26.3 — but it is the cheapest, and the only one in this suite.
 ///
 /// **What it proves depends on the server it runs against**, and that is
 /// deliberate rather than papered over:

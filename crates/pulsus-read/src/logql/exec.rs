@@ -3562,6 +3562,7 @@ mod tests {
         let body = "\u{1}\u{1}v\u{6}StringCode: 307. DB::Exception: Limit for rows or bytes to \
                     read exceeded, max bytes: 1.05 MiB, current bytes: 1.50 MiB: While executing \
                     NumbersRange. (TOO_MANY_BYTES) (version 26.3.17.110 (official build))";
+        assert_eq!(body.len(), 209, "verbatim capture, pinned against an edit");
         let raw = ChError::from(clickhouse::error::Error::BadResponse(body.to_string()));
         assert!(matches!(
             map_read_error(raw, 1024),

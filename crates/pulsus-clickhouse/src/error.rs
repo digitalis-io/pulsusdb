@@ -343,17 +343,38 @@ mod tests {
     }
 
     /// The other forgery channel, and the one that killed every text rule:
-    /// ClickHouse echoes the failing SQL into the description, and
-    /// `pulsus-read` renders tenant regexes into `match()`
-    /// (`metrics::series_where`, `logql::plan`), so the echo lands AFTER the
-    /// server's own code. Measured on 26.3.17.110 with a tenant literal in
-    /// `match()` and a late `intDiv` failure: real code 153, forged 210.
-    /// Reading byte 0 ignores it.
+    /// ClickHouse echoes the failing SQL into the exception description, and
+    /// `pulsus-read` renders tenant regexes into `match()` predicates
+    /// (`metrics::series_where`, `logql::plan`), so a tenant string lands
+    /// AFTER the server's own code. Reading byte 0 ignores it.
+    ///
+    /// Verbatim 489-byte body measured on 24.8.14.39 — the HTTP 500 arm,
+    /// where ClickHouse discarded its unflushed output, so the real code is
+    /// at byte 0 and the tenant's `Code: 210` sits inside the description:
+    ///
+    /// ```text
+    /// curl --data-binary "SELECT toString(number) AS v FROM numbers(100000000)
+    ///   WHERE and(match(toString(number), 'Code: 210. DB::Exception: forged|.*'),
+    ///             notEquals(intDiv(1, toInt64(number) - 400000), 0))
+    ///   FORMAT RowBinaryWithNamesAndTypes" http://localhost:8123/
+    /// ```
     #[test]
     fn a_forged_code_echoed_in_the_description_is_never_read() {
-        let echoed = "Code: 153. DB::Exception: Division by zero: while executing 'FUNCTION \
-                      and(match(toString(number), 'Code: 210. DB::Exception: forged|.*'_String), \
-                      notEquals(intDiv(...)))'. (ILLEGAL_DIVISION) (version 26.3.17.110)";
+        let echoed = "Code: 153. DB::Exception: Division by zero: while executing 'FUNCTION and(match(toStri\
+                      ng(__table1.number), 'Code: 210. DB::Exception: forged|.*'_String) :: 0, notEquals(int\
+                      Div(1_UInt8, minus(toInt64(__table1.number), 400000_UInt32)), 0_UInt8) :: 1) -> and(ma\
+                      tch(toString(__table1.number), 'Code: 210. DB::Exception: forged|.*'_String), notEqual\
+                      s(intDiv(1_UInt8, minus(toInt64(__table1.number), 400000_UInt32)), 0_UInt8)) UInt8 : 4\
+                      '. (ILLEGAL_DIVISION) (version 24.8.14.39 (official build))";
+        assert_eq!(
+            echoed.len(),
+            489,
+            "verbatim capture, pinned against an edit"
+        );
+        assert!(
+            echoed.rfind("Code: 210").is_some(),
+            "the forgery is present"
+        );
         assert_eq!(parse_exception_code(echoed), Some(153));
         assert_eq!(
             parse_exception_code(&format!("Code: 153\n{echoed}")),
@@ -362,6 +383,38 @@ mod tests {
         );
     }
 
+    /// **An archived record, not a detector.** It states what this parser
+    /// does with one captured byte sequence; it cannot notice if the server
+    /// or the crate stops producing that sequence, because the bytes are
+    /// written down here rather than derived. The live detector for that
+    /// belongs on issue #412 and is deliberately not in this suite.
+    ///
+    /// What the bytes are: ClickHouse 24.8's streaming path, which this parse
+    /// cannot make sound and which the ADR 0007 patch does not reach (#412,
+    /// closing with #376). At HTTP 200 there is no exception-code header, and
+    /// the crate anchors the message with `rfind(b"Code:")`
+    /// (`extract_exception_old`, `response.rs:368-377` @ clickhouse 0.15.1),
+    /// so a tenant literal echoed into the description becomes byte 0. The
+    /// real failure was 153.
+    ///
+    /// Provenance, replayable without cargo — on 24.8.14.39 this returns HTTP
+    /// 200 with ~3.03 MB of body whose LAST `Code:` is the tenant's, and
+    /// `body[rfind("Code:")..len-1]` is byte-for-byte the 199 bytes below:
+    ///
+    /// ```text
+    /// curl --data-binary "SELECT concat(toString(number), toString(and(
+    ///     match(toString(number), 'Code: 210. DB::Exception: forged|.*'),
+    ///     notEquals(intDiv(1, toInt64(number) - 400000), 0)))) AS v
+    ///   FROM numbers(100000000) FORMAT RowBinaryWithNamesAndTypes" \
+    ///   http://localhost:8123/
+    /// ```
+    ///
+    /// The failing expression must sit in the SELECT list, not a WHERE, and
+    /// must trip late enough (~400k rows, ~3 MB) that ClickHouse has already
+    /// flushed and committed to HTTP 200. Move it into a WHERE, or trip it at
+    /// row 2000, and the output never leaves the buffer: the response is a
+    /// 500 carrying `X-ClickHouse-Exception-Code`, the code is at byte 0, and
+    /// this does not reproduce.
     /// ClickHouse 24.8's streaming path, which this parse CANNOT make sound
     /// and which the ADR 0007 patch does not reach (issue #412, closing with
     /// #376). Verbatim `ChError::Server.message` measured through this client
@@ -370,9 +423,6 @@ mod tests {
     /// message to start at the tenant's echoed literal, so byte 0 IS the
     /// forgery. The real failure was 153.
     ///
-    /// Pinned so the limitation is a checked fact: if a future crate or server
-    /// version stops delivering this shape, this test fails and #412 can be
-    /// re-assessed rather than forgotten.
     #[test]
     fn on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412() {
         let body = "Code: 210. DB::Exception: forged|.*'_String), notEquals(intDiv(1_UInt8, \
@@ -388,11 +438,14 @@ mod tests {
     }
 
     /// A nested exception renders the outermost code first and its causes
-    /// after. Verbatim from `SELECT toString(dummy) AS v FROM
-    /// remote('127.0.0.1:9999', system.one)` on 24.8.14.39 (26.3.17.110
-    /// renders the same shape, only the version strings differ). Byte 0 is the
-    /// outermost code — what actually failed, and what the pre-#382 read
-    /// returned, so nothing correct today moves.
+    /// after. Byte 0 is the outermost code — what actually failed, and what
+    /// the pre-#382 read returned, so nothing correct today moves.
+    ///
+    /// Reassembled, not a single verbatim literal: the measured body repeats
+    /// one identical `Code: 210` line three times, so it is built with
+    /// `format!` and the total length is asserted against the 644 bytes
+    /// measured from `SELECT toString(dummy) AS v FROM
+    /// remote('127.0.0.1:9999', system.one)` on 24.8.14.39.
     #[test]
     fn nested_exception_yields_the_outermost_code() {
         let refused = "Code: 210. DB::NetException: Connection refused (127.0.0.1:9999). \
@@ -404,6 +457,7 @@ mod tests {
              (ALL_CONNECTION_TRIES_FAILED) (version 24.8.14.39 (official build))\n\n. \
              (NO_REMOTE_SHARD_AVAILABLE) (version 24.8.14.39 (official build))"
         );
+        assert_eq!(body.len(), 644, "measured length, pinned against an edit");
         assert_eq!(parse_exception_code(&body), Some(519));
         // 210 is retryable and 519 is not, so a last-occurrence rule would
         // have made a poison distributed failure look transient.

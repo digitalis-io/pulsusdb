@@ -2726,6 +2726,10 @@ mod tests {
                         to read exceeded, max bytes: 1.05 MiB, current bytes: 1.50 MiB: While \
                         executing NumbersRange. (TOO_MANY_BYTES) (version 26.3.17.110 (official \
                         build))";
+        // Verbatim captures: the lengths are pinned so an edit that quietly
+        // reshapes a fixture fails here instead of weakening the case.
+        assert_eq!(body_396.len(), 174);
+        assert_eq!(body_307.len(), 209);
         for (code, body, expected) in [
             (396, body_396, TRACE_MAX_RESULT_BYTES),
             (307, body_307, TRACE_READ_BYTES_BUDGET),
