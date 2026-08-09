@@ -3,10 +3,11 @@
 //! plan (v2's error table + v3's `406 not_acceptable`) plus issue #57's
 //! search rows.
 //!
-//! Issue #384 replaced the previous `{"status","errorType","error",
-//! "position"?}` JSON envelope with the reference's shape. **Which
-//! reference writer, exactly, matters here** — Tempo has two, they
-//! disagree, and only one of them is user-facing:
+//! Issue #384 replaced the previous four-key JSON envelope — a status
+//! string, a machine-readable type label, the message, and an optional
+//! byte offset — with the reference's shape. **Which reference writer,
+//! exactly, matters here** — Tempo has two, they disagree, and only one
+//! of them is user-facing:
 //!
 //! - **The query frontend** serves every user-facing `/api/*` query route
 //!   (`cmd/tempo/app/modules.go:500-512 @ v3.0.2`, each `base.Wrap(
@@ -23,11 +24,18 @@
 //!   so Go's `net/http` sniffs `Content-Type` from the body, **nothing
 //!   sets `X-Content-Type-Options`**, and nothing appends a terminator.
 //!   (`writeError` -> dskit `httpgrpc.WriteError` is the *other* branch of
-//!   the same handler, `handler.go:160-169`; it sets no headers either —
-//!   `WriteResponse` copies the httpgrpc response's own headers, of which
-//!   `httpgrpc.Error` has none — and its non-httpgrpc fallback is a
-//!   hard-coded **500**, `vendor/github.com/grafana/dskit/httpgrpc/
-//!   httpgrpc.go:81-88`, so it produces no 4xx of this class.)
+//!   the same handler, `handler.go:160-169`, and it reaches the same
+//!   container by a different road. It **does** emit 4xx: the frontend's
+//!   own `httpgrpc.Error` vars are 499/504/413 (`handler.go:32-34`, with
+//!   `StatusClientClosedRequest = 499` at `pkg/util/errors.go:14`) and
+//!   `pkg/api/http.go:307,335,342` return 400s the same way. Those take
+//!   `WriteResponse` (`vendor/github.com/grafana/dskit/httpgrpc/
+//!   httpgrpc.go:73-78`), which copies the httpgrpc response's own
+//!   headers at `:74` — and `httpgrpc.Error` builds one with **no
+//!   `Headers`** (`:112-117`) — then `w.Write(resp.Body)` at `:76`,
+//!   appending nothing. Only the **non-httpgrpc fallback**, `:86`, is a
+//!   hard-coded 500. So this branch changes which statuses are
+//!   reachable, not the container.)
 //! - **The querier's own handlers** — the `http.Error` sites in
 //!   `modules/querier/http.go` — are registered ONLY under
 //!   `path.Join(api.PathPrefixQuerier, …)` (`modules.go:438-459`, with
@@ -124,9 +132,9 @@ use super::params::{
 /// 408 (`middleware.rs`) and axum's own 404/405 for an unmounted path or
 /// method.
 ///
-/// Issue #384 dropped the `errorType` column with the JSON envelope — the
-/// status code is the whole machine-readable classification now, exactly
-/// as in the reference, whose frontend rejections carry a status and a
+/// Issue #384 dropped the machine-readable type column with the JSON
+/// envelope — the status code is the whole classification now, exactly as
+/// in the reference, whose frontend rejections carry a status and a
 /// message and nothing else.
 ///
 /// | variant | HTTP |
@@ -793,13 +801,28 @@ mod tests {
     /// out (`Plan`'s point cap, and `QueryText`'s inners under both
     /// carriers).
     ///
-    /// Per case it asserts: the status; that the WHOLE body is the
-    /// variant's own `Display` and nothing else; that the body does not
-    /// parse as JSON; and whether the body carries the variant's byte
-    /// offset as the literal `byte {n}` — the column that replaced the old
-    /// `position` field when #384 dropped the envelope. Every case reaches
+    /// Per case it asserts: the status; whether the body carries the
+    /// variant's byte offset as the literal `byte {n}` — the column that
+    /// replaced the old `position` field when #384 dropped the envelope;
+    /// that the WHOLE body equals a **committed literal**; and that the
+    /// body does not parse as JSON. Every case reaches
     /// [`assert_reference_container`] through [`rendered`], so the header
     /// rules hold for the whole table too.
+    ///
+    /// **The body column is a literal on purpose.** An earlier revision
+    /// re-rendered each variant's own `Display` inside this test to build
+    /// the expectation, which made the assertion move with the wording
+    /// instead of catching a change to it — a test that cannot fail for
+    /// the thing it looks like it covers. Changing a message now fails
+    /// here, and updating this table is how you say the change was
+    /// deliberate. (Bodies are wording, not an identity: nothing branches
+    /// on them, so this table is a review prompt, not a wire contract.
+    /// The one message a client is entitled to rely on byte for byte is
+    /// pinned separately in `traces_search_live.rs`, issue #335 Stage B.)
+    ///
+    /// The offset check runs BEFORE the body check because dropping an
+    /// offset from a `Display` impl breaks both, and the failure should
+    /// name the property that moved.
     ///
     /// It does not fail when a variant is ADDED: a list of cases cannot
     /// notice a variant nobody listed. What the compiler forces on a new
@@ -835,90 +858,107 @@ mod tests {
             pos: 3,
         };
 
-        // (case, error, status, the byte offset the MESSAGE must carry)
-        let cases: Vec<(&str, ApiError, StatusCode, Option<usize>)> = vec![
+        // (case, error, status, the EXACT body, the byte offset the message
+        // must carry). The body is a COMMITTED LITERAL, never the
+        // variant's own `Display` re-rendered here — see this test's doc.
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, ApiError, StatusCode, &str, Option<usize>)> = vec![
             (
                 "Param",
                 ApiError::Param(TraceIdError::InvalidLength("abc".to_string())),
                 StatusCode::BAD_REQUEST,
+                r#"invalid trace id "abc": expected 16 or 32 hex characters"#,
                 None,
             ),
             (
                 "SearchParam",
                 ApiError::SearchParam(SearchParamError::ConflictingQuery),
                 StatusCode::BAD_REQUEST,
+                r#"'q' and the legacy search params (tags/minDuration/maxDuration) are mutually exclusive: supply one or the other, never both"#,
                 None,
             ),
             (
                 "SearchParam(QueryText(Invalid))",
                 ApiError::SearchParam(SearchParamError::QueryText(invalid())),
                 StatusCode::BAD_REQUEST,
+                r#"invalid TraceQL query: unexpected '}' at byte 7: expected a field, a literal, or '('"#,
                 Some(invalid_offset),
             ),
             (
                 "SearchParam(QueryText(TooLong))",
                 ApiError::SearchParam(SearchParamError::QueryText(too_long())),
                 StatusCode::BAD_REQUEST,
+                r#"TraceQL expression exceeds the configured maximum size of 8 bytes, reduce the query expression size or contact your system administrator"#,
                 None,
             ),
             (
                 "SearchParam(QueryText(Semantic))",
                 ApiError::SearchParam(SearchParamError::QueryText(semantic())),
                 StatusCode::BAD_REQUEST,
+                r#"invalid TraceQL query: binary operations must operate on the same type: 1 = `a`"#,
                 None,
             ),
             (
                 "MetricsParam",
                 ApiError::MetricsParam(MetricsParamError::InvalidStep("500ms".to_string())),
                 StatusCode::BAD_REQUEST,
+                r#"invalid 'step' "500ms": expected positive whole seconds (e.g. 60, 60s, 5m, 1h)"#,
                 None,
             ),
             (
                 "GraphParam",
                 ApiError::GraphParam(GraphParamError::MissingRange),
                 StatusCode::BAD_REQUEST,
+                r#"missing required parameters: supply start and end (unix seconds), or since"#,
                 None,
             ),
             (
                 "TagsParam",
                 ApiError::TagsParam(TagsParamError::UnsupportedScope("bogus".to_string())),
                 StatusCode::BAD_REQUEST,
+                r#"unsupported scope "bogus": expected "resource" or "span" (or omit the parameter for both scopes)"#,
                 None,
             ),
             (
                 "TagPath",
                 ApiError::TagPath(TagPathError::EmptyKey),
                 StatusCode::BAD_REQUEST,
+                r#"invalid tag: the attribute key must be non-empty"#,
                 None,
             ),
             (
                 "Legacy",
                 ApiError::Legacy(legacy_err()),
                 StatusCode::BAD_REQUEST,
+                r#"invalid 'tags' logfmt at byte 3: unquoted value for key "a" contains '=' — quote the value to include '='"#,
                 Some(3),
             ),
             (
                 "Query",
                 ApiError::Query(traceql_err()),
                 StatusCode::BAD_REQUEST,
+                r#"unexpected end of query at byte 2: expected a field, a literal, or '('"#,
                 Some(traceql_err().span().start),
             ),
             (
                 "QueryText(Invalid)",
                 ApiError::QueryText(invalid()),
                 StatusCode::BAD_REQUEST,
+                r#"invalid TraceQL query: unexpected '}' at byte 7: expected a field, a literal, or '('"#,
                 Some(invalid_offset),
             ),
             (
                 "QueryText(TooLong)",
                 ApiError::QueryText(too_long()),
                 StatusCode::BAD_REQUEST,
+                r#"TraceQL expression exceeds the configured maximum size of 8 bytes, reduce the query expression size or contact your system administrator"#,
                 None,
             ),
             (
                 "QueryText(Semantic)",
                 ApiError::QueryText(semantic()),
                 StatusCode::BAD_REQUEST,
+                r#"invalid TraceQL query: binary operations must operate on the same type: 1 = `a`"#,
                 None,
             ),
             (
@@ -927,6 +967,7 @@ mod tests {
                     "status supports only = and !=".to_string(),
                 )),
                 StatusCode::BAD_REQUEST,
+                r#"type mismatch: status supports only = and !="#,
                 None,
             ),
             (
@@ -936,66 +977,52 @@ mod tests {
                     cap: 11_000,
                 }),
                 StatusCode::UNPROCESSABLE_ENTITY,
+                r#"metrics range resolves 12000 buckets, exceeding the 11000-point cap"#,
                 None,
             ),
-            ("NotFound", ApiError::NotFound, StatusCode::NOT_FOUND, None),
+            (
+                "NotFound",
+                ApiError::NotFound,
+                StatusCode::NOT_FOUND,
+                r#"trace not found"#,
+                None,
+            ),
             (
                 "NotAcceptable",
                 ApiError::NotAcceptable,
                 StatusCode::NOT_ACCEPTABLE,
+                r#"no acceptable representation: this endpoint serves application/json and application/protobuf"#,
                 None,
             ),
             (
                 "Read",
                 ApiError::Read(ReadError::EmptyMatcherSet),
                 StatusCode::BAD_REQUEST,
+                r#"selector matches everything: at least one equality or regexp matcher is required"#,
                 None,
             ),
             (
                 "Assemble",
                 ApiError::Assemble(AssembleError::UnsupportedPayloadType { count: 3 }),
                 StatusCode::INTERNAL_SERVER_ERROR,
+                r#"unsupported payload_type on 3 span(s)"#,
                 None,
             ),
             (
                 "PoolUnavailable",
                 ApiError::PoolUnavailable,
                 StatusCode::SERVICE_UNAVAILABLE,
+                r#"clickhouse pool not yet established"#,
                 None,
             ),
         ];
 
-        for (case, err, want_status, want_offset) in cases {
-            // The whole body must be this variant's own rendering, so the
-            // expectation is taken from the error itself before it moves.
-            let want_body = match &err {
-                ApiError::NotFound => "trace not found".to_string(),
-                ApiError::NotAcceptable => {
-                    "no acceptable representation: this endpoint serves application/json and \
-                     application/protobuf"
-                        .to_string()
-                }
-                ApiError::PoolUnavailable => "clickhouse pool not yet established".to_string(),
-                ApiError::Param(e) => e.to_string(),
-                ApiError::SearchParam(e) => e.to_string(),
-                ApiError::MetricsParam(e) => e.to_string(),
-                ApiError::GraphParam(e) => e.to_string(),
-                ApiError::TagsParam(e) => e.to_string(),
-                ApiError::TagPath(e) => e.to_string(),
-                ApiError::Legacy(e) => e.to_string(),
-                ApiError::Query(e) => e.to_string(),
-                ApiError::QueryText(e) => e.to_string(),
-                ApiError::Plan(e) => e.to_string(),
-                ApiError::Read(e) => e.to_string(),
-                ApiError::Assemble(e) => e.to_string(),
-            };
+        for (case, err, want_status, want_body, want_offset) in cases {
             let (status, body) = rendered(err).await;
             assert_eq!(status, want_status, "{case}: status, body {body}");
-            assert_eq!(body, want_body, "{case}: the body is the message, verbatim");
-            assert!(
-                serde_json::from_str::<serde_json::Value>(&body).is_err(),
-                "{case}: the body must not parse as JSON, got {body}"
-            );
+            // The offset column is checked BEFORE the body: dropping an
+            // offset from a `Display` impl breaks both, and this ordering
+            // makes the failure name the property that actually moved.
             match want_offset {
                 Some(n) => assert!(
                     body.contains(&format!("byte {n}")),
@@ -1006,6 +1033,14 @@ mod tests {
                     "{case}: no offset may appear in the message, got {body}"
                 ),
             }
+            assert_eq!(
+                body, want_body,
+                "{case}: the body is the committed message, byte for byte"
+            );
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&body).is_err(),
+                "{case}: the body must not parse as JSON, got {body}"
+            );
         }
     }
 
