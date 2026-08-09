@@ -81,8 +81,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
 use manifest::{
-    CaseClass, ExpectedError, Gate, Method, PlainTextWriter, RouteSpec, RouteStatus, Surface,
-    route_manifest,
+    CaseClass, ExpectedError, Gate, Method, NosniffRule, PlainTextWriter, RouteSpec, RouteStatus,
+    Surface, route_manifest,
 };
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -782,18 +782,15 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
         }
         (Surface::TracesFetch, _) => {
             // Against this suite's empty databases the documented outcome
-            // of a well-formed fetch is the mounted-but-absent `404
-            // not_found` JSON envelope — the mounting oracle
-            // (`Surface::TracesFetch`'s doc comment): an unmounted path
-            // would return axum's *empty* 404 instead, so this arm fails
-            // on a silently un-mounted route. Errors on this surface are
-            // always JSON, never protobuf.
+            // of a well-formed fetch is the mounted-but-absent `404 trace
+            // not found` plain-text body (issue #384) — the mounting
+            // oracle (`Surface::TracesFetch`'s doc comment): an unmounted
+            // path would return axum's *empty* 404 instead, so this arm
+            // fails on a silently un-mounted route. Errors on this
+            // surface never switch representation under `Accept`.
             assert_case_envelope(
                 res,
-                &ExpectedError::Json {
-                    error_type: "not_found",
-                    has_position: false,
-                },
+                &ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
                 ctx,
             );
         }
@@ -1007,10 +1004,7 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
 
 fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
     match expect {
-        ExpectedError::Json {
-            error_type,
-            has_position,
-        } => {
+        ExpectedError::Json { error_type } => {
             assert!(
                 res.content_type()
                     .is_some_and(|ct| ct.starts_with("application/json")),
@@ -1026,10 +1020,16 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
                     .is_some_and(|s| !s.is_empty()),
                 "{ctx}: `error` message must be a non-empty string, body {json}"
             );
-            assert_eq!(
-                json.get("position").is_some(),
-                *has_position,
-                "{ctx}: `position` field presence, body {json}"
+            // Issue #384: this variant is `prom_api`'s alone now, and
+            // upstream Prometheus's envelope is exactly three fields
+            // (`respondError`, `web/api/v1/api.go:2200-2230` vendored @
+            // grafana/loki v3.7.4). `position` is never one of them, on
+            // ANY case — so the absence is asserted unconditionally
+            // rather than through a per-case knob that could be set
+            // wrong.
+            assert!(
+                json.get("position").is_none(),
+                "{ctx}: the Prometheus envelope has no `position` field, body {json}"
             );
         }
         ExpectedError::Otlp { code } => {
@@ -1067,35 +1067,58 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
                 "{ctx}: a plain-text error body must not parse as JSON, got {:?}",
                 String::from_utf8_lossy(&res.body)
             );
-            // `nosniff` is what the two Loki writers AGREE on — Go's
-            // `http.Error` sets it and so does `WriteError`
-            // (pkg/util/server/error.go:49 @ v3.7.4). Asserting it only for
-            // the query family is what let our own push responder omit it
-            // unnoticed, so it is keyed off `sets_nosniff` and not off the
-            // terminator distinction below.
-            if writer.sets_nosniff() {
-                assert_eq!(
+            // `nosniff` is one of TWO independent per-writer axes, not a
+            // corollary of the terminator: the two Loki writers agree on
+            // it (Go's `http.Error` sets it and so does `WriteError`,
+            // pkg/util/server/error.go:49 @ loki v3.7.4) and Tempo's
+            // frontend sets no header at all. Asserting it only for the
+            // query family is what let our own push responder omit it
+            // unnoticed (#264 round 1); asserting only its PRESENCE would
+            // now let the traces surface emit a header Tempo never emits
+            // (#384). So both are asserted, and "no rule at all" is a
+            // third value rather than a silent `false`.
+            match writer.nosniff_rule() {
+                NosniffRule::Present => assert_eq!(
                     res.header("x-content-type-options"),
                     Some("nosniff"),
                     "{ctx}: this writer's reference sets nosniff"
-                );
+                ),
+                NosniffRule::Absent => assert_eq!(
+                    res.header("x-content-type-options"),
+                    None,
+                    "{ctx}: this writer's reference sets NO headers at all \
+                     (modules/frontend/handler.go:113-116 @ tempo v3.0.2) — nosniff \
+                     must be absent"
+                ),
+                NosniffRule::Unasserted => {}
             }
-            // The trailing byte, and ONLY the trailing byte, is per-writer:
-            // `fmt.Fprint` vs `fmt.Fprintln`. See `manifest::PlainTextWriter`.
+            // The trailing byte, the second axis: `fmt.Fprint` vs
+            // `fmt.Fprintln` vs a copied body. See
+            // `manifest::PlainTextWriter`.
             match writer {
                 PlainTextWriter::LogqlWriteError => assert!(
                     !res.body.ends_with(b"\n"),
                     "{ctx}: the reference's `fmt.Fprint` writes no trailing newline \
-                     (pkg/util/server/error.go:51 @ v3.7.4), got {:?}",
+                     (pkg/util/server/error.go:51 @ loki v3.7.4), got {:?}",
                     String::from_utf8_lossy(&res.body)
                 ),
                 // Issue #374: `http.Error` -> `fmt.Fprintln`
-                // (pkg/loghttp/push/push.go:606-608 @ v3.7.4). Exactly one
-                // `\n`, so a doubled terminator fails too.
+                // (pkg/loghttp/push/push.go:606-608 @ loki v3.7.4). Exactly
+                // one `\n`, so a doubled terminator fails too.
                 PlainTextWriter::LokiPushHttpError => assert!(
                     res.body.ends_with(b"\n") && !res.body.ends_with(b"\n\n"),
                     "{ctx}: this endpoint's writer is `fmt.Fprintln` — the body ends \
                      in exactly one newline, got {:?}",
+                    String::from_utf8_lossy(&res.body)
+                ),
+                // Issue #384: the frontend copies the response body with
+                // `io.Copy` (modules/frontend/handler.go:116 @ tempo
+                // v3.0.2) and appends nothing. Shared with
+                // `LogqlWriteError` — this axis does NOT separate the two,
+                // which is why the `nosniff` arm above has to.
+                PlainTextWriter::TempoFrontendResponse => assert!(
+                    !res.body.ends_with(b"\n"),
+                    "{ctx}: Tempo's frontend appends no terminator, got {:?}",
                     String::from_utf8_lossy(&res.body)
                 ),
                 // Two references, one responder, and they disagree on the
@@ -1292,18 +1315,20 @@ fn assert_detected_fields_handler_identity(port: u16, spec: &RouteSpec, spawn: &
 /// the resolved path, which here merely *mutates the param* and hits the
 /// same route as a 400, not axum's empty 404. The sibling here is proven
 /// by appending an extra `/segment` instead, making the path genuinely
-/// unrouted. Cells (plan v2/v3): absent 32-hex → 404 `not_found` JSON
-/// envelope; 16-hex short id → 404 (accepted, not 400); protobuf /
-/// x-protobuf `Accept` on absent → still the 404 JSON envelope (errors
-/// never switch to protobuf; for the `/json` route this also proves the
-/// suffix ignores `Accept`); `POST` → 405 `Allow: GET,HEAD`; extra-segment
-/// sibling → empty 404; plus the manifest's `CaseClass`es (malformed hex →
-/// 400).
+/// unrouted. Cells (plan v2/v3, container updated by issue #384): absent
+/// 32-hex → 404 `trace not found` plain text; 16-hex short id → 404
+/// (accepted, not 400); protobuf / x-protobuf `Accept` on absent → still
+/// the 404 plain-text body (errors never switch to protobuf; for the
+/// `/json` route this also proves the suffix ignores `Accept`); `POST` →
+/// 405 `Allow: GET,HEAD`; extra-segment sibling → empty 404; plus the
+/// manifest's `CaseClass`es (malformed hex → 400).
 fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
-    let absent_404 = ExpectedError::Json {
-        error_type: "not_found",
-        has_position: false,
-    };
+    // Issue #384: the fetch route's errors are Tempo's frontend
+    // container, not a JSON envelope. The mounting oracle is unchanged —
+    // the body stays NON-EMPTY (`trace not found`) where axum's unrouted
+    // 404 is empty; see `Surface::TracesFetch`'s doc for why that stays a
+    // named residual against Tempo's own empty 404.
+    let absent_404 = ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse);
     let path = resolve_path(spec.path);
 
     // The negotiating route (`trace_by_id`) carries `Vary: accept` on
@@ -1353,11 +1378,13 @@ fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
 
     // Errors never switch representation: a protobuf-flavoured `Accept`
     // (both the canonical name and the x- request-side alias) still gets
-    // the 404 JSON envelope. On the `/json` route this doubles as the
-    // "/json ignores Accept" error-path cell.
+    // the 404 plain-text body. The PROPERTY is the one #55 pinned — an
+    // error never re-encodes under `Accept` — only its container changed
+    // with issue #384. On the `/json` route this doubles as the "/json
+    // ignores Accept" error-path cell.
     for accept in ["application/protobuf", "application/x-protobuf"] {
         let ctx = format!(
-            "[{spawn}] GET {} case=absent-404-stays-json accept={accept}",
+            "[{spawn}] GET {} case=absent-404-stays-plain-text accept={accept}",
             spec.path
         );
         let mut req = manifest::Req::new("GET", path.clone());

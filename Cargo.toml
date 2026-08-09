@@ -38,6 +38,9 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # `clickhouse` (HTTP + RowBinary) — highest bulk insert throughput on both
 # documented row shapes, and its own HTTP transport handles DDL/MV/backfill
 # reliably, so a single crate suffices (no native-protocol client shipped).
+# ADR 0007 (issue #382) redirects this requirement to a vendored, patched copy
+# via the `[patch.crates-io]` entry below; every `clickhouse::...` import path
+# and the feature set here are unchanged.
 clickhouse = { version = "0.15", features = ["rustls-tls-webpki-roots", "futures03"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1"
@@ -174,6 +177,20 @@ promql-parser = { path = "vendor/promql-parser" }
 # this entry only redirects them to the patched tree, so every
 # `opentelemetry_proto::...` import path is untouched.
 opentelemetry-proto = { path = "vendor/opentelemetry-proto" }
+# ADR 0007 (vendor+patch `clickhouse 0.15.1`, issue #382): on an error response
+# the crate reads `X-ClickHouse-Exception-Code` and then discards it whenever
+# the body decodes, leaving `Error::BadResponse(String)` — which carries no
+# numeric code — as the only channel. When the query had already written
+# output, that body is `<result bytes><exception>`, and BOTH halves can contain
+# a forged `Code: N. DB::Exception:` (result bytes are tenant data; the
+# description echoes the SQL, including tenant regexes rendered into `match()`),
+# so no parse of the text is sound. The vendored copy puts the header-derived
+# code at byte 0 and keeps the body whole after it — additive, and
+# byte-identical to upstream for every response whose exception was not
+# preceded by output. See vendor/clickhouse/PATCHES.md for the change and the
+# re-vendor rule, and note that this does NOT make ClickHouse 24.8 sound: its
+# streaming path has no such header and is issue #412, closing with #376.
+clickhouse = { path = "vendor/clickhouse" }
 
 # Dev-profile debuginfo is line-tables-only: full DWARF across the workspace's
 # ~70 test binaries accumulated 45+ GB in target/debug/deps and filled the

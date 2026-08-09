@@ -53,6 +53,9 @@ fn should_run() -> bool {
 
 struct RawResponse {
     status: u16,
+    /// Kept (rather than dropped after dechunking) so error cases can
+    /// assert the issue #384 container, `nosniff`'s ABSENCE included.
+    headers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -67,6 +70,41 @@ impl RawResponse {
     }
 }
 
+/// Issue #384: every §4 error is Tempo's frontend container over the real
+/// wire — `text/plain; charset=utf-8`, **no** `X-Content-Type-Options`, no
+/// trailing newline, and not JSON — carrying the message and nothing else.
+/// Returns the body so the caller can assert the message with a LITERAL
+/// needle (the #237 Rule D shape: a derived needle in a substring search
+/// over a wire body is exactly what that guard forbids).
+///
+/// `nosniff`'s absence is the property that separates this container from
+/// `logs_api`'s (`pkg/util/server/error.go:49 @ loki v3.7.4` sets it;
+/// Tempo's frontend sets no headers at all,
+/// `modules/frontend/handler.go:113-116 @ tempo v3.0.2`). Reusing the
+/// LogQL responder would pass every other assertion here.
+fn assert_error_body(res: &RawResponse, status: u16, ctx: &str) -> String {
+    let body = String::from_utf8_lossy(&res.body).into_owned();
+    assert_eq!(res.status, status, "{ctx}: status (body: {body:?})");
+    assert_eq!(
+        res.headers.get("content-type").map(String::as_str),
+        Some("text/plain; charset=utf-8"),
+        "{ctx}: error content type"
+    );
+    assert_eq!(
+        res.headers.get("x-content-type-options"),
+        None,
+        "{ctx}: Tempo's frontend emits no nosniff"
+    );
+    assert!(
+        !res.body.ends_with(b"\n"),
+        "{ctx}: no trailing newline, got {body:?}"
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&res.body).is_err(),
+        "{ctx}: the body must not parse as JSON, got {body:?}"
+    );
+    body
+}
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -149,7 +187,11 @@ fn request(
         raw_body.to_vec()
     };
 
-    Some(RawResponse { status, body })
+    Some(RawResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn get(port: u16, path: &str, ctx: &str) -> RawResponse {
@@ -1274,15 +1316,8 @@ async fn scan_budget_breach_is_422_query_too_broad() {
         base + 3_600
     );
     let res = get(port, &path, ctx);
-    assert_eq!(
-        res.status,
-        422,
-        "{ctx}: status, body {:?}",
-        String::from_utf8_lossy(&res.body)
-    );
-    let json = res.json(ctx);
-    assert_eq!(json["status"], "error", "{ctx}");
-    assert_eq!(json["errorType"], "query_too_broad", "{ctx}: body {json}");
+    let body = assert_error_body(&res, 422, ctx);
+    assert!(body.contains("budget"), "{ctx}: {body:?}");
 }
 
 // ---------------------------------------------------------------------
@@ -1389,22 +1424,19 @@ async fn negation_demands_a_boolean_where_truthiness_tolerates_a_string() {
         enc("{ !.a = 1 }")
     );
     let res = get(port, &path, ctx);
+    // Issue #384: the whole body IS the reason — the container is
+    // asserted here and the message is pinned by EQUALITY on the raw
+    // bytes, not by `contains`: this message read `expression (!the
+    // attribute) expected a boolean` until this test was written, which
+    // is no use to anyone whose query mentions several attributes. The
+    // reference names the operand too (`expression (!.a) expected a
+    // boolean, but got TypeString`).
+    assert_error_body(&res, 400, ctx);
     assert_eq!(
-        res.status,
-        400,
-        "{ctx}: a present non-boolean under `!` must fail the query, not \
-         answer an empty 200, body {:?}",
-        String::from_utf8_lossy(&res.body)
+        res.body, b"expression (!.a) expected a boolean",
+        "{ctx}: a present non-boolean under `!` must fail the query, not answer an \
+         empty 200, and the body must be that reason and nothing else"
     );
-    let json = res.json(ctx);
-    assert_eq!(json["status"], "error", "{ctx}");
-    let msg = json["error"].as_str().unwrap_or_default();
-    // The reference names the operand too (`expression (!.a) expected a
-    // boolean, but got TypeString`). Pinned by EQUALITY, not `contains`:
-    // this message read `expression (!the attribute) expected a boolean`
-    // until this test was written, which is no use to anyone whose query
-    // mentions several attributes.
-    assert_eq!(msg, "expression (!.a) expected a boolean", "{ctx}");
 
     // 3. A field on both sides is a boolean-vs-boolean comparison since
     //    issue #351, so the `!` type demand still fires on the string span
@@ -1419,17 +1451,15 @@ async fn negation_demands_a_boolean_where_truthiness_tolerates_a_string() {
         ),
         ctx,
     );
+    // Issue #335 Stage B: the whole body IS the reason, byte-exact —
+    // asserted on the raw bytes so a re-decorated message or a
+    // re-introduced envelope fails here (issue #384 moved this from the
+    // JSON `error` field to the body itself).
+    assert_error_body(&res, 400, ctx);
     assert_eq!(
-        res.status,
-        400,
-        "{ctx}: body {:?}",
-        String::from_utf8_lossy(&res.body)
-    );
-    let json = res.json(ctx);
-    assert_eq!(json["errorType"], "bad_data", "{ctx}");
-    assert_eq!(
-        json["error"], "expression (!.a) expected a boolean",
-        "{ctx}: the boolean-operand path must name the operand it refused"
+        res.body, b"expression (!.a) expected a boolean",
+        "{ctx}: the boolean-operand path must name the operand it refused, \
+         and the body must be that reason and nothing else"
     );
 
     // 4. Issue #351: the match sets, over spans whose booleans are the
@@ -1715,15 +1745,11 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
         enc(wide_query)
     );
     let res = get(port, &path, ctx);
-    assert_eq!(
-        res.status,
-        422,
-        "{ctx}: a wide event set must be refused, body {:?}",
-        String::from_utf8_lossy(&res.body)
+    let body = assert_error_body(&res, 422, ctx);
+    assert!(
+        body.contains("budget"),
+        "{ctx}: a wide event set must be refused, {body:?}"
     );
-    let json = res.json(ctx);
-    assert_eq!(json["status"], "error", "{ctx}");
-    assert_eq!(json["errorType"], "query_too_broad", "{ctx}: body {json}");
 
     // The SUCCESS control, on a second server over the SAME database with
     // a normal budget (review 2's second test gap). Without it, a 422

@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use super::querytext::{QueryTextError, TraceQlText, validate_traceql_query};
 
-/// Errors from parsing the `{traceId}` path parameter — mapped to `400
-/// bad_data` by `error::ApiError`.
+/// Errors from parsing the `{traceId}` path parameter — mapped to `400`
+/// by `error::ApiError`.
 #[derive(Debug, Error)]
 pub(crate) enum TraceIdError {
     #[error("invalid trace id {0:?}: expected 16 or 32 hex characters")]
@@ -46,7 +46,7 @@ pub(crate) const DEFAULT_LIMIT: u32 = 20;
 pub(crate) const DEFAULT_SPSS: u32 = 3;
 
 /// Errors from parsing `/api/traces/v1/search` request parameters —
-/// mapped to `400 bad_data` by `error::ApiError`.
+/// mapped to `400` by `error::ApiError`.
 #[derive(Debug, Error)]
 pub(crate) enum SearchParamError {
     #[error("missing required parameter {0:?}: start and end are required")]
@@ -66,24 +66,6 @@ pub(crate) enum SearchParamError {
     /// validator: over the cap (issue #284) or unparseable (issue #326).
     #[error(transparent)]
     QueryText(#[from] QueryTextError),
-}
-
-impl SearchParamError {
-    /// The byte offset the `400` envelope reports as `position`
-    /// (`error::ApiError`). Only the validator's parse step has one; every
-    /// other search-parameter failure is about the request, not about a
-    /// place inside an expression. Matched exhaustively on purpose — a new
-    /// variant must decide, not inherit a catch-all `None`.
-    pub(crate) fn position(&self) -> Option<usize> {
-        match self {
-            SearchParamError::QueryText(e) => e.position(),
-            SearchParamError::MissingRange(_)
-            | SearchParamError::InvalidTimestamp(_)
-            | SearchParamError::InvalidRange { .. }
-            | SearchParamError::InvalidCount { .. }
-            | SearchParamError::ConflictingQuery => None,
-        }
-    }
 }
 
 /// The raw, percent-decoded search request — `q` XOR the legacy params
@@ -212,8 +194,8 @@ fn parse_count(
 }
 
 /// Errors from parsing `/api/traces/v1/metrics/{query_range,query}`
-/// request parameters (issue #59, docs/api.md §4.4) — mapped to `400
-/// bad_data` by `error::ApiError`.
+/// request parameters (issue #59, docs/api.md §4.4) — mapped to `400` by
+/// `error::ApiError`.
 #[derive(Debug, Error)]
 pub(crate) enum MetricsParamError {
     #[error("missing required parameter: 'q' (or 'query') must carry a TraceQL metrics expression")]
@@ -372,7 +354,7 @@ fn parse_whole_seconds(raw: &str) -> Option<i64> {
 }
 
 /// Errors from parsing `/api/traces/v1/service_graph` request parameters
-/// (issue #173, docs/api.md §4.5) — mapped to `400 bad_data` by
+/// (issue #173, docs/api.md §4.5) — mapped to `400` by
 /// `error::ApiError`. Same window grammar as the metrics surface (`start`/
 /// `end`/`since`), minus `q`/`step` — the service graph is a fixed
 /// aggregation over a window, with no expression and no bucketing.
@@ -406,7 +388,7 @@ pub(crate) struct RawGraphParams {
 /// metrics surface's window grammar exactly: `start`/`end` (unix s/ns/
 /// RFC3339) XOR a relative `since` (whole-second duration), `now_s` feeding
 /// the `since` window (injected for testability). Any missing/invalid/
-/// conflicting window is an explicit `400 bad_data`.
+/// conflicting window is an explicit `400`.
 pub(crate) fn parse_graph_params(raw: &str, now_s: i64) -> Result<RawGraphParams, GraphParamError> {
     let pairs = parse_pairs(raw);
     let parse_ts = |name: &str| -> Result<Option<i64>, GraphParamError> {
@@ -449,7 +431,7 @@ pub(crate) fn parse_graph_params(raw: &str, now_s: i64) -> Result<RawGraphParams
 }
 
 /// Errors from parsing the `/api/traces/v1/tags` query parameters —
-/// mapped to `400 bad_data` by `error::ApiError` (issue #58).
+/// mapped to `400` by `error::ApiError` (issue #58).
 #[derive(Debug, Error)]
 pub(crate) enum TagsParamError {
     #[error(
@@ -460,7 +442,7 @@ pub(crate) enum TagsParamError {
 }
 
 /// Errors from parsing the `{tag}` path parameter of
-/// `/api/traces/v1/tag/{tag}/values` — mapped to `400 bad_data`.
+/// `/api/traces/v1/tag/{tag}/values` — mapped to `400`.
 #[derive(Debug, Error)]
 pub(crate) enum TagPathError {
     #[error("invalid tag: the attribute key must be non-empty")]
@@ -993,7 +975,13 @@ mod tests {
                 err.to_string().starts_with("invalid TraceQL query: "),
                 "{raw}: the reference's `:54` wrapping, got {err}"
             );
-            assert!(err.position().is_some(), "{raw}: parse errors carry one");
+            // Issue #384: the offset reaches the client inside the
+            // message, not in a `position` field — every one of these
+            // parse rejections still names a byte.
+            assert!(
+                err.to_string().contains("byte "),
+                "{raw}: parse errors name their offset, got {err}"
+            );
         }
 
         // Accepted, and STILL not the search expression: the parse step

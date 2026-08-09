@@ -369,7 +369,11 @@ fn shipped_metrics_shapes_and_limits_are_documented() {
         "DEFAULT_METRICS_POINTS",
         "MAX_METRICS_POINTS",
         "11000",
-        "query_too_broad",
+        // The §4.4 point-cap taxonomy. Issue #384 removed the `errorType`
+        // vocabulary from §4 with the JSON envelope, so the old
+        // `query_too_broad` needle would now pass only if the doc still
+        // named a field the wire no longer carries. The sentence is the pin.
+        "is rejected **statically before execution** with `422`",
         "left-closed",
     ] {
         assert!(

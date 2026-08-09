@@ -2698,6 +2698,63 @@ mod tests {
         }
     }
 
+    /// Issue #382, the user-visible defect: the three tests above hand
+    /// `map_trace_read_error` a `ChError::Server` they built themselves, so
+    /// none of them can see how the code is READ off the wire — and that is
+    /// where the defect was. These start from the `BadResponse` the
+    /// `clickhouse` crate hands us when ClickHouse raised the limit AFTER it
+    /// had already written output.
+    ///
+    /// The bodies are verbatim captures from 26.3.17.110 (`SELECT
+    /// toString(number) AS v FROM numbers(100000000)` with
+    /// `max_result_bytes=1000000, result_overflow_mode=throw` for 396 and
+    /// `max_bytes_to_read=1100000` for 307), prefixed with the
+    /// header-derived `Code: N` that the ADR 0007 vendored patch
+    /// (`vendor/clickhouse/PATCHES.md`) puts in front of them. That prefix is
+    /// the whole fix: the result bytes after it are tenant data and cannot be
+    /// parsed for a code soundly, so without it these map to 500 `internal`
+    /// rather than the 422 `query_too_broad` the query deserves.
+    ///
+    /// 307 is here because 396 is not the only affected arm — every code in
+    /// this mapper reaches it through the same single parse.
+    #[test]
+    fn a_limit_raised_after_output_was_written_still_maps_to_its_byte_budget() {
+        let body_396 = "\u{1}\u{1}v\u{6}StringCode: 396. DB::Exception: Limit for result \
+                        exceeded, max bytes: 976.56 KiB, current bytes: 1.64 MiB. \
+                        (TOO_MANY_ROWS_OR_BYTES) (version 26.3.17.110 (official build))";
+        let body_307 = "\u{1}\u{1}v\u{6}StringCode: 307. DB::Exception: Limit for rows or bytes \
+                        to read exceeded, max bytes: 1.05 MiB, current bytes: 1.50 MiB: While \
+                        executing NumbersRange. (TOO_MANY_BYTES) (version 26.3.17.110 (official \
+                        build))";
+        // Verbatim captures: the lengths are pinned so an edit that quietly
+        // reshapes a fixture fails here instead of weakening the case.
+        assert_eq!(body_396.len(), 174);
+        assert_eq!(body_307.len(), 209);
+        for (code, body, expected) in [
+            (396, body_396, TRACE_MAX_RESULT_BYTES),
+            (307, body_307, TRACE_READ_BYTES_BUDGET),
+        ] {
+            // Unpatched, the code is not in a trustworthy position and the
+            // client gets the generic passthrough. Stated, not hidden.
+            let raw = ChError::from(clickhouse::error::Error::BadResponse(body.to_string()));
+            assert!(matches!(
+                map_trace_read_error(raw, &cfg()),
+                ReadError::Clickhouse(_)
+            ));
+
+            let patched = format!("Code: {code}\n{body}");
+            match map_trace_read_error(
+                ChError::from(clickhouse::error::Error::BadResponse(patched)),
+                &cfg(),
+            ) {
+                ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes {
+                    budget_bytes, ..
+                }) => assert_eq!(budget_bytes, expected),
+                other => panic!("expected ScanBudgetBytes, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn code_191_maps_to_the_metrics_set_budget_on_the_metrics_path_only() {
         let e = || ChError::Server {

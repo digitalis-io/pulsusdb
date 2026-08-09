@@ -108,7 +108,7 @@ fn single_node_pins_the_documented_fragments() {
 /// Doc-consistency gate (the metrics suite's AC8 pattern): every shipped
 /// service-graph SQL shape and committed constant is documented —
 /// docs/schemas.md §4.2 (the ledger + query-time pairing) and docs/api.md
-/// §4.5 (params, envelope, boundary rule, 400/422 taxonomy).
+/// §4.5 (params, response shape, boundary rule, 400/422 taxonomy).
 #[test]
 fn shipped_graph_shapes_and_limits_are_documented() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -132,7 +132,12 @@ fn shipped_graph_shapes_and_limits_are_documented() {
         "/api/traces/v1/service_graph",
         "connectionType",
         "SERVICE_GRAPH_MAX_EDGES",
-        "query_too_broad",
+        // The §4.5 400/422 taxonomy. Issue #384 removed the `errorType`
+        // vocabulary from §4 with the JSON envelope, so the old
+        // `query_too_broad` needle would now pass only if the doc still
+        // named a field the wire no longer carries. The sentence itself
+        // is the pin.
+        "A window too broad to bound within the reader scan budget is `422`",
     ] {
         assert!(
             api.contains(needle),
