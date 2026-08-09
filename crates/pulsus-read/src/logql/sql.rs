@@ -116,25 +116,54 @@ pub fn probe(streams_idx_table: &str, months: &[String], key_literal: &str) -> S
 }
 
 /// Labels discovery (#13 `GET|POST /api/logs/v1/labels`): every distinct
-/// `log_streams_idx` key within `months`, ascending. Budget-capped like
-/// every other index scan in this module (`LogQlEngine::budget_settings`).
-pub fn label_names(streams_idx_table: &str, months: &[String]) -> String {
+/// `log_streams_idx` key of a stream ACTIVE within `window`, ascending.
+/// Budget-capped like every other index scan in this module
+/// (`LogQlEngine::budget_settings`).
+///
+/// **Issue #399:** the month partition alone is not the requested window —
+/// `log_streams_idx` carries no time column at all (`month Date, key, val,
+/// fingerprint`), so the window arrives as the
+/// [`active_fingerprints`] semi-join over the log rollup. The month
+/// predicate is kept exactly where it was: it is the partition-pruning
+/// bound, and the semi-join narrows within it. **M1 scope, unchanged:**
+/// `label_names` takes no fingerprints — `query=`-selector narrowing is
+/// deferred (docs/api.md §2.3), so this form is always unscoped.
+pub fn label_names(
+    streams_idx_table: &str,
+    months: &[String],
+    rollup_table: &str,
+    window: TimeWindow,
+    rollup_res_ns: u64,
+) -> String {
     format!(
-        "SELECT DISTINCT key AS name\nFROM {streams_idx_table}\nWHERE {}\nORDER BY name",
-        month_clause(months)
+        "SELECT DISTINCT key AS name\nFROM {streams_idx_table}\nWHERE {}\n  AND fingerprint IN ({})\nORDER BY name",
+        month_clause(months),
+        active_fingerprints(rollup_table, None, window, rollup_res_ns)
     )
 }
 
 /// Label-values discovery (#13 `GET /api/logs/v1/label/{{name}}/values`):
-/// every distinct value of one key within `months`, ascending.
-/// `key_literal` is a pre-escaped ClickHouse string literal (see
-/// [`super::escape::ch_string`]). **M1 scope:** returns the key's full
-/// distinct-value set; `query=`-selector narrowing is deferred to M6
-/// parity (docs/api.md §2.3).
-pub fn label_values(streams_idx_table: &str, months: &[String], key_literal: &str) -> String {
+/// every distinct value of one key, over the streams ACTIVE within
+/// `window`, ascending. `key_literal` is a pre-escaped ClickHouse string
+/// literal (see [`super::escape::ch_string`]). **M1 scope:** returns the
+/// key's full distinct-value set over that window; `query=`-selector
+/// narrowing is deferred to M6 parity (docs/api.md §2.3).
+///
+/// **Issue #399:** same shape and same reason as [`label_names`] — the
+/// month predicate prunes partitions, the [`active_fingerprints`]
+/// semi-join applies the request's own window.
+pub fn label_values(
+    streams_idx_table: &str,
+    months: &[String],
+    key_literal: &str,
+    rollup_table: &str,
+    window: TimeWindow,
+    rollup_res_ns: u64,
+) -> String {
     format!(
-        "SELECT DISTINCT val AS value\nFROM {streams_idx_table}\nWHERE {} AND key = {key_literal}\nORDER BY value",
-        month_clause(months)
+        "SELECT DISTINCT val AS value\nFROM {streams_idx_table}\nWHERE {} AND key = {key_literal}\n  AND fingerprint IN ({})\nORDER BY value",
+        month_clause(months),
+        active_fingerprints(rollup_table, None, window, rollup_res_ns)
     )
 }
 
@@ -159,25 +188,84 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 /// ([`UUID_RE`]) — the server-side half of the reference's
 /// `containsAllIDTypes` relevance filter (the keep rule — static label OR
 /// `non_id_values > 0` — applies client-side in `exec`). `fingerprints` =
-/// `None` for the unscoped form; `Some` appends the same `fingerprint IN`
-/// filter to the identical idx-months scan. **Never touches
-/// `log_samples`** — same table and scan class as [`label_names`],
-/// month-partition-pruned, server-side aggregated (fan-in is one row per
-/// key, never per value).
+/// `None` for the unscoped form; `Some` pushes the caller's stage-1 result
+/// **into** the [`active_fingerprints`] subquery (the two `IN`s compose:
+/// the subquery's result is already a subset of the list, so rendering the
+/// list once inside it is equivalent and cheaper — measured ~395× fewer
+/// rows read, issue #399). **Never touches `log_samples`** — it reads the
+/// stream index plus the log rollup's `(fingerprint, bucket_ns)` prefix,
+/// month-partition-pruned on one side and bucket-range-pruned on the
+/// other, server-side aggregated (fan-in is one row per key, never per
+/// value).
+///
+/// **Issue #399:** before this, the only time bound was `month`, so a
+/// ten-minute request was answered from the whole calendar month.
 pub fn detected_labels(
     streams_idx_table: &str,
     months: &[String],
     fingerprints: Option<&[u64]>,
+    rollup_table: &str,
+    window: TimeWindow,
+    rollup_res_ns: u64,
 ) -> String {
     let month_clause = month_clause(months);
     let uuid_literal = super::escape::ch_string(UUID_RE);
-    let mut sql = format!(
-        "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {uuid_literal})) AS non_id_values\nFROM {streams_idx_table}\nWHERE {month_clause}"
-    );
+    let active = active_fingerprints(rollup_table, fingerprints, window, rollup_res_ns);
+    format!(
+        "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {uuid_literal})) AS non_id_values\nFROM {streams_idx_table}\nWHERE {month_clause}\n  AND fingerprint IN ({active})\nGROUP BY key\nORDER BY key"
+    )
+}
+
+/// The rollup bucket CONTAINING `start_ns` — the activity semi-join's
+/// lower bound (issue #399).
+///
+/// The rollup MV stores `bucket_ns = intDiv(timestamp_ns, res) * res`
+/// (`crates/pulsus-schema/src/catalog.rs`, `log_metrics_{{…}}_mv`), so a
+/// sample inside the request's `(start, end]` window can sit in a bucket
+/// that starts at or before `start`; comparing `bucket_ns` against
+/// `start_ns` itself — the half-open shape [`log_stats_rollup`] uses on
+/// the SAMPLE axis, where it is correct — would silently drop that
+/// stream. Flooring makes the filter conservative in the only safe
+/// direction: it can over-include by at most one bucket (5s by default)
+/// at each edge and can never drop a stream with a line in the window.
+///
+/// Floor division (`div_euclid`), not truncation, so a negative
+/// `start_ns` rounds DOWN; `saturating_mul` so no input can overflow.
+pub fn activity_lower_bucket_ns(start_ns: i64, rollup_res_ns: u64) -> i64 {
+    let res = i64::try_from(rollup_res_ns).unwrap_or(i64::MAX).max(1);
+    start_ns.div_euclid(res).saturating_mul(res)
+}
+
+/// Fingerprints with at least one log line in (approximately) `window` —
+/// the stream-activity semi-join source shared by [`detected_labels`],
+/// [`label_names`], [`label_values`] and `/series` (issue #399).
+///
+/// `log_streams_idx` has no time column, so the window has to come from
+/// the one co-sharded table that records per-stream activity in time: the
+/// log rollup `log_metrics_<res>` (`ORDER BY (fingerprint, bucket_ns)`,
+/// `PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))`), already the
+/// source for `/stats` and `/volume`.
+///
+/// `DISTINCT` on the PK prefix is a streaming distinct and is load-bearing:
+/// without it the `IN` set carries one row per bucket per stream.
+/// `fingerprints` = `Some` pushes the caller's stage-1 result INTO this
+/// scan so it reads PK point ranges instead of the whole bucket range.
+///
+/// The lower bound is [`activity_lower_bucket_ns`], NOT `start_ns` — see
+/// that function for why the obvious `bucket_ns > start_ns` is wrong here.
+pub fn active_fingerprints(
+    rollup_table: &str,
+    fingerprints: Option<&[u64]>,
+    window: TimeWindow,
+    rollup_res_ns: u64,
+) -> String {
+    let TimeWindow { start_ns, end_ns } = window;
+    let lower = activity_lower_bucket_ns(start_ns, rollup_res_ns);
+    let mut sql = format!("SELECT DISTINCT fingerprint FROM {rollup_table} WHERE ");
     if let Some(fps) = fingerprints {
-        sql.push_str(&format!("\n  AND fingerprint IN ({})", fp_list(fps)));
+        sql.push_str(&format!("fingerprint IN ({}) AND ", fp_list(fps)));
     }
-    sql.push_str("\nGROUP BY key\nORDER BY key");
+    sql.push_str(&format!("bucket_ns >= {lower} AND bucket_ns <= {end_ns}"));
     sql
 }
 
@@ -658,11 +746,29 @@ mod tests {
         );
     }
 
+    /// The `[start, end]` window every discovery-builder test below
+    /// renders — 5s-aligned so the floored lower bound equals `start_ns`
+    /// and the expectation stays readable.
+    const DISCOVERY_WINDOW: TimeWindow = TimeWindow {
+        start_ns: 1_751_328_000_000_000_000,
+        end_ns: 1_751_331_600_000_000_000,
+    };
+    const RES_5S: u64 = 5_000_000_000;
+    const ACTIVE_ALL: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
+
     #[test]
     fn label_names_renders_a_distinct_key_scan_for_one_month() {
         assert_eq!(
-            label_names("log_streams_idx", &["'2026-07-01'".to_string()]),
-            "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE month = '2026-07-01'\nORDER BY name"
+            label_names(
+                "log_streams_idx",
+                &["'2026-07-01'".to_string()],
+                "log_metrics_5s",
+                DISCOVERY_WINDOW,
+                RES_5S
+            ),
+            format!(
+                "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND fingerprint IN ({ACTIVE_ALL})\nORDER BY name"
+            )
         );
     }
 
@@ -671,6 +777,9 @@ mod tests {
         let sql = label_names(
             "log_streams_idx",
             &["'2026-07-01'".to_string(), "'2026-08-01'".to_string()],
+            "log_metrics_5s",
+            DISCOVERY_WINDOW,
+            RES_5S,
         );
         assert!(sql.contains("WHERE month IN ('2026-07-01', '2026-08-01')"));
     }
@@ -678,33 +787,131 @@ mod tests {
     #[test]
     fn label_values_renders_a_distinct_value_scan_scoped_to_one_key() {
         assert_eq!(
-            label_values("log_streams_idx", &["'2026-07-01'".to_string()], "'env'"),
-            "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE month = '2026-07-01' AND key = 'env'\nORDER BY value"
+            label_values(
+                "log_streams_idx",
+                &["'2026-07-01'".to_string()],
+                "'env'",
+                "log_metrics_5s",
+                DISCOVERY_WINDOW,
+                RES_5S
+            ),
+            format!(
+                "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE month = '2026-07-01' AND key = 'env'\n  AND fingerprint IN ({ACTIVE_ALL})\nORDER BY value"
+            )
         );
     }
 
     #[test]
     fn detected_labels_unscoped_renders_one_row_per_key_with_the_id_predicate() {
-        let sql = detected_labels("log_streams_idx", &["'2026-07-01'".to_string()], None);
+        let sql = detected_labels(
+            "log_streams_idx",
+            &["'2026-07-01'".to_string()],
+            None,
+            "log_metrics_5s",
+            DISCOVERY_WINDOW,
+            RES_5S,
+        );
         assert!(sql.starts_with("SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, "));
         assert!(sql.contains("WHERE month = '2026-07-01'"));
-        assert!(!sql.contains("fingerprint"));
+        assert!(sql.contains(&format!("\n  AND fingerprint IN ({ACTIVE_ALL})\n")));
         assert!(sql.ends_with("GROUP BY key\nORDER BY key"));
     }
 
+    /// Issue #399: scoping moves the stage-1 list INSIDE the activity
+    /// subquery rather than adding a second outer `IN` — the two forms
+    /// differ by exactly that prefix, and the list is rendered once.
     #[test]
-    fn detected_labels_scoped_appends_the_fingerprint_filter_to_the_same_scan() {
+    fn detected_labels_scoped_pushes_the_fingerprint_list_into_the_activity_subquery() {
         let scoped = detected_labels(
             "log_streams_idx",
             &["'2026-07-01'".to_string()],
             Some(&[7, 9]),
+            "log_metrics_5s",
+            DISCOVERY_WINDOW,
+            RES_5S,
         );
-        assert!(scoped.contains("WHERE month = '2026-07-01'\n  AND fingerprint IN (7, 9)"));
-        let unscoped = detected_labels("log_streams_idx", &["'2026-07-01'".to_string()], None);
+        assert!(scoped.contains(
+            "AND fingerprint IN (SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE \
+             fingerprint IN (7, 9) AND bucket_ns >="
+        ));
         assert_eq!(
-            scoped.replace("\n  AND fingerprint IN (7, 9)", ""),
+            scoped.matches("fingerprint IN (7, 9)").count(),
+            1,
+            "the stage-1 list must be rendered exactly once: {scoped}"
+        );
+        let unscoped = detected_labels(
+            "log_streams_idx",
+            &["'2026-07-01'".to_string()],
+            None,
+            "log_metrics_5s",
+            DISCOVERY_WINDOW,
+            RES_5S,
+        );
+        assert_eq!(
+            scoped.replace("fingerprint IN (7, 9) AND ", ""),
             unscoped,
-            "scoped form must be the unscoped scan plus only the fingerprint filter"
+            "scoped form must be the unscoped scan plus only the pushed-down list"
+        );
+    }
+
+    /// Issue #399 AC2 — the discriminator against the plausible-but-wrong
+    /// `bucket_ns > start_ns` copy from [`log_stats_rollup`]: the bound is
+    /// the bucket CONTAINING `start_ns`.
+    #[test]
+    fn activity_lower_bucket_ns_floors_to_the_containing_bucket() {
+        const B: i64 = 100 * RES_5S as i64;
+        assert_eq!(activity_lower_bucket_ns(B + 1_000_000_000, RES_5S), B);
+        assert_eq!(activity_lower_bucket_ns(B, RES_5S), B);
+        assert_eq!(activity_lower_bucket_ns(B - 1, RES_5S), B - RES_5S as i64);
+        // Floor, not truncation-toward-zero: `-1 / 5e9` is `0` in Rust's
+        // integer division and would round a pre-epoch bound UP.
+        assert_eq!(activity_lower_bucket_ns(-1, RES_5S), -(RES_5S as i64));
+        // No input can overflow or panic.
+        assert_eq!(
+            activity_lower_bucket_ns(i64::MIN, u64::MAX),
+            i64::MIN.div_euclid(i64::MAX).saturating_mul(i64::MAX)
+        );
+        // A zero resolution is not representable in config, but the
+        // builder must not divide by zero if one ever reaches it.
+        assert_eq!(activity_lower_bucket_ns(7, 0), 7);
+    }
+
+    #[test]
+    fn active_fingerprints_renders_a_streaming_distinct_over_the_rollup_pk() {
+        assert_eq!(
+            active_fingerprints("log_metrics_5s", None, DISCOVERY_WINDOW, RES_5S),
+            ACTIVE_ALL
+        );
+        assert_eq!(
+            active_fingerprints(
+                "log_metrics_5s",
+                Some(&[101, 205]),
+                DISCOVERY_WINDOW,
+                RES_5S
+            ),
+            "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE fingerprint IN (101, 205) \
+             AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000"
+        );
+    }
+
+    /// A `start_ns` one nanosecond past a bucket edge must render the
+    /// bucket's own start, not `start_ns` — the whole point of #399's
+    /// floor (a sample at `B + 1s` lives in bucket `B`).
+    #[test]
+    fn active_fingerprints_lower_bound_is_the_containing_bucket_not_the_request_start() {
+        let b = 1_751_328_000_000_000_000_i64;
+        let sql = active_fingerprints(
+            "log_metrics_5s",
+            None,
+            TimeWindow {
+                start_ns: b + 1_000_000_000,
+                end_ns: b + 4_000_000_000,
+            },
+            RES_5S,
+        );
+        assert!(
+            sql.contains(&format!("bucket_ns >= {b} AND")),
+            "lower bound must floor to the containing bucket: {sql}"
         );
     }
 

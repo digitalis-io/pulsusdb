@@ -21,7 +21,10 @@
 //! - the `/loki/api/v1/*` aliases are byte-identical to native;
 //! - issue #261: at the two value counts where the reference's p14
 //!   HyperLogLog estimate stops matching the truth, `detected_labels`
-//!   answers the EXACT count — the number the reference does not give.
+//!   answers the EXACT count — the number the reference does not give;
+//! - issue #399: `detected_labels` answers the REQUESTED WINDOW, not the
+//!   calendar month containing it, with the lower bound floored to the
+//!   rollup bucket containing `start`.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
@@ -32,8 +35,9 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Ports 31155-31156 and 31165, distinct from every other live suite.
-//! (31157, the next number up, already belongs to `loki_push_live.rs`.)
+//! Ports 31155-31156, 31165 and 31167, distinct from every other live
+//! suite. (31157, the next number up, already belongs to
+//! `loki_push_live.rs`; 31166 belongs to it too.)
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -248,6 +252,34 @@ async fn seed_stream(
         .expect("seed log_streams");
 }
 
+/// Seeds one `log_metrics_5s` row per fingerprint, at the 5s bucket
+/// CONTAINING `ts_ns` — the stream-activity evidence issue #399's window
+/// filter reads.
+///
+/// Inserted directly rather than through `log_samples`: a stream that
+/// only exists to exercise `/detected_labels` must not acquire sample
+/// rows, which would change what `/detected_fields` samples in the same
+/// fixture. Streams that DO have `log_samples` rows get their rollup rows
+/// from the shipped `log_metrics_5s_mv` and need no call here.
+async fn seed_activity(client: &ChClient, db: &str, ts_ns: i64, fingerprints: &[u64]) {
+    let bucket = ts_ns / 5_000_000_000 * 5_000_000_000;
+    let values: Vec<String> = fingerprints
+        .iter()
+        .map(|fp| format!("({fp}, {bucket}, 1, 10)"))
+        .collect();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_metrics_5s (fingerprint, bucket_ns, count, bytes) VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_metrics_5s");
+}
+
 /// A `log_samples` bulk-insert row (the `query_log_gates.rs` shape plus
 /// the per-entry structured-metadata column).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -406,6 +438,12 @@ async fn detected_labels_and_fields_end_to_end() {
         r#"{"service_name":"sparse-svc"}"#,
     )
     .await;
+    // Issue #399: `/detected_labels` is now window-scoped, so a stream
+    // with no activity in `[start, end]` is correctly absent. Fps 1 and 9
+    // get their rollup rows from the MV over the `log_samples` inserts
+    // below; fps 2 and 3 exist only for the label-relevance cases and
+    // deliberately have no samples, so their activity is seeded here.
+    seed_activity(&client, db, now, &[2, 3]).await;
 
     // Samples for detected_fields, all on fp 1 (distinct timestamps —
     // deterministic last-entry-wins detection): a JSON body, a logfmt
@@ -482,12 +520,17 @@ async fn detected_labels_and_fields_end_to_end() {
         .iter()
         .find(|s| s["name"] == "detected_labels")
         .expect("a detected_labels stage");
+    let agg_sql = agg["sql"].as_str().expect("sql");
     assert!(
-        agg["sql"]
-            .as_str()
-            .expect("sql")
-            .contains("log_streams_idx"),
+        agg_sql.contains("log_streams_idx"),
         "the aggregation reads the stream index"
+    );
+    // Issue #399 AC9: the same single scan now also names the configured
+    // log rollup — the activity semi-join carrying the request's window.
+    assert!(
+        agg_sql.contains("log_metrics_5s"),
+        "the aggregation must carry the activity semi-join over the configured \
+         rollup table: {agg_sql}"
     );
     for stage in stages {
         let sql = stage["sql"].as_str().unwrap_or_default();
@@ -904,6 +947,25 @@ async fn detected_labels_cardinality_is_exact_at_the_reference_divergence_points
             )
             .await
             .expect("seed log_streams");
+        // Issue #399: this fixture seeds `log_streams` only (the index MV
+        // fans it out), so without rollup rows every stream is inactive
+        // in the requested window and both cases would answer with an
+        // empty label set — the exact-cardinality claim would become
+        // vacuous rather than false. Seeded here in one statement over
+        // `numbers()`, matching the fixture's own idiom; `n` is 7,708 /
+        // 4,533 rows, not a corpus.
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_metrics_5s (fingerprint, bucket_ns, count, bytes) \
+                     SELECT {fp_base} + number, intDiv({now}, 5000000000) * 5000000000, 1, 10 \
+                     FROM numbers({n})"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_metrics_5s activity");
     }
 
     let start = now - 3 * 24 * 3_600_000_000_000;
@@ -945,6 +1007,135 @@ async fn detected_labels_cardinality_is_exact_at_the_reference_divergence_points
             "the /loki/api/v1 alias must be byte-identical to native"
         );
     }
+
+    drop_db(db).await;
+}
+
+/// Issue #399 AC3/AC4 — `/detected_labels` answers the requested window,
+/// not the calendar month containing it.
+///
+/// **Measured on `c7649da` (the pre-fix tree):** the response was a pure
+/// function of the months overlapping `[start, end]`. A ten-minute window
+/// returned every label in August and reported `job` cardinality 2 where
+/// only one `job` value existed inside it.
+///
+/// **The reference bounds this endpoint by the window too, but coarsely.**
+/// `grafana/loki:3.7.4` (`b318f2829f0ae2094ab3a1e90780450e9e4b03be`,
+/// tsdb/v13, index period 24h, flushed) answered a `[T−2h, T−1h]` window
+/// with a label whose only line sat ~5h outside it, and answered the
+/// previous day's window with `[]`: `MultiIndex.LabelNames` filters index
+/// FILES by `forMatchingIndices` (`pkg/storage/stores/shipper/indexshipper/tsdb/multi_file_index.go:115-132`
+/// @ v3.7.4) while `TSDBIndex.LabelNames` ignores `from`/`through`
+/// entirely (`single_file_index.go:304-310` @ v3.7.4 — the signature is
+/// literally `_, _ model.Time`). Ours lands at one rollup bucket per edge,
+/// strictly tighter; registered as
+/// `detected-labels-window-scoped-to-rollup-bucket` in
+/// docs/benchmarks/logs-differential-ledger.md.
+///
+/// Both requests below run against ONE fixture and ONE server spawn.
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_labels_is_scoped_to_the_requested_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_167;
+    let db = "pulsus_detected_it_window";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+    let client = data_client(db).await;
+
+    let now = now_ns();
+    // `b` is the 5s bucket containing `now - 3600s`. Stream 3's only line
+    // sits at `b + 1s`, i.e. INSIDE bucket `b`, which starts before it —
+    // the case that discriminates the correct floored lower bound from
+    // the plausible-but-wrong `bucket_ns > start_ns` copy of
+    // `sql::log_stats_rollup`'s half-open sample predicate.
+    let b = (now - 3_600_000_000_000) / 5_000_000_000 * 5_000_000_000;
+    let fixture: [(u64, &str, &str, i64); 3] = [
+        (
+            1,
+            "fix",
+            r#"{"inwin":"yes","job":"fix","service_name":"fix"}"#,
+            now - 60_000_000_000,
+        ),
+        (
+            2,
+            "stale",
+            r#"{"job":"stale","outwin":"yes","service_name":"stale"}"#,
+            now - 6 * 3_600_000_000_000,
+        ),
+        (
+            3,
+            "fix",
+            r#"{"edge":"yes","job":"fix","service_name":"fix"}"#,
+            b + 1_000_000_000,
+        ),
+    ];
+    for (fp, service, labels, ts) in fixture {
+        seed_stream(&client, db, ts, fp, service, labels).await;
+        // Real `log_samples` rows here (this case makes no
+        // `/detected_fields` assertions), so the shipped rollup MV — not
+        // the test — decides which bucket each line lands in. That is the
+        // point: the bucket boundary under test is production's.
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                     body, structured_metadata) VALUES ('{service}', {fp}, {ts}, 0, 'line', '')"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_samples");
+    }
+
+    // -- AC3: a ten-minute window sees only what is in it ---------------
+    let start = now - 600_000_000_000;
+    let res = http_get(
+        port,
+        &format!("/api/logs/v1/detected_labels?start={start}&end={now}"),
+        false,
+    );
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    let json: serde_json::Value = serde_json::from_str(&res.body).expect("detected_labels JSON");
+    assert_eq!(
+        json["detectedLabels"],
+        serde_json::json!([
+            {"label": "inwin", "cardinality": 1},
+            {"label": "job", "cardinality": 1},
+            {"label": "service_name", "cardinality": 1},
+        ]),
+        "`outwin` and `edge` are outside the window and `job` has ONE value in it; \
+         the pre-fix tree returned every August label and job:2: {json}"
+    );
+
+    // -- AC4, THE DISCRIMINATOR: a sample in the bucket CONTAINING start
+    //    survives. Window `[b + 500ms, b + 4s]` holds only stream 3's
+    //    line, whose bucket is `b` — at or before `start`. A
+    //    `bucket_ns > start_ns` lower bound returns nothing here
+    //    (measured on the pre-fix tree with that exact wrong fix),
+    //    silently losing an in-window label. -----------------------------
+    let edge_start = b + 500_000_000;
+    let edge_end = b + 4_000_000_000;
+    let res = http_get(
+        port,
+        &format!("/api/logs/v1/detected_labels?start={edge_start}&end={edge_end}"),
+        false,
+    );
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    let json: serde_json::Value = serde_json::from_str(&res.body).expect("edge JSON");
+    assert_eq!(
+        json["detectedLabels"],
+        serde_json::json!([
+            {"label": "edge", "cardinality": 1},
+            {"label": "job", "cardinality": 1},
+            {"label": "service_name", "cardinality": 1},
+        ]),
+        "the lower bound must floor to the bucket CONTAINING start, so `edge` is kept \
+         while `inwin`/`outwin` stay out: {json}"
+    );
 
     drop_db(db).await;
 }

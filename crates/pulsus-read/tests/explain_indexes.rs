@@ -205,6 +205,28 @@ async fn explain(client: &ChClient, sql: &str) -> Vec<String> {
     index_usage(&explain_raw(client, sql).await)
 }
 
+/// The FIRST `Parts: m/n` count in raw `EXPLAIN indexes = 1` text —
+/// deliberately not part of [`index_usage`]'s extract, which drops these
+/// counts as volatile (issue #11's round-2 disposition). Issue #399 needs
+/// them for exactly one claim the extract cannot make: that a `Condition:`
+/// on `bucket_ns` actually *prunes* parts rather than merely appearing.
+/// The first block ClickHouse prints for these queries is `MinMax`, whose
+/// `Parts:` line is the partition-level prune the assertion is about.
+fn parts_selected(raw: &str) -> Option<(u64, u64)> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Parts: ")
+            && let Some((m, n)) = rest.split_once('/')
+        {
+            return Some((m.trim().parse().ok()?, n.trim().parse().ok()?));
+        }
+    }
+    None
+}
+
+/// The rollup resolution `test_ctx` renders (`log_rollup: 5s`).
+const ROLLUP_RES_NS: u64 = 5_000_000_000;
+
 fn plan_ctx(db: &str) -> PlanCtx<'_> {
     PlanCtx {
         db,
@@ -843,12 +865,31 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
     };
     let months = pulsus_read::logql::plan::months_overlapping(start_ns, end_ns);
     let table = format!("{db}.log_streams_idx");
-    let sql = sql::detected_labels(&table, &months, None);
+    let sql = sql::detected_labels(
+        &table,
+        &months,
+        None,
+        &format!("{db}.log_metrics_5s"),
+        TimeWindow { start_ns, end_ns },
+        ROLLUP_RES_NS,
+    );
     assert!(!sql.contains("log_samples"), "never touches log_samples");
 
     let usage = explain(&client, &sql).await;
     assert_eq!(
         usage,
+        // The outer `log_streams_idx` scan is unchanged by issue #399 —
+        // same `month` MinMax/Partition pruning — and additionally
+        // engages the index primary key's TRAILING column, replacing the
+        // pre-#399 `PrimaryKey / Condition: true`: the activity semi-join
+        // materializes a `fingerprint` set before the outer scan reads.
+        //
+        // `EXPLAIN indexes = 1` reports index analysis for the OUTER
+        // table only — the subquery is executed to build the set, not
+        // planned inline — so the rollup's own `bucket_ns` blocks are
+        // absent here (measured, ClickHouse 24.8.14.39) and are pinned
+        // separately, on the subquery's standalone form, by
+        // `detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range`.
         v(&[
             "MinMax",
             "Keys:",
@@ -859,8 +900,173 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
             "month",
             "Condition: (month in [#, #])",
             "PrimaryKey",
-            "Condition: true",
+            "Keys:",
+            "fingerprint",
+            "Condition: (fingerprint in #-element set)",
         ])
+    );
+}
+
+/// Issue #399 AC5 — the activity semi-join's own scan prunes the rollup
+/// on `bucket_ns`, which is the partition key's only input column
+/// (`PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))`), so a
+/// window narrower than the corpus reads strictly fewer parts. The
+/// `Parts: m/n` check is the one that carries the claim: `index_usage`
+/// deliberately drops those counts, so a `Condition:` that pruned nothing
+/// would still match the extract.
+#[tokio::test]
+async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_activity_subquery";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    // Four distinct DAY partitions of rollup rows, one bucket each. The
+    // window below covers only the newest, so at least three parts must
+    // be pruned away.
+    const DAY_NS: i64 = 86_400_000_000_000;
+    for day in 1..=4i64 {
+        let bucket = (ts_ns - day * DAY_NS) / ROLLUP_RES_NS as i64 * ROLLUP_RES_NS as i64;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_metrics_5s (fingerprint, bucket_ns, count, bytes) \
+                     VALUES ({FP_PROD}, {bucket}, 1, 10)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed rollup day partition");
+    }
+
+    let table = format!("{db}.log_metrics_5s");
+    let window = TimeWindow {
+        start_ns: ts_ns - DAY_NS - 3_600_000_000_000,
+        end_ns: ts_ns - DAY_NS + 3_600_000_000_000,
+    };
+
+    let unscoped = sql::active_fingerprints(&table, None, window, ROLLUP_RES_NS);
+    let raw = explain_raw(&client, &unscoped).await;
+    assert_eq!(
+        index_usage(&raw),
+        v(&[
+            "MinMax",
+            "Keys:",
+            "bucket_ns",
+            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "bucket_ns",
+            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+        ])
+    );
+    let (selected, total) = parts_selected(&raw).expect("a MinMax Parts: m/n line");
+    assert!(
+        total >= 4,
+        "the fixture must offer at least four day partitions to prune from, saw {total}\n{raw}"
+    );
+    assert!(
+        selected < total,
+        "the bucket range must prune parts: {selected}/{total}\n{raw}"
+    );
+
+    // Scoped: the caller's fingerprint list is pushed inside, so the
+    // primary key's LEADING column joins the condition too.
+    let scoped = sql::active_fingerprints(&table, Some(&[FP_PROD]), window, ROLLUP_RES_NS);
+    assert_eq!(
+        explain(&client, &scoped).await,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "bucket_ns",
+            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "fingerprint",
+            "bucket_ns",
+            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (fingerprint in #-element set)))",
+        ])
+    );
+}
+
+/// Issue #399 AC15 — `/labels` and `/label/{name}/values` keep their
+/// month partition pruning and gain the same activity semi-join.
+#[tokio::test]
+async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_bucket_range() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_label_discovery_window";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let params = range_params(ts_ns);
+    let (start_ns, end_ns) = match params.spec {
+        QuerySpec::Range {
+            start_ns, end_ns, ..
+        } => (start_ns, end_ns),
+        QuerySpec::Instant { .. } => unreachable!("range_params builds a Range spec"),
+    };
+    let months = pulsus_read::logql::plan::months_overlapping(start_ns, end_ns);
+    let idx = format!("{db}.log_streams_idx");
+    let rollup = format!("{db}.log_metrics_5s");
+    let window = TimeWindow { start_ns, end_ns };
+
+    // `EXPLAIN indexes = 1` reports the OUTER table's analysis only (see
+    // `detected_labels_aggregation_prunes_on_the_month_partition`), so
+    // both extracts are month blocks plus that builder's own primary-key
+    // condition. The subquery's rollup pruning is pinned on its
+    // standalone form by
+    // `detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range`.
+    let month_blocks = [
+        "MinMax",
+        "Keys:",
+        "month",
+        "Condition: (month in [#, #])",
+        "Partition",
+        "Keys:",
+        "month",
+        "Condition: (month in [#, #])",
+    ];
+
+    let names_sql = sql::label_names(&idx, &months, &rollup, window, ROLLUP_RES_NS);
+    let mut expected: Vec<&str> = month_blocks.to_vec();
+    expected.extend([
+        "PrimaryKey",
+        "Keys:",
+        "fingerprint",
+        "Condition: (fingerprint in #-element set)",
+    ]);
+    assert_eq!(explain(&client, &names_sql).await, v(&expected));
+
+    let values_sql = sql::label_values(&idx, &months, "'env'", &rollup, window, ROLLUP_RES_NS);
+    let mut expected: Vec<&str> = month_blocks.to_vec();
+    expected.extend([
+        "PrimaryKey",
+        "Keys:",
+        "key",
+        "fingerprint",
+        // Operand order is ClickHouse's, MEASURED (24.8.14.39), not the
+        // order the predicate is written in: `label_values` renders `key
+        // = 'env'` before the `fingerprint IN`, and the analyser reports
+        // the reverse. The issue #399 plan predicted the written order;
+        // the plan was not wrong about WHICH conditions engage the
+        // primary key, only about the order the extract prints them in.
+        "Condition: and((fingerprint in #-element set), (key in ['env', 'env']))",
+    ]);
+    assert_eq!(explain(&client, &values_sql).await, v(&expected));
+
+    // What embedding the semi-join must NOT cost: the outer scan's month
+    // partition pruning. `index_usage` drops `Parts:` counts, so assert
+    // it on the raw text.
+    let raw = explain_raw(&client, &names_sql).await;
+    let (selected, total) = parts_selected(&raw).expect("a MinMax Parts: m/n line");
+    assert!(
+        selected <= total,
+        "sanity: parts selected must not exceed parts total ({selected}/{total})\n{raw}"
     );
 }
 
