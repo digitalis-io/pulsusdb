@@ -223,6 +223,530 @@ mod tests {
             .expect("build request")
     }
 
+    // -- Issue #391: present-but-empty scalar params are absent ones -----
+
+    /// One row of the empty-vs-absent identity table: a mounted route, a
+    /// base query string that does NOT already carry `param` (first-wins
+    /// would otherwise mask the empty value), and the scalar parameter
+    /// under test.
+    #[derive(Debug)]
+    struct EmptyParamCase {
+        path: &'static str,
+        base: &'static str,
+        param: &'static str,
+    }
+
+    /// Every scalar parameter every mounted `/api/logs/v1` handler reads
+    /// through `params::get`, except `/tail`'s `delay_for`
+    /// ([`TAIL_ONLY_PARAMS`]). Completeness is a checked claim, not a hand
+    /// list — see `the_empty_param_table_covers_every_parameter_the_handlers_read`.
+    ///
+    /// Selectors are percent-encoded because these are query strings.
+    const EMPTY_PARAM_CASES: &[EmptyParamCase] = &[
+        // /query_range
+        EmptyParamCase {
+            path: "/api/logs/v1/query_range",
+            base: SELECTOR_QUERY,
+            param: "limit",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query_range",
+            base: SELECTOR_QUERY,
+            param: "direction",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query_range",
+            base: SELECTOR_QUERY,
+            param: "step",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query_range",
+            base: SELECTOR_QUERY,
+            param: "start",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query_range",
+            base: SELECTOR_QUERY,
+            param: "end",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query_range",
+            base: "",
+            param: "query",
+        },
+        // /query
+        EmptyParamCase {
+            path: "/api/logs/v1/query",
+            base: SELECTOR_QUERY,
+            param: "limit",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query",
+            base: SELECTOR_QUERY,
+            param: "direction",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query",
+            base: SELECTOR_QUERY,
+            param: "time",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query",
+            base: "",
+            param: "query",
+        },
+        // /labels
+        EmptyParamCase {
+            path: "/api/logs/v1/labels",
+            base: "",
+            param: "start",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/labels",
+            base: "",
+            param: "end",
+        },
+        // /label/{name}/values
+        EmptyParamCase {
+            path: "/api/logs/v1/label/env/values",
+            base: "",
+            param: "start",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/label/env/values",
+            base: "",
+            param: "end",
+        },
+        // /series — `match[]` present so `start`/`end` are actually reached.
+        EmptyParamCase {
+            path: "/api/logs/v1/series",
+            base: SELECTOR_MATCH,
+            param: "start",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/series",
+            base: SELECTOR_MATCH,
+            param: "end",
+        },
+        // /stats
+        EmptyParamCase {
+            path: "/api/logs/v1/stats",
+            base: "",
+            param: "query",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/stats",
+            base: SELECTOR_QUERY,
+            param: "start",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/stats",
+            base: SELECTOR_QUERY,
+            param: "end",
+        },
+        // /volume
+        EmptyParamCase {
+            path: "/api/logs/v1/volume",
+            base: "",
+            param: "query",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/volume",
+            base: SELECTOR_QUERY,
+            param: "limit",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/volume",
+            base: SELECTOR_QUERY,
+            param: "aggregateBy",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/volume",
+            base: SELECTOR_QUERY,
+            param: "targetLabels",
+        },
+        // /patterns
+        EmptyParamCase {
+            path: "/api/logs/v1/patterns",
+            base: "",
+            param: "query",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/patterns",
+            base: SELECTOR_QUERY,
+            param: "step",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/patterns",
+            base: SELECTOR_QUERY,
+            param: "start",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/patterns",
+            base: SELECTOR_QUERY,
+            param: "end",
+        },
+        // /detected_labels — `query` is optional here.
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_labels",
+            base: "",
+            param: "query",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_labels",
+            base: "",
+            param: "start",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_labels",
+            base: "",
+            param: "end",
+        },
+        // /detected_fields
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_fields",
+            base: "",
+            param: "query",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_fields",
+            base: SELECTOR_QUERY,
+            param: "line_limit",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_fields",
+            base: SELECTOR_QUERY,
+            param: "limit",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_fields",
+            base: SELECTOR_QUERY,
+            param: "field_limit",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_fields",
+            base: SELECTOR_QUERY,
+            param: "start",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_fields",
+            base: SELECTOR_QUERY,
+            param: "end",
+        },
+    ];
+
+    /// `query={env="prod"}` percent-encoded — a bare stream selector, so
+    /// it is accepted by every route in the table including `/volume` and
+    /// `/patterns`, which reject any pipeline stage.
+    const SELECTOR_QUERY: &str = "query=%7Benv%3D%22prod%22%7D";
+    /// The same selector as a repeated `match[]`, for `/series`.
+    const SELECTOR_MATCH: &str = "match%5B%5D=%7Benv%3D%22prod%22%7D";
+
+    /// The scalar parameters read through `params::get` that
+    /// [`EMPTY_PARAM_CASES`] cannot carry, because `/tail` is the only
+    /// route that reads them and `/tail` cannot ride the routed table:
+    /// axum's `WebSocketUpgrade` extractor rejects a plain `GET` before
+    /// the handler body runs, so a routed probe of `/tail` measures
+    /// axum's rejection and never our parsing — identically for every
+    /// parameter, including one we got wrong. They are gated directly on
+    /// `parse_tail_params` instead, by `tail.rs`'s
+    /// `empty_tail_params_default_exactly_as_absent_ones`.
+    ///
+    /// **This list is CHECKED, not maintained by hand.**
+    /// `the_empty_param_table_covers_every_parameter_the_handlers_read`
+    /// asserts it equals, exactly, the parameters `tail.rs`'s production
+    /// region reads through `params::get(` and no other `logs_api`
+    /// production region reads. Both halves of that are load-bearing:
+    ///
+    /// * A name here that `tail.rs` does not read would be a free pass —
+    ///   the union below would absorb a parameter genuinely missing from
+    ///   [`EMPTY_PARAM_CASES`] and the guard would stay green while
+    ///   exactly what it exists to catch happened.
+    /// * A name `tail.rs` reads but another handler reads too (`query`,
+    ///   `limit`, `start`) must NOT be exempted: a routed row can reach
+    ///   it, so it belongs in the table, and listing it here would let
+    ///   the union mask its removal from the table in the same way.
+    const TAIL_ONLY_PARAMS: &[&str] = &["delay_for"];
+
+    /// The `/api/logs/v1` paths mounted with a `POST` binding
+    /// ([`mount_log_query_routes`], [`mount_detected_routes`]) — the rows
+    /// of [`EMPTY_PARAM_CASES`] that also run through `form_post`, where
+    /// the same pairs arrive as an `application/x-www-form-urlencoded`
+    /// body through `handlers::read_form_pairs` rather than as a query
+    /// string.
+    const POST_PATHS: &[&str] = &[
+        "/api/logs/v1/query_range",
+        "/api/logs/v1/query",
+        "/api/logs/v1/labels",
+        "/api/logs/v1/series",
+        "/api/logs/v1/detected_labels",
+        "/api/logs/v1/detected_fields",
+    ];
+
+    fn with_empty(base: &str, param: &str) -> String {
+        if base.is_empty() {
+            format!("{param}=")
+        } else {
+            format!("{base}&{param}=")
+        }
+    }
+
+    fn uri(path: &str, query: &str) -> String {
+        if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        }
+    }
+
+    /// **Issue #391, the identity — routed, over every scalar parameter.**
+    ///
+    /// A present-but-empty scalar parameter answers exactly as an absent
+    /// one: same status, byte-identical body. That is Go's `r.Form.Get`,
+    /// which returns `""` for an absent key and for an empty one alike and
+    /// so cannot distinguish them; every parse helper behind it defaults
+    /// on `""` (`pkg/loghttp/params.go:152-159` @ v3.7.4 `b318f282`).
+    ///
+    /// Against the POOLLESS `test_state()`, so a request that gets past
+    /// parsing lands on `engine_for`'s `503` — the discriminating rows
+    /// (`limit`, `direction`, `step`, `start`, `end`, `time`,
+    /// `aggregateBy`) were `400` before this issue and are `503` after,
+    /// and the `query` rows keep their `400` but move to the absent
+    /// path's body. The non-discriminating rows (`targetLabels`,
+    /// `line_limit`, `/detected_fields`' `limit`/`field_limit`) are pins:
+    /// they already collapsed, and this stops them regressing.
+    #[tokio::test]
+    async fn an_empty_scalar_param_answers_exactly_as_an_absent_one() {
+        for case in EMPTY_PARAM_CASES {
+            let empty = with_empty(case.base, case.param);
+
+            let (absent_status, absent_body) =
+                routed(router(), get_req(&uri(case.path, case.base))).await;
+            let (empty_status, empty_body) =
+                routed(router(), get_req(&uri(case.path, &empty))).await;
+            assert_eq!(
+                empty_status,
+                absent_status,
+                "GET {} with `{}=` must answer as the absent parameter does\nempty: {}\nabsent: {}",
+                case.path,
+                case.param,
+                String::from_utf8_lossy(&empty_body),
+                String::from_utf8_lossy(&absent_body),
+            );
+            assert_eq!(
+                empty_body,
+                absent_body,
+                "GET {} with `{}=` must answer BYTE-identically to the absent parameter\nempty: \
+                 {}\nabsent: {}",
+                case.path,
+                case.param,
+                String::from_utf8_lossy(&empty_body),
+                String::from_utf8_lossy(&absent_body),
+            );
+
+            if !POST_PATHS.contains(&case.path) {
+                continue;
+            }
+            let (absent_status, absent_body) =
+                routed(router(), form_post(case.path, case.base.to_string())).await;
+            let (empty_status, empty_body) =
+                routed(router(), form_post(case.path, empty.clone())).await;
+            assert_eq!(
+                empty_status,
+                absent_status,
+                "POST {} with `{}=` must answer as the absent parameter does\nempty: {}\nabsent: \
+                 {}",
+                case.path,
+                case.param,
+                String::from_utf8_lossy(&empty_body),
+                String::from_utf8_lossy(&absent_body),
+            );
+            assert_eq!(
+                empty_body,
+                absent_body,
+                "POST {} with `{}=` must answer BYTE-identically to the absent parameter\nempty: \
+                 {}\nabsent: {}",
+                case.path,
+                case.param,
+                String::from_utf8_lossy(&empty_body),
+                String::from_utf8_lossy(&absent_body),
+            );
+        }
+    }
+
+    /// Every string literal passed to `needle` in `src`, taken from the
+    /// call's own argument list (bounded at the closing `)`), so a call
+    /// shape this scanner cannot read is a PANIC rather than a silent
+    /// miss.
+    fn param_literals(src: &str, needle: &str) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(needle) {
+            rest = &rest[i + needle.len()..];
+            let close = rest
+                .find(')')
+                .unwrap_or_else(|| panic!("a `{needle}` call must close its argument list"));
+            let args = &rest[..close];
+            let open_quote = args
+                .find('"')
+                .unwrap_or_else(|| panic!("a `{needle}` call must name its parameter literally"));
+            let after = &args[open_quote + 1..];
+            let end_quote = after
+                .find('"')
+                .unwrap_or_else(|| panic!("a `{needle}` parameter literal must terminate"));
+            out.insert(after[..end_quote].to_string());
+            rest = &rest[close..];
+        }
+        out
+    }
+
+    /// **Issue #391, the completeness guard.** The identity table above is
+    /// only as good as its coverage, so coverage is checked rather than
+    /// claimed: every parameter any `logs_api` handler reads through
+    /// `params::get` must appear in [`EMPTY_PARAM_CASES`] or in
+    /// [`TAIL_ONLY_PARAMS`], and the only parameter read through
+    /// `params::get_all` must be `match[]`. A new parameter added to any
+    /// handler reddens this test until it is classified into one seam or
+    /// the other — which is the point, because the two seams behave
+    /// DIFFERENTLY (see
+    /// `an_empty_repeated_match_is_a_value_not_an_absence`).
+    ///
+    /// **The exemption is derived from the same scan, not trusted.**
+    /// [`TAIL_ONLY_PARAMS`] is asserted equal to the parameters `tail.rs`
+    /// reads and no other production region reads, BEFORE it is unioned
+    /// into the classified set. Without that, a stale or speculative name
+    /// there would absorb a parameter genuinely missing from
+    /// [`EMPTY_PARAM_CASES`] and this test would stay green through
+    /// exactly the failure it exists to catch (task-manager ruling on
+    /// #391, 2026-08-09).
+    ///
+    /// **What this test cannot see:** a parameter the reference reads and
+    /// we never read at all. `since`, `interval`, `regexp` and `shards`
+    /// are read by `pkg/loghttp` @ v3.7.4 on routes we mount and appear
+    /// nowhere in our source, so no scan of our source can surface them.
+    /// They are absence gaps rather than empty-vs-absent ones, are
+    /// enumerated from the reference's handlers in issue #391's plan, and
+    /// are filed separately.
+    #[test]
+    fn the_empty_param_table_covers_every_parameter_the_handlers_read() {
+        type Params = std::collections::BTreeSet<String>;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logs_api");
+        let mut scalar = Params::new();
+        let mut repeated = Params::new();
+        // Kept per-file so the `/tail` exemption below can be DERIVED from
+        // the scan rather than trusted.
+        let mut tail_scalar = Params::new();
+        let mut non_tail_scalar = Params::new();
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("the logs_api source directory") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let is_tail = path.file_name().is_some_and(|n| n == "tail.rs");
+            let src = std::fs::read_to_string(&path).expect("source");
+            // Production region only — the same `#[cfg(test)]` split
+            // `no_request_path_calls_the_logql_parser_directly` uses.
+            let production = match src.find("\n#[cfg(test)]\nmod tests {") {
+                Some(i) => &src[..i],
+                None => &src[..],
+            };
+            let file_scalar = param_literals(production, "params::get(");
+            if is_tail {
+                tail_scalar.extend(file_scalar.iter().cloned());
+            } else {
+                non_tail_scalar.extend(file_scalar.iter().cloned());
+            }
+            scalar.extend(file_scalar);
+            repeated.extend(param_literals(production, "params::get_all("));
+            scanned += 1;
+        }
+        assert!(scanned >= 9, "the scan found only {scanned} source files");
+        assert!(
+            !tail_scalar.is_empty(),
+            "the scan never found tail.rs — the exemption below would be vacuous"
+        );
+
+        // The exemption, derived: what `tail.rs` reads that NO routed
+        // handler reads. A name `tail.rs` does not read at all would be a
+        // free pass; a name another handler also reads can ride the routed
+        // table and must not be exempted. Either way the union below would
+        // otherwise absorb a parameter missing from EMPTY_PARAM_CASES.
+        let derived_tail_only: Params = tail_scalar.difference(&non_tail_scalar).cloned().collect();
+        let declared_tail_only: Params = TAIL_ONLY_PARAMS.iter().map(|p| p.to_string()).collect();
+        assert_eq!(
+            declared_tail_only, derived_tail_only,
+            "TAIL_ONLY_PARAMS must be exactly the parameters tail.rs reads through `params::get(` \
+             and no routed handler reads — each one gated by tail.rs's \
+             `empty_tail_params_default_exactly_as_absent_ones`"
+        );
+
+        let mut classified: Params = EMPTY_PARAM_CASES
+            .iter()
+            .map(|c| c.param.to_string())
+            .collect();
+        classified.extend(derived_tail_only);
+        assert_eq!(
+            scalar, classified,
+            "every parameter read through `params::get` must be classified: in \
+             EMPTY_PARAM_CASES, or in TAIL_ONLY_PARAMS with its own gate in tail.rs"
+        );
+
+        let expected_repeated: Params = ["match[]".to_string()].into_iter().collect();
+        assert_eq!(
+            repeated, expected_repeated,
+            "`params::get_all` is the NON-collapsing seam (issue #391); a new repeated parameter \
+             needs its own decision, not this table's"
+        );
+    }
+
+    /// **Issue #391, the pin on the fix SHAPE.** The reference collapses
+    /// empty into absent at the SCALAR seam only. Repeated parameters go
+    /// through `r.Form[...]` (`pkg/loghttp/params.go:79-81`,
+    /// `pkg/loghttp/series.go:23-25` @ v3.7.4 `b318f282`), which keeps
+    /// `""` as a value — measured against `grafana/loki:3.7.4` on
+    /// 2026-08-09, `/loki/api/v1/series?match[]=` is a `400`
+    /// `parse error : syntax error: unexpected $end` while `/series` with
+    /// no `match[]` at all is a `200`. Ours is the same `400` from the
+    /// same seam with our own parser's prose (the message text is below
+    /// the parity bar, owner ruling on #253); the body asserted below is
+    /// PulsusDB's, measured 2026-08-09.
+    ///
+    /// So `params::get_all` deliberately does NOT collapse, and the two
+    /// answers must stay different. This test passes both before and
+    /// after the change by design: it is not evidence of the fix, it is
+    /// the guard that fails if the collapse is over-applied to `get_all`,
+    /// which would look like a completion rather than a regression.
+    ///
+    /// (Our absent-`match[]` answer is a `400 MissingMatch` where the
+    /// reference's is a `200` over every series. That is a different
+    /// mechanism — absent, not empty — filed separately; this test asserts
+    /// only that the two answers DIFFER.)
+    #[tokio::test]
+    async fn an_empty_repeated_match_is_a_value_not_an_absence() {
+        let (empty_status, empty_body) =
+            routed(router(), get_req("/api/logs/v1/series?match%5B%5D=")).await;
+        let (absent_status, absent_body) = routed(router(), get_req("/api/logs/v1/series")).await;
+        assert_eq!(empty_status, StatusCode::BAD_REQUEST);
+        assert_eq!(absent_status, StatusCode::BAD_REQUEST);
+        let empty_text = String::from_utf8_lossy(&empty_body).into_owned();
+        let absent_text = String::from_utf8_lossy(&absent_body).into_owned();
+        assert_eq!(
+            absent_text, "missing required parameter 'match[]': at least one selector is required",
+            "an absent `match[]` is the MissingMatch 400"
+        );
+        assert!(
+            !empty_text.contains("missing required parameter"),
+            "an EMPTY `match[]` is a value, not an absence — it must not become MissingMatch, got \
+             {empty_text:?}"
+        );
+        assert_eq!(
+            empty_text, "unexpected end of query at byte 0: expected '{'",
+            "an empty `match[]` reaches the selector parser"
+        );
+        assert_ne!(empty_body, absent_body);
+    }
+
     /// Issue #279 (AC5): the `/loki/api/v1` alias surface rejects an
     /// over-cap query (exactly 131,072 bytes — `MAX_QUERY_BYTES`, the
     /// reference's `maxInputSize`) identically to the native paths, for

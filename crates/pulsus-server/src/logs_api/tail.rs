@@ -2292,4 +2292,53 @@ mod tests {
         let hour = 3_600_000_000_000i64;
         assert!(p.start_ns >= before - hour && p.start_ns <= after - hour);
     }
+
+    /// Issue #391: `/tail`'s three scalar params collapse present-but-
+    /// empty into absent, like every other scalar on this surface.
+    ///
+    /// Gated HERE rather than on `mod.rs`'s routed identity table for the
+    /// same reason as `tail_params_reject_an_over_cap_query_as_query_too_long`
+    /// above: axum's `WebSocketUpgrade` extractor rejects a plain `GET`
+    /// before the handler body runs, so a routed probe would measure
+    /// axum's rejection and not our parsing — an identity that holds for
+    /// every parameter, including one we got wrong.
+    ///
+    /// Container-measured against `grafana/loki:3.7.4`, 2026-08-09:
+    /// `/loki/api/v1/tail` with `limit=`, `delay_for=` or `start=` reaches
+    /// the websocket-upgrade stage (a generic `Bad Request`) rather than a
+    /// param error, while `delay_for=%20` is
+    /// `strconv.Atoi: parsing " ": invalid syntax` and `limit=0` is
+    /// `limit must be a positive value` — empty is accepted, a space is
+    /// not.
+    ///
+    /// `start_ns` is compared within a 5 s window rather than for
+    /// equality: its absent-path default derives from `now_ns()`, which
+    /// advances between the two calls. `fetch_limit` and `delay_ns` are
+    /// exact.
+    #[test]
+    fn empty_tail_params_default_exactly_as_absent_ones() {
+        let cfg = cfg_default();
+        let base = "query=%7Ba%3D%22x%22%7D";
+        let absent = parse_tail_params(&params::parse_pairs(base), &cfg).expect("absent params");
+        for param in ["limit", "delay_for", "start"] {
+            let pairs = params::parse_pairs(&format!("{base}&{param}="));
+            let empty = parse_tail_params(&pairs, &cfg)
+                .unwrap_or_else(|e| panic!("`{param}=` must parse as absent, got {e:?}"));
+            assert_eq!(
+                empty.fetch_limit, absent.fetch_limit,
+                "`{param}=` must yield the absent-path fetch_limit"
+            );
+            assert_eq!(
+                empty.delay_ns, absent.delay_ns,
+                "`{param}=` must yield the absent-path delay_ns"
+            );
+            assert!(
+                (empty.start_ns - absent.start_ns).abs() < 5_000_000_000,
+                "`{param}=` must yield the absent-path start_ns (within the wall-clock window), \
+                 got {} vs {}",
+                empty.start_ns,
+                absent.start_ns
+            );
+        }
+    }
 }

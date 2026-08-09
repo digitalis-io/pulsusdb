@@ -2553,6 +2553,135 @@ async fn a_malformed_selector_regex_is_refused_on_every_mounted_logs_route() {
     );
 }
 
+/// **Issue #391, end to end against a live store.**
+///
+/// A present-but-empty scalar parameter answers byte-identically to an
+/// absent one over a real socket, against a real ClickHouse, on a `200`
+/// — not merely at the hermetic `503` the poolless router probe in
+/// `logs_api::tests::an_empty_scalar_param_answers_exactly_as_an_absent_one`
+/// can reach. That is the reference's `r.Form.Get`, which cannot tell an
+/// absent key from an empty one (`pkg/loghttp/params.go:152-159` @
+/// v3.7.4 `b318f282`); `/loki/api/v1/query_range?limit=` measures `200`
+/// there and measured `400` here before this issue.
+///
+/// `start`/`end` are given explicitly on every request so the bodies are
+/// deterministic, and empty `start=`/`end=` are deliberately NOT part of
+/// the byte-identity leg: their absent path derives from `now_ns()`, so
+/// the two bodies legitimately differ in the window they cover. Those two
+/// parameters are covered by the routed identity table (AC 1) and by
+/// `params::every_scalar_param_defaults_identically_whether_empty_or_absent`
+/// (AC 5) instead.
+#[tokio::test]
+async fn empty_params_answer_byte_identically_to_absent_ones() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_empty_param";
+    let port = 31_126;
+    drop_database(db).await;
+    let (_guard, _client, base_ns) = setup(db, port).await;
+    let start = (base_ns - 3_600_000_000_000).to_string();
+    let end = (base_ns + 3_600_000_000_000).to_string();
+    const SELECTOR: &str = r#"{service_name="checkout"}"#;
+    let metric = format!("count_over_time({SELECTOR}[5m])");
+
+    /// `(label, the request's params WITHOUT the parameter under test,
+    /// the parameter under test)`. The base must not already carry the
+    /// parameter: duplicate keys are first-wins, so it would mask the
+    /// empty value.
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
+    let cases: [Case<'_>; 3] = [
+        (
+            "limit",
+            vec![
+                ("query", SELECTOR),
+                ("start", start.as_str()),
+                ("end", end.as_str()),
+            ],
+            "limit",
+        ),
+        (
+            "direction",
+            vec![
+                ("query", SELECTOR),
+                ("start", start.as_str()),
+                ("end", end.as_str()),
+            ],
+            "direction",
+        ),
+        (
+            "step",
+            vec![
+                ("query", metric.as_str()),
+                ("start", start.as_str()),
+                ("end", end.as_str()),
+            ],
+            "step",
+        ),
+    ];
+
+    for (label, base, param) in &cases {
+        let absent = http_get(port, &q("/api/logs/v1/query_range", base))
+            .unwrap_or_else(|| panic!("{label}: absent request reachable"));
+        let mut with_empty = base.clone();
+        with_empty.push((param, ""));
+        let empty = http_get(port, &q("/api/logs/v1/query_range", &with_empty))
+            .unwrap_or_else(|| panic!("{label}: empty request reachable"));
+
+        assert_eq!(
+            absent.status, 200,
+            "{label}: the absent-parameter control must be served: {}",
+            absent.body
+        );
+        assert_eq!(
+            empty.status, 200,
+            "`{param}=` must be served exactly as the absent parameter is (it was a 400 before \
+             issue #391): {}",
+            empty.body
+        );
+        assert_eq!(
+            empty.body, absent.body,
+            "`{param}=` must answer BYTE-identically to the absent parameter"
+        );
+    }
+
+    // The control that keeps the identity above from being vacuous: a
+    // NON-empty value for the same parameter changes the body, so
+    // "identical" is a statement about the empty value and not about the
+    // endpoint ignoring the parameter.
+    let forward = http_get(
+        port,
+        &q(
+            "/api/logs/v1/query_range",
+            &[
+                ("query", SELECTOR),
+                ("start", start.as_str()),
+                ("end", end.as_str()),
+                ("direction", "forward"),
+            ],
+        ),
+    )
+    .expect("direction=forward reachable");
+    let backward = http_get(
+        port,
+        &q(
+            "/api/logs/v1/query_range",
+            &[
+                ("query", SELECTOR),
+                ("start", start.as_str()),
+                ("end", end.as_str()),
+            ],
+        ),
+    )
+    .expect("absent direction reachable");
+    assert_eq!(forward.status, 200, "{}", forward.body);
+    assert_ne!(
+        forward.body, backward.body,
+        "`direction=forward` must change the body, or the identity above proves nothing"
+    );
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {

@@ -563,15 +563,49 @@ pub(crate) fn parse_pairs(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The first value for `key`, if present.
+/// The first value for `key`, treating a **present-but-empty** value as
+/// absent — the reference's `r.Form.Get`, which returns `""` for both an
+/// absent key and an empty one and so cannot distinguish them (issue
+/// #391). Every scalar parameter on Loki's log surface is read through it
+/// and every parse helper behind it defaults on `""`: `parseInt`
+/// (`pkg/loghttp/params.go:152-159 @ v3.7.4 b318f282`), `parseTimestamp`
+/// (`:161-186`), `parseDirection` (`:188-200`), plus the inline
+/// `if value == ""` in `step` (`:122-128`), `interval` (`:130-136`),
+/// `volumeAggregateBy` (`query.go:741-751`) and the split shape in
+/// `targetLabels` (`query.go:714-721`).
+///
+/// **First, then filter — not "the first non-empty".** Go returns the
+/// first value and *then* treats it as empty. Container-measured on a
+/// 150-entry stream, 2026-08-09: `?limit=&limit=5` serves 100 entries
+/// (the default), `?limit=5&limit=` serves 5. Pinned by
+/// `get_takes_the_first_value_then_treats_empty_as_absent`.
+///
+/// **Only the empty string is empty.** Measured: `?limit=` and a bare
+/// `?limit` with no `=` are 200; `?limit=%20`, `?limit=+`, `?limit=%09`
+/// and `?limit=%00` are 400 (`strconv.Atoi: parsing " ": invalid
+/// syntax`, `"\t"`, `"\x00"`). Our [`percent_decode`] already agrees with
+/// `url.ParseQuery` on `+` and `%XX`, so the boundary needs no work here.
+///
+/// **[`get_all`] deliberately does NOT collapse.** The reference reads
+/// repeated parameters through `r.Form[...]`, which keeps `""` as a
+/// value: `?match[]=` is a 400 parse error there (`series.go:23-25`,
+/// measured) while an absent `match[]` is a 200, and `?shards=` is a 500
+/// (`params.go:79-81`, measured). Pinned by
+/// `an_empty_repeated_match_is_a_value_not_an_absence`.
 pub(crate) fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs
         .iter()
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
 }
 
 /// Every value for `key`, in appearance order (`match[]` repeats).
+///
+/// **This seam does not collapse empty into absent, and must not start**
+/// — see [`get`]'s note: the reference reads repeated parameters through
+/// `r.Form[...]` rather than `r.Form.Get`, so an empty `match[]=` is a
+/// value there and a 400, where an absent one is a 200 (issue #391).
 pub(crate) fn get_all<'a>(pairs: &'a [(String, String)], key: &str) -> Vec<&'a str> {
     pairs
         .iter()
@@ -1336,5 +1370,159 @@ mod tests {
     fn get_is_none_for_a_missing_key() {
         let pairs = parse_pairs("start=1");
         assert_eq!(get(&pairs, "end"), None);
+    }
+
+    // -- Issue #391: a present-but-empty SCALAR param is an absent one ----
+    //
+    // Every `// ref:` comment below records what `grafana/loki:3.7.4`
+    // answered for that exact spelling, container-measured 2026-08-09
+    // (issue #391 architect plan) against a single-binary container
+    // holding one 150-entry stream.
+
+    /// **First, then filter — not "the first non-empty".** Go's
+    /// `r.Form.Get` returns the FIRST value for the key, and the parse
+    /// helper behind it then treats `""` as absent
+    /// (`pkg/loghttp/params.go:152-159 @ v3.7.4 b318f282`); it never skips
+    /// to the first non-empty occurrence. Only the duplicate-key pair
+    /// discriminates between the two candidate spellings of the collapse
+    /// — every single-occurrence case passes either way, so this is the
+    /// test that pins the fix SHAPE.
+    ///
+    /// The rest of the case list is the measured boundary: only the
+    /// literal empty string collapses (and a bare key with no `=`, which
+    /// decodes to one). A space, a `+`, a tab and a NUL are VALUES, and
+    /// 400s, on both sides.
+    #[test]
+    fn get_takes_the_first_value_then_treats_empty_as_absent() {
+        // ref: `?limit=&limit=5` -> 200, 100 entries (the default), NOT 5.
+        assert_eq!(get(&parse_pairs("limit=&limit=5"), "limit"), None);
+        // ref: `?limit=5&limit=` -> 200, 5 entries.
+        assert_eq!(get(&parse_pairs("limit=5&limit="), "limit"), Some("5"));
+        // ref: `?limit` (no `=` at all) -> 200, 100 entries.
+        assert_eq!(get(&parse_pairs("limit"), "limit"), None);
+        // ref: `?limit=%20` -> 400 `strconv.Atoi: parsing " ": invalid syntax`.
+        assert_eq!(get(&parse_pairs("limit=%20"), "limit"), Some(" "));
+        // ref: `?limit=+` -> 400, same message (`+` decodes to a space).
+        assert_eq!(get(&parse_pairs("limit=+"), "limit"), Some(" "));
+        // ref: `?limit=%09` -> 400 `strconv.Atoi: parsing "\t": invalid syntax`.
+        assert_eq!(get(&parse_pairs("limit=%09"), "limit"), Some("\t"));
+        // ref: `?limit=%00` -> 400 `strconv.Atoi: parsing "\x00": invalid syntax`.
+        assert_eq!(get(&parse_pairs("limit=%00"), "limit"), Some("\0"));
+    }
+
+    /// Issue #391: empty and absent produce the same VALUE, not merely
+    /// the same status — for every scalar param on this surface the
+    /// collapsed result is the documented default the absent path already
+    /// returns. Status identity alone would be satisfied by defaulting to
+    /// something else entirely; this is the assertion that makes "no
+    /// parameter here has a destructive default" breakable.
+    #[test]
+    fn every_scalar_param_defaults_identically_whether_empty_or_absent() {
+        let empty = parse_pairs("k=");
+        let absent: Vec<(String, String)> = Vec::new();
+
+        // ref: `?limit=` -> 200, 100 entries against a 150-entry stream
+        // (`?limit=150` -> 150).
+        assert_eq!(
+            parse_limit(get(&empty, "k")).unwrap(),
+            parse_limit(get(&absent, "k")).unwrap()
+        );
+        assert_eq!(parse_limit(get(&empty, "k")).unwrap(), DEFAULT_LIMIT);
+
+        // ref: `/index/volume?limit=` -> 200, the `seriesvolume.DefaultLimit`
+        // of 100 (`pkg/loghttp/query.go:723-739`, `volume.go:13`).
+        assert_eq!(
+            parse_volume_limit(get(&empty, "k")).unwrap(),
+            parse_volume_limit(get(&absent, "k")).unwrap()
+        );
+        assert_eq!(parse_volume_limit(get(&empty, "k")).unwrap(), DEFAULT_LIMIT);
+
+        // ref: `?direction=` -> 200, first entry `seq 0` — identical to
+        // `backward` and unlike `forward`'s `seq 29`.
+        assert_eq!(
+            parse_direction(get(&empty, "k")).unwrap(),
+            parse_direction(get(&absent, "k")).unwrap()
+        );
+        assert_eq!(
+            parse_direction(get(&empty, "k")).unwrap(),
+            Direction::Backward
+        );
+
+        // ref: `/index/volume?aggregateBy=` -> 200, label-PAIR metrics —
+        // identical to `series` and unlike `labels`' `{"env":""}` shape.
+        assert_eq!(
+            parse_aggregate_by(get(&empty, "k")).unwrap(),
+            parse_aggregate_by(get(&absent, "k")).unwrap()
+        );
+        assert_eq!(
+            parse_aggregate_by(get(&empty, "k")).unwrap(),
+            VolumeAggregateBy::Series
+        );
+
+        // ref: `/index/volume?targetLabels=` -> 200, unaggregated (nil
+        // targets, `pkg/loghttp/query.go:714-721`).
+        assert_eq!(
+            parse_target_labels(get(&empty, "k")).unwrap(),
+            parse_target_labels(get(&absent, "k")).unwrap()
+        );
+        assert!(parse_target_labels(get(&empty, "k")).unwrap().is_empty());
+
+        // ref: `/detected_fields?line_limit=` -> 200, the 100 default
+        // (issue #253's own measurement, re-pinned here through `get`).
+        assert_eq!(
+            parse_line_limit(get(&empty, "k")).unwrap(),
+            parse_line_limit(get(&absent, "k")).unwrap()
+        );
+        assert_eq!(
+            parse_line_limit(get(&empty, "k")).unwrap(),
+            DEFAULT_LINE_LIMIT
+        );
+
+        // ref: `/detected_fields?limit=&field_limit=` -> 200, "limit":1000.
+        assert_eq!(
+            parse_field_limit(get(&empty, "k"), get(&empty, "k")).unwrap(),
+            parse_field_limit(get(&absent, "k"), get(&absent, "k")).unwrap()
+        );
+        assert_eq!(
+            parse_field_limit(get(&empty, "k"), get(&empty, "k")).unwrap(),
+            DEFAULT_FIELD_LIMIT
+        );
+
+        // `start`/`end`/`time` are read as
+        // `match get(..) { Some(v) => parse_ts(v)?, None => <default> }`
+        // (`handlers::parse_bounds`, `handlers::query_impl`), so the seam
+        // is modelled rather than called through the handler here — the
+        // routed half is `mod.rs`'s identity table.
+        // ref: `?start=`/`?end=`/`?time=` -> 200, the same window as absent
+        // (`parseTimestamp(value, def)`, `pkg/loghttp/params.go:161-186`).
+        let ts_or_default = |raw: Option<&str>, default_ns: i64| match raw {
+            Some(v) => parse_ts(v).unwrap(),
+            None => default_ns,
+        };
+        const SENTINEL_NS: i64 = 1_782_864_000_000_000_000;
+        assert_eq!(
+            ts_or_default(get(&empty, "k"), SENTINEL_NS),
+            ts_or_default(get(&absent, "k"), SENTINEL_NS)
+        );
+        assert_eq!(ts_or_default(get(&empty, "k"), SENTINEL_NS), SENTINEL_NS);
+
+        // ref: `?step=` on a 1h metric query -> 200, 11 points — identical
+        // to absent and to the derived `step=14s`, unlike `step=60s`'s 3.
+        let start_ns = 1_782_864_000_000_000_000;
+        let end_ns = start_ns + 3_600_000_000_000;
+        assert_eq!(
+            parse_step(get(&empty, "k"), start_ns, end_ns).unwrap(),
+            parse_step(get(&absent, "k"), start_ns, end_ns).unwrap()
+        );
+        assert_eq!(
+            parse_step(get(&empty, "k"), start_ns, end_ns).unwrap(),
+            parse_step(None, start_ns, end_ns).unwrap()
+        );
+
+        // `/patterns`' step rides the same seam through `parse_step`.
+        assert_eq!(
+            parse_pattern_step(get(&empty, "k"), start_ns, end_ns).unwrap(),
+            parse_pattern_step(get(&absent, "k"), start_ns, end_ns).unwrap()
+        );
     }
 }
