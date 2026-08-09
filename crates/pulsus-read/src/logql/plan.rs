@@ -154,7 +154,10 @@ impl LabelReplaceSpec {
         regex: &str,
     ) -> Result<Self, ReadError> {
         let translated = pulsus_promql::re2_pattern_to_rust(regex);
-        let re = regex::Regex::new(&format!("^(?:{translated})$")).map_err(|e| {
+        // Issue #291: routed through the shared compile budget. The
+        // message prefix and the WRAPPED-form reporting are unchanged —
+        // `RegexCompileError::Display` renders the engine error verbatim.
+        let re = pulsus_re2::compile_user_regex_anchored(&translated).map_err(|e| {
             ReadError::PipelineInvalid {
                 reason: format!("invalid regex in label_replace: {e}"),
             }

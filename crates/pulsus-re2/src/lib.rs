@@ -23,6 +23,10 @@
 //!   against ClickHouse's RE2.
 //! * [`re2_verdict`] (#328, new) — the three-valued acceptance verdict
 //!   the TraceQL validator consumes, built on the other two.
+//! * [`compile_user_regex`] (#291) — the ONE entry point every
+//!   user-supplied pattern in the workspace compiles through, bounding
+//!   what compiling it may allocate before it allocates it. See
+//!   `compile_budget`'s module doc.
 //!
 //! # Why three values
 //!
@@ -67,8 +71,15 @@
 
 use std::borrow::Cow;
 
+mod compile_budget;
 mod re2_syntax;
 
+pub use compile_budget::{
+    MAX_REGEX_COMPILE_TRANSIENT_BYTES, REGEX_PROGRAM_SIZE_LIMIT, RegexCompileError,
+    class_ranges_for_test, compile_user_regex, compile_user_regex_anchored,
+    compile_user_regex_with, per_atom_hir_charge_for_test, regex_compile_transient_bound,
+    regex_compile_transient_bound_with,
+};
 pub use re2_syntax::re2_pattern_to_rust;
 // Issue #331: the ClickHouse `match()` flag-group-head strategy — the
 // fourth RE2-compatibility surface, landed alongside the #328
@@ -125,9 +136,18 @@ pub fn re2_verdict(pattern: &str) -> Re2Verdict {
         Scan::JointReject => Re2Verdict::Rejects,
         Scan::Portable => {
             let rewritten: Cow<'_, str> = re2_pattern_to_rust(pattern);
-            match regex::Regex::new(&rewritten) {
+            match compile_user_regex(&rewritten) {
                 Ok(_) => Re2Verdict::Accepts,
-                Err(regex::Error::CompiledTooBig(_)) => Re2Verdict::Unknown,
+                // Issue #291: OUR compile budget is not RE2's, exactly as
+                // the crate's own `CompiledTooBig` is not. This function
+                // is a VALIDATOR, and over-rejection is the harmful
+                // direction (see the module doc), so a pattern refused
+                // for what compiling it would cost us says nothing about
+                // whether RE2 accepts it.
+                Err(RegexCompileError::TooLarge { .. }) => Re2Verdict::Unknown,
+                Err(RegexCompileError::Engine(regex::Error::CompiledTooBig(_))) => {
+                    Re2Verdict::Unknown
+                }
                 Err(_) if rust_rejects_beyond_its_remit(pattern) => Re2Verdict::Unknown,
                 Err(_) => Re2Verdict::Rejects,
             }

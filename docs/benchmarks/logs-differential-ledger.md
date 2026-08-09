@@ -2164,6 +2164,329 @@ clients only display it).
   builders (#286). The corpus runner's pushdown blind spot (**#278**)
   is why AC7's gates are Rust tests rather than corpus rows.
 
+## Issue #291 — the regex compile budget
+
+### `regex-compile-budget` (issue #291, owner ruling 2026-08-09 — a deliberate limit, and a deliberate narrowing)
+
+- **The defect this closes.** `regex::RegexBuilder::size_limit` is
+  `nfa_size_limit` (`regex-1.13.0/src/builders.rs:184-187`) and bounds the
+  compiled PROGRAM, which is the last of three compile phases. Nothing in
+  the crate bounds the phase before it. Measured on this tree with a
+  counting global allocator, peak live bytes, `regex::Regex::new`:
+
+  | pattern | pattern bytes | AST parse | HIR translate | whole compile |
+  |---|---|---|---|---|
+  | `a`×131071 | 131,071 | 9.44 MB | 0.26 MB | 29.36 MB, `Ok` |
+  | `\w`×64 | 128 | 4.8 KB | 0.43 MB | 10.62 MB, `Ok` |
+  | `\p{L}`×20000 | 100,000 | 2.78 MB | **114.64 MB** | 128.73 MB, `Err` |
+  | `\w`×65535 | 131,070 | 4.72 MB | **432.01 MB** | 445.23 MB, `Err` |
+  | `(?i)\p{L}`×20000 | 100,004 | 2.78 MB | **872.88 MB** | **886.98 MB, `Err`** |
+
+  The last row is the shape of the problem: a **100 KB** query, inside
+  #279's 131,072-byte text cap, allocating **887 MB** on its way to a
+  `400`. Sweeping `size_limit` on a fixed pattern proves the knob is the
+  wrong one — `(?i)\p{L}`×170 (854 B) peaks 7.75 MB at `size_limit(4 KiB)`
+  and 28.74 MB at the 10 MiB default: cutting the limit 2,560× cuts the
+  peak 3.7×, and the pattern is refused at every value.
+
+- **The limit.** One entry point, `pulsus_re2::compile_user_regex`, used
+  by all nine user-pattern compile sites across LogQL, PromQL and TraceQL.
+  Before compiling, it bounds the allocation compiling would take, from
+  the pattern's own AST, and refuses at **96 MiB** with `400 bad_data` and
+  the message `expression too large`. `400` and not `422` because the
+  refusal is decidable from the query text alone, before any data is
+  touched — the same class as `five-year-span-cap`; a budget discovered
+  while executing against data is the `422` class (`template-output-budget`,
+  `variants-label-collision-and-fanout-bounds`).
+
+- **Reference behaviour, MEASURED** on the digest-pinned v3.7.4 oracle
+  with a populated store (an empty one answers `200` to almost anything),
+  and from the reference's source. Loki, Prometheus and Tempo all parse
+  user regexes with **`github.com/grafana/regexp/syntax`** — Loki and
+  Prometheus by vendoring it, Tempo through
+  `prometheus/model/labels.NewFastRegexMatcher`, which vendors the same
+  fork (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:22,67
+  @ tempo v3.0.2`). It carries three limits the Rust crate has no
+  counterpart for: `maxHeight = 1000`, `maxSize = 128<<20 / 40` and
+  `maxRunes = 128<<20 / 4`, raised as `ErrLarge` / `expression too large`
+  (`vendor/github.com/grafana/regexp/syntax/parse.go:47,93,102-103,122-123,161-163,206-207
+  @ loki v3.7.4`; Go's own standard library carries the identical
+  constants at `src/regexp/syntax/parse.go:94,103,123`). So all three
+  references bound this the SAME way, which is why one cap serves all nine
+  sites.
+
+  | probe | reference | PulsusDB |
+  |---|---|---|
+  | `\p{L}`×200 (1,000 B) | `200`, 49 ms | `200` |
+  | `(?i)\p{L}`×1000 | `200`, 1.33 s | `400` |
+  | `\w`×20000 | `200`, 35 ms | `400` |
+  | `\w`×40000 | `200`, 62 ms | `400` |
+  | `\p{L}`×20000 | `200`, 2.31 s | `400` |
+  | `(?i)[\p{L}×20000]` | `200`, 1.26 s | `400` |
+  | `(?i)\p{L}`×20000 | **no answer in 50 s**, not rejected | `400` |
+  | `\p{L}\|…`×10,013 atoms | `200` | `200` — the last size WE accept |
+  | `\p{L}\|…`×10,014 atoms | `200` | `400` `expression too large` — the band opens |
+  | `\p{L}\|…`×12,728 atoms | `200` — the last size IT accepts | `400` — the band closes |
+  | `\p{L}\|…`×12,729 atoms | `400 error parsing regexp: expression too large` | `400` |
+  | `a`×130000 | `200`, 34 ms | `200` |
+
+- **The divergence at the SHIPPED cap, both boundaries measured.** Neither
+  number here is projected from the formula. Ours was bisected over the
+  estimator and the reference's against the pinned container, one atom at
+  a time: on the `\p{L}|…` alternation family **we serve up to 10,013
+  atoms and the reference up to 12,728** (12,729 is its own
+  `error parsing regexp: expression too large`). **A band remains, and it
+  is 10,014..12,728** — 2,715 atoms out of the 12,728 the reference
+  accepts, 21% of its range. Outside that band the two agree on this
+  family.
+
+  Four of the rows above were already a `400` here before this issue (the
+  crate's own `CompiledTooBig`, a limit that has always been in force);
+  the 10,014..12,728 band and one further row — `(?i)[\p{L}×20000]`, which
+  moves from `200` to `400` — are what this cap adds.
+
+  **The pair "~11,000 against ~13,000" that the first plan and the first
+  ruling both used was never measured.** It came from the range term alone
+  while the formula that produced it carries three more terms. Measured at
+  the 64 MiB the first ruling approved, our boundary was 6,079 — roughly
+  half the reference's range, not the near-parity the pair implied — and
+  the cap was raised to 96 MiB on that measurement (owner ruling v2,
+  2026-08-09). Do not reuse the old pair; the table above is the only
+  boundary claim this row makes, and the note below records how it
+  reached its final value.
+
+- **Why the divergence is justified, in the terms the owner ruled.** A
+  divergence needs a defect in the reference to justify it, and here there
+  is one, measured. **Matching the reference's boundary means porting Go's
+  `maxRunes`/`maxSize`/`maxHeight`, and those admit 128 MB parse trees —
+  the exact unboundedness this issue exists to close.** They are per-limit
+  caps on a parse tree, not a bound on what compiling costs; the reference
+  burns over 50 s on `(?i)\p{L}`×20000 without ever refusing it. Adopting
+  its boundary would mean adopting its defect. This is not "we chose
+  96 MiB": 96 MiB is what a bound that actually bounds costs us, and the
+  price is the measured 10,014..12,728 band.
+
+  **The boundary moved twice while this landed, and both moves were the
+  cross-check doing its job.** At 64 MiB it was 6,079. Raising the cap to
+  96 MiB put it at 11,801 — and admitted `[^\p{L}]`×10000, a shape the
+  64 MiB cap had always refused and which therefore had never been
+  measured against its estimate. It allocated 223.10 MB against an
+  88.72 MB bound. Two charges were short: negation
+  (`CLASS_NEGATION_TRANSIENT_FACTOR`, new, measured 4.06–4.56×) and the
+  NFA floor (`NFA_PEAK_FACTOR` 3 → 4, measured 4.08× on `[^a-z]`×10000).
+  Correcting them moved our boundary to its final 10,013. The number in
+  the table is the one the shipped constants produce, not the one the cap
+  raise projected.
+
+- **A second, deliberate consequence: the LogQL template site's per-compile
+  render charge.** `template/funcs.rs` charged a flat
+  `DYNAMIC_REGEX_PROGRAM_CEILING` (**1 MiB**) against
+  `MAX_TEMPLATE_RENDER_BYTES` before compiling a template-computed
+  pattern, on the belief that `size_limit` bounded what compiling costs.
+  It does not. Measured at that same 1 MiB program ceiling, `\w`×16 — a
+  **32-byte** pattern — peaks **2.67 MB**, and `[[:alpha:]]`×5000 peaks
+  3.79 MB. The charge is now
+  `pulsus_re2::regex_compile_transient_bound_with(text, 1 MiB)`, whose
+  floor is **4,194,328 B** — `NFA_PEAK_FACTOR` (4) × the 1 MiB program
+  ceiling, paid by even a one-character pattern, since that term is a
+  floor rather than a function of the pattern.
+
+  **Accept-surface consequence, recorded rather than absorbed:** one
+  render fits **15** distinct dynamic regex compiles where it fitted
+  **64** before (64 MiB ÷ 1 MiB → 64 MiB ÷ 4,194,329 B including the
+  pattern copy). Nothing about the render budget or the program ceiling
+  moved; the charge stopped under-reporting. Cached and literal patterns
+  are unaffected at RENDER time — a literal pattern is served from the
+  prewarmed cache — but the prewarm itself is budgeted too, so a literal
+  pattern too large to compile is simply not cached and takes its verdict
+  at render time. Only a template that COMPUTES its pattern per line pays
+  the per-compile charge, and one computing fifteen distinct patterns is
+  already an unusual shape.
+
+  Pinned by three assertions inside
+  `pulsus-read/tests/logql_template_alloc_gate.rs`'s
+  `every_registry_function_charge_dominates_its_allocations`: the floor a
+  one-character dynamic pattern is charged (**4,194,329 B**, asserted
+  inside a 4 KiB window), the consequence
+  (`MAX_TEMPLATE_RENDER_BYTES / floor == 15`, an `assert_eq!`), and the
+  class-heavy dominance row that was red under the flat charge —
+  `allocated 7,805,952 B > bound 4,260,040 B (charged 1,048,626 B)`.
+
+- **What is NOT bounded, stated plainly.** Cumulative allocation across
+  several compiles in ONE query. A query carrying 1,000 small line filters
+  (95,009 bytes, inside the text cap) allocates 5.24 GB over 5.9 s with a
+  3.6 MB peak; no per-compile cap can see that. It needs a query-scoped
+  accumulator threaded through the nine sites. **#291 stays open to carry
+  it** after this cap lands.
+
+- **The one site that was outside this cap, and is not any more.**
+  `template/mod.rs`'s literal-regex PREWARM — the query-compile-time fill
+  of a template's `regex_cache` — compiled with a bare `Regex::new`.
+  Being a cache warm-up bought it nothing: the pattern is the user's and
+  the allocation is the same allocation. Measured on a template carrying
+  a literal `\w`×43000, **86,033 bytes of template text and 129,033 bytes
+  of query text — inside the 131,072-byte cap** — it peaked **298.92 MB
+  and returned `Ok`**. It now goes through
+  `pulsus_re2::compile_user_regex` at the crate default program limit,
+  which is what it always compiled at, so nothing but the over-budget
+  refusal moves. A refusal is dropped exactly as a compile failure
+  already was: the pattern is not prewarmed and `funcs.rs`'s render-time
+  seam takes the verdict, budgeted and charged. Pinned by the prewarm
+  block in `logql_template_alloc_gate.rs`, which asserts both text
+  lengths so it stays a reachable input.
+
+- **Every charge is bounded below by a measurement, and the margins are
+  stated rather than implied.** Each figure below was produced by making
+  the edit and running the suite — the constant is RED at or below the
+  threshold given:
+
+  | constant | shipped | red at | over threshold | worst measured |
+  |---|---|---|---|---|
+  | `AST_BYTES_PER_PATTERN_BYTE` | 320 | 256 | 1.25× | 160 B/byte |
+  | `HIR_BYTES_PER_NODE` | 448 | 331 | 1.35× | 356.5 B/node |
+  | `HIR_BYTES_PER_LITERAL_NODE` | 24 | 1 | 24× | ~2 B/node |
+  | `HIR_BYTES_PER_CLASS_RANGE` | 8 | 7 | 1.14× | 8.34 B/range |
+  | `CASE_FOLD_TRANSIENT_FACTOR` | 10 | 7 | 1.43× | 8.05× |
+  | `CLASS_NEGATION_TRANSIENT_FACTOR` | 5 | 3 | 1.67× | 4.40× |
+  | `NFA_PEAK_FACTOR` | 4 | 3 | 1.33× | 4.08× |
+
+  The two node charges are pinned by
+  `each_hir_charge_dominates_the_phase_cost_it_models`, which measures
+  the HIR phase ALONE per repeated atom; the end-to-end gates cannot pin
+  them, because wherever those terms could bite the AST term or the
+  41.9 MB NFA floor is already larger. Review found exactly that gap —
+  `HIR_BYTES_PER_NODE` 448→224 and `CLASS_NEGATION_TRANSIENT_FACTOR` 5→3
+  were both green before that test existed. The residual margins are
+  deliberate: an exact-fit charge against an allocator measurement is
+  width-dependent, which the alloc-bound rule forbids.
+
+- **Pinned by** `crates/pulsus-re2/tests/regex_compile_budget.rs` — a
+  counting global allocator over a 16-row corpus asserting the measured
+  peak stays under the cap (refusals included), that the estimate upper
+  bounds the measured peak (which is what makes the four charges breakable
+  rather than asserted), that `size_limit` alone does not bound it at any
+  of three values two-and-a-half orders of magnitude apart, that the
+  committed accept list still compiles, and that an over-budget pattern is
+  `Unknown` and never `Rejects` to the TraceQL validator. The wire
+  verdicts are pinned by `crates/pulsus-read/tests/logql_regex_accept_matrix.rs`'s
+  `class_alt_over_budget` row, whose reference column was captured from
+  the pinned container at **10,100 atoms** — inside the band, near its
+  cheap end.
+
+  **That row costs the reference real time, and the number, the client
+  deadline and a readiness gate are all load-bearing.** It first shipped
+  at 12,000 and failed CI with `unexpected status 000` — curl never
+  obtaining a status.
+
+  **`000` has TWO causes.** (a) The reference's own 30 s HTTP write
+  timeout — see (c), which is where it is actually explained; raising our
+  client deadline from 30 s to 120 s did NOT fix that, it only stopped our
+  own deadline from racing the server's and let the server's behaviour
+  surface as what it is. (b) The reference is not READY yet on
+  a freshly created container. The evidence is a LOG LINE, not a
+  duration: review saw a cold first probe fail on a container that was
+  not OOM-killed and had `RestartCount=0`, whose log carried
+  `empty ring`. Reproduced here — `ratestore.go:110 err="empty
+  ring"`, the HTTP port refusing connections for ~3 s and `/ready`
+  answering 503 for ~23 s. No deadline touches (b), and **CI creates a
+  fresh container every run, so the first probe is exactly where it
+  lives**. It is closed by `wait_for_reference`, which polls until the
+  reference answers BOTH `/ready` 200 and a trivial `query_range` 200,
+  bounded at 180 s and panicking loudly if readiness never arrives.
+  Verified by pointing the suite at a container created seconds earlier
+  with no external wait: green twice.
+
+  **(c) There was never a third mode. There was ONE mechanism, and it
+  was the reference's own HTTP write timeout.** `server.http-write-timeout`
+  defaults to **30 s**
+  (`vendor/github.com/grafana/dskit/server/server.go:217 @ v3.7.4`, wired
+  into Go's `http.Server.WriteTimeout` at `:544`), and
+  `ci/logql/config.yaml` sets no timeout, so the default is what runs.
+  When it expires with nothing written, Go closes the connection. The
+  client then sees an empty reply (curl **52**), or a reset (**56**) if it
+  reads after the RST, or — while our own deadline was also 30 s — its own
+  timeout (**28**) winning the race. Three appearances, one cause.
+
+  **This was found by reading the reference's source and confirmed by
+  moving its timeout, after four rounds of inferring from the symptom.**
+  The same query at the same N answers
+  `000 | curl exit 52 | Empty reply from server` after **6.28 s** with
+  `http_server_write_timeout: 5s`, and after **30.48 s** with the shipped
+  30 s default — which is the CI failure exactly.
+
+  **Two observations are deliberately NOT attributed to this.** The
+  `000`s at 47.7 s and 47.8 s recorded on 2026-08-09 predate the
+  exit-code capture, so neither has a cause on record, and neither fits:
+  the wall tracks its setting closely (5 s → 6.28 s, 30 s → 30.48 s) and
+  47.7 matches no setting. Firing a heavy query before the container was
+  ready — testing whether ~17 s of startup plus a 30 s deadline lands
+  near 47 — did not reproduce it either; the query was served in 13.68 s.
+  They stay recorded as dated observations whose cause was not captured,
+  rather than assigned to the nearest known mechanism. The symptom tracks the
+  SERVER's timeout, not our client deadline, which is why every round
+  that raised OUR patience produced what looked like another mode.
+
+  **Consequence for the live leg (owner ruling, 2026-08-10).** The
+  reference cannot serve this pattern in more than 30 s, on any hardware,
+  by its own configuration. It costs 0.6 s at `line_re`, 6.5-7.1 s at
+  `labelfilter_re` unconstrained, 10-27 s on two cores, and past the wall
+  on a CI runner. The live probe was narrowed to `line_re` — 0.6 s here,
+  ~48x margin — and **failed there too, at 31.45 s**. Three positions,
+  four rounds, one wall. **`class_alt_over_budget` is therefore pinned
+  from the measurements already taken and re-probed at NO position.**
+
+  Everything else about the row is unchanged: it stays whole in
+  `PATTERNS` and in this divergence's enumeration, our verdict is still
+  asserted hermetically at all eighteen positions, and the reference
+  column stays the recorded 2026-08-09 capture (`200` at all eighteen,
+  pinned container, store populated and verified queryable).
+
+  **What that costs, recorded because it is a real cost:** this row is no
+  longer re-verified against the reference on any run, so a change in the
+  reference's behaviour here would go unnoticed until someone re-measures
+  by hand. Its only remaining automatic detector is on OUR side — 10,100
+  sits 87 atoms above our boundary of 10,013, so a shift in our estimate
+  flips the verdict to `Accept` and fails
+  `pulsus_verdicts_match_the_committed_table` hermetically.
+
+  Raising the write timeout in `ci/logql/config.yaml` was refused
+  deliberately: it would alter the shared oracle every differential row is
+  measured against, to rescue one row. Raising its LOG LEVEL to `info` was
+  approved on the opposite reasoning — verbosity changes what the
+  reference tells us, not what it answers — and stays.
+
+  **What is still not known, recorded rather than resolved: why `line_re`
+  costs 0.6 s here and past 30 s on the runner.** With `log_level: info`
+  shipped, a failing run captured **3,024** per-query entries from the
+  reference and **none of them was this query**: no `latency=slow`,
+  nothing with a query text over 60,000 characters, and a 29-second gap
+  between the last entry and the failure. `caller=metrics.go` logs on
+  query COMPLETION, so a request the server closes without responding can
+  never appear there — the one query needing description is the one the
+  reference structurally cannot describe. Refuted along the way, each with
+  a measurement: runner speed alone; store contents (empty, one line and
+  ~10,000 lines all 0.65 s); CPU starvation (0.62 s at 0.25 CPU with
+  data); container death, restart or memory pressure (`OOMKilled=false`,
+  `RestartCount=0`, 0.42% CPU, 105 MiB at the moment of failure); our own
+  client deadline; and the theory that Go's write deadline starts when the
+  request is read (a heavy query fired at a cold container was served in
+  13.68 s).
+
+  The deadline half was reproduced by constraining the container
+  (`--cpus 2 --memory 4g`): at the four positions that build a
+  `NewFastRegexMatcher` — the two label filters, `drop` and `keep` — Go
+  pays **10-27 s per query** for a pattern this size, and a cold container
+  spikes past 30 s. **Lowering N does not fix it**: 10,014, the very
+  bottom of the band, still peaked at 30.08 s cold, and the one other
+  shape this cap newly refuses, `(?i)[\p{L}x20000]`, costs the same
+  16-27 s. The divergence exists precisely when the pattern is enormous,
+  so no cheap member of the class exists. **No client-side number fixes
+  this** — the wall is the reference's, described in (c) — and no position
+  escapes it either, which is why this row ended up pinned rather than
+  probed. 10,100 is kept because it is the cheapest N that carries the
+  divergence, which matters to anyone re-measuring it by hand.
+
+
 ## Issue #279 — LogQL query-text cap
 
 The 131,072-byte `MAX_QUERY_BYTES` cap (docs/api.md §2.3, the reference's

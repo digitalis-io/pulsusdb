@@ -25,8 +25,13 @@ use crate::value::{InstantSample, Labels};
 /// rewrite, not an aggregation hot path — plan edge case 5).
 pub fn compile_label_replace_regex(regex: &str) -> Result<regex::Regex, PromqlError> {
     let translated = re2_pattern_to_rust(regex);
-    regex::Regex::new(&format!("^(?s:{translated})$")).map_err(|_| PromqlError::LabelSet {
-        detail: format!("invalid regular expression in label_replace(): {regex}"),
+    // Issue #291: through the shared compile budget, on the EXACT string
+    // that gets compiled — upstream's `^(?s:…)$` wrapper, not the
+    // `^(?:…)$` one the anchored helper builds.
+    pulsus_re2::compile_user_regex(&format!("^(?s:{translated})$")).map_err(|_| {
+        PromqlError::LabelSet {
+            detail: format!("invalid regular expression in label_replace(): {regex}"),
+        }
     })
 }
 

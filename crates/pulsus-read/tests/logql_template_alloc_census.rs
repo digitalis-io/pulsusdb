@@ -919,16 +919,9 @@ static PINS: &[Pin] = &[
     Pin {
         file: "funcs.rs",
         func: "compile_regex",
-        callees: &[
-            ".build",
-            ".clone",
-            ".to_string",
-            "RegexBuilder::new",
-            "format!",
-            "str::from_utf8",
-        ],
+        callees: &[".clone", ".to_string", "format!", "str::from_utf8"],
         disposition: CHARGED,
-        why: "pattern copy (≤3× U+FFFD ceiling when invalid UTF-8, round 4) + the 1 MiB dynamic-program ceiling, both charged BEFORE converting/building; cache hits share the query-compile program",
+        why: "pattern copy (≤3× U+FFFD ceiling when invalid UTF-8, round 4) + what compiling THAT pattern costs, both charged BEFORE converting/building; cache hits share the query-compile program. Issue #291 replaced the `RegexBuilder::new(…).build()` pair with `pulsus_re2::compile_user_regex_with` at the same 1 MiB program ceiling, and the second charge with `regex_compile_transient_bound_with` — the flat ceiling bounded only the NFA phase, so a 32-byte class-heavy pattern allocated 2.67 MB against it",
     },
     Pin {
         file: "funcs.rs",
@@ -1745,16 +1738,9 @@ static PINS: &[Pin] = &[
     Pin {
         file: "mod.rs",
         func: "compile",
-        callees: &[
-            ".clone",
-            ".insert",
-            ".to_string",
-            "Box::new",
-            "Regex::new",
-            "format!",
-        ],
+        callees: &[".clone", ".insert", ".to_string", "Box::new", "format!"],
         disposition: COMPILE_TIME,
-        why: "tree/fast-path derivation + literal-regex programs ≤ query-capped template text, once per query",
+        why: "tree/fast-path derivation + literal-regex programs, once per query. This `why` used to end ‘≤ query-capped template text’ and issue #291's review measured that false for the regex half: the prewarm's bare `Regex::new` peaked 298.92 MB on a literal `\\w`x43000 inside the query-text cap. `Regex::new` has left the callee set because the prewarm now goes through `pulsus_re2::compile_user_regex`, which bounds the compile before it runs",
     },
     Pin {
         file: "mod.rs",

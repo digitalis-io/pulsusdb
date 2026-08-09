@@ -337,22 +337,51 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
             );
         }
     }
-    // §3.4: the interpolating anchored template may exist at exactly the
-    // four committed sites — the escaper, the byte-identity replica in
+    // §3.4: the interpolating anchored template may exist at exactly
+    // THREE committed sites — the escaper, the byte-identity replica in
     // the escaper's OWN tests (issue #331 fix round 1: the corpus-wide
     // crossing that pins `ch_regex_anchored`'s Verbatim output against
     // the pre-#331 construction has to spell that construction, and it
     // lives beside the module-private escaper because nothing outside
-    // the module can call it), the validator, and (issue #276)
-    // `plan.rs`'s `LabelReplaceSpec::compile`. The last is deliberately
-    // OUTSIDE the checked-escape seam: `label_replace`'s pattern never
-    // reaches SQL (the transform runs over the evaluated result), the
-    // anchored text it compiles is the #317 RE2→Rust REWRITE of the
-    // user's pattern (not the bytes the SQL seam validates), and its
-    // compile error must surface the WRAPPED form — the #240 asymmetry
-    // — which the `bad_regex`-routed seams must never produce.
+    // the module can call it), and `pulsus-re2`'s
+    // `compile_user_regex_anchored` — which counts TWICE, because this
+    // scan runs over raw lines and that function's doc comment spells the
+    // wrapper it builds. That is deliberate on both sides: a reader of
+    // the entry point should see the exact form, and the count here is
+    // exact, so a third occurrence in that file still fails.
+    //
+    // It used to be four: `pipeline.rs`'s validator and (issue #276)
+    // `plan.rs`'s `LabelReplaceSpec::compile` each built the wrapper by
+    // hand. Issue #291 routed both through the shared budgeted entry
+    // point, so the two hand-built sites became one shared one and the
+    // count fell by one. What #276 established about `label_replace`
+    // still holds and is still not the checked-escape seam: its pattern
+    // never reaches SQL (the transform runs over the evaluated result),
+    // the anchored text it compiles is the #317 RE2→Rust REWRITE of
+    // the user's pattern (not the bytes the SQL seam validates), and its
+    // compile error must surface the WRAPPED form — the #240
+    // asymmetry — which the `bad_regex`-routed seams must never
+    // produce. Routing it through the budget changed none of that: the
+    // entry point returns the engine's error untouched and the site
+    // still renders the wrapped form.
+    // Issue #291 moved the pipeline and `label_replace` constructions OUT
+    // of `src/logql` and into the one shared budgeted entry point, which
+    // this walk cannot see — so the walk is EXTENDED to it rather than
+    // the two entries being dropped. Dropping them would have left the
+    // guard passing while the thing it guards moved out of its domain,
+    // which is the failure this file exists to make impossible.
+    {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pulsus-re2/src/compile_budget.rs");
+        let text = std::fs::read_to_string(&path).expect("pulsus-re2 compile_budget.rs");
+        for (i, line) in text.lines().enumerate() {
+            if line.contains("^(?:{") {
+                anchored_hits.push(format!("compile_budget.rs:{}", i + 1));
+            }
+        }
+    }
     anchored_hits.sort();
-    let allowed: &[(&str, usize)] = &[("escape.rs", 2), ("pipeline.rs", 1), ("plan.rs", 1)];
+    let allowed: &[(&str, usize)] = &[("escape.rs", 2), ("compile_budget.rs", 2)];
     let total: usize = allowed.iter().map(|(_, n)| n).sum();
     if anchored_hits.len() != total
         || !allowed
@@ -361,11 +390,12 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
     {
         let _ = writeln!(
             errors,
-            "anchoring guard: `^(?:{{` must occur at exactly four sites (escape.rs's \
-             escaper and its tests' pre-#331 replica, pipeline.rs's validator, and \
-             plan.rs's `LabelReplaceSpec::compile`), found {anchored_hits:?} — every \
-             OTHER site must build the anchored form through \
-             `escape::ch_regex_anchored_checked`, never by hand"
+            "anchoring guard: `^(?:{{` must occur at exactly three sites (escape.rs's \
+             escaper and its tests' pre-#331 replica, and pulsus-re2's \
+             `compile_user_regex_anchored`), found {anchored_hits:?} — every OTHER \
+             site must build the anchored form through \
+             `escape::ch_regex_anchored_checked` or \
+             `pulsus_re2::compile_user_regex_anchored`, never by hand"
         );
     }
     assert!(errors.is_empty(), "{errors}");

@@ -7,3 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 regex.workspace = true
+regex-syntax.workspace = true
+
+[dev-dependencies]
+# Issue #291: the allocation gate asserts the intersection premise
+# (`[\p{L}&&\p{Nd}]` translates to an EMPTY class) against the same
+# parser the estimator uses, rather than restating it.
+regex-syntax.workspace = true

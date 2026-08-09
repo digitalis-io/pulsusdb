@@ -20,6 +20,14 @@ futures = "0.3"
 # regex cache backs `=~`/`!~` matchers, mirroring ClickHouse RE2's fully-
 # anchored `match()` semantics on the SQL fallback path.
 regex = "1"
+# Issue #291: the compile-time allocation estimator parses the user's
+# pattern with the SAME parser `regex` compiles with, so the range count
+# it charges for is the one the compiler will actually materialise rather
+# than a per-byte constant fitted to a measurement. Already in the lock at
+# 0.8.11 via `regex`; a direct dependency so the version cannot drift
+# apart from it silently (the tripwire is `pulsus-re2`'s
+# `the_estimate_upper_bounds_the_measured_peak`).
+regex-syntax = "0.8"
 
 # HTTP server stack (issue #6): axum/tower/tower-http for the router and its
 # middleware layers, tracing/tracing-subscriber for structured logging driven

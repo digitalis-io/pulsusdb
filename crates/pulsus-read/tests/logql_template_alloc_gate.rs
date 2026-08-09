@@ -151,16 +151,20 @@ fn invalid_big_str() -> Value<'static> {
 /// A 128-byte invalid-UTF-8 PATTERN — enough to exercise
 /// `compile_regex`'s invalid-pattern conversion (the round-6 finding-2
 /// gap: derived variants only invalidate BIG args, and patterns were
-/// tiny), sized to stay inside the charged 1 MiB program ceiling.
+/// tiny).
 ///
-/// It is deliberately NOT larger: measured on this toolchain, regex
-/// COMPILATION allocates ~630x the pattern length and
-/// `RegexBuilder::size_limit` does not bound it (a 16 KiB literal
-/// pattern allocates 10.4 MB and still reports Ok under a 1 MiB
-/// limit) — an amplification path INDEPENDENT of invalid UTF-8 (valid
-/// patterns behave identically), filed separately as #291 rather than
-/// papered over here. This shape is scoped to the conversion it was
-/// added for.
+/// It is deliberately NOT larger: regex COMPILATION allocates a large
+/// multiple of the pattern length and `RegexBuilder::size_limit` does not
+/// bound it — it is `nfa_size_limit`, governing only the last of three
+/// compile phases. **The clause that used to stand here saying this shape
+/// is "sized to stay inside the charged 1 MiB program ceiling" was false**
+/// and issue #291 measured it: `\w`x64 is 128 bytes and peaks 2.20 MB at
+/// a 1 MiB ceiling, 10.62 MB at the 10 MiB default. What makes the shape
+/// safe now is not its size but the budget — `compile_regex` charges
+/// `pulsus_re2::regex_compile_transient_bound_with` and the estimate is
+/// an upper bound on the peak. The class-heavy block at the end of
+/// [`every_registry_function_charge_dominates_its_allocations`] is what
+/// checks that at this site; `\w`x16, 32 bytes, allocates 2.67 MB.
 fn invalid_pattern() -> Value<'static> {
     let mut v = vec![b'x'; 128];
     for i in (0..v.len()).step_by(2) {
@@ -1429,6 +1433,185 @@ fn every_registry_function_charge_dominates_its_allocations() {
                  (round 6, finding 1)"
             ));
         }
+    }
+
+    // Issue #291: the DYNAMIC-REGEX row. `compile_regex` used to charge a
+    // flat `DYNAMIC_REGEX_PROGRAM_CEILING` (1 MiB) before compiling, on
+    // the belief that `size_limit` bounded what compiling costs. It does
+    // not — it is `nfa_size_limit`, the LAST of three phases — so a
+    // class-heavy pattern blew straight through the charge.
+    //
+    // Red before the fix, measured on this tree: `\w`x16 is **32 bytes**
+    // and allocates 2.67 MB peak at the 1 MiB ceiling against a charge of
+    // 1 MiB + 32 B — two and a half times over, from a pattern a quarter
+    // the length of `invalid_pattern()`. Length is not the quantity that
+    // predicts the cost, which is why the fix is a bound and not a length
+    // cap.
+    //
+    // The bound is this file's own `4 * charged + SLACK`, and it has to
+    // be: `BYTES` is CUMULATIVE (every `alloc`/`realloc`, never
+    // decremented) while the charge bounds the compile's PEAK LIVE bytes.
+    // Measured here, `\w`x16 peaks 2.67 MB and churns 7.81 MB through the
+    // same call. A factor-1 assertion between those two units would be
+    // asserting something false about a correct implementation. Red today
+    // regardless: 4 x (1 MiB + 32 B) + 64 KiB = 4.26 MB against 7.81 MB
+    // churned.
+    {
+        let line: Vec<u8> = b"app=frontend status=200".to_vec();
+        let regex_cache = HashMap::new();
+        let gate = GateEnv {
+            env: env.clone(),
+            budget: RenderBudget::default(),
+        };
+        let ctx = FuncCtx {
+            print_env: &gate,
+            line: &line,
+            ts_ns: 1_700_000_000_000_000_000,
+            regex_cache: &regex_cache,
+            budget: &gate.budget,
+            _marker: std::marker::PhantomData,
+        };
+        let def = REGISTRY
+            .iter()
+            .find(|d| d.name == "regexReplaceAll")
+            .expect("regexReplaceAll registered");
+        let pattern = r"\w".repeat(16);
+        let args = vec![
+            Value::Str(Cow::Owned(pattern.clone().into_bytes())),
+            s("frontend"),
+            s("Z"),
+        ];
+        let before = BYTES.load(Ordering::Relaxed);
+        let result = (def.call)(&ctx, &args);
+        let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+        let charged = gate.budget.charged_bytes();
+        assert!(
+            result.is_ok(),
+            "premise: the class-heavy pattern must COMPILE, or this row measures a \
+             rejection instead of a compile: {result:?}"
+        );
+        let bound = 4 * charged + SLACK;
+        if alloc > bound {
+            failures.push(format!(
+                "dynamic class-heavy regex: allocated {alloc} B > bound {bound} B \
+                 (charged {charged} B) for a {}-byte pattern — the render budget must be \
+                 charged what compiling this pattern costs, not a flat program ceiling \
+                 that models only the NFA phase (issue #291)",
+                pattern.len()
+            ));
+        }
+    }
+
+    // Issue #291, owner ruling v2: the new per-compile charge is an
+    // ACCEPT-SURFACE change and must not arrive silently. `compile_regex`
+    // charged a flat 1 MiB before compiling a template-computed pattern;
+    // it now charges what compiling that pattern costs, whose floor is
+    // `NFA_PEAK_FACTOR * DYNAMIC_REGEX_PROGRAM_CEILING`. Both numbers are
+    // asserted here so neither the floor nor its consequence can move
+    // without this reddening, and both are in the ledger under
+    // `regex-compile-budget`.
+    {
+        let line: Vec<u8> = b"app=frontend".to_vec();
+        let regex_cache = HashMap::new();
+        let gate = GateEnv {
+            env: env.clone(),
+            budget: RenderBudget::default(),
+        };
+        let ctx = FuncCtx {
+            print_env: &gate,
+            line: &line,
+            ts_ns: 1_700_000_000_000_000_000,
+            regex_cache: &regex_cache,
+            budget: &gate.budget,
+            _marker: std::marker::PhantomData,
+        };
+        let def = REGISTRY
+            .iter()
+            .find(|d| d.name == "regexReplaceAll")
+            .expect("regexReplaceAll registered");
+        // The CHEAPEST possible dynamic pattern: one literal character.
+        // Whatever it is charged is the floor every dynamic compile pays.
+        let args = vec![s("a"), s("frontend"), s("Z")];
+        let result = (def.call)(&ctx, &args);
+        assert!(result.is_ok(), "premise: `a` must compile: {result:?}");
+        let floor = gate.budget.charged_bytes();
+
+        // The 1 MiB program ceiling times `NFA_PEAK_FACTOR`, plus the
+        // one-byte pattern copy: 4,194,329 B. Asserted as a narrow RANGE
+        // so the test says what the floor IS, not merely that it is
+        // large.
+        assert!(
+            (4 * 1024 * 1024..=4 * 1024 * 1024 + 4096).contains(&floor),
+            "one dynamic regex compile now charges {floor} B; the ledger records \
+             4,194,329. Before #291 it charged a flat 1 MiB, which under-reported: \
+             `\\w`x16 (32 bytes) allocates 2.67 MB at this same program ceiling. If this \
+             moved, update `regex-compile-budget`'s template bullet with it"
+        );
+
+        // The consequence, as the number a user would feel: how many
+        // distinct dynamic compiles fit in one render budget.
+        let fits = MAX_TEMPLATE_RENDER_BYTES / floor;
+        assert_eq!(
+            fits, 15,
+            "one render now fits {fits} distinct dynamic regex compiles; the ledger records \
+             15, down from 64 under the flat 1 MiB charge. That narrowing is deliberate \
+             (the old charge was wrong) but it is an accept-surface change and must not \
+             move without the ledger moving with it"
+        );
+    }
+
+    // Issue #291 review finding 1, `[high]`: the literal-regex PREWARM in
+    // `template::compile` was the one user-pattern compile in the
+    // workspace outside the budget, and it is reachable inside the
+    // 131,072-byte query-text cap. The reviewer's own shape, replayed:
+    // a template carrying a literal `\w`x43000 as a regex argument,
+    // 129,033 bytes of template text. Before the fix it peaked
+    // **298.92 MB** and returned `Ok` — a cache prewarm allocating three
+    // hundred megabytes of a user's pattern at query-compile time.
+    //
+    // Measured over `template::compile` itself, not over a registry
+    // function, because the prewarm runs there and nowhere else. The
+    // ceiling is the compile budget's own cap: the prewarm now estimates
+    // the pattern before compiling it and declines to cache what it
+    // cannot afford, exactly as it already declined to cache what would
+    // not compile.
+    {
+        let pattern = r"\w".repeat(43_000);
+        // A Go RAW string (backquotes) for the pattern: `\w` is not a Go
+        // escape, so the double-quoted form is a template parse error
+        // before the prewarm is reached — and a user writing this regex
+        // writes it exactly this way.
+        let text = format!("{{{{ regexReplaceAll `{pattern}` .app \"z\" }}}}");
+        // Two lengths, and the larger is the one that has to fit. The
+        // template TEXT is 86,033 bytes; written into a LogQL
+        // double-quoted `line_format` argument every backslash doubles,
+        // so the QUERY is 129,033 — the figure the reviewer measured, and
+        // still inside the 131,072-byte cap. Both are asserted so this
+        // stays a reachable input and not a curiosity.
+        let query_bytes = text.len() + text.matches('\\').count();
+        assert_eq!(text.len(), 86_033);
+        assert_eq!(query_bytes, 129_033);
+        assert!(query_bytes < 131_072, "premise: inside the query-text cap");
+        let before = BYTES.load(Ordering::Relaxed);
+        let compiled = pulsus_read::logql::template::compile(
+            &text,
+            pulsus_read::logql::template::TemplateKind::Line,
+        );
+        let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+        assert!(
+            compiled.is_ok(),
+            "premise: the TEMPLATE still parses — the budget declines to prewarm the \
+             pattern, it does not reject the template: {:?}",
+            compiled.err()
+        );
+        assert!(
+            alloc <= pulsus_re2::MAX_REGEX_COMPILE_TRANSIENT_BYTES,
+            "the literal-regex prewarm allocated {alloc} B compiling a template of {} \
+             bytes — inside the query-text cap. This site is `template/mod.rs`'s \
+             `regex_cache` fill; it must go through `pulsus_re2::compile_user_regex` \
+             like every other user-pattern compile (issue #291 review finding 1)",
+            text.len()
+        );
     }
 
     assert!(

@@ -1763,6 +1763,7 @@ name = "pulsus-re2"
 version = "0.0.0"
 dependencies = [
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]

@@ -12,7 +12,25 @@ auth_enabled: false
 
 server:
   http_listen_port: 3100
-  log_level: warn
+  # `info`, not `warn`, and NOT a stylistic choice — do not tidy it back.
+  #
+  # At `warn` this container says nothing about the queries it serves. At
+  # `info` it emits its own per-query accounting,
+  # `caller=metrics.go:457 ... duration=...`, which is the one measurement
+  # issue #291 spent four rounds without: a query that took 31.45 s at the
+  # wire left NO entry in this log at `warn`, so nobody could say whether
+  # the reference thought it was slow, or even saw it.
+  #
+  # Verbosity only. No limit, timeout or code path moves with it, and
+  # nothing consumes this container's log — the two `docker logs` calls in
+  # `.github/workflows/ci.yml` dump it for a human on failure and parse
+  # nothing. Checked before changing: no test reads this file's contents
+  # (only its mount path is named), no capture fixture records
+  # `log_level`, and the capture-drift legs
+  # (`logql_json_key_sanitization`, `structured_metadata_collisions`) plus
+  # `logql_regex_accept_matrix` and `logql_differential` all pass
+  # unchanged against a container running at `info`.
+  log_level: info
 
 common:
   instance_addr: 127.0.0.1
