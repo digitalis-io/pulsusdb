@@ -120,7 +120,7 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
 
     let db = std::env::var("PULSUS_TEST_CH_DATABASE")
         .unwrap_or_else(|_| "pulsus_prom_api_live_test".to_string());
-    let port: u16 = 31_101;
+    let port: u16 = 31_173;
 
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
@@ -324,7 +324,7 @@ async fn prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution() {
     }
 
     let db = "pulsus_prom_api_live_fanout_test";
-    let port: u16 = 31_102;
+    let port: u16 = 31_174;
 
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
@@ -456,7 +456,7 @@ async fn prom_api_name_regex_discovery_over_the_cache_scan_budget_is_422_executi
     }
 
     let db = "pulsus_prom_api_live_scan_budget_test";
-    let port: u16 = 31_103;
+    let port: u16 = 31_175;
 
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")

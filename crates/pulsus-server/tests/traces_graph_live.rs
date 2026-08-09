@@ -21,8 +21,7 @@
 //!   `client → server` edge, and a shared server half whose `parent_id`
 //!   coincidentally collides with a real client span produces NO false edge.
 //!
-//! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Ports 31140-31141 (distinct from
-//! every other live suite's fixed ports). Run locally:
+//! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:24.8
@@ -413,7 +412,7 @@ async fn service_graph_end_to_end_over_http() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_140;
+    let port = 31_139;
     let db = "pulsus_traces_graph_live_it";
     drop_db(db).await;
     let _guard = spawn_ready(port, db);
