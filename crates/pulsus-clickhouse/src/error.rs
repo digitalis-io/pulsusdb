@@ -92,7 +92,7 @@ impl ChError {
     /// |---|---|---|
     /// | `Code: N. DB::Exception: …` | byte 0 | 24.8.14.39 and 26.3.17.110 |
     /// | `Code: N` (no framing at all — the crate's header-derived `reason()`, `response.rs:179-187`) | byte 0 | 26.3.17.110 |
-    /// | `<result bytes>Code: N. DB::Exception: …` | byte 10 … 1_262_489 | 26.3.17.110 |
+    /// | `<result bytes>Code: N. DB::Exception: …` | past byte 0, unbounded | 26.3.17.110 |
     ///
     /// The third shape is the defect. It is a property of the *server*, not
     /// of any one code: 24.8 discards its not-yet-flushed output buffer when
@@ -100,6 +100,24 @@ impl ChError {
     /// single block, the exception), while 26.3 keeps it (two blocks: the
     /// written result, then the exception). No 24.8 shape that produced it
     /// was found, so on 24.8 this parse is a pin and on 26.3 it is the fix.
+    /// The offset itself is not a stable function of any one setting — the
+    /// same `max_result_bytes` yields different offsets run to run — so
+    /// nothing here or in the tests depends on a particular offset value.
+    ///
+    /// **Why the text is parsed at all, when the code is also on the wire.**
+    /// ClickHouse sends `X-ClickHouse-Exception-Code: N` on this response —
+    /// measured present on every post-flush 500 on both pinned versions —
+    /// and that header is a source no query result can forge. The
+    /// `clickhouse` crate reads it (`response.rs:85` @ 0.15.1) but does not
+    /// surface it: it is passed to `collect_bad_response` only as the
+    /// `reason()` fallback used when the body cannot be collected, is empty,
+    /// or is not UTF-8 (`response.rs:142`, `:145`, `:161`); when the body
+    /// *does* decode, `response.rs:158-163` returns the body and the header
+    /// code is dropped. `clickhouse::error::Error` carries no numeric code
+    /// in any variant — `BadResponse(String)` is the only channel. So the
+    /// typed source exists on the wire and is unreachable from here without
+    /// changing the dependency; until then [`parse_exception_code`] must be
+    /// sound against a body whose leading bytes are tenant-controlled.
     ///
     /// See [`parse_exception_code`] for the search rule.
     pub(crate) fn server_from_bad_response(message: String) -> ChError {
@@ -127,75 +145,135 @@ const EXCEPTION_CODE_FRAME: &str = ". DB::";
 
 /// Finds ClickHouse's exception code in an HTTP error body.
 ///
-/// Scans left to right and returns the FIRST `Code: <ascii digits>` that is
-/// believable, where believable means either
+/// The body is one of two things, and the rule has one arm for each:
 ///
-/// 1. it sits at byte 0 — the shape of a body carrying nothing but the
-///    exception, and also of the crate's header-derived fallback
-///    (`reason()`, `response.rs:179-187` @ clickhouse 0.15.1), which is the
-///    bare `Code: 396` with no framing at all; or
-/// 2. the digits are followed by [`EXCEPTION_CODE_FRAME`] — the framing
-///    only a real ClickHouse exception carries.
+/// 1. **The body IS the exception** — nothing was written before it. Then
+///    the code is at byte 0, and that is the code, exactly as the
+///    `strip_prefix("Code: ")` read this replaces took it. This arm also
+///    covers the crate's header-derived fallback (`reason()`,
+///    `response.rs:179-187` @ clickhouse 0.15.1), the bare `Code: 396` with
+///    no framing at all.
+/// 2. **Output was written first**, so the body is
+///    `<result bytes><exception>`. Then the code is the **last**
+///    `Code: <digits>` in the body, and it must carry the
+///    [`EXCEPTION_CODE_FRAME`] framing; anything else reads as `0`.
 ///
-/// Arm 1 is what keeps this compatible with the `strip_prefix("Code: ")`
-/// read it replaces: **for every body whose byte 0 begins `Code: ` followed
-/// by a run of ASCII digits that fits `i32` — the shape of every body
-/// measured across thirteen error classes on both pinned versions — this
-/// returns exactly what `strip_prefix` returned**, so no classification
-/// that is correct today moves. The two bodies where
-/// the two reads differ are `Code: -5.` and `Code: +5.`: the old read took
-/// them as -5 and 5, this one as `None` (0). ClickHouse emits neither, no
-/// code table in this workspace holds a negative code, and both are pinned
-/// by a test so the divergence is recorded rather than assumed away.
-/// Arm 2 is what makes issue #382's post-flush body classify.
+/// # Why the last occurrence, and what makes it sound
 ///
-/// What the other cases do, deliberately:
+/// Result bytes are **tenant-controlled**: a stored log line or span name
+/// can contain any text at all, including a whole forged
+/// `Code: 210. DB::Exception: …`. Taking the *first* believable occurrence
+/// would let that forgery decide the classification — a 500 where
+/// `docs/api.md`'s contract requires a 422, or a retry decision made by the
+/// data. The soundness property that rules this out is positional, not
+/// syntactic:
+///
+/// > ClickHouse appends its exception **after every byte the query
+/// > produced**, so every tenant-controlled byte in the message sits at a
+/// > strictly smaller index than the server's exception. The last
+/// > `Code: ` occurrence therefore always lies inside server-authored text,
+/// > whatever the result bytes contain and wherever in them it sits.
+///
+/// The rule is deliberately anchored on the last occurrence of the *marker*
+/// rather than the last *framed* occurrence, and that distinction is the
+/// whole guarantee. Anchoring on the last framed occurrence would step over
+/// a server exception rendered without `DB::` — `getCurrentExceptionMessage`
+/// renders a non-`DB::` failure as `Poco::Exception. Code: 1000, e.code() =
+/// …` — and hand the decision back to the tenant's framed text. Anchoring
+/// on the last marker cannot: if the server's own trailing `Code: ` is not
+/// framed, the parse yields `None` and the caller sees `0`, which is what it
+/// saw before this change. **Every way this rule can fail, it fails to `0`
+/// and never to a tenant-chosen code.** Both cases are pinned by tests.
+///
+/// Arm 1 is not forgeable either, for the same positional reason: byte 0 of
+/// a written result is the `RowBinaryWithNamesAndTypes` header — a column
+/// count varint, then column names and type names, all fixed by the SQL we
+/// render, never by stored data (measured: `\u{1}\u{1}v\u{6}String…`).
+///
+/// # What this costs, deliberately
 ///
 /// - **Nested exceptions.** A failed distributed read renders the outermost
 ///   code first and its causes after (`Code: 519. DB::NetException: …
-///   Code: 279 … Code: 210 …`). First-match returns 519, what actually
-///   failed, and the same code `strip_prefix` returned — the outermost one
-///   is the prefix.
-/// - **Result bytes that contain the framing.** The already-written result
-///   precedes the appended exception, so a stored log line or span name
-///   holding literal `Code: 42. DB::Exception: …` text wins over the real
-///   exception. Accepted, and pinned by a test. The alternative — taking
-///   the LAST match, as the crate's own streaming extractor does
-///   (`response.rs:369` @ 0.15.1, `rfind`) — would return the innermost 210
-///   of the nested case above, moving a classification that is correct
-///   today, and 210 is in [`RETRYABLE_SERVER_CODES`] while 519 is not.
-/// - **`Code: N` with no framing, past byte 0.** Rejected. Result bytes are
-///   far likelier to contain the two words than the whole `Code: N. DB::`
-///   shape.
+///   Code: 279 … Code: 210 …`). Arriving *without* prior output it takes
+///   arm 1 and reads 519, what actually failed — the same code
+///   `strip_prefix` returned, so nothing correct today moves. Arriving
+///   *after* output it takes arm 2 and reads the innermost cause, 210.
+///   Accepted and pinned: both codes are server-authored, the tenant cannot
+///   steer the choice, and that body reads as `0` today — so this residual
+///   only ever touches a case that is already broken.
+/// - **A `Code: ` inside the exception's own description.** ClickHouse
+///   echoes query text into some messages (a 427 carries the user's regex),
+///   so a pattern containing `Code: 42` can become the last marker in the
+///   body. Unframed, so the parse yields `None` and the caller sees `0` —
+///   again the pre-change reading, never a forged code.
+/// - **`Code: N` with no framing, past byte 0.** Rejected.
 /// - **A truncated tail.** `…Code: 39` at the end is rejected (no framing);
 ///   `…Code: 396. DB::` truncated right there is accepted — the framing is
 ///   what carries the meaning, not the description.
-/// - **Non-ClickHouse framings.** Poco's `Poco::Exception. Code: 1000,
-///   e.code() = 111, …` has no `. DB::` and is not at byte 0, so it reads
-///   as `0` — exactly as before this change.
 ///
-/// Cost: one left-to-right pass (`str::find` is `memchr`-backed; `from`
-/// only ever advances, so each byte is scanned once) over a body that, on
-/// the buffered path, is as large as the written result — 1.26 MB in the
-/// largest measured case. This runs once per failed query, never per row.
+/// # Compatibility with the read it replaces
+///
+/// For every body that begins `Code: ` + a run of ASCII digits that fits
+/// `i32` — the shape of every body measured across thirteen error classes
+/// on both pinned versions — this returns exactly what `strip_prefix`
+/// returned. The two bodies where the two reads differ are `Code: -5.` and
+/// `Code: +5.`: the old read took them as -5 and 5, this one as `None` (0).
+/// ClickHouse emits neither, no code table in this workspace holds a
+/// negative code, and both are pinned by a test so the divergence is
+/// recorded rather than assumed away.
+///
+/// # Cost
+///
+/// One `str::strip_prefix` at byte 0 plus one `str::rfind` (`memchr`-backed)
+/// over a body that, on the buffered path, is as large as the written
+/// result. Runs once per failed query, never per row.
+///
+/// # Re-validating this
+///
+/// Most of the tests below call this function directly, so **reverting the
+/// rule inside this function is the only revert that exercises them all**.
+/// Reverting the call site in [`ChError::server_from_bad_response`] instead
+/// reaches only the ones that go through `ChError` — one here, plus the two
+/// mapper tests in `pulsus-read` — and leaves the rest green, which reads
+/// exactly like a passing suite.
+///
+/// Three reverts are worth keeping distinct, because each is caught by a
+/// different set of tests and none subsumes another: the pre-#382
+/// `strip_prefix` read; **first**-match over believable occurrences; and
+/// **last-framed**-match. The tests name which of the three they defeat.
 fn parse_exception_code(message: &str) -> Option<i32> {
-    let mut from = 0usize;
-    while let Some(offset) = message[from..].find(EXCEPTION_CODE_MARKER) {
-        let at = from + offset;
-        let after_marker = at + EXCEPTION_CODE_MARKER.len();
-        // `EXCEPTION_CODE_MARKER` and ASCII digits are single-byte, so
-        // every index derived here is a char boundary.
-        let rest = &message[after_marker..];
-        let digits = &rest[..rest.bytes().take_while(u8::is_ascii_digit).count()];
-        if !digits.is_empty()
-            && (at == 0 || rest[digits.len()..].starts_with(EXCEPTION_CODE_FRAME))
-            && let Ok(code) = digits.parse::<i32>()
-        {
-            return Some(code);
-        }
-        from = after_marker;
+    // Arm 1: the body is the exception itself.
+    if let Some(code) = code_at(message, 0, Framing::NotRequired) {
+        return Some(code);
     }
-    None
+    // Arm 2: output was written first. The last marker is server-authored
+    // no matter what the result bytes hold; the framing is what says it is
+    // an exception rather than an echo inside one.
+    let at = message.rfind(EXCEPTION_CODE_MARKER)?;
+    code_at(message, at, Framing::Required)
+}
+
+/// Whether [`code_at`] insists on [`EXCEPTION_CODE_FRAME`] after the digits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    Required,
+    NotRequired,
+}
+
+/// Reads `Code: <ascii digits>` at exactly `at`, or `None`. `at` is always a
+/// char boundary: it is either 0 or a `rfind` hit on an all-ASCII needle,
+/// and the marker and the digits that follow it are single-byte, so every
+/// index derived here is a boundary too.
+fn code_at(message: &str, at: usize, framing: Framing) -> Option<i32> {
+    let rest = message[at..].strip_prefix(EXCEPTION_CODE_MARKER)?;
+    let digit_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (digits, tail) = rest.split_at(digit_len);
+    if digits.is_empty()
+        || (framing == Framing::Required && !tail.starts_with(EXCEPTION_CODE_FRAME))
+    {
+        return None;
+    }
+    digits.parse::<i32>().ok()
 }
 
 impl From<clickhouse::error::Error> for ChError {
@@ -379,18 +457,16 @@ mod tests {
     }
 
     /// The written result can be arbitrarily long before the exception. The
-    /// deepest offset measured on 26.3.17.110 was 1_262_489 bytes — a 396
-    /// from `SELECT toString(number) AS v FROM numbers(100000000)` with
-    /// `max_result_bytes=8000000, result_overflow_mode=throw`, whose whole
-    /// `ChError::Server.message` was 1_262_651 bytes. Only the offset is
-    /// measured here; the prefix is synthetic, because a 1.2 MB literal has
-    /// no place in a source file.
+    /// prefix length here is synthetic and carries no claim: the offset is
+    /// not a stable function of any setting — repeats of the same
+    /// `max_result_bytes` put the code at different offsets — so the test
+    /// asserts only that depth does not defeat the scan.
     #[test]
     fn a_code_deep_inside_a_written_result_still_parses() {
-        const DEEPEST_MEASURED_OFFSET: usize = 1_262_489;
-        let mut body = "x".repeat(DEEPEST_MEASURED_OFFSET);
+        const DEEP: usize = 1_262_489;
+        let mut body = "x".repeat(DEEP);
         body.push_str("Code: 396. DB::Exception: Limit for result exceeded");
-        assert_eq!(body.find("Code: "), Some(DEEPEST_MEASURED_OFFSET));
+        assert_eq!(body.find("Code: "), Some(DEEP));
         assert_eq!(parse_exception_code(&body), Some(396));
     }
 
@@ -398,24 +474,26 @@ mod tests {
     /// after. Verbatim `ChError::Server.message` from `SELECT
     /// toString(dummy) AS v FROM remote('127.0.0.1:9999', system.one)` on
     /// 24.8.14.39 (26.3.17.110 renders the same shape, only the version
-    /// strings differ). First-match returns 519, what actually failed;
-    /// taking the LAST match instead would return the innermost 210 —
-    /// which is in `RETRYABLE_SERVER_CODES` while 519 is not, so the choice
-    /// is not cosmetic.
-    #[test]
-    fn nested_exception_yields_the_outermost_code() {
+    /// strings differ). Arriving with nothing written before it, this takes
+    /// arm 1 and reads 519 — what actually failed, and what the pre-#382
+    /// read returned, so nothing correct today moves.
+    fn nested_body() -> String {
         let refused = "Code: 210. DB::NetException: Connection refused (127.0.0.1:9999). \
                        (NETWORK_ERROR) (version 24.8.14.39 (official build))";
-        let body = format!(
+        format!(
             "Code: 519. DB::NetException: All attempts to get table structure failed. Log: \n\n\
              Code: 279. DB::NetException: All connection tries failed. Log: \n\n\
              {refused}\n{refused}\n{refused}\n\n. \
              (ALL_CONNECTION_TRIES_FAILED) (version 24.8.14.39 (official build))\n\n. \
              (NO_REMOTE_SHARD_AVAILABLE) (version 24.8.14.39 (official build))"
-        );
+        )
+    }
+
+    #[test]
+    fn nested_exception_yields_the_outermost_code() {
+        let body = nested_body();
         assert_eq!(parse_exception_code(&body), Some(519));
-        // Not the innermost, and not the pre-#382 reading either: both reads
-        // agree here, which is the point — the change moves nothing.
+        // Both reads agree here, which is the point — the change moves nothing.
         assert_eq!(
             body.strip_prefix("Code: ")
                 .and_then(|r| r.split(['.', ' ']).next())
@@ -424,9 +502,97 @@ mod tests {
         );
     }
 
+    /// The accepted residual of anchoring arm 2 on the LAST marker: the same
+    /// nested exception, arriving after output was written, reports the
+    /// innermost cause instead of the outermost. Both codes are
+    /// server-authored — the tenant cannot steer which — and this body reads
+    /// as `0` under the pre-#382 parse, so the residual only ever touches a
+    /// case that is already broken. Recorded rather than claimed away.
+    ///
+    /// Defeats: `strip_prefix` (0), and first-match (519).
+    #[test]
+    fn a_nested_exception_after_written_output_reports_the_innermost_cause() {
+        let body = format!("\u{1}\u{1}v\u{6}String{}", nested_body());
+        assert_eq!(parse_exception_code(&body), Some(210));
+        assert_eq!(body.strip_prefix("Code: "), None, "0 before this change");
+    }
+
+    /// **The finding this rule exists for.** Result bytes are
+    /// tenant-controlled: a stored log line can carry a whole forged
+    /// `Code: N. DB::Exception: …`. It must never decide the
+    /// classification, wherever in the result it sits — near the front, near
+    /// the very end, or repeatedly.
+    ///
+    /// Defeats: `strip_prefix` (0), and first-match (the forged 210).
+    #[test]
+    fn result_bytes_cannot_forge_the_code_wherever_they_sit() {
+        let forged = "Code: 210. DB::Exception: a line a tenant stored";
+        let real = "Code: 396. DB::Exception: Limit for result exceeded. \
+                    (TOO_MANY_ROWS_OR_BYTES) (version 26.3.17.110 (official build))";
+        for result_bytes in [
+            format!("\u{1}\u{1}v\u{6}String{forged} then 800 KiB of other rows"),
+            format!("\u{1}\u{1}v\u{6}String{} {forged}", "row ".repeat(2000)),
+            format!("\u{1}\u{1}v\u{6}String{forged}{forged}{forged}"),
+        ] {
+            let body = format!("{result_bytes}{real}");
+            assert_eq!(
+                parse_exception_code(&body),
+                Some(396),
+                "the appended exception must win over tenant bytes"
+            );
+        }
+        // 210 is retryable and 396 is not, so picking the forgery would also
+        // have handed a tenant the retry decision.
+        assert!(RETRYABLE_SERVER_CODES.contains(&210));
+        assert!(!RETRYABLE_SERVER_CODES.contains(&396));
+    }
+
+    /// The reason arm 2 anchors on the last **marker** and not the last
+    /// **framed** marker. `getCurrentExceptionMessage` renders a non-`DB::`
+    /// failure as `Poco::Exception. Code: N, e.code() = …`. Had the rule
+    /// scanned back for the last *framed* occurrence, it would have stepped
+    /// over that trailing exception and handed the decision to the tenant's
+    /// forged text. Anchored on the last marker it cannot: the parse fails
+    /// to `0`, the pre-change reading, never to the tenant's code.
+    ///
+    /// Defeats: first-match and last-framed-match (both the forged 210).
+    /// `strip_prefix` also reads 0 here, so this one does not discriminate
+    /// against the pre-change tree — it discriminates against the two rules
+    /// that were considered and rejected.
+    #[test]
+    fn an_unframed_server_exception_does_not_let_result_bytes_decide() {
+        let body = "\u{1}\u{1}v\u{6}StringCode: 210. DB::Exception: a line a tenant stored\
+                    Poco::Exception. Code: 1000, e.code() = 111, Connection refused";
+        assert_eq!(parse_exception_code(body), None);
+        // What a last-FRAMED-occurrence rule would have returned instead.
+        assert_eq!(body.rfind("Code: 210. DB::").map(|_| 210), Some(210));
+    }
+
+    /// The other way the rule can fail, also to `0`: ClickHouse echoes query
+    /// text into some messages (a 427 carries the user's regex), so a
+    /// pattern containing `Code: 42` can become the last marker in the body.
+    /// Unframed, so the parse yields `None` — the pre-change reading, and
+    /// still not a code the pattern chose.
+    ///
+    /// This is the price of anchoring on the last marker, stated rather than
+    /// hidden: first-match and last-framed-match both read 427 here and this
+    /// rule reads 0. It is the fail-safe direction, and it is the same
+    /// direction the pre-change tree already failed in. Post-flush 427 was
+    /// not produced by any measured shape (RE2 compiles before output), so
+    /// no measured case pays it — but that is an observation, not a proof of
+    /// unreachability, which is why the cost is pinned here.
+    ///
+    /// Defeats: first-match and last-framed-match (both 427).
+    #[test]
+    fn a_code_echoed_inside_the_exception_text_fails_to_zero() {
+        let body = "\u{1}\u{1}v\u{6}StringCode: 427. DB::Exception: cannot compile re2: \
+                    ^(?:Code: 42), error: missing ): while executing 'FUNCTION match'";
+        assert_eq!(parse_exception_code(body), None);
+    }
+
     /// `Code: N` past byte 0 without the `. DB::` framing is result data,
     /// not an exception — rejected, so a log line that merely mentions a
-    /// code cannot re-classify a failure.
+    /// code cannot re-classify a failure, and cannot mask one either.
     #[test]
     fn an_unframed_code_past_byte_zero_is_not_believed() {
         assert_eq!(
@@ -515,10 +681,10 @@ mod tests {
         assert!(!RETRYABLE_SERVER_CODES.contains(&0));
     }
 
-    /// A digit run too wide for `i32` is not a code: the parse fails, and
-    /// the scan must move on rather than stop at the failed candidate.
+    /// A digit run too wide for `i32` is not a code: arm 1 declines it and
+    /// arm 2 still reaches the real trailing exception.
     #[test]
-    fn an_overlong_digit_run_is_skipped_not_returned() {
+    fn an_overlong_digit_run_is_not_returned() {
         assert_eq!(
             parse_exception_code("Code: 99999999999999. DB::Exception: x"),
             None
@@ -529,15 +695,15 @@ mod tests {
         );
     }
 
-    /// The accepted residual: retained result bytes carrying the FULL
-    /// framing win over the exception ClickHouse appended after them.
-    /// Pinned rather than fixed — see [`parse_exception_code`] for why
-    /// last-match is worse.
+    /// The finding's own case, stated the way it now behaves: retained
+    /// result bytes carrying the FULL framing lose to the exception
+    /// ClickHouse appended after them. This is the assertion that was
+    /// inverted — it read `Some(42)` while the rule took the first match.
     #[test]
-    fn framed_text_inside_result_bytes_wins_over_the_appended_exception() {
+    fn the_appended_exception_wins_over_framed_text_inside_result_bytes() {
         let body = "\u{2}a stored log line: Code: 42. DB::Exception: something a tenant logged\
                     Code: 396. DB::Exception: Limit for result exceeded. (TOO_MANY_ROWS_OR_BYTES)";
-        assert_eq!(parse_exception_code(body), Some(42));
+        assert_eq!(parse_exception_code(body), Some(396));
     }
 
     /// A body cut short: digits with nothing after them are rejected past
