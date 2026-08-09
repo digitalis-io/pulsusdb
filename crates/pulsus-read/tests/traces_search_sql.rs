@@ -684,7 +684,11 @@ fn shipped_shapes_and_limits_are_documented() {
         "\"partial\":<bool>,\"limit\":<n>,\"returned\":<n>",
         "**Ordering contract:**",
         "trace_id` ascending as the tiebreak",
-        "query_too_broad",
+        // The §4.2 budget-rejection row. Issue #384 removed the
+        // `errorType` vocabulary from §4 with the JSON envelope, so the
+        // old `query_too_broad` needle would now pass only if the doc
+        // still named a field the wire no longer carries.
+        "too broad to bound, never silently slow or quietly incomplete | `422` |",
         "mutually exclusive",
         "logfmt",
         // Issue #57 re-audit: the response string-truncation contract.

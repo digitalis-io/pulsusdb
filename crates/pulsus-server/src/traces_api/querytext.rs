@@ -156,7 +156,7 @@ pub(crate) use leaf::TraceQlText;
 /// a different layer.
 pub(crate) const MAX_QUERY_EXPRESSION_BYTES: usize = 128 * 1024;
 
-/// The rejections this module can produce. `400 bad_data` via the
+/// The rejections this module can produce. `400` via the
 /// search / metrics parameter errors that carry it.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum QueryTextError {
@@ -175,36 +175,24 @@ pub(crate) enum QueryTextError {
     /// `pulsus_traceql`'s message, not Go's — the parser messages have
     /// never been byte-identical and are not an identity.
     ///
-    /// `message`/`position` rather than the `TraceQlError` itself so this
-    /// enum keeps `PartialEq`/`Eq` (`TraceQlError` has neither); the
-    /// offset is the error's span start, the same value
-    /// `error::ApiError::Query` puts in the envelope's `position`.
+    /// `message` rather than the `TraceQlError` itself so this enum keeps
+    /// `PartialEq`/`Eq` (`TraceQlError` has neither). There is no separate
+    /// offset field: every positioned `TraceQlError` renders `at byte {n}`
+    /// into its own message, and since issue #384 dropped the JSON
+    /// envelope the message is the ONLY place an offset travels on this
+    /// surface — asserted in
+    /// `an_unparseable_expression_is_rejected_with_the_reference_prefix_and_an_offset`.
     #[error("invalid TraceQL query: {message}")]
-    Invalid { message: String, position: usize },
+    Invalid { message: String },
 
     /// The expression parsed but failed the reference's semantic
     /// validation (issue #328, `pulsus_traceql::validate` — the
     /// middleware's `traceql.Validate` at
     /// `async_query_validator_middleware.go:51`). Same `invalid TraceQL
-    /// query: ` wrapping as the parse half (`:54` wraps both); no
-    /// position — the reference's Validate errors carry no line/col.
+    /// query: ` wrapping as the parse half (`:54` wraps both); no byte
+    /// offset — the reference's Validate errors carry no line/col.
     #[error("invalid TraceQL query: {0}")]
     Semantic(pulsus_traceql::ValidateError),
-}
-
-impl QueryTextError {
-    /// The byte offset into the rejected expression, for the `400`
-    /// envelope's `position` field. `None` for the length cap (the
-    /// reference's message names no offset there either — the whole
-    /// value is the problem) and for a semantic rejection (the
-    /// reference's Validate errors carry no line/col).
-    pub(crate) fn position(&self) -> Option<usize> {
-        match self {
-            QueryTextError::TooLong { .. } => None,
-            QueryTextError::Invalid { position, .. } => Some(*position),
-            QueryTextError::Semantic(_) => None,
-        }
-    }
 }
 
 /// The reference's `traceql.Validate` step
@@ -233,7 +221,6 @@ pub(crate) fn validate_traceql_query(raw: &str) -> Result<(), QueryTextError> {
     check_length(raw)?;
     let query = pulsus_traceql::parse(raw).map_err(|e| QueryTextError::Invalid {
         message: e.to_string(),
-        position: e.span().start,
     })?;
     // The reference's `traceql.Validate(expr)` at `:51` (issue #328) —
     // after the parse succeeds, exactly as the middleware sequences it.
@@ -341,7 +328,7 @@ mod tests {
             "TraceQL expression exceeds the configured maximum size of 131072 bytes, reduce \
              the query expression size or contact your system administrator"
         );
-        assert_eq!(err.position(), None);
+        assert!(!err.to_string().contains("byte "), "got {err}");
     }
 
     // --- issue #326: the validator's parse step -------------------------
@@ -373,6 +360,11 @@ mod tests {
 
     /// The parse step, with the reference's `:54` prefix and an offset
     /// into the rejected text.
+    ///
+    /// Issue #384: the offset is asserted on the MESSAGE, which is where
+    /// it reaches the client now that this surface writes a bare
+    /// plain-text body with no `position` field
+    /// (`traces_api::error::plain_text_error`).
     #[test]
     fn an_unparseable_expression_is_rejected_with_the_reference_prefix_and_an_offset() {
         let err = validate_traceql_query("{ .a = }").expect_err("unparseable");
@@ -380,12 +372,15 @@ mod tests {
             err.to_string().starts_with("invalid TraceQL query: "),
             "got {err}"
         );
-        assert_eq!(err.position(), Some(7), "the offset of the stray '}}'");
+        assert!(
+            err.to_string().contains("byte 7"),
+            "the offset of the stray '}}' must be in the message, got {err}"
+        );
 
         // End-of-input failures carry the zero-width end offset, so a
         // truncated expression still points somewhere real.
         let err = validate_traceql_query("{").expect_err("unparseable");
-        assert_eq!(err.position(), Some(1));
+        assert!(err.to_string().contains("byte 1"), "got {err}");
     }
 
     /// ORDER. `:45` returns before `:49` runs, so a value that is both

@@ -470,3 +470,53 @@ re-decide from the evidence rather than re-derive it.
   dropped unpinned. Production:
   `traces::exec::sort_histogram_series_by_bucket_ascending`. User-facing
   write-up: docs/api.md §4.4.1.
+
+### `traces-absent-trace-404-body` (issue #384)
+
+- **What:** `GET /api/traces/v1/trace/{traceId}` for a trace that is not
+  stored answers `404` with the body `trace not found` under
+  `Content-Type: text/plain; charset=utf-8`. The reference answers `404`
+  with **no body at all and no `Content-Type` header** — measured on the
+  CI-pinned oracle (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf5516
+  9bb8d135852ad58700aa96880653c3d8f7`, the digest at
+  `.github/workflows/ci.yml:483`), on `/api/traces/{id}` for a valid,
+  absent 32-hex id. Every other §4 error body matches the reference's
+  container exactly; this one row is about the body being EMPTY, not
+  about the envelope #384 removed.
+
+- **Why we do not match it.** `api_conformance`'s fetch surface has no
+  other live mounting oracle. Against that suite's empty databases the
+  documented outcome of a well-formed fetch IS the absent-trace `404`, so
+  a mounted-but-absent response and axum's unrouted `404` are told apart
+  by exactly one thing: our body is non-empty and axum's is not
+  (`assert_404_empty`). Making ours empty makes a silently unmounted
+  `/api/traces/v1/trace/{traceId}` indistinguishable from a working one,
+  in every mode-gated spawn the suite runs.
+
+  `route_inventory` does **not** stand in for that, and this was checked
+  rather than assumed: that guard is hermetic and starts no server — no
+  spawn, no socket, no request anywhere in the file. It scans the router
+  **source text** for `.route(` registrations and compares the extracted
+  `(method, path)` set against the manifest, pins the composition
+  functions' bodies, and checks `docs/api.md` mentions each mounted path.
+  So it proves the route is registered in the tree and documented; it
+  cannot observe that a running `pulsusdb`, under a given
+  reader/writer/compat gating, actually serves that path from the traces
+  handler rather than from axum's fallback. That is the property the live
+  oracle exists for.
+
+- **Consumer impact.** A client distinguishes "absent" from "unrouted" by
+  the `404` status, which is identical on both sides; ours additionally
+  carries a human-readable reason. Nothing in the Grafana Tempo
+  datasource's path branches on the body of a `404`.
+
+- **Where it is enforced.** `api_conformance`'s
+  `assert_traces_fetch_route` (the `documented-method-absent-404`,
+  `short-16-hex-absent-404` and `absent-404-stays-plain-text` cells) and
+  `traces_api_live::assert_error_body`. User-facing write-up:
+  docs/api.md §4.1.
+
+- **Retiring this row** means giving the fetch surface a live mounting
+  oracle that does not read the body — the `405 Allow: GET,HEAD` cell and
+  the `Vary: accept` header on the `404` are both candidates — and then
+  emptying the body.

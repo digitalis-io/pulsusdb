@@ -83,8 +83,7 @@ fn render(graph: &ServiceGraph) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use axum::body::to_bytes;
-
+    use super::super::error::testutil::error_body;
     use super::*;
     use crate::app::BuildInfo;
     use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
@@ -115,16 +114,12 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
-        let status = res.status();
-        let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
-    }
-
-    async fn run(query: &str) -> (StatusCode, serde_json::Value) {
+    /// Every case below is an ERROR response, so it goes through
+    /// `error::testutil::error_body`, which asserts Tempo's container on
+    /// the way through (#384).
+    async fn run(query: &str) -> (StatusCode, String) {
         let res = service_graph(State(test_state()), RawQuery(Some(query.to_string()))).await;
-        status_and_body(res).await
+        error_body(res).await
     }
 
     // Param failures resolve BEFORE the pool is consulted, so the no-pool
@@ -132,32 +127,29 @@ mod tests {
     // 503 (no pool), proving parse precedes execution.
 
     #[tokio::test]
-    async fn a_missing_window_is_400_bad_data() {
-        let (status, json) = run("").await;
+    async fn a_missing_window_is_400() {
+        let (status, body) = run("").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
-        assert!(json.get("position").is_none());
+        assert!(!body.contains("byte "), "body {body}");
     }
 
     #[tokio::test]
-    async fn an_inverted_range_is_400_bad_data() {
-        let (status, json) = run("start=200&end=100").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
+    async fn an_inverted_range_is_400() {
+        let (status, body) = run("start=200&end=100").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
     }
 
     #[tokio::test]
-    async fn since_together_with_absolute_bounds_is_400_bad_data() {
-        let (status, json) = run("since=1h&start=1700000000&end=1700003600").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data", "body {json}");
+    async fn since_together_with_absolute_bounds_is_400() {
+        let (status, body) = run("since=1h&start=1700000000&end=1700003600").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
     }
 
     #[tokio::test]
-    async fn a_well_formed_request_without_a_pool_is_503_unavailable() {
-        let (status, json) = run("start=1700000000&end=1700003600").await;
+    async fn a_well_formed_request_without_a_pool_is_503() {
+        let (status, body) = run("start=1700000000&end=1700003600").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[test]

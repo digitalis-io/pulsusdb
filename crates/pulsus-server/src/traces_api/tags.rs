@@ -67,9 +67,9 @@ async fn tag_values_impl(state: AppState, raw_tag: &str) -> Result<Response, Api
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::testutil::error_body;
     use super::*;
 
-    use axum::body::to_bytes;
     use pulsus_config::Config;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -99,50 +99,44 @@ mod tests {
         }
     }
 
-    async fn status_and_body(res: Response) -> (StatusCode, serde_json::Value) {
-        let status = res.status();
-        let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        (status, json)
-    }
-
     // Param failures resolve BEFORE the pool is consulted (no-pool test
     // state); a well-formed request stops at 503, proving parse precedes
     // execution.
 
     #[tokio::test]
-    async fn a_bogus_scope_is_400_bad_data_before_the_pool() {
+    async fn a_bogus_scope_is_400_before_the_pool() {
         let res = tags(
             State(test_state()),
             RawQuery(Some("scope=bogus".to_string())),
         )
         .await;
-        let (status, json) = status_and_body(res).await;
+        // `error_body` asserts Tempo's container on the way through, so
+        // this module is not a hole in the #384 check.
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
+        assert!(body.contains("bogus"), "body {body}");
     }
 
     #[tokio::test]
-    async fn a_well_formed_tags_request_without_a_pool_is_503_unavailable() {
+    async fn a_well_formed_tags_request_without_a_pool_is_503() {
         let res = tags(State(test_state()), RawQuery(None)).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 
     #[tokio::test]
-    async fn an_empty_tag_key_is_400_bad_data_before_the_pool() {
+    async fn an_empty_tag_key_is_400_before_the_pool() {
         let res = tag_values(State(test_state()), Path("resource.".to_string())).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, _) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["errorType"], "bad_data");
     }
 
     #[tokio::test]
-    async fn a_well_formed_values_request_without_a_pool_is_503_unavailable() {
+    async fn a_well_formed_values_request_without_a_pool_is_503() {
         let res = tag_values(State(test_state()), Path("service.name".to_string())).await;
-        let (status, json) = status_and_body(res).await;
+        let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(json["errorType"], "unavailable");
+        assert_eq!(body, "clickhouse pool not yet established");
     }
 }

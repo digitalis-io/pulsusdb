@@ -12,9 +12,9 @@
 //!   are the **only** escapes (anything else is a `400`). An unquoted
 //!   value ends at whitespace and may contain neither `=` nor `"`; a
 //!   quoted value must be followed by whitespace or end-of-input. A bare
-//!   key with no `=`, an empty key, or an unterminated quote is a `400
-//!   bad_data` — every grammar error carries a `position` (byte offset
-//!   into the decoded `tags` value).
+//!   key with no `=`, an empty key, or an unterminated quote is a `400`
+//!   — every grammar error names a byte offset into the decoded `tags`
+//!   value, inside its message.
 //! - `minDuration`/`maxDuration` compile to `duration >= <lit>` /
 //!   `duration <= <lit>` conjuncts; a malformed duration surfaces as the
 //!   parser's positioned error → `400`.
@@ -23,9 +23,9 @@
 
 use thiserror::Error;
 
-/// Errors from the strict logfmt `tags` grammar — mapped to `400
-/// bad_data` with `position` = the byte offset into the decoded `tags`
-/// value ([`LegacyError::pos`]).
+/// Errors from the strict logfmt `tags` grammar — mapped to `400`, each
+/// message naming the byte offset into the decoded `tags` value (issue
+/// #384: the offset travels in the message, there is no `position` field).
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum LegacyError {
     #[error("invalid 'tags' logfmt at byte {pos}: bare key {key:?} has no '=' value")]
@@ -54,22 +54,6 @@ pub(crate) enum LegacyError {
          \\\\ are recognized inside quotes"
     )]
     InvalidEscape { escape: char, pos: usize },
-}
-
-impl LegacyError {
-    /// The byte offset into the decoded `tags` value — surfaced as the
-    /// error envelope's `position` field.
-    pub(crate) fn pos(&self) -> usize {
-        match self {
-            LegacyError::BareKey { pos, .. }
-            | LegacyError::UnterminatedQuote { pos, .. }
-            | LegacyError::EmptyKey { pos }
-            | LegacyError::UnquotedEquals { pos, .. }
-            | LegacyError::UnquotedQuote { pos, .. }
-            | LegacyError::MissingSeparator { pos }
-            | LegacyError::InvalidEscape { pos, .. } => *pos,
-        }
-    }
 }
 
 /// One parsed logfmt pair.
@@ -325,6 +309,10 @@ mod tests {
         );
     }
 
+    /// Issue #384: every variant names its byte offset in its own
+    /// MESSAGE, which since the JSON envelope went away is the only place
+    /// the offset reaches a client
+    /// (`traces_api::error::plain_text_error`).
     #[test]
     fn every_error_variant_reports_its_position() {
         let cases: Vec<(LegacyError, usize)> = vec![
@@ -367,7 +355,10 @@ mod tests {
             ),
         ];
         for (err, want) in cases {
-            assert_eq!(err.pos(), want, "{err}");
+            assert!(
+                err.to_string().contains(&format!("byte {want}")),
+                "{err}: must name byte {want}"
+            );
         }
     }
 

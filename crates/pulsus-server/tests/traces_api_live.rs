@@ -556,22 +556,40 @@ fn assert_context_preserved(data: &TracesData, ctx: &str) {
     }
 }
 
-fn assert_error_envelope(res: &RawResponse, status: u16, error_type: &str, ctx: &str) {
+/// Issue #384: every §4 error is Tempo's frontend container over the real
+/// wire — `text/plain; charset=utf-8`, **no** `X-Content-Type-Options`, no
+/// trailing newline, and not JSON — carrying the message and nothing else.
+/// Returns the body so the caller can assert the message with a LITERAL
+/// needle (the #237 Rule D shape: a derived needle in a substring search
+/// over a wire body is exactly what that guard forbids).
+///
+/// `nosniff`'s absence is the property that separates this container from
+/// `logs_api`'s (`pkg/util/server/error.go:49 @ loki v3.7.4` sets it;
+/// Tempo's frontend sets no headers at all,
+/// `modules/frontend/handler.go:113-116 @ tempo v3.0.2`). Reusing the
+/// LogQL responder would pass every other assertion here.
+fn assert_error_body(res: &RawResponse, status: u16, ctx: &str) -> String {
+    let body = String::from_utf8_lossy(&res.body).into_owned();
+    assert_eq!(res.status, status, "{ctx}: status (body: {body:?})");
     assert_eq!(
-        res.status,
-        status,
-        "{ctx}: status (body: {:?})",
-        String::from_utf8_lossy(&res.body)
+        res.content_type(),
+        Some("text/plain; charset=utf-8"),
+        "{ctx}: error content type"
+    );
+    assert_eq!(
+        res.headers.get("x-content-type-options"),
+        None,
+        "{ctx}: Tempo's frontend emits no nosniff"
     );
     assert!(
-        res.content_type()
-            .is_some_and(|ct| ct.starts_with("application/json")),
-        "{ctx}: errors must stay JSON, content-type {:?}",
-        res.content_type()
+        !res.body.ends_with(b"\n"),
+        "{ctx}: no trailing newline, got {body:?}"
     );
-    let json = res.json(ctx);
-    assert_eq!(json["status"], "error", "{ctx}");
-    assert_eq!(json["errorType"], error_type, "{ctx}: body {json}");
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&res.body).is_err(),
+        "{ctx}: the body must not parse as JSON, got {body:?}"
+    );
+    body
 }
 
 // ---------------------------------------------------------------------
@@ -688,18 +706,27 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     // exercised on the success path, not only error paths).
     let ctx = "GET trace A with Accept: text/plain";
     let res = get(PORT, &fetch_path(&a_hex), &[("accept", "text/plain")], ctx);
-    assert_error_envelope(&res, 406, "not_acceptable", ctx);
+    let body = assert_error_body(&res, 406, ctx);
+    assert!(
+        body.contains("no acceptable representation"),
+        "{ctx}: {body:?}"
+    );
     assert!(has_vary_accept(&res), "{ctx}: 406 must Vary: accept");
 
     // -- Absent + malformed ids.
     let ctx = "GET absent trace";
     let res = get(PORT, &fetch_path(&"ee".repeat(16)), &[], ctx);
-    assert_error_envelope(&res, 404, "not_found", ctx);
+    let body = assert_error_body(&res, 404, ctx);
+    assert!(body.contains("trace not found"), "{ctx}: {body:?}");
     assert!(has_vary_accept(&res), "{ctx}: 404 must Vary: accept");
 
     let ctx = "GET malformed trace id";
     let res = get(PORT, &fetch_path("zzzz"), &[], ctx);
-    assert_error_envelope(&res, 400, "bad_data", ctx);
+    let body = assert_error_body(&res, 400, ctx);
+    assert!(
+        body.contains("expected 16 or 32 hex characters"),
+        "{ctx}: {body:?}"
+    );
     assert!(has_vary_accept(&res), "{ctx}: 400 must Vary: accept");
 
     // -- Dedup: ingest the same span twice, fetch returns it once.

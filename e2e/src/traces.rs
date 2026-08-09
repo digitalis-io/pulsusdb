@@ -618,18 +618,50 @@ async fn fetch_tempo_trace(
     }
 }
 
-/// The shared status-returning search core (issue #328 D3′): one GET
-/// against `url`, returning the status AND the body so a caller can
-/// assert a REJECTION — the JSON-returning wrappers below `bail!` on
-/// every non-2xx and structurally cannot.
-async fn search_status(
+/// One rejection response's whole observable wire shape — issue #384's
+/// two-sided gate needs the CONTAINER, not just the status and body.
+/// Scenario-local on purpose: nothing derives `Row`, nothing is shared.
+#[derive(Debug)]
+struct ErrorWire {
+    status: reqwest::StatusCode,
+    content_type: Option<String>,
+    nosniff: bool,
+    body: Vec<u8>,
+}
+
+impl ErrorWire {
+    fn is_plain_text(&self) -> bool {
+        self.content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("text/plain"))
+    }
+
+    fn ends_with_lf(&self) -> bool {
+        self.body.ends_with(b"\n")
+    }
+
+    fn is_json(&self) -> bool {
+        serde_json::from_slice::<serde_json::Value>(&self.body).is_ok()
+    }
+
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
+}
+
+/// The shared search core: one GET against `url`, returning the whole
+/// wire shape so a caller can assert a REJECTION's container as well as
+/// its status (issue #328 D3′ for the status/body half; issue #384 added
+/// the headers). The JSON-returning wrappers below `bail!` on every
+/// non-2xx and structurally cannot.
+async fn search_wire(
     ctx: &Ctx,
     url: &str,
     q: &str,
     window: SearchWindow,
     limit: u32,
     query_timeout: Duration,
-) -> Result<(reqwest::StatusCode, String)> {
+) -> Result<ErrorWire> {
     let start = window.start_s.to_string();
     let end = window.end_s.to_string();
     let limit_s = limit.to_string();
@@ -647,8 +679,33 @@ async fn search_status(
         .await
         .with_context(|| format!("GET {url} failed"))?;
     let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    Ok((status, body))
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let nosniff = res.headers().contains_key("x-content-type-options");
+    let body = res.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+    Ok(ErrorWire {
+        status,
+        content_type,
+        nosniff,
+        body,
+    })
+}
+
+/// [`search_wire`] narrowed to what the existing callers need, so their
+/// three call sites are unchanged.
+async fn search_status(
+    ctx: &Ctx,
+    url: &str,
+    q: &str,
+    window: SearchWindow,
+    limit: u32,
+    query_timeout: Duration,
+) -> Result<(reqwest::StatusCode, String)> {
+    let wire = search_wire(ctx, url, q, window, limit, query_timeout).await?;
+    Ok((wire.status, wire.text().into_owned()))
 }
 
 async fn search_status_pulsus(
@@ -2281,6 +2338,19 @@ async fn assert_reference_metrics_positive_control(
 /// where the reference answers. Hard-gated on BOTH sides: a PulsusDB
 /// 200 here is the validator not running end to end, a Tempo non-400 is
 /// a stale fixture premise.
+///
+/// Issue #384 added the second half, on the SAME requests (no extra
+/// round-trip, no extra CI budget): the two stores must also agree on
+/// the error CONTAINER — content type, `X-Content-Type-Options`,
+/// terminator, JSON-ness. The hermetic suites and the live conformance
+/// arm both check our side against a written-down expectation; this is
+/// the only leg that checks it against Tempo itself, which is what makes
+/// the `PlainTextWriter::TempoFrontendResponse` expectation evidence
+/// rather than a restatement of our own code.
+///
+/// The Tempo side is gated FIRST and separately, with the stale-premise
+/// wording: if the reference stopped writing plain text, this fixture's
+/// premise is what changed, not our responder.
 async fn assert_rejection_parity(
     ctx: &Ctx,
     fixture: &TracesFixture,
@@ -2288,33 +2358,117 @@ async fn assert_rejection_parity(
 ) -> Result<()> {
     let query_timeout = Duration::from_secs(30);
     for case in &fixture.rejection_cases {
-        let (pulsus_status, pulsus_body) =
-            search_status_pulsus(ctx, &case.q, window, fixture.limit, query_timeout)
-                .await
-                .with_context(|| format!("rejection case {:?} (pulsus)", case.case_id))?;
-        if pulsus_status != reqwest::StatusCode::BAD_REQUEST {
+        let pulsus = search_wire(
+            ctx,
+            &ctx.url("/api/traces/v1/search"),
+            &case.q,
+            window,
+            fixture.limit,
+            query_timeout,
+        )
+        .await
+        .with_context(|| format!("rejection case {:?} (pulsus)", case.case_id))?;
+        if pulsus.status != reqwest::StatusCode::BAD_REQUEST {
             bail!(
-                "rejection case {:?} ({}, q={:?}): PulsusDB answered {pulsus_status} instead of                  400: {pulsus_body}",
+                "rejection case {:?} ({}, q={:?}): PulsusDB answered {} instead of 400: {}",
                 case.case_id,
                 case.check,
-                case.q
+                case.q,
+                pulsus.status,
+                pulsus.text()
             );
         }
-        let (tempo_status, tempo_body) =
-            search_status_tempo(ctx, &case.q, window, fixture.limit, query_timeout)
-                .await
-                .with_context(|| format!("rejection case {:?} (tempo)", case.case_id))?;
-        if tempo_status != reqwest::StatusCode::BAD_REQUEST {
+        let tempo = search_wire(
+            ctx,
+            &format!("{}/api/search", ctx.tempo_url),
+            &case.q,
+            window,
+            fixture.limit,
+            query_timeout,
+        )
+        .await
+        .with_context(|| format!("rejection case {:?} (tempo)", case.case_id))?;
+        if tempo.status != reqwest::StatusCode::BAD_REQUEST {
             bail!(
-                "rejection case {:?} ({}, q={:?}): Tempo answered {tempo_status} instead of 400                  — the fixture premise is stale: {tempo_body}",
+                "rejection case {:?} ({}, q={:?}): Tempo answered {} instead of 400 — the \
+                 fixture premise is stale: {}",
                 case.case_id,
                 case.check,
-                case.q
+                case.q,
+                tempo.status,
+                tempo.text()
             );
         }
+
+        // -- The Tempo-side VALIDITY gate. A reference that no longer
+        //    writes a bare plain-text body means the premise moved; say
+        //    so in those words rather than blaming our responder.
+        for (property, holds) in [
+            ("a text/plain content type", tempo.is_plain_text()),
+            ("no X-Content-Type-Options", !tempo.nosniff),
+            ("no trailing newline", !tempo.ends_with_lf()),
+            ("a body that is not JSON", !tempo.is_json()),
+        ] {
+            if !holds {
+                bail!(
+                    "rejection case {:?} ({}, q={:?}): Tempo's 400 no longer has {property} \
+                     — the fixture premise is stale. content-type={:?} nosniff={} body={:?}",
+                    case.case_id,
+                    case.check,
+                    case.q,
+                    tempo.content_type,
+                    tempo.nosniff,
+                    tempo.text()
+                );
+            }
+        }
+
+        // -- The DECISION gate: our container against the reference's,
+        //    property by property, each named in the failure.
+        for (property, ours, theirs) in [
+            (
+                "content type is text/plain",
+                pulsus.is_plain_text(),
+                tempo.is_plain_text(),
+            ),
+            (
+                "X-Content-Type-Options present",
+                pulsus.nosniff,
+                tempo.nosniff,
+            ),
+            (
+                "body ends in a newline",
+                pulsus.ends_with_lf(),
+                tempo.ends_with_lf(),
+            ),
+            ("body parses as JSON", pulsus.is_json(), tempo.is_json()),
+        ] {
+            if ours != theirs {
+                bail!(
+                    "rejection case {:?} ({}, q={:?}): error containers differ on \
+                     `{property}` — PulsusDB={ours}, Tempo={theirs}. \
+                     PulsusDB content-type={:?} nosniff={} body={:?}; \
+                     Tempo content-type={:?} nosniff={} body={:?}",
+                    case.case_id,
+                    case.check,
+                    case.q,
+                    pulsus.content_type,
+                    pulsus.nosniff,
+                    pulsus.text(),
+                    tempo.content_type,
+                    tempo.nosniff,
+                    tempo.text()
+                );
+            }
+        }
+
         println!(
-            "pulsus-e2e:   traces rejection parity {:?} ({}): both stores 400",
-            case.case_id, case.check
+            "pulsus-e2e:   traces rejection parity {:?} ({}): both stores 400, and the \
+             error containers agree (text/plain, nosniff={}, trailing-LF={}, json=false)",
+            case.case_id,
+            case.check,
+            pulsus.nosniff,
+            pulsus.ends_with_lf()
         );
     }
     Ok(())
