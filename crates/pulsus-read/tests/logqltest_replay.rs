@@ -548,14 +548,21 @@ fn a_ledgered_divergence_row_is_never_replayed() {
     }
 }
 
-/// Every slot the live leg uses must sit inside the reference's measured
-/// [`INGESTION_WINDOW`], or its pushes succeed and answer nothing — which
-/// reads exactly like a replay finding a mismatch.
+/// [`SLOT_SECS`] is squeezed from both sides, and BOTH sides are checked
+/// here — the upper one against the slice, the lower one against the
+/// corpus itself. Without the lower half a slot could be shortened until
+/// neighbouring cases interleaved in one stream, which the reference
+/// would merge and the replay would report as a value mismatch.
 ///
-/// Checked arithmetically, so widening the slice cannot outgrow the
-/// window unnoticed.
+/// Checked arithmetically and from the corpus, never from prose, so
+/// neither a widening slice nor a widening case can outgrow the layout
+/// unnoticed.
 #[test]
 fn slots_fit_inside_the_measured_ingestion_window() {
+    // ABOVE: every slot the live leg uses must sit inside the
+    // reference's measured `INGESTION_WINDOW`, or its pushes succeed and
+    // answer nothing — which reads exactly like a replay finding a
+    // mismatch.
     let span = SLOT_SECS * REACHABLE as u64;
     assert!(
         FIRST_SLOT_AGE.as_secs() + SLOT_SECS <= INGESTION_WINDOW.as_secs(),
@@ -570,6 +577,37 @@ fn slots_fit_inside_the_measured_ingestion_window() {
          {}s window)",
         FIRST_SLOT_AGE.as_secs(),
         INGESTION_WINDOW.as_secs()
+    );
+
+    // BELOW: a slot must hold its own case's sample span. Derived from
+    // the corpus rather than restated as a number in a comment, because
+    // it is the corpus that moves it — the widest case is whatever the
+    // widest case happens to be.
+    let widest_ns = classify()
+        .iter()
+        .filter_map(|r| r.reach.as_ref().ok())
+        .map(|c| {
+            let mut lo = i64::MAX;
+            let mut hi = i64::MIN;
+            for (ts, _) in c.load.iter().flat_map(|s| s.samples.iter()) {
+                lo = lo.min(*ts);
+                hi = hi.max(*ts);
+            }
+            if lo > hi { 0 } else { (hi - lo) as u64 }
+        })
+        .max()
+        .expect("the reachable slice is non-empty");
+    let widest_s = widest_ns.div_ceil(1_000_000_000);
+    // Twice, not merely more: the separation between two cases is the
+    // GAP after the widest one, so requiring the gap to be at least as
+    // large as the case keeps the margin proportional to what it
+    // separates instead of shrinking silently as cases grow.
+    assert!(
+        2 * widest_s <= SLOT_SECS,
+        "the widest reachable case spans {widest_s}s and the slot is {SLOT_SECS}s — a slot \
+         must leave a gap at least as wide as the case it holds, or two neighbours interleave \
+         in one stream and the reference merges them. Widen the slot (bounded above by \
+         `SLOT_SECS * REACHABLE <= FIRST_SLOT_AGE`, asserted above) or narrow the case."
     );
 }
 
@@ -664,12 +702,20 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// exclusion rather than [`PROVENANCE_PERMITS`]; the `eval` rows are all
 /// streams queries at a single instant over a relative-offset load set,
 /// so they move every figure here together.
-const TOTAL_DIRECTIVES: usize = 1_365;
+///
+/// Issue #389 adds `b23_json_raw_read.test`, captured against the same
+/// pinned image with no config delta. Its captured rows are all streams
+/// queries at a single instant over a relative-offset load set, so they
+/// move every figure here together; its mid-line-malformed rows carry a
+/// `divergence` marker and so enlarge the `pinned-divergence` exclusion
+/// instead, leaving [`PROVENANCE_PERMITS`] and [`REACHABLE`] to move by
+/// the captured share alone.
+const TOTAL_DIRECTIVES: usize = 1_400;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_075;
+const PROVENANCE_PERMITS: usize = 1_105;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -680,11 +726,14 @@ const PROVENANCE_PERMITS: usize = 1_075;
 /// streams query at a single instant over a relative-offset load set,
 /// and so is every permitted `b22_logfmt_expr_reject.test` row (issue
 /// #247) — its metric rows are all `eval_fail`, which the markers do not
-/// permit in the first place.
-const REACHABLE: usize = 148;
+/// permit in the first place. `b23_json_raw_read.test` (issue #389) is
+/// the same shape throughout: every permitted row is a streams query at
+/// a single instant over a relative-offset load set, so its whole
+/// captured share lands here.
+const REACHABLE: usize = 178;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=128, not a capture claim (derived)=29, \
-not a capture claim (ported)=29, our-error-text (eval_fail)=86, pinned-divergence=18";
+not a capture claim (ported)=29, our-error-text (eval_fail)=86, pinned-divergence=23";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice
@@ -700,12 +749,43 @@ metric query (slice: streams only)=239, range/matrix eval (slice: instant only)=
 /// asserted by [`slots_fit_inside_the_measured_ingestion_window`].
 const FIRST_SLOT_AGE: Duration = Duration::from_secs(150 * 60);
 
-/// One case's exclusive time slot. Every corpus case spans at most 10s,
-/// so 60s leaves ample separation between neighbours — needed because
-/// the corpus reuses stream labels constantly (`clear` scopes them, and
-/// the reference has no equivalent), so time is what keeps two cases
-/// apart.
-const SLOT_SECS: u64 = 60;
+/// One case's exclusive time slot: the corpus reuses stream labels
+/// constantly (`clear` scopes them and the reference has no
+/// equivalent), so time is the only thing keeping two cases apart.
+///
+/// **THE PROPERTY THIS VALUE HAS TO SATISFY, so the next person to move
+/// it does not have to re-derive it.** It is squeezed from both sides,
+/// and the window between them is what a change has to land in:
+///
+/// * **Above, by the slice.** Every reachable case gets its own slot and
+///   they march forward from [`FIRST_SLOT_AGE`] back, so
+///   `SLOT_SECS * REACHABLE <= FIRST_SLOT_AGE` — otherwise the last
+///   slots march past `now` and their entries are pushed into the
+///   future. [`slots_fit_inside_the_measured_ingestion_window`] asserts
+///   exactly this, and it is the assertion that moves when the corpus
+///   grows.
+/// * **Below, by the widest case.** A slot must hold its case's own
+///   sample span with room to spare, or two neighbouring cases' entries
+///   interleave in one stream and the reference merges them. The widest
+///   committed case spans 10s, so the value must stay comfortably above
+///   that — the gap, not the slot, is what does the separating.
+///
+/// So the admissible range today is roughly `[10s + headroom,
+/// FIRST_SLOT_AGE / REACHABLE]`, and `FIRST_SLOT_AGE` is itself capped
+/// by [`INGESTION_WINDOW`]. **When the corpus outgrows this again there
+/// are two levers, and they are not equivalent**: shortening the slot
+/// spends the lower margin, while raising [`FIRST_SLOT_AGE`] spends the
+/// [`INGESTION_WINDOW`] margin — and that one is the dangerous side,
+/// because the leg spends real wall-clock time between planning the
+/// slots and querying them, so a slot placed near the window's edge can
+/// fall OUT of it mid-run and read as a mismatch rather than as a
+/// misconfiguration. Prefer the slot until the gap gets tight, then
+/// widen the window's own headroom deliberately.
+///
+/// It was 60s until issue #389 widened the slice past what
+/// [`FIRST_SLOT_AGE`] could hold at that width. 45s satisfies both
+/// bounds with a 35s gap after the widest case.
+const SLOT_SECS: u64 = 45;
 
 // ---------------------------------------------------------------------
 // The live replay (issue #352 step 3).

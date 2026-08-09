@@ -252,6 +252,53 @@ fn per_row_allocation_bounds_hold() {
          {clean_or_total} for a clean keep — a skipped operand must not cost anything"
     );
 
+    // --- Issue #389 part B: a targeted `| json` extraction that lands on
+    // --- an object or array hands back the DOCUMENT'S OWN BYTES instead
+    // --- of re-rendering a parsed value. One owned copy of the span, and
+    // --- nothing per key.
+    //
+    // The bound is stated as a DIFFERENCE against a scalar extraction
+    // from the SAME line, so the line's own parse cost — which dominates
+    // and is not what this gate is about — cancels. Scale-invariant by
+    // construction: the second half extracts a much larger container out
+    // of the same line and requires the difference not to grow with it.
+    //
+    // What it rules out, measured on this machine at the commit before
+    // the fix: re-rendering the small object costs 14 allocations/row on
+    // top of the scalar extraction and the large one costs proportionally
+    // more, so a regression to that shape fails BOTH halves rather than
+    // drifting under a loose ceiling. The span search itself allocates
+    // nothing (it borrows out of the line and skips with `IgnoredAny`),
+    // and neither does the debug-build check that the span and the walked
+    // node agree — it compares them in lockstep rather than building a
+    // value out of each side, which is why this measurement is the arm's
+    // and not its invariant's.
+    {
+        let mut big = String::from(r#"{"kk0":"vv0""#);
+        for i in 1..40 {
+            big.push_str(&format!(r#","kk{i}":"vv{i}""#));
+        }
+        big.push('}');
+        let json_bodies = vec![format!(
+            r#"{{"ts":"2026-08-09T12:00:00Z","level":"info","request":{{"method":"GET",  "path":"/api/items/42","proto":"HTTP/1.1","ua":"curl/8.5.0"}},"status":200,"big":{big},"host":"api-7"}}"#
+        )];
+        let scalar = count_run_into(r#"{a="b"} | json v="status""#, &json_bodies, &base);
+        let small = count_run_into(r#"{a="b"} | json v="request""#, &json_bodies, &base);
+        let large = count_run_into(r#"{a="b"} | json v="big""#, &json_bodies, &base);
+        // The container arm's whole cost over the scalar arm is the one
+        // owned `String` the label value has to be.
+        const SPAN_COPY: u64 = 1;
+        assert!(
+            small <= scalar + SPAN_COPY * ROWS + ZERO_RESIDUE,
+            "container extraction: {small} allocations over {ROWS} rows against {scalar} for a              scalar extraction from the same line — the container arm must cost one owned span              copy per row, not a re-rendering"
+        );
+        // ... and it does not depend on the container's size.
+        assert!(
+            large <= small + ZERO_RESIDUE,
+            "container extraction is not scale-invariant: {large} allocations over {ROWS} rows              for a 40-key object against {small} for a 4-key one out of the SAME line — the arm              must copy the span, never walk it"
+        );
+    }
+
     // --- Assembly paths (`run_pipeline_rows` end to end). Output
     // --- materialization is inherent (owned `StreamResult`s), so these
     // --- pin small per-surviving-row constants, not zero.

@@ -336,10 +336,19 @@ fn declared_slots(files: &[(String, String)], members: &[String]) -> Vec<Slot> {
 /// `Array` only by `visit_seq` and `Leaf` only by the scalar visitors
 /// (`visit_bool`/`i64`/`u64`/`f64`/`str`/`string`/`none`/`unit`), all
 /// inside `WireJsonVisitor` in `pipeline.rs`, and the only way in is
-/// `serde_json::from_str` — three call sites, all on a log line. So
+/// `parse_wire_json_prefix` — three call sites, all on a log line. So
 /// every value of this type came through the deserializer, which refuses
 /// a document nested past its own recursion limit, and no log line can
 /// make one deeper than that.
+///
+/// Issue #389 changed the SPELLING of that entry point and nothing else:
+/// `serde_json::from_str` became `serde_json::Deserializer::from_str`
+/// plus `WireJson::deserialize`, which is the same deserializer with the
+/// same limit, minus the `end()` call that used to refuse a line with
+/// bytes after the value. The limit is enforced by `deserialize_any`'s
+/// own descent, not by `end()`, so the bound is untouched — which is
+/// what the check below exists to say rather than assert in prose, and
+/// it passes UNCHANGED across that refactor.
 ///
 /// That also says WHERE the depth can be, which is why the check below
 /// is sufficient rather than merely present: since `Leaf` is built only

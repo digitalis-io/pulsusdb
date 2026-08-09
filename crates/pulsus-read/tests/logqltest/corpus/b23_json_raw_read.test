@@ -1,0 +1,422 @@
+# b23_json_raw_read.test — issue #389: how a JSON value is READ OUT of a
+# log line. Two halves of one decision, plus the residual it leaves.
+#
+# Every expected label set below is a byte-exact capture from
+# grafana/loki:3.7.4 (container `pulsus-389-loki`, image digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc),
+# booted on `ci/logql/config.yaml` with no delta of its own;
+# `detected_level` stripped per PROVENANCE.md. Container identity READ
+# FROM THE RUNNING PROCESS, not from this header:
+# /loki/api/v1/status/buildinfo answered {"version":"3.7.4",
+# "revision":"b318f282","branch":"release-3.7.x"} — the same b318f282 the
+# pinned digest and the Go checkout at v3.7.4 resolve to. Captured
+# 2026-08-09 over `/loki/api/v1/query_range`, which is the only endpoint
+# that serves a log query — `/query` refuses one with `log queries are
+# not supported as an instant query type`. Every row was captured twice,
+# on that config and on a bare single-binary one, and the pair agrees
+# except for the stripped label.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
+#
+# THE RULE, read from the reference rather than inferred from these rows
+# (grafana/loki @ v3.7.4, b318f2829f0ae2094ab3a1e90780450e9e4b03be).
+#
+# PART A — THE SCAN STOPS AT THE END OF THE FIRST VALUE. `ObjectEach`
+# returns `nil` the moment it reaches the object's closing brace and
+# never looks at what follows
+# (`vendor/github.com/grafana/jsonparser/parser.go:1108-1112,1155-1160`),
+# and `EachKey`'s byte dispatch has no default case, so a byte it does
+# not recognise is skipped rather than refused (`:568-577`). PulsusDB
+# used to route the line through a parse that demanded end-of-input, so
+# `{"a":1}trailing` yielded nothing at all. ONE call, THREE entrypoints:
+# `| json`, `| json <id>="<path>"` and `| unpack`.
+#
+# PART A' — THE THREE ENTRYPOINTS HAVE THREE DIFFERENT VALIDITY GATES,
+# and none of them is "does the line parse".
+#
+#   `| json`     `ObjectEach` and nothing else (`pkg/logql/log/parser.go:150`):
+#                a line whose first value is not an object is the error
+#                class, detail included.
+#   `| json <id>="<path>"`
+#                `len(line) == 0` returns with NO label written at all,
+#                then `isValidJSONStart(line)` — ONE RAW BYTE, `line[0]`,
+#                whitespace NOT skipped — writes `__error__` with NO
+#                detail (`addErrLabel(errJSON, nil, lbs)` sets the detail
+#                only for a non-nil error, `:664-670,726-742`). Past that
+#                gate every miss is the missing-path fill, `Set(id, "")`
+#                (`:714-720`), so a line that does not parse answers
+#                `<id>=""` and no error.
+#   `| unpack`   `len(line) == 0` returns silently, then `line[0] != '{'`
+#                (`:753-762`).
+#
+# PART B — A CONTAINER EXTRACTION HANDS BACK THE DOCUMENT'S OWN BYTES.
+# `readValue`'s arms as the expression parser reaches them (`:700-706`):
+# `case jsonparser.Object` is `string(data)`, the value's own slice out
+# of the line (`vendor/.../parser.go:878-940`), so key order, duplicate
+# keys, inner whitespace and the spelling of an escape all survive. An
+# ARRAY is not an object here: it falls to `default`, which is the same
+# slice with `jsonparser.Unescape` run over the WHOLE span
+# (`vendor/.../escape.go:130-171`) and then every U+FFFD in the result
+# mapped to a space (`:44-49,278-281`). PulsusDB used to re-render a
+# parsed value, which lost all of it. Neither the flatten arm nor
+# `| unpack` ever emits a container, so this half is the targeted form's
+# alone.
+#
+# NOT EXPRESSIBLE IN THIS DSL, and therefore pinned in
+# `tests/logql_pipeline_golden.rs` instead: a body with leading or
+# trailing whitespace, an empty body, and a body carrying a raw tab or
+# newline. The load block reads `<offset> <body>` off a trimmed line, so
+# ` {"a":1}`, `{"a":1}   `, `` and `{"o":{"a":\t1,\n"b":2}}` cannot be
+# written here at all. `json_expression_gates_on_the_first_byte_only`,
+# `unpack_gates_on_the_first_byte_only`,
+# `json_extraction_hands_back_the_document_bytes` and
+# `json_extraction_of_an_array_unescapes_the_span` carry them.
+#
+# ALSO NOT HERE, deliberately: `| unpack`'s error DETAIL. The reference
+# has two constants — `expecting json object(6), but it is not` for
+# `unpack`'s non-object gate and `Value looks like object, but can't find
+# closing '}' symbol` for `| json`'s — and PulsusDB emits the second for
+# both. That is a wrong constant rather than this issue's mechanism, it
+# has its own owner, and every row below is one where our answer IS the
+# reference's; the divergent rows at the end say so at the row.
+
+# =====================================================================
+# A — bytes after the first value are ignored, at all three entrypoints
+# =====================================================================
+
+load
+  {env="prod", service_name="jr-flat-trail"}
+  0s  {"a":1}trailing
+
+eval instant at 60s {service_name="jr-flat-trail"} | json
+  {env="prod", service_name="jr-flat-trail", a="1"}  0s  {"a":1}trailing
+
+clear
+
+# --- only the FIRST value is read: `b` is never seen -------------------
+load
+  {env="prod", service_name="jr-flat-two"}
+  0s  {"a":1}{"b":2}
+
+eval instant at 60s {service_name="jr-flat-two"} | json
+  {env="prod", service_name="jr-flat-two", a="1"}  0s  {"a":1}{"b":2}
+
+clear
+
+# --- the brace that ends the value is INSIDE a string, so any
+#     "truncate at a brace" shortcut answers something else ------------
+load
+  {env="prod", service_name="jr-flat-brace"}
+  0s  {"a":"}x"}trailing
+
+eval instant at 60s {service_name="jr-flat-brace"} | json
+  {env="prod", service_name="jr-flat-brace", a="}x"}  0s  {"a":"}x"}trailing
+
+clear
+
+load
+  {env="prod", service_name="jr-flat-nest"}
+  0s  {"a":1,"o":{"x":2}}junk
+
+eval instant at 60s {service_name="jr-flat-nest"} | json
+  {env="prod", service_name="jr-flat-nest", a="1", o_x="2"}  0s  {"a":1,"o":{"x":2}}junk
+
+clear
+
+# --- the targeted form, same rule --------------------------------------
+load
+  {env="prod", service_name="jr-expr-trail"}
+  0s  {"a":1}trailing
+
+eval instant at 60s {service_name="jr-expr-trail"} | json v="a"
+  {env="prod", service_name="jr-expr-trail", v="1"}  0s  {"a":1}trailing
+
+clear
+
+# --- each path fires at most once, so a repeat resolves to the FIRST
+#     occurrence and the bytes after the value are still ignored --------
+load
+  {env="prod", service_name="jr-expr-dup"}
+  0s  {"a":1,"a":2}zz
+
+eval instant at 60s {service_name="jr-expr-dup"} | json v="a"
+  {env="prod", service_name="jr-expr-dup", v="1"}  0s  {"a":1,"a":2}zz
+
+clear
+
+# --- and `| unpack`, which promotes `_entry` back to the line ----------
+load
+  {env="prod", service_name="jr-unpack-trail"}
+  0s  {"_entry":"hi","lbl":"v"}trailing
+
+eval instant at 60s {service_name="jr-unpack-trail"} | unpack
+  {env="prod", service_name="jr-unpack-trail", lbl="v"}  0s  hi
+
+clear
+
+# --- both halves at once: trailing bytes AND a container extraction ----
+load
+  {env="prod", service_name="jr-both"}
+  0s  {"o":{"b":1,  "a":2}}trailing
+
+eval instant at 60s {service_name="jr-both"} | json o="o"
+  {env="prod", service_name="jr-both", o="{\"b\":1,  \"a\":2}"}  0s  {"o":{"b":1,  "a":2}}trailing
+
+clear
+
+# =====================================================================
+# A' — the targeted form's gate is one raw byte, and a miss past it is
+#      the fill, not an error
+# =====================================================================
+
+# --- a non-object first value is fine here: the scan finds nothing and
+#     the fill writes "" ------------------------------------------------
+load
+  {env="prod", service_name="jr-gate-arr"}
+  0s  [1,2]junk
+
+eval instant at 60s {service_name="jr-gate-arr"} | json v="a"
+  {env="prod", service_name="jr-gate-arr", v=""}  0s  [1,2]junk
+
+clear
+
+load
+  {env="prod", service_name="jr-gate-str"}
+  0s  "hello"trailing
+
+eval instant at 60s {service_name="jr-gate-str"} | json v="a"
+  {env="prod", service_name="jr-gate-str", v=""}  0s  "hello"trailing
+
+clear
+
+# --- the scan does not validate, so a line that never parses is still
+#     only a miss --------------------------------------------------------
+load
+  {env="prod", service_name="jr-gate-garb"}
+  0s  {garbage
+
+eval instant at 60s {service_name="jr-gate-garb"} | json v="a"
+  {env="prod", service_name="jr-gate-garb", v=""}  0s  {garbage
+
+clear
+
+load
+  {env="prod", service_name="jr-gate-nocolon"}
+  0s  {"a"}
+
+eval instant at 60s {service_name="jr-gate-nocolon"} | json v="a"
+  {env="prod", service_name="jr-gate-nocolon", v=""}  0s  {"a"}
+
+clear
+
+# --- and the gate itself: first byte `x`, so the error WITHOUT a detail
+#     (the flatten arm's error always carries one) ----------------------
+load
+  {env="prod", service_name="jr-gate-lead"}
+  0s  x{"a":1}
+
+eval instant at 60s {service_name="jr-gate-lead"} | json v="a"
+  {env="prod", service_name="jr-gate-lead", __error__="JSONParserErr"}  0s  x{"a":1}
+
+clear
+
+# =====================================================================
+# B — the object arm copies the span; the array arm unescapes it
+# =====================================================================
+
+# --- key order and inner whitespace both survive -----------------------
+load
+  {env="prod", service_name="jr-obj-order"}
+  0s  {"o":{"b":1,  "a":2},"k":3}
+
+eval instant at 60s {service_name="jr-obj-order"} | json o="o"
+  {env="prod", service_name="jr-obj-order", o="{\"b\":1,  \"a\":2}"}  0s  {"o":{"b":1,  "a":2},"k":3}
+
+clear
+
+# --- whitespace INSIDE the span, and none outside it -------------------
+load
+  {env="prod", service_name="jr-obj-spaced"}
+  0s  { "a" : 1 , "o" : { "z" : 1 } }
+
+eval instant at 60s {service_name="jr-obj-spaced"} | json o="o"
+  {env="prod", service_name="jr-obj-spaced", o="{ \"z\" : 1 }"}  0s  { "a" : 1 , "o" : { "z" : 1 } }
+
+clear
+
+# --- a duplicate key inside the extracted object is kept, because
+#     nothing re-renders it ---------------------------------------------
+load
+  {env="prod", service_name="jr-obj-dup"}
+  0s  {"o":{"a":1,"a":2},"k":3}
+
+eval instant at 60s {service_name="jr-obj-dup"} | json o="o"
+  {env="prod", service_name="jr-obj-dup", o="{\"a\":1,\"a\":2}"}  0s  {"o":{"a":1,"a":2},"k":3}
+
+clear
+
+# --- an escape keeps its SPELLING in an object: this is the row that
+#     separates "hand back the bytes" from "re-render in wire order" ----
+load
+  {env="prod", service_name="jr-obj-esc"}
+  0s  {"o":{"k":"a\u0041b"},"k":3}
+
+eval instant at 60s {service_name="jr-obj-esc"} | json o="o"
+  {env="prod", service_name="jr-obj-esc", o="{\"k\":\"a\\u0041b\"}"}  0s  {"o":{"k":"a\u0041b"},"k":3}
+
+clear
+
+load
+  {env="prod", service_name="jr-obj-esc2"}
+  0s  {"o":{"k":"\u00e9"},"k":3}
+
+eval instant at 60s {service_name="jr-obj-esc2"} | json o="o"
+  {env="prod", service_name="jr-obj-esc2", o="{\"k\":\"\\u00e9\"}"}  0s  {"o":{"k":"\u00e9"},"k":3}
+
+clear
+
+load
+  {env="prod", service_name="jr-obj-slash"}
+  0s  {"o":{"p":"a\/b"}}
+
+eval instant at 60s {service_name="jr-obj-slash"} | json o="o"
+  {env="prod", service_name="jr-obj-slash", o="{\"p\":\"a\\/b\"}"}  0s  {"o":{"p":"a\/b"}}
+
+clear
+
+# --- an ARRAY takes the other arm: whitespace survives ... -------------
+load
+  {env="prod", service_name="jr-arr-space"}
+  0s  {"o":[3,  1,2],"k":3}
+
+eval instant at 60s {service_name="jr-arr-space"} | json o="o"
+  {env="prod", service_name="jr-arr-space", o="[3,  1,2]"}  0s  {"o":[3,  1,2],"k":3}
+
+clear
+
+# --- ... and escapes do NOT, because `Unescape` runs over the whole
+#     span, quotes and all -----------------------------------------------
+load
+  {env="prod", service_name="jr-arr-esc"}
+  0s  {"o":["a\"b",  "c"],"k":3}
+
+eval instant at 60s {service_name="jr-arr-esc"} | json o="o"
+  {env="prod", service_name="jr-arr-esc", o="[\"a\"b\",  \"c\"]"}  0s  {"o":["a\"b",  "c"],"k":3}
+
+clear
+
+load
+  {env="prod", service_name="jr-arr-uesc"}
+  0s  {"o":["a\u0041b"],"k":3}
+
+eval instant at 60s {service_name="jr-arr-uesc"} | json o="o"
+  {env="prod", service_name="jr-arr-uesc", o="[\"aAb\"]"}  0s  {"o":["a\u0041b"],"k":3}
+
+clear
+
+# --- the U+FFFD → space map, which lives only on this arm --------------
+load
+  {env="prod", service_name="jr-arr-fffd"}
+  0s  {"o":["x�y"]}
+
+eval instant at 60s {service_name="jr-arr-fffd"} | json o="o"
+  {env="prod", service_name="jr-arr-fffd", o="[\"x y\"]"}  0s  {"o":["x�y"]}
+
+clear
+
+# =====================================================================
+# B' — a duplicated key resolves to the first occurrence whose REMAINING
+#      path resolves, and the span search must backtrack the same way
+# =====================================================================
+
+load
+  {env="prod", service_name="jr-dup-objfirst"}
+  0s  {"o":{"z":1},"o":[[7],  8]}
+
+eval instant at 60s {service_name="jr-dup-objfirst"} | json x="o"
+  {env="prod", service_name="jr-dup-objfirst", x="{\"z\":1}"}  0s  {"o":{"z":1},"o":[[7],  8]}
+
+eval instant at 60s {service_name="jr-dup-objfirst"} | json x="o.z"
+  {env="prod", service_name="jr-dup-objfirst", x="1"}  0s  {"o":{"z":1},"o":[[7],  8]}
+
+# THE ROW A NAIVE FIRST-OCCURRENCE DESCENT GETS WRONG: `o[0]` skips past
+# the object and resolves inside the SECOND `o`.
+eval instant at 60s {service_name="jr-dup-objfirst"} | json x="o[0]"
+  {env="prod", service_name="jr-dup-objfirst", x="[7]"}  0s  {"o":{"z":1},"o":[[7],  8]}
+
+clear
+
+load
+  {env="prod", service_name="jr-dup-arrfirst"}
+  0s  {"o":[1],"o":{"z":{"w":  9}}}
+
+eval instant at 60s {service_name="jr-dup-arrfirst"} | json x="o"
+  {env="prod", service_name="jr-dup-arrfirst", x="[1]"}  0s  {"o":[1],"o":{"z":{"w":  9}}}
+
+# ... and the mirror image: `o.z` skips past the ARRAY.
+eval instant at 60s {service_name="jr-dup-arrfirst"} | json x="o.z"
+  {env="prod", service_name="jr-dup-arrfirst", x="{\"w\":  9}"}  0s  {"o":[1],"o":{"z":{"w":  9}}}
+
+eval instant at 60s {service_name="jr-dup-arrfirst"} | json x="o[0]"
+  {env="prod", service_name="jr-dup-arrfirst", x="1"}  0s  {"o":[1],"o":{"z":{"w":  9}}}
+
+clear
+
+# =====================================================================
+# THE RESIDUAL — malformed IN THE MIDDLE, not trailing after a complete
+# value. The reference's scan does not validate, so it extracts from a
+# line it never proves well-formed; we cannot without a scanner of our
+# own. Ledgered as `json-nonvalidating-scan-residual` (issue #389),
+# which also records what the reference does with a raw U+FFFD inside an
+# extracted OBJECT's bytes — it either 500s or rewrites them, depending
+# on its frontend encoding, which is why no row here pins that cell.
+# =====================================================================
+
+load
+  {env="prod", service_name="jr-mid-obj"}
+  0s  {"o":{"z":1}x,"a":2}
+
+# The reference reports the error AND the label it already extracted
+# (`o_z="1"`); we report the error alone.
+# provenance: divergence(json-nonvalidating-scan-residual)
+eval instant at 60s {service_name="jr-mid-obj"} | json
+  {env="prod", service_name="jr-mid-obj", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  {"o":{"z":1}x,"a":2}
+
+# The reference reads past the malformed part and answers `a="2"`.
+# provenance: divergence(json-nonvalidating-scan-residual)
+eval instant at 60s {service_name="jr-mid-obj"} | json v="a"
+  {env="prod", service_name="jr-mid-obj", v=""}  0s  {"o":{"z":1}x,"a":2}
+
+# The reference answers `{"z":1}` — the span BEFORE the malformed byte.
+# provenance: divergence(json-nonvalidating-scan-residual)
+eval instant at 60s {service_name="jr-mid-obj"} | json o="o"
+  {env="prod", service_name="jr-mid-obj", o=""}  0s  {"o":{"z":1}x,"a":2}
+
+clear
+
+load
+  {env="prod", service_name="jr-mid-esc"}
+  0s  {"o":["a\qb"],"a":2}
+
+# An invalid escape is the same class: the reference reads straight
+# past it and answers `v="2"`.
+# provenance: divergence(json-nonvalidating-scan-residual)
+eval instant at 60s {service_name="jr-mid-esc"} | json v="a"
+  {env="prod", service_name="jr-mid-esc", v=""}  0s  {"o":["a\qb"],"a":2}
+
+# Under the flatten arm the reference answers `a="2"` with NO error at
+# all; we report the error class and no label.
+# provenance: divergence(json-nonvalidating-scan-residual)
+eval instant at 60s {service_name="jr-mid-esc"} | json
+  {env="prod", service_name="jr-mid-esc", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  {"o":["a\qb"],"a":2}
+
+# The bound on the residual: where the invalid escape is INSIDE the span
+# the expression selects, both sides answer the empty string — the
+# reference because `unescapeJSONString` fails, we because the parse
+# does.
+eval instant at 60s {service_name="jr-mid-esc"} | json o="o"
+  {env="prod", service_name="jr-mid-esc", o=""}  0s  {"o":["a\qb"],"a":2}
+
+clear

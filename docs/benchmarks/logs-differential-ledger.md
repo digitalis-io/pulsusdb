@@ -1872,6 +1872,90 @@ clients only display it).
   output length overflow` per line (that surface is bounded and
   correct).
 
+### `json-nonvalidating-scan-residual` (issue #389, measured residual — the record, not a fix)
+
+- **What issue #389 CLOSED, so this row is not read as covering it.**
+  A line with bytes after a COMPLETE JSON value is now parsed as the
+  reference parses it, at all of `| json`, `| json <id>="<path>"` and
+  `| unpack`; a targeted extraction that lands on an object or array
+  now hands back the document's own bytes. Those are parity, gated by
+  `b23_json_raw_read.test` and `tests/logql_pipeline_golden.rs`. What
+  remains is the class below, which is a different mechanism.
+- **Reference behaviour.** grafana/loki v3.7.4 reads a log line with
+  `jsonparser`, a scanner that never validates the document. `EachKey`'s
+  byte dispatch has no default case
+  (`vendor/github.com/grafana/jsonparser/parser.go:568-577`) and
+  `ObjectEach` returns the moment it reaches the closing brace
+  (`:1108-1112,1155-1160`), so the reference extracts from a line that is
+  malformed AFTER — or beside — the part it needed. PulsusDB reads the
+  line with `serde_json`, which validates the whole first value, so a
+  byte we cannot parse costs us everything downstream of it.
+- **Measured, on `grafana/loki:3.7.4` digest
+  `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+  (buildinfo read from the running process: version 3.7.4, revision
+  b318f282), 2026-08-09:**
+
+  | line | query | reference | PulsusDB |
+  |---|---|---|---|
+  | `{"o":{"z":1}x,"a":2}` | `\| json` | `o_z="1"` **and** the error pair | the error pair alone |
+  | `{"o":{"z":1}x,"a":2}` | `\| json v="a"` | `v="2"` | `v=""` |
+  | `{"o":{"z":1}x,"a":2}` | `\| json o="o"` | `o="{"z":1}"` | `o=""` |
+  | `{"o":["a\qb"],"a":2}` | `\| json` | `a="2"`, no error at all | the error pair, no label |
+  | `{"o":["a\qb"],"a":2}` | `\| json v="a"` | `v="2"` | `v=""` |
+  | `{"o":["a\qb"],"a":2}` | `\| json o="o"` | `o=""` | `o=""` — the bound: where the malformed part is INSIDE the selected span, both sides answer the empty string |
+
+- **Why deliberate, for now.** Closing it means writing a
+  non-validating JSON scanner of our own; nothing short of that reaches
+  the class, because every route through `serde_json` validates. That
+  same scanner is the only affordable route to the OTHER open residual
+  in this area — emitting a number's raw lexeme rather than a
+  re-rendering (`1.500` → `1.5`), whose read-side gate
+  (`crates/pulsus-read/tests/logql_json_float_roundtrip.rs`) lives on
+  issue **#270** and would pass BY CONSTRUCTION once the lexeme is
+  emitted, so that gate has to be re-established on a surviving
+  observable before anyone changes the emit. **Issue #389 stays open to
+  carry both**, with the three cheaper designs that were measured and
+  rejected recorded on it; this row is the record of what remains, not
+  a plan. Gated by `b23_json_raw_read.test`'s `jr-mid-obj` and
+  `jr-mid-esc` rows, each carrying
+  `# provenance: divergence(json-nonvalidating-scan-residual)`.
+- **A second, opposite cell in the same area, and it turns on the
+  reference's own config: `| json o="o"` over `{"o":{"k":"x\u{FFFD}y"}}`
+  — a raw U+FFFD inside the extracted object's bytes.** The object arm
+  copies the span verbatim (`readValue`'s `case jsonparser.Object`,
+  `pkg/logql/log/parser.go:700-706`), so the rune reaches the label
+  value; what happens next is the response path's, and the two paths
+  disagree. Isolated by A/B on the pinned image, changing one setting at
+  a time:
+
+  | reference config | answer |
+  |---|---|
+  | default (JSON) frontend encoding | `HTTP 500 could not write JSON response: 1:4: parse error: invalid UTF-8 rune` |
+  | `frontend.encoding: protobuf` (what `ci/logql/config.yaml` sets) | `200`, `o="{"k":"x y"}"` — U+FFFD mapped to a space |
+  | `discover_log_levels` either way | no effect (probed both) |
+
+  So the reference either fails to answer its own query or rewrites the
+  bytes it just promised to copy, depending on a transport setting.
+  PulsusDB answers `200` with the bytes in both cases. The `200` half is
+  a deliberate non-replication of a reference defect under the standing
+  "match it except where it is wrong" rule; the space-mapping half is
+  the SAME divergence as the scalar one in the last bullet — the
+  reference maps U+FFFD out at the response boundary
+  (`pkg/util/marshal/query.go:87-100`, `NewStreams`), which is not the
+  parser's arm and is not this issue's. The ARRAY arm needs none of
+  that: `unescapeJSONString` maps the rune itself (`:44-49,278-281`), so
+  `{"o":["x\u{FFFD}y"]}` gives `["x y"]` on both sides under either
+  config, and that row IS in the corpus. No corpus row can gate the
+  object cell — under one config the reference cannot answer the query
+  at all.
+- **Not in this row, and not this issue's:** `| unpack` emitting
+  `| json`'s error-detail constant (the reference has
+  `expecting json object(6), but it is not` for `unpack`'s non-object
+  gate, measured on the same container), and U+FFFD in a SCALAR value
+  not being mapped to a space (`{"a":"x\u{FFFD}y"}` is `a="x y"` there
+  and `a="x\u{FFFD}y"` here). Both were measured in the same run and
+  both are owned elsewhere.
+
 ### `json-flatten-key-budget` (issue #287, bounded divergence)
 
 - **Reference behaviour — the FLATTEN itself is parity, only the
