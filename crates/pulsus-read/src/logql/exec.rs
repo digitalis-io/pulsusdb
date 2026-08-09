@@ -3542,6 +3542,44 @@ mod tests {
         }
     }
 
+    /// Issue #382. `code_307_maps_to_scan_budget_bytes` above hands the
+    /// mapper a `ChError::Server` it built itself, so it cannot see how the
+    /// code is READ off the wire — and that is where the defect was. This
+    /// starts from the `BadResponse` the `clickhouse` crate hands us when the
+    /// server raised 307 AFTER it had already written output: a verbatim
+    /// capture from 26.3.17.110 (`SELECT toString(number) AS v FROM
+    /// numbers(100000000)` with `max_bytes_to_read=1100000`), whose
+    /// `RowBinaryWithNamesAndTypes` column header precedes the exception.
+    ///
+    /// The `Code: N` prefix is the one the ADR 0007 vendored patch
+    /// (`vendor/clickhouse/PATCHES.md`) takes from
+    /// `X-ClickHouse-Exception-Code` and puts at byte 0. Without it the result
+    /// bytes cannot be parsed for a code soundly, so the client gets 500
+    /// `internal` instead of the 422 `query_too_broad` that tells them to
+    /// narrow the query.
+    #[test]
+    fn a_307_raised_after_output_was_written_still_maps_to_scan_budget_bytes() {
+        let body = "\u{1}\u{1}v\u{6}StringCode: 307. DB::Exception: Limit for rows or bytes to \
+                    read exceeded, max bytes: 1.05 MiB, current bytes: 1.50 MiB: While executing \
+                    NumbersRange. (TOO_MANY_BYTES) (version 26.3.17.110 (official build))";
+        assert_eq!(body.len(), 209, "verbatim capture, pinned against an edit");
+        let raw = ChError::from(clickhouse::error::Error::BadResponse(body.to_string()));
+        assert!(matches!(
+            map_read_error(raw, 1024),
+            ReadError::Clickhouse(_)
+        ));
+
+        let patched = ChError::from(clickhouse::error::Error::BadResponse(format!(
+            "Code: 307\n{body}"
+        )));
+        match map_read_error(patched, 1024) {
+            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, 1024);
+            }
+            other => panic!("expected QueryTooBroad(ScanBudgetBytes), got {other:?}"),
+        }
+    }
+
     #[test]
     fn code_158_is_not_mapped_to_query_too_broad() {
         let e = ChError::Server {
