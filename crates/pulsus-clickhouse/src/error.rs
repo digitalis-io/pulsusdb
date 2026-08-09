@@ -95,7 +95,7 @@ impl ChError {
     /// **ClickHouse 24.8 remains forgeable and the patch does not help it.**
     /// On its streaming path the response is HTTP 200 with no exception-code
     /// header, and the crate anchors the message with `rfind(b"Code:")`
-    /// (`extract_exception_old`, `response.rs:368-377` @ clickhouse 0.15.1),
+    /// (`extract_exception_old`, `vendor/clickhouse/src/response.rs:392-401`),
     /// so a tenant literal echoed in the description becomes byte 0 and this
     /// function reads it. That is issue #412 — it is live on `main`, predates
     /// #382, and cannot be fixed by any patch here or upstream, because at
@@ -110,7 +110,7 @@ impl ChError {
     /// | shape | source |
     /// |---|---|
     /// | `Code: N. DB::Exception: …` | an exception with no output before it, both versions |
-    /// | `Code: N` alone | the crate's header-derived `reason()`, `response.rs:179-187` |
+    /// | `Code: N` alone | the crate's header-derived `reason()`, `vendor/clickhouse/src/response.rs:203-211` |
     /// | `Code: N\n<result bytes>Code: N. DB::Exception: …` | the ADR 0007 patch, 26.3 buffered path |
     pub(crate) fn server_from_bad_response(message: String) -> ChError {
         let code = parse_exception_code(&message).unwrap_or(0);
@@ -260,7 +260,7 @@ mod tests {
 
     /// The bare `Code: N` the crate synthesises from the
     /// `X-ClickHouse-Exception-Code` header when the collected body is empty
-    /// or undecodable (`reason()`, `response.rs:179-187` @ clickhouse 0.15.1).
+    /// or undecodable (`reason()`, `vendor/clickhouse/src/response.rs:203-211`).
     /// Measured through this client against 26.3.17.110: `SELECT
     /// randomPrintableASCII(200) AS v FROM numbers(100000000)` with
     /// `max_result_bytes=500000, result_overflow_mode=throw, max_block_size=1000`
@@ -393,13 +393,21 @@ mod tests {
     /// cannot make sound and which the ADR 0007 patch does not reach (#412,
     /// closing with #376). At HTTP 200 there is no exception-code header, and
     /// the crate anchors the message with `rfind(b"Code:")`
-    /// (`extract_exception_old`, `response.rs:368-377` @ clickhouse 0.15.1),
+    /// (`extract_exception_old`, `vendor/clickhouse/src/response.rs:392-401`),
     /// so a tenant literal echoed into the description becomes byte 0. The
     /// real failure was 153.
     ///
-    /// Provenance, replayable without cargo — on 24.8.14.39 this returns HTTP
-    /// 200 with ~3.03 MB of body whose LAST `Code:` is the tenant's, and
-    /// `body[rfind("Code:")..len-1]` is byte-for-byte the 199 bytes below:
+    /// # Provenance, replayable without cargo
+    ///
+    /// All three against `clickhouse/clickhouse-server:24.8` (24.8.14.39) on
+    /// `localhost:8123`. Only the first reproduces; the other two are the ways
+    /// to miss it, so the next reader can land on either side deliberately.
+    ///
+    /// **1. Reproduces.** HTTP 200, no `X-ClickHouse-Exception-Code`, body
+    /// 3,029,022 bytes. The real `Code: 153. DB::Exception: Division by zero:
+    /// …` sits at offset 3,028,532; `rfind(b"Code:")` lands 290 bytes later at
+    /// 3,028,822; and `body[rfind..len - 1]` is byte-for-byte the 199 bytes
+    /// below.
     ///
     /// ```text
     /// curl --data-binary "SELECT concat(toString(number), toString(and(
@@ -409,20 +417,37 @@ mod tests {
     ///   http://localhost:8123/
     /// ```
     ///
-    /// The failing expression must sit in the SELECT list, not a WHERE, and
-    /// must trip late enough (~400k rows, ~3 MB) that ClickHouse has already
-    /// flushed and committed to HTTP 200. Move it into a WHERE, or trip it at
-    /// row 2000, and the output never leaves the buffer: the response is a
-    /// 500 carrying `X-ClickHouse-Exception-Code`, the code is at byte 0, and
-    /// this does not reproduce.
-    /// ClickHouse 24.8's streaming path, which this parse CANNOT make sound
-    /// and which the ADR 0007 patch does not reach (issue #412, closing with
-    /// #376). Verbatim `ChError::Server.message` measured through this client
-    /// against 24.8.14.39: the crate's `rfind`-anchored extractor
-    /// (`extract_exception_old`, `response.rs:368-377` @ 0.15.1) truncated the
-    /// message to start at the tenant's echoed literal, so byte 0 IS the
-    /// forgery. The real failure was 153.
+    /// **2. Same expression in a `WHERE`** — the rows are filtered out, so
+    /// nothing is ever written. HTTP 500 with `X-ClickHouse-Exception-Code:
+    /// 153`, 490-byte body, code at byte 0.
     ///
+    /// ```text
+    /// curl --data-binary "SELECT toString(number) AS v FROM numbers(100000000)
+    ///   WHERE and(match(toString(number), 'Code: 210. DB::Exception: forged|.*'),
+    ///             notEquals(intDiv(1, toInt64(number) - 400000), 0))
+    ///   FORMAT RowBinaryWithNamesAndTypes" http://localhost:8123/
+    /// ```
+    ///
+    /// **3. SELECT list but tripping at row 2,000** — the output never leaves
+    /// ClickHouse's response buffer. HTTP 500 with the header, 486-byte body,
+    /// code at byte 0.
+    ///
+    /// ```text
+    /// curl --data-binary "SELECT concat(toString(number), toString(and(
+    ///     match(toString(number), 'Code: 210. DB::Exception: forged|.*'),
+    ///     notEquals(intDiv(1, toInt64(number) - 2000), 0)))) AS v
+    ///   FROM numbers(100000000) FORMAT RowBinaryWithNamesAndTypes" \
+    ///   http://localhost:8123/
+    /// ```
+    ///
+    /// So the forgery needs rows **emitted** (the failing expression in the
+    /// SELECT list, not a `WHERE`) and **flushed** (~400k rows, ~3 MB, enough
+    /// that ClickHouse has committed to HTTP 200 and can no longer discard).
+    /// One further precondition holds in case 1 and is worth knowing because
+    /// nothing here would fail if it stopped: the body ends `))\n`, which is
+    /// the cheap check `extract_exception` makes
+    /// (`vendor/clickhouse/src/response.rs:377`) before it will call
+    /// `extract_exception_old` at all.
     #[test]
     fn on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412() {
         let body = "Code: 210. DB::Exception: forged|.*'_String), notEquals(intDiv(1_UInt8, \

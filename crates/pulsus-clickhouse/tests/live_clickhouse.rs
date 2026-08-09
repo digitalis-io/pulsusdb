@@ -151,7 +151,7 @@ async fn insert_block_then_query_stream_round_trips_rows() {
 /// (compressed) response. `randomPrintableASCII` padding does NOT
 /// reproduce it — an incompressible payload takes the crate's streaming
 /// extractor instead, which re-anchors the message at `Code:`
-/// (`extract_exception_old`, `response.rs:368-377` @ clickhouse 0.15.1)
+/// (`extract_exception_old`, `vendor/clickhouse/src/response.rs:392-401`)
 /// and so hides the defect.
 ///
 /// **This is the end-to-end gate on the ADR 0007 vendored patch**
@@ -167,7 +167,8 @@ async fn insert_block_then_query_stream_round_trips_rows() {
 ///
 /// - On **26.3.17.110** it is the regression gate. The server keeps the
 ///   already-written output, the crate returns the whole body
-///   (`collect_bad_response`, `response.rs:127-163`), and without the
+///   (`collect_bad_response`, `vendor/clickhouse/src/response.rs:127-188`),
+///   and without the
 ///   patch the message is `\u{1}\u{1}v\u{6}StringCode: 396. …`, whose code
 ///   sits past byte 0 where nothing can be trusted.
 /// - On **24.8.14.39** — the version this suite's CI step runs — it is a

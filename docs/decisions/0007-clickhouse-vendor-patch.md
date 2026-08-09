@@ -92,7 +92,8 @@ Consequences:
 version currently pinned in CI. On its streaming path — output already on the
 socket — the response is HTTP 200 with no exception-code header, and the crate
 anchors the message with `rfind(b"Code:")` (`extract_exception_old`,
-`src/response.rs:368-377`), so a tenant literal echoed into the description
+`src/response.rs:368-377` upstream, `:392-401` in `vendor/clickhouse/`), so a
+tenant literal echoed into the description
 becomes byte 0 of the message we receive. Measured on 24.8.14.39: real code
 153, message delivered beginning `Code: 210. DB::Exception: forged…`. There is
 no header to fall back on, and the exception boundary is genuinely

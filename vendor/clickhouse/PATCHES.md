@@ -87,16 +87,18 @@ untouched.
 **ClickHouse 24.8 remains forgeable on its streaming path, and no patch can
 fix it — here or upstream.** When output has already reached the socket the
 response is HTTP 200 with no exception-code header, and upstream anchors the
-message with `rfind(b"Code:")` (`extract_exception_old`, `src/response.rs`
-`:368-377`), so a tenant literal echoed into the description becomes byte 0 of
+message with `rfind(b"Code:")` (`extract_exception_old`, upstream
+`src/response.rs:368-377`, `:392-401` in this vendored copy — the patch above
+shifts every line after it), so a tenant literal echoed into the description
+becomes byte 0 of
 the message. Measured on 24.8.14.39: real code 153, delivered message begins
 `Code: 210. DB::Exception: forged…`. There is no header to fall back on and
 the exception boundary is genuinely unrecoverable from the text.
 
 That is **issue #412**. It is live on `main`, it predates #382, and it closes
 with the move to ClickHouse 26.3 (**#376**), whose streaming path frames the
-exception with a length the client trusts (`extract_exception_new`,
-`:382-419`) rather than searching for it.
+exception with a length the client trusts (`extract_exception_new`, upstream
+`:382-419`, `:406-443` here) rather than searching for it.
 
 **So this patch alone does not make the read path sound; it is sound only
 together with #376.** Do not read the vendored fix as complete.
