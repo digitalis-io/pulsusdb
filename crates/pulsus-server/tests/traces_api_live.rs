@@ -25,8 +25,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Ports 31130 (fetch suite) and 31135 (alias suite) — distinct from
-//! every other live suite's fixed ports (31100-31134).
+//! Fixed loopback ports are declared inline per test (`let port = 31_1NN;`).
+//! That no two live tests anywhere declare the same one is not a
+//! convention re-derived by hand any more — `live_port_uniqueness.rs`
+//! (hermetic) enumerates every declaration under `crates/*/tests` and
+//! fails if two collide.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -51,15 +54,15 @@ fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
 }
 
-const PORT: u16 = 31_130;
+const PORT: u16 = 31_190;
 /// The issue #61 alias byte-identity suite's own spawn (both tests in
 /// this binary may run concurrently — distinct ports, distinct
 /// throwaway databases).
-const ALIAS_PORT: u16 = 31_135;
+const ALIAS_PORT: u16 = 31_191;
 /// The issue #75 Zipkin shared-span round-trip suite's own spawn.
-const ZIPKIN_PORT: u16 = 31_136;
+const ZIPKIN_PORT: u16 = 31_192;
 /// The issue #237 ns→seconds wire-byte suite's own spawn.
-const ULP_PORT: u16 = 31_137;
+const ULP_PORT: u16 = 31_193;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,

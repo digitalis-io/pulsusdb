@@ -125,9 +125,9 @@ fn tls_listener_serves_ready_and_config_and_rejects_plaintext() {
         return;
     }
 
-    // Fixed loopback port, distinct from every other live suite's pin
-    // (they occupy 31100-31154).
-    let port: u16 = 31_160;
+    // Fixed loopback port; `live_port_uniqueness.rs` is what proves no
+    // other live test declares this one.
+    let port: u16 = 31_179;
 
     let certified =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])

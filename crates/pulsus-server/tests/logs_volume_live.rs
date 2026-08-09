@@ -21,7 +21,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Port 31148, distinct from every other live suite.
+//! Fixed loopback ports are declared inline per test (`let port = 31_1NN;`).
+//! That no two live tests anywhere declare the same one is not a
+//! convention re-derived by hand any more — `live_port_uniqueness.rs`
+//! (hermetic) enumerates every declaration under `crates/*/tests` and
+//! fails if two collide.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

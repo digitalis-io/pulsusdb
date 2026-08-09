@@ -20,8 +20,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Ports 31131-31133 — distinct from every other live suite's fixed
-//! ports (31100-31125, 31130).
+//! Fixed loopback ports are declared inline per test (`let port = 31_1NN;`).
+//! That no two live tests anywhere declare the same one is not a
+//! convention re-derived by hand any more — `live_port_uniqueness.rs`
+//! (hermetic) enumerates every declaration under `crates/*/tests` and
+//! fails if two collide.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
@@ -1760,7 +1763,7 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
     // `{ name != event:name }` is ALL-match: none of the 400 event names
     // is `ev-bulk`, so every element satisfies the inequality and the
     // span matches.
-    let wide_port = port + 1;
+    let wide_port = 31_137;
     let _wide_guard = spawn_ready(wide_port, db, &[]);
     let ctx = "wide-event-set-succeeds-under-a-normal-budget";
     let res = search(wide_port, wide_query, w0, w1, "", ctx);

@@ -2579,7 +2579,7 @@ async fn a_case_variant_streams_key_is_accepted_and_its_lines_are_stored() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_160;
+    let port = 31_178;
     let db = "pulsus_loki_push_streams_case_it";
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);

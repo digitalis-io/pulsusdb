@@ -41,8 +41,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Port 31134 — distinct from every other live suite's fixed ports
-//! (31100-31133 and `traces_api_live.rs`'s 31135).
+//! Fixed loopback ports are declared inline per test (`let port = 31_1NN;`).
+//! That no two live tests anywhere declare the same one is not a
+//! convention re-derived by hand any more — `live_port_uniqueness.rs`
+//! (hermetic) enumerates every declaration under `crates/*/tests` and
+//! fails if two collide.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -449,7 +452,7 @@ async fn tag_discovery_against_real_clickhouse() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_134;
+    let port = 31_138;
     // Per-run nonce'd database (the traces-read bench's nonce rationale):
     // `system.query_log` outlives databases, so a fixed name would
     // aggregate rows across local re-runs and break the EXACT-count
