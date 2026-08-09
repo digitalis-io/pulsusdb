@@ -45,16 +45,31 @@
 //! window, so that is not a corner case here — it is the common case. The
 //! same flaw invalidates any bulk `freed >= allocated − residue`
 //! retention identity. [`Window::bulk_peak`]/[`Window::bulk_live_at_close`]
-//! carry the naive quantities so the discrimination tests I1–I4 can show
+//! carry the naive quantities so the discrimination tests I1–I5 can show
 //! the two instruments disagree, rather than asserting that they would.
+//!
+//! # The release identity (issue #241)
+//!
+//! `run_chain`/`run_binary` drop the stage's result INSIDE the measured
+//! window, so [`Window::retained`] is "bytes this stage allocated and did
+//! not release" and every exercised cell asserts it is EXACTLY zero — at
+//! no extra measured windows, and without moving any pre-existing per-cell
+//! number (deallocations after the peak cannot raise `bytes`, `count`,
+//! `peak` or `overflow`). That gate proves the ledger's `Drop` discharge
+//! coincides with a real heap release, which the coverage gate
+//! (`peak <= modelled`) says nothing about. It also reaches the
+//! `select_k_*` group maps, whose keys never appear in the output and so
+//! are invisible to any gate expressed as a property of the result.
 //!
 //! # What this file gates
 //!
 //! | gate | what it proves |
 //! |---|---|
 //! | I1–I4 | the instrument itself is sound and fails loudly |
+//! | I5 | on the SHIPPED path, a leak the retired bulk identity accepts is loud in `retained` |
 //! | the cell matrix | every construct has a measured fixture, enforced by exhaustive `match`es with no `_` arm |
 //! | the per-cell safety gate | `measured peak <= modelled bytes` for EVERY cell |
+//! | the per-cell release gate | `retained == 0` for EVERY cell — the stage frees everything it allocates |
 //! | the ladders | each coefficient is `WITNESS_MARGIN x rate_max` over a >= 64x span, and the stage is observed linear |
 //! | the paired fixtures | each coefficient is NECESSARY — the model without it fails to cover the increment the pair causes |
 //! | the derivation | `max(X_chain, X_bin) <= MAX_POST_AGG_BYTES` over the leaf-gated feasible region at the non-amplifying corner |
@@ -264,7 +279,11 @@ struct Window {
     /// **The load-bearing quantity**: the maximum bytes this window
     /// itself held live.
     peak: u64,
-    /// Bytes this window allocated that are still live at close.
+    /// Bytes this window allocated that are still live at close. Issue
+    /// #241's release identity gates this at EXACTLY zero for every
+    /// measured cell; a free of a pointer the window never allocated
+    /// cannot lower it, and a missed free can only raise it, so both
+    /// failure directions are loud.
     retained: u64,
     /// The naive high-water mark (see the module doc) — never gates.
     bulk_peak: u64,
@@ -307,7 +326,7 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, Window) {
 const MIB: usize = 1024 * 1024;
 
 // =====================================================================
-// 2. Instrument discrimination — I1..I4 (AC 23)
+// 2. Instrument discrimination — I1..I5 (AC 23; I5 is issue #241)
 // =====================================================================
 
 /// I1 — an 8 MiB buffer allocated BEFORE the window is dropped INSIDE it,
@@ -417,6 +436,124 @@ fn i4_exhausting_the_cohort_table_fails_loudly() {
     assert!(
         w.overflow,
         "more live allocations than COHORT_SLOTS must set OVERFLOW: {w:?}"
+    );
+}
+
+/// The allowance the RETIRED bulk retention identity carried: issue #241
+/// round 11 (comment 5088539920) rejected `freed >= allocated - residue`
+/// as an instrument, and this is that identity's residue expressed in the
+/// naive counter — `allocated - freed = bulk_live_at_close`, so
+/// `freed >= allocated - R` is exactly `bulk_live_at_close <= R`.
+///
+/// It is deliberately a FIXED page, not a function of the fixture: the
+/// point of I5 is that the retired identity stays quiet no matter how
+/// small its residue is, because the pre-window input free has already
+/// driven the naive counter to its floor. I5 additionally requires the
+/// leak to be `LEAK_OVER_RESIDUE` times this, so the discrimination can
+/// never be an artefact of a generous allowance.
+const NAIVE_RESIDUE: u64 = 4096;
+
+/// How far the leak must exceed [`NAIVE_RESIDUE`] for I5's discrimination
+/// to mean anything.
+const LEAK_OVER_RESIDUE: u64 = 16;
+
+/// I5 — **issue #241's release identity, and the control that makes it
+/// worth asserting.** On the SHIPPED path (`apply_vector_aggs`, not a
+/// synthetic buffer), the same fixture is run twice:
+///
+/// * run A releases its result inside the window — `retained == 0`;
+/// * run B `mem::forget`s it. The result's label sets ARE the
+///   `group_instant` map's keys (`fold.rs:190-225`, `.cloned()`), so this
+///   leaks exactly the byte class #241 is about.
+///
+/// The discriminating assertion is the last one: on run B the retired
+/// bulk identity **passes**, because the stage's pre-window input is
+/// freed inside the window and drives the naive counter to its floor,
+/// while `retained` reports the leak in full. That is I1's demonstration
+/// moved onto production code, and it is what stops `retained == 0` from
+/// being an assertion nobody has ever seen fail.
+#[test]
+fn i5_a_leaked_group_map_is_loud_where_the_retired_bulk_identity_is_silent() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // One output group per series (every `id00` value is series-distinct)
+    // over 8 label pairs, so the input's label mass is 8x the output's.
+    let fx = Fixture {
+        series: 2048,
+        pairs: 8,
+        value_bytes: 64,
+        steps: 1,
+        skew: Skew::Uniform,
+    };
+    let aggs: Vec<VectorAggSpec> = vec![(
+        VectorAggOp::Sum,
+        Some(Grouping {
+            kind: GroupingKind::By,
+            labels: vec!["id00".to_string()],
+        }),
+        None,
+    )];
+
+    // (0) Sizing, UNMEASURED. `expected` is derived from a third run of
+    // the same fixture rather than hardcoded, and the pre-window free
+    // mass must dominate the leak mass — otherwise the naive counter
+    // would stay above its floor for a reason unrelated to the defect.
+    let probe = QueryResult::Vector(build_vector(&fx, false));
+    let input = measure_result(&probe);
+    let sized = apply_vector_aggs(probe, &aggs).expect("the sizing run must be admitted");
+    let expected = measure_result(&sized).label_bytes();
+    drop(sized);
+    assert!(
+        input.label_bytes() >= 4 * expected,
+        "the fixture must free at least 4x the leak mass inside the window: input {} vs \
+         output {expected}",
+        input.label_bytes()
+    );
+    assert!(
+        expected >= LEAK_OVER_RESIDUE * NAIVE_RESIDUE,
+        "the leak ({expected} B) must dwarf the retired identity's residue ({NAIVE_RESIDUE} \
+         B) or the discrimination proves nothing"
+    );
+
+    // (A) The shipped behaviour: released inside the window.
+    let clean = QueryResult::Vector(build_vector(&fx, false));
+    let (ok_a, wa) = measure(|| {
+        let out = apply_vector_aggs(clean, &aggs);
+        let ok = out.is_ok();
+        drop(out);
+        ok
+    });
+    assert!(ok_a, "run A must be admitted");
+    assert!(!wa.overflow, "run A: cohort table overflowed");
+    assert_eq!(wa.retained, 0, "run A must retain nothing: {wa:?}");
+
+    // (B) The same fixture, leaking.
+    let leaky = QueryResult::Vector(build_vector(&fx, false));
+    let (ok_b, wb) = measure(|| match apply_vector_aggs(leaky, &aggs) {
+        Ok(q) => {
+            std::mem::forget(q);
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(ok_b, "run B must be admitted");
+    assert!(!wb.overflow, "run B: cohort table overflowed");
+    assert!(
+        wb.retained >= expected,
+        "a forgotten result must show at least its own label bytes as retained: {} < \
+         {expected} ({wb:?})",
+        wb.retained
+    );
+
+    // The discrimination. Both instruments observed the SAME run.
+    assert!(
+        wb.bulk_live_at_close <= NAIVE_RESIDUE,
+        "the retired `freed >= allocated - {NAIVE_RESIDUE}` identity is expected to PASS on \
+         this leaking run — if it now fails, this control no longer shows the two \
+         instruments disagreeing: {wb:?}"
+    );
+    assert!(
+        wb.retained > wb.bulk_live_at_close,
+        "cohort and bulk retention must disagree on the leaking run: {wb:?}"
     );
 }
 
@@ -788,9 +925,17 @@ fn measure_result(result: &QueryResult) -> StageInput {
     }
 }
 
-/// Measures one chain cell: the fixture is built OUTSIDE the window, the
-/// stage input is measured outside it, and the returned result is dropped
-/// after the window closes.
+/// Measures one chain cell. The fixture is built OUTSIDE the window and
+/// the stage input is measured outside it; the result is dropped INSIDE
+/// it, so [`Window::retained`] is exactly "bytes this stage allocated and
+/// did not release" — issue #241's release identity. Adding deallocations
+/// after the peak cannot move `peak`, `bytes`, `count` or `overflow`, so
+/// every pre-existing per-cell gate reads the same number it read before
+/// (measured, not assumed — see the implementation notes on #241).
+///
+/// The zero is EXACT and must stay exact: a retained group map scales with
+/// series count and label width, so no constant residue could be justified
+/// against it. A non-zero reading is a finding, never a tolerance.
 fn run_chain(
     op: VectorAggOp,
     key: &ChainKey,
@@ -799,8 +944,25 @@ fn run_chain(
 ) -> (StageInput, Vec<VectorAggSpec>, Window) {
     let (result, aggs) = build_chain(op, key, fx, scale);
     let input = measure_result(&result);
-    let (out, w) = measure(|| apply_vector_aggs(result, &aggs));
-    drop(out.expect("a witness cell must be admitted; a refusal would read as a small peak"));
+    let (ok, w) = measure(|| {
+        let out = apply_vector_aggs(result, &aggs);
+        // `is_ok` borrows and allocates nothing, so the admission check
+        // costs the window no bytes; the release itself is the drop.
+        let ok = out.is_ok();
+        drop(out);
+        ok
+    });
+    assert!(
+        ok,
+        "a witness cell must be admitted; a refusal would read as a small peak"
+    );
+    assert!(!w.overflow, "cohort table overflowed");
+    assert_eq!(
+        w.retained, 0,
+        "the stage retained {} bytes it allocated — the ledger discharged but the heap did \
+         not: {w:?}",
+        w.retained,
+    );
     (input, aggs, w)
 }
 
@@ -1530,7 +1692,9 @@ fn matching_for(key: &BinaryKey, include: &[&str]) -> Option<VectorMatching> {
 
 /// Measures one binary cell. Both operands carry the same `id` values, so
 /// every matching shape pairs one-to-one and the join's output path is
-/// genuinely exercised.
+/// genuinely exercised. The result is dropped INSIDE the window on the
+/// same terms as [`run_chain`], so `retained == 0` covers the join's own
+/// containers too.
 fn run_binary(
     op: BinOp,
     key: &BinaryKey,
@@ -1559,8 +1723,20 @@ fn run_binary(
         }
     };
     let m = matching.clone();
-    let (out, w) = measure(move || combine_binary(op, false, m.as_ref(), lhs, rhs));
-    drop(out.expect("a witness binary fixture must combine cleanly"));
+    let (ok, w) = measure(move || {
+        let out = combine_binary(op, false, m.as_ref(), lhs, rhs);
+        let ok = out.is_ok();
+        drop(out);
+        ok
+    });
+    assert!(ok, "a witness binary fixture must combine cleanly");
+    assert!(!w.overflow, "cohort table overflowed");
+    assert_eq!(
+        w.retained, 0,
+        "the join retained {} bytes it allocated — the ledger discharged but the heap did \
+         not: {w:?}",
+        w.retained,
+    );
     (li, ri, matching, w)
 }
 
