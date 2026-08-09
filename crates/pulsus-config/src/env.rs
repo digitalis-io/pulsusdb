@@ -72,6 +72,9 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
     "PULSUS_TRACEQL_MAX_SERIES",
     "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
+    "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
+    "PULSUS_PROMQL_READ_MAX_MEMORY_BYTES",
+    "PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_QUERY_EVAL_CONCURRENCY",
     "PULSUS_TAIL_POLL_INTERVAL",
     "PULSUS_TAIL_MAX_DELAY",
@@ -348,6 +351,21 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
         cfg.reader.traceql_generator_max_memory_bytes =
             parse_int("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES", &v)?;
     }
+    // Issue #398: the three per-surface read memory ceilings. Plain
+    // integers (bytes), mirroring `PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES`
+    // rather than the `ByteSize`-parsed `PULSUS_LOGQL_SCAN_BUDGET_BYTES`.
+    if let Some(v) = read("PULSUS_LOGQL_READ_MAX_MEMORY_BYTES") {
+        cfg.reader.logql_read_max_memory_bytes =
+            parse_int("PULSUS_LOGQL_READ_MAX_MEMORY_BYTES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROMQL_READ_MAX_MEMORY_BYTES") {
+        cfg.reader.promql_read_max_memory_bytes =
+            parse_int("PULSUS_PROMQL_READ_MAX_MEMORY_BYTES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES") {
+        cfg.reader.traceql_read_max_memory_bytes =
+            parse_int("PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES", &v)?;
+    }
     if let Some(v) = read("PULSUS_QUERY_EVAL_CONCURRENCY") {
         cfg.reader.query_eval_concurrency = parse_int("PULSUS_QUERY_EVAL_CONCURRENCY", &v)?;
     }
@@ -404,8 +422,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            70,
-            "docs/configuration.md §§1-8 document exactly 70 variables"
+            73,
+            "docs/configuration.md §§1-8 document exactly 73 variables"
         );
     }
 

@@ -35,7 +35,15 @@
 //!   (`config.generator_max_memory_bytes`) +
 //!   `max_bytes_before_external_group_by=0`, bounding a dense
 //!   common-value prefix's `GROUP BY` aggregation state; breach → code
-//!   241 → [`TooBroadReason::TraceGeneratorMemory`] → 422. Layer 2 — a
+//!   241 → [`TooBroadReason::TraceGeneratorMemory`] → 422. Issue #398
+//!   extends `max_memory_usage` + `max_bytes_before_external_group_by=0`
+//!   to EVERY trace read at all three of this module's settings origins —
+//!   [`search_settings`], the independent [`catalog_settings`], and the
+//!   §4.2 point read ([`TraceEngine::fetch_by_id`], which carried no
+//!   settings at all and bypassed [`map_trace_read_error`]) — from
+//!   `config.read_max_memory_bytes`; breach → code 241 →
+//!   [`TooBroadReason::TraceReadMemory`] → 422. The generator's tighter
+//!   ceiling layers on top and keeps its own reason. Layer 2 — a
 //!   single request-scoped byte counter ([`HYDRATION_BYTE_BUDGET`])
 //!   charges every retained byte (merge tuples, batch rows, membership
 //!   sets, heap summaries); breach → 422.
@@ -327,6 +335,18 @@ pub struct TraceReadConfig {
     /// phase-2 reads (hydration/membership/value/root), which set no
     /// memory limit of their own.
     pub generator_max_memory_bytes: u64,
+    /// Issue #398: `reader.traceql_read_max_memory_bytes` — the
+    /// `max_memory_usage` ceiling (throw-not-spill) carried by EVERY trace
+    /// read, at all three of this module's settings origins:
+    /// [`search_settings`], [`catalog_settings`], and the §4.2 point read
+    /// ([`TraceEngine::fetch_by_id`], which sent a bare
+    /// `QuerySettings::new()` and mapped errors around
+    /// [`map_trace_read_error`] entirely before #398). Breach → server code
+    /// 241 → [`TooBroadReason::TraceReadMemory`] → `422`. Phase-1
+    /// generator reads layer the TIGHTER
+    /// [`Self::generator_max_memory_bytes`] on top and keep their own
+    /// reason.
+    pub read_max_memory_bytes: u64,
     /// Clustered mode: inject the docs/schemas.md §7 clustered-reader
     /// settings on every search query (both phases are shard-local by
     /// the `cityHash64(trace_id)` co-sharding).
@@ -502,17 +522,35 @@ fn map_trace_metrics_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     map_trace_read_error(e, config)
 }
 
-/// Maps a ClickHouse error on the **trace search** path, and (issue #58
-/// re-review) the two §4.3 catalog reads that carry the same budget via
-/// [`catalog_settings`]. Unlike the LogQL mapper, this one deliberately
-/// sets `max_rows_to_read`, so code 158 maps to
-/// [`TooBroadReason::TraceScanBudgetRows`]; the read/result byte ceilings
-/// (codes 307/396) map to the shared byte-budget reason. Everything else
-/// passes through unmapped (never reinterpreted as a timeout or vice
-/// versa).
+/// Maps a ClickHouse error on the **trace search** path, the (issue #58
+/// re-review) two §4.3 catalog reads that carry the same budget via
+/// [`catalog_settings`], and (issue #398) the §4.2 trace-by-id point read.
+/// Unlike the LogQL mapper, this one deliberately sets `max_rows_to_read`,
+/// so code 158 maps to [`TooBroadReason::TraceScanBudgetRows`]; the
+/// read/result byte ceilings (codes 307/396) map to the shared byte-budget
+/// reason; and code 241 maps to [`TooBroadReason::TraceReadMemory`].
+/// Everything else passes through unmapped (never reinterpreted as a
+/// timeout or vice versa).
+///
+/// **The #412 rule** applies here exactly as it does in
+/// `logql::exec::map_read_error` (see that doc for the full argument): the
+/// BOUND is enforced by ClickHouse regardless of how the code was parsed,
+/// a missed 241 falls open to the pre-#398 `500`, a false 241 only
+/// relabels an already-failing query, and this mapper reads only the
+/// already-parsed `code` field so it inherits #412's fix for free.
 fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     if let ChError::Server { code, .. } = &e {
         match *code {
+            // Issue #398: the surface-wide memory ceiling
+            // `search_settings`/`catalog_settings` now carry. Generator
+            // reads never reach this arm — `map_trace_generator_error`
+            // classifies 241 as the tighter, more specific
+            // `TraceGeneratorMemory` first and only delegates the rest.
+            CODE_MEMORY_LIMIT_EXCEEDED => {
+                return ReadError::QueryTooBroad(TooBroadReason::TraceReadMemory {
+                    budget_bytes: config.read_max_memory_bytes,
+                });
+            }
             CODE_TOO_MANY_ROWS => {
                 return ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows {
                     budget_rows: config.scan_budget_rows,
@@ -541,8 +579,13 @@ fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
 /// (`MEMORY_LIMIT_EXCEEDED`) — raised only by [`generator_settings`]'s
 /// memory ceiling — maps to the dedicated, never-conflated
 /// [`TooBroadReason::TraceGeneratorMemory`]; everything else delegates
-/// to the shared trace mapper ([`map_trace_read_error`]), which never
-/// maps 241 itself (no other trace/LogQL query sets a memory limit).
+/// to the shared trace mapper ([`map_trace_read_error`]).
+///
+/// Issue #398: [`map_trace_read_error`] DOES map 241 now, to the
+/// surface-wide [`TooBroadReason::TraceReadMemory`]. The order below is
+/// therefore load-bearing rather than incidental — this mapper runs first
+/// on generator reads and returns before delegating, so the generator's
+/// tighter ceiling keeps reporting its own reason and the two never mix.
 fn map_trace_generator_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     if let ChError::Server {
         code: CODE_MEMORY_LIMIT_EXCEEDED,
@@ -1296,13 +1339,23 @@ impl TraceEngine {
         // Scoped stream: the pooled-connection lease is dropped when this
         // binding leaves scope at the end of the function, after full
         // consumption.
+        //
+        // Issue #398: this read sent a bare `QuerySettings::new()` — no
+        // budget of any kind — and mapped both `ChError` seams with
+        // `ReadError::Clickhouse` DIRECTLY, bypassing
+        // [`map_trace_read_error`] entirely. It now carries
+        // [`catalog_settings`] (the point read is a primary-key-prefix
+        // lookup on the Traces family, the same read-budget class as the
+        // catalog scans) and routes both seams through the shared mapper,
+        // so a memory breach here is a `422`, not a `500`.
+        let settings = catalog_settings(&self.config);
         let mut stream = self
             .client
-            .query_stream::<StoredSpanRow>(&sql, &QuerySettings::new())
+            .query_stream::<StoredSpanRow>(&sql, &settings)
             .await
-            .map_err(ReadError::Clickhouse)?;
+            .map_err(|e| map_trace_read_error(e, &self.config))?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(ReadError::Clickhouse)?;
+            let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
             spans.push(StoredSpan::from(row));
         }
         Ok(spans)
@@ -2117,6 +2170,14 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
         // batches, root hydration) routes through `collect_rows_charged`,
         // which carries this settings object.
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+        // Issue #398: the surface-wide per-query memory ceiling
+        // (`reader.traceql_read_max_memory_bytes`), throw-not-spill. Every
+        // phase-2 read (hydration/membership/value/root) previously set no
+        // memory limit at all, so a memory breach there was a `500`.
+        // Phase-1 generator reads override this with their own tighter
+        // ceiling in `generator_settings`.
+        .set("max_memory_usage", config.read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
 }
 
 /// The phase-1 candidate-generator query settings (issue #57 re-audit,
@@ -2125,9 +2186,17 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
 /// `max_bytes_before_external_group_by = 0` (throw-not-spill: a spilled
 /// aggregation would silently slow rather than fail loud). Bounds a
 /// dense common-value prefix's `GROUP BY trace_id` aggregation state;
-/// breach → server code 241 → [`map_trace_generator_error`]. Applied
-/// ONLY to phase-1 generator reads — phase-2 reads set no memory limit
-/// of their own.
+/// breach → server code 241 → [`map_trace_generator_error`].
+///
+/// **Issue #398: this OVERRIDES [`search_settings`]' surface-wide ceiling
+/// with a tighter one (512 MiB by default vs 8 GiB), and that is not a
+/// carve-out.** A carve-out leaves a path *unbounded*; this path ends up
+/// bounded more strictly, not less — and it keeps its own, more specific
+/// [`TooBroadReason::TraceGeneratorMemory`] via [`map_trace_generator_error`],
+/// which runs before the shared mapper. Removing it would LOOSEN a
+/// shipped guarantee. The `.set` calls below are ordinary overrides
+/// (`QuerySettings::set` replaces rather than duplicates), so a generator
+/// read carries exactly one `max_memory_usage`, the generator's.
 fn generator_settings(config: &TraceReadConfig) -> QuerySettings {
     search_settings(config)
         .set("max_memory_usage", config.generator_max_memory_bytes)
@@ -2157,6 +2226,14 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("read_overflow_mode", "throw")
         // Issue #35: same raised parse-buffer cap as `search_settings`.
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+        // Issue #398: same memory ceiling as `search_settings`. This root
+        // is deliberately INDEPENDENT of `search_settings` (it omits the
+        // clustered-reader block on purpose), which is precisely why the
+        // ceiling has to be repeated here rather than inherited — and this
+        // is the root whose unbounded `/api/search/tag/{tag}/values` read
+        // produced the measured `500` that opened #398.
+        .set("max_memory_usage", config.read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
 }
 
 /// The Layer-1 settings every metrics query carries (issue #59 plan v2
@@ -2621,6 +2698,13 @@ mod wire_literal {
 mod tests {
     use super::*;
 
+    /// Issue #398: a distinctive, non-default
+    /// `reader.traceql_read_max_memory_bytes` for these tests —
+    /// deliberately unequal to `generator_max_memory_bytes` above, so the
+    /// surface-wide ceiling and the generator's tighter one can never be
+    /// confused for one another in an assertion.
+    const TEST_READ_MEM: u64 = 7_654_321;
+
     #[test]
     fn trace_read_config_is_cloneable_and_debuggable() {
         let config = TraceReadConfig {
@@ -2632,6 +2716,7 @@ mod tests {
             scan_budget_rows: 50_000_000,
             max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
+            read_max_memory_bytes: TEST_READ_MEM,
             distributed: false,
             skip_unavailable_shards: false,
         };
@@ -2651,6 +2736,7 @@ mod tests {
             scan_budget_rows: 1_000,
             max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
+            read_max_memory_bytes: TEST_READ_MEM,
             distributed: false,
             skip_unavailable_shards: false,
         }
@@ -2885,6 +2971,65 @@ mod tests {
                 "the generator memory ceiling must pass through verbatim"
             );
             assert_ne!(s.get("max_memory_usage"), Some("0"));
+        }
+    }
+
+    /// Issue #398 AC T1: **all three** of this module's settings origins
+    /// carry the surface-wide memory ceiling and throw rather than spill.
+    ///
+    /// Three, not one. `search_settings` is the obvious root;
+    /// `catalog_settings` is a DELIBERATELY INDEPENDENT root (it omits the
+    /// clustered-reader block on purpose) and is the one whose unbounded
+    /// `/api/search/tag/{tag}/values` read produced the measured 500 that
+    /// opened this issue; and the §4.2 point read
+    /// (`TraceEngine::fetch_by_id`) sent a bare `QuerySettings::new()`
+    /// while mapping errors around `map_trace_read_error` entirely. The
+    /// point read is included here by asserting the settings object it now
+    /// dispatches with — `catalog_settings(&self.config)`, its whole body.
+    ///
+    /// This unit test alone is NOT the completeness proof: it can only
+    /// check the origins someone remembered to list. That is what
+    /// `every_trace_engine_query_carries_the_memory_ceiling` in
+    /// `tests/query_log_gates.rs` is for — a `system.query_log` sweep sees
+    /// a dispatch site no enumeration mentions.
+    #[test]
+    fn trace_catalog_settings_carry_the_memory_ceiling() {
+        for bytes in [1u64, pulsus_config::TRACEQL_READ_MAX_MEMORY_BYTES_CEILING] {
+            let mut c = cfg();
+            c.read_max_memory_bytes = bytes;
+            let expected = bytes.to_string();
+            for (name, s) in [
+                ("search_settings", search_settings(&c)),
+                ("catalog_settings", catalog_settings(&c)),
+                // `fetch_by_id`'s settings object, by construction.
+                ("fetch_by_id (point read)", catalog_settings(&c)),
+                ("metrics_settings", metrics_settings(&c)),
+                ("graph_settings", graph_settings(&c)),
+            ] {
+                assert_eq!(
+                    s.get("max_memory_usage"),
+                    Some(expected.as_str()),
+                    "{name} must carry the surface-wide memory ceiling verbatim"
+                );
+                assert_ne!(
+                    s.get("max_memory_usage"),
+                    Some("0"),
+                    "{name} must never send ClickHouse's unlimited sentinel"
+                );
+                assert_eq!(
+                    s.get("max_bytes_before_external_group_by"),
+                    Some("0"),
+                    "{name} must throw rather than spill"
+                );
+            }
+            // The generator layers its own TIGHTER ceiling on top and wins.
+            // Not a carve-out: this path ends up bounded more strictly.
+            let g = generator_settings(&c);
+            assert_eq!(
+                g.get("max_memory_usage"),
+                Some(c.generator_max_memory_bytes.to_string().as_str()),
+                "the generator's own ceiling must override the surface-wide one"
+            );
         }
     }
 
@@ -3315,13 +3460,23 @@ mod tests {
             }
             other => panic!("expected TraceGeneratorMemory, got {other:?}"),
         }
-        // The shared trace mapper never maps 241 — the memory ceiling is
-        // set only on the phase-1 generator settings, and the reasons
-        // stay unconflated.
-        assert!(matches!(
-            map_trace_read_error(e(), &cfg()),
-            ReadError::Clickhouse(_)
-        ));
+        // Issue #398: the shared trace mapper DOES map 241 now — every
+        // trace read carries the surface-wide ceiling — but to its own,
+        // separate reason carrying its own, separate budget. The two stay
+        // unconflated, which is what this test has always been for, and
+        // the generator's mapper returning FIRST is what keeps the tighter
+        // ceiling reporting as `TraceGeneratorMemory`.
+        match map_trace_read_error(e(), &cfg()) {
+            ReadError::QueryTooBroad(TooBroadReason::TraceReadMemory { budget_bytes }) => {
+                assert_eq!(budget_bytes, cfg().read_max_memory_bytes);
+                assert_ne!(
+                    budget_bytes,
+                    cfg().generator_max_memory_bytes,
+                    "the two memory budgets must be distinguishable in the message"
+                );
+            }
+            other => panic!("expected TraceReadMemory, got {other:?}"),
+        }
     }
 
     #[test]

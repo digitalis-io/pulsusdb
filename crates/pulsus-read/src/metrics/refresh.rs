@@ -205,16 +205,39 @@ pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
     Ok(())
 }
 
+/// Issue #398: the sweep carries the same per-query memory ceiling
+/// (`max_memory_usage` + `max_bytes_before_external_group_by = 0`,
+/// throw-not-spill) as every request-path metrics read, from
+/// `reader.promql_read_max_memory_bytes`. It sent `QuerySettings::new()`
+/// before — the one metrics ClickHouse read with no bound at all.
+///
+/// The failure BEHAVIOUR is unchanged on purpose: a breach still returns
+/// `Err` here, and [`spawn_refresh_loop`] still logs it and keeps serving
+/// the last good snapshot. This only stops an unbounded sweep from
+/// competing for server memory; it does not, and is not meant to, change
+/// the fact that a degraded cache keeps answering `200` (recorded as
+/// remaining work on issue #398).
 async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChError> {
     let mut rows = Vec::new();
     let mut stream = cache
         .client
-        .query_stream::<SeriesRow>(sql, &QuerySettings::new())
+        .query_stream::<SeriesRow>(sql, &sweep_settings(cache.config.read_max_memory_bytes))
         .await?;
     while let Some(row) = stream.next().await {
         rows.push(row?);
     }
     Ok(rows)
+}
+
+/// The label-cache sweep's query settings (issue #398): the per-query
+/// memory ceiling from `reader.promql_read_max_memory_bytes`, the same
+/// throw-not-spill pair `metrics::exec::metrics_read_settings` sets. A
+/// free function so the decision is provable without a ClickHouse
+/// connection (the `read_query_settings`/`probe_fanout_bound` precedent).
+pub(crate) fn sweep_settings(read_max_memory_bytes: u64) -> QuerySettings {
+    QuerySettings::new()
+        .set("max_memory_usage", read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one

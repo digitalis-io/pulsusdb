@@ -453,6 +453,57 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// Issue #398 AC L4: a LogQL read that exhausted ClickHouse's memory
+    /// answers **422**, not 500 — the same status the too-broad family
+    /// already answers, in the reference error container, naming the knob
+    /// an operator would raise.
+    ///
+    /// 422 rather than the reference's 400 is the PRE-EXISTING,
+    /// family-wide divergence already recorded under `#236` in
+    /// `docs/benchmarks/logs-differential-ledger.md`; this reason joins
+    /// that family and opens no new one. (Prometheus v3.13.0 and Tempo
+    /// v3.0.2 were both measured at 422 for their own equivalents, so only
+    /// Loki differs.)
+    #[tokio::test]
+    async fn logql_read_memory_maps_to_422() {
+        let err = ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::LogqlReadMemory {
+            budget_bytes: 8_589_934_592,
+        });
+        let expected = err.to_string();
+        let (status, body) = rendered(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, expected);
+        assert!(
+            body.contains("reader.logql_read_max_memory_bytes"),
+            "the body must name the knob an operator would raise: {body}"
+        );
+        assert!(
+            body.contains("8589934592"),
+            "the body must carry the configured ceiling: {body}"
+        );
+        // The pre-#398 failure mode: the raw server exception in the body.
+        assert!(
+            !body.contains("DB::Exception") && !body.contains("version 24.8"),
+            "the 422 body must carry only our own message: {body}"
+        );
+    }
+
+    /// Issue #398: the sibling surfaces' reasons are variants of the SAME
+    /// shared `ReadError`, so this mapper must classify them too rather
+    /// than falling into an unreachable-today arm that silently becomes
+    /// reachable later (the `NamelessSelectorUnresolvable` precedent
+    /// above).
+    #[tokio::test]
+    async fn the_sibling_surfaces_read_memory_reasons_also_map_to_422() {
+        for reason in [
+            pulsus_read::logql::TooBroadReason::PromqlReadMemory { budget_bytes: 4096 },
+            pulsus_read::logql::TooBroadReason::TraceReadMemory { budget_bytes: 4096 },
+        ] {
+            let (status, _) = rendered(ApiError::Read(ReadError::QueryTooBroad(reason))).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reason:?}");
+        }
+    }
+
     #[tokio::test]
     async fn read_error_clickhouse_timeout_maps_to_504() {
         let err = ReadError::Clickhouse(ChError::Timeout("deadline".to_string()));

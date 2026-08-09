@@ -322,6 +322,21 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.traceql_generator_max_memory_bytes == 1_048_576,
     },
     Row {
+        var: "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
+        value: "2097152",
+        check: |c| c.reader.logql_read_max_memory_bytes == 2_097_152,
+    },
+    Row {
+        var: "PULSUS_PROMQL_READ_MAX_MEMORY_BYTES",
+        value: "3145728",
+        check: |c| c.reader.promql_read_max_memory_bytes == 3_145_728,
+    },
+    Row {
+        var: "PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES",
+        value: "4194304",
+        check: |c| c.reader.traceql_read_max_memory_bytes == 4_194_304,
+    },
+    Row {
         var: "PULSUS_QUERY_EVAL_CONCURRENCY",
         value: "64",
         check: |c| c.reader.query_eval_concurrency == 64,
@@ -401,8 +416,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        70,
-        "docs/configuration.md §§1-8 document exactly 70 variables"
+        73,
+        "docs/configuration.md §§1-8 document exactly 73 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

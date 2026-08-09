@@ -711,6 +711,11 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     let engine = TraceEngine::new(
         ChClient::new(data_cfg).await?,
         TraceReadConfig {
+            // Issue #398: compilation-forced only — the struct gained a
+            // required field. Set to the production default so the bench's
+            // queries are unchanged apart from a ceiling they never
+            // approach; no measured quantity can move.
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             spans_table: "trace_spans_dist".to_string(),
             attrs_table: "trace_attrs_idx_dist".to_string(),
             // Never `_dist`: the tag catalog is a Global table with no

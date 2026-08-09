@@ -141,6 +141,9 @@ async fn execute_fingerprint_sql(client: &ChClient, sql: &str) -> Vec<u64> {
 
 fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> LabelCacheConfig {
     LabelCacheConfig {
+        // Issue #398: the per-query ClickHouse memory ceiling; the
+        // production default, so this fixture keeps today's behaviour.
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: series_table.to_string(),
         bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
@@ -754,4 +757,123 @@ fn serde_json_like_encode(key: &str, value: &str) -> String {
         out
     }
     format!("{{\"{}\":\"{}\"}}", escape(key), escape(value))
+}
+
+/// Issue #398 AC M4 (behaviour half): bounding the background label-cache
+/// refresh sweep with `reader.promql_read_max_memory_bytes` does NOT change
+/// what a failed sweep does — it still keeps serving the LAST GOOD
+/// SNAPSHOT rather than blanking the cache.
+///
+/// Both halves are asserted on ONE cache, so neither can pass by accident:
+/// the tight ceiling lets a small sweep through (proving the cache is
+/// functional under it), then the corpus is widened until the SAME cache's
+/// next sweep breaches the bound. The sweep returns `Err` — proving the
+/// ceiling is live on this path, which no settings unit test can show — and
+/// the resident snapshot is byte-for-byte the pre-failure one. The widening
+/// size is measured on this sweep itself; see the comment at the insert.
+///
+/// That distinction is the whole reason this issue records "stale or empty
+/// results, not a status code" as the metrics surface's real symptom, and
+/// leaves it as remaining work: bounding the sweep makes it fail at a
+/// predictable point, it does not stop a degraded cache answering `200`.
+///
+/// The settings object itself is pinned hermetically by
+/// `metrics::exec::tests::label_cache_sweep_carries_the_memory_ceiling`.
+#[tokio::test]
+async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_sweep_mem";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("now fits in i64");
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent = (now_ms / bucket) * bucket;
+
+    // A handful of series: small enough that the tight ceiling never bites,
+    // so there IS a last good snapshot for the failed sweep to retain.
+    let small: Vec<SeedSeriesRow> = (0..10u64)
+        .map(|n| SeedSeriesRow {
+            metric_name: "up".to_string(),
+            fingerprint: n + 1,
+            unix_milli: recent,
+            labels: format!(r#"{{"job":"j{n}"}}"#),
+        })
+        .collect();
+    seed(&client, &small).await;
+
+    let mut cfg = cache_config(db, "metric_series", 24 * 3_600_000, Duration::from_secs(60));
+    cfg.read_max_memory_bytes = 1024;
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let cache = LabelCache::new(cache_client, cfg);
+
+    cache
+        .refresh()
+        .await
+        .expect("a small sweep fits under the tight ceiling");
+    let good = cache.tsdb_snapshot();
+    assert_eq!(good.num_series, 10, "the last GOOD snapshot");
+    assert!(cache.is_warm());
+
+    // Widen the corpus so the next sweep over the SAME cache cannot fit
+    // under the same ceiling.
+    //
+    // **Sizing, measured through this test's own `cache.refresh()` at a
+    // 1024-byte ceiling** — not on a SQL statement in isolation: the sweep
+    // returns `Ok` at 1 000, 5 000, 10 000, 20 000 and 30 000 widening rows
+    // and `Err(Server { code: 241, .. })` at 40 000, 50 000, 100 000 and
+    // 200 000, so the threshold sits between 30 000 and 40 000. 200 000 is
+    // 5x that, and the widening is one server-side `INSERT … FROM
+    // numbers()`, so the margin is free.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
+                 SELECT 'up', number + 1000, {recent}, \
+                        concat('{{\"job\":\"w', toString(number), '\"}}') \
+                 FROM numbers(200000)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("widen metric_series");
+
+    let err = cache
+        .refresh()
+        .await
+        .expect_err("the widened sweep must breach the ceiling");
+    match err {
+        pulsus_clickhouse::ChError::Server { code, .. } => assert_eq!(
+            code, 241,
+            "the sweep must fail on MEMORY_LIMIT_EXCEEDED, not something else"
+        ),
+        other => panic!("expected a server 241, got {other:?}"),
+    }
+
+    // Behaviour deliberately unchanged: the last good snapshot is still
+    // resident, not blanked — a blanked cache would mass-false-empty every
+    // in-window query.
+    let after = cache.tsdb_snapshot();
+    assert_eq!(
+        after.num_series, good.num_series,
+        "a failed sweep must never clobber the last good snapshot"
+    );
+    assert!(cache.is_warm(), "a failed sweep must not un-warm the cache");
+
+    drop_database(&bootstrap, db).await;
 }

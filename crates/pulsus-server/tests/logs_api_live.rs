@@ -2811,6 +2811,201 @@ async fn label_discovery_and_series_are_scoped_to_the_requested_window() {
     drop_database(db).await;
 }
 
+// ---------------------------------------------------------------------
+// Issue #398 — a read that exhausts ClickHouse's memory answers 422, not
+// 500. The measurement that opened the issue: at 051fd8a, with the server
+// profile pinning `max_memory_usage`, FIVE endpoints answered 500 with the
+// raw ClickHouse exception in the body (`clickhouse: server [241]: Code:
+// 241. DB::Exception: Memory limit (for query) exceeded … maximum: 976.56
+// KiB.`) — `/query_range`, `/series`, `/detected_labels`,
+// `/detected_fields` and `/stats`. All five run the SHARED stage-1 stream
+// resolution, which the issue measured at 2.78–3.49 GiB against
+// `/detected_labels`' own 0.87–0.92 GiB.
+// ---------------------------------------------------------------------
+
+/// The five endpoints that run the shared stage-1 stream resolution, with
+/// the IDENTICAL selector on each so the endpoint is the only variable.
+/// `start`/`end` are appended by the caller.
+const STAGE1_ENDPOINTS: &[(&str, &str, &str)] = &[
+    ("/api/logs/v1/query_range", "query", r#"{env="prod"}"#),
+    ("/api/logs/v1/series", "match[]", r#"{env="prod"}"#),
+    ("/api/logs/v1/detected_labels", "query", r#"{env="prod"}"#),
+    ("/api/logs/v1/detected_fields", "query", r#"{env="prod"}"#),
+    ("/api/logs/v1/stats", "query", r#"{env="prod"}"#),
+];
+
+/// Streams seeded on top of [`seed`]'s two, all carrying `env="prod"` and a
+/// distinct `service_name`.
+///
+/// **Sizing, measured through this test at `PULSUS_LOGQL_READ_MAX_MEMORY_BYTES
+/// = 1024` — i.e. on the endpoints, not on a SQL statement in isolation.**
+/// The breach is 422 on all five endpoints at every size tried from **one**
+/// extra stream upward (1, 2, 3, 5, 10, 100, 1 000, 5 000, 20 000, 50 000),
+/// and 200 on all five with this seeding removed entirely (3 runs each way,
+/// identical every time). So one extra stream is already enough: the
+/// discriminator does **not** need a wide corpus to trip.
+///
+/// It needs this constant anyway, and for a reason worth stating because it
+/// is the one that survives:
+///
+/// - With the seeding removed the endpoints answer **200** — so the fixture
+///   is load-bearing, not decoration.
+/// - What one extra stream buys is a SECOND PART, not more rows: a single
+///   extra stream carrying `env="other"`, which the selector never matches,
+///   trips it just the same. Measured.
+/// - Parts are transient. `OPTIMIZE TABLE … FINAL` after the same one-row
+///   seeding puts the endpoints back to **200**; background merges do that
+///   on their own schedule, so a fixture resting on the part count is a
+///   fixture resting on a race.
+/// - On a SINGLE merged part the trigger is row count, and the threshold sits
+///   between 500 (200, does not trip) and 1 000 (422, trips) — measured with
+///   `OPTIMIZE … FINAL` forced before the requests.
+///
+/// 5 000 is 5x that merged threshold, so the gate trips whether or not a
+/// merge has collapsed the seed's two parts. It costs nothing to carry: the
+/// whole test runs in ~0.8-1.2 s and the timing does not move with this
+/// number (0.84 s at 100 rows, 1.07 s at 50 000) because the seed is one
+/// server-side `INSERT … FROM numbers()`.
+///
+/// A separate observation, recorded because it explains the step but
+/// **measured on the bare stage-1 SQL and NOT on these endpoints**: run that
+/// one statement alone against ClickHouse 24.8.14.39 and it needs ~20 000
+/// rows before it raises 241, because allocations below
+/// `max_untracked_memory` (4 MiB default) accumulate unaccounted. The
+/// endpoint path runs more than that one statement and crosses the same
+/// threshold far sooner. Do not use the bare-statement number to size this
+/// fixture — that mistake is what this comment replaces.
+const WIDE_STREAMS: u64 = 5_000;
+
+/// Bulk-seeds [`WIDE_STREAMS`] `log_streams` rows; `log_streams_idx` is
+/// filled by the schema's own materialized view (docs/schemas.md §3.1),
+/// exactly as [`seed`] relies on.
+async fn seed_wide_streams(client: &ChClient, db: &str, base_ns: i64) {
+    let sql = format!(
+        "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+         SELECT toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), \
+                number + 1000, \
+                'checkout', \
+                concat('{{\"env\":\"prod\",\"service_name\":\"svc', toString(number), '\"}}'), \
+                0 \
+         FROM numbers({WIDE_STREAMS})"
+    );
+    client
+        .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+        .await
+        .expect("seed wide log_streams");
+}
+
+/// **The discriminator** (issue #398 AC L5a). A LogQL read that breaches
+/// the per-query memory ceiling answers **422** on every one of the five
+/// stage-1 endpoints, with our own message and no ClickHouse exception
+/// text.
+///
+/// This is the test that tells the correct fix from the plausible-but-wrong
+/// one. The wrong fix is "cap `/detected_labels`, the endpoint where the
+/// symptom was noticed": under it `/detected_labels` turns 422 and the
+/// other four stay 500, leaving the expensive shared half uncapped. A
+/// single-endpoint assertion cannot see the difference; this sweep fails
+/// loudly on the cheap-half-only fix.
+#[tokio::test]
+async fn stage1_memory_breach_is_422_on_every_stage1_endpoint() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_mem_422";
+    let port = 31_127;
+    drop_database(db).await;
+    let (_guard, client, base_ns) =
+        setup_env(db, port, &[("PULSUS_LOGQL_READ_MAX_MEMORY_BYTES", "1024")]).await;
+    seed_wide_streams(&client, db, base_ns).await;
+
+    let start = (base_ns - 3_600_000_000_000).to_string();
+    let end = (base_ns + 1_000_000_000).to_string();
+    // Collected, not short-circuited: a loop that stopped at the first
+    // failure would report one endpoint and hide the other four — exactly
+    // the shape this discriminator exists to make visible.
+    let mut wrong: Vec<String> = Vec::new();
+    for (path, key, selector) in STAGE1_ENDPOINTS {
+        let res = http_get(
+            port,
+            &q(
+                path,
+                &[
+                    (key, selector),
+                    ("start", start.as_str()),
+                    ("end", end.as_str()),
+                ],
+            ),
+        )
+        .expect("route reachable");
+        if res.status != 422 {
+            wrong.push(format!("{path} -> {} {}", res.status, res.body));
+            continue;
+        }
+        if !res.body.contains("reader.logql_read_max_memory_bytes") {
+            wrong.push(format!("{path} -> 422 without the knob name: {}", res.body));
+        }
+        // The pre-#398 body leaked the raw server exception, including the
+        // ClickHouse version string.
+        if res.body.contains("DB::Exception") || res.body.contains("official build") {
+            wrong.push(format!("{path} -> 422 leaking the exception: {}", res.body));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a memory breach must be 422 with our own message on every stage-1 endpoint:\n{}",
+        wrong.join("\n")
+    );
+
+    drop_database(db).await;
+}
+
+/// The direction-neutral validity gate (issue #398 AC L5b): with the knob
+/// unset — i.e. at the shipped 8 GiB default — the same five endpoints,
+/// the same selector and the SAME wide corpus answer **200**. Without it, a
+/// fix that 422'd everything would pass the discriminator above.
+#[tokio::test]
+async fn default_memory_ceiling_does_not_refuse_an_ordinary_query() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_mem_200";
+    let port = 31_128;
+    drop_database(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+    seed_wide_streams(&client, db, base_ns).await;
+
+    let start = (base_ns - 3_600_000_000_000).to_string();
+    let end = (base_ns + 1_000_000_000).to_string();
+    let mut refused: Vec<String> = Vec::new();
+    for (path, key, selector) in STAGE1_ENDPOINTS {
+        let res = http_get(
+            port,
+            &q(
+                path,
+                &[
+                    (key, selector),
+                    ("start", start.as_str()),
+                    ("end", end.as_str()),
+                ],
+            ),
+        )
+        .expect("route reachable");
+        if res.status != 200 {
+            refused.push(format!("{path} -> {} {}", res.status, res.body));
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "the default ceiling must not refuse an ordinary query:\n{}",
+        refused.join("\n")
+    );
+
+    drop_database(db).await;
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {

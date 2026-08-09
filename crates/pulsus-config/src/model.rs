@@ -376,6 +376,29 @@ pub struct ReaderConfig {
     /// measured for a 500k-row/500k-key aggregation, well below the
     /// server's 10 GiB default.
     pub traceql_generator_max_memory_bytes: u64,
+    /// Issue #398: the per-query ClickHouse memory ceiling every **LogQL**
+    /// read carries (`max_memory_usage` + `max_bytes_before_external_group_by
+    /// = 0`, throw-not-spill). A breach is server code 241
+    /// `MEMORY_LIMIT_EXCEEDED` → `422 query_too_broad`
+    /// (`TooBroadReason::LogqlReadMemory`), never a 500. Per query **per
+    /// server**, not a cluster-wide total. Must be >= 1 (`0` is
+    /// ClickHouse's *unlimited* sentinel). Default 8 GiB — the value the
+    /// sliding range read already shipped before this knob existed.
+    pub logql_read_max_memory_bytes: u64,
+    /// Issue #398: the same per-query memory ceiling on every **PromQL**
+    /// read (including the background label-cache refresh sweep, which
+    /// keeps its warn-and-serve-the-last-good-snapshot behaviour). Breach
+    /// → `422 execution` (`TooBroadReason::PromqlReadMemory`). Per query
+    /// per server; must be >= 1. Default 8 GiB.
+    pub promql_read_max_memory_bytes: u64,
+    /// Issue #398: the same per-query memory ceiling on every **TraceQL**
+    /// read — search, catalog discovery and the trace-by-id point read.
+    /// Breach → `422 query_too_broad` (`TooBroadReason::TraceReadMemory`).
+    /// The phase-1 candidate generator layers its own, TIGHTER
+    /// `reader.traceql_generator_max_memory_bytes` on top and keeps its own
+    /// `TooBroadReason::TraceGeneratorMemory`. Per query per server; must
+    /// be >= 1. Default 8 GiB.
+    pub traceql_read_max_memory_bytes: u64,
     /// Issue #101: process-wide bound on concurrent CPU-bound PromQL
     /// evaluations offloaded onto tokio's blocking pool (the read path's
     /// one `spawn_blocking(evaluate)` site). A query past the limit waits
@@ -446,6 +469,14 @@ impl Default for ReaderConfig {
             traceql_scan_budget_rows: 50_000_000,
             traceql_max_series: 1_000,
             traceql_generator_max_memory_bytes: 536_870_912,
+            // Issue #398: 8 GiB on each of the three read surfaces — the
+            // value the LogQL sliding range read's own hard-coded
+            // `max_memory_usage` override already shipped (issue #227),
+            // so the default is behaviourally unchanged there and merely
+            // extended to every other read.
+            logql_read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+            promql_read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
+            traceql_read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             query_eval_concurrency: 256,
             tail_poll_interval: HumanDuration(Duration::from_secs(1)),
             tail_max_delay: HumanDuration(Duration::from_secs(5)),

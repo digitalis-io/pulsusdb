@@ -72,6 +72,17 @@ pub struct LabelCacheConfig {
     pub ttl: Duration,
     /// See [`DEFAULT_STALENESS_MULTIPLIER`].
     pub staleness_multiplier: u32,
+    /// Issue #398: `reader.promql_read_max_memory_bytes` — the same
+    /// `max_memory_usage` ceiling (throw-not-spill) every request-path
+    /// metrics read carries, applied to the background refresh sweep too
+    /// ([`super::refresh::fetch_rows`]), which sent `QuerySettings::new()`
+    /// before. The sweep is not on any request path and its failure never
+    /// becomes an HTTP status, so it is bounded here rather than exempted:
+    /// an exemption would leave one unbounded metrics read competing for
+    /// server memory, which is the carve-out shape #398 exists to remove.
+    /// Its failure BEHAVIOUR is deliberately unchanged — warn and keep
+    /// serving the last good snapshot.
+    pub read_max_memory_bytes: u64,
 }
 
 /// Resident snapshot: `fingerprint -> LabelSet` plus `metric_name ->
@@ -1209,6 +1220,9 @@ impl MultiMetricScanProbe {
                 cache_max_series: 50_000,
                 ttl: Duration::from_secs(60),
                 staleness_multiplier: DEFAULT_STALENESS_MULTIPLIER,
+                // Never dispatches (this probe is in-memory only); the
+                // value is the production default for shape parity.
+                read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             },
             // Never matches any `m######` fixture name — every examined
             // name `continue`s, so the fingerprint loop never runs and no
@@ -1293,6 +1307,7 @@ mod tests {
             cache_max_series: 50_000,
             ttl: Duration::from_secs(60),
             staleness_multiplier: DEFAULT_STALENESS_MULTIPLIER,
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         }
     }
 
