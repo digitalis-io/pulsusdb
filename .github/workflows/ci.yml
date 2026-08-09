@@ -1227,11 +1227,12 @@ jobs:
       # value counts where the reference's p14 HLL estimate stops matching
       # the truth (7708 and 4533 distinct values, measured against
       # grafana/loki:3.7.4), the response body carries the EXACT count.
-      # Issue #399 adds the window-scoping case: a ten-minute request is
-      # answered from that window, not the calendar month, with the lower
-      # bound floored to the rollup bucket containing `start`.
-      # Ports 31155-31156, 31165 and 31167. Reuses this job's ClickHouse
-      # 24.8 container.
+      # Issue #399 adds two window-scoping cases: a ten-minute request is
+      # answered from that window rather than the calendar month, and —
+      # separately named because it discriminates a different wrong fix —
+      # a line whose rollup bucket STARTS BEFORE `start` still counts.
+      # Ports 31155-31156, 31165, 31167 and 31169. Reuses this job's
+      # ClickHouse 24.8 container.
       - name: Live logs detected labels/fields suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"

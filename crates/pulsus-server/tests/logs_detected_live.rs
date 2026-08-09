@@ -35,9 +35,10 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Ports 31155-31156, 31165 and 31167, distinct from every other live
-//! suite. (31157, the next number up, already belongs to
-//! `loki_push_live.rs`; 31166 belongs to it too.)
+//! Ports 31155-31156, 31165, 31167 and 31169, distinct from every other
+//! live suite. (31157, the next number up, already belongs to
+//! `loki_push_live.rs`; 31166 belongs to it too, and 31168 to
+//! `logs_api_live.rs`.)
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -1011,46 +1012,26 @@ async fn detected_labels_cardinality_is_exact_at_the_reference_divergence_points
     drop_db(db).await;
 }
 
-/// Issue #399 AC3/AC4 — `/detected_labels` answers the requested window,
-/// not the calendar month containing it.
+/// The issue #399 window fixture, shared by the two cases below — each
+/// seeds its OWN database so either can be run alone.
 ///
-/// **Measured on `c7649da` (the pre-fix tree):** the response was a pure
-/// function of the months overlapping `[start, end]`. A ten-minute window
-/// returned every label in August and reported `job` cardinality 2 where
-/// only one `job` value existed inside it.
+/// Three streams, one `log_samples` line each. Returns `b`, the 5s bucket
+/// containing `now - 3600s`: stream 3's only line sits at `b + 1s`, i.e.
+/// INSIDE bucket `b`, which starts BEFORE it. That is the whole point of
+/// the fixture — real `log_samples` rows, so the shipped rollup MV (not
+/// the test) decides which bucket each line lands in, and the bucket
+/// boundary under test is production's.
 ///
-/// **The reference bounds this endpoint by the window too, but coarsely.**
-/// `grafana/loki:3.7.4` (`b318f2829f0ae2094ab3a1e90780450e9e4b03be`,
-/// tsdb/v13, index period 24h, flushed) answered a `[T−2h, T−1h]` window
-/// with a label whose only line sat ~5h outside it, and answered the
-/// previous day's window with `[]`: `MultiIndex.LabelNames` filters index
-/// FILES by `forMatchingIndices` (`pkg/storage/stores/shipper/indexshipper/tsdb/multi_file_index.go:115-132`
-/// @ v3.7.4) while `TSDBIndex.LabelNames` ignores `from`/`through`
-/// entirely (`single_file_index.go:304-310` @ v3.7.4 — the signature is
-/// literally `_, _ model.Time`). Ours lands at one rollup bucket per edge,
-/// strictly tighter; registered as
-/// `detected-labels-window-scoped-to-rollup-bucket` in
-/// docs/benchmarks/logs-differential-ledger.md.
+/// | fp | labels | line at |
+/// |---|---|---|
+/// | 1 | `inwin=yes, job=fix, service_name=fix` | `now − 60s` |
+/// | 2 | `job=stale, outwin=yes, service_name=stale` | `now − 6h` |
+/// | 3 | `edge=yes, job=fix, service_name=fix` | `b + 1s` |
 ///
-/// Both requests below run against ONE fixture and ONE server spawn.
-#[tokio::test(flavor = "multi_thread")]
-async fn detected_labels_is_scoped_to_the_requested_window() {
-    if !should_run() {
-        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
-        return;
-    }
-    let port = 31_167;
-    let db = "pulsus_detected_it_window";
-    drop_db(db).await;
-    let _guard = spawn_ready(port, db, &[]);
-    let client = data_client(db).await;
-
-    let now = now_ns();
-    // `b` is the 5s bucket containing `now - 3600s`. Stream 3's only line
-    // sits at `b + 1s`, i.e. INSIDE bucket `b`, which starts before it —
-    // the case that discriminates the correct floored lower bound from
-    // the plausible-but-wrong `bucket_ns > start_ns` copy of
-    // `sql::log_stats_rollup`'s half-open sample predicate.
+/// These cases make no `/detected_fields` assertions, so real sample rows
+/// are safe here (unlike `detected_labels_and_fields_end_to_end`, whose
+/// fps 2 and 3 must stay sample-free and get `log_metrics_5s` rows direct).
+async fn seed_window_fixture(client: &ChClient, db: &str, now: i64) -> i64 {
     let b = (now - 3_600_000_000_000) / 5_000_000_000 * 5_000_000_000;
     let fixture: [(u64, &str, &str, i64); 3] = [
         (
@@ -1073,11 +1054,7 @@ async fn detected_labels_is_scoped_to_the_requested_window() {
         ),
     ];
     for (fp, service, labels, ts) in fixture {
-        seed_stream(&client, db, ts, fp, service, labels).await;
-        // Real `log_samples` rows here (this case makes no
-        // `/detected_fields` assertions), so the shipped rollup MV — not
-        // the test — decides which bucket each line lands in. That is the
-        // point: the bucket boundary under test is production's.
+        seed_stream(client, db, ts, fp, service, labels).await;
         client
             .execute(
                 &format!(
@@ -1090,8 +1067,50 @@ async fn detected_labels_is_scoped_to_the_requested_window() {
             .await
             .expect("seed log_samples");
     }
+    b
+}
 
-    // -- AC3: a ten-minute window sees only what is in it ---------------
+/// Issue #399 AC3 — `/detected_labels` answers the requested window, not
+/// the calendar month containing it.
+///
+/// **Measured on `c7649da` (the pre-fix tree):** the response was a pure
+/// function of the months overlapping `[start, end]`. A ten-minute window
+/// returned every label in August and reported `job` cardinality 2 where
+/// only one `job` value existed inside it.
+///
+/// **The reference bounds this endpoint by the window too, but coarsely.**
+/// `grafana/loki:3.7.4` (`b318f2829f0ae2094ab3a1e90780450e9e4b03be`,
+/// tsdb/v13, index period 24h, flushed) answered a `[T−2h, T−1h]` window
+/// with a label whose only line sat ~5h outside it, and answered the
+/// previous day's window with `[]`: `MultiIndex.LabelNames` filters index
+/// FILES by `forMatchingIndices` (`pkg/storage/stores/shipper/indexshipper/tsdb/multi_file_index.go:115-132`
+/// @ v3.7.4) while `TSDBIndex.LabelNames` ignores `from`/`through`
+/// entirely (`single_file_index.go:304-310` @ v3.7.4 — the signature is
+/// literally `_, _ model.Time`). Ours lands at one rollup bucket per edge,
+/// strictly tighter; registered as
+/// `detected-labels-window-scoped-to-rollup-bucket` in
+/// docs/benchmarks/logs-differential-ledger.md.
+///
+/// The bucket-edge half of #399 is
+/// [`detected_labels_keeps_a_sample_in_the_bucket_that_contains_start`],
+/// deliberately its own named test rather than a second request block
+/// here: it discriminates a different wrong implementation, and a named
+/// property is what a regression report can point at.
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_labels_is_scoped_to_the_requested_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_167;
+    let db = "pulsus_detected_it_window";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+    let client = data_client(db).await;
+
+    let now = now_ns();
+    seed_window_fixture(&client, db, now).await;
+
     let start = now - 600_000_000_000;
     let res = http_get(
         port,
@@ -1111,12 +1130,47 @@ async fn detected_labels_is_scoped_to_the_requested_window() {
          the pre-fix tree returned every August label and job:2: {json}"
     );
 
-    // -- AC4, THE DISCRIMINATOR: a sample in the bucket CONTAINING start
-    //    survives. Window `[b + 500ms, b + 4s]` holds only stream 3's
-    //    line, whose bucket is `b` — at or before `start`. A
-    //    `bucket_ns > start_ns` lower bound returns nothing here
-    //    (measured on the pre-fix tree with that exact wrong fix),
-    //    silently losing an in-window label. -----------------------------
+    drop_db(db).await;
+}
+
+/// Issue #399 AC4 — **THE DISCRIMINATOR.** A sample in the bucket
+/// CONTAINING `start` must survive the activity filter.
+///
+/// The window is `[b + 500ms, b + 4s]`, which holds only stream 3's line
+/// (at `b + 1s`). That line's rollup bucket is `b` — at or BEFORE
+/// `start` — because the MV stores `bucket_ns = intDiv(timestamp_ns,
+/// res) * res`. So the lower bound must floor to the containing bucket,
+/// not compare against `start_ns` itself.
+///
+/// **What it rules out, measured rather than argued.** Copying
+/// `sql::log_stats_rollup`'s half-open `bucket_ns > start_ns` — which is
+/// correct on the SAMPLE axis and wrong on the BUCKET axis — is the
+/// plausible wrong fix. Introduced deliberately against this fixture on
+/// `clickhouse/clickhouse-server:24.8.14.39`, it answers
+/// `{"detectedLabels":[]}`: it silently loses a label whose line is
+/// genuinely inside the window. This case fails under that fix (via
+/// `edge` vanishing) and on the pre-#399 tree (via `outwin` appearing),
+/// and passes only for the floored bound.
+///
+/// Kept as its own named test rather than folded into
+/// [`detected_labels_is_scoped_to_the_requested_window`]: the property
+/// has a name so a future reader can find it and a regression can point
+/// at it.
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_labels_keeps_a_sample_in_the_bucket_that_contains_start() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_169;
+    let db = "pulsus_detected_it_bucket_edge";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+    let client = data_client(db).await;
+
+    let now = now_ns();
+    let b = seed_window_fixture(&client, db, now).await;
+
     let edge_start = b + 500_000_000;
     let edge_end = b + 4_000_000_000;
     let res = http_get(
