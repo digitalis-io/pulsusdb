@@ -110,3 +110,25 @@ length the client trusts (`extract_exception_new`) instead of searching for it.
 `on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412`, on a
 verbatim 24.8 capture, so it fails loudly if a future crate or server version
 changes the shape.
+
+## The shortest true summary of this issue
+
+Six times over this issue's review — in the parse rule twice, in the
+version-dependence, in a retyped fixture, in a paraphrased one, and in the
+stated cause of a reproduction's negative control — an explanation was adopted
+that fitted the observed outcome and was not its cause. Every outcome was
+right; every mechanism was wrong until it was measured. The last of them was
+caught only because the *summary* still carried the superseded reason after the
+paragraph above it had been corrected.
+
+The resolution was the same move every time: **stop reasoning about the text
+and go and get the authoritative value.** Count the rows the predicate actually
+admits. Capture the bytes rather than retyping them. Open the cited line rather
+than computing it.
+
+That move is also, exactly, what this ADR does. The exception code was
+recoverable from the response text right up until it was not, and every rule
+that tried was defeated by a body an attacker could shape. The patch stops
+reading the text and takes the value ClickHouse already sent in a header. When
+a future reader wonders whether a cleverer parse would have done, the answer is
+in the two that were implemented, measured and deleted.

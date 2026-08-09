@@ -428,7 +428,8 @@ mod tests {
     /// (`SELECT count() FROM numbers(1000) WHERE match(…)` returns 1000). It
     /// is `notEquals(intDiv(1, number - 400000), 0)` that admits exactly one
     /// row below the trip — `number = 399999`, where `intDiv(1, -1) = -1`;
-    /// every smaller `number` gives `0`. One row is ~7 bytes, so the response
+    /// every smaller `number` gives `0`. That one row makes a 17-byte
+    /// response (a 10-byte column header and a 7-byte row), so the output
     /// stays buffered and the server can still discard it and set a status.
     ///
     /// ```text
@@ -451,9 +452,14 @@ mod tests {
     ///   http://localhost:8123/
     /// ```
     ///
-    /// So the forgery needs rows **emitted** (the failing expression in the
-    /// SELECT list, not a `WHERE`) and **flushed** (~400k rows, ~3 MB, enough
-    /// that ClickHouse has committed to HTTP 200 and can no longer discard).
+    /// So the forgery needs **one** thing: enough output before the failure
+    /// to reach a flush, so ClickHouse has committed to HTTP 200 and can no
+    /// longer discard (~400k rows, ~3 MB, in case 1). Both negatives miss it
+    /// for that single reason — case 2 emits one row, 17 bytes, and case 3
+    /// emits 2,000. Where the failing expression sits is not the
+    /// requirement; it only changes how many rows the predicate admits before
+    /// the failure, and a `WHERE` here admits one.
+    ///
     /// One further precondition holds in case 1 and is worth knowing because
     /// nothing here would fail if it stopped: the body ends `))\n`, which is
     /// the cheap check `extract_exception` makes
