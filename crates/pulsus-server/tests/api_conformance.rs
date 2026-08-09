@@ -30,8 +30,11 @@
 //! reconcile, a handful of seconds) plus a few hundred cheap loopback
 //! requests (the sixth spawn also seeds two tiny rows directly) — comfortably
 //! inside the single-digit-minute budget the architect plan documents.
-//! Ports 31120-31125, distinct from every other live suite's fixed ports
-//! (31100-31117).
+//! Fixed loopback ports are declared inline per test (`let port = 31_1NN;`).
+//! That no two live tests anywhere declare the same one is not a
+//! convention re-derived by hand any more — `live_port_uniqueness.rs`
+//! (hermetic) enumerates every declaration under `crates/*/tests` and
+//! fails if two collide.
 //!
 //! **`query_too_broad` (422) live coverage** (code-review round-1 finding):
 //! `TooBroadReason` has two independent triggers (`logql/error.rs`) —
@@ -1944,7 +1947,7 @@ async fn all_mode_auth_off_compat_on_full_matrix() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_120;
+    let port = 31_180;
     let db = "pulsus_api_conformance_it_full";
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
 
@@ -1984,7 +1987,7 @@ async fn all_mode_auth_on_perimeter() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_121;
+    let port = 31_181;
     let db = "pulsus_api_conformance_it_auth";
     let _guard = spawn_ready(
         port,
@@ -2095,7 +2098,7 @@ async fn all_mode_compat_off_alias_404() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_122;
+    let port = 31_182;
     let db = "pulsus_api_conformance_it_compat_off";
     let _guard = spawn_ready(port, db, &[]); // PULSUS_COMPAT_ENDPOINTS unset => false.
 
@@ -2141,7 +2144,7 @@ async fn writer_only_mode_reader_routes_404() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_123;
+    let port = 31_183;
     let db = "pulsus_api_conformance_it_writer_only";
     // Review round-3 finding (medium): `PULSUS_COMPAT_ENDPOINTS=true` here
     // too, not just mode=writer — pins the actual gating interaction
@@ -2202,7 +2205,7 @@ async fn reader_only_mode_writer_routes_404() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_124;
+    let port = 31_184;
     let db = "pulsus_api_conformance_it_reader_only";
     let _guard = spawn_ready(port, db, &[("PULSUS_MODE", "reader")]);
 
@@ -2289,7 +2292,7 @@ async fn reader_only_mode_compat_on_writer_compat_route_404() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_128;
+    let port = 31_188;
     let db = "pulsus_api_conformance_it_reader_compat_on";
     let _guard = spawn_ready(
         port,
@@ -2335,7 +2338,7 @@ async fn logql_scan_budget_query_too_broad_live_case() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_125;
+    let port = 31_185;
     let db = "pulsus_api_conformance_it_query_too_broad";
     let _guard = spawn_ready(port, db, &[("PULSUS_LOGQL_SCAN_BUDGET_BYTES", "1")]);
 
@@ -2421,7 +2424,7 @@ async fn tail_slot_exhaustion_returns_429_before_the_upgrade() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_127;
+    let port = 31_187;
     let db = "pulsus_api_conformance_it_tail_slots";
     let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_MAX_CONNECTIONS", "1")]);
 
@@ -2486,7 +2489,7 @@ async fn prom_query_string_literal_renders_result_type_string_live_case() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let port = 31_126;
+    let port = 31_186;
     let db = "pulsus_api_conformance_it_string_result";
     let _guard = spawn_ready(port, db, &[]);
 

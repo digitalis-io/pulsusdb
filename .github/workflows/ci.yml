@@ -990,8 +990,11 @@ jobs:
         run: cargo test -p pulsus-write --test live_metric_writer
 
       # Spawns the real `pulsusdb` binary against this job's ClickHouse
-      # container (fixed loopback ports 31100-31117, distinct from any
-      # other port this job uses) to drive it over HTTP end-to-end.
+      # container to drive it over HTTP end-to-end. Every live suite below
+      # binds fixed loopback ports declared inline in its own source; that
+      # they are distinct from each other is not a convention anyone
+      # re-derives by hand, it is enforced by the hermetic
+      # `live_port_uniqueness` test in the `ci` job above.
       - name: Live server smoke test (/ready, /metrics, /config, /buildinfo)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1003,8 +1006,7 @@ jobs:
       # run time — no committed keys) and proves the inbound TLS listener
       # end-to-end: /ready reaches 200 over TLS, a plaintext GET on the
       # TLS port gets no valid HTTP response, and /config over TLS shows
-      # both path fields. Port 31160. Reuses this job's ClickHouse 24.8
-      # container.
+      # both path fields. Reuses this job's ClickHouse 24.8 container.
       - name: Live inbound TLS suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1035,8 +1037,8 @@ jobs:
       # Issue #55: spawns the real `pulsusdb` binary and drives the
       # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
       # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406
-      # mapping), dedup, short-id resolution, canonical ordering. Port
-      # 31130. Reuses this job's ClickHouse 24.8 container.
+      # mapping), dedup, short-id resolution, canonical ordering. Reuses
+      # this job's ClickHouse 24.8 container.
       - name: Live traces API suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1063,9 +1065,9 @@ jobs:
       # Issue #57 AC3/AC5: spawns the real `pulsusdb` binary and drives
       # `GET /api/traces/v1/search` end-to-end — exact trace-ID sets for
       # the pre-committed q= cases, legacy-params equivalence, ordering/
-      # tiebreak, cap/partial contract, scan-budget 422. Ports
-      # 31131-31133. Wired here by issue #58 — the step was omitted when
-      # #57 landed. Reuses this job's ClickHouse 24.8 container.
+      # tiebreak, cap/partial contract, scan-budget 422. Wired here by
+      # issue #58 — the step was omitted when #57 landed. Reuses this job's
+      # ClickHouse 24.8 container.
       - name: Live traces search suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1087,7 +1089,7 @@ jobs:
       # §4.3 tags/tag-values surface end-to-end — deduped scoped names,
       # typed value inference, q= superset semantics, the truncation
       # contract, and the zero-payload query_log proof (catalog-only
-      # reads). Port 31134. Reuses this job's ClickHouse 24.8 container.
+      # reads). Reuses this job's ClickHouse 24.8 container.
       - name: Live traces tags suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1142,8 +1144,8 @@ jobs:
       # service-graph surface end-to-end — OTLP ingest -> the edge MV ->
       # GET /api/traces/v1/service_graph exact JSON edges (client fan-out,
       # messaging vs cross-kind decoy, error failed count, replay + FINAL
-      # invariance, Zipkin shared-span correctness). Port 31140. Reuses this
-      # job's ClickHouse 24.8 container.
+      # invariance, Zipkin shared-span correctness). Reuses this job's
+      # ClickHouse 24.8 container.
       - name: Live service graph suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1169,8 +1171,8 @@ jobs:
       # the first-page start bound and slice-bounded backlog scans proven
       # from system.query_log, the live slow-consumer eviction/accounting
       # contract, the tail-vs-range differential, and the
-      # /loki/api/v1/tail alias. Ports 31140-31146. Reuses this job's
-      # ClickHouse 24.8 container.
+      # /loki/api/v1/tail alias. Reuses this job's ClickHouse 24.8
+      # container.
       - name: Live logs tail (WebSocket) suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1183,7 +1185,7 @@ jobs:
       # shift), without it, and configured again — and asserts the
       # `| line_format "{{ __timestamp__ }}"` response text. The hermetic
       # suites cannot see this: removing the install call from serve::run
-      # leaves every one of them green. Ports 31170-31172. Reuses this
+      # leaves every one of them green. Reuses this
       # job's ClickHouse 24.8 container.
       - name: Live LogQL template timezone suite
         env:
@@ -1194,7 +1196,7 @@ jobs:
       # Issue #74: /api/logs/v1/stats — seeded exact counters (chunks =
       # the adjudicated partition-count proxy), the Tier-1 rollup-vs-raw
       # pushdown routing gate from X-Pulsus-Explain stage SQL, and
-      # /loki/api/v1/index/stats byte-identity. Port 31145. Reuses this
+      # /loki/api/v1/index/stats byte-identity. Reuses this
       # job's ClickHouse 24.8 container.
       - name: Live logs stats suite
         env:
@@ -1207,7 +1209,7 @@ jobs:
       # truncation, the zero-body-read pushdown proof from
       # X-Pulsus-Explain stage SQL (log_metrics_5s only, never
       # log_samples), and /loki/api/v1/index/volume byte-identity.
-      # Port 31148. Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 24.8 container.
       - name: Live logs volume suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1231,8 +1233,7 @@ jobs:
       # answered from that window rather than the calendar month, and —
       # separately named because it discriminates a different wrong fix —
       # a line whose rollup bucket STARTS BEFORE `start` still counts.
-      # Ports 31155-31156, 31165, 31167 and 31169. Reuses this job's
-      # ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 24.8 container.
       - name: Live logs detected labels/fields suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1244,8 +1245,8 @@ jobs:
       # BOTH encodings (JSON + snappy-protobuf), then proves the load-bearing
       # correctness gate live: the pushed stream is queryable via LogQL
       # query_range (native + /loki alias) and appears in
-      # /api/logs/v1/tail with its exact entries + labels. Ports 31150-31151.
-      # Reuses this job's ClickHouse 24.8 container.
+      # /api/logs/v1/tail with its exact entries + labels. Reuses this
+      # job's ClickHouse 24.8 container.
       - name: Live Loki push receiver round-trip
         env:
           PULSUS_TEST_CLICKHOUSE: "1"

@@ -35,10 +35,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Ports 31155-31156, 31165, 31167 and 31169, distinct from every other
-//! live suite. (31157, the next number up, already belongs to
-//! `loki_push_live.rs`; 31166 belongs to it too, and 31168 to
-//! `logs_api_live.rs`.)
+//! Fixed loopback ports are declared inline per test (`let port = 31_1NN;`).
+//! That no two live tests anywhere declare the same one is not a
+//! convention re-derived by hand any more — `live_port_uniqueness.rs`
+//! (hermetic) enumerates every declaration under `crates/*/tests` and
+//! fails if two collide.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -390,7 +391,7 @@ async fn detected_labels_and_fields_end_to_end() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_155;
+    let port = 31_176;
     let db = "pulsus_detected_it_live";
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
@@ -797,7 +798,7 @@ async fn detected_fields_budget_truncation_signals_pulsus_partial() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let port = 31_156;
+    let port = 31_177;
     let db = "pulsus_detected_it_budget";
     drop_db(db).await;
     // ~4.2 MiB corpus (10,000 rows x ~420 read bytes each); a 6 MiB
