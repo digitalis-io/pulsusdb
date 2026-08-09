@@ -74,6 +74,34 @@ Direct pprof ingestion for SDKs/agents that don't route through the collector. F
 M1 ships the five core endpoints below (§2.1-2.3); `/tail` (§2.4) and
 `/stats` (§2.5) ship M6, and the drilldown endpoints (§2.6) ship M7.
 
+**A present-but-empty scalar parameter is an absent one** (issue #391).
+`?limit=` is answered exactly as `limit` omitted altogether — same status,
+byte-identical body — and the same holds for every scalar parameter in
+§2.1-§2.6: `query`, `start`, `end`, `time`, `step`, `limit`, `direction`,
+`delay_for`, `aggregateBy`, `targetLabels`, `line_limit`, `field_limit`.
+This is the reference's rule and not a PulsusDB one: it reads scalar
+parameters through Go's `r.Form.Get`, which returns `""` for an absent key
+and for an empty one alike and so cannot tell them apart, and every parse
+helper behind it defaults on `""` (`parseInt`, `parseTimestamp`,
+`parseDirection` — `pkg/loghttp/params.go:152-159` @ grafana/loki v3.7.4 =
+`b318f2829f0ae2094ab3a1e90780450e9e4b03be`). Three details of the rule,
+each container-measured against `grafana/loki:3.7.4` rather than inferred:
+
+- **Only the literal empty string counts.** `?limit=` collapses, and so
+  does a bare `?limit` with no `=` (which decodes to the empty string).
+  `?limit=%20`, `?limit=+` (a space), `?limit=%09` and `?limit=%00` are
+  **values**, and are rejected `400` as the malformed values they are.
+- **Duplicate keys are first-wins, and the collapse applies afterwards.**
+  `?limit=&limit=5` uses the *first* occurrence, finds it empty and falls
+  back to the default — it does not skip ahead to `5`. `?limit=5&limit=`
+  uses `5`.
+- **A required parameter is still required.** An empty `query=` is a `400`
+  identical to omitting `query` (§2.1-§2.2, §2.5, §2.6), because absent is
+  what empty means here.
+
+The one exception is `match[]`, the only **repeated** parameter on this
+surface — see §2.3.
+
 ### 2.1 `GET|POST /api/logs/v1/query_range`
 
 | Param | Type | Notes |
@@ -110,6 +138,8 @@ GET|POST /api/logs/v1/series                 ?match[]=<selector>&start=&end=
 ```
 
 `start`/`end` default the same way as §2.1 (`end = now`, `start = end - 1h`). POST accepts the same params as an `application/x-www-form-urlencoded` body (`match[]` repeated for `/series`); `/label/{name}/values` is `GET`-only. `match[]` selectors are bare LogQL stream selectors (e.g. `{service_name="checkout"}`); at least one is required.
+
+**`match[]` is the exception to §2's present-but-empty rule.** It is the only *repeated* parameter here, and the reference reads repeated parameters through `r.Form[...]` rather than `r.Form.Get` (`pkg/loghttp/series.go:23-25` @ grafana/loki v3.7.4 `b318f282`), which keeps `""` as a value instead of collapsing it. So `?match[]=` is an empty **selector** and a `400` parse error — not an absent `match[]` — on both stores, measured 2026-08-09.
 
 Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values` return an array of strings, `series` returns an array of label maps (sorted for a deterministic response). With `X-Pulsus-Explain: 1`, `explain` (the §2.1 shape, `routing` always `null`) is added as a **top-level sibling of `data`** (not nested under it — these responses' `data` is an array, not an object).
 
