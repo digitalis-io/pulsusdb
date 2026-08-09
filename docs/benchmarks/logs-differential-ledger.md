@@ -479,21 +479,35 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   itself is gated, scale-invariantly, by
   `detected_labels_fan_in_is_one_row_per_key_at_any_cardinality`
   (`crates/pulsus-read/tests/query_log_gates.rs`).
-- **Memory characteristic — a refusal on this path is a 500, not a 422,
-  and that is issue #398's to fix, not this entry's.** LogQL reads set
-  `max_bytes_to_read` but no `max_memory_usage`
-  (`read_query_settings`, `crates/pulsus-read/src/logql/exec.rs:3225`),
-  so a
-  ClickHouse code 241 falls through `map_read_error` (`exec.rs:3255`) to
-  `ReadError::Clickhouse` and surfaces as **500**, where the
-  `QueryTooBroad` family answers 422. It is deliberately NOT fixed under
+- **Memory characteristic — CLOSED by issue #398; the measurement that
+  motivated it is kept.** Before #398, LogQL reads set `max_bytes_to_read`
+  but no `max_memory_usage` (`read_query_settings`,
+  `crates/pulsus-read/src/logql/exec.rs`), so a ClickHouse code 241 fell
+  through `map_read_error` to `ReadError::Clickhouse` and surfaced as
+  **500** — carrying the raw server exception in the body — where the
+  `QueryTooBroad` family answers 422. It was deliberately NOT fixed under
   #261, because it is not this endpoint's exposure: on the identical
-  corpus B above, the SHARED stage-1 stream resolution
-  (`sql::stage1`, which `/query_range`, `/series`, `/detected_fields`
-  and `/detected_labels` all run) used **3.19 / 3.03 / 2.91 GiB**
-  against this endpoint's aggregate at 0.87–0.88 GiB — 3.3-3.6× more. A cap
-  scoped to `/detected_labels` would sit on the cheaper half and leave
-  the expensive half uncapped. One mechanism, one issue: **#398**.
+  corpus B above, the SHARED stage-1 stream resolution (`sql::stage1`,
+  which `/query_range`, `/series`, `/detected_fields` and
+  `/detected_labels` all run) used **3.19 / 3.03 / 2.91 GiB** against this
+  endpoint's aggregate at 0.87–0.88 GiB — 3.3-3.6× more. A cap scoped to
+  `/detected_labels` would have sat on the cheaper half and left the
+  expensive half uncapped. One mechanism, one issue: **#398**.
+
+  **What #398 shipped.** `reader.logql_read_max_memory_bytes`
+  (`PULSUS_LOGQL_READ_MAX_MEMORY_BYTES`, default 8 GiB) applies
+  `max_memory_usage` + `max_bytes_before_external_group_by = 0`
+  (throw-not-spill) at `read_query_settings` — the single origin every
+  LogQL dispatch site's settings object comes from, so the shared stage-1
+  read is covered along with everything else — and code 241 maps to
+  `TooBroadReason::LogqlReadMemory`, i.e. **422 `query_too_broad`** naming
+  the knob. Sibling knobs do the same on the other two read surfaces
+  (`promql_read_max_memory_bytes`, `traceql_read_max_memory_bytes`). No
+  endpoint-scoped cap exists anywhere, so there is no carve-out to
+  justify. Gated by `stage1_memory_breach_is_422_on_every_stage1_endpoint`
+  (all five stage-1 endpoints, `crates/pulsus-server/tests/logs_api_live.rs`)
+  and `every_logql_engine_query_carries_the_memory_ceiling`
+  (`crates/pulsus-read/tests/query_log_gates.rs`).
 - **Fixture status:** neither `/detected_fields` nor `/detected_labels`
   has a case in `test/fixtures/logs/differential.json`, so this entry is
   not referenced from the fixture
@@ -1440,6 +1454,28 @@ not "fix" us toward the panic.
   difference is the HTTP status — 422 `query_too_broad` where the
   reference returns 400 — carrying the reference's verbatim body, under
   the established matching-error-status precedent.
+
+  **Issue #398 adds a member to this same status family and opens no new
+  row.** A read that exhausts ClickHouse's memory is now refused
+  `422 query_too_broad` on all three read surfaces
+  (`reader.{logql,promql,traceql}_read_max_memory_bytes`, server code 241)
+  rather than answering `500` with the raw server exception. That is the
+  same "we could not afford this query" class as the result-size cap above
+  and inherits its 400-vs-422 delta against Loki. It needs no ledger row of
+  its own, and — this is the part worth recording — **the other two
+  surfaces need no row at all**, because their references agree with us.
+  Measured against containers with data in the store while planning #398:
+
+  | reference | condition | status |
+  |---|---|---|
+  | Loki v3.7.4 | `max_query_series: 1` on `sum by (…)(count_over_time(…))` | **400** |
+  | Loki v3.7.4 | `max_entries_limit_per_query: 2` at `limit=5` | **400** |
+  | Loki v3.7.4 | `max_query_bytes_read: 1B` | **400 — SOURCE-DERIVED, NOT MEASURED** (the limiter ran but index stats report `0B` on that corpus, so it could not trip; status read from `pkg/querier/queryrange/limits.go:405 @ v3.7.4`). Do not promote this row to a measurement. |
+  | Prometheus v3.13.0 | `--query.max-samples=1`, instant **and** range | **422** `execution` (`web/api/v1/api.go:2236-2237 @ v3.13.0`) |
+  | Tempo v3.0.2 | `max_bytes_per_trace: 1000`, `GET /api/traces/{id}` | **422** (`modules/frontend/combiner/trace_by_id.go:99`, `modules/querier/http.go:398`) |
+
+  So PulsusDB's 422 matches Prometheus and Tempo on this condition and
+  diverges only from Loki, inside this entry's existing family.
 
 - **(b) `avg`/`stddev`/`stdvar` member order.** *Reference:* computes these
   with Welford's online recurrence (`pkg/logql/evaluator.go:547-550`,

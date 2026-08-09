@@ -139,6 +139,11 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
         patterns_table: format!("log_patterns{dist}"),
         rollup_res_ns: config.log_rollup_resolution.0.as_nanos() as u64,
         scan_budget_bytes: config.reader.logql_scan_budget_bytes.0,
+        // Issue #398: the LogQL per-query ClickHouse memory ceiling's
+        // production carrier — `ReaderConfig -> EngineConfig ->
+        // logql::exec::read_query_settings`, the single origin every LogQL
+        // dispatch site's settings object comes from.
+        read_max_memory_bytes: config.reader.logql_read_max_memory_bytes,
         max_streams: pulsus_read::DEFAULT_MAX_STREAMS,
         pipeline_scan_factor: config.reader.logql_pipeline_scan_factor,
         // Issue #399: the same predicate the `_dist` suffix above uses —
@@ -250,6 +255,10 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
         cache_max_series: config.reader.cache_max_series,
         ttl: config.reader.cache_ttl.0,
         staleness_multiplier: pulsus_read::DEFAULT_STALENESS_MULTIPLIER,
+        // Issue #398: the background refresh sweep carries the same
+        // per-query memory ceiling as the request path; its warn-and-serve-
+        // the-last-good-snapshot failure behaviour is unchanged.
+        read_max_memory_bytes: config.reader.promql_read_max_memory_bytes,
     }
 }
 
@@ -307,6 +316,11 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // ClickHouse's default `distributed_product_mode='deny'` rejects
         // (Code 288) on a clustered deployment.
         distributed: config.cluster.is_some(),
+        // Issue #398: the PromQL per-query ClickHouse memory ceiling's
+        // production carrier — `ReaderConfig -> MetricsConfig ->
+        // metrics::exec::metrics_read_settings` and the sealed
+        // `MetricsDispatch`'s error mapper.
+        read_max_memory_bytes: config.reader.promql_read_max_memory_bytes,
     }
 }
 
@@ -360,6 +374,11 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
         max_series: config.reader.traceql_max_series,
         generator_max_memory_bytes: config.reader.traceql_generator_max_memory_bytes,
+        // Issue #398: the TraceQL per-query ClickHouse memory ceiling's
+        // production carrier — `ReaderConfig -> TraceReadConfig ->
+        // traces::exec::{search_settings, catalog_settings}` (and, through
+        // `catalog_settings`, the §4.2 point read).
+        read_max_memory_bytes: config.reader.traceql_read_max_memory_bytes,
         distributed: config.cluster.is_some(),
         skip_unavailable_shards: config.skip_unavailable_shards,
     }

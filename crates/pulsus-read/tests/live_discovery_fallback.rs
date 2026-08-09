@@ -137,6 +137,9 @@ fn now_ms() -> i64 {
 
 fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
+        // Issue #398: the per-query ClickHouse memory ceiling; the
+        // production default, so this fixture keeps today's behaviour.
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),
         bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
@@ -149,6 +152,9 @@ fn cache_config(db: &str) -> LabelCacheConfig {
 
 fn engine_config(db: &str, max_metric_fanout: u64) -> MetricsConfig {
     MetricsConfig {
+        // Issue #398: the per-query ClickHouse memory ceiling; the
+        // production default, so this fixture keeps today's behaviour.
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         samples_table: "metric_samples".to_string(),
         hist_samples_table: "metric_hist_samples".to_string(),

@@ -141,6 +141,14 @@ pub struct MetricsConfig {
     /// fetches only ([`fallback_fetch_settings`]); every other dispatch
     /// keeps [`metrics_read_settings`] unchanged.
     pub distributed: bool,
+    /// Issue #398: `reader.promql_read_max_memory_bytes` — the
+    /// `max_memory_usage` ceiling (throw-not-spill) every metrics read
+    /// carries, applied in [`metrics_read_settings`] and handed to the
+    /// sealed dispatch so its mapper can name the budget it broke. Breach
+    /// → server code 241 →
+    /// [`crate::logql::error::TooBroadReason::PromqlReadMemory`] → `422
+    /// execution`.
+    pub read_max_memory_bytes: u64,
 }
 
 /// The `SqlFallback` sample-fetch path's label-hydration result row
@@ -405,7 +413,7 @@ impl MetricsEngine {
         config: MetricsConfig,
     ) -> Self {
         Self {
-            dispatch: super::dispatch::MetricsDispatch::new(client),
+            dispatch: super::dispatch::MetricsDispatch::new(client, config.read_max_memory_bytes),
             resolver,
             config,
             eval_gate: std::sync::Arc::new(crate::eval_gate::EvalGate::new(
@@ -994,7 +1002,10 @@ impl MetricsEngine {
                 // (Code 288) on a clustered `_dist` table set —
                 // `fallback_fetch_settings` injects the exact `'local'`
                 // rewrite ONLY here (never a blanket client-wide default).
-                let settings = fallback_fetch_settings(self.config.distributed);
+                let settings = fallback_fetch_settings(
+                    self.config.read_max_memory_bytes,
+                    self.config.distributed,
+                );
                 let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
                     fetch_dual_concurrently(
                         self.fetch_rows_with(sql, &settings, Some(budget)),
@@ -1051,8 +1062,12 @@ impl MetricsEngine {
     /// [`Self::fetch_sample_rows`] (or `fetch_rows_with` with
     /// `Some(budget)` on the fallback path).
     async fn fetch_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
-        self.fetch_rows_with(sql, &metrics_read_settings(), None)
-            .await
+        self.fetch_rows_with(
+            sql,
+            &metrics_read_settings(self.config.read_max_memory_bytes),
+            None,
+        )
+        .await
     }
 
     /// Issue #138: [`Self::fetch_rows_with`] under the standard
@@ -1065,8 +1080,12 @@ impl MetricsEngine {
         sql: String,
         budget: &SampleBudget,
     ) -> Result<Vec<R>, ReadError> {
-        self.fetch_rows_with(sql, &metrics_read_settings(), Some(budget))
-            .await
+        self.fetch_rows_with(
+            sql,
+            &metrics_read_settings(self.config.read_max_memory_bytes),
+            Some(budget),
+        )
+        .await
     }
 
     /// Delegates to the sealed [`MetricsDispatch::fetch_rows_with`] —
@@ -1466,17 +1485,30 @@ impl MetricsEngine {
     }
 }
 
-/// The metrics read-path settings (issue #35): `max_query_size` only —
-/// scan budgets (`max_bytes_to_read`) remain explicitly out of scope for
-/// the metrics path (standing decision, [`MetricsEngine::fetch_rows`]'s
-/// doc comment), so this is deliberately narrower than `logql::exec::
-/// read_query_settings`. Closes a live gap: `fetch_rows` previously sent
-/// `QuerySettings::new()` (no settings at all), so a broad selector's
-/// rendered `metric_name IN (...)`/`fingerprint IN (...)` lists could trip
-/// ClickHouse's 262,144-byte `max_query_size` default with an opaque
-/// parse error instead of the engine's own `422 query_too_broad`.
-fn metrics_read_settings() -> QuerySettings {
-    QuerySettings::new().set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+/// The metrics read-path settings (issue #35): `max_query_size` plus
+/// (issue #398) the per-query memory ceiling. Closes a live gap:
+/// `fetch_rows` previously sent `QuerySettings::new()` (no settings at
+/// all), so a broad selector's rendered `metric_name IN (...)`/
+/// `fingerprint IN (...)` lists could trip ClickHouse's 262,144-byte
+/// `max_query_size` default with an opaque parse error instead of the
+/// engine's own `422 query_too_broad`.
+///
+/// **Issue #398 narrows, but does not reverse, the standing scope
+/// decision** recorded on [`MetricsEngine::fetch_rows`]: BYTE budgets
+/// (`max_bytes_to_read`) remain out of scope for the metrics path, so this
+/// stays narrower than `logql::exec::read_query_settings`. What comes in
+/// is the MEMORY ceiling — `max_memory_usage` from
+/// `reader.promql_read_max_memory_bytes` plus
+/// `max_bytes_before_external_group_by = 0` (throw, not spill) — because a
+/// metrics read that exhausts ClickHouse's memory answered `500` for
+/// exactly the reason a LogQL one did, and leaving one of the three read
+/// surfaces unbounded would reproduce the carve-out shape #398 exists to
+/// remove.
+fn metrics_read_settings(read_max_memory_bytes: u64) -> QuerySettings {
+    QuerySettings::new()
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+        .set("max_memory_usage", read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
 }
 
 /// The `SqlFallback` sample-fetch settings (issue #136): [`metrics_read_settings`]
@@ -1496,8 +1528,8 @@ fn metrics_read_settings() -> QuerySettings {
 /// ([`MetricsEngine::execute_fetch_plan`]'s `Fallback` arm) — a blanket
 /// client-wide default would let a future non-co-sharded subquery silently
 /// return wrong shard-local results instead of failing loud.
-fn fallback_fetch_settings(distributed: bool) -> QuerySettings {
-    let base = metrics_read_settings();
+fn fallback_fetch_settings(read_max_memory_bytes: u64, distributed: bool) -> QuerySettings {
+    let base = metrics_read_settings(read_max_memory_bytes);
     if distributed {
         base.set("distributed_product_mode", "local")
     } else {
@@ -2327,6 +2359,12 @@ mod tests {
     use pulsus_promql::Point;
     use pulsus_promql::eval::aggregation;
 
+    /// Issue #398: a distinctive, non-default
+    /// `reader.promql_read_max_memory_bytes` for the settings tests —
+    /// unequal to any other number these tests use, so a mix-up shows up
+    /// as a value mismatch rather than an accidental pass.
+    const TEST_READ_MEM: u64 = 7_654_321;
+
     fn ls(pairs: &[(&str, &str)]) -> LabelSet {
         LabelSet::from_verbatim(
             pairs
@@ -2448,9 +2486,56 @@ mod tests {
 
     // --- Issue #35: full-shape parse bound (metrics read path) ---
 
+    /// Issue #398 AC M1: every metrics read carries the per-query memory
+    /// ceiling and throws rather than spills. This NARROWS the standing
+    /// "budgets are out of scope for the metrics path" decision recorded on
+    /// `metrics_read_settings` — byte budgets stay out, the memory ceiling
+    /// comes in — so the byte-budget keys must still be absent.
+    #[test]
+    fn metrics_read_settings_carry_the_memory_ceiling() {
+        let s = metrics_read_settings(TEST_READ_MEM);
+        assert_eq!(
+            s.get("max_memory_usage"),
+            Some(TEST_READ_MEM.to_string().as_str())
+        );
+        assert_eq!(s.get("max_bytes_before_external_group_by"), Some("0"));
+        assert_eq!(
+            s.get("max_bytes_to_read"),
+            None,
+            "byte budgets remain out of scope for the metrics path (issue #398 narrows that \
+             decision, it does not reverse it)"
+        );
+        // The `SqlFallback` variant layers on top and must keep both.
+        for distributed in [false, true] {
+            let f = fallback_fetch_settings(TEST_READ_MEM, distributed);
+            assert_eq!(
+                f.get("max_memory_usage"),
+                Some(TEST_READ_MEM.to_string().as_str()),
+                "fallback_fetch_settings(distributed={distributed}) must carry the ceiling"
+            );
+            assert_eq!(f.get("max_bytes_before_external_group_by"), Some("0"));
+        }
+    }
+
+    /// Issue #398 AC M4: the background label-cache refresh sweep — the one
+    /// metrics ClickHouse read that sent `QuerySettings::new()`, i.e. no
+    /// bound at all — carries the same ceiling. It is bounded rather than
+    /// exempted: an exemption would leave one unbounded metrics read
+    /// competing for server memory, which is the carve-out shape #398
+    /// exists to remove.
+    #[test]
+    fn label_cache_sweep_carries_the_memory_ceiling() {
+        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM);
+        assert_eq!(
+            s.get("max_memory_usage"),
+            Some(TEST_READ_MEM.to_string().as_str())
+        );
+        assert_eq!(s.get("max_bytes_before_external_group_by"), Some("0"));
+    }
+
     #[test]
     fn metrics_read_settings_sets_the_raised_query_text_cap() {
-        let s = metrics_read_settings();
+        let s = metrics_read_settings(TEST_READ_MEM);
         assert_eq!(
             s.get("max_query_size"),
             Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
@@ -2501,7 +2586,7 @@ mod tests {
     #[test]
     fn fallback_fetch_settings_carries_the_read_settings_and_omits_local_product_mode_unclustered()
     {
-        let unclustered = format!("{:?}", fallback_fetch_settings(false));
+        let unclustered = format!("{:?}", fallback_fetch_settings(TEST_READ_MEM, false));
         assert!(
             unclustered.contains("max_query_size"),
             "missing max_query_size in {unclustered}"
@@ -2514,7 +2599,7 @@ mod tests {
 
     #[test]
     fn fallback_fetch_settings_adds_the_local_product_mode_when_clustered() {
-        let clustered = format!("{:?}", fallback_fetch_settings(true));
+        let clustered = format!("{:?}", fallback_fetch_settings(TEST_READ_MEM, true));
         assert!(clustered.contains("max_query_size"));
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));

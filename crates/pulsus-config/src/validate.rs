@@ -160,6 +160,26 @@ pub const TRACEQL_SCAN_BUDGET_ROWS_CEILING: u64 = 50_000_000_000;
 /// 512 MiB default (512 GiB, the power-of-two byte analogue).
 pub const TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
 
+/// `reader.logql_read_max_memory_bytes` (issue #398) — the per-query
+/// `max_memory_usage` (throw-not-OOM) ceiling every LogQL read carries.
+/// ClickHouse treats `0` as *unlimited*, so zero is rejected too. 64x the
+/// 8 GiB default (512 GiB, matching
+/// [`TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING`]'s power-of-two byte
+/// analogue).
+pub const LOGQL_READ_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
+
+/// `reader.promql_read_max_memory_bytes` (issue #398) — the PromQL
+/// surface's twin of [`LOGQL_READ_MAX_MEMORY_BYTES_CEILING`], same value
+/// and the same zero-is-unlimited rejection.
+pub const PROMQL_READ_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
+
+/// `reader.traceql_read_max_memory_bytes` (issue #398) — the TraceQL
+/// surface's twin of [`LOGQL_READ_MAX_MEMORY_BYTES_CEILING`], same value
+/// and the same zero-is-unlimited rejection. Independent of
+/// [`TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING`], which bounds only the
+/// phase-1 generator's tighter layered ceiling.
+pub const TRACEQL_READ_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
+
 /// `reader.traceql_max_series` (issue #182) — the metrics `by(...)`
 /// distinct-series cap. Rendered into a `LIMIT {cap + 1}` probe, so the
 /// ceiling keeps `cap + 1` overflow-free; 1000x the 1000 default.
@@ -505,6 +525,47 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
             1,
             "the generator memory guard",
+        ));
+    }
+    // Issue #398: the three per-surface read memory ceilings. Same trap as
+    // the generator guard directly above — ClickHouse reads
+    // `max_memory_usage = 0` as UNLIMITED, so zero would silently remove
+    // the bound this issue exists to add and put the surface back on the
+    // 500 path. Floor and ceiling enforced on all three.
+    positive_u64(
+        "reader.logql_read_max_memory_bytes",
+        cfg.reader.logql_read_max_memory_bytes,
+    )?;
+    if cfg.reader.logql_read_max_memory_bytes > LOGQL_READ_MAX_MEMORY_BYTES_CEILING {
+        return Err(ceiling_err(
+            "reader.logql_read_max_memory_bytes",
+            LOGQL_READ_MAX_MEMORY_BYTES_CEILING,
+            1,
+            "the LogQL read memory guard",
+        ));
+    }
+    positive_u64(
+        "reader.promql_read_max_memory_bytes",
+        cfg.reader.promql_read_max_memory_bytes,
+    )?;
+    if cfg.reader.promql_read_max_memory_bytes > PROMQL_READ_MAX_MEMORY_BYTES_CEILING {
+        return Err(ceiling_err(
+            "reader.promql_read_max_memory_bytes",
+            PROMQL_READ_MAX_MEMORY_BYTES_CEILING,
+            1,
+            "the PromQL read memory guard",
+        ));
+    }
+    positive_u64(
+        "reader.traceql_read_max_memory_bytes",
+        cfg.reader.traceql_read_max_memory_bytes,
+    )?;
+    if cfg.reader.traceql_read_max_memory_bytes > TRACEQL_READ_MAX_MEMORY_BYTES_CEILING {
+        return Err(ceiling_err(
+            "reader.traceql_read_max_memory_bytes",
+            TRACEQL_READ_MAX_MEMORY_BYTES_CEILING,
+            1,
+            "the TraceQL read memory guard",
         ));
     }
     // Issue #182: the metrics by()-series cap is rendered into a
@@ -1181,6 +1242,64 @@ mod tests {
             |c, v| c.reader.traceql_generator_max_memory_bytes = v,
             u64::MAX,
             TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
+        );
+    }
+
+    /// Issue #398 AC X1: the three per-surface read memory ceilings share
+    /// the generator guard's shape — `max_memory_usage = 0` is
+    /// ClickHouse-unlimited, so zero is a silently disabled bound and the
+    /// surface falls back to the 500 this issue removes.
+    #[test]
+    fn logql_read_max_memory_bytes_rejects_zero_and_the_absurd_and_accepts_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.logql_read_max_memory_bytes = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.logql_read_max_memory_bytes");
+            }
+            other => panic!("expected a Value error for zero, got {other:?}"),
+        }
+        assert_ceiling_boundary(
+            "reader.logql_read_max_memory_bytes",
+            |c, v| c.reader.logql_read_max_memory_bytes = v,
+            u64::MAX,
+            LOGQL_READ_MAX_MEMORY_BYTES_CEILING,
+        );
+    }
+
+    #[test]
+    fn promql_read_max_memory_bytes_rejects_zero_and_the_absurd_and_accepts_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.promql_read_max_memory_bytes = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.promql_read_max_memory_bytes");
+            }
+            other => panic!("expected a Value error for zero, got {other:?}"),
+        }
+        assert_ceiling_boundary(
+            "reader.promql_read_max_memory_bytes",
+            |c, v| c.reader.promql_read_max_memory_bytes = v,
+            u64::MAX,
+            PROMQL_READ_MAX_MEMORY_BYTES_CEILING,
+        );
+    }
+
+    #[test]
+    fn traceql_read_max_memory_bytes_rejects_zero_and_the_absurd_and_accepts_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.traceql_read_max_memory_bytes = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.traceql_read_max_memory_bytes");
+            }
+            other => panic!("expected a Value error for zero, got {other:?}"),
+        }
+        assert_ceiling_boundary(
+            "reader.traceql_read_max_memory_bytes",
+            |c, v| c.reader.traceql_read_max_memory_bytes = v,
+            u64::MAX,
+            TRACEQL_READ_MAX_MEMORY_BYTES_CEILING,
         );
     }
 

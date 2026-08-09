@@ -822,6 +822,11 @@ pub async fn run_all(
     let idx_table = table_name("metric_series_idx", cfg.dist);
 
     let cache_cfg = LabelCacheConfig {
+        // Issue #398: compilation-forced only — the struct gained a
+        // required field. Set to the production default so the bench's
+        // queries are unchanged apart from a ceiling they never approach;
+        // no measured quantity (read_rows/read_bytes/marks) can move.
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: cfg.db.to_string(),
         series_table: series_table.clone(),
         bucket_ms: summary.bucket_ms,

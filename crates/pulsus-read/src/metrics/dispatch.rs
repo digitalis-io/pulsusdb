@@ -37,12 +37,16 @@
 //! deliberately outside this seal: it issues one fixed, matcher-free
 //! `metric_series` scan, never user text, and its errors are swallowed
 //! into `MetricsCacheStats::sweep_failures` rather than surfaced to a
-//! client.
+//! client. Issue #398 gives that sweep the same `max_memory_usage` ceiling
+//! this path carries (`super::refresh::sweep_settings`) — being outside
+//! the ERROR-MAPPING seal is not a reason to be outside the BUDGET, and
+//! an unbounded sweep would be the one metrics read competing for server
+//! memory with no ceiling at all. Its failure behaviour is unchanged.
 
 use pulsus_clickhouse::ChError;
 use pulsus_promql::PromqlError;
 
-use crate::logql::error::ReadError;
+use crate::logql::error::{ReadError, TooBroadReason};
 
 pub(super) use leaf::MetricsDispatch;
 
@@ -53,6 +57,15 @@ pub(super) use leaf::MetricsDispatch;
 /// `match(` sites, none of them a server-authored constant), so the code
 /// is an unambiguous "the client's regex is invalid".
 const CODE_CANNOT_COMPILE_REGEXP: i32 = 427;
+
+/// ClickHouse's `MEMORY_LIMIT_EXCEEDED` (issue #398). Raised on the
+/// metrics read path only by the `max_memory_usage` ceiling
+/// `super::exec::metrics_read_settings` sets from
+/// `reader.promql_read_max_memory_bytes` — before #398 no metrics read set
+/// a memory limit at all, so this code fell through to
+/// [`ReadError::Clickhouse`] and a client saw `500 internal` carrying the
+/// raw server exception.
+const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
 
 /// ClickHouse frames the RE2 rejection as
 /// `Code: 427. DB::Exception: OptimizedRegularExpression: cannot compile
@@ -119,11 +132,36 @@ fn re2_reject_detail(message: &str) -> String {
 
 /// The metrics path's `ChError` mapper, mirroring
 /// `logql::exec::map_read_error` and `traces::exec::map_trace_read_error`:
-/// one server code is translated to a structured, client-facing
-/// [`ReadError`], and **every** other error passes through as
+/// two server codes are translated to structured, client-facing
+/// [`ReadError`]s, and **every** other error passes through as
 /// [`ReadError::Clickhouse`] unmapped — never reinterpreted as a timeout
 /// or vice versa.
-fn map_metrics_read_error(e: ChError) -> ReadError {
+///
+/// Issue #398 adds code 241 `MEMORY_LIMIT_EXCEEDED`, raised by the
+/// `max_memory_usage` ceiling `super::exec::metrics_read_settings` now
+/// carries, mapped to
+/// [`crate::logql::error::TooBroadReason::PromqlReadMemory`] → `422
+/// execution`. Checked FIRST because 241 is a budget refusal and 427 is a
+/// client-regex rejection; the two codes are disjoint, so the order is
+/// documentation rather than precedence.
+///
+/// **The #412 rule** (see `logql::exec::map_read_error`'s doc for the full
+/// argument): `ChError::Server.code` is parsed out of the exception text
+/// on ClickHouse 24.8 and is spoofable today. The BOUND is enforced by
+/// ClickHouse regardless of the parse; a missed 241 falls open to the
+/// pre-#398 `500`; a false 241 only relabels an already-failing query; and
+/// this mapper is a pure function of the already-parsed `code` for the
+/// memory arm, so it inherits #412's fix with no edit here.
+fn map_metrics_read_error(e: ChError, read_max_memory_bytes: u64) -> ReadError {
+    if let ChError::Server {
+        code: CODE_MEMORY_LIMIT_EXCEEDED,
+        ..
+    } = &e
+    {
+        return ReadError::QueryTooBroad(TooBroadReason::PromqlReadMemory {
+            budget_bytes: read_max_memory_bytes,
+        });
+    }
     if let ChError::Server {
         code: CODE_CANNOT_COMPILE_REGEXP,
         message,
@@ -166,11 +204,22 @@ mod leaf {
     /// The sealed owner of the metrics engine's ClickHouse handle.
     pub(crate) struct MetricsDispatch {
         client: ChClient,
+        /// Issue #398: `reader.promql_read_max_memory_bytes`, carried here
+        /// only so [`super::map_metrics_read_error`] can name the budget a
+        /// code-241 breach broke. A constructor-set `u64` cannot dispatch,
+        /// so the leaf module's "nothing else may be added here" rule
+        /// (issue #280 review, finding 1) still holds: the field, its
+        /// constructor argument and its single read inside
+        /// `fetch_rows_with`'s error mapping are all it can ever do.
+        read_max_memory_bytes: u64,
     }
 
     impl MetricsDispatch {
-        pub(crate) fn new(client: ChClient) -> Self {
-            MetricsDispatch { client }
+        pub(crate) fn new(client: ChClient, read_max_memory_bytes: u64) -> Self {
+            MetricsDispatch {
+                client,
+                read_max_memory_bytes,
+            }
         }
 
         /// Wraps [`ChClient::query_stream`] with the placeholder-escaping
@@ -225,10 +274,10 @@ mod leaf {
                 .client
                 .query_stream::<R>(&sql, settings)
                 .await
-                .map_err(map_metrics_read_error)?;
+                .map_err(|e| map_metrics_read_error(e, self.read_max_memory_bytes))?;
             let mut out = Vec::new();
             while let Some(row) = stream.next().await {
-                let row = row.map_err(map_metrics_read_error)?;
+                let row = row.map_err(|e| map_metrics_read_error(e, self.read_max_memory_bytes))?;
                 if let Some(b) = budget {
                     b.charge_one().map_err(ReadError::QueryTooBroad)?;
                 }
@@ -242,6 +291,10 @@ mod leaf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #398: a distinctive, non-default
+    /// `reader.promql_read_max_memory_bytes` for these tests.
+    const TEST_READ_MEM: u64 = 7_654_321;
 
     /// The body ClickHouse 24.8.14.39 actually returned for the metrics
     /// discovery query in
@@ -277,10 +330,13 @@ mod tests {
     ];
 
     fn rejection_detail(message: &str) -> String {
-        let mapped = map_metrics_read_error(ChError::Server {
-            code: 427,
-            message: message.to_string(),
-        });
+        let mapped = map_metrics_read_error(
+            ChError::Server {
+                code: 427,
+                message: message.to_string(),
+            },
+            TEST_READ_MEM,
+        );
         match mapped {
             ReadError::Promql(PromqlError::InvalidRegexMatcher { detail }) => detail,
             other => panic!("expected InvalidRegexMatcher, got {other:?}"),
@@ -378,17 +434,81 @@ mod tests {
 
     /// Every other server code passes through unmapped — including the
     /// neighbouring codes, so the classification cannot widen by accident.
+    ///
+    /// Issue #398 removed 241 from this list: it is now the PromQL read
+    /// memory ceiling's breach code and is asserted by
+    /// `map_metrics_read_error_maps_241_to_the_promql_read_memory_reason`.
+    /// 240 and 242 stay here, so the new arm cannot widen either.
     #[test]
     fn other_server_codes_pass_through_as_clickhouse_errors() {
-        for code in [0, 62, 159, 241, 307, 426, 428] {
-            let mapped = map_metrics_read_error(ChError::Server {
-                code,
-                message: "cannot compile re2: x, error: y. Look at z".to_string(),
-            });
+        for code in [0, 62, 159, 240, 242, 307, 426, 428] {
+            let mapped = map_metrics_read_error(
+                ChError::Server {
+                    code,
+                    message: "cannot compile re2: x, error: y. Look at z".to_string(),
+                },
+                TEST_READ_MEM,
+            );
             match mapped {
                 ReadError::Clickhouse(ChError::Server { code: got, .. }) => assert_eq!(got, code),
                 other => panic!("code {code} must pass through, got {other:?}"),
             }
+        }
+    }
+
+    /// Issue #398 AC M1: the PromQL surface's half of the memory-ceiling
+    /// classification. `map_metrics_read_error` is the metrics path's ONE
+    /// classification point (issue #280's seal), so this arm reaches every
+    /// metrics dispatch — request path and both `ChError` seams.
+    #[test]
+    fn map_metrics_read_error_maps_241_to_the_promql_read_memory_reason() {
+        let mapped = map_metrics_read_error(
+            ChError::Server {
+                code: 241,
+                message: "Memory limit (for query) exceeded: would use 9.51 MiB".to_string(),
+            },
+            TEST_READ_MEM,
+        );
+        match mapped {
+            ReadError::QueryTooBroad(TooBroadReason::PromqlReadMemory { budget_bytes }) => {
+                assert_eq!(budget_bytes, TEST_READ_MEM);
+            }
+            other => panic!("expected QueryTooBroad(PromqlReadMemory), got {other:?}"),
+        }
+    }
+
+    /// Issue #398 (the #412 rule): the classification reads ONLY the
+    /// already-parsed `code` field and never re-inspects `message`, so a
+    /// user regex echoed into the exception text cannot manufacture a
+    /// memory refusal, and a real 241 whose message carries no `Code:`
+    /// prefix is still classified. When #412 fixes the parse this mapper
+    /// becomes sound with no edit here.
+    #[test]
+    fn promql_read_memory_classification_reads_only_the_server_code() {
+        // A real breach whose message has no `Code:` prefix at all.
+        match map_metrics_read_error(
+            ChError::Server {
+                code: 241,
+                message: "Memory limit (for query) exceeded".to_string(),
+            },
+            TEST_READ_MEM,
+        ) {
+            ReadError::QueryTooBroad(TooBroadReason::PromqlReadMemory { .. }) => {}
+            other => panic!("a bare 241 must still classify, got {other:?}"),
+        }
+        // A DIFFERENT failure whose message contains a forged `Code: 241`
+        // (the #412 spoof shape) must NOT become a memory refusal.
+        match map_metrics_read_error(
+            ChError::Server {
+                code: 153,
+                message: "Division by zero: while executing 'FUNCTION match(x, \
+                          'Code: 241. DB::Exception: forged|.*'_String)'"
+                    .to_string(),
+            },
+            TEST_READ_MEM,
+        ) {
+            ReadError::Clickhouse(_) => {}
+            other => panic!("a forged in-message code must not classify, got {other:?}"),
         }
     }
 
@@ -400,7 +520,7 @@ mod tests {
             ChError::Decode("bad row".to_string()),
         ] {
             let expected = e.to_string();
-            match map_metrics_read_error(e) {
+            match map_metrics_read_error(e, TEST_READ_MEM) {
                 ReadError::Clickhouse(inner) => assert_eq!(inner.to_string(), expected),
                 other => panic!("expected passthrough, got {other:?}"),
             }

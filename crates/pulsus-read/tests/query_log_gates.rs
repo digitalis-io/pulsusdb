@@ -527,6 +527,9 @@ async fn fresh_run_db() -> (ChClient, String, i64) {
 
 fn engine_config(db: &str, scan_budget_bytes: u64) -> EngineConfig {
     EngineConfig {
+        // Issue #398: the per-query ClickHouse memory ceiling; the
+        // production default, so this fixture keeps today's behaviour.
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         streams_idx: "log_streams_idx".to_string(),
         streams: "log_streams".to_string(),
@@ -1222,4 +1225,373 @@ async fn run_detected_labels(client: &ChClient, sql: &str, query_id: &str) -> (u
         .unwrap_or_else(|| panic!("no query_log row for query_id {query_id}"))
         .expect("decode query_log row");
     (returned, evidence)
+}
+
+// ---------------------------------------------------------------------
+// Issue #398 — the memory-ceiling COMPLETENESS gates, one per engine.
+//
+// These are `system.query_log` sweeps rather than settings unit tests, and
+// the difference is load-bearing. A settings test can only check the
+// origins someone remembered to list; a sweep over every finalized `Select`
+// this run's database saw catches a dispatch site no enumeration mentions.
+//
+// The traces sweep exists for a specific wrong fix. TraceQL has THREE
+// settings roots, not one: `search_settings` (the obvious one),
+// `catalog_settings` (deliberately independent — it omits the clustered-
+// reader block on purpose, and it is the root whose unbounded
+// `/api/search/tag/{tag}/values` read produced the measured 500 that opened
+// #398), and `TraceEngine::fetch_by_id`, the §4.2 point read, which sent a
+// bare `QuerySettings::new()` AND mapped both of its `ChError` seams with
+// `ReadError::Clickhouse` directly, bypassing `map_trace_read_error`
+// entirely. "Add the ceiling to `search_settings`" passes a settings unit
+// test on that root while leaving the other two bare. It cannot pass the
+// sweep.
+// ---------------------------------------------------------------------
+
+/// The per-query memory ceiling both #398 gates configure. A distinctive
+/// value, never a default, so `Settings['max_memory_usage']` in
+/// `system.query_log` identifies THIS configuration rather than merely
+/// being non-empty.
+const MEM_CEILING: u64 = 3_221_225_472; // 3 GiB
+
+/// One finalized `system.query_log` row for a #398 sweep.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MemCeilingRow {
+    /// 1 when the query was issued with a `max_memory_usage` setting.
+    has_ceiling: u8,
+    /// The setting's value, `0` when absent.
+    ceiling: u64,
+    /// First 120 chars of the SQL — for the failure message only.
+    q: String,
+}
+
+/// A ClickHouse-side timestamp marker, taken AFTER schema init and corpus
+/// seeding and BEFORE the engine is driven. The sweeps scope on it so
+/// `run_init`'s own bookkeeping `SELECT`s — which run in the run database
+/// and legitimately carry no reader settings — are outside the claim,
+/// while every engine dispatch is inside it. Scoping by time rather than by
+/// SQL text is what keeps the sweep a COMPLETENESS check: a whitelist of
+/// table names could not see a dispatch against a table nobody listed.
+async fn query_log_marker(admin: &ChClient) -> String {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct NowRow {
+        t: String,
+    }
+    let mut stream = admin
+        .query_stream::<NowRow>("SELECT toString(now64(6)) AS t", &QuerySettings::new())
+        .await
+        .expect("read server clock");
+    let mut out = String::new();
+    while let Some(row) = stream.next().await {
+        out = row.expect("decode now row").t;
+    }
+    assert!(!out.is_empty(), "server clock marker must be non-empty");
+    out
+}
+
+/// Every finalized `Select` issued against `db` at or after `marker`.
+/// `type != 'QueryStart'` keeps one row per query INCLUDING the terminal
+/// `ExceptionWhileProcessing` row of a query aborted by its own budget.
+async fn mem_ceiling_rows(admin: &ChClient, db: &str, marker: &str) -> Vec<MemCeilingRow> {
+    admin
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    let sql = format!(
+        "SELECT toUInt8(mapContains(Settings, 'max_memory_usage')) AS has_ceiling, \
+         toUInt64OrZero(Settings['max_memory_usage']) AS ceiling, \
+         substring(query, 1, 120) AS q \
+         FROM system.query_log \
+         WHERE current_database = '{db}' AND type != 'QueryStart' \
+           AND query_kind = 'Select' \
+           AND query_start_time_microseconds >= toDateTime64('{marker}', 6) \
+         ORDER BY query_start_time_microseconds ASC"
+    );
+    let mut stream = admin
+        .query_stream::<MemCeilingRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.query_log");
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await {
+        rows.push(row.expect("decode mem ceiling row"));
+    }
+    rows
+}
+
+/// Asserts the sweep is non-empty and that EVERY row carries the ceiling at
+/// the configured value.
+fn assert_every_row_carries_the_ceiling(rows: &[MemCeilingRow], what: &str) {
+    assert!(
+        !rows.is_empty(),
+        "{what}: the sweep saw no queries at all — it would pass vacuously"
+    );
+    let bare: Vec<String> = rows
+        .iter()
+        .filter(|r| r.has_ceiling != 1 || r.ceiling != MEM_CEILING)
+        .map(|r| {
+            format!(
+                "has_ceiling={} ceiling={} :: {}",
+                r.has_ceiling, r.ceiling, r.q
+            )
+        })
+        .collect();
+    assert!(
+        bare.is_empty(),
+        "{what}: {} of {} dispatched queries did not carry \
+         max_memory_usage = {MEM_CEILING}:\n{}",
+        bare.len(),
+        rows.len(),
+        bare.join("\n")
+    );
+}
+
+/// Issue #398 AC L8: EVERY query the LogQL engine dispatches carries the
+/// per-query memory ceiling. Drives stage-1 resolution, stage-2 hydration,
+/// a stage-3 entry read, a client-aggregated metric read, the paged
+/// fetch-until-limit loop, and both discovery reads in one run database,
+/// then sweeps `system.query_log`.
+#[tokio::test]
+async fn every_logql_engine_query_carries_the_memory_ceiling() {
+    skip_unless_live!();
+    let (admin, run_db, ts_ns) = fresh_run_db().await;
+
+    let mut config = engine_config(&run_db, 50 * 1024 * 1024 * 1024);
+    config.read_max_memory_bytes = MEM_CEILING;
+    // The client is built BEFORE the marker on purpose: `ChClient::new`
+    // opens the pool with a `SELECT 1` connectivity probe, which is not an
+    // engine dispatch and carries no reader settings. Putting it outside
+    // the swept window is a boundary on WHEN, not a whitelist of WHAT — no
+    // engine query can hide behind it.
+    let client = data_client(&run_db).await;
+    let marker = query_log_marker(&admin).await;
+    let engine = LogQlEngine::new(client, config);
+
+    let bounds = pulsus_read::logql::TimeBounds {
+        start_ns: ts_ns - 3_600_000_000_000,
+        end_ns: ts_ns + 3_600_000_000_000,
+    };
+    let params = full_window_params(ts_ns, 50);
+
+    // Stage 1 + 2 + 3 (entries).
+    let selector = format!(r#"{{service_name="{SERVICE}"}}"#);
+    engine
+        .query(&parse(&selector).expect("parse"), &params)
+        .await
+        .expect("entry query");
+    // The paged fetch-until-limit loop (a distinct dispatch site).
+    engine
+        .query(&parse(&dropping_query()).expect("parse"), &params)
+        .await
+        .expect("paged query");
+    // A client-aggregated metric read.
+    engine
+        .query(
+            &parse(&format!("count_over_time({selector}[5m])")).expect("parse"),
+            &params,
+        )
+        .await
+        .expect("metric query");
+    // Discovery reads.
+    engine.label_names(bounds).await.expect("label_names");
+    engine
+        .label_values("service_name", bounds)
+        .await
+        .expect("label_values");
+    engine
+        .series(&[parse(&selector).expect("parse")], bounds)
+        .await
+        .expect("series");
+    engine
+        .stats(&parse(&selector).expect("parse"), bounds)
+        .await
+        .expect("stats");
+    engine
+        .detected_labels(Some(&parse(&selector).expect("parse")), bounds)
+        .await
+        .expect("detected_labels");
+    engine
+        .detected_fields(&parse(&selector).expect("parse"), bounds, 100, 100)
+        .await
+        .expect("detected_fields");
+
+    let rows = mem_ceiling_rows(&admin, &run_db, &marker).await;
+    assert_every_row_carries_the_ceiling(&rows, "LogQL engine");
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop run db");
+}
+
+/// Issue #398 AC T3 — **the traces discriminator / completeness gate.**
+/// EVERY query the trace engine dispatches carries the per-query memory
+/// ceiling.
+///
+/// The wrong fix this gate is built to fail is "add the ceiling to
+/// `search_settings`, the obvious root". TraceQL has three settings roots
+/// (see this section's header): `catalog_settings` is independent of
+/// `search_settings` and is the one that produced the measured 500, and
+/// `TraceEngine::fetch_by_id` sent a bare `QuerySettings::new()` while
+/// mapping its errors around `map_trace_read_error` entirely. Under that
+/// wrong fix a settings unit test on `search_settings` passes; this sweep
+/// does not, because it sees every dispatch the run actually made rather
+/// than the ones an enumeration remembered.
+#[tokio::test]
+async fn every_trace_engine_query_carries_the_memory_ceiling() {
+    skip_unless_live!();
+    let run_db = format!("pulsus_read_it_qlg_tr_{}", uuid::Uuid::new_v4().simple());
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("strict CREATE DATABASE for unique run db");
+    run_init(&admin, &test_ctx(&run_db))
+        .await
+        .expect("schema init");
+
+    let seed = data_client(&run_db).await;
+    let ts_ns = now_ns();
+    let date_days = ts_ns / 86_400_000_000_000;
+    let trace_hex = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
+    // A handful of spans, their attribute-index registrations, a tag
+    // catalog entry and one service-graph edge pair — enough that every
+    // read below returns rows rather than short-circuiting on an empty
+    // phase-1 result.
+    for sql in [
+        format!(
+            "INSERT INTO {run_db}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload) \
+             SELECT unhex('{trace_hex}'), \
+                    reinterpretAsFixedString(toUInt64(number + 1)), \
+                    reinterpretAsFixedString(toUInt64(0)), \
+                    'op', 'checkout', {ts_ns} + number, 1000000, 0, 2, 0, '' \
+             FROM numbers(64)"
+        ),
+        format!(
+            "INSERT INTO {run_db}.trace_attrs_idx \
+             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             SELECT toDate({date_days}), 'http.status_code', '500', 'span', NULL, \
+                    {ts_ns} + number, unhex('{trace_hex}'), \
+                    reinterpretAsFixedString(toUInt64(number + 1)), 1000000 \
+             FROM numbers(64)"
+        ),
+        format!(
+            "INSERT INTO {run_db}.trace_tag_catalog (scope, key, val) \
+             SELECT 'span', 'http.status_code', concat('v', toString(number)) FROM numbers(64)"
+        ),
+    ] {
+        seed.execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("seed failed: {e}\nSQL:\n{sql}"));
+    }
+
+    let config = pulsus_read::TraceReadConfig {
+        spans_table: "trace_spans".to_string(),
+        attrs_table: "trace_attrs_idx".to_string(),
+        catalog_table: "trace_tag_catalog".to_string(),
+        edges_table: "trace_edges".to_string(),
+        max_candidates: 100_000,
+        scan_budget_rows: 50_000_000,
+        max_series: 1_000,
+        generator_max_memory_bytes: MEM_CEILING,
+        // The surface-wide ceiling under test. Set equal to the generator's
+        // so the single sweep predicate below covers both — the generator
+        // deliberately overrides `max_memory_usage` with its own (tighter
+        // in production) value, and this gate is about PRESENCE at the
+        // configured ceiling on every dispatch, not about which of the two
+        // won on any one query. Their independence is asserted separately
+        // by `trace_catalog_settings_carry_the_memory_ceiling`.
+        read_max_memory_bytes: MEM_CEILING,
+        distributed: false,
+        skip_unavailable_shards: false,
+    };
+    // Built before the marker: `ChClient::new` opens the pool with a
+    // `SELECT 1` connectivity probe, which is not an engine dispatch.
+    let engine_client = data_client(&run_db).await;
+    let marker = query_log_marker(&admin).await;
+    let engine = pulsus_read::TraceEngine::new(engine_client, config);
+
+    // 1. Search — `search_settings` + `generator_settings` (phase 1) and
+    //    the phase-2 hydration/membership reads.
+    let query = pulsus_traceql::parse(r#"{ span.http.status_code = "500" }"#).expect("parses");
+    let plan = pulsus_read::traces::search_plan::plan_search(
+        &query,
+        &pulsus_read::traces::search_plan::SearchParams {
+            start_ns: ts_ns - 3_600_000_000_000,
+            end_ns: ts_ns + 3_600_000_000_000,
+            limit: 20,
+            spss: 10,
+        },
+        &engine.search_ctx(),
+    )
+    .expect("plans");
+    let found = engine.search(&plan).await.expect("search executes");
+    assert!(
+        !found.traces.is_empty(),
+        "the search fixture must return rows, or the phase-2 reads never dispatch"
+    );
+
+    // 2. Trace-by-id — the §4.2 point read, the third settings root.
+    let spans = engine.fetch_by_id(trace_hex).await.expect("point read");
+    assert!(!spans.is_empty(), "the point-read fixture must return rows");
+
+    // 3 + 4. Catalog discovery — `catalog_settings`, the root that
+    //        produced the measured 500.
+    engine.list_tag_names(None).await.expect("tag names");
+    engine
+        .list_tag_values("http.status_code", Some("span"))
+        .await
+        .expect("tag values");
+
+    // 5. A trace-metrics query — `metrics_settings`.
+    let metric_query = pulsus_traceql::parse(r#"{ span.http.status_code = "500" } | rate()"#)
+        .expect("metric query parses");
+    let metric_plan = pulsus_read::traces::metrics_plan::plan_trace_metrics(
+        &metric_query,
+        &pulsus_read::traces::metrics_plan::MetricsParams {
+            start_ns: (ts_ns / 1_000_000_000 - 300) * 1_000_000_000,
+            end_ns: (ts_ns / 1_000_000_000 + 60) * 1_000_000_000,
+            step_s: 60,
+        },
+        &engine.metrics_ctx(),
+    )
+    .expect("metric query plans");
+    engine
+        .metrics_range(&metric_plan)
+        .await
+        .expect("metrics range");
+
+    // 6. The service graph — `graph_settings`.
+    engine
+        .service_graph(pulsus_read::traces::graph_sql::GraphWindow {
+            start_ns: ts_ns - 3_600_000_000_000,
+            end_ns: ts_ns + 3_600_000_000_000,
+        })
+        .await
+        .expect("service graph");
+
+    let rows = mem_ceiling_rows(&admin, &run_db, &marker).await;
+    assert_every_row_carries_the_ceiling(&rows, "trace engine");
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop run db");
 }

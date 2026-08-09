@@ -352,6 +352,55 @@ mod tests {
         );
     }
 
+    /// Issue #398 AC M2: a PromQL read that exhausted ClickHouse's memory
+    /// answers **422 `execution`**, not 500 `internal`.
+    ///
+    /// That envelope is not a compromise — it is what prometheus/prometheus
+    /// v3.13.0 returns for its own memory refusal, measured against a
+    /// container with data in the store: `--query.max-samples=1` on both
+    /// `/api/v1/query` and `/api/v1/query_range` gives 422 with
+    /// `"errorType":"execution"` (`web/api/v1/api.go:2236-2237 @ v3.13.0`).
+    /// So the metrics surface needs no ledger row at all.
+    #[tokio::test]
+    async fn promql_read_memory_maps_to_422_execution() {
+        let err = pulsus_read::logql::ReadError::QueryTooBroad(
+            pulsus_read::logql::TooBroadReason::PromqlReadMemory {
+                budget_bytes: 8_589_934_592,
+            },
+        );
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert_eq!(json["status"], "error");
+        let body = json["error"].as_str().unwrap_or_default();
+        assert!(
+            body.contains("reader.promql_read_max_memory_bytes"),
+            "the body must name the knob an operator would raise: {json}"
+        );
+        assert!(
+            !body.contains("DB::Exception") && !body.contains("version 24.8"),
+            "the 422 body must carry only our own message: {json}"
+        );
+    }
+
+    /// Issue #398: the LogQL and TraceQL read-memory reasons ride the same
+    /// `QueryTooBroad(_)` wildcard here, so a future cross-surface route
+    /// cannot land on 500 by accident.
+    #[tokio::test]
+    async fn the_sibling_surfaces_read_memory_reasons_also_map_to_422_execution() {
+        for reason in [
+            pulsus_read::logql::TooBroadReason::LogqlReadMemory { budget_bytes: 4096 },
+            pulsus_read::logql::TooBroadReason::TraceReadMemory { budget_bytes: 4096 },
+        ] {
+            let (status, json) = envelope(ApiError::Read(
+                pulsus_read::logql::ReadError::QueryTooBroad(reason),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reason:?}");
+            assert_eq!(json["errorType"], "execution");
+        }
+    }
+
     #[tokio::test]
     async fn promql_parse_error_maps_to_400_bad_data_and_embeds_the_message() {
         let err = PromqlError::Parse("unexpected token at char 3".to_string());

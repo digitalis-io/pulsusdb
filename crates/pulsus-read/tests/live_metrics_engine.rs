@@ -175,6 +175,9 @@ fn now_ms() -> i64 {
 
 fn cache_config(db: &str, window_ms: i64) -> LabelCacheConfig {
     LabelCacheConfig {
+        // Issue #398: the per-query ClickHouse memory ceiling; the
+        // production default, so this fixture keeps today's behaviour.
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),
         bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
@@ -187,6 +190,9 @@ fn cache_config(db: &str, window_ms: i64) -> LabelCacheConfig {
 
 fn engine_config(db: &str) -> MetricsConfig {
     MetricsConfig {
+        // Issue #398: the per-query ClickHouse memory ceiling; the
+        // production default, so this fixture keeps today's behaviour.
+        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         samples_table: "metric_samples".to_string(),
         hist_samples_table: "metric_hist_samples".to_string(),
@@ -1230,6 +1236,9 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
         on_client,
         cache,
         MetricsConfig {
+            // Issue #398: the per-query ClickHouse memory ceiling; the
+            // production default, so this fixture keeps today's behaviour.
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             experimental_functions: true,
             ..engine_config(db)
         },
@@ -1326,6 +1335,9 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
         engine_client,
         cache,
         MetricsConfig {
+            // Issue #398: the per-query ClickHouse memory ceiling; the
+            // production default, so this fixture keeps today's behaviour.
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             experimental_functions: true,
             max_info_series: 2,
             ..engine_config(db)
@@ -1434,6 +1446,9 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
         engine_client,
         cache,
         MetricsConfig {
+            // Issue #398: the per-query ClickHouse memory ceiling; the
+            // production default, so this fixture keeps today's behaviour.
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             experimental_functions: true,
             max_info_series: 2,
             ..engine_config(db)
@@ -1537,6 +1552,9 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
             .expect("connect (capped engine client)"),
         Arc::clone(&cache),
         MetricsConfig {
+            // Issue #398: the per-query ClickHouse memory ceiling; the
+            // production default, so this fixture keeps today's behaviour.
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             max_samples: 4,
             ..engine_config(db)
         },
@@ -1561,6 +1579,9 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
             .expect("connect (at-cap engine client)"),
         cache,
         MetricsConfig {
+            // Issue #398: the per-query ClickHouse memory ceiling; the
+            // production default, so this fixture keeps today's behaviour.
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             max_samples: 5,
             ..engine_config(db)
         },
@@ -1680,6 +1701,9 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
         engine_client,
         cache,
         MetricsConfig {
+            // Issue #398: the per-query ClickHouse memory ceiling; the
+            // production default, so this fixture keeps today's behaviour.
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             experimental_functions: true,
             max_info_series: 2,
             ..engine_config(db)
@@ -3028,6 +3052,9 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
             .expect("connect (capped engine client)"),
         cache,
         MetricsConfig {
+            // Issue #398: the per-query ClickHouse memory ceiling; the
+            // production default, so this fixture keeps today's behaviour.
+            read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             max_metric_fanout: 1,
             ..engine_config(db)
         },

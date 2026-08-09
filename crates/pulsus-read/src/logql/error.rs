@@ -17,11 +17,12 @@ use pulsus_clickhouse::ChError;
 use pulsus_logql::LogQlError;
 use thiserror::Error;
 
-/// Why a query was rejected as too broad. Six structurally separate
-/// reason families, never conflated (architect plan amendment §4; issue
-/// #57 adds the traces row budget and (re-audit) the traces generator
-/// memory budget; issue #59 adds the trace-metrics IN-set budget), each
-/// with its own exclusive code path:
+/// Why a query was rejected as too broad. Structurally separate reason
+/// families, never conflated (architect plan amendment §4; issue #57 adds
+/// the traces row budget and (re-audit) the traces generator memory
+/// budget; issue #59 adds the trace-metrics IN-set budget; issue #398 adds
+/// one per-surface read memory budget for each of LogQL, PromQL and
+/// TraceQL), each with its own exclusive producing code path:
 ///
 /// - [`TooBroadReason::ScanBudgetBytes`] — byte budgets only: LogQL
 ///   `max_bytes_to_read` (code 307), the traces `max_bytes_to_read`/
@@ -40,8 +41,23 @@ use thiserror::Error;
 /// - [`TooBroadReason::TraceGeneratorMemory`] — issue #57 re-audit: the
 ///   traces phase-1 candidate-generator's memory ceiling
 ///   (`max_memory_usage` + `max_bytes_before_external_group_by = 0`,
-///   throw — code 241) set **only** on generator reads; no other path
-///   sets a memory limit, and no other code maps code 241.
+///   throw — code 241) set **only** on generator reads, and mapped
+///   **only** by `traces::exec::map_trace_generator_error`. Issue #398
+///   ended this reason's exclusive claim on code 241: all three read
+///   surfaces now carry a memory ceiling, so code 241 is mapped by four
+///   mappers in total. The generator's mapper runs FIRST on generator
+///   reads and delegates the rest, so the more specific (and tighter)
+///   generator reason still wins there and the four never mix.
+/// - [`TooBroadReason::LogqlReadMemory`] / [`TooBroadReason::PromqlReadMemory`]
+///   / [`TooBroadReason::TraceReadMemory`] — issue #398: the per-surface
+///   read memory ceilings (`reader.{logql,promql,traceql}_read_max_memory_bytes`,
+///   same `max_memory_usage` + `max_bytes_before_external_group_by = 0`
+///   throw-not-spill pair, same server code 241). One variant per
+///   producing mapper — `logql::exec::map_read_error`,
+///   `metrics::dispatch::map_metrics_read_error`,
+///   `traces::exec::map_trace_read_error` — so each keeps the
+///   "produced only by X" claim this enum is built on, and each names its
+///   own knob in its message.
 /// - [`TooBroadReason::WalkTransientBytes`] — issue #272: the iterative
 ///   AST/plan walkers' transient heap, admitted from `query.len()` before
 ///   the walks run. Rust-side; never a ClickHouse error code.
@@ -115,7 +131,43 @@ pub enum TooBroadReason {
     /// budget. Set **only** by `traces::exec`'s generator error mapper
     /// (`map_trace_generator_error`); never conflated with the row/byte
     /// scan budgets or the trace-metrics set budget.
+    ///
+    /// Issue #398: `generator_settings` keeps this TIGHTER 512 MiB ceiling
+    /// layered on top of the surface-wide
+    /// `reader.traceql_read_max_memory_bytes`, so a generator read is
+    /// bounded by the smaller of the two and still reports through this
+    /// reason. That is deliberately **not** a carve-out from #398's
+    /// bound-every-read rule: a carve-out leaves a path *unbounded*, and
+    /// this path ends up bounded more strictly, not less.
     TraceGeneratorMemory { budget_bytes: u64 },
+    /// Issue #398: a **LogQL** read exceeded
+    /// `reader.logql_read_max_memory_bytes` (`max_memory_usage` +
+    /// `max_bytes_before_external_group_by = 0`, throw-not-spill — server
+    /// code 241 `MEMORY_LIMIT_EXCEEDED`). Produced **ONLY** by
+    /// `logql::exec::map_read_error`. The sibling surfaces map the same
+    /// server code from their own mappers to their own reasons
+    /// ([`TooBroadReason::PromqlReadMemory`],
+    /// [`TooBroadReason::TraceReadMemory`],
+    /// [`TooBroadReason::TraceGeneratorMemory`]) and the four never mix —
+    /// each mapper only ever sees its own surface's errors.
+    LogqlReadMemory { budget_bytes: u64 },
+    /// Issue #398: a **PromQL** read exceeded
+    /// `reader.promql_read_max_memory_bytes` — the same setting pair and
+    /// the same server code 241 as [`TooBroadReason::LogqlReadMemory`].
+    /// Produced **ONLY** by `metrics::dispatch::map_metrics_read_error`,
+    /// the metrics path's single sealed classification point (issue #280).
+    /// Surfaces as `422 execution` through `prom_api::error`, matching
+    /// prometheus/prometheus v3.13.0's own memory refusal
+    /// (`web/api/v1/api.go:2236-2237 @ v3.13.0`).
+    PromqlReadMemory { budget_bytes: u64 },
+    /// Issue #398: a **TraceQL** read — search, catalog discovery, or the
+    /// trace-by-id point read — exceeded
+    /// `reader.traceql_read_max_memory_bytes`. Produced **ONLY** by
+    /// `traces::exec::map_trace_read_error`. Phase-1 generator reads are
+    /// classified by `map_trace_generator_error` FIRST, so their tighter
+    /// ceiling reports as [`TooBroadReason::TraceGeneratorMemory`] and
+    /// never as this.
+    TraceReadMemory { budget_bytes: u64 },
     /// Issue #85 (M6-08c): a name-less/regex-`__name__` PromQL selector
     /// matched more metric names than the configured fan-out cap
     /// (`reader.promql_max_metric_fanout`, default 1000 — the adjudicated
@@ -420,6 +472,37 @@ impl fmt::Display for TooBroadReason {
                 write!(
                     f,
                     "trace search generator memory budget of {budget_bytes} bytes exceeded"
+                )
+            }
+            // Issue #398: PulsusDB's own wording on all three. The
+            // reference has no counterpart body for this condition —
+            // Loki's nearest limit (`limErrQueryTooManyBytesTmpl`,
+            // grafana/loki `pkg/querier/queryrange/limits.go @ v3.7.4`)
+            // bounds bytes READ, not memory — so nothing is copied
+            // verbatim and no verbatim-parity claim is made. Each names
+            // its own knob so an operator can act on it.
+            TooBroadReason::LogqlReadMemory { budget_bytes } => {
+                write!(
+                    f,
+                    "logql read memory budget of {budget_bytes} bytes exceeded \
+                     (reader.logql_read_max_memory_bytes) — narrow the selector, the time \
+                     range, or the pipeline"
+                )
+            }
+            TooBroadReason::PromqlReadMemory { budget_bytes } => {
+                write!(
+                    f,
+                    "promql read memory budget of {budget_bytes} bytes exceeded \
+                     (reader.promql_read_max_memory_bytes) — narrow the selector or the \
+                     time range"
+                )
+            }
+            TooBroadReason::TraceReadMemory { budget_bytes } => {
+                write!(
+                    f,
+                    "trace read memory budget of {budget_bytes} bytes exceeded \
+                     (reader.traceql_read_max_memory_bytes) — narrow the query, the time \
+                     range, or the tag scope"
                 )
             }
             TooBroadReason::MetricBuckets { buckets, cap } => {

@@ -270,6 +270,12 @@ async fn drop_db(db: &str) {
 }
 
 fn spawn_ready(port: u16, db: &str) -> ChildGuard {
+    spawn_ready_env(port, db, &[])
+}
+
+/// [`spawn_ready`] with extra environment on top of the baseline (issue
+/// #398: `PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES`).
+fn spawn_ready_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -286,6 +292,9 @@ fn spawn_ready(port: u16, db: &str) -> ChildGuard {
         // wire-shape assertions below need them; native behavior is
         // unaffected (router-build-time merging only).
         .env("PULSUS_COMPAT_ENDPOINTS", "true");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     let guard = ChildGuard(cmd.spawn().expect("spawn pulsusdb"));
 
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -953,6 +962,158 @@ async fn tag_discovery_against_real_clickhouse() {
         "no Select in this run — regardless of its SQL text — may touch trace_spans or \
          trace_attrs_idx"
     );
+
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #398 — the TraceQL half. Measured at 051fd8a with a ClickHouse
+// user profile pinning `max_memory_usage = 1000000`:
+// `GET /api/search/tag/{tag}/values` answered **500** with the raw server
+// exception in the body — `clickhouse: server [241]: Code: 241.
+// DB::Exception: Memory limit (for query) exceeded: would use 9.51 MiB …
+// maximum: 976.56 KiB.`
+//
+// That read comes from `traces::exec::catalog_settings`, which is a
+// DELIBERATELY INDEPENDENT settings root from `search_settings` (it omits
+// the clustered-reader block on purpose). Adding the ceiling to
+// `search_settings` alone — the obvious root — would leave this endpoint
+// exactly as it was.
+// ---------------------------------------------------------------------
+
+/// Catalog rows seeded for the memory-breach fixture.
+///
+/// **Sizing, measured through this test at `PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES
+/// = 1024` — on the two routes below, not on a SQL statement in isolation.**
+/// Both routes answer 200 at 0, 1, 10, 100, 500, 1 000, 5 000, 10 000, 20 000
+/// and 30 000 rows, and 422 at 40 000, 50 000, 100 000 and 200 000. The
+/// threshold is therefore between 30 000 and 40 000 — an order of magnitude
+/// above the LogQL fixture's, because this is one `SELECT DISTINCT` over a
+/// single freshly written part with no other read in front of it.
+///
+/// 200 000 is 5x the measured threshold. The previous value, 50 000, sat only
+/// 1.25x above it, which is too thin to leave unstated for a CI gate. It costs
+/// nothing to raise: the test runs in 0.77 s at 50 000 and 0.81 s at 200 000,
+/// because the seed is one server-side `INSERT … FROM numbers()`.
+const MEM_CATALOG_ROWS: u64 = 200_000;
+
+/// Issue #398 AC T2: a TraceQL catalog read that breaches the per-query
+/// memory ceiling answers **422**, on the native route and on the Tempo
+/// alias that produced the measured 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn trace_tag_values_memory_breach_is_422() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_129;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = format!("pulsus_traces_tags_mem_it_{nonce}");
+    let db = db.as_str();
+    drop_db(db).await;
+    let _guard = spawn_ready_env(
+        port,
+        db,
+        &[("PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES", "1024")],
+    );
+
+    // Seed the catalog directly (the MV path is covered by the suite
+    // above; this fixture is about the READ's budget, not ingest).
+    let mut cfg = ch_config();
+    cfg.database = db.to_string();
+    let client = ChClient::new(cfg).await.expect("connect data client");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')) \
+                 FROM numbers({MEM_CATALOG_ROWS})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed trace_tag_catalog");
+
+    let mut wrong: Vec<String> = Vec::new();
+    for path in [
+        "/api/traces/v1/tag/span.bulk.id/values",
+        // The Tempo alias the 500 was measured on.
+        "/api/search/tag/span.bulk.id/values",
+    ] {
+        let res = get(port, path, "memory breach");
+        let body = String::from_utf8_lossy(&res.body).into_owned();
+        if res.status != 422 {
+            wrong.push(format!("{path} -> {} {body}", res.status));
+            continue;
+        }
+        if !body.contains("reader.traceql_read_max_memory_bytes") {
+            wrong.push(format!("{path} -> 422 without the knob name: {body}"));
+        }
+        if body.contains("DB::Exception") || body.contains("official build") {
+            wrong.push(format!("{path} -> 422 leaking the exception: {body}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a catalog memory breach must be 422 with our own message:\n{}",
+        wrong.join("\n")
+    );
+
+    drop_db(db).await;
+}
+
+/// The direction-neutral twin of `trace_tag_values_memory_breach_is_422`:
+/// at the shipped 8 GiB default the SAME corpus and the SAME routes answer
+/// **200**. Without it, a change that 422'd every catalog read would pass
+/// the discriminator above.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_default_trace_memory_ceiling_does_not_refuse_a_catalog_read() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_130;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = format!("pulsus_traces_tags_mem_ok_it_{nonce}");
+    let db = db.as_str();
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db);
+
+    let mut cfg = ch_config();
+    cfg.database = db.to_string();
+    let client = ChClient::new(cfg).await.expect("connect data client");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')) \
+                 FROM numbers({MEM_CATALOG_ROWS})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed trace_tag_catalog");
+
+    for path in [
+        "/api/traces/v1/tag/span.bulk.id/values",
+        "/api/search/tag/span.bulk.id/values",
+    ] {
+        let res = get(port, path, "default ceiling");
+        assert_eq!(
+            res.status,
+            200,
+            "{path}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+    }
 
     drop_db(db).await;
 }

@@ -44,15 +44,25 @@ use super::window::{ClientWindow, materialize_vector_lit};
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
 /// `max_bytes_to_read` overflow this module sets from
-/// `reader.logql_scan_budget_bytes`. Deliberately the *only* server code
-/// [`map_read_error`] maps to [`ReadError::QueryTooBroad`]:
-/// `max_rows_to_read` is never set on **LogQL** read paths (the traces
-/// scan budget sets it deliberately on its generator queries, where code
-/// 158 maps to `TooBroadReason::TraceScanBudgetRows` via
+/// `reader.logql_scan_budget_bytes`. One of exactly **two** server codes
+/// [`map_read_error`] maps to [`ReadError::QueryTooBroad`] (issue #398
+/// added the second, [`CODE_MEMORY_LIMIT_EXCEEDED`]; before it, this was
+/// the only one). `max_rows_to_read` is never set on **LogQL** read paths
+/// (the traces scan budget sets it deliberately on its generator queries,
+/// where code 158 maps to `TooBroadReason::TraceScanBudgetRows` via
 /// `traces::exec`'s own mapper — issue #57), so on the LogQL path code
 /// 158 (`TOO_MANY_ROWS`) can never masquerade as the byte budget
 /// (architect plan amendment §4).
 const CODE_TOO_MANY_BYTES: i32 = 307;
+
+/// ClickHouse server exception code for `MEMORY_LIMIT_EXCEEDED` — the
+/// `max_memory_usage` overflow issue #398 sets on **every** LogQL read
+/// from `reader.logql_read_max_memory_bytes`. Before #398 no LogQL read
+/// set a memory limit at all, so this code fell through to
+/// [`ReadError::Clickhouse`] and the client saw a `500` carrying the raw
+/// server exception — the same "we could not afford this query" condition
+/// the byte budget already reported as `422`.
+const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
 
 /// Owned table/budget configuration a [`LogQlEngine`] plans every query
 /// against. Mirrors [`PlanCtx`]'s fields as owned `String`s/values so the
@@ -71,6 +81,12 @@ pub struct EngineConfig {
     pub patterns_table: String,
     pub rollup_res_ns: u64,
     pub scan_budget_bytes: u64,
+    /// Issue #398: `reader.logql_read_max_memory_bytes` — the
+    /// `max_memory_usage` ceiling (throw-not-spill) every read this engine
+    /// issues carries, applied in [`read_query_settings`] so no dispatch
+    /// site can be missed. Breach → server code 241 →
+    /// [`TooBroadReason::LogqlReadMemory`] → `422`.
+    pub read_max_memory_bytes: u64,
     pub max_streams: usize,
     /// `reader.logql_pipeline_scan_factor` (issue M6-09) — see
     /// [`PlanCtx::pipeline_scan_factor`].
@@ -318,7 +334,13 @@ impl LogQlEngine {
             .query_stream::<LabelNameRow>(&sql, &self.activity_settings())
             .await?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            let row = row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?;
             names.push(row.name);
         }
         Ok(names)
@@ -368,7 +390,13 @@ impl LogQlEngine {
             .query_stream::<LabelValueRow>(&sql, &self.activity_settings())
             .await?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            let row = row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?;
             values.push(row.value);
         }
         Ok(values)
@@ -541,7 +569,13 @@ impl LogQlEngine {
         self.client
             .query_stream::<R>(&sql, settings)
             .await
-            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))
+            .map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })
     }
 
     /// Stage 1 — stream resolution. **Budget-capped** (fix-plan amendment
@@ -556,7 +590,13 @@ impl LogQlEngine {
             .query_stream::<StreamRow>(stage1_sql, &self.budget_settings())
             .await?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            let row = row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?;
             fingerprints.push(row.fingerprint);
             check_stream_cap(fingerprints.len(), self.config.max_streams)?;
         }
@@ -580,7 +620,13 @@ impl LogQlEngine {
             .query_stream::<StreamMetaRow>(&sql, &self.budget_settings())
             .await?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            let row = row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?;
             // ReplacingMergeTree without FINAL may yield duplicate rows per
             // fingerprint; labels/service are identical per fingerprint, so
             // keeping any one row is safe (docs/schemas.md §3.2 edge cases).
@@ -590,7 +636,10 @@ impl LogQlEngine {
     }
 
     fn budget_settings(&self) -> QuerySettings {
-        read_query_settings(self.config.scan_budget_bytes)
+        read_query_settings(
+            self.config.scan_budget_bytes,
+            self.config.read_max_memory_bytes,
+        )
     }
 
     /// The request's own bounds, as the activity semi-join's window
@@ -630,7 +679,11 @@ impl LogQlEngine {
     /// non-co-sharded subquery silently return wrong shard-local results
     /// instead of failing loud.
     fn activity_settings(&self) -> QuerySettings {
-        activity_query_settings(self.config.scan_budget_bytes, self.config.distributed)
+        activity_query_settings(
+            self.config.scan_budget_bytes,
+            self.config.read_max_memory_bytes,
+            self.config.distributed,
+        )
     }
 
     /// Narrows a resolved fingerprint set to those with log lines in
@@ -672,7 +725,13 @@ impl LogQlEngine {
                 .query_stream::<StreamRow>(&sql, &self.budget_settings())
                 .await?;
             while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
                 active.insert(row.fingerprint);
             }
         }
@@ -709,8 +768,14 @@ impl LogQlEngine {
     /// (the setting only affects the CLIENT-side per-page `read_bytes` this
     /// method's caller uses for budget accounting), so the wiring is only
     /// observable here, at the settings object (issue #90).
+    ///
+    /// Issue #398: `remaining` is the DECREMENTED byte budget and lands in
+    /// `max_bytes_to_read` only. The memory ceiling is per query and is
+    /// never decremented — every page carries the same
+    /// `reader.logql_read_max_memory_bytes`.
     pub fn paging_settings(&self, remaining: u64) -> QuerySettings {
-        read_query_settings(remaining).set("wait_end_of_query", 1)
+        read_query_settings(remaining, self.config.read_max_memory_bytes)
+            .set("wait_end_of_query", 1)
     }
 
     /// Executes a [`StreamsPlan`] end to end. When `explain` is `Some`,
@@ -796,7 +861,13 @@ impl LogQlEngine {
                 .query_stream::<SampleRow>(&sql, &self.budget_settings())
                 .await?;
             while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
                 if row.structured_metadata.is_empty() {
                     by_fp
                         .entry(row.fingerprint)
@@ -844,7 +915,13 @@ impl LogQlEngine {
             .query_stream::<SampleRow>(&sql, &self.budget_settings())
             .await?;
         while let Some(row) = stream.next().await {
-            rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
+            rows.push(row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?);
         }
 
         Ok((
@@ -962,7 +1039,9 @@ impl LogQlEngine {
                     .query_stream::<TailSampleRow>(&sql, &self.paging_settings(page_cap))
                     .await?;
                 while let Some(row) = stream.next().await {
-                    rows.push(row.map_err(|e| map_read_error(e, budget))?);
+                    rows.push(row.map_err(|e| {
+                        map_read_error(e, budget, self.config.read_max_memory_bytes)
+                    })?);
                 }
                 Ok(stream.read_bytes())
             }
@@ -1138,7 +1217,13 @@ impl LogQlEngine {
                 .await?;
             let mut series: Vec<InstantSeries> = Vec::new();
             while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
                 let Some(m) = meta.get(&row.fingerprint) else {
                     continue;
                 };
@@ -1180,7 +1265,13 @@ impl LogQlEngine {
                 .await?;
             let mut by_fp: HashMap<u64, BTreeMap<i64, f64>> = HashMap::new();
             while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
                 let value = apply_rate(row.n as f64, mp.rate_window_ns);
                 by_fp
                     .entry(row.fingerprint)
@@ -1241,10 +1332,15 @@ impl LogQlEngine {
         // (`optimize_read_in_order`, no server sort) for the streaming slide;
         // an instant query keeps the total-timestamp order its reducers pin.
         let sql = client_metric_read_sql(mp, &services, fingerprints, time_window);
+        // Issue #398: the hard-coded 8 GiB `max_memory_usage` override
+        // that used to sit here is gone — every
+        // LogQL read now carries the ceiling from
+        // `reader.logql_read_max_memory_bytes` via `read_query_settings`,
+        // whose default is that same 8 GiB. Keeping the override would
+        // have inverted the carve-out: the one path that already had a
+        // bound would be the one path the operator's knob cannot reach.
         let settings = if is_range {
-            self.budget_settings()
-                .set("optimize_read_in_order", 1)
-                .set("max_memory_usage", RANGE_READ_MAX_MEMORY_BYTES)
+            self.budget_settings().set("optimize_read_in_order", 1)
         } else {
             self.budget_settings()
         };
@@ -1314,7 +1410,13 @@ impl LogQlEngine {
             // runs inside this block, and the lease ends at the brace.
             let mut stream = self.query_stream::<MetricScanRow>(&sql, &settings).await?;
             while let Some(row) = stream.next().await {
-                chunk.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
+                chunk.push(row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?);
                 if chunk.len() >= CLIENT_AGG_CHUNK_ROWS {
                     state.push_rows(&chunk)?;
                     chunk.clear();
@@ -1397,10 +1499,15 @@ impl LogQlEngine {
             end_ns: scan.end_ns,
         };
         let sql = client_metric_read_sql(scan, &services, &fingerprints, time_window);
+        // Issue #398: the hard-coded 8 GiB `max_memory_usage` override
+        // that used to sit here is gone — every
+        // LogQL read now carries the ceiling from
+        // `reader.logql_read_max_memory_bytes` via `read_query_settings`,
+        // whose default is that same 8 GiB. Keeping the override would
+        // have inverted the carve-out: the one path that already had a
+        // bound would be the one path the operator's knob cannot reach.
         let settings = if is_range {
-            self.budget_settings()
-                .set("optimize_read_in_order", 1)
-                .set("max_memory_usage", RANGE_READ_MAX_MEMORY_BYTES)
+            self.budget_settings().set("optimize_read_in_order", 1)
         } else {
             self.budget_settings()
         };
@@ -1419,7 +1526,13 @@ impl LogQlEngine {
             // dropped (the `ChRowStream` lease rule).
             let mut stream = self.query_stream::<MetricScanRow>(&sql, &settings).await?;
             while let Some(row) = stream.next().await {
-                chunk.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
+                chunk.push(row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?);
                 if chunk.len() >= CLIENT_AGG_CHUNK_ROWS {
                     state.push_rows(&chunk)?;
                     chunk.clear();
@@ -1963,7 +2076,13 @@ impl LogQlEngine {
             .query_stream::<LogStatsRow>(&sql, &self.budget_settings())
             .await?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            let row = row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?;
             result = LogStats {
                 streams: row.streams,
                 chunks: row.chunks,
@@ -2075,7 +2194,13 @@ impl LogQlEngine {
                 .query_stream::<PatternFetchRow>(&sql, &self.budget_settings())
                 .await?;
             while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
                 // ClickHouse already ordered by (total desc, pattern asc) and
                 // arraySorted the samples ascending by ts_ns; each ts_ns is a
                 // multiple of step_ns (≥ 10s), so ns→unix-seconds is exact.
@@ -2224,7 +2349,13 @@ impl LogQlEngine {
                 .query_stream::<VolumeRow>(&sql, &self.budget_settings())
                 .await?;
             while let Some(row) = stream.next().await {
-                rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
+                rows.push(row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?);
             }
         }
         Ok(accumulate_volume(
@@ -2335,7 +2466,13 @@ impl LogQlEngine {
             .query_stream::<DetectedLabelRow>(&sql, &self.activity_settings())
             .await?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            let row = row.map_err(|e| {
+                map_read_error(
+                    e,
+                    self.config.scan_budget_bytes,
+                    self.config.read_max_memory_bytes,
+                )
+            })?;
             // The reference keep rule: static labels always; anything
             // else only when NOT every value is float-or-UUID.
             if detected::is_static_detected_label(&row.key) || row.non_id_values > 0 {
@@ -2498,7 +2635,13 @@ impl LogQlEngine {
                     .query_stream::<SampleRow>(&sql, &self.budget_settings())
                     .await?;
                 while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                    let row = row.map_err(|e| {
+                        map_read_error(
+                            e,
+                            self.config.scan_budget_bytes,
+                            self.config.read_max_memory_bytes,
+                        )
+                    })?;
                     if matched >= line_limit {
                         // `line_limit` stops FEEDING, never DRAINING.
                         continue;
@@ -2691,7 +2834,7 @@ impl LogQlEngine {
                 st.absorb_page(
                     &mut stream,
                     |s| s.read_bytes(),
-                    |e| map_read_error(e, budget),
+                    |e| map_read_error(e, budget, self.config.read_max_memory_bytes),
                     base_labels,
                     compiled,
                     acc,
@@ -2847,7 +2990,13 @@ impl LogQlEngine {
                 .query_stream::<TailSampleRow>(&sql, &self.budget_settings())
                 .await?;
             while let Some(row) = stream.next().await {
-                rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
+                rows.push(row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?);
             }
         }
         let fetched = u32::try_from(rows.len()).unwrap_or(u32::MAX);
@@ -3340,15 +3489,6 @@ fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
     }
 }
 
-/// The high, last-resort ClickHouse `max_memory_usage` net for the sliding
-/// range read (issue #227): far above any streamed footprint (the read is
-/// scan-buffer-bounded, ~tens of MiB, range-independent) so it never gates a
-/// normal query — the per-query memory bound is the Rust-side concurrent
-/// retention cap, not this. A documented constant (the `DEFAULT_MAX_STREAMS`
-/// precedent); promote to `reader.logql_metric_range_max_memory_bytes` only
-/// if a deployment needs it.
-pub const RANGE_READ_MAX_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
 /// The read-path settings every LogQL query now carries (issue #35): the
 /// byte scan budget (`max_bytes_to_read` + `read_overflow_mode = 'throw'`,
 /// unchanged from before this issue) plus `max_query_size` — ClickHouse's
@@ -3361,11 +3501,25 @@ pub const RANGE_READ_MAX_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// [`crate::querytext::MAX_QUERY_TEXT_BYTES`] directly (not this function)
 /// to keep its own settings key-for-key identical to what produced the
 /// frozen evidence JSONs (issue #35 plan v2, "Frozen-bench resolution").
-pub fn read_query_settings(scan_budget_bytes: u64) -> QuerySettings {
+///
+/// Issue #398 adds the per-query memory ceiling —
+/// `max_memory_usage = read_max_memory_bytes` (from
+/// `reader.logql_read_max_memory_bytes`) plus
+/// `max_bytes_before_external_group_by = 0`, i.e. **throw, not spill**: a
+/// spilled aggregation is the silently-slow outcome this repo rejects, and
+/// the shipped traces precedent (`traces::exec::generator_settings`, issue
+/// #57) sets exactly the same pair. Because every LogQL settings object is
+/// built here, one edit reaches all eighteen dispatch sites including the
+/// shared stage-1 stream resolution several endpoints run — a breach is
+/// server code 241 → [`TooBroadReason::LogqlReadMemory`] → `422`, never
+/// the raw-exception `500` it was before.
+pub fn read_query_settings(scan_budget_bytes: u64, read_max_memory_bytes: u64) -> QuerySettings {
     QuerySettings::new()
         .set("max_bytes_to_read", scan_budget_bytes)
         .set("read_overflow_mode", "throw")
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+        .set("max_memory_usage", read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
 }
 
 /// [`read_query_settings`] plus, when `distributed`,
@@ -3373,8 +3527,12 @@ pub fn read_query_settings(scan_budget_bytes: u64) -> QuerySettings {
 /// [`LogQlEngine::activity_settings`], whose whole body this is. Split out
 /// as a free function for the same reason [`read_query_settings`] is one:
 /// the settings decision is provable without a ClickHouse connection.
-fn activity_query_settings(scan_budget_bytes: u64, distributed: bool) -> QuerySettings {
-    let base = read_query_settings(scan_budget_bytes);
+fn activity_query_settings(
+    scan_budget_bytes: u64,
+    read_max_memory_bytes: u64,
+    distributed: bool,
+) -> QuerySettings {
+    let base = read_query_settings(scan_budget_bytes, read_max_memory_bytes);
     if distributed {
         base.set("distributed_product_mode", "local")
     } else {
@@ -3398,21 +3556,47 @@ fn scan_budget_spent(spent: u64, budget: u64) -> bool {
 }
 
 /// Maps a ClickHouse error to [`ReadError`], translating the byte-budget
-/// overflow code to a structured [`TooBroadReason::ScanBudgetBytes`] and
-/// leaving every other server code (including 158 `TOO_MANY_ROWS`, which
-/// the LogQL path never triggers because it never sets `max_rows_to_read`
-/// — the traces search path sets that budget deliberately and maps 158 in
-/// its **own** mapper, `traces::exec::map_trace_read_error`, issue #57) as
-/// a generic [`ReadError::Clickhouse`] passthrough — never reinterpreted
-/// as a timeout or vice versa.
-fn map_read_error(e: ChError, budget_bytes: u64) -> ReadError {
-    if let ChError::Server { code, .. } = &e
-        && *code == CODE_TOO_MANY_BYTES
-    {
-        return ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes {
-            budget_bytes,
-            estimate: None,
-        });
+/// overflow code and (issue #398) the memory-ceiling overflow code to
+/// structured [`ReadError::QueryTooBroad`] reasons, and leaving every
+/// other server code (including 158 `TOO_MANY_ROWS`, which the LogQL path
+/// never triggers because it never sets `max_rows_to_read` — the traces
+/// search path sets that budget deliberately and maps 158 in its **own**
+/// mapper, `traces::exec::map_trace_read_error`, issue #57) as a generic
+/// [`ReadError::Clickhouse`] passthrough — never reinterpreted as a
+/// timeout or vice versa.
+///
+/// **The #412 rule.** `ChError::Server.code` is parsed out of the
+/// exception TEXT on ClickHouse 24.8, and a user-supplied regex can reach
+/// that text, so the code is spoofable on `main` today (issue #412, which
+/// closes with the 26.3 move, #376). The classification here is designed
+/// so a wrong code can never make anything worse:
+///
+/// 1. The BOUND is not the parse — `max_memory_usage` is enforced by
+///    ClickHouse whether or not we read the code correctly, so a spoofed
+///    code only changes the LABEL on a query that was stopped regardless.
+/// 2. Fail-open: a MISSED 241 falls through the unchanged
+///    [`ReadError::Clickhouse`] arm to the pre-#398 `500`.
+/// 3. A FALSE 241 relabels an already-failing query `422`; no data is
+///    served and no body content is exposed that the `500` did not.
+/// 4. The code drives nothing but status and message — read dispatches
+///    never retry (`ChClient::query_stream` has no retry loop; only
+///    `execute` retries, and only for idempotent DDL), so a spoofed
+///    *retryable* code cannot re-execute a memory-exhausting read.
+/// 5. This function is a pure function of the already-parsed `code` field
+///    and never re-inspects `message`, so it inherits #412's fix for free.
+fn map_read_error(e: ChError, budget_bytes: u64, read_max_memory_bytes: u64) -> ReadError {
+    if let ChError::Server { code, .. } = &e {
+        if *code == CODE_TOO_MANY_BYTES {
+            return ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes {
+                budget_bytes,
+                estimate: None,
+            });
+        }
+        if *code == CODE_MEMORY_LIMIT_EXCEEDED {
+            return ReadError::QueryTooBroad(TooBroadReason::LogqlReadMemory {
+                budget_bytes: read_max_memory_bytes,
+            });
+        }
     }
     ReadError::Clickhouse(e)
 }
@@ -3588,6 +3772,12 @@ mod tests {
     use super::*;
     use crate::logql::testkit::*;
 
+    /// Issue #398: a distinctive, non-default `reader.logql_read_max_memory_bytes`
+    /// for the settings/mapper tests — deliberately unequal to any scan
+    /// budget any test passes, so a mix-up between the two budgets shows up
+    /// as a value mismatch rather than an accidental pass.
+    const TEST_READ_MEM: u64 = 7_654_321;
+
     /// Review round 5, finding 3: EXPLAIN and execution share ONE SQL
     /// builder, so the reported `metric_read` query IS the query that runs —
     /// a range plan yields the PK-ordered sliding scan, an instant plan the
@@ -3686,7 +3876,7 @@ mod tests {
             code: 307,
             message: "Code: 307. DB::Exception: Limit for bytes to read exceeded".to_string(),
         };
-        let err = map_read_error(e, 1024);
+        let err = map_read_error(e, 1024, TEST_READ_MEM);
         match err {
             ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
                 assert_eq!(budget_bytes, 1024);
@@ -3718,14 +3908,14 @@ mod tests {
         assert_eq!(body.len(), 209, "verbatim capture, pinned against an edit");
         let raw = ChError::from(clickhouse::error::Error::BadResponse(body.to_string()));
         assert!(matches!(
-            map_read_error(raw, 1024),
+            map_read_error(raw, 1024, TEST_READ_MEM),
             ReadError::Clickhouse(_)
         ));
 
         let patched = ChError::from(clickhouse::error::Error::BadResponse(format!(
             "Code: 307\n{body}"
         )));
-        match map_read_error(patched, 1024) {
+        match map_read_error(patched, 1024, TEST_READ_MEM) {
             ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
                 assert_eq!(budget_bytes, 1024);
             }
@@ -3739,8 +3929,134 @@ mod tests {
             code: 158,
             message: "Code: 158. DB::Exception: Limit for rows to read exceeded".to_string(),
         };
-        let err = map_read_error(e, 1024);
+        let err = map_read_error(e, 1024, TEST_READ_MEM);
         assert!(matches!(err, ReadError::Clickhouse(_)));
+    }
+
+    /// Issue #398 AC L3: server code 241 becomes the named LogQL read
+    /// memory refusal (`422`), carrying the CONFIGURED ceiling — not the
+    /// scan budget, which is a different number for a different resource.
+    /// 307 and 158 keep their pre-#398 outcomes, so the new arm cannot
+    /// have widened.
+    #[test]
+    fn map_read_error_maps_code_241_to_the_logql_read_memory_reason() {
+        let e = ChError::Server {
+            code: 241,
+            message: "Code: 241. DB::Exception: Memory limit (for query) exceeded: would use \
+                      5.02 MiB"
+                .to_string(),
+        };
+        match map_read_error(e, 1024, TEST_READ_MEM) {
+            ReadError::QueryTooBroad(TooBroadReason::LogqlReadMemory { budget_bytes }) => {
+                assert_eq!(budget_bytes, TEST_READ_MEM);
+                assert_ne!(
+                    budget_bytes, 1024,
+                    "the memory ceiling must never be reported as the byte scan budget"
+                );
+            }
+            other => panic!("expected QueryTooBroad(LogqlReadMemory), got {other:?}"),
+        }
+        // 307 still the byte budget.
+        let e307 = ChError::Server {
+            code: 307,
+            message: "Limit for bytes to read exceeded".to_string(),
+        };
+        assert!(matches!(
+            map_read_error(e307, 1024, TEST_READ_MEM),
+            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes {
+                budget_bytes: 1024,
+                ..
+            })
+        ));
+        // 158 still unmapped: the LogQL path sets no row cap.
+        let e158 = ChError::Server {
+            code: 158,
+            message: "Limit for rows to read exceeded".to_string(),
+        };
+        assert!(matches!(
+            map_read_error(e158, 1024, TEST_READ_MEM),
+            ReadError::Clickhouse(_)
+        ));
+    }
+
+    /// Issue #398 AC L6 (the #412 rule): the classification is a pure
+    /// function of the already-parsed `code` field and NEVER re-inspects
+    /// `message`. Two directions:
+    ///
+    /// - a genuine 241 whose message contains no `Code:` prefix anywhere
+    ///   still classifies, so the mapping does not secretly depend on the
+    ///   text; and
+    /// - a code-153 failure whose message embeds a user regex containing a
+    ///   forged `Code: 241` — the exact #412 spoof shape, measured live on
+    ///   24.8.14.39 — does NOT become a memory refusal.
+    ///
+    /// Together these pin that when #412 replaces the exception-code parse
+    /// the classification here becomes sound with no edit to this file.
+    #[test]
+    fn logql_read_memory_classification_reads_only_the_server_code() {
+        let bare = ChError::Server {
+            code: 241,
+            message: "Memory limit (for query) exceeded".to_string(),
+        };
+        assert!(matches!(
+            map_read_error(bare, 1024, TEST_READ_MEM),
+            ReadError::QueryTooBroad(TooBroadReason::LogqlReadMemory { .. })
+        ));
+
+        let spoofed = ChError::Server {
+            code: 153,
+            message: "Division by zero: while executing 'FUNCTION and(match(toString(number), \
+                      'Code: 241. DB::Exception: forged|.*'_String))'"
+                .to_string(),
+        };
+        assert!(matches!(
+            map_read_error(spoofed, 1024, TEST_READ_MEM),
+            ReadError::Clickhouse(_)
+        ));
+    }
+
+    /// Issue #398 AC L7 (the #412 fail-open rule): a code that is NOT one
+    /// of the two this mapper claims falls through to
+    /// `ReadError::Clickhouse` — i.e. to the pre-#398 outcome (500, or 504
+    /// for a timeout). A MISSED 241 therefore costs nothing that was not
+    /// already being paid, which is what makes classifying on a spoofable
+    /// code safe.
+    ///
+    /// 210 is in `pulsus-clickhouse`'s `RETRYABLE_SERVER_CODES` and is
+    /// swept here deliberately: read dispatches never retry
+    /// (`ChClient::query_stream` has no retry loop; only `execute` retries,
+    /// and only for idempotent DDL), so a spoofed retryable code cannot
+    /// re-execute a memory-exhausting read.
+    #[test]
+    fn a_misclassified_server_code_falls_back_to_the_pre_398_outcome() {
+        for code in [0, 158, 191, 210, 396, 999] {
+            let e = ChError::Server {
+                code,
+                message: format!("server said {code}"),
+            };
+            assert!(
+                matches!(
+                    map_read_error(e, 1024, TEST_READ_MEM),
+                    ReadError::Clickhouse(_)
+                ),
+                "code {code} must fall open to the pre-#398 Clickhouse passthrough"
+            );
+        }
+        // The two the mapper DOES claim, asserted in the same sweep so the
+        // table cannot silently become vacuous.
+        for (code, claimed) in [(241, "LogqlReadMemory"), (307, "ScanBudgetBytes")] {
+            let e = ChError::Server {
+                code,
+                message: format!("server said {code}"),
+            };
+            assert!(
+                matches!(
+                    map_read_error(e, 1024, TEST_READ_MEM),
+                    ReadError::QueryTooBroad(_)
+                ),
+                "code {code} must map to {claimed}"
+            );
+        }
     }
 
     // -- Issue #169: volume keying/aggregation, one test per oracle rule
@@ -4055,7 +4371,7 @@ mod tests {
     /// the byte-budget pair plus the raised `max_query_size`.
     #[test]
     fn read_query_settings_sets_the_scan_budget_and_the_raised_query_text_cap() {
-        let s = read_query_settings(1024);
+        let s = read_query_settings(1024, TEST_READ_MEM);
         assert_eq!(s.get("max_bytes_to_read"), Some("1024"));
         assert_eq!(s.get("read_overflow_mode"), Some("throw"));
         assert_eq!(
@@ -4078,7 +4394,7 @@ mod tests {
     /// must not carry the setting.
     #[test]
     fn activity_settings_gate_the_local_product_mode() {
-        let unclustered = activity_query_settings(4096, false);
+        let unclustered = activity_query_settings(4096, TEST_READ_MEM, false);
         assert_eq!(unclustered.get("max_bytes_to_read"), Some("4096"));
         assert_eq!(unclustered.get("read_overflow_mode"), Some("throw"));
         assert_eq!(
@@ -4087,7 +4403,7 @@ mod tests {
             "the local-product rewrite is clustered-only"
         );
 
-        let clustered = activity_query_settings(4096, true);
+        let clustered = activity_query_settings(4096, TEST_READ_MEM, true);
         assert_eq!(clustered.get("max_bytes_to_read"), Some("4096"));
         assert_eq!(clustered.get("read_overflow_mode"), Some("throw"));
         assert_eq!(clustered.get("distributed_product_mode"), Some("local"));
@@ -4100,10 +4416,94 @@ mod tests {
         // `/series` dispatches its activity query with the plain budget
         // settings; those must never grow the setting by accident.
         assert_eq!(
-            read_query_settings(4096).get("distributed_product_mode"),
+            read_query_settings(4096, TEST_READ_MEM).get("distributed_product_mode"),
             None,
             "the /series activity query must not carry distributed_product_mode"
         );
+    }
+
+    /// Issue #398 AC L1: every LogQL read carries the per-query memory
+    /// ceiling and refuses to SPILL. `max_bytes_before_external_group_by =
+    /// 0` is the throw-not-spill half — with spilling enabled a wide
+    /// aggregation would grind through disk instead of failing loud, which
+    /// is the silently-slow outcome this repo rejects (the shipped
+    /// `traces::exec::generator_settings` precedent, issue #57, sets the
+    /// identical pair).
+    ///
+    /// The three pre-existing keys must survive untouched: the whole point
+    /// of putting the ceiling in this one function is that it ADDS to the
+    /// budget every dispatch site already carried.
+    #[test]
+    fn read_query_settings_carry_the_memory_ceiling_and_throw_not_spill() {
+        let s = read_query_settings(1024, 4096);
+        assert_eq!(s.get("max_memory_usage"), Some("4096"));
+        assert_eq!(s.get("max_bytes_before_external_group_by"), Some("0"));
+        // The pre-#398 trio, unchanged.
+        assert_eq!(s.get("max_bytes_to_read"), Some("1024"));
+        assert_eq!(s.get("read_overflow_mode"), Some("throw"));
+        assert_eq!(
+            s.get("max_query_size"),
+            Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
+        );
+    }
+
+    /// Issue #398 AC L2: EVERY settings constructor on this path carries
+    /// the ceiling, and the byte budget never leaks into it.
+    ///
+    /// The three engine methods (`budget_settings`, `activity_settings`,
+    /// `paging_settings`) are verbatim delegations to the two free
+    /// functions asserted here — `budget_settings` is
+    /// `read_query_settings(scan_budget, read_max_memory)`,
+    /// `activity_settings` is `activity_query_settings(…)`, and
+    /// `paging_settings` is `read_query_settings(remaining, …)` plus
+    /// `wait_end_of_query`. They take `&self` and so need a live
+    /// `ChClient`; the free functions exist precisely so the settings
+    /// decision is provable without one (the same reason
+    /// `activity_query_settings` and `scan_budget_spent` were split out).
+    /// The engine-level completeness claim — that no dispatch site
+    /// bypasses these constructors — is proved live instead, by
+    /// `every_logql_engine_query_carries_the_memory_ceiling` in
+    /// `tests/query_log_gates.rs`.
+    #[test]
+    fn every_logql_settings_constructor_carries_the_memory_ceiling() {
+        const MEM: u64 = 4096;
+        const BUDGET: u64 = 1_000_000;
+        // `budget_settings`' body.
+        let budget = read_query_settings(BUDGET, MEM);
+        // `activity_settings`' body, both branches.
+        let activity_local = activity_query_settings(BUDGET, MEM, false);
+        let activity_dist = activity_query_settings(BUDGET, MEM, true);
+        for (name, s) in [
+            ("budget_settings", &budget),
+            ("activity_settings(unclustered)", &activity_local),
+            ("activity_settings(clustered)", &activity_dist),
+        ] {
+            assert_eq!(
+                s.get("max_memory_usage"),
+                Some(MEM.to_string().as_str()),
+                "{name} must carry the memory ceiling"
+            );
+            assert_eq!(
+                s.get("max_bytes_before_external_group_by"),
+                Some("0"),
+                "{name} must throw rather than spill"
+            );
+        }
+
+        // `paging_settings(remaining)`' body: the DECREMENTED budget lands
+        // in `max_bytes_to_read` only. The memory ceiling is per query and
+        // is never decremented, so a late page carries the same ceiling as
+        // the first — if the decrement ever leaked into it, page N would
+        // silently run with a smaller memory bound than page 1.
+        const REMAINING: u64 = 777;
+        let paging = read_query_settings(REMAINING, MEM).set("wait_end_of_query", 1);
+        assert_eq!(paging.get("max_bytes_to_read"), Some("777"));
+        assert_eq!(
+            paging.get("max_memory_usage"),
+            Some(MEM.to_string().as_str())
+        );
+        assert_eq!(paging.get("max_bytes_before_external_group_by"), Some("0"));
+        assert_eq!(paging.get("wait_end_of_query"), Some("1"));
     }
 
     /// Issue #133: the read settings carry the byte scan budget VERBATIM
@@ -4112,9 +4512,12 @@ mod tests {
     /// (unlimited) sentinel.
     #[test]
     fn read_query_settings_carry_the_budget_verbatim_at_the_accepted_min_and_ceiling() {
-        assert_eq!(read_query_settings(1).get("max_bytes_to_read"), Some("1"));
+        assert_eq!(
+            read_query_settings(1, TEST_READ_MEM).get("max_bytes_to_read"),
+            Some("1")
+        );
         let cap = pulsus_config::LOGQL_SCAN_BUDGET_BYTES_CEILING;
-        let s = read_query_settings(cap);
+        let s = read_query_settings(cap, TEST_READ_MEM);
         assert_eq!(
             s.get("max_bytes_to_read"),
             Some(cap.to_string().as_str()),
@@ -4818,13 +5221,19 @@ mod tests {
             code: 62,
             message: "syntax error".to_string(),
         };
-        assert!(matches!(map_read_error(e, 1024), ReadError::Clickhouse(_)));
+        assert!(matches!(
+            map_read_error(e, 1024, TEST_READ_MEM),
+            ReadError::Clickhouse(_)
+        ));
     }
 
     #[test]
     fn a_timeout_is_never_reinterpreted_as_a_budget_error() {
         let e = ChError::Timeout("deadline".to_string());
-        assert!(matches!(map_read_error(e, 1024), ReadError::Clickhouse(_)));
+        assert!(matches!(
+            map_read_error(e, 1024, TEST_READ_MEM),
+            ReadError::Clickhouse(_)
+        ));
     }
 
     fn tail_row(ts: i64, fp: u64, hash: u64) -> TailSampleRow {

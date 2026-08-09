@@ -574,3 +574,214 @@ async fn prom_api_name_regex_discovery_over_the_cache_scan_budget_is_422_executi
         .await
         .expect("drop test database");
 }
+
+// ---------------------------------------------------------------------
+// Issue #398 — the PromQL half, and the one acceptance criterion in this
+// issue that needs a non-vacuity assertion.
+//
+// The 500 this issue is about was NOT reproducible on this surface. Under
+// the same ClickHouse ceiling that made five LogQL endpoints answer 500,
+// every metrics shape answered 200 — the only breach was the background
+// label-cache refresh sweep, which by design logs and keeps serving the
+// last good snapshot. So on the metrics surface the user-visible symptom
+// of memory exhaustion is stale or empty results, not a status code (that
+// is recorded as remaining work on #398 and deliberately NOT fixed here).
+//
+// The bound still ships: `metrics_read_settings` setting only
+// `max_query_size` was the same missing bound, the 500 mapping is
+// reachable by construction, and leaving one of three surfaces unbounded
+// would reproduce the carve-out shape the issue exists to remove.
+//
+// Which is exactly why the test below asserts DISPATCH as well as status.
+// The metrics request path is heavily cache-fronted and frequently answers
+// 200 without touching ClickHouse at all, so a status-only assertion could
+// pass for the wrong reason on BOTH sides of the fix. `PROBE_METRIC` is
+// the discriminator: `metrics::sql::discovery_query` renders `metric_name
+// = '<name>'` into the SQL, and the background sweep's SQL carries no
+// metric name at all — so a `system.query_log` row for this run's database
+// whose text contains that name can only have come from this request.
+// ---------------------------------------------------------------------
+
+/// A metric name that appears in no other query this process issues.
+const PROBE_METRIC: &str = "pulsus_issue398_dispatch_probe";
+
+/// Series seeded for the breach fixture.
+///
+/// **Sizing, measured through this test at `PULSUS_PROMQL_READ_MAX_MEMORY_BYTES
+/// = 1024` — on `/api/v1/series`, not on a SQL statement in isolation.** The
+/// route answers 200 at 0, 100, 1 000, 5 000 and 20 000 series, and 422 at
+/// 30 000, 40 000, 50 000, 60 000 and 100 000. The threshold is therefore
+/// between 20 000 and 30 000.
+///
+/// 100 000 is 3.3x the measured threshold and runs in ~1.0 s (0.84 s at
+/// 30 000). Deliberately not larger: 150 000 was measured at 5.3 s, and buying
+/// more margin than the threshold's stability warrants is not worth five
+/// seconds on every CI run.
+const PROBE_SERIES: u64 = 100_000;
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct QueryLogProbeRow {
+    n: u64,
+}
+
+/// Issue #398 AC M3. Asserts BOTH halves, and the second is what makes the
+/// first mean anything:
+///
+/// - (a) a PromQL read that breaches `reader.promql_read_max_memory_bytes`
+///   answers **422** with `errorType: "execution"` — the envelope
+///   prometheus/prometheus v3.13.0 itself returns for a memory refusal
+///   (`--query.max-samples=1` measured at 422 `execution`,
+///   `web/api/v1/api.go:2236-2237 @ v3.13.0`) — and never a 500; and
+/// - (b) the request **actually dispatched to ClickHouse**, proved from
+///   `system.query_log` by the request-only marker described above.
+#[tokio::test(flavor = "multi_thread")]
+async fn promql_memory_breach_is_422_and_actually_dispatched() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+
+    // Per-run nonce'd database: `system.query_log` outlives databases, so a
+    // fixed name would let a previous local run satisfy (b).
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = format!("pulsus_prom_api_mem_it_{nonce}");
+    let db = db.as_str();
+    let port: u16 = 31_149;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("PULSUS_PROMQL_READ_MAX_MEMORY_BYTES", "1024")
+        .env(
+            "CLICKHOUSE_SERVER",
+            std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        )
+        .env(
+            "CLICKHOUSE_HTTP_PORT",
+            std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
+        )
+        .env("CLICKHOUSE_DB", db)
+        .spawn()
+        .expect("spawn pulsusdb");
+    let _guard = ChildGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut became_ready = false;
+    while Instant::now() < deadline {
+        if let Some((200, _)) = http_get(port, "/ready") {
+            became_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(became_ready, "/ready never reached 200 within 60s");
+
+    let client = ChClient::new(test_ch_config(db))
+        .await
+        .expect("connect to seed data");
+    let bucket_ms: i64 = 3_600_000;
+    let recent_bucket = (now_ms() / bucket_ms) * bucket_ms;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
+                 SELECT '{PROBE_METRIC}', number + 1, {recent_bucket}, \
+                        concat('{{\"job\":\"j', toString(number), '\"}}') \
+                 FROM numbers({PROBE_SERIES})"
+            ),
+            &QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed metric_series");
+
+    // (a) The status. `/api/v1/series` with a concrete metric name reads
+    // `metric_series` directly (never the cache's coarse superset — the
+    // #30 handoff), so this is a request that must touch ClickHouse.
+    let (status, body) = http_get(port, &format!("/api/v1/series?match[]={PROBE_METRIC}"))
+        .expect("/api/v1/series reachable");
+    assert_eq!(status, 422, "body: {body}");
+    assert!(
+        body.contains("\"errorType\":\"execution\""),
+        "the memory refusal must use Prometheus's own envelope: {body}"
+    );
+    assert!(
+        body.contains("reader.promql_read_max_memory_bytes"),
+        "the body must name the knob an operator would raise: {body}"
+    );
+    assert!(
+        !body.contains("DB::Exception") && !body.contains("official build"),
+        "the 422 body must carry only our own message: {body}"
+    );
+
+    // (b) Non-vacuity: the request really dispatched. Without this, a
+    // cache-fronted 200 (or a pre-dispatch rejection) would satisfy a
+    // status-only assertion on either side of the fix.
+    let admin = ChClient::new(test_ch_config("default"))
+        .await
+        .expect("connect (admin)");
+    admin
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    let probe_sql = format!(
+        "SELECT count() AS n FROM system.query_log \
+         WHERE current_database = '{db}' AND type != 'QueryStart' \
+           AND query_kind = 'Select' AND query LIKE '%{PROBE_METRIC}%'"
+    );
+    let mut n = 0u64;
+    {
+        use futures::StreamExt;
+        let mut stream = admin
+            .query_stream::<QueryLogProbeRow>(&probe_sql, &QuerySettings::new())
+            .await
+            .expect("query system.query_log");
+        while let Some(row) = stream.next().await {
+            n = row.expect("decode probe row").n;
+        }
+    }
+    assert!(
+        n > 0,
+        "the request never reached ClickHouse — a status-only assertion here would be vacuous \
+         (no system.query_log Select for {db} mentions {PROBE_METRIC})"
+    );
+
+    // And that dispatch carried the ceiling: the completeness half.
+    let settings_sql = format!(
+        "SELECT count() AS n FROM system.query_log \
+         WHERE current_database = '{db}' AND type != 'QueryStart' \
+           AND query_kind = 'Select' AND query LIKE '%{PROBE_METRIC}%' \
+           AND mapContains(Settings, 'max_memory_usage') = 0"
+    );
+    let mut unbounded = 0u64;
+    {
+        use futures::StreamExt;
+        let mut stream = admin
+            .query_stream::<QueryLogProbeRow>(&settings_sql, &QuerySettings::new())
+            .await
+            .expect("query system.query_log");
+        while let Some(row) = stream.next().await {
+            unbounded = row.expect("decode probe row").n;
+        }
+    }
+    assert_eq!(
+        unbounded, 0,
+        "every dispatched metrics read must carry max_memory_usage"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+}
