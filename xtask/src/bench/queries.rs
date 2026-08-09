@@ -506,6 +506,7 @@ async fn explain_lines(
     sql: &str,
     dist: bool,
     query_id: &str,
+    product: ProductMode,
 ) -> anyhow::Result<Vec<String>> {
     if sql.is_empty() {
         return Ok(Vec::new());
@@ -515,7 +516,7 @@ async fn explain_lines(
         explain: String,
     }
     let full = format!("EXPLAIN {kind} {sql}").replace('?', "??");
-    let settings = reader_settings(dist, query_id);
+    let settings = reader_settings(dist, query_id, product);
     let mut stream = client.query_stream::<ExplainRow>(&full, &settings).await?;
     let mut out = Vec::new();
     while let Some(row) = stream.next().await {
@@ -552,6 +553,11 @@ struct StageRef {
     query_id: String,
     sql: String,
     roster: StageRoster,
+    /// Whether this stage's SQL nests a distributed table inside an `IN
+    /// (subquery)` — decides whether its `EXPLAIN PIPELINE` re-issue
+    /// needs `distributed_product_mode='local'` (issue #399). Only the
+    /// `discovery` stage is [`ProductMode::Nested`].
+    product: ProductMode,
 }
 
 /// Builds the `expected-pruned` derivation string for `shard_num` — the
@@ -630,6 +636,7 @@ async fn capture_stage_evidence(
         &stage.sql,
         true,
         &format!("{}-explain-pipeline", stage.query_id),
+        stage.product,
     )
     .await?;
     anyhow::ensure!(
@@ -893,9 +900,38 @@ const LOG_COMMENT: &str = "pulsus-bench:logs-read";
 /// verification/benchmark run should fail loudly on genuine shard
 /// unavailability rather than silently tolerate it and record evidence for
 /// a degraded read as if it were normal.
-fn reader_settings(dist: bool, query_id: &str) -> QuerySettings {
+/// Whether a bench query nests a distributed table inside an `IN
+/// (subquery)` — issue #399's activity semi-join, which the `/labels`
+/// discovery shape now carries. `Nested` needs
+/// `distributed_product_mode='local'` in `--dist` mode, exactly as
+/// production's `LogQlEngine::activity_settings` does: `FROM
+/// log_streams_idx_dist … IN (SELECT … FROM log_metrics_5s_dist …)` is
+/// rejected at analysis time under ClickHouse's default `deny` (Code 288).
+/// `Flat` is every other shape, which must NOT carry the setting.
+///
+/// **The `--dist` leg this exists for is UNVERIFIED, not passed.** A
+/// multi-shard cluster is not startable in the sandbox this was written
+/// in (rootless podman, no multi-shard fixture), so the Code 288 failure
+/// it prevents was reasoned from ClickHouse's documented
+/// `distributed_product_mode` semantics and from the identical shape
+/// already fixed in production code (issue #136
+/// `metrics::exec::fallback_fetch_settings`, issue #59
+/// `traces::exec::metrics_settings`) — NOT reproduced here. The
+/// single-node path IS measured. Whoever first runs `xtask bench --dist`
+/// after issue #399 is the one who confirms this.
+#[derive(Debug, Clone, Copy)]
+enum ProductMode {
+    Flat,
+    Nested,
+}
+
+fn reader_settings(dist: bool, query_id: &str, product: ProductMode) -> QuerySettings {
     let base = if dist {
-        QuerySettings::clustered_reader(false)
+        let clustered = QuerySettings::clustered_reader(false);
+        match product {
+            ProductMode::Flat => clustered,
+            ProductMode::Nested => clustered.set("distributed_product_mode", "local"),
+        }
     } else {
         QuerySettings::new()
     };
@@ -908,7 +944,7 @@ async fn resolve_fingerprints(
     query_id: &str,
     dist: bool,
 ) -> anyhow::Result<Vec<u64>> {
-    let settings = reader_settings(dist, query_id);
+    let settings = reader_settings(dist, query_id, ProductMode::Flat);
     let mut stream = client
         .query_stream::<FingerprintRow>(stage1_sql, &settings)
         .await?;
@@ -925,7 +961,7 @@ async fn hydrate(
     query_id: &str,
     dist: bool,
 ) -> anyhow::Result<Vec<StreamMetaRow>> {
-    let settings = reader_settings(dist, query_id);
+    let settings = reader_settings(dist, query_id, ProductMode::Flat);
     let mut stream = client
         .query_stream::<StreamMetaRow>(stage2_sql, &settings)
         .await?;
@@ -1004,6 +1040,7 @@ async fn run_streams_once(
         query_id: s1_id.clone(),
         sql: sp.stage1_sql.clone(),
         roster: StageRoster::Full,
+        product: ProductMode::Flat,
     }];
     if fingerprints.is_empty() {
         let totals = sum_query_log(client, std::slice::from_ref(&s1_id)).await?;
@@ -1022,6 +1059,7 @@ async fn run_streams_once(
         query_id: s2_id.clone(),
         sql: stage2_sql,
         roster: StageRoster::Fingerprints(fingerprints.clone()),
+        product: ProductMode::Flat,
     });
 
     let mut services: Vec<&str> = meta.iter().map(|m| m.service.as_str()).collect();
@@ -1045,7 +1083,7 @@ async fn run_streams_once(
         sp.direction,
         sp.scan_limit,
     );
-    let settings3 = reader_settings(dist, &s3_id);
+    let settings3 = reader_settings(dist, &s3_id, ProductMode::Flat);
     let returned = {
         let mut stream = client.query_stream::<SampleRow>(&sql3, &settings3).await?;
         let mut n = 0u64;
@@ -1060,6 +1098,7 @@ async fn run_streams_once(
         query_id: s3_id.clone(),
         sql: sql3,
         roster: StageRoster::Fingerprints(fingerprints.clone()),
+        product: ProductMode::Flat,
     });
 
     let totals = sum_query_log(client, &[s1_id, s2_id, s3_id]).await?;
@@ -1139,6 +1178,7 @@ async fn run_shape(
         &terminal_sql,
         cfg.dist,
         &format!("{terminal_query_id}-explain-indexes"),
+        ProductMode::Flat,
     )
     .await?;
     let stage_evidence = if cfg.dist {
@@ -1269,10 +1309,30 @@ async fn run_discovery_shape(
     cfg: RunConfig<'_>,
 ) -> anyhow::Result<QueryEvidence> {
     let months = month_literals(dataset.start_ns, dataset.end_ns);
-    let sql = sql::label_names(&tables.streams_idx, &months);
+    // Issue #399: `/labels` is window-scoped through an activity
+    // semi-join over the log rollup, so the bench must issue the same
+    // two-table query production does — the corpus window is the
+    // discovery window here, as it always was.
+    let sql = sql::label_names(
+        &tables.streams_idx,
+        &months,
+        &tables.rollup,
+        TimeWindow {
+            start_ns: dataset.start_ns,
+            end_ns: dataset.end_ns,
+        },
+        5_000_000_000,
+    );
     let base_id = format!("bench-label_series_discovery_7d-{}", std::process::id());
 
-    execute_discard::<LabelNameRow>(client, &sql, &format!("{base_id}-warmup"), cfg.dist).await?;
+    execute_discard::<LabelNameRow>(
+        client,
+        &sql,
+        &format!("{base_id}-warmup"),
+        cfg.dist,
+        ProductMode::Nested,
+    )
+    .await?;
 
     let mut wall_ms = Vec::with_capacity(cfg.reps);
     let mut returned = 0u64;
@@ -1280,7 +1340,9 @@ async fn run_discovery_shape(
     for rep in 0..cfg.reps {
         let id = format!("{base_id}-r{rep}");
         let t0 = Instant::now();
-        returned = execute_discard::<LabelNameRow>(client, &sql, &id, cfg.dist).await?;
+        returned =
+            execute_discard::<LabelNameRow>(client, &sql, &id, cfg.dist, ProductMode::Nested)
+                .await?;
         wall_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         if first_id.is_empty() {
             first_id = id;
@@ -1300,6 +1362,7 @@ async fn run_discovery_shape(
         &sql,
         cfg.dist,
         &format!("{first_id}-explain-indexes"),
+        ProductMode::Nested,
     )
     .await?;
     let total = total_marks(
@@ -1315,6 +1378,7 @@ async fn run_discovery_shape(
             query_id: first_id,
             sql: sql.clone(),
             roster: StageRoster::Full,
+            product: ProductMode::Nested,
         };
         vec![
             capture_stage_evidence(
@@ -1360,8 +1424,9 @@ async fn execute_discard<R: ChRow>(
     sql: &str,
     query_id: &str,
     dist: bool,
+    product: ProductMode,
 ) -> anyhow::Result<u64> {
-    let settings = reader_settings(dist, query_id);
+    let settings = reader_settings(dist, query_id, product);
     let mut stream = client.query_stream::<R>(sql, &settings).await?;
     let mut n = 0u64;
     while let Some(row) = stream.next().await {
@@ -1417,6 +1482,7 @@ async fn run_metric_shape(
             query_id: s1_id.clone(),
             sql: mp.stage1_sql.clone(),
             roster: StageRoster::Full,
+            product: ProductMode::Flat,
         }];
         if fingerprints.is_empty() {
             let totals = sum_query_log(client, std::slice::from_ref(&s1_id)).await?;
@@ -1435,6 +1501,7 @@ async fn run_metric_shape(
             query_id: s2_id.clone(),
             sql: stage2_sql,
             roster: StageRoster::Fingerprints(fingerprints.clone()),
+            product: ProductMode::Flat,
         });
 
         let services: Vec<String> = if mp.rollup {
@@ -1470,12 +1537,14 @@ async fn run_metric_shape(
             mp.step_ns.map(|d| d.as_u64()).unwrap_or(300_000_000_000),
             &mp.extra_predicates,
         );
-        let returned = execute_discard::<MetricRow>(client, &sql3, &s3_id, dist).await?;
+        let returned =
+            execute_discard::<MetricRow>(client, &sql3, &s3_id, dist, ProductMode::Flat).await?;
         stages.push(StageRef {
             stage: "rollup_range",
             query_id: s3_id.clone(),
             sql: sql3,
             roster: StageRoster::Fingerprints(fingerprints.clone()),
+            product: ProductMode::Flat,
         });
         let totals = sum_query_log(client, &[s1_id, s2_id, s3_id]).await?;
         Ok(RunOnce {
@@ -1523,6 +1592,7 @@ async fn run_metric_shape(
         &terminal_sql,
         cfg.dist,
         &format!("{terminal_query_id}-explain-indexes"),
+        ProductMode::Flat,
     )
     .await?;
     let stage_evidence = if cfg.dist {

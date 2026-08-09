@@ -558,6 +558,7 @@ async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_coun
             scan_budget_bytes: 50 * 1024 * 1024 * 1024,
             max_streams: 100_000,
             pipeline_scan_factor: 10,
+            distributed: false,
         },
     );
 
@@ -635,6 +636,7 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
             scan_budget_bytes: 50 * 1024 * 1024 * 1024,
             max_streams: 100_000,
             pipeline_scan_factor: 10,
+            distributed: false,
         },
     );
 
@@ -726,6 +728,7 @@ async fn engine_client_agg_scan_past_the_byte_budget_is_a_named_query_too_broad(
             scan_budget_bytes: TIGHT_BUDGET,
             max_streams: 100_000,
             pipeline_scan_factor: 10,
+            distributed: false,
         },
     );
 

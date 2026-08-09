@@ -75,6 +75,12 @@ pub struct EngineConfig {
     /// `reader.logql_pipeline_scan_factor` (issue M6-09) — see
     /// [`PlanCtx::pipeline_scan_factor`].
     pub pipeline_scan_factor: u32,
+    /// Clustered mode (`PULSUS_CLUSTER` set). Gates
+    /// `distributed_product_mode='local'` on the three label-discovery
+    /// queries that carry an `IN (subquery)` after issue #399; mirrors
+    /// `MetricsConfig::distributed` and `TraceReadConfig::distributed`.
+    /// See [`LogQlEngine::activity_settings`].
+    pub distributed: bool,
 }
 
 impl EngineConfig {
@@ -297,13 +303,19 @@ impl LogQlEngine {
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<String>, ReadError> {
         let months = plan::months_overlapping(b.start_ns, b.end_ns);
-        let sql = super::sql::label_names(&self.config.streams_idx, &months);
+        let sql = super::sql::label_names(
+            &self.config.streams_idx,
+            &months,
+            &self.config.rollup_table,
+            self.activity_window(b),
+            self.config.rollup_res_ns,
+        );
         if let Some(e) = explain.as_mut() {
             e.push("label_names", sql.clone(), None);
         }
         let mut names = Vec::new();
         let mut stream = self
-            .query_stream::<LabelNameRow>(&sql, &self.budget_settings())
+            .query_stream::<LabelNameRow>(&sql, &self.activity_settings())
             .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
@@ -340,13 +352,20 @@ impl LogQlEngine {
     ) -> Result<Vec<String>, ReadError> {
         let months = plan::months_overlapping(b.start_ns, b.end_ns);
         let key_literal = super::escape::ch_string(name);
-        let sql = super::sql::label_values(&self.config.streams_idx, &months, &key_literal);
+        let sql = super::sql::label_values(
+            &self.config.streams_idx,
+            &months,
+            &key_literal,
+            &self.config.rollup_table,
+            self.activity_window(b),
+            self.config.rollup_res_ns,
+        );
         if let Some(e) = explain.as_mut() {
             e.push("label_values", sql.clone(), None);
         }
         let mut values = Vec::new();
         let mut stream = self
-            .query_stream::<LabelValueRow>(&sql, &self.budget_settings())
+            .query_stream::<LabelValueRow>(&sql, &self.activity_settings())
             .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
@@ -439,6 +458,30 @@ impl LogQlEngine {
         // code review finding 1). Re-check the cap on the union before
         // proceeding.
         check_stream_cap(fingerprints.len(), self.config.max_streams)?;
+        if fingerprints.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Issue #399: stage 1 is month-scoped (`sql::stage1`, shared with
+        // every other LogQL path — see `LogQlEngine::active_fingerprints`
+        // for why it must stay that way), so the request's own window is
+        // applied here, as its own statement, AFTER the cap above.
+        // Ordering is load-bearing in both directions: filtering first
+        // would silently relax `max_streams` to the post-window survivors
+        // (`series_stream_cap.rs::series_cap_counts_the_pre_window_union`).
+        let window = self.activity_window(b);
+        if let Some(e) = explain.as_mut() {
+            e.push(
+                "series_activity_filter",
+                super::sql::active_fingerprints(
+                    &self.config.rollup_table,
+                    Some(&fingerprints),
+                    window,
+                    self.config.rollup_res_ns,
+                ),
+                None,
+            );
+        }
+        let fingerprints = self.active_fingerprints(&fingerprints, window).await?;
         if fingerprints.is_empty() {
             return Ok(Vec::new());
         }
@@ -548,6 +591,96 @@ impl LogQlEngine {
 
     fn budget_settings(&self) -> QuerySettings {
         read_query_settings(self.config.scan_budget_bytes)
+    }
+
+    /// The request's own bounds, as the activity semi-join's window
+    /// (issue #399). A plain re-wrap: the discovery endpoints take client
+    /// bounds verbatim and never widen them, so there is nothing to
+    /// derive — the ONE quantization is
+    /// [`super::sql::activity_lower_bucket_ns`], applied inside the
+    /// builder where the rollup resolution lives.
+    fn activity_window(&self, b: TimeBounds) -> super::sql::TimeWindow {
+        super::sql::TimeWindow {
+            start_ns: b.start_ns,
+            end_ns: b.end_ns,
+        }
+    }
+
+    /// [`LogQlEngine::budget_settings`] plus, when clustered,
+    /// `distributed_product_mode='local'` — the settings the three
+    /// label-discovery scans carrying issue #399's activity semi-join
+    /// dispatch with.
+    ///
+    /// `FROM log_streams_idx_dist … WHERE fingerprint IN (SELECT … FROM
+    /// log_metrics_5s_dist …)` is a double-distributed `IN`, rejected at
+    /// analysis time under ClickHouse's default `deny` (Code 288,
+    /// `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`) — deterministic 500s on a
+    /// clustered deployment. `local` is EXACT here, not merely permissive:
+    /// both tables are Logs-family and shard on `fingerprint`
+    /// (docs/schemas.md §7), so a stream's index rows and its rollup rows
+    /// are always on the same shard and shard-local `IN` decides
+    /// identically to global `IN` — the `metrics::exec::
+    /// fallback_fetch_settings` (issue #136) and `traces::exec::
+    /// metrics_settings` (issue #59) precedent.
+    ///
+    /// Applied ONLY to these three dispatches. Stage-1 resolution, stage-2
+    /// hydration and `/series`' own activity query keep
+    /// [`LogQlEngine::budget_settings`]: none of them nests a distributed
+    /// table, and a blanket client-wide default would let a future
+    /// non-co-sharded subquery silently return wrong shard-local results
+    /// instead of failing loud.
+    fn activity_settings(&self) -> QuerySettings {
+        activity_query_settings(self.config.scan_budget_bytes, self.config.distributed)
+    }
+
+    /// Narrows a resolved fingerprint set to those with log lines in
+    /// `window` (issue #399). `/series` is the one endpoint of the four
+    /// that cannot embed [`super::sql::active_fingerprints`] as a
+    /// subquery: its month-scoped scan is [`super::sql::stage1`], shared
+    /// with every other LogQL path, where the predicate would be
+    /// redundant (those paths bound the window on their own
+    /// sample/rollup/patterns read) and a straight read-path regression.
+    ///
+    /// Runs AFTER `check_stream_cap` so the cap keeps its current meaning
+    /// — the deduped pre-window union — and the cap test keeps failing for
+    /// the reason it was written for (`series_stream_cap.rs`). PK-pruned:
+    /// the caller's list is the `(fingerprint, bucket_ns)` prefix
+    /// (measured, issue #399: 73,728 rows vs 29,080,654 unscoped on the
+    /// cost fixture). Dispatched with [`LogQlEngine::budget_settings`],
+    /// deliberately NOT [`LogQlEngine::activity_settings`] — there is no
+    /// nested distributed table here, so widening the shard-locality
+    /// assumption to it would be unearned.
+    ///
+    /// Returns the caller's order filtered by membership, so
+    /// `series_inner`'s sort/dedup contract is untouched.
+    async fn active_fingerprints(
+        &self,
+        fingerprints: &[u64],
+        window: super::sql::TimeWindow,
+    ) -> Result<Vec<u64>, ReadError> {
+        let sql = super::sql::active_fingerprints(
+            &self.config.rollup_table,
+            Some(fingerprints),
+            window,
+            self.config.rollup_res_ns,
+        );
+        let mut active: BTreeSet<u64> = BTreeSet::new();
+        // Scoped so the pooled connection's lease drops before the caller
+        // issues stage 2 (the `ChRowStream` lease contract).
+        {
+            let mut stream = self
+                .query_stream::<StreamRow>(&sql, &self.budget_settings())
+                .await?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                active.insert(row.fingerprint);
+            }
+        }
+        Ok(fingerprints
+            .iter()
+            .copied()
+            .filter(|fp| active.contains(fp))
+            .collect())
     }
 
     /// Per-page settings for the fetch-until-limit paging loop (issue
@@ -2186,14 +2319,20 @@ impl LogQlEngine {
                 Some(fps)
             }
         };
-        let sql =
-            super::sql::detected_labels(&self.config.streams_idx, &months, fingerprints.as_deref());
+        let sql = super::sql::detected_labels(
+            &self.config.streams_idx,
+            &months,
+            fingerprints.as_deref(),
+            &self.config.rollup_table,
+            self.activity_window(b),
+            self.config.rollup_res_ns,
+        );
         if let Some(e) = explain.as_mut() {
             e.push("detected_labels", sql.clone(), None);
         }
         let mut out = Vec::new();
         let mut stream = self
-            .query_stream::<DetectedLabelRow>(&sql, &self.budget_settings())
+            .query_stream::<DetectedLabelRow>(&sql, &self.activity_settings())
             .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
@@ -3229,6 +3368,20 @@ pub fn read_query_settings(scan_budget_bytes: u64) -> QuerySettings {
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
 }
 
+/// [`read_query_settings`] plus, when `distributed`,
+/// `distributed_product_mode='local'` — see
+/// [`LogQlEngine::activity_settings`], whose whole body this is. Split out
+/// as a free function for the same reason [`read_query_settings`] is one:
+/// the settings decision is provable without a ClickHouse connection.
+fn activity_query_settings(scan_budget_bytes: u64, distributed: bool) -> QuerySettings {
+    let base = read_query_settings(scan_budget_bytes);
+    if distributed {
+        base.set("distributed_product_mode", "local")
+    } else {
+        base
+    }
+}
+
 /// Pure paging-termination decision (issue #133, the #96
 /// `probe_fanout_bound` extraction shape): `true` once the cumulative
 /// per-page `read_bytes` has consumed the whole
@@ -3908,6 +4061,48 @@ mod tests {
         assert_eq!(
             s.get("max_query_size"),
             Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
+        );
+    }
+
+    /// Issue #399 AC16: the three label-discovery scans carrying the
+    /// activity semi-join gate `distributed_product_mode='local'` on
+    /// clustered mode alone, and carry the byte budget through unchanged
+    /// in both states. Mirrors
+    /// `metrics::exec::fallback_fetch_settings_*` (#136) and
+    /// `traces::exec::metrics_settings_carry_the_set_limits_and_gate_the_local_product_mode`
+    /// (#59).
+    ///
+    /// The complement is asserted here too, and it is the half that
+    /// matters: `/series`' own activity query dispatches with
+    /// `budget_settings`, NOT this — it nests no distributed table, so it
+    /// must not carry the setting.
+    #[test]
+    fn activity_settings_gate_the_local_product_mode() {
+        let unclustered = activity_query_settings(4096, false);
+        assert_eq!(unclustered.get("max_bytes_to_read"), Some("4096"));
+        assert_eq!(unclustered.get("read_overflow_mode"), Some("throw"));
+        assert_eq!(
+            unclustered.get("distributed_product_mode"),
+            None,
+            "the local-product rewrite is clustered-only"
+        );
+
+        let clustered = activity_query_settings(4096, true);
+        assert_eq!(clustered.get("max_bytes_to_read"), Some("4096"));
+        assert_eq!(clustered.get("read_overflow_mode"), Some("throw"));
+        assert_eq!(clustered.get("distributed_product_mode"), Some("local"));
+        assert_eq!(
+            clustered.get("max_query_size"),
+            Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str()),
+            "the raised query-text cap survives the clustered branch"
+        );
+
+        // `/series` dispatches its activity query with the plain budget
+        // settings; those must never grow the setting by accident.
+        assert_eq!(
+            read_query_settings(4096).get("distributed_product_mode"),
+            None,
+            "the /series activity query must not carry distributed_product_mode"
         );
     }
 

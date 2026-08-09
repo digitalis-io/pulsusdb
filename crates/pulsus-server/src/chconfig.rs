@@ -141,6 +141,13 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
         scan_budget_bytes: config.reader.logql_scan_budget_bytes.0,
         max_streams: pulsus_read::DEFAULT_MAX_STREAMS,
         pipeline_scan_factor: config.reader.logql_pipeline_scan_factor,
+        // Issue #399: the same predicate the `_dist` suffix above uses —
+        // gates `distributed_product_mode='local'` on the three label-
+        // discovery scans whose activity semi-join (`fingerprint IN
+        // (SELECT … FROM log_metrics_<res>_dist …)`) is a double-
+        // distributed `IN`, rejected by ClickHouse's default `deny`
+        // (Code 288) on a clustered deployment.
+        distributed: config.cluster.is_some(),
     }
 }
 
@@ -621,6 +628,30 @@ mod tests {
             config.reader.logql_scan_budget_bytes.0
         );
         assert_eq!(engine_cfg.max_streams, pulsus_read::DEFAULT_MAX_STREAMS);
+    }
+
+    /// Issue #399: `EngineConfig.distributed` is true iff a cluster is
+    /// configured — the SAME predicate that produces the `_dist` table
+    /// suffix, checked against the same config, so the two can never
+    /// disagree (a `_dist` read with a global `IN` subquery is Code 288).
+    #[test]
+    fn engine_config_from_marks_a_clustered_deployment_distributed() {
+        let unclustered = Config::default();
+        let cfg = engine_config_from(&unclustered);
+        assert!(!cfg.distributed);
+        assert_eq!(cfg.streams_idx, "log_streams_idx");
+
+        let clustered = Config {
+            cluster: Some("prod".to_string()),
+            ..Config::default()
+        };
+        let cfg = engine_config_from(&clustered);
+        assert!(cfg.distributed);
+        assert_eq!(
+            cfg.streams_idx, "log_streams_idx_dist",
+            "the flag must track the same predicate as the _dist suffix"
+        );
+        assert_eq!(cfg.rollup_table, "log_metrics_5s_dist");
     }
 
     /// Issue M6-09: `reader.logql_pipeline_scan_factor` maps into

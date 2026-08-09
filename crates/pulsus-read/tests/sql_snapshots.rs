@@ -804,20 +804,47 @@ fn log_volume_rollup_is_byte_exact() {
 /// `ch_string` escapes the regex's `\{`/`\}` backslashes, hence `\\{`.
 const UUID_LITERAL: &str = r"'(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\}|[0-9a-f]{32})$'";
 
+/// The `[start, end]` window the label-discovery snapshots below render.
+/// 5s-aligned (`1751328000` s is exactly divisible by 5), so
+/// `sql::activity_lower_bucket_ns` leaves `start_ns` unchanged and the
+/// expected literal below is readable; the flooring behaviour itself is
+/// pinned by `sql.rs`'s own unit tests and by
+/// `logs_detected_live.rs::detected_labels_keeps_a_sample_in_the_bucket_that_contains_start`.
+const DISCOVERY_WINDOW: TimeWindow = TimeWindow {
+    start_ns: 1_751_328_000_000_000_000,
+    end_ns: 1_751_331_600_000_000_000,
+};
+const DISCOVERY_RES_NS: u64 = 5_000_000_000;
+
+/// Issue #399's activity semi-join, unscoped — the byte-exact subquery
+/// every one of the three embedded discovery builders carries.
+const ACTIVE_UNSCOPED: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
+     WHERE bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
+
 /// Byte-exact unscoped `detected_labels` snapshot: ONE aggregation over
 /// `log_streams_idx` — month-partition-pruned, one output row per key,
 /// `uniqExact` cardinality plus the server-side `containsAllIDTypes`
-/// predicate — and no `log_samples`/body reference anywhere (the
-/// detected_labels endpoint never reads samples by construction).
+/// predicate — narrowed to the streams active in the requested window by
+/// issue #399's rollup semi-join, and with no `log_samples`/body
+/// reference anywhere (the detected_labels endpoint still never reads
+/// samples by construction).
 #[test]
 fn detected_labels_unscoped_is_byte_exact() {
-    let sql = sql::detected_labels("log_streams_idx", &["'2026-07-01'".to_string()], None);
+    let sql = sql::detected_labels(
+        "log_streams_idx",
+        &["'2026-07-01'".to_string()],
+        None,
+        "log_metrics_5s",
+        DISCOVERY_WINDOW,
+        DISCOVERY_RES_NS,
+    );
     assert_eq!(
         sql,
         format!(
             "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\n\
              FROM log_streams_idx\n\
              WHERE month = '2026-07-01'\n\
+             \x20 AND fingerprint IN ({ACTIVE_UNSCOPED})\n\
              GROUP BY key\n\
              ORDER BY key"
         )
@@ -827,14 +854,19 @@ fn detected_labels_unscoped_is_byte_exact() {
 }
 
 /// Byte-exact scoped `detected_labels` snapshot: the identical idx-months
-/// scan plus only the `fingerprint IN` filter (the `query=` scoping runs
-/// stage-1 resolution first; this is the follow-up aggregation).
+/// scan, with the `query=` stage-1 fingerprint list pushed INSIDE the
+/// activity subquery rather than added as a second outer `IN` (issue
+/// #399) — the subquery's result is already a subset of the list, so the
+/// two are equivalent and the list is rendered once.
 #[test]
 fn detected_labels_scoped_is_byte_exact() {
     let sql = sql::detected_labels(
         "log_streams_idx",
         &["'2026-07-01'".to_string(), "'2026-08-01'".to_string()],
         Some(&[101, 205]),
+        "log_metrics_5s",
+        DISCOVERY_WINDOW,
+        DISCOVERY_RES_NS,
     );
     assert_eq!(
         sql,
@@ -842,9 +874,57 @@ fn detected_labels_scoped_is_byte_exact() {
             "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\n\
              FROM log_streams_idx\n\
              WHERE month IN ('2026-07-01', '2026-08-01')\n\
-             \x20 AND fingerprint IN (101, 205)\n\
+             \x20 AND fingerprint IN (SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE fingerprint IN (101, 205) AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000)\n\
              GROUP BY key\n\
              ORDER BY key"
+        )
+    );
+}
+
+/// Byte-exact `label_names` snapshot (issue #399 AC11): the `/labels`
+/// scan is the same single `DISTINCT key` pass it always was, plus the
+/// activity semi-join. Always unscoped — `label_names` takes no
+/// fingerprints (`query=` narrowing is deferred M1 scope).
+#[test]
+fn label_names_is_byte_exact() {
+    assert_eq!(
+        sql::label_names(
+            "log_streams_idx",
+            &["'2026-07-01'".to_string()],
+            "log_metrics_5s",
+            DISCOVERY_WINDOW,
+            DISCOVERY_RES_NS,
+        ),
+        format!(
+            "SELECT DISTINCT key AS name\n\
+             FROM log_streams_idx\n\
+             WHERE month = '2026-07-01'\n\
+             \x20 AND fingerprint IN ({ACTIVE_UNSCOPED})\n\
+             ORDER BY name"
+        )
+    );
+}
+
+/// Byte-exact `label_values` snapshot (issue #399 AC11): the semi-join
+/// sits beside the existing `AND key = ...`, on its own line, so the
+/// key predicate keeps its place in the primary-key prefix.
+#[test]
+fn label_values_is_byte_exact() {
+    assert_eq!(
+        sql::label_values(
+            "log_streams_idx",
+            &["'2026-07-01'".to_string()],
+            "'env'",
+            "log_metrics_5s",
+            DISCOVERY_WINDOW,
+            DISCOVERY_RES_NS,
+        ),
+        format!(
+            "SELECT DISTINCT val AS value\n\
+             FROM log_streams_idx\n\
+             WHERE month = '2026-07-01' AND key = 'env'\n\
+             \x20 AND fingerprint IN ({ACTIVE_UNSCOPED})\n\
+             ORDER BY value"
         )
     );
 }

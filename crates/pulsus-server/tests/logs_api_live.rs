@@ -2682,6 +2682,135 @@ async fn empty_params_answer_byte_identically_to_absent_ones() {
     );
 }
 
+/// Issue #399 AC12/AC13 — `/labels`, `/label/{name}/values` and
+/// `/series` answer the REQUESTED WINDOW, not the calendar month
+/// containing it.
+///
+/// **Measured on `c7649da` (the pre-fix tree)** with this fixture shape:
+/// all three returned the stale stream — `/labels` listed its keys,
+/// `/label/env/values` returned `["prod","stale"]`, and `/series`
+/// returned both label sets.
+///
+/// **The reference is not uniform across the three, and `/series` is
+/// where our divergence was largest.** `TSDBIndex.Series` passes
+/// `from`/`through` into the reader and drops a series with no chunks in
+/// range (`pkg/storage/stores/shipper/indexshipper/tsdb/single_file_index.go:282-302`
+/// @ `grafana/loki` v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`),
+/// i.e. chunk-granular; `TSDBIndex.LabelNames`/`LabelValues` ignore the
+/// window entirely (`:304-324` @ v3.7.4 — both take `_, _ model.Time`)
+/// and are bounded only by which index FILES overlap it
+/// (`multi_file_index.go:115-132`). Measured on `grafana/loki:3.7.4` with
+/// a store-only window containing one of three streams: `/series`
+/// returned exactly that stream while `/labels` and `/label/job/values`
+/// returned all three streams' keys and values.
+///
+/// One fixture, one spawn, three requests.
+#[tokio::test]
+async fn label_discovery_and_series_are_scoped_to_the_requested_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_window_scope";
+    let port = 31_168;
+    drop_database(db).await;
+    let _guard = spawn_ready_server_env(port, db, &[]);
+    let client = ChClient::new(data_client_config(db))
+        .await
+        .expect("connect data client");
+
+    let now = now_ns();
+    // Stream A is inside the ten-minute window; stream B's only line is
+    // six hours before it. Real `log_samples` rows, so the shipped rollup
+    // MV — not the test — decides each line's activity bucket.
+    let fixture: [(u64, &str, &str, i64); 2] = [
+        (
+            0x8100_0000_0000_0001,
+            "checkout",
+            r#"{"env":"prod","service_name":"checkout"}"#,
+            now - 60_000_000_000,
+        ),
+        (
+            0x8100_0000_0000_0002,
+            "gone",
+            r#"{"env":"stale","service_name":"gone"}"#,
+            now - 6 * 3_600_000_000_000,
+        ),
+    ];
+    for (fp, service, labels, ts) in fixture {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({ts}))), {fp}, '{service}', \
+                     '{labels}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                     body) VALUES ('{service}', {fp}, {ts}, 0, 'line')"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_samples");
+    }
+
+    let start = (now - 600_000_000_000).to_string();
+    let end = now.to_string();
+    let bounds = [("start", start.as_str()), ("end", end.as_str())];
+
+    let res = http_get(port, &q("/api/logs/v1/labels", &bounds)).expect("labels reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(
+        json(&res)["data"],
+        serde_json::json!(["env", "service_name"]),
+        "the stale stream's keys must not appear: {}",
+        res.body
+    );
+
+    let res =
+        http_get(port, &q("/api/logs/v1/label/env/values", &bounds)).expect("values reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(
+        json(&res)["data"],
+        serde_json::json!(["prod"]),
+        "`stale` is outside the window; the pre-fix tree returned it: {}",
+        res.body
+    );
+
+    let res = http_get(
+        port,
+        &q(
+            "/api/logs/v1/series",
+            &[
+                ("match[]", r#"{service_name=~".+"}"#),
+                ("start", start.as_str()),
+                ("end", end.as_str()),
+            ],
+        ),
+    )
+    .expect("series reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(
+        json(&res)["data"],
+        serde_json::json!([{"env": "prod", "service_name": "checkout"}]),
+        "exactly the one stream with a line in the window — the endpoint where the \
+         reference is chunk-exact and we were month-wide: {}",
+        res.body
+    );
+
+    drop_database(db).await;
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {

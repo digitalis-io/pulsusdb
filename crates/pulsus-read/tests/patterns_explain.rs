@@ -359,6 +359,7 @@ fn engine_config(db: &str) -> EngineConfig {
         scan_budget_bytes: 50 * 1024 * 1024 * 1024,
         max_streams: 100_000,
         pipeline_scan_factor: 10,
+        distributed: false,
     }
 }
 
