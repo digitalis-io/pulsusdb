@@ -89,7 +89,8 @@
 //! | P-b | parameterized vs parameterless aggregation | ::parse_vector_agg_params | plan.rs parse_vector_agg_params | BAND | G1a (param) vs G1c (none) |
 //! | P-c | sort-grouping + approx_topk-in-range rejections | ::parse_vector_agg_params | plan.rs parse_vector_agg_params | NIL | error paths abort the plan - B1 |
 //! | P-d | grouping created / by-cloned / without-cloned | ::build_variants_node | plan.rs VariantSpec::try_new injection | BAND | G1a / G1c / G1g |
-//! | P-e | tail empty vs non-empty | ::build_variants_node | plan.rs variant_tail + try_new clone | BAND | G1a/G1d/G1e vs G1c |
+//! | P-e1 | BARE variant: unwrap tail empty vs non-empty | ::build_variants_node | plan.rs variant_tail + try_new clone | BAND | G1a/G1d/G1e vs G1c |
+//! | P-e2 | WRAPPED variant: whole pipeline as the tail (no prefix compile) | ::build_variants_node | plan.rs build_variants_node bare/wrapped arm | BAND | G1i (F_wrap) |
 //! | P-f | arity class success side (forbids vs requires unwrap) | ::build_variants_node | plan.rs build_variants_node arity gates | BAND | G1a vs G1c |
 //! | P-g | ClientValue Count / Bytes / Unwrap | ::build_variants_node | plan.rs build_variants_node value arm | BAND | G1a / G1f / G1c |
 //! | P-h | quantile parameter parse | ::build_variants_node | plan.rs build_variants_node quantile arm | BAND | G1h |
@@ -404,6 +405,31 @@ const PLAN_ALLOCS_PER_VARIANT: u64 = 3;
 ///   `Compare.name` ("dur"), `NumericLiteral::Number` ("1") = 3
 ///   (charge: the `stage_source_bytes × 130` clone factor)
 const PLAN_ALLOCS_PER_VARIANT_RICH: u64 = 9;
+
+/// F_wrap `sum by (app) (count_over_time({app="a"} |= "z" | logfmt
+/// [5m]))` (issue #397) — the WRAPPED arm carrying a real pre-`unwrap`
+/// prefix, so its tail is the WHOLE 2-stage pipeline rather than an
+/// unwrap tail. It is the only plan fixture that charges the new "clone
+/// the whole pipeline into the tail" term; without it that term rides in
+/// no band at all:
+/// - item 1: the `Result<Vec<VectorAggSpec>>` collect block, one layer
+///   (`plan.rs::parse_vector_agg_params`) = 1
+/// - item 2: `grouping.cloned()` — the labels buffer = 1
+/// - item 3: `grouping.cloned()` — the `"app"` label `String` = 1
+/// - item 4: the `__variant__` injection push realloc (cap 1 → 2) = 1
+/// - item 5: `VARIANT_LABEL.to_string()` = 1
+/// - item 6: the 2-stage tail `to_vec()` buffer — `[LineFilter, Parser]`,
+///   which under the BARE rule would have been empty = 1
+/// - item 7: the tail's one owned string, `LineFilter.value` (`"z"`);
+///   the `logfmt` stage carries no expressions and the filter's
+///   `or_matches` is empty, so neither allocates (charge: the
+///   `stage_source_bytes × 130` clone factor, the term F_rich's items
+///   7–9 ride) = 1
+///
+/// The discarded-prefix `compile` that F_rich's constant absorbs is
+/// absent here by construction — the wrapped arm does not run it — so
+/// this band also reddens if that compile is reinstated unconditionally.
+const PLAN_ALLOCS_PER_VARIANT_WRAPPED: u64 = 7;
 
 /// F_abs `absent_over_time({app="a", env="prod"}[5m])`:
 /// - item 1: the `filter().map().collect()` absent-labels buffer (the
@@ -755,6 +781,18 @@ fn variants_allocation_gates() {
             r#"{app="a"} | logfmt [5m]"#,
         )
     };
+    // Issue #397: a WRAPPED variant with a real pre-`unwrap` prefix —
+    // the one shape whose tail is the WHOLE pipeline. Every other plan
+    // fixture here is either bare or wrapped-with-nothing-before-the-
+    // `unwrap`, so without this one the new "clone the whole pipeline
+    // into the tail" term rides in no band at all.
+    let f_wrap = |n: usize| {
+        n_variant_query(
+            n,
+            r#"sum by (app) (count_over_time({app="a"} |= "z" | logfmt [5m]))"#,
+            r#"{app="a"} | logfmt [5m]"#,
+        )
+    };
     for n in [1usize, 8, 64] {
         let (_, variants, _) = plan_variants(&f_min(n), &range_params());
         assert_eq!(variants.len(), n);
@@ -857,12 +895,23 @@ fn variants_allocation_gates() {
         64,
         "G1h (F_quant = F_rich's constant)",
     );
+    assert_band(
+        plan_slope(&f_wrap(1), &f_wrap(64)),
+        PLAN_ALLOCS_PER_VARIANT_WRAPPED,
+        64,
+        "G1i (F_wrap)",
+    );
 
     // --- G1b: W_plan byte slope ≤ the spec charge slope (the soundness
     // half — 2–6× model slack, catches only LARGE uncharged work).
-    {
-        let expr1 = parse(&f_rich(1)).expect("parse");
-        let expr64 = parse(&f_rich(64)).expect("parse");
+    //
+    // Issue #397 runs it over F_wrap as well as F_rich: the wrapped arm
+    // hands `try_new` a LONGER tail slice to clone, and `variant_spec_bytes`
+    // is slice-driven, so the charge is expected to keep up with the
+    // clone. Expected, not assumed — hence the second fixture.
+    let byte_slope_soundness = |query: &dyn Fn(usize) -> String, what: &str| {
+        let expr1 = parse(&query(1)).expect("parse");
+        let expr64 = parse(&query(64)).expect("parse");
         let params = range_params();
         let c = ctx();
         let (_, bytes1, _, out1) = measured(|| plan(&expr1, &params, &c));
@@ -877,11 +926,13 @@ fn variants_allocation_gates() {
         };
         assert!(
             bytes64.saturating_sub(bytes1) <= sb64 - sb1,
-            "G1b: plan-time byte slope {} exceeds the charged spec slope {}",
+            "{what}: plan-time byte slope {} exceeds the charged spec slope {}",
             bytes64.saturating_sub(bytes1),
             sb64 - sb1
         );
-    }
+    };
+    byte_slope_soundness(&f_rich, "G1b (F_rich)");
+    byte_slope_soundness(&f_wrap, "G1b (F_wrap)");
 
     // --- W_ctor count bands: G2b (range min), G2c (range absent),
     // G2d (instant min), G2e (instant absent), G2f (shared non-empty
@@ -1546,7 +1597,32 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // band [547, 587], and the prefix-only form passes it. The band
         // constants are therefore untouched by this issue. Inventory row
         // P-l.
-        branches: 29,
+        //
+        // Issue #397: 29 -> 30, and `.is_empty` joins the callee set.
+        // The paragraph above holds for a BARE variant only. The
+        // reference type-switches on the variant expression
+        // (`pkg/logql/syntax/extractor.go:114 @ v3.7.4`), so a variant
+        // wrapped in a vector aggregation runs its WHOLE pipeline; the
+        // new branch is `if raw_buf.is_empty()`, choosing between the
+        // bare arm (validate the discarded prefix; tail = `variant_tail`)
+        // and the wrapped arm (tail = the whole pipeline, no validation
+        // compile — `VariantArena::build` already compiles `common ++
+        // tail` before any I/O).
+        //
+        // W-MEM disposition of the new callee: **NIL** — `<[_]>::is_empty`
+        // is a length test on a slice already in hand. The BRANCH is
+        // BAND on both arms, and they move the per-variant cost in
+        // OPPOSITE directions, which is why the inventory splits P-e
+        // into P-e1/P-e2: the bare arm keeps the discarded-prefix
+        // `compile` (a per-stage allocation) and a tail starting at the
+        // `unwrap`; the wrapped arm drops that compile and hands
+        // `try_new` a LONGER tail slice to clone. Both terms are
+        // slice-driven and already charged — `variant_spec_bytes(tail,
+        // …)` and `variant_pipeline_entry_bytes(common, tail)` take the
+        // tail BY SLICE, so a longer tail is charged more with no
+        // formula change. F_wrap puts a band on the wrapped arm;
+        // G1a/G1c/G1d/G1e keep the bare one.
+        branches: 30,
         callees: &[
             ".any",
             ".as_nanos",
@@ -1555,6 +1631,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             ".as_u64",
             ".clone",
             ".enumerate",
+            // Issue #397: the bare/wrapped type-switch test, NIL.
+            ".is_empty",
             ".is_some",
             ".iter",
             ".len",
@@ -2419,8 +2497,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
 /// W_ctor + 23 W_fin = 46 rows, each with exactly ONE disposition. The
 /// module-doc tables are a RENDERING of this const (assertion 7), never
 /// the source.
-static INVENTORY: [Row; 49] = [
-    // --- W_plan (12) ---
+static INVENTORY: [Row; 50] = [
+    // --- W_plan (13) ---
     Row {
         id: "P-a",
         window: Win::Plan,
@@ -2457,14 +2535,27 @@ static INVENTORY: [Row; 49] = [
         disp: Disp::Band,
         covered_by: "G1a / G1c / G1g",
     },
+    // Issue #397 splits the old single P-e ("tail empty vs non-empty")
+    // into its two axes, because the tail is now chosen by TWO
+    // independent facts: whether the variant is bare or wrapped, and —
+    // on the bare arm only — whether it carries an `unwrap`.
     Row {
-        id: "P-e",
+        id: "P-e1",
         window: Win::Plan,
-        what: "tail empty vs non-empty",
+        what: "BARE variant: unwrap tail empty vs non-empty",
         frames: &["::build_variants_node"],
         site: "plan.rs variant_tail + try_new clone",
         disp: Disp::Band,
         covered_by: "G1a/G1d/G1e vs G1c",
+    },
+    Row {
+        id: "P-e2",
+        window: Win::Plan,
+        what: "WRAPPED variant: whole pipeline as the tail (no prefix compile)",
+        frames: &["::build_variants_node"],
+        site: "plan.rs build_variants_node bare/wrapped arm",
+        disp: Disp::Band,
+        covered_by: "G1i (F_wrap)",
     },
     Row {
         id: "P-f",
@@ -3038,11 +3129,11 @@ fn g4_frame_census_and_inventory_closure() {
         );
     }
     // (3) inventory size and per-window counts; unique ids.
-    assert_eq!(INVENTORY.len(), 49);
+    assert_eq!(INVENTORY.len(), 50);
     let count = |w: Win| INVENTORY.iter().filter(|r| r.window == w).count();
     assert_eq!(
         (count(Win::Plan), count(Win::Ctor), count(Win::Fin)),
-        (12, 12, 25)
+        (13, 12, 25)
     );
     let mut ids = BTreeSet::new();
     for r in &INVENTORY {

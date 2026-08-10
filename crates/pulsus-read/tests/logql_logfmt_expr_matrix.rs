@@ -1395,9 +1395,12 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
             1,
             1,
             "`VariantArena::build` :509 compiles the COMMON pipeline and :536 extends it with \
-             each variant's unwrap tail — the `variants_common_side` position covers the \
-             common half; the tails carry no extraction expression of their own because \
-             `variant_tail` starts at the `unwrap`",
+             each variant's tail — the `variants_common_side` position covers the common \
+             half. A BARE variant's tail starts at its `unwrap`, so it carries no \
+             extraction expression of its own; a variant WRAPPED in a vector aggregation \
+             carries its WHOLE pipeline as the tail (issue #397), so a logfmt expression \
+             there IS compiled — through this same single `extended_with`, never a second \
+             compiler, and it refuses exactly as the common half does",
         ),
     ];
 

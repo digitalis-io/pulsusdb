@@ -710,7 +710,16 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// `divergence` marker and so enlarge the `pinned-divergence` exclusion
 /// instead, leaving [`PROVENANCE_PERMITS`] and [`REACHABLE`] to move by
 /// the captured share alone.
-const TOTAL_DIRECTIVES: usize = 1_400;
+///
+/// Issue #397 adds the `W` section to `b13_variants.test`, which is a
+/// CONFIG-DELTA file (`enable_multi_variant_queries`). So its captured
+/// rows enlarge the `config-delta file` exclusion; its `eval_fail` rows
+/// marked `divergence(variants-surviving-error-status)` enlarge
+/// `pinned-divergence`; and its unmarked `eval_fail` row enlarges
+/// `our-error-text`. [`PROVENANCE_PERMITS`] and [`REACHABLE`] therefore
+/// do not move at all: the whole section is excluded before
+/// reachability is even asked.
+const TOTAL_DIRECTIVES: usize = 1_429;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
@@ -732,8 +741,8 @@ const PROVENANCE_PERMITS: usize = 1_105;
 /// captured share lands here.
 const REACHABLE: usize = 178;
 
-const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=128, not a capture claim (derived)=29, \
-not a capture claim (ported)=29, our-error-text (eval_fail)=86, pinned-divergence=23";
+const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=154, not a capture claim (derived)=29, \
+not a capture claim (ported)=29, our-error-text (eval_fail)=87, pinned-divergence=25";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice

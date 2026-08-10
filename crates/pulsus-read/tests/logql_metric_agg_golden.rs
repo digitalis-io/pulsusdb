@@ -3268,12 +3268,25 @@ fn sort_with_a_grouping_is_rejected() {
 // Issue #221: `variants(<metricExpr>, …) of (<logRangeExpr>)` — hermetic
 // goldens over the pure fan-out twin (`run_variants_rows` via
 // `eval_node`). Reference semantics per the #221 plan §1 (live-probed
-// against the pinned reference container): a variant's own selector/
-// filters/parsers are dead syntax; its `[range]`, reducer, unwrap tail
-// and post-`unwrap` filters are honoured; `__variant__` is the plain
-// decimal index injected into an outer aggregation's grouping for BOTH
-// `by` and `without`; a `__variant__`-less series is returned at instant
-// and dropped at range.
+// against the pinned reference container): a BARE variant's own
+// selector/filters/parsers are dead syntax; its `[range]`, reducer,
+// unwrap tail and post-`unwrap` filters are honoured; `__variant__` is
+// the plain decimal index injected into an outer aggregation's grouping
+// for BOTH `by` and `without`; a `__variant__`-less series is returned
+// at instant and dropped at range.
+//
+// **"Dead syntax" is the BARE arm only** (issue #397). The reference
+// type-switches on the variant expression
+// (`pkg/logql/syntax/extractor.go:114 @ v3.7.4`): only a bare
+// `*RangeAggregationExpr` takes `variantRangeAggExprExtractor` and its
+// `nil` stages (`:186`, `:225`). A variant wrapped in a vector
+// aggregation takes `variant.Extractors()` (`:128`), which builds the
+// FULL stage list, and the consolidated extractor runs it on the line
+// the COMMON pipeline already produced
+// (`pkg/logql/log/consolidated_variant_extractor.go:42-60`). The two
+// arms are gated by
+// `variants_ignores_a_bare_variants_own_selector_and_line_filters` and
+// `variants_wrapped_variant_runs_its_own_pipeline` below.
 // ---------------------------------------------------------------------
 
 fn meta_env(entries: &[(u64, &str, &str)]) -> HashMap<u64, StreamMetaRow> {
@@ -3346,11 +3359,15 @@ fn variants_two_extractors_yield_different_values_per_index() {
     );
 }
 
-/// B10 — the variant's OWN selector and line filters are DEAD SYNTAX:
+/// B10 — a BARE variant's OWN selector and line filters are DEAD SYNTAX:
 /// only the common range selects data (reference `variantRangeAggExprExtractor`
 /// passes nil stages; live-probed).
+///
+/// **Bare only** (issue #397): the wrapped twin is
+/// [`variants_wrapped_variant_runs_its_own_pipeline`], where the same
+/// filter is live. This case is the parity half and must not move.
 #[test]
-fn variants_ignores_the_variants_own_selector_and_line_filters() {
+fn variants_ignores_a_bare_variants_own_selector_and_line_filters() {
     let node = metric_node_of(
         r#"variants(count_over_time({service_name="nope"} |= "zzzz" [5m])) of ({service_name="checkout"}[5m])"#,
         &instant_params(60 * NS),
@@ -3367,6 +3384,110 @@ fn variants_ignores_the_variants_own_selector_and_line_filters() {
             ]),
             2.0
         )]
+    );
+}
+
+/// The dataset the issue #397 goldens below share — the same shape the
+/// `W` section of `logqltest/corpus/b13_variants.test` captured from the
+/// pinned container: two streams, three logfmt lines each.
+fn variants_397_rows() -> Vec<MetricScanRow> {
+    vec![
+        row(1, 0, "lvl=alpha n=1"),
+        row(1, 5 * NS, "lvl=alpha n=2"),
+        row(1, 10 * NS, "lvl=beta n=4"),
+        row(2, NS, "lvl=alpha n=8"),
+        row(2, 6 * NS, "lvl=beta n=16"),
+        row(2, 11 * NS, "lvl=beta n=32"),
+    ]
+}
+
+/// Issue #397 — a variant WRAPPED in a vector aggregation runs its OWN
+/// pipeline, so its line filter and its parser both bite. The values are
+/// the container's (`b13_variants.test` W3 and W15).
+///
+/// Before the fix the same two queries answered `env=a 3, env=b 3` and a
+/// single `{__variant__="0"} 6`: more data than the query asked for, with
+/// nothing to show that anything had gone wrong. **The series count
+/// moving from one group to two in the second half is as load-bearing as
+/// the values in the first.**
+#[test]
+fn variants_wrapped_variant_runs_its_own_pipeline() {
+    let meta = meta_env(&[(1, "v397", "a"), (2, "v397", "b")]);
+    let rows = variants_397_rows();
+
+    // W3 — the wrapped variant's `|= "alpha"` is LIVE: 2 and 1, not 3
+    // and 3. This is the row the issue was filed on.
+    let filter_node = metric_node_of(
+        r#"variants(sum by (env) (count_over_time({service_name="v397"} |= "alpha" [5m]))) of ({service_name="v397"}[5m])"#,
+        &instant_params(60 * NS),
+    );
+    assert_eq!(
+        sorted_vector(eval_node(&filter_node, &rows, &meta).unwrap()),
+        vec![
+            (lbl(&[("__variant__", "0"), ("env", "a")]), 2.0),
+            (lbl(&[("__variant__", "0"), ("env", "b")]), 1.0),
+        ]
+    );
+
+    // W15 — the wrapped variant's PARSER is live too, so `by (lvl)`
+    // finds the extracted label: TWO groups of 3, not one `{}` of 6.
+    let parser_node = metric_node_of(
+        r#"variants(sum by (lvl) (count_over_time({service_name="v397"} | logfmt [5m]))) of ({service_name="v397"}[5m])"#,
+        &instant_params(60 * NS),
+    );
+    assert_eq!(
+        sorted_vector(eval_node(&parser_node, &rows, &meta).unwrap()),
+        vec![
+            (lbl(&[("__variant__", "0"), ("lvl", "alpha")]), 3.0),
+            (lbl(&[("__variant__", "0"), ("lvl", "beta")]), 3.0),
+        ]
+    );
+}
+
+/// Issue #397, DISCRIMINATOR — the wrapped variant's pipeline runs AFTER
+/// the common one, on the line the common one produced
+/// (`pkg/logql/log/consolidated_variant_extractor.go:42-60 @ v3.7.4`:
+/// the consolidated extractor processes the line through
+/// `commonPipeline` first and hands `processedLine` to each variant).
+///
+/// This rules out the plausible-but-wrong fix "run the variant's
+/// pipeline on the RAW scanned line" — equivalently, "let the variant's
+/// pipeline replace the common one", or "apply it BEFORE the common
+/// one". Under any of those the first query's `| logfmt` parses the
+/// original `lvl=alpha …` line and it answers `env=a 2, env=b 1` instead
+/// of empty. The second query is the control that makes the emptiness
+/// mean something: asking for what the COMMON pipeline actually
+/// produced answers 3 and 3, so the pipeline is running, just later.
+/// (Corpus rows W9 and W10; W13's byte count is the independent second
+/// witness.)
+#[test]
+fn variants_wrapped_pipeline_composes_after_the_common_one() {
+    let meta = meta_env(&[(1, "v397", "a"), (2, "v397", "b")]);
+    let rows = variants_397_rows();
+
+    // W9 — the common `line_format` has rewritten every line to
+    // `lvl=zz`, so the variant's `| logfmt | lvl="alpha"` matches none.
+    let after_node = metric_node_of(
+        r#"variants(sum by (env) (count_over_time({service_name="v397"} | logfmt | lvl="alpha" [5m]))) of ({service_name="v397"} | line_format "lvl=zz" [5m])"#,
+        &instant_params(60 * NS),
+    );
+    assert_eq!(
+        sorted_vector(eval_node(&after_node, &rows, &meta).unwrap()),
+        vec![],
+        "the variant pipeline must see the COMMON pipeline's output line"
+    );
+
+    // W10 — the same shape asking for what the common pipeline wrote.
+    let control_node = metric_node_of(
+        r#"variants(sum by (env) (count_over_time({service_name="v397"} | logfmt | lvl="zz" [5m]))) of ({service_name="v397"} | line_format "lvl=zz" [5m])"#,
+        &instant_params(60 * NS),
+    );
+    assert_eq!(
+        sorted_vector(eval_node(&control_node, &rows, &meta).unwrap()),
+        vec![
+            (lbl(&[("__variant__", "0"), ("env", "a")]), 3.0),
+            (lbl(&[("__variant__", "0"), ("env", "b")]), 3.0),
+        ]
     );
 }
 

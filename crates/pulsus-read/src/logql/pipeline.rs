@@ -953,6 +953,16 @@ struct CompileState {
     rewrites_line: bool,
     has_unwrap: bool,
     all_line_filter_source: bool,
+    /// Whether the stages being compiled were offered to the SQL
+    /// pushdown. TRUE for [`CompiledPipeline::compile`] — a scan plan
+    /// renders its own pipeline's pushable line filters into SQL, so
+    /// compiling them again here would double-evaluate them. FALSE for
+    /// every stage [`CompiledPipeline::extended_with`] appends (issue
+    /// #397): a variants TAIL is never rendered into SQL — the one scan
+    /// is planned from the COMMON range alone — so eliding a pushable
+    /// filter there DROPS it, and the query answers with rows it asked
+    /// to exclude.
+    pushdown_active: bool,
 }
 
 impl Default for CompileState {
@@ -965,6 +975,7 @@ impl Default for CompileState {
             // Vacuously true over the empty prefix; any non-line-filter
             // source stage clears it.
             all_line_filter_source: true,
+            pushdown_active: true,
         }
     }
 }
@@ -990,7 +1001,15 @@ fn compile_stage(
             // An `ip(…)`/mixed-`or` filter, or any filter following a
             // `line_format`, is served here client-side, matching
             // `plan::compile_line_filters`'s pushdown split exactly.
-            if !st.seen_line_format && super::plan::is_pushable_line_filter(lf) {
+            //
+            // …and only when a pushdown actually took place (issue
+            // #397): a variants tail's stages are never rendered into
+            // SQL, so `pushdown_active` is false for them and the
+            // filter compiles client-side however pushable it looks.
+            if st.pushdown_active
+                && !st.seen_line_format
+                && super::plan::is_pushable_line_filter(lf)
+            {
                 return Ok(None);
             }
             let mut matchers = Vec::with_capacity(1 + lf.or_matches.len());
@@ -1160,6 +1179,12 @@ impl CompiledPipeline {
     /// recompile every common-pipeline regex per distinct tail (a real
     /// OOM vector: each program is bounded only by the crate's 10 MiB
     /// `nfa_size_limit`).
+    ///
+    /// One state field is NOT resumed: `pushdown_active` is seeded FALSE
+    /// (issue #397). `self`'s own stages were offered to the SQL
+    /// pushdown, `tail`'s never are — the variants scan is planned from
+    /// the COMMON range alone — so a pushable line filter in `tail` must
+    /// compile client-side or it is silently dropped.
     pub fn extended_with(&self, tail: &[Stage]) -> Result<Self, PipelineError> {
         let mut st = CompileState {
             seen_line_format: self.seen_line_format,
@@ -1167,6 +1192,7 @@ impl CompiledPipeline {
             rewrites_line: self.rewrites_line,
             has_unwrap: self.has_unwrap,
             all_line_filter_source: self.all_line_filter_source,
+            pushdown_active: false,
         };
         let mut stages = self.stages.clone();
         for stage in tail {
