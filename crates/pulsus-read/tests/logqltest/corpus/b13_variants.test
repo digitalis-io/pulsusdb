@@ -361,6 +361,18 @@ clear
 # with no variants involved already answers on a different grid here and
 # there, which is why no `W` row compares a shifted grid.
 #
+# WHAT THIS SECTION CANNOT SAY, AND THE ISSUE THAT OWNS IT: **#278**
+# (open since 2026-07-27). This runner compiles the pipeline instead of
+# planning it, and `compile_stage` elides a PUSHABLE line filter because
+# the scan plan renders it into SQL — so in a hermetic run there is no
+# SQL to render it into and the filter is simply not applied. That makes
+# EVERY metric row in this corpus blind to a pushable line filter on the
+# COMMON side, not just the rows below: it is a property of the runner,
+# not of `variants(...)`. W11 and W12 therefore put their common-side
+# filter in a LABEL filter, which is never pushed down. The VARIANT side
+# is unaffected — a variant tail is never rendered into SQL, which is
+# exactly what issue #397 fixed, and W3 is that row.
+#
 # Reference-observed statuses for the eval_fail rows below (both sides
 # reject or both sides answer; PulsusDB's own substring is on the row):
 #   W27 variants(sum by (env) (count_over_time(S | json [5m]))) of (S[5m])
@@ -446,15 +458,17 @@ eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"}
 # three `env="b"` lines the common filter keeps, one holds `alpha`.
 #
 # The common filter here is a LABEL filter, deliberately, and the reason
-# is a property of this runner rather than of variants. A PUSHABLE line
-# filter on the common side is elided from the compiled client pipeline
-# (`pipeline.rs`'s `compile_stage`) because the scan plan renders it into
-# SQL — and this corpus is hermetic, so there is no SQL to render it
-# into. Every metric row in this corpus is blind to a pushed-down common
-# line filter for the same reason; a label filter is not pushed down and
-# so does the same job in a form the runner can evaluate. (Issue #397's
-# own fix is about the VARIANT side's filters, which are never pushed
-# down and now always compile — W3 is that row.)
+# is **issue #278** (open since 2026-07-27) — a property of this runner
+# rather than of variants. A PUSHABLE line filter on the common side is
+# elided from the compiled client pipeline (`pipeline.rs`'s
+# `compile_stage`) because the scan plan renders it into SQL — and this
+# corpus is hermetic, so there is no SQL to render it into. Every metric
+# row in this corpus is blind to a pushed-down common line filter for the
+# same reason; a label filter is not pushed down and so does the same job
+# in a form the runner can evaluate. (Issue #397's own fix is about the
+# VARIANT side's filters, which are never pushed down and now always
+# compile — W3 is that row.) The pushed-down-common case is covered
+# live instead, on the real SQL path, in issue #397's notes.
 eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} |= "alpha" [5m]))) of ({service_name="v397"} | env="b" [5m])
   {__variant__="0", env="b"} 1
 
