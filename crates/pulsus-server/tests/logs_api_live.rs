@@ -1371,7 +1371,7 @@ async fn query_range_fan_out_pipeline_filters_reformats_and_relabels_streams() {
     let port = 31_118;
     // Exact-count assertions below: `log_samples` is a plain MergeTree, so
     // a stale database from a previous run would double the seeded rows
-    // (see `drop_database`'s doc comment).
+    // (see `live_db::drop_db`'s doc comment).
     drop_db(db).await;
     let guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
@@ -3544,9 +3544,9 @@ async fn a_json_content_type_post_is_served_from_the_url_query() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_post_content_type";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_post_content_type");
     let port = 31_198;
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) = setup(db, port).await;
     seed_run(&client, db, base_ns, 150).await;
 
@@ -3654,7 +3654,7 @@ async fn a_json_content_type_post_is_served_from_the_url_query() {
         "a form POST must still wait for the body it was promised"
     );
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 /// Sends a POST that advertises `advertised` body bytes and then writes
