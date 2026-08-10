@@ -99,6 +99,14 @@
 //! guard can notice it. Two exist today (`pulsus-clickhouse/live_tls`,
 //! `pulsus-read/nestedset_value_differential`); the checked
 //! suite-to-CI-step inventory that would close that class is issue #323.
+//!
+//! # Naming a test database
+//!
+//! [`test_db`] is the single place a live suite's throwaway database name
+//! is composed, so that several checkouts can share one ClickHouse server.
+//! See its documentation, and the guard
+//! `crates/pulsus-server/tests/live_db_naming.rs`, which enforces that no
+//! suite composes such a name by hand.
 
 use std::fmt;
 
@@ -241,6 +249,102 @@ pub fn live_clickhouse_enabled() -> bool {
     live_gate_enabled(CLICKHOUSE_GATE)
 }
 
+// ---------------------------------------------------------------------
+// Test database naming
+// ---------------------------------------------------------------------
+
+/// Prepended to every name [`test_db`] composes, so that two checkouts
+/// running the same live suite against **one** ClickHouse server do not
+/// pick the same throwaway database and `DROP DATABASE` each other's data
+/// mid-run.
+///
+/// Unset — the default everywhere, including CI — the composed name is the
+/// bare one the suite asked for, so behaviour is exactly what it was
+/// before this variable existed.
+pub const DATABASE_PREFIX_VAR: &str = "PULSUS_TEST_CH_DATABASE_PREFIX";
+
+/// The longest database name ClickHouse will accept here. Its on-disk
+/// path component is escaped, so the real ceiling depends on the
+/// characters used; 200 is comfortably under it for the `[A-Za-z0-9_]`
+/// names this function admits, and the point of the check is to turn "an
+/// over-long prefix produces an opaque server-side error deep inside a
+/// live suite" into a message that names the variable.
+const MAX_DATABASE_NAME_LEN: usize = 200;
+
+/// Composes the name of a throwaway test database: `name`, prefixed with
+/// [`DATABASE_PREFIX_VAR`] when that variable is set.
+///
+/// ```text
+/// PULSUS_TEST_CH_DATABASE_PREFIX unset  -> "pulsus_read_it_s1_single"
+/// PULSUS_TEST_CH_DATABASE_PREFIX=wt3    -> "wt3_pulsus_read_it_s1_single"
+/// ```
+///
+/// Every live suite composes its database name through here and nowhere
+/// else; `crates/pulsus-server/tests/live_db_naming.rs` fails the build if
+/// a suite writes one itself.
+///
+/// # Panics
+///
+/// The result is interpolated straight into `CREATE DATABASE {db}` /
+/// `DROP DATABASE IF EXISTS {db}` by every caller, unquoted. So both parts
+/// are checked rather than trusted: `name` must be a non-empty
+/// `[A-Za-z0-9_]` word starting with a letter or `_`, the prefix must be
+/// the same shape, and the composed name must not exceed
+/// [`MAX_DATABASE_NAME_LEN`]. A bad value panics naming the offender —
+/// during a test, which is the only place this crate is ever linked.
+pub fn test_db(name: &str) -> String {
+    let prefix = std::env::var(DATABASE_PREFIX_VAR).ok();
+    compose_db_name(prefix.as_deref(), name)
+}
+
+/// [`test_db`]'s whole decision as a pure function of the prefix reading —
+/// testable without mutating process environment (`std::env::set_var` is
+/// `unsafe` in edition 2024 and racy under a threaded harness besides).
+fn compose_db_name(prefix: Option<&str>, name: &str) -> String {
+    if let Err(why) = check_identifier(name) {
+        panic!(
+            "test database name {name:?} is not usable unquoted in `CREATE DATABASE`: {why}. \
+             Name it with ASCII letters, digits and underscores only."
+        );
+    }
+    let composed = match prefix.map(str::trim).filter(|p| !p.is_empty()) {
+        None => name.to_string(),
+        Some(prefix) => {
+            if let Err(why) = check_identifier(prefix) {
+                panic!(
+                    "{DATABASE_PREFIX_VAR}={prefix:?} is not a usable database-name prefix: \
+                     {why}. Set it to a short ASCII word such as `wt3`."
+                );
+            }
+            format!("{prefix}_{name}")
+        }
+    };
+    assert!(
+        composed.len() <= MAX_DATABASE_NAME_LEN,
+        "composed test database name {composed:?} is {} characters, over the {MAX_DATABASE_NAME_LEN} \
+         this project allows — shorten {DATABASE_PREFIX_VAR}",
+        composed.len()
+    );
+    composed
+}
+
+/// `Ok` iff `s` is a non-empty `[A-Za-z_][A-Za-z0-9_]*`. A leading digit
+/// is refused as well as punctuation: ClickHouse needs such a name
+/// backquoted, and every call site interpolates the result bare.
+fn check_identifier(s: &str) -> Result<(), String> {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return Err("it is empty".to_string());
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(format!("it starts with {first:?}, not a letter or `_`"));
+    }
+    if let Some(bad) = chars.find(|c| !(c.is_ascii_alphanumeric() || *c == '_')) {
+        return Err(format!("it contains {bad:?}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +434,106 @@ mod tests {
     fn the_suite_name_strips_cargos_binary_hash_suffix() {
         assert!(!suite_name().is_empty());
         assert!(!suite_name().contains('/'));
+    }
+
+    // -----------------------------------------------------------------
+    // Test database naming
+    // -----------------------------------------------------------------
+
+    /// The default has to be byte-for-byte what the suites used before the
+    /// prefix existed, or every committed EXPLAIN/SQL expectation that
+    /// interpolates the database name would have to move with it.
+    #[test]
+    fn no_prefix_leaves_the_name_exactly_as_the_suite_wrote_it() {
+        assert_eq!(
+            compose_db_name(None, "pulsus_read_it_s1_single"),
+            "pulsus_read_it_s1_single"
+        );
+    }
+
+    /// An empty or whitespace-only value reads as "unset": exporting
+    /// `PULSUS_TEST_CH_DATABASE_PREFIX=` must not produce `_pulsus_…`.
+    #[test]
+    fn an_empty_or_blank_prefix_reads_as_unset() {
+        assert_eq!(compose_db_name(Some(""), "pulsus_x_it"), "pulsus_x_it");
+        assert_eq!(compose_db_name(Some("   "), "pulsus_x_it"), "pulsus_x_it");
+    }
+
+    #[test]
+    fn a_prefix_is_joined_to_the_name_with_one_underscore() {
+        assert_eq!(compose_db_name(Some("wt3"), "pulsus_x_it"), "wt3_pulsus_x_it");
+        assert_eq!(
+            compose_db_name(Some("agent_b"), "pulsus_x_it"),
+            "agent_b_pulsus_x_it"
+        );
+    }
+
+    /// Surrounding whitespace is a shell accident (`export P=" wt3"`), not
+    /// a request for a database called `" wt3_…"`.
+    #[test]
+    fn a_prefix_is_trimmed_before_use() {
+        assert_eq!(compose_db_name(Some(" wt3 "), "pulsus_x_it"), "wt3_pulsus_x_it");
+    }
+
+    /// Two different prefixes never compose to the same database — the
+    /// whole point of the variable.
+    #[test]
+    fn two_prefixes_never_collide_on_one_suite_name() {
+        assert_ne!(
+            compose_db_name(Some("a"), "pulsus_x_it"),
+            compose_db_name(Some("b"), "pulsus_x_it")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a usable database-name prefix")]
+    fn a_prefix_with_punctuation_is_refused() {
+        // `DROP DATABASE x; DROP DATABASE pulsus_x_it` would otherwise be
+        // two statements.
+        let _ = compose_db_name(Some("x; DROP DATABASE y"), "pulsus_x_it");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a usable database-name prefix")]
+    fn a_prefix_starting_with_a_digit_is_refused() {
+        let _ = compose_db_name(Some("3wt"), "pulsus_x_it");
+    }
+
+    #[test]
+    #[should_panic(expected = "not usable unquoted")]
+    fn a_name_with_punctuation_is_refused() {
+        let _ = compose_db_name(None, "pulsus-x-it");
+    }
+
+    #[test]
+    #[should_panic(expected = "not usable unquoted")]
+    fn an_empty_name_is_refused() {
+        let _ = compose_db_name(Some("wt3"), "");
+    }
+
+    /// A name left un-substituted by a missing `format!` argument (`{}`)
+    /// must not reach ClickHouse as a database name.
+    #[test]
+    #[should_panic(expected = "not usable unquoted")]
+    fn an_unsubstituted_format_placeholder_is_refused() {
+        let _ = compose_db_name(None, "pulsus_x_it_{nonce}");
+    }
+
+    #[test]
+    #[should_panic(expected = "over the 200")]
+    fn an_over_long_composed_name_is_refused() {
+        let _ = compose_db_name(Some(&"p".repeat(190)), "pulsus_x_it");
+    }
+
+    /// The public entry point reads the documented variable. Asserted
+    /// without mutating the environment: whatever the ambient value is,
+    /// `test_db` must agree with `compose_db_name` on it.
+    #[test]
+    fn test_db_reads_the_documented_variable() {
+        let ambient = std::env::var(DATABASE_PREFIX_VAR).ok();
+        assert_eq!(
+            test_db("pulsus_x_it"),
+            compose_db_name(ambient.as_deref(), "pulsus_x_it")
+        );
     }
 }
