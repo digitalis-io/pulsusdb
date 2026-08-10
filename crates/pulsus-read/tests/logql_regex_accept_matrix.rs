@@ -201,6 +201,16 @@ enum Body {
     NestedGroups(usize),
     /// `s` repeated `n` times — the other LIMIT probe.
     Repeated(&'static str, usize),
+    /// `n` copies of `s` joined by `|` — the SIZE probe (issue #291).
+    ///
+    /// Not `Repeated("\\p{L}|", n)`, and the difference was measured
+    /// rather than reasoned: a trailing `|` makes the alternation
+    /// empty-compatible, and the reference then refuses the two selector
+    /// positions with `queries require at least one regexp or equality
+    /// matcher that does not have an empty-compatible value` — a
+    /// different rule, which would have masked the size verdict at
+    /// exactly the positions this row exists to measure.
+    Alternated(&'static str, usize),
     /// **The text goes into the LogQL string literal verbatim, unescaped.**
     /// Every other body is a REGEX that gets LogQL-quoted on the way in;
     /// this one is the literal's own SOURCE, because the construct under
@@ -656,6 +666,68 @@ const PATTERNS: &[Pattern] = &[
         reference: Verdict::Accept,
         pulsus: Verdict::Accept,
     },
+    // Issue #291: the SIZE boundary, and the one row whose divergence is
+    // deliberate. 10,100 `\p{L}` atoms alternated — 70,700 query bytes,
+    // inside #279's 131,072-byte cap. The reference SERVES it at all
+    // eighteen positions (captured on the pinned container, 2026-08-09,
+    // with 20 lines pushed and verified queryable); PulsusDB refuses it
+    // at every position where the pattern is compiled, because the
+    // compile-allocation cap (`pulsus_re2::MAX_REGEX_COMPILE_TRANSIENT_BYTES`,
+    // 96 MiB) estimates it over budget.
+    //
+    // **10,100 and not 12,000 — a cost reduction, not the fix.** Any N in
+    // the band shows the same divergence, but the reference's cost across
+    // it is steeply non-linear, climbing towards its OWN `maxSize` limit
+    // at 12,729. 12,000 shipped first and failed the `schema-it` job with
+    // `unexpected status 000` — curl never obtaining a status. **Two
+    // causes produce that, and neither is about N**: the reference's own
+    // 30 s HTTP write timeout (see `live_probe_is_affordable`), and the
+    // reference not being ready yet on a freshly created container, which
+    // `wait_for_reference` closes. Reproduced
+    // by constraining the container (`--cpus 2 --memory 4g`), worst
+    // position per run:
+    //
+    // | N | 2 CPU / 4 GB | 1 CPU / 2 GB |
+    // |---|---|---|
+    // | 10,014 | **30.08 s, `000`** (cold) | — |
+    // | 10,100 | 9.6-18.8 s | 8.9 s |
+    // | 11,000 | — | 13.5 s |
+    // | 12,000 | **30.2 s, `000`** | — |
+    //
+    // **Lowering N alone does NOT fix it, and that is the finding:** even
+    // 10,014, the very bottom of the band, spikes to 30.08 s on a cold
+    // container. No N here is cheap for the reference, because the
+    // divergence exists precisely when the pattern is enormous — at the
+    // four positions that build a `NewFastRegexMatcher` (the two label
+    // filters, `drop`, `keep`) Go pays 10-27 s whatever N is. The other
+    // shape the cap newly refuses, `(?i)[\p{L}x20000]`, was measured too
+    // and costs 16-27 s at the same positions, so it buys nothing either.
+    // What ACTUALLY resolves this row is not a number here at all: the
+    // reference cannot answer any of it in more than 30 s, by its own
+    // configuration. The live probe moved to `line_re` — 0.6 s here,
+    // ~48x margin — and **failed there too on the runner, at 31.45 s**.
+    // Three positions, four rounds, one wall. **This row is now pinned
+    // from the measurements already taken and is re-probed at NO
+    // position** (owner ruling, 2026-08-10); what that costs, what is
+    // known and what is still not known are all on
+    // `live_probe_is_affordable`. 10,100 is kept because it is the
+    // cheapest N that carries the divergence, which still matters to
+    // anyone re-measuring by hand.
+    //
+    // 10,100 sits 87 atoms above OUR boundary of 10,013. That margin is
+    // thin deliberately, and it is now the ONLY automatic detector this
+    // row has: if the boundary moved (a `regex-syntax` bump changing
+    // `\p{L}`'s range count would do it) our verdict flips to `Accept`
+    // and `pulsus_verdicts_match_the_committed_table` fails hermetically
+    // and loudly. The reference side has no detector at all any more —
+    // that is the cost, stated where the number lives.
+    Pattern {
+        id: "class_alt_over_budget",
+        body: Body::Alternated(r"\p{L}", 10_100),
+        go_code: None,
+        reference: Verdict::Accept,
+        pulsus: Verdict::Reject,
+    },
     // --- Direction A: PulsusDB rejects, the reference serves.
     p(
         "dup_capture_name",
@@ -1010,6 +1082,42 @@ const BOTH_REJECT: &[&str] = &[
 ];
 
 const DIVERGENCES: &[Divergence] = &[
+    // Issue #291: the compile-allocation cap. The ONLY divergence in this
+    // file that is deliberate rather than owned as a defect — hence
+    // `owner: "#291"` and not `#400`.
+    Divergence {
+        id: "regex_compile_budget",
+        pulsus: Verdict::Reject,
+        patterns: &["class_alt_over_budget"],
+        positions: &[
+            "sel_re",
+            "sel_nre",
+            "line_re",
+            "line_nre",
+            "line_after_line_format",
+            "regexp_named",
+            "labelfilter_re",
+            "labelfilter_nre",
+            "drop",
+            "keep",
+            "metric_line",
+            "metric_binary",
+            "label_replace",
+            "variants_variant_after_line_format",
+            "variants_common_side",
+        ],
+        owner: "#291",
+        why: "the compile-allocation cap, and the one row here that is a DECISION rather than \
+              a defect: bounding what compiling a pattern may allocate refuses class-heavy \
+              patterns sooner than the reference does — the band where it serves and we \
+              refuse is 10,014..12,728 alternated Unicode-class atoms, both endpoints \
+              bisected one atom at a time rather than projected. Matching its \
+              boundary would mean porting Go's `maxRunes`/`maxSize`/`maxHeight`, which admit \
+              128 MB parse trees — the unboundedness the cap exists to remove. Ledgered as \
+              `regex-compile-budget`; docs/api.md \u{a7}9.4. `variants_variant_side` is \
+              absent for the reason every other row omits it: a PUSHABLE line filter is not \
+              compiled at all there, so both sides serve it and the budget never runs.",
+    },
     Divergence {
         id: "engine_dir_a_perl_and_flag_forms",
         pulsus: Verdict::Reject,
@@ -1585,6 +1693,7 @@ impl Pattern {
             Body::Literal(s) => logql_quote(s),
             Body::NestedGroups(n) => logql_quote(&format!("{}a{}", "(".repeat(n), ")".repeat(n))),
             Body::Repeated(s, n) => logql_quote(&s.repeat(n)),
+            Body::Alternated(s, n) => logql_quote(&vec![s; n].join("|")),
             Body::LogqlSource(s) => s.to_string(),
         }
     }
@@ -1596,6 +1705,7 @@ impl Pattern {
             Body::Literal(s) => s.to_string(),
             Body::NestedGroups(n) => format!("{}a{}", "(".repeat(n), ")".repeat(n)),
             Body::Repeated(s, n) => s.repeat(n),
+            Body::Alternated(s, n) => vec![s; n].join("|"),
             Body::LogqlSource(s) => s.to_string(),
         }
     }
@@ -1815,18 +1925,18 @@ fn the_divergence_set_is_exactly_the_committed_enumeration() {
     // describes.
     assert_eq!(
         POSITIONS.len() * PATTERNS.len(),
-        704,
-        "the ledger says 704 unmasked points"
+        720,
+        "the ledger says 720 unmasked points"
     );
     assert_eq!(
         measured.len(),
-        308,
-        "the ledger says 308 of the 704 unmasked points disagree"
+        323,
+        "the ledger says 323 of the 720 unmasked points disagree"
     );
     assert_eq!(
         POSITIONS.len() * PATTERNS.len() + MASKED.len() * PATTERNS.len(),
-        792,
-        "the ledger says 792 probed points, masked positions included"
+        810,
+        "the ledger says 810 probed points, masked positions included"
     );
 
     let claimed = |skip: Option<usize>| -> Vec<(String, String)> {
@@ -2309,44 +2419,64 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         (
             "pipeline.rs",
             &[
-                ("Regex::new(", 3),
+                ("Regex::new(", 1),
                 ("compile_regex(", 5),
                 ("compile_anchored_regex(", 4),
                 ("validate_anchored_regex(", 1),
                 ("validate_unanchored_regex(", 1),
                 ("compile_drop_keep(", 3),
+                ("compile_user_regex(", 1),
+                ("compile_user_regex_anchored(", 1),
             ],
             "the in-process seam and its callers: the line filter compiled after a \
              `line_format` (`line_after_line_format`), `DECOLORIZE_PATTERN` (EXCLUDED, a \
              `const`), `| drop`/`| keep` (`drop`, `keep`), the `| regexp` parser \
              (`regexp_named`), the label filter (`labelfilter_re`, `labelfilter_nre`), and the \
              definitions of `compile_regex`/`compile_anchored_regex`/`validate_*`/ \
-             `compile_drop_keep` themselves. The third `Regex::new(` is inside `bad_regex`, \
-             which re-compiles the user's own pattern only to choose which error text to \
-             report — it decides no verdict, and issue #240 pins its rule.",
+             `compile_drop_keep` themselves. Issue #291 moved the two seams onto \
+             `pulsus_re2::compile_user_regex`/`_anchored`, so what used to be three \
+             `Regex::new(` is now one: the survivor is inside `bad_regex`, which \
+             re-compiles the user's own pattern only to choose which error text to \
+             report — it decides no verdict, is reached only AFTER the budget estimate \
+             passed, and issue #240 pins its rule.",
         ),
         (
             "plan.rs",
-            &[("Regex::new(", 1)],
+            &[("compile_user_regex_anchored(", 1)],
             "`LabelReplaceSpec::compile` — the one LogQL site that translates the pattern \
              through `re2_pattern_to_rust` before compiling it, and the one that reports the \
-             WRAPPED form (issue #276). Covered by `label_replace`.",
+             WRAPPED form (issue #276). Covered by `label_replace`. Issue #291 routed it \
+             through the shared budgeted entry point; the marker changed with it, which is \
+             the whole reason the four #291 markers are in `MARKERS` — without them this \
+             site would have vanished from the census instead of moving in it.",
         ),
         (
             "template/funcs.rs",
-            &[("RegexBuilder::new(", 1), ("compile_regex(", 4)],
+            &[
+                ("compile_regex(", 4),
+                ("compile_user_regex_with(", 1),
+                ("regex_compile_transient_bound_with(", 1),
+            ],
             "the template regex functions `regexReplaceAll`, `regexReplaceAllLiteral` and \
              `count`, plus their shared compile seam. NOT a status axis — a bad pattern here is \
              a 200 carrying `__error__: TemplateFormatErr` — so it is covered by \
              `the_template_regex_boundary_does_not_match_the_reference` rather than by a \
-             matrix position. This file is invisible to a non-recursive walk.",
+             matrix position. This file is invisible to a non-recursive walk. Issue #291 \
+             replaced the bare `RegexBuilder::new(` with the budgeted \
+             `compile_user_regex_with(` at the SAME 1 MiB program ceiling, and charges the \
+             render budget `regex_compile_transient_bound_with(` instead of a flat 1 MiB.",
         ),
         (
             "template/mod.rs",
-            &[("Regex::new(", 1)],
-            "EXCLUDED, decides nothing: the compile-time prewarm of the literal-pattern cache, \
-             written `if let Ok(re) = …` so a failure is dropped and the pattern is recompiled \
-             at render time by `funcs.rs`'s seam, which is where the verdict is taken.",
+            &[("compile_user_regex(", 1)],
+            "the compile-time prewarm of the literal-pattern cache, written `if let Ok(re) = …` \
+             so a failure is dropped and the pattern is recompiled at render time by \
+             `funcs.rs`'s seam, which is where the VERDICT is taken. It decides no verdict — \
+             but issue #291's review measured that it decided ALLOCATION: as a bare \
+             `Regex::new` it peaked 298.92 MB on a literal `\\w`x43000 inside the query-text \
+             cap, so it is now budgeted like every other user-pattern compile. It was listed \
+             here as EXCLUDED before that, which is why the marker moved rather than the row \
+             disappearing.",
         ),
     ];
 
@@ -2358,6 +2488,15 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         "validate_anchored_regex(",
         "validate_unanchored_regex(",
         "compile_drop_keep(",
+        // Issue #291: the shared budgeted entry point. These four had to
+        // be added the moment the sites started routing through it —
+        // without them `plan.rs`'s `label_replace` compile disappeared
+        // from the census entirely, which is the failure mode this test
+        // exists to prevent (a compile site nothing enumerates).
+        "compile_user_regex(",
+        "compile_user_regex_anchored(",
+        "compile_user_regex_with(",
+        "regex_compile_transient_bound_with(",
     ];
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
@@ -2600,6 +2739,281 @@ fn the_corrected_sentences_are_not_in_the_tree() {
 // The live legs (gated on PULSUSDB_LOGQL_DIFF_URL)
 // ---------------------------------------------------------------------
 
+/// Seconds curl will wait for the reference, and **not a round number
+/// chosen for comfort**.
+///
+/// It was 30, and `class_alt_over_budget` failed the `schema-it` job with
+/// `unexpected status 000` — curl never obtaining a status, rather than a
+/// status the reference returned.
+///
+/// **`000` has TWO causes and this constant fixes NEITHER.** One is the
+/// reference not being READY yet, which [`wait_for_reference`] closes.
+/// The other is the reference's own 30 s HTTP write timeout, explained in
+/// full on [`wait_for_reference`] — raising this from 30 s to 120 s did
+/// not fix that either; it only stopped OUR deadline from racing the
+/// server's, so the server's behaviour surfaces as what it is (curl 52 /
+/// 56) instead of as our timeout (28). What this constant buys is that a
+/// slow-but-successful answer is not reported as a failure.
+///
+/// The deadline half was diagnosed by constraining the container rather than guessing
+/// (`podman run --cpus 2 --memory 4g`), which reproduces it exactly, and
+/// the cause is that the reference genuinely needs that long: building a
+/// ten-thousand-branch Unicode-class matcher is real work, and at the
+/// four positions that construct a `NewFastRegexMatcher` — the two label
+/// filters, `drop` and `keep` — it costs 10-27 s per query on two cores.
+/// A cold container spikes past 30 s on its first few queries and settles
+/// afterwards.
+///
+/// **Raising this does not weaken anything.** Every verdict is still
+/// asserted at every position; what changes is that slow-but-successful
+/// stops being reported as a failure. A genuine hang still fails, just
+/// later. Lowering it back reintroduces a flake whose symptom (`000`)
+/// looks nothing like its cause.
+///
+/// Measured alternatives, both rejected: no N inside the divergent band
+/// `10,014..12,728` is cheap for the reference (10,014, the very bottom,
+/// still peaks at 30.08 s cold), and the one other shape the cap newly
+/// refuses — `(?i)[\p{L}x20000]` — costs 16-27 s at the same positions,
+/// so it buys nothing.
+///
+/// **This is a hang-guard, not a performance assertion.** It says only
+/// that the reference eventually answered; it says nothing about how
+/// fast, and no row's passing time may be read as evidence the reference
+/// was quick. The times above are the measurement — this constant is not.
+///
+/// **Verified on COLD containers, freshly created rather than restarted,
+/// because cold start is where the spikes are:** four runs green, three
+/// at 2 CPU / 4 GB and one at **1 CPU / 2 GB**, tighter than any CI
+/// runner.
+const REFERENCE_MAX_SECONDS: &str = "120";
+
+/// How long [`wait_for_reference`] will wait for the container to become
+/// serviceable before failing the run.
+const REFERENCE_READY_SECONDS: u64 = 180;
+
+/// **Waits for the reference to be serviceable before the first probe.**
+///
+/// The second cause of `000`, and the one a deadline cannot touch. The
+/// evidence for it is a LOG LINE, not a duration: review saw a cold first
+/// probe fail on a container that was not OOM-killed and had
+/// `RestartCount=0`, whose log carried `empty ring`. Reproduced here on a
+/// freshly created container: `ratestore.go:110 msg="error getting
+/// ingester clients" err="empty ring"`, with the HTTP port refusing
+/// connections for the first ~3 s and `/ready` answering 503 for ~23 s.
+///
+/// That probe took 47.7 s, and **that number is not cited as evidence
+/// here, because nothing we have measured explains it** — see [`Probe`].
+/// Warm re-probes on the same container answered 200. **CI creates a
+/// fresh container every run, so the first probe is exactly where this
+/// lives** — a longer deadline makes it less likely to coincide, not
+/// gone.
+///
+/// **This closes the READINESS mode. It does not close every `000`, and
+/// after four rounds of inferring from the symptom the rest turned out to
+/// be ONE mechanism, not three.**
+///
+/// The branch used to describe three modes here — 28 (timed out), 56
+/// (reset by peer), 52 (empty reply) — with one of them "unexplained".
+/// That was wrong. All three are **the reference's own HTTP write
+/// timeout**: `server.http-write-timeout` defaults to **30 s**
+/// (`vendor/github.com/grafana/dskit/server/server.go:217 @ v3.7.4`,
+/// wired into Go's `http.Server.WriteTimeout` at `:544`), and
+/// `ci/logql/config.yaml` sets no timeout, so the default is what runs.
+/// When it expires with nothing written, Go closes the connection: the
+/// client sees an empty reply (52), or a reset (56) if it reads after the
+/// RST, or — back when our own deadline was also 30 s — our timeout (28)
+/// winning the race.
+///
+/// **Found by reading the reference's source and confirmed by moving its
+/// timeout**, not by reasoning about the symptom: the same query at the
+/// same N answers `000 | curl exit 52 | Empty reply from server` after
+/// **6.28 s** with `http_server_write_timeout: 5s` and after **30.48 s**
+/// with the shipped 30 s default, which is exactly the CI failure. The
+/// symptom tracks the SERVER's timeout, not our client deadline — which
+/// is why every round that raised OUR patience produced "another mode".
+///
+/// **Scope of that attribution:** it covers the `000`s whose exit code
+/// was captured. The two 47.7 s / 47.8 s observations from before
+/// [`Probe`] existed are NOT attributed to it and do not fit it; see
+/// [`Probe`].
+///
+/// Runs once per test binary, not once per test: the three live legs
+/// share a container, and this is a property of the container.
+///
+/// If readiness never arrives it PANICS with the last status and body
+/// rather than proceeding — an unready reference would otherwise be
+/// scored as a wall of `000` and read as a verdict mismatch.
+fn wait_for_reference(base: &str) {
+    static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    READY.get_or_init(|| {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(REFERENCE_READY_SECONDS);
+        let mut last = String::from("no attempt completed");
+        while std::time::Instant::now() < deadline {
+            let ready = curl_probe("5", &[&format!("{base}/ready")]);
+            let now = now_s();
+            let probe = curl_probe(
+                "15",
+                &[
+                    "-G",
+                    &format!("{base}/loki/api/v1/query_range"),
+                    "--data-urlencode",
+                    "query={app=\"pulsus_readiness_probe\"}",
+                    "--data-urlencode",
+                    &format!("start={}", (now - 300) * 1_000_000_000),
+                    "--data-urlencode",
+                    &format!("end={}", now * 1_000_000_000),
+                    "--data-urlencode",
+                    "step=60s",
+                ],
+            );
+            if ready.http_code == "200" && probe.http_code == "200" {
+                return;
+            }
+            // Both CAUSES, not just both statuses — see [`Probe`].
+            last = format!(
+                "/ready: {} | query_range: {}",
+                ready.describe(),
+                probe.describe()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        panic!(
+            "the reference at {base} never became serviceable within \
+             {REFERENCE_READY_SECONDS}s (last: {last}). It must answer BOTH `/ready` 200 and a \
+             trivial `query_range` 200 before any verdict is probed — an unready container \
+             answers `000` on every position, which this file would otherwise score as a wall \
+             of verdict mismatches"
+        );
+    });
+}
+
+/// **What one curl invocation observed, cause included.**
+///
+/// `000` is not a status. It is curl declining to produce one, and until
+/// this struct existed the suite recorded it with no way to tell WHICH
+/// refusal it was. That blindness is why issue #291's CI failure took
+/// four rounds: a `000` at 47.8 s under a 120 s deadline, on a container
+/// whose readiness gates were both already 200, is neither a timeout nor
+/// unreadiness — and nobody could say what it was, because curl's exit
+/// code and message were thrown away.
+///
+/// **Those two 2026-08-09 observations — 47.7 s and 47.8 s — remain
+/// unattributed, deliberately.** They predate this struct, so no exit
+/// code was captured for either, and they do not fit the mechanism the
+/// later ones did: the write timeout's measured wall is **30.48 s** at
+/// the shipped 30 s setting and **6.28 s** at a 5 s setting, tracking the
+/// setting closely both times, and 47.7 fits neither. An attempt to
+/// explain the gap by firing a heavy query before the container was
+/// ready — on the theory that Go's write deadline starts when the request
+/// is read, so ~17 s of startup plus 30 s would land near 47 — did not
+/// reproduce it: the query was served in 13.68 s. They are dated
+/// observations whose cause was not captured, and they are recorded that
+/// way rather than assigned to the nearest known mechanism. That
+/// assignment is the habit this issue spent four rounds paying for.
+///
+/// Curl distinguishes these, and the distinction is what produced the
+/// diagnosis: `7` couldn't connect (nothing listening yet), `28`
+/// operation timed out (our own [`REFERENCE_MAX_SECONDS`] expiring),
+/// `52` empty reply from server, `56` recv failure / connection reset by
+/// peer.
+///
+/// **52 and 56 are the diagnosed cause, not an open question.** They are
+/// the reference's own 30 s HTTP write timeout closing the connection
+/// with nothing written — 52 when the client reads the FIN, 56 when it
+/// reads after the RST — and 28 was the same wall reached by our
+/// deadline first, back when ours was also 30 s. One mechanism, three
+/// presentations; [`wait_for_reference`] carries the source citation and
+/// the two boundary measurements. This struct is how that was found, so
+/// its own doc had better not still call it unexplained.
+///
+/// Carried on every probe and printed on every failure. Deliberately NOT
+/// paired with a retry: retrying a `000` would turn CI green and destroy
+/// the only signal there is.
+#[derive(Debug)]
+struct Probe {
+    /// `"000"` when curl never got one.
+    http_code: String,
+    /// Curl's exit code — `0` on success. See the struct docs.
+    exit_code: String,
+    /// Curl's own error text, empty on success.
+    err_msg: String,
+    /// The response body, empty when there was none.
+    body: String,
+}
+
+impl Probe {
+    /// A one-line rendering for a panic or a failure record. Always names
+    /// the cause when there is one.
+    fn describe(&self) -> String {
+        if self.err_msg.is_empty() && self.exit_code == "0" {
+            format!("status {} ({})", self.http_code, truncate(&self.body, 200))
+        } else {
+            format!(
+                "status {} — curl exit {} ({}); body {}",
+                self.http_code,
+                self.exit_code,
+                self.err_msg,
+                truncate(&self.body, 200)
+            )
+        }
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    let s = s.trim();
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// Runs curl with `args`, capturing the status, the body **and curl's own
+/// exit code and message**.
+///
+/// The three write-out fields are one tab-separated line on stdout, so
+/// the body can keep going to stderr (`-o /dev/stderr`) exactly as it did
+/// before. `%{exitcode}` and `%{errormsg}` need curl 7.75+; the CI image
+/// and this machine are both well past that, and if they were not the
+/// fields would render literally and the assertion below would say so
+/// rather than silently reporting nothing.
+fn curl_probe(max_time: &str, args: &[&str]) -> Probe {
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-S",
+            "--max-time",
+            max_time,
+            "-o",
+            "/dev/stderr",
+            "-w",
+        ])
+        .arg("%{http_code}\t%{exitcode}\t%{errormsg}")
+        .args(args)
+        .output()
+        .expect("curl");
+    let written = String::from_utf8_lossy(&out.stdout).to_string();
+    let mut fields = written.trim_end_matches('\n').split('\t');
+    let http_code = fields.next().unwrap_or("").trim().to_string();
+    let exit_code = fields.next().unwrap_or("").trim().to_string();
+    let err_msg = fields.next().unwrap_or("").trim().to_string();
+    assert!(
+        !exit_code.is_empty() && !exit_code.contains("exitcode"),
+        "curl did not expand `%{{exitcode}}` — this suite needs curl 7.75+ to record WHY a \
+         probe failed, and recording `000` with no cause is what issue #291 spent four \
+         rounds paying for. Got: {written:?}"
+    );
+    Probe {
+        http_code,
+        exit_code,
+        err_msg,
+        // Curl's own diagnostics go to stderr under `-S` too, so the body
+        // is whatever precedes them; keeping the whole thing is right —
+        // it is only ever read by a human diagnosing a failure.
+        body: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    }
+}
+
 fn now_s() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2611,15 +3025,9 @@ fn now_s() -> u64 {
 /// load-bearing** — see the module docs' trap 3.
 fn reference_verdict(base: &str, query: &str) -> (Verdict, String) {
     let now = now_s();
-    let out = Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "30",
-            "-o",
-            "/dev/stderr",
-            "-w",
-            "%{http_code}",
+    let probe = curl_probe(
+        REFERENCE_MAX_SECONDS,
+        &[
             "-G",
             &format!("{base}/loki/api/v1/query_range"),
             "--data-urlencode",
@@ -2630,16 +3038,83 @@ fn reference_verdict(base: &str, query: &str) -> (Verdict, String) {
             &format!("end={}", now * 1_000_000_000),
             "--data-urlencode",
             "step=60s",
-        ])
-        .output()
-        .expect("curl");
-    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let body = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    match code.as_str() {
+        ],
+    );
+    let body = probe.body.clone();
+    match probe.http_code.as_str() {
         "200" => (Verdict::Accept, body),
         "400" => (Verdict::Reject, body),
-        other => panic!("unexpected status {other} for {query:?}: {body}"),
+        // Never `000` without its cause — see [`Probe`].
+        _ => panic!("unexpected {} for {query:?}", probe.describe()),
     }
+}
+
+/// **Which (position, pattern) cells the LIVE legs re-probe, and the one
+/// row they do not.**
+///
+/// Every cell is asserted from the committed table by the hermetic tests;
+/// this decides only which are additionally re-measured against the
+/// container on every run.
+///
+/// `class_alt_over_budget` is **not re-probed at any position** (owner
+/// ruling, 2026-08-10, after four rounds and three positions). The reason
+/// is a hard wall in the reference: **`server.http-write-timeout`
+/// defaults to 30 s** (`vendor/github.com/grafana/dskit/server/server.go:217
+/// @ v3.7.4`, wired into Go's `http.Server.WriteTimeout` at `:544`), and
+/// `ci/logql/config.yaml` sets no timeout, so the default is what runs.
+/// When it expires with nothing written, Go closes the connection and the
+/// client gets an empty reply, never a status.
+///
+/// # What is known, and what is not
+///
+/// **Reproduced, on three machines.** The divergence itself: we refuse
+/// `\p{L}|…` alternations from 10,014 atoms, the reference serves to
+/// 12,728, band `10,014..12,728` — both endpoints bisected one atom at a
+/// time, here and on the reviewer's hardware.
+///
+/// **The reference's wall, measured by moving it.** The same query at the
+/// same N answers `000 | curl exit 52 | Empty reply from server` after
+/// **6.28 s** with `http_server_write_timeout: 5s` and after **30.48 s**
+/// with the shipped 30 s default.
+///
+/// **Refuted, each with a measurement, not an argument:** runner speed
+/// alone; store contents (empty, one line, and ~10,000 lines all answer
+/// in 0.65 s); CPU starvation (0.62 s at 0.25 CPU with data); container
+/// death, restart or memory pressure (`OOMKilled=false`,
+/// `RestartCount=0`, 0.42% CPU, 105 MiB at the moment of failure); our
+/// own client deadline (the failure is the server's close, not ours); and
+/// the theory that Go's write deadline starts when the request is READ,
+/// so ~17 s of startup plus 30 s would land near 47 s — a heavy query
+/// fired at a cold container was served in 13.68 s.
+///
+/// **NOT KNOWN: why `line_re` costs 0.6 s here and past 30 s on the CI
+/// runner.** Four rounds, three positions, and the reference's own log is
+/// silent on it — `caller=metrics.go` logs on query COMPLETION, so a
+/// request the server closes without responding can never appear there.
+/// With `log_level: info` shipped, a failing run captured 3,024 per-query
+/// entries and **none** for this query: no `latency=slow`, nothing with a
+/// query text over 60,000 chars, and a 29-second gap between the last
+/// entry and the failure. That residue is recorded rather than resolved,
+/// because an investigation that ends without naming what it did not
+/// learn teaches nothing.
+///
+/// # What this costs
+///
+/// **This row is no longer re-verified against the reference on any run**,
+/// so a change in the reference's behaviour here would go unnoticed until
+/// someone re-measures by hand. It stays asserted from the recorded
+/// measurement — 2026-08-09, pinned container, `200` at all eighteen
+/// positions — and the whole row stays in `PATTERNS` and in the
+/// `regex_compile_budget` divergence enumeration. Only the live re-check
+/// is dropped, and only for this row: every other pattern is still put to
+/// the container at every position on every run.
+///
+/// Nothing the investigation bought is given up with it — `log_level:
+/// info`, the `docker logs` capture on failure, [`Probe`],
+/// [`wait_for_reference`] and the wall-clock deadline all stay. Each was
+/// earned by a failure and prevents a different one.
+fn live_probe_is_affordable(_position: &str, pattern: &str) -> bool {
+    pattern != "class_alt_over_budget"
 }
 
 /// **Re-measures every committed reference verdict against the pinned
@@ -2652,16 +3127,22 @@ fn live_matrix_against_the_reference() {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live regex accept matrix");
         return;
     };
+    wait_for_reference(&base);
     let mut points = matrix(POSITIONS);
     points.extend(matrix(MASKED));
 
     let mut disagree = Vec::new();
     let (mut accepts, mut rejects) = (0usize, 0usize);
+    let mut skipped = 0usize;
     for pt in &points {
         let want = committed(pt.position, pt.pattern, Side::Reference);
         match want {
             Verdict::Accept => accepts += 1,
             Verdict::Reject => rejects += 1,
+        }
+        if !live_probe_is_affordable(pt.position.id, pt.pattern.id) {
+            skipped += 1;
+            continue;
         }
         let (got, body) = reference_verdict(&base, &pt.query);
         if got != want {
@@ -2707,8 +3188,20 @@ fn live_matrix_against_the_reference() {
         Verdict::Reject,
         "a malformed selector regex is a parse error and must be refused in every window"
     );
+    // The skip count is asserted, not merely reported: this narrowing is
+    // scoped to ONE pattern at every position, and if it ever grew
+    // silently the live leg would quietly stop measuring the matrix.
+    assert_eq!(
+        skipped, 18,
+        "exactly the 18 cells of `class_alt_over_budget` — one per position, masked \
+         included — may skip the live probe, and nothing else may. See \
+         `live_probe_is_affordable`"
+    );
     eprintln!(
-        "re-measured {} points against the reference; the committed column holds",
+        "re-measured {} of {} points against the reference ({skipped} skipped, all one \
+         pattern the reference cannot answer inside its own 30s write timeout); the \
+         committed column holds",
+        points.len() - skipped,
         points.len()
     );
 }
@@ -2733,6 +3226,7 @@ fn live_reference_error_codes_are_exactly_the_covered_set() {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live error-code census");
         return;
     };
+    wait_for_reference(&base);
 
     // (1) Each captured fragment, at its captured position.
     let mut wrong = Vec::new();
@@ -2769,6 +3263,13 @@ fn live_reference_error_codes_are_exactly_the_covered_set() {
     points.extend(matrix(MASKED));
     let mut observed: Vec<&str> = Vec::new();
     for pt in &points {
+        // Same wall, same scope — see `live_probe_is_affordable`. This
+        // census only ever learns from cells the reference REJECTS, and
+        // this row is a `200` at every position, so skipping the
+        // whole row removes no code from the observed set.
+        if !live_probe_is_affordable(pt.position.id, pt.pattern.id) {
+            continue;
+        }
         let (verdict, body) = reference_verdict(&base, &pt.query);
         if verdict != Verdict::Reject {
             continue;
@@ -2808,15 +3309,9 @@ fn live_reference_error_codes_are_exactly_the_covered_set() {
 }
 
 fn stale_verdict(base: &str, query: &str, end_s: u64) -> Verdict {
-    let out = Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "30",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
+    let probe = curl_probe(
+        REFERENCE_MAX_SECONDS,
+        &[
             "-G",
             &format!("{base}/loki/api/v1/query_range"),
             "--data-urlencode",
@@ -2827,13 +3322,12 @@ fn stale_verdict(base: &str, query: &str, end_s: u64) -> Verdict {
             &format!("end={}", end_s * 1_000_000_000),
             "--data-urlencode",
             "step=60s",
-        ])
-        .output()
-        .expect("curl");
-    match String::from_utf8_lossy(&out.stdout).trim() {
+        ],
+    );
+    match probe.http_code.as_str() {
         "200" => Verdict::Accept,
         "400" => Verdict::Reject,
-        other => panic!("unexpected status {other} for {query:?}"),
+        _ => panic!("unexpected {} for {query:?}", probe.describe()),
     }
 }
 
@@ -2847,29 +3341,22 @@ fn live_template_axis_against_the_reference() {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live template axis");
         return;
     };
+    wait_for_reference(&base);
     let ts = (now_s() - 10) * 1_000_000_000;
     let payload = format!(
         r#"{{"streams":[{{"stream":{{"app":"x","job":"pulsus_it246"}},"values":[["{ts}","x"]]}}]}}"#
     );
-    let push = Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "30",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
+    let push = curl_probe(
+        REFERENCE_MAX_SECONDS,
+        &[
             "-H",
             "Content-Type: application/json",
             "--data-binary",
             &payload,
             &format!("{base}/loki/api/v1/push"),
-        ])
-        .output()
-        .expect("curl");
-    let code = String::from_utf8_lossy(&push.stdout).trim().to_string();
-    assert_eq!(code, "204", "push failed");
+        ],
+    );
+    assert_eq!(push.http_code, "204", "push failed: {}", push.describe());
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let mut wrong = Vec::new();
@@ -2882,11 +3369,9 @@ fn live_template_axis_against_the_reference() {
             ))
         );
         let now = now_s();
-        let out = Command::new("curl")
-            .args([
-                "-s",
-                "--max-time",
-                "30",
+        let out = curl_probe(
+            REFERENCE_MAX_SECONDS,
+            &[
                 "-G",
                 &format!("{base}/loki/api/v1/query_range"),
                 "--data-urlencode",
@@ -2899,14 +3384,14 @@ fn live_template_axis_against_the_reference() {
                 "limit=10",
                 "--data-urlencode",
                 "direction=backward",
-            ])
-            .output()
-            .expect("curl");
-        let body = String::from_utf8_lossy(&out.stdout).to_string();
+            ],
+        );
+        let body = out.body.clone();
         assert!(
             body.contains("\"status\":\"success\""),
-            "{:?}: the template axis is a 200 axis, never a status: {body}",
-            probe.pattern
+            "{:?}: the template axis is a 200 axis, never a status — {}",
+            probe.pattern,
+            out.describe()
         );
         // A bad regex surfaces as the per-line `__error__` label, not as
         // a status and not as a body.

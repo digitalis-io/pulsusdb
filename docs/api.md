@@ -933,6 +933,8 @@ Two engines evaluate regexes here: **ClickHouse's `match()`, which is RE2 itself
 
 Separately from evaluation, **every LogQL regex except `label_replace`'s is also compiled in process at plan time as a validity check**, including the ones ClickHouse goes on to evaluate. That is why a LogQL pattern the Rust crate cannot compile is rejected even when it would have been pushed down (§9.4).
 
+**Every in-process compile in the table above goes through one budgeted entry point** (issue #291). Before a pattern is compiled, the memory that compiling it would take is bounded from the pattern itself, and a pattern whose compile could exceed **96 MiB** is refused with `400 bad_data` and the message `expression too large`. The refusal is decidable from the query text alone, before any data is read, which is why it is a `400` rather than a `422`; and it costs less than serving it would, because it happens before the expansion it is refusing. This is a PulsusDB-specific boundary the references do not have — §9.4's size row says where it sits relative to theirs.
+
 ### 9.2 Constructs that mean different things in the two engines
 
 | Construct | RE2 — and what PulsusDB should mean | Rust `regex`, unrewritten |
@@ -979,14 +981,16 @@ The "where" column then names the routes, because a query only reaches the Rust 
 | `\u{…}` escapes | `\u{263A}` | Rust accepts | LogQL in process only |
 | Lookaround | `(?=x)`, `(?!x)`, `(?<=x)`, `(?<!x)` | nothing decides it | trace validation only |
 | Comment groups; a trailing backslash | `(?#c)a`, `a\` | nothing decides it | trace validation only |
-| A pattern over the Rust crate's compiled-size budget | `(?:(?:(?:(?:[0-9a-f]{32}){32}){32}){32})` | nothing decides it — the crate rejects it as `CompiledTooBig`, and that budget is not RE2's, so its rejection says nothing about RE2's verdict | trace validation only |
+| A pattern over PulsusDB's compile budget | `(?:(?:(?:(?:[0-9a-f]{32}){32}){32}){32})` (the crate's `CompiledTooBig`), or any pattern over §9.4's 96 MiB compile-allocation cap | nothing decides it — neither budget is RE2's, so a refusal for either says nothing about RE2's verdict | trace validation only |
+
+**Correction (issue #291, measured 2026-08-09).** The row above used to read as though the *divergence* were confined to trace validation. Only the **acceptance** is. On every other route the same two budgets produce the **opposite** divergence — a `400` here against the reference's `200` — and that is measured at five sizes in §9.4's size row. Trace validation is where an over-budget pattern is still *accepted*; it is not where the disagreement lives.
 | An invalid-UTF-8 **escape** in the pattern's string literal | `"\xff"` — Go's unquoting gives the reference one 0xFF byte, which its parser refuses. **Our lexer produces neither that byte nor U+00FF**: it drops the backslash on an unknown escape (`crates/pulsus-logql/src/lexer.rs:322-331`), so the pattern silently becomes the three ASCII characters `xff` and compiles. See the value-divergence note below §9.4 — this row understates it | Rust accepts | LogQL, and only where the pattern reaches a parser: the line filter, `\| regexp` and `label_replace`. The reference *also* serves it on the selector, label filters and `drop`/`keep`, which short-circuit a plain literal before parsing it (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) — the accept/reject verdicts agree there, and the MATCHES do not |
 
 **For LogQL this direction is now measured position by position and checked in** (issue #246): `crates/pulsus-read/tests/logql_regex_accept_matrix.rs` puts every class above to each of the sixteen LogQL constructs that carry a regex — on the digest-pinned v3.7.4 reference and through PulsusDB's own `parse → plan → compile` chain — and its live leg re-measures the reference half in CI. Two things it adds to the table. The `\u{263A}` row's *LogQL in process only* is exact and the reason is `label_replace`, the one LogQL site that rewrites a pattern before compiling it; `[a--b]` behaves identically there, which is why §9.4's closing sentence about it needed the correction it now carries. And there is a class this table does not have: **a malformed regex in a `variants(...)` variant's own line filter is served here and refused by the reference** — but only while that filter is PUSHABLE. PulsusDB validates a variant's discarded prefix through the pipeline compiler, which skips a pushable line filter entirely (its regex is validated on the SQL-rendering path, and a discarded prefix renders no SQL); put the same filter after a `line_format` and the pushdown is cleared, the filter is compiled, and both sides refuse it. Everything measured is enumerated in `logql-regex-accept-surface-divergence` (docs/benchmarks/logs-differential-ledger.md) and owned by issue #400.
 
 ### 9.4 Patterns PulsusDB rejects that the reference accepts
 
-The narrower and more disruptive direction. One mechanism produces all of it: each row is a construct RE2 accepts and the Rust `regex` crate rejects, so a route that hands it to the crate answers `400`. Which routes those are differs by row, because the §9.1 rewrite changes some patterns and not others — that is the last column, using §9.1's two labels:
+The narrower and more disruptive direction. **Two** mechanisms produce it. The first, and the one the table below is entirely about, is *syntactic*: each row is a construct RE2 accepts and the Rust `regex` crate rejects, so a route that hands it to the crate answers `400`. Which routes those are differs by row, because the §9.1 rewrite changes some patterns and not others — that is the last column, using §9.1's two labels. The second is about *size* rather than syntax and applies to every row of §9.1's **in process** and **rewritten** rows equally; it has its own subsection after the table.
 
 | Pattern class | Example | Rust `regex` error | Rejected on |
 |---------------|---------|--------------------|-------------|
@@ -999,6 +1003,36 @@ The narrower and more disruptive direction. One mechanism produces all of it: ea
 | A repeated capture-group name | `(?P<n>a)(?P<n>b)` | `duplicate capture group name` | **as written** and **rewritten** alike. The reference's vendored regex parser has no duplicate-name check at all; its `| regexp` PARSER has one of its own (`duplicate extracted label name 'n'`), so that single LogQL construct agrees and every other one does not |
 
 ClickHouse's RE2 accepts every row above, so a predicate it compiles is answered. On logs that rarely helps: §9.1's plan-time validity check compiles every LogQL regex except `label_replace`'s as written, so these are rejected before reaching ClickHouse even when they would have been pushed down — measured, `{app="x"} |~ "a{bbb}c"` is a plan-time rejection here and a `200` on Loki 3.7.4. On metrics the outcome follows §9.1's row: a selector that reaches storage is answered, one served from the warm label cache compiles the rewrite.
+
+#### The size boundary — `regex-compile-budget` (issue #291)
+
+Separately from syntax, a pattern can be refused here for what compiling it would COST. Two limits do that, and they are ours rather than RE2's:
+
+- the Rust `regex` crate's own **10 MiB compiled-program limit** (`CompiledTooBig`), which has been in force since the first release; and
+- PulsusDB's **96 MiB compile-allocation cap** (issue #291), which bounds the memory spent PRODUCING the program. The crate's limit does not: it governs only the last of three compile phases, so a valid 100 KB pattern could allocate 887 MB and still be refused afterwards.
+
+Both answer `400 bad_data`; the second's message is `expression too large`, the same wording class the reference uses at its own boundary (`ErrLarge`, `vendor/github.com/grafana/regexp/syntax/parse.go:47 @ v3.7.4`).
+
+**The reference has a boundary here too, and ours is tighter.** Loki, Prometheus and Tempo all parse user regexes with Go's `regexp/syntax` — Loki and Prometheus through the vendored `github.com/grafana/regexp` fork, Tempo through `prometheus/model/labels.NewFastRegexMatcher`, which uses the same fork — and it caps `maxHeight = 1000`, `maxSize = 128<<20/40` instructions and `maxRunes = 128<<20/4` (`syntax/parse.go:93,102-103,122-123 @ v3.7.4`; Go's standard library carries the identical constants). Those are *per-limit* caps on a parse tree, and they admit a **128 MB** one. Adopting them would mean adopting the unboundedness this cap exists to remove, which is why our boundary is not theirs.
+
+Measured against `grafana/loki:3.7.4` at the wire, both before and after the cap landed:
+
+| Pattern | Reference | PulsusDB |
+|---------|-----------|----------|
+| `\p{L}`×200 (1,000 B) | `200`, 49 ms | `200` |
+| `(?i)\p{L}`×1000 | `200`, 1.33 s | `400` |
+| `\w`×20000 | `200`, 35 ms | `400` |
+| `\w`×40000 | `200`, 62 ms | `400` |
+| `\p{L}`×20000 | `200`, 2.31 s | `400` |
+| `\p{L}\|…` alternation, 10,013 atoms | `200` | `200` — the last size we accept |
+| `\p{L}\|…` alternation, 10,014 atoms | `200` | `400` `expression too large` — the band opens |
+| `\p{L}\|…` alternation, 12,728 atoms | `200` — the last size it accepts | `400` |
+| `\p{L}\|…` alternation, 12,729 atoms | `400` `error parsing regexp: expression too large` | `400` |
+| `a`×130000 (a plain literal) | `200`, 34 ms | `200` — length alone never refuses |
+
+The rows before `(?i)\p{L}`×1000 and from 12,729 atoms on are agreement; the middle is the divergence. Both alternation boundaries were bisected one atom at a time rather than projected — ours over the estimator, the reference's against the pinned container — so the residue can be named exactly: **the reference serves and we refuse over `\p{L}|…` alternations of 10,014 to 12,728 atoms, a band 2,715 atoms wide against the 12,728 it accepts.** Outside that band the two agree on this family. **We refuse nothing on length alone**: a literal is the cheapest shape there is, `a`×292624 still estimates under the cap, and the 131,071-byte query-text cap bites long before this one does.
+
+Ledgered as `regex-compile-budget` in `docs/benchmarks/logs-differential-ledger.md`, with the cap itself pinned by `crates/pulsus-re2/tests/regex_compile_budget.rs`.
 
 **Correction (issue #246, measured 2026-08-08).** This paragraph used to end by saying `[a--b]` is rejected by PulsusDB *and* by the reference, so it is agreement rather than a divergence. That holds only on the **rewritten** routes. On every LogQL route that compiles a pattern **as written** — twelve of the thirteen — `{app=~"[a--b]"}` is a `200` here and a `400` there, because the Rust crate reads it as set difference (§9.2) and compiles it happily; only `label_replace`, which rewrites first, agrees with the reference. `\u{263A}` splits exactly the same way. Both are in §9.3's direction, not this one, and the point-by-point measurement is `crates/pulsus-read/tests/logql_regex_accept_matrix.rs`.
 

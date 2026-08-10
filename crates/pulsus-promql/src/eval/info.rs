@@ -137,8 +137,9 @@ impl MatcherCache {
                         // Issue #317: RE2's reading of the pattern, not the
                         // Rust crate's superset grammar.
                         let translated = crate::re2_syntax::re2_pattern_to_rust(&m.value);
+                        // Issue #291: through the shared compile budget.
                         let re =
-                            regex::Regex::new(&format!("^(?:{translated})$")).map_err(|e| {
+                            pulsus_re2::compile_user_regex_anchored(&translated).map_err(|e| {
                                 PromqlError::LabelSet {
                                     detail: format!(
                                         "invalid matcher regex in info(): {:?}: {e}",

@@ -267,7 +267,11 @@ pub(crate) fn concrete_name_matches(
                 }
                 // Issue #317: RE2's reading of the pattern (the storage
                 // path's own), never the Rust crate's superset grammar.
-                let re = Regex::new(&format!("^(?:{})$", re2_pattern_to_rust(&m.value)))
+                // Issue #291: through the shared compile budget; an
+                // over-budget pattern falls back to the storage engine
+                // exactly like an uncompilable one, which is this site's
+                // existing behaviour for every compile failure.
+                let re = pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(&m.value))
                     .map_err(|_| FallbackReason::RegexUnsupported { key: m.key.clone() })?;
                 let is_match = re.is_match(name);
                 if m.op == MatchOp::Re {
@@ -608,8 +612,12 @@ impl RegexCache {
         // Issue #317: compile RE2's reading of the pattern, not the Rust
         // crate's superset grammar. Once per distinct pattern, behind the
         // memo, so the per-series loop never sees it.
-        let anchored = format!("^(?:{})$", re2_pattern_to_rust(pattern));
-        let re = Arc::new(Regex::new(&anchored).ok()?);
+        // Issue #291: through the shared compile budget. `None` here
+        // means "the cache cannot answer" and defers to the storage
+        // engine — the same direction an uncompilable pattern already
+        // took, and the safe one for a memory refusal.
+        let re =
+            Arc::new(pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(pattern)).ok()?);
         guard.insert(
             pattern.to_string(),
             CachedPattern::InProcess(Arc::clone(&re)),

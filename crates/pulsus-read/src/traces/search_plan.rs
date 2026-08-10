@@ -741,7 +741,10 @@ mod eval_compile {
     /// every regex as it renders it (issue #282), and this compile must
     /// never become a second opinion about which patterns are acceptable.
     fn compile_anchored(pat: &str) -> Result<Regex, PlanError> {
-        Regex::new(&format!("^(?:{pat})$"))
+        // Issue #291: through the shared compile budget; the message
+        // prefix is unchanged, and `RegexCompileError::Display` renders
+        // an engine error verbatim.
+        pulsus_re2::compile_user_regex_anchored(pat)
             .map_err(|e| PlanError::TypeMismatch(format!("invalid regex {pat:?}: {e}")))
     }
 

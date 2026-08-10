@@ -1763,13 +1763,22 @@ fn json_to_value<'a>(v: serde_json::Value) -> Value<'a> {
 
 /// The compiled-program ceiling for a DYNAMICALLY-built pattern (one
 /// whose text a template computes per line, so it misses the
-/// compile-time cache): `regex::RegexBuilder::size_limit` guarantees
-/// the program stays under it, and the render budget is charged the
-/// full ceiling BEFORE compiling (review round 2: regex programs are
-/// caller-sized allocations like any other). 1 MiB keeps 64 dynamic
-/// compiles inside one render budget; the reference is unbounded here
-/// (Go regexp has no program cap) — the same ledgered class as the
-/// output budget itself (`template-output-budget`).
+/// compile-time cache): `regex::RegexBuilder::size_limit` bounds the
+/// compiled PROGRAM to this. The reference is unbounded here (Go regexp
+/// has no program cap) — the same ledgered class as the output budget
+/// itself (`template-output-budget`).
+///
+/// **What it does NOT bound, corrected by issue #291:** the memory spent
+/// PRODUCING that program. `size_limit` is `nfa_size_limit` and governs
+/// only the last of three compile phases, so #230's note that a
+/// 128-byte pattern sits "inside the charged ceiling" was false —
+/// `\w`×64 is 128 bytes and peaks 4.16 MB in the HIR phase alone (10.6 MB
+/// through the whole compile) against a flat 1 MiB charge. The render
+/// budget is therefore charged
+/// `pulsus_re2::regex_compile_transient_bound_with(text, this)` — the
+/// real per-pattern bound at THIS ceiling — instead of a flat 1 MiB.
+/// The ceiling itself does not move: that accept boundary is out of
+/// scope for #291.
 const DYNAMIC_REGEX_PROGRAM_CEILING: usize = 1 << 20;
 
 fn compile_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex::Regex, String> {
@@ -1795,31 +1804,36 @@ fn compile_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex::Regex, 
         // Arc-backed, the clone shares it — no per-line program.
         return Ok(re.clone());
     }
-    ctx.charge(DYNAMIC_REGEX_PROGRAM_CEILING)?;
-    regex::RegexBuilder::new(&text)
-        .size_limit(DYNAMIC_REGEX_PROGRAM_CEILING)
-        .build()
-        .map_err(|e| {
-            // The reference emits Go's `error parsing regexp: …` wording;
-            // rust-regex words its diagnostics differently. The wording
-            // difference is ledgered (owner error-wording ruling).
-            //
-            // **The accept/reject boundary does NOT match**, and this
-            // comment said it did until issue #246 measured it. Both
-            // engines are RE2-CLASS, which is not the same as agreeing:
-            // driven through `{{ regexReplaceAll <p> .app "z" }}` on the
-            // pinned v3.7.4 container and here, 18 of 20 probes disagree,
-            // and two of them answer with a different STRING rather than
-            // a different verdict — `a**` renders `zxz` from the input
-            // `x` (the Rust crate reads it as `(a*)*` and replaces at
-            // every position) and `\p{Alphabetic}` renders `z`. Those are
-            // wrong answers, not boundary differences. The measurement is
-            // `pulsus-read/tests/logql_regex_accept_matrix.rs`'s
-            // `the_template_regex_boundary_does_not_match_the_reference`
-            // and its gated companion; the classes are ledgered under
-            // `logql-regex-accept-surface-divergence` and owned by #400.
-            format!("error parsing regexp: {e}")
-        })
+    // Issue #291: charge what compiling THIS pattern can cost, not a flat
+    // ceiling that models only the last phase. A pattern the estimator
+    // cannot bound (its AST does not parse) is charged the ceiling and
+    // falls through to the engine for the canonical error.
+    ctx.charge(
+        pulsus_re2::regex_compile_transient_bound_with(&text, DYNAMIC_REGEX_PROGRAM_CEILING)
+            .and_then(|b| usize::try_from(b).ok())
+            .unwrap_or(DYNAMIC_REGEX_PROGRAM_CEILING),
+    )?;
+    pulsus_re2::compile_user_regex_with(&text, DYNAMIC_REGEX_PROGRAM_CEILING).map_err(|e| {
+        // The reference emits Go's `error parsing regexp: …` wording;
+        // rust-regex words its diagnostics differently. The wording
+        // difference is ledgered (owner error-wording ruling).
+        //
+        // **The accept/reject boundary does NOT match**, and this
+        // comment said it did until issue #246 measured it. Both
+        // engines are RE2-CLASS, which is not the same as agreeing:
+        // driven through `{{ regexReplaceAll <p> .app "z" }}` on the
+        // pinned v3.7.4 container and here, 18 of 20 probes disagree,
+        // and two of them answer with a different STRING rather than
+        // a different verdict — `a**` renders `zxz` from the input
+        // `x` (the Rust crate reads it as `(a*)*` and replaces at
+        // every position) and `\p{Alphabetic}` renders `z`. Those are
+        // wrong answers, not boundary differences. The measurement is
+        // `pulsus-read/tests/logql_regex_accept_matrix.rs`'s
+        // `the_template_regex_boundary_does_not_match_the_reference`
+        // and its gated companion; the classes are ledgered under
+        // `logql-regex-accept-surface-divergence` and owned by #400.
+        format!("error parsing regexp: {e}")
+    })
 }
 
 /// `uint8` element of a `[]byte` (for `index $b 0`).

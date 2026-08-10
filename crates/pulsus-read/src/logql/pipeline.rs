@@ -2353,8 +2353,19 @@ pub(super) fn validate_anchored_regex(p: &str) -> Result<(), PipelineError> {
     compile_anchored_regex(p).map(|_| ())
 }
 
+/// Issue #291: every user pattern on this path compiles through
+/// `pulsus_re2::compile_user_regex`, which refuses it BEFORE the HIR
+/// translation when translating it could allocate more than
+/// `MAX_REGEX_COMPILE_TRANSIENT_BYTES`. The engine's own accept/reject
+/// decision and wording are untouched — an `Engine` error still routes to
+/// [`bad_regex`], and only the new over-budget refusal is a new message.
 fn compile_regex(pattern: &str) -> Result<regex::Regex, PipelineError> {
-    regex::Regex::new(pattern).map_err(|e| bad_regex(pattern, &e))
+    pulsus_re2::compile_user_regex(pattern).map_err(|e| match e {
+        pulsus_re2::RegexCompileError::Engine(e) => bad_regex(pattern, &e),
+        e @ pulsus_re2::RegexCompileError::TooLarge { .. } => {
+            PipelineError::BadRegex(e.to_string())
+        }
+    })
 }
 
 /// The ANSI SGR (Select Graphic Rendition) color-escape pattern
@@ -2393,7 +2404,14 @@ fn compile_drop_keep(elems: &[DropKeepElem]) -> Result<Vec<CompiledDropKeep>, Pi
 /// the same `^(?:...)$` wrapping shape `escape::ch_regex_anchored` uses
 /// for the SQL side, compiled locally for in-engine evaluation.
 fn compile_anchored_regex(pattern: &str) -> Result<regex::Regex, PipelineError> {
-    regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| bad_regex(pattern, &e))
+    // Issue #291: the ANCHORED string is what gets compiled, so it is the
+    // one the budget estimates.
+    pulsus_re2::compile_user_regex_anchored(pattern).map_err(|e| match e {
+        pulsus_re2::RegexCompileError::Engine(e) => bad_regex(pattern, &e),
+        e @ pulsus_re2::RegexCompileError::TooLarge { .. } => {
+            PipelineError::BadRegex(e.to_string())
+        }
+    })
 }
 
 fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {

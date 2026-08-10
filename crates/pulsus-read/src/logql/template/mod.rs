@@ -318,7 +318,25 @@ pub fn compile(text: &str, kind: TemplateKind) -> Result<Template, TemplateCompi
     }
     let mut regex_cache = HashMap::new();
     for pattern in flags.literal_regexes {
-        if let Ok(re) = regex::Regex::new(&pattern) {
+        // Issue #291 review: this prewarm compiled with a bare
+        // `Regex::new` and was the ONE user-pattern compile in the
+        // workspace outside the budget. It is reachable — a 129,033-byte
+        // template, inside the 131,072-byte query-text cap, carrying a
+        // literal `\w`x43000 peaked **298.92 MB here and returned `Ok`**.
+        // Being a cache prewarm bought it nothing: the pattern is the
+        // user's, and the allocation is the same allocation.
+        //
+        // `compile_user_regex` and not `compile_user_regex_with(...,
+        // DYNAMIC_REGEX_PROGRAM_CEILING)`: this site has always compiled
+        // at the crate default (10 MiB), `funcs.rs`'s render-time seam at
+        // 1 MiB, and #291 moves no `size_limit`. So the accept surface
+        // here is unchanged apart from the new over-budget refusal.
+        //
+        // A refusal is dropped exactly as a compile failure already was —
+        // the `if let Ok` shape is load-bearing and predates this: the
+        // pattern is simply not prewarmed, and `funcs.rs`'s seam takes
+        // the verdict at render time, where it is budgeted and charged.
+        if let Ok(re) = pulsus_re2::compile_user_regex(&pattern) {
             regex_cache.insert(pattern, re);
         }
     }

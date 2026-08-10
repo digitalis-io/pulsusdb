@@ -558,11 +558,98 @@ jobs:
             -v "$GITHUB_WORKSPACE"/ci/logql/config.yaml:/etc/loki/local-config.yaml:ro \
             grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc \
             -config.file=/etc/loki/local-config.yaml
-          for _ in $(seq 1 60); do
-            [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:13100/ready)" = "200" ] && break
+          # Issue #291. This wait is NOT the readiness authority and must
+          # not be treated as one: `logql_regex_accept_matrix.rs`'s
+          # `wait_for_reference` is, and it gates its own leg regardless
+          # of what happens here.
+          #
+          # It used to poll `/ready` ALONE, which is not sufficient —
+          # review measured a query failing with `empty ring` after
+          # `/ready` was already 200, while on other hardware a trivial
+          # query succeeds ~13 s BEFORE `/ready` does. Which signal
+          # settles last is environment-dependent, so this now waits on
+          # the same CONJUNCTION the suite's gate uses rather than a
+          # weaker half of it.
+          #
+          # It exists only because the OTHER reference-facing legs below
+          # (`logql_differential`, the nested-ip and logfmt matrices) have
+          # no gate of their own and would otherwise probe a container
+          # that is still refusing connections. Hoisting
+          # `wait_for_reference` into a shared helper so they gate
+          # themselves is the real fix and spans seven suites; it is not
+          # #291's to make.
+          # A WALL-CLOCK deadline, not an attempt count. This was
+          # `seq 1 180` with a message saying "within 180s", and those are
+          # not the same bound: an attempt costs up to 5 s + 15 s of probe
+          # timeout plus the sleep, so 180 attempts can run for about an
+          # hour while claiming three minutes. Counting time means the
+          # printed bound is the bound enforced and the two cannot drift
+          # apart again.
+          #
+          # 180 s deliberately, for two reasons rather than inheritance:
+          # it is the same bound `wait_for_reference` uses in
+          # `logql_regex_accept_matrix.rs`, so the container has ONE
+          # readiness budget rather than two that can disagree; and the
+          # cold-start settle measured on constrained containers is
+          # ~23-27 s (`/ready` 503 until ~23 s at 2 CPU / 4 GB), so it is
+          # roughly seven times the observed worst. The per-probe
+          # timeouts below are unchanged — they are what makes a single
+          # attempt bounded; this bounds the sequence of them.
+          ready=''
+          probe=''
+          started=$(date +%s)
+          deadline=$(( started + 180 ))
+          # A FAILING PROBE IS DATA, NOT AN ABORT. GitHub runs `run:` under
+          # `bash -e {0}`, and an unguarded `var=$(curl …)` takes curl's
+          # exit status as the assignment's — so the first probe that
+          # fails kills the step before the loop can retry and before the
+          # reporting below can run. That is exactly what happened on
+          # #418: the step died with `Process completed with exit code 56`
+          # and printed none of the diagnosis, because a cold Loki
+          # accepted the connection and reset it. A probe failing during
+          # startup is the EXPECTED case — it is why this loop exists —
+          # so each probe is explicitly made non-fatal and its cause is
+          # read out of `%{exitcode}`/`%{errormsg}` instead of the shell's
+          # `$?`. Must tolerate 7 (connect), 28 (timeout), 52 (empty
+          # reply) and 56 (reset by peer) and keep waiting.
+          probe_url() {
+            curl -s -o /dev/null -w '%{http_code}|%{exitcode}|%{errormsg}' "$@" || true
+          }
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=$(probe_url --max-time 5 http://localhost:13100/ready)
+            now=$(date +%s)
+            probe=$(probe_url --max-time 15 -G \
+              http://localhost:13100/loki/api/v1/query_range \
+              --data-urlencode 'query={app="pulsus_readiness_probe"}' \
+              --data-urlencode "start=$(( (now - 300) ))000000000" \
+              --data-urlencode "end=${now}000000000" \
+              --data-urlencode 'step=60s')
+            [ "${ready%%|*}" = '200' ] && [ "${probe%%|*}" = '200' ] && break
             sleep 1
           done
-          curl -sf http://localhost:13100/ready
+          # The step's exit condition must be the SAME predicate as the
+          # loop's. It was not: the loop broke on the conjunction while
+          # the check after it was `curl -sf /ready` alone, so a loop that
+          # exhausted with `/ready` 200 and the query non-200 PASSED the
+          # step and handed the ungated legs below the exact state the
+          # loop had just proved insufficient. Both results are kept and
+          # both are asserted, and the message prints both so a future
+          # failure says WHICH half was missing rather than just that the
+          # wait ended.
+          if [ "${ready%%|*}" != '200' ] || [ "${probe%%|*}" != '200' ]; then
+            # The elapsed time is MEASURED and printed, not asserted from
+            # the deadline: the loop stops STARTING attempts at 180 s, so
+            # a final attempt already in flight can carry it ~20 s past
+            # (measured: 189 s against a blackhole where every probe times
+            # out). Printing the real number is what stops this message
+            # from drifting away from the mechanism a third time.
+            elapsed=$(( $(date +%s) - started ))
+            echo "the reference never became serviceable — gave up after ${elapsed}s (deadline 180s, plus the attempt already in flight)" >&2
+            echo "  /ready      http|exit|err = ${ready}" >&2
+            echo "  query_range http|exit|err = ${probe}" >&2
+            docker logs --tail 50 pulsus-logql-diff >&2 || true
+            exit 1
+          fi
 
       - name: LogQL differential leg (syntax)
         env:
@@ -690,6 +777,31 @@ jobs:
         env:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logqltest_replay
+
+      # Issue #291. The differential legs above probe this container, and
+      # when one of them fails we have never once looked at what the
+      # REFERENCE said — `docker logs` ran only inside the readiness step,
+      # so a leg failing produced no reference log at all. Curl exit codes
+      # 28, 56 and 52 were seen on the same query and looked like three
+      # separate faults; they are ONE — the reference's own 30 s
+      # `server.http-write-timeout` closing the connection
+      # (`dskit/server/server.go:217 @ v3.7.4`). This step stays because
+      # it is how the next such question gets answered from the
+      # reference's own account rather than by inference: four rounds went
+      # on inferring from the symptom before anyone read the log.
+      #
+      # `if: failure()` so it costs nothing on a green run, and BEFORE the
+      # stop step below, which would otherwise delete the evidence.
+      - name: LogQL reference diagnostics (on failure only)
+        if: failure()
+        run: |
+          echo '--- docker inspect: was it killed, did it exit, did it restart?'
+          docker inspect pulsus-logql-diff \
+            --format 'OOMKilled={{.State.OOMKilled}} Status={{.State.Status}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} StartedAt={{.State.StartedAt}} FinishedAt={{.State.FinishedAt}}' || true
+          echo '--- docker stats (one sample)'
+          docker stats --no-stream pulsus-logql-diff || true
+          echo '--- loki log (whole, not tailed: the interesting line is not always last)'
+          docker logs pulsus-logql-diff 2>&1 || true
 
       - name: Stop LogQL differential oracle
         if: always()
