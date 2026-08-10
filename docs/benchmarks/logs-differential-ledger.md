@@ -4582,3 +4582,84 @@ Issue #392 stays open for two things the ruling kept on it:
   `# provenance: divergence(logfmt-expression-duplicate-source-key-tiebreak)`,
   and by `pipeline.rs`'s
   `two_identifiers_sharing_a_source_key_are_broken_by_query_order`.
+
+### `logfmt-expression-parser-hints-unmodelled` (issue #393 — a residual whose printed value MOVED at this commit, and why that is not a regression)
+
+**Read this row before reading the metric answers below as a regression.**
+One of them changed at the commit that closed #393, and it changed
+because the extraction became CORRECT while a second, independent
+mechanism stayed unmodelled. Two axes, one moved.
+
+- **The mechanism.** The reference gates line-key extraction on
+  `ParserHint.ShouldExtract` (`pkg/logql/log/parser.go:580 @ v3.7.4`),
+  with `alwaysExtract` (`:554-558`) as the escape hatch for a key that is
+  itself an extraction identifier. `Hints.ShouldExtract`
+  (`pkg/logql/log/parser_hints.go:73-85 @ v3.7.4`) answers true only for
+  a REQUIRED label — one the rest of the query actually needs — or for
+  every key when the query requires none. A `sum by (a) (…)` makes `a`
+  required and nothing else, so a line key that is not `a` and is not an
+  identifier is skipped, and the identifier's PRE-SEEDED empty string
+  survives to the grouping. `git grep ShouldExtract -- crates/` returns
+  doc comments only: PulsusDB extracts every key, always.
+- **This is invisible for the implicit parsers** (`| logfmt`, `| json`,
+  `| regexp`, `| pattern`), because grouping discards the extra labels
+  anyway. Only the EXPRESSION parsers make it observable, and only
+  because of the pre-seed — there has to be an empty value already
+  sitting under the identifier for the skipped extraction to leave
+  something behind.
+- **Measured on `grafana/loki:3.7.4` digest
+  `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+  (buildinfo read from the running process: version 3.7.4, revision
+  b318f282, branch release-3.7.x), 2026-08-10**, one line per stream
+  pushed once and each query issued at a single instant through
+  `/loki/api/v1/query`:
+
+  | line | query | reference | PulsusDB before #393 | PulsusDB now | moved? |
+  |---|---|---|---|---|---|
+  | `b=1 a-b=2 x=3` | `sum by (a) (count_over_time(… \| logfmt a="nosuch" [5m]))` | `{a=""}` | `{}` | `{a=""}` | **moved, and now AGREES** |
+  | `b=1 a-b=2 x=3 b.c=4` | `sum by (a) (count_over_time(… \| logfmt a="b_c" [5m]))` | `{a=""}` | `{}` | `{a="4"}` | **MOVED, still differs — this row** |
+  | `b=1 a-b=2 x=3` | `sum by (a) (count_over_time(… \| logfmt a="x" [5m]))` | `{a=""}` | `{a="3"}` | `{a="3"}` | **did NOT move** |
+  | `b=1 a-b=2 x=3` | `sum by (a,x) (count_over_time(… \| logfmt a="x" [5m]))` | `{a="3"}` | `{a="3"}` | `{a="3"}` | agrees — the control |
+
+- **Why the second row moved, stated plainly.** Before #393 the source
+  key `b_c` was compared against RAW line keys, matched nothing, and the
+  empty-drop rule then removed the label entirely — so the series carried
+  no `a` at all and `by (a)` grouped it to `{}`. #393 fixed both halves:
+  the line key `b.c` now sanitizes to `b_c` and matches, and a miss now
+  leaves the pre-seeded empty label instead of nothing. The extraction is
+  therefore CORRECT now — `| logfmt a="b_c"` really does read `4` on the
+  reference too, which the streams row in
+  `b24_logfmt_expr_eval.test` pins. What still differs is only whether
+  the reference KEEPS that value once it knows the query needs only `a`:
+  it does not, because `ShouldExtract("b_c")` is false, so its
+  pre-seeded `""` survives. The printed value changed and is still not
+  the reference's, and both of those facts have separate causes.
+- **Why the fourth row is the control.** Add `x` to the `by` clause and
+  the source key becomes a required label, `ShouldExtract` returns true,
+  and the reference extracts and renames it — answering `{a="3"}`, which
+  is what we answer unconditionally. The divergence is exactly the hint,
+  not the rename, not the pre-seed and not the sanitizer.
+- **Why the third row is the one that did NOT move.** Its source key `x`
+  was already matching before #393 (a raw line key equal to the source
+  key needs no sanitizer), so #393 changed nothing about it. It is the
+  same mechanism as the second row and the same direction, but it was
+  divergent at `ec774ee` and is divergent now with the identical value —
+  which is what makes the pair distinguishable: one row's value changed
+  at this commit and one did not.
+- **What closing it would take, and why it is not this issue's.**
+  `ParserHint` is a whole-pipeline concern — it needs the set of labels
+  the rest of the query requires threaded into every parser stage, and it
+  changes the per-row cost model for all of them (it exists in the
+  reference as an optimisation, not as a semantic). It touches
+  `| json`'s expression parser identically. Not filed as a new issue by
+  the #393 plan's ruling; recorded here so the metric rows above are
+  checkable rather than remembered.
+- Our side of every row above is gated by
+  `b24_logfmt_expr_eval.test`'s first metric directive (the row that
+  moved INTO agreement) and by its `lfe2` streams row, both of which
+  redden when `crates/pulsus-read/src/logql/pipeline.rs` is checked out
+  at `ec774ee`. The two rows that still differ carry no corpus
+  expectation, deliberately: a corpus row asserting our answer would need
+  a `divergence(...)` marker naming this id, and it would then be
+  excluded from the live replay leg — which is the one thing that would
+  notice if the reference's answer ever changed.

@@ -60,9 +60,15 @@
 #    `{a=""}` there (the source key `x` is not a required label, so it is
 #    skipped and the pre-seeded empty survives) and `{a="3"}` here, and
 #    `... | logfmt a="b_c" ...` is `{a=""}` there and `{a="4"}` here.
-#    That is a fourth, separate mechanism touching every parser stage;
-#    the metric row pinned below is the one where the hint changes
-#    nothing because the extraction misses on both sides.
+#    That is a fourth, separate mechanism touching every parser stage.
+#    ONE OF THOSE TWO ROWS CHANGED ITS PRINTED VALUE AT THE COMMIT THAT
+#    ADDED THIS FILE and the other did not; the difference is recorded,
+#    with the before/after column and the reason, under
+#    `logfmt-expression-parser-hints-unmodelled` in
+#    docs/benchmarks/logs-differential-ledger.md. Read that row before
+#    reading either answer as a regression. The metric row PINNED below
+#    is the third case — the one where the hint changes nothing, because
+#    the extraction misses on both sides — and it moved INTO agreement.
 #
 # provenance: captured
 # (file default; see logqltest/PROVENANCE.md §provenance markers.
