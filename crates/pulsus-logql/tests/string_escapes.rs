@@ -36,10 +36,17 @@
 //!   Loki actually calls sets `multibyte` and hands the value to
 //!   `utf8.EncodeRune`, which writes `RuneError` for an invalid rune.
 //!
-//! The returned-LINES consequence — which stream `{app=~"\101"}` selects
-//! — is pinned by `pulsus-read`'s corpus file
-//! `tests/logqltest/corpus/b24_string_escapes.test`, captured from the
-//! pinned container. This file pins the decode.
+//! The returned-LINES consequence is pinned by `pulsus-read`'s corpus
+//! file `tests/logqltest/corpus/b24_string_escapes.test`, captured from
+//! the pinned reference. **What that file pins is the LINES a `|~`
+//! filter returns, not the streams a SELECTOR picks** — its runner
+//! replays every loaded line through the pipeline and never re-applies
+//! the stream selector, so a selector row there would pin nothing. The
+//! disjoint-stream measurement that opened this issue
+//! (`{app=~"\101"}` against `{app=~"101"}`) lives at the wire, quoted in
+//! that file's header and in the `logql-regex-accept-surface-divergence`
+//! ledger row. What THIS file pins is the decode itself, at the selector
+//! and at a line filter alike.
 
 use pulsus_logql::{Expr, LogQlError, Stage, parse};
 

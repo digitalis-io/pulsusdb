@@ -1,17 +1,22 @@
 # b24_string_escapes.test — issue #400 Stage 1: what a LogQL double-quoted
-# string DECODES to, pinned by the lines a query returns.
+# string DECODES to. The `eval` rows pin it by the LINES a query returns;
+# the `eval_fail` rows pin the escapes the grammar refuses.
 #
 # Every expected label set and line below is a byte-exact capture from
-# grafana/loki:3.7.4 (container `pulsus-400s1-loki`, image digest
-# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc),
+# grafana/loki:3.7.4, image digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc,
 # booted on `ci/logql/config.yaml` with no delta of its own;
-# `detected_level` stripped per PROVENANCE.md. Container identity READ
-# FROM THE RUNNING PROCESS, not from this header:
-# /loki/api/v1/status/buildinfo answered {"version":"3.7.4",
-# "revision":"b318f282","branch":"release-3.7.x"} — the same b318f282 the
-# pinned digest and the Go checkout at v3.7.4 resolve to. Captured
-# 2026-08-10 over `/loki/api/v1/query_range`, the only endpoint that
-# serves a log query.
+# `detected_level` stripped per PROVENANCE.md. **Two containers from that
+# one digest, and the split is stated because the header used to name
+# only the first:** `pulsus-400s1-loki` captured the `esc` and `escc`
+# sections, `pulsus-400s1-ci` the `ctl` section, which was added a round
+# later. Container identity READ FROM THE RUNNING PROCESS, not from this
+# header: /loki/api/v1/status/buildinfo answered {"version":"3.7.4",
+# "revision":"b318f282","branch":"release-3.7.x"} on each — the same
+# b318f282 the pinned digest and the Go checkout at v3.7.4 resolve to.
+# Captured 2026-08-10 over `/loki/api/v1/query_range`, every row replayed
+# from the query text read back out of this file so the probe cannot
+# drift from what is committed.
 #
 # provenance: captured
 # (file default; see logqltest/PROVENANCE.md §provenance markers.
@@ -60,14 +65,18 @@
 # `crates/pulsus-logql/tests/string_escapes.rs`, which asserts the
 # decoded matcher value as BYTES.
 #
-# NOT HERE, and deliberately: `\a` (0x07), `\b` (0x08), `\f` (0x0C) and
-# `\v` (0x0B). Their decoded byte would have to appear in a `load` body,
-# and this DSL reads `<offset> <body>` off a line split on whitespace —
-# 0x0B and 0x0C ARE whitespace to Rust, so those two cannot be written
-# here at all, and a raw 0x07/0x08 in a committed fixture is unreadable.
-# They are pinned by byte in `string_escapes.rs` instead, and were
-# measured at the wire on the same container: `|~ "\a"` and `|~ "\x07"`
-# both return only the line carrying byte 0x07.
+# THE SHORT ESCAPES `\a` (0x07), `\b` (0x08), `\f` (0x0C) and `\v` (0x0B)
+# ARE HERE, in the `ctl` section at the end of this file, with their own
+# note. An earlier draft of this header said they were deliberately
+# absent because 0x0B and 0x0C are whitespace to Rust and so could not be
+# written in a `load` body at all. That was wrong twice over: `trim` and
+# `split_once(char::is_whitespace)` only touch the ENDS of the line and
+# the FIRST whitespace run, so a decoded control byte sitting INTERIOR to
+# a body survives, which is how the `ctl` bodies are written.
+#
+# The escapes Stage 1 does NOT change are named once, at the `ctl`
+# section that would otherwise be their home. Stating them twice is how a
+# qualifier goes missing from one copy.
 
 load
   {app="esc", service_name="esc"}
@@ -104,9 +113,15 @@ eval instant at 60s {service_name="esc"} | decolorize |~ "\U00000041"
   {app="esc", service_name="esc"} 0s A
 
 # An escape Go does not define is a 400 at the reference's LEXER, before
-# any regex parser — `parse error at line 1, col 25: invalid char escape`
-# for each of these, the column being the only thing that moves. Before
-# Stage 1 they were served here as the patterns `d+`, `q`, `0` and `'`.
+# any regex parser. All four rows below answer
+# `parse error at line 1, col 38: invalid char escape` — the same column,
+# because the escape sits at the same offset in each. The column is the
+# ONLY thing that moves when the same escape is put to another construct,
+# and this figure moved once already: it read col 25 while these rows
+# were still written without `| decolorize`. 38 - 25 = 13, the length of
+# the inserted ` | decolorize`, which is the check that the two readings
+# are the same rule and not a re-measurement gone wrong. Before Stage 1
+# they were served here as the patterns `d+`, `q`, `0` and `'`.
 # The `msg:` text is PulsusDB's own (only the STATUS is claimed against
 # the reference — owner ruling on #246).
 eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\d+"
@@ -173,6 +188,15 @@ eval instant at 60s {service_name="escc"} | decolorize |~ "\udfff"
 # and nothing (measured: `{app=~"\xff", service_name="esc"}` is 200 with
 # an empty result), and where no line in this store could match a 0xFF
 # byte anyway.
+#
+# RE-MEASURING THESE TWO NEEDS A RECENT WINDOW. They are a pipeline-BUILD
+# error on the reference, so it answers 400 over a window it executes and
+# 200 over a stale one — the trap this issue was filed with. Verified
+# both ways on a fresh container: over a window ending at now they are
+# `400 parse error : stage '|~ "\xff"' : error parsing regexp: invalid
+# UTF-8`, and over a window months old they are 200. The lexer refusals
+# above are NOT window-sensitive — they answer col 38 in either window,
+# which is what "raised before any regex parser" means at the wire.
 eval_fail instant at 60s {service_name="escc"} | decolorize |~ "\xff"
   msg: not valid UTF-8
 
@@ -200,9 +224,12 @@ load
 # DSL reads `<offset> <body>` off a `trim`ed line, and 0x0B and 0x0C are
 # whitespace to Rust, so a leading or trailing one would be eaten.
 #
-# `\n`, `\r`, `\t`, `\\` and `\"` are absent because Stage 1 does not
-# change them — the old arm decoded the first three and passed the last
-# two through as themselves.
+# `\n`, `\r`, `\t`, `\\` and `\"` are absent, and that IS deliberate:
+# Stage 1 does not change them — the old arm already decoded the first
+# three and passed the last two through as themselves — so a row for any
+# of them would pass before and after the fix and measure nothing. A
+# decoded `\n` could not be written in a body in any case: it ends the
+# line.
 eval instant at 60s {service_name="ctl"} | decolorize |~ "\a"
   {app="ctl", service_name="ctl"} 0s x07--end
 

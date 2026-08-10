@@ -1887,11 +1887,15 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// and move `DIVERGENCE`, not this constant — the reference has no answer
 /// there.
 /// Issue #400 added `b24_string_escapes.test` — what a double-quoted
-/// LogQL string DECODES to, pinned by the lines a query returns rather
-/// than by a status. Captured against the pinned v3.7.4 container in a
-/// single run over a window ending at now, same file-level `captured`
-/// default. Its `eval_fail` rows gate on PulsusDB's own wording, as
-/// elsewhere, while the REJECTION each pins was captured.
+/// LogQL string DECODES to. Its `eval` rows pin that by the lines a
+/// query returns; its `eval_fail` rows pin the escapes the grammar
+/// refuses, so this file is not lines alone. Captured against the pinned
+/// v3.7.4 image over a window ending at now, same file-level `captured`
+/// default — in SEPARATE runs, on fresh containers from that same digest
+/// and config: the short-escape section was added a round later, and the
+/// file's own header names which section came from which container. Its
+/// `eval_fail` rows gate on PulsusDB's own wording, as elsewhere, while
+/// the REJECTION each pins was captured.
 const CAPTURED: usize = 1_395;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
