@@ -1040,19 +1040,66 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    /// **Issue #406 inverted this test.** It used to assert that
+    /// `application/json` was a `400`; the reference serves it, reading
+    /// the request from the URL query and never opening the body. Its old
+    /// body was a `400` for TWO reasons at once — the content type, and
+    /// (once the body is ignored) a missing `query` — so simply deleting
+    /// the header assertion would have left it green against the defect.
+    /// Hence the URL query below: it makes the request otherwise VALID,
+    /// so the only thing the status can be measuring is the header.
     #[tokio::test]
-    async fn query_range_post_rejects_a_non_form_content_type() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        let res = query_range_post(
-            State(test_state()),
-            headers,
-            RawQuery(None),
-            Bytes::from_static(b"{}"),
-        )
-        .await;
-        let (status, _body) = status_and_body(res).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+    async fn query_range_post_serves_a_non_form_content_type_from_the_url() {
+        for content_type in ["application/json", "text/plain", "garbage"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+            let res = query_range_post(
+                State(test_state()),
+                headers,
+                RawQuery(Some(r#"query={app="x"}"#.to_string())),
+                // Would be a 400 if it were read: no `query` and a
+                // `since` that does not parse.
+                Bytes::from_static(b"since=bogus"),
+            )
+            .await;
+            let (status, body) = status_and_body(res).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Content-Type {content_type:?} must reach the engine with its body unread \
+                 (poolless: 503), not be refused: {body}"
+            );
+        }
+    }
+
+    /// The other half: a `Content-Type` that cannot be PARSED is still a
+    /// `400`, on an otherwise valid request, and for the header's own
+    /// reason. The reference refuses these too — `mime.ParseMediaType`
+    /// errors, `ParseForm` propagates, and the middleware answers `400`
+    /// before any handler runs.
+    #[tokio::test]
+    async fn query_range_post_refuses_a_malformed_content_type() {
+        for content_type in ["application/", "application/json/x", ";"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+            let res = query_range_post(
+                State(test_state()),
+                headers,
+                RawQuery(Some(r#"query={app="x"}"#.to_string())),
+                Bytes::from_static(b""),
+            )
+            .await;
+            let (status, body) = status_and_body(res).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "Content-Type {content_type:?} must be refused: {body}"
+            );
+            assert!(
+                body.contains("malformed 'Content-Type' header"),
+                "Content-Type {content_type:?} must be refused for the HEADER: {body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1227,19 +1274,28 @@ mod tests {
         );
     }
 
+    /// `/series`' half of the same inversion (issue #406). Note that a
+    /// bodyless `/series` is no longer a `400` at all — Part A made an
+    /// absent `match[]` mean "every series in the window" — so this one
+    /// would have gone green on the defect for a second reason too. The
+    /// URL selector and the poisoned body keep the two axes apart.
     #[tokio::test]
-    async fn series_post_rejects_a_non_form_content_type() {
+    async fn series_post_serves_a_non_form_content_type_from_the_url() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         let res = series_post(
             State(test_state()),
             headers,
-            RawQuery(None),
-            Bytes::from_static(b"{}"),
+            RawQuery(Some(r#"match[]={app="x"}"#.to_string())),
+            Bytes::from_static(b"since=bogus"),
         )
         .await;
-        let (status, _body) = status_and_body(res).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = status_and_body(res).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a JSON content type must reach the engine with its body unread: {body}"
+        );
     }
 
     #[tokio::test]
