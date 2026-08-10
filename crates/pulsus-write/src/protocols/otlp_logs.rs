@@ -485,6 +485,13 @@ fn build_stream_labels(
 ///   (`4fa045d3`) returns `keep`, `sm_keep`, **and** `team=""`, `sm_empty=""`;
 ///   `grafana/loki:3.7.4` (`b318f282`) returns only `keep` and `sm_keep`.
 ///
+///   That version split is the whole content of the #259 reopen, and it is
+///   ledgered: the logs e2e differential still scores against a 3.4.2 oracle,
+///   so its shared corpus may carry no empty-valued attribute at all. See
+///   docs/benchmarks/logs-differential-ledger.md
+///   `empty-value-oracle-version-skew` for the measured three-store matrix
+///   and the close condition. No rule on this path changed for it.
+///
 /// All three rules are now the [`structured_metadata_json`] seam's own —
 /// `pulsus_model::resolve_structured_metadata`, the reference's
 /// `labels.Builder`, over keys this path has ALREADY renamed exactly as the

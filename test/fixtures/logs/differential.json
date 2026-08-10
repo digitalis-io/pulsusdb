@@ -98,7 +98,7 @@
     },
     {
       "case_id": "scope_structured_metadata",
-      "construct": "issue #109: an OTLP log record's InstrumentationScope lands in per-entry structured metadata (Loki 3.4.2 parity, not indexed stream labels). `| scope_name=\"coll-scope\"` is a structured-metadata pipeline filter selecting the single collision-bearing svc-scope witness; the flattened response (last-write-wins collision resolution: dup_key=v_us, scope_name=coll-scope beating scope.name=LOSE, scope_version=1.0, emptyattr=\"\") is compared set-equal PulsusDB==grafana/loki:3.4.2. run_streams_case additionally asserts the {scope_name=\"coll-scope\"} STREAM selector returns empty on both stores (the placement discriminator).",
+      "construct": "issue #109: an OTLP log record's InstrumentationScope lands in per-entry structured metadata (Loki 3.4.2 parity, not indexed stream labels). `| scope_name=\"coll-scope\"` is a structured-metadata pipeline filter selecting the single collision-bearing svc-scope witness; the flattened response (last-write-wins collision resolution: dup_key=v_us, scope_name=coll-scope beating scope.name=LOSE, scope_version=1.0) is compared set-equal PulsusDB==grafana/loki:3.4.2. run_streams_case additionally asserts the {scope_name=\"coll-scope\"} STREAM selector returns empty on both stores (the placement discriminator). A fourth scope attribute carrying an empty VALUE was removed by the #259 reopen: the oracle at 3.4.2 keeps an empty attribute value while the pinned reference grafana/loki:3.7.4 and PulsusDB drop it, so no such input can match on both stores — docs/benchmarks/logs-differential-ledger.md `empty-value-oracle-version-skew`.",
       "mode": "gated",
       "query": "{run_id=\"{R}\"} | scope_name=\"coll-scope\""
     },

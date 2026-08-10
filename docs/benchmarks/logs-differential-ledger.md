@@ -830,6 +830,101 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   was `oracle diverged from the corpus expectation` on
   `metric_rate_sliding`, the first of the five range cases to run.
 
+### empty-value-oracle-version-skew (issue #259 reopen, oracle-version note — no case downgraded)
+
+- **What diverges:** nothing in PulsusDB. This entry records that the
+  logs differential's **oracle container is two minor versions behind
+  the reference PulsusDB is built against**, and that the two versions
+  disagree about one input class — an attribute or structured-metadata
+  pair carrying an **empty value**. The e2e oracle is
+  `grafana/loki:3.4.2@sha256:58a6c186…` (`deploy/e2e/compose.single.yaml`,
+  buildinfo `3.4.2` / revision `4fa045d3`); the pinned log-ingest
+  reference is `grafana/loki:3.7.4@sha256:87f0a067…`
+  (`.github/workflows/ci.yml`, buildinfo `3.7.4` / revision `b318f282`).
+  **3.4.2 keeps an empty value; 3.7.4 and PulsusDB drop it.**
+- **Measured**, three stores, one probe run, both images given this
+  repo's own `deploy/e2e/loki.yaml` and PulsusDB built from the branch
+  and run against a throwaway ClickHouse database. Read back with
+  `/loki/api/v1/query_range` and a `| label_format` stage, so structured
+  metadata is flattened into the returned label set on every store:
+
+  | seam | input | Loki 3.4.2 (e2e oracle) | Loki 3.7.4 (pinned reference) | PulsusDB |
+  |---|---|---|---|---|
+  | OTLP scope attribute | `emptyattr=""` | **kept** | dropped | dropped |
+  | OTLP scope attribute (**control**) | `keepattr="kept"` | kept | kept | kept |
+  | OTLP scope attribute (**control**) | `dup.key`/`dup_key` collision | `dup_key="v_us"` | same | same |
+  | OTLP scope identity (**control**) | `scope.name="LOSE"` vs identity | `scope_name="coll-scope"` | same | same |
+  | OTLP resource attribute | `emptyres=""` | **kept** | dropped | dropped |
+  | OTLP resource attribute (**control**) | `keepres="kept"` | kept | kept | kept |
+  | Loki-push structured metadata | `emptyattr=""` | **kept** | dropped | dropped |
+  | Loki-push structured metadata (**control**) | `keepattr="kept"` | kept | kept | kept |
+  | Loki-push stream label | `emptylbl=""` | dropped (merges into the label-less stream) | dropped | dropped |
+
+  Every control row is identical on all three stores, so the probe
+  harness is sound; the case rows split **3.4.2 versus everything else**
+  on both ingest paths and on both OTLP attribute scopes. There is no
+  seam, and no ingest path, on which v3.7.4 keeps an empty value.
+- **The rule, from the source.** v3.4.2's distributor mutates an entry's
+  structured metadata **in place** with no empty-value filter anywhere on
+  the path (`pkg/distributor/distributor.go:552 @ v3.4.2` — direct
+  assignment to `structuredMetadata[i].Name`). At v3.7.4 the same block
+  routes through Prometheus' `labels.Builder`
+  (`pkg/distributor/distributor.go:700` and `:722 @ v3.7.4`), whose
+  `Reset` records the name of **every empty-valued base label** in `del`
+  (`vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:471-480
+  @ v3.7.4`), so `Labels()` never emits it. The stream-label seam strips
+  in both versions, which is why that row does not split.
+- **Verdict — PulsusDB is correct and no ingest code changed for this
+  entry.** v3.7.4 is the pinned log-ingest reference: roughly twenty
+  committed tests, `docs/api.md` §8.2 and two ledger entries
+  (`inadmissible-label-name-status`,
+  `inadmissible-label-name-echo-escaping`) are written against it. A
+  container digest in a compose file does not outrank that.
+- **Consequence for the differential — the corpus, not the ingest path.**
+  A shared corpus scored against BOTH stores cannot contain an input the
+  two stores answer differently, so `logs_corpus::SCOPE_WITNESS_ATTRS`
+  lost its fourth element `("emptyattr", "")` (it keeps the three
+  collision-bearing attributes, which every store agrees on — control
+  rows 3 and 4 above). The `scope_structured_metadata` case stays
+  **`gated`** with its full set-equality comparison and names no `ledger`
+  field; no case is downgraded and no other corpus input changed.
+- **History:** `e2e-metrics-full` succeeded on 2026-08-05 and 08-06 and
+  failed on every scheduled run from 08-07, the day `b54b542`
+  ("ingest: strip empty labels and metadata where the reference strips
+  them") merged. Artifacts of runs `31294900892` (08-09) and
+  `31356879557` (08-10) both report the oracle at `raw 330 / matched 330
+  / missing 0 / extra 0` and PulsusDB at `matched 329`, missing the
+  single record whose labels include `emptyattr: ""` and extra the same
+  record without it. The **cluster** variant fails identically even
+  though it runs oracle-less (issue #204), because
+  `wait_for_completeness` requires every present store to equal
+  `corpus.expected_all_records()` — so an oracle-side-only fix would have
+  left it red, and the corpus-side fix fixes both.
+- **Guard.** `logs_corpus::tests::the_shared_corpus_carries_no_empty_valued_attribute`
+  walks the corpus's actual OTLP export body at both scales and refuses
+  any empty `stringValue`, naming the JSON path and this entry.
+  `logs::tests::the_scope_case_construct_does_not_promise_an_empty_attribute`
+  does the same for the shipped fixture's prose. **Boundary, stated so it
+  is not over-read:** both cover exactly the empty-VALUE class — the one
+  divergence measured here. Neither is a general 3.4.2-versus-3.7.4 skew
+  detector, and nothing in this repo is.
+- **CLOSE CONDITION.** This entry closes when
+  `deploy/e2e/compose.single.yaml`'s Loki digest moves to v3.7.4
+  (owner-scheduled; re-pinning re-scores all 39 gated cases in
+  `test/fixtures/logs/differential.json` plus `sm_differential.json`
+  against a new oracle and is only validatable in CI). Whoever does that
+  makes exactly these edits **in the same commit**:
+  1. restore `("emptyattr", "")` to `logs_corpus::SCOPE_WITNESS_ATTRS`;
+  2. restore the expectation in
+     `the_scope_witness_record_resolves_its_collisions_and_is_isolated`
+     with `emptyattr` **absent** from the resolved SM map — v3.7.4's
+     answer, not 3.4.2's, so the corpus's by-construction oracle keeps
+     agreeing with both stores;
+  3. delete `the_shared_corpus_carries_no_empty_valued_attribute` and
+     `the_scope_case_construct_does_not_promise_an_empty_attribute`,
+     which would otherwise block step 1, and drop this entry's needles
+     from `the_oracle_version_skew_is_recorded_in_the_committed_ledger`.
+
 ### matching-error-status-divergence (informational note, not a gate downgrade)
 
 - **Cases:** `metric_match_multiple_err`, `metric_match_duplicate_err`

@@ -9,6 +9,16 @@
 # digest — tag AND digest, the grafana/tempo:3.0.2 / prom/prometheus
 # precedent; upgrades are deliberate future commits, never floating).
 #
+# THIS ORACLE IS v3.7.4's PREDECESSOR and disagrees with the pinned
+# log-ingest reference (grafana/loki:3.7.4, .github/workflows/ci.yml) on
+# empty-valued structured metadata: 3.4.2 KEEPS an empty attribute value,
+# 3.7.4 and PulsusDB DROP it — measured on OTLP scope attributes, OTLP
+# resource attributes and the Loki push path alike. Read
+# docs/benchmarks/logs-differential-ledger.md
+# `empty-value-oracle-version-skew`, close condition included, before
+# adding ANY empty-valued input to the shared logs corpus; a hermetic
+# guard refuses one today.
+#
 # The differential's stream-label-set equality rests on this file's
 # limits_config (M6-09 plan v3 delta 3):
 #   - `otlp_config` promotes the corpus's isolation attribute (`run_id`)
