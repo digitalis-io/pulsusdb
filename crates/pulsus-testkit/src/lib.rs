@@ -570,11 +570,12 @@ mod tests {
     // not, and a hand-written list beside an "every" is the defect this
     // branch had already produced once before. So the set is derived
     // instead of enumerated: [`characters_trim_strips`] computes it by
-    // running `trim`, and nothing here names a whitespace character
-    // except as a sanity anchor on the derivation itself. A character
-    // added to Rust's definition in a future toolchain is picked up on
-    // the next run rather than silently falsifying the sentence — which
-    // is also why no comment in this file states how large the set is.
+    // running `trim`, and a character added to Rust's definition in a
+    // future toolchain is picked up on the next run.
+    //
+    // The derivation is the mechanism, and it is what is verified. To see
+    // which characters are in the set, run the tests below; no comment
+    // here answers that, deliberately.
     // -----------------------------------------------------------------
 
     /// The characters [`str::trim`] strips, **derived by running `trim`**
@@ -597,9 +598,12 @@ mod tests {
     /// A sweep over an empty (or universal) set passes vacuously, so this
     /// asserts that [`characters_trim_strips`] found the characters any
     /// working `trim` must strip and did not classify an ordinary letter
-    /// as whitespace. The characters named below are a probe on the
-    /// machinery — read as a claim about the set's membership they would
-    /// be exactly the enumeration this whole section exists to avoid.
+    /// as whitespace.
+    ///
+    /// The characters below are named on purpose: they are the probe, and
+    /// a probe has to be written down. They say nothing about what else
+    /// the derived set contains — that question is answered by running
+    /// the tests, not by reading this.
     fn assert_derivation_is_sane(ws: &[char]) {
         for anchor in [' ', '\t', '\n', '\r'] {
             assert!(
