@@ -134,9 +134,12 @@ future with it (the reference's `endOrNow`, `params.go:105-111`).
 and `/detected_fields` — `invalid time range: 'end' precedes 'start'` —
 where it used to be a silently empty `200`. The reference deliberately
 does **not** apply the check on `/query` (an instant query has no range)
-or on `/patterns`, and neither do we. `end == start` is served everywhere:
-every one of the reference's call sites spells `End.Before(Start)`,
-despite its message's "or equal".
+or on `/patterns`, and neither do we — both exemptions verified against a
+reference whose `/patterns` can actually answer (it needs
+`pattern_ingester.enabled: true`, or the route 404s and nothing about it
+can be measured). `end == start` is served everywhere: every one of the
+reference's call sites spells `End.Before(Start)`, despite its message's
+"or equal".
 
 **A `POST` reads the URL query alongside the body.** `POST
 /query_range?limit=5` with a body carrying no `limit` serves 5 entries, not

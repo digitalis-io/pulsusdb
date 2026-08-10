@@ -1019,6 +1019,41 @@ mod tests {
     /// rows here. Container-measured on both stores 2026-08-10 (issue #406
     /// adjacent finding 7, folded in by ruling v2).
     ///
+    /// **Each exemption carries a CONTROL, because "serves a reversed
+    /// window" means nothing from a route that cannot answer at all.**
+    /// Re-measured 2026-08-10 after review, on one `grafana/loki:3.7.4`
+    /// and one PulsusDB holding the same 160-entry corpus:
+    ///
+    /// * `/patterns` — control first: the same window the RIGHT way round
+    ///   answers `200` on **both** stores with the same pattern
+    ///   (`GET /api/users <_> took <_>`) over the same fifteen 10s buckets
+    ///   at the same counts. Only then the reversal: `200` with
+    ///   `"data":[]` on both, while `/query_range` reversed on those very
+    ///   same stores is `400` — so the reversal is what is being measured.
+    /// * `/query` — control: an instant query answers `200` with a real
+    ///   vector on both (same timestamp, same value `"101"`). Reversed
+    ///   `start`/`end`: still `200` with a real vector, because `/query`
+    ///   never reads them — it evaluates at `time`. The exemption is
+    ///   structural, not an artefact.
+    ///
+    /// **The reference needs `pattern_ingester: {enabled: true}` before
+    /// `/patterns` can be measured at all, and `ci/logql/config.yaml` does
+    /// not set it.** Without it `SingleTenantQuerier.Patterns` returns
+    /// `httpgrpc.Errorf(http.StatusNotFound, "")` on the nil
+    /// `patternQuerier` (`pkg/querier/querier.go:810-816 @ v3.7.4
+    /// b318f282`) while the route itself is still registered
+    /// (`pkg/loki/modules.go:694`, `:1367`) — so the right-way-round
+    /// window 404s and the reversed one can still answer `200`, which
+    /// looks exactly like a measurement and is not one. A reviewer hit
+    /// precisely that. The config used here is `deploy/e2e/loki.yaml`'s
+    /// shape plus `pattern_ingester.enabled: true`, the same fix issues
+    /// #296 and #391 needed.
+    ///
+    /// The reference has no `end < start` check on either route in source
+    /// either: `ParsePatternsQuery` (`pkg/loghttp/patterns.go:9-38`) never
+    /// compares the bounds, and `ParseInstantQuery` has no range to
+    /// compare. The measurement and the source agree.
+    ///
     /// Against the poolless `test_state()` the refusal is a `400` and
     /// everything else is the engine `503`, so the two outcomes are
     /// distinguishable without a database.
@@ -1044,10 +1079,10 @@ mod tests {
             ("/api/logs/v1/volume", SELECTOR_QUERY, true),
             ("/api/logs/v1/detected_labels", "", true),
             ("/api/logs/v1/detected_fields", SELECTOR_QUERY, true),
-            // The two the reference deliberately does NOT check.
-            // `/query` is an instant query and carries no `start`/`end` at
-            // all; the row is here so its absence from the refusal set is
-            // asserted rather than assumed.
+            // The two the reference deliberately does NOT check, each
+            // backed by the control in this test's doc comment (a
+            // right-way-round window serving identically on both stores)
+            // rather than by a bare "it answered 200".
             ("/api/logs/v1/query", SELECTOR_QUERY, false),
             ("/api/logs/v1/patterns", SELECTOR_QUERY, false),
         ];

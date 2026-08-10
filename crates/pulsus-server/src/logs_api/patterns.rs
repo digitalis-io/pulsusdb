@@ -71,10 +71,17 @@ async fn patterns_impl(
     let expr = super::parse_logql(query)?;
     validate_patterns_query(&expr)?;
     // `parse_bounds`, NOT `parse_bounds_ordered`: `/patterns` is one of
-    // the reference's two `end < start` exemptions (`ParsePatternsQuery`
-    // never checks it — `pkg/loghttp/patterns.go` @ v3.7.4 `b318f282`),
-    // measured `200` there on a reversed window. Pinned as a NEGATIVE row
-    // by `mod.rs`'s `end_before_start_is_refused_on_exactly_the_reference_routes`.
+    // the reference's two `end < start` exemptions —
+    // `ParsePatternsQuery` never compares the bounds
+    // (`pkg/loghttp/patterns.go:9-38` @ v3.7.4 `b318f282`), and a
+    // reversed window measured `200` there. That measurement is only
+    // meaningful against a reference whose `/patterns` can answer at all
+    // (`pattern_ingester.enabled: true`, else a nil `patternQuerier`
+    // 404s — `pkg/querier/querier.go:810-816`); the control that
+    // establishes it, and the container configuration it needs, are
+    // written out at `mod.rs`'s
+    // `end_before_start_is_refused_on_exactly_the_reference_routes`,
+    // which pins this route as a NEGATIVE row.
     let (start_ns, end_ns) = parse_bounds(&pairs)?;
     // Floor to 10s + reject an over-11k grid, in pure param parsing — BEFORE
     // any pool/engine/SQL work.
