@@ -34,7 +34,7 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds, read_form_pairs};
+use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs};
 use super::params::{self, ParamError};
 
 /// `X-Pulsus-Explain: 1` — same header contract as the query endpoints.
@@ -64,9 +64,10 @@ pub(crate) async fn detected_labels(
 pub(crate) async fn detected_labels_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match detected_labels_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -95,7 +96,7 @@ async fn detected_labels_impl(
             }))
         }
     };
-    let (start_ns, end_ns) = parse_bounds(&pairs)?;
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
 
     let engine = engine_for(&state).await?;
@@ -129,9 +130,10 @@ pub(crate) async fn detected_fields(
 pub(crate) async fn detected_fields_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match detected_fields_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -160,7 +162,7 @@ async fn detected_fields_impl(
         }
         .into());
     }
-    let (start_ns, end_ns) = parse_bounds(&pairs)?;
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
     let line_limit = params::parse_line_limit(params::get(&pairs, "line_limit"))?;
     let field_limit = params::parse_field_limit(

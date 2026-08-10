@@ -3006,6 +3006,495 @@ async fn default_memory_ceiling_does_not_refuse_an_ordinary_query() {
     drop_database(db).await;
 }
 
+// ---------------------------------------------------------------------
+// Issue #406 — the request-parameter surface, against a store with data.
+// An EMPTY store answers 200 to almost all of this, so the seed IS the
+// test in every case below.
+// ---------------------------------------------------------------------
+
+/// Seeds `count` samples on `FP_A`, one second apart, ending at
+/// `base_ns`. Returns the timestamp of the OLDEST seeded entry.
+async fn seed_run(client: &ChClient, db: &str, base_ns: i64, count: i64) -> i64 {
+    let oldest = base_ns - (count - 1) * 1_000_000_000;
+    let values: Vec<String> = (0..count)
+        .map(|i| {
+            let ts = oldest + i * 1_000_000_000;
+            format!("('checkout', {FP_A}, {ts}, 0, 'run line {i}')")
+        })
+        .collect();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                 body) VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed run");
+    oldest
+}
+
+/// **Part A, live.** `/series` with no `match[]` returns exactly the
+/// series seeded in the window — and an empty array outside it, which is
+/// what separates "we serve everything" from "we serve the window".
+/// Pre-change: `400 missing required parameter 'match[]'`. The reference
+/// answers `200` with every series (measured 2026-08-10).
+#[tokio::test]
+async fn series_without_match_returns_every_series_in_the_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_series_all";
+    let port = 31_189;
+    drop_database(db).await;
+    let (_guard, _client, base_ns) = setup(db, port).await;
+
+    let start = (base_ns - 3_600_000_000_000).to_string();
+    let end = (base_ns + 1_000_000_000).to_string();
+
+    // No `match[]` at all.
+    let res = http_get(
+        port,
+        &q(
+            "/api/logs/v1/series",
+            &[("start", start.as_str()), ("end", end.as_str())],
+        ),
+    )
+    .expect("series reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    let all = json(&res);
+    let series = all["data"].as_array().expect("data array").clone();
+    assert_eq!(
+        series.len(),
+        2,
+        "both seeded streams must come back: {}",
+        res.body
+    );
+    let envs: Vec<&str> = series
+        .iter()
+        .map(|s| s["env"].as_str().expect("env label"))
+        .collect();
+    assert!(
+        envs.contains(&"prod") && envs.contains(&"staging"),
+        "{envs:?}"
+    );
+
+    // A lone `{}` (and `{ }`) is the same request — the reference's
+    // collapse. Byte-identical bodies.
+    for lone in ["%7B%7D", "%7B%20%7D"] {
+        let res_lone = http_get(
+            port,
+            &format!("/api/logs/v1/series?match%5B%5D={lone}&start={start}&end={end}"),
+        )
+        .expect("series reachable");
+        assert_eq!(res_lone.status, 200, "{}", res_lone.body);
+        assert_eq!(res_lone.body, res.body, "match[]={lone} must collapse");
+    }
+
+    // OUTSIDE the window: the same unmatched request answers empty. An
+    // empty store could not tell these two apart.
+    let old_start = (base_ns - 90 * 86_400_000_000_000).to_string();
+    let old_end = (base_ns - 89 * 86_400_000_000_000).to_string();
+    let res_out = http_get(
+        port,
+        &q(
+            "/api/logs/v1/series",
+            &[("start", old_start.as_str()), ("end", old_end.as_str())],
+        ),
+    )
+    .expect("series reachable");
+    assert_eq!(res_out.status, 200, "{}", res_out.body);
+    assert!(
+        json(&res_out)["data"].as_array().expect("array").is_empty(),
+        "an unmatched /series is still WINDOW-bounded: {}",
+        res_out.body
+    );
+
+    drop_database(db).await;
+}
+
+/// **Part B1, live.** A POST reads the URL query alongside the body.
+/// `POST /query_range?limit=5` with a body carrying no `limit` serves 5
+/// entries against a 150-entry seed (pre-change: 100, the default); a body
+/// `limit=` serves 100, not 5 — the row that rules out "fall back to the
+/// URL when the body value is empty".
+#[tokio::test]
+async fn a_post_reads_the_url_query_alongside_the_body() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_post_query_merge";
+    let port = 31_194;
+    drop_database(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+    seed_run(&client, db, base_ns, 150).await;
+
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 1_000_000_000;
+    let selector = urlencode(r#"{service_name="checkout"}"#);
+    let body = format!("query={selector}&start={start}&end={end}");
+
+    let entries = |res: &HttpResponse| -> usize {
+        let v = json(res);
+        v["data"]["result"]
+            .as_array()
+            .expect("streams result")
+            .iter()
+            .map(|s| s["values"].as_array().expect("values").len())
+            .sum()
+    };
+
+    // (a) `limit` only in the URL — pre-change this was dropped and the
+    // response carried the 100 default.
+    let res = http_request(
+        port,
+        "POST",
+        "/api/logs/v1/query_range?limit=5",
+        &[],
+        Some(&body),
+    )
+    .expect("query_range POST reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(
+        entries(&res),
+        5,
+        "the URL's limit must be read: {}",
+        res.body
+    );
+
+    // (b) a collision: the BODY wins, both ways round.
+    let res = http_request(
+        port,
+        "POST",
+        "/api/logs/v1/query_range?limit=7",
+        &[],
+        Some(&format!("{body}&limit=5")),
+    )
+    .expect("reachable");
+    assert_eq!(entries(&res), 5, "body-wins: {}", res.body);
+    let res = http_request(
+        port,
+        "POST",
+        "/api/logs/v1/query_range?limit=5",
+        &[],
+        Some(&format!("{body}&limit=7")),
+    )
+    .expect("reachable");
+    assert_eq!(entries(&res), 7, "body-wins: {}", res.body);
+
+    // (c) the discriminator: an EMPTY body value is the body's value, so
+    // it defaults — it does not fall through to the URL's 5.
+    let res = http_request(
+        port,
+        "POST",
+        "/api/logs/v1/query_range?limit=5",
+        &[],
+        Some(&format!("{body}&limit=")),
+    )
+    .expect("reachable");
+    assert_eq!(
+        entries(&res),
+        100,
+        "an empty body `limit=` defaults to 100, it does not fall back to the URL's 5: {}",
+        res.body
+    );
+
+    // (d) the repeated seam UNIONS across the two carriers.
+    let res = http_request(
+        port,
+        "POST",
+        &format!(
+            "/api/logs/v1/series?match%5B%5D={}&start={start}&end={end}",
+            urlencode(r#"{env="staging"}"#)
+        ),
+        &[],
+        Some(&format!("match%5B%5D={}", urlencode(r#"{env="prod"}"#))),
+    )
+    .expect("series POST reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    let series = json(&res)["data"].as_array().expect("array").clone();
+    assert_eq!(
+        series.len(),
+        2,
+        "the body's and the URL's `match[]` must UNION: {}",
+        res.body
+    );
+
+    drop_database(db).await;
+}
+
+/// **Part C, live.** `since` bounds the default `start`. Against a seed
+/// that ends 20 minutes ago, `since=5m` returns nothing and `since=1h`
+/// returns the seed — and `since=bogus` is a 400 where it used to be a
+/// silently-ignored 200.
+#[tokio::test]
+async fn since_supplies_the_default_start() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_since";
+    let port = 31_195;
+    drop_database(db).await;
+    let _guard = spawn_ready_server(port, db);
+    let client = ChClient::new(data_client_config(db))
+        .await
+        .expect("connect data client");
+    // Seed 20 minutes in the past, so a 5-minute lookback misses it and a
+    // 1-hour one does not.
+    seed(&client, db, now_ns() - 20 * 60 * 1_000_000_000).await;
+
+    let selector = urlencode(r#"{service_name="checkout"}"#);
+    let entries = |res: &HttpResponse| -> usize {
+        let v = json(res);
+        v["data"]["result"]
+            .as_array()
+            .expect("streams result")
+            .iter()
+            .map(|s| s["values"].as_array().expect("values").len())
+            .sum()
+    };
+
+    let res = http_get(
+        port,
+        &format!("/api/logs/v1/query_range?query={selector}&since=1h"),
+    )
+    .expect("reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(
+        entries(&res) > 0,
+        "since=1h must reach 20-minute-old data: {}",
+        res.body
+    );
+
+    let res = http_get(
+        port,
+        &format!("/api/logs/v1/query_range?query={selector}&since=5m"),
+    )
+    .expect("reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(
+        entries(&res),
+        0,
+        "since=5m must NOT reach 20-minute-old data: {}",
+        res.body
+    );
+
+    let res = http_get(
+        port,
+        &format!("/api/logs/v1/query_range?query={selector}&since=bogus"),
+    )
+    .expect("reachable");
+    assert_eq!(res.status, 400, "since=bogus must be a 400: {}", res.body);
+
+    // The `endOrNow` clamp: a FUTURE `end` with no `start` must still
+    // answer from `now - since`, not from `end - since`.
+    let future_end = now_ns() + 7_200_000_000_000;
+    let res = http_get(
+        port,
+        &format!("/api/logs/v1/query_range?query={selector}&end={future_end}"),
+    )
+    .expect("reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(
+        entries(&res) > 0,
+        "a future `end` must not push the default `start` into the future: {}",
+        res.body
+    );
+
+    drop_database(db).await;
+}
+
+/// **Part D, live — the headline defect.** A window expressed in unix
+/// SECONDS, the form every Prometheus-style client sends, returns the seed.
+/// Pre-change: `200` with zero entries, no error. And a mixed
+/// seconds/nanoseconds pair no longer reports a fifty-six-year span the
+/// client never asked for.
+///
+/// An empty store cannot show either — the seed IS the test.
+#[tokio::test]
+async fn a_seconds_valued_window_returns_the_seed() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_ts_seconds";
+    let port = 31_196;
+    drop_database(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+    seed_run(&client, db, base_ns, 150).await;
+
+    let selector = urlencode(r#"{service_name="checkout"}"#);
+    let start_s = base_ns / 1_000_000_000 - 60;
+    let end_s = base_ns / 1_000_000_000 + 400;
+    let start_ns = start_s * 1_000_000_000;
+    let end_ns = end_s * 1_000_000_000;
+    let entries = |res: &HttpResponse| -> usize {
+        let v = json(res);
+        v["data"]["result"]
+            .as_array()
+            .expect("streams result")
+            .iter()
+            .map(|s| s["values"].as_array().expect("values").len())
+            .sum()
+    };
+
+    // Ten-digit seconds — 10 characters, so the reference reads them as
+    // seconds and so, now, do we.
+    assert_eq!(start_s.to_string().len(), 10);
+    let secs = http_get(
+        port,
+        &format!("/api/logs/v1/query_range?query={selector}&start={start_s}&end={end_s}&limit=200"),
+    )
+    .expect("reachable");
+    assert_eq!(secs.status, 200, "{}", secs.body);
+    assert!(
+        entries(&secs) > 0,
+        "a SECONDS-valued window must return the seed, not an empty 200: {}",
+        secs.body
+    );
+
+    // …and it is the same request as the nanosecond spelling, byte for byte.
+    let nanos = http_get(
+        port,
+        &format!(
+            "/api/logs/v1/query_range?query={selector}&start={start_ns}&end={end_ns}&limit=200"
+        ),
+    )
+    .expect("reachable");
+    assert_eq!(nanos.status, 200, "{}", nanos.body);
+    assert_eq!(
+        secs.body, nanos.body,
+        "the seconds and nanosecond spellings of one window must answer identically"
+    );
+
+    // A fraction is seconds too, at any length (pre-change: a flat 400).
+    let frac = http_get(
+        port,
+        &format!(
+            "/api/logs/v1/query_range?query={selector}&start={start_s}.500&end={end_s}&limit=200"
+        ),
+    )
+    .expect("reachable");
+    assert_eq!(
+        frac.status, 200,
+        "a fractional timestamp must be accepted: {}",
+        frac.body
+    );
+    assert!(entries(&frac) > 0, "{}", frac.body);
+
+    // Mixed scales no longer invent a 56-year span.
+    let mixed = http_get(
+        port,
+        &format!(
+            "/api/logs/v1/query_range?query={selector}&start={start_s}&end={end_ns}&limit=200"
+        ),
+    )
+    .expect("reachable");
+    assert_eq!(
+        mixed.status, 200,
+        "a seconds `start` with a nanosecond `end` must not report a span the client never sent: \
+         {}",
+        mixed.body
+    );
+
+    drop_database(db).await;
+}
+
+/// **Issue #406, found by a CI failure on this suite's own
+/// `a_seconds_valued_window_returns_the_seed`.** Two entries sharing a
+/// byte-identical `timestamp_ns` came back in one order on a developer
+/// box and the other on a CI runner, so a test asserting byte-identity
+/// between two equivalent queries failed for a reason that had nothing to
+/// do with what it was testing.
+///
+/// The cause was ours: `sql::stage3` ordered by `timestamp_ns` alone, and
+/// ClickHouse does not fix the relative order of equal sort keys across
+/// runs — it varies with how the parts happen to be read. Measured
+/// 2026-08-10 over 81 active parts holding 200 rows at one timestamp,
+/// **fifteen identical queries returned fifteen different orderings**,
+/// and at a `LIMIT` cutting through the tie group, **fifteen different
+/// result SETS** — the same query answering with different log lines. The
+/// reference is stable over the same corpus shape.
+///
+/// `stage3` now carries the same total order `stage3_keyset` always did
+/// (`timestamp_ns, fingerprint, cityHash64(body), body`). This gates the
+/// behaviour rather than the SQL text — the byte pin on the text lives in
+/// `pulsus-read/tests/sql_snapshots.rs`.
+///
+/// **The many-parts fixture is the test.** One `INSERT` per row keeps the
+/// rows in separate parts (merges are stopped first), which is what makes
+/// the read parallel enough to reorder; a single-part fixture is stable
+/// even without a tie-break and would pass against the defect.
+#[tokio::test]
+async fn entries_sharing_a_timestamp_come_back_in_a_stable_order() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_ts_ties";
+    let port = 31_197;
+    drop_database(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+
+    // Merges off, then one INSERT per row: 40 single-row parts, every row
+    // at the SAME timestamp, in one stream.
+    client
+        .execute(
+            &format!("SYSTEM STOP MERGES {db}.log_samples"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("stop merges");
+    let tied_ns = base_ns - 10_000_000_000;
+    for i in 0..40 {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                     body) VALUES ('checkout', {FP_A}, {tied_ns}, 0, 'tied line {i:03}')"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed one tied row per part");
+    }
+
+    let start = (base_ns - 3_600_000_000_000).to_string();
+    let end = (base_ns + 1_000_000_000).to_string();
+    let selector = urlencode(r#"{service_name="checkout"}"#);
+
+    // Two limits: one comfortably past the tie group (order alone is at
+    // stake) and one that cuts through it (MEMBERSHIP is at stake too —
+    // the worse half of the defect).
+    for limit in ["500", "20"] {
+        let path = format!(
+            "/api/logs/v1/query_range?query={selector}&start={start}&end={end}&limit={limit}"
+        );
+        let first = http_get(port, &path).expect("query_range reachable");
+        assert_eq!(first.status, 200, "{}", first.body);
+        for run in 1..12 {
+            let again = http_get(port, &path).expect("query_range reachable");
+            assert_eq!(again.status, 200, "{}", again.body);
+            assert_eq!(
+                again.body, first.body,
+                "limit={limit}, run {run}: entries sharing a timestamp must come back in a STABLE \
+                 order — and at a limit cutting the tie group, the same SET. Repeating one query \
+                 must not answer differently."
+            );
+        }
+    }
+
+    drop_database(db).await;
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {

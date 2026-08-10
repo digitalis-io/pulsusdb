@@ -1219,6 +1219,22 @@ fn loki_alias_documented(row: &str, suffix: &str) -> bool {
 /// `Mounted` route's `doc_ref` must resolve against `docs/api.md`'s actual
 /// text. `Planned` entries are excluded (`DocRef::Skip`, plan v1/v4:
 /// "Planned entries don't fail the guard").
+///
+/// **What this guard does NOT check: the METHOD.** It resolves a route's
+/// PATH as a whole token and stops there. `RouteSpec.methods` drives the
+/// `api_conformance` method matrix and the `Allow` header — nothing else —
+/// so a `### 2.5 GET /api/logs/v1/stats` heading left behind after the
+/// route gained `POST` resolves here exactly as `GET|POST` would, and
+/// every test stays green.
+///
+/// Said plainly because issue #406's plan believed the opposite (its edge
+/// case 7 asserted that `methods` drives a heading drift guard through
+/// `DocRef::Verbatim`) and moved four headings on the strength of it. The
+/// headings were right; the belief was not. **A docs-heading move on this
+/// surface is currently unguarded — check it by reading.** Building the
+/// guard was deliberately left out of #406's scope; if it is ever built,
+/// delete this paragraph rather than leaving two accounts of the same
+/// mechanism.
 #[test]
 fn every_mounted_route_is_documented_in_docs_api_md() {
     let docs = docs_api_md();

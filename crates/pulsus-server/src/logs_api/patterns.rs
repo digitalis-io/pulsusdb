@@ -1,4 +1,4 @@
-//! `GET /api/logs/v1/patterns` (M7-C3, issue #171, docs/api.md §2.6): parse
+//! `GET|POST /api/logs/v1/patterns` (M7-C3, issue #171, docs/api.md §2.6): parse
 //! `query`/`start`/`end`/`step`, validate the query shape (a bare stream
 //! selector — ANY pipeline stage is a 400, line filters included, like
 //! `/volume`; templates are precomputed and the bodies are gone), floor `step`
@@ -8,6 +8,7 @@
 //! primary-key prefix pruning and a server-side top-1000 (no hydration, no body
 //! read), visible via `X-Pulsus-Explain`.
 
+use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -19,7 +20,7 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds};
+use super::handlers::{engine_for, parse_bounds, read_form_pairs};
 use super::params::{self, ParamError};
 
 /// `X-Pulsus-Explain: 1` — same header contract as the query endpoints.
@@ -42,6 +43,25 @@ pub(crate) async fn patterns(
     }
 }
 
+/// `POST /api/logs/v1/patterns` (issue #406 Part B2): the reference
+/// registers `/loki/api/v1/patterns` `Methods("GET","POST")`
+/// (`pkg/loki/modules.go:692`, `:1371` @ v3.7.4 `b318f282`) and answers a
+/// form POST `200` where we answered `405` — measured 2026-08-10.
+pub(crate) async fn patterns_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Response {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
+        Ok(pairs) => match patterns_impl(state, &headers, pairs).await {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        },
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn patterns_impl(
     state: AppState,
     headers: &HeaderMap,
@@ -50,6 +70,18 @@ async fn patterns_impl(
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
     let expr = super::parse_logql(query)?;
     validate_patterns_query(&expr)?;
+    // `parse_bounds`, NOT `parse_bounds_ordered`: `/patterns` is one of
+    // the reference's two `end < start` exemptions —
+    // `ParsePatternsQuery` never compares the bounds
+    // (`pkg/loghttp/patterns.go:9-38` @ v3.7.4 `b318f282`), and a
+    // reversed window measured `200` there. That measurement is only
+    // meaningful against a reference whose `/patterns` can answer at all
+    // (`pattern_ingester.enabled: true`, else a nil `patternQuerier`
+    // 404s — `pkg/querier/querier.go:810-816`); the control that
+    // establishes it, and the container configuration it needs, are
+    // written out at `mod.rs`'s
+    // `end_before_start_is_refused_on_exactly_the_reference_routes`,
+    // which pins this route as a NEGATIVE row.
     let (start_ns, end_ns) = parse_bounds(&pairs)?;
     // Floor to 10s + reject an over-11k grid, in pure param parsing — BEFORE
     // any pool/engine/SQL work.

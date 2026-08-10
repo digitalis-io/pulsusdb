@@ -361,8 +361,11 @@ mod tests {
 
         // `compat_endpoints=true`, default `Mode::All` (Reader mounted):
         // the alias is present — reachable, so *not* 404 (503, no pool in
-        // `test_state`) — and its method matrix matches native exactly
-        // (`label/{name}/values` is GET-only, so POST there is 405).
+        // `test_state`) — and its method matrix matches native exactly.
+        // The method probe is `/tail`: `label/{name}/values` gained `POST`
+        // in issue #406 Part B2, while `/tail` stays GET-only because its
+        // upstream POST registration is nominal (a POST cannot carry a
+        // WebSocket handshake).
         let enabled_cfg = Config {
             compat_endpoints: true,
             ..Config::default()
@@ -374,6 +377,11 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
+            status(&enabled_router, Method::POST, "/loki/api/v1/tail").await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        // …and the route that DID gain POST is reachable on the alias too.
+        assert_ne!(
             status(
                 &enabled_router,
                 Method::POST,

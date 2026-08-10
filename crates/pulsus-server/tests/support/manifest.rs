@@ -528,10 +528,6 @@ fn logs_wrong_content_type(req: &mut Req) {
     req.body = b"{}".to_vec();
 }
 
-fn logs_series_missing_match(req: &mut Req) {
-    req.query.clear();
-}
-
 const LOGS_QUERY_LIKE_CASES: &[CaseClass] = &[
     CaseClass {
         name: "missing_query",
@@ -812,20 +808,21 @@ const LOGS_DETECTED_FIELDS_CASES: &[CaseClass] = &[
     },
 ];
 
-const LOGS_SERIES_CASES: &[CaseClass] = &[
-    CaseClass {
-        name: "missing_match",
-        build: logs_series_missing_match,
-        expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
-    },
-    CaseClass {
-        name: "wrong_content_type",
-        build: logs_wrong_content_type,
-        expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
-    },
-];
+/// Issue #406 Part A deleted this list's `missing_match` class: a
+/// `/series` request with no `match[]` is now a `200` over every series in
+/// the window, exactly as the reference answers it
+/// (`MatchForSeriesRequest(nil)` returns no error,
+/// `pkg/logql/matchers.go:13-26` @ v3.7.4 `b318f282`). Re-asserting the
+/// old `400` here would re-assert the defect; the `200` itself is pinned
+/// by `logs_api/mod.rs`'s
+/// `series_without_match_answers_every_series_in_the_window` and, against
+/// a seeded store, by `logs_api_live.rs`.
+const LOGS_SERIES_CASES: &[CaseClass] = &[CaseClass {
+    name: "wrong_content_type",
+    build: logs_wrong_content_type,
+    expect_status: 400,
+    expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+}];
 
 fn prom_missing_query(req: &mut Req) {
     req.query.clear();
@@ -1483,6 +1480,12 @@ pub struct RouteSpec {
     /// The axum route template exactly as `.route(...)` registers it
     /// (e.g. `/api/v1/label/{name}/values`).
     pub path: &'static str,
+    /// The documented method matrix. Drives the `api_conformance` method
+    /// case class and the `Allow` header assertion — and **nothing in the
+    /// docs**. `docs/api.md`'s `GET|POST` headings are NOT checked against
+    /// this list (`route_inventory::every_mounted_route_is_documented_in_docs_api_md`
+    /// resolves a path token only), so adding a method here does not make
+    /// a stale heading fail; move the heading by hand and read it back.
     pub methods: &'static [Method],
     pub surface: Surface,
     pub gate: Gate,
@@ -1629,7 +1632,11 @@ static MANIFEST: &[RouteSpec] = &[
     },
     RouteSpec {
         path: "/api/logs/v1/label/{name}/values",
-        methods: &[Method::Get],
+        // Issue #406 Part B2: the reference registers this route
+        // `Methods("GET","POST")` (`pkg/loki/modules.go:687-694`, `:1361-1374`
+        // @ v3.7.4 `b318f282`) and answered a form POST 200 where we
+        // answered 405 — measured 2026-08-10.
+        methods: &[Method::Get, Method::Post],
         surface: Surface::LogsQuery,
         gate: Gate::ReaderMode,
         status: RouteStatus::Mounted,
@@ -1668,7 +1675,11 @@ static MANIFEST: &[RouteSpec] = &[
     },
     RouteSpec {
         path: "/api/logs/v1/stats",
-        methods: &[Method::Get],
+        // Issue #406 Part B2: the reference registers this route
+        // `Methods("GET","POST")` (`pkg/loki/modules.go:687-694`, `:1361-1374`
+        // @ v3.7.4 `b318f282`) and answered a form POST 200 where we
+        // answered 405 — measured 2026-08-10.
+        methods: &[Method::Get, Method::Post],
         surface: Surface::LogsStats,
         gate: Gate::ReaderMode,
         status: RouteStatus::Mounted,
@@ -1685,7 +1696,11 @@ static MANIFEST: &[RouteSpec] = &[
     // data-is-object check.
     RouteSpec {
         path: "/api/logs/v1/volume",
-        methods: &[Method::Get],
+        // Issue #406 Part B2: the reference registers this route
+        // `Methods("GET","POST")` (`pkg/loki/modules.go:687-694`, `:1361-1374`
+        // @ v3.7.4 `b318f282`) and answered a form POST 200 where we
+        // answered 405 — measured 2026-08-10.
+        methods: &[Method::Get, Method::Post],
         surface: Surface::LogsQuery,
         gate: Gate::ReaderMode,
         status: RouteStatus::Mounted,
@@ -1700,7 +1715,11 @@ static MANIFEST: &[RouteSpec] = &[
     //    matches `patterns`), which the empty-DB matrix asserts as `[]`.
     RouteSpec {
         path: "/api/logs/v1/patterns",
-        methods: &[Method::Get],
+        // Issue #406 Part B2: the reference registers this route
+        // `Methods("GET","POST")` (`pkg/loki/modules.go:687-694`, `:1361-1374`
+        // @ v3.7.4 `b318f282`) and answered a form POST 200 where we
+        // answered 405 — measured 2026-08-10.
+        methods: &[Method::Get, Method::Post],
         surface: Surface::LogsQuery,
         gate: Gate::ReaderMode,
         status: RouteStatus::Mounted,
@@ -1778,7 +1797,11 @@ static MANIFEST: &[RouteSpec] = &[
     },
     RouteSpec {
         path: "/loki/api/v1/label/{name}/values",
-        methods: &[Method::Get],
+        // Issue #406 Part B2: the reference registers this route
+        // `Methods("GET","POST")` (`pkg/loki/modules.go:687-694`, `:1361-1374`
+        // @ v3.7.4 `b318f282`) and answered a form POST 200 where we
+        // answered 405 — measured 2026-08-10.
+        methods: &[Method::Get, Method::Post],
         surface: Surface::LogsQuery,
         gate: Gate::CompatAndReader,
         status: RouteStatus::Mounted,
@@ -1818,7 +1841,11 @@ static MANIFEST: &[RouteSpec] = &[
     },
     RouteSpec {
         path: "/loki/api/v1/index/stats",
-        methods: &[Method::Get],
+        // Issue #406 Part B2: the reference registers this route
+        // `Methods("GET","POST")` (`pkg/loki/modules.go:687-694`, `:1361-1374`
+        // @ v3.7.4 `b318f282`) and answered a form POST 200 where we
+        // answered 405 — measured 2026-08-10.
+        methods: &[Method::Get, Method::Post],
         surface: Surface::LogsStats,
         gate: Gate::CompatAndReader,
         status: RouteStatus::Mounted,
@@ -1833,7 +1860,11 @@ static MANIFEST: &[RouteSpec] = &[
     // prefix swap of the native `/volume`.
     RouteSpec {
         path: "/loki/api/v1/index/volume",
-        methods: &[Method::Get],
+        // Issue #406 Part B2: the reference registers this route
+        // `Methods("GET","POST")` (`pkg/loki/modules.go:687-694`, `:1361-1374`
+        // @ v3.7.4 `b318f282`) and answered a form POST 200 where we
+        // answered 405 — measured 2026-08-10.
+        methods: &[Method::Get, Method::Post],
         surface: Surface::LogsQuery,
         gate: Gate::CompatAndReader,
         status: RouteStatus::Mounted,
@@ -1879,7 +1910,11 @@ static MANIFEST: &[RouteSpec] = &[
     // scoped to the M1 alias row only). Reuses the native `CaseClass` list.
     RouteSpec {
         path: "/loki/api/v1/patterns",
-        methods: &[Method::Get],
+        // Issue #406 Part B2: the reference registers this route
+        // `Methods("GET","POST")` (`pkg/loki/modules.go:687-694`, `:1361-1374`
+        // @ v3.7.4 `b318f282`) and answered a form POST 200 where we
+        // answered 405 — measured 2026-08-10.
+        methods: &[Method::Get, Method::Post],
         surface: Surface::LogsQuery,
         gate: Gate::CompatAndReader,
         status: RouteStatus::Mounted,
@@ -2489,19 +2524,20 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
         function: "reader_router",
         body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router())",
     },
-    // Re-pinned for issue #170 (M7-C2): both surfaces now finish through
-    // `mount_detected_routes` (the detected_labels/fields prefix-swap
-    // family). (Previously re-pinned for issue #169's `/volume` +
-    // `/index/volume` explicit mounts, and #74's tail + stats mounts.)
+    // Re-pinned for issue #406 Part B2: `/stats`, `/volume` and
+    // `/patterns` gained a `POST` binding on both surfaces. (Previously
+    // re-pinned for #170's `mount_detected_routes` finish, #169's
+    // `/volume` + `/index/volume` explicit mounts, and #74's tail + stats
+    // mounts.)
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "router",
-        body: "let router = mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats)).route(\"/api/logs/v1/volume\", get(volume::volume)).route(\"/api/logs/v1/patterns\", get(patterns::patterns)); mount_detected_routes(router, \"/api/logs/v1\")",
+        body: "let router = mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats).post(stats::stats_post)).route(\"/api/logs/v1/volume\", get(volume::volume).post(volume::volume_post)).route(\"/api/logs/v1/patterns\", get(patterns::patterns).post(patterns::patterns_post)); mount_detected_routes(router, \"/api/logs/v1\")",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "compat_router",
-        body: "let router = mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats)).route(\"/loki/api/v1/index/volume\", get(volume::volume)).route(\"/loki/api/v1/patterns\", get(patterns::patterns)); mount_detected_routes(router, \"/loki/api/v1\")",
+        body: "let router = mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats).post(stats::stats_post)).route(\"/loki/api/v1/index/volume\", get(volume::volume).post(volume::volume_post)).route(\"/loki/api/v1/patterns\", get(patterns::patterns).post(patterns::patterns_post)); mount_detected_routes(router, \"/loki/api/v1\")",
     },
     // NOT a router-composition function — this is the Loki-push `PushRequest`'s
     // hand-written `prost::Message::merge` (issue #115 round 2), which routes the

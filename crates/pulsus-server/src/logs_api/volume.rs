@@ -1,4 +1,4 @@
-//! `GET /api/logs/v1/volume` (issue #169, docs/api.md §2.6): parse
+//! `GET|POST /api/logs/v1/volume` (issue #169, docs/api.md §2.6): parse
 //! `query`/`start`/`end`/`limit`/`aggregateBy`/`targetLabels`, validate
 //! the query shape (a bare stream selector — ANY pipeline stage is a 400,
 //! line filters included, unlike `/stats`), dispatch to
@@ -9,6 +9,7 @@
 //! caps (`params::MAX_TARGET_LABELS`/`MAX_TARGET_LABEL_BYTES`) reject
 //! here, in pure param parsing, BEFORE any AST mutation/planning/SQL.
 
+use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -20,7 +21,7 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds};
+use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs};
 use super::params::{self, ParamError};
 
 /// `X-Pulsus-Explain: 1` — same header contract as the query endpoints.
@@ -43,6 +44,25 @@ pub(crate) async fn volume(
     }
 }
 
+/// `POST /api/logs/v1/volume` (issue #406 Part B2): the reference
+/// registers `/loki/api/v1/index/volume` `Methods("GET","POST")`
+/// (`pkg/loki/modules.go:691`, `:1369` @ v3.7.4 `b318f282`) and answers a
+/// form POST `200` where we answered `405` — measured 2026-08-10.
+pub(crate) async fn volume_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Response {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
+        Ok(pairs) => match volume_impl(state, &headers, pairs).await {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        },
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn volume_impl(
     state: AppState,
     headers: &HeaderMap,
@@ -51,10 +71,10 @@ async fn volume_impl(
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
     let expr = super::parse_logql(query)?;
     validate_volume_query(&expr)?;
-    let (start_ns, end_ns) = parse_bounds(&pairs)?;
-    if end_ns < start_ns {
-        return Err(ParamError::EndBeforeStart.into());
-    }
+    // `/volume`'s `end < start` refusal predates issue #406 and is now
+    // the shared one (`parse_bounds_ordered`), so all seven routes that
+    // carry it carry the same implementation and the same message.
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let limit = params::parse_volume_limit(params::get(&pairs, "limit"))?;
     let aggregate_by = params::parse_aggregate_by(params::get(&pairs, "aggregateBy"))?;
     // Bounded HERE (count + per-entry length caps), before the engine

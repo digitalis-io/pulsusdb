@@ -45,9 +45,12 @@ use crate::app::AppState;
 /// `/query_range` and `/query` (issue #13 architect plan amendment 3 §2,
 /// ratified by task-manager, reversing amendment 1's M1 GET-only deferral
 /// for those two) and `GET|POST` on `/labels` and `/series` (pinned
-/// `GET|POST` from amendment 1 onward, per api.md §2.3); `label/{name}/values`
-/// is `GET`-only throughout. Any other method on a mounted path is a 405;
-/// any method on an unmounted path (alias off, or writer-only mode) is a 404.
+/// `GET|POST` from amendment 1 onward, per api.md §2.3). `label/{name}/values`
+/// joined them in issue #406 Part B2 — the reference registers it
+/// `Methods("GET","POST")` (`pkg/loki/modules.go:687`, `:1365` @ v3.7.4
+/// `b318f282`) and answered a form POST `200` where we answered `405`.
+/// Any other method on a mounted path is a 405; any method on an unmounted
+/// path (alias off, or writer-only mode) is a 404.
 fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppState> {
     router
         .route(
@@ -64,7 +67,7 @@ fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppS
         )
         .route(
             &format!("{prefix}/label/{{name}}/values"),
-            get(handlers::label_values),
+            get(handlers::label_values).post(handlers::label_values_post),
         )
         .route(
             &format!("{prefix}/series"),
@@ -90,11 +93,6 @@ fn mount_detected_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
         )
 }
 
-/// The native `/api/logs/v1` surface (docs/api.md §2.1-2.6): the five
-/// query routes via [`mount_log_query_routes`], the two detected
-/// drilldown routes via [`mount_detected_routes`] (issue #170), plus
-/// `/tail` (WebSocket, issue #74), `/stats`, and `/volume` (issue #169)
-/// mounted explicitly (all `GET`-only).
 /// Parses a LogQL query and admits its iterative walks (issue #272).
 ///
 /// **ORDER IS LOAD-BEARING.** #279's 131,072-byte query-text cap lives
@@ -117,12 +115,31 @@ pub(crate) fn parse_logql(query: &str) -> Result<pulsus_logql::Expr, error::ApiE
     Ok(expr)
 }
 
+/// The native `/api/logs/v1` surface (docs/api.md §2.1-2.6): the five
+/// query routes via [`mount_log_query_routes`], the two detected
+/// drilldown routes via [`mount_detected_routes`] (issue #170), plus
+/// `/tail` (WebSocket, issue #74), `/stats`, `/volume` (issue #169) and
+/// `/patterns` (issue #171) mounted explicitly. Issue #406 Part B2 added
+/// `POST` to the last three (the reference registers all of them
+/// `Methods("GET","POST")`, `pkg/loki/modules.go:690-692` @ v3.7.4
+/// `b318f282`); `/tail` stays `GET`-only, because its upstream `POST`
+/// registration is nominal — a POST cannot carry a WebSocket handshake and
+/// the reference answers `400`, measured 2026-08-10.
 pub(crate) fn router() -> Router<AppState> {
     let router = mount_log_query_routes(Router::new(), "/api/logs/v1")
         .route("/api/logs/v1/tail", get(tail::tail))
-        .route("/api/logs/v1/stats", get(stats::stats))
-        .route("/api/logs/v1/volume", get(volume::volume))
-        .route("/api/logs/v1/patterns", get(patterns::patterns));
+        .route(
+            "/api/logs/v1/stats",
+            get(stats::stats).post(stats::stats_post),
+        )
+        .route(
+            "/api/logs/v1/volume",
+            get(volume::volume).post(volume::volume_post),
+        )
+        .route(
+            "/api/logs/v1/patterns",
+            get(patterns::patterns).post(patterns::patterns_post),
+        );
     mount_detected_routes(router, "/api/logs/v1")
 }
 
@@ -139,12 +156,21 @@ pub(crate) fn compat_router() -> Router<AppState> {
         // a prefix swap (docs/api.md §8.1's M6 row). Issue #169: the M7
         // `/index/volume` alias follows the same irregular-suffix rule.
         .route("/loki/api/v1/tail", get(tail::tail))
-        .route("/loki/api/v1/index/stats", get(stats::stats))
-        .route("/loki/api/v1/index/volume", get(volume::volume))
+        .route(
+            "/loki/api/v1/index/stats",
+            get(stats::stats).post(stats::stats_post),
+        )
+        .route(
+            "/loki/api/v1/index/volume",
+            get(volume::volume).post(volume::volume_post),
+        )
         // Issue #171: `/loki/api/v1/patterns` IS a pure prefix swap of the
         // native `/patterns` (docs/api.md §8.1's M7 row), unlike the irregular
         // `/index/stats`/`/index/volume` aliases.
-        .route("/loki/api/v1/patterns", get(patterns::patterns));
+        .route(
+            "/loki/api/v1/patterns",
+            get(patterns::patterns).post(patterns::patterns_post),
+        );
     mount_detected_routes(router, "/loki/api/v1")
 }
 
@@ -271,6 +297,11 @@ mod tests {
         },
         EmptyParamCase {
             path: "/api/logs/v1/query_range",
+            base: SELECTOR_QUERY,
+            param: "since",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/query_range",
             base: "",
             param: "query",
         },
@@ -306,6 +337,11 @@ mod tests {
             base: "",
             param: "end",
         },
+        EmptyParamCase {
+            path: "/api/logs/v1/labels",
+            base: "",
+            param: "since",
+        },
         // /label/{name}/values
         EmptyParamCase {
             path: "/api/logs/v1/label/env/values",
@@ -317,6 +353,11 @@ mod tests {
             base: "",
             param: "end",
         },
+        EmptyParamCase {
+            path: "/api/logs/v1/label/env/values",
+            base: "",
+            param: "since",
+        },
         // /series — `match[]` present so `start`/`end` are actually reached.
         EmptyParamCase {
             path: "/api/logs/v1/series",
@@ -327,6 +368,11 @@ mod tests {
             path: "/api/logs/v1/series",
             base: SELECTOR_MATCH,
             param: "end",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/series",
+            base: SELECTOR_MATCH,
+            param: "since",
         },
         // /stats
         EmptyParamCase {
@@ -343,6 +389,11 @@ mod tests {
             path: "/api/logs/v1/stats",
             base: SELECTOR_QUERY,
             param: "end",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/stats",
+            base: SELECTOR_QUERY,
+            param: "since",
         },
         // /volume
         EmptyParamCase {
@@ -365,6 +416,11 @@ mod tests {
             base: SELECTOR_QUERY,
             param: "targetLabels",
         },
+        EmptyParamCase {
+            path: "/api/logs/v1/volume",
+            base: SELECTOR_QUERY,
+            param: "since",
+        },
         // /patterns
         EmptyParamCase {
             path: "/api/logs/v1/patterns",
@@ -386,6 +442,11 @@ mod tests {
             base: SELECTOR_QUERY,
             param: "end",
         },
+        EmptyParamCase {
+            path: "/api/logs/v1/patterns",
+            base: SELECTOR_QUERY,
+            param: "since",
+        },
         // /detected_labels — `query` is optional here.
         EmptyParamCase {
             path: "/api/logs/v1/detected_labels",
@@ -401,6 +462,11 @@ mod tests {
             path: "/api/logs/v1/detected_labels",
             base: "",
             param: "end",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_labels",
+            base: "",
+            param: "since",
         },
         // /detected_fields
         EmptyParamCase {
@@ -432,6 +498,11 @@ mod tests {
             path: "/api/logs/v1/detected_fields",
             base: SELECTOR_QUERY,
             param: "end",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/detected_fields",
+            base: SELECTOR_QUERY,
+            param: "since",
         },
     ];
 
@@ -478,9 +549,15 @@ mod tests {
         "/api/logs/v1/query_range",
         "/api/logs/v1/query",
         "/api/logs/v1/labels",
+        "/api/logs/v1/label/env/values",
         "/api/logs/v1/series",
         "/api/logs/v1/detected_labels",
         "/api/logs/v1/detected_fields",
+        // Issue #406 Part B2: these four gained `POST` with the same
+        // form-decode core, so the #391 identity has to hold on them too.
+        "/api/logs/v1/stats",
+        "/api/logs/v1/volume",
+        "/api/logs/v1/patterns",
     ];
 
     fn with_empty(base: &str, param: &str) -> String {
@@ -692,7 +769,12 @@ mod tests {
              EMPTY_PARAM_CASES, or in TAIL_ONLY_PARAMS with its own gate in tail.rs"
         );
 
-        let expected_repeated: Params = ["match[]".to_string()].into_iter().collect();
+        // Issue #406 Part A: `/series` now reads BOTH repeated keys the
+        // reference reads — `match` and `match[]` (`pkg/loghttp/series.go:23-25`
+        // @ v3.7.4 `b318f282`). Neither collapses empty into absent.
+        let expected_repeated: Params = ["match".to_string(), "match[]".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(
             repeated, expected_repeated,
             "`params::get_all` is the NON-collapsing seam (issue #391); a new repeated parameter \
@@ -718,33 +800,560 @@ mod tests {
     /// the guard that fails if the collapse is over-applied to `get_all`,
     /// which would look like a completion rather than a regression.
     ///
-    /// (Our absent-`match[]` answer is a `400 MissingMatch` where the
-    /// reference's is a `200` over every series. That is a different
-    /// mechanism — absent, not empty — filed separately; this test asserts
-    /// only that the two answers DIFFER.)
+    /// (Issue #406 Part A closed the other half: an ABSENT `match[]` is
+    /// now the reference's `200` over every series, which against the
+    /// poolless `test_state()` surfaces as the engine `503`. The two
+    /// answers still differ, and now differ by status class.)
     #[tokio::test]
     async fn an_empty_repeated_match_is_a_value_not_an_absence() {
         let (empty_status, empty_body) =
             routed(router(), get_req("/api/logs/v1/series?match%5B%5D=")).await;
         let (absent_status, absent_body) = routed(router(), get_req("/api/logs/v1/series")).await;
         assert_eq!(empty_status, StatusCode::BAD_REQUEST);
-        assert_eq!(absent_status, StatusCode::BAD_REQUEST);
-        let empty_text = String::from_utf8_lossy(&empty_body).into_owned();
-        let absent_text = String::from_utf8_lossy(&absent_body).into_owned();
         assert_eq!(
-            absent_text, "missing required parameter 'match[]': at least one selector is required",
-            "an absent `match[]` is the MissingMatch 400"
+            absent_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an absent `match[]` reaches the engine (issue #406 Part A)"
         );
+        let empty_text = String::from_utf8_lossy(&empty_body).into_owned();
         assert!(
             !empty_text.contains("missing required parameter"),
-            "an EMPTY `match[]` is a value, not an absence — it must not become MissingMatch, got \
-             {empty_text:?}"
+            "an EMPTY `match[]` is a value, not an absence, got {empty_text:?}"
         );
         assert_eq!(
             empty_text, "unexpected end of query at byte 0: expected '{'",
             "an empty `match[]` reaches the selector parser"
         );
         assert_ne!(empty_body, absent_body);
+    }
+
+    // -- Issue #406 --------------------------------------------------------
+
+    /// **Part A, the routed half.** `/series` with no `match[]` no longer
+    /// short-circuits on a missing parameter: it reaches the engine, which
+    /// against the poolless `test_state()` is a `503`. Pre-change: `400`
+    /// `missing required parameter 'match[]': at least one selector is
+    /// required`, container-measured against `grafana/loki:3.7.4` as a
+    /// `200` over all three seeded series on 2026-08-10.
+    ///
+    /// The `{}` and `{ }` spellings ride the same branch (the reference's
+    /// lone-`{}` collapse), and both alias surfaces answer identically.
+    #[tokio::test]
+    async fn series_without_match_answers_every_series_in_the_window() {
+        for query in ["", "?match%5B%5D=%7B%7D", "?match%5B%5D=%7B%20%7D"] {
+            let (status, body) =
+                routed(router(), get_req(&format!("/api/logs/v1/series{query}"))).await;
+            let text = String::from_utf8_lossy(&body).into_owned();
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "GET /series{query} must reach the engine, got {text:?}"
+            );
+            assert!(
+                !text.contains("missing required parameter"),
+                "GET /series{query} must not be MissingMatch, got {text:?}"
+            );
+        }
+        // A `{}` alongside a real selector is NOT a collapse — the
+        // reference answers `400 0 matchers in group: {}` there, and ours
+        // is the same status from our own parser.
+        let (status, _body) = routed(
+            router(),
+            get_req("/api/logs/v1/series?match%5B%5D=%7B%7D&match%5B%5D=%7Bapp%3D%22a%22%7D"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// **Part B2.** The four routes that were `GET`-only answer a form
+    /// `POST` exactly as the equivalent `GET` — same status, byte-identical
+    /// body — on both the native and the `/loki/api/v1` alias surface.
+    /// Pre-change: `405` on all eight bindings. `/tail` stays out, on the
+    /// measurement that its upstream `POST` registration is nominal (a POST
+    /// cannot carry a WebSocket handshake; the reference answers `400`).
+    #[tokio::test]
+    async fn the_get_only_routes_now_accept_a_form_post() {
+        let native = [
+            ("/api/logs/v1/stats", SELECTOR_QUERY),
+            ("/api/logs/v1/volume", SELECTOR_QUERY),
+            ("/api/logs/v1/patterns", SELECTOR_QUERY),
+            ("/api/logs/v1/label/env/values", ""),
+        ];
+        let alias = [
+            ("/loki/api/v1/index/stats", SELECTOR_QUERY),
+            ("/loki/api/v1/index/volume", SELECTOR_QUERY),
+            ("/loki/api/v1/patterns", SELECTOR_QUERY),
+            ("/loki/api/v1/label/env/values", ""),
+        ];
+        for (make, rows) in [
+            (router as fn() -> Router<AppState>, native),
+            (compat_router as fn() -> Router<AppState>, alias),
+        ] {
+            for (path, base) in rows {
+                let (get_status, get_body) = routed(make(), get_req(&uri(path, base))).await;
+                let (post_status, post_body) =
+                    routed(make(), form_post(path, base.to_string())).await;
+                assert_ne!(
+                    post_status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "POST {path} must be mounted"
+                );
+                assert_eq!(post_status, get_status, "POST {path} vs GET {path}");
+                assert_eq!(
+                    post_body, get_body,
+                    "POST {path} must answer byte-identically to GET {path}"
+                );
+            }
+        }
+        // `/tail` stays GET-only.
+        let (status, _body) = routed(
+            router(),
+            form_post("/api/logs/v1/tail", SELECTOR_QUERY.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// **Part B1, the routed table.** A `POST` reads the URL query
+    /// alongside the body, in the reference's order: the body's pairs
+    /// first, the URL's appended (Go's `ParseForm`). Three rows per POST
+    /// route, each one a different failure if the merge is wrong:
+    ///
+    /// * **URL-only** must equal the GET with the same query string —
+    ///   fails on `ff0fb09`, where the URL was dropped entirely.
+    /// * **body `limit=` + URL `limit=5`** must equal the parameter being
+    ///   absent, NOT `5` — passes today and fails under the plausible
+    ///   "fall back to the URL when the body value is empty" spelling.
+    ///   Container-measured: the reference serves 100 there, not 5.
+    /// * **repeated `match[]` split across the two carriers** must union —
+    ///   the reference returns BOTH series.
+    #[tokio::test]
+    async fn a_post_reads_url_query_parameters_alongside_the_body() {
+        for path in POST_PATHS {
+            let base = post_base_query(path);
+            // (a) URL-only POST == the equivalent GET.
+            let (get_status, get_body) = routed(router(), get_req(&uri(path, base))).await;
+            let (post_status, post_body) =
+                routed(router(), form_post(&uri(path, base), String::new())).await;
+            assert_eq!(
+                post_status,
+                get_status,
+                "POST {path} with everything in the URL must answer as the GET does: {}",
+                String::from_utf8_lossy(&post_body)
+            );
+            assert_eq!(
+                post_body, get_body,
+                "POST {path} with everything in the URL must answer byte-identically to GET"
+            );
+
+            // (b) an empty body value is the BODY's value and wins, so the
+            // URL's `limit=5` is not consulted.
+            let with_url_limit = if base.is_empty() {
+                format!("{path}?limit=5")
+            } else {
+                format!("{path}?{base}&limit=5")
+            };
+            let (empty_status, empty_body) = routed(
+                router(),
+                form_post(&with_url_limit, format!("{base}&limit=")),
+            )
+            .await;
+            let (absent_status, absent_body) =
+                routed(router(), form_post(path, base.to_string())).await;
+            assert_eq!(
+                empty_status, absent_status,
+                "POST {path} body `limit=` must not fall back to the URL's `limit=5`"
+            );
+            assert_eq!(empty_body, absent_body, "POST {path}");
+        }
+
+        // (c) the repeated seam unions across carriers. Both selectors
+        // parse, so the request reaches the engine (503, poolless) rather
+        // than a parse 400 — and a body-only merge would answer the same,
+        // so the discriminating half is the URL-only `match[]` above.
+        let (status, body) = routed(
+            router(),
+            form_post(
+                "/api/logs/v1/series?match%5B%5D=%7Bapp%3D%22b%22%7D",
+                "match%5B%5D=%7Bapp%3D%22a%22%7D".to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "both carriers' selectors must parse: {}",
+            String::from_utf8_lossy(&body)
+        );
+        // A malformed selector arriving ONLY through the URL must still be
+        // seen — the direct proof that the URL half is parsed at all.
+        let (status, _body) = routed(
+            router(),
+            form_post(
+                "/api/logs/v1/series?match%5B%5D=%7B",
+                "match%5B%5D=%7Bapp%3D%22a%22%7D".to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A minimal valid query string for `path`, for the POST-merge table.
+    fn post_base_query(path: &str) -> &'static str {
+        if path.ends_with("/series") {
+            SELECTOR_MATCH
+        } else if path.ends_with("/labels")
+            || path.ends_with("/values")
+            || path.ends_with("/detected_labels")
+        {
+            ""
+        } else {
+            SELECTOR_QUERY
+        }
+    }
+
+    /// **The `end < start` table, both positives and negatives.** The
+    /// reference refuses a reversed window on seven of the nine routes and
+    /// deliberately serves it on `/query` and `/patterns` — an exemption
+    /// nobody tests is where the next defect hides, so both negatives are
+    /// rows here. Container-measured on both stores 2026-08-10 (issue #406
+    /// adjacent finding 7, folded in by ruling v2).
+    ///
+    /// **Each exemption carries a CONTROL, because "serves a reversed
+    /// window" means nothing from a route that cannot answer at all.**
+    /// Re-measured 2026-08-10 after review, on one `grafana/loki:3.7.4`
+    /// and one PulsusDB holding the same 160-entry corpus:
+    ///
+    /// * `/patterns` — control first: the same window the RIGHT way round
+    ///   answers `200` on **both** stores with the same pattern
+    ///   (`GET /api/users <_> took <_>`) over the same fifteen 10s buckets
+    ///   at the same counts. Only then the reversal: `200` with
+    ///   `"data":[]` on both, while `/query_range` reversed on those very
+    ///   same stores is `400` — so the reversal is what is being measured.
+    /// * `/query` — control: an instant query answers `200` with a real
+    ///   vector on both (same timestamp, same value `"101"`). Reversed
+    ///   `start`/`end`: still `200` with a real vector, because `/query`
+    ///   never reads them — it evaluates at `time`. The exemption is
+    ///   structural, not an artefact.
+    ///
+    /// **The reference needs `pattern_ingester: {enabled: true}` before
+    /// `/patterns` can be measured at all, and `ci/logql/config.yaml` does
+    /// not set it.** Without it `SingleTenantQuerier.Patterns` returns
+    /// `httpgrpc.Errorf(http.StatusNotFound, "")` on the nil
+    /// `patternQuerier` (`pkg/querier/querier.go:810-816 @ v3.7.4
+    /// b318f282`) while the route itself is still registered
+    /// (`pkg/loki/modules.go:694`, `:1367`) — so the right-way-round
+    /// window 404s and the reversed one can still answer `200`, which
+    /// looks exactly like a measurement and is not one. A reviewer hit
+    /// precisely that. The config used here is `deploy/e2e/loki.yaml`'s
+    /// shape plus `pattern_ingester.enabled: true`, the same fix issues
+    /// #296 and #391 needed.
+    ///
+    /// The reference has no `end < start` check on either route in source
+    /// either: `ParsePatternsQuery` (`pkg/loghttp/patterns.go:9-38`) never
+    /// compares the bounds, and `ParseInstantQuery` has no range to
+    /// compare. The measurement and the source agree.
+    ///
+    /// Against the poolless `test_state()` the refusal is a `400` and
+    /// everything else is the engine `503`, so the two outcomes are
+    /// distinguishable without a database.
+    #[tokio::test]
+    async fn end_before_start_is_refused_on_exactly_the_reference_routes() {
+        // A window whose `end` precedes its `start` by one hour. Both are
+        // 19-digit nanosecond literals, so Part D's length rule cannot
+        // change what they mean.
+        const START: &str = "1786342706000000000";
+        const END: &str = "1786339106000000000";
+        // (path, base query, refuses?)
+        let cases: &[(&str, &str, bool)] = &[
+            ("/api/logs/v1/query_range", SELECTOR_QUERY, true),
+            ("/api/logs/v1/labels", "", true),
+            // The tenth row (issue #406 rulings v3): upstream this is the
+            // SAME handler as `/labels` — `ParseLabelQuery` sets
+            // `Values: ok` from the path variable and
+            // `SingleTenantQuerier.Label` validates the range before
+            // branching on it. Measured `400` there against our `200`.
+            ("/api/logs/v1/label/env/values", "", true),
+            ("/api/logs/v1/series", SELECTOR_MATCH, true),
+            ("/api/logs/v1/stats", SELECTOR_QUERY, true),
+            ("/api/logs/v1/volume", SELECTOR_QUERY, true),
+            ("/api/logs/v1/detected_labels", "", true),
+            ("/api/logs/v1/detected_fields", SELECTOR_QUERY, true),
+            // The two the reference deliberately does NOT check, each
+            // backed by the control in this test's doc comment (a
+            // right-way-round window serving identically on both stores)
+            // rather than by a bare "it answered 200".
+            ("/api/logs/v1/query", SELECTOR_QUERY, false),
+            ("/api/logs/v1/patterns", SELECTOR_QUERY, false),
+        ];
+        for &(path, base, refuses) in cases {
+            let query = if base.is_empty() {
+                format!("start={START}&end={END}")
+            } else {
+                format!("{base}&start={START}&end={END}")
+            };
+            let (status, body) = routed(router(), get_req(&uri(path, &query))).await;
+            let text = String::from_utf8_lossy(&body).into_owned();
+            if refuses {
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "GET {path} with `end` before `start` must be a 400, got {text:?}"
+                );
+                assert_eq!(
+                    text, "invalid time range: 'end' precedes 'start'",
+                    "GET {path}"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "GET {path} is a reference EXEMPTION and must still be served, got {text:?}"
+                );
+            }
+        }
+
+        // `end == start` is served everywhere: every reference call site
+        // spells `End.Before(Start)`, despite the message's "or equal".
+        let (status, body) = routed(
+            router(),
+            get_req(&uri(
+                "/api/logs/v1/query_range",
+                &format!("{SELECTOR_QUERY}&start={START}&end={START}"),
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "`end == start` is served: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// **Part D, routed.** The ten-digit unix-SECONDS spelling of a window
+    /// and its nineteen-digit nanosecond spelling are the same request:
+    /// same status, byte-identical body, on every route that reads
+    /// `start`/`end`.
+    ///
+    /// **What the per-route table can and cannot see.** Against the
+    /// poolless `test_state()` most of these rows land on the engine `503`
+    /// whatever the window is, so the table alone would stay green with
+    /// `parse_ts` reverted — it is a REGRESSION PIN, not the proof. The
+    /// discriminating row is the last one, `step=1ns`: a 3,600-**second**
+    /// window at a one-nanosecond step is far past the 11,000-point
+    /// resolution fence and is a `400` from request parsing, while the
+    /// same digits read as 3,600 **nanoseconds** are 3,600 points and sail
+    /// through to the `503`. That row differs before the change and agrees
+    /// after it, so this test fails on `ff0fb09` for the reason it is
+    /// about. The parse itself is gated by `params.rs`'s
+    /// `parse_ts_follows_the_references_length_and_fraction_rules`, the
+    /// masking by `a_six_year_seconds_window_reaches_the_span_cap`, and
+    /// the end-to-end answer by `logs_api_live.rs` against a seeded store.
+    #[tokio::test]
+    async fn a_seconds_window_and_the_same_window_in_nanoseconds_answer_identically() {
+        const START_S: &str = "1786342706";
+        const END_S: &str = "1786346306";
+        const START_NS: &str = "1786342706000000000";
+        const END_NS: &str = "1786346306000000000";
+        let routes: &[(&str, &str)] = &[
+            ("/api/logs/v1/query_range", SELECTOR_QUERY),
+            ("/api/logs/v1/labels", ""),
+            ("/api/logs/v1/label/env/values", ""),
+            ("/api/logs/v1/series", SELECTOR_MATCH),
+            ("/api/logs/v1/stats", SELECTOR_QUERY),
+            ("/api/logs/v1/volume", SELECTOR_QUERY),
+            ("/api/logs/v1/patterns", SELECTOR_QUERY),
+            ("/api/logs/v1/detected_labels", ""),
+            ("/api/logs/v1/detected_fields", SELECTOR_QUERY),
+        ];
+        for &(path, base) in routes {
+            let build = |start: &str, end: &str| {
+                let q = if base.is_empty() {
+                    format!("start={start}&end={end}")
+                } else {
+                    format!("{base}&start={start}&end={end}")
+                };
+                uri(path, &q)
+            };
+            let (secs_status, secs_body) = routed(router(), get_req(&build(START_S, END_S))).await;
+            let (nanos_status, nanos_body) =
+                routed(router(), get_req(&build(START_NS, END_NS))).await;
+            assert_eq!(
+                secs_status,
+                nanos_status,
+                "GET {path}: seconds and nanoseconds must be the same request\nseconds: {}\nnanos: \
+                 {}",
+                String::from_utf8_lossy(&secs_body),
+                String::from_utf8_lossy(&nanos_body),
+            );
+            assert_eq!(secs_body, nanos_body, "GET {path}");
+        }
+
+        // `/query`'s `time` rides the same parser.
+        let (secs_status, secs_body) = routed(
+            router(),
+            get_req(&uri(
+                "/api/logs/v1/query",
+                &format!("{SELECTOR_QUERY}&time={START_S}"),
+            )),
+        )
+        .await;
+        let (nanos_status, nanos_body) = routed(
+            router(),
+            get_req(&uri(
+                "/api/logs/v1/query",
+                &format!("{SELECTOR_QUERY}&time={START_NS}"),
+            )),
+        )
+        .await;
+        assert_eq!(secs_status, nanos_status);
+        assert_eq!(secs_body, nanos_body);
+
+        // The discriminating row (see the doc comment): a one-nanosecond
+        // step makes the WIDTH of the parsed window observable without a
+        // pool. Both spellings must now be the same 400.
+        let step_probe = |start: &str, end: &str| {
+            uri(
+                "/api/logs/v1/query_range",
+                &format!("{SELECTOR_QUERY}&start={start}&end={end}&step=1ns"),
+            )
+        };
+        let (secs_status, secs_body) = routed(router(), get_req(&step_probe(START_S, END_S))).await;
+        let (nanos_status, nanos_body) =
+            routed(router(), get_req(&step_probe(START_NS, END_NS))).await;
+        assert_eq!(
+            secs_status,
+            StatusCode::BAD_REQUEST,
+            "a 3600-SECOND window at a 1ns step is far past the 11,000-point fence, so the \
+             seconds spelling must be refused exactly as the nanosecond one is: {}",
+            String::from_utf8_lossy(&secs_body)
+        );
+        assert_eq!(nanos_status, secs_status);
+        assert_eq!(secs_body, nanos_body);
+    }
+
+    /// **Part D's second failure mode, and the worst of the three: an
+    /// error describing a query nobody wrote.** A `start` in seconds with
+    /// an `end` in nanoseconds used to compute a 1,786,343,164,213,657,294
+    /// ns — fifty-six year — span and refuse it with the span cap, naming
+    /// a window the user never asked for. The reference serves it. After
+    /// Part D the two bounds land on the same scale and the request is
+    /// served (poolless: `503`).
+    #[tokio::test]
+    async fn a_mixed_seconds_and_nanoseconds_window_no_longer_reports_a_fifty_six_year_span() {
+        for (start, end) in [
+            ("1786342706", "1786346306000000000"),
+            ("1786342706000000000", "1786346306"),
+        ] {
+            let (status, body) = routed(
+                router(),
+                get_req(&uri(
+                    "/api/logs/v1/query_range",
+                    &format!("{SELECTOR_QUERY}&start={start}&end={end}"),
+                )),
+            )
+            .await;
+            let text = String::from_utf8_lossy(&body).into_owned();
+            assert!(
+                !text.contains("outside the supported range"),
+                "start={start}&end={end} must not invent a span the client never sent: {text:?}"
+            );
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "start={start}&end={end}: {text:?}"
+            );
+        }
+    }
+
+    /// **What Part D masks, pinned as a pair.** A seconds-valued window
+    /// used to collapse to microseconds, so the 5-year span cap
+    /// (`MAX_QUERY_SPAN_NS`) never fired on it and a six-year request was
+    /// a `200`. Without this criterion, the identity test above could pass
+    /// on windows that are empty on both sides while the cap stays
+    /// unexercised. The two spellings must produce the same `400` **byte
+    /// for byte** — same span figure, same message.
+    #[tokio::test]
+    async fn a_six_year_seconds_window_reaches_the_span_cap() {
+        // Six 365-day years, in seconds and in nanoseconds.
+        const START_S: i64 = 1_500_000_000;
+        const SIX_YEARS_S: i64 = 6 * 365 * 24 * 3_600;
+        let end_s = START_S + SIX_YEARS_S;
+        let secs = format!("{SELECTOR_QUERY}&start={START_S}&end={end_s}");
+        let nanos = format!(
+            "{SELECTOR_QUERY}&start={}&end={}",
+            START_S * 1_000_000_000,
+            end_s * 1_000_000_000
+        );
+        let (secs_status, secs_body) =
+            routed(router(), get_req(&uri("/api/logs/v1/query_range", &secs))).await;
+        let (nanos_status, nanos_body) =
+            routed(router(), get_req(&uri("/api/logs/v1/query_range", &nanos))).await;
+        assert_eq!(
+            secs_status,
+            StatusCode::BAD_REQUEST,
+            "a six-year window in SECONDS must reach the span cap: {}",
+            String::from_utf8_lossy(&secs_body)
+        );
+        assert_eq!(nanos_status, secs_status);
+        assert_eq!(
+            secs_body, nanos_body,
+            "the cap's 400 must be byte-identical in both encodings"
+        );
+        let text = String::from_utf8_lossy(&secs_body).into_owned();
+        assert!(
+            text.contains("189216000000000000") && text.contains("157680000000000000"),
+            "the cap message names the requested span and the cap: {text:?}"
+        );
+    }
+
+    /// **Part C, routed.** `since` is read on the nine routes that carry a
+    /// `start`/`end` pair and rejected rather than ignored: `since=bogus`
+    /// moves from a silent `200` to a `400`. `/query` is the reference's
+    /// exemption (it has only `time`) and is asserted as such.
+    #[tokio::test]
+    async fn since_is_read_on_every_bounded_route_and_ignored_on_the_instant_one() {
+        let bounded: &[(&str, &str)] = &[
+            ("/api/logs/v1/query_range", SELECTOR_QUERY),
+            ("/api/logs/v1/labels", ""),
+            ("/api/logs/v1/label/env/values", ""),
+            ("/api/logs/v1/series", SELECTOR_MATCH),
+            ("/api/logs/v1/stats", SELECTOR_QUERY),
+            ("/api/logs/v1/volume", SELECTOR_QUERY),
+            ("/api/logs/v1/patterns", SELECTOR_QUERY),
+            ("/api/logs/v1/detected_labels", ""),
+            ("/api/logs/v1/detected_fields", SELECTOR_QUERY),
+        ];
+        for &(path, base) in bounded {
+            let q = if base.is_empty() {
+                "since=bogus".to_string()
+            } else {
+                format!("{base}&since=bogus")
+            };
+            let (status, body) = routed(router(), get_req(&uri(path, &q))).await;
+            let text = String::from_utf8_lossy(&body).into_owned();
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "GET {path}?since=bogus must be a 400, got {text:?}"
+            );
+            assert_eq!(
+                text, "could not parse 'since' parameter \"bogus\": expected a duration literal",
+                "GET {path}"
+            );
+        }
+
+        // `/query` never reads it (the reference's one exemption).
+        let (status, _body) = routed(
+            router(),
+            get_req(&uri(
+                "/api/logs/v1/query",
+                &format!("{SELECTOR_QUERY}&since=bogus"),
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// Issue #279 (AC5): the `/loki/api/v1` alias surface rejects an

@@ -38,9 +38,11 @@ pub(crate) const MAX_TARGET_LABELS: usize = 32;
 /// (post-percent-decode) — bounds each injected matcher's escaped SQL
 /// fragment (issue #169 plan v2; same 400-not-clamp rule as above).
 pub(crate) const MAX_TARGET_LABEL_BYTES: usize = 256;
-/// Default lookback window (`end - start`) when `start` is omitted
-/// (docs/api.md §2.1: "default: last hour").
-const DEFAULT_LOOKBACK_NS: i64 = 3_600_000_000_000;
+/// `since`'s default — the lookback used for `start` when `start` is
+/// omitted (docs/api.md §2.1: "default: last hour"). The reference's
+/// `defaultSince = 1 * time.Hour` (`pkg/loghttp/params.go:23 @ v3.7.4
+/// b318f282`).
+pub(crate) const DEFAULT_SINCE_NS: i64 = 3_600_000_000_000;
 /// `step`'s target point count when derived rather than supplied
 /// (architect plan: "derived `clamp((end-start)/250, >=1s)`").
 const DERIVED_STEP_TARGET_POINTS: i64 = 250;
@@ -54,10 +56,17 @@ const ONE_SECOND_NS: u64 = 1_000_000_000;
 pub(crate) enum ParamError {
     #[error("missing required parameter 'query'")]
     MissingQuery,
-    #[error("missing required parameter 'match[]': at least one selector is required")]
-    MissingMatch,
-    #[error("invalid timestamp {0:?}: expected unix nanoseconds or RFC3339")]
+    #[error(
+        "invalid timestamp {0:?}: expected unix seconds (<= 10 characters), unix nanoseconds, a \
+         fractional-second value, or RFC3339"
+    )]
     InvalidTimestamp(String),
+    /// Issue #406 Part C: `since` — the `start` default's lookback,
+    /// rejected rather than ignored (the reference's
+    /// `could not parse 'since' parameter`, `pkg/loghttp/params.go:93-97 @
+    /// v3.7.4 b318f282`).
+    #[error("could not parse 'since' parameter {0:?}: expected a duration literal")]
+    InvalidSince(String),
     #[error("invalid 'limit' {0:?}: expected a non-negative integer")]
     InvalidLimit(String),
     #[error("'limit' {limit} exceeds the maximum of {max}")]
@@ -190,12 +199,80 @@ pub(crate) fn now_ns() -> i64 {
     i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX)
 }
 
-/// Parses a `start`/`end`/`time` timestamp: an integer literal is unix
-/// nanoseconds; anything else is parsed as RFC3339 (docs/api.md §2.1's
-/// "ns / RFC3339").
+/// A `start`/`end`/`time` value, in the reference's exact reading
+/// (`parseTimestamp`, `pkg/loghttp/params.go:161-186` @ grafana/loki
+/// v3.7.4 `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), issue #406 Part D.
+///
+/// Order is load-bearing and is the reference's:
+///
+/// 1. **A `.` means seconds with a fraction**, whatever the length: parse
+///    as `f64`, split off the fractional part, round it to **three
+///    decimal places** (`math.Round(frac*1000.0)/1000.0` — the reference
+///    keeps only milliseconds), then `secs * 1e9 + frac * 1e9`. If the
+///    float parse fails, fall THROUGH to step 2 rather than erroring —
+///    `2026-08-10T06:18:26.5Z` contains a dot and is a valid RFC3339
+///    timestamp.
+/// 2. Otherwise parse as `i64`; if that fails, try RFC3339 (with
+///    nanosecond fractions); if that fails, [`ParamError::InvalidTimestamp`].
+/// 3. **`raw.len() <= 10` ⇒ the integer is SECONDS**, otherwise
+///    nanoseconds. The test is the length of the ORIGINAL STRING, not the
+///    magnitude of the number.
+///
+/// **The string-length rule is not a paraphrase of a magnitude rule**, and
+/// the two disagree. Read off the reference's own query log (which prints
+/// the parsed `start=`/`end=`), 2026-08-10 against `grafana/loki:3.7.4`:
+/// `9999999999` → `2286-11-20T17:46:39Z` (10 characters ⇒ seconds);
+/// `99999999999` → `1970-01-01T00:01:39.999999999Z` (11 ⇒ nanoseconds);
+/// **`01786342706` → `1970-01-01T00:00:01.786342706Z`** — the same number
+/// as `1786342706`, but eleven characters because of the leading zero, so
+/// it is read as nanoseconds and lands in 1970; `-1` →
+/// `1969-12-31T23:59:59Z` (the sign counts toward the length, so a
+/// negative is seconds); `1786342706.123456` → `…T06:18:26.123Z`;
+/// `1786342706.1239` → `…T06:18:26.124Z` (round-half-up at the third
+/// decimal place).
+///
+/// **Do NOT unify this with `traces_api`'s or `prom_api`'s timestamp
+/// parser.** The traces rule is on MAGNITUDE (`>= 10^12` ⇒ nanoseconds,
+/// docs/api.md §4) and Prometheus's is seconds-with-a-fraction; each
+/// matches its own reference. Tidying the three into one helper would
+/// silently break one surface to make the code look neater.
+///
+/// Overflow is refused, not wrapped: a ten-character value up to
+/// `9999999999` is ~1.0e19 ns and does NOT fit `i64`, so `checked_mul`
+/// decides rather than a cast. Everything the reference can express and
+/// `i64` can hold round-trips; anything else is an
+/// [`ParamError::InvalidTimestamp`] rather than a silently wrapped
+/// instant.
 pub(crate) fn parse_ts(raw: &str) -> Result<i64, ParamError> {
-    if let Ok(ns) = raw.parse::<i64>() {
-        return Ok(ns);
+    // 1. A fractional value is ALWAYS seconds, at any length.
+    if raw.contains('.')
+        && let Ok(t) = raw.parse::<f64>()
+    {
+        // `math.Modf`: integer and fractional parts, both carrying the
+        // sign. The fraction is rounded to milliseconds BEFORE it becomes
+        // nanoseconds — `…706.123456` is `…706.123` at the reference, a
+        // real truncation and not a float artifact.
+        let secs = t.trunc();
+        let frac = (t.fract() * 1000.0).round() / 1000.0;
+        // `f64 as i64` saturates in Rust, so a non-finite or astronomical
+        // `secs` lands on `i64::MIN`/`i64::MAX` and the `checked_mul`
+        // below refuses it — no wrap, no UB.
+        let secs_ns = (secs as i64)
+            .checked_mul(ONE_SECOND_NS as i64)
+            .ok_or_else(|| ParamError::InvalidTimestamp(raw.to_string()))?;
+        let frac_ns = (frac * ONE_SECOND_NS as f64) as i64;
+        return secs_ns
+            .checked_add(frac_ns)
+            .ok_or_else(|| ParamError::InvalidTimestamp(raw.to_string()));
+    }
+    // 2/3. An integer literal: seconds at <= 10 characters, else nanoseconds.
+    if let Ok(n) = raw.parse::<i64>() {
+        return if raw.len() <= 10 {
+            n.checked_mul(ONE_SECOND_NS as i64)
+                .ok_or_else(|| ParamError::InvalidTimestamp(raw.to_string()))
+        } else {
+            Ok(n)
+        };
     }
     let dt = chrono::DateTime::parse_from_rfc3339(raw)
         .map_err(|_| ParamError::InvalidTimestamp(raw.to_string()))?;
@@ -203,9 +280,32 @@ pub(crate) fn parse_ts(raw: &str) -> Result<i64, ParamError> {
         .ok_or_else(|| ParamError::InvalidTimestamp(raw.to_string()))
 }
 
-/// `start`'s default when omitted: `end - 1h` (docs/api.md §2.1).
-pub(crate) fn default_start_ns(end_ns: i64) -> i64 {
-    end_ns.saturating_sub(DEFAULT_LOOKBACK_NS)
+/// `since` (`pkg/loghttp/params.go:83-119` @ v3.7.4 `b318f282`), issue
+/// #406 Part C: the `start` default's lookback, defaulting to 1 h. Read on
+/// every logs route carrying a `start`/`end` pair — that is, every one but
+/// `/query` (which has only `time`) — and used ONLY when `start` is
+/// absent, so `?start=…&since=5m` answers from `start`.
+///
+/// Container-measured 2026-08-10 against `grafana/loki:3.7.4` (plan
+/// tables on issue #406): `since=bogus` is a `400` there and was a
+/// silently-ignored `200` here; `since=5m` against 20-minute-old data
+/// returns empty there and returned everything here.
+///
+/// **The accepted duration set is [`parse_duration_ns`]'s, not
+/// Prometheus's `model.ParseDuration`** (the plan's "no new duration
+/// grammar"): ours additionally accepts a bare integer as seconds and the
+/// `us`/`ns` units, and does not accept `w`/`y`. Every value either
+/// grammar accepts is read identically; ours is the looser side, so no
+/// request the reference serves is refused here.
+pub(crate) fn parse_since(raw: Option<&str>) -> Result<i64, ParamError> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_SINCE_NS);
+    };
+    let ns = parse_duration_ns(raw).map_err(|_| ParamError::InvalidSince(raw.to_string()))?;
+    // `parse_duration_ns` is unsigned, so a negative literal never reaches
+    // here (it fails the grammar); this refuses the other end instead — a
+    // duration too large to be an `i64` nanosecond offset.
+    i64::try_from(ns).map_err(|_| ParamError::InvalidSince(raw.to_string()))
 }
 
 /// `limit`: default 100, hard cap 5000 — values above the cap are a `400`,
@@ -656,9 +756,315 @@ fn percent_decode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // -- Issue #406 Part D: the reference's length + fraction rules ------
+
+    /// **Part D's discriminating test.** Every row is the reference's own
+    /// parse, read off its query log (which prints the parsed
+    /// `start=`/`end=`) against `grafana/loki:3.7.4`, 2026-08-10 — an
+    /// observation of the parse itself rather than an inference from
+    /// entry counts.
+    ///
+    /// **`"01786342706"` is the whole point of the table.** The plausible
+    /// magnitude spelling — `if n < 10_000_000_000 { seconds }` — agrees
+    /// with the reference on every other row and disagrees only here,
+    /// where the number is small enough to look like seconds but the
+    /// STRING is eleven characters long because of the leading zero. The
+    /// reference follows the string (`len(value) <= 10`,
+    /// `pkg/loghttp/params.go:183-186 @ v3.7.4 b318f282`) and reads it as
+    /// nanoseconds, landing in 1970.
     #[test]
-    fn parse_ts_reads_a_plain_integer_as_unix_nanoseconds() {
-        assert_eq!(parse_ts("1234567890").unwrap(), 1_234_567_890);
+    fn parse_ts_follows_the_references_length_and_fraction_rules() {
+        for (raw, want) in [
+            // ref log: start=2026-05-08T06:18:26Z — 10 chars ⇒ seconds.
+            ("1786342706", 1_786_342_706_000_000_000_i64),
+            // ref log: start=1970-01-01T00:00:01.786342706Z — the SAME
+            // number, eleven characters, so nanoseconds. Magnitude and
+            // string length disagree here and only here.
+            ("01786342706", 1_786_342_706),
+            // ref log: start=1970-01-01T00:01:39.999999999Z — 11 chars.
+            ("99999999999", 99_999_999_999),
+            // ref log: start=1969-12-31T23:59:59Z — the sign counts
+            // toward the length, so `-1` is two characters and SECONDS.
+            ("-1", -1_000_000_000),
+            // 0 s and 0 ns are the same instant either way.
+            ("0", 0),
+            // The largest 10-character seconds value an i64 nanosecond
+            // domain can hold (2262-04-11T23:47:16Z); one more second is
+            // refused below.
+            ("9223372036", 9_223_372_036_000_000_000),
+            // 19-digit nanoseconds, the control.
+            ("1786342706000000000", 1_786_342_706_000_000_000),
+            // ref log: start=…T06:18:26.123Z — the fraction is rounded to
+            // THREE decimal places (milliseconds) before it becomes
+            // nanoseconds. Dropping that round is a silent 456 ns skew.
+            ("1786342706.123456", 1_786_342_706_123_000_000),
+            // ref log: start=…T06:18:26.124Z — round-half-up at the 3rd dp.
+            ("1786342706.1239", 1_786_342_706_124_000_000),
+            // A fraction is seconds at ANY length, so the ten-character
+            // rule never sees these.
+            ("1786342706.5", 1_786_342_706_500_000_000),
+            ("1786342706.0", 1_786_342_706_000_000_000),
+            ("-1.5", -1_500_000_000),
+            // RFC3339 is unchanged.
+            ("2026-07-01T00:00:00Z", 1_782_864_000_000_000_000),
+            // A dot that is not a float still reaches RFC3339: the `.`
+            // branch must fall THROUGH on a failed float parse, never
+            // error inside it.
+            ("2026-07-01T00:00:00.5Z", 1_782_864_000_500_000_000),
+        ] {
+            assert_eq!(parse_ts(raw).unwrap(), want, "parse_ts({raw:?})");
+        }
+
+        for raw in [
+            "not-a-timestamp",
+            "1.2.3",
+            "",
+            " 1786342706",
+            "1786342706abc",
+        ] {
+            assert!(
+                matches!(parse_ts(raw), Err(ParamError::InvalidTimestamp(_))),
+                "parse_ts({raw:?}) must be InvalidTimestamp"
+            );
+        }
+    }
+
+    /// **The one place we refuse where the reference serves**, and it is
+    /// the same refusal our RFC3339 path has always made. Go's
+    /// `time.Time` stores seconds and nanoseconds separately, so
+    /// `9999999999` seconds (`2286-11-20T17:46:39Z`) is representable
+    /// there; PulsusDB's whole timestamp domain is `i64` nanoseconds
+    /// (`~1677-09-21` to `2262-04-11`), so `9999999999 * 1e9` ≈ 1.0e19
+    /// does not fit and `checked_mul` refuses it rather than wrapping to
+    /// some arbitrary instant. `chrono`'s `timestamp_nanos_opt` already
+    /// refuses `2286-11-20T17:46:39Z` spelled as RFC3339, so this keeps
+    /// the two spellings of one instant answering alike.
+    ///
+    /// Recorded as a deviation from issue #406's AC D1, whose
+    /// `"9999999999" ⇒ 9_999_999_999 * 1e9` row is not representable.
+    #[test]
+    fn parse_ts_refuses_a_seconds_value_outside_the_i64_nanosecond_domain() {
+        assert!(matches!(
+            parse_ts("9999999999"),
+            Err(ParamError::InvalidTimestamp(_))
+        ));
+        assert!(matches!(
+            parse_ts("9223372037"),
+            Err(ParamError::InvalidTimestamp(_))
+        ));
+        // The RFC3339 spelling of the same instant is refused too.
+        assert!(matches!(
+            parse_ts("2286-11-20T17:46:39Z"),
+            Err(ParamError::InvalidTimestamp(_))
+        ));
+        // …and the fractional spelling.
+        assert!(matches!(
+            parse_ts("9999999999.5"),
+            Err(ParamError::InvalidTimestamp(_))
+        ));
+    }
+
+    /// Issue #406 Part D, the sweep of risk 12: after Part D a short
+    /// integer `start`/`end`/`time` on a **logs** route means something
+    /// different from what it meant when the suite was written. Every
+    /// remaining one must be a value the change cannot move — i.e. `0`,
+    /// where 0 s and 0 ns are the same instant.
+    ///
+    /// **Claimed domain = checked domain.** The claim is about the
+    /// workspace's own request corpora, so the scan is exactly
+    /// `crates/*/tests/**`, `e2e/**` and `xtask/**` — the directories that
+    /// build requests. `src/**` is excluded because a handler's own unit
+    /// tests are edited by the same change that edits the handler.
+    ///
+    /// Two filters keep the claim about LOGS requests rather than about
+    /// every timestamp-shaped literal, and both are stated so a reader can
+    /// see what the guard cannot see:
+    ///
+    /// * **Comment lines carry no request** — a line whose first non-space
+    ///   characters are `//` or `#` is skipped. Two such lines exist today
+    ///   (`logql_nested_ip_matrix.rs` and `logqltest/corpus/b20_nested_ip.test`
+    ///   both quote the reference's `start=0&end=1` behaviour in prose).
+    /// * **Non-logs surfaces keep their own timestamp rules.** `prom_api`
+    ///   reads seconds and `traces_api` switches on magnitude; neither is
+    ///   touched by Part D. A hit is counted only when the nearest
+    ///   preceding SURFACE MARKER — a quoted route path, or an enclosing
+    ///   `fn`/`const`/`static` name — is a logs one. Files with no marker
+    ///   at all fall back to their path.
+    #[test]
+    fn no_pulsus_suite_sends_a_short_integer_timestamp_it_no_longer_means() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(root.join("crates")).expect("crates/") {
+            let path = entry.expect("dir entry").path().join("tests");
+            collect_scan_files(&path, &mut files);
+        }
+        collect_scan_files(&root.join("e2e"), &mut files);
+        collect_scan_files(&root.join("xtask"), &mut files);
+        assert!(
+            files.len() > 50,
+            "the sweep only found {} files — its domain has moved",
+            files.len()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut logs_lines = 0usize;
+        for path in &files {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(path).expect("source");
+            let mut surface = surface_of(&rel);
+            for (i, line) in src.lines().enumerate() {
+                if let Some(marked) = surface_marker(line) {
+                    surface = marked;
+                }
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with('#') {
+                    continue;
+                }
+                if surface != Surface::Logs {
+                    continue;
+                }
+                logs_lines += 1;
+                for hit in short_integer_timestamps(line) {
+                    offenders.push(format!("{rel}:{}: {hit}", i + 1));
+                }
+            }
+        }
+        assert!(
+            logs_lines > 500,
+            "only {logs_lines} lines classified as a logs surface — the marker rule has broken \
+             and this guard would pass vacuously"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these logs-surface literals send a <= 10-character integer timestamp, which issue \
+             #406 Part D now reads as unix SECONDS — re-express them in nanoseconds (or as `0`, \
+             which means the same instant either way): {offenders:?}"
+        );
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Surface {
+        Logs,
+        Other,
+    }
+
+    /// A file's default surface, from its path.
+    fn surface_of(rel: &str) -> Surface {
+        let lower = rel.to_ascii_lowercase();
+        if lower.contains("prom") || lower.contains("trace") || lower.contains("profile") {
+            Surface::Other
+        } else if lower.contains("log") || lower.contains("loki") {
+            Surface::Logs
+        } else {
+            Surface::Other
+        }
+    }
+
+    /// A line that says which API surface the lines after it describe: a
+    /// quoted route path, or an item declaration whose name names one.
+    fn surface_marker(line: &str) -> Option<Surface> {
+        if line.contains("/api/logs/") || line.contains("/loki/api/") {
+            return Some(Surface::Logs);
+        }
+        if line.contains("/api/v1/")
+            || line.contains("/api/traces/")
+            || line.contains("/api/profiles/")
+        {
+            return Some(Surface::Other);
+        }
+        let rest = ["fn ", "const ", "static "]
+            .iter()
+            .find_map(|kw| line.split_once(kw).map(|(_, rest)| rest))?;
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if name.is_empty() {
+            return None;
+        }
+        if name.contains("prom") || name.contains("trace") || name.contains("profile") {
+            Some(Surface::Other)
+        } else if name.contains("log") || name.contains("loki") {
+            Some(Surface::Logs)
+        } else {
+            None
+        }
+    }
+
+    /// `start=`/`end=`/`time=` query-string keys carrying an integer of ten
+    /// characters or fewer — the values Part D re-reads as seconds. `0` is
+    /// excluded: it is the same instant on either rule.
+    fn short_integer_timestamps(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for key in ["start=", "end=", "time="] {
+            let mut from = 0usize;
+            while let Some(rel) = line[from..].find(key) {
+                let at = from + rel;
+                from = at + key.len();
+                // A query-string key, not `let start=` or `..._start=`.
+                let prev = line[..at].chars().next_back();
+                if !matches!(prev, None | Some('?') | Some('&') | Some('"') | Some('\'')) {
+                    continue;
+                }
+                let value: String = line[from..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '-')
+                    .collect();
+                // The next character must end the value, or these digits
+                // are a prefix of something else (`{start}`, `%7D`).
+                let after = line[from + value.len()..].chars().next();
+                if !matches!(after, None | Some('&') | Some('"') | Some('\'') | Some(' ')) {
+                    continue;
+                }
+                if value.is_empty() || value.len() > 10 || value.trim_start_matches('-') == "0" {
+                    continue;
+                }
+                out.push(format!("{key}{value}"));
+            }
+        }
+        out
+    }
+
+    /// Every `.rs` source and `.test` corpus file under `dir`.
+    fn collect_scan_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_scan_files(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs" || x == "test") {
+                out.push(path);
+            }
+        }
+    }
+
+    // -- Issue #406 Part C: `since` --------------------------------------
+
+    #[test]
+    fn parse_since_defaults_to_one_hour_and_rejects_a_bad_value() {
+        assert_eq!(parse_since(None).unwrap(), DEFAULT_SINCE_NS);
+        assert_eq!(parse_since(Some("30m")).unwrap(), 1_800_000_000_000);
+        assert_eq!(parse_since(Some("5m")).unwrap(), 300_000_000_000);
+        assert_eq!(parse_since(Some("1h")).unwrap(), DEFAULT_SINCE_NS);
+        // A bare integer is seconds (`parse_duration_ns`'s grammar).
+        assert_eq!(parse_since(Some("300")).unwrap(), 300_000_000_000);
+        for raw in ["bogus", "-5m", "-5", "5x", ""] {
+            assert!(
+                matches!(parse_since(Some(raw)), Err(ParamError::InvalidSince(_))),
+                "since={raw:?} must be a 400"
+            );
+        }
     }
 
     #[test]
@@ -674,11 +1080,6 @@ mod tests {
     fn parse_ts_rejects_garbage() {
         let err = parse_ts("not-a-timestamp").unwrap_err();
         assert!(matches!(err, ParamError::InvalidTimestamp(_)));
-    }
-
-    #[test]
-    fn default_start_ns_is_one_hour_before_end() {
-        assert_eq!(default_start_ns(3_600_000_000_000), 0);
     }
 
     #[test]
