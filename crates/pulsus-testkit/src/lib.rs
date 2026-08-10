@@ -293,14 +293,26 @@ const MAX_DATABASE_NAME_LEN: usize = 200;
 /// [`MAX_DATABASE_NAME_LEN`]. A bad value panics naming the offender —
 /// during a test, which is the only place this crate is ever linked.
 ///
-/// **Surrounding whitespace on the prefix is trimmed, not refused.** That
-/// is a deliberate exception to "check, do not fix", and it covers exactly
-/// one mistake: `export PULSUS_TEST_CH_DATABASE_PREFIX=$(cat .prefix)` and
-/// its relatives leave a trailing newline, which is invisible in a shell
-/// and would otherwise abort every live suite with a message about an
-/// unprintable character. Whitespace cannot change which database is
-/// named — `" wt3 "` and `"wt3"` compose the same one — so trimming it
-/// costs no isolation. Every other malformed prefix still panics.
+/// Two prefix values are handled without panicking, and both are
+/// deliberate:
+///
+/// * **A blank prefix reads as unset.** `PULSUS_TEST_CH_DATABASE_PREFIX=`
+///   composes the bare name rather than `_pulsus_…`, so unsetting the
+///   variable and emptying it mean the same thing
+///   (`an_empty_or_blank_prefix_reads_as_unset`).
+/// * **Surrounding whitespace is trimmed.** `" wt3 "` and `"wt3"` compose
+///   the same database, so trimming costs no isolation — that is the
+///   whole justification, and no claim is made here about how such a
+///   value would arise. (A previous revision of this comment blamed
+///   `export …=$(cat .prefix)`; that is false — bash command substitution
+///   strips trailing newlines, measured: `$(printf 'wt3\n')` yields the
+///   bytes `77 74 33`. Recorded so the story is not reinvented.) The trim
+///   is not dead code: a quoted assignment does carry whitespace into a
+///   child's environment, measured — `C="wt3 "` reaches `env` as
+///   `C=wt3 `.
+///
+/// Whitespace *inside* the prefix is not covered by either: `"wt 3"` and
+/// `"wt\n3"` panic like any other bad character.
 pub fn test_db(name: &str) -> String {
     test_ident(name)
 }
@@ -329,10 +341,9 @@ fn compose_db_name(prefix: Option<&str>, name: &str) -> String {
              Name it with ASCII letters, digits and underscores only."
         );
     }
-    // Trim, do not refuse — see the note in [`test_db`]'s `# Panics`
-    // section. Whitespace cannot change which database is named, and a
-    // shell-captured prefix carrying a trailing newline is the one
-    // mistake common enough to be worth absorbing.
+    // Trim, and treat blank as unset — both deliberate, both justified in
+    // [`test_db`]'s `# Panics` section. Surrounding whitespace cannot
+    // change which database is named, so absorbing it costs no isolation.
     let composed = match prefix.map(str::trim).filter(|p| !p.is_empty()) {
         None => name.to_string(),
         Some(prefix) => {
@@ -543,13 +554,11 @@ mod tests {
         );
     }
 
-    /// Surrounding whitespace is a shell accident (`export P=" wt3"`), not
-    /// a request for a database called `" wt3_…"`. Trimmed rather than
-    /// refused, deliberately — see the note in `test_db`'s docs. A
-    /// trailing newline is the case that actually happens (`export
-    /// P=$(cat .prefix)`) and it is invisible in a shell, so refusing it
-    /// would abort a live run with a message about a character the
-    /// operator cannot see.
+    /// Surrounding whitespace is trimmed rather than refused: `" wt3 "`
+    /// and `"wt3"` name the same database, so accepting both isolates two
+    /// checkouts exactly as well. Deliberate — see the note in
+    /// `test_db`'s docs, which also records the *false* justification a
+    /// previous revision gave for it.
     #[test]
     fn a_prefix_is_trimmed_before_use_rather_than_refused() {
         for spelling in [" wt3 ", "wt3\n", "\twt3\r\n", "wt3 "] {
@@ -561,12 +570,25 @@ mod tests {
         }
     }
 
-    /// Trimming is the *only* repair: whitespace inside the prefix cannot
-    /// be a shell accident and still panics like any other bad character.
+    /// Trimming reaches the ends and nothing else: whitespace *inside* a
+    /// prefix would change the composed name, so it panics like any other
+    /// bad character. One case per whitespace character that
+    /// [`str::trim`] would have removed at an end, so the two behaviours
+    /// cannot silently converge.
     #[test]
-    #[should_panic(expected = "is not a usable database-name prefix")]
     fn whitespace_inside_a_prefix_is_still_refused() {
-        let _ = compose_db_name(Some("wt 3"), "pulsus_x_it");
+        for spelling in ["wt 3", "wt\t3", "wt\n3", "wt\r\n3"] {
+            let err = std::panic::catch_unwind(|| compose_db_name(Some(spelling), "pulsus_x_it"))
+                .expect_err("whitespace inside a prefix must panic");
+            let msg = err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or("<non-string panic payload>");
+            assert!(
+                msg.contains("is not a usable database-name prefix"),
+                "{spelling:?}: {msg}"
+            );
+        }
     }
 
     /// Two different prefixes never compose to the same database — the

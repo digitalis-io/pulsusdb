@@ -1010,7 +1010,7 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
 #[tokio::test]
 async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_series_all";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_series_all");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 

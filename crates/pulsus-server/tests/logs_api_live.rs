@@ -3029,9 +3029,9 @@ async fn series_without_match_returns_every_series_in_the_window() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_series_all";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_series_all");
     let port = 31_189;
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
     let start = (base_ns - 3_600_000_000_000).to_string();
@@ -3095,7 +3095,7 @@ async fn series_without_match_returns_every_series_in_the_window() {
         res_out.body
     );
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 /// **Part B1, live.** A POST reads the URL query alongside the body.
@@ -3109,9 +3109,9 @@ async fn a_post_reads_the_url_query_alongside_the_body() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_post_query_merge";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_post_query_merge");
     let port = 31_194;
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) = setup(db, port).await;
     seed_run(&client, db, base_ns, 150).await;
 
@@ -3206,7 +3206,7 @@ async fn a_post_reads_the_url_query_alongside_the_body() {
         res.body
     );
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 /// **Part C, live.** `since` bounds the default `start`. Against a seed
@@ -3219,9 +3219,9 @@ async fn since_supplies_the_default_start() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_since";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_since");
     let port = 31_195;
-    drop_database(db).await;
+    drop_db(db).await;
     let _guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
         .await
@@ -3288,7 +3288,7 @@ async fn since_supplies_the_default_start() {
         res.body
     );
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 /// **Part D, live — the headline defect.** A window expressed in unix
@@ -3304,9 +3304,9 @@ async fn a_seconds_valued_window_returns_the_seed() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_ts_seconds";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_ts_seconds");
     let port = 31_196;
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) = setup(db, port).await;
     seed_run(&client, db, base_ns, 150).await;
 
@@ -3384,7 +3384,7 @@ async fn a_seconds_valued_window_returns_the_seed() {
         mixed.body
     );
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 /// **Issue #406, found by a CI failure on this suite's own
@@ -3418,9 +3418,9 @@ async fn entries_sharing_a_timestamp_come_back_in_a_stable_order() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_ts_ties";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_ts_ties");
     let port = 31_197;
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) = setup(db, port).await;
 
     // Merges off, then one INSERT per row: 40 single-row parts, every row
@@ -3473,7 +3473,7 @@ async fn entries_sharing_a_timestamp_come_back_in_a_stable_order() {
         }
     }
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 fn read_rss_kb(pid: u32) -> Option<u64> {
