@@ -167,7 +167,10 @@ async fn run_to_completion<R: pulsus_clickhouse::ChRow>(
 #[tokio::test]
 async fn stage2_oversized_sql_fails_under_ch_defaults_and_succeeds_under_the_raised_setting() {
     skip_unless_live!();
-    let client = setup_db("pulsus_read_it_query_text_cap_stage2").await;
+    let client = setup_db(&pulsus_testkit::test_db(
+        "pulsus_read_it_query_text_cap_stage2",
+    ))
+    .await;
     let fps = oversized_fingerprint_set();
     let sql = sql::stage2("log_streams", &fps);
     assert!(
@@ -202,7 +205,10 @@ async fn stage2_oversized_sql_fails_under_ch_defaults_and_succeeds_under_the_rai
 async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_the_raised_setting()
 {
     skip_unless_live!();
-    let client = setup_db("pulsus_read_it_query_text_cap_metrics").await;
+    let client = setup_db(&pulsus_testkit::test_db(
+        "pulsus_read_it_query_text_cap_metrics",
+    ))
+    .await;
     let fps = oversized_fingerprint_set();
     let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
         "metric_samples",

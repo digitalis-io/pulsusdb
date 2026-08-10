@@ -29,6 +29,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -183,20 +188,6 @@ fn ch_config(db: &str) -> ChConnConfig {
         query_timeout: Duration::from_secs(30),
         ..ChConnConfig::default()
     }
-}
-
-async fn drop_db(db: &str) {
-    let client = ChClient::new(ch_config("default"))
-        .await
-        .expect("connect for drop");
-    client
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
 }
 
 async fn optimize_edges_final(db: &str) {
@@ -413,7 +404,7 @@ async fn service_graph_end_to_end_over_http() {
         return;
     }
     let port = 31_139;
-    let db = "pulsus_traces_graph_live_it";
+    let db = &pulsus_testkit::test_db("pulsus_traces_graph_live_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db);
     let ctx = "graph-live";

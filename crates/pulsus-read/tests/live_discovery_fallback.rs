@@ -222,7 +222,7 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_discovery_fallback_parity";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_discovery_fallback_parity");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -327,7 +327,7 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
         1_000,
     )
     .replace('?', "??");
-    let query_id = "pulsus_read_it_discovery_fallback_probe";
+    let query_id = &pulsus_testkit::test_ident("pulsus_read_it_discovery_fallback_probe");
     let mut stream = client
         .query_stream::<ProbeNameRow>(&probe_sql, &QuerySettings::new().set("query_id", query_id))
         .await
@@ -378,7 +378,7 @@ async fn degraded_regex_name_discovery_over_the_fanout_cap_is_query_too_broad() 
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_discovery_fallback_cap";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_discovery_fallback_cap");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await

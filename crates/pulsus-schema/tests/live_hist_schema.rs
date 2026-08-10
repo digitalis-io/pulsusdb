@@ -184,7 +184,7 @@ const HIST_SELECT_COLS: &str = "metric_name, fingerprint, unix_milli, schema, ze
 async fn native_histogram_migrations_apply_and_are_idempotent() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_hist_it_apply";
+    let db = &pulsus_testkit::test_db("pulsus_hist_it_apply");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
@@ -245,7 +245,7 @@ struct HintRow {
 async fn counter_reset_hint_column_is_additive_uint8_default_zero() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_hist_it_reset_hint";
+    let db = &pulsus_testkit::test_db("pulsus_hist_it_reset_hint");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init");
@@ -328,7 +328,7 @@ async fn counter_reset_hint_column_is_additive_uint8_default_zero() {
 async fn metric_hist_samples_explain_shows_metric_name_pk_pruning() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_hist_it_explain";
+    let db = &pulsus_testkit::test_db("pulsus_hist_it_explain");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init");
@@ -434,7 +434,7 @@ fn last_selected_granules(plan: &[String]) -> Option<u64> {
 async fn complementary_hist_read_selects_zero_granules_for_single_type_series() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_hist_it_zero_granules";
+    let db = &pulsus_testkit::test_db("pulsus_hist_it_zero_granules");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init");
@@ -536,7 +536,7 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
 async fn native_histogram_row_round_trips_losslessly_exponential_and_nhcb() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_hist_it_roundtrip";
+    let db = &pulsus_testkit::test_db("pulsus_hist_it_roundtrip");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init");

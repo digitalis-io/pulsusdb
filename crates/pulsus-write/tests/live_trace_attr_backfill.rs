@@ -307,7 +307,7 @@ async fn l_t1_lost_attr_index_heals_and_the_primary_key_probe_finds_the_span() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_trace_attr_backfill_lt1";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_trace_attr_backfill_lt1");
     init_db(&bootstrap, db).await;
 
     let client = Arc::new(

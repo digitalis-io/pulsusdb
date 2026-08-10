@@ -420,7 +420,7 @@ async fn assert_rollup_matches_raw(
 #[tokio::test]
 async fn count_over_time_rollup_matches_raw_at_step_equal_to_resolution() {
     skip_unless_live!();
-    let db = "pulsus_read_it_diff_cot_step_res";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_diff_cot_step_res");
     let (client, base_ns) = setup(db).await;
     let params = range_params(base_ns, RES_NS as u64);
     assert_rollup_matches_raw(
@@ -436,7 +436,7 @@ async fn count_over_time_rollup_matches_raw_at_step_equal_to_resolution() {
 #[tokio::test]
 async fn count_over_time_rollup_matches_raw_at_step_twelve_times_resolution() {
     skip_unless_live!();
-    let db = "pulsus_read_it_diff_cot_step_12x";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_diff_cot_step_12x");
     let (client, base_ns) = setup(db).await;
     let params = range_params(base_ns, 12 * RES_NS as u64);
     assert_rollup_matches_raw(
@@ -452,7 +452,7 @@ async fn count_over_time_rollup_matches_raw_at_step_twelve_times_resolution() {
 #[tokio::test]
 async fn rate_numerator_rollup_matches_raw() {
     skip_unless_live!();
-    let db = "pulsus_read_it_diff_rate";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_diff_rate");
     let (client, base_ns) = setup(db).await;
     let params = range_params(base_ns, 12 * RES_NS as u64);
     // `rate`'s SQL shape is identical to `count_over_time`'s — the only
@@ -473,7 +473,7 @@ async fn rate_numerator_rollup_matches_raw() {
 #[tokio::test]
 async fn bytes_over_time_rollup_matches_raw() {
     skip_unless_live!();
-    let db = "pulsus_read_it_diff_bot";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_diff_bot");
     let (client, base_ns) = setup(db).await;
     let params = range_params(base_ns, 12 * RES_NS as u64);
     let raw_map = assert_rollup_matches_raw(
@@ -503,7 +503,7 @@ async fn bytes_over_time_rollup_matches_raw() {
 #[tokio::test]
 async fn bytes_rate_numerator_rollup_matches_raw() {
     skip_unless_live!();
-    let db = "pulsus_read_it_diff_bytes_rate";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_diff_bytes_rate");
     let (client, base_ns) = setup(db).await;
     let params = range_params(base_ns, 12 * RES_NS as u64);
     assert_rollup_matches_raw(
@@ -524,7 +524,7 @@ async fn bytes_rate_numerator_rollup_matches_raw() {
 #[tokio::test]
 async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_counts() {
     skip_unless_live!();
-    let db = "pulsus_read_it_diff_engine";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_diff_engine");
     let (client, base_ns) = setup(db).await;
     let w = window(base_ns);
     let step_ns = 12 * RES_NS as u64;
@@ -601,7 +601,7 @@ async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_coun
 #[tokio::test]
 async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() {
     skip_unless_live!();
-    let db = "pulsus_read_it_diff_client_agg";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_diff_client_agg");
     let (client, base_ns) = setup(db).await;
     let w = window(base_ns);
     let step_ns = 12 * RES_NS as u64;
@@ -687,7 +687,7 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
 #[tokio::test]
 async fn engine_client_agg_scan_past_the_byte_budget_is_a_named_query_too_broad() {
     skip_unless_live!();
-    let db = "pulsus_read_it_diff_budget";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_diff_budget");
     let (client, base_ns) = setup(db).await;
     // Bulk-seed enough body bytes that the samples scan must read far
     // past the budget below, while the stage-1/stage-2 index reads (a

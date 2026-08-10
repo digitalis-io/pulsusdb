@@ -236,7 +236,7 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_count_lookback";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_count_lookback");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -363,7 +363,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_name_keeps";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_name_keeps");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -456,7 +456,7 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_historical";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_historical");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -549,7 +549,7 @@ async fn group_with_offset_routes_through_metric_series() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_group_offset";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_group_offset");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -640,7 +640,7 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_range_count_matrix";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_range_count_matrix");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -787,7 +787,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_range_count_routing";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_range_count_routing");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -928,7 +928,7 @@ async fn binary_expression_fetches_both_sides_concurrently() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_concurrency";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_concurrency");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -1105,7 +1105,7 @@ async fn rate_end_to_end_against_real_samples() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_rate";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_rate");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -1194,7 +1194,7 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_experimental_gate";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_experimental_gate");
     init_db(&bootstrap, db).await;
     let cache_client = ChClient::new(test_config(db))
         .await
@@ -1274,7 +1274,7 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_info_cardinality";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_info_cardinality");
     init_db(&bootstrap, db).await;
     let cache_client = ChClient::new(test_config(db))
         .await
@@ -1376,7 +1376,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_info_cardinality_fallback";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_info_cardinality_fallback");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -1494,7 +1494,7 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_sample_budget";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_sample_budget");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -1624,7 +1624,7 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_info_cardinality_distinct";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_info_cardinality_distinct");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -1749,7 +1749,7 @@ async fn time_only_query_shapes_execute_with_zero_fetch_stages() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_time_only";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_time_only");
     init_db(&bootstrap, db).await;
     let cache_client = ChClient::new(test_config(db))
         .await
@@ -1835,7 +1835,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_explain";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_explain");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -1919,7 +1919,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_explain_fallback";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_explain_fallback");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2025,7 +2025,7 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_discovery";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_discovery");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2171,7 +2171,7 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_re2_rejected_matcher";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_re2_rejected_matcher");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2354,7 +2354,7 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_warm_cache_re2_matcher";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_warm_cache_re2_matcher");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2505,7 +2505,7 @@ async fn label_names_with_no_filters_covers_every_metric_in_window() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_discovery_unfiltered";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_discovery_unfiltered");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2580,7 +2580,7 @@ async fn series_applies_regex_matchers() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_discovery_regex";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_discovery_regex");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2655,7 +2655,7 @@ async fn series_with_a_matcher_only_filter_matches_across_metric_names() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_discovery_matcher_only";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_discovery_matcher_only");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2753,7 +2753,7 @@ async fn metadata_collapses_to_the_latest_write() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_metadata";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_metadata");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2838,7 +2838,7 @@ async fn tsdb_status_reports_series_counts_with_zero_sample_table_access() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_tsdb_status";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_tsdb_status");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -2911,7 +2911,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_nameless_fanout";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_nameless_fanout");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -3086,7 +3086,7 @@ async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels()
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_cross_pair";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_cross_pair");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -3217,7 +3217,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_dual_read_hist";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_dual_read_hist");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -3411,7 +3411,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_nameless_invalid_regex";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_nameless_invalid_regex");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await

@@ -212,7 +212,7 @@ async fn hist_sum_nan_payloads_survive_clickhouse_bit_for_bit_and_stay_distinct(
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_hist_nan_gate";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_hist_nan_gate");
     let client = init_db(&bootstrap, db).await;
     let writer = writer(client.clone());
 
@@ -268,7 +268,7 @@ async fn native_exp_histogram_round_trips_absolute_counts_through_clickhouse() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_hist_roundtrip";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_hist_roundtrip");
     let client = init_db(&bootstrap, db).await;
     let writer = writer(client.clone());
 
@@ -373,7 +373,7 @@ async fn cross_request_float_and_histogram_register_both_value_type_rows() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_hist_value_type";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_hist_value_type");
     let client = init_db(&bootstrap, db).await;
     let writer = writer(client.clone());
 

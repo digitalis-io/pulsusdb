@@ -15,6 +15,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -280,30 +285,6 @@ fn now_ns() -> i64 {
     .expect("current time fits in i64 nanoseconds")
 }
 
-/// Drops `db` (via a bootstrap connection to ClickHouse's built-in
-/// `default` database — the target database may not exist yet) before
-/// seeding, same idiom as `pulsus-read`'s live tests
-/// (`rollup_differential.rs`/`explain_indexes.rs`). Load-bearing for exact-
-/// count assertions specifically: unlike `log_streams` (`ReplacingMergeTree`,
-/// logically deduped by fingerprint at read time), `log_samples` is a plain
-/// `MergeTree` — without this, re-running a test against a container that
-/// still holds a previous run's rows for the same database name silently
-/// doubles (or worse) the row count a byte-exact `count_over_time` golden
-/// depends on.
-async fn drop_database(db: &str) {
-    let mut cfg = data_client_config(db);
-    cfg.database = "default".to_string();
-    let client = ChClient::new(cfg).await.expect("connect bootstrap client");
-    client
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
-}
-
 const FP_A: u64 = 0x8000_0000_0000_0001;
 const FP_B: u64 = 0x8000_0000_0000_0002;
 
@@ -395,7 +376,7 @@ async fn labels_get_returns_the_distinct_keys_seeded() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_labels";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_labels");
     let port = 31_101;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -432,7 +413,7 @@ async fn labels_post_form_matches_the_get_response() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_labels_post";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_labels_post");
     let port = 31_102;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -458,7 +439,7 @@ async fn label_values_returns_the_distinct_values_of_env() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_label_values";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_label_values");
     let port = 31_103;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -489,7 +470,7 @@ async fn series_get_returns_the_matched_label_sets() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_series";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_series");
     let port = 31_104;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -522,7 +503,7 @@ async fn series_post_form_with_repeated_match_selectors() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_series_post";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_series_post");
     let port = 31_105;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -546,7 +527,7 @@ async fn query_range_returns_streams_with_the_global_limit_applied() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_query_range";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_query_range");
     let port = 31_106;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -580,7 +561,7 @@ async fn query_range_honours_x_pulsus_explain() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_query_range_explain";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_query_range_explain");
     let port = 31_107;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -623,7 +604,7 @@ async fn query_range_metric_returns_a_matrix() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_query_range_matrix";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_query_range_matrix");
     let port = 31_111;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -701,9 +682,9 @@ async fn query_range_post_metric_is_byte_exact_against_a_computed_golden() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_query_range_post";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_query_range_post");
     let port = 31_112;
-    drop_database(db).await;
+    drop_db(db).await;
     let _guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
         .await
@@ -761,9 +742,9 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_query_range_post_explain";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_query_range_post_explain");
     let port = 31_113;
-    drop_database(db).await;
+    drop_db(db).await;
     let _guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
         .await
@@ -855,7 +836,7 @@ async fn query_post_form_matches_the_get_response() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_query_post";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_query_post");
     let port = 31_114;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -877,7 +858,7 @@ async fn query_instant_returns_a_vector_for_a_metric_query() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_query_instant";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_query_instant");
     let port = 31_108;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -911,7 +892,7 @@ async fn malformed_query_returns_a_400_bare_text_plain_body() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_query_bad";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_query_bad");
     let port = 31_109;
     let _guard = spawn_ready_server(port, db);
 
@@ -960,7 +941,7 @@ async fn query_range_memory_scales_with_the_limit_not_the_seeded_stream_count() 
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_memory";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_memory");
     let port = 31_110;
     let guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
@@ -1051,7 +1032,7 @@ async fn loki_compat_aliases_404_when_the_flag_is_off() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_compat_off";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_compat_off");
     let port = 31_115;
     let _guard = spawn_ready_server(port, db);
 
@@ -1084,7 +1065,7 @@ async fn loki_compat_aliases_are_byte_identical_to_native() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_compat_identical";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_compat_identical");
     let port = 31_116;
     let (_guard, _client, base_ns) = setup_env(db, port, &[("PULSUS_COMPAT_ENDPOINTS", "1")]).await;
 
@@ -1204,7 +1185,7 @@ async fn gzip_accept_encoding_is_byte_identical_and_never_panics_across_all_endp
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_gzip";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_gzip");
     let port = 31_117;
     let (_guard, _client, base_ns) = setup_env(db, port, &[("PULSUS_COMPAT_ENDPOINTS", "1")]).await;
 
@@ -1344,12 +1325,12 @@ async fn query_range_fan_out_pipeline_filters_reformats_and_relabels_streams() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_pipeline_fanout";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_pipeline_fanout");
     let port = 31_118;
     // Exact-count assertions below: `log_samples` is a plain MergeTree, so
     // a stale database from a previous run would double the seeded rows
     // (see `drop_database`'s doc comment).
-    drop_database(db).await;
+    drop_db(db).await;
     let guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
         .await
@@ -1477,9 +1458,9 @@ async fn query_range_surfaces_error_details_label_end_to_end() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_error_details";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_error_details");
     let port = 31_119;
-    drop_database(db).await;
+    drop_db(db).await;
     let guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
         .await
@@ -1634,12 +1615,12 @@ async fn offset_shifts_the_data_window_and_not_the_reported_timestamps() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_offset";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_offset");
     let port = 31_120;
     // Dropped first: every count below is EXACT, so a previous run's rows
     // surviving in the window would inflate them (the sibling tests here
     // assert `>= 1` and do not care).
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) = setup(db, port).await;
 
     // `setup` seeds 3 samples on the prod stream at base-3s/-2s/-1s. Add 5
@@ -1778,7 +1759,7 @@ async fn an_offset_past_the_timestamp_axis_issues_no_scan_at_all() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_offset_domain_edge";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_offset_domain_edge");
     let port = 31_122;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
@@ -1865,7 +1846,7 @@ async fn nothing_in_a_query_may_span_more_than_five_years() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_span_cap";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_span_cap");
     let port = 31_123;
     let (_guard, _client, base_ns) = setup(db, port).await;
     const CAP_NS: i64 = 157_680_000_000_000_000;
@@ -2054,10 +2035,10 @@ async fn variants_reads_each_variants_offset_window_intersected_with_the_shared_
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_variants_offset";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_variants_offset");
     let port = 31_121;
     // Exact counts throughout, so a previous run's rows must not survive.
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) = setup(db, port).await;
 
     // THE REFERENCE PROBE'S FIXTURE, on a compressed timescale (seconds
@@ -2237,10 +2218,10 @@ async fn a_grouped_range_aggregation_merges_two_streams_raw_samples_end_to_end()
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_range_grouping";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_range_grouping");
     let port = 31_124;
     // Exact values throughout, so a previous run's rows must not survive.
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) = setup(db, port).await;
 
     // `setup` seeds 3 unwrappable-free lines per stream; they are dropped
@@ -2426,7 +2407,7 @@ async fn a_malformed_selector_regex_is_refused_on_every_mounted_logs_route() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_regex_surface";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_regex_surface");
     let port = 31_125;
     let (_guard, _client, base_ns) = setup(db, port).await;
     let start = (base_ns - 3_600_000_000_000).to_string();
@@ -2577,9 +2558,9 @@ async fn empty_params_answer_byte_identically_to_absent_ones() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_empty_param";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_empty_param");
     let port = 31_126;
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, _client, base_ns) = setup(db, port).await;
     let start = (base_ns - 3_600_000_000_000).to_string();
     let end = (base_ns + 3_600_000_000_000).to_string();
@@ -2711,9 +2692,9 @@ async fn label_discovery_and_series_are_scoped_to_the_requested_window() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_window_scope";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_window_scope");
     let port = 31_168;
-    drop_database(db).await;
+    drop_db(db).await;
     let _guard = spawn_ready_server_env(port, db, &[]);
     let client = ChClient::new(data_client_config(db))
         .await
@@ -2808,7 +2789,7 @@ async fn label_discovery_and_series_are_scoped_to_the_requested_window() {
         res.body
     );
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 // ---------------------------------------------------------------------
@@ -2913,9 +2894,9 @@ async fn stage1_memory_breach_is_422_on_every_stage1_endpoint() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_mem_422";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_mem_422");
     let port = 31_127;
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) =
         setup_env(db, port, &[("PULSUS_LOGQL_READ_MAX_MEMORY_BYTES", "1024")]).await;
     seed_wide_streams(&client, db, base_ns).await;
@@ -2958,7 +2939,7 @@ async fn stage1_memory_breach_is_422_on_every_stage1_endpoint() {
         wrong.join("\n")
     );
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 /// The direction-neutral validity gate (issue #398 AC L5b): with the knob
@@ -2971,9 +2952,9 @@ async fn default_memory_ceiling_does_not_refuse_an_ordinary_query() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_logs_api_it_mem_200";
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_mem_200");
     let port = 31_128;
-    drop_database(db).await;
+    drop_db(db).await;
     let (_guard, client, base_ns) = setup(db, port).await;
     seed_wide_streams(&client, db, base_ns).await;
 
@@ -3003,7 +2984,7 @@ async fn default_memory_ceiling_does_not_refuse_an_ordinary_query() {
         refused.join("\n")
     );
 
-    drop_database(db).await;
+    drop_db(db).await;
 }
 
 // ---------------------------------------------------------------------

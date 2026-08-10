@@ -263,7 +263,7 @@ async fn l1_lost_registration_backfill_resolves_the_stream_in_the_samples_month(
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_stream_backfill_l1";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_stream_backfill_l1");
     init_db(&bootstrap, db).await;
 
     let client = Arc::new(
@@ -333,7 +333,7 @@ async fn l2_false_poisoned_duplicate_reinsert_collapses_on_final_read() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_stream_backfill_l2";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_stream_backfill_l2");
     init_db(&bootstrap, db).await;
 
     let client = Arc::new(

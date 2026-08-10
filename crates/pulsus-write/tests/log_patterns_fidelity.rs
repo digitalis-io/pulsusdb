@@ -252,7 +252,10 @@ async fn otlp_and_loki_push_land_identical_hand_derived_pattern_rows() {
     let bucket_ns = (ts_ns / 10_000_000_000) * 10_000_000_000;
 
     // -- OTLP transport --------------------------------------------------
-    let otlp_db = format!("pulsus_patterns_fid_otlp_it_{}", std::process::id());
+    let otlp_db = pulsus_testkit::test_db(&format!(
+        "pulsus_patterns_fid_otlp_it_{}",
+        std::process::id()
+    ));
     let client = fresh_db(&otlp_db).await;
     let fp = ch_fingerprint(&client).await;
     let otlp_batch = pulsus_write::parse(&otlp_request(ts_ns), ts_ns).expect("otlp parse");
@@ -260,7 +263,10 @@ async fn otlp_and_loki_push_land_identical_hand_derived_pattern_rows() {
     let otlp_rows = read_patterns(&client, &otlp_db).await;
 
     // -- Loki push transport ---------------------------------------------
-    let loki_db = format!("pulsus_patterns_fid_loki_it_{}", std::process::id());
+    let loki_db = pulsus_testkit::test_db(&format!(
+        "pulsus_patterns_fid_loki_it_{}",
+        std::process::id()
+    ));
     let loki_client = fresh_db(&loki_db).await;
     let loki_batch =
         pulsus_write::parse_loki_json(&loki_push_json(ts_ns), ts_ns).expect("loki parse");
@@ -300,7 +306,7 @@ async fn otlp_and_loki_push_land_identical_hand_derived_pattern_rows() {
 async fn re_admitting_an_identical_batch_sums_counts_at_log_metrics_parity() {
     skip_unless_live!();
     let ts_ns = recent_ns();
-    let db = format!("pulsus_patterns_replay_it_{}", std::process::id());
+    let db = pulsus_testkit::test_db(&format!("pulsus_patterns_replay_it_{}", std::process::id()));
     let client = fresh_db(&db).await;
 
     // Client re-send simulation: admit the SAME OTLP batch twice.

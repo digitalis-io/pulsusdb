@@ -108,8 +108,7 @@ fn ready_transitions_from_503_to_200_and_ops_endpoints_respond() {
             // live_clickhouse.rs) — this database must be created by
             // startup's own schema-reconcile step, which is exactly the
             // behavior this test exists to prove.
-            std::env::var("PULSUS_TEST_CH_DATABASE")
-                .unwrap_or_else(|_| "pulsus_live_test".to_string()),
+            pulsus_testkit::test_db("pulsus_server_live_it"),
         )
         .spawn()
         .expect("spawn pulsusdb");
@@ -117,7 +116,7 @@ fn ready_transitions_from_503_to_200_and_ops_endpoints_respond() {
 
     // A longer deadline than a bare pool connect needs: startup now runs the
     // full schema reconcile (`CREATE DATABASE` + migrations + MVs) against
-    // `pulsus_live_test` before `/ready` can flip to 200.
+    // `pulsus_server_live_it` before `/ready` can flip to 200.
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut saw_503 = false;
     let mut became_ready = false;

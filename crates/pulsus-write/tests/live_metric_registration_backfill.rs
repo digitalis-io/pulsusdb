@@ -341,7 +341,7 @@ async fn l_m1_series_orphan_heals_and_limit1_lookup_is_duplicate_stable() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_metric_backfill_lm1";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_backfill_lm1");
     init_db(&bootstrap, db).await;
 
     let client = Arc::new(
@@ -467,7 +467,7 @@ async fn l_m2_metadata_duplicate_and_stale_reinserts_collapse_to_the_max_updated
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_metric_backfill_lm2";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_backfill_lm2");
     init_db(&bootstrap, db).await;
 
     let client = Arc::new(

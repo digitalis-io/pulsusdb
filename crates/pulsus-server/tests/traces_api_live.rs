@@ -609,7 +609,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
         return;
     }
 
-    let _guard = spawn_ready(PORT, "pulsus_traces_api_it_live");
+    let _guard = spawn_ready(PORT, &pulsus_testkit::test_db("pulsus_traces_api_it_live"));
 
     // -- Seed trace A: 3 spans, start times chosen so canonical output
     // order (startTimeUnixNano, spanId) differs from insert order.
@@ -861,7 +861,10 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
     }
 
     let port = ALIAS_PORT;
-    let _guard = spawn_ready(port, "pulsus_traces_compat_it_live");
+    let _guard = spawn_ready(
+        port,
+        &pulsus_testkit::test_db("pulsus_traces_compat_it_live"),
+    );
 
     // Seed one trace: 2 spans, start times chosen so canonical output
     // order differs from insert order (a real, non-trivial body). Window
@@ -1030,7 +1033,10 @@ async fn zipkin_shared_span_trace_by_id_returns_both_the_server_and_client_sides
         return;
     }
 
-    let _guard = spawn_ready(ZIPKIN_PORT, "pulsus_traces_api_it_zipkin_shared");
+    let _guard = spawn_ready(
+        ZIPKIN_PORT,
+        &pulsus_testkit::test_db("pulsus_traces_api_it_zipkin_shared"),
+    );
 
     // Recent timestamp so the 7-day delete-TTL never drops the part; micros
     // on the wire, seconds for the search window.
@@ -1172,7 +1178,10 @@ async fn duration_seconds_reach_the_wire_exactly_as_the_reference_emits_them() {
         return;
     }
 
-    let _guard = spawn_ready(ULP_PORT, "pulsus_traces_ulp_it_live");
+    let _guard = spawn_ready(
+        ULP_PORT,
+        &pulsus_testkit::test_db("pulsus_traces_ulp_it_live"),
+    );
 
     // One single-span service per width (12 discriminating + 3 controls),
     // one `ResourceSpans` per service, one sync protobuf POST /v1/traces.

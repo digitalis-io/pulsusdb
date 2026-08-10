@@ -206,7 +206,7 @@ async fn point_read_is_a_primary_index_read_with_pruned_granules() {
         return;
     }
 
-    let db = "pulsus_traces_point_read_it";
+    let db = &pulsus_testkit::test_db("pulsus_traces_point_read_it");
     let admin = ChClient::new(test_config()).await.expect("connect");
     admin
         .execute(

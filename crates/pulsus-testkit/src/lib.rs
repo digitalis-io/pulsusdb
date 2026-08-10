@@ -293,6 +293,19 @@ const MAX_DATABASE_NAME_LEN: usize = 200;
 /// [`MAX_DATABASE_NAME_LEN`]. A bad value panics naming the offender —
 /// during a test, which is the only place this crate is ever linked.
 pub fn test_db(name: &str) -> String {
+    test_ident(name)
+}
+
+/// [`test_db`]'s composition for the other server-side names a live test
+/// creates inside a database it does **not** own — a table in `default`,
+/// or the `query_id` it later looks up in `system.query_log`. Those
+/// collide between two concurrent checkouts exactly as a database name
+/// does, and they are prefixed by the same variable for the same reason.
+///
+/// # Panics
+///
+/// As [`test_db`].
+pub fn test_ident(name: &str) -> String {
     let prefix = std::env::var(DATABASE_PREFIX_VAR).ok();
     compose_db_name(prefix.as_deref(), name)
 }
@@ -326,6 +339,52 @@ fn compose_db_name(prefix: Option<&str>, name: &str) -> String {
         composed.len()
     );
     composed
+}
+
+/// A suite-wide test database name, composed once on first use.
+///
+/// The `const DB: &str = "pulsus_…_it";` that several suites used before
+/// the prefix existed cannot survive as a `const`, because the name is now
+/// a function of the environment. `static DB: TestDb = TestDb::new("…");`
+/// replaces it without disturbing the interpolations: `TestDb` is
+/// [`Display`](fmt::Display), so `format!("DROP DATABASE {DB}")` and
+/// `DB.to_string()` keep working, and it derefs to `str`, so `&DB` passes
+/// anywhere a `&str` was passed before.
+#[derive(Debug)]
+pub struct TestDb {
+    base: &'static str,
+    composed: std::sync::OnceLock<String>,
+}
+
+impl TestDb {
+    /// Declares the suite's database. `base` is the unprefixed name; the
+    /// prefix is read the first time [`TestDb::name`] is called, never at
+    /// declaration time.
+    pub const fn new(base: &'static str) -> Self {
+        Self {
+            base,
+            composed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The composed name. Panics on the same inputs [`test_db`] does.
+    pub fn name(&self) -> &str {
+        self.composed.get_or_init(|| test_db(self.base))
+    }
+}
+
+impl fmt::Display for TestDb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::ops::Deref for TestDb {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.name()
+    }
 }
 
 /// `Ok` iff `s` is a non-empty `[A-Za-z_][A-Za-z0-9_]*`. A leading digit
@@ -461,7 +520,10 @@ mod tests {
 
     #[test]
     fn a_prefix_is_joined_to_the_name_with_one_underscore() {
-        assert_eq!(compose_db_name(Some("wt3"), "pulsus_x_it"), "wt3_pulsus_x_it");
+        assert_eq!(
+            compose_db_name(Some("wt3"), "pulsus_x_it"),
+            "wt3_pulsus_x_it"
+        );
         assert_eq!(
             compose_db_name(Some("agent_b"), "pulsus_x_it"),
             "agent_b_pulsus_x_it"
@@ -472,7 +534,10 @@ mod tests {
     /// a request for a database called `" wt3_…"`.
     #[test]
     fn a_prefix_is_trimmed_before_use() {
-        assert_eq!(compose_db_name(Some(" wt3 "), "pulsus_x_it"), "wt3_pulsus_x_it");
+        assert_eq!(
+            compose_db_name(Some(" wt3 "), "pulsus_x_it"),
+            "wt3_pulsus_x_it"
+        );
     }
 
     /// Two different prefixes never compose to the same database — the
@@ -523,6 +588,34 @@ mod tests {
     #[should_panic(expected = "over the 200")]
     fn an_over_long_composed_name_is_refused() {
         let _ = compose_db_name(Some(&"p".repeat(190)), "pulsus_x_it");
+    }
+
+    /// `TestDb` has to interpolate and coerce exactly like the `&str`
+    /// constant it replaces, or migrating a suite to it would mean
+    /// rewriting every `format!("… {DB} …")` in the file.
+    #[test]
+    fn a_test_db_interpolates_and_derefs_like_the_str_constant_it_replaces() {
+        static DB: TestDb = TestDb::new("pulsus_x_it");
+        fn takes_str(s: &str) -> usize {
+            s.len()
+        }
+        let expected = test_db("pulsus_x_it");
+        assert_eq!(
+            format!("DROP DATABASE {DB}"),
+            format!("DROP DATABASE {expected}")
+        );
+        assert_eq!(DB.to_string(), expected);
+        assert_eq!(DB.name(), expected);
+        assert_eq!(takes_str(&DB), expected.len());
+    }
+
+    /// The name is composed once and then stable, so a suite that
+    /// interpolates it in twenty places names one database.
+    #[test]
+    fn a_test_db_composes_its_name_once() {
+        static DB: TestDb = TestDb::new("pulsus_y_it");
+        assert_eq!(DB.name(), DB.name());
+        assert!(std::ptr::eq(DB.name(), DB.name()));
     }
 
     /// The public entry point reads the documented variable. Asserted

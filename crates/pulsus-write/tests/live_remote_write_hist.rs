@@ -174,7 +174,7 @@ async fn gauge_hint_native_histogram_lands_counter_reset_hint_3_end_to_end() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_rw_hist_gauge";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_rw_hist_gauge");
     let client = init_db(&bootstrap, db).await;
     let writer = MetricWriter::new_with_tables(
         client.clone(),

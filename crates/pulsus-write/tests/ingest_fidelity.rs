@@ -646,8 +646,8 @@ async fn poll_until_idx_settled(
 async fn assert_fidelity(case: &str) {
     skip_unless_live!();
     let fixture = load_fixture(case);
-    let db_a = format!("pulsus_write_fidelity_{case}_a");
-    let db_b = format!("pulsus_write_fidelity_{case}_b");
+    let db_a = pulsus_testkit::test_db(&format!("pulsus_write_fidelity_it_{case}_a"));
+    let db_b = pulsus_testkit::test_db(&format!("pulsus_write_fidelity_it_{case}_b"));
 
     run_path_a(&db_a, &fixture).await;
     run_path_b(&db_b, &fixture).await;

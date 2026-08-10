@@ -28,6 +28,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -36,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use prost::Message;
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings};
 use pulsus_write::protocols::loki_push::{
     EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter, Timestamp,
 };
@@ -198,27 +203,6 @@ fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("/ready never reached 200 within 60s (port {port}, db {db})");
-}
-
-async fn drop_db(db: &str) {
-    let cfg = ChConnConfig {
-        server: ch_host(),
-        http_port: ch_http_port(),
-        database: "default".to_string(),
-        proto: ChProto::Http,
-        pool_size: 2,
-        query_timeout: Duration::from_secs(20),
-        ..ChConnConfig::default()
-    };
-    let client = ChClient::new(cfg).await.expect("connect bootstrap client");
-    client
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop db");
 }
 
 /// A single-column `count()` against `db`, used to prove a rejected push
@@ -484,7 +468,7 @@ async fn push_both_encodings_then_query_range_returns_the_exact_entries() {
         return;
     }
     let port = 31_150;
-    let db = "pulsus_loki_push_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -577,7 +561,7 @@ async fn push_structured_metadata_surfaces_in_query_range_and_is_filterable() {
         return;
     }
     let port = 31_152;
-    let db = "pulsus_loki_push_sm_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -665,7 +649,7 @@ async fn structured_metadata_colliding_with_a_stream_label_lands_under_extracted
         return;
     }
     let port = 31_153;
-    let db = "pulsus_loki_push_sm_collision_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_collision_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -735,7 +719,7 @@ async fn structured_metadata_double_collision_overwrites_the_extracted_slot_once
         return;
     }
     let port = 31_154;
-    let db = "pulsus_loki_push_sm_double_collision_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_double_collision_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -893,7 +877,7 @@ async fn empty_valued_structured_metadata_is_never_stored() {
         return;
     }
     let port = 31_162;
-    let db = "pulsus_loki_push_empty_sm_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_empty_sm_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -1082,7 +1066,7 @@ async fn colliding_structured_metadata_is_stored_as_the_reference_resolves_it() 
         return;
     }
     let port = 31_166;
-    let db = "pulsus_loki_push_sm_collision_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_collision_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -1173,7 +1157,7 @@ async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_store
         return;
     }
     let port = 31_164;
-    let db = "pulsus_loki_push_sm_name_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_sm_name_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -1299,7 +1283,7 @@ async fn empty_valued_stream_labels_are_never_stored_and_merge_the_stream() {
         return;
     }
     let port = 31_163;
-    let db = "pulsus_loki_push_empty_labels_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_empty_labels_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -1551,7 +1535,7 @@ async fn pushed_stream_appears_in_tail() {
         return;
     }
     let port = 31_151;
-    let db = "pulsus_loki_push_tail_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_tail_it");
     drop_db(db).await;
     let _guard = spawn_ready(
         port,
@@ -1708,7 +1692,7 @@ async fn over_wide_label_value_is_rejected_and_stores_nothing() {
         return;
     }
     let port = 31_155;
-    let db = "pulsus_loki_push_label_bounds_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_label_bounds_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -1839,7 +1823,7 @@ async fn a_mixed_batch_stores_the_good_streams_and_still_answers_400() {
         return;
     }
     let port = 31_156;
-    let db = "pulsus_loki_push_mixed_batch_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_mixed_batch_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -1911,7 +1895,7 @@ async fn an_empty_valued_label_does_not_split_the_stream() {
         return;
     }
     let port = 31_157;
-    let db = "pulsus_loki_push_empty_label_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_empty_label_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -2058,7 +2042,7 @@ async fn an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label() {
         return;
     }
     let port = 31_158;
-    let db = "pulsus_loki_push_otlp_near_miss_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_otlp_near_miss_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -2286,7 +2270,7 @@ async fn the_discovered_service_name_reaches_the_service_column_on_both_receiver
         return;
     }
     let port = 31_160;
-    let db = "pulsus_loki_push_service_discovery_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_service_discovery_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -2451,7 +2435,7 @@ async fn a_stream_less_push_is_422_on_both_receivers_and_stores_nothing() {
         return;
     }
     let port = 31_159;
-    let db = "pulsus_loki_push_stream_less_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_stream_less_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -2580,7 +2564,7 @@ async fn a_case_variant_streams_key_is_accepted_and_its_lines_are_stored() {
         return;
     }
     let port = 31_178;
-    let db = "pulsus_loki_push_streams_case_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_streams_case_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 
@@ -2716,7 +2700,7 @@ async fn a_superseded_over_cap_value_is_accepted_and_the_final_one_is_stored() {
         return;
     }
     let port = 31_161;
-    let db = "pulsus_loki_push_superseded_caps_it";
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_superseded_caps_it");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
 

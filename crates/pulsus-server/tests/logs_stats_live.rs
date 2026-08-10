@@ -27,6 +27,11 @@
 //! (hermetic) enumerates every declaration under `crates/*/tests` and
 //! fails if two collide.
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -179,28 +184,6 @@ fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
     panic!("/ready never reached 200 within 60s (port {port}, db {db})");
 }
 
-async fn drop_db(db: &str) {
-    let admin = ChClient::new(ChConnConfig {
-        server: ch_host(),
-        http_port: ch_http_port(),
-        database: "default".to_string(),
-        proto: ChProto::Http,
-        pool_size: 2,
-        query_timeout: Duration::from_secs(30),
-        ..ChConnConfig::default()
-    })
-    .await
-    .expect("connect admin client");
-    admin
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop db");
-}
-
 /// Finds the `stats_read` stage in an explain block.
 fn stats_read_stage(explain: &serde_json::Value) -> &serde_json::Value {
     explain["stages"]
@@ -218,7 +201,7 @@ async fn stats_counters_routing_gate_and_alias_identity() {
         return;
     }
     let port = 31_145;
-    let db = "pulsus_stats_it_live";
+    let db = &pulsus_testkit::test_db("pulsus_stats_it_live");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
 

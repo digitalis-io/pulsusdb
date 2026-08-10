@@ -360,7 +360,7 @@ fn stage<'a>(explain: &'a PlanExplain, name: &str) -> &'a ExplainStage {
 async fn fallback_fetch_sql_is_denied_by_default_on_the_cluster() {
     skip_unless_live!();
 
-    let db = "pulsus_read_it_metrics_cluster_fallback_negative";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cluster_fallback_negative");
     let shard1_bootstrap = init_clustered_db(db).await;
     let shard2 = ChClient::new(shard2_config("default"))
         .await
@@ -440,7 +440,7 @@ async fn fallback_fetch_sql_is_denied_by_default_on_the_cluster() {
 async fn engine_returns_exact_samples_across_shards_via_the_local_product_mode_fix() {
     skip_unless_live!();
 
-    let db = "pulsus_read_it_metrics_cluster_fallback_positive";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cluster_fallback_positive");
     let shard1_bootstrap = init_clustered_db(db).await;
     let shard2 = ChClient::new(shard2_config("default"))
         .await
