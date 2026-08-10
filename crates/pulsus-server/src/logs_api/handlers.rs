@@ -43,9 +43,16 @@ pub(super) async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError
     chconfig::logql_engine(pool, &state.config).map_err(|_| ApiError::PoolUnavailable)
 }
 
-/// Parses `start`/`end` (defaults: `end = now`, `start = end - 1h`,
-/// docs/api.md §2.1) and applies the **5-year query-span cap** (issue
-/// #343).
+/// Parses `start`/`end`/`since` (docs/api.md §2.1) and applies the
+/// **5-year query-span cap** (issue #343).
+///
+/// **Defaults, issue #406 Part C, exactly the reference's `determineBounds`
+/// (`pkg/loghttp/params.go:91-119` @ grafana/loki v3.7.4 `b318f282`):**
+/// `end = now`; `start = min(end, now) - since`; `since = 1h`. `since` is
+/// read here and nowhere else, and is ignored entirely when `start` is
+/// present. The `min(end, now)` clamp — the reference's `endOrNow` — is
+/// what stops a future `end` dragging the default `start` into the future
+/// with it, and it applies to requests carrying no `since` at all.
 ///
 /// **THE CAP LIVES HERE BECAUSE THIS IS THE ONLY PLACE EVERY ENDPOINT
 /// CARRYING `start`/`end` PASSES THROUGH.** Its first cut sat in
@@ -93,22 +100,82 @@ pub(super) async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError
 /// `plan` keeps its own call for the library API.
 pub(super) fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), ApiError> {
     let now = params::now_ns();
+    let since_ns = params::parse_since(params::get(pairs, "since"))?;
     let end_ns = match params::get(pairs, "end") {
         Some(v) => params::parse_ts(v)?,
         None => now,
     };
+    // `endOrNow` (`pkg/loghttp/params.go:105-111` @ v3.7.4 `b318f282`): a
+    // future `end` does not push the default `start` into the future with
+    // it. Container-measured on the reference 2026-08-10 — `end = now+2h`
+    // with no `start` answers from `now - 1h`, not from `end - 1h`; the
+    // same request with `since=10m` answers from `now - 10m` and returns
+    // nothing against 20-minute-old data.
+    let end_or_now = end_ns.min(now);
     let start_ns = match params::get(pairs, "start") {
         Some(v) => params::parse_ts(v)?,
-        None => params::default_start_ns(end_ns),
+        None => end_or_now.saturating_sub(since_ns),
     };
     pulsus_read::logql::check_query_span_ns(start_ns, end_ns)?;
     Ok((start_ns, end_ns))
 }
 
+/// [`parse_bounds`] plus the reference's `end < start` refusal — issue
+/// #406, folded in by task-manager ruling v2 (a user swapping two dates in
+/// a URL gets a plain error rather than an empty dashboard).
+///
+/// **The check is PER ROUTE and the exemptions are deliberate.** The
+/// reference applies it on `query_range` (`ParseRangeQuery`,
+/// `pkg/loghttp/query.go:483-485 @ v3.7.4 b318f282`), on `index/stats`
+/// (`ParseIndexStatsQuery`, which IS `ParseRangeQuery`, `:543-547`), on
+/// `index/volume` (`:621-623`), on `detected_fields` (`:676-678`), on
+/// `detected_labels` (`pkg/loghttp/labels.go:99-101`), and on `labels` and
+/// `series` one layer down, where `ValidateQueryTimeRangeLimits`
+/// (`pkg/querier/limits/validation.go:91-93`) refuses `through.Before(from)`
+/// for `SingleTenantQuerier.Label`/`Series` (`pkg/querier/querier.go:311,388`).
+/// It does **not** apply it on `/query` (instant — no range) or on
+/// `/patterns` (`ParsePatternsQuery` never checks). Both negatives are
+/// pinned by `mod.rs`'s
+/// `end_before_start_is_refused_on_exactly_the_reference_routes`;
+/// container-measured on both stores 2026-08-10.
+///
+/// Strictly BEFORE, not before-or-equal, despite the reference's own
+/// message prose: every one of those call sites spells `End.Before(Start)`,
+/// so `end == start` is served.
+pub(super) fn parse_bounds_ordered(pairs: &[(String, String)]) -> Result<(i64, i64), ApiError> {
+    let (start_ns, end_ns) = parse_bounds(pairs)?;
+    if end_ns < start_ns {
+        return Err(ParamError::EndBeforeStart.into());
+    }
+    Ok((start_ns, end_ns))
+}
+
+/// Form pairs for a POST: the body's pairs FIRST, then the URL query's,
+/// appended — Go's `ParseForm` copies `PostForm` into `Form` and then
+/// appends `url.ParseQuery(r.URL.RawQuery)` per key, and
+/// `NewPrepopulateMiddleware` (`pkg/util/server/middleware.go:12-23` @
+/// v3.7.4 `b318f282`) runs it for every logs route, so every handler
+/// upstream sees both carriers (issue #406 Part B1).
+///
+/// **Order is the whole contract.** [`params::get`] returns the FIRST
+/// occurrence, so the body wins a scalar collision, and
+/// [`params::get_all`] returns BOTH, concatenated, so a repeated
+/// parameter unions across the two carriers. Container-measured against
+/// `grafana/loki:3.7.4` 2026-08-10: `?limit=7` + body `limit=5` serves 5;
+/// `?limit=5` + body `limit=` serves 100 (the DEFAULT, not 5 — which is
+/// what rules out the plausible "fall back to the URL when the body value
+/// is empty" spelling); `?match[]={app="b"}` + body `match[]={app="a"}`
+/// returns both series.
+///
+/// The content-type gate is unchanged here: the reference accepts a POST
+/// with any (or no) `Content-Type` and we still answer `400`, which is a
+/// separate widening recorded on issue #406 and not part of this change.
+///
 /// `pub(super)` (issue #170): the detected_labels/detected_fields POST
 /// handlers (`detected.rs`) reuse the same form-decode core.
 pub(super) async fn read_form_pairs(
     headers: &HeaderMap,
+    raw_query: Option<&str>,
     body: Bytes,
 ) -> Result<Vec<(String, String)>, ApiError> {
     let content_type = headers
@@ -122,7 +189,39 @@ pub(super) async fn read_form_pairs(
     }
     let text =
         std::str::from_utf8(&body).map_err(|_| ApiError::Param(ParamError::InvalidFormBody))?;
-    Ok(params::parse_pairs(text))
+    let mut pairs = params::parse_pairs(text);
+    pairs.extend(params::parse_pairs(raw_query.unwrap_or("")));
+    Ok(pairs)
+}
+
+/// The reference's series groups (`ParseSeriesQuery`,
+/// `pkg/loghttp/series.go:23-38` @ v3.7.4 `b318f2829f0ae2094ab3a1e90780450e9e4b03be`),
+/// issue #406 Part A: `match` and `match[]` are BOTH read, through the
+/// repeated seam (`r.Form[...]`), unioned, sorted and deduped; a set of
+/// exactly one element that is `{}` after removing every ASCII space
+/// collapses to empty, which is legal and means "every series in the
+/// window" (`MatchForSeriesRequest(nil)` returns no error —
+/// `pkg/logql/matchers.go:13-26`).
+///
+/// Container-measured against `grafana/loki:3.7.4`, 2026-08-10: no
+/// `match[]` → `200` with all series; `?match[]={}` and `?match[]={ }` →
+/// `200` with all series; **`?match[]={}&match[]={app="a"}` → `400`**
+/// (`0 matchers in group: {}` — the collapse needs `len == 1`, so the
+/// plausible `retain(|g| g != "{}")` spelling would wrongly turn this into
+/// a scoped `200`); `?match[]=` → `400`, unchanged, because the repeated
+/// seam does not collapse empty into absent (issue #391).
+///
+/// Space stripping is ASCII space only (`strings.ReplaceAll(matcher, " ",
+/// "")`): `{ }` collapses, a tab does not — so no `trim`/`is_whitespace`.
+fn series_groups<'a>(pairs: &'a [(String, String)]) -> Vec<&'a str> {
+    let mut groups: Vec<&str> = params::get_all(pairs, "match");
+    groups.extend(params::get_all(pairs, "match[]"));
+    groups.sort_unstable();
+    groups.dedup();
+    if groups.len() == 1 && groups[0].replace(' ', "") == "{}" {
+        groups.clear();
+    }
+    groups
 }
 
 // ---------------------------------------------------------------------
@@ -149,9 +248,10 @@ pub(crate) async fn query_range(
 pub(crate) async fn query_range_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match query_range_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -167,7 +267,7 @@ async fn query_range_impl(
 ) -> Result<Response, ApiError> {
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
     let expr = super::parse_logql(query)?;
-    let (start_ns, end_ns) = parse_bounds(&pairs)?;
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let step_ns = params::parse_step(params::get(&pairs, "step"), start_ns, end_ns)?;
     // Issue #227: Loki's `(end-start)/step > 11000` resolution limit — a hard
     // 400 at request parsing with Loki's exact message (the engine keeps its
@@ -217,9 +317,10 @@ pub(crate) async fn query(
 pub(crate) async fn query_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match query_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -305,9 +406,10 @@ pub(crate) async fn labels_get(
 pub(crate) async fn labels_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match labels_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -321,7 +423,7 @@ async fn labels_impl(
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (start_ns, end_ns) = parse_bounds(&pairs)?;
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
     let engine = engine_for(&state).await?;
     if wants_explain(headers) {
@@ -334,7 +436,7 @@ async fn labels_impl(
 }
 
 // ---------------------------------------------------------------------
-// GET /api/logs/v1/label/{name}/values
+// GET|POST /api/logs/v1/label/{name}/values
 // ---------------------------------------------------------------------
 
 pub(crate) async fn label_values(
@@ -346,6 +448,30 @@ pub(crate) async fn label_values(
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
     match label_values_impl(state, &name, &headers, pairs).await {
         Ok(res) => res,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/logs/v1/label/{name}/values` (issue #406 Part B2, folded in
+/// by task-manager ruling): the reference registers this route
+/// `Methods("GET","POST")` like the other three
+/// (`pkg/loki/modules.go:687`, `:1365` @ v3.7.4 `b318f282`) and answers a
+/// form POST `200` where we answered `405` — measured 2026-08-10.
+///
+/// Extractor order matters: `Path` before the `Bytes` body extractor,
+/// which must stay last.
+pub(crate) async fn label_values_post(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Response {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
+        Ok(pairs) => match label_values_impl(state, &name, &headers, pairs).await {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        },
         Err(e) => e.into_response(),
     }
 }
@@ -387,9 +513,10 @@ pub(crate) async fn series_get(
 pub(crate) async fn series_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match series_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -403,19 +530,21 @@ async fn series_impl(
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let matches = params::get_all(&pairs, "match[]");
-    if matches.is_empty() {
-        return Err(ApiError::Param(ParamError::MissingMatch));
-    }
-    let mut selectors = Vec::with_capacity(matches.len());
-    for m in matches {
+    // Issue #406 Part A: an EMPTY group set is legal and means "every
+    // series active in the window" — the reference's
+    // `MatchForSeriesRequest(nil)` returns no error
+    // (`pkg/logql/matchers.go:13-26 @ v3.7.4 b318f282`), and it is reached
+    // both by sending no `match[]` at all and by sending a lone `{}`.
+    let groups = series_groups(&pairs);
+    let mut selectors = Vec::with_capacity(groups.len());
+    for m in groups {
         let selector = pulsus_logql::parse_selector(m)?;
         selectors.push(Expr::Log(LogExpr {
             selector,
             pipeline: Vec::new(),
         }));
     }
-    let (start_ns, end_ns) = parse_bounds(&pairs)?;
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
     let engine = engine_for(&state).await?;
     if wants_explain(headers) {
@@ -882,7 +1011,7 @@ mod tests {
     async fn query_range_post_rejects_a_non_form_content_type() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        let res = query_range_post(State(test_state()), headers, Bytes::from_static(b"{}")).await;
+        let res = query_range_post(State(test_state()), headers, RawQuery(None), Bytes::from_static(b"{}")).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -895,7 +1024,7 @@ mod tests {
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
         let body = Bytes::from_static(b"query=%7Bapp%3D%22x%22%7D");
-        let res = query_range_post(State(test_state()), headers, body).await;
+        let res = query_range_post(State(test_state()), headers, RawQuery(None), body).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -907,7 +1036,7 @@ mod tests {
             header::CONTENT_TYPE,
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
-        let res = query_post(State(test_state()), headers, Bytes::from_static(b"")).await;
+        let res = query_post(State(test_state()), headers, RawQuery(None), Bytes::from_static(b"")).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -920,23 +1049,144 @@ mod tests {
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
         let body = Bytes::from_static(b"query=%7Bapp%3D%22x%22%7D");
-        let res = query_post(State(test_state()), headers, body).await;
+        let res = query_post(State(test_state()), headers, RawQuery(None), body).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// Issue #406 Part A: no `match[]` reaches the engine (`503` against a
+    /// poolless state) instead of the old `400 missing required parameter
+    /// 'match[]'`. Container-measured on `grafana/loki:3.7.4` 2026-08-10:
+    /// `200` with every series in the window.
     #[tokio::test]
-    async fn series_without_any_match_param_is_400() {
+    async fn series_without_any_match_param_reaches_the_engine() {
         let res = series_get(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
-        let (status, _body) = status_and_body(res).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(!body.contains("missing required parameter"), "{body}");
+    }
+
+    /// **Issue #406 Part A's discriminating test**, over the reference's
+    /// group collection itself (`ParseSeriesQuery`,
+    /// `pkg/loghttp/series.go:23-38` @ v3.7.4 `b318f282`). Every row is
+    /// the reference's measured answer.
+    ///
+    /// Two wrong spellings die here and nowhere else:
+    ///
+    /// * `groups.retain(|g| g.replace(' ', "") != "{}")` satisfies every
+    ///   single-value row and turns the reference's `400` on
+    ///   `{}`-plus-a-real-selector into a scoped `200`. The
+    ///   `["{}", "{app=\"a\"}"]` row is what fails it — the collapse runs
+    ///   only when the deduped set has exactly ONE element.
+    /// * collapsing `match[]=` alongside `{}` would undo #391's
+    ///   repeated-seam asymmetry: an empty value is a value there, and a
+    ///   `400`, while an absent one is a `200`.
+    #[test]
+    fn series_group_collection_matches_the_reference_rules() {
+        let groups = |raw: &str| -> Vec<String> {
+            let pairs = params::parse_pairs(raw);
+            series_groups(&pairs)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        // ref: no `match[]` at all -> 200, all series.
+        assert!(groups("").is_empty());
+        // ref: `?match[]={}` -> 200, all series (the lone-`{}` collapse).
+        assert!(groups("match%5B%5D=%7B%7D").is_empty());
+        // ref: `?match[]={ }` -> 200 — ASCII spaces are stripped.
+        assert!(groups("match%5B%5D=%7B%20%7D").is_empty());
+        // A tab is NOT stripped (`strings.ReplaceAll(matcher, " ", "")`).
+        assert_eq!(groups("match%5B%5D=%7B%09%7D"), vec!["{\t}".to_string()]);
+        // ref: `?match[]={}&match[]={app="a"}` -> 400 `0 matchers in group: {}`.
+        // Sorted byte-wise, so `{app="a"}` precedes `{}`.
+        assert_eq!(
+            groups("match%5B%5D=%7B%7D&match%5B%5D=%7Bapp%3D%22a%22%7D"),
+            vec![r#"{app="a"}"#.to_string(), "{}".to_string()]
+        );
+        // ref: `?match={app="a"}` -> 200, one series (the unbracketed
+        // alias, read through the same repeated seam).
+        assert_eq!(
+            groups("match=%7Bapp%3D%22a%22%7D"),
+            vec![r#"{app="a"}"#.to_string()]
+        );
+        // ref: the two spellings union and DEDUPE.
+        assert_eq!(
+            groups("match=%7Bapp%3D%22a%22%7D&match%5B%5D=%7Bapp%3D%22a%22%7D"),
+            vec![r#"{app="a"}"#.to_string()]
+        );
+        // ref: `?match[]=X&match[]=X` -> 200, deduped.
+        assert_eq!(
+            groups("match%5B%5D=%7Ba%7D&match%5B%5D=%7Ba%7D"),
+            vec!["{a}".to_string()]
+        );
+        // ref: `?match[]=` -> 400 parse error. The repeated seam does not
+        // collapse empty into absent (#391), so this is ONE group `""`.
+        assert_eq!(groups("match%5B%5D="), vec![String::new()]);
+        // …and the union is sorted, so `""` sorts first.
+        assert_eq!(
+            groups("match%5B%5D=&match%5B%5D=%7Ba%7D"),
+            vec![String::new(), "{a}".to_string()]
+        );
+    }
+
+    /// Issue #406 Part C: `since` supplies the `start` default and is
+    /// ignored the moment `start` is present (`determineBounds`,
+    /// `pkg/loghttp/params.go:91-119` @ v3.7.4 `b318f282`).
+    #[test]
+    fn bounds_take_since_only_when_start_is_absent() {
+        let end_ns = params::now_ns() - 60_000_000_000; // in the past, so no clamp
+        let bounds = |raw: &str| parse_bounds(&params::parse_pairs(raw)).expect("bounds");
+
+        let (start, end) = bounds(&format!("end={end_ns}&since=30m"));
+        assert_eq!(end, end_ns);
+        assert_eq!(start, end_ns - 1_800_000_000_000);
+
+        let (start, _end) = bounds(&format!("end={end_ns}"));
+        assert_eq!(start, end_ns - params::DEFAULT_SINCE_NS, "the 1h default");
+
+        let explicit = end_ns - 12_345_000_000_000;
+        let (start, _end) = bounds(&format!("start={explicit}&end={end_ns}&since=30m"));
+        assert_eq!(start, explicit, "`since` is ignored when `start` is present");
+
+        let err = parse_bounds(&params::parse_pairs("since=bogus")).expect_err("400");
+        assert!(matches!(
+            err,
+            ApiError::Param(ParamError::InvalidSince(_))
+        ));
+    }
+
+    /// Issue #406 Part C, the `endOrNow` clamp — the one row that changes
+    /// behaviour for requests carrying no `since` at all. Measured on
+    /// `grafana/loki:3.7.4` 2026-08-10: `end = now + 2h` with no `start`
+    /// answers from `now - 1h`, returning all 150 seeded entries; the same
+    /// request with `since=10m` answers from `now - 10m` and returns none.
+    /// Pre-change PulsusDB defaulted `start` to `end - 1h`, i.e. one hour
+    /// into the FUTURE, and answered empty.
+    #[test]
+    fn a_future_end_does_not_push_the_default_start_into_the_future() {
+        let now = params::now_ns();
+        let end_ns = now + 7_200_000_000_000; // now + 2h
+        let (start, end) =
+            parse_bounds(&params::parse_pairs(&format!("end={end_ns}"))).expect("bounds");
+        assert_eq!(end, end_ns);
+        let expected = now - params::DEFAULT_SINCE_NS;
+        assert!(
+            (start - expected).abs() < 5_000_000_000,
+            "start must be `now - 1h` ({expected}), not `end - 1h` ({}); got {start}",
+            end_ns - params::DEFAULT_SINCE_NS
+        );
+        assert!(
+            start < now,
+            "the default start must never be in the future; got {start} vs now {now}"
+        );
     }
 
     #[tokio::test]
     async fn series_post_rejects_a_non_form_content_type() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        let res = series_post(State(test_state()), headers, Bytes::from_static(b"{}")).await;
+        let res = series_post(State(test_state()), headers, RawQuery(None), Bytes::from_static(b"{}")).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -949,7 +1199,7 @@ mod tests {
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
         let body = Bytes::from_static(b"match%5B%5D=%7Bapp%3D%22x%22%7D");
-        let res = series_post(State(test_state()), headers, body).await;
+        let res = series_post(State(test_state()), headers, RawQuery(None), body).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }

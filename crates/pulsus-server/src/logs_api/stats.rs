@@ -1,4 +1,4 @@
-//! `GET /api/logs/v1/stats` (issue #74, docs/api.md §2.5): parse
+//! `GET|POST /api/logs/v1/stats` (issue #74, docs/api.md §2.5): parse
 //! `query`/`start`/`end`, validate the query shape (a log stream selector
 //! plus optional line filters — nothing else has a pushdown aggregation),
 //! dispatch to `LogQlEngine::stats`, and encode the bare
@@ -7,6 +7,7 @@
 //! skip-index `log_samples` scan otherwise — the routing is visible via
 //! `X-Pulsus-Explain`.
 
+use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -18,7 +19,7 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds};
+use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs};
 use super::params::{self, ParamError};
 
 /// `X-Pulsus-Explain: 1` — same header contract as the query endpoints.
@@ -41,6 +42,26 @@ pub(crate) async fn stats(
     }
 }
 
+/// `POST /api/logs/v1/stats` (issue #406 Part B2): the reference
+/// registers `/loki/api/v1/index/stats` `Methods("GET","POST")`
+/// (`pkg/loki/modules.go:690`, `:1367` @ v3.7.4 `b318f282`) and answers a
+/// form POST `200` where we answered `405` — measured 2026-08-10. Same
+/// shape as `handlers::labels_post`; `stats_impl` is unchanged.
+pub(crate) async fn stats_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Response {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
+        Ok(pairs) => match stats_impl(state, &headers, pairs).await {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        },
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn stats_impl(
     state: AppState,
     headers: &HeaderMap,
@@ -49,7 +70,7 @@ async fn stats_impl(
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
     let expr = super::parse_logql(query)?;
     validate_stats_query(&expr)?;
-    let (start_ns, end_ns) = parse_bounds(&pairs)?;
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
 
     let engine = engine_for(&state).await?;

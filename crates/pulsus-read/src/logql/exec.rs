@@ -411,6 +411,16 @@ impl LogQlEngine {
     /// from `match[]`); a metric expression is planned all the same (both
     /// `Plan` variants carry `stage1_sql`/`streams_table`) since stage 1
     /// resolution does not depend on the pipeline/aggregation.
+    ///
+    /// **An EMPTY `selectors` is legal and means "every series active in
+    /// the window"** (issue #406 Part A): the reference's
+    /// `MatchForSeriesRequest(nil)` returns no error
+    /// (`pkg/logql/matchers.go:13-26` @ grafana/loki v3.7.4 `b318f282`),
+    /// so `/series` with no `match[]` — and `/series?match[]={}` — is a
+    /// `200` over every series there. That branch skips stage 1 entirely
+    /// and reads [`LogQlEngine::all_active_fingerprints`], bounded by the
+    /// same `max_streams` cap and the same scan budget as the matched
+    /// path, over two statements instead of three.
     pub async fn series(
         &self,
         selectors: &[Expr],
@@ -454,62 +464,86 @@ impl LogQlEngine {
         };
         let mut fingerprints: Vec<u64> = Vec::new();
         let mut streams_table = self.config.streams.clone();
-        for expr in selectors {
-            // A binary metric expression carries one stage-1 resolution
-            // per leaf selector; the other plan shapes carry exactly one.
-            let stage1s: Vec<(String, String)> = match plan::plan(expr, &qp, &ctx)? {
-                Plan::Streams(sp) => vec![(sp.stage1_sql, sp.streams_table)],
-                Plan::Metric(mp) => vec![(mp.stage1_sql, mp.streams_table)],
-                Plan::MetricBinary(node) => node
-                    .leaves()
-                    .into_iter()
-                    .map(|mp| (mp.stage1_sql.clone(), mp.streams_table.clone()))
-                    .collect(),
-            };
-            for (stage1_sql, table) in stage1s {
-                if let Some(e) = explain.as_mut() {
-                    e.push("stage1_stream_resolution", stage1_sql.clone(), None);
-                }
-                let fps = self.resolve_fingerprints(&stage1_sql).await?;
-                fingerprints.extend(fps);
-                streams_table = table;
-            }
-        }
-        fingerprints.sort_unstable();
-        fingerprints.dedup();
-        // Each selector's own `resolve_fingerprints` call already caps that
-        // *individual* selector at `max_streams` (`check_stream_cap` inside
-        // it), but says nothing about the deduped union across selectors —
-        // N disjoint `match[]` values can each stay under the cap
-        // individually while their union blows well past it, building an
-        // oversized stage-2 `fingerprint IN (...)` hydration query (round-1
-        // code review finding 1). Re-check the cap on the union before
-        // proceeding.
-        check_stream_cap(fingerprints.len(), self.config.max_streams)?;
-        if fingerprints.is_empty() {
-            return Ok(Vec::new());
-        }
         // Issue #399: stage 1 is month-scoped (`sql::stage1`, shared with
         // every other LogQL path — see `LogQlEngine::active_fingerprints`
         // for why it must stay that way), so the request's own window is
-        // applied here, as its own statement, AFTER the cap above.
-        // Ordering is load-bearing in both directions: filtering first
-        // would silently relax `max_streams` to the post-window survivors
-        // (`series_stream_cap.rs::series_cap_counts_the_pre_window_union`).
+        // applied as its own statement.
         let window = self.activity_window(b);
-        if let Some(e) = explain.as_mut() {
-            e.push(
-                "series_activity_filter",
-                super::sql::active_fingerprints(
-                    &self.config.rollup_table,
-                    Some(&fingerprints),
-                    window,
-                    self.config.rollup_res_ns,
-                ),
-                None,
-            );
+        if selectors.is_empty() {
+            // Issue #406 Part A: no `match[]` (or a lone `{}`) means
+            // "every series active in the window". There is no selector to
+            // resolve, so there is NO `stage1_stream_resolution` here —
+            // the activity scan is the whole first stage, exactly as
+            // `/labels` and `/detected_labels` already render it.
+            if let Some(e) = explain.as_mut() {
+                e.push(
+                    "series_activity_filter",
+                    super::sql::active_fingerprints(
+                        &self.config.rollup_table,
+                        None,
+                        window,
+                        self.config.rollup_res_ns,
+                    ),
+                    None,
+                );
+            }
+            // Capped inside the streaming loop, so `check_stream_cap` must
+            // NOT be repeated on the result here.
+            fingerprints = self.all_active_fingerprints(window).await?;
+        } else {
+            for expr in selectors {
+                // A binary metric expression carries one stage-1 resolution
+                // per leaf selector; the other plan shapes carry exactly one.
+                let stage1s: Vec<(String, String)> = match plan::plan(expr, &qp, &ctx)? {
+                    Plan::Streams(sp) => vec![(sp.stage1_sql, sp.streams_table)],
+                    Plan::Metric(mp) => vec![(mp.stage1_sql, mp.streams_table)],
+                    Plan::MetricBinary(node) => node
+                        .leaves()
+                        .into_iter()
+                        .map(|mp| (mp.stage1_sql.clone(), mp.streams_table.clone()))
+                        .collect(),
+                };
+                for (stage1_sql, table) in stage1s {
+                    if let Some(e) = explain.as_mut() {
+                        e.push("stage1_stream_resolution", stage1_sql.clone(), None);
+                    }
+                    let fps = self.resolve_fingerprints(&stage1_sql).await?;
+                    fingerprints.extend(fps);
+                    streams_table = table;
+                }
+            }
+            fingerprints.sort_unstable();
+            fingerprints.dedup();
+            // Each selector's own `resolve_fingerprints` call already caps
+            // that *individual* selector at `max_streams`
+            // (`check_stream_cap` inside it), but says nothing about the
+            // deduped union across selectors — N disjoint `match[]` values
+            // can each stay under the cap individually while their union
+            // blows well past it, building an oversized stage-2
+            // `fingerprint IN (...)` hydration query (round-1 code review
+            // finding 1). Re-check the cap on the union before proceeding.
+            check_stream_cap(fingerprints.len(), self.config.max_streams)?;
+            if fingerprints.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Ordering is load-bearing in both directions: filtering first
+            // would silently relax `max_streams` to the post-window
+            // survivors
+            // (`series_stream_cap.rs::series_cap_counts_the_pre_window_union`).
+            if let Some(e) = explain.as_mut() {
+                e.push(
+                    "series_activity_filter",
+                    super::sql::active_fingerprints(
+                        &self.config.rollup_table,
+                        Some(&fingerprints),
+                        window,
+                        self.config.rollup_res_ns,
+                    ),
+                    None,
+                );
+            }
+            fingerprints = self.active_fingerprints(&fingerprints, window).await?;
         }
-        let fingerprints = self.active_fingerprints(&fingerprints, window).await?;
         if fingerprints.is_empty() {
             return Ok(Vec::new());
         }
@@ -600,6 +634,56 @@ impl LogQlEngine {
             fingerprints.push(row.fingerprint);
             check_stream_cap(fingerprints.len(), self.config.max_streams)?;
         }
+        Ok(fingerprints)
+    }
+
+    /// Every fingerprint ACTIVE in `window`, with no selector to narrow it
+    /// — the unscoped arm of [`super::sql::active_fingerprints`], which
+    /// `label_names`/`label_values`/`detected_labels` already render today
+    /// (issue #399). Issue #406 Part A: this is what `/series` with no
+    /// `match[]` resolves against.
+    ///
+    /// Caps INSIDE the streaming loop, exactly as
+    /// [`LogQlEngine::resolve_fingerprints`] does, so an oversized store is
+    /// refused after `max_streams + 1` rows rather than after all of them —
+    /// and so the caller must not re-check the cap on the result.
+    ///
+    /// Sorted before returning so the stage-2 `fingerprint IN (...)` text
+    /// (and therefore the explain trace) is deterministic, matching the
+    /// matched path's sorted union. `DISTINCT fingerprint` already makes
+    /// the rows unique; the `dedup` is a cheap restatement of that
+    /// invariant, not a second pass over duplicates.
+    async fn all_active_fingerprints(
+        &self,
+        window: super::sql::TimeWindow,
+    ) -> Result<Vec<u64>, ReadError> {
+        let sql = super::sql::active_fingerprints(
+            &self.config.rollup_table,
+            None,
+            window,
+            self.config.rollup_res_ns,
+        );
+        let mut fingerprints: Vec<u64> = Vec::new();
+        // Scoped so the pooled connection's lease drops before the caller
+        // issues stage 2 (the `ChRowStream` lease contract).
+        {
+            let mut stream = self
+                .query_stream::<StreamRow>(&sql, &self.budget_settings())
+                .await?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
+                fingerprints.push(row.fingerprint);
+                check_stream_cap(fingerprints.len(), self.config.max_streams)?;
+            }
+        }
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
         Ok(fingerprints)
     }
 

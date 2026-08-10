@@ -138,7 +138,12 @@ fn parse_tail_params(pairs: &[(String, String)], cfg: &Config) -> Result<TailPar
     };
     let start_ns = match params::get(pairs, "start") {
         Some(v) => params::parse_ts(v)?,
-        None => params::default_start_ns(params::now_ns()),
+        // `now - 1h`. `/tail` is deliberately OUTSIDE issue #406 Part
+        // C's `since` widening: it has no `end` and its own retention
+        // clamp below already owns the lower bound, so the nine routes
+        // that read `since` are exactly the ones going through
+        // `handlers::parse_bounds`.
+        None => params::now_ns().saturating_sub(params::DEFAULT_SINCE_NS),
     };
     // Retention clamp (issue #94 item 1): raise an ancient first-page
     // lower bound to the retention floor so catch-up never walks
