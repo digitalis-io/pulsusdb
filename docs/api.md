@@ -151,6 +151,38 @@ parameter takes **both, concatenated** (`?match[]={app="b"}` + body
 body's value and still collapses to the default — `?limit=5` + body
 `limit=` serves 100, not 5.
 
+**A `POST`'s `Content-Type` decides whether its BODY is read, not whether
+the request is served.** The body is parsed as form pairs only under
+`application/x-www-form-urlencoded` (case-insensitively, parameters such as
+`; charset=UTF-8` allowed). Under **any other** well-formed media type —
+`application/json`, `text/plain`, `multipart/form-data`, a bare token like
+`garbage`, or **no `Content-Type` header at all** — the body is not read,
+and the request is answered from its URL query alone. So a POST carrying
+every parameter in its URL is served whatever the client labels the body,
+which matters because plenty of HTTP clients send `application/json` by
+default. What *is* rejected `400` is a `Content-Type` that cannot be
+**parsed**: an empty subtype (`application/`), a missing type (`;`,
+`/json`), trailing content after the subtype (`application/json/x`), or a
+malformed parameter (`application/json; charset`, or a repeated parameter
+whose values disagree — `; a=1; a=2`; a repeat whose values *agree* is
+allowed, as is one trailing `;`). This is the reference's rule throughout,
+in its own `mime.ParseMediaType`/`ParseForm` terms; the rejection message
+prose is PulsusDB's.
+
+**"Not read" means the upload is never awaited.** The `Content-Type` is
+examined before any of the body is consumed, so a POST that is answerable
+from its URL is answered while the client may still be sending — a client
+that advertises a large body it did not need to send does not pay for the
+transfer. The one place PulsusDB stops short of the reference here is a
+form `Content-Type` with a **malformed parameter**
+(`application/x-www-form-urlencoded; bogus`): the reference reads and
+parses the whole body before returning the error it had already decided on,
+where PulsusDB returns it immediately. Same `400`, same body, less
+transfer. A body-size limit still applies on the branch that *does* read
+the body: over roughly 2 MiB the request is rejected `413` (the reference's
+own form cap is 10 MiB and it answers `400` — a difference in a limit, not
+in the parameter surface).
+
 ### 2.1 `GET|POST /api/logs/v1/query_range`
 
 | Param | Type | Notes |

@@ -50,8 +50,8 @@ const ONE_SECOND_NS: u64 = 1_000_000_000;
 
 /// Errors from parsing `/api/logs/v1` request parameters — mapped to
 /// `400` by `error::ApiError` (the one exception,
-/// `UnsupportedContentType`, still maps to `400`, just for a
-/// POST-specific reason).
+/// `MalformedContentType`, still maps to `400`, just for a POST-specific
+/// reason).
 #[derive(Debug, Error)]
 pub(crate) enum ParamError {
     #[error("missing required parameter 'query'")]
@@ -75,8 +75,15 @@ pub(crate) enum ParamError {
     InvalidDirection(String),
     #[error("invalid 'step' {raw:?}: {reason}")]
     InvalidStep { raw: String, reason: String },
-    #[error("request body must be application/x-www-form-urlencoded, got {0:?}")]
-    UnsupportedContentType(String),
+    /// Issue #406: a `Content-Type` that cannot be PARSED. The reference
+    /// refuses one before any handler runs, because `ParseForm` returns
+    /// `mime.ParseMediaType`'s error and `NewPrepopulateMiddleware` turns
+    /// any `ParseForm` error into a `400`
+    /// (`pkg/util/server/middleware.go:16-20 @ v3.7.4 b318f282`). A
+    /// well-formed but non-form type is NOT this error — the body is
+    /// simply not read; see [`form_body_disposition`].
+    #[error("malformed 'Content-Type' header {0:?}")]
+    MalformedContentType(String),
     #[error("request body is not valid UTF-8")]
     InvalidFormBody,
     /// Issue #74: `/tail` and `/stats` take log stream queries only — a
@@ -752,6 +759,296 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+// -- POST `Content-Type` (issue #406) ----------------------------------
+
+/// What a POST's `Content-Type` says about its BODY.
+///
+/// Two outcomes, never three: the header decides whether the body is read,
+/// and it never decides whether the request is served. A malformed header
+/// is a separate axis and is a [`ParamError::MalformedContentType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormBody {
+    /// `application/x-www-form-urlencoded` — parse the body as form pairs.
+    Parse,
+    /// Any other well-formed media type, and an absent or empty header —
+    /// the body is not read at all. The URL query is still read.
+    Ignore,
+}
+
+/// Whether a POST body is read, in the reference's exact reading
+/// (`parsePostForm`, Go's `net/http/request.go:1263-1307` @ go1.25.5,
+/// reached from `ParseForm` via `NewPrepopulateMiddleware`,
+/// `pkg/util/server/middleware.go:12-23` @ grafana/loki v3.7.4
+/// `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), issue #406.
+///
+/// **The reference does not gate SERVICE on this header — it gates
+/// BODY-READING.** An absent, empty or non-form `Content-Type` makes the
+/// body invisible and the request is answered from the URL query alone;
+/// only a header that cannot be PARSED is refused, and then by
+/// `ParseForm` returning `mime.ParseMediaType`'s error, which the
+/// middleware turns into a `400` before any handler runs.
+///
+/// Order is the reference's:
+///
+/// 1. An empty header value becomes `application/octet-stream`
+///    (`request.go:1271-1273`, RFC 7231 §3.1.1.5). An **absent** header
+///    reads the same, because Go's `Header.Get` returns `""` for both —
+///    and so does an all-whitespace one, because both HTTP stacks strip
+///    a header value's surrounding whitespace before we see it
+///    (container-measured, below).
+/// 2. [`parse_media_type`] — Go's `mime.ParseMediaType`. On error, the
+///    whole request is a `400`; the body is never reached.
+/// 3. The parsed media type, lowercased and stripped of its parameters,
+///    is compared to `application/x-www-form-urlencoded`
+///    (`request.go:1276`). Equal ⇒ [`FormBody::Parse`]; anything else,
+///    including `multipart/form-data`, ⇒ [`FormBody::Ignore`].
+///
+/// Container-measured against `grafana/loki:3.7.4`, 2026-08-10, with all
+/// parameters in the URL and `limit=5` in the body against a 150-entry
+/// seed — so "5" reads the body and "7" (the URL's `limit`) ignores it:
+/// absent ⇒ 7; `Content-Type:` ⇒ 7; `Content-Type:` + three spaces ⇒ 7;
+/// `application/json` ⇒ 7; `text/plain` ⇒ 7; `application/octet-stream`
+/// ⇒ 7; `multipart/form-data` ⇒ 7; `garbage` (a bare token, no slash,
+/// which IS a legal media type) ⇒ 7; `application/x-www-form-urlencodedX`
+/// ⇒ 7; `application/x-www-form-urlencoded` ⇒ 5;
+/// `…urlencoded; charset=UTF-8` ⇒ 5; `APPLICATION/X-WWW-Form-URLENCODED`
+/// ⇒ 5; `  application/x-www-form-urlencoded  ` ⇒ 5.
+pub(crate) fn form_body_disposition(content_type: Option<&str>) -> Result<FormBody, ParamError> {
+    let raw = content_type.unwrap_or("");
+    // `request.go:1271-1273` — an empty type MAY be treated as
+    // `application/octet-stream`, and Go takes that option. Spelled as the
+    // substitution rather than as an early return so the fall-through is
+    // the reference's own.
+    let ct = if raw.is_empty() {
+        "application/octet-stream"
+    } else {
+        raw
+    };
+    let media_type =
+        parse_media_type(ct).map_err(|_| ParamError::MalformedContentType(raw.to_string()))?;
+    if media_type == "application/x-www-form-urlencoded" {
+        Ok(FormBody::Parse)
+    } else {
+        Ok(FormBody::Ignore)
+    }
+}
+
+/// Go's `mime.ParseMediaType` (`mime/mediatype.go:134-227` @ go1.25.5),
+/// reduced to what `parsePostForm` consumes: the lowercased media type,
+/// and whether the value parsed at all. The parameter MAP is discarded
+/// upstream too (`ct, _, err = mime.ParseMediaType(ct)`), but the
+/// parameters are still WALKED, because a parameter that does not parse
+/// makes the whole header — and therefore the whole request — an error.
+///
+/// Container-measured `400`s that reach us only through this walk:
+/// `application/json; charset` and `application/x-www-form-urlencoded;
+/// bogus` (`ErrInvalidMediaParameter`), and
+/// `application/x-www-form-urlencoded; a=1; a=2` (duplicate parameter
+/// name). Measured `200`s that would be `400`s without it:
+/// `application/x-www-form-urlencoded; a=1; a=1` (a duplicate whose value
+/// AGREES is allowed) and a trailing `;` (ignored, not an error).
+///
+/// RFC 2231 continuations (`a*0=…`) are walked and their values
+/// duplicate-checked exactly as upstream, but never stitched: the
+/// stitching pass (`mediatype.go:186-226`) writes only into the params map
+/// and cannot fail — every one of its decode steps swallows its error into
+/// an `ok` bool — so it cannot change either value this function returns.
+fn parse_media_type(v: &str) -> Result<String, MediaTypeError> {
+    let base = v.split(';').next().unwrap_or("");
+    let media_type = base.trim().to_ascii_lowercase();
+    check_media_type_disposition(&media_type)?;
+
+    // Parameter walk. Upstream files each name into one of two maps —
+    // `params`, or a per-base-name continuation map when the name contains
+    // a `*` — but the map it picks is a function of the NAME, and the
+    // lookup key is the whole name either way. So two names collide
+    // exactly when they are equal, and the continuation bucketing cannot
+    // change that; `seen` therefore keys on the full name.
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut rest = &v[base.len()..];
+    while !rest.is_empty() {
+        rest = trim_start_unicode_space(rest);
+        if rest.is_empty() {
+            break;
+        }
+        match consume_media_param(rest) {
+            Some((key, value, next)) => {
+                // `mediatype.go:178-181`: a repeated parameter is an error
+                // only when the values DISAGREE.
+                if let Some((_, prev)) = seen.iter().find(|(k, _)| *k == key)
+                    && *prev != value
+                {
+                    return Err(MediaTypeError::DuplicateParameterName);
+                }
+                seen.push((key, value));
+                rest = next;
+            }
+            None => {
+                // `mediatype.go:157-165`: a trailing `;` (possibly with
+                // trailing space) is deliberately not an error.
+                if rest.trim() == ";" {
+                    break;
+                }
+                return Err(MediaTypeError::InvalidMediaParameter);
+            }
+        }
+    }
+    Ok(media_type)
+}
+
+/// Why a `Content-Type` could not be parsed. The variants exist so the
+/// port stays legible against `mime/mediatype.go`; the wire carries one
+/// `400` and PulsusDB's own prose either way — the reference's messages
+/// (`mime: expected token after slash`, and three siblings) are its
+/// implementation language, and message prose is below the parity bar
+/// (issue #253 ruling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaTypeError {
+    /// `mime: no media type` — e.g. `;` or `/json`.
+    NoMediaType,
+    /// `mime: expected slash after first token` — e.g. `app lication/json`.
+    ExpectedSlash,
+    /// `mime: expected token after slash` — e.g. `application/`.
+    ExpectedTokenAfterSlash,
+    /// `mime: unexpected content after media subtype` — e.g.
+    /// `application/json/x`.
+    TrailingContent,
+    /// `mime: invalid media parameter` — e.g. `application/json; charset`.
+    InvalidMediaParameter,
+    /// `mime: duplicate parameter name` — a repeat whose value disagrees.
+    DuplicateParameterName,
+}
+
+/// Go's `checkMediaTypeDisposition` (`mime/mediatype.go:98-117`). A bare
+/// token with no slash at all is **legal** (`rest == ""` returns `nil`),
+/// which is why `Content-Type: garbage` is a measured `200` upstream and
+/// not a `400`.
+fn check_media_type_disposition(s: &str) -> Result<(), MediaTypeError> {
+    let (typ, rest) = consume_token(s);
+    if typ.is_empty() {
+        return Err(MediaTypeError::NoMediaType);
+    }
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let Some(after_slash) = rest.strip_prefix('/') else {
+        return Err(MediaTypeError::ExpectedSlash);
+    };
+    let (subtype, rest) = consume_token(after_slash);
+    if subtype.is_empty() {
+        return Err(MediaTypeError::ExpectedTokenAfterSlash);
+    }
+    if !rest.is_empty() {
+        return Err(MediaTypeError::TrailingContent);
+    }
+    Ok(())
+}
+
+/// Go's `isTSpecial` (`mime/grammar.go`): the RFC 1521/2045 `tspecials`.
+fn is_tspecial(c: u8) -> bool {
+    matches!(
+        c,
+        b'(' | b')'
+            | b'<'
+            | b'>'
+            | b'@'
+            | b','
+            | b';'
+            | b':'
+            | b'\\'
+            | b'"'
+            | b'/'
+            | b'['
+            | b']'
+            | b'?'
+            | b'='
+    )
+}
+
+/// Go's `isTokenChar` (`mime/grammar.go`): any US-ASCII character that is
+/// not SPACE, a CTL, or a `tspecial`. Bytes >= 0x80 are not token
+/// characters, so a non-ASCII byte terminates a token exactly as upstream.
+fn is_token_char(c: u8) -> bool {
+    c > 0x20 && c < 0x7f && !is_tspecial(c)
+}
+
+/// Go's `consumeToken` (`mime/mediatype.go`): the longest token prefix,
+/// and the remainder. Byte-wise, as upstream is.
+fn consume_token(v: &str) -> (&str, &str) {
+    let end = v
+        .as_bytes()
+        .iter()
+        .position(|c| !is_token_char(*c))
+        .unwrap_or(v.len());
+    v.split_at(end)
+}
+
+/// Go's `consumeValue` (`mime/mediatype.go`): a token, or a quoted-string
+/// with Go's MSIE-tolerant backslash rule (a backslash escapes only a
+/// `tspecial`; before anything else it is a literal backslash). Returns
+/// `None` when no value could be consumed, which is upstream's
+/// `value == "" && rest2 == rest` signal.
+fn consume_value(v: &str) -> Option<(String, &str)> {
+    if v.is_empty() {
+        return None;
+    }
+    let bytes = v.as_bytes();
+    if bytes[0] != b'"' {
+        let (token, rest) = consume_token(v);
+        if token.is_empty() {
+            return None;
+        }
+        return Some((token.to_string(), rest));
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 1;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' {
+            return Some((String::from_utf8_lossy(&out).into_owned(), &v[i + 1..]));
+        }
+        if c == b'\\' && i + 1 < bytes.len() && is_tspecial(bytes[i + 1]) {
+            out.push(bytes[i + 1]);
+            i += 2;
+            continue;
+        }
+        if c == b'\r' || c == b'\n' {
+            return None;
+        }
+        out.push(c);
+        i += 1;
+    }
+    // No closing quote.
+    None
+}
+
+/// Go's `consumeMediaParam` (`mime/mediatype.go`): `; name=value`, with
+/// unicode whitespace tolerated around each piece and the name lowercased.
+/// `None` is upstream's "returned `v` unchanged", which the caller turns
+/// into `ErrInvalidMediaParameter` unless what remains is a bare trailing
+/// semicolon.
+fn consume_media_param(v: &str) -> Option<(String, String, &str)> {
+    let rest = trim_start_unicode_space(v);
+    let rest = rest.strip_prefix(';')?;
+    let rest = trim_start_unicode_space(rest);
+    let (param, rest) = consume_token(rest);
+    if param.is_empty() {
+        return None;
+    }
+    let param = param.to_ascii_lowercase();
+    let rest = trim_start_unicode_space(rest);
+    let rest = rest.strip_prefix('=')?;
+    let rest = trim_start_unicode_space(rest);
+    let (value, rest) = consume_value(rest)?;
+    Some((param, value, rest))
+}
+
+/// `strings.TrimLeftFunc(s, unicode.IsSpace)` — Go trims UNICODE space
+/// here, not just ASCII, so the port does too.
+fn trim_start_unicode_space(s: &str) -> &str {
+    s.trim_start_matches(|c: char| c.is_whitespace())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,6 +1361,203 @@ mod tests {
                 matches!(parse_since(Some(raw)), Err(ParamError::InvalidSince(_))),
                 "since={raw:?} must be a 400"
             );
+        }
+    }
+
+    // -- Issue #406: the POST `Content-Type` rule ------------------------
+
+    /// **Every row is a container measurement, not a source reading**, and
+    /// the two columns are the only two questions the reference answers
+    /// about this header: is the BODY read, and is the REQUEST refused.
+    ///
+    /// Measured 2026-08-10 against `grafana/loki:3.7.4` (`b318f282`) and,
+    /// side by side, against a `pulsusdb` carrying the same 160-entry
+    /// corpus: a `POST /query_range` with `limit=7` in the URL and
+    /// `limit=5` in the body, so the ANSWER distinguishes the outcomes —
+    /// 5 entries means the body was read, 7 means it was ignored, and a
+    /// `400` means the request was refused. All 52 probed rows (this
+    /// table plus [`the_media_type_parameter_walk_matches_the_reference`])
+    /// agreed on both stores.
+    ///
+    /// **The discriminating rows are the ones a "just accept everything"
+    /// fix gets wrong.** `application/` and `;` are `400` at the reference
+    /// — its `ParseForm` propagates `mime.ParseMediaType`'s error and the
+    /// middleware turns it into a `400` before any handler runs — and
+    /// they were `400` here BEFORE this change too, for the unrelated
+    /// reason that we refused everything non-form. Widening to
+    /// "unconditionally ignore a non-form body" would turn those into
+    /// `200`s and trade one divergence for another; that is what the
+    /// [`MediaTypeError`] half of the port exists for.
+    ///
+    /// `application/x-www-form-urlencodedX` is the mirror image: a prefix
+    /// match (which is what this gate used to be) READS a body the
+    /// reference ignores.
+    #[test]
+    fn the_post_content_type_decides_the_body_not_the_request() {
+        use FormBody::{Ignore, Parse};
+
+        // (Content-Type, expected disposition — `None` = a 400.)
+        let cases: &[(Option<&str>, Option<FormBody>)] = &[
+            // Absent, empty, and whitespace-only all read as `""`, which
+            // Go substitutes with `application/octet-stream`. (Both HTTP
+            // stacks strip a header value's surrounding whitespace before
+            // the handler sees it, so the third case arrives as the
+            // second — measured on both stores, raw socket.)
+            (None, Some(Ignore)),
+            (Some(""), Some(Ignore)),
+            // Well-formed, non-form: the body is invisible, the request
+            // is served. This is the row that refused working clients.
+            (Some("application/json"), Some(Ignore)),
+            (Some("APPLICATION/JSON"), Some(Ignore)),
+            (Some("text/plain"), Some(Ignore)),
+            (Some("application/octet-stream"), Some(Ignore)),
+            (Some("application/xhtml+xml"), Some(Ignore)),
+            // `multipart/form-data` is a form type and STILL does not
+            // reach `parsePostForm`'s body read (`request.go:1298-1304`
+            // is an empty case) — so it ignores, like any other.
+            (Some("multipart/form-data"), Some(Ignore)),
+            // A bare token with no slash is a LEGAL media type
+            // (`checkMediaTypeDisposition` returns nil when nothing
+            // follows the first token), so it is served, not refused.
+            (Some("garbage"), Some(Ignore)),
+            (Some("x"), Some(Ignore)),
+            (Some("x/y"), Some(Ignore)),
+            // Form: the body is read.
+            (Some("application/x-www-form-urlencoded"), Some(Parse)),
+            (
+                Some("application/x-www-form-urlencoded; charset=UTF-8"),
+                Some(Parse),
+            ),
+            // Case-insensitive: `mime.ParseMediaType` lowercases the base
+            // type. The old prefix gate refused this one.
+            (Some("APPLICATION/X-WWW-Form-URLENCODED"), Some(Parse)),
+            // Surrounding whitespace is trimmed off the base type.
+            (Some("  application/x-www-form-urlencoded  "), Some(Parse)),
+            // NOT a prefix match: one trailing character makes it a
+            // different media type, whose body is ignored.
+            (Some("application/x-www-form-urlencodedX"), Some(Ignore)),
+            // Malformed — refused, on both stores, before the body.
+            (Some("application/"), None),
+            (Some("/json"), None),
+            (Some(";"), None),
+            (Some("="), None),
+            (Some("application/json/x"), None),
+            (Some("x/y/z"), None),
+            (Some("app lication/json"), None),
+            (Some("\"quoted/type\""), None),
+            (Some("application/x-www-form-urlencoded, text/plain"), None),
+        ];
+
+        for (raw, expected) in cases {
+            let got = form_body_disposition(*raw);
+            match expected {
+                Some(disposition) => assert_eq!(
+                    got.as_ref().ok(),
+                    Some(disposition),
+                    "Content-Type {raw:?} must be {disposition:?}, got {got:?}"
+                ),
+                None => assert!(
+                    matches!(got, Err(ParamError::MalformedContentType(_))),
+                    "Content-Type {raw:?} must be a 400, got {got:?}"
+                ),
+            }
+        }
+    }
+
+    /// The parameter half of `mime.ParseMediaType`, which
+    /// `parsePostForm` discards (`ct, _, err = …`) but still WALKS — so a
+    /// parameter that does not parse refuses the whole request even when
+    /// the base type is the form type it was going to accept.
+    ///
+    /// Every row container-measured 2026-08-10, same two stores, same
+    /// probe. The pairs are the point: `a=1; a=1` is served and
+    /// `a=1; a=2` is refused (a duplicate is an error only when the
+    /// values DISAGREE); `charset="utf-8"` is served and
+    /// `charset="utf-8` is refused (an unterminated quoted-string
+    /// consumes no value); a trailing `;` is served and a trailing `; ;`
+    /// is refused. Dropping the walk entirely satisfies neither half of
+    /// any pair.
+    #[test]
+    fn the_media_type_parameter_walk_matches_the_reference() {
+        use FormBody::{Ignore, Parse};
+
+        let cases: &[(&str, Option<FormBody>)] = &[
+            (
+                "application/x-www-form-urlencoded; charset=\"utf-8\"",
+                Some(Parse),
+            ),
+            // No closing quote: `consumeValue` consumes nothing.
+            ("application/x-www-form-urlencoded; charset=\"utf-8", None),
+            // Go's MSIE rule: a backslash escapes a `tspecial` and is a
+            // literal byte before anything else. Both parse.
+            (
+                "application/x-www-form-urlencoded; charset=\"a\\;b\"",
+                Some(Parse),
+            ),
+            (
+                "application/x-www-form-urlencoded; charset=\"a\\qb\"",
+                Some(Parse),
+            ),
+            // A bare `=` with nothing after it consumes no value.
+            ("application/x-www-form-urlencoded; charset=", None),
+            // An empty QUOTED value does.
+            (
+                "application/x-www-form-urlencoded; charset=\"\"",
+                Some(Parse),
+            ),
+            (
+                "application/x-www-form-urlencoded ; charset=utf-8",
+                Some(Parse),
+            ),
+            (
+                "application/x-www-form-urlencoded;charset=utf-8;boundary=x",
+                Some(Parse),
+            ),
+            // RFC 2231 continuations: walked and duplicate-checked, never
+            // stitched (the stitching pass cannot fail).
+            (
+                "application/x-www-form-urlencoded; a*0=1; a*1=2",
+                Some(Parse),
+            ),
+            ("application/x-www-form-urlencoded; a*0=1; a*0=2", None),
+            // A repeat whose value agrees is allowed; one that disagrees
+            // is not — and the name is compared case-folded.
+            ("application/x-www-form-urlencoded; a=1; a=1", Some(Parse)),
+            ("application/x-www-form-urlencoded; a=1; a=2", None),
+            ("application/x-www-form-urlencoded; A=1; a=2", None),
+            (
+                "application/x-www-form-urlencoded; charset=utf-8; charset=utf-8",
+                Some(Parse),
+            ),
+            ("application/x-www-form-urlencoded; a=1; b=1", Some(Parse)),
+            // One trailing `;` is deliberately not an error; a second is.
+            ("application/x-www-form-urlencoded;", Some(Parse)),
+            ("application/x-www-form-urlencoded;;", None),
+            ("application/x-www-form-urlencoded; ;", None),
+            ("application/x-www-form-urlencoded; bogus", None),
+            (
+                "APPLICATION/X-WWW-FORM-URLENCODED; CHARSET=UTF-8",
+                Some(Parse),
+            ),
+            // The walk applies to a type whose body would be ignored too.
+            ("application/json; charset=utf-8", Some(Ignore)),
+            ("application/json; charset", None),
+            ("text/plain; a=1; a=2", None),
+        ];
+
+        for (raw, expected) in cases {
+            let got = form_body_disposition(Some(raw));
+            match expected {
+                Some(disposition) => assert_eq!(
+                    got.as_ref().ok(),
+                    Some(disposition),
+                    "Content-Type {raw:?} must be {disposition:?}, got {got:?}"
+                ),
+                None => assert!(
+                    matches!(got, Err(ParamError::MalformedContentType(_))),
+                    "Content-Type {raw:?} must be a 400, got {got:?}"
+                ),
+            }
         }
     }
 

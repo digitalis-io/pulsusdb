@@ -22,7 +22,7 @@
 //! acquisition (the stats precedent). `step`/`since` are accepted and
 //! ignored (documented).
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -65,14 +65,14 @@ pub(crate) async fn detected_labels_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match detected_labels_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 
@@ -131,14 +131,14 @@ pub(crate) async fn detected_fields_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match detected_fields_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 

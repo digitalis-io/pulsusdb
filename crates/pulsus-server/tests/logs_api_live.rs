@@ -83,6 +83,29 @@ fn http_request_bytes(
     extra_headers: &[(&str, &str)],
     body: Option<&str>,
 ) -> Option<HttpResponseBytes> {
+    http_request_bytes_typed(
+        port,
+        method,
+        path,
+        extra_headers,
+        Some("application/x-www-form-urlencoded"),
+        body,
+    )
+}
+
+/// [`http_request_bytes`] with the POST body's `Content-Type` under the
+/// caller's control — `None` sends the body with **no** `Content-Type`
+/// header at all, which issue #406's rule distinguishes from every other
+/// value. The header is written here rather than through `extra_headers`
+/// so it can never be sent twice.
+fn http_request_bytes_typed(
+    port: u16,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+    content_type: Option<&str>,
+    body: Option<&str>,
+) -> Option<HttpResponseBytes> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
 
@@ -92,7 +115,9 @@ fn http_request_bytes(
         request.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(body) = body {
-        request.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+        if let Some(content_type) = content_type {
+            request.push_str(&format!("Content-Type: {content_type}\r\n"));
+        }
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
@@ -170,6 +195,23 @@ fn http_request(
     body: Option<&str>,
 ) -> Option<HttpResponse> {
     let res = http_request_bytes(port, method, path, extra_headers, body)?;
+    Some(HttpResponse {
+        status: res.status,
+        headers: res.headers,
+        body: String::from_utf8_lossy(&res.body).into_owned(),
+    })
+}
+
+/// [`http_request`] with the POST body's `Content-Type` under the caller's
+/// control; `None` sends no `Content-Type` header at all (issue #406).
+fn http_request_typed(
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: Option<&str>,
+) -> Option<HttpResponse> {
+    let res = http_request_bytes_typed(port, method, path, &[], content_type, body)?;
     Some(HttpResponse {
         status: res.status,
         headers: res.headers,
@@ -1329,7 +1371,7 @@ async fn query_range_fan_out_pipeline_filters_reformats_and_relabels_streams() {
     let port = 31_118;
     // Exact-count assertions below: `log_samples` is a plain MergeTree, so
     // a stale database from a previous run would double the seeded rows
-    // (see `drop_database`'s doc comment).
+    // (see `live_db::drop_db`'s doc comment).
     drop_db(db).await;
     let guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
@@ -3474,6 +3516,183 @@ async fn entries_sharing_a_timestamp_come_back_in_a_stable_order() {
     }
 
     drop_db(db).await;
+}
+
+/// **Issue #406, live: a POST's `Content-Type` gates the BODY, not the
+/// request.** Against a 150-entry seed, `POST /query_range?limit=5` under
+/// `application/json` — and under no `Content-Type` at all — serves the
+/// URL's five entries, where before this change both were
+/// `400 request body must be application/x-www-form-urlencoded`.
+///
+/// **An empty store cannot show this**, which is why the case is live: the
+/// pre-change failure was a `400`, and the post-change success has to be
+/// distinguishable from "a `200` with nothing in it". The entry COUNT is
+/// what distinguishes them, so the seed is the test.
+///
+/// Reference behaviour container-measured 2026-08-10 on
+/// `grafana/loki:3.7.4` (`b318f282`) with the same probe against the same
+/// corpus shape: `application/json` ⇒ the URL's limit; absent ⇒ the URL's
+/// limit; `application/x-www-form-urlencoded` ⇒ the body's limit;
+/// `application/` ⇒ `400`.
+///
+/// **The last section is the ORDERING**, which no complete-body probe can
+/// see: the answer must arrive without waiting for a body the request does
+/// not need. See [`partial_body_status`].
+#[tokio::test]
+async fn a_json_content_type_post_is_served_from_the_url_query() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_post_content_type");
+    let port = 31_198;
+    drop_db(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+    seed_run(&client, db, base_ns, 150).await;
+
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 1_000_000_000;
+    let selector = urlencode(r#"{service_name="checkout"}"#);
+    // Everything the request needs is in the URL; the body would set a
+    // DIFFERENT limit, so whether it was read is visible in the count.
+    let path = format!("/api/logs/v1/query_range?query={selector}&start={start}&end={end}&limit=5");
+    let body = "limit=9";
+
+    let entries = |res: &HttpResponse| -> usize {
+        json(res)["data"]["result"]
+            .as_array()
+            .expect("streams result")
+            .iter()
+            .map(|s| s["values"].as_array().expect("values").len())
+            .sum()
+    };
+
+    // Control: read as a form, the body's limit wins (the body-first
+    // precedence #406 Part B1 established). Without this row, the rows
+    // below could pass against a body that was never read by anyone.
+    let res = http_request_typed(
+        port,
+        "POST",
+        &path,
+        Some("application/x-www-form-urlencoded"),
+        Some(body),
+    )
+    .expect("query_range POST reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(entries(&res), 9, "the form body must be read: {}", res.body);
+
+    // The widening: a non-form type, and no type at all, make the body
+    // invisible and answer from the URL. Both were 400 before #406.
+    for content_type in [None, Some("application/json"), Some("text/plain")] {
+        let res = http_request_typed(port, "POST", &path, content_type, Some(body))
+            .expect("query_range POST reachable");
+        assert_eq!(
+            res.status, 200,
+            "Content-Type {content_type:?} must be served: {}",
+            res.body
+        );
+        assert_eq!(
+            entries(&res),
+            5,
+            "Content-Type {content_type:?}: the URL's limit must be used and the body ignored: {}",
+            res.body
+        );
+    }
+
+    // The refusal that survives: a Content-Type that cannot be parsed.
+    let res = http_request_typed(port, "POST", &path, Some("application/"), Some(body))
+        .expect("query_range POST reachable");
+    assert_eq!(
+        res.status, 400,
+        "a malformed Content-Type must still refuse: {}",
+        res.body
+    );
+    assert!(
+        res.body.contains("malformed 'Content-Type' header"),
+        "the refusal must name the header: {}",
+        res.body
+    );
+
+    // -- the answer must not wait for a body it will not read ----------
+    //
+    // Issue #406, review round 2. Every assertion above sends a COMPLETE
+    // body and so cannot see the ordering: `Bytes` buffers the whole
+    // upload before the handler runs. Here the request ADVERTISES 100,000
+    // bytes and sends seven, exactly as the reference was probed, and the
+    // claim is that a response arrives anyway.
+    //
+    // Measured on `grafana/loki:3.7.4` (`b318f282`) 2026-08-10 with this
+    // same probe: `200` in under 10 ms for `application/json`, `text/plain`
+    // and an absent header; `400` as promptly for `application/`. PulsusDB
+    // answered none of the four before the fix.
+    for (content_type, expected) in [
+        (None, 200_u16),
+        (Some("application/json"), 200),
+        (Some("text/plain"), 200),
+        (Some("application/"), 400),
+    ] {
+        let answered = partial_body_status(port, &path, content_type, 100_000, b"limit=9");
+        assert_eq!(
+            answered,
+            Some(expected),
+            "Content-Type {content_type:?}: the answer must arrive without the rest of the \
+             body (advertised 100000, sent 7)"
+        );
+    }
+    // CONTROL: a form POST genuinely needs its body, so it must NOT answer
+    // early. Without this row the four above would pass against a server
+    // that had simply stopped reading request bodies at all.
+    assert_eq!(
+        partial_body_status(
+            port,
+            &path,
+            Some("application/x-www-form-urlencoded"),
+            100_000,
+            b"limit=9"
+        ),
+        None,
+        "a form POST must still wait for the body it was promised"
+    );
+
+    drop_db(db).await;
+}
+
+/// Sends a POST that advertises `advertised` body bytes and then writes
+/// only `sent`, and reports the response status if one arrives within a
+/// few seconds — `None` meaning the server is still waiting for the rest
+/// of the body.
+///
+/// Raw socket rather than [`http_request`] because the whole point is a
+/// request that is never completed, which no buffering client can express.
+fn partial_body_status(
+    port: u16,
+    path: &str,
+    content_type: Option<&str>,
+    advertised: usize,
+    sent: &[u8],
+) -> Option<u16> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut head =
+        format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {advertised}\r\n");
+    if let Some(value) = content_type {
+        head.push_str(&format!("Content-Type: {value}\r\n"));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).ok()?;
+    stream.write_all(sent).ok()?;
+    stream.flush().ok();
+
+    let mut buf = [0u8; 1024];
+    let read = stream.read(&mut buf).ok()?;
+    if read == 0 {
+        return None;
+    }
+    String::from_utf8_lossy(&buf[..read])
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn read_rss_kb(pid: u32) -> Option<u64> {

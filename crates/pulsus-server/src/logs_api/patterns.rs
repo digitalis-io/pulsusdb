@@ -8,7 +8,7 @@
 //! primary-key prefix pruning and a server-side top-1000 (no hydration, no body
 //! read), visible via `X-Pulsus-Explain`.
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -51,14 +51,14 @@ pub(crate) async fn patterns_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match patterns_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 
