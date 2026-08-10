@@ -1012,6 +1012,125 @@ mod tests {
         }
     }
 
+    /// A POST with an arbitrary `Content-Type`, or none at all when
+    /// `content_type` is `None` — which [`form_post`] cannot express,
+    /// since it always sets the form type.
+    fn post_with_content_type(
+        uri: &str,
+        content_type: Option<&str>,
+        form: String,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method("POST").uri(uri);
+        if let Some(value) = content_type {
+            builder = builder.header("content-type", value);
+        }
+        builder.body(Body::from(form)).expect("build request")
+    }
+
+    /// A body that is a `400` **if it is read at all** — so "the body was
+    /// ignored" is observable hermetically, without a store. `since` is
+    /// read on every logs route except `/query`, which reads `time`
+    /// instead; both reject an unparseable value.
+    fn poison_body(path: &str) -> &'static str {
+        if path.ends_with("/query") {
+            "time=bogus"
+        } else {
+            "since=bogus"
+        }
+    }
+
+    /// **Issue #406: a POST's `Content-Type` decides whether the BODY is
+    /// read, and never whether the REQUEST is served.** Routed, over every
+    /// POST path, with every parameter in the URL and a **poisoned** body —
+    /// one that is a `400` if it is read and invisible if it is not.
+    ///
+    /// Container-measured 2026-08-10 against `grafana/loki:3.7.4`
+    /// (`b318f282`) and a `pulsusdb`, both holding the same 160-entry
+    /// corpus, on all ten of these routes: `application/json` and an
+    /// absent header are `200` upstream, where PulsusDB answered `400
+    /// request body must be application/x-www-form-urlencoded, got
+    /// "application/json"`. Plenty of HTTP clients send `application/json`
+    /// by default, so that refused working clients.
+    ///
+    /// **Each leg fails a different wrong fix**, which is why the control
+    /// and the refusal are in the same test as the widening:
+    ///
+    /// * *Control* — the form type, same poisoned body, must be a `400`.
+    ///   Without it the "invisible body" legs would pass against a body
+    ///   that was never poisonous, and the test would assert nothing.
+    /// * *Widening* — `application/json`, `text/plain` and an absent
+    ///   header must answer **byte-identically to the GET**. Fails before
+    ///   this change (all three were `400`), and fails under a fix that
+    ///   accepts the request but still parses the body.
+    /// * *Refusal* — `application/` must stay a `400`, and one that names
+    ///   the HEADER rather than the poison. The reference refuses it too
+    ///   (its `ParseForm` returns `mime.ParseMediaType`'s error, which
+    ///   `NewPrepopulateMiddleware` renders as `400 mime: expected token
+    ///   after slash`), and it was a `400` here before this change only
+    ///   because we refused everything non-form. A fix that simply drops
+    ///   the gate turns it into a `200` and trades one divergence for
+    ///   another.
+    #[tokio::test]
+    async fn a_post_content_type_gates_the_body_not_the_request() {
+        for path in POST_PATHS {
+            let base = post_base_query(path);
+            let poison = poison_body(path).to_string();
+            let target = uri(path, base);
+            let (get_status, get_body) = routed(router(), get_req(&target)).await;
+
+            // Control: read as a form, the poison lands and refuses.
+            let (control_status, control_body) =
+                routed(router(), form_post(&target, poison.clone())).await;
+            assert_eq!(
+                control_status,
+                StatusCode::BAD_REQUEST,
+                "POST {path}: the poisoned body must refuse when it IS read, else the \
+                 ignored-body rows below assert nothing: {}",
+                String::from_utf8_lossy(&control_body)
+            );
+
+            // Widening: a well-formed non-form type — and no type at all —
+            // makes the body invisible and changes nothing else.
+            for content_type in [None, Some("application/json"), Some("text/plain")] {
+                let (status, body) = routed(
+                    router(),
+                    post_with_content_type(&target, content_type, poison.clone()),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    get_status,
+                    "POST {path} with Content-Type {content_type:?} must answer as the GET \
+                     does, with its body unread: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                assert_eq!(
+                    body, get_body,
+                    "POST {path} with Content-Type {content_type:?} must answer \
+                     byte-identically to GET {path}"
+                );
+            }
+
+            // Refusal: a Content-Type that cannot be PARSED is still a 400,
+            // and for the header's own reason rather than the poison's.
+            let (status, body) = routed(
+                router(),
+                post_with_content_type(&target, Some("application/"), poison.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "POST {path} with a malformed Content-Type must stay a 400"
+            );
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("malformed 'Content-Type' header"),
+                "POST {path} must refuse for the HEADER, not for the poisoned body: {text}"
+            );
+        }
+    }
+
     /// **The `end < start` table, both positives and negatives.** The
     /// reference refuses a reversed window on seven of the nine routes and
     /// deliberately serves it on `/query` and `/patterns` — an exemption

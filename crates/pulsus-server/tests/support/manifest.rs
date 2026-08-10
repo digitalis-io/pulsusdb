@@ -522,9 +522,26 @@ fn logs_limit_over_cap(req: &mut Req) {
     req.query = format!("query={}&limit=5001", enc(r#"{service_name="x"}"#));
 }
 
-fn logs_wrong_content_type(req: &mut Req) {
+/// **Issue #406 rewrote this class.** It used to send `application/json`
+/// and expect a `400`; the reference answers that `200`, reading the
+/// request from its URL query and never looking at the body, so expecting
+/// a `400` here was asserting a defect. The refusal that survives is a
+/// `Content-Type` that cannot be PARSED — `application/` has an empty
+/// subtype, which is `400 mime: expected token after slash` upstream
+/// (`mime.ParseMediaType` errors, `ParseForm` propagates it, and
+/// `NewPrepopulateMiddleware` renders it before any handler runs) and a
+/// `400 malformed 'Content-Type' header` here. Both container-measured
+/// 2026-08-10 on all ten POST routes.
+///
+/// The `200` half cannot live in this list: a [`CaseClass`] carries an
+/// [`ExpectedError`] and describes error responses only. It is pinned by
+/// `logs_api/mod.rs`'s
+/// `a_post_content_type_gates_the_body_not_the_request` and, against a
+/// seeded store, by `logs_api_live.rs`'s
+/// `a_json_content_type_post_is_served_from_the_url_query`.
+fn logs_malformed_content_type(req: &mut Req) {
     req.method = "POST";
-    req.content_type = Some("application/json");
+    req.content_type = Some("application/");
     req.body = b"{}".to_vec();
 }
 
@@ -548,16 +565,16 @@ const LOGS_QUERY_LIKE_CASES: &[CaseClass] = &[
         expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
-        name: "wrong_content_type",
-        build: logs_wrong_content_type,
+        name: "malformed_content_type",
+        build: logs_malformed_content_type,
         expect_status: 400,
         expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
 ];
 
 const LOGS_LABELS_CASES: &[CaseClass] = &[CaseClass {
-    name: "wrong_content_type",
-    build: logs_wrong_content_type,
+    name: "malformed_content_type",
+    build: logs_malformed_content_type,
     expect_status: 400,
     expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
 }];
@@ -762,8 +779,8 @@ const LOGS_DETECTED_LABELS_CASES: &[CaseClass] = &[
         expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
-        name: "wrong_content_type",
-        build: logs_wrong_content_type,
+        name: "malformed_content_type",
+        build: logs_malformed_content_type,
         expect_status: 400,
         expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
@@ -801,8 +818,8 @@ const LOGS_DETECTED_FIELDS_CASES: &[CaseClass] = &[
         expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
     CaseClass {
-        name: "wrong_content_type",
-        build: logs_wrong_content_type,
+        name: "malformed_content_type",
+        build: logs_malformed_content_type,
         expect_status: 400,
         expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
     },
@@ -818,8 +835,8 @@ const LOGS_DETECTED_FIELDS_CASES: &[CaseClass] = &[
 /// `series_without_match_answers_every_series_in_the_window` and, against
 /// a seeded store, by `logs_api_live.rs`.
 const LOGS_SERIES_CASES: &[CaseClass] = &[CaseClass {
-    name: "wrong_content_type",
-    build: logs_wrong_content_type,
+    name: "malformed_content_type",
+    build: logs_malformed_content_type,
     expect_status: 400,
     expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
 }];

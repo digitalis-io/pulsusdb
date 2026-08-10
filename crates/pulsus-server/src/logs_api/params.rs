@@ -1364,6 +1364,176 @@ mod tests {
         }
     }
 
+    // -- Issue #406: the POST `Content-Type` rule ------------------------
+
+    /// **Every row is a container measurement, not a source reading**, and
+    /// the two columns are the only two questions the reference answers
+    /// about this header: is the BODY read, and is the REQUEST refused.
+    ///
+    /// Measured 2026-08-10 against `grafana/loki:3.7.4` (`b318f282`) and,
+    /// side by side, against a `pulsusdb` carrying the same 160-entry
+    /// corpus: a `POST /query_range` with `limit=7` in the URL and
+    /// `limit=5` in the body, so the ANSWER distinguishes the outcomes —
+    /// 5 entries means the body was read, 7 means it was ignored, and a
+    /// `400` means the request was refused. All 52 probed rows (this
+    /// table plus [`the_media_type_parameter_walk_matches_the_reference`])
+    /// agreed on both stores.
+    ///
+    /// **The discriminating rows are the ones a "just accept everything"
+    /// fix gets wrong.** `application/` and `;` are `400` at the reference
+    /// — its `ParseForm` propagates `mime.ParseMediaType`'s error and the
+    /// middleware turns it into a `400` before any handler runs — and
+    /// they were `400` here BEFORE this change too, for the unrelated
+    /// reason that we refused everything non-form. Widening to
+    /// "unconditionally ignore a non-form body" would turn those into
+    /// `200`s and trade one divergence for another; that is what the
+    /// [`MediaTypeError`] half of the port exists for.
+    ///
+    /// `application/x-www-form-urlencodedX` is the mirror image: a prefix
+    /// match (which is what this gate used to be) READS a body the
+    /// reference ignores.
+    #[test]
+    fn the_post_content_type_decides_the_body_not_the_request() {
+        use FormBody::{Ignore, Parse};
+
+        // (Content-Type, expected disposition — `None` = a 400.)
+        let cases: &[(Option<&str>, Option<FormBody>)] = &[
+            // Absent, empty, and whitespace-only all read as `""`, which
+            // Go substitutes with `application/octet-stream`. (Both HTTP
+            // stacks strip a header value's surrounding whitespace before
+            // the handler sees it, so the third case arrives as the
+            // second — measured on both stores, raw socket.)
+            (None, Some(Ignore)),
+            (Some(""), Some(Ignore)),
+            // Well-formed, non-form: the body is invisible, the request
+            // is served. This is the row that refused working clients.
+            (Some("application/json"), Some(Ignore)),
+            (Some("APPLICATION/JSON"), Some(Ignore)),
+            (Some("text/plain"), Some(Ignore)),
+            (Some("application/octet-stream"), Some(Ignore)),
+            (Some("application/xhtml+xml"), Some(Ignore)),
+            // `multipart/form-data` is a form type and STILL does not
+            // reach `parsePostForm`'s body read (`request.go:1298-1304`
+            // is an empty case) — so it ignores, like any other.
+            (Some("multipart/form-data"), Some(Ignore)),
+            // A bare token with no slash is a LEGAL media type
+            // (`checkMediaTypeDisposition` returns nil when nothing
+            // follows the first token), so it is served, not refused.
+            (Some("garbage"), Some(Ignore)),
+            (Some("x"), Some(Ignore)),
+            (Some("x/y"), Some(Ignore)),
+            // Form: the body is read.
+            (Some("application/x-www-form-urlencoded"), Some(Parse)),
+            (
+                Some("application/x-www-form-urlencoded; charset=UTF-8"),
+                Some(Parse),
+            ),
+            // Case-insensitive: `mime.ParseMediaType` lowercases the base
+            // type. The old prefix gate refused this one.
+            (Some("APPLICATION/X-WWW-Form-URLENCODED"), Some(Parse)),
+            // Surrounding whitespace is trimmed off the base type.
+            (Some("  application/x-www-form-urlencoded  "), Some(Parse)),
+            // NOT a prefix match: one trailing character makes it a
+            // different media type, whose body is ignored.
+            (Some("application/x-www-form-urlencodedX"), Some(Ignore)),
+            // Malformed — refused, on both stores, before the body.
+            (Some("application/"), None),
+            (Some("/json"), None),
+            (Some(";"), None),
+            (Some("="), None),
+            (Some("application/json/x"), None),
+            (Some("x/y/z"), None),
+            (Some("app lication/json"), None),
+            (Some("\"quoted/type\""), None),
+            (Some("application/x-www-form-urlencoded, text/plain"), None),
+        ];
+
+        for (raw, expected) in cases {
+            let got = form_body_disposition(*raw);
+            match expected {
+                Some(disposition) => assert_eq!(
+                    got.as_ref().ok(),
+                    Some(disposition),
+                    "Content-Type {raw:?} must be {disposition:?}, got {got:?}"
+                ),
+                None => assert!(
+                    matches!(got, Err(ParamError::MalformedContentType(_))),
+                    "Content-Type {raw:?} must be a 400, got {got:?}"
+                ),
+            }
+        }
+    }
+
+    /// The parameter half of `mime.ParseMediaType`, which
+    /// `parsePostForm` discards (`ct, _, err = …`) but still WALKS — so a
+    /// parameter that does not parse refuses the whole request even when
+    /// the base type is the form type it was going to accept.
+    ///
+    /// Every row container-measured 2026-08-10, same two stores, same
+    /// probe. The pairs are the point: `a=1; a=1` is served and
+    /// `a=1; a=2` is refused (a duplicate is an error only when the
+    /// values DISAGREE); `charset="utf-8"` is served and
+    /// `charset="utf-8` is refused (an unterminated quoted-string
+    /// consumes no value); a trailing `;` is served and a trailing `; ;`
+    /// is refused. Dropping the walk entirely satisfies neither half of
+    /// any pair.
+    #[test]
+    fn the_media_type_parameter_walk_matches_the_reference() {
+        use FormBody::{Ignore, Parse};
+
+        let cases: &[(&str, Option<FormBody>)] = &[
+            ("application/x-www-form-urlencoded; charset=\"utf-8\"", Some(Parse)),
+            // No closing quote: `consumeValue` consumes nothing.
+            ("application/x-www-form-urlencoded; charset=\"utf-8", None),
+            // Go's MSIE rule: a backslash escapes a `tspecial` and is a
+            // literal byte before anything else. Both parse.
+            ("application/x-www-form-urlencoded; charset=\"a\\;b\"", Some(Parse)),
+            ("application/x-www-form-urlencoded; charset=\"a\\qb\"", Some(Parse)),
+            // A bare `=` with nothing after it consumes no value.
+            ("application/x-www-form-urlencoded; charset=", None),
+            // An empty QUOTED value does.
+            ("application/x-www-form-urlencoded; charset=\"\"", Some(Parse)),
+            ("application/x-www-form-urlencoded ; charset=utf-8", Some(Parse)),
+            ("application/x-www-form-urlencoded;charset=utf-8;boundary=x", Some(Parse)),
+            // RFC 2231 continuations: walked and duplicate-checked, never
+            // stitched (the stitching pass cannot fail).
+            ("application/x-www-form-urlencoded; a*0=1; a*1=2", Some(Parse)),
+            ("application/x-www-form-urlencoded; a*0=1; a*0=2", None),
+            // A repeat whose value agrees is allowed; one that disagrees
+            // is not — and the name is compared case-folded.
+            ("application/x-www-form-urlencoded; a=1; a=1", Some(Parse)),
+            ("application/x-www-form-urlencoded; a=1; a=2", None),
+            ("application/x-www-form-urlencoded; A=1; a=2", None),
+            ("application/x-www-form-urlencoded; charset=utf-8; charset=utf-8", Some(Parse)),
+            ("application/x-www-form-urlencoded; a=1; b=1", Some(Parse)),
+            // One trailing `;` is deliberately not an error; a second is.
+            ("application/x-www-form-urlencoded;", Some(Parse)),
+            ("application/x-www-form-urlencoded;;", None),
+            ("application/x-www-form-urlencoded; ;", None),
+            ("application/x-www-form-urlencoded; bogus", None),
+            ("APPLICATION/X-WWW-FORM-URLENCODED; CHARSET=UTF-8", Some(Parse)),
+            // The walk applies to a type whose body would be ignored too.
+            ("application/json; charset=utf-8", Some(Ignore)),
+            ("application/json; charset", None),
+            ("text/plain; a=1; a=2", None),
+        ];
+
+        for (raw, expected) in cases {
+            let got = form_body_disposition(Some(raw));
+            match expected {
+                Some(disposition) => assert_eq!(
+                    got.as_ref().ok(),
+                    Some(disposition),
+                    "Content-Type {raw:?} must be {disposition:?}, got {got:?}"
+                ),
+                None => assert!(
+                    matches!(got, Err(ParamError::MalformedContentType(_))),
+                    "Content-Type {raw:?} must be a 400, got {got:?}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn parse_ts_reads_rfc3339() {
         // 2026-07-01T00:00:00Z.

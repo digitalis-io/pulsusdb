@@ -151,6 +151,24 @@ parameter takes **both, concatenated** (`?match[]={app="b"}` + body
 body's value and still collapses to the default — `?limit=5` + body
 `limit=` serves 100, not 5.
 
+**A `POST`'s `Content-Type` decides whether its BODY is read, not whether
+the request is served.** The body is parsed as form pairs only under
+`application/x-www-form-urlencoded` (case-insensitively, parameters such as
+`; charset=UTF-8` allowed). Under **any other** well-formed media type —
+`application/json`, `text/plain`, `multipart/form-data`, a bare token like
+`garbage`, or **no `Content-Type` header at all** — the body is not read,
+and the request is answered from its URL query alone. So a POST carrying
+every parameter in its URL is served whatever the client labels the body,
+which matters because plenty of HTTP clients send `application/json` by
+default. What *is* rejected `400` is a `Content-Type` that cannot be
+**parsed**: an empty subtype (`application/`), a missing type (`;`,
+`/json`), trailing content after the subtype (`application/json/x`), or a
+malformed parameter (`application/json; charset`, or a repeated parameter
+whose values disagree — `; a=1; a=2`; a repeat whose values *agree* is
+allowed, as is one trailing `;`). This is the reference's rule throughout,
+in its own `mime.ParseMediaType`/`ParseForm` terms; the rejection message
+prose is PulsusDB's.
+
 ### 2.1 `GET|POST /api/logs/v1/query_range`
 
 | Param | Type | Notes |
