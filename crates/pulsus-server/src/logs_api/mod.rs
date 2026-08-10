@@ -1178,8 +1178,7 @@ mod tests {
                 &format!("{SELECTOR_QUERY}&start={start}&end={end}&step=1ns"),
             )
         };
-        let (secs_status, secs_body) =
-            routed(router(), get_req(&step_probe(START_S, END_S))).await;
+        let (secs_status, secs_body) = routed(router(), get_req(&step_probe(START_S, END_S))).await;
         let (nanos_status, nanos_body) =
             routed(router(), get_req(&step_probe(START_NS, END_NS))).await;
         assert_eq!(
