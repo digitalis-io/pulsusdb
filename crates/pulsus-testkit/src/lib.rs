@@ -265,10 +265,10 @@ pub const DATABASE_PREFIX_VAR: &str = "PULSUS_TEST_CH_DATABASE_PREFIX";
 
 /// The longest database name ClickHouse will accept here. Its on-disk
 /// path component is escaped, so the real ceiling depends on the
-/// characters used; 200 is comfortably under it for the `[A-Za-z0-9_]`
-/// names this function admits, and the point of the check is to turn "an
-/// over-long prefix produces an opaque server-side error deep inside a
-/// live suite" into a message that names the variable.
+/// characters used; the value below is comfortably under it for the
+/// `[A-Za-z0-9_]` names this function admits, and the point of the check
+/// is to turn "an over-long prefix produces an opaque server-side error
+/// deep inside a live suite" into a message that names the variable.
 const MAX_DATABASE_NAME_LEN: usize = 200;
 
 /// Composes the name of a throwaway test database: `name`, prefixed with
@@ -293,7 +293,7 @@ const MAX_DATABASE_NAME_LEN: usize = 200;
 /// [`MAX_DATABASE_NAME_LEN`]. A bad value panics naming the offender —
 /// during a test, which is the only place this crate is ever linked.
 ///
-/// Two prefix values are handled without panicking, and both are
+/// Some prefix values are accepted rather than refused. Each is
 /// deliberate:
 ///
 /// * **A blank prefix reads as unset.** `PULSUS_TEST_CH_DATABASE_PREFIX=`
@@ -565,14 +565,16 @@ mod tests {
     // Trimming, over the whole set of characters `str::trim` strips.
     //
     // Review finding (PR #424, round 3): the previous version of these
-    // two tests used four hand-written spellings and claimed to cover
-    // "every whitespace character `str::trim` would have removed". It
-    // covered four of the twenty-five. A hand-written list beside an
-    // "every" is the defect this branch has now produced twice, so the
-    // set is derived instead of enumerated — nothing below names a
-    // whitespace character except as a sanity anchor, and a character
+    // tests wrote out a handful of spellings by hand and claimed to cover
+    // "every whitespace character `str::trim` would have removed". It did
+    // not, and a hand-written list beside an "every" is the defect this
+    // branch had already produced once before. So the set is derived
+    // instead of enumerated: [`characters_trim_strips`] computes it by
+    // running `trim`, and nothing here names a whitespace character
+    // except as a sanity anchor on the derivation itself. A character
     // added to Rust's definition in a future toolchain is picked up on
-    // the next run rather than silently falsifying the sentence.
+    // the next run rather than silently falsifying the sentence — which
+    // is also why no comment in this file states how large the set is.
     // -----------------------------------------------------------------
 
     /// The characters [`str::trim`] strips, **derived by running `trim`**
@@ -590,9 +592,14 @@ mod tests {
             .collect()
     }
 
-    /// The derivation is only trustworthy if it finds something; these
-    /// four are anchors against a scan that silently returns nothing (or
-    /// everything), not a statement of what the set contains.
+    /// Checks the derivation, **not** the set it produced.
+    ///
+    /// A sweep over an empty (or universal) set passes vacuously, so this
+    /// asserts that [`characters_trim_strips`] found the characters any
+    /// working `trim` must strip and did not classify an ordinary letter
+    /// as whitespace. The characters named below are a probe on the
+    /// machinery — read as a claim about the set's membership they would
+    /// be exactly the enumeration this whole section exists to avoid.
     fn assert_derivation_is_sane(ws: &[char]) {
         for anchor in [' ', '\t', '\n', '\r'] {
             assert!(
@@ -633,10 +640,11 @@ mod tests {
         }
     }
 
-    /// …and every one of them is refused *inside* a prefix, where it
-    /// would change the composed name. Derived from the same set, so the
-    /// two behaviours cannot silently converge on a character neither
-    /// test happens to mention.
+    /// …and every character `trim` strips is refused *inside* a prefix,
+    /// where it would change the composed name. Iterated from the same
+    /// derivation as the test above, so absorbing at an end and refusing
+    /// in the middle cannot silently converge on a character neither test
+    /// happens to mention.
     #[test]
     fn every_character_trim_strips_is_refused_inside_a_prefix() {
         let ws = characters_trim_strips();
@@ -700,10 +708,23 @@ mod tests {
         let _ = compose_db_name(None, "pulsus_x_it_{nonce}");
     }
 
+    /// The length ceiling, driven from the constant rather than from a
+    /// literal repeated in prose: a prefix long enough to breach it
+    /// whatever the constant is set to.
     #[test]
-    #[should_panic(expected = "over the 200")]
     fn an_over_long_composed_name_is_refused() {
-        let _ = compose_db_name(Some(&"p".repeat(190)), "pulsus_x_it");
+        let err = std::panic::catch_unwind(|| {
+            compose_db_name(Some(&"p".repeat(MAX_DATABASE_NAME_LEN)), "pulsus_x_it")
+        })
+        .expect_err("a name over the ceiling must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            msg.contains(&format!("over the {MAX_DATABASE_NAME_LEN}")),
+            "{msg}"
+        );
     }
 
     /// `TestDb` has to interpolate and coerce exactly like the `&str`
@@ -726,7 +747,7 @@ mod tests {
     }
 
     /// The name is composed once and then stable, so a suite that
-    /// interpolates it in twenty places names one database.
+    /// interpolates it throughout a suite names one database.
     #[test]
     fn a_test_db_composes_its_name_once() {
         static DB: TestDb = TestDb::new("pulsus_y_it");
