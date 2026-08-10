@@ -292,6 +292,15 @@ const MAX_DATABASE_NAME_LEN: usize = 200;
 /// the same shape, and the composed name must not exceed
 /// [`MAX_DATABASE_NAME_LEN`]. A bad value panics naming the offender —
 /// during a test, which is the only place this crate is ever linked.
+///
+/// **Surrounding whitespace on the prefix is trimmed, not refused.** That
+/// is a deliberate exception to "check, do not fix", and it covers exactly
+/// one mistake: `export PULSUS_TEST_CH_DATABASE_PREFIX=$(cat .prefix)` and
+/// its relatives leave a trailing newline, which is invisible in a shell
+/// and would otherwise abort every live suite with a message about an
+/// unprintable character. Whitespace cannot change which database is
+/// named — `" wt3 "` and `"wt3"` compose the same one — so trimming it
+/// costs no isolation. Every other malformed prefix still panics.
 pub fn test_db(name: &str) -> String {
     test_ident(name)
 }
@@ -320,6 +329,10 @@ fn compose_db_name(prefix: Option<&str>, name: &str) -> String {
              Name it with ASCII letters, digits and underscores only."
         );
     }
+    // Trim, do not refuse — see the note in [`test_db`]'s `# Panics`
+    // section. Whitespace cannot change which database is named, and a
+    // shell-captured prefix carrying a trailing newline is the one
+    // mistake common enough to be worth absorbing.
     let composed = match prefix.map(str::trim).filter(|p| !p.is_empty()) {
         None => name.to_string(),
         Some(prefix) => {
@@ -531,13 +544,29 @@ mod tests {
     }
 
     /// Surrounding whitespace is a shell accident (`export P=" wt3"`), not
-    /// a request for a database called `" wt3_…"`.
+    /// a request for a database called `" wt3_…"`. Trimmed rather than
+    /// refused, deliberately — see the note in `test_db`'s docs. A
+    /// trailing newline is the case that actually happens (`export
+    /// P=$(cat .prefix)`) and it is invisible in a shell, so refusing it
+    /// would abort a live run with a message about a character the
+    /// operator cannot see.
     #[test]
-    fn a_prefix_is_trimmed_before_use() {
-        assert_eq!(
-            compose_db_name(Some(" wt3 "), "pulsus_x_it"),
-            "wt3_pulsus_x_it"
-        );
+    fn a_prefix_is_trimmed_before_use_rather_than_refused() {
+        for spelling in [" wt3 ", "wt3\n", "\twt3\r\n", "wt3 "] {
+            assert_eq!(
+                compose_db_name(Some(spelling), "pulsus_x_it"),
+                "wt3_pulsus_x_it",
+                "{spelling:?} must compose the same database as \"wt3\""
+            );
+        }
+    }
+
+    /// Trimming is the *only* repair: whitespace inside the prefix cannot
+    /// be a shell accident and still panics like any other bad character.
+    #[test]
+    #[should_panic(expected = "is not a usable database-name prefix")]
+    fn whitespace_inside_a_prefix_is_still_refused() {
+        let _ = compose_db_name(Some("wt 3"), "pulsus_x_it");
     }
 
     /// Two different prefixes never compose to the same database — the

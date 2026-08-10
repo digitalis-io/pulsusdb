@@ -78,9 +78,12 @@
 //! * **A name split across literals** — `concat!("pulsus_x", "_it")`.
 //!
 //! The floors below are what keeps a *silent* zero-finding pass from
-//! looking like success, and
-//! [`finder_tests::the_floors_reject_a_tree_with_nothing_in_it`] proves
-//! they fire.
+//! looking like success. Each one is shown firing **on its own**, from a
+//! fixture that clears the other three — `the_files_scanned_floor_fires_on_its_own`
+//! and its three siblings — and
+//! [`finder_tests::an_empty_tree_breaches_every_floor_and_names_each_one`]
+//! shows all four reporting together. See the note on the floor constants
+//! for why one empty-tree observation was not enough.
 
 #[path = "support/source_scan.rs"]
 mod source_scan;
@@ -116,10 +119,37 @@ const SHARED_DATABASES: &[&str] = &["default", "system", "pulsus"];
 /// sites. Set below the real counts at the time of writing (179 files
 /// scanned, 261 helper call sites in 53 files, 666 rule-2 naming sites)
 /// with enough slack that ordinary deletions do not trip them.
+///
+/// [`check_inventory`] evaluates **all four** and reports every breach,
+/// rather than returning on the first. That is not a nicety: with a
+/// short-circuiting check, the only way to watch a floor fire is to point
+/// the scan at an empty tree, where the *first* floor fails and the other
+/// three never evaluate — so three of the four would be unobservable, and
+/// a floor nobody can watch fire is the same shape as the vacuous pass it
+/// exists to prevent. [`finder_tests`] additionally drives each floor on
+/// its own, from a fixture that satisfies the other three (see
+/// [`Floor`]'s variants for which test proves which).
 const MIN_FILES_SCANNED: usize = 120;
 const MIN_HELPER_CALLS: usize = 200;
 const MIN_HELPER_CALL_FILES: usize = 40;
 const MIN_BINDING_SITES: usize = 500;
+
+/// The four floors, named so a breach can be asserted on individually
+/// rather than by matching prose.
+///
+/// | variant | floor | demonstrated alone by |
+/// |---|---|---|
+/// | [`Floor::FilesScanned`] | [`MIN_FILES_SCANNED`] | `the_files_scanned_floor_fires_on_its_own` |
+/// | [`Floor::HelperCalls`] | [`MIN_HELPER_CALLS`] | `the_helper_call_floor_fires_on_its_own` |
+/// | [`Floor::HelperCallFiles`] | [`MIN_HELPER_CALL_FILES`] | `the_helper_call_file_floor_fires_on_its_own` |
+/// | [`Floor::BindingSites`] | [`MIN_BINDING_SITES`] | `the_binding_site_floor_fires_on_its_own` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Floor {
+    FilesScanned,
+    HelperCalls,
+    HelperCallFiles,
+    BindingSites,
+}
 
 /// What one whole-tree scan found.
 #[derive(Debug, Default)]
@@ -562,39 +592,60 @@ fn scan_tree(root: &Path) -> Result<Inventory, Vec<String>> {
     }
 }
 
-/// The floors, over an already-scanned tree.
-fn check_inventory(inv: &Inventory) -> Result<(), String> {
+/// All four floors, over an already-scanned tree.
+///
+/// Every floor is evaluated; the error carries one entry per breach, in
+/// [`Floor`] order. Deliberately not short-circuiting — see the note on
+/// the floor constants.
+fn check_inventory(inv: &Inventory) -> Result<(), Vec<(Floor, String)>> {
+    let mut breaches = Vec::new();
     if inv.files_scanned < MIN_FILES_SCANNED {
-        return Err(format!(
-            "scanned only {} test source files (floor {MIN_FILES_SCANNED}) — the walk found \
-             almost nothing, so a green result here would mean nothing was checked.",
-            inv.files_scanned
+        breaches.push((
+            Floor::FilesScanned,
+            format!(
+                "scanned only {} test source files (floor {MIN_FILES_SCANNED}) — the walk found \
+                 almost nothing, so a green result here would mean nothing was checked.",
+                inv.files_scanned
+            ),
         ));
     }
     if inv.helper_calls.len() < MIN_HELPER_CALLS {
-        return Err(format!(
-            "found only {} `pulsus_testkit::test_db` call sites (floor {MIN_HELPER_CALLS}) — \
-             either the live suites were deleted or the helper is being spelled a way this scan \
-             does not match, in which case rule 1 is passing over names it never saw.",
-            inv.helper_calls.len()
+        breaches.push((
+            Floor::HelperCalls,
+            format!(
+                "found only {} `pulsus_testkit::test_db` call sites (floor {MIN_HELPER_CALLS}) — \
+                 either the live suites were deleted or the helper is being spelled a way this \
+                 scan does not match, in which case rule 1 is passing over names it never saw.",
+                inv.helper_calls.len()
+            ),
         ));
     }
     let files: BTreeSet<&str> = inv.helper_calls.iter().map(|(f, _)| f.as_str()).collect();
     if files.len() < MIN_HELPER_CALL_FILES {
-        return Err(format!(
-            "only {} files compose a test database name (floor {MIN_HELPER_CALL_FILES}) — the \
-             scan is matching one file's shape and missing the rest.",
-            files.len()
+        breaches.push((
+            Floor::HelperCallFiles,
+            format!(
+                "only {} files compose a test database name (floor {MIN_HELPER_CALL_FILES}) — the \
+                 scan is matching one file's shape and missing the rest.",
+                files.len()
+            ),
         ));
     }
     if inv.binding_sites < MIN_BINDING_SITES {
-        return Err(format!(
-            "rule 2 inspected only {} database naming sites (floor {MIN_BINDING_SITES}) — the \
-             site recogniser has stopped matching, so rule 2 is passing vacuously.",
-            inv.binding_sites
+        breaches.push((
+            Floor::BindingSites,
+            format!(
+                "rule 2 inspected only {} database naming sites (floor {MIN_BINDING_SITES}) — the \
+                 site recogniser has stopped matching, so rule 2 is passing vacuously.",
+                inv.binding_sites
+            ),
         ));
     }
-    Ok(())
+    if breaches.is_empty() {
+        Ok(())
+    } else {
+        Err(breaches)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -620,8 +671,17 @@ fn every_live_test_database_name_comes_from_the_helper() {
             errors.join("\n")
         ),
     };
-    if let Err(msg) = check_inventory(&inv) {
-        panic!("{msg}");
+    if let Err(breaches) = check_inventory(&inv) {
+        let list = breaches
+            .iter()
+            .map(|(floor, msg)| format!("  {floor:?}: {msg}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "{} of the 4 scan floors were breached — the scan checked far less than it should \
+             have:\n{list}",
+            breaches.len()
+        );
     }
 }
 
@@ -815,11 +875,139 @@ fn f() {
         accept(r#"fn f() { exec(&format!("DROP DATABASE IF EXISTS {db}")); }"#);
     }
 
-    /// The floor half of the guard: a scan that matches nothing must fail,
-    /// not pass. Pointed at a directory tree that really is empty — the
-    /// exact shape a renamed `tests/` directory or a broken walk produces.
+    // -----------------------------------------------------------------
+    // The floors, one at a time.
+    //
+    // Review finding (PR #424): pointing the scan at an empty tree used
+    // to be the only way to watch a floor fire, and with a
+    // short-circuiting check only the FIRST floor was observable that
+    // way. Three of the four could have been set to zero and nothing
+    // would have said so. Each floor now has a fixture that satisfies the
+    // other three and breaches exactly that one, so every floor is
+    // demonstrable on its own — and `check_inventory` reports all
+    // breaches, so the empty tree names all four at once.
+    // -----------------------------------------------------------------
+
+    /// `helper_calls` spread over `files` distinct files, `calls` in
+    /// total. `calls >= files` or the file count comes out short.
+    fn calls_over_files(calls: usize, files: usize) -> Vec<(String, usize)> {
+        assert!(calls >= files, "fixture needs at least one call per file");
+        (0..calls)
+            .map(|i| (format!("crates/c/tests/f{}.rs", i % files), i + 1))
+            .collect()
+    }
+
+    /// An inventory that clears all four floors — the control every
+    /// per-floor fixture is a one-field mutation of.
+    fn passing_inventory() -> Inventory {
+        Inventory {
+            files_scanned: MIN_FILES_SCANNED,
+            helper_calls: calls_over_files(MIN_HELPER_CALLS, MIN_HELPER_CALL_FILES),
+            binding_sites: MIN_BINDING_SITES,
+        }
+    }
+
+    /// Asserts `inv` breaches exactly `expected` and nothing else. The
+    /// "and nothing else" half is what makes the fixture a proof about
+    /// *that* floor rather than about the check as a whole.
+    fn breaches_exactly(inv: &Inventory, expected: Floor, needle: &str) {
+        let breaches = check_inventory(inv).expect_err("this fixture must breach a floor");
+        let floors: Vec<Floor> = breaches.iter().map(|(f, _)| *f).collect();
+        assert_eq!(floors, vec![expected], "breaches: {breaches:?}");
+        assert!(breaches[0].1.contains(needle), "{}", breaches[0].1);
+    }
+
     #[test]
-    fn the_floors_reject_a_tree_with_nothing_in_it() {
+    fn the_control_inventory_clears_every_floor() {
+        assert!(
+            check_inventory(&passing_inventory()).is_ok(),
+            "the per-floor fixtures are one-field mutations of this; if it does not pass, they \
+             prove nothing about the field they mutate"
+        );
+    }
+
+    /// A floor of zero admits everything, so each floor being non-zero is
+    /// asserted rather than assumed — at compile time, which is where a
+    /// constant's value can be settled once and for all.
+    #[test]
+    fn no_floor_is_set_to_zero() {
+        const {
+            assert!(MIN_FILES_SCANNED > 0);
+            assert!(MIN_HELPER_CALLS > 0);
+            assert!(MIN_HELPER_CALL_FILES > 0);
+            assert!(MIN_BINDING_SITES > 0);
+        }
+    }
+
+    /// Floor 1 alone: the walk found almost no files, but everything it
+    /// did find is in order.
+    #[test]
+    fn the_files_scanned_floor_fires_on_its_own() {
+        let inv = Inventory {
+            files_scanned: MIN_FILES_SCANNED - 1,
+            ..passing_inventory()
+        };
+        breaches_exactly(
+            &inv,
+            Floor::FilesScanned,
+            &format!("scanned only {} test source files", MIN_FILES_SCANNED - 1),
+        );
+    }
+
+    /// Floor 2 alone: plenty of files, still spread over enough of them,
+    /// but one call site short — the shape of the helper being spelled a
+    /// way this scan no longer matches.
+    #[test]
+    fn the_helper_call_floor_fires_on_its_own() {
+        let inv = Inventory {
+            helper_calls: calls_over_files(MIN_HELPER_CALLS - 1, MIN_HELPER_CALL_FILES),
+            ..passing_inventory()
+        };
+        breaches_exactly(
+            &inv,
+            Floor::HelperCalls,
+            &format!("found only {}", MIN_HELPER_CALLS - 1),
+        );
+    }
+
+    /// Floor 3 alone: the call count is fine, but they have all collapsed
+    /// into too few files — the shape of the scan matching one file's
+    /// idiom and missing the rest.
+    #[test]
+    fn the_helper_call_file_floor_fires_on_its_own() {
+        let inv = Inventory {
+            helper_calls: calls_over_files(MIN_HELPER_CALLS, MIN_HELPER_CALL_FILES - 1),
+            ..passing_inventory()
+        };
+        breaches_exactly(
+            &inv,
+            Floor::HelperCallFiles,
+            &format!("only {} files compose", MIN_HELPER_CALL_FILES - 1),
+        );
+    }
+
+    /// Floor 4 alone: rule 1's inventory is untouched, but rule 2's site
+    /// recogniser has stopped matching, which is how rule 2 would go
+    /// quietly vacuous while rule 1 kept the test green.
+    #[test]
+    fn the_binding_site_floor_fires_on_its_own() {
+        let inv = Inventory {
+            binding_sites: MIN_BINDING_SITES - 1,
+            ..passing_inventory()
+        };
+        breaches_exactly(
+            &inv,
+            Floor::BindingSites,
+            &format!("inspected only {}", MIN_BINDING_SITES - 1),
+        );
+    }
+
+    /// And the whole set together: a directory tree that really is empty
+    /// — the exact shape a renamed `tests/` directory or a broken walk
+    /// produces — breaches **all four**, each named. Before the check
+    /// stopped short-circuiting, this observed one of the four.
+    #[test]
+    fn an_empty_tree_breaches_every_floor_and_names_each_one() {
         let empty = std::env::temp_dir().join(format!(
             "pulsus_db_guard_empty_{}_{}",
             std::process::id(),
@@ -830,56 +1018,18 @@ fn f() {
         assert_eq!(inv.files_scanned, 0);
         assert_eq!(inv.helper_calls.len(), 0);
         assert_eq!(inv.binding_sites, 0);
-        let msg = check_inventory(&inv).expect_err("an empty tree must not pass");
-        assert!(msg.contains("scanned only 0 test source files"), "{msg}");
+        let breaches = check_inventory(&inv).expect_err("an empty tree must not pass");
+        let floors: Vec<Floor> = breaches.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            floors,
+            vec![
+                Floor::FilesScanned,
+                Floor::HelperCalls,
+                Floor::HelperCallFiles,
+                Floor::BindingSites,
+            ],
+            "every floor must report, not just the first: {breaches:?}"
+        );
         std::fs::remove_dir_all(&empty).ok();
-    }
-
-    /// …and the helper-call floor fires independently of the file floor:
-    /// plenty of files, no helper calls left in them.
-    #[test]
-    fn the_helper_call_floor_fires_when_the_files_are_there_but_the_calls_are_not() {
-        let inv = Inventory {
-            files_scanned: MIN_FILES_SCANNED,
-            helper_calls: Vec::new(),
-            binding_sites: MIN_BINDING_SITES,
-        };
-        let msg = check_inventory(&inv).expect_err("zero helper calls must not pass");
-        assert!(msg.contains("found only 0"), "{msg}");
-    }
-
-    /// And the declaring-file floor fires when one file still matches but
-    /// the others have drifted out of the scan's sight.
-    #[test]
-    fn the_helper_call_file_floor_fires_when_only_one_file_still_matches() {
-        let inv = Inventory {
-            files_scanned: MIN_FILES_SCANNED,
-            helper_calls: (0..MIN_HELPER_CALLS)
-                .map(|i| ("crates/c/tests/only.rs".to_string(), i + 1))
-                .collect(),
-            binding_sites: MIN_BINDING_SITES,
-        };
-        let msg = check_inventory(&inv).expect_err("one helper-calling file must not pass");
-        assert!(msg.contains("files compose a test database name"), "{msg}");
-    }
-
-    /// And the rule-2 floor fires when the site recogniser stops matching,
-    /// which is how rule 2 would go quietly vacuous.
-    #[test]
-    fn the_binding_site_floor_fires_when_rule_two_recognises_nothing() {
-        let inv = Inventory {
-            files_scanned: MIN_FILES_SCANNED,
-            helper_calls: (0..MIN_HELPER_CALLS)
-                .map(|i| {
-                    (
-                        format!("crates/c/tests/f{}.rs", i % MIN_HELPER_CALL_FILES),
-                        1,
-                    )
-                })
-                .collect(),
-            binding_sites: 0,
-        };
-        let msg = check_inventory(&inv).expect_err("zero naming sites must not pass");
-        assert!(msg.contains("inspected only 0"), "{msg}");
     }
 }
