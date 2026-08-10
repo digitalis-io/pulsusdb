@@ -324,6 +324,14 @@ pub fn stage2(streams_table: &str, fingerprints: &[u64]) -> String {
 /// inside a sort that already had to happen, over at most the matched
 /// rows. Index engagement is pinned unchanged by
 /// `explain_indexes.rs`'s stage-3 cases.
+///
+/// **This buys determinism, NOT the reference's order.** Both stores are
+/// deterministic and they settle into different sequences — ours is
+/// `cityHash64(body)`, the reference's is arrival order within a stream
+/// and `streamHash` across streams. At a `LIMIT` cutting a tie group that
+/// means a different subset survives, so it is registered as
+/// `timestamp-tie-order` in docs/benchmarks/logs-differential-ledger.md
+/// with the probe, both sequences, and why matching it is separate work.
 pub fn stage3(
     samples_table: &str,
     services: &[String],

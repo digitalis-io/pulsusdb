@@ -2493,6 +2493,81 @@ The 131,072-byte `MAX_QUERY_BYTES` cap (docs/api.md §2.3, the reference's
 `maxInputSize`) matches the reference exactly at the parse seam. Its one
 divergence is a transport-layer bound discovered while shipping it.
 
+### `timestamp-tie-order` (issue #406 — both stores deterministic, neither settles into the other's order)
+
+No fixture case references this entry — nothing is downgraded. It records
+a divergence found while fixing a defect of our own: `sql::stage3` used to
+order by `timestamp_ns` alone, so entries sharing a timestamp came back in
+whatever order the parts were read in, and the same query answered
+differently run to run (up to fifteen orderings, and — at a `LIMIT`
+cutting the tie group — fifteen different result SETS). That is fixed:
+`stage3` now renders the total order `sql::stage3_keyset` always did.
+**Both stores are now individually deterministic. They do not agree on
+WHICH order.**
+
+- **The probe, 2026-08-10.** Ten lines `ord_0 … ord_9` pushed as ten
+  separate appends at ONE byte-identical `timestamp_ns` into one stream,
+  on `grafana/loki:3.7.4` and on PulsusDB, then one `query_range`
+  repeated ten times against each.
+
+  | | `direction=backward` | `direction=forward` |
+  |---|---|---|
+  | reference (10/10 runs) | `ord_9, ord_8, ord_7, ord_6, ord_5, ord_4, ord_3, ord_2, ord_1, ord_0` | `ord_0, ord_1, … ord_9` |
+  | PulsusDB (10/10 runs) | `ord_3, ord_7, ord_5, ord_2, ord_4, ord_1, ord_6, ord_8, ord_0, ord_9` | the exact reverse of ours |
+
+  Ten identical runs gave one sequence on each store, so this is a
+  difference of ORDER, not of stability.
+
+- **The consequence, and it is the reason this is a ledger row rather than
+  a footnote: at a `LIMIT` that cuts through a tie group, a different
+  order means a different SUBSET survives.** Same query, same data, same
+  limit — `limit=4` over that fixture returns
+  `{ord_9, ord_8, ord_7, ord_6}` at the reference and
+  `{ord_3, ord_7, ord_5, ord_2}` here. One row in common out of four.
+  These are **different rows, not the same rows rearranged**, and no
+  amount of client-side sorting recovers the reference's answer.
+
+- **The two mechanisms.** Ours is
+  `ORDER BY timestamp_ns, fingerprint, cityHash64(body), body`, all
+  following `direction` — verified against ClickHouse directly: the
+  backward sequence above is exactly `cityHash64(body)` descending
+  (`ord_3` = 18389771029585043774 … `ord_9` = 555397834495227519). The
+  reference's is two different keys depending on the case
+  (`pkg/iter/entry_iterator.go:241-275` @ grafana/loki v3.7.4
+  `b318f2829f0ae2094ab3a1e90780450e9e4b03be`): **across** streams it
+  compares `streamHash`, falling back to `labels` when the hash is
+  unavailable; **within** a stream it compares nothing at all — the merge
+  iterator's own comment says it "does not merge entries within individual
+  iterator", so entries keep the order they were appended in, which is
+  what the table above shows.
+
+- **Why we do not match it, stated as a decision.** Two separate gaps, and
+  neither is a line of SQL:
+  1. *Within a stream* the reference's key is **arrival order**. We do not
+     store one. `log_samples` rows carry no ordinal, and a MergeTree part
+     exposes no stable append rank a query can read, so matching would
+     mean adding a per-entry sequence column to the hottest table on the
+     write path and threading it through ingest.
+  2. *Across streams* its key is `streamHash`. Our `fingerprint` is a
+     different identity function over the same label set, so even ordering
+     by it does not reproduce their sequence; matching would mean
+     computing and storing Loki's stream hash alongside our own.
+
+  Both are real work with their own storage and ingest cost, weighed
+  against a divergence that is only observable when several entries share
+  a nanosecond AND a limit cuts through them. We took determinism now and
+  left order-equivalence unclaimed rather than half-claimed.
+
+- **What IS gated, so the claim above stays honest:** our own stability
+  (`logs_api_live.rs::entries_sharing_a_timestamp_come_back_in_a_stable_order`
+  — 40 single-row parts at one timestamp, one query repeated twelve times
+  at two limits, one of which cuts the tie group) and the agreement of our
+  two stage-3 builders
+  (`sql_snapshots.rs::stage3_breaks_timestamp_ties_with_the_same_total_order_as_the_keyset_builder`,
+  which reads the key list off `stage3_keyset` rather than restating it).
+  Nothing gates equivalence with the reference's order, because we do not
+  claim it.
+
 ### `logs-timestamp-i64-nanosecond-domain` (issue #406 Part D, rulings v3 — a representation limit with a date on it)
 
 No fixture case references this entry — nothing is downgraded. It records
