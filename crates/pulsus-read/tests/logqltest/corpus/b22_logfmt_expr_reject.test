@@ -171,13 +171,18 @@ eval_fail instant at 60s count_over_time({service_name="lfx"} | logfmt a="b.c" [
 eval_fail instant at 60s sum by (a) (count_over_time({service_name="lfx"} | logfmt a="b.c" [5m]))
   msg: unexpected char .
 
-# A VARIANT's own pipeline is dead syntax at evaluation on both sides —
-# and validated anyway on both sides. The reference builds the variant's
-# extractor purely to count it (pkg/logql/evaluator.go:1417, :1422 @
-# v3.7.4) while the real extraction passes nil variant stages
+# A BARE VARIANT's own pipeline is dead syntax at evaluation on both
+# sides — and validated anyway on both sides. The reference builds the
+# variant's extractor purely to count it (pkg/logql/evaluator.go:1417,
+# :1422 @ v3.7.4) while the real extraction passes nil variant stages
 # (extractor.go:186, :225), so a malformed stage there is a 400 that
 # never runs. Captured 400; not window-dependent, unlike every other
 # eval_fail in this file, because the reference raises it in the querier.
+# BARE is load-bearing (issue #397): a variant wrapped in a vector
+# aggregation reaches variant.Extractors() (extractor.go:128) instead,
+# and its pipeline both runs and is validated. The refusal below is the
+# same either way — it is the shape of the answer that differs, which
+# b13_variants.test's `W` section pins.
 eval_fail instant at 60s variants(count_over_time({service_name="lfx"} | logfmt a="b.c" [5m])) of ({service_name="lfx"}[5m])
   msg: unexpected char .
 

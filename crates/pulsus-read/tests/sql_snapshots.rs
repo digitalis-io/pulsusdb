@@ -1344,6 +1344,16 @@ fn n_variants(n: usize, common: &str) -> String {
 /// service` PK-prefix engagement, same `tokenbf_v1` line-filter pushdown
 /// surface, same single round-trip. A common-range `unwrap` (dead
 /// syntax) changes neither string.
+///
+/// Issue #397 extends it: a WRAPPED variant now runs its own whole
+/// pipeline, and that pipeline must add nothing to the scan. A variant's
+/// line filter cannot be pushed to ClickHouse — one scan feeds every
+/// variant, so a per-variant predicate would drop rows its siblings need
+/// — and the reference has the same constraint (it selects once, from
+/// `m.logRange.Left`, `pkg/logql/syntax/extractor.go:104 @ v3.7.4`). So
+/// the scan for a variant carrying ` |= "z" | logfmt` is byte-identical
+/// to the same query with those stages deleted: no extra predicate, no
+/// extra probe, no extra round-trip.
 #[test]
 fn variants_scan_sql_is_byte_identical_to_the_single_extractor_plan() {
     let services = &["'checkout'".to_string()];
@@ -1406,6 +1416,33 @@ fn variants_scan_sql_is_byte_identical_to_the_single_extractor_plan() {
         );
         assert_eq!(scan.stage1_sql, baseline_stage1);
         assert_eq!(read_sql(&scan), baseline_read);
+
+        // Issue #397: a WRAPPED variant with a LIVE prefix changes
+        // neither string either. Its ` |= "z" | logfmt` runs
+        // client-side, on rows the one shared scan already returned.
+        let wrapped = variants_scan(
+            r#"variants(sum by (env) (count_over_time({env="prod"} |= "z" | logfmt [5m]))) of ({env="prod"}[5m])"#,
+            &params,
+        );
+        let stripped = variants_scan(
+            r#"variants(sum by (env) (count_over_time({env="prod"}[5m]))) of ({env="prod"}[5m])"#,
+            &params,
+        );
+        assert_eq!(
+            wrapped.stage1_sql, stripped.stage1_sql,
+            "a live variant prefix must not reach stage-1 SQL"
+        );
+        assert_eq!(
+            wrapped.extra_predicates, stripped.extra_predicates,
+            "a live variant prefix must not become a scan predicate"
+        );
+        assert_eq!(
+            read_sql(&wrapped),
+            read_sql(&stripped),
+            "a live variant prefix must not change the read SQL"
+        );
+        assert_eq!(wrapped.stage1_sql, baseline_stage1);
+        assert_eq!(read_sql(&wrapped), baseline_read);
     }
 }
 

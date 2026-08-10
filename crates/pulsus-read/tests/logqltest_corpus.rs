@@ -307,3 +307,145 @@ fn msg_exact_discriminates_and_its_grammar_is_exactly_one_assert_line() {
     let err = run_file("inline/msg_zero_lines.test", &zero).expect_err("no assert line");
     assert!(err.contains("requires exactly one"), "grammar error: {err}");
 }
+
+// ---------------------------------------------------------------------
+// Issue #397 — the corpus finding, as a CHECKED claim rather than prose.
+//
+// The issue predicted that a committed corpus row would have to move,
+// because #221 pinned "the variant pipeline is dead syntax" as the rule.
+// It does not move: every wrapped variant committed BEFORE #397 has an
+// EMPTY pipeline, so no expected value depends on the rule that changed.
+// An untouched corpus therefore means ABSENCE of coverage, not coverage
+// — and this test is what keeps that reading from having to be taken on
+// trust. It fails if a wrapped-variant-with-a-pipeline query appears in
+// any of the three artefacts outside the section that was captured for
+// this issue.
+// ---------------------------------------------------------------------
+
+/// The three artefacts read for the claim, by name so the next reader
+/// can check the list rather than infer it.
+const PRE_397_ARTEFACTS: &[&str] = &[
+    "tests/logqltest/corpus/b13_variants.test",
+    "tests/logql_metric_agg_golden.rs",
+    "tests/golden/plan_build_differential.txt",
+];
+
+/// Every `variants(...)`-bearing query text in the three artefacts,
+/// paired with its artefact. Extraction is deliberately crude — any
+/// line holding `variants(` yields the substring from the first
+/// `variants(` to the end of its enclosing literal/line — because a
+/// missed query can only WEAKEN this test, while the "at least one
+/// wrapped-with-pipeline query is found" assertion below proves the
+/// extractor still finds anything at all.
+fn variants_queries() -> Vec<(&'static str, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    for artefact in PRE_397_ARTEFACTS {
+        let text = std::fs::read_to_string(root.join(artefact))
+            .unwrap_or_else(|e| panic!("read {artefact}: {e}"));
+        for line in text.lines() {
+            let Some(start) = line.find("variants(") else {
+                continue;
+            };
+            let rest = &line[start..];
+            // Trim the Rust raw-string / golden-header tails so the
+            // parser sees a query and nothing else.
+            let query = rest
+                .split("\"#,")
+                .next()
+                .unwrap_or(rest)
+                .trim_end_matches(&['"', '#', ',', ' '][..]);
+            out.push((*artefact, query.to_string()));
+        }
+    }
+    out
+}
+
+/// Whether `query` plans to a variants node holding at least one variant
+/// that is WRAPPED in a vector aggregation AND carries a non-empty
+/// pipeline of its own — the exact shape whose meaning issue #397
+/// changed. Unparseable or non-variants queries answer `false`.
+fn has_a_wrapped_variant_with_a_pipeline(query: &str) -> bool {
+    use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
+    let Ok(expr) = pulsus_logql::parse(query) else {
+        return false;
+    };
+    let params = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let ctx = PlanCtx {
+        db: "pulsus",
+        streams_idx: "log_streams_idx",
+        streams: "log_streams",
+        samples: "log_samples",
+        rollup_table: "log_metrics_5s",
+        rollup_res_ns: 5_000_000_000,
+        scan_budget_bytes: 50 * 1024 * 1024 * 1024,
+        max_streams: 100_000,
+        pipeline_scan_factor: 10,
+    };
+    match plan(&expr, &params, &ctx) {
+        Ok(Plan::MetricBinary(node)) => {
+            let mut nodes = Vec::new();
+            pulsus_logql::walk::postorder_into::<pulsus_read::logql::MetricNodeScc>(
+                &node, &mut nodes,
+            );
+            nodes.iter().any(|n| match n {
+                pulsus_read::logql::MetricNode::Variants { variants, .. } => variants
+                    .iter()
+                    .any(|s| !s.vector_aggs().is_empty() && !s.client().pipeline.is_empty()),
+                _ => false,
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Every wrapped-variant-with-a-pipeline query in the three artefacts is
+/// one the `W` section of `b13_variants.test` captured for issue #397 —
+/// the hermetic goldens added alongside it reuse those exact query
+/// strings. So nothing committed BEFORE #397 depended on the rule it
+/// changed, and the untouched expected values elsewhere are absence of
+/// coverage rather than coverage.
+#[test]
+fn only_the_397_section_has_a_wrapped_variant_with_a_pipeline() {
+    // The W section's queries, taken from the file itself so the two
+    // halves cannot drift.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let b13 = std::fs::read_to_string(root.join(PRE_397_ARTEFACTS[0])).expect("read b13");
+    let w_section = b13
+        .split_once("# --- Issue #397")
+        .expect("b13 carries the #397 section")
+        .1;
+
+    let mut outside = Vec::new();
+    let mut inside = 0usize;
+    for (artefact, query) in variants_queries() {
+        if !has_a_wrapped_variant_with_a_pipeline(&query) {
+            continue;
+        }
+        if w_section.contains(query.as_str()) {
+            inside += 1;
+        } else {
+            outside.push(format!("{artefact}: {query}"));
+        }
+    }
+    assert!(
+        outside.is_empty(),
+        "a wrapped variant with a live pipeline appears that issue #397's own corpus \
+         section did not capture. Its expected value depends on the rule #397 changed, so \
+         it must be captured against the pinned container rather than left standing:\n  {}",
+        outside.join("\n  ")
+    );
+    // Finder validation: the extractor above must actually be finding
+    // this shape, or the emptiness of `outside` means nothing.
+    assert!(
+        inside > 0,
+        "the extractor found no wrapped-variant-with-a-pipeline query at all, so the \
+         assertion above is vacuous — fix the extraction, not the assertion"
+    );
+}

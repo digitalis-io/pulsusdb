@@ -2165,9 +2165,14 @@ pub const MAX_VARIANT_SUB_STATES: u64 = AggCaps::DEFAULT.min_field();
 /// everything BEFORE the first `Stage::Unwrap` (issue #221 Δ1). A
 /// common-range `unwrap` and its post-`unwrap` label filters are dead
 /// syntax inside `variants(...) of (...)` — the reference's common
-/// extraction is `logRange.Left.Pipeline()`, and its `Unwrap` is a
+/// extraction is `logRange.Left.Pipeline()`
+/// (`pkg/logql/syntax/extractor.go:104 @ v3.7.4`), and its `Unwrap` is a
 /// sibling field it never reads. The parser guarantees only label filters
 /// follow `unwrap`, so the truncated prefix IS `Left`.
+///
+/// **The COMMON side has no bare/wrapped split** (issue #397): there is
+/// one path here, so this truncation is unconditional. The split lives on
+/// the VARIANT side only — see [`variant_tail`].
 fn common_stages(pipeline: &[Stage]) -> &[Stage] {
     match pipeline.iter().position(|s| matches!(s, Stage::Unwrap(_))) {
         Some(i) => &pipeline[..i],
@@ -2175,11 +2180,20 @@ fn common_stages(pipeline: &[Stage]) -> &[Stage] {
     }
 }
 
-/// A variant's own executable TAIL: its pipeline from its first
+/// A **BARE** variant's own executable TAIL: its pipeline from its first
 /// `Stage::Unwrap` (the unwrap plus the post-`unwrap` label filters the
 /// reference honours — `ReduceAndLabelFilter(PostFilters)`); empty for
-/// every non-unwrap reducer. Everything before it — the variant's own
+/// every non-unwrap reducer. Everything before it — that variant's own
 /// selector, line filters, parsers, formatters — is dead syntax.
+///
+/// **Bare only** (issue #397). A variant wrapped in a vector aggregation
+/// runs its WHOLE pipeline, so `build_variants_node` passes the pipeline
+/// through untruncated instead of calling this. The reference's own type
+/// switch is the rule: a bare `*RangeAggregationExpr` takes
+/// `variantRangeAggExprExtractor`, which passes `nil` stages
+/// (`pkg/logql/syntax/extractor.go:114`, `:186`, `:225 @ v3.7.4`);
+/// anything else takes `variant.Extractors()` (`:128`), which builds the
+/// full stage list.
 fn variant_tail(pipeline: &[Stage]) -> &[Stage] {
     match pipeline.iter().position(|s| matches!(s, Stage::Unwrap(_))) {
         Some(i) => &pipeline[i..],
@@ -2193,9 +2207,11 @@ mod variant_spec {
     use super::*;
 
     /// One variant's reducer, derived from the variant metric expression
-    /// (issue #221). The variant's own selector, line filters, parsers
-    /// and formatters are DISCARDED (reference:
-    /// `variantRangeAggExprExtractor` passes `nil` stages — live-probed).
+    /// (issue #221). A **BARE** variant's own selector, line filters,
+    /// parsers and formatters are DISCARDED (reference:
+    /// `variantRangeAggExprExtractor` passes `nil` stages — live-probed);
+    /// a variant wrapped in a vector aggregation keeps all of them and
+    /// runs them after the common pipeline (issue #397).
     ///
     /// COMPILE-ENFORCED: every `VariantSpec` in existence was sized and
     /// charged, because the fields are private to this module and
@@ -2212,11 +2228,14 @@ mod variant_spec {
         /// expression (`strconv.Itoa(i)` in the reference — plain
         /// decimal, no padding).
         index: usize,
-        /// `client.pipeline` is this variant's UNWRAP TAIL ONLY (empty
-        /// for every non-unwrap reducer) — NEVER the common pipeline,
-        /// which lives once in the scan plan's `client.pipeline`. exec
-        /// runs `common ++ tail` through the [`super::super::variants::VariantArena`];
-        /// nothing may compile `client.pipeline` on its own.
+        /// `client.pipeline` is this variant's TAIL: its unwrap tail
+        /// alone when the variant is BARE (empty for every non-unwrap
+        /// reducer), its WHOLE pipeline when the variant is wrapped in a
+        /// vector aggregation (issue #397). Either way it is NEVER the
+        /// common pipeline, which lives once in the scan plan's
+        /// `client.pipeline`. exec runs `common ++ tail` through the
+        /// [`super::super::variants::VariantArena`]; nothing may compile
+        /// `client.pipeline` on its own.
         client: ClientAgg,
         /// This variant's OWN evaluation window (its `[range]`) on the
         /// SHARED grid. The SCAN window stays the common range's, so a
@@ -2606,10 +2625,11 @@ fn build_variants_node(
             }
             _ => None,
         };
-        // **Issue #247: a variant's own pipeline is VALIDATED even though
-        // nothing consumes it.** Everything before the first `unwrap` is
-        // dead syntax at evaluation — [`variant_tail`] discards it, and
-        // so does the reference (`variantRangeAggExprExtractor` passes
+        // **Issue #247: a BARE variant's own pipeline is VALIDATED even
+        // though nothing consumes it.** For a bare range aggregation
+        // everything before the first `unwrap` is dead syntax at
+        // evaluation — [`variant_tail`] discards it, and so does the
+        // reference (`variantRangeAggExprExtractor` passes
         // `nil` stages, `pkg/logql/syntax/extractor.go:186`, `:225 @
         // v3.7.4`). But the reference still BUILDS it:
         // `newVariantsEvaluator` calls `variant.Extractors()`
@@ -2641,8 +2661,33 @@ fn build_variants_node(
         // `tests/logql_logfmt_expr_matrix.rs`'s `variants_variant_side`
         // position; `variant_pipelines_are_validated_though_nothing_runs_them`
         // below is the unit-level guard.
-        CompiledPipeline::compile(common_stages(pipeline))?;
-        let tail = variant_tail(pipeline);
+        //
+        // **Issue #397 — and it applies to the BARE arm only.** The
+        // reference type-switches on the variant expression
+        // (`pkg/logql/syntax/extractor.go:114 @ v3.7.4`): a bare
+        // `*RangeAggregationExpr` takes `variantRangeAggExprExtractor`
+        // (nil stages, `:186`/`:225`), everything else falls through to
+        // `variant.Extractors()` (`:128`), which reaches the FULL stage
+        // list (`ast.go:1612-1628` -> `extractor.go:52-60`). `raw_buf`
+        // holds the peeled vector-aggregation layers; `> 1` and
+        // `approx_topk` were already rejected above, so exactly those
+        // two classes reach here.
+        let tail: &[Stage] = if raw_buf.is_empty() {
+            // BARE range aggregation: the prefix is dead. Validate it
+            // and throw it away (issue #247, above).
+            CompiledPipeline::compile(common_stages(pipeline))?;
+            variant_tail(pipeline)
+        } else {
+            // WRAPPED in one vector aggregation: the whole pipeline is
+            // live and runs AFTER the common one, on the line the common
+            // pipeline already produced
+            // (`pkg/logql/log/consolidated_variant_extractor.go:42-60 @
+            // v3.7.4`). No validation compile here: `VariantArena::build`
+            // compiles `common ++ tail` before any I/O, so a second
+            // compile would double the per-variant allocation band for
+            // no new rejection.
+            pipeline
+        };
         let value = if has_unwrap {
             ClientValue::Unwrap
         } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {

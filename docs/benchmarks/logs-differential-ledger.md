@@ -998,6 +998,27 @@ not "fix" us toward the panic.
 - **Why deliberate:** the reference contradicts itself; we match its
   consistent branch. Same class as the ratified
   `matching-error-status-divergence`.
+- **Newly reachable through a WRAPPED variant's own pipeline (issue
+  #397, measured 2026-08-10).** Until #397 a variant's own pipeline was
+  discarded before evaluation, so this row could only be reached through
+  the COMMON pipeline. A variant wrapped in a vector aggregation now runs
+  its whole pipeline (the reference's own type switch,
+  `pkg/logql/syntax/extractor.go:114 @ v3.7.4`), so an error raised
+  there reaches the same surface. Measured on the pinned image with a
+  seeded logfmt store, `S = {service_name="v397"}`:
+
+  | query | reference | PulsusDB |
+  |---|---|---|
+  | `variants(sum by (env) (count_over_time(S \| json [5m]))) of (S[5m])` | `500 unexpected empty result` | `400 pipeline error: 'JSONParserErr'` |
+  | the same wrapped variant BESIDE a clean one | `200`, silently dropping the erroring variant | `400 pipeline error: 'JSONParserErr'` |
+  | `variants(sum by (__error__) (count_over_time(S \| json [5m]))) of (S[5m])` | `200` `{__error__="JSONParserErr", __variant__="0"} 6` | `400`, as above |
+
+  Three behaviours for one condition on the reference side, the middle
+  one being the worst: **answering 200 while silently discarding a
+  variant is returning wrong data with nothing to indicate it**, the
+  same failure class #397 exists to fix. We keep the 400. No new entry —
+  this is the decision above reaching further, not a fresh one. Corpus
+  rows W27 and W28 in `b13_variants.test` pin the first two.
 
 ### `variants-label-collision-and-fanout-bounds` (issue #221, adjudicated)
 
@@ -3215,6 +3236,24 @@ absence of a corpus row for an oversight.
   `logql-regex-accept-surface-divergence`, bounded there by the
   `variants_variant_after_line_format` position, and owned by **#400**.
 
+  **Narrowing (issue #397, measured 2026-08-10).** The escape needs one
+  more word: the variant must be **BARE**. The reference type-switches on
+  the variant expression (`pkg/logql/syntax/extractor.go:114 @ v3.7.4`)
+  and only a bare `*RangeAggregationExpr` gets the `nil` stages above; a
+  variant wrapped in a vector aggregation reaches `variant.Extractors()`
+  (`:128`) and the full stage list, so PulsusDB now compiles that whole
+  pipeline, its pushable line filter included. Measured on the pinned
+  image, same session:
+
+  | query | reference | PulsusDB |
+  |---|---|---|
+  | `variants(count_over_time({app="x"} \|~ "(" [5m])) of ({app="x"}[5m])` | `400` | **`200`** (BARE — the escape, unchanged) |
+  | `variants(sum by (env) (count_over_time({app="x"} \|~ "(" [5m]))) of ({app="x"}[5m])` | `400` | `400` (WRAPPED — parity, newly gained) |
+
+  Corpus row W29 in `b13_variants.test` pins the wrapped half. Adding a
+  wrapped POSITION to `logql_regex_accept_matrix.rs` belongs to **#400**
+  with the rest of that surface.
+
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
@@ -3305,7 +3344,7 @@ often than they agree about it.
   | `engine_dir_b_read_as_a_different_pattern` | `\U0001F600`, `(?R)a`, `(?x)a`, `a**`, `[[:foo:]]`, `\p{Alphabetic}`, `a{1001}` | 15 | `(?R)` is read as the Rust crate's CRLF flag and matches everything; `[[:foo:]]` as a nested class matching `:`/`f`/`o`; `a**` as `(a*)*`. In a `line_format` template `a**` renders **`zxz`** from the input `x` and `\p{Alphabetic}` renders **`z`** — see `template-error-wording-residuals` |
   | `engine_dir_b_class_forms` | `[a--b]`, `\u{263A}` | 14 | `label_replace` excluded — its rewrite makes the Rust crate agree with the reference, so that one position is the only LogQL site where these are refused |
   | `engine_dir_b_invalid_utf8_escape` | `"\xff"` | 9 | the VERDICT half of something worse, and see the note under this table. Go's `strconv.Unquote` gives the reference one 0xFF byte, which its parser refuses as invalid UTF-8 wherever the pattern reaches it — these nine positions. **Our lexer does not produce that byte, and does not produce U+00FF either**: `scan_double_quoted` drops the backslash on an unknown escape (`crates/pulsus-logql/src/lexer.rs:322-331`, `Some(other) => value.push(other)`), so the pattern becomes the three ASCII characters `xff` and compiles. The positions absent from the nine are the `NewFastRegexMatcher` sites, which never parse a plain literal at all (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) |
-  | `variants_variant_side_skips_the_line_filter` | the 14 patterns both sides reject | 1 | found by this matrix. The reference refuses a malformed line filter inside a `variants(...)` variant; we serve it — but only while the filter is PUSHABLE. `compile_stage` returns `Ok(None)` for a pushable line filter (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`, so the discarded variant prefix `VariantSpec::try_new` compiles (`plan.rs:2641`) never sees the regex, and a discarded prefix renders no SQL either. Put the same filter after a `line_format` and the pushdown is cleared, the filter is compiled, and both sides refuse it — that is the `variants_variant_after_line_format` position, which agrees at every pattern and is what bounds this row. `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused on both sides too |
+  | `variants_variant_side_skips_the_line_filter` | the 14 patterns both sides reject | 1 | found by this matrix. The reference refuses a malformed line filter inside a `variants(...)` variant; we serve it — but only while the filter is PUSHABLE **and the variant is BARE** (issue #397: a variant wrapped in a vector aggregation runs its whole pipeline, so the filter is compiled and both sides refuse; that wrapped position is #400's to add, and corpus row W29 pins it meanwhile). `compile_stage` returns `Ok(None)` for a pushable line filter (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`, so the discarded variant prefix `VariantSpec::try_new` compiles (`plan.rs:2641`) never sees the regex, and a discarded prefix renders no SQL either. Put the same filter after a `line_format` and the pushdown is cleared, the filter is compiled, and both sides refuse it — that is the `variants_variant_after_line_format` position, which agrees at every pattern and is what bounds this row. `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused on both sides too |
 
 - **The LogQL string ESCAPE is one root cause with TWO divergences, and
   only one of them is in this matrix at all** (issue #246 review rounds 2

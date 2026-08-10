@@ -1864,7 +1864,16 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// reference's non-validating scan reads past a line that is malformed
 /// in the MIDDLE carry their own `divergence` marker instead and move
 /// `DIVERGENCE`, not this constant.
-const CAPTURED: usize = 1_314;
+///
+/// Issue #397 added the `W` section to `b13_variants.test` — the
+/// bare/wrapped split in a variant's own pipeline — captured against the
+/// pinned reference container in a single run, over a load pushed at a
+/// step-aligned base so the range rows' grid coincides with the corpus
+/// grid. Same file-level `captured` default; the rows pinning the
+/// reference's surviving-error surface there carry a
+/// `divergence(variants-surviving-error-status)` marker instead and move
+/// `DIVERGENCE`, not this constant.
+const CAPTURED: usize = 1_341;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1873,8 +1882,10 @@ const CAPTURED: usize = 1_314;
 const DERIVED: usize = 31;
 /// Issue #389's residual rows — the mid-line-malformed class, and its
 /// bound where both sides answer the empty string — all name
-/// `json-nonvalidating-scan-residual`.
-const DIVERGENCE: usize = 23;
+/// `json-nonvalidating-scan-residual`. Issue #397's wrapped-variant rows
+/// on the reference's surviving-error surface name
+/// `variants-surviving-error-status`.
+const DIVERGENCE: usize = 25;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_400;
+const TOTAL: usize = 1_429;
 // corpus-counts: end (provenance-corpus-constants)

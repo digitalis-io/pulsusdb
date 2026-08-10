@@ -394,17 +394,22 @@ const POSITIONS: &[Position] = &[
     Position {
         id: "variants_variant_side",
         template: r#"variants(count_over_time({app="x"} |~ "{P}" [5m])) of ({app="x"}[5m])"#,
-        why: "a `variants(...)` VARIANT's own pipeline, with a PUSHABLE line filter. The \
+        why: "a BARE `variants(...)` VARIANT's own pipeline, with a PUSHABLE line filter. The \
               reference builds it purely to count the extractors \
               (`pkg/logql/evaluator.go:1417,1422 @ v3.7.4`) and so refuses a malformed stage \
-              there. PulsusDB validates the variant's discarded prefix in `VariantSpec::try_new` \
+              there. PulsusDB validates a BARE variant's discarded prefix in \
+              `VariantSpec::try_new` \
               (`plan.rs:2641`) — but through `CompiledPipeline::compile`, whose `compile_stage` \
               returns `Ok(None)` for a PUSHABLE line filter (`pipeline.rs:986-996`) before it \
               reaches `compile_regex` at `:1013`; the regex of a pushable filter is validated on \
               the SQL-rendering path instead, and a discarded prefix renders no SQL. Hence \
-              `AcceptsEverything` here, and a divergence row. The escape is the PUSHDOWN, not \
-              the construct — `variants_variant_after_line_format` is the same filter with \
-              pushdown cleared, and it agrees.",
+              `AcceptsEverything` here, and a divergence row. The escape needs BOTH facts — \
+              the pushdown AND the bare shape, not the construct. \
+              `variants_variant_after_line_format` is the same filter with the pushdown \
+              cleared, and it agrees; a variant WRAPPED in a vector aggregation runs its whole \
+              pipeline (issue #397), so the same filter is compiled there and agrees too — \
+              that wrapped position belongs to #400 with the rest of this surface, and is \
+              pinned meanwhile by corpus row W29 in `b13_variants.test`.",
         reference: Rule::PerPattern,
         pulsus: Rule::AcceptsEverything,
     },

@@ -86,8 +86,10 @@ eval instant at 60s variants(count_over_time({service_name="svcv"}[5m]), bytes_o
   {__variant__="1", env="dev", service_name="svcv"} 4
   {__variant__="1", env="prod", service_name="svcv"} 6
 
-# case 3 — the variant's own selector and line filters are DEAD SYNTAX:
-# only the common range selects data.
+# case 3 — a BARE variant's own selector and line filters are DEAD
+# SYNTAX: only the common range selects data. BARE only — a variant
+# wrapped in a vector aggregation runs its whole pipeline (issue #397;
+# the `W` section at the end of this file).
 eval instant at 60s variants(count_over_time({service_name="nope"} |= "zzzz" [5m])) of ({service_name="svcv"}[5m])
   {__variant__="0", env="dev", service_name="svcv"} 2
   {__variant__="0", env="prod", service_name="svcv"} 3
@@ -329,3 +331,232 @@ eval range from 3600s to 3660s step 60s variants(absent_over_time({service_name=
 # the same image this file's other captures name), `ci/logql/config.yaml`.
 eval instant at 3600s variants(sum(absent_over_time({service_name="svcy", tier="x"}[5m]))) of ({service_name="svcy"}[5m])
   {} 1
+
+clear
+
+# --- Issue #397: a WRAPPED variant runs its OWN pipeline; a BARE one
+# --- does not. The `W` rows below.
+#
+# The reference type-switches on the variant expression
+# (`pkg/logql/syntax/extractor.go:114 @ v3.7.4`). A bare
+# `*RangeAggregationExpr` takes `variantRangeAggExprExtractor`, which
+# passes `nil` stages (`:186`, `:225`) — its pre-`unwrap` pipeline really
+# is dead, which is what cases 1-16s above pin. Anything else falls
+# through to `variant.Extractors()` (`:128`), which reaches the FULL
+# stage list (`ast.go:1612-1628` -> `extractor.go:52-60`), and the
+# consolidated extractor runs it on the line the COMMON pipeline already
+# produced (`pkg/logql/log/consolidated_variant_extractor.go:42-60`).
+# Exactly one shape has a dead variant pipeline, then: a bare range
+# aggregation, parentheses included (W2). Every vector-aggregation
+# wrapper makes the whole pipeline live.
+#
+# Captured 2026-08-10 on `grafana/loki:3.7.4`, digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc
+# (the same image this file's other captures name), `ci/logql/config.yaml`.
+# The load below was pushed at a base timestamp ALIGNED to a 60s
+# boundary, so the reference's own step grid (which floors/ceils to a
+# multiple of `step`) coincides exactly with W25/W26's `from 0s to 60s
+# step 60s` and the two grids are comparable point for point. At an
+# UNALIGNED base they are not — a plain `count_over_time({...}[1m])`
+# with no variants involved already answers on a different grid here and
+# there, which is why no `W` row compares a shifted grid.
+#
+# Reference-observed statuses for the eval_fail rows below (both sides
+# reject or both sides answer; PulsusDB's own substring is on the row):
+#   W27 variants(sum by (env) (count_over_time(S | json [5m]))) of (S[5m])
+#       500 unexpected empty result
+#   W28 the same wrapped variant BESIDE a clean one
+#       200, silently DROPPING the erroring variant
+#   W29 variants(sum by (env) (count_over_time(S |~ "[" [5m]))) of (S[5m])
+#       400 parse error : stage '|~ "["' — both reject; parity, newly
+#       gained (a BARE malformed pushable regex stays a 200 here, the
+#       #400 divergence, which this section does not move)
+
+load
+  {env="a", service_name="v397"} service=v397
+  0s   lvl=alpha n=1
+  5s   lvl=alpha n=2
+  10s  lvl=beta n=4
+  {env="b", service_name="v397"} service=v397
+  1s   lvl=alpha n=8
+  6s   lvl=beta n=16
+  11s  lvl=beta n=32
+
+# W1 — BARE: the variant's `|= "alpha"` is dead, so every line counts.
+eval instant at 60s variants(count_over_time({service_name="v397"} |= "alpha" [5m])) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a", service_name="v397"} 3
+  {__variant__="0", env="b", service_name="v397"} 3
+
+# W2 — parenthesising a bare range aggregation does NOT wrap it: both
+# grammars erase the parens, so this is still the bare arm.
+eval instant at 60s variants((count_over_time({service_name="v397"} |= "alpha" [5m]))) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a", service_name="v397"} 3
+  {__variant__="0", env="b", service_name="v397"} 3
+
+# W3 — WRAPPED: the same filter is LIVE. THE HEADLINE ROW — 2 and 1, not
+# 3 and 3. A fix that sets the tail without disabling the pushable
+# line-filter elision still answers 3 and 3 here.
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} |= "alpha" [5m]))) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a"} 2
+  {__variant__="0", env="b"} 1
+
+# W4 — BARE, filter matching nothing: still every line.
+eval instant at 60s variants(count_over_time({service_name="v397"} |= "nomatch" [5m])) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a", service_name="v397"} 3
+  {__variant__="0", env="b", service_name="v397"} 3
+
+# W5 — WRAPPED, the same filter: EMPTY. The issue's second row.
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} |= "nomatch" [5m]))) of ({service_name="v397"}[5m])
+
+# W6 — the per-variant proof in ONE query over ONE scan: variants 0 and
+# 2 are bare and keep every line; variant 1 is wrapped and filters.
+eval instant at 60s variants(count_over_time({service_name="v397"} |= "alpha" [5m]), sum by (env) (count_over_time({service_name="v397"} |= "alpha" [5m])), bytes_over_time({service_name="v397"} |= "alpha" [5m])) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a", service_name="v397"} 3
+  {__variant__="0", env="b", service_name="v397"} 3
+  {__variant__="1", env="a"} 2
+  {__variant__="1", env="b"} 1
+  {__variant__="2", env="a", service_name="v397"} 38
+  {__variant__="2", env="b", service_name="v397"} 39
+
+# W7 — BARE with its OWN grouping: the split is "wrapped in a vector
+# aggregation", NOT "declares a grouping". A grouping-keyed fix drops
+# the beta group (the variant's `|= "alpha"` would filter it out).
+eval instant at 60s variants(max_over_time({service_name="v397"} |= "alpha" | logfmt | unwrap n [5m]) by (lvl)) of ({service_name="v397"} | logfmt [5m])
+  {__variant__="0", lvl="alpha"} 8
+  {__variant__="0", lvl="beta"} 32
+
+# W8 — the same expression WRAPPED: one group survives.
+eval instant at 60s variants(sum by (lvl) (max_over_time({service_name="v397"} |= "alpha" | logfmt | unwrap n [5m]) by (lvl))) of ({service_name="v397"} | logfmt [5m])
+  {__variant__="0", lvl="alpha"} 8
+
+# W9 — ORDER: the wrapped variant's pipeline runs AFTER the common one,
+# on the line the common one produced. The common `line_format` has
+# rewritten every line to `lvl=zz`, so the variant's `| logfmt |
+# lvl="alpha"` matches nothing. Running the variant pipeline on the RAW
+# line (or before the common one, or instead of it) answers 2 and 1.
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} | logfmt | lvl="alpha" [5m]))) of ({service_name="v397"} | line_format "lvl=zz" [5m])
+
+# W10 — the same shape asking for what the COMMON pipeline produced:
+# 3 and 3. W9's emptiness is composition, not a broken pipeline.
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} | logfmt | lvl="zz" [5m]))) of ({service_name="v397"} | line_format "lvl=zz" [5m])
+  {__variant__="0", env="a"} 3
+  {__variant__="0", env="b"} 3
+
+# W11 — BOTH sides filter and the answer is the intersection: of the
+# three `env="b"` lines the common filter keeps, one holds `alpha`.
+#
+# The common filter here is a LABEL filter, deliberately, and the reason
+# is a property of this runner rather than of variants. A PUSHABLE line
+# filter on the common side is elided from the compiled client pipeline
+# (`pipeline.rs`'s `compile_stage`) because the scan plan renders it into
+# SQL — and this corpus is hermetic, so there is no SQL to render it
+# into. Every metric row in this corpus is blind to a pushed-down common
+# line filter for the same reason; a label filter is not pushed down and
+# so does the same job in a form the runner can evaluate. (Issue #397's
+# own fix is about the VARIANT side's filters, which are never pushed
+# down and now always compile — W3 is that row.)
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} |= "alpha" [5m]))) of ({service_name="v397"} | env="b" [5m])
+  {__variant__="0", env="b"} 1
+
+# W12 — the bare twin of W11: only the common filter applies, so all
+# three of its lines count.
+eval instant at 60s variants(count_over_time({service_name="v397"} |= "alpha" [5m])) of ({service_name="v397"} | env="b" [5m])
+  {__variant__="0", env="b", service_name="v397"} 3
+
+# W13 — the second, independent ordering witness, in bytes: the common
+# `line_format "z"` makes each line 1 byte, the variant's `line_format
+# "abcd"` then makes it 4, so 3 lines per stream measure 12. Applying
+# them in the other order measures 3.
+eval instant at 60s variants(sum by (env) (bytes_over_time({service_name="v397"} | line_format "abcd" [5m]))) of ({service_name="v397"} | line_format "z" [5m])
+  {__variant__="0", env="a"} 12
+  {__variant__="0", env="b"} 12
+
+# W14 — the bare twin of W13: the variant's `line_format` is dead, so
+# the common `"z"` decides the byte count.
+eval instant at 60s variants(bytes_over_time({service_name="v397"} | line_format "abcd" [5m])) of ({service_name="v397"} | line_format "z" [5m])
+  {__variant__="0", env="a", service_name="v397"} 3
+  {__variant__="0", env="b", service_name="v397"} 3
+
+# W15 — a wrapped variant's PARSER is live too, so `by (lvl)` finds the
+# extracted label: two groups, not one `{}` of 6.
+eval instant at 60s variants(sum by (lvl) (count_over_time({service_name="v397"} | logfmt [5m]))) of ({service_name="v397"}[5m])
+  {__variant__="0", lvl="alpha"} 3
+  {__variant__="0", lvl="beta"} 3
+
+# W16 — a wrapped variant's pre-`unwrap` parser feeds its own `unwrap`:
+# without the live `| logfmt` the `unwrap n` finds nothing and the
+# answer is empty instead of 3 and 8.
+eval instant at 60s variants(sum by (env) (sum_over_time({service_name="v397"} |= "alpha" | logfmt | unwrap n [5m]))) of ({service_name="v397"} | logfmt [5m])
+  {__variant__="0", env="a"} 3
+  {__variant__="0", env="b"} 8
+
+# W17 — the bare twin of W16: the variant's `|= "alpha"` and `| logfmt`
+# are dead, the common `| logfmt` supplies `n`, and every line sums.
+eval instant at 60s variants(sum_over_time({service_name="v397"} |= "alpha" | logfmt | unwrap n [5m])) of ({service_name="v397"} | logfmt [5m])
+  {__variant__="0", env="a", lvl="alpha", service_name="v397"} 3
+  {__variant__="0", env="a", lvl="beta", service_name="v397"} 4
+  {__variant__="0", env="b", lvl="alpha", service_name="v397"} 8
+  {__variant__="0", env="b", lvl="beta", service_name="v397"} 48
+
+# W18 — a wrapped `absent_over_time` whose live filter matches nothing:
+# the synthetic absent series exists, so the sum is 1.
+eval instant at 60s variants(sum(absent_over_time({service_name="v397"} |= "zzz" [5m]))) of ({service_name="v397"}[5m])
+  {} 1
+
+# W19 — …and with a filter that DOES match, nothing is absent: empty.
+eval instant at 60s variants(sum(absent_over_time({service_name="v397"} |= "alpha" [5m]))) of ({service_name="v397"}[5m])
+
+# W20 — the bare twin: the filter is dead, lines are present, empty.
+eval instant at 60s variants(absent_over_time({service_name="v397"} |= "zzz" [5m])) of ({service_name="v397"}[5m])
+
+# W21 — a live REGEX line filter (also pushable, so it exercises the
+# same elision as W3).
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} |~ "alp.a" [5m]))) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a"} 2
+  {__variant__="0", env="b"} 1
+
+# W22 — a live NEGATED line filter: the complement of W3.
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} != "alpha" [5m]))) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a"} 1
+  {__variant__="0", env="b"} 2
+
+# W23 — a live `ip(...)` line filter, which is NOT pushable and so was
+# already compiled client-side: no line holds that address.
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} |= ip("1.2.3.4") [5m]))) of ({service_name="v397"}[5m])
+
+# W24 — a live pre-`unwrap` LABEL filter: `| json` fails on every
+# logfmt line, so `__error__=""` keeps none.
+eval instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} | json | __error__="" [5m]))) of ({service_name="v397"}[5m])
+
+# W25 — the wrapped arm at RANGE (grid-aligned capture, see the section
+# header): t=0's (-5m, 0] window holds only env=a's 0s line.
+eval range from 0s to 60s step 60s variants(sum by (env) (count_over_time({service_name="v397"} |= "alpha" [5m]))) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a"} 0s 1 60s 2
+  {__variant__="0", env="b"} 60s 1
+
+# W26 — the bare arm at range: the dead filter, so every line counts.
+eval range from 0s to 60s step 60s variants(count_over_time({service_name="v397"} |= "alpha" [5m])) of ({service_name="v397"}[5m])
+  {__variant__="0", env="a", service_name="v397"} 0s 1 60s 3
+  {__variant__="0", env="b", service_name="v397"} 60s 3
+
+# W27 — a wrapped variant whose now-live pipeline errors on every line.
+# PulsusDB 400s (the same surface the identical non-variants query gets,
+# which the reference also 400s outside `variants`); inside `variants`
+# the reference 500s. Ledgered: `variants-surviving-error-status`.
+# provenance: divergence(variants-surviving-error-status)
+eval_fail instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} | json [5m]))) of ({service_name="v397"}[5m])
+  msg: pipeline error: 'JSONParserErr'
+
+# W28 — the same erroring variant BESIDE a clean one. The reference
+# answers 200 and silently DROPS the broken variant — wrong data with
+# nothing to show for it. We refuse the query instead (same ledger row).
+# provenance: divergence(variants-surviving-error-status)
+eval_fail instant at 60s variants(count_over_time({service_name="v397"}[5m]), sum by (env) (count_over_time({service_name="v397"} | json [5m]))) of ({service_name="v397"}[5m])
+  msg: pipeline error: 'JSONParserErr'
+
+# W29 — a malformed PUSHABLE regex in a WRAPPED variant is now a 400
+# here, agreeing with the reference's own 400. The bare position still
+# serves 200 (the #400 divergence), which is why `docs/api.md` and the
+# ledger say "bare".
+eval_fail instant at 60s variants(sum by (env) (count_over_time({service_name="v397"} |~ "[" [5m]))) of ({service_name="v397"}[5m])
+  msg: bad regex

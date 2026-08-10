@@ -1020,9 +1020,14 @@ pub struct VariantsExpr {
     /// validated at PLAN time to be a range aggregation optionally
     /// wrapped in exactly ONE vector aggregation.
     pub variants: ChildVec<MetricExpr>,
-    /// The single common log range — the ONLY selector/pipeline that
-    /// selects and transforms data (a variant's own selector, line
-    /// filters and parsers are dead syntax in the reference).
+    /// The single common log range — the only selector that SELECTS
+    /// data, and the first pipeline to transform it. A BARE variant's
+    /// own selector, line filters and parsers are dead syntax in the
+    /// reference; a variant wrapped in a vector aggregation runs its
+    /// whole pipeline afterwards, on the line this one produced (issue
+    /// #397; the reference's type switch at
+    /// `pkg/logql/syntax/extractor.go:114 @ v3.7.4`). Either way no
+    /// variant selector reaches the store.
     pub range: LogRange,
 }
 
