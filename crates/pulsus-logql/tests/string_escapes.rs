@@ -216,7 +216,14 @@ fn the_refusal_names_the_offending_escape_and_its_offset() {
 /// Go's grammar has no arm for at all.
 #[test]
 fn a_malformed_form_of_a_defined_escape_is_refused() {
-    for source in [r"\x4", r"\xzz", r"\400", r"\777", r"\U00110000", r"\u{263A}"] {
+    for source in [
+        r"\x4",
+        r"\xzz",
+        r"\400",
+        r"\777",
+        r"\U00110000",
+        r"\u{263A}",
+    ] {
         assert!(
             matches!(
                 selector_value(source),
@@ -238,7 +245,10 @@ fn a_byte_escape_composes_with_its_neighbour() {
     assert_eq!(got, vec![0xC3, 0xA9]);
     assert_eq!(String::from_utf8(got).expect("valid UTF-8"), "é");
     // The Latin-1 reading would produce these four bytes.
-    assert_ne!(selector_value(r"\xc3\xa9").expect("parses"), b"\xc3\x83\xc2\xa9");
+    assert_ne!(
+        selector_value(r"\xc3\xa9").expect("parses"),
+        b"\xc3\x83\xc2\xa9"
+    );
 }
 
 /// The deliberate narrowing, ledgered as `logql-string-escape-non-utf8`:

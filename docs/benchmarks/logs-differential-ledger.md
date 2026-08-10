@@ -3310,15 +3310,19 @@ this entry records is what the scouting run found while measuring the
 prose question — the two engines disagree about the **decision** far more
 often than they agree about it.
 
-- **Measurement conditions.** 16 query positions × 44 patterns = 704
-  points, plus 2 masked positions × 44 = 88, so 792 probed in all. Reference: the digest-pinned
+- **Measurement conditions.** 16 query positions × 45 patterns = 720
+  points, plus 2 masked positions × 45 = 90, so 810 probed in all. (These
+  read 704/88/792 until #400 Stage 1 and were stale by one pattern: the
+  three assertions in `the_divergence_set_is_exactly_the_committed_enumeration`
+  that say "the ledger says N" are recomputed from the table, so the
+  table had already moved while this sentence had not.) Reference: the digest-pinned
   `grafana/loki@sha256:87f0a067…` v3.7.4 oracle
   (`/loki/api/v1/status/buildinfo` = `{"version":"3.7.4","revision":"b318f282"}`)
   with `ci/logql/config.yaml`, probed at `/loki/api/v1/query_range` over a
   5-minute window **ending at `now`** — load-bearing, see
   `malformed-query-refused-in-every-window`. PulsusDB: `parse → plan →
   CompiledPipeline::compile`, the compile `exec` runs before any I/O.
-  **308 of the 704 unmasked points disagree**, in the classes below. Every
+  **321 of the 720 unmasked points disagree**, in the classes below. Every
   figure here is recomputed by
   `crates/pulsus-read/tests/logql_regex_accept_matrix.rs` rather than
   restated: the class enumeration is asserted equal to the matrix's own
@@ -3334,6 +3338,7 @@ often than they agree about it.
   | `engine_dir_a_duplicate_capture_name` | `(?P<n>a)(?P<n>b)` | 14 | **not one of the eighteen classes #400 was filed with** — found by this matrix. The reference's vendored parser has no duplicate-name check (`git grep -n duplicate vendor/github.com/grafana/regexp/ @ v3.7.4` finds only an unrelated comment); the Rust crate refuses it. `regexp_named` excluded: the reference refuses it there for its own reason, `duplicate extracted label name 'n'` (`pkg/logql/log/parser.go:309-311 @ v3.7.4`) |
   | `engine_dir_a_nesting_limit` | 999 nested groups | 7 | a LIMIT, not a construct. The reference's `maxHeight` is 1000 (`vendor/github.com/grafana/regexp/syntax/parse.go:93 @ v3.7.4`) and every site that wraps the pattern in `^(?:…)$` spends part of it, so this rejects on both sides at the anchored positions and only diverges at the unanchored ones |
   | `variants_common_side_hides_the_build_error` | the 14 patterns both sides reject | 1 | **owned by #380**, not #400: the reference swallows a `variants(...)` common-pipeline build error in every window. Deliberate, and the direction the owner ruled for |
+  | `engine_dir_a_non_utf8_string_literal` | `"\xff"` | 7 | **new in #400 Stage 1, and DELIBERATE** — see `logql-string-escape-non-utf8` below for the reachability argument, which is the part that makes it acceptable. With the reference's string grammar in the lexer, `"\xff"` decodes to the byte 0xFF here as it does there, and a decoded byte string that is not valid UTF-8 cannot be a Rust `String`, so it is a positioned `400` at every position. The nine positions that reach the reference's regex parser therefore now AGREE. What is left is the six `NewFastRegexMatcher` sites, which short-circuit a plain literal before `syntax.Parse` (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) and answer `200` with nothing, plus `variants_common_side`, whose `200` is #380's swallowed build error rather than the short-circuit |
 
 - **Direction B — PulsusDB serves, the reference rejects. Several of these
   answer with a DIFFERENT PATTERN, which is a wrong answer and not
@@ -3341,77 +3346,86 @@ often than they agree about it.
 
   | class | patterns | positions | note |
   |---|---|---|---|
-  | `engine_dir_b_read_as_a_different_pattern` | `\U0001F600`, `(?R)a`, `(?x)a`, `a**`, `[[:foo:]]`, `\p{Alphabetic}`, `a{1001}` | 15 | `(?R)` is read as the Rust crate's CRLF flag and matches everything; `[[:foo:]]` as a nested class matching `:`/`f`/`o`; `a**` as `(a*)*`. In a `line_format` template `a**` renders **`zxz`** from the input `x` and `\p{Alphabetic}` renders **`z`** — see `template-error-wording-residuals` |
-  | `engine_dir_b_class_forms` | `[a--b]`, `\u{263A}` | 14 | `label_replace` excluded — its rewrite makes the Rust crate agree with the reference, so that one position is the only LogQL site where these are refused |
-  | `engine_dir_b_invalid_utf8_escape` | `"\xff"` | 9 | the VERDICT half of something worse, and see the note under this table. Go's `strconv.Unquote` gives the reference one 0xFF byte, which its parser refuses as invalid UTF-8 wherever the pattern reaches it — these nine positions. **Our lexer does not produce that byte, and does not produce U+00FF either**: `scan_double_quoted` drops the backslash on an unknown escape (`crates/pulsus-logql/src/lexer.rs:322-331`, `Some(other) => value.push(other)`), so the pattern becomes the three ASCII characters `xff` and compiles. The positions absent from the nine are the `NewFastRegexMatcher` sites, which never parse a plain literal at all (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) |
+  | `engine_dir_b_read_as_a_different_pattern` | `\U0001F600`, `(?R)a`, `(?x)a`, `a**`, `[[:foo:]]`, `\p{Alphabetic}`, `a{1001}` | 15 | `a**` is read as `(a*)*`, which matches **every** subject tested (`""`, `a`, `b`, `:`, `101`, an emoji), so a line filter carrying it returns the whole stream; `[[:foo:]]` as a nested class matching `:`/`f`/`o`. In a `line_format` template `a**` renders **`zxz`** from the input `x` and `\p{Alphabetic}` renders **`z`** — see `template-error-wording-residuals`. **Correction (issue #400, measured 2026-08-10):** this cell said `(?R)` is read as the crate's line-terminator flag "and matches everything". It is not: `(?R)a` matches `"a"` and does not match `""`, `"b"` or `"x\r\ny"`. The false half was an inference from a category — a flag we do not have — sitting beside two measured facts, the same shape as `template-error-wording-residuals`' own correction. Three copies of the sentence shipped (here, `docs/api.md` §9.3, and the fixture's own row) and all three are now `the_wrong_pattern_row_says_what_each_member_actually_does`, which probes both members |
+  | `engine_dir_b_class_forms` | `[a--b]`, `\u{263A}` | 14 | `label_replace` excluded — its rewrite makes the Rust crate agree with the reference, so that one position is the only LogQL site where these are refused. **Owner ruling 2026-08-10: both are #400's to close with a decidable check, NOT the deferred `re2_pattern_to_rust` rewrite** ("What is NOT here", below) — `[a--b]` because it matches `a` where the reference sends `400`, and `\u{263A}` because it falls out of the same `\u` rule for free. #400 Stage 1 closes neither: it is the string-literal LEXER, and both of these are REGEX bodies that reach the compiler with their backslashes doubled. The spelling `{app=~"\u{263A}"}` — the escape in the string literal rather than in the pattern — *is* refused as of Stage 1, matching the reference; `{app=~"\\u{263A}"}` is the row here and is not |
+  | *(retired by #400 Stage 1)* `engine_dir_b_invalid_utf8_escape` | `"\xff"` | was 9 | **this row is gone and its successor points the other way** — see `engine_dir_a_non_utf8_string_literal` in Direction A above. It recorded the verdict half of a wrong-answer defect: Go's unquoting gives the reference one 0xFF byte, refused as invalid UTF-8 at the nine positions that reach its parser, while our lexer dropped the backslash and compiled the three ASCII characters `xff`. Stage 1 gave the lexer the reference's own grammar, so those nine positions now AGREE and the six that never parse a plain literal are what is left |
   | `variants_variant_side_skips_the_line_filter` | the 14 patterns both sides reject | 1 | found by this matrix. The reference refuses a malformed line filter inside a `variants(...)` variant; we serve it — but only while the filter is PUSHABLE **and the variant is BARE** (issue #397: a variant wrapped in a vector aggregation runs its whole pipeline, so the filter is compiled and both sides refuse; that wrapped position is #400's to add, and corpus row W29 pins it meanwhile). `compile_stage` returns `Ok(None)` for a pushable line filter (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`, so the discarded variant prefix `VariantSpec::try_new` compiles (`plan.rs:2641`) never sees the regex, and a discarded prefix renders no SQL either. Put the same filter after a `line_format` and the pushdown is cleared, the filter is compiled, and both sides refuse it — that is the `variants_variant_after_line_format` position, which agrees at every pattern and is what bounds this row. `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused on both sides too |
 
-- **The LogQL string ESCAPE is one root cause with TWO divergences, and
-  only one of them is in this matrix at all** (issue #246 review rounds 2
-  and 3). `scan_double_quoted`
-  (`crates/pulsus-logql/src/lexer.rs:322-331`) knows `\n`, `\t` and `\r`
-  and handles everything else with `Some(other) => value.push(other)` —
-  dropping the backslash and keeping the character. Go's string grammar
-  knows a great deal more and rejects what it does not know. Measured on
-  the pinned oracle and through this tree's parser, 2026-08-08:
+- **The LogQL string ESCAPE was one root cause with TWO divergences, and
+  #400 Stage 1 closed both at the one line they shared.**
+  `scan_double_quoted` (`crates/pulsus-logql/src/lexer.rs`) knew `\n`,
+  `\t` and `\r` and handled everything else with
+  `Some(other) => value.push(other)` — dropping the backslash and keeping
+  the character. It now carries the grammar the reference actually uses:
+  `prometheus/util/strutil.Unquote`
+  (`vendor/github.com/prometheus/prometheus/util/strutil/quote.go:66-231 @ v3.7.4`),
+  which Loki's lexer calls on every string token
+  (`pkg/logql/syntax/lex.go:190-201`). Measured on the pinned oracle and
+  through this tree's parser; the "was" column is what shipped until
+  2026-08-10:
 
-  | spelling | reference | PulsusDB | half |
+  | spelling | reference | PulsusDB, was | PulsusDB, now |
   |---|---|---|---|
-  | `{app=~"\xff"}` | `200`, a matcher for byte `0xFF` | `200`, a matcher for `xff` | value |
-  | `{app=~"\101"}` | `200`, a matcher for `A` (Go octal) | `200`, a matcher for `101` | value |
-  | `{app=~"\d+"}` | `400 parse error at line 1, col 7: invalid char escape` | `200`, a matcher for `d+` | reject |
-  | `{app=~"\0"}` | `400 … invalid char escape` | `200`, a matcher for `0` | reject |
-  | `{app="x"} \|~ "\d+"` | `400 … col 14` | `200`, filter `d+` | reject |
-  | `{app="x"} \| regexp "(?P<c>\d+)"` | `400 … col 20` | `200` | reject |
+  | `{app=~"\101"}` | `200`, a matcher for `A` (Go octal) | `200`, a matcher for `101` | `200`, a matcher for `A` |
+  | `{app=~"\x41"}` | `200`, a matcher for `A` | `200`, a matcher for `x41` | `200`, a matcher for `A` |
+  | `{app=~"\u0041"}`, `{app=~"\U00000041"}` | `200`, a matcher for `A` | `200`, `u0041` / `U00000041` | `200`, a matcher for `A` |
+  | `"\xc3\xa9"` | one character, `é` (byte escapes compose) | the six characters `xc3xa9` | one character, `é` |
+  | `"\ud800"` | U+FFFD (`utf8.EncodeRune` on a surrogate) | the five characters `ud800` | U+FFFD |
+  | `{app=~"\d+"}` | `400 parse error at line 1, col 7: invalid char escape` | `200`, a matcher for `d+` | `400` |
+  | `{app=~"\0"}`, `{app=~"\q"}`, `{app=~"\'"}` | `400 … invalid char escape` | `200`, `0` / `q` / `'` | `400` |
+  | `{app="x"} \|~ "\d+"` | `400 … col 14` | `200`, filter `d+` | `400` |
+  | `{app="x"} \| regexp "(?P<c>\d+)"` | `400 … col 20` | `200` | `400` |
+  | `{app=~"\xff"}` | `200` at the selector, `400 … invalid UTF-8` wherever it parses | `200`, a matcher for `xff` | `400` everywhere — see `logql-string-escape-non-utf8` |
 
-  **The value half** — an escape Go DEFINES and we do not — is what
-  `engine_dir_b_invalid_utf8_escape` records the verdicts of. Its real
-  damage is that at the five `NewFastRegexMatcher` positions both systems
-  answer `200` and match different lines: **a user's pattern silently
-  becomes a different pattern.** (This entry claimed for one round that
-  our lexer produced U+00FF. It does not produce that, nor the reference's
-  0xFF byte.)
+  **Why the value half was the severe one, and it is not an accept-surface
+  story at all.** Pushed as two streams under one `service_name` and asked
+  as one query on the pinned container: `{app=~"\101", service_name="esc2"}`
+  returns the `app="A"` stream and its line, and `{app=~"101", …}` returns
+  the `app="101"` stream — disjoint answers, both `200`, no error on either
+  side. That is a query silently reading a different part of the store, not
+  a permissive parse.
 
-  **The reject half** — an escape Go does NOT define — is an ordinary
-  accept-surface divergence: a `400` there at the LEXER, before any regex
-  parser, and therefore at every construct rather than at particular
-  positions (the column numbers above are the only thing that moves), and
-  a `200` here. **It is in none of the 792 points and none of the nine
-  classes**, and the reason is worth stating exactly, because a looser
-  version of it was wrong: every **other** pattern in the matrix is a
-  regex body that `logql_quote` escapes on the way in, so it cannot carry
-  a string escape at all. `Pattern::literal` deliberately exempts one body
-  variant, `Body::LogqlSource`, and `invalid_utf8` (`\xff`) IS that
-  variant — the exemption is the whole point of it. So the coverage
-  argument splits 43 patterns × 18 positions = 774 points (quoted, cannot
-  carry a string escape) plus **one pattern at 18 points** (`invalid_utf8`,
-  unquoted), and 774 + 18 = 792. Those 18 are still not in this half,
-  because all of them carry the same `\x`, which is an escape Go DEFINES;
-  they are the value half's probe. Nothing here covers the reject half,
-  and this entry does not claim to.
+  **What pins it now.** The decoded values are asserted BY BYTE in
+  `crates/pulsus-logql/tests/string_escapes.rs` (one row per arm of
+  `unquoteChar`, at the selector and at a line filter, so the claim that
+  this is a LEXER rule is itself checked), and the LINES each escape
+  selects are `crates/pulsus-read/tests/logqltest/corpus/b24_string_escapes.test`,
+  captured from the pinned container. The three rows that discriminate
+  against a plausible-but-wrong implementation are named there: an `Err`
+  for `\d` (rules out keeping the pass-through fallback), `"\xc3\xa9"`
+  decoding to two bytes (rules out a Latin-1 reading of `\xHH`), and
+  `"\ud800"` decoding to U+FFFD (rules out lifting `pulsus-traceql`'s
+  scanner, which refuses surrogates — true of Go's SOURCE literal grammar,
+  false of the `strutil` copy Loki calls).
 
-  Both halves are owned by **#400**; the reject half is an accept-surface
-  divergence and belongs there beside the value one. The PromQL side of
-  the same escape family was examined once before, on
+  **Neither half was in the matrix's points, and the reason needs its
+  qualifier**: every **other** pattern there is a regex body that
+  `logql_quote` escapes on the way in, so it cannot carry a string escape
+  at all. `Body::LogqlSource` deliberately exempts one body variant, and
+  `invalid_utf8` (`\xff`) IS that variant — the exemption is the whole
+  point of it. So the coverage argument splits 44 patterns × 18 positions
+  = 792 points (quoted, cannot carry a string escape) plus **one pattern
+  at 18 points** (`invalid_utf8`, unquoted), and 792 + 18 = 810. Those 18
+  carry `\x`, an escape Go DEFINES, so they were the value half's probe
+  and never the reject half's. **The matrix was not widened to cover
+  either half** — it scores verdicts, and a decode is not a verdict.
+
+  **Why the value half survived a review round is the limit worth keeping**:
+  that matrix scores VERDICTS. Both sides accepted at all 16 positions, so
+  no cell moved, no test moved, and no amount of adding patterns or
+  positions would have caught it. Its module docs say so under "What this
+  matrix cannot see". The PromQL side of the same escape family was
+  examined once before, on
   `docs/decisions/0002-promql-parser-selection.md:110`.
-
-  **Why the value half survived a review round is the limit worth
-  recording**: this matrix scores VERDICTS. Both sides accept at all 16
-  positions, so no cell moves, no test moves, and no amount of adding
-  patterns or positions would have caught it. The matrix's module docs now
-  say so under "What this matrix cannot see", and the decoded value itself
-  is asserted by
-  `the_parsed_pattern_value_is_committed_where_the_escape_changes_it` —
-  the one check in the file with a value in it rather than a disposition.
-  Demonstrated rather than asserted: with a real `\xHH`-decoding arm added
-  to the lexer, that one test fails and the other twelve — every verdict
-  test, both live legs and the divergence enumeration — stay green while
-  the compiled pattern has genuinely changed.
 
 - **Status parity, in contrast, holds everywhere.** Every rejection above
   is `400` on both sides — ours through `PipelineError::BadRegex` →
-  `ReadError::PipelineInvalid` → `StatusCode::BAD_REQUEST` — at all 792
-  probed points. That is the half this issue shipped as a pin.
+  `ReadError::PipelineInvalid` → `StatusCode::BAD_REQUEST`, and, for the
+  string-escape refusals #400 Stage 1 added, through
+  `LogQlError::{InvalidCharEscape, NonUtf8StringLiteral}` →
+  `ApiError::LogQl` → `StatusCode::BAD_REQUEST`
+  (`crates/pulsus-server/src/logs_api/error.rs:160`) — at all 810 probed
+  points. That is the half this issue shipped as a pin.
 
 - **The three ways to measure this and learn nothing**, each hit during
   the scouting run and each now built into the fixture: probing `| regexp`
@@ -3462,6 +3476,63 @@ often than they agree about it.
   the already-running `pulsus-logql-diff` container. The per-route surface
   axis is `crates/pulsus-server/tests/logs_api_live.rs`'s
   `a_malformed_selector_regex_is_refused_on_every_mounted_logs_route`.
+
+### `logql-string-escape-non-utf8` (issue #400 Stage 1 — DELIBERATE narrowing, owner ruling 2026-08-10)
+
+- **Reference behaviour.** `"\xff"` in a LogQL string literal is one
+  0xFF byte (`strutil.Unquote`'s `\xHH` arm is a byte, `quote.go:186-190`).
+  The reference refuses that pattern wherever it reaches its regex parser
+  — `400 error parsing regexp: invalid UTF-8` at the line filter in both
+  operators, after a `line_format`, at `| regexp`, inside
+  `count_over_time` and a binary op, at `label_replace` and at both
+  `variants(...)` positions — and SERVES it at the five
+  `NewFastRegexMatcher` sites (the selector in both operators, both label
+  filters, `drop`, `keep`), because `optimizeAlternatingLiterals` returns
+  a string matcher for a plain literal before `syntax.Parse`
+  (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`).
+  Measured on the pinned container: `{app=~"\xff", service_name="esc"}`
+  is `200` with an empty result; `{service_name="esc"} | decolorize |~ "\xff"`
+  is `400 … invalid UTF-8`.
+
+- **PulsusDB behaviour.** `400` at every position. The lexer decodes the
+  same 0xFF byte the reference does, and a decoded byte string that is not
+  valid UTF-8 cannot become the `String` the rest of the engine carries,
+  so it is a positioned `LogQlError::NonUtf8StringLiteral`. Reached only
+  by a `\xHH`/`\NNN` escape above `0x7F` that no neighbouring escape
+  completes: `"\xc3\xa9"` composes to `é` and is served.
+
+- **Why this is acceptable — the reachability argument, which is the part
+  that makes it a narrowing and not a regression.** **No mounted ingest
+  route can store invalid UTF-8.** Every one materialises a line body and
+  a label value into a Rust `String` — `LogRow.body: String`,
+  `StreamRow.labels: LabelSet`
+  (`crates/pulsus-write/src/protocols/otlp_logs.rs:37-55`) — through prost
+  or `serde_json`, both of which require valid UTF-8 and fail the push
+  otherwise. So no line and no label value in this store could match the
+  reference's 0xFF byte, and the five positions where it serves the
+  pattern are exactly the five where it answers `200` **and nothing**. A
+  user cannot observe a row difference through any door they have; they
+  observe an error instead of an empty result.
+
+- **The alternative was refused.** Compiling a never-matching pattern so
+  those positions answer `200` and nothing would make the plan-time
+  validity check assert something false, and would answer differently from
+  the nine positions where the reference itself sends `400`.
+
+- **`pulsus-traceql` carries the identical ruling** (`lexer.rs`, #56), and
+  two surfaces disagreeing on the same question would be worse than either
+  answer. LogQL's version is NARROWER than TraceQL's: the byte buffer lets
+  `"\xc3\xa9"` through, where TraceQL refuses any byte escape above
+  `0x7F`.
+
+- **Fixture status:** `crates/pulsus-logql/tests/string_escapes.rs`
+  (`a_lone_high_byte_escape_is_refused`, `a_byte_escape_composes_with_its_neighbour`),
+  the `engine_dir_a_non_utf8_string_literal` row and
+  `the_parsed_pattern_value_is_committed_where_the_escape_changes_it` in
+  `crates/pulsus-read/tests/logql_regex_accept_matrix.rs`, whose live leg
+  re-measures the reference's `Accept` at the short-circuit positions
+  rather than assuming it, and the `\xff` rows of
+  `crates/pulsus-read/tests/logqltest/corpus/b24_string_escapes.test`.
 
 ## Issue #374 — the per-stream label rules at log ingest
 

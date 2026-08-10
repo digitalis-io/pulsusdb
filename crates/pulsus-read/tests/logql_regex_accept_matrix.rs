@@ -109,14 +109,24 @@
 //! This is not a hypothetical limit. `engine_dir_b_invalid_utf8_escape`
 //! shipped with a false mechanism ("our lexer decodes `\xff` to U+00FF")
 //! and survived a review round, because no check in this file could
-//! contradict it. What our lexer actually does is drop the backslash
-//! (`pulsus-logql/src/lexer.rs:322-331`), so the pattern becomes the three
-//! ASCII characters `xff` while the reference sees one 0xFF byte — and at
-//! the five positions where BOTH sides serve it, the two engines match
-//! different lines with every cell agreeing.
+//! contradict it. What the lexer actually did was drop the backslash, so
+//! the pattern became the three ASCII characters `xff` while the
+//! reference saw one 0xFF byte — and at the positions where BOTH sides
+//! served it, the two engines matched different lines with every cell
+//! agreeing.
+//!
+//! **#400 Stage 1 fixed the lexer**, so that particular blind spot is
+//! closed at its source: `scan_double_quoted` now carries the
+//! reference's own string grammar (`prometheus/util/strutil.Unquote`,
+//! `quote.go:66-231 @ v3.7.4`), the decoded values are pinned by byte in
+//! `pulsus-logql/tests/string_escapes.rs`, and the LINES each selects
+//! are pinned by `logqltest/corpus/b24_string_escapes.test`. The limit
+//! this section describes is unchanged — **this file still scores
+//! verdicts and still cannot see a meaning** — and the fix is a
+//! demonstration of why the pin has to live elsewhere.
 //!
 //! [`the_parsed_pattern_value_is_committed_where_the_escape_changes_it`]
-//! is the one check here with a value in it, and it covers exactly the
+//! is the one check here that is not a verdict, and it covers exactly the
 //! patterns whose LogQL escape is the construct under test. Anything
 //! broader — what a pattern MATCHES, rather than whether it compiles —
 //! belongs to the value-differential suites, not here. **If you add a
@@ -124,21 +134,22 @@
 //! report agreement.**
 //!
 //! **And the escape family this matrix touches is only half of one.** An
-//! escape Go's string grammar DEFINES and this lexer does not (`\xff`,
-//! `\101`) is the value half above, and `invalid_utf8` is its one probe
-//! here. An escape Go does **not** define (`\d`, `\w`, `\0`, `\q`) is an
-//! ordinary accept-surface divergence — measured, `{app=~"\d+"}` is
-//! `400 parse error at line 1, col 7: invalid char escape` on the
-//! reference and parses to the pattern `d+` here — and **it is in none of
-//! this file's points and none of its divergence classes**, because every
-//! **other** pattern is a regex body that [`logql_quote`] escapes on the
-//! way in, so it cannot carry a string escape at all. The exception is
-//! `invalid_utf8`, which [`Pattern::literal`] passes through unescaped by
-//! design — and it is not in this half either, because `\x` is an escape
-//! Go DEFINES. **Both clauses are load-bearing**: the two prose copies of
-//! this sentence dropped the "other" and became false, which is exactly
-//! what made the exemption invisible. Both halves are #400's; do not
-//! widen this file to cover the reject half.
+//! escape Go's string grammar DEFINES and this lexer did not (`\xff`,
+//! `\101`) was the value half above, and `invalid_utf8` is its one probe
+//! here. An escape Go does **not** define (`\d`, `\w`, `\0`, `\q`) was an
+//! ordinary accept-surface divergence — measured before Stage 1,
+//! `{app=~"\d+"}` was `400 parse error at line 1, col 7: invalid char
+//! escape` on the reference and parsed to the pattern `d+` here — and
+//! **it is in none of this file's points and none of its divergence
+//! classes**, because every **other** pattern is a regex body that
+//! [`logql_quote`] escapes on the way in, so it cannot carry a string
+//! escape at all. The exception is `invalid_utf8`, which
+//! [`Body::LogqlSource`] passes through unescaped by design — and it is
+//! not in this half either, because `\x` is an escape Go DEFINES.
+//! **Both clauses are load-bearing**: the two prose copies of this
+//! sentence dropped the "other" and became false, which is exactly what
+//! made the exemption invisible. Stage 1 closed both halves at the one
+//! line they shared; do not widen this file to cover them.
 //!
 //! **If this file has to be split**, the seam is the template axis:
 //! [`TEMPLATE_AXIS`] and its two tests have a different verdict TYPE from
@@ -651,25 +662,37 @@ const PATTERNS: &[Pattern] = &[
     // assumed: `{app=~"a\xffb.*"}` is a 400 at the selector and
     // `{app=~"\xff|\xfe"}` is a 200, so it is the literal short-circuit.
     //
-    // **PulsusDB serves it everywhere, and NOT because it reads the same
-    // pattern.** `scan_double_quoted` (`pulsus-logql/src/lexer.rs:322-331`)
-    // handles an unknown escape with `Some(other) => value.push(other)` —
-    // it drops the backslash and keeps the `x` — so the pattern the
-    // planner receives is the three ASCII characters `xff`, pinned by
-    // [`the_parsed_pattern_value_is_committed_where_the_escape_changes_it`].
-    // The reference sees one 0xFF byte. So the user's pattern silently
-    // becomes a DIFFERENT pattern matching different lines: at the five
-    // positions where both sides serve it, the reference matches lines
-    // containing byte 0xFF and we match lines containing `xff`. That is a
-    // wrong answer, not a lenient accept, and this matrix scores verdicts
-    // and cannot see it — see the module docs' "What this matrix cannot
-    // see".
+    // **PulsusDB refuses it everywhere, and that is a DELIBERATE
+    // narrowing** (issue #400 Stage 1, owner ruling 2026-08-10). This
+    // column used to be `Accept`, and not because we read the same
+    // pattern: `scan_double_quoted` ended in
+    // `Some(other) => value.push(other)`, dropping the backslash, so the
+    // planner received the three ASCII characters `xff` while the
+    // reference saw one 0xFF byte — both sides `200`, matching different
+    // lines, and no cell of this matrix moving. Stage 1 gave the lexer
+    // the reference's own grammar
+    // (`prometheus/util/strutil.Unquote`, quote.go:66-231 @ v3.7.4), so
+    // `\xff` now decodes to the byte 0xFF as it does there — and a
+    // decoded byte string that is not valid UTF-8 cannot be a Rust
+    // `String`, so it is a positioned `400`.
+    //
+    // **Why that narrowing is acceptable, and the row must say it rather
+    // than just record the verdict:** no mounted ingest route can store
+    // invalid UTF-8 — every one materialises a body and a label value
+    // into a Rust `String` (`LogRow.body: String`,
+    // `pulsus-write/src/protocols/otlp_logs.rs:37-55`) through prost or
+    // `serde_json`, both of which require it — so nothing in this store
+    // could match the reference's 0xFF byte. The alternative (compile a
+    // never-matching pattern so those positions answer `200` and
+    // nothing) would make the plan-time validity check assert something
+    // false. `pulsus-traceql` carries the identical ruling (#56).
+    // Ledgered as `logql-string-escape-non-utf8`.
     Pattern {
         id: "invalid_utf8",
         body: Body::LogqlSource(r"\xff"),
         go_code: Some("ErrInvalidUTF8"),
         reference: Verdict::Accept,
-        pulsus: Verdict::Accept,
+        pulsus: Verdict::Reject,
     },
     // Issue #291: the SIZE boundary, and the one row whose divergence is
     // deliberate. 10,100 `\p{L}` atoms alternated — 70,700 query bytes,
@@ -964,12 +987,20 @@ const EXCEPTIONS: &[Exception] = &[
         "`mustNewLabelReplaceExpr` compiles `^(?:…)$` directly (`syntax/ast.go:2225-2233 @ \
          v3.7.4`), and the body quotes that WRAPPED form",
     ),
-    ex_ref(
-        "variants_variant_side",
-        "invalid_utf8",
-        Verdict::Reject,
-        "as `line_re`",
-    ),
+    Exception {
+        position: "variants_variant_side",
+        pattern: "invalid_utf8",
+        reference: Some(Verdict::Reject),
+        pulsus: Some(Verdict::Reject),
+        why: "the reference half is `as line_re`. The PulsusDB half is the exception: this \
+              position's `AcceptsEverything` rule is about the PUSHDOWN skipping the regex \
+              COMPILE, and since #400 Stage 1 this pattern is refused at the LEXER, above the \
+              planner entirely — nothing about the variant's discarded prefix can reach it. \
+              **The one point where Stage 1 narrows \
+              `variants_variant_side_skips_the_line_filter`**, and why that row keeps \
+              `BOTH_REJECT` rather than gaining this pattern: every other member of it is a \
+              regex-GRAMMAR rejection, which still slips through here.",
+    },
     ex_ref(
         "variants_variant_after_line_format",
         "invalid_utf8",
@@ -1253,11 +1284,17 @@ const DIVERGENCES: &[Divergence] = &[
             "variants_variant_side",
         ],
         owner: "#400",
-        why: "not merely lenient. `(?R)` is read as the Rust crate's CRLF flag (matches \
-              everything), `[[:foo:]]` as a nested class (matches `:`/`f`/`o`), and `a**` as \
-              `(a*)*`, which in a template renders `zxz` from the input `x` — see \
-              `the_template_regex_boundary_does_not_match_the_reference`. A wrong answer, not \
-              a permissive one. docs/api.md \u{a7}9.2/\u{a7}9.3.",
+        why: "not merely lenient. `a**` is read as `(a*)*`, which matches EVERY subject tested \
+              (`\"\"`, `a`, `b`, `:`, `101`, an emoji), so a line filter carrying it returns \
+              the whole stream, and in a template it renders `zxz` from the input `x` — see \
+              `the_template_regex_boundary_does_not_match_the_reference`. `[[:foo:]]` is read \
+              as a nested class (matches `:`/`f`/`o`). **`(?R)` is NOT one of the \
+              match-everything members** — this row said for three releases that the crate \
+              reads it as a line-terminator flag \"so the pattern silently matches \
+              everything\"; measured, `(?R)a` matches `\"a\"` and not `\"\"`, `\"b\"` or \
+              `\"x\\r\\ny\"`. That was an inference from a category, not a measurement, and it \
+              is now `the_wrong_pattern_row_says_what_each_member_actually_does`. A wrong \
+              answer, not a permissive one. docs/api.md \u{a7}9.2/\u{a7}9.3.",
     },
     Divergence {
         id: "engine_dir_b_class_forms",
@@ -1284,33 +1321,39 @@ const DIVERGENCES: &[Divergence] = &[
               reference — the same one-site partial fix as the brace forms.",
     },
     Divergence {
-        id: "engine_dir_b_invalid_utf8_escape",
-        pulsus: Verdict::Accept,
+        id: "engine_dir_a_non_utf8_string_literal",
+        pulsus: Verdict::Reject,
         patterns: &["invalid_utf8"],
         positions: &[
-            "line_re",
-            "line_nre",
-            "line_after_line_format",
-            "regexp_named",
-            "metric_line",
-            "metric_binary",
-            "label_replace",
-            "variants_variant_side",
-            "variants_variant_after_line_format",
+            "sel_re",
+            "sel_nre",
+            "labelfilter_re",
+            "labelfilter_nre",
+            "drop",
+            "keep",
+            "variants_common_side",
         ],
-        owner: "#400",
-        why: "the verdict half of something worse. `\"\\xff\"` is one 0xFF byte in the \
-              reference's pattern, refused as invalid UTF-8 wherever the pattern actually \
-              reaches a parser — these nine positions. Our lexer does NOT decode it to that \
-              byte, nor to U+00FF: `scan_double_quoted` drops the backslash on an unknown \
-              escape (`pulsus-logql/src/lexer.rs:322-331`), so the pattern becomes the three \
-              ASCII characters `xff` and compiles. The positions absent from this list are the \
-              `NewFastRegexMatcher` sites, which never parse a plain literal at all — they \
-              serve it on both sides, and THAT is where the real damage is: the reference \
-              matches lines containing byte 0xFF, we match lines containing `xff`, and no cell \
-              of this matrix moves. A wrong answer, recorded on #400 as a value divergence; \
-              `the_parsed_pattern_value_is_committed_where_the_escape_changes_it` is the only \
-              check here that can see it.",
+        owner: "#400 (ledgered `logql-string-escape-non-utf8`, deliberate)",
+        why: "**this row REPLACED `engine_dir_b_invalid_utf8_escape` and points the other way** \
+              (#400 Stage 1). Until then our lexer dropped the backslash on `\"\\xff\"` and \
+              compiled the three ASCII characters `xff`, so we served it everywhere while the \
+              reference — which decodes one 0xFF byte — refused it at the nine positions that \
+              reach its regex parser. With the reference's own string grammar in the lexer we \
+              decode that byte too, and a decoded byte string that is not valid UTF-8 is a \
+              positioned `400`. The nine parser positions therefore now AGREE, and what is \
+              left is these six: the `NewFastRegexMatcher` sites, which short-circuit a plain \
+              literal before `syntax.Parse` \
+              (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ \
+              v3.7.4`) and answer `200` with nothing. **Deliberate, and unreachable as a \
+              wrong answer:** no mounted ingest route can store invalid UTF-8 (`LogRow.body: \
+              String`, `pulsus-write/src/protocols/otlp_logs.rs:37-55`), so no line or label \
+              value here could match a 0xFF byte; `pulsus-traceql` carries the identical \
+              ruling. **`variants_common_side` is in this list for a DIFFERENT reference-side \
+              reason**, and the distinction matters: the common pipeline's line filter DOES \
+              reach the reference's regex parser, and its `200` comes from the querier \
+              swallowing the build error in every window (#380, \
+              `variants_common_side_hides_the_build_error`). These rows group by OUR cause, \
+              which is one string-grammar refusal at all seven positions.",
     },
     Divergence {
         id: "variants_common_side_hides_the_build_error",
@@ -1935,8 +1978,8 @@ fn the_divergence_set_is_exactly_the_committed_enumeration() {
     );
     assert_eq!(
         measured.len(),
-        323,
-        "the ledger says 323 of the 720 unmasked points disagree"
+        321,
+        "the ledger says 321 of the 720 unmasked points disagree"
     );
     assert_eq!(
         POSITIONS.len() * PATTERNS.len() + MASKED.len() * PATTERNS.len(),
@@ -2122,23 +2165,40 @@ fn the_enumeration_is_self_consistent_and_says_why_each_entry_exists() {
 /// because no cell moves either way.
 ///
 /// So: for every [`Body::LogqlSource`] pattern — the ones whose escape is
-/// the construct under test — the decoded value the planner sees is
-/// committed here and asserted through the real parser, together with
-/// what it does and does not match. A new `LogqlSource` pattern without
-/// an entry fails rather than being scored on its verdict alone.
+/// the construct under test — what the lexer does with it is committed
+/// here and asserted through the real parser. A new `LogqlSource` pattern
+/// without an entry fails rather than being scored on its verdict alone.
+///
+/// **Since #400 Stage 1 the committed outcome for `\xff` is a REFUSAL**,
+/// not a decoded string: the lexer now carries the reference's own
+/// grammar, decodes `\xff` to the byte 0xFF exactly as it does, and
+/// cannot hold that byte in a Rust `String`. The escapes that DO decode
+/// are pinned by byte in `pulsus-logql/tests/string_escapes.rs`, and the
+/// lines they select by `logqltest/corpus/b24_string_escapes.test`;
+/// keeping the whole decode table here would be a second copy of both.
 #[test]
 fn the_parsed_pattern_value_is_committed_where_the_escape_changes_it() {
-    /// `(pattern id, the value our parser hands the planner, what the
-    /// REFERENCE's parser sees instead)`.
-    const DECODED: &[(&str, &str, &str)] = &[(
+    /// `(pattern id, what the lexer does with the source, what the
+    /// REFERENCE's own unquoting produces)`.
+    enum Decoded {
+        /// The planner receives this exact value.
+        Value(&'static str),
+        /// The lexer refuses the literal; the `&str` names the reason.
+        Refused(&'static str),
+    }
+    const DECODED: &[(&str, Decoded, &str)] = &[(
         "invalid_utf8",
-        // `scan_double_quoted` (`pulsus-logql/src/lexer.rs:322-331`)
-        // handles an unknown escape with `Some(other) => value.push(other)`
-        // — the backslash is dropped and the `x` kept.
-        "xff",
-        // Go's `strconv.Unquote` decodes `\xff` to the single byte 0xFF,
+        // Stage 1: `\xff` is the byte 0xFF here as it is there, and a
+        // literal whose decoded bytes are not valid UTF-8 is a
+        // `NonUtf8StringLiteral`. Before Stage 1 this committed the
+        // string `"xff"` — backslash dropped, `x` kept — which is the
+        // wrong-pattern defect #400 was filed on.
+        Decoded::Refused("not valid UTF-8"),
+        // Go's `strutil.Unquote` decodes `\xff` to the single byte 0xFF,
         // which is why the reference's parser raises `ErrInvalidUTF8`
-        // wherever the pattern reaches it at all.
+        // wherever the pattern reaches it at all — and why the six
+        // `NewFastRegexMatcher` positions, which never parse it, are the
+        // whole of `engine_dir_a_non_utf8_string_literal`.
         "one 0xFF byte",
     )];
 
@@ -2159,40 +2219,93 @@ fn the_parsed_pattern_value_is_committed_where_the_escape_changes_it() {
         // Through the real parser, at a position whose pattern slot is the
         // whole matcher value, so the decoded text is readable directly.
         let query = format!(r#"{{app=~"{source}"}}"#);
-        let expr = parse(&query).unwrap_or_else(|e| panic!("{query}: {e}"));
-        let pulsus_logql::Expr::Log(log) = expr else {
-            panic!("{query}: expected a log query")
-        };
-        let value = &log.selector.matchers[0].value;
-        assert_eq!(
-            value, decoded,
-            "`{}`: the planner receives {value:?}, not the committed {decoded:?}. If the lexer \
-             changed, re-record the value AND the divergence's mechanism — the sentence in \
-             `engine_dir_b_invalid_utf8_escape` describes exactly this string.",
-            pattern.id
-        );
+        let parsed = parse(&query);
+        match decoded {
+            Decoded::Refused(reason) => {
+                let err = parsed.as_ref().err().unwrap_or_else(|| {
+                    panic!(
+                        "`{}`: the lexer must refuse {query} — if it decodes again, re-record \
+                         BOTH this entry and the mechanism sentence in \
+                         `engine_dir_a_non_utf8_string_literal`",
+                        pattern.id
+                    )
+                });
+                let text = err.to_string();
+                assert!(
+                    text.contains(reason),
+                    "`{}`: the refusal says {text:?}, which does not name {reason:?}",
+                    pattern.id
+                );
+            }
+            Decoded::Value(expected) => {
+                let Ok(pulsus_logql::Expr::Log(log)) = parsed else {
+                    panic!("{query}: expected a log query, got {parsed:?}");
+                };
+                let value = &log.selector.matchers[0].value;
+                assert_eq!(
+                    value, expected,
+                    "`{}`: the planner receives {value:?}, not the committed {expected:?}. If \
+                     the lexer changed, re-record the value AND the divergence's mechanism.",
+                    pattern.id
+                );
+            }
+        }
+    }
+}
 
-        // And what that value MEANS, because "the pattern became `xff`"
-        // is only a defect if `xff` matches something else.
-        let compiled = regex::Regex::new(value).expect("the decoded pattern compiles");
+/// **What the members of `engine_dir_b_read_as_a_different_pattern`
+/// actually do**, because the row's own sentence got one of them wrong
+/// for three releases and no check could contradict it.
+///
+/// The claim was that `(?R)` is read as the Rust crate's CRLF flag "so
+/// the pattern silently matches everything". Measured here: `(?R)a`
+/// matches `"a"` and does NOT match `""`, `"b"` or `"x\r\ny"` — the flag
+/// changes what `.` and `(?m)^$` mean, not what the rest of the pattern
+/// is. The member that really does match everything is `a**`, which the
+/// crate reads as `(a*)*`.
+///
+/// It is the same shape as the template-boundary defect this issue
+/// recorded: an inference from a CATEGORY ("it is a flag we do not
+/// have") to a behaviour, sitting beside measured facts. So the fix is
+/// not a better sentence — it is this test, which fails if the sentence
+/// comes back or if the behaviour moves under a `regex` bump.
+#[test]
+fn the_wrong_pattern_row_says_what_each_member_actually_does() {
+    let perl_r = regex::Regex::new("(?R)a").expect("`(?R)a` compiles in the Rust crate");
+    assert!(
+        perl_r.is_match("a"),
+        "`(?R)a` matches a subject containing `a`"
+    );
+    for subject in ["", "b", "x\r\ny", ":", "101"] {
         assert!(
-            compiled.is_match("xff"),
-            "`{}`: the decoded pattern must match its own literal text",
-            pattern.id
-        );
-        assert!(
-            !compiled.is_match("\u{00FF}"),
-            "`{}`: the decoded pattern must NOT match U+00FF — a previous version of this \
-             file's mechanism claimed the escape produced that character",
-            pattern.id
-        );
-        // The reference's byte, as the transport would deliver it.
-        assert!(
-            !compiled.is_match(&String::from_utf8_lossy(&[0xFFu8])),
-            "`{}`: the decoded pattern must not match the reference's 0xFF byte either",
-            pattern.id
+            !perl_r.is_match(subject),
+            "`(?R)a` must NOT match {subject:?} — the CRLF flag does not make the pattern \
+             match everything, and saying it does was this row's false claim"
         );
     }
+    // The member the claim was true of.
+    let nested_star = regex::Regex::new("a**").expect("`a**` compiles as `(a*)*`");
+    for subject in ["", "a", "b", ":", "101", "\u{1F600}"] {
+        assert!(
+            nested_star.is_match(subject),
+            "`a**` must match {subject:?} — it is the member that returns the whole stream"
+        );
+    }
+    // And the sentence itself, so a re-worded copy cannot drift back.
+    let row = DIVERGENCES
+        .iter()
+        .find(|d| d.id == "engine_dir_b_read_as_a_different_pattern")
+        .expect("the row exists");
+    let flat: String = row.why.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !flat.to_lowercase().contains("crlf"),
+        "this row named the CRLF flag as the reason a pattern matches everything; it is not — \
+         see this test's own probes"
+    );
+    assert!(
+        row.why.contains("a**"),
+        "the row must name `a**`, which is the member that matches everything"
+    );
 }
 
 /// **Every committed exception is a real exception.** A row that agrees
@@ -2714,11 +2827,25 @@ fn the_corrected_sentences_are_not_in_the_tree() {
             "that instruction was withdrawn by the owner's 2026-08-08 ruling; #246 ships the \
              status pin, not a translation table",
         ),
+        // Issue #400, owner ruling 2026-08-10. The word itself is the
+        // needle because it appeared in these files for one reason only:
+        // to explain why `(?R)` "silently matches everything". It does
+        // not — see `the_wrong_pattern_row_says_what_each_member_actually_does`.
+        // This file is deliberately NOT in the list below, so that this
+        // very table cannot match itself; the copy that lived here is
+        // asserted away by that test, against the row's own `why` field
+        // rather than against the file's bytes.
+        (
+            "crlf",
+            "`(?R)` is a line-terminator flag, not a match-everything one: `(?R)a` matches \
+             \"a\" and not \"\" or \"b\". The member that matches everything is `a**`",
+        ),
     ];
     let files = [
         "crates/pulsus-read/src/logql/template/funcs.rs",
         "crates/pulsus-read/src/logql/pipeline.rs",
         "docs/benchmarks/logs-differential-ledger.md",
+        "docs/api.md",
     ];
     for rel in files {
         let path = root.join(rel);

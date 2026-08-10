@@ -374,8 +374,9 @@ fn scan_double_quoted(sc: &mut Scanner<'_>, start: usize) -> Result<String, LogQ
             Some('"') => {
                 sc.advance();
                 let end = sc.current_byte();
-                return String::from_utf8(bytes)
-                    .map_err(|_| LogQlError::NonUtf8StringLiteral { span: Span { start, end } });
+                return String::from_utf8(bytes).map_err(|_| LogQlError::NonUtf8StringLiteral {
+                    span: Span { start, end },
+                });
             }
             Some('\\') => {
                 let esc_start = sc.current_byte();

@@ -1,0 +1,182 @@
+# b24_string_escapes.test — issue #400 Stage 1: what a LogQL double-quoted
+# string DECODES to, pinned by the lines a query returns.
+#
+# Every expected label set and line below is a byte-exact capture from
+# grafana/loki:3.7.4 (container `pulsus-400s1-loki`, image digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc),
+# booted on `ci/logql/config.yaml` with no delta of its own;
+# `detected_level` stripped per PROVENANCE.md. Container identity READ
+# FROM THE RUNNING PROCESS, not from this header:
+# /loki/api/v1/status/buildinfo answered {"version":"3.7.4",
+# "revision":"b318f282","branch":"release-3.7.x"} — the same b318f282 the
+# pinned digest and the Go checkout at v3.7.4 resolve to. Captured
+# 2026-08-10 over `/loki/api/v1/query_range`, the only endpoint that
+# serves a log query.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
+#
+# THE RULE, read from the reference rather than inferred from these rows
+# (grafana/loki @ v3.7.4, b318f2829f0ae2094ab3a1e90780450e9e4b03be).
+# Loki's lexer hands every string token to
+# `prometheus/util/strutil.Unquote`
+# (`pkg/logql/syntax/lex.go:190-201` → `util/strutil/quote.go:66-231`),
+# whose `unquoteChar` defines `\a \b \f \n \r \t \v \\ \"`,
+# `\xHH` (two hex, a raw BYTE), `\NNN` (exactly three octal digits, over
+# 255 an error), `\uXXXX` and `\UXXXXXXXX` (over `utf8.MaxRune` an error)
+# — and REFUSES everything else, including `\d`, `\q`, `\0` and `\'`.
+# Two consequences this file exists for:
+#
+#   * `\xHH`/`\NNN` are BYTES, so consecutive escapes compose: `"\xc3\xa9"`
+#     is the single character `é` (`Unquote` appends `byte(c)` for a
+#     non-multibyte value, `quote.go:99-104`).
+#   * a `\u`/`\U` SURROGATE is not refused — `utf8.EncodeRune` writes
+#     U+FFFD for an invalid rune — so `"\ud800"` is a pattern for U+FFFD.
+#
+# WHY THIS FILE IS ABOUT RETURNED LINES AND NOT STATUSES. Until #400
+# Stage 1, `scan_double_quoted` ended in `Some(other) => value.push(other)`
+# — drop the backslash, keep the character. `{app=~"\101"}` therefore
+# selected the stream `101` where the reference selects `A`: **two
+# disjoint answers, both 200, no error on either side.** Measured at the
+# wire on the capture container, with the two streams pushed under one
+# `service_name`:
+#
+#   {app=~"\101", service_name="esc2"} -> the `app="A"` stream and its line
+#   {app=~"101",  service_name="esc2"} -> the `app="101"` stream and its line
+#
+# The hermetic runner does not re-apply the stream SELECTOR (§ the DSL
+# note in PROVENANCE.md: an eval replays every loaded line), so the rows
+# below put the same escapes in a LINE FILTER instead. **`| decolorize`
+# is load-bearing and not decoration**: a line filter sitting directly on
+# the selector is PUSHED DOWN to SQL, so `CompiledPipeline::compile`
+# skips it (`pipeline.rs:986-996` returns `Ok(None)`) and this runner —
+# which executes the pipeline and no SQL — returns every loaded line
+# whatever the pattern says. Written without it, every row here passes
+# before and after Stage 1 while measuring nothing. `| decolorize` is a
+# no-op on these bodies (no ANSI escapes) and clears the pushdown, which
+# is the same device `b1_parsers_filters.test` uses. The SELECTOR
+# spelling is pinned instead by
+# `crates/pulsus-logql/tests/string_escapes.rs`, which asserts the
+# decoded matcher value as BYTES.
+#
+# NOT HERE, and deliberately: `\a` (0x07), `\b` (0x08), `\f` (0x0C) and
+# `\v` (0x0B). Their decoded byte would have to appear in a `load` body,
+# and this DSL reads `<offset> <body>` off a line split on whitespace —
+# 0x0B and 0x0C ARE whitespace to Rust, so those two cannot be written
+# here at all, and a raw 0x07/0x08 in a committed fixture is unreadable.
+# They are pinned by byte in `string_escapes.rs` instead, and were
+# measured at the wire on the same container: `|~ "\a"` and `|~ "\x07"`
+# both return only the line carrying byte 0x07.
+
+load
+  {app="esc", service_name="esc"}
+  0s   A
+  5s   101
+  10s  x41
+  15s  u0041
+  20s  U00000041
+
+# The control: the spelling that means itself still means itself, so the
+# rows below are a CHANGE of answer rather than a collapse of every
+# pattern onto one line.
+eval instant at 60s {service_name="esc"} | decolorize |~ "A"
+  {app="esc", service_name="esc"} 0s A
+
+eval instant at 60s {service_name="esc"} | decolorize |~ "101"
+  {app="esc", service_name="esc"} 5s 101
+
+# Go octal. The row #400 was filed on: before Stage 1 this returned the
+# `101` line.
+eval instant at 60s {service_name="esc"} | decolorize |~ "\101"
+  {app="esc", service_name="esc"} 0s A
+
+# `\xHH`. Before Stage 1 this returned the `x41` line.
+eval instant at 60s {service_name="esc"} | decolorize |~ "\x41"
+  {app="esc", service_name="esc"} 0s A
+
+# `\uXXXX`. Before Stage 1 this returned the `u0041` line.
+eval instant at 60s {service_name="esc"} | decolorize |~ "\u0041"
+  {app="esc", service_name="esc"} 0s A
+
+# `\UXXXXXXXX`. Before Stage 1 this returned the `U00000041` line.
+eval instant at 60s {service_name="esc"} | decolorize |~ "\U00000041"
+  {app="esc", service_name="esc"} 0s A
+
+# An escape Go does not define is a 400 at the reference's LEXER, before
+# any regex parser — `parse error at line 1, col 25: invalid char escape`
+# for each of these, the column being the only thing that moves. Before
+# Stage 1 they were served here as the patterns `d+`, `q`, `0` and `'`.
+# The `msg:` text is PulsusDB's own (only the STATUS is claimed against
+# the reference — owner ruling on #246).
+eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\d+"
+  msg: invalid char escape
+
+eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\q"
+  msg: invalid char escape
+
+eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\0"
+  msg: invalid char escape
+
+eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\'"
+  msg: invalid char escape
+
+# A malformed form of an escape the grammar DOES define: too few hex
+# digits, an octal value above the byte it denotes, a code point above
+# `utf8.MaxRune`, and the brace form Go has no arm for. The reference
+# answers `invalid char escape` for the first and last and `invalid
+# syntax` for the middle two (the value checks live in `Unquote`, the
+# shape checks in Go's `text/scanner`); both are 400.
+eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\x4"
+  msg: invalid char escape
+
+eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\400"
+  msg: invalid char escape
+
+eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\U00110000"
+  msg: invalid char escape
+
+eval_fail instant at 60s {service_name="esc"} | decolorize |~ "\u{263A}"
+  msg: invalid char escape
+
+clear
+
+load
+  {app="escc", service_name="escc"}
+  0s   café
+  5s   repl�ace
+  10s  plain
+  15s  tail-ÿ
+
+# Byte escapes COMPOSE. `"\xc3\xa9"` is one character, `é` — reading each
+# `\xHH` as `char::from_u32(HH)` would give four bytes and match nothing
+# here. Before Stage 1 the pattern was `xc3xa9` and this returned nothing.
+eval instant at 60s {service_name="escc"} | decolorize |~ "\xc3\xa9"
+  {app="escc", service_name="escc"} 0s café
+
+eval instant at 60s {service_name="escc"} | decolorize |~ "\303\277"
+  {app="escc", service_name="escc"} 15s tail-ÿ
+
+# A surrogate decodes to U+FFFD rather than being refused — the half
+# that differs from `pulsus-traceql`'s otherwise identical scanner.
+eval instant at 60s {service_name="escc"} | decolorize |~ "\ud800"
+  {app="escc", service_name="escc"} 5s repl�ace
+
+eval instant at 60s {service_name="escc"} | decolorize |~ "\udfff"
+  {app="escc", service_name="escc"} 5s repl�ace
+
+# The one place this narrows the reference (ledgered
+# `logql-string-escape-non-utf8`): a literal whose decoded BYTES are not
+# valid UTF-8. At a line filter the reference refuses it too — `error
+# parsing regexp: invalid UTF-8` — so this row is parity; the divergence
+# is at its five `NewFastRegexMatcher` positions, where it answers 200
+# and nothing (measured: `{app=~"\xff", service_name="esc"}` is 200 with
+# an empty result), and where no line in this store could match a 0xFF
+# byte anyway.
+eval_fail instant at 60s {service_name="escc"} | decolorize |~ "\xff"
+  msg: not valid UTF-8
+
+eval_fail instant at 60s {service_name="escc"} | decolorize |~ "\x41\xff"
+  msg: not valid UTF-8
+
+clear

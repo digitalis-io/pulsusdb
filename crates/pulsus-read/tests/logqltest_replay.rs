@@ -730,12 +730,18 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// source key carry
 /// `divergence(logfmt-expression-duplicate-source-key-tiebreak)` and so
 /// enlarge `pinned-divergence`.
-const TOTAL_DIRECTIVES: usize = 1_459;
+/// Issue #400 adds `b24_string_escapes.test`, captured against the same
+/// pinned image with no config delta. Its `eval_fail` rows carry
+/// PulsusDB's own error text and so enlarge the `our-error-text`
+/// exclusion; its `eval` rows are streams queries at a single instant
+/// over a relative-offset load set, so they move [`PROVENANCE_PERMITS`]
+/// and [`REACHABLE`] together.
+const TOTAL_DIRECTIVES: usize = 1_479;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_132;
+const PROVENANCE_PERMITS: usize = 1_142;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -752,10 +758,15 @@ const PROVENANCE_PERMITS: usize = 1_132;
 /// captured share lands here. `b24_logfmt_expr_eval.test` (issue #393)
 /// is that shape too, apart from its instant metric row, which
 /// [`TOTAL_DIRECTIVES`] names.
-const REACHABLE: usize = 204;
+///
+/// `b24_string_escapes.test` (issue #400) is
+/// that shape too: every `eval` row is a streams query at a single
+/// instant over a relative-offset load set, so its whole permitted share
+/// lands here and its `eval_fail` rows never enter the question.
+const REACHABLE: usize = 214;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=154, not a capture claim (derived)=29, \
-not a capture claim (ported)=29, our-error-text (eval_fail)=87, pinned-divergence=28";
+not a capture claim (ported)=29, our-error-text (eval_fail)=97, pinned-divergence=28";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice

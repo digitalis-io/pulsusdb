@@ -1886,7 +1886,13 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// `divergence(logfmt-expression-duplicate-source-key-tiebreak)` instead
 /// and move `DIVERGENCE`, not this constant — the reference has no answer
 /// there.
-const CAPTURED: usize = 1_368;
+/// Issue #400 added `b24_string_escapes.test` — what a double-quoted
+/// LogQL string DECODES to, pinned by the lines a query returns rather
+/// than by a status. Captured against the pinned v3.7.4 container in a
+/// single run over a window ending at now, same file-level `captured`
+/// default. Its `eval_fail` rows gate on PulsusDB's own wording, as
+/// elsewhere, while the REJECTION each pins was captured.
+const CAPTURED: usize = 1_388;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1902,5 +1908,5 @@ const DERIVED: usize = 31;
 /// `logfmt-expression-duplicate-source-key-tiebreak`.
 const DIVERGENCE: usize = 28;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_459;
+const TOTAL: usize = 1_479;
 // corpus-counts: end (provenance-corpus-constants)
