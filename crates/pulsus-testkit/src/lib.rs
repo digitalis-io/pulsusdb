@@ -574,8 +574,7 @@ mod tests {
     // future toolchain is picked up on the next run.
     //
     // The derivation is the mechanism, and it is what is verified. To see
-    // which characters are in the set, run the tests below; no comment
-    // here answers that, deliberately.
+    // which characters are in the set, run the tests below.
     // -----------------------------------------------------------------
 
     /// The characters [`str::trim`] strips, **derived by running `trim`**
@@ -601,9 +600,7 @@ mod tests {
     /// as whitespace.
     ///
     /// The characters below are named on purpose: they are the probe, and
-    /// a probe has to be written down. They say nothing about what else
-    /// the derived set contains — that question is answered by running
-    /// the tests, not by reading this.
+    /// a probe has to be written down.
     fn assert_derivation_is_sane(ws: &[char]) {
         for anchor in [' ', '\t', '\n', '\r'] {
             assert!(
